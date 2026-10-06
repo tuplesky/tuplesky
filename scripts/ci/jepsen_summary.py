@@ -11,6 +11,8 @@ directory (`store/latest`) and writes what a reader looks for first:
 * under a simulated WAN, the round trips the nemesis measured at setup
   against the profile's (jepsen.tuplesky.wan);
 * each node's final reads, which say whether the domain served again;
+* where the runner's CPU went over the workload, by process group, when
+  the job sampled it (`cpu-samples.csv` from `cpu_sampler.py`);
 * the commonest failure reasons;
 * the faults, in order;
 * for a TupleSky run, one row per voter from its `coordd.log`: boots,
@@ -37,8 +39,9 @@ directory (`store/latest`) and writes what a reader looks for first:
         [--profile strict|replay]
 
 The Markdown goes to `$GITHUB_STEP_SUMMARY` when it is set, and to standard
-output either way (in a folded group on a runner). It reads only `jepsen.log`, `results.edn` and
-`n*/coordd.log`; a missing file leaves its section out. Exit status 0
+output either way (in a folded group on a runner). It reads only
+`jepsen.log`, `results.edn`, `cpu-samples.csv` and `n*/coordd.log`; a
+missing file leaves its section out. Exit status 0
 unless the store directory does not exist.
 """
 from __future__ import annotations
@@ -440,6 +443,73 @@ def throughput(client: list[Op], end: datetime.datetime | None):
     return oks, (end - start).total_seconds(), {f: sorted(ms) for f, ms in latencies.items()}
 
 
+# What `cpu_sampler.py` groups the runner's processes into, in its columns'
+# order, and what this summary calls each.
+CPU_GROUPS = (
+    ("servers", "the servers under test"),
+    ("clients", "their Jepsen clients (shims)"),
+    ("jvm", "Jepsen's JVM"),
+    ("plumbing", "docker, containerd and ssh"),
+)
+
+
+def read_cpu_samples(path: str) -> list[dict]:
+    """The rows `cpu_sampler.py` wrote, with the time parsed; [] without
+    the file or with a row that does not parse."""
+    if not os.path.exists(path):
+        return []
+    rows = []
+    try:
+        with open(path) as f:
+            header = f.readline().strip().split(",")
+            for line in f:
+                cells = line.strip().split(",")
+                if len(cells) != len(header):
+                    continue
+                row = {k: float(v) for k, v in zip(header[1:], cells[1:])}
+                row["time"] = datetime.datetime.strptime(cells[0], "%Y-%m-%d %H:%M:%S.%f")
+                rows.append(row)
+    except (OSError, ValueError):
+        return []
+    return rows
+
+
+def runner_cpu(rows: list[dict], start: datetime.datetime, end: datetime.datetime, completed: int) -> list[str]:
+    """Where the runner's CPU went from `start` to `end`: the sample rows
+    that bracket the window, each group's CPU seconds between them, as
+    cores and per completed operation. [] when no rows bracket it."""
+    before = [r for r in rows if r["time"] <= start]
+    after = [r for r in rows if r["time"] >= end]
+    if not before or not after:
+        return []
+    a, b = before[-1], after[0]
+    secs = (b["time"] - a["time"]).total_seconds()
+    if secs <= 0:
+        return []
+    busy = b["host_busy_s"] - a["host_busy_s"]
+    cells = []
+    for key, label in CPU_GROUPS:
+        cpu = b.get(f"{key}_s", 0.0) - a.get(f"{key}_s", 0.0)
+        cells.append((label, cpu))
+    cells.append(("everything else (the kernel's interrupts included)", busy - sum(c for _, c in cells)))
+    cells.append(("**the host, busy**", busy))
+    idle = (b["host_total_s"] - a["host_total_s"]) - busy
+    out = [
+        f"**Runner CPU** (sampled from `/proc` once a second by `cpu_sampler.py`, over the {secs:.0f} s between "
+        f"the samples around the workload, {int(b['cpus'])} CPUs; a group is its processes by name; per "
+        f"operation is over the {completed} operations completed in that time, `ok`, `fail` or `info`)",
+        "",
+        "| | CPU (s) | Cores | Per operation (ms) |",
+        "| --- | --- | --- | --- |",
+    ]
+    for label, cpu in cells:
+        per = f"{cpu * 1000 / completed:.2f}" if completed else "-"
+        out.append(f"| {label} | {cpu:.1f} | {cpu / secs:.2f} | {per} |")
+    out.append(f"| idle | {idle:.1f} | {idle / secs:.2f} | - |")
+    out.append("")
+    return out
+
+
 def node_of(op: Op, nodes: list[str]) -> str:
     """Jepsen binds worker thread N to node N mod the node count."""
     m = WORKER.match(op.thread)
@@ -531,6 +601,12 @@ def summarize(store: str, nodes: list[str], title: str, profile: str | None = No
                 cells = " | ".join(f"{percentile(ms, q):.0f}" for q in (0.5, 0.95, 0.99))
                 out.append(f"| `{f}` | {len(ms)} | {cells} | {ms[-1]:.0f} |")
             out.append("")
+
+        rows = read_cpu_samples(os.path.join(store, "cpu-samples.csv"))
+        if rows:
+            until = heal if heal is not None else done[-1].at if done else start
+            completed = sum(1 for o in done if start <= o.at <= until)
+            out.extend(runner_cpu(rows, start, until, completed))
 
         # The final reads: each worker's operations invoked after the last
         # fault operation (the final heal), with what answered them. A

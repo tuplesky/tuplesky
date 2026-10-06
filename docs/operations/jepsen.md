@@ -424,6 +424,19 @@ of lines. `scripts/ci/jepsen_summary.py` reads the test's store
   which says whether the domain served again;
 * the commonest reasons an operation was not `ok`, and the faults in
   order;
+* in every job, where the runner's CPU went over the workload (Runner
+  CPU): `jepsen_bounded.sh` runs `scripts/ci/cpu_sampler.py` beside the
+  test, which reads every process's CPU time from `/proc` once a second,
+  the node containers' processes included, and groups them by name: the
+  servers under test (`coordd`, `etcd`, `swiftpaxos`), their Jepsen
+  clients (`coord-jepsen`, `swiftpaxos-jepsen`), Jepsen's JVM, and
+  docker, containerd and ssh. Everything else is the host's busy time less
+  those, the kernel's interrupts included. The table takes the samples
+  around the first invocation and the final heal (or the last operation),
+  and gives each group's CPU seconds, cores and milliseconds per completed
+  operation, so a client's cost is a reading rather than a subtraction. A
+  process that exits between two samples loses at most a second of its
+  time. The samples are in the store as `cpu-samples.csv`;
 * for the TupleSky job, one row per voter from its `coordd.log`: boots,
   the position it last recovered at, the highest position it executed by
   the end (read from its store by `coord-jepsen-executed --last`, so a

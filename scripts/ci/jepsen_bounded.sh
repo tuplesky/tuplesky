@@ -10,6 +10,10 @@
 # and a hung nemesis or client shows in the dump as the thread still waiting,
 # with the node-side command it waits on. Exits with the command's status
 # (124 when the bound was hit).
+#
+# With JEPSEN_CPU_SAMPLES set to a path, cpu_sampler.py writes where the
+# runner's CPU goes, once a second, to it while the command runs, for the
+# summary's Runner CPU table.
 set -u
 
 if [ $# -lt 4 ] || [ "$3" != "--" ]; then
@@ -40,8 +44,19 @@ dump() {
 (exec 2>/dev/null; sleep $((bound - 60)) && dump) &
 watchdog=$!
 
+sampler=
+if [ -n "${JEPSEN_CPU_SAMPLES:-}" ]; then
+  python3 "$(dirname "$0")/cpu_sampler.py" --out "$JEPSEN_CPU_SAMPLES" &
+  sampler=$!
+fi
+
 rc=0
 timeout -k 60 "$bound" "$@" || rc=$?
+
+if [ -n "$sampler" ]; then
+  kill "$sampler" 2>/dev/null || true
+  wait "$sampler" 2>/dev/null || true
+fi
 
 pkill -P "$watchdog" 2>/dev/null || true
 kill "$watchdog" 2>/dev/null || true

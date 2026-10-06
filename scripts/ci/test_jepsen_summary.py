@@ -437,5 +437,52 @@ class CheckpointTests(unittest.TestCase):
         self.assertNotIn("**Checkpoints**", self.summarize(REPLAY_VOTER))
 
 
+
+class RunnerCpuTests(unittest.TestCase):
+    """Where the runner's CPU went over the workload, from the sampler's
+    rows around it: the first invocation (10:00:01) to the final heal
+    (10:00:40), one operation completed in it."""
+
+    SAMPLES = (
+        "time,host_busy_s,host_total_s,cpus,servers_s,clients_s,jvm_s,plumbing_s\n"
+        "2026-09-27 10:00:00.500000,0.00,0.00,4,0.00,0.00,0.00,0.00\n"
+        "2026-09-27 10:00:20.000000,40.00,80.00,4,20.00,4.00,10.00,1.00\n"
+        "2026-09-27 10:00:41.500000,82.00,164.00,4,40.00,8.00,20.00,2.00\n"
+        "2026-09-27 10:01:50.000000,300.00,440.00,4,90.00,9.00,180.00,3.00\n"
+    )
+
+    def summary(self, samples):
+        with tempfile.TemporaryDirectory() as store:
+            with open(os.path.join(store, "jepsen.log"), "w") as f:
+                f.write(LOG)
+            with open(os.path.join(store, "results.edn"), "w") as f:
+                f.write(RESULTS)
+            if samples is not None:
+                with open(os.path.join(store, "cpu-samples.csv"), "w") as f:
+                    f.write(samples)
+            return js.summarize(store, ["n1", "n2"], "Jepsen")
+
+    def test_the_rows_around_the_workload_are_differenced(self):
+        text = self.summary(self.SAMPLES)
+        self.assertIn("over the 41 s between the samples around the workload, 4 CPUs", text)
+        self.assertIn("over the 1 operations completed in that time", text)
+        self.assertIn("| the servers under test | 40.0 | 0.98 | 40000.00 |", text)
+        self.assertIn("| their Jepsen clients (shims) | 8.0 | 0.20 | 8000.00 |", text)
+        self.assertIn("| Jepsen's JVM | 20.0 | 0.49 | 20000.00 |", text)
+        self.assertIn("| everything else (the kernel's interrupts included) | 12.0 | 0.29 | 12000.00 |", text)
+        self.assertIn("| **the host, busy** | 82.0 | 2.00 | 82000.00 |", text)
+        self.assertIn("| idle | 82.0 | 2.00 | - |", text)
+
+    def test_no_samples_no_table(self):
+        self.assertNotIn("Runner CPU", self.summary(None))
+
+    def test_samples_that_do_not_bracket_the_workload_are_left_out(self):
+        late = self.SAMPLES.splitlines(keepends=True)
+        self.assertNotIn("Runner CPU", self.summary(late[0] + "".join(late[3:])))
+
+    def test_a_row_that_does_not_parse_drops_the_table(self):
+        self.assertNotIn("Runner CPU", self.summary(self.SAMPLES + "garbage,1,2,3,4,5,6,7\n"))
+
+
 if __name__ == "__main__":
     unittest.main()

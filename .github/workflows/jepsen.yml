@@ -81,6 +81,7 @@ on:
     paths:
       - .github/workflows/jepsen.yml
       - crates/coord-jepsen/**
+      - scripts/ci/cpu_sampler.py
       - scripts/ci/jepsen_bounded.sh
       - scripts/ci/jepsen_scenario.sh
       - scripts/ci/jepsen_summary.py
@@ -232,6 +233,7 @@ jobs:
         # harness from before it.
         run: |
           wan=(); if [ "$WAN" != none ]; then wan=(--wan "$WAN"); fi
+          export JEPSEN_CPU_SAMPLES="$RUNNER_TEMP/cpu-samples.csv"
           "$GITHUB_WORKSPACE/tuplesky/scripts/ci/jepsen_bounded.sh" \
             $((TIME_LIMIT + 1200)) "$RUNNER_TEMP/cluster/nodes" -- lein run test \
             --nodes-file "$RUNNER_TEMP/cluster/nodes" \
@@ -268,6 +270,7 @@ jobs:
         # voter, in the job summary; each voter's last 400 lines follow here.
         run: |
           if [ -d jepsen/tuplesky/store/latest ]; then
+            cp "$RUNNER_TEMP/cpu-samples.csv" jepsen/tuplesky/store/latest/ 2>/dev/null || true
             python3 tuplesky/scripts/ci/jepsen_summary.py jepsen/tuplesky/store/latest \
               --nodes-file "$RUNNER_TEMP/cluster/nodes" --profile "$PROFILE" \
               --title "TupleSky: $WORKLOAD, $NEMESIS$TITLE_SUFFIX$STORE_SUFFIX$PROFILE_SUFFIX$CHECKPOINT_SUFFIX"
@@ -542,6 +545,7 @@ jobs:
         # never returned, one of them for 84 minutes after its time limit.
         run: |
           wan=(); if [ "$WAN" != none ]; then wan=(--wan "$WAN"); fi
+          export JEPSEN_CPU_SAMPLES="$RUNNER_TEMP/cpu-samples.csv"
           "$GITHUB_WORKSPACE/tuplesky/scripts/ci/jepsen_bounded.sh" \
             $((TIME_LIMIT + 1200)) "$RUNNER_TEMP/cluster/nodes" -- lein run test \
             --nodes-file "$RUNNER_TEMP/cluster/nodes" \
@@ -560,6 +564,7 @@ jobs:
         if: always()
         run: |
           if [ -d etcd-test/store/latest ]; then
+            cp "$RUNNER_TEMP/cpu-samples.csv" etcd-test/store/latest/ 2>/dev/null || true
             python3 tuplesky/scripts/ci/jepsen_summary.py etcd-test/store/latest \
               --nodes-file "$RUNNER_TEMP/cluster/nodes" --title "etcd $ETCD_VERSION: $WORKLOAD, $NEMESIS$TITLE_SUFFIX$STORE_SUFFIX"
           else
@@ -680,6 +685,7 @@ jobs:
         # and network, bounded the same way.
         run: |
           wan=(); if [ "$WAN" != none ]; then wan=(--wan "$WAN"); fi
+          export JEPSEN_CPU_SAMPLES="$RUNNER_TEMP/cpu-samples.csv"
           "$GITHUB_WORKSPACE/tuplesky/scripts/ci/jepsen_bounded.sh" \
             $((TIME_LIMIT + 1200)) "$RUNNER_TEMP/cluster/nodes" -- lein run test \
             --nodes-file "$RUNNER_TEMP/cluster/nodes" \
@@ -696,6 +702,7 @@ jobs:
         if: always()
         run: |
           if [ -d jepsen/swiftpaxos/store/latest ]; then
+            cp "$RUNNER_TEMP/cpu-samples.csv" jepsen/swiftpaxos/store/latest/ 2>/dev/null || true
             python3 tuplesky/scripts/ci/jepsen_summary.py jepsen/swiftpaxos/store/latest \
               --nodes-file "$RUNNER_TEMP/cluster/nodes" --title "SwiftPaxos: register, $SWIFTPAXOS_NEMESIS$TITLE_SUFFIX"
           else
