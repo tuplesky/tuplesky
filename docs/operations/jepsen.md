@@ -206,7 +206,10 @@ etcd's and SwiftPaxos's jobs ignore the input.
 
 The `checkpoint-after-records` input sets how far each TupleSky voter's
 journal runs past its last local checkpoint before it publishes the next
-(task-d55): empty keeps the daemon's 4,096, and 0 never publishes. The
+(task-d55): empty keeps the profile's default, and 0 never publishes. The
+default is 4,096 records under `strict`; under `replay` it is 65,536
+records and 30 s since the last publication, whichever comes later
+(task-d51; before task-d51, 4,096 for both). The
 scenario step exports it as `COORD_HARNESS_CHECKPOINT_AFTER_RECORDS`, which
 `coord-harness provision` reads the same way as the profile; it needs a
 carry with the harness of task-d55, and a carry without it keeps the
@@ -465,6 +468,11 @@ of lines. `scripts/ci/jepsen_summary.py` reads the test's store
   barrier answered or
   refused reads as leader (task-d50), three more columns give the reads
   served, refused, and a served read's mean wait to its answer;
+* and, where voters publish local checkpoints (task-d55), a Checkpoints
+  table: per voter, over its whole log, how many it published and how many
+  failed, the mean and the longest `loop_ms` (what a publication held the
+  domain thread, task-d51; empty on a build before it), how many held it
+  over task-d51's 10 ms, and the longest `took_ms`;
 * and, where voters print what their start replayed (task-d55), a Boots
   table with a row for every start of every voter: when Jepsen started
   it; the `replayed` line's records, from and through (where the attach

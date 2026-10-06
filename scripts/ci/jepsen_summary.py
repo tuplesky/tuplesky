@@ -27,6 +27,8 @@ directory (`store/latest`) and writes what a reader looks for first:
   dispatched under one profile whose voters ran the other says so at the
   top, and under the replay profile each voter's row carries how far its
   projection was durable against what it had applied;
+* and each voter's local checkpoints (task-d55): how many it published
+  and how long each held the domain thread (task-d51's `loop_ms`);
 * and, where the voters report what their start replayed (task-d55),
   every boot of every voter: what the attach replayed, from where it
   found the projection, and how long the replay and the attach took.
@@ -93,6 +95,11 @@ BALLOT = re.compile(r"ballot (\d+)")
 # `[:no-client "throw+: {:type :ns/kind, ... :error \"why\"}"]`
 SLINGSHOT = re.compile(r':type :[\w.-]+/([\w-]+).*?:error \\?"([^"\\]*)')
 RECOVERED = re.compile(r"^recovered .*\bexecuted=(\d+)")
+# A local checkpoint's publication (task-d55), with what it held the domain
+# thread (`loop_ms`, task-d51; absent before it) and how long it took.
+CHECKPOINT = re.compile(r"^checkpoint represented=\d+ .*\btook_ms=(\d+)")
+LOOP_MS = re.compile(r"\bloop_ms=([\d.]+)")
+CHECKPOINT_FAILED = "could not publish a recovery checkpoint"
 # What the attach replayed from the journal into the projection (task-d55).
 REPLAYED = re.compile(
     r"^replayed records=(\d+) from=(\d+) through=(\d+) took_ms=([\d.]+) attach_ms=([\d.]+)"
@@ -154,6 +161,10 @@ class Voter:
     replay: bool = False
     # Every start, in order.
     boot_rows: list = field(default_factory=list)
+    # Every publication this voter's log reports, over all its boots:
+    # (took_ms, loop_ms or None before task-d51), and the failed ones.
+    checkpoints: list = field(default_factory=list)
+    checkpoints_failed: int = 0
 
 
 @dataclass
@@ -349,6 +360,12 @@ def parse_voter(lines) -> Voter:
             v.executed = m[1]
             if v.boot_rows:
                 v.boot_rows[-1].executed = m[1]
+        m = CHECKPOINT.match(line)
+        if m:
+            loop = LOOP_MS.search(line)
+            v.checkpoints.append((int(m[1]), float(loop[1]) if loop else None))
+        if CHECKPOINT_FAILED in line:
+            v.checkpoints_failed += 1
         m = REPLAYED.match(line)
         if m and v.boot_rows:
             v.boot_rows[-1].replayed = (int(m[1]), int(m[2]), int(m[3]), float(m[4]), float(m[5]))
@@ -669,6 +686,29 @@ def summarize(store: str, nodes: list[str], title: str, profile: str | None = No
                     else:
                         replayed = "- | - | - | - | -"
                     out.append(f"| {node} | {i} | {b.started or '-'} | {replayed} | {b.executed} |")
+            out.append("")
+        if any(v.checkpoints or v.checkpoints_failed for v in voters.values()):
+            out.append(
+                "**Checkpoints** (every local checkpoint each voter published, over all its boots, from its "
+                "`checkpoint` lines; on the loop is `loop_ms`, what the publication held the domain thread, which "
+                "task-d51's acceptance bounds at 10 ms; took is from the pin to the end of the reclaim, most of it off "
+                "the loop since task-d51)"
+            )
+            out.append("")
+            out.append(
+                "| Node | Published | Failed | Mean on the loop (ms) | Max on the loop (ms) | Over 10 ms on the loop "
+                "| Max took (ms) |"
+            )
+            out.append("| --- " * 7 + "|")
+            for node, v in voters.items():
+                loops = [l for _, l in v.checkpoints if l is not None]
+                mean = f"{sum(loops) / len(loops):.1f}" if loops else "-"
+                peak = f"{max(loops):.1f}" if loops else "-"
+                over = str(sum(1 for l in loops if l > 10)) if loops else "-"
+                took = str(max(t for t, _ in v.checkpoints)) if v.checkpoints else "-"
+                out.append(
+                    f"| {node} | {len(v.checkpoints)} | {v.checkpoints_failed} | {mean} | {peak} | {over} | {took} |"
+                )
             out.append("")
         timed = [(node, name, r) for node, v in voters.items() for name, r in v.stages.items() if r[1] or r[2]]
         if timed:

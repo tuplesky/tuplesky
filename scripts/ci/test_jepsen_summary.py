@@ -394,5 +394,48 @@ class BootTests(unittest.TestCase):
         self.assertNotIn("**Boots**", self.summarize(REPLAY_VOTER))
 
 
+
+class CheckpointTests(unittest.TestCase):
+    """task-d51: each voter's publications, and what each held the loop."""
+
+    LOG = (
+        "coordd domain=tuplesky-harness roles=[Voter] phase=starting votes=true\n"
+        "checkpoint represented=4095 retired=true reclaimed=0 took_ms=171 loop_ms=4.5 pin_ms=0.1 export_ms=77.7 "
+        "write_ms=82.2 drain_ms=0.0 sync_ms=3.8 append_ms=0.2 retire_ms=0.6 reclaim_ms=0.0\n"
+        "checkpoint represented=8190 retired=true reclaimed=1 took_ms=240 loop_ms=12.5 pin_ms=0.1 export_ms=90.0 "
+        "write_ms=100.0 drain_ms=2.0 sync_ms=0.0 append_ms=5.0 retire_ms=5.0 reclaim_ms=30.0\n"
+        "this node could not publish a recovery checkpoint after 61000 ms: abandoned\n"
+    )
+    # Before task-d51 the line has no loop_ms.
+    OLD = (
+        "checkpoint represented=65527 retired=true reclaimed=0 took_ms=171 export_ms=77.7 write_ms=82.2 "
+        "drain_ms=0.0 sync_ms=3.8 append_ms=0.2 retire_ms=0.6 reclaim_ms=0.0\n"
+    )
+
+    def summarize(self, voter):
+        with tempfile.TemporaryDirectory() as store:
+            os.mkdir(os.path.join(store, "n1"))
+            with open(os.path.join(store, "n1", "coordd.log"), "w") as f:
+                f.write(voter)
+            return js.summarize(store, ["n1"], "TupleSky")
+
+    def test_each_publication_is_parsed(self):
+        v = js.parse_voter(self.LOG.splitlines(keepends=True))
+        self.assertEqual(v.checkpoints, [(171, 4.5), (240, 12.5)])
+        self.assertEqual(v.checkpoints_failed, 1)
+        self.assertEqual(js.parse_voter(self.OLD.splitlines(keepends=True)).checkpoints, [(171, None)])
+
+    def test_the_table_reads_the_loop(self):
+        text = self.summarize(self.LOG)
+        self.assertIn("**Checkpoints**", text)
+        self.assertIn("| n1 | 2 | 1 | 8.5 | 12.5 | 1 | 240 |", text)
+
+    def test_a_line_without_loop_ms_leaves_its_columns_empty(self):
+        self.assertIn("| n1 | 1 | 0 | - | - | - | 171 |", self.summarize(self.OLD))
+
+    def test_no_publication_no_table(self):
+        self.assertNotIn("**Checkpoints**", self.summarize(REPLAY_VOTER))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -23,7 +23,9 @@
 #   IN_CHECKPOINT_AFTER_RECORDS
 #                  journal records each TupleSky voter holds past its last
 #                  local checkpoint before publishing the next (task-d55);
-#                  0 never publishes; empty for the daemon's default. It
+#                  0 never publishes; empty for the profile's default
+#                  (4096 under strict; 65536 records and 30 s, whichever
+#                  comes later, under replay: task-d51). It
 #                  reaches the voters as COORD_HARNESS_CHECKPOINT_AFTER_RECORDS
 #                  and is named in the TupleSky title when set
 #
