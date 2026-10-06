@@ -38,15 +38,29 @@ pub struct Limits {
     pub max_live_subscriptions: usize,
     /// Journal records a domain may hold beyond its published
     /// checkpoint before the next one is published and the prefix
-    /// reclaimed. Zero never publishes.
+    /// reclaimed. Zero never publishes. Unset, 4,096 under the strict
+    /// profile and 65,536 under the replay profile (task-d51); see
+    /// [`Config::checkpoint_cadence`].
     ///
     /// A local setting, and only a local one: what it decides is when
     /// this node spends I/O on its own redo, and no replicated result
     /// depends on the answer. Publishing more often costs exports and
     /// keeps the journal small; publishing less often costs journal and
     /// makes a restart replay further.
-    #[serde(default = "default_checkpoint_after")]
-    pub checkpoint_after_records: u64,
+    #[serde(default)]
+    pub checkpoint_after_records: Option<u64>,
+    /// The least time between two publications, in seconds, beside
+    /// `checkpoint_after_records`: both have to have passed. Zero is no
+    /// bound by time. Unset, none under the strict profile and 30 under
+    /// the replay profile (task-d51).
+    ///
+    /// An image copies the whole projection, so a cadence by records
+    /// alone costs a busy domain an export every few seconds, each
+    /// larger than the last. Under the replay profile the journal is the
+    /// record, so publishing once an interval costs nothing but the
+    /// replay a restart does, which is at most an interval's records.
+    #[serde(default)]
+    pub checkpoint_after_seconds: Option<u64>,
     /// Commands a voter's command table holds at once (task-d05): the
     /// ones it still owes work on, and the executed ones it has not
     /// retired yet.
@@ -74,9 +88,17 @@ pub struct Limits {
     pub max_admitted_per_second: u32,
 }
 
-const fn default_checkpoint_after() -> u64 {
-    4096
-}
+/// The checkpoint interval in records a strict configuration that names
+/// none gets.
+pub const DEFAULT_CHECKPOINT_AFTER_RECORDS: u64 = 4096;
+/// The checkpoint interval in records a replay configuration that names
+/// none gets (task-d51). One publication in two minutes at this interval
+/// cost the Jepsen runner's six-node row nothing visible against none at
+/// all, where one every 4,096 records cost it a third of its throughput.
+pub const DEFAULT_REPLAY_CHECKPOINT_AFTER_RECORDS: u64 = 65_536;
+/// The least time between two publications a replay configuration that
+/// names none gets (task-d51).
+pub const DEFAULT_REPLAY_CHECKPOINT_AFTER_SECONDS: u64 = 30;
 
 /// The admission rate a configuration that names none gets (task-d26): a
 /// design target and a ceiling, not a proved bound. It is under a sixth
@@ -124,7 +146,8 @@ impl Default for Limits {
             max_response_bytes: 8 * 1024 * 1024,
             max_outstanding_per_session: 256,
             max_live_subscriptions: 4096,
-            checkpoint_after_records: default_checkpoint_after(),
+            checkpoint_after_records: None,
+            checkpoint_after_seconds: None,
             command_table_capacity: default_command_table_capacity(),
             max_admitted_per_second: default_max_admitted_per_second(),
         }
@@ -871,6 +894,33 @@ impl Config {
         Ok(config)
     }
 
+    /// When this node publishes its local recovery baseline (task-d51):
+    /// once the journal holds this many records past the last one, and,
+    /// where there is a duration, once that long has passed since it.
+    /// Zero records never publishes.
+    ///
+    /// What a configuration leaves unset follows the journal profile.
+    /// Under the strict profile the projection is durable at every
+    /// commit, so the cadence is by records only. Under the replay
+    /// profile a restart replays from the projection's last durable
+    /// commit and the journal is the record, so an image every 30 s at
+    /// the most is enough, and 65,536 records at the least.
+    pub fn checkpoint_cadence(&self) -> (u64, Option<core::time::Duration>) {
+        let replays = self.journal.replays_projection();
+        let records = self.limits.checkpoint_after_records.unwrap_or(if replays {
+            DEFAULT_REPLAY_CHECKPOINT_AFTER_RECORDS
+        } else {
+            DEFAULT_CHECKPOINT_AFTER_RECORDS
+        });
+        let seconds = self.limits.checkpoint_after_seconds.unwrap_or(if replays {
+            DEFAULT_REPLAY_CHECKPOINT_AFTER_SECONDS
+        } else {
+            0
+        });
+        let every = (seconds > 0).then(|| core::time::Duration::from_secs(seconds));
+        (records, every)
+    }
+
     /// The parsed role set.
     pub fn role_set(&self) -> Result<RoleSet, ConfigError> {
         RoleSet::parse(&self.role).map_err(ConfigError::Role)
@@ -1237,5 +1287,38 @@ allow_insecure_loopback = {allow}
         off.renewal = None;
         off.floor.images = "checkpoints".to_owned();
         assert_eq!(off.validate_as(Build::Test), Ok(()));
+    }
+
+    /// What a configuration leaves unset follows the journal profile
+    /// (task-d51); what it names is taken as named.
+    #[test]
+    fn the_checkpoint_cadence_follows_the_profile_unless_named() {
+        use core::time::Duration;
+        let strict = with_renewal(false);
+        assert_eq!(strict.checkpoint_cadence(), (4096, None));
+
+        let mut replay = with_renewal(false);
+        replay.journal.profile = super::JOURNAL_REPLAY_PROFILE.to_owned();
+        assert_eq!(
+            replay.checkpoint_cadence(),
+            (65_536, Some(Duration::from_secs(30)))
+        );
+
+        replay.limits.checkpoint_after_records = Some(4096);
+        replay.limits.checkpoint_after_seconds = Some(0);
+        assert_eq!(
+            replay.checkpoint_cadence(),
+            (4096, None),
+            "zero is no bound"
+        );
+
+        let mut named = with_renewal(false);
+        named.limits.checkpoint_after_seconds = Some(5);
+        named.limits.checkpoint_after_records = Some(0);
+        assert_eq!(
+            named.checkpoint_cadence(),
+            (0, Some(Duration::from_secs(5))),
+            "zero records never publishes, whatever the time"
+        );
     }
 }

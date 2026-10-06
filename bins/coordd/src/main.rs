@@ -1167,11 +1167,11 @@ fn main() -> ExitCode {
     if let Some((appender, materializer)) = waits {
         domain = domain.count_pipeline_waits(appender, materializer);
     }
-    let domain = domain
-        // Where this node keeps its own recovery images, and how much
-        // unrepresented journal it tolerates before making one. Local
-        // to this node: no replicated result depends on the answer.
-        .with_checkpoints(checkpoints, config.limits.checkpoint_after_records);
+    // Where this node keeps its own recovery images, and how much
+    // unrepresented journal and how long it tolerates before making one.
+    // Local to this node: no replicated result depends on the answer.
+    let (after, every) = config.checkpoint_cadence();
+    let domain = domain.with_checkpoints(checkpoints, after, every);
     // Under the replay-backed profile, the time bound on a working
     // projection commit (task-j06); the store keeps the other two.
     let mut domain = if config.journal.replays_projection() {
