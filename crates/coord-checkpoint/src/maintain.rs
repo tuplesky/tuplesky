@@ -412,11 +412,20 @@ where
 
     fn finish_local(&mut self, written: Written) -> Result<Publication, BaselineError> {
         let domain = self.domain();
-        // The image was produced from the storage the pin saw. A domain
-        // reattached since then, from a peer's baseline, has another
-        // origin, and the image describes storage it no longer has.
-        // It is left unselected, and the next publication's reclaim
-        // removes it.
+        // Why an image produced while this thread went on serving is
+        // still the baseline it claims: under one origin, a position
+        // names one projection state, because the projection is the
+        // journal's prefix applied in order. So an image of (origin,
+        // `represented`) stays valid whatever was committed after the
+        // pin, provided the origin is still the domain's -- checked here
+        // -- and `C <= M` holds -- checked by `publish_checkpoint`.
+        //
+        // A domain reattached since the pin, from a peer's baseline
+        // (task-d08), has another origin, and the image describes
+        // storage it no longer has. It is left unselected, and the next
+        // publication's reclaim removes it. A reinstall from this node's
+        // own image keeps the origin and replays to the same state, and
+        // happens at attach, not while a publication is in flight.
         if self.store().origin(domain) != Some(written.pointer.origin) {
             return Err(BaselineError::Superseded);
         }

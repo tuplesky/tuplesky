@@ -9620,13 +9620,22 @@ and the closed loop's tail was those stalls.
   which the profile's own cadence has usually made it by the time an
   image produced off the thread is published.
 - **What the domain thread waits for.** Nothing. It checks the writer
-  each turn, publishes once it has finished, and starts the next only
-  after that: at most one image is in flight.
+  each turn, finishes the publication once the image is written, and
+  starts the next only after the reclaim: at most one publication is in
+  flight.
 - **The bound.** A read of the snapshot after 60 s fails the export as
-  abandoned. The snapshot is released and nothing is written. An image
-  of a domain reattached under another origin meanwhile is not
+  abandoned. The snapshot is released and nothing is written.
+- **Why an image produced while the domain serves is still its
+  baseline.** Under one origin, a position names one projection state,
+  because the projection is the journal's prefix applied in order. So
+  an image of (origin, represented) stays valid whatever is committed
+  after the pin, provided the origin is still the domain's at the
+  finish and `C <= M` holds there. `finish_local` checks the first and
+  `publish_checkpoint` the second. An image of a domain reattached from
+  a peer's baseline meanwhile (task-d08) has another origin and is not
   published (`BaselineError::Superseded`); the next publication's
-  reclaim removes it.
+  reclaim removes it. A reinstall from this node's own image keeps the
+  origin, replays to the same state, and happens at attach.
 - **The cadence.** Unset, `checkpoint_after_records` is 4,096 under the
   strict profile and 65,536 under the replay profile, and the new
   `checkpoint_after_seconds` is none under strict and 30 under replay.
@@ -9635,5 +9644,8 @@ and the closed loop's tail was those stalls.
 - **The line.** `checkpoint` gains `loop_ms`, what the publication held
   the domain thread for (the pin, the pointer and the retirement), and
   `pin_ms`.
-  `took_ms` is now from the pin to the finish, most of it off the
-  thread. The `Checkpoint` stage samples `loop_ms`.
+  `took_ms` is now from the pin to the end of the reclaim, most of it
+  off the thread, and the line is printed then. A reclaim that fails,
+  or a reclaimer that panics, still prints it: the pointer is durable,
+  and the images it left are the next reclaim's. The `Checkpoint` stage
+  samples `loop_ms`.

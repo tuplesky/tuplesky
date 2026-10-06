@@ -1478,14 +1478,19 @@ enum Job {
     /// Steps 1 and 2: producing the image and writing it.
     Write(std::thread::JoinHandle<Result<Written, BaselineError>>),
     /// Step 5, once the pointer is durable: removing what it supersedes.
-    Reclaim(std::thread::JoinHandle<(Publication, Result<(), BaselineError>)>),
+    /// The publication is kept here as well, so that a reclaimer that
+    /// panics still leaves it accounted as the durable one it is.
+    Reclaim(
+        std::thread::JoinHandle<(Publication, Result<(), BaselineError>)>,
+        Box<Publication>,
+    ),
 }
 
 impl Job {
     fn is_finished(&self) -> bool {
         match self {
             Job::Write(worker) => worker.is_finished(),
-            Job::Reclaim(worker) => worker.is_finished(),
+            Job::Reclaim(worker, _) => worker.is_finished(),
         }
     }
 }
@@ -3036,8 +3041,9 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     /// The image is produced and written on a thread of its own from a
     /// snapshot pinned here, and the domain goes on serving meanwhile.
     /// This thread keeps the steps that order the publication: the pin,
-    /// then once the image and its directory are durable the pointer, the
-    /// retirement and the reclaim, in task-j04's order. A publication
+    /// then once the image and its directory are durable the pointer and
+    /// the retirement, in task-j04's order. The reclaim runs off it again
+    /// once the pointer is durable. A publication
     /// costs it a pin and a pointer's sync, not the projection's size.
     fn publish(&mut self, housekeeping: &mut Housekeeping) {
         use coord_daemon::metrics::Stage;
@@ -3073,7 +3079,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                                     housekeeping.export = Some(Export {
                                         started,
                                         on_loop,
-                                        job: Job::Reclaim(worker),
+                                        job: Job::Reclaim(worker, Box::new(publication)),
                                     });
                                 }
                                 // No thread to spare: the images stay
@@ -3097,18 +3103,26 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                         }
                     }
                 }
-                Job::Reclaim(worker) => match worker.join() {
-                    Ok((publication, reclaimed)) => {
-                        // The pointer is durable whatever the reclaim did:
-                        // a failure leaves images on disk for the next
-                        // publication to remove, not a failed publication.
-                        if let Err(e) = reclaimed {
+                // The pointer is durable whatever the reclaim did: a
+                // failure, or a reclaimer that panicked, leaves images on
+                // disk for the next publication to remove, not a failed
+                // publication.
+                Job::Reclaim(worker, unreclaimed) => {
+                    let publication = match worker.join() {
+                        Ok((publication, Ok(()))) => publication,
+                        Ok((publication, Err(e))) => {
                             eprintln!("the superseded images were not reclaimed: {e}");
+                            publication
                         }
-                        self.published(housekeeping, publication, started, on_loop);
-                    }
-                    Err(_) => eprintln!("the checkpoint reclaimer panicked"),
-                },
+                        Err(_) => {
+                            eprintln!(
+                                "the superseded images were not reclaimed: the reclaimer panicked"
+                            );
+                            *unreclaimed
+                        }
+                    };
+                    self.published(housekeeping, publication, started, on_loop);
+                }
             }
             return;
         }
