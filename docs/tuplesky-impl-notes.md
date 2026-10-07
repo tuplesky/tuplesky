@@ -10083,3 +10083,43 @@ less the base:
 - task-d61's acceptance is the streams cut. The change is kept for what
   QUIC's stream limits and a WAN path care about, not for CPU.
 
+
+## The leader's re-send past each voter's adoption (task-d59)
+
+The leader's domain loop calls `Leader::resend_unvoted` once every 250 ms.
+Each call sorted every durable proposal the leader keeps until the history
+sweep, thousands of them, and walked them once per voter to find what that
+voter had not adopted. The leader now keeps the durable proposals in
+sequence order as they become durable and as they are replaced or swept,
+and each voter's highest adoption as adoptions are counted. A call looks
+past that, and before it only at the unsettled proposals, which hold every
+undecided one. What a call sends is unchanged: in debug builds every call
+is checked against the sorted walk. The metrics report the calls, the
+proposals they looked at, and the loop's time in them, in all and the
+longest.
+
+Five voters on one four-core host, replay profile, stores on disk, 30
+callers, 40,000 measured operations, `put=30,get=50,contended=20`, three
+pairs of #150's build against this one, alternated:
+
+| | #150 | this |
+| --- | --- | --- |
+| completed a second | 885, 906, 891 | 867, 875, 906 |
+| get p99, ms | 116, 111, 111 | 120, 119, 109 |
+| leader's domain thread, CPU ms per command | 0.698, 0.704, 0.713 | 0.675, 0.691, 0.650 |
+| leader: re-send calls | -- | 208, 207, 200 |
+| leader: ms per call (longest) | -- | 0.109 (4.3), 0.094 (1.8), 0.080 (1.5) |
+| leader: proposals looked at per call | -- | 26.6, 24.8, 26.9 |
+
+- The leader's domain thread is 0.033 ms per command cheaper on average,
+  lower in every pair (0.023, 0.013 and 0.063). At about 890 commands a
+  second and four calls a second that is about 7 ms a call, the size the
+  runner's profile gave the old walk.
+- A call now looks at about 26 proposals over four voters, and takes 0.08
+  to 0.11 ms of wall time on the loop. That time is the whole of
+  `Node::resend_proposals`, the sends it hands to the transport included,
+  on a host where five voters share four cores; the longest calls, 1.5 to
+  4.3 ms, are most likely the thread being descheduled.
+- Throughput and get p99 moved inside the pairs' spread on this host,
+  whose p99.9 is half a second either way. The runner pair, with the
+  leader's read p99, is the acceptance.

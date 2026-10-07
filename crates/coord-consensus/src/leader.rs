@@ -20,6 +20,7 @@
 
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::vec::Vec;
+use core::ops::Bound;
 
 use coord_core::capability::{AdmissionFacts, ReleasedResult, admission_digest};
 use coord_core::effect::{BarrierId, BootId, Effect, PeerId, PersistBatch, StoreUpdate};
@@ -337,6 +338,16 @@ pub struct ResendCounts {
     pub handed_off: u64,
     /// Votes refused as duplicates, fast or slow, re-sent or not.
     pub duplicate_votes: u64,
+    /// Calls of [`Leader::resend_unvoted`] that looked for something to
+    /// send (task-d59).
+    #[serde(default)]
+    pub calls: u64,
+    /// Proposals those calls looked at, over every voter (task-d59): the
+    /// ones past each voter's highest adoption, and the undecided ones
+    /// before it. A voter that answers costs what it has not answered
+    /// yet, not every proposal kept until the history sweep.
+    #[serde(default)]
+    pub scanned: u64,
 }
 
 impl ResendCounts {
@@ -362,6 +373,8 @@ impl ResendCounts {
         self.late += other.late;
         self.handed_off += other.handed_off;
         self.duplicate_votes += other.duplicate_votes;
+        self.calls += other.calls;
+        self.scanned += other.scanned;
     }
 }
 
@@ -413,6 +426,18 @@ pub struct Leader {
     /// Each proposal's current batch (task-d46): what a storage event is
     /// matched with, instead of a pass over every proposal.
     by_barrier: BTreeMap<BarrierId, CommandId>,
+    /// The durable proposals by sequence number (task-d59), entered as
+    /// each becomes durable and left as it is replaced or swept: what
+    /// [`Leader::resend_unvoted`] walks past each voter's highest
+    /// adoption, instead of sorting every proposal `proposals` keeps
+    /// until the history sweep.
+    durable: BTreeSet<(u64, CommandId)>,
+    /// Per voter, the durable proposal with the highest sequence number
+    /// it adopted (task-d59), raised as adoptions are counted and as a
+    /// proposal a voter adopted becomes durable. Never below the truth;
+    /// above it only once the proposal it names was swept or its votes
+    /// replaced, which [`Leader::adopted_through`] finds and corrects.
+    adopted_through: BTreeMap<ReplicaId, (u64, CommandId)>,
     votes: BTreeMap<CommandId, VoteSet>,
     /// Acknowledgements that reached this leader before it had proposed
     /// the command they are about, held until it does.
@@ -512,6 +537,18 @@ struct OwnAdoption {
     requires: Vec<BarrierId>,
 }
 
+/// Raise `voter`'s highest adoption to `key` if it is higher (task-d59).
+fn raise(
+    through: &mut BTreeMap<ReplicaId, (u64, CommandId)>,
+    voter: ReplicaId,
+    key: (u64, CommandId),
+) {
+    let top = through.entry(voter).or_insert(key);
+    if key > *top {
+        *top = key;
+    }
+}
+
 /// The commands a chain of re-proposals follows once `ready`, entries of
 /// `decision` that were waiting on re-proposed commands, are placed after
 /// `last` (task-d34): those of `last` and `ready` that no other of them
@@ -587,6 +624,8 @@ impl Leader {
             proposals: BTreeMap::new(),
             unsettled: BTreeSet::new(),
             by_barrier: BTreeMap::new(),
+            durable: BTreeSet::new(),
+            adopted_through: BTreeMap::new(),
             votes: BTreeMap::new(),
             early_votes: BTreeMap::new(),
             early_order: VecDeque::new(),
@@ -682,6 +721,8 @@ impl Leader {
             proposals: BTreeMap::new(),
             unsettled: BTreeSet::new(),
             by_barrier: BTreeMap::new(),
+            durable: BTreeSet::new(),
+            adopted_through: BTreeMap::new(),
             votes: BTreeMap::new(),
             early_votes: BTreeMap::new(),
             early_order: VecDeque::new(),
@@ -932,6 +973,7 @@ impl Leader {
         self.proposals.retain(|c, _| !table.forgotten(c));
         let proposals = &self.proposals;
         self.unsettled.retain(|(_, c)| proposals.contains_key(c));
+        self.durable.retain(|(_, c)| proposals.contains_key(c));
         self.by_barrier.retain(|_, c| proposals.contains_key(c));
         self.votes.retain(|c, _| !table.forgotten(c));
         // A retry of a forgotten command is refused from the table's
@@ -1150,71 +1192,62 @@ impl Leader {
             // or never: a call is long enough to wait for it.
             self.answered.retain(|_, (_, at)| *at + 1 > call);
         }
-        let mut order: Vec<(u64, CommandId)> = self
-            .proposals
-            .values()
-            .filter(|p| p.durable)
-            .map(|p| (p.seqnum, p.command))
-            .collect();
-        order.sort();
         let me = self.config.identity.replica;
         let ballot = self.config.quorum.ballot();
         let context = self.ballots.context(boot, ballot, LocalJournalSeq::ZERO);
+        let voters: Vec<ReplicaId> = self
+            .config
+            .identity
+            .voters
+            .iter()
+            .copied()
+            .filter(|v| *v != me)
+            .collect();
+        let throughs: Vec<Option<(u64, CommandId)>> =
+            voters.iter().map(|v| self.adopted_through(v)).collect();
         let mut chosen: Vec<(CommandId, ReplicaId, Resend)> = Vec::new();
-        for voter in &self.config.identity.voters {
-            if *voter == me {
-                continue;
-            }
+        let mut scanned = 0u64;
+        for (voter, through) in voters.iter().zip(&throughs) {
             let interval = self.resend_interval(voter);
-            let voted = |c: &CommandId| self.votes.get(c).is_some_and(|v| v.adopted_by(voter));
-            let through = order
-                .iter()
-                .filter(|(_, c)| voted(c))
-                .map(|(s, _)| *s)
-                .max();
             let mut taken = 0;
             let mut trickled = false;
-            for (seqnum, command) in &order {
+            // Before the voter's highest adoption only an undecided
+            // proposal can be due, and every undecided one is unsettled;
+            // past it, any durable one.
+            let below = through
+                .map(|top| self.unsettled.range(..=top))
+                .into_iter()
+                .flatten();
+            let past = match through {
+                Some(top) => self
+                    .durable
+                    .range((Bound::Excluded(*top), Bound::Unbounded)),
+                None => self.durable.range::<(u64, CommandId), _>(..),
+            };
+            for (seqnum, command) in below.chain(past) {
                 if taken == per_voter {
                     break;
                 }
-                if voted(command) {
+                scanned += 1;
+                if !self.proposals[command].durable || self.adopted(command, voter) {
                     continue;
                 }
-                let decided = self
-                    .table
-                    .phase_of(command)
-                    .is_some_and(|phase| phase >= Phase::Commit);
-                if decided && through.is_some_and(|t| *seqnum <= t) {
-                    continue;
+                if let Some(kind) = self.resend_kind(
+                    *seqnum,
+                    command,
+                    voter,
+                    through.map(|(t, _)| t),
+                    (call, interval),
+                    &mut trickled,
+                ) {
+                    taken += 1;
+                    chosen.push((*command, *voter, kind));
                 }
-                let resent = self.resent.get(&(*command, *voter));
-                let sent = self.proposals[command].sent;
-                let old = decided
-                    && sent.is_some_and(|at| call >= at.saturating_add(RESEND_HANDOFF_CALLS));
-                let kind = match (resent, sent) {
-                    (Some(r), _) if call < r.next => continue,
-                    _ if old && trickled => continue,
-                    _ if old => {
-                        trickled = true;
-                        Resend::HandedOff
-                    }
-                    (None, Some(sent)) if call < sent.saturating_add(interval) => continue,
-                    (None, None) => Resend::Deferred,
-                    _ if decided => Resend::Decided,
-                    _ if self
-                        .votes
-                        .get(command)
-                        .is_some_and(|v| v.voted().contains(voter)) =>
-                    {
-                        Resend::Acknowledged
-                    }
-                    _ => Resend::Unanswered,
-                };
-                taken += 1;
-                chosen.push((*command, *voter, kind));
             }
         }
+        debug_assert_eq!(chosen, self.resend_by_sort(per_voter, call));
+        self.counts.calls += 1;
+        self.counts.scanned += scanned;
         let mut sends = Vec::new();
         for (command, voter, kind) in chosen {
             match kind {
@@ -1751,10 +1784,14 @@ impl Leader {
         let command = proposal.command;
         if let Some(old) = self.proposals.get(&command) {
             self.unsettled.remove(&(old.seqnum, command));
+            self.durable.remove(&(old.seqnum, command));
             self.by_barrier.remove(&old.barrier);
         }
         if !(proposal.durable && proposal.executed) {
             self.unsettled.insert((proposal.seqnum, command));
+        }
+        if proposal.durable {
+            self.durable.insert((proposal.seqnum, command));
         }
         self.by_barrier.insert(proposal.barrier, command);
         self.proposals.insert(command, proposal);
@@ -1785,7 +1822,13 @@ impl Leader {
             .values()
             .map(|p| (p.barrier, p.command))
             .collect();
-        unsettled == self.unsettled && by_barrier == self.by_barrier
+        let durable: BTreeSet<(u64, CommandId)> = self
+            .proposals
+            .values()
+            .filter(|p| p.durable)
+            .map(|p| (p.seqnum, p.command))
+            .collect();
+        unsettled == self.unsettled && by_barrier == self.by_barrier && durable == self.durable
     }
 
     /// The next proposal to speculate (task-29), if the bound allows and
@@ -2363,6 +2406,17 @@ impl Leader {
                         // Its first send was released with the batch.
                         if p.published && p.sent.is_none() {
                             p.sent = Some(calls);
+                        }
+                        let key = (p.seqnum, command);
+                        self.durable.insert(key);
+                        // An adoption counted before the proposal was
+                        // durable raises the voter's highest now.
+                        if let Some(set) = self.votes.get(&command) {
+                            for voter in &self.config.identity.voters {
+                                if set.adopted_by(voter) {
+                                    raise(&mut self.adopted_through, *voter, key);
+                                }
+                            }
                         }
                     }
                     self.settle(command);
@@ -3010,8 +3064,15 @@ impl Leader {
             self.rejections.push(Rejection::Vote(e));
             return Vec::new();
         }
-        if slow && from != self.config.identity.replica {
-            self.note_adoption(command, from);
+        if slow {
+            if let Some(p) = self.proposals.get(&command)
+                && p.durable
+            {
+                raise(&mut self.adopted_through, from, (p.seqnum, command));
+            }
+            if from != self.config.identity.replica {
+                self.note_adoption(command, from);
+            }
         }
         self.learn();
         self.release_ready()
@@ -3037,6 +3098,124 @@ impl Leader {
             return;
         }
         self.sample_latency(from, took);
+    }
+
+    /// Whether `voter` adopted `command` (task-d59).
+    fn adopted(&self, command: &CommandId, voter: &ReplicaId) -> bool {
+        self.votes.get(command).is_some_and(|v| v.adopted_by(voter))
+    }
+
+    /// The durable proposal with the highest sequence number `voter`
+    /// adopted (task-d59). What `adopted_through` holds is never below
+    /// it; once the proposal it names was swept, or its votes replaced by
+    /// a new proposal of the command, the highest is looked for below.
+    fn adopted_through(&mut self, voter: &ReplicaId) -> Option<(u64, CommandId)> {
+        let top = *self.adopted_through.get(voter)?;
+        if self.durable.contains(&top) && self.adopted(&top.1, voter) {
+            return Some(top);
+        }
+        let found = self
+            .durable
+            .range(..top)
+            .rev()
+            .find(|(_, c)| self.adopted(c, voter))
+            .copied();
+        match found {
+            Some(key) => self.adopted_through.insert(*voter, key),
+            None => self.adopted_through.remove(voter),
+        };
+        found
+    }
+
+    /// What one durable proposal `voter` has not adopted is to be sent
+    /// as, this call, or None if it is not sent (task-d49): `through` is
+    /// the sequence number of the voter's highest adoption, `at` the call
+    /// and the voter's interval, and `trickled` whether the voter's one
+    /// handed-off proposal of the call was chosen.
+    fn resend_kind(
+        &self,
+        seqnum: u64,
+        command: &CommandId,
+        voter: &ReplicaId,
+        through: Option<u64>,
+        (call, interval): (u64, u64),
+        trickled: &mut bool,
+    ) -> Option<Resend> {
+        let decided = self
+            .table
+            .phase_of(command)
+            .is_some_and(|phase| phase >= Phase::Commit);
+        if decided && through.is_some_and(|t| seqnum <= t) {
+            return None;
+        }
+        let resent = self.resent.get(&(*command, *voter));
+        let sent = self.proposals[command].sent;
+        let old = decided && sent.is_some_and(|at| call >= at.saturating_add(RESEND_HANDOFF_CALLS));
+        Some(match (resent, sent) {
+            (Some(r), _) if call < r.next => return None,
+            _ if old && *trickled => return None,
+            _ if old => {
+                *trickled = true;
+                Resend::HandedOff
+            }
+            (None, Some(sent)) if call < sent.saturating_add(interval) => return None,
+            (None, None) => Resend::Deferred,
+            _ if decided => Resend::Decided,
+            _ if self
+                .votes
+                .get(command)
+                .is_some_and(|v| v.voted().contains(voter)) =>
+            {
+                Resend::Acknowledged
+            }
+            _ => Resend::Unanswered,
+        })
+    }
+
+    /// What `resend_unvoted` chose before task-d59, from every durable
+    /// proposal sorted: checked against the indexed walk in debug builds.
+    fn resend_by_sort(&self, per_voter: usize, call: u64) -> Vec<(CommandId, ReplicaId, Resend)> {
+        let mut order: Vec<(u64, CommandId)> = self
+            .proposals
+            .values()
+            .filter(|p| p.durable)
+            .map(|p| (p.seqnum, p.command))
+            .collect();
+        order.sort();
+        let mut chosen = Vec::new();
+        for voter in &self.config.identity.voters {
+            if *voter == self.config.identity.replica {
+                continue;
+            }
+            let interval = self.resend_interval(voter);
+            let through = order
+                .iter()
+                .filter(|(_, c)| self.adopted(c, voter))
+                .map(|(s, _)| *s)
+                .max();
+            let mut taken = 0;
+            let mut trickled = false;
+            for (seqnum, command) in &order {
+                if taken == per_voter {
+                    break;
+                }
+                if self.adopted(command, voter) {
+                    continue;
+                }
+                if let Some(kind) = self.resend_kind(
+                    *seqnum,
+                    command,
+                    voter,
+                    through,
+                    (call, interval),
+                    &mut trickled,
+                ) {
+                    taken += 1;
+                    chosen.push((*command, *voter, kind));
+                }
+            }
+        }
+        chosen
     }
 
     fn sample_latency(&mut self, voter: ReplicaId, took: u64) {
