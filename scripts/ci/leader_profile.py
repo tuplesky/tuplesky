@@ -16,7 +16,8 @@ the process's own mount namespace.
 
 With --call-graph, `perf record` walks each sample's stack by its frame
 pointers (`--call-graph fp`), so `coordd` must be built with them
-(`-C force-frame-pointers=yes`): DWARF unwinding from a copied stack
+(`-C force-frame-pointers=yes`), and libc too for the allocator's callers
+(Ubuntu 24.04's glibc keeps them, Debian's does not): DWARF unwinding from a copied stack
 stopped short of the domain loop, below the runtime's `block_on`, in nine
 samples of ten. A frame in a library built without them (libc's allocator)
 hides its caller, and the walk resumes at the caller's caller. The

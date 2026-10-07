@@ -275,10 +275,14 @@ phase in microseconds per command, with the difference, which is the
 leader's own part of each phase. A 10 s DWARF sample of the leader
 follows (`leader-profile-alloc-chains.txt`): it unwinds out of libc's
 allocator, which the frame-pointer walk cannot, and names the TupleSky
-function that allocated. With a `jepsen-ref` whose `docker/up.sh` takes
-`--libc-debug`, a `call-graph` job builds the node image with glibc's
-debug symbols, so libc's local functions (the variants of `memcpy` and
-`memmove`, `_int_free`) are named rather than left as addresses. The summary gives the thread, the window, its samples by object
+function that allocated. A `call-graph` job builds the node image on
+`ubuntu:24.04`, the runner's own system, whose glibc keeps frame pointers
+(`malloc` and `free` open with `push %rbp`), so the frame-pointer walk
+leaves the allocator for its caller; on the default Debian image it gave
+out inside libc, and the DWARF sample did no better. With a `jepsen-ref`
+whose `docker/up.sh` takes `--libc-debug`, the image also has glibc's
+debug symbols, so libc's local functions (`_int_malloc`, the variants of
+`memcmp` and `memmove`) are named rather than left as addresses. The summary gives the thread, the window, its samples by object
 (`coordd`, libc, the kernel) and the symbols that held most of them; the full report is `leader-profile.txt` in the store.
 
 The `voter-workers` input sets each TupleSky voter's tokio worker count
