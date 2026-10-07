@@ -9797,6 +9797,15 @@ The leader's domain thread, profiled (samples counted inclusively):
   A read waits 2 ms longer for its round and no longer in all: its
   wait for its index to execute is two and a half times as long, and
   the round overlaps it.
+- **Held behind.** A due read was held behind its snapshot 21,923 to
+  22,438 times per 20,339 reads here, 1.08 to 1.10 per read, and on the
+  Jepsen runner 1.07 to 1.21 (#98, 6032679507): about once per read in
+  both places, the projection's commit trailing execution. Snapshots per
+  read were 0.38 to 0.39 here and 0.53 to 0.55 there. A read held behind
+  costs the pump that finds it so only the snapshot's frontier check
+  (`evaluate` returns at its first line), and no new snapshot until the
+  completed frontier moves, so the churn is the snapshots, 3.2 to 3.7% of
+  the leader's thread here.
 - **The domain.** The leader's loop costs 15% less per operation. The
   throughput's range moved up by about 50 operations a second and still
   overlaps the baseline's; the host's four cores are what these runs
@@ -9810,3 +9819,66 @@ one run each, as task-d50 ran it:
 | partition 45 s | 0 | 33,292 (185 at the cut-off leader) | 14,322 | n2 (elected) |
 | pause 5 s, then 40 s | 0 | 48,992 | 21,731 | n2 (elected) |
 | kill and restart, twice | 0 | 21,628 | 9,011 | n1 |
+
+## A fast-set follower held off the leader's path
+
+Run E on #98 (37576818613: five voters, one boot each, no faults, the
+default worker count) made no fast decision in 46,000 commands. The
+six other runs of the same day, on the same commit and runner type,
+made 3.5 to 11%:
+
+| run | fast | the leader's first proposal |
+| --- | --- | --- |
+| A | 4.7% | |
+| B (one worker) | 11.1% | |
+| C (two workers) | 5.3% | |
+| D (one worker) | 3.5% | |
+| E | **0** | `ProposalRepublished` |
+| #147, 1 | 3.9% | |
+| #147, 2 | 7.2% | |
+
+Every voter of E counts the same: `established_fast` 0. Its leader is
+the only one of the seven whose log shows `ProposalRepublished` at
+startup: it proposed its first command, the lease authority's epoch,
+before its peers were connected (`peers connected=0 of 4`,
+`voters submittable=0 of 4`), and presented it again later. That
+places the run's first client commands in the same window, where a
+frontend's collector reaches some voters and not the leader.
+
+**The mechanism**, reproduced in one process
+(`crates/coord-daemon/tests/fast_path.rs`: five voters over the
+reference store, the fast set `coordd` builds, the leader and the next
+two):
+
+- A follower appends a command to its path log when it pre-accepts it.
+  A command the leader never orders is never synchronized there, and a
+  record leaves the log only when it executes or a durable Sync releases
+  it (task-d24).
+- The next command the leader orders marks it reordered (task-d34's
+  F7). From then on the follower's head is `reordered_path`, which no
+  leader path equals, so every acknowledgement it sends fails the fast
+  predicate until the next election.
+- With the fast set the leader and two followers, one such follower is
+  enough.
+
+| one put, never presented again, reached | fast, of the next 40 |
+| --- | --- |
+| every voter | 40 |
+| n4 only, outside the fast set | 40 |
+| n4 and n5 | 40 |
+| n2 only, in the fast set | **0** |
+| n2 and n3 | **0** |
+
+A lost first service command reproduces it too, by another route: the
+followers hold every later proposal until it arrives, the leader's
+table fills, and the commands it then refuses for room are pre-accepted
+at the followers and never ordered. With 60 commands before the
+republication, none of the 176 commands established was fast, the 120
+after it included; with 20, the table did not fill, and 39 of the 40
+after it were fast.
+
+E's leader refused nothing for room, so its orphan came the first way,
+most likely; the voters' logs are in its artifact, which this container
+cannot fetch. task-d67 decides when a follower lets go of such a
+pre-acceptance, and task-d62 counts them.
+
