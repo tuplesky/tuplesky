@@ -525,6 +525,46 @@ pub struct Cost {
     /// (task-d62).
     #[serde(default)]
     pub release: Release,
+    /// What this voter's transport carried to and from the other voters
+    /// (task-d62), or why there is no reading.
+    #[serde(default = "not_instrumented")]
+    pub traffic: Measure<Traffic>,
+}
+
+/// What a voter's transport carried between voters (task-d62),
+/// cumulative over every peer link and lane. A frame is on a stream of
+/// its own today, so the stream counts equal the frame counts until
+/// task-d61 batches them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Traffic {
+    /// Frames written to peers.
+    pub sent_frames: u64,
+    /// Their bytes.
+    pub sent_bytes: u64,
+    /// Streams opened to peers.
+    pub sent_streams: u64,
+    /// Frames to a peer lost before they were written.
+    pub sent_lost: u64,
+    /// Frames read from peers.
+    pub received_frames: u64,
+    /// Their bytes.
+    pub received_bytes: u64,
+    /// Streams peers opened to this voter.
+    pub received_streams: u64,
+}
+
+/// A pipeline thread's jobs and their three times (task-d62), summed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Jobs {
+    /// Jobs taken back.
+    pub count: u64,
+    /// From hand-over to the thread starting each.
+    pub queued: Duration,
+    /// The thread running each: the append and its sync, or the
+    /// projection's commit.
+    pub served: Duration,
+    /// From each one's end to the domain thread taking it back.
+    pub completed: Duration,
 }
 
 /// Why commands missed the fast path, and the fast acknowledgements a
@@ -576,6 +616,11 @@ pub struct UnorderedPreAcceptances {
     /// How long the oldest of those has been held, from the first
     /// snapshot that saw it.
     pub oldest: Duration,
+    /// For a leader, the commands its own path log holds pending, which it
+    /// never synchronizes (task-d68): every command it proposed this
+    /// ballot, until that is fixed. Zero for a follower.
+    #[serde(default)]
+    pub leader_log: u64,
 }
 
 /// From learned to released on the leader (task-d62), summed over
@@ -600,6 +645,12 @@ pub struct PipelineWaits {
     pub appender: Wait,
     /// Waits for a projection commit on the materializer's thread.
     pub materializer: Wait,
+    /// The appender's jobs, timed (task-d62).
+    #[serde(default)]
+    pub appender_jobs: Jobs,
+    /// The materializer's jobs, timed (task-d62).
+    #[serde(default)]
+    pub materializer_jobs: Jobs,
 }
 
 /// Blocking takes and their total time.

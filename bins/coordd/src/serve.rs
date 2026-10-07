@@ -434,6 +434,11 @@ pub struct PeerPlane {
 }
 
 impl PeerPlane {
+    /// What this node's transport carried between voters (task-d62).
+    pub fn traffic(&self) -> coord_transport::PeerTraffic {
+        self.transport.peer_traffic()
+    }
+
     /// The plane over `transport`, for the voters in `peers`.
     pub fn new(
         transport: Transport,
@@ -1615,7 +1620,8 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     /// interval since the last printed snapshot (task-d45).
     fn cost(&self) -> coord_daemon::metrics::Measure<coord_daemon::metrics::Cost> {
         use coord_daemon::metrics::{
-            Cost, Cpu, Interval, Measure, PipelineWaits, Scheduling, Unavailable, Wait,
+            Cost, Cpu, Interval, Jobs, Measure, PipelineWaits, Scheduling, Traffic, Unavailable,
+            Wait,
         };
         let Backing::Voting(voter) = &self.backing else {
             // A process without a voter applies what it serves, but the
@@ -1680,6 +1686,21 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             fast_path: fast_path(&voter.node().fast_path_counts()),
             unordered: self.unordered,
             release: release(&voter.node().release_split()),
+            traffic: self.plane.as_ref().map_or(
+                Measure::Unavailable(Unavailable::NotInstrumented),
+                |plane| {
+                    let t = plane.traffic();
+                    Measure::Observed(Traffic {
+                        sent_frames: t.sent_frames,
+                        sent_bytes: t.sent_bytes,
+                        sent_streams: t.sent_streams,
+                        sent_lost: t.sent_lost,
+                        received_frames: t.received_frames,
+                        received_bytes: t.received_bytes,
+                        received_streams: t.received_streams,
+                    })
+                },
+            ),
             cpu,
             waits: self.pipeline_waits.as_ref().map_or(
                 Measure::Unavailable(Unavailable::NotInstrumented),
@@ -1688,9 +1709,20 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                         let (count, time) = waits.read();
                         Wait { count, time }
                     };
+                    let jobs = |waits: &coord_storage::Waits| {
+                        let times = waits.jobs();
+                        Jobs {
+                            count: times.jobs,
+                            queued: times.queued,
+                            served: times.served,
+                            completed: times.completed,
+                        }
+                    };
                     Measure::Observed(PipelineWaits {
                         appender: wait(appender),
                         materializer: wait(materializer),
+                        appender_jobs: jobs(appender),
+                        materializer_jobs: jobs(materializer),
                     })
                 },
             ),
@@ -1712,6 +1744,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 pending: seen.pending,
                 reordered: seen.reordered,
                 oldest: seen.oldest,
+                leader_log: seen.leader_log,
             };
         }
         let snapshot = self.metrics(&roles);

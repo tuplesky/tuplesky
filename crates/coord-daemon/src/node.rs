@@ -191,10 +191,21 @@ impl Machine {
 
     /// The pre-acceptances this replica holds that the leader has not
     /// ordered, and those it has ordered a later command past (task-d62).
+    /// None for a leader, which orders what it pre-accepts: its own path
+    /// log's suffix is not left unsynchronized by anyone else.
     pub fn unordered(&self) -> (usize, std::collections::BTreeSet<CommandId>) {
         match self {
-            Machine::Leader(m) => m.table().unordered(),
+            Machine::Leader(_) => (0, std::collections::BTreeSet::new()),
             Machine::Follower(m) => m.table().unordered(),
+        }
+    }
+
+    /// For a leader, the commands its own path logs hold pending, which it
+    /// never synchronizes (task-d68); nothing for a follower.
+    pub fn leader_log_pending(&self) -> usize {
+        match self {
+            Machine::Leader(m) => m.table().pending_in_logs(),
+            Machine::Follower(_) => 0,
         }
     }
 
@@ -607,6 +618,9 @@ pub struct Unordered {
     /// How long the oldest of those has been seen, at the observation's
     /// resolution.
     pub oldest: std::time::Duration,
+    /// For a leader, the commands its own path log holds pending
+    /// (task-d68).
+    pub leader_log: u64,
 }
 
 /// Commands a replica established since boot, by the learning path that
@@ -1012,6 +1026,7 @@ impl<P: Persistence> Node<P> {
             self.unordered_since.entry(*command).or_insert(now);
         }
         Unordered {
+            leader_log: self.machine().leader_log_pending() as u64,
             pending: pending as u64,
             reordered: reordered.len() as u64,
             oldest: self

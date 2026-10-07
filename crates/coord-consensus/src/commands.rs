@@ -692,6 +692,16 @@ impl CommandTable {
         (pending.len(), reordered)
     }
 
+    /// How many commands this replica's path logs hold pending, summed
+    /// over keys (task-d68): for a leader, which never synchronizes its
+    /// own log, every command it proposed this ballot.
+    pub fn pending_in_logs(&self) -> usize {
+        self.keys
+            .values()
+            .map(|state| state.log.pending().len())
+            .sum()
+    }
+
     /// The leader ordered `command` at `seqnum` with these per-key path
     /// digests: align this replica's logs so later commands' paths follow
     /// the leader's order (prototype `recordLeaderHash`/`updateLogs`).

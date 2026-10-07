@@ -146,3 +146,28 @@ pub struct LaneStats {
     /// Path RTT as QUIC estimates it (a separate quantity).
     pub rtt: Duration,
 }
+
+/// What a node's transport carried between voters (task-d62), across
+/// every peer link and lane, cumulative.
+///
+/// Today each frame goes on a stream of its own, so the stream counts
+/// equal the frame counts; task-d61 batches a turn's frames to a peer,
+/// and the two part.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PeerTraffic {
+    /// Frames handed to QUIC for a peer.
+    pub sent_frames: u64,
+    /// Their bytes.
+    pub sent_bytes: u64,
+    /// Streams opened to peers.
+    pub sent_streams: u64,
+    /// Frames to a peer lost before they were written: no stream could be
+    /// opened, or the write did not complete.
+    pub sent_lost: u64,
+    /// Frames read from peers.
+    pub received_frames: u64,
+    /// Their bytes.
+    pub received_bytes: u64,
+    /// Streams peers opened to this node.
+    pub received_streams: u64,
+}

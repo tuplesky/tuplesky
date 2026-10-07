@@ -28,7 +28,7 @@ use crate::frames::{
 };
 use crate::identity::{BoundIdentity, IdentityBinder, role_class};
 use crate::lane::{self, Lane, LaneLimits, lane_of_hello, role_lanes};
-use crate::sched::{FairQueue, LaneStats, QueueError, Queued};
+use crate::sched::{FairQueue, LaneStats, PeerTraffic, QueueError, Queued};
 
 /// Identity of one connection at this endpoint (never reused).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -486,6 +486,39 @@ struct LaneState {
     stats: LaneStats,
 }
 
+/// [`PeerTraffic`]'s counters, kept beside the links rather than in each
+/// lane's [`LaneStats`] so that a total over the node does not take every
+/// link's lock (task-d62).
+#[derive(Default)]
+struct Traffic {
+    sent_frames: AtomicU64,
+    sent_bytes: AtomicU64,
+    sent_streams: AtomicU64,
+    sent_lost: AtomicU64,
+    received_frames: AtomicU64,
+    received_bytes: AtomicU64,
+    received_streams: AtomicU64,
+}
+
+impl Traffic {
+    fn add(counter: &AtomicU64, n: u64) {
+        counter.fetch_add(n, Ordering::Relaxed);
+    }
+
+    fn read(&self) -> PeerTraffic {
+        let load = |c: &AtomicU64| c.load(Ordering::Relaxed);
+        PeerTraffic {
+            sent_frames: load(&self.sent_frames),
+            sent_bytes: load(&self.sent_bytes),
+            sent_streams: load(&self.sent_streams),
+            sent_lost: load(&self.sent_lost),
+            received_frames: load(&self.received_frames),
+            received_bytes: load(&self.received_bytes),
+            received_streams: load(&self.received_streams),
+        }
+    }
+}
+
 /// Everything shared by the lanes to one destination.
 struct Link {
     budget: Budget,
@@ -536,6 +569,8 @@ struct Shared {
     /// Bytes of frames being received, across every stream (task-d26).
     receive_budget: Budget,
     next: AtomicU64,
+    /// What went between this node and its peers (task-d62).
+    traffic: Traffic,
     accept_permits: Arc<Semaphore>,
     /// What this endpoint presents, and what it needs in order to present
     /// another leaf later (task-d02; see [`Transport::set_identity`]).
@@ -1146,6 +1181,7 @@ impl Transport {
             )),
             receive_budget: Budget::new(limits.budget.receive_bytes, limits.budget.control_reserve),
             next: AtomicU64::new(1),
+            traffic: Traffic::default(),
             accept_permits: Arc::new(Semaphore::new(limits.max_connections.max(1))),
             tls: Mutex::new(Tls {
                 provider,
@@ -1435,6 +1471,11 @@ impl Transport {
             .collect()
     }
 
+    /// What this node's transport carried between voters (task-d62).
+    pub fn peer_traffic(&self) -> PeerTraffic {
+        self.shared.traffic.read()
+    }
+
     /// Accounting of one lane of a replica link, with the path RTT.
     pub fn stats(
         &self,
@@ -1688,6 +1729,9 @@ async fn sender_loop(shared: Arc<Shared>, link: Arc<Link>, peer: Arc<Peer>) {
                 // loss, counted, never buffered.
                 let mut state = link.lanes[idx].lock().unwrap();
                 state.stats.refused += 1;
+                if peer.class == Class::Peer {
+                    Traffic::add(&shared.traffic.sent_lost, 1);
+                }
                 continue;
             }
         };
@@ -1696,6 +1740,11 @@ async fn sender_loop(shared: Arc<Shared>, link: Arc<Link>, peer: Arc<Peer>) {
             state.stats.credit_wait.record(picked.elapsed());
             state.stats.frames += 1;
             state.stats.bytes += bytes as u64;
+        }
+        if peer.class == Class::Peer {
+            Traffic::add(&shared.traffic.sent_streams, 1);
+            Traffic::add(&shared.traffic.sent_frames, 1);
+            Traffic::add(&shared.traffic.sent_bytes, bytes as u64);
         }
         // The deadline covers the write and the finish too. A peer that
         // completes the open and then grants no more flow-control credit
@@ -1708,6 +1757,9 @@ async fn sender_loop(shared: Arc<Shared>, link: Arc<Link>, peer: Arc<Peer>) {
         if written != Ok(true) {
             let mut state = link.lanes[idx].lock().unwrap();
             state.stats.refused += 1;
+            if peer.class == Class::Peer {
+                Traffic::add(&shared.traffic.sent_lost, 1);
+            }
             continue;
         }
         // The bytes stay counted against both budgets until the peer
@@ -2000,6 +2052,7 @@ async fn serve(shared: Arc<Shared>, peer: Arc<Peer>, control: ControlStream) {
         match peer.class {
             Class::Peer => match peer.conn.accept_uni().await {
                 Ok(recv) => {
+                    Traffic::add(&shared.traffic.received_streams, 1);
                     tokio::spawn(read_uni(shared.clone(), peer.clone(), recv, permit));
                 }
                 Err(e) => break e,
@@ -2106,6 +2159,11 @@ async fn read_uni(
                 peer.conn.close(VarInt::from_u32(reason.code() as u32), b"");
                 return;
             }
+            Traffic::add(&shared.traffic.received_frames, 1);
+            Traffic::add(
+                &shared.traffic.received_bytes,
+                (coord_types::wire_v1::HEADER_LEN + frame.payload.len()) as u64,
+            );
             let (Some(replica), Some(incarnation)) =
                 (peer.identity.replica, peer.identity.incarnation)
             else {

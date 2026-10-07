@@ -146,6 +146,34 @@ class ReduceTests(unittest.TestCase):
         self.assertFalse(cost.per_command("n1", snap)["fast_path"]["reasons_sum"])
         self.assertNotIn("release", cost.per_command("n1", snapshot()))
 
+    def test_peer_traffic_and_pipeline_jobs_are_read_per_command(self):
+        snap = snapshot()
+        observed = snap["cost"]["Observed"]
+        observed["traffic"] = {"Observed": {
+            "sent_frames": 900, "sent_bytes": 270000, "sent_streams": 900, "sent_lost": 2,
+            "received_frames": 880, "received_bytes": 190000, "received_streams": 880,
+        }}
+        jobs = lambda n, q, s, c: {"count": n, "queued": duration(q), "served": duration(s),
+                                   "completed": duration(c)}
+        observed["waits"] = {"Observed": {
+            "appender": {"count": 9, "time": duration(0.04)},
+            "materializer": {"count": 3, "time": duration(0.012)},
+            "appender_jobs": jobs(90, 0.003, 0.18, 0.026),
+            "materializer_jobs": jobs(12, 0.004, 0.07, 0.009),
+        }}
+        reading = cost.per_command("n1", snap)
+        traffic = reading["traffic_per_command"]
+        self.assertAlmostEqual(traffic["sent_frames"], 9.0)
+        self.assertAlmostEqual(traffic["received_bytes"], 1900.0)
+        self.assertAlmostEqual(traffic["sent_lost"], 0.02)
+        appender = reading["appender_jobs"]
+        self.assertAlmostEqual(appender["jobs_per_command"], 0.9)
+        self.assertAlmostEqual(appender["served_ms_per_command"], 1.8)
+        self.assertAlmostEqual(reading["materializer_jobs"]["completed_ms_per_command"], 0.09)
+        table = cost.paths_table({"runs": [{"callers": 1, "voters": [reading]}]})
+        self.assertIn("9.00/8.80 (9.00)", table)
+        self.assertNotIn("traffic_per_command", cost.per_command("n1", snapshot()))
+
     def test_a_run_with_no_fast_decision_is_a_finding(self):
         def voter(fast):
             snap = snapshot()
