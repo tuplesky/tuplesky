@@ -31,6 +31,10 @@ count. These are cumulative from the process's
 start, so the summary takes differences; a run queue is time a thread was
 ready to run and waiting for a CPU.
 
+It also writes the host's CPU model, its mean clock when the sampler
+starts and its CPU count to the same path with -host.txt in place of
+.csv, so a row says which kind of VM it ran on.
+
 A process is counted from its first row (its time before it is subtracted)
 or from its start if it starts later, and up to the last row it was seen in:
 one that exits between two rows loses at most an interval of its time. The
@@ -69,6 +73,25 @@ def host() -> tuple[float, float, float]:
     total = sum(fields[:8])
     idle = fields[3] + fields[4]
     return (total - idle) / TICK, total / TICK, fields[7] / TICK
+
+
+def host_info() -> str:
+    """The CPU model, the mean clock across CPUs and the CPU count, as
+    `name=value` lines, from `/proc/cpuinfo`."""
+    model, clocks = "unknown", []
+    try:
+        with open("/proc/cpuinfo") as f:
+            for line in f:
+                key, _, value = line.partition(":")
+                key, value = key.strip(), value.strip()
+                if key == "model name" and model == "unknown":
+                    model = value
+                elif key == "cpu MHz":
+                    clocks.append(float(value))
+    except (OSError, ValueError):
+        pass
+    mhz = f"{sum(clocks) / len(clocks):.0f}" if clocks else "unknown"
+    return f"model={model}\nmhz={mhz}\ncpus={os.cpu_count()}\n"
 
 
 def schedstat(path: str) -> tuple[float, float] | None:
@@ -151,6 +174,9 @@ def main() -> int:
     last: dict = {}  # (pid, start) -> (group, ticks at the latest row it was seen)
     first = True
     host0 = host()
+    stem = args.out[: -len(".csv")] if args.out.endswith(".csv") else args.out
+    with open(stem + "-host.txt", "w") as f:
+        f.write(host_info())
     threads = open(args.threads, "w") if args.threads else None
     if threads:
         threads.write("time,pid,start,loop_cpu_s,loop_runq_s,workers_cpu_s,workers_runq_s,workers\n")

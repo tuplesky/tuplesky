@@ -1,0 +1,91 @@
+"""Tests for jepsen_pairs.py: python3 -m unittest test_jepsen_pairs (from scripts/ci)."""
+
+import json
+import os
+import tempfile
+import unittest
+
+import jepsen_pairs as jp
+
+
+def op(ts, worker, kind, f="read"):
+    return f"2026-09-27 {ts}{{GMT}}\tINFO\t[jepsen worker {worker}] jepsen.print: {worker}\t:{kind}\t:{f}\tnil\n"
+
+
+def metrics(served, executed, loop_s, process_s):
+    cost = {
+        "executed": executed,
+        "busy": {"secs": 1, "nanos": 0},
+        "uptime": {"secs": 10, "nanos": 0},
+        "recent": {"Unavailable": "NotInstrumented"},
+        "reads": {"served": served, "refused": 0, "rounds": served, "confirmed": served, "waited_ms": 0},
+        "cpu": {"Observed": {"domain": {"secs": 0, "nanos": int(loop_s * 1e9)}, "process": {"secs": process_s, "nanos": 0}}},
+    }
+    return "metrics " + json.dumps({"stages": [], "cost": {"Observed": cost}}) + "\n"
+
+
+def store(root, name, read_ms, leader_loop_s, process_s):
+    """A run of four reads over 10 s (0.4 `ok`/s), each taking read_ms,
+    with a leader n1 and a follower n2 that each executed 1000 commands."""
+    path = os.path.join(root, name)
+    os.makedirs(os.path.join(path, "n1"))
+    os.makedirs(os.path.join(path, "n2"))
+    lines = []
+    for i, second in enumerate((0, 3, 6, 10)):
+        lines.append(op(f"10:00:{second:02d},000", i, "invoke"))
+        lines.append(op(f"10:00:{second:02d},{read_ms:03d}", i, "ok"))
+    with open(os.path.join(path, "jepsen.log"), "w") as f:
+        f.writelines(lines)
+    with open(os.path.join(path, "n1", "coordd.log"), "w") as f:
+        f.write(metrics(4, 1000, leader_loop_s, process_s))
+    with open(os.path.join(path, "n2", "coordd.log"), "w") as f:
+        f.write(metrics(0, 1000, 0.4, process_s))
+    return path
+
+
+class PairTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = self.tmp.name
+        # Pair 1 ran base then head, pair 2 head then base.
+        self.runs = [
+            jp.read_run("base", store(root, "1", 50, 0.6, 2)),
+            jp.read_run("head", store(root, "2", 40, 0.5, 2)),
+            jp.read_run("head", store(root, "3", 30, 0.5, 1)),
+            jp.read_run("base", store(root, "4", 60, 0.7, 2)),
+        ]
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_a_run_reads_its_measures(self):
+        run = self.runs[0]
+        # Four `ok` from the first invocation to the last completion, 10.05 s.
+        self.assertAlmostEqual(run.ok_per_s, 4 / 10.05)
+        self.assertEqual(run.read_p99, 50)
+        # Both voters' process CPU (2 s each) over the 4 operations.
+        self.assertAlmostEqual(run.voters_cpu_per_op, 1000.0)
+        self.assertAlmostEqual(run.leader_loop, 0.6)
+        self.assertAlmostEqual(run.followers_loop, 0.4)
+        self.assertAlmostEqual(run.leader_excess, 0.2)
+        self.assertIsNone(run.servers_cpu_per_op)
+
+    def test_pairs_take_either_order(self):
+        paired = jp.pairs(self.runs)
+        self.assertEqual([(b.store[-1], h.store[-1]) for b, h in paired], [("1", "2"), ("4", "3")])
+
+    def test_the_table_gives_each_pair_and_the_mean(self):
+        text = jp.render(self.runs, "Paired")
+        self.assertIn("| 1 | base | 0.4 | 50 | 1000.00 | - | 0.600 | 0.400 | 0.200 |", text)
+        # Pair 1: read p99 40 against 50; pair 2: 30 against 60.
+        self.assertIn("| 1 | +0.0 (+0.1%) | -10 (-20.0%) | +0.00 (+0.0%) | - | -0.100 (-16.7%) | +0.000 (+0.0%) | -0.100 (-50.0%) |", text)
+        self.assertIn("| 2 | +0.0 (+0.3%) | -30 (-50.0%) | -500.00 (-50.0%) | - | -0.200 (-28.6%) |", text)
+        self.assertIn("| mean (smallest to largest) of 2 | +0.0 (0.0 to 0.0) | -20 (-30 to -10) |", text)
+
+    def test_runs_that_are_not_side_by_side_are_not_paired(self):
+        text = jp.render([self.runs[0], self.runs[3]], "Paired")
+        self.assertIn("no pair to compare", text)
+
+
+if __name__ == "__main__":
+    unittest.main()

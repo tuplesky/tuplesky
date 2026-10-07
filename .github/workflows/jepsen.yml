@@ -75,6 +75,17 @@ on:
       voter-workers:
         description: "Tokio worker threads per TupleSky voter (TOKIO_WORKER_THREADS, through jepsen.tuplesky's --voter-workers); empty for tokio's default of one per runner core, which each co-located voter takes"
         default: ""
+      pair-base:
+        description: "Run TupleSky in pairs on one runner against this base: a tuplesky ref (branch, tag or commit) built beside the head, or env:NAME=VALUE for the head's own build with that variable on every voter; empty for one run"
+        default: ""
+      pairs:
+        description: "How many base and head pairs, when pair-base is set (the order alternates from pair to pair)"
+        default: "3"
+      leader-profile:
+        description: "Profile the TupleSky leader's domain thread with perf for 20 s in each run's workload, into its summary"
+        type: choice
+        options: ["false", "true"]
+        default: "false"
       swiftpaxos:
         description: "Faults for the SwiftPaxos baseline (pause, partition, packet; kill ends its cluster), none, or skip to not run it; empty for the scenario's"
         default: ""
@@ -86,6 +97,8 @@ on:
       - crates/coord-jepsen/**
       - scripts/ci/cpu_sampler.py
       - scripts/ci/jepsen_bounded.sh
+      - scripts/ci/jepsen_pairs.py
+      - scripts/ci/leader_profile.py
       - scripts/ci/jepsen_scenario.sh
       - scripts/ci/jepsen_summary.py
   schedule:
@@ -117,6 +130,9 @@ env:
   IN_PROFILE: ${{ inputs.profile }}
   IN_CHECKPOINT_AFTER_RECORDS: ${{ inputs.checkpoint-after-records }}
   IN_VOTER_WORKERS: ${{ inputs.voter-workers }}
+  IN_PAIR_BASE: ${{ inputs.pair-base }}
+  IN_PAIRS: ${{ inputs.pairs || '3' }}
+  IN_LEADER_PROFILE: ${{ inputs.leader-profile || 'false' }}
   NODES: ${{ inputs.nodes || '5' }}
   ETCD_VERSION: ${{ inputs.etcd-version || 'latest' }}
   # jepsen-io/etcd, pinned; its head when the baseline was added.
@@ -178,6 +194,45 @@ jobs:
       - name: Build the daemon, the harness and the Jepsen client
         working-directory: tuplesky
         run: cargo build --locked --release -p coordd -p coord-harness -p coord-jepsen
+      - name: Keep the head's binaries
+        if: env.IN_PAIR_BASE != ''
+        run: |
+          mkdir -p "$RUNNER_TEMP/head-bin"
+          for b in coordd coord-harness coord-jepsen coord-jepsen-executed; do
+            cp "tuplesky/target/release/$b" "$RUNNER_TEMP/head-bin/" 2>/dev/null || true
+          done
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        if: env.IN_PAIR_BASE != '' && !startsWith(env.IN_PAIR_BASE, 'env:')
+        with:
+          ref: ${{ inputs.pair-base }}
+          path: tuplesky-base
+          persist-credentials: false
+      - name: Build the pair's base
+        # Into the head's target directory, so the dependencies the two
+        # share are not built twice; the head's binaries are put back after.
+        if: env.IN_PAIR_BASE != '' && !startsWith(env.IN_PAIR_BASE, 'env:')
+        working-directory: tuplesky-base
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          echo "base: $IN_PAIR_BASE at $(git rev-parse --short HEAD)"
+          # A product branch has no coord-jepsen (it is this PR's); the
+          # base then runs the head's shim, which only the client uses.
+          shim=(); if [ -d crates/coord-jepsen ]; then shim=(-p coord-jepsen); fi
+          cargo build --locked --release -p coordd -p coord-harness ${shim[@]+"${shim[@]}"} \
+            --target-dir "$GITHUB_WORKSPACE/tuplesky/target"
+          mkdir -p "$RUNNER_TEMP/base-bin"
+          for b in coordd coord-harness coord-jepsen coord-jepsen-executed; do
+            cp "$GITHUB_WORKSPACE/tuplesky/target/release/$b" "$RUNNER_TEMP/base-bin/" 2>/dev/null || true
+            cp "$RUNNER_TEMP/head-bin/$b" "$GITHUB_WORKSPACE/tuplesky/target/release/" 2>/dev/null || true
+          done
+      - name: Install perf
+        if: env.IN_LEADER_PROFILE == 'true'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends "linux-tools-$(uname -r)" linux-tools-common \
+            || sudo apt-get install -y -qq --no-install-recommends linux-tools-azure linux-tools-common \
+            || echo "::warning::perf could not be installed; the leader's profile will say so"
+          sudo perf --version || true
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -245,23 +300,87 @@ jobs:
             fi
             workers=(--voter-workers "$IN_VOTER_WORKERS")
           fi
-          export JEPSEN_CPU_SAMPLES="$RUNNER_TEMP/cpu-samples.csv"
-          "$GITHUB_WORKSPACE/tuplesky/scripts/ci/jepsen_bounded.sh" \
-            $((TIME_LIMIT + 1200)) "$RUNNER_TEMP/cluster/nodes" -- lein run test \
-            --nodes-file "$RUNNER_TEMP/cluster/nodes" \
-            --ssh-private-key "$RUNNER_TEMP/cluster/id_ed25519" \
-            --username root \
-            --bin-dir "$GITHUB_WORKSPACE/tuplesky/target/release" \
-            --workload "$WORKLOAD" \
-            --nemesis "$NEMESIS" \
-            --time-limit "$TIME_LIMIT" \
-            --rate "$RATE" \
-            --recovery-time "$RECOVERY_TIME" \
-            --concurrency "$CONCURRENCY" \
-            ${wan[@]+"${wan[@]}"} \
-            ${workers[@]+"${workers[@]}"}
+          common=(lein run test
+            --nodes-file "$RUNNER_TEMP/cluster/nodes"
+            --ssh-private-key "$RUNNER_TEMP/cluster/id_ed25519"
+            --username root
+            --workload "$WORKLOAD"
+            --nemesis "$NEMESIS"
+            --time-limit "$TIME_LIMIT"
+            --rate "$RATE"
+            --recovery-time "$RECOVERY_TIME"
+            --concurrency "$CONCURRENCY"
+            ${wan[@]+"${wan[@]}"}
+            ${workers[@]+"${workers[@]}"})
+          ci="$GITHUB_WORKSPACE/tuplesky/scripts/ci"
+          # One test with the binaries in $1, its samples and profile in $2.
+          run_one() {
+            local bin=$1 dir=$2
+            shift 2
+            mkdir -p "$dir"
+            export JEPSEN_CPU_SAMPLES="$dir/cpu-samples.csv"
+            if [ "$IN_LEADER_PROFILE" = true ]; then export JEPSEN_LEADER_PROFILE="$dir/leader-profile.txt"; fi
+            "$ci/jepsen_bounded.sh" $((TIME_LIMIT + 1200)) "$RUNNER_TEMP/cluster/nodes" -- \
+              "${common[@]}" --bin-dir "$bin" "$@"
+          }
+          if [ -z "$IN_PAIR_BASE" ]; then
+            run_one "$GITHUB_WORKSPACE/tuplesky/target/release" "$RUNNER_TEMP"
+            exit $?
+          fi
+          # Paired: base and head in turn on this runner, the order
+          # alternating from pair to pair, each run summarized as it ends,
+          # then the head's difference from the base pair by pair.
+          head_bin="$RUNNER_TEMP/head-bin" base_bin="$RUNNER_TEMP/base-bin" base_args=()
+          head_sha=$(git -C "$GITHUB_WORKSPACE/tuplesky" rev-parse --short HEAD)
+          case $IN_PAIR_BASE in
+            env:*)
+              if ! grep -q -- '--voter-env' src/jepsen/tuplesky.clj; then
+                echo "::error::tuplesky/jepsen@$JEPSEN_REF has no --voter-env; dispatch with a jepsen-ref that has it"
+                exit 1
+              fi
+              base_bin=$head_bin base_args=(--voter-env "${IN_PAIR_BASE#env:}")
+              base_name="$head_sha with ${IN_PAIR_BASE#env:}" ;;
+            *)
+              base_name="$IN_PAIR_BASE at $(git -C "$GITHUB_WORKSPACE/tuplesky-base" rev-parse --short HEAD)" ;;
+          esac
+          rc=0 n=0 runs=() previous=""
+          for i in $(seq 1 "$IN_PAIRS"); do
+            if [ $((i % 2)) = 1 ]; then order="base head"; else order="head base"; fi
+            for side in $order; do
+              n=$((n + 1))
+              dir="$RUNNER_TEMP/run-$n"
+              if [ "$side" = base ]; then
+                run_one "$base_bin" "$dir" ${base_args[@]+"${base_args[@]}"} || rc=$?
+                name=$base_name
+              else
+                run_one "$head_bin" "$dir" || rc=$?
+                name=$head_sha
+              fi
+              store=$(readlink -f store/latest || true)
+              if [ -z "$store" ] || [ "$store" = "$previous" ]; then
+                echo "::warning::pair $i, $side: the test left no store"
+                continue
+              fi
+              previous=$store
+              cp "$dir"/cpu-samples*.csv "$dir"/leader-profile.txt "$store"/ 2>/dev/null || true
+              for db in "$store"/n*/domain.redb; do
+                [ -e "$db" ] || continue
+                cp "$db" "$RUNNER_TEMP/scratch.redb"
+                "$head_bin/coord-jepsen-executed" "$RUNNER_TEMP/scratch.redb" --last \
+                  > "$(dirname "$db")/executed-at-end" || true
+              done
+              python3 "$ci/jepsen_summary.py" "$store" \
+                --nodes-file "$RUNNER_TEMP/cluster/nodes" --profile "$PROFILE" \
+                --title "TupleSky: $WORKLOAD, $NEMESIS$TITLE_SUFFIX$STORE_SUFFIX$PROFILE_SUFFIX$CHECKPOINT_SUFFIX: pair $i, $side ($name)" || true
+              runs+=("$side=$store")
+            done
+          done
+          python3 "$ci/jepsen_pairs.py" \
+            --title "TupleSky pairs: $head_sha (head) against $base_name (base), $WORKLOAD, $NEMESIS$TITLE_SUFFIX$STORE_SUFFIX$PROFILE_SUFFIX$CHECKPOINT_SUFFIX" \
+            ${runs[@]+"${runs[@]}"} || true
+          exit $rc
       - name: Read how far each voter executed
-        if: always()
+        if: always() && env.IN_PAIR_BASE == ''
         # Each voter's highest executed position at the end, from its store
         # (a crash image, jepsen.tuplesky.db's log-files kills coordd first),
         # for the summary's "Executed at end" column: a voter left behind
@@ -278,12 +397,12 @@ jobs:
             echo "$node: $(head -c 200 "$dir/executed-at-end")"
           done
       - name: Summarize the run
-        if: always()
+        if: always() && env.IN_PAIR_BASE == ''
         # The verdict, counts, final reads per node, faults and one row per
         # voter, in the job summary; each voter's last 400 lines follow here.
         run: |
           if [ -d jepsen/tuplesky/store/latest ]; then
-            cp "$RUNNER_TEMP"/cpu-samples*.csv jepsen/tuplesky/store/latest/ 2>/dev/null || true
+            cp "$RUNNER_TEMP"/cpu-samples*.csv "$RUNNER_TEMP"/leader-profile.txt jepsen/tuplesky/store/latest/ 2>/dev/null || true
             python3 tuplesky/scripts/ci/jepsen_summary.py jepsen/tuplesky/store/latest \
               --nodes-file "$RUNNER_TEMP/cluster/nodes" --profile "$PROFILE" \
               --title "TupleSky: $WORKLOAD, $NEMESIS$TITLE_SUFFIX$STORE_SUFFIX$PROFILE_SUFFIX$CHECKPOINT_SUFFIX${IN_VOTER_WORKERS:+, $IN_VOTER_WORKERS tokio workers per voter}"
@@ -347,8 +466,9 @@ jobs:
         # notice in the digest.
         run: |
           shopt -s nullglob
+          # Every run's voters: a paired job leaves one store per run.
           stops=$(grep -HE 'this node stopped: (release-record-mismatch|incompatible-admission)\(' \
-            jepsen/tuplesky/store/latest/n*/coordd.log || true)
+            jepsen/tuplesky/store/*/[0-9]*/n*/coordd.log || true)
           if [ -n "$stops" ]; then
             echo "$stops" | cut -c1-300
             echo "::error::A voter stopped on a divergence (above); the execution order around it is in the step before."

@@ -488,7 +488,19 @@ def read_cpu_samples(path: str) -> list[dict]:
     return rows
 
 
-def runner_cpu(rows: list[dict], start: datetime.datetime, end: datetime.datetime, completed: int) -> list[str]:
+def read_host(path: str) -> dict:
+    """The sampler's `-host.txt`: the CPU model, mean clock and count; {}
+    without it."""
+    try:
+        with open(path) as f:
+            return dict(line.rstrip("\n").split("=", 1) for line in f if "=" in line)
+    except OSError:
+        return {}
+
+
+def runner_cpu(
+    rows: list[dict], start: datetime.datetime, end: datetime.datetime, completed: int, host: dict | None = None
+) -> list[str]:
     """Where the runner's CPU went from `start` to `end`: the sample rows
     that bracket the window, each group's CPU seconds between them, as
     cores and per completed operation. [] when no rows bracket it."""
@@ -513,7 +525,9 @@ def runner_cpu(rows: list[dict], start: datetime.datetime, end: datetime.datetim
     idle = (b["host_total_s"] - a["host_total_s"]) - busy
     out = [
         f"**Runner CPU** (sampled from `/proc` once a second by `cpu_sampler.py`, over the {secs:.0f} s between "
-        f"the samples around the workload, {int(b['cpus'])} CPUs; a group is its processes by name; per "
+        f"the samples around the workload, {int(b['cpus'])} CPUs"
+        + (f" ({host.get('model', 'unknown')}, {host.get('mhz', '?')} MHz on average when sampling began)" if host else "")
+        + "; a group is its processes by name; per "
         f"operation is over the {completed} operations completed in that time, `ok`, `fail` or `info`)",
         "",
         "| | CPU (s) | Cores | Per operation (ms) |",
@@ -644,6 +658,37 @@ def leader_loop(rows: list[dict], threads: dict, start: datetime.datetime, end: 
     return out
 
 
+def leader_profile(path: str, top: int = 30) -> list[str]:
+    """The leader's domain thread, profiled by `leader_profile.py`: its
+    header and the symbols that held most of the samples, in a folded
+    block; [] without the file."""
+    try:
+        with open(path) as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return []
+    if not lines:
+        return []
+    header, rows = lines[0], [line.split() for line in lines[1:] if line.strip()]
+    out = [f"**The leader's domain thread, profiled** (`perf record` on that one thread, from `leader_profile.py`): {header}", ""]
+    if not rows:
+        return out + [""]
+    out += [
+        f"<details><summary>The {min(top, len(rows))} symbols that held most of its samples</summary>",
+        "",
+        "| Self | Object | Symbol |",
+        "| --- | --- | --- |",
+    ]
+    for cells in rows[:top]:
+        # perf's columns: overhead, object, the [.] or [k] marker, symbol.
+        if len(cells) < 3:
+            continue
+        symbol = " ".join(cells[3:] if cells[2] in ("[.]", "[k]") else cells[2:])
+        out.append(f"| {cells[0]} | `{cells[1]}` | `{symbol.replace('|', '/')}` |")
+    out += ["", "</details>", ""]
+    return out
+
+
 def node_of(op: Op, nodes: list[str]) -> str:
     """Jepsen binds worker thread N to node N mod the node count."""
     m = WORKER.match(op.thread)
@@ -740,10 +785,12 @@ def summarize(store: str, nodes: list[str], title: str, profile: str | None = No
         if rows:
             until = heal if heal is not None else done[-1].at if done else start
             completed = sum(1 for o in done if start <= o.at <= until)
-            out.extend(runner_cpu(rows, start, until, completed))
+            out.extend(runner_cpu(rows, start, until, completed, read_host(os.path.join(store, "cpu-samples-host.txt"))))
             threads = read_thread_samples(os.path.join(store, "cpu-samples-threads.csv"))
             if threads:
                 out.extend(leader_loop(rows, threads, start, until, completed))
+
+        out.extend(leader_profile(os.path.join(store, "leader-profile.txt")))
 
         # The final reads: each worker's operations invoked after the last
         # fault operation (the final heal), with what answered them. A

@@ -15,7 +15,9 @@
 # where the runner's CPU goes, once a second, to it while the command runs,
 # and each coordd's domain loop and tokio workers to the same path with
 # -threads before the .csv, for the summary's Runner CPU and leader's loop
-# tables.
+# tables. With JEPSEN_LEADER_PROFILE set to a path, leader_profile.py
+# profiles the TupleSky leader's domain thread with perf once the workload
+# is under way, into it.
 set -u
 
 if [ $# -lt 4 ] || [ "$3" != "--" ]; then
@@ -53,8 +55,19 @@ if [ -n "${JEPSEN_CPU_SAMPLES:-}" ]; then
   sampler=$!
 fi
 
+profiler=
+if [ -n "${JEPSEN_LEADER_PROFILE:-}" ]; then
+  python3 "$(dirname "$0")/leader_profile.py" --out "$JEPSEN_LEADER_PROFILE" &
+  profiler=$!
+fi
+
 rc=0
 timeout -k 60 "$bound" "$@" || rc=$?
+
+if [ -n "$profiler" ]; then
+  kill "$profiler" 2>/dev/null || true
+  wait "$profiler" 2>/dev/null || true
+fi
 
 if [ -n "$sampler" ]; then
   kill "$sampler" 2>/dev/null || true

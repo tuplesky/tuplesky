@@ -218,6 +218,30 @@ scenario step exports it as `COORD_HARNESS_CHECKPOINT_AFTER_RECORDS`, which
 carry with the harness of task-d55, and a carry without it keeps the
 default. The TupleSky summary's title then ends in ", checkpoint every N"
 (", no checkpoints" for 0).
+The `pair-base` input runs the TupleSky job in pairs on one runner, so a
+change is measured against its base without the spread between runners
+(20% in `ok`/s and more in CPU per operation between runs of one commit on
+different VMs). It is a tuplesky ref, built beside the head into the same
+target directory (a base without `coord-jepsen` runs the head's shim), or
+`env:NAME=VALUE`, the head's own build with that variable on every voter
+through jepsen.tuplesky's `--voter-env` (such as
+`env:COORDD_PEER_STREAM_FRAMES=1` against the default). `pairs` (3) sets
+how many; the order alternates from pair to pair, so a drift over the job
+favours neither side. Each run gets its own summary as it ends, and
+`scripts/ci/jepsen_pairs.py` then gives one row per run and the head's
+difference from the base pair by pair, with the mean, smallest and
+largest: `ok`/s, read p99, the voters' CPU per operation, the servers'
+sampled CPU per operation, and the leader's loop CPU per command, the
+followers' and the leader's excess over them. Each run's store is in the
+uploaded archive, and the divergence check covers every run.
+
+The `leader-profile` input installs `perf` and profiles the leader's
+domain thread in each TupleSky run: `scripts/ci/leader_profile.py` waits
+for the workload to load the busiest loop, lets it settle for 30 s, takes
+that thread (coordd's main thread) and samples it alone for 20 s at
+999 Hz. The summary gives the thread, the window and the symbols that held
+most of its samples; the full report is `leader-profile.txt` in the store.
+
 The `voter-workers` input sets each TupleSky voter's tokio worker count
 through jepsen.tuplesky's `--voter-workers`, which starts `coordd` with
 `TOKIO_WORKER_THREADS`; empty keeps tokio's default of one worker per
@@ -440,7 +464,9 @@ of lines. `scripts/ci/jepsen_summary.py` reads the test's store
   the node containers' processes included, and groups them by name: the
   servers under test (`coordd`, `etcd`, `swiftpaxos`), their Jepsen
   clients (`coord-jepsen`, `swiftpaxos-jepsen`), Jepsen's JVM, and
-  docker, containerd and ssh. Steal, the time the VM was runnable while
+  docker, containerd and ssh. The caption names the runner's CPU model
+  and its mean clock when sampling began (`cpu-samples-host.txt`), so a
+  row says what kind of VM it ran on. Steal, the time the VM was runnable while
   its hypervisor ran something else, is its own row. Everything else is
   the host's busy time less those and steal, the kernel's interrupts
   included. The table takes the samples
