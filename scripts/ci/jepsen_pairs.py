@@ -56,6 +56,12 @@ class Run:
     # That run's samples as folded stacks, for the loop's phases and the
     # allocator's callers.
     chains: list = field(default_factory=list)
+    # task-d59's re-send timer on the leader: the loop's time in a call on
+    # average and at most, and the proposals a call looked at; None for a
+    # build without it.
+    resend_ms_per_call: float | None = None
+    resend_longest_ms: float | None = None
+    resend_scanned_per_call: float | None = None
     fast_share: float | None = None
     path_share: float | None = None
     frames_per_cmd: float | None = None
@@ -70,6 +76,13 @@ class Run:
         if self.leader_loop is None or self.followers_loop is None:
             return None
         return self.leader_loop - self.followers_loop
+
+    @property
+    def resend_profile_us(self) -> float | None:
+        share = self.profile.get(RESEND_SYMBOL)
+        if share is None or self.leader_loop is None:
+            return None
+        return share / 100 * self.leader_loop * 1000
 
 
 # The measures, in the tables' order: (attribute, heading, format).
@@ -93,6 +106,19 @@ TRAFFIC = (
     ("datagrams_per_cmd", "Leader's datagrams sent per command", "{:.2f}"),
     ("lost_frames", "Lost frames, all voters", "{:.0f}"),
     ("lost_streams", "Lost streams, all voters", "{:.0f}"),
+)
+
+
+RESEND_SYMBOL = ("coordd", "coord_consensus::leader::Leader::resend_unvoted")
+
+# task-d59's measures: the timer's own, where the build has them, and for
+# any build the profile's share of `Leader::resend_unvoted` costed per
+# command on the leader's loop.
+RESEND = (
+    ("resend_ms_per_call", "Leader's re-send call, mean (ms)", "{:.3f}"),
+    ("resend_longest_ms", "Leader's re-send call, longest (ms)", "{:.2f}"),
+    ("resend_scanned_per_call", "Proposals looked at per call", "{:.1f}"),
+    ("resend_profile_us", "`resend_unvoted`, profiled (µs per command)", "{:.1f}"),
 )
 
 
@@ -148,6 +174,11 @@ def read_run(label: str, store: str) -> Run:
             run.datagrams_per_cmd = t.get("datagrams_sent", 0) / leader.executed
             if t.get("sent_streams"):
                 run.frames_per_stream = t["sent_frames"] / t["sent_streams"]
+        r = leader.resends
+        if r.get("calls") and "time" in r:
+            run.resend_ms_per_call = js.seconds(r["time"]) * 1e3 / r["calls"]
+            run.resend_longest_ms = js.seconds(r.get("longest")) * 1e3
+            run.resend_scanned_per_call = r.get("scanned", 0) / r["calls"]
         traffic = [c.traffic for c in costs if c.traffic]
         if traffic:
             run.lost_frames = sum(t.get("sent_lost", 0) for t in traffic)
@@ -376,6 +407,17 @@ def render(runs: list[Run], title: str) -> str:
                 "**Fast path and traffic** (task-d62's counts from each voter's last `metrics` line: the leader's "
                 "fast share and the share of its slow commands that missed on their path, its peer frames, streams "
                 "and datagrams sent per command; lost frames and the streams they were lost on, over every voter)",
+            )
+        )
+    if any(getattr(r, a) is not None for r in runs for a, _, _ in RESEND):
+        out.extend(
+            group_tables(
+                runs,
+                paired,
+                RESEND,
+                "**Re-send timer** (task-d59's counts on the leader, where the build has them: a call's time on the "
+                "loop, mean and longest, and the proposals it looked at; and for any build the leader profile's own "
+                "share of `Leader::resend_unvoted` times the loop's CPU per command)",
             )
         )
     if not paired:

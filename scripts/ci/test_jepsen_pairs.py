@@ -148,6 +148,31 @@ class PairTests(unittest.TestCase):
         self.assertIn("| `coord_daemon::voter::Voter<P>::resend_proposals` | 200.0 | 0.0 |", text)
         self.assertIn("(run 2, head: 300.0 µs per command in", text)
 
+    def test_the_resend_timer_and_the_profiled_share_by_pair(self):
+        root = self.tmp.name
+        runs = []
+        for name, label, resends, share in (("r1", "base", None, "10.00"), ("r2", "head", True, "1.00")):
+            path = store(root, name, 50, 0.6, 2)
+            if resends:
+                text = metrics(4, 1000, 0.6, 2)
+                cost = json.loads(text[len("metrics "):])
+                cost["cost"]["Observed"]["resends"] = {"decided": 0, "acknowledged": 0, "unanswered": 0,
+                                                       "duplicate_votes": 0, "calls": 400, "scanned": 10000,
+                                                       "time": {"secs": 0, "nanos": 40000000},
+                                                       "longest": {"secs": 0, "nanos": 2000000}}
+                with open(os.path.join(path, "n1", "coordd.log"), "w") as f:
+                    f.write("metrics " + json.dumps(cost) + "\n")
+            with open(os.path.join(path, "leader-profile.txt"), "w") as f:
+                f.write("leader thread 1\nby object: coordd 60.00%\n"
+                        f"    {share}%  coordd  [.] coord_consensus::leader::Leader::resend_unvoted\n")
+            runs.append(jp.read_run(label, path))
+        self.assertAlmostEqual(runs[1].resend_ms_per_call, 0.1)
+        text = jp.render(runs, "Paired")
+        # The base has no timer; its profile gives 10% of 0.6 ms, 60 µs.
+        self.assertIn("| 1 | base | - | - | - | 60.0 |", text)
+        self.assertIn("| 2 | head | 0.100 | 2.00 | 25.0 | 6.0 |", text)
+        self.assertIn("| 1 | - | - | - | -54.0 (-90.0%) |", text)
+
     def test_runs_that_are_not_side_by_side_are_not_paired(self):
         text = jp.render([self.runs[0], self.runs[3]], "Paired")
         self.assertIn("no pair to compare", text)

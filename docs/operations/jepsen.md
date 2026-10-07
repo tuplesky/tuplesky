@@ -241,7 +241,12 @@ head's side by side. A second group of the pair table gives task-d62's
 and task-d61's counts: the leader's fast share and the share of its slow
 commands that missed on their path, its peer frames, streams and datagrams
 sent per command and frames per stream, and the frames lost over every
-voter with the streams they were lost on. A paired job prints no voter
+voter with the streams they were lost on. A third gives task-d59's
+re-send timer on the leader, where the build has it: a call's time on the
+loop, mean and longest, and the proposals it looked at, with the leader
+profile's share of `Leader::resend_unvoted` costed per command for any
+build, so a base without the timer still compares. The run's summary has
+the timer per voter that ran it. A paired job prints no voter
 logs (the API returns only a job log's last 5000 lines, which the runs'
 summaries and the pair table need); every run's logs are in the store.
 Each run's store is in the
@@ -263,7 +268,17 @@ pointers (libc's allocator) hides its own caller. The call graph gives each symb
 pair table split the loop by phase, the first TupleSky function a sample
 ran below the domain loop's turn (reads, resends, the outbox), and the
 allocator's samples by the innermost TupleSky function that called it, and
-say how many stacks unwound as far as the loop. The summary gives the thread, the window, its samples by object
+say how many stacks unwound as far as the loop. A `call-graph` run also
+samples the busiest follower's loop over the same 20 s
+(`follower-profile*.txt`), and the summary sets the two side by side by
+phase in microseconds per command, with the difference, which is the
+leader's own part of each phase. A 10 s DWARF sample of the leader
+follows (`leader-profile-alloc-chains.txt`): it unwinds out of libc's
+allocator, which the frame-pointer walk cannot, and names the TupleSky
+function that allocated. With a `jepsen-ref` whose `docker/up.sh` takes
+`--libc-debug`, a `call-graph` job builds the node image with glibc's
+debug symbols, so libc's local functions (the variants of `memcpy` and
+`memmove`, `_int_free`) are named rather than left as addresses. The summary gives the thread, the window, its samples by object
 (`coordd`, libc, the kernel) and the symbols that held most of them; the full report is `leader-profile.txt` in the store.
 
 The `voter-workers` input sets each TupleSky voter's tokio worker count

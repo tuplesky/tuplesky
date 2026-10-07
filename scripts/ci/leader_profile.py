@@ -19,8 +19,14 @@ pointers (`--call-graph fp`), so `coordd` must be built with them
 (`-C force-frame-pointers=yes`): DWARF unwinding from a copied stack
 stopped short of the domain loop, below the runtime's `block_on`, in nine
 samples of ten. A frame in a library built without them (libc's allocator)
-hides its caller, and the walk resumes at the caller's caller. FILE gets
-the same flat report, and
+hides its caller, and the walk resumes at the caller's caller. The
+busiest follower's loop is sampled the same way over the same window, into
+FILE with "leader" replaced by "follower" (follower-profile.txt beside
+leader-profile.txt), so each phase's leader-only part is the difference.
+After both, a 10 s DWARF sample of the leader (250 Hz, 16 KiB of stack)
+goes to FILE with -alloc-chains before its extension, folded: it unwinds
+out of libc's allocator, which a frame-pointer walk cannot, to name the
+TupleSky function that allocated. FILE gets the same flat report, and
 FILE with -inclusive before its extension gets each symbol's share with
 everything it called (`perf report --children`), which splits the loop's
 time by caller rather than by the function that happened to be running,
@@ -41,6 +47,10 @@ import signal
 import subprocess
 import sys
 import time
+
+
+# Seconds of the leader's DWARF sample, taken after the frame-pointer one.
+ALLOC_SECONDS = 10
 
 
 def loops() -> dict:
@@ -117,22 +127,25 @@ def main() -> int:
     if not candidates:
         write("No profile: no coordd ran through the settle window.\n")
         return 0
-    (pid, _), used = max(candidates.items(), key=lambda kv: kv[1])
+    ranked = sorted(candidates.items(), key=lambda kv: kv[1], reverse=True)
+    (pid, _), used = ranked[0]
     span = len(history) - 1
-    started = now()
-    data = args.out + ".data"
-    record = subprocess.run(
-        ["sudo", "-n", "perf", "record", "-F", str(args.frequency), "-t", str(pid), "-o", data]
-        + (["--call-graph", "fp"] if args.call_graph else [])
-        + ["--", "sleep", str(args.seconds)],
-        capture_output=True,
-        text=True,
-    )
-    ended = now()
-    if record.returncode != 0:
-        write(f"No profile: perf record failed ({record.returncode}): {record.stderr.strip()[-500:]}\n")
-        return 0
-    def report(fields: str, limit: str, children: bool = False, graph: str = "none") -> tuple[list[str], str]:
+    stem, dot, ext = args.out.rpartition(".")
+
+    def beside(suffix: str) -> str:
+        return f"{stem}-{suffix}.{ext}" if dot else f"{args.out}-{suffix}"
+
+    def record(tid: int, data: str, graph: list[str], seconds: float, frequency: int) -> subprocess.Popen:
+        return subprocess.Popen(
+            ["sudo", "-n", "perf", "record", "-F", str(frequency), "-t", str(tid), "-o", data]
+            + graph
+            + ["--", "sleep", str(seconds)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+    def report(data: str, fields: str, limit: str, children: bool = False, graph: str = "none") -> tuple[list[str], str]:
         done = subprocess.run(
             ["sudo", "-n", "perf", "report", "-i", data, "--stdio", "-F", fields, "--percent-limit", limit, "-g", graph]
             + (["--children"] if children else ["--no-children"]),
@@ -143,31 +156,80 @@ def main() -> int:
         samples = next((line for line in lines if line.startswith("# Samples")), "")
         return [line for line in lines if line.strip() and not line.startswith("#")], samples.lstrip("# ").strip()
 
-    symbols, samples = report("overhead,dso,sym", "0.2")
-    objects, _ = report("overhead,dso", "0")
-    by_object = ", ".join(f"{' '.join(line.split()[1:])} {line.split()[0]}" for line in objects[:6] if line.split())
-    header = (
-        f"leader thread {pid}, {used / span:.2f} of a core over the {span} s before, sampled at "
-        f"{args.frequency} Hz{' with call graphs by frame pointer' if args.call_graph else ''} from {started} to {ended} UTC; "
-        f"{samples}"
-    )
-    if args.call_graph:
-        inclusive, _ = report("overhead_children,overhead,dso,sym", "0.5", children=True)
-        chains, _ = report("overhead,dso,sym", "0", graph="folded,0,caller,function,percent")
-        stem, dot, ext = args.out.rpartition(".")
-        with open(f"{stem}-inclusive.{ext}" if dot else args.out + "-inclusive", "w") as f:
-            f.write(header + "; each symbol with everything it called, then its own share\n" + "\n".join(inclusive) + "\n")
-        with open(f"{stem}-chains.{ext}" if dot else args.out + "-chains", "w") as f:
-            f.write(header + "; each symbol, then its stacks from the root, in percent of the samples\n" + "\n".join(chains) + "\n")
-    subprocess.run(["sudo", "-n", "rm", "-f", data], capture_output=True)
-    write(
-        header + "\n"
-        f"by object: {by_object}\n"
-        + "\n".join(symbols)
-        + "\n"
-    )
+    def write_profile(out: str, role: str, tid: int, used: float, data: str, started: str, ended: str) -> None:
+        symbols, samples = report(data, "overhead,dso,sym", "0.2")
+        objects, _ = report(data, "overhead,dso", "0")
+        by_object = ", ".join(f"{' '.join(line.split()[1:])} {line.split()[0]}" for line in objects[:6] if line.split())
+        header = (
+            f"{role} thread {tid}, {used / span:.2f} of a core over the {span} s before, sampled at "
+            f"{args.frequency} Hz{' with call graphs by frame pointer' if args.call_graph else ''} from {started} to "
+            f"{ended} UTC; {samples}"
+        )
+        if args.call_graph:
+            o_stem, o_dot, o_ext = out.rpartition(".")
+            inclusive, _ = report(data, "overhead_children,overhead,dso,sym", "0.5", children=True)
+            chains, _ = report(data, "overhead,dso,sym", "0", graph="folded,0,caller,function,percent")
+            with open(f"{o_stem}-inclusive.{o_ext}" if o_dot else out + "-inclusive", "w") as f:
+                f.write(header + "; each symbol with everything it called, then its own share\n" + "\n".join(inclusive) + "\n")
+            with open(f"{o_stem}-chains.{o_ext}" if o_dot else out + "-chains", "w") as f:
+                f.write(header + "; each symbol, then its stacks from the root, in percent of the samples\n" + "\n".join(chains) + "\n")
+        with open(out, "w") as f:
+            f.write(header + "\n" f"by object: {by_object}\n" + "\n".join(symbols) + "\n")
+
+    graph = ["--call-graph", "fp"] if args.call_graph else []
+    # With a call graph, the busiest follower too, over the same window, so
+    # each phase's leader-only part is the difference between the two.
+    jobs = [("leader", pid, used, args.out)]
+    if args.call_graph and len(ranked) > 1:
+        (fpid, _), fused = ranked[1]
+        jobs.append(("follower", fpid, fused, follower_path(args.out)))
+    started = now()
+    running = [(role, tid, u, out, out + ".data", record(tid, out + ".data", graph, args.seconds, args.frequency))
+               for role, tid, u, out in jobs]
+    failed = []
+    for role, tid, u, out, data, proc in running:
+        _, err = proc.communicate()
+        if proc.returncode != 0:
+            failed.append((role, out, proc.returncode, err))
+    ended = now()
+    for role, out, code, err in failed:
+        with open(out, "w") as f:
+            f.write(f"No profile: perf record failed ({code}): {err.strip()[-500:]}\n")
+    for role, tid, u, out, data, proc in running:
+        if proc.returncode == 0:
+            write_profile(out, role, tid, u, data, started, ended)
+        subprocess.run(["sudo", "-n", "rm", "-f", data], capture_output=True)
+
+    # The allocator's callers: libc's allocator keeps no frame pointer, so
+    # a walk that starts inside it gives out at once. A short DWARF sample
+    # of the leader unwinds from the copied stack instead, which reaches
+    # the first TupleSky frame above malloc even where it stops short of
+    # the loop.
+    if args.call_graph and not stopping:
+        data = args.out + ".dwarf.data"
+        started = now()
+        proc = record(pid, data, ["--call-graph", "dwarf,16384"], ALLOC_SECONDS, 250)
+        _, err = proc.communicate()
+        ended = now()
+        if proc.returncode == 0:
+            chains, samples = report(data, "overhead,dso,sym", "0", graph="folded,0,caller,function,percent")
+            with open(beside("alloc-chains"), "w") as f:
+                f.write(
+                    f"leader thread {pid}, sampled at 250 Hz with DWARF call graphs from {started} to {ended} UTC; "
+                    f"{samples}; each symbol, then its stacks from the root, in percent of the samples\n"
+                    + "\n".join(chains)
+                    + "\n"
+                )
+        subprocess.run(["sudo", "-n", "rm", "-f", data], capture_output=True)
     return 0
 
+
+def follower_path(out: str) -> str:
+    """The follower's profile beside the leader's: leader-profile.txt gives
+    follower-profile.txt."""
+    head, base = os.path.split(out)
+    name = base.replace("leader", "follower", 1) if "leader" in base else "follower-" + base
+    return os.path.join(head, name)
 
 if __name__ == "__main__":
     sys.exit(main())

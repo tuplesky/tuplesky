@@ -223,6 +223,10 @@ class Cost:
     unordered: dict = field(default_factory=dict)
     release: dict = field(default_factory=dict)
     traffic: dict | None = None
+    # The re-sends (task-d49) and, since task-d59, the re-send timer's
+    # calls, the proposals they looked at, their time on the loop and the
+    # longest; empty before task-d49.
+    resends: dict = field(default_factory=dict)
 
 
 def seconds(d) -> float:
@@ -258,6 +262,7 @@ def parse_cost(snapshot: dict) -> Cost | None:
         unordered=cost.get("unordered") or {},
         release=cost.get("release") or {},
         traffic=(cost.get("traffic") or {}).get("Observed") if isinstance(cost.get("traffic"), dict) else None,
+        resends=cost.get("resends") if isinstance(cost.get("resends"), dict) else {},
         fast=cost.get("established_fast", 0),
         slow=cost.get("established_slow", 0),
         cpu=(seconds(cpu.get("domain")), seconds(cpu.get("process"))) if isinstance(cpu, dict) else None,
@@ -907,6 +912,91 @@ def loop_split(chains: list) -> dict:
     }
 
 
+def resend_table(voters: dict) -> list[str]:
+    """task-d59's re-send timer on each voter that ran it (the leader): its
+    calls, the loop's time in a call on average and at most, and the
+    proposals a call looked at; [] before task-d59 or where none ran."""
+    rows = [(node, v.cost.resends) for node, v in voters.items() if v.cost and v.cost.resends.get("calls")]
+    rows = [(node, r) for node, r in rows if "time" in r]
+    if not rows:
+        return []
+    out = [
+        "**Re-send timer** (task-d59, each voter that ran it, from its last `metrics` line: a call is one "
+        "`Node::resend_proposals` on the domain loop, once per re-send interval, sends included; looked at is "
+        "the proposals it examined)",
+        "",
+        "| Node | Calls | Mean per call (ms) | Longest (ms) | Looked at per call | Re-sent (decided / acknowledged / unanswered) |",
+        "| --- | --- | --- | --- | --- | --- |",
+    ]
+    for node, r in rows:
+        calls = r["calls"]
+        out.append(
+            f"| {node} | {calls} | {seconds(r['time']) * 1e3 / calls:.3f} | {seconds(r.get('longest')) * 1e3:.2f} "
+            f"| {r.get('scanned', 0) / calls:.1f} | {r.get('decided', 0)} / {r.get('acknowledged', 0)} / {r.get('unanswered', 0)} |"
+        )
+    out.append("")
+    return out
+
+
+def loop_per_command(voters: dict) -> tuple[float | None, float | None]:
+    """The leader's loop CPU per command (the voter whose read barrier
+    served reads) and the followers' mean, in microseconds; None where the
+    line has no CPU."""
+    costs = [v.cost for v in voters.values() if v.cost and v.cost.cpu and v.cost.executed]
+    if not costs:
+        return None, None
+    leader = max(costs, key=lambda c: (c.served, c.cpu[0] / c.executed))
+    followers = [c for c in costs if c is not leader]
+    mean = sum(c.cpu[0] / c.executed for c in followers) / len(followers) * 1e6 if followers else None
+    return leader.cpu[0] / leader.executed * 1e6, mean
+
+
+def leader_and_follower(store: str, voters: dict, top: int = 20) -> list[str]:
+    """The leader's and the follower's loops by phase side by side, in
+    microseconds per command (each phase's share times its loop's CPU per
+    command, the followers' mean for the follower), with the difference:
+    the leader's own part of each phase. Then the allocator's callers from
+    the leader's DWARF sample. [] without the profiles."""
+    leader_us, follower_us = loop_per_command(voters)
+    out = []
+    lead = read_chains(os.path.join(store, "leader-profile-chains.txt"))
+    follow = read_chains(os.path.join(store, "follower-profile-chains.txt"))
+    if lead and follow and leader_us and follower_us:
+        a, b = loop_split(lead), loop_split(follow)
+        phases = sorted(set(a["phases"]) | set(b["phases"]), key=lambda k: -max(a["phases"][k] * leader_us, b["phases"][k] * follower_us))
+        out += [
+            f"**The leader's loop beside a follower's, by phase** (both sampled over the same 20 s by frame pointer; "
+            f"microseconds per command: each phase's share of its thread's samples times its loop's CPU per command, "
+            f"{leader_us:.0f} on the leader and {follower_us:.0f} on the followers' mean; the stacks reached the loop "
+            f"in {a['reached']:.1f}% and {b['reached']:.1f}%)",
+            "",
+            "| Phase | Leader (µs) | Follower (µs) | Leader less follower (µs) |",
+            "| --- | --- | --- | --- |",
+        ]
+        for phase in phases[:top]:
+            x, y = a["phases"][phase] * leader_us / 100, b["phases"][phase] * follower_us / 100
+            out.append(f"| `{phase.replace('|', '/')}` | {x:.1f} | {y:.1f} | {x - y:+.1f} |")
+        out.append(f"| **all** | {leader_us:.1f} | {follower_us:.1f} | {leader_us - follower_us:+.1f} |")
+        out.append("")
+    alloc = read_chains(os.path.join(store, "leader-profile-alloc-chains.txt"))
+    if alloc:
+        s = loop_split(alloc)
+        scale = leader_us / 100 if leader_us else None
+        unit = "µs per command" if scale else "percent of the samples"
+        out += [
+            f"**The leader's allocator by caller, from a DWARF sample** (10 s at 250 Hz after the frame-pointer one; "
+            f"{s['alloc']:.2f}% of its samples in `malloc`, `free`, `realloc` and kin or under Rust's allocator "
+            f"calls, by the innermost TupleSky function on the stack; {unit})",
+            "",
+            "| Caller | Allocator |",
+            "| --- | --- |",
+        ]
+        for owner, share in s["owners"].most_common(top):
+            out.append(f"| `{owner.replace('|', '/')}` | {share * scale:.1f} |" if scale else f"| `{owner.replace('|', '/')}` | {share:.2f}% |")
+        out.append("")
+    return out
+
+
 def leader_loop_split(path: str, top: int = 25) -> list[str]:
     """The call-graph profile's samples by the loop's phase, and the
     allocator's by the TupleSky function that called it; [] without one."""
@@ -1322,6 +1412,8 @@ def summarize(store: str, nodes: list[str], title: str, profile: str | None = No
                 out.append(row)
             out.append("")
             out.extend(fast_path_table(voters))
+            out.extend(resend_table(voters))
+            out.extend(leader_and_follower(store, voters))
     return "\n".join(out) + "\n"
 
 

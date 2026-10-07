@@ -579,6 +579,65 @@ def d62_metrics(fast, slow, reasons, oldest_s, uptime_s, traffic=True):
     return "metrics " + json.dumps({"stages": [], "cost": {"Observed": cost}}) + "\n"
 
 
+def d59_metrics(served, loop_ms_per_cmd, resends=None):
+    """A voter that executed 1000 commands with its loop's CPU at
+    loop_ms_per_cmd each, its read barrier having served `served`."""
+    cost = {
+        "executed": 1000,
+        "busy": {"secs": 1, "nanos": 0},
+        "uptime": {"secs": 120, "nanos": 0},
+        "recent": {"Unavailable": "NotInstrumented"},
+        "reads": {"served": served, "refused": 0, "rounds": served, "confirmed": served, "waited_ms": 0},
+        # 1000 commands at loop_ms_per_cmd milliseconds each is that many seconds.
+        "cpu": {"Observed": {"domain": {"secs": int(loop_ms_per_cmd), "nanos": round(loop_ms_per_cmd % 1 * 1e9)},
+                             "process": {"secs": 2, "nanos": 0}}},
+    }
+    if resends is not None:
+        cost["resends"] = resends
+    return "metrics " + json.dumps({"stages": [], "cost": {"Observed": cost}}) + "\n"
+
+
+class ResendAndFollowerTests(unittest.TestCase):
+    def voters(self, *lines):
+        return {f"n{i}": js.parse_voter([line]) for i, line in enumerate(lines, 1)}
+
+    def test_the_timer_per_call_on_the_voter_that_ran_it(self):
+        voters = self.voters(
+            d59_metrics(500, 0.8, {"decided": 3, "acknowledged": 1, "unanswered": 2, "duplicate_votes": 0, "calls": 480,
+                                   "scanned": 12000, "time": {"secs": 0, "nanos": 48000000},
+                                   "longest": {"secs": 0, "nanos": 1500000}}),
+            d59_metrics(0, 0.6, {"decided": 0, "acknowledged": 0, "unanswered": 0, "duplicate_votes": 0, "calls": 0,
+                                 "scanned": 0, "time": {"secs": 0, "nanos": 0}, "longest": {"secs": 0, "nanos": 0}}),
+        )
+        text = "\n".join(js.resend_table(voters))
+        self.assertIn("| n1 | 480 | 0.100 | 1.50 | 25.0 | 3 / 1 / 2 |", text)
+        self.assertNotIn("| n2 |", text)
+        # A build before task-d59 has no timer to show.
+        self.assertEqual(js.resend_table(self.voters(d59_metrics(500, 0.8, {"decided": 1, "acknowledged": 0,
+                                                                          "unanswered": 0, "duplicate_votes": 0}))), [])
+
+    def test_the_leader_beside_a_follower_by_phase(self):
+        voters = self.voters(d59_metrics(500, 0.8), d59_metrics(0, 0.6), d59_metrics(0, 0.6))
+        run = "main;coordd::serve::Domain<P>::run::{{closure}}"
+        with tempfile.TemporaryDirectory() as store:
+            with open(os.path.join(store, "leader-profile-chains.txt"), "w") as f:
+                f.write("leader\n    100.00%  coordd  [.] x\n"
+                        f"50.00% {run};coord_daemon::node::Node<P>::settle;x\n"
+                        f"50.00% {run};coord_daemon::node::Machine::resend_unvoted;x\n")
+            with open(os.path.join(store, "follower-profile-chains.txt"), "w") as f:
+                f.write("follower\n    100.00%  coordd  [.] x\n"
+                        f"100.00% {run};coord_daemon::node::Node<P>::settle;x\n")
+            with open(os.path.join(store, "leader-profile-alloc-chains.txt"), "w") as f:
+                f.write("leader dwarf\n    10.00%  libc.so.6  [.] malloc\n"
+                        f"10.00% {run};coord_daemon::voter::Voter<P>::pump_reads;__rust_alloc;malloc\n")
+            text = "\n".join(js.leader_and_follower(store, voters))
+        # Leader 800 µs a command, half each; the follower 600, all settle.
+        self.assertIn("| `coord_daemon::node::Node<P>::settle` | 400.0 | 600.0 | -200.0 |", text)
+        self.assertIn("| `coord_daemon::node::Machine::resend_unvoted` | 400.0 | 0.0 | +400.0 |", text)
+        self.assertIn("| **all** | 800.0 | 600.0 | +200.0 |", text)
+        self.assertIn("| `coord_daemon::voter::Voter<P>::pump_reads` | 80.0 |", text)
+
+
 class FastPathTests(unittest.TestCase):
     def summary(self, n1, n2):
         with tempfile.TemporaryDirectory() as store:
