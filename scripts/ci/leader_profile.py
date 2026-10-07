@@ -127,7 +127,7 @@ def main() -> int:
 
     symbols, samples = report("overhead,dso,sym", "0.2")
     objects, _ = report("overhead,dso", "0")
-    by_object = ", ".join(" ".join(reversed(line.split(None, 1))) for line in objects[:6])
+    by_object = ", ".join(f"{' '.join(line.split()[1:])} {line.split()[0]}" for line in objects[:6] if line.split())
     write(
         f"leader thread {pid}, {used / span:.2f} of a core over the {span} s before, sampled at "
         f"{args.frequency} Hz from {started} to {ended} UTC; {samples}\n"
