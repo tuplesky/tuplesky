@@ -173,6 +173,26 @@ class PairTests(unittest.TestCase):
         self.assertIn("| 2 | head | 0.100 | 2.00 | 25.0 | 6.0 |", text)
         self.assertIn("| 1 | - | - | - | -54.0 (-90.0%) |", text)
 
+    def test_the_allocator_copies_and_memory_by_pair(self):
+        for run, (alloc_sym, alloc_pct, rss) in zip(self.runs[:2], (("_int_malloc", "20.00", 130), ("mi_malloc", "5.00", 175))):
+            with open(os.path.join(run.store, "leader-profile.txt"), "w") as f:
+                f.write("leader thread 1\nby object: coordd 60.00%\n"
+                        f"    {alloc_pct}%  libc.so.6  [.] {alloc_sym}\n"
+                        "    10.00%  libc.so.6  [.] __memcmp_avx2_movbe\n")
+            with open(os.path.join(run.store, "cpu-samples-memory.csv"), "w") as f:
+                f.write("time,pid,start,rss_kib,hwm_kib\n"
+                        f"2026-10-07 10:00:00.000000,1,1,{rss * 1024},{(rss + 10) * 1024}\n")
+        runs = [jp.read_run(r.label, r.store) for r in self.runs[:2]]
+        # Base: 20% of 0.6 ms; head: 5% of 0.5 ms.
+        self.assertAlmostEqual(runs[0].alloc_us, 120.0)
+        self.assertAlmostEqual(runs[1].alloc_us, 25.0)
+        text = jp.render(runs, "Paired")
+        self.assertIn("| 1 | base | 120.0 | 60.0 | 0.0 |", text)
+        self.assertIn("| 2 | head | 25.0 | 50.0 | 0.0 |", text)
+        self.assertIn("| 1 | -95.0 (-79.2%) | -10.0 (-16.7%) |", text)
+        self.assertIn("| 1 | base | 130 | 130 | 140 |", text)
+        self.assertIn("| 1 | +45 (+34.6%) | +45 (+34.6%) | +45 (+32.1%) |", text)
+
     def test_runs_that_are_not_side_by_side_are_not_paired(self):
         text = jp.render([self.runs[0], self.runs[3]], "Paired")
         self.assertIn("no pair to compare", text)

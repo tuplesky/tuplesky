@@ -638,6 +638,47 @@ class ResendAndFollowerTests(unittest.TestCase):
         self.assertIn("| `coord_daemon::voter::Voter<P>::pump_reads` | 80.0 |", text)
 
 
+class MemoryAndCopiesTests(unittest.TestCase):
+    def test_each_voter_at_its_end_and_its_peak(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "cpu-samples-memory.csv")
+            with open(path, "w") as f:
+                f.write("time,pid,start,rss_kib,hwm_kib\n"
+                        "2026-10-07 10:00:00.000000,11,1,102400,102400\n"
+                        "2026-10-07 10:00:00.000000,12,1,153600,153600\n"
+                        "2026-10-07 10:00:01.000000,11,1,133120,204800\n"
+                        "2026-10-07 10:00:01.000000,12,1,174080,174080\n")
+            samples = js.read_memory(path)
+        text = "\n".join(js.voters_memory(samples))
+        # pid 11: 130 MiB at the end, 130 the largest sampled, 200 its high-water mark.
+        self.assertIn("| 11 | 2 | 130 | 130 | 200 |", text)
+        self.assertEqual(js.memory_summary(samples), {"processes": 2, "end_mean": 150.0, "end_max": 170.0, "hwm_max": 200.0})
+        self.assertEqual(js.voters_memory({}), [])
+
+    def test_memcmp_and_memmove_by_caller_and_what_a_phase_calls(self):
+        run = "main;coordd::serve::Domain<P>::run::{{closure}}"
+        flush = run + ";coordd::serve::Domain<P>::stops_on_flush"
+        chains = js.read_chains_from_lines([
+            "header",
+            "    30.00%  libc.so.6  [.] __memcmp_avx2_movbe",
+            f"30.00% {flush};coord_consensus::leader::Leader::propose;alloc::collections::btree::search::search_tree (inlined);__memcmp_avx2_movbe",
+            "    20.00%  libc.so.6  [.] __memmove_avx_unaligned_erms",
+            f"20.00% {flush};coord_journal_api::record::JournalRecordV1::encode;alloc::raw_vec::finish_grow;__memmove_avx_unaligned_erms",
+            "    50.00%  coordd  [.] mi_malloc",
+            f"50.00% {flush};mi_malloc",
+        ])
+        text = "\n".join(js.copies_table(chains, 10.0))
+        # 30% and 20% of a 1000 µs loop.
+        self.assertIn("| `coord_consensus::leader::Leader::propose` | `alloc::collections::btree::search::search_tree` | 300.0 | 0.0 |", text)
+        self.assertIn("| `coord_journal_api::record::JournalRecordV1::encode` | `alloc::raw_vec::finish_grow` | 0.0 | 200.0 |", text)
+        # mimalloc counts as the allocator.
+        self.assertAlmostEqual(js.loop_split(chains)["alloc"], 50.0)
+        children = "\n".join(js.children_table(chains, 10.0, "follower"))
+        self.assertIn("| `coordd::serve::Domain<P>::stops_on_flush` | **all** | **1000.0** |", children)
+        self.assertIn("| | `coord_consensus::leader::Leader::propose` | 300.0 |", children)
+        self.assertIn("| | `(in mi_malloc)` | 500.0 |", children)
+
+
 class FastPathTests(unittest.TestCase):
     def summary(self, n1, n2):
         with tempfile.TemporaryDirectory() as store:

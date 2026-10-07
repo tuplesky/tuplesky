@@ -82,7 +82,7 @@ on:
         description: "How many base and head pairs, when pair-base is set (the order alternates from pair to pair)"
         default: "3"
       leader-profile:
-        description: "Profile the TupleSky leader's domain thread with perf for 20 s in each run's workload, into its summary: true (flat), call-graph (call graphs by frame pointers, with every build in the job made with them), or false"
+        description: "Profile the TupleSky leader's domain thread with perf for 20 s in each run's workload, into its summary: true (flat), call-graph (call graphs by frame pointer, on the first pair's runs in a paired job, with every build in the job made with frame pointers), or false"
         type: choice
         options: ["false", "true", "call-graph"]
         default: "false"
@@ -153,6 +153,10 @@ jobs:
       # the job, a pair's base included, takes them, so a pair compares like
       # with like.
       RUSTFLAGS: ${{ inputs.leader-profile == 'call-graph' && '-C force-frame-pointers=yes' || '' }}
+      # The C the build compiles through `cc` too (mimalloc's, task-d60),
+      # which Rust's flag does not reach: without it the walk gives out
+      # inside the allocator.
+      CFLAGS: ${{ inputs.leader-profile == 'call-graph' && '-fno-omit-frame-pointer' || '' }}
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
@@ -371,7 +375,9 @@ jobs:
             for side in $order; do
               n=$((n + 1))
               dir="$RUNNER_TEMP/run-$n"
-              graph=flat; if [ "$IN_LEADER_PROFILE" = call-graph ]; then graph=graph; fi
+              # The call graph on the first pair's two runs: the rest of the
+              # pairs keep the flat profile, which costs the loop less.
+              graph=flat; if [ "$IN_LEADER_PROFILE" = call-graph ] && [ "$i" = 1 ]; then graph=graph; fi
               if [ "$side" = base ]; then
                 run_one "$base_bin" "$dir" "$graph" ${base_args[@]+"${base_args[@]}"} || rc=$?
                 name=$base_name

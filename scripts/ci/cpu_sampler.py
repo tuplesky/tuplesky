@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Sample where the runner's CPU goes while a Jepsen test runs.
 
-    scripts/ci/cpu_sampler.py --out FILE [--threads FILE] [--interval SECONDS]
+    scripts/ci/cpu_sampler.py --out FILE [--threads FILE] [--memory FILE] [--interval SECONDS]
 
 Once an interval, until it is sent SIGTERM or SIGINT, this reads every
 process's user and system time from `/proc/<pid>/stat` and the host's from
@@ -30,6 +30,11 @@ take the same name), with their
 count. These are cumulative from the process's
 start, so the summary takes differences; a run queue is time a thread was
 ready to run and waiting for a CPU.
+
+With --memory, each row also appends one row per `coordd` to that file:
+the time, its pid and start time, and its resident set (`VmRSS`) and the
+resident set's high-water mark (`VmHWM`) from `/proc/<pid>/status`, in KiB,
+so a run reads each voter's memory at its end and at its peak.
 
 It also writes the host's CPU model, its mean clock when the sampler
 starts and its CPU count to the same path with -host.txt in place of
@@ -136,6 +141,25 @@ def loops(pids) -> list[str]:
     return out
 
 
+def memory(pids) -> list[str]:
+    """One `--memory` row's cells after the time for each coordd in `pids`
+    (pid, start): its resident set and its high-water mark, in KiB."""
+    out = []
+    for pid, start in pids:
+        fields = {}
+        try:
+            with open(f"/proc/{pid}/status") as f:
+                for line in f:
+                    name, _, value = line.partition(":")
+                    if name in ("VmRSS", "VmHWM"):
+                        fields[name] = int(value.split()[0])
+        except (OSError, ValueError, IndexError):
+            continue
+        if len(fields) == 2:
+            out.append(f"{pid},{start},{fields['VmRSS']},{fields['VmHWM']}")
+    return out
+
+
 def processes():
     """(pid, start time, comm, user plus system ticks) of every process."""
     for entry in os.listdir("/proc"):
@@ -158,6 +182,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--out", required=True)
     parser.add_argument("--threads")
+    parser.add_argument("--memory")
     parser.add_argument("--interval", type=float, default=1.0)
     args = parser.parse_args()
 
@@ -180,6 +205,9 @@ def main() -> int:
     threads = open(args.threads, "w") if args.threads else None
     if threads:
         threads.write("time,pid,start,loop_cpu_s,loop_runq_s,workers_cpu_s,workers_runq_s,workers\n")
+    mem = open(args.memory, "w") if args.memory else None
+    if mem:
+        mem.write("time,pid,start,rss_kib,hwm_kib\n")
     with open(args.out, "w") as out:
         out.write("time,host_busy_s,host_total_s,cpus," + ",".join(f"{n}_s" for n in NAMES) + ",steal_s\n")
         while True:
@@ -207,6 +235,10 @@ def main() -> int:
                 for cells in loops(coordd):
                     threads.write(f"{now:%Y-%m-%d %H:%M:%S.%f},{cells}\n")
                 threads.flush()
+            if mem:
+                for cells in memory(coordd):
+                    mem.write(f"{now:%Y-%m-%d %H:%M:%S.%f},{cells}\n")
+                mem.flush()
             first = False
             if stopping:
                 return 0

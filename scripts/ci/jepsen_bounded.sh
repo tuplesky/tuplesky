@@ -15,7 +15,8 @@
 # where the runner's CPU goes, once a second, to it while the command runs,
 # and each coordd's domain loop and tokio workers to the same path with
 # -threads before the .csv, for the summary's Runner CPU and leader's loop
-# tables. With JEPSEN_LEADER_PROFILE set to a path, leader_profile.py
+# tables, and each coordd's resident set and its high-water mark with
+# -memory before the .csv. With JEPSEN_LEADER_PROFILE set to a path, leader_profile.py
 # profiles the TupleSky leader's domain thread with perf once the workload
 # is under way, into it, with call graphs by frame pointer when
 # JEPSEN_LEADER_CALLGRAPH is set.
@@ -52,7 +53,8 @@ watchdog=$!
 sampler=
 if [ -n "${JEPSEN_CPU_SAMPLES:-}" ]; then
   python3 "$(dirname "$0")/cpu_sampler.py" --out "$JEPSEN_CPU_SAMPLES" \
-    --threads "${JEPSEN_CPU_SAMPLES%.csv}-threads.csv" &
+    --threads "${JEPSEN_CPU_SAMPLES%.csv}-threads.csv" \
+    --memory "${JEPSEN_CPU_SAMPLES%.csv}-memory.csv" &
   sampler=$!
 fi
 

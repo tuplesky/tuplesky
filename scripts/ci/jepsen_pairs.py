@@ -62,6 +62,14 @@ class Run:
     resend_ms_per_call: float | None = None
     resend_longest_ms: float | None = None
     resend_scanned_per_call: float | None = None
+    # The follower's call graph beside the leader's, in a call-graph run.
+    follower_chains: list = field(default_factory=list)
+    # The voters' memory (task-d60): the mean and largest resident set of
+    # the coordd processes alive at the last sample, and the largest
+    # high-water mark of any, in MiB; None without the sampler's file.
+    rss_end_mean: float | None = None
+    rss_end_max: float | None = None
+    hwm_max: float | None = None
     fast_share: float | None = None
     path_share: float | None = None
     frames_per_cmd: float | None = None
@@ -76,6 +84,26 @@ class Run:
         if self.leader_loop is None or self.followers_loop is None:
             return None
         return self.leader_loop - self.followers_loop
+
+    def _profile_us(self, match) -> float | None:
+        """The flat profile's symbols that `match` (a bare name), costed per
+        command on the leader's loop; None without a profile."""
+        if not self.profile or self.leader_loop is None:
+            return None
+        share = sum(v for (_, sym), v in self.profile.items() if match(js.bare(sym)))
+        return share / 100 * self.leader_loop * 1000
+
+    @property
+    def alloc_us(self) -> float | None:
+        return self._profile_us(lambda n: n in js.ALLOCATOR or n.startswith(js.ALLOC_PREFIXES))
+
+    @property
+    def compare_us(self) -> float | None:
+        return self._profile_us(lambda n: n.startswith(js.COMPARE))
+
+    @property
+    def copy_us(self) -> float | None:
+        return self._profile_us(lambda n: n.startswith(js.COPY))
 
     @property
     def resend_profile_us(self) -> float | None:
@@ -110,6 +138,20 @@ TRAFFIC = (
 
 
 RESEND_SYMBOL = ("coordd", "coord_consensus::leader::Leader::resend_unvoted")
+
+# task-d60's measures: what the leader's flat profile puts in the allocator
+# (glibc's functions, or mimalloc's in coordd) and in libc's comparing and
+# copying, costed per command, and the voters' memory.
+PROFILE = (
+    ("alloc_us", "Leader's allocator, profiled (µs per command)", "{:.1f}"),
+    ("compare_us", "Leader's `memcmp`, profiled (µs per command)", "{:.1f}"),
+    ("copy_us", "Leader's `memmove`/`memcpy`, profiled (µs per command)", "{:.1f}"),
+)
+MEMORY = (
+    ("rss_end_mean", "Voters' resident set at the end, mean (MiB)", "{:.0f}"),
+    ("rss_end_max", "Voters' resident set at the end, largest (MiB)", "{:.0f}"),
+    ("hwm_max", "Voters' high-water mark, largest (MiB)", "{:.0f}"),
+)
 
 # task-d59's measures: the timer's own, where the build has them, and for
 # any build the profile's share of `Leader::resend_unvoted` costed per
@@ -187,6 +229,10 @@ def read_run(label: str, store: str) -> Run:
     run.profile = read_profile(os.path.join(store, "leader-profile.txt"))
     run.inclusive = read_inclusive(os.path.join(store, "leader-profile-inclusive.txt"))
     run.chains = js.read_chains(os.path.join(store, "leader-profile-chains.txt"))
+    run.follower_chains = js.read_chains(os.path.join(store, "follower-profile-chains.txt"))
+    mem = js.memory_summary(js.read_memory(os.path.join(store, "cpu-samples-memory.csv")))
+    if mem:
+        run.rss_end_mean, run.rss_end_max, run.hwm_max = mem["end_mean"], mem["end_max"], mem["hwm_max"]
     rows = js.read_cpu_samples(os.path.join(store, "cpu-samples.csv"))
     if rows and start is not None and completed:
         before = [r for r in rows if r["time"] <= start]
@@ -294,6 +340,13 @@ def split_tables(runs: list[Run], top: int = 20) -> list[str]:
         for owner, share in s["owners"].most_common(top):
             out.append(f"| `{owner.replace('|', '/')}` | {share * us:.1f} |")
         out.append("")
+        follower_us = run.followers_loop * 1000 if run.followers_loop else None
+        comparison = js.phase_comparison(run.chains, run.follower_chains, run.leader_loop * 1000, follower_us, top)
+        if comparison:
+            out += [f"(run {i}, {run.label})", ""] + comparison
+        out.extend(js.copies_table(run.chains, us))
+        if follower_us:
+            out.extend(js.children_table(run.follower_chains, follower_us / 100, "follower"))
     return out
 
 
@@ -409,6 +462,21 @@ def render(runs: list[Run], title: str) -> str:
                 "and datagrams sent per command; lost frames and the streams they were lost on, over every voter)",
             )
         )
+    for measures, heading in (
+        (
+            PROFILE,
+            "**Allocator and copies** (task-d60: the leader's flat profile, each group's share of its samples times "
+            "the loop's CPU per command; the allocator is glibc's functions, or mimalloc's in `coordd`; symbols below "
+            "the report's 0.2% cut are not counted)",
+        ),
+        (
+            MEMORY,
+            "**The voters' memory** (task-d60: each `coordd`'s resident set at the last sample, over the voters alive "
+            "then, and the largest high-water mark, `VmHWM`, of any; from `cpu_sampler.py --memory`)",
+        ),
+    ):
+        if any(getattr(r, a) is not None for r in runs for a, _, _ in measures):
+            out.extend(group_tables(runs, paired, measures, heading))
     if any(getattr(r, a) is not None for r in runs for a, _, _ in RESEND):
         out.extend(
             group_tables(

@@ -592,6 +592,65 @@ def read_thread_samples(path: str) -> dict:
     return by_time
 
 
+def read_memory(path: str) -> dict:
+    """The rows `cpu_sampler.py --memory` wrote: each coordd (pid, start)
+    to its samples, (time, resident set, high-water mark) in MiB, in
+    order; {} without the file or with a row that does not parse."""
+    if not os.path.exists(path):
+        return {}
+    out: dict = {}
+    try:
+        with open(path) as f:
+            f.readline()
+            for line in f:
+                cells = line.strip().split(",")
+                if len(cells) != 5:
+                    continue
+                when = datetime.datetime.strptime(cells[0], "%Y-%m-%d %H:%M:%S.%f")
+                out.setdefault((int(cells[1]), int(cells[2])), []).append(
+                    (when, int(cells[3]) / 1024, int(cells[4]) / 1024)
+                )
+    except (OSError, ValueError):
+        return {}
+    return out
+
+
+def memory_summary(samples: dict) -> dict | None:
+    """Over the coordd processes alive at the last sample: their mean and
+    largest resident set then, and the largest high-water mark of any
+    process in the run; None without samples."""
+    if not samples:
+        return None
+    last = max(rows[-1][0] for rows in samples.values())
+    alive = [rows[-1] for rows in samples.values() if rows[-1][0] == last]
+    return {
+        "processes": len(samples),
+        "end_mean": sum(r[1] for r in alive) / len(alive),
+        "end_max": max(r[1] for r in alive),
+        "hwm_max": max(rows[-1][2] for rows in samples.values()),
+    }
+
+
+def voters_memory(samples: dict) -> list[str]:
+    """Each coordd's resident set at its last sample and its high-water
+    mark, from `cpu_sampler.py --memory`; [] without them."""
+    if not samples:
+        return []
+    out = [
+        "**The voters' memory** (each `coordd` process, from `/proc/<pid>/status` once a second: its resident set "
+        "at its last sample, the largest sampled, and the kernel's high-water mark of it, `VmHWM`; MiB)",
+        "",
+        "| Process (pid) | Samples | Resident at its last sample | Largest sampled | High-water mark |",
+        "| --- | --- | --- | --- | --- |",
+    ]
+    for (pid, _), rows in sorted(samples.items(), key=lambda kv: kv[1][0][0]):
+        out.append(
+            f"| {pid} | {len(rows)} | {rows[-1][1]:.0f} | {max(r[1] for r in rows):.0f} | {rows[-1][2]:.0f} |"
+        )
+    out.append("")
+    return out
+
+
 def pearson(xs: list[float], ys: list[float]) -> float | None:
     if len(xs) < 3:
         return None
@@ -818,6 +877,7 @@ ALLOCATOR = {
 ALLOC_FRAMES = (
     "__rust_alloc", "__rust_dealloc", "__rust_realloc", "__rdl_alloc", "__rdl_dealloc", "__rdl_realloc",
     "alloc::alloc::alloc", "alloc::alloc::dealloc", "alloc::alloc::realloc", "as core::alloc::Allocator>",
+    "mimalloc::MiMalloc",
 )
 LIBRARY = ("alloc::", "core::", "std::", "hashbrown::", "__rust", "__GI_", "__libc", "_int_", "tcache", "checked_request")
 # The domain loop's frames, innermost first: a sample's phase is the first
@@ -833,12 +893,15 @@ def read_chains(path: str) -> list:
     """A call-graph profile's samples as folded stacks: (leaf symbol, share
     of the thread's samples in percent, frames from the root to the leaf),
     from `perf report --no-children -g folded,0,caller`; [] without one."""
-    out = []
     try:
         with open(path) as f:
-            lines = f.read().splitlines()
+            return read_chains_from_lines(f.read().splitlines())
     except OSError:
-        return out
+        return []
+
+
+def read_chains_from_lines(lines: list[str]) -> list:
+    out = []
     leaf = None
     for line in lines[1:]:
         m = CHAIN_ENTRY.match(line)
@@ -852,7 +915,9 @@ def read_chains(path: str) -> list:
 
 
 # glibc's allocator internals, which its debug symbols name.
-ALLOC_PREFIXES = ("_int_", "unlink_chunk", "malloc_consolidate", "sysmalloc", "tcache_", "arena_", "alloc_perturb")
+ALLOC_PREFIXES = ("_int_", "unlink_chunk", "malloc_consolidate", "sysmalloc", "tcache_", "arena_", "alloc_perturb",
+                  # mimalloc's (task-d60), in coordd itself.
+                  "mi_", "_mi_")
 
 
 def bare(name: str) -> str:
@@ -897,6 +962,100 @@ def alloc_owner(frames: list[str]) -> str:
         if bare(f) not in ALLOCATOR and not bare(f).startswith(ALLOC_PREFIXES) and not name.startswith(LIBRARY) and not name.startswith("0x") and f != "0":
             return f
     return "(no frame outside the allocator)"
+
+
+# glibc's comparing and copying, by the name its variants start with.
+COMPARE = ("memcmp", "__memcmp", "bcmp", "__bcmp")
+COPY = ("memmove", "__memmove", "memcpy", "__memcpy", "__mempcpy")
+
+
+def library_frame(name: str) -> bool:
+    bare_name = name.lstrip("<")
+    return bare(name) in ALLOCATOR or bare(name).startswith(ALLOC_PREFIXES + COMPARE + COPY) or bare_name.startswith("0x")
+
+
+def copies(chains: list) -> dict:
+    """The samples in glibc's memcmp and memmove (memcpy) variants, by the
+    innermost TupleSky function on the stack and the frame that called
+    libc (which may be the standard library's, a BTreeMap probe or a Vec's
+    growth): (caller, via) -> [compare %, copy %]."""
+    out: dict = collections.defaultdict(lambda: [0.0, 0.0])
+    for leaf, share, frames in chains:
+        name = bare(leaf)
+        kind = 0 if name.startswith(COMPARE) else 1 if name.startswith(COPY) else None
+        if kind is None:
+            continue
+        via = next((f for f in reversed(frames) if not library_frame(f)), "(none)")
+        caller = next((f for f in reversed(frames) if own(f)), "(no TupleSky frame)")
+        out[(caller, via)][kind] += share
+    return out
+
+
+def phase_children(chains: list, phase: str) -> collections.Counter:
+    """Within one phase, each sample by the first TupleSky function it ran
+    below the phase's own frame, or, where it ran none, by the libc or
+    standard-library function it was in: what the phase spends on."""
+    out = collections.Counter()
+    for leaf, share, frames in chains:
+        if loop_phase(frames) != phase:
+            continue
+        at = max(i for i, f in enumerate(frames) if f == phase)
+        below = [f for f in frames[at + 1 :] if own(f)]
+        out[below[0] if below else f"{phase} itself" if not frames[at + 1 :] else f"(in {bare(leaf)})"] += share
+    return out
+
+
+def copies_table(chains: list, scale: float | None, top: int = 15) -> list[str]:
+    """memcmp and memmove by caller, in µs per command where `scale` (the
+    loop's µs per command over 100) is known, else percent."""
+    rows = copies(chains)
+    if not rows:
+        return []
+    unit = "µs per command" if scale else "percent of the samples"
+    k = scale or 1.0
+    fmt = "{:.1f}" if scale else "{:.2f}%"
+    total = [sum(v[0] for v in rows.values()), sum(v[1] for v in rows.values())]
+    out = [
+        f"**The leader's `memcmp` and `memmove` by caller** ({unit}; the innermost TupleSky function on the stack, "
+        f"and the frame that called libc; {fmt.format(total[0] * k)} comparing and {fmt.format(total[1] * k)} copying "
+        "in all)",
+        "",
+        "| Caller | Via | `memcmp` | `memmove`, `memcpy` |",
+        "| --- | --- | --- | --- |",
+    ]
+    for (caller, via), (cmp_, cpy) in sorted(rows.items(), key=lambda kv: -sum(kv[1]))[:top]:
+        out.append(
+            f"| `{caller.replace('|', '/')}` | `{via.replace('|', '/')}` | {fmt.format(cmp_ * k)} | {fmt.format(cpy * k)} |"
+        )
+    out.append("")
+    return out
+
+
+def children_table(chains: list, scale: float | None, who: str, phases: int = 4, top: int = 6) -> list[str]:
+    """The `phases` largest phases of one thread, each with the `top`
+    largest things it spends on."""
+    if not chains:
+        return []
+    split = loop_split(chains)
+    largest = [p for p, _ in split["phases"].most_common() if not p.startswith("(")][:phases]
+    if not largest:
+        return []
+    k = scale or 1.0
+    fmt = "{:.1f}" if scale else "{:.2f}%"
+    out = [
+        f"**The {who}'s largest phases, by what they call** ({'µs per command' if scale else 'percent of the samples'}; "
+        "each sample in a phase by the first TupleSky function below the phase's frame, or the library function it "
+        "was in)",
+        "",
+        "| Phase | Calls | Cost |",
+        "| --- | --- | --- |",
+    ]
+    for phase in largest:
+        out.append(f"| `{phase.replace('|', '/')}` | **all** | **{fmt.format(split['phases'][phase] * k)}** |")
+        for child, share in phase_children(chains, phase).most_common(top):
+            out.append(f"| | `{child.replace('|', '/')}` | {fmt.format(share * k)} |")
+    out.append("")
+    return out
 
 
 def loop_split(chains: list) -> dict:
@@ -966,6 +1125,30 @@ def loop_per_command(voters: dict) -> tuple[float | None, float | None]:
     return leader.cpu[0] / leader.executed * 1e6, mean
 
 
+def phase_comparison(lead: list, follow: list, leader_us: float | None, follower_us: float | None, top: int = 20) -> list[str]:
+    """The leader's and a follower's loops by phase, side by side in
+    microseconds per command, with the difference; [] without both."""
+    if not (lead and follow and leader_us and follower_us):
+        return []
+    a, b = loop_split(lead), loop_split(follow)
+    phases = sorted(set(a["phases"]) | set(b["phases"]), key=lambda k: -max(a["phases"][k] * leader_us, b["phases"][k] * follower_us))
+    out = [
+        f"**The leader's loop beside a follower's, by phase** (both sampled over the same 20 s by frame pointer; "
+        f"microseconds per command: each phase's share of its thread's samples times its loop's CPU per command, "
+        f"{leader_us:.0f} on the leader and {follower_us:.0f} on the followers' mean; the stacks reached the loop "
+        f"in {a['reached']:.1f}% and {b['reached']:.1f}%)",
+        "",
+        "| Phase | Leader (µs) | Follower (µs) | Leader less follower (µs) |",
+        "| --- | --- | --- | --- |",
+    ]
+    for phase in phases[:top]:
+        x, y = a["phases"][phase] * leader_us / 100, b["phases"][phase] * follower_us / 100
+        out.append(f"| `{phase.replace('|', '/')}` | {x:.1f} | {y:.1f} | {x - y:+.1f} |")
+    out.append(f"| **all** | {leader_us:.1f} | {follower_us:.1f} | {leader_us - follower_us:+.1f} |")
+    out.append("")
+    return out
+
+
 def leader_and_follower(store: str, voters: dict, top: int = 20) -> list[str]:
     """The leader's and the follower's loops by phase side by side, in
     microseconds per command (each phase's share times its loop's CPU per
@@ -973,26 +1156,11 @@ def leader_and_follower(store: str, voters: dict, top: int = 20) -> list[str]:
     the leader's own part of each phase. Then the allocator's callers from
     the leader's DWARF sample. [] without the profiles."""
     leader_us, follower_us = loop_per_command(voters)
-    out = []
     lead = read_chains(os.path.join(store, "leader-profile-chains.txt"))
     follow = read_chains(os.path.join(store, "follower-profile-chains.txt"))
-    if lead and follow and leader_us and follower_us:
-        a, b = loop_split(lead), loop_split(follow)
-        phases = sorted(set(a["phases"]) | set(b["phases"]), key=lambda k: -max(a["phases"][k] * leader_us, b["phases"][k] * follower_us))
-        out += [
-            f"**The leader's loop beside a follower's, by phase** (both sampled over the same 20 s by frame pointer; "
-            f"microseconds per command: each phase's share of its thread's samples times its loop's CPU per command, "
-            f"{leader_us:.0f} on the leader and {follower_us:.0f} on the followers' mean; the stacks reached the loop "
-            f"in {a['reached']:.1f}% and {b['reached']:.1f}%)",
-            "",
-            "| Phase | Leader (µs) | Follower (µs) | Leader less follower (µs) |",
-            "| --- | --- | --- | --- |",
-        ]
-        for phase in phases[:top]:
-            x, y = a["phases"][phase] * leader_us / 100, b["phases"][phase] * follower_us / 100
-            out.append(f"| `{phase.replace('|', '/')}` | {x:.1f} | {y:.1f} | {x - y:+.1f} |")
-        out.append(f"| **all** | {leader_us:.1f} | {follower_us:.1f} | {leader_us - follower_us:+.1f} |")
-        out.append("")
+    out = phase_comparison(lead, follow, leader_us, follower_us, top)
+    out.extend(copies_table(lead, leader_us / 100 if leader_us else None))
+    out.extend(children_table(follow, follower_us / 100 if follower_us else None, "follower"))
     alloc = read_chains(os.path.join(store, "leader-profile-alloc-chains.txt"))
     if alloc:
         s = loop_split(alloc)
@@ -1144,6 +1312,7 @@ def summarize(store: str, nodes: list[str], title: str, profile: str | None = No
             threads = read_thread_samples(os.path.join(store, "cpu-samples-threads.csv"))
             if threads:
                 out.extend(leader_loop(rows, threads, start, until, completed))
+        out.extend(voters_memory(read_memory(os.path.join(store, "cpu-samples-memory.csv"))))
 
         out.extend(leader_profile(os.path.join(store, "leader-profile.txt")))
         out.extend(leader_profile_inclusive(os.path.join(store, "leader-profile-inclusive.txt")))

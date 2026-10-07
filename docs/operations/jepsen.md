@@ -246,7 +246,11 @@ re-send timer on the leader, where the build has it: a call's time on the
 loop, mean and longest, and the proposals it looked at, with the leader
 profile's share of `Leader::resend_unvoted` costed per command for any
 build, so a base without the timer still compares. The run's summary has
-the timer per voter that ran it. A paired job prints no voter
+the timer per voter that ran it. Two more give, for task-d60, the
+leader's allocator (glibc's functions, or mimalloc's in `coordd`), its
+`memcmp` and its `memmove` from the flat profile in microseconds per
+command, and the voters' resident set at the end and their largest
+high-water mark. A paired job prints no voter
 logs (the API returns only a job log's last 5000 lines, which the runs'
 summaries and the pair table need); every run's logs are in the store.
 Each run's store is in the
@@ -256,10 +260,11 @@ The `leader-profile` input installs `perf` and profiles the leader's
 domain thread in each TupleSky run: `scripts/ci/leader_profile.py` waits
 for the workload to load the busiest loop, lets it settle for 30 s, takes
 that thread (coordd's main thread) and samples it alone for 20 s at
-999 Hz. `call-graph` also takes the call graph on every run, by frame
-pointer: every build in the job, a pair's base included, is made with
-`-C force-frame-pointers=yes`, and the kernel's stack limit is raised to
-1024 frames. DWARF unwinding from a copied stack stopped short of the
+999 Hz. `call-graph` also takes the call graph, by frame pointer, on
+every run, or in a paired job on the first pair's two runs: every build in
+the job, a pair's base included, is made with `-C force-frame-pointers=yes`
+and its C (mimalloc's, through `cc`) with `-fno-omit-frame-pointer`, and
+the kernel's stack limit is raised to 1024 frames. DWARF unwinding from a copied stack stopped short of the
 domain loop, below the runtime's `block_on`, in nine samples of ten, even
 with perf's largest copy. A frame in a library built without frame
 pointers (libc's allocator) hides its own caller. The call graph gives each symbol's share with everything it called
@@ -282,7 +287,10 @@ leaves the allocator for its caller; on the default Debian image it gave
 out inside libc, and the DWARF sample did no better. With a `jepsen-ref`
 whose `docker/up.sh` takes `--libc-debug`, the image also has glibc's
 debug symbols, so libc's local functions (`_int_malloc`, the variants of
-`memcmp` and `memmove`) are named rather than left as addresses. The summary gives the thread, the window, its samples by object
+`memcmp` and `memmove`) are named rather than left as addresses. From the
+call graph the summary and the pair table also give the leader's `memcmp`
+and `memmove` by caller (the innermost TupleSky function and the frame that
+called libc), and the follower's four largest phases by what they call. The summary gives the thread, the window, its samples by object
 (`coordd`, libc, the kernel) and the symbols that held most of them; the full report is `leader-profile.txt` in the store.
 
 The `voter-workers` input sets each TupleSky voter's tokio worker count
@@ -539,7 +547,9 @@ of lines. `scripts/ci/jepsen_summary.py` reads the test's store
   the correlation of run queue and idle: when they rise and fall together,
   the demand comes in bursts shorter than a second. A line after it gives
   the voters' tokio threads' CPU and run queue per operation. The samples
-  are in the store as `cpu-samples-threads.csv`;
+  are in the store as `cpu-samples-threads.csv`. The voters' memory follows:
+  each `coordd`'s resident set at its last sample, the largest sampled, and
+  its high-water mark (`VmRSS` and `VmHWM`, from `cpu-samples-memory.csv`);
 * for the TupleSky job, one row per voter from its `coordd.log`: boots,
   the position it last recovered at, the highest position it executed by
   the end (read from its store by `coord-jepsen-executed --last`, so a
