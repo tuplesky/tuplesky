@@ -221,7 +221,8 @@ default. The TupleSky summary's title then ends in ", checkpoint every N"
 The `pair-base` input runs the TupleSky job in pairs on one runner, so a
 change is measured against its base without the spread between runners
 (20% in `ok`/s and more in CPU per operation between runs of one commit on
-different VMs). It is a tuplesky ref, built beside the head into the same
+different VMs). It is a tuplesky ref (a branch, a tag or a full commit
+SHA: `actions/checkout` does not take a short one), built beside the head into the same
 target directory (a base without `coord-jepsen` runs the head's shim), or
 `env:NAME=VALUE`, the head's own build with that variable on every voter
 through jepsen.tuplesky's `--voter-env` (such as

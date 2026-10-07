@@ -76,7 +76,7 @@ on:
         description: "Tokio worker threads per TupleSky voter (TOKIO_WORKER_THREADS, through jepsen.tuplesky's --voter-workers); empty for tokio's default of one per runner core, which each co-located voter takes"
         default: ""
       pair-base:
-        description: "Run TupleSky in pairs on one runner against this base: a tuplesky ref (branch, tag or commit) built beside the head, or env:NAME=VALUE for the head's own build with that variable on every voter; empty for one run"
+        description: "Run TupleSky in pairs on one runner against this base: a tuplesky ref (a branch, a tag or a full commit SHA, which actions/checkout needs whole) built beside the head, or env:NAME=VALUE for the head's own build with that variable on every voter; empty for one run"
         default: ""
       pairs:
         description: "How many base and head pairs, when pair-base is set (the order alternates from pair to pair)"
