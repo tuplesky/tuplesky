@@ -100,6 +100,9 @@ quinn-proto = { version = "=0.11.17", default-features = false, features = ["rus
 rustls = { version = "=0.23.45", default-features = false, features = ["std", "aws_lc_rs"] }
 rustls-pki-types = { version = "=1.15.1", default-features = false, features = ["std"] }
 tokio = { version = "=1.53.1", default-features = false, features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util"] }
+# coordd's global allocator (task-d60): size-class heaps with thread-local
+# caches, for the many small short-lived allocations every voter's loop makes.
+mimalloc = { version = "=0.1.52", default-features = false }
 # Test certificates only (never a production dependency edge).
 rcgen = { version = "=0.14.10", default-features = false, features = ["aws_lc_rs", "x509-parser"] }
 x509-parser = { version = "=0.18.1", default-features = false }

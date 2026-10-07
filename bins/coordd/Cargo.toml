@@ -50,6 +50,8 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "si
 rcgen.workspace = true
 reqwest.workspace = true
 rustls.workspace = true
+# The global allocator (task-d60).
+mimalloc.workspace = true
 
 [dev-dependencies]
 coord-sdk.workspace = true

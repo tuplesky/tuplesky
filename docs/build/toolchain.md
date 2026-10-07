@@ -54,6 +54,7 @@ claimed as qualification (Section 22.2).
 | proptest | =1.11.0 | std | dev-dependency only |
 | loom | =0.7.2 | default | linked only under `cfg(loom)` (never set in production builds); the policy filters metadata by platform |
 | tempfile | =3.27.0 | default | dev-dependency only |
+| mimalloc (libmimalloc-sys 0.1.49) | =0.1.52 | none (no default) | `coordd`'s global allocator (task-d60); MIT; builds the bundled mimalloc C sources with `cc` |
 
 Candidates not yet consumed by any crate (quinn, rustls, tokio, fjall, the
 OIDC/JWT/HTTP stack, keyring stores, telemetry, loom, criterion, fuzzing) are
