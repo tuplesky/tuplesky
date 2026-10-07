@@ -233,15 +233,19 @@ favours neither side. Each run gets its own summary as it ends, and
 difference from the base pair by pair, with the mean, smallest and
 largest: `ok`/s, read p99, the voters' CPU per operation, the servers'
 sampled CPU per operation, and the leader's loop CPU per command, the
-followers' and the leader's excess over them. Each run's store is in the
+followers' and the leader's excess over them. With `leader-profile`, it
+also costs each symbol of the leader's profile per command (its share of
+the thread's samples times the run's loop CPU per command, since a share
+alone moves when the loop's total does) and gives the base's and the
+head's side by side. Each run's store is in the
 uploaded archive, and the divergence check covers every run.
 
 The `leader-profile` input installs `perf` and profiles the leader's
 domain thread in each TupleSky run: `scripts/ci/leader_profile.py` waits
 for the workload to load the busiest loop, lets it settle for 30 s, takes
 that thread (coordd's main thread) and samples it alone for 20 s at
-999 Hz. The summary gives the thread, the window and the symbols that held
-most of its samples; the full report is `leader-profile.txt` in the store.
+999 Hz. The summary gives the thread, the window, its samples by object
+(`coordd`, libc, the kernel) and the symbols that held most of them; the full report is `leader-profile.txt` in the store.
 
 The `voter-workers` input sets each TupleSky voter's tokio worker count
 through jepsen.tuplesky's `--voter-workers`, which starts `coordd` with

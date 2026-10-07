@@ -553,5 +553,23 @@ class LeaderLoopTests(unittest.TestCase):
         self.assertNotIn("leader's loop and the host's idle", self.summary(self.THREADS + "garbage\n" + "x,1,2,3,4,5,6,7\n"))
 
 
-if __name__ == "__main__":
-    unittest.main()
+
+class LeaderProfileTests(unittest.TestCase):
+    def test_the_header_objects_and_symbols(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "leader-profile.txt")
+            with open(path, "w") as f:
+                f.write(
+                    "leader thread 7, 0.28 of a core over the 5 s before; Samples: 5K\n"
+                    "by object: coordd 61.20%, libc.so.6 22.10%\n"
+                    "     7.17%  coordd  [.] coord_consensus::leader::Leader::resend_unvoted\n"
+                    "     1.81%  [kernel.kallsyms]  [k] irqentry_exit_to_user_mode\n"
+                )
+            text = "\n".join(js.leader_profile(path))
+        self.assertIn("leader thread 7, 0.28 of a core", text)
+        self.assertIn("Its samples by object: coordd 61.20%, libc.so.6 22.10%.", text)
+        self.assertIn("| 7.17% | `coordd` | `coord_consensus::leader::Leader::resend_unvoted` |", text)
+        self.assertIn("| 1.81% | `[kernel.kallsyms]` | `irqentry_exit_to_user_mode` |", text)
+
+    def test_no_profile_no_block(self):
+        self.assertEqual(js.leader_profile("/nonexistent/leader-profile.txt"), [])

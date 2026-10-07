@@ -16,7 +16,11 @@ over the job does not favour one side). For every run it reads, with
   (what only the leader does, reads most of it), from each voter's last
   `metrics` line; the leader is the voter whose read barrier served reads;
 * the servers' CPU per operation from the runner's samples, when there
-  are any.
+  are any;
+* the leader's profile (`leader-profile.txt`, from `leader_profile.py`),
+  each symbol's share of the leader thread's samples times that run's
+  loop CPU per command, so a symbol's cost per command, which a share
+  alone is not when the loop's total changes.
 
 It writes one row per run and one per pair with the head's difference from
 the base, then the mean, smallest and largest difference over the pairs,
@@ -28,7 +32,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import jepsen_summary as js
 
@@ -43,6 +47,9 @@ class Run:
     leader_loop: float | None = None
     followers_loop: float | None = None
     servers_cpu_per_op: float | None = None
+    # (object, symbol) -> share of the leader thread's samples, in percent;
+    # empty without a profile.
+    profile: dict = field(default_factory=dict)
 
     @property
     def leader_excess(self) -> float | None:
@@ -105,6 +112,7 @@ def read_run(label: str, store: str) -> Run:
         if followers:
             run.followers_loop = sum(c.cpu[0] * 1000 / c.executed for c in followers) / len(followers)
 
+    run.profile = read_profile(os.path.join(store, "leader-profile.txt"))
     rows = js.read_cpu_samples(os.path.join(store, "cpu-samples.csv"))
     if rows and start is not None and completed:
         before = [r for r in rows if r["time"] <= start]
@@ -112,6 +120,63 @@ def read_run(label: str, store: str) -> Run:
         if before and after:
             run.servers_cpu_per_op = (after[0]["servers_s"] - before[-1]["servers_s"]) * 1000 / completed
     return run
+
+
+def read_profile(path: str) -> dict:
+    """`perf report`'s rows in a leader profile: (object, symbol) -> its
+    share in percent; {} without one."""
+    out: dict = {}
+    try:
+        with open(path) as f:
+            lines = f.read().splitlines()[1:]
+    except OSError:
+        return out
+    for line in lines:
+        cells = line.split()
+        if len(cells) < 3 or not cells[0].endswith("%"):
+            continue
+        symbol = " ".join(cells[3:] if cells[2] in ("[.]", "[k]") else cells[2:])
+        try:
+            out[(cells[1], symbol)] = out.get((cells[1], symbol), 0.0) + float(cells[0].rstrip("%"))
+        except ValueError:
+            continue
+    return out
+
+
+def profile_table(runs: list[Run], top: int = 20) -> list[str]:
+    """Each symbol's mean cost per command on the leader's loop, by build:
+    its share of the thread's samples times the run's loop CPU per command,
+    averaged over the build's profiled runs (a symbol below the report's
+    cut in a run counts as 0 there)."""
+    builds = {}
+    for label in ("base", "head"):
+        profiled = [r for r in runs if r.label == label and r.profile and r.leader_loop]
+        if profiled:
+            builds[label] = profiled
+    if len(builds) < 2:
+        return []
+    keys = set()
+    for profiled in builds.values():
+        for r in profiled:
+            keys |= set(r.profile)
+    cost = {
+        label: {k: sum(r.profile.get(k, 0.0) / 100 * r.leader_loop for r in profiled) / len(profiled) for k in keys}
+        for label, profiled in builds.items()
+    }
+    ranked = sorted(keys, key=lambda k: max(cost["base"][k], cost["head"][k]), reverse=True)[:top]
+    out = [
+        f"**The leader's loop by symbol** (each symbol's share of the leader thread's `perf` samples times the run's "
+        f"loop CPU per command, averaged over {len(builds['base'])} base and {len(builds['head'])} head runs; "
+        "microseconds per command)",
+        "",
+        "| Symbol | Object | Base (µs) | Head (µs) | Head less base (µs) |",
+        "| --- | --- | --- | --- | --- |",
+    ]
+    for k in ranked:
+        b, h = cost["base"][k] * 1000, cost["head"][k] * 1000
+        out.append(f"| `{k[1].replace('|', '/')}` | `{k[0]}` | {b:.1f} | {h:.1f} | {h - b:+.1f} |")
+    out.append("")
+    return out
 
 
 def pairs(runs: list[Run]) -> list[tuple[Run, Run]]:
@@ -170,6 +235,7 @@ def render(runs: list[Run], title: str) -> str:
         summary.append(f"{'+' if mean >= 0 else '-'}{f.format(abs(mean))} ({f.format(min(ds))} to {f.format(max(ds))})")
     out.append(f"| mean (smallest to largest) of {len(paired)} | " + " | ".join(summary) + " |")
     out.append("")
+    out.extend(profile_table(runs))
     return "\n".join(out) + "\n"
 
 

@@ -82,6 +82,23 @@ class PairTests(unittest.TestCase):
         self.assertIn("| 2 | +0.0 (+0.3%) | -30 (-50.0%) | -500.00 (-50.0%) | - | -0.200 (-28.6%) |", text)
         self.assertIn("| mean (smallest to largest) of 2 | +0.0 (0.0 to 0.0) | -20 (-30 to -10) |", text)
 
+    def test_profiles_are_costed_per_command_by_build(self):
+        profile = (
+            "leader thread 1, 0.30 of a core over the 5 s before, sampled at 999 Hz; Samples: 5K\n"
+            "by object: coordd 60.00%, libc.so.6 25.00%\n"
+            "    {resend:>6}%  coordd  [.] coord_consensus::leader::Leader::resend_unvoted\n"
+            "     5.00%  libc.so.6  [.] malloc\n"
+        )
+        for run in self.runs:
+            with open(os.path.join(run.store, "leader-profile.txt"), "w") as f:
+                f.write(profile.format(resend="20.00" if run.label == "base" else "10.00"))
+        runs = [jp.read_run(r.label, r.store) for r in self.runs]
+        self.assertEqual(runs[0].profile[("coordd", "coord_consensus::leader::Leader::resend_unvoted")], 20.0)
+        text = jp.render(runs, "Paired")
+        # Base: 20% of 0.6 and 0.7 ms, 130 µs; head: 10% of 0.5 ms, 50 µs.
+        self.assertIn("| `coord_consensus::leader::Leader::resend_unvoted` | `coordd` | 130.0 | 50.0 | -80.0 |", text)
+        self.assertIn("| `malloc` | `libc.so.6` | 32.5 | 25.0 | -7.5 |", text)
+
     def test_runs_that_are_not_side_by_side_are_not_paired(self):
         text = jp.render([self.runs[0], self.runs[3]], "Paired")
         self.assertIn("no pair to compare", text)

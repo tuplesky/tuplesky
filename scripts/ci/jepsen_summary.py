@@ -669,8 +669,14 @@ def leader_profile(path: str, top: int = 30) -> list[str]:
         return []
     if not lines:
         return []
-    header, rows = lines[0], [line.split() for line in lines[1:] if line.strip()]
+    header, rest = lines[0], lines[1:]
+    objects = ""
+    if rest and rest[0].startswith("by object: "):
+        objects, rest = rest[0], rest[1:]
+    rows = [line.split() for line in rest if line.strip()]
     out = [f"**The leader's domain thread, profiled** (`perf record` on that one thread, from `leader_profile.py`): {header}", ""]
+    if objects:
+        out += [f"Its samples {objects}.", ""]
     if not rows:
         return out + [""]
     out += [

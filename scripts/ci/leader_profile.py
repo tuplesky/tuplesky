@@ -114,18 +114,25 @@ def main() -> int:
     if record.returncode != 0:
         write(f"No profile: perf record failed ({record.returncode}): {record.stderr.strip()[-500:]}\n")
         return 0
-    report = subprocess.run(
-        ["sudo", "-n", "perf", "report", "-i", data, "--stdio", "--no-children", "--sort", "dso,symbol",
-         "--percent-limit", "0.3"],
-        capture_output=True,
-        text=True,
-    )
-    lines = [line for line in report.stdout.splitlines() if line.strip() and not line.startswith("#")]
-    samples = next((line for line in report.stdout.splitlines() if line.startswith("# Samples")), "")
+    def report(fields: str, limit: str) -> tuple[list[str], str]:
+        done = subprocess.run(
+            ["sudo", "-n", "perf", "report", "-i", data, "--stdio", "--no-children", "-F", fields,
+             "--percent-limit", limit],
+            capture_output=True,
+            text=True,
+        )
+        lines = done.stdout.splitlines()
+        samples = next((line for line in lines if line.startswith("# Samples")), "")
+        return [line for line in lines if line.strip() and not line.startswith("#")], samples.lstrip("# ").strip()
+
+    symbols, samples = report("overhead,dso,sym", "0.2")
+    objects, _ = report("overhead,dso", "0")
+    by_object = ", ".join(" ".join(reversed(line.split(None, 1))) for line in objects[:6])
     write(
         f"leader thread {pid}, {used / span:.2f} of a core over the {span} s before, sampled at "
-        f"{args.frequency} Hz from {started} to {ended} UTC; {samples.lstrip('# ').strip()}\n"
-        + "\n".join(lines)
+        f"{args.frequency} Hz from {started} to {ended} UTC; {samples}\n"
+        f"by object: {by_object}\n"
+        + "\n".join(symbols)
         + "\n"
     )
     return 0

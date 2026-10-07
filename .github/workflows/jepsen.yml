@@ -362,7 +362,7 @@ jobs:
                 continue
               fi
               previous=$store
-              cp "$dir"/cpu-samples*.csv "$dir"/leader-profile.txt "$store"/ 2>/dev/null || true
+              cp "$dir"/cpu-samples* "$dir"/leader-profile.txt "$store"/ 2>/dev/null || true
               for db in "$store"/n*/domain.redb; do
                 [ -e "$db" ] || continue
                 cp "$db" "$RUNNER_TEMP/scratch.redb"
@@ -402,7 +402,7 @@ jobs:
         # voter, in the job summary; each voter's last 400 lines follow here.
         run: |
           if [ -d jepsen/tuplesky/store/latest ]; then
-            cp "$RUNNER_TEMP"/cpu-samples*.csv "$RUNNER_TEMP"/leader-profile.txt jepsen/tuplesky/store/latest/ 2>/dev/null || true
+            cp "$RUNNER_TEMP"/cpu-samples* "$RUNNER_TEMP"/leader-profile.txt jepsen/tuplesky/store/latest/ 2>/dev/null || true
             python3 tuplesky/scripts/ci/jepsen_summary.py jepsen/tuplesky/store/latest \
               --nodes-file "$RUNNER_TEMP/cluster/nodes" --profile "$PROFILE" \
               --title "TupleSky: $WORKLOAD, $NEMESIS$TITLE_SUFFIX$STORE_SUFFIX$PROFILE_SUFFIX$CHECKPOINT_SUFFIX${IN_VOTER_WORKERS:+, $IN_VOTER_WORKERS tokio workers per voter}"
@@ -697,7 +697,7 @@ jobs:
         if: always()
         run: |
           if [ -d etcd-test/store/latest ]; then
-            cp "$RUNNER_TEMP"/cpu-samples*.csv etcd-test/store/latest/ 2>/dev/null || true
+            cp "$RUNNER_TEMP"/cpu-samples* etcd-test/store/latest/ 2>/dev/null || true
             python3 tuplesky/scripts/ci/jepsen_summary.py etcd-test/store/latest \
               --nodes-file "$RUNNER_TEMP/cluster/nodes" --title "etcd $ETCD_VERSION: $WORKLOAD, $NEMESIS$TITLE_SUFFIX$STORE_SUFFIX"
           else
@@ -835,7 +835,7 @@ jobs:
         if: always()
         run: |
           if [ -d jepsen/swiftpaxos/store/latest ]; then
-            cp "$RUNNER_TEMP"/cpu-samples*.csv jepsen/swiftpaxos/store/latest/ 2>/dev/null || true
+            cp "$RUNNER_TEMP"/cpu-samples* jepsen/swiftpaxos/store/latest/ 2>/dev/null || true
             python3 tuplesky/scripts/ci/jepsen_summary.py jepsen/swiftpaxos/store/latest \
               --nodes-file "$RUNNER_TEMP/cluster/nodes" --title "SwiftPaxos: register, $SWIFTPAXOS_NEMESIS$TITLE_SUFFIX"
           else
