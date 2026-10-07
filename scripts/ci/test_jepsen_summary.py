@@ -715,16 +715,19 @@ class LeaderProfileTests(unittest.TestCase):
                     f"15.00% {turn};coord_daemon::voter::Voter<P>::pump_reads;alloc::raw_vec::finish_grow;"
                     "alloc::alloc::realloc (inlined);0x00000000001621f8\n"
                     "5.00% 0x00000000001621f8\n"
+                    "    10.00%  libc.so.6  [.] unlink_chunk.isra.0\n"
+                    f"10.00% {turn};coord_daemon::voter::Voter<P>::pump_reads;free;_int_free;unlink_chunk.isra.0\n"
                 )
             split = js.loop_split(js.read_chains(path))
             text = "\n".join(js.leader_loop_split(path))
-        self.assertAlmostEqual(split["reached"], 85.0)
-        self.assertAlmostEqual(split["alloc"], 45.0)
-        self.assertAlmostEqual(split["phases"]["coord_daemon::voter::Voter<P>::pump_reads"], 35.0)
+        self.assertAlmostEqual(split["reached"], 95.0)
+        # glibc's internals count, by their bare names.
+        self.assertAlmostEqual(split["alloc"], 55.0)
+        self.assertAlmostEqual(split["phases"]["coord_daemon::voter::Voter<P>::pump_reads"], 45.0)
         self.assertAlmostEqual(split["owners"]["coord_daemon::reads::Reads::due"], 20.0)
         # A Rust allocator frame marks an unresolved libc address as allocation.
-        self.assertAlmostEqual(split["owners"]["coord_daemon::voter::Voter<P>::pump_reads"], 15.0)
-        self.assertIn("The stacks reached the loop in 85.0% of 90.0%.", text)
+        self.assertAlmostEqual(split["owners"]["coord_daemon::voter::Voter<P>::pump_reads"], 25.0)
+        self.assertIn("The stacks reached the loop in 95.0% of 100.0%.", text)
         self.assertIn("| `coord_daemon::voter::Voter<P>::resend_proposals` | 40.00% | 0.00% |", text)
         self.assertIn("| `coordd::serve::Domain<P>::carry` | 10.00% | 10.00% |", text)
         self.assertIn("| `(the stack did not unwind to the loop)` | 5.00% | 0.00% |", text)

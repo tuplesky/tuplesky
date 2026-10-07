@@ -851,8 +851,23 @@ def read_chains(path: str) -> list:
     return out
 
 
+# glibc's allocator internals, which its debug symbols name.
+ALLOC_PREFIXES = ("_int_", "unlink_chunk", "malloc_consolidate", "sysmalloc", "tcache_", "arena_", "alloc_perturb")
+
+
+def bare(name: str) -> str:
+    """A symbol without its version (cfree@GLIBC_2.2.5) or the compiler's
+    clone suffix (unlink_chunk.isra.0)."""
+    return name.split("@")[0].split(".")[0]
+
+
 def allocating(leaf: str, frames: list[str]) -> bool:
-    return leaf.split("@")[0] in ALLOCATOR or any(a in f for f in frames for a in ALLOC_FRAMES)
+    leaf = bare(leaf)
+    return (
+        leaf in ALLOCATOR
+        or leaf.startswith(ALLOC_PREFIXES)
+        or any(a in f for f in frames for a in ALLOC_FRAMES)
+    )
 
 
 def own(name: str) -> bool:
@@ -878,8 +893,8 @@ def alloc_owner(frames: list[str]) -> str:
         if own(f):
             return f
     for f in reversed(frames):
-        bare = f.lstrip("<")
-        if f.split("@")[0] not in ALLOCATOR and not bare.startswith(LIBRARY) and not bare.startswith("0x"):
+        name = f.lstrip("<")
+        if bare(f) not in ALLOCATOR and not bare(f).startswith(ALLOC_PREFIXES) and not name.startswith(LIBRARY) and not name.startswith("0x") and f != "0":
             return f
     return "(no frame outside the allocator)"
 
