@@ -532,9 +532,9 @@ pub struct Cost {
 }
 
 /// What a voter's transport carried between voters (task-d62),
-/// cumulative over every peer link and lane. A frame is on a stream of
-/// its own today, so the stream counts equal the frame counts until
-/// task-d61 batches them.
+/// cumulative over every peer link and lane. Where a link carries a
+/// turn's frames together (task-d61), frames over streams is the
+/// batching factor; elsewhere the two are equal.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Traffic {
     /// Frames written to peers.
@@ -545,12 +545,32 @@ pub struct Traffic {
     pub sent_streams: u64,
     /// Frames to a peer lost before they were written.
     pub sent_lost: u64,
+    /// Streams those frames were lost on: a refused stream loses every
+    /// frame it carried (task-d61).
+    #[serde(default)]
+    pub sent_lost_streams: u64,
     /// Frames read from peers.
     pub received_frames: u64,
     /// Their bytes.
     pub received_bytes: u64,
     /// Streams peers opened to this voter.
     pub received_streams: u64,
+    /// UDP datagrams QUIC sent on peer connections, acknowledgements
+    /// included (task-d61).
+    #[serde(default)]
+    pub datagrams_sent: u64,
+    /// UDP datagrams QUIC received on peer connections.
+    #[serde(default)]
+    pub datagrams_received: u64,
+    /// The system calls that sent those datagrams.
+    #[serde(default)]
+    pub send_calls: u64,
+    /// ACK frames QUIC sent on peer connections.
+    #[serde(default)]
+    pub acks_sent: u64,
+    /// ACK frames QUIC received on peer connections.
+    #[serde(default)]
+    pub acks_received: u64,
 }
 
 /// A pipeline thread's jobs and their three times (task-d62), summed.

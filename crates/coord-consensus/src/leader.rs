@@ -1029,6 +1029,8 @@ impl Leader {
         if publish {
             let context = self.ballots.context(boot, ballot, LocalJournalSeq::ZERO);
             let outbox = self.outbox.as_mut().expect("booted");
+            // Encoded once for every voter it goes to (task-d61).
+            let frame = ProtocolMessage::Proposal(proposal.clone()).encode();
             for voter in &self.config.identity.voters {
                 if *voter == self.config.identity.replica {
                     continue;
@@ -1040,7 +1042,7 @@ impl Leader {
                         replica: *voter,
                         incarnation: ReplicaIncarnation::ZERO,
                     },
-                    frame: ProtocolMessage::Proposal(proposal.clone()).encode(),
+                    frame: frame.clone(),
                 });
             }
         }
@@ -2054,6 +2056,8 @@ impl Leader {
         let barrier = proposal.barrier;
         let context = self.ballots.context(boot, ballot, LocalJournalSeq::ZERO);
         let outbox = self.outbox.as_mut()?;
+        // Encoded once for every voter it goes to (task-d61).
+        let frame = ProtocolMessage::Proposal(ack.clone()).encode();
         for voter in &self.config.identity.voters {
             if *voter == self.config.identity.replica {
                 continue;
@@ -2065,7 +2069,7 @@ impl Leader {
                     replica: *voter,
                     incarnation: ReplicaIncarnation::ZERO,
                 },
-                frame: ProtocolMessage::Proposal(ack.clone()).encode(),
+                frame: frame.clone(),
             });
         }
         self.rejections
@@ -2238,6 +2242,8 @@ impl Leader {
         };
         let context = self.ballots.context(boot, ballot, LocalJournalSeq::ZERO);
         let outbox = self.outbox.as_mut().expect("booted");
+        // Encoded once for every voter it goes to (task-d61).
+        let frame = ProtocolMessage::Proposal(proposal.clone()).encode();
         for voter in &self.config.identity.voters {
             if *voter == self.config.identity.replica {
                 continue;
@@ -2249,7 +2255,7 @@ impl Leader {
                     replica: *voter,
                     incarnation: ReplicaIncarnation::ZERO,
                 },
-                frame: ProtocolMessage::Proposal(proposal.clone()).encode(),
+                frame: frame.clone(),
             });
         }
         let reply = ProtocolMessage::LeaderReply {
@@ -2442,6 +2448,8 @@ impl Leader {
         let ballot = self.config.quorum.ballot();
         let context = self.ballots.context(boot, ballot, LocalJournalSeq::ZERO);
         let outbox = self.outbox.as_mut().expect("booted");
+        // Encoded once for every voter it goes to (task-d61).
+        let frame = ProtocolMessage::Proposal(ack.clone()).encode();
         for voter in &self.config.identity.voters {
             if *voter == self.config.identity.replica {
                 continue;
@@ -2453,7 +2461,7 @@ impl Leader {
                     replica: *voter,
                     incarnation: ReplicaIncarnation::ZERO,
                 },
-                frame: ProtocolMessage::Proposal(ack.clone()).encode(),
+                frame: frame.clone(),
             });
         }
         let reply = ProtocolMessage::LeaderReply {

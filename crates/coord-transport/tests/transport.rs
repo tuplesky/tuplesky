@@ -158,8 +158,13 @@ async fn voters_negotiate_roles_and_exchange_frames_with_bound_provenance() {
             assert_eq!(identity.role, PeerRole::Voter);
             assert_eq!(
                 identity.capabilities,
-                vec![1, 2, Lane::Control.capability()],
-                "granted intersection plus the lane"
+                vec![
+                    1,
+                    2,
+                    Lane::Control.capability(),
+                    coord_transport::CAPABILITY_FRAMES_PER_STREAM
+                ],
+                "granted intersection plus the lane, and several frames a stream"
             );
         }
         other => panic!("{other:?}"),
@@ -2761,4 +2766,319 @@ async fn frames_being_received_hold_no_more_than_the_receive_budget() {
         "the budget held {peak} bytes at its peak"
     );
     assert!(peak >= 2 * PAYLOAD, "frames were not received side by side");
+}
+
+/// `n` evidence frames whose payloads say their place.
+fn numbered(n: usize) -> Vec<Vec<u8>> {
+    (0..n)
+        .map(|i| evidence_frame(format!("frame-{i}").as_bytes()).unwrap())
+        .collect()
+}
+
+/// The payloads of the next `n` peer frames `t` emits, in order.
+async fn payloads(t: &mut Transport, n: usize) -> Vec<Vec<u8>> {
+    let mut got = Vec::new();
+    while got.len() < n {
+        match event(t).await {
+            TransportEvent::PeerFrame { payload, .. } => got.push(payload),
+            TransportEvent::Connected { .. } => {}
+            other => panic!("{other:?}"),
+        }
+    }
+    got
+}
+
+fn said(n: usize) -> Vec<Vec<u8>> {
+    (0..n).map(|i| format!("frame-{i}").into_bytes()).collect()
+}
+
+/// The same payloads in any order: frames on different streams were
+/// never ordered against each other, only those on one stream are.
+fn sorted(mut payloads: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+    payloads.sort();
+    payloads
+}
+
+/// Two voters with these limits, linked on control, both told so.
+async fn linked(a: Limits, b: Limits) -> (Fixture, Transport, Transport) {
+    let f = fixture(&[PeerRole::Voter, PeerRole::Voter]);
+    let mut ta = bind_with(&f, 0, a);
+    let mut tb = bind_with(&f, 1, b);
+    connect_lane(&ta, &tb, &f.ids[1], Lane::Control).await;
+    for t in [&mut ta, &mut tb] {
+        assert!(matches!(event(t).await, TransportEvent::Connected { .. }));
+    }
+    (f, ta, tb)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_turns_frames_to_one_peer_share_a_stream_in_order() {
+    // task-d61: what one call queues for a peer goes on one stream, each
+    // frame unchanged and in order, every one admitted and delivered on
+    // its own.
+    let (_f, a, mut b) = linked(limits(), limits()).await;
+    let sent = a.send_many(dest(1, Lane::Control), DOMAIN, numbered(10));
+    assert!(sent.iter().all(Result::is_ok), "{sent:?}");
+    assert_eq!(payloads(&mut b, 10).await, said(10));
+    let out = a.peer_traffic();
+    assert_eq!(
+        (out.sent_frames, out.sent_streams, out.sent_lost),
+        (10, 1, 0)
+    );
+    let bytes: u64 = numbered(10).iter().map(|f| f.len() as u64).sum();
+    assert_eq!(out.sent_bytes, bytes);
+    let heard = b.peer_traffic();
+    assert_eq!(
+        (
+            heard.received_frames,
+            heard.received_streams,
+            heard.received_bytes
+        ),
+        (10, 1, bytes)
+    );
+    let stats = a.stats(r(1), inc(1), Lane::Control).unwrap();
+    assert_eq!(
+        (
+            stats.frames,
+            stats.queue_wait.count,
+            stats.credit_wait.count
+        ),
+        (10, 10, 1)
+    );
+    // QUIC's own counts are read from the open connection: datagrams
+    // went each way, every one sent by a system call.
+    let (out, heard) = (a.peer_traffic(), b.peer_traffic());
+    assert!(
+        out.datagrams_sent > 0 && heard.datagrams_received > 0,
+        "{out:?} {heard:?}"
+    );
+    assert!(
+        out.send_calls > 0 && out.send_calls <= out.datagrams_sent,
+        "{out:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stream_carries_no_more_frames_or_bytes_than_its_bounds() {
+    // Four frames a stream: ten frames take three streams.
+    let four = Limits {
+        stream_frames: 4,
+        ..limits()
+    };
+    let (_f, a, mut b) = linked(four, limits()).await;
+    let sent = a.send_many(dest(1, Lane::Control), DOMAIN, numbered(10));
+    assert!(sent.iter().all(Result::is_ok));
+    assert_eq!(sorted(payloads(&mut b, 10).await), sorted(said(10)));
+    assert_eq!(a.peer_traffic().sent_streams, 3);
+    assert_eq!(b.peer_traffic().received_streams, 3);
+
+    // Room for three frames' bytes a stream: ten take four. A frame
+    // larger than the room goes, alone.
+    let one = numbered(1)[0].len();
+    let three = Limits {
+        stream_bytes: 3 * one,
+        ..limits()
+    };
+    let (_f, a, mut b) = linked(three, limits()).await;
+    let sent = a.send_many(dest(1, Lane::Control), DOMAIN, numbered(10));
+    assert!(sent.iter().all(Result::is_ok));
+    assert_eq!(sorted(payloads(&mut b, 10).await), sorted(said(10)));
+    assert_eq!(a.peer_traffic().sent_streams, 4);
+    let big = evidence_frame(&vec![7u8; 4 * one]).unwrap();
+    assert!(a.send(dest(1, Lane::Control), DOMAIN, big).is_ok());
+    assert_eq!(payloads(&mut b, 1).await, vec![vec![7u8; 4 * one]]);
+    assert_eq!(a.peer_traffic().sent_streams, 5);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_end_that_sends_one_frame_a_stream_is_sent_one_either_way() {
+    // One end is set to one frame a stream, as a build before task-d61
+    // is: it does not offer the capability, so neither end batches, and
+    // the link carries everything it did before.
+    let single = Limits {
+        stream_frames: 1,
+        ..limits()
+    };
+    for (a_limits, b_limits) in [(limits(), single), (single, limits())] {
+        let (_f, mut a, mut b) = linked(a_limits, b_limits).await;
+        let sent = a.send_many(dest(1, Lane::Control), DOMAIN, numbered(5));
+        assert!(sent.iter().all(Result::is_ok));
+        assert_eq!(sorted(payloads(&mut b, 5).await), sorted(said(5)));
+        let sent = b.send_many(dest(0, Lane::Control), DOMAIN, numbered(5));
+        assert!(sent.iter().all(Result::is_ok));
+        assert_eq!(sorted(payloads(&mut a, 5).await), sorted(said(5)));
+        for t in [&a, &b] {
+            let traffic = t.peer_traffic();
+            assert_eq!((traffic.sent_frames, traffic.sent_streams), (5, 5));
+            assert_eq!((traffic.received_frames, traffic.received_streams), (5, 5));
+        }
+    }
+}
+
+/// A raw peer that offers several frames a stream, or not, negotiated
+/// with `acceptor`.
+async fn raw_peer(
+    f: &Fixture,
+    acceptor: &mut Transport,
+    batched: bool,
+) -> (quinn::Endpoint, quinn::Connection, quinn::SendStream) {
+    let client = raw_client(f, &f.ids[1], ALPN_PEER);
+    let conn = client
+        .connect(acceptor.local_addr().unwrap(), &f.ids[0].name)
+        .unwrap()
+        .await
+        .unwrap();
+    let (mut send, _recv) = conn.open_bi().await.unwrap();
+    let mut caps = vec![1, Lane::Control.capability()];
+    if batched {
+        caps.push(coord_transport::CAPABILITY_FRAMES_PER_STREAM);
+    }
+    send.write_all(&hello_with(PeerRole::Voter, CLUSTER, Some(inc(1)), caps))
+        .await
+        .unwrap();
+    match event(acceptor).await {
+        TransportEvent::Connected { identity, .. } => assert_eq!(
+            identity
+                .capabilities
+                .contains(&coord_transport::CAPABILITY_FRAMES_PER_STREAM),
+            batched
+        ),
+        other => panic!("{other:?}"),
+    }
+    (client, conn, send)
+}
+
+/// What `acceptor` emitted for one stream of `frames` from a raw peer:
+/// the payloads it delivered, and how it closed the connection if it
+/// did.
+async fn one_stream(batched: bool, frames: Vec<Vec<u8>>) -> (Vec<Vec<u8>>, Option<CloseReason>) {
+    let f = fixture(&[PeerRole::Voter, PeerRole::Voter]);
+    let mut acceptor = bind(&f, 0);
+    let (_client, conn, _control) = raw_peer(&f, &mut acceptor, batched).await;
+    let mut uni = conn.open_uni().await.unwrap();
+    for frame in &frames {
+        uni.write_all(frame).await.unwrap();
+    }
+    uni.finish().unwrap();
+    let mut got = Vec::new();
+    loop {
+        match timeout(Duration::from_secs(2), acceptor.next_event()).await {
+            Ok(Some(TransportEvent::PeerFrame { payload, .. })) => got.push(payload),
+            Ok(Some(TransportEvent::Closed { reason, .. })) => return (got, Some(reason)),
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => return (got, None),
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_stream_carries_several_frames_only_where_that_was_granted() {
+    // Granted: three frames on one stream are three frames, in order,
+    // and the connection stays.
+    let (got, closed) = one_stream(true, numbered(3)).await;
+    assert_eq!(got, said(3));
+    assert!(closed.is_none(), "{closed:?}");
+
+    // Not granted: one frame a stream, as before. A second is trailing
+    // bytes, and closes the connection without being delivered.
+    let (got, closed) = one_stream(false, numbered(2)).await;
+    assert!(got.is_empty(), "{got:?}");
+    assert!(
+        matches!(closed, Some(CloseReason::Malformed(ref m)) if m.contains("Trailing")),
+        "{closed:?}"
+    );
+
+    // Granted, but past the protocol's bound: what came before it was
+    // delivered, the stream past it was not, and the connection closes.
+    let most = coord_transport::MAX_FRAMES_PER_STREAM;
+    let (got, closed) = one_stream(true, numbered(most + 1)).await;
+    assert_eq!(got, said(most));
+    assert!(
+        matches!(closed, Some(CloseReason::Malformed(ref m)) if m.contains("more than")),
+        "{closed:?}"
+    );
+
+    // Granted, and a frame in the middle is not peer evidence: the one
+    // before it is delivered, nothing after it, and the connection
+    // closes. No batch turns a bad frame into a good one.
+    let mut frames = numbered(3);
+    frames[1] = evidence_with(0x0100, 1, b"not-evidence");
+    let (got, closed) = one_stream(true, frames).await;
+    assert_eq!(got, said(1));
+    assert!(
+        matches!(closed, Some(CloseReason::Malformed(ref m)) if m.contains("peer frame")),
+        "{closed:?}"
+    );
+
+    // Granted, and the stream ends inside its second frame: the first
+    // is delivered, the part is not.
+    let mut frames = numbered(2);
+    let cut = frames[1].len() - 3;
+    frames[1].truncate(cut);
+    let (got, closed) = one_stream(true, frames).await;
+    assert_eq!(got, said(1));
+    assert!(
+        matches!(closed, Some(CloseReason::Malformed(ref m)) if m.contains("Truncated")),
+        "{closed:?}"
+    );
+
+    // Granted, and a stream with no frame at all is as truncated as one
+    // that ends inside its frame.
+    let (got, closed) = one_stream(true, Vec::new()).await;
+    assert!(got.is_empty());
+    assert!(
+        matches!(closed, Some(CloseReason::Malformed(ref m)) if m.contains("Truncated")),
+        "{closed:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_batch_that_cannot_be_sent_is_lost_whole_and_counted_so() {
+    // b takes one control stream at a time and holds one event, and
+    // never reads: its first stream stays open, so a's next stream never
+    // gets credit. That batch is lost, every frame of it counted, and
+    // none of it is delivered when b reads again: a refused stream is a
+    // loss the counts show, not a quiet peer and not a success.
+    let mut stalled = limits();
+    stalled.event_queue = 1;
+    stalled.lanes[Lane::Control.index()].max_uni_streams = 1;
+    let quick = Limits {
+        frame_timeout: Duration::from_millis(500),
+        stream_frames: 4,
+        ..limits()
+    };
+    let (_f, a, mut b) = linked(quick, stalled).await;
+    let first = a.send_many(dest(1, Lane::Control), DOMAIN, numbered(4));
+    assert!(first.iter().all(Result::is_ok));
+    let second: Vec<Vec<u8>> = (0..4)
+        .map(|i| evidence_frame(format!("lost-{i}").as_bytes()).unwrap())
+        .collect();
+    // Admitted to the queue is all a send's success ever meant.
+    assert!(
+        a.send_many(dest(1, Lane::Control), DOMAIN, second)
+            .iter()
+            .all(Result::is_ok)
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while a.peer_traffic().sent_lost_streams == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the second batch was never refused"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let out = a.peer_traffic();
+    assert_eq!((out.sent_frames, out.sent_streams), (4, 1));
+    assert_eq!((out.sent_lost, out.sent_lost_streams), (4, 1));
+    assert_eq!(a.stats(r(1), inc(1), Lane::Control).unwrap().refused, 4);
+    // b reads again: the first batch, all of it, and nothing of the
+    // second.
+    assert_eq!(payloads(&mut b, 4).await, said(4));
+    assert!(
+        timeout(Duration::from_millis(500), b.next_event())
+            .await
+            .is_err(),
+        "nothing past the first batch"
+    );
+    assert_eq!(b.peer_traffic().received_frames, 4);
 }

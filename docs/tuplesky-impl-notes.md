@@ -10003,3 +10003,57 @@ is its acceptance and is ignored until then; it fails today with 0 of
 
 Not yet in task-d62: the matched workload and the runner rows, which are
 three pairs each.
+
+## Several frames a stream (task-d61): streams fell, packets hardly did
+
+task-d61 puts what one turn queues for one peer on one QUIC stream, where
+both ends of the link offer capability `0x0020` (`spec/wire-v1.md`), and
+encodes a leader's proposal once for every voter it goes to. A link where
+either end does not offer it carries one frame a stream, as before; a
+stream carries at most 256 frames and 256 KiB, and never more than either
+byte budget can hold. Each frame is still admitted, refused and delivered
+on its own; frames on one stream are delivered in order, and frames on
+different streams are, as before, not ordered against each other. A
+stream that cannot be opened or written loses every frame it carried,
+counted as frames lost and as a stream lost, so a saturated peer does not
+read as a quiet one.
+
+The transport now also reports QUIC's own counts on peer connections:
+datagrams each way, the system calls that sent them, and ACK frames each
+way. `COORDD_PEER_STREAM_FRAMES=1` sends one frame a stream from the same
+binary, a measurement lever and not configuration.
+
+Five voters on one four-core host, replay profile, stores on disk, 30
+callers, 20,000 measured operations, `put=30,get=50,contended=20`, one
+binary, three pairs with batching off and on, alternated:
+
+| | off | on |
+| --- | --- | --- |
+| completed a second | 893, 850, 916 | 900, 928, 931 |
+| tokio workers' CPU ms per operation, five voters | 1.043, 1.153, 1.081 | 0.999, 1.005, 0.975 |
+| all threads' CPU ms per operation | 3.202, 3.346, 3.186 | 3.099, 3.097, 3.075 |
+| leader: frames / streams per command sent | 10.0 / 10.0 | 10.0 / 3.1 |
+| fast-set follower: frames / streams per command sent | 8.5 / 8.5 | 8.5 / 2.0 |
+| leader: datagrams sent / send calls / ACK frames sent per command | 5.37 / 5.04 / 1.61 | 5.09 / 4.79 / 1.53 |
+| fast-set follower: datagrams sent per command | 3.54 | 3.25 |
+
+- Streams fell by the batching factor, three to four times. The
+  transport threads' CPU fell by 9% in every pair, and the throughput
+  rose by 4%.
+- Datagrams fell by 5 to 7% only. The leader already sent about two frames
+  a datagram before: QUIC packs the frames of streams written together
+  into one packet, so a turn's frames to a peer were sharing packets
+  already, and what batching took away is the work per stream, not per
+  packet.
+- A `perf` profile of the leader's tokio workers (20 s at 199 Hz, one run
+  each way, two builds) agrees: QUIC's own work went from 22.8% of the
+  samples to 18.8% and the stream opening, accepting and reading from 16.3%
+  to 14.5%, while `sendmsg` stayed at about 15% and parking and waking at
+  about 32%. Counted with `perf stat`, the leader made 5.5 `sendmsg`, 5.5
+  `recvmmsg` and 11 `futex` calls a command either way.
+- What is left is per packet and per wake-up. Fewer packets needs fewer
+  turns a command (each turn sends what it has to each peer) or fewer
+  ACK-only packets; fewer wake-ups needs fewer events between the
+  transport and the domain thread. Neither is this task's change; the
+  runner rows of this PR size them first.
+

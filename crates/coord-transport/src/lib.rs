@@ -51,7 +51,10 @@ pub use endpoint::{
     CloseCode, CloseReason, ConnectionId, Destination, Dialer, RequestError, Responder, SendError,
     Transport, TransportError, TransportEvent,
 };
-pub use frames::{FrameError, KIND_PEER_EVIDENCE, evidence_frame};
+pub use frames::{
+    CAPABILITY_FRAMES_PER_STREAM, FrameError, FrameStream, KIND_PEER_EVIDENCE,
+    MAX_FRAMES_PER_STREAM, evidence_frame,
+};
 pub use identity::{BindError, BoundIdentity, IdentityBinder, role_class};
 pub use lane::{Lane, LaneError, LaneLimits, lane_of_hello, role_lanes};
 pub use sched::{FairQueue, LaneStats, PeerTraffic, QueueError, Queued, WaitStats};
