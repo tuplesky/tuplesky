@@ -409,6 +409,15 @@ impl Default for Budgets {
     }
 }
 
+/// What became of one frame handed to [`PeerPlane::send_turn`].
+type Sent = (
+    coord_core::effect::PeerId,
+    Result<(), coord_transport::SendError>,
+);
+
+/// A voter and the lane a turn's frames go to it on.
+type Route = (coord_core::effect::PeerId, coord_transport::Lane);
+
 /// The other voters of this domain, and the connections held to them.
 ///
 /// Dialling is best effort and never a precondition. A voter this
@@ -434,6 +443,11 @@ pub struct PeerPlane {
 }
 
 impl PeerPlane {
+    /// What this node's transport carried between voters (task-d62).
+    pub fn traffic(&self) -> coord_transport::PeerTraffic {
+        self.transport.peer_traffic()
+    }
+
     /// The plane over `transport`, for the voters in `peers`.
     pub fn new(
         transport: Transport,
@@ -519,40 +533,56 @@ impl PeerPlane {
         self.transport.linked(peer.replica, peer.incarnation, lane)
     }
 
-    /// Queue one protocol frame for a voter.
-    fn send(
-        &self,
-        to: coord_core::effect::PeerId,
-        message: &[u8],
-    ) -> Result<(), coord_transport::SendError> {
-        // A machine publishes the consensus message; the frame around it
-        // is the transport's vocabulary, put on here. A peer stream
-        // carries exactly this kind, and the reader on the other end
-        // refuses anything else rather than handing it to consensus.
-        let frame = coord_transport::evidence_frame(message)
-            .map_err(|_| coord_transport::SendError::NotConnected)?;
-        // Catch-up traffic goes down the bulk lane, and everything the
-        // protocol needs to make progress goes down the control one.
-        // They are separated because they compete: a replica fetching
-        // the content of commands it missed moves whole payloads, and
-        // sharing a queue with proposals and acknowledgements means the
-        // frames it drops when that queue fills are the ones it is
-        // catching up *with*. That is not a hypothesis -- it is what one
-        // voter of three did under a benchmark, permanently.
-        let lane = if coord_consensus::is_payload_transfer(message) {
-            coord_transport::Lane::Bulk
-        } else {
-            coord_transport::Lane::Control
-        };
-        self.transport.send(
-            coord_transport::Destination::Replica {
-                replica: to.replica,
-                incarnation: to.incarnation,
-                lane,
-            },
-            self.domain,
-            frame,
-        )
+    /// Queue one turn's protocol frames for the voters they name, each
+    /// with its own result.
+    ///
+    /// What the turn has for one voter on one lane is handed to the
+    /// transport in one call, in the order the turn made it, so a link
+    /// that carries several frames a stream sends it together (task-d61).
+    /// Each frame is still admitted, and refused, on its own.
+    fn send_turn(&self, frames: Vec<(coord_core::effect::PeerId, Vec<u8>)>) -> Vec<Sent> {
+        let mut results = Vec::with_capacity(frames.len());
+        let mut turn: Vec<(Route, Vec<Vec<u8>>)> = Vec::new();
+        for (to, message) in frames {
+            // A machine publishes the consensus message; the frame around
+            // it is the transport's vocabulary, put on here. A peer stream
+            // carries exactly this kind, and the reader on the other end
+            // refuses anything else rather than handing it to consensus.
+            let Ok(frame) = coord_transport::evidence_frame(&message) else {
+                results.push((to, Err(coord_transport::SendError::NotConnected)));
+                continue;
+            };
+            // Catch-up traffic goes down the bulk lane, and everything the
+            // protocol needs to make progress goes down the control one.
+            // They are separated because they compete: a replica fetching
+            // the content of commands it missed moves whole payloads, and
+            // sharing a queue with proposals and acknowledgements means
+            // the frames it drops when that queue fills are the ones it is
+            // catching up *with*. That is not a hypothesis -- it is what
+            // one voter of three did under a benchmark, permanently.
+            let lane = if coord_consensus::is_payload_transfer(&message) {
+                coord_transport::Lane::Bulk
+            } else {
+                coord_transport::Lane::Control
+            };
+            match turn.iter_mut().find(|(key, _)| *key == (to, lane)) {
+                Some((_, queued)) => queued.push(frame),
+                None => turn.push(((to, lane), vec![frame])),
+            }
+        }
+        for ((to, lane), queued) in turn {
+            let sent = self.transport.send_many(
+                coord_transport::Destination::Replica {
+                    replica: to.replica,
+                    incarnation: to.incarnation,
+                    lane,
+                },
+                self.domain,
+                queued,
+            );
+            results.extend(sent.into_iter().map(|result| (to, result)));
+        }
+        results
     }
 }
 
@@ -973,6 +1003,9 @@ pub struct Domain<P: Persistence> {
     /// How long this loop has waited, and when it next prints a
     /// snapshot (task-d45).
     pacing: Pacing,
+    /// The pre-acceptances the voter held that the leader had not ordered,
+    /// at the last interval snapshot (task-d62).
+    unordered: coord_daemon::metrics::UnorderedPreAcceptances,
     /// Notified by the voter's materializer thread each time a projection
     /// commit finishes (task-d52), so the loop takes it back and releases
     /// what waited on it. `None` where commits run on this thread.
@@ -1569,6 +1602,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             budgets,
             recorder,
             pacing: Pacing::default(),
+            unordered: coord_daemon::metrics::UnorderedPreAcceptances::default(),
             materialized: None,
             pipeline_waits: None,
             read_orders: Vec::new(),
@@ -1611,7 +1645,8 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     /// interval since the last printed snapshot (task-d45).
     fn cost(&self) -> coord_daemon::metrics::Measure<coord_daemon::metrics::Cost> {
         use coord_daemon::metrics::{
-            Cost, Cpu, Interval, Measure, PipelineWaits, Scheduling, Unavailable, Wait,
+            Cost, Cpu, Interval, Jobs, Measure, PipelineWaits, Scheduling, Traffic, Unavailable,
+            Wait,
         };
         let Backing::Voting(voter) = &self.backing else {
             // A process without a voter applies what it serves, but the
@@ -1673,6 +1708,30 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             established_fast: voter.node().established.fast,
             established_slow: voter.node().established.slow,
             reads: reads(&voter.read_counts()),
+            fast_path: fast_path(&voter.node().fast_path_counts()),
+            unordered: self.unordered,
+            release: release(&voter.node().release_split()),
+            traffic: self.plane.as_ref().map_or(
+                Measure::Unavailable(Unavailable::NotInstrumented),
+                |plane| {
+                    let t = plane.traffic();
+                    Measure::Observed(Traffic {
+                        sent_frames: t.sent_frames,
+                        sent_bytes: t.sent_bytes,
+                        sent_streams: t.sent_streams,
+                        sent_lost: t.sent_lost,
+                        sent_lost_streams: t.sent_lost_streams,
+                        datagrams_sent: t.datagrams_sent,
+                        datagrams_received: t.datagrams_received,
+                        send_calls: t.send_calls,
+                        acks_sent: t.acks_sent,
+                        acks_received: t.acks_received,
+                        received_frames: t.received_frames,
+                        received_bytes: t.received_bytes,
+                        received_streams: t.received_streams,
+                    })
+                },
+            ),
             cpu,
             waits: self.pipeline_waits.as_ref().map_or(
                 Measure::Unavailable(Unavailable::NotInstrumented),
@@ -1681,9 +1740,20 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                         let (count, time) = waits.read();
                         Wait { count, time }
                     };
+                    let jobs = |waits: &coord_storage::Waits| {
+                        let times = waits.jobs();
+                        Jobs {
+                            count: times.jobs,
+                            queued: times.queued,
+                            served: times.served,
+                            completed: times.completed,
+                        }
+                    };
                     Measure::Observed(PipelineWaits {
                         appender: wait(appender),
                         materializer: wait(materializer),
+                        appender_jobs: jobs(appender),
+                        materializer_jobs: jobs(materializer),
                     })
                 },
             ),
@@ -1698,6 +1768,15 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         };
         if self.pacing.due.is_some_and(|due| now < due) {
             return;
+        }
+        if let Backing::Voting(voter) = &mut self.backing {
+            let seen = voter.node_mut().observe_unordered(now);
+            self.unordered = coord_daemon::metrics::UnorderedPreAcceptances {
+                pending: seen.pending,
+                reordered: seen.reordered,
+                oldest: seen.oldest,
+                leader_log: seen.leader_log,
+            };
         }
         let snapshot = self.metrics(&roles);
         match serde_json::to_string(&snapshot) {
@@ -3242,6 +3321,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         for frame in out.frontend {
             self.hand_to_collector(api, provenance, &frame);
         }
+        let mut turn = Vec::with_capacity(out.peer.len());
         for (to, frame) in out.peer {
             // Which generation of that node may receive it is the
             // committed configuration's answer, settled here on the way
@@ -3261,7 +3341,20 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 self.frontend.counts.not_a_voter += 1;
                 continue;
             };
-            match self.plane.as_ref().map(|p| p.send(to, &frame)) {
+            turn.push((to, frame));
+        }
+        // The turn's frames for one voter go to the transport together
+        // (task-d61); what became of each is counted as before.
+        let sent: Vec<_> = match self.plane.as_ref() {
+            Some(plane) => plane
+                .send_turn(turn)
+                .into_iter()
+                .map(|(to, result)| (to, Some(result)))
+                .collect(),
+            None => turn.into_iter().map(|(to, _)| (to, None)).collect(),
+        };
+        for (to, result) in sent {
+            match result {
                 // Admitted to the lane's queue. Not a vote and not a
                 // delivery: what the peer does with it is the peer's,
                 // and the collector counts the evidence.
@@ -4696,6 +4789,30 @@ fn resends(counts: &coord_consensus::ResendCounts) -> coord_daemon::metrics::Res
     }
 }
 
+/// The snapshot's reading of what the fast path did (task-d62).
+fn fast_path(counts: &coord_consensus::FastPathCounts) -> coord_daemon::metrics::FastPath {
+    coord_daemon::metrics::FastPath {
+        missed_path: counts.missed_path,
+        missed_deps: counts.missed_deps,
+        missed_missing: counts.missed_missing,
+        missed_slow_first: counts.missed_slow_first,
+        missed_unclassified: counts.missed_unclassified,
+        acks: counts.acks,
+        acks_reordered: counts.acks_reordered,
+    }
+}
+
+/// The snapshot's reading of the leader's waits from learned to released
+/// (task-d62).
+fn release(split: &coord_daemon::learned::ReleaseSplit) -> coord_daemon::metrics::Release {
+    coord_daemon::metrics::Release {
+        commands: split.commands,
+        predecessors: split.predecessors,
+        group: split.group,
+        projection: split.projection,
+    }
+}
+
 /// The snapshot's reading of the read barrier's counts (task-d50).
 fn reads(counts: &coord_daemon::reads::ReadCounts) -> coord_daemon::metrics::Reads {
     coord_daemon::metrics::Reads {
@@ -4929,6 +5046,17 @@ fn endpoint(
         .and_then(|v| v.parse::<u64>().ok())
     {
         limits.max_connection_age = std::time::Duration::from_millis(ms);
+    }
+    // How many frames a peer stream carries (task-d61), set from the
+    // environment so one binary measures with and without batching: a
+    // measurement lever, like the runtime's worker count, and not
+    // configuration. One is a stream a frame, as before task-d61; a peer
+    // that batches then sends this node one frame a stream too.
+    if let Some(frames) = std::env::var("COORDD_PEER_STREAM_FRAMES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        limits.stream_frames = frames.max(1);
     }
     Transport::with_socket(socket, identity, std::sync::Arc::new(binder), limits)
         .map_err(|e| TransportError::Endpoint(format!("{e:?}")))

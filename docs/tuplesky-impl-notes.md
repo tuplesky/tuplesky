@@ -9634,9 +9634,29 @@ A fourth one-worker run is left out: the host's disk stalled for about
   cores here, so on this host it is not the VM.
 - **Not a default.** One transport worker serves a voter alone on its
   host poorly, and a host's cores are not the voters'. It belongs to
-  whoever co-locates voters: the harness can set it, and a
-  `[transport]` key is the follow-up if the Jepsen runner's six nodes
-  show the same. task-d61 is measured against whichever count that is.
+  whoever co-locates voters, and the Jepsen runner decides whether it
+  carries over.
+
+**On the Jepsen runner it does not.** #98's runner set
+`TOKIO_WORKER_THREADS` on its five voters (six nodes, replay, 120 s, 30
+clients, disk, the default cadence; one run per row except two at the
+default and two at one worker), where the same four cores also carry
+Jepsen's JVM and the shims:
+
+| workers per voter | `ok`/s | read p99 | voters' CPU / op | leader loop CPU / run queue per command | tokio threads' CPU / run queue per op |
+| --- | --- | --- | --- | --- | --- |
+| default (4) | 546, 533 | 72 ms | 2.98–3.28 ms | 0.57–0.70 / 0.86–0.97 ms | 1.42 / 6.96 ms |
+| 2 | 537 | 71 ms | 2.91 ms | 0.62 / 0.88 ms | 1.16 / 4.38 ms |
+| 1 | 374, 450 | 73–85 ms | 3.95–4.07 ms | 0.89–0.94 / 1.11–1.37 ms | 1.55 / 4.14 ms |
+
+- One worker cut the tokio threads' run queue as it did here, but not
+  their CPU, and was 17 to 31% slower. Two matched the default.
+- **Unexplained: the leader's loop costs more CPU per command with one
+  worker** (0.89 to 0.94 ms against 0.57 to 0.70), the opposite of the
+  runs above, where it fell. task-d61's frames-per-turn count is the
+  measurement that would explain it.
+- So no `[transport]` key, and task-d58 and task-d61 are measured at
+  the default count.
 
 ## The local checkpoint off the domain thread
 
@@ -9705,7 +9725,10 @@ round.
   every read due in the pump, and `reads::evaluate` plans each over it.
   Each is due because everything below its index executed, so a
   snapshot pinned after that covers all of them. A read whose position
-  the snapshot has not reached yet is held again, as before.
+  the snapshot has not reached yet is held again, as before. Three
+  voters in one process show it end to end: two reads due in one pump
+  are both served, from one snapshot
+  (`the_reads_due_in_one_pump_are_served_from_one_snapshot`).
 - **A snapshot that was behind is not pinned again until it could
   differ.** A read is due once its index has executed and answerable
   once the projection has committed that far, which is later. The first
@@ -9774,6 +9797,15 @@ The leader's domain thread, profiled (samples counted inclusively):
   A read waits 2 ms longer for its round and no longer in all: its
   wait for its index to execute is two and a half times as long, and
   the round overlaps it.
+- **Held behind.** A due read was held behind its snapshot 21,923 to
+  22,438 times per 20,339 reads here, 1.08 to 1.10 per read, and on the
+  Jepsen runner 1.07 to 1.21 (#98, 6032679507): about once per read in
+  both places, the projection's commit trailing execution. Snapshots per
+  read were 0.38 to 0.39 here and 0.53 to 0.55 there. A read held behind
+  costs the pump that finds it so only the snapshot's frontier check
+  (`evaluate` returns at its first line), and no new snapshot until the
+  completed frontier moves, so the churn is the snapshots, 3.2 to 3.7% of
+  the leader's thread here.
 - **The domain.** The leader's loop costs 15% less per operation. The
   throughput's range moved up by about 50 operations a second and still
   overlaps the baseline's; the host's four cores are what these runs
@@ -9787,3 +9819,241 @@ one run each, as task-d50 ran it:
 | partition 45 s | 0 | 33,292 (185 at the cut-off leader) | 14,322 | n2 (elected) |
 | pause 5 s, then 40 s | 0 | 48,992 | 21,731 | n2 (elected) |
 | kill and restart, twice | 0 | 21,628 | 9,011 | n1 |
+
+## A fast-set follower held off the leader's path
+
+Run E on #98 (37576818613: five voters, one boot each, no faults, the
+default worker count) made no fast decision in 46,000 commands. The
+six other runs of the same day, on the same commit and runner type,
+made 3.5 to 11%:
+
+| run | fast | the leader's first proposal |
+| --- | --- | --- |
+| A | 4.7% | |
+| B (one worker) | 11.1% | |
+| C (two workers) | 5.3% | |
+| D (one worker) | 3.5% | |
+| E | **0** | `ProposalRepublished` |
+| #147, 1 | 3.9% | |
+| #147, 2 | 7.2% | |
+
+Every voter of E counts the same: `established_fast` 0. Its leader is
+the only one of the seven whose log shows `ProposalRepublished` at
+startup: it proposed its first command, the lease authority's epoch,
+before its peers were connected (`peers connected=0 of 4`,
+`voters submittable=0 of 4`), and presented it again later. That
+places the run's first client commands in the same window, where a
+frontend's collector reaches some voters and not the leader.
+
+**The mechanism**, reproduced in one process
+(`crates/coord-daemon/tests/fast_path.rs`: five voters over the
+reference store, the fast set `coordd` builds, the leader and the next
+two):
+
+- A follower appends a command to its path log when it pre-accepts it.
+  A command the leader never orders is never synchronized there, and a
+  record leaves the log only when it executes or a durable Sync releases
+  it (task-d24).
+- The next command the leader orders marks it reordered (task-d34's
+  F7). From then on the follower's head is `reordered_path`, which no
+  leader path equals, so every acknowledgement it sends fails the fast
+  predicate until the next election.
+- With the fast set the leader and two followers, one such follower is
+  enough.
+
+| one put, never presented again, reached | fast, of the next 40 |
+| --- | --- |
+| every voter | 40 |
+| n4 only, outside the fast set | 40 |
+| n4 and n5 | 40 |
+| n2 only, in the fast set | **0** |
+| n2 and n3 | **0** |
+
+A lost first service command reproduces it too, by another route: the
+followers hold every later proposal until it arrives, the leader's
+table fills, and the commands it then refuses for room are pre-accepted
+at the followers and never ordered. With 60 commands before the
+republication, none of the 176 commands established was fast, the 120
+after it included; with 20, the table did not fill, and 39 of the 40
+after it were fast.
+
+E's leader refused nothing for room, so its orphan came the first way,
+most likely; the voters' logs are in its artifact, which this container
+cannot fetch. task-d67 decides when a follower lets go of such a
+pre-acceptance, and task-d62 counts them.
+
+
+## What a command costs and why its fast path failed: the first counts
+
+task-d62's first part is in `metrics` and in `command_cost.py`'s second
+table. Counting only: no voter decides, sends or orders anything
+differently.
+
+- **Why a command missed the fast path** (`cost.fast_path`). Each command
+  a voter establishes on the slow path is classified when it executes,
+  from the votes that voter counted by then, and counted when its
+  establishment is, so the five add up to `established_slow`: `path`, a
+  fast-set acknowledgement saw another conflict path; `deps`, the path
+  but other direct dependencies; `missing`, an acknowledgement the
+  quorum needed had not arrived; `slow_first`, the fast quorum formed
+  after the slow one decided; `unclassified`, a command the voter did not
+  decide from its own votes (a follower executing the leader's commit)
+  or a run forced onto the slow path. Read at execution, later than the
+  decision, `missing` is an acknowledgement that had not come even then,
+  and one that agreed and came late is `slow_first`.
+- **An acknowledgement made under a `reordered` marker** is counted by
+  its sender (`acks_reordered`, beside `acks`), not by the leader. The
+  acknowledgement does not say so, and saying it would change the wire
+  form of every acknowledgement; the leader counts it under `path`.
+- **The pre-acceptances a voter holds that the leader has not ordered**
+  (`cost.unordered`): how many, how many the leader has ordered a later
+  command past, and how long the oldest of those has been held, from the
+  first interval snapshot that saw it. One the next synchronization
+  orders is gone by the next snapshot; task-d67's orphan shows as an age
+  that grows with the run.
+- **From learned to released** (`cost.release`), per command the leader
+  committed from its own votes: committed to applied (predecessors and
+  the loop reaching it), applied to its group closing, and the group
+  closing to the release (the projection's commit). Summed, with the
+  commands timed.
+- **The read waits**, which are cumulative from arrival, are taken apart
+  by the summary: the confirmation, the index after it, the answer after
+  the index, with reads per round and reads held behind their snapshot
+  per read.
+
+On the orphan of the section above (`fast_path.rs`, five voters, an
+orphan at n2, then 20 commands), the leader names `path` for all 20 of
+its slow establishments and nothing else; n2 sent 26 acknowledgements,
+19 of them under the marker, and holds one pre-acceptance the leader
+ordered later commands past. The first command after the orphan missed
+by the orphan alone, in n2's pending suffix, before anything was
+ordered past it. n3 sent 25 and none under a marker.
+
+### The second part: frames, streams and the storage threads
+
+- **Peer traffic** (`cost.traffic`), counted by the transport for the
+  peer class only: frames, bytes and streams sent and received, and
+  frames lost to a failed open or write. Bytes are the frame header and
+  payload, not QUIC's framing. Every peer frame is its own stream today,
+  so streams equal frames; task-d61 is read against this.
+- **The journal's and the materializer's jobs** (`cost.waits`,
+  `appender_jobs`, `materializer_jobs`): each job is stamped when it is
+  sent, so the summary splits its life into queued (sent to taken),
+  served (taken to done) and completed (done to the loop taking the
+  outcome).
+- **A leader's own path log** (`cost.unordered.leader_log`): the
+  commands in its pending suffix. A leader holds no pre-acceptance it
+  has not ordered, so it reports 0 there, and this length beside it.
+
+A local run (five voters on one host, replay profile, stores on disk, 30
+callers, 20,000 measured operations, `put=30,get=50,contended=20`, 862
+completed a second):
+
+| node | fast share | path / deps / missing / slow first | acks (reordered) | peer frames per command sent / received | journal ms per command queued / served / completed | projection ms per command queued / served / completed |
+| --- | --- | --- | --- | --- | --- | --- |
+| n1 (leader) | 3.9% | 9282 / 165 / 264 / 48 | -- | 9.96 / 7.89 | 0.10 / 0.78 / 0.30 | 0.13 / 0.57 / 0.36 |
+| n2 (fast set) | 4.2% | 9349 / 169 / 178 / 32 | 10150 (1976) | 8.48 / 6.49 | 0.11 / 0.81 / 0.30 | 0.14 / 0.56 / 0.30 |
+| n3 (fast set) | 4.1% | 9376 / 164 / 172 / 26 | 10150 (2137) | 8.47 / 6.49 | 0.10 / 0.80 / 0.31 | 0.15 / 0.55 / 0.32 |
+| n4 | 3.9% | 9224 / 164 / 334 / 36 | -- | 4.47 / 7.49 | 0.11 / 0.82 / 0.33 | 0.16 / 0.56 / 0.30 |
+| n5 | 3.8% | 9208 / 165 / 356 / 35 | -- | 4.47 / 7.48 | 0.10 / 0.84 / 0.36 | 0.15 / 0.51 / 0.26 |
+
+- The reasons add up to each voter's slow establishments, and `path` is
+  nearly all of them. About one fast-set acknowledgement in five was made
+  under a `reordered` marker, so most `path` misses are paths the
+  follower chained in another order without a marker.
+- No follower held a pre-acceptance the leader had not ordered at the
+  last snapshot.
+- Streams sent equal frames sent on every voter: about ten streams a
+  command at the leader, eight and a half at a fast-set follower.
+- On the leader, a command waited 1.76 ms for its predecessors, 0.90 ms
+  for its group to close and 7.80 ms for the projection's commit. A read
+  waited 6.82 ms to be confirmed, 10.83 ms more for the index and 6.91 ms
+  more for its answer, at 2.32 reads a round and 1.09 held behind their
+  snapshot per read.
+- This run's leader reported its 10,150 commands as unordered before the
+  count was split: the leader's own pending suffix, which led to the
+  next finding.
+
+### The fast path after a leader change (task-d68)
+
+`fast_path.rs`'s `fast_after_a_leader_change` drives five voters through
+a number of commands, moves the leader, and counts the fast decisions
+after the change. Under the counts above, every command after a change
+is slow, all `path` at the new leader, for as many commands as the old
+ballot ordered, and one more: 3 commands under the genesis leader leave
+the next 4 slow, 20 leave 21, 40 leave 41, with either the old leader's
+fast-set neighbor or a voter outside its fast set winning.
+
+A follower takes a synchronization as its new prefix only when its
+leader sequence number is above the highest it has taken. A new leader
+numbers its proposals from zero, and nothing resets a follower's highest
+at the ballot change, so until the new numbers pass the old ones each
+follower chains from the old ballot's head and every acknowledgement it
+sends disagrees with the leader's path.
+
+The same trace shows the leader's own log: a leader appends each command
+it proposes to its path log and never synchronizes it, and retiring a
+command does not take it out of the pending suffix. It grows by one a
+command led and is cleared at the role change.
+
+task-d68 plans the fix, with a design step first: what a follower's
+synchronized prefix is across ballots. `the_fast_path_resumes_after_a_leader_change`
+is its acceptance and is ignored until then; it fails today with 0 of
+20 fast after 40 commands under the old leader.
+
+Not yet in task-d62: the matched workload and the runner rows, which are
+three pairs each.
+
+## Several frames a stream (task-d61): streams fell, packets hardly did
+
+task-d61 puts what one turn queues for one peer on one QUIC stream, where
+both ends of the link offer capability `0x0020` (`spec/wire-v1.md`), and
+encodes a leader's proposal once for every voter it goes to. A link where
+either end does not offer it carries one frame a stream, as before; a
+stream carries at most 256 frames and 256 KiB, and never more than either
+byte budget can hold. Each frame is still admitted, refused and delivered
+on its own; frames on one stream are delivered in order, and frames on
+different streams are, as before, not ordered against each other. A
+stream that cannot be opened or written loses every frame it carried,
+counted as frames lost and as a stream lost, so a saturated peer does not
+read as a quiet one.
+
+The transport now also reports QUIC's own counts on peer connections:
+datagrams each way, the system calls that sent them, and ACK frames each
+way. `COORDD_PEER_STREAM_FRAMES=1` sends one frame a stream from the same
+binary, a measurement lever and not configuration.
+
+Five voters on one four-core host, replay profile, stores on disk, 30
+callers, 20,000 measured operations, `put=30,get=50,contended=20`, one
+binary, three pairs with batching off and on, alternated:
+
+| | off | on |
+| --- | --- | --- |
+| completed a second | 893, 850, 916 | 900, 928, 931 |
+| tokio workers' CPU ms per operation, five voters | 1.043, 1.153, 1.081 | 0.999, 1.005, 0.975 |
+| all threads' CPU ms per operation | 3.202, 3.346, 3.186 | 3.099, 3.097, 3.075 |
+| leader: frames / streams per command sent | 10.0 / 10.0 | 10.0 / 3.1 |
+| fast-set follower: frames / streams per command sent | 8.5 / 8.5 | 8.5 / 2.0 |
+| leader: datagrams sent / send calls / ACK frames sent per command | 5.37 / 5.04 / 1.61 | 5.09 / 4.79 / 1.53 |
+| fast-set follower: datagrams sent per command | 3.54 | 3.25 |
+
+- Streams fell by the batching factor, three to four times. The
+  transport threads' CPU fell by 9% in every pair, and the throughput
+  rose by 4%.
+- Datagrams fell by 5 to 7% only. The leader already sent about two frames
+  a datagram before: QUIC packs the frames of streams written together
+  into one packet, so a turn's frames to a peer were sharing packets
+  already, and what batching took away is the work per stream, not per
+  packet.
+- A `perf` profile of the leader's tokio workers (20 s at 199 Hz, one run
+  each way, two builds) agrees: QUIC's own work went from 22.8% of the
+  samples to 18.8% and the stream opening, accepting and reading from 16.3%
+  to 14.5%, while `sendmsg` stayed at about 15% and parking and waking at
+  about 32%. Counted with `perf stat`, the leader made 5.5 `sendmsg`, 5.5
+  `recvmmsg` and 11 `futex` calls a command either way.
+- What is left is per packet and per wake-up. Fewer packets needs fewer
+  turns a command (each turn sends what it has to each peer) or fewer
+  ACK-only packets; fewer wake-ups needs fewer events between the
+  transport and the domain thread. Neither is this task's change; the
+  runner rows of this PR size them first.
+

@@ -81,6 +81,15 @@ pub struct Limits {
     pub lanes: [LaneLimits; 4],
     /// Shared destination and node byte budgets (task-31).
     pub budget: BudgetLimits,
+    /// The most frames a peer lane's sender puts on one stream, where the
+    /// link grants [`crate::CAPABILITY_FRAMES_PER_STREAM`] (task-d61).
+    /// One, and the endpoint does not offer the capability: each frame
+    /// has a stream of its own. Above [`crate::MAX_FRAMES_PER_STREAM`]
+    /// it is that.
+    pub stream_frames: usize,
+    /// The most bytes of frames a peer lane's sender puts on one stream.
+    /// A frame larger than this still goes, alone.
+    pub stream_bytes: usize,
 }
 
 impl Default for Limits {
@@ -98,6 +107,8 @@ impl Default for Limits {
             max_inflight: 64,
             lanes: LaneLimits::DEFAULTS,
             budget: BudgetLimits::default(),
+            stream_frames: 64,
+            stream_bytes: 256 * 1024,
         }
     }
 }

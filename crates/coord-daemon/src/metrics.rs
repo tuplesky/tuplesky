@@ -513,6 +513,149 @@ pub struct Cost {
     /// for a journal append or a projection commit to come back.
     #[serde(default = "not_instrumented")]
     pub waits: Measure<PipelineWaits>,
+    /// Why the commands this voter established on the slow path missed
+    /// the fast one, and the fast acknowledgements it sent (task-d62).
+    #[serde(default)]
+    pub fast_path: FastPath,
+    /// The pre-acceptances this voter holds that the leader has not
+    /// ordered, as the snapshot found them (task-d62).
+    #[serde(default)]
+    pub unordered: UnorderedPreAcceptances,
+    /// From learned to released, over the commands this voter led
+    /// (task-d62).
+    #[serde(default)]
+    pub release: Release,
+    /// What this voter's transport carried to and from the other voters
+    /// (task-d62), or why there is no reading.
+    #[serde(default = "not_instrumented")]
+    pub traffic: Measure<Traffic>,
+}
+
+/// What a voter's transport carried between voters (task-d62),
+/// cumulative over every peer link and lane. Where a link carries a
+/// turn's frames together (task-d61), frames over streams is the
+/// batching factor; elsewhere the two are equal.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Traffic {
+    /// Frames written to peers.
+    pub sent_frames: u64,
+    /// Their bytes.
+    pub sent_bytes: u64,
+    /// Streams opened to peers.
+    pub sent_streams: u64,
+    /// Frames to a peer lost before they were written.
+    pub sent_lost: u64,
+    /// Streams those frames were lost on: a refused stream loses every
+    /// frame it carried (task-d61).
+    #[serde(default)]
+    pub sent_lost_streams: u64,
+    /// Frames read from peers.
+    pub received_frames: u64,
+    /// Their bytes.
+    pub received_bytes: u64,
+    /// Streams peers opened to this voter.
+    pub received_streams: u64,
+    /// UDP datagrams QUIC sent on peer connections, acknowledgements
+    /// included (task-d61).
+    #[serde(default)]
+    pub datagrams_sent: u64,
+    /// UDP datagrams QUIC received on peer connections.
+    #[serde(default)]
+    pub datagrams_received: u64,
+    /// The system calls that sent those datagrams.
+    #[serde(default)]
+    pub send_calls: u64,
+    /// ACK frames QUIC sent on peer connections.
+    #[serde(default)]
+    pub acks_sent: u64,
+    /// ACK frames QUIC received on peer connections.
+    #[serde(default)]
+    pub acks_received: u64,
+}
+
+/// A pipeline thread's jobs and their three times (task-d62), summed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Jobs {
+    /// Jobs taken back.
+    pub count: u64,
+    /// From hand-over to the thread starting each.
+    pub queued: Duration,
+    /// The thread running each: the append and its sync, or the
+    /// projection's commit.
+    pub served: Duration,
+    /// From each one's end to the domain thread taking it back.
+    pub completed: Duration,
+}
+
+/// Why commands missed the fast path, and the fast acknowledgements a
+/// voter sent (task-d62), cumulative.
+///
+/// The `missed_*` counts add up to [`Cost::established_slow`]: each
+/// command this voter established on the slow path is classified from
+/// the votes it counted, read when the command executed. The reasons are
+/// the leader's for a leader, and a follower's own for a command it
+/// learned from its own votes; a command it executed from a commit it
+/// did not learn itself is unclassified.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FastPath {
+    /// A fast-set acknowledgement saw another conflict path.
+    pub missed_path: u64,
+    /// A fast-set acknowledgement saw the path but other direct
+    /// dependencies.
+    pub missed_deps: u64,
+    /// A fast-set acknowledgement the quorum needed had not arrived by
+    /// execution.
+    pub missed_missing: u64,
+    /// The fast quorum formed, after the slow one had decided.
+    pub missed_slow_first: u64,
+    /// No reason this voter could read.
+    pub missed_unclassified: u64,
+    /// Fast acknowledgements this voter sent as a fast-set follower.
+    pub acks: u64,
+    /// Of them, those sent while a command reordered behind a
+    /// synchronization held its path off every leader path: each counts
+    /// under [`FastPath::missed_path`] at the leader, if it decided
+    /// anything.
+    pub acks_reordered: u64,
+}
+
+/// The pre-acceptances a voter holds that the leader has not ordered
+/// (task-d62), at the snapshot. Not cumulative.
+///
+/// A pre-acceptance the leader ordered a later command past keeps this
+/// voter's path off the leader's until it is ordered or released. One
+/// the next synchronization orders is gone by the next snapshot; one
+/// that stays for the rest of the ballot (task-d67) shows as an age that
+/// grows from snapshot to snapshot.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnorderedPreAcceptances {
+    /// Pre-acceptances the leader has not ordered.
+    pub pending: u64,
+    /// Of them, those it has ordered a later command past.
+    pub reordered: u64,
+    /// How long the oldest of those has been held, from the first
+    /// snapshot that saw it.
+    pub oldest: Duration,
+    /// For a leader, the commands its own path log holds pending, which it
+    /// never synchronizes (task-d68): every command it proposed this
+    /// ballot, until that is fixed. Zero for a follower.
+    #[serde(default)]
+    pub leader_log: u64,
+}
+
+/// From learned to released on the leader (task-d62), summed over
+/// [`Release::commands`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Release {
+    /// Commands timed: committed from this voter's own votes while it led,
+    /// and released by it.
+    pub commands: u64,
+    /// From committed to applied: predecessors executing.
+    pub predecessors: Duration,
+    /// From applied to its execution group closing.
+    pub group: Duration,
+    /// From the group closing to the release: the projection committing.
+    pub projection: Duration,
 }
 
 /// The domain loop's blocking takes from its pipeline threads (task-d54).
@@ -522,6 +665,12 @@ pub struct PipelineWaits {
     pub appender: Wait,
     /// Waits for a projection commit on the materializer's thread.
     pub materializer: Wait,
+    /// The appender's jobs, timed (task-d62).
+    #[serde(default)]
+    pub appender_jobs: Jobs,
+    /// The materializer's jobs, timed (task-d62).
+    #[serde(default)]
+    pub materializer_jobs: Jobs,
 }
 
 /// Blocking takes and their total time.

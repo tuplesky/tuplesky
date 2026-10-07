@@ -131,7 +131,7 @@ pub use materialize::{
 };
 pub use persistence::{JournaledDomain, Lowered, Persistence, Refused, StorageCost};
 pub use pipeline::{
-    ManualAppendHandle, ManualAppender, ManualHandle, ManualMaterializer, ThreadAppender,
+    JobTimes, ManualAppendHandle, ManualAppender, ManualHandle, ManualMaterializer, ThreadAppender,
     ThreadMaterializer, Waits, Waker,
 };
 pub use retry::{Admission, Resolution, RetryBinding};

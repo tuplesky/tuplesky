@@ -17,6 +17,14 @@ spreads it over commands that ran while the history was short.
     command_cost.py table RESULT_JSON
     command_cost.py gate --baseline BASELINE_JSON RESULT_JSON
 
+`table` prints a second table beside the cost (task-d62): why the
+commands a voter established on the slow path missed the fast one, the
+pre-acceptances it held that the leader had not ordered, the leader's
+waits from learned to released, the read waits taken apart, the peer
+frames and streams per command, and the journal's and the projection's
+jobs per command, queued, served and completed. A run
+in which no voter decided anything fast is printed as a finding.
+
 `gate` fails when, at any caller count the baseline records, the
 busiest voter's busy time per command, over the run or over its last
 quarter, any voter's last quarter over its first three, or the busiest voter's
@@ -104,9 +112,11 @@ def per_command(node: str, snapshot: dict) -> dict:
         "busy_fraction": busy / uptime if uptime > 0 else None,
         **resends_of(cost, executed),
         **paths_of(cost),
+        **release_of(cost),
         **reads_of(cost),
         **cpu_of(cost, executed),
         **waits_of(cost, executed),
+        **traffic_of(cost, executed),
     }
 
 
@@ -133,41 +143,130 @@ def waits_of(cost: dict, executed: int) -> dict:
     if not isinstance(waits, dict) or "Observed" not in waits:
         return {}
     waits = waits["Observed"]
-    return {
+    out = {
         "appender_wait_ms_per_command": seconds(waits["appender"]["time"]) * 1000 / executed,
         "materializer_wait_ms_per_command": seconds(waits["materializer"]["time"]) * 1000
         / executed,
     }
+    # Each job's three times on the two pipeline threads (task-d62), per
+    # command: queued for the thread, served by it, and waiting to be
+    # taken back.
+    for side in ("appender", "materializer"):
+        jobs = waits.get(f"{side}_jobs")
+        if isinstance(jobs, dict):
+            out[f"{side}_jobs"] = {
+                "jobs_per_command": jobs["count"] / executed,
+                **{f"{t}_ms_per_command": seconds(jobs[t]) * 1000 / executed
+                   for t in ("queued", "served", "completed")},
+            }
+    return out
+
+
+def traffic_of(cost: dict, executed: int) -> dict:
+    """What a voter's transport carried to and from the other voters, per
+    command (task-d62): frames, bytes and streams each way, and frames
+    lost before they were written. Beside them, frames per stream each
+    way, the batching factor (task-d61), and frames lost per stream lost.
+    Empty for a binary older than the reading."""
+    traffic = cost.get("traffic")
+    if not isinstance(traffic, dict) or "Observed" not in traffic:
+        return {}
+    traffic = traffic["Observed"]
+    out = {"traffic_per_command": {k: v / executed for k, v in traffic.items()}}
+    for side in ("sent", "received"):
+        if traffic.get(f"{side}_streams"):
+            out[f"frames_per_stream_{side}"] = (
+                traffic[f"{side}_frames"] / traffic[f"{side}_streams"])
+    if traffic.get("sent_lost_streams"):
+        out["frames_per_lost_stream"] = traffic["sent_lost"] / traffic["sent_lost_streams"]
+    return out
 
 
 def reads_of(cost: dict) -> dict:
     """What a voter's read barrier served and refused, and how long a
     served read waited on average: for its confirmation round, for its
-    index to execute (round included), and in all (task-d50). Empty for
-    a binary older than the counts, or a voter that served none."""
+    index to execute (round included), and in all (task-d50). The waits
+    are cumulative from arrival, so the three a sizing reads (task-d62)
+    are taken apart here: the confirmation, the index after it, and the
+    answer after the index. Beside them, reads per confirmation round and
+    the times a read was held again behind its snapshot (task-d58), per
+    read. Empty for a binary older than the counts, or a voter that
+    served none."""
     reads = cost.get("reads")
     if not isinstance(reads, dict) or reads["served"] + reads["refused"] == 0:
         return {}
     served = reads["served"]
     mean = lambda total: total / served if served else None
-    return {
-        "reads": {
-            "served": served,
-            "refused": reads["refused"],
-            "mean_confirm_ms": mean(reads["waited_confirm_ms"]),
-            "mean_index_ms": mean(reads["waited_index_ms"]),
-            "mean_served_ms": mean(reads["waited_ms"]),
-        }
+    confirm, index, total = (
+        reads["waited_confirm_ms"], reads["waited_index_ms"], reads["waited_ms"])
+    out = {
+        "served": served,
+        "refused": reads["refused"],
+        "mean_confirm_ms": mean(confirm),
+        "mean_index_ms": mean(index),
+        "mean_served_ms": mean(total),
+        "mean_after_confirm_ms": mean(index - confirm),
+        "mean_after_index_ms": mean(total - index),
+        "reads_per_round": served / reads["rounds"] if reads["rounds"] else None,
     }
+    if "behind" in reads:
+        out["behind_per_read"] = mean(reads["behind"])
+        out["snapshots_per_read"] = mean(reads["snapshots"])
+    return {"reads": out}
+
+
+MISSED = ("path", "deps", "missing", "slow_first", "unclassified")
 
 
 def paths_of(cost: dict) -> dict:
     """The share of the commands a voter established that the fast path
-    decided (task-d50). Empty for a binary older than the counts."""
+    decided (task-d50), and why the rest missed it, with the fast
+    acknowledgements the voter sent and the pre-acceptances it held that
+    the leader had not ordered (task-d62). The reasons add up to the
+    commands established on the slow path; `reasons_sum` says whether they
+    do. Empty for a binary older than the counts."""
     fast, slow = cost.get("established_fast"), cost.get("established_slow")
     if fast is None or slow is None or fast + slow == 0:
         return {}
-    return {"fast_path_share": fast / (fast + slow)}
+    out = {"fast_path_share": fast / (fast + slow)}
+    counts = cost.get("fast_path")
+    if isinstance(counts, dict):
+        missed = {reason: counts[f"missed_{reason}"] for reason in MISSED}
+        out["fast_path"] = {
+            "missed": missed,
+            "reasons_sum": sum(missed.values()) == slow,
+            "acks": counts["acks"],
+            "acks_reordered": counts["acks_reordered"],
+        }
+    unordered = cost.get("unordered")
+    if isinstance(unordered, dict):
+        out["unordered"] = {
+            "pending": unordered["pending"],
+            "reordered": unordered["reordered"],
+            "oldest_seconds": seconds(unordered["oldest"]),
+            "leader_log": unordered.get("leader_log"),
+        }
+    return out
+
+
+def release_of(cost: dict) -> dict:
+    """The leader's mean milliseconds per command from learned to
+    released (task-d62): waiting for predecessors to execute, for the
+    group to close, and for the projection to commit it. Empty for a
+    binary older than the reading, or a voter that timed none."""
+    release = cost.get("release")
+    if not isinstance(release, dict) or release["commands"] == 0:
+        return {}
+    commands = release["commands"]
+    per = lambda field: seconds(release[field]) * 1000 / commands
+    return {
+        "release": {
+            "commands": commands,
+            "predecessors_ms": per("predecessors"),
+            "group_ms": per("group"),
+            "projection_ms": per("projection"),
+        }
+    }
 
 
 def resends_of(cost: dict, executed: int) -> dict:
@@ -246,12 +345,32 @@ def reduce(callers: int, wall: float, bench: dict | None, logs: dict[str, str]) 
         reading["tail_busy_ms_per_command"] = tail
         voters.append(reading)
     run = {"callers": callers, "wall_seconds": wall, "voters": voters}
+    findings = findings_of(voters)
+    if findings:
+        run["findings"] = findings
     if bench is not None:
         achieved = bench["achieved"]
         window = achieved["wall_ns"] / 1e9
         run["completed"] = achieved["completed"]
         run["completed_per_second"] = achieved["completed"] / window if window > 0 else None
     return run
+
+
+def findings_of(voters: list[dict]) -> list[str]:
+    """What a run's readings say that a column would hide (task-d62): no
+    voter decided anything fast, which reads as a 0% share beside runs
+    that did, and is a finding about the run rather than a reading of
+    it; and a voter whose fast-path reasons do not add up to its slow
+    establishments."""
+    findings = []
+    shares = [v["fast_path_share"] for v in voters if "fast_path_share" in v]
+    if shares and max(shares) == 0:
+        findings.append("no voter decided a command on the fast path")
+    for voter in voters:
+        if voter.get("fast_path", {}).get("reasons_sum") is False:
+            findings.append(
+                f"{voter['node']}'s fast-path reasons do not add up to its slow establishments")
+    return findings
 
 
 def busiest(run: dict, field: str) -> float:
@@ -355,6 +474,64 @@ def table(result: dict) -> str:
     return "\n".join(lines)
 
 
+def paths_table(result: dict) -> str:
+    """Why commands missed the fast path, the leader's waits from learned
+    to released, and the read waits taken apart (task-d62), one row per
+    voter per run."""
+    lines = [
+        "| callers | node | fast share | missed path/deps/missing/slow first/other "
+        "| acks (reordered) | unordered (reordered, oldest s) "
+        "| learned to released ms: predecessors/group/projection "
+        "| read ms: confirm/after confirm/after index | reads/round | behind/read "
+        "| peer frames/cmd sent/received (streams sent/received) "
+        "| peer datagrams/cmd sent/received (send calls, ACKs sent) "
+        "| journal ms/cmd queued/served/completed | projection ms/cmd queued/served/completed |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+    ]
+    dash = "--"
+    for run in result["runs"]:
+        for finding in run.get("findings", []):
+            lines.append(f"| {run['callers']} | **finding** | {finding} "
+                         "| | | | | | | | | | | |")
+        for v in run["voters"]:
+            share = v.get("fast_path_share")
+            share = dash if share is None else f"{share:.1%}"
+            paths = v.get("fast_path")
+            missed = dash if paths is None else "/".join(
+                str(paths["missed"][reason]) for reason in MISSED)
+            acks = dash if paths is None else f"{paths['acks']} ({paths['acks_reordered']})"
+            held = v.get("unordered")
+            held = dash if held is None else (
+                f"{held['pending']} ({held['reordered']}, {held['oldest_seconds']:.0f})")
+            release = v.get("release")
+            release = dash if release is None else "/".join(
+                f"{release[f]:.2f}" for f in ("predecessors_ms", "group_ms", "projection_ms"))
+            reads = v.get("reads")
+            waits = dash if reads is None else "/".join(
+                f"{reads[f]:.2f}" for f in
+                ("mean_confirm_ms", "mean_after_confirm_ms", "mean_after_index_ms"))
+            per_round = dash if not reads or reads["reads_per_round"] is None else (
+                f"{reads['reads_per_round']:.2f}")
+            behind = dash if not reads or "behind_per_read" not in reads else (
+                f"{reads['behind_per_read']:.2f}")
+            traffic = v.get("traffic_per_command")
+            traffic = dash if traffic is None else (
+                f"{traffic['sent_frames']:.2f}/{traffic['received_frames']:.2f} "
+                f"({traffic['sent_streams']:.2f}/{traffic['received_streams']:.2f})")
+            traffic_cmd = v.get("traffic_per_command")
+            packets = dash if not traffic_cmd or "datagrams_sent" not in traffic_cmd else (
+                f"{traffic_cmd['datagrams_sent']:.2f}/{traffic_cmd['datagrams_received']:.2f} "
+                f"({traffic_cmd['send_calls']:.2f}, {traffic_cmd['acks_sent']:.2f})")
+            jobs = lambda side: dash if f"{side}_jobs" not in v else "/".join(
+                f"{v[f'{side}_jobs'][f'{t}_ms_per_command']:.3f}"
+                for t in ("queued", "served", "completed"))
+            lines.append(
+                f"| {run['callers']} | {v['node']} | {share} | {missed} | {acks} | {held} "
+                f"| {release} | {waits} | {per_round} | {behind} | {traffic} | {packets} "
+                f"| {jobs('appender')} | {jobs('materializer')} |")
+    return "\n".join(lines)
+
+
 def per_command_or_dash(voter: dict, field: str) -> str:
     """A per-command reading to three places, or `--` when the binary
     did not report it."""
@@ -394,7 +571,10 @@ def main(argv: list[str]) -> int:
             runs.sort(key=lambda run: run["callers"])
             print(json.dumps({"runs": runs}, indent=2))
         elif args.command == "table":
-            print(table(json.loads(args.result.read_text())))
+            result = json.loads(args.result.read_text())
+            print(table(result))
+            print()
+            print(paths_table(result))
         else:
             baseline = json.loads(args.baseline.read_text())
             result = json.loads(args.result.read_text())

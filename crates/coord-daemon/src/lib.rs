@@ -72,6 +72,7 @@ pub mod diagnostics;
 pub mod fanout;
 pub mod floor;
 pub mod identity;
+pub mod learned;
 pub mod lifecycle;
 pub mod listen;
 pub mod mailbox;
