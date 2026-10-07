@@ -9,8 +9,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use coord_consensus::{
-    BallotConfiguration, FastAck, GuardViolation, Learned, Phase, RecoveryError, RecoveryReport,
-    ReportEntry, SlowAck, Vote, VoteError, VoteSet, guard_accept, guard_commit, select,
+    BallotConfiguration, FastAck, GuardViolation, Learned, MissedFast, Phase, RecoveryError,
+    RecoveryReport, ReportEntry, SlowAck, Vote, VoteError, VoteSet, guard_accept, guard_commit,
+    select,
 };
 use coord_types::identity::Digest32;
 use coord_types::ids::*;
@@ -1297,6 +1298,58 @@ fn a_fast_acknowledgement_with_the_leaders_path_and_other_dependencies_decides_n
     set.add(fast(0, b0, x, &[y], 7, Some(1))).unwrap();
     set.add(fast(1, b0, x, &[y], 7, None)).unwrap();
     assert_eq!(set.learned(), Some(Learned::Fast { deps: vec![y] }));
+}
+
+/// task-d62: a command decided on the slow path is classified by what the
+/// fast path lacked when it is read. Five voters, the fast set the leader
+/// and voters 1 and 2, the slow quorum three adoptions.
+#[test]
+fn a_slow_decision_says_why_the_fast_path_missed_it() {
+    let b0 = ballot(0, 0);
+    let (x, y, z) = (cmd(1), cmd(2), cmd(3));
+    let decided = |acks: &[Vote]| {
+        let mut set = VoteSet::new(config(5, 0, &[0, 1, 2], 0), x);
+        set.add(fast(0, b0, x, &[y], 7, Some(1))).unwrap();
+        for replica in [0, 3, 4] {
+            set.add(slow(replica, b0, x)).unwrap();
+        }
+        for ack in acks {
+            set.add(ack.clone()).unwrap();
+        }
+        set
+    };
+    // Nothing from the fast set: the acknowledgements it needed are
+    // missing, and one alone that agrees still leaves one missing.
+    assert_eq!(decided(&[]).missed_fast(), Some(MissedFast::Missing));
+    let agrees = fast(1, b0, x, &[y], 7, None);
+    assert_eq!(
+        decided(core::slice::from_ref(&agrees)).missed_fast(),
+        Some(MissedFast::Missing)
+    );
+    // One that disagrees leaves too few to make up the quorum: its path,
+    // or with the path, its dependencies, decided it.
+    let other_path = fast(2, b0, x, &[y], 8, None);
+    assert_eq!(
+        decided(&[agrees.clone(), other_path.clone()]).missed_fast(),
+        Some(MissedFast::Path)
+    );
+    let other_deps = fast(2, b0, x, &[z], 7, None);
+    assert_eq!(
+        decided(&[agrees.clone(), other_deps]).missed_fast(),
+        Some(MissedFast::Deps)
+    );
+    // A path that disagrees is named before dependencies that do.
+    assert_eq!(
+        decided(&[fast(1, b0, x, &[z], 7, None), other_path]).missed_fast(),
+        Some(MissedFast::Path)
+    );
+    // Both agreed, after the slow quorum: the slow path completed first.
+    let set = decided(&[agrees, fast(2, b0, x, &[y], 7, None)]);
+    assert_eq!(set.learned(), Some(Learned::Fast { deps: vec![y] }));
+    assert_eq!(set.missed_fast(), Some(MissedFast::SlowFirst));
+    // No leader proposal: nothing to compare with.
+    let set = VoteSet::new(config(5, 0, &[0, 1, 2], 0), x);
+    assert_eq!(set.missed_fast(), None);
 }
 
 /// task-d34 (found by the protocol simulator): the source leader's own

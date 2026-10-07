@@ -7,9 +7,10 @@
 use std::time::Duration;
 
 use coord_daemon::metrics::{
-    Cost, Cpu, Durability, Frontiers, Headroom, Interval, Lane, LaneReading, Latency,
-    MAX_REPORTED_SHARDS, Measure, MetricsSnapshot, PipelineWaits, Reads, Recorder, Resends,
-    Scheduling, ShardIndex, ShardReading, Stage, StageReading, Unavailable, Wait,
+    Cost, Cpu, Durability, FastPath, Frontiers, Headroom, Interval, Jobs, Lane, LaneReading,
+    Latency, MAX_REPORTED_SHARDS, Measure, MetricsSnapshot, PipelineWaits, Reads, Recorder,
+    Release, Resends, Scheduling, ShardIndex, ShardReading, Stage, StageReading, Traffic,
+    Unavailable, UnorderedPreAcceptances, Wait,
 };
 use coord_daemon::role::RoleSet;
 
@@ -401,6 +402,48 @@ fn a_rendered_snapshot_carries_no_secret_or_key_shaped_text() {
                     count: 3,
                     time: Duration::from_millis(12),
                 },
+                appender_jobs: Jobs {
+                    count: 900,
+                    queued: Duration::from_millis(30),
+                    served: Duration::from_millis(1800),
+                    completed: Duration::from_millis(260),
+                },
+                materializer_jobs: Jobs {
+                    count: 120,
+                    queued: Duration::from_millis(40),
+                    served: Duration::from_millis(700),
+                    completed: Duration::from_millis(90),
+                },
+            }),
+            fast_path: FastPath {
+                missed_path: 900,
+                missed_deps: 10,
+                missed_missing: 200,
+                missed_slow_first: 45,
+                missed_unclassified: 5,
+                acks: 0,
+                acks_reordered: 0,
+            },
+            unordered: UnorderedPreAcceptances {
+                pending: 3,
+                reordered: 1,
+                oldest: Duration::from_secs(30),
+                leader_log: 0,
+            },
+            release: Release {
+                commands: 1150,
+                predecessors: Duration::from_millis(900),
+                group: Duration::from_millis(300),
+                projection: Duration::from_millis(2100),
+            },
+            traffic: Measure::Observed(Traffic {
+                sent_frames: 9000,
+                sent_bytes: 2_700_000,
+                sent_streams: 9000,
+                sent_lost: 0,
+                received_frames: 8800,
+                received_bytes: 1_900_000,
+                received_streams: 8800,
             }),
         }),
     };

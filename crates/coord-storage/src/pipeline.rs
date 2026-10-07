@@ -44,10 +44,37 @@ pub type Waker = Arc<dyn Fn() + Send + Sync>;
 /// Cumulative and shared, so the runtime reads it while the store owns
 /// the pipeline thread. Only the threaded pipelines count; the manual
 /// ones a test drives do not wait.
+///
+/// Beside the blocking takes, each job's three times (task-d62): queued,
+/// from its hand-over to the thread starting it; served, while the thread
+/// ran it; and completed, from its end to the domain thread taking it
+/// back, which a blocking take is part of.
 #[derive(Debug, Default)]
 pub struct Waits {
     count: AtomicU64,
     nanos: AtomicU64,
+    jobs: AtomicU64,
+    queued: AtomicU64,
+    served: AtomicU64,
+    completed: AtomicU64,
+}
+
+/// A pipeline thread's jobs and their three times, summed (task-d62).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct JobTimes {
+    /// Jobs taken back.
+    pub jobs: u64,
+    /// From hand-over to the thread starting the job.
+    pub queued: Duration,
+    /// The thread running it.
+    pub served: Duration,
+    /// From its end to the domain thread taking it back.
+    pub completed: Duration,
+}
+
+fn add_nanos(counter: &AtomicU64, d: Duration) {
+    let nanos = u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
+    counter.fetch_add(nanos, Ordering::Relaxed);
 }
 
 impl Waits {
@@ -59,26 +86,82 @@ impl Waits {
         )
     }
 
+    /// The jobs taken back so far and their times (task-d62).
+    pub fn jobs(&self) -> JobTimes {
+        let nanos = |c: &AtomicU64| Duration::from_nanos(c.load(Ordering::Relaxed));
+        JobTimes {
+            jobs: self.jobs.load(Ordering::Relaxed),
+            queued: nanos(&self.queued),
+            served: nanos(&self.served),
+            completed: nanos(&self.completed),
+        }
+    }
+
     fn record(&self, waited: Duration) {
         self.count.fetch_add(1, Ordering::Relaxed);
-        let nanos = u64::try_from(waited.as_nanos()).unwrap_or(u64::MAX);
-        self.nanos.fetch_add(nanos, Ordering::Relaxed);
+        add_nanos(&self.nanos, waited);
+    }
+
+    /// A job ran on the pipeline thread: queued, then served.
+    fn ran(&self, queued: Duration, served: Duration) {
+        add_nanos(&self.queued, queued);
+        add_nanos(&self.served, served);
+    }
+
+    /// A job that finished at `finished` was taken back now.
+    fn taken(&self, finished: Instant) {
+        self.jobs.fetch_add(1, Ordering::Relaxed);
+        add_nanos(&self.completed, finished.elapsed());
+    }
+}
+
+/// A job handed to a pipeline thread, with when.
+type Timed<T> = (Instant, T);
+
+/// Run jobs from `inbox` in order, timing each into `waits`, sending each
+/// outcome with when it finished, and calling `waker` after each.
+fn run_jobs<J, D>(
+    inbox: Receiver<Timed<J>>,
+    outbox: Sender<Timed<D>>,
+    waits: Arc<Waits>,
+    waker: Waker,
+    run: impl Fn(J) -> D,
+) {
+    while let Ok((submitted, job)) = inbox.recv() {
+        let started = Instant::now();
+        let done = run(job);
+        let finished = Instant::now();
+        waits.ran(started - submitted, finished - started);
+        if outbox.send((finished, done)).is_err() {
+            return;
+        }
+        waker();
     }
 }
 
 /// Take the next job back from `done`, blocking if it is still running,
-/// and record the block in `waits`.
-fn take_counting<T>(done: &Receiver<T>, waits: &Waits) -> Result<T, TryRecvError> {
-    match done.try_recv() {
-        Ok(done) => Ok(done),
+/// and record the block and the job's completion in `waits`.
+fn take_counting<T>(done: &Receiver<Timed<T>>, waits: &Waits) -> Result<T, TryRecvError> {
+    let (finished, done) = match done.try_recv() {
+        Ok(done) => done,
         Err(TryRecvError::Empty) => {
             let started = Instant::now();
             let taken = done.recv().map_err(|_| TryRecvError::Disconnected);
             waits.record(started.elapsed());
-            taken
+            taken?
         }
-        Err(e) => Err(e),
-    }
+        Err(e) => return Err(e),
+    };
+    waits.taken(finished);
+    Ok(done)
+}
+
+/// Take the next job back from `done` if it has finished, recording its
+/// completion in `waits`.
+fn try_take_timed<T>(done: &Receiver<Timed<T>>, waits: &Waits) -> Result<T, TryRecvError> {
+    let (finished, done) = done.try_recv()?;
+    waits.taken(finished);
+    Ok(done)
 }
 
 /// Projection commits on a thread of their own (task-d52).
@@ -88,8 +171,8 @@ fn take_counting<T>(done: &Receiver<T>, waits: &Waits) -> Result<T, TryRecvError
 /// the jobs already submitted have run; an engine still out is dropped
 /// there.
 pub struct ThreadMaterializer<E: LocalEngine> {
-    jobs: Option<Sender<MaterializeJob<E>>>,
-    done: Receiver<MaterializeDone<E>>,
+    jobs: Option<Sender<Timed<MaterializeJob<E>>>>,
+    done: Receiver<Timed<MaterializeDone<E>>>,
     out: usize,
     thread: Option<JoinHandle<()>>,
     waits: Arc<Waits>,
@@ -98,24 +181,19 @@ pub struct ThreadMaterializer<E: LocalEngine> {
 impl<E: LocalEngine> ThreadMaterializer<E> {
     /// Start the thread. `waker` is called after each commit.
     pub fn new(waker: Waker) -> std::io::Result<Self> {
-        let (jobs, inbox) = channel::<MaterializeJob<E>>();
-        let (outbox, done) = channel::<MaterializeDone<E>>();
+        let (jobs, inbox) = channel::<Timed<MaterializeJob<E>>>();
+        let (outbox, done) = channel::<Timed<MaterializeDone<E>>>();
+        let waits = Arc::<Waits>::default();
+        let timed = Arc::clone(&waits);
         let thread = std::thread::Builder::new()
             .name("materializer".into())
-            .spawn(move || {
-                while let Ok(job) = inbox.recv() {
-                    if outbox.send(job.run()).is_err() {
-                        return;
-                    }
-                    waker();
-                }
-            })?;
+            .spawn(move || run_jobs(inbox, outbox, timed, waker, MaterializeJob::run))?;
         Ok(ThreadMaterializer {
             jobs: Some(jobs),
             done,
             out: 0,
             thread: Some(thread),
-            waits: Arc::default(),
+            waits,
         })
     }
 
@@ -130,7 +208,8 @@ impl<E: LocalEngine> Materializer<E> for ThreadMaterializer<E> {
         let jobs = self.jobs.as_ref().expect("open until dropped");
         // The thread ends only when this sender is dropped or the done
         // channel is, and neither has happened while `self` lives.
-        jobs.send(job).expect("the materializer thread is running");
+        jobs.send((Instant::now(), job))
+            .expect("the materializer thread is running");
         self.out += 1;
     }
 
@@ -138,7 +217,7 @@ impl<E: LocalEngine> Materializer<E> for ThreadMaterializer<E> {
         if self.out == 0 {
             return None;
         }
-        match self.done.try_recv() {
+        match try_take_timed(&self.done, &self.waits) {
             Ok(done) => {
                 self.out -= 1;
                 Some(done)
@@ -298,8 +377,8 @@ impl<E: LocalEngine> Materializer<E> for ManualMaterializer<E> {
 /// after each. Dropping it ends the thread once a job already submitted
 /// has run; a journal still out is dropped there.
 pub struct ThreadAppender<J: JournalEngine + Send + 'static> {
-    jobs: Option<Sender<AppendJob<J>>>,
-    done: Receiver<AppendDone<J>>,
+    jobs: Option<Sender<Timed<AppendJob<J>>>>,
+    done: Receiver<Timed<AppendDone<J>>>,
     out: usize,
     thread: Option<JoinHandle<()>>,
     waits: Arc<Waits>,
@@ -308,24 +387,19 @@ pub struct ThreadAppender<J: JournalEngine + Send + 'static> {
 impl<J: JournalEngine + Send + 'static> ThreadAppender<J> {
     /// Start the thread. `waker` is called after each append.
     pub fn new(waker: Waker) -> std::io::Result<Self> {
-        let (jobs, inbox) = channel::<AppendJob<J>>();
-        let (outbox, done) = channel::<AppendDone<J>>();
+        let (jobs, inbox) = channel::<Timed<AppendJob<J>>>();
+        let (outbox, done) = channel::<Timed<AppendDone<J>>>();
+        let waits = Arc::<Waits>::default();
+        let timed = Arc::clone(&waits);
         let thread = std::thread::Builder::new()
             .name("appender".into())
-            .spawn(move || {
-                while let Ok(job) = inbox.recv() {
-                    if outbox.send(job.run()).is_err() {
-                        return;
-                    }
-                    waker();
-                }
-            })?;
+            .spawn(move || run_jobs(inbox, outbox, timed, waker, AppendJob::run))?;
         Ok(ThreadAppender {
             jobs: Some(jobs),
             done,
             out: 0,
             thread: Some(thread),
-            waits: Arc::default(),
+            waits,
         })
     }
 
@@ -340,7 +414,8 @@ impl<J: JournalEngine + Send + 'static> Appender<J> for ThreadAppender<J> {
         let jobs = self.jobs.as_ref().expect("open until dropped");
         // The thread ends only when this sender is dropped or the done
         // channel is, and neither has happened while `self` lives.
-        jobs.send(job).expect("the appender thread is running");
+        jobs.send((Instant::now(), job))
+            .expect("the appender thread is running");
         self.out += 1;
     }
 
@@ -348,7 +423,7 @@ impl<J: JournalEngine + Send + 'static> Appender<J> for ThreadAppender<J> {
         if self.out == 0 {
             return None;
         }
-        match self.done.try_recv() {
+        match try_take_timed(&self.done, &self.waits) {
             Ok(done) => {
                 self.out -= 1;
                 Some(done)
@@ -485,14 +560,14 @@ mod tests {
     #[test]
     fn a_take_that_blocks_is_counted_and_one_that_finds_the_job_done_is_not() {
         let waits = Waits::default();
-        let (outbox, done) = channel::<u8>();
-        outbox.send(1).unwrap();
+        let (outbox, done) = channel::<Timed<u8>>();
+        outbox.send((Instant::now(), 1)).unwrap();
         assert_eq!(take_counting(&done, &waits), Ok(1));
         assert_eq!(waits.read(), (0, Duration::ZERO));
 
         let late = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(20));
-            outbox.send(2).unwrap();
+            outbox.send((Instant::now(), 2)).unwrap();
         });
         assert_eq!(take_counting(&done, &waits), Ok(2));
         let (count, time) = waits.read();
@@ -503,5 +578,39 @@ mod tests {
             take_counting(&done, &waits),
             Err(TryRecvError::Disconnected)
         );
+        assert_eq!(waits.jobs().jobs, 2);
+    }
+
+    /// task-d62: a job's three times are its wait for the thread, its run,
+    /// and its wait to be taken back.
+    #[test]
+    fn a_job_is_timed_queued_served_and_completed() {
+        let waits = Arc::new(Waits::default());
+        let (jobs, inbox) = channel::<Timed<u64>>();
+        let (outbox, done) = channel::<Timed<u64>>();
+        let thread = std::thread::spawn({
+            let waits = Arc::clone(&waits);
+            move || {
+                run_jobs(inbox, outbox, waits, Arc::new(|| {}), |ms: u64| {
+                    std::thread::sleep(Duration::from_millis(ms));
+                    ms
+                })
+            }
+        });
+        // Two jobs at once: the second queues behind the first's run.
+        jobs.send((Instant::now(), 30)).unwrap();
+        jobs.send((Instant::now(), 10)).unwrap();
+        drop(jobs);
+        thread.join().unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(try_take_timed(&done, &waits), Ok(30));
+        assert_eq!(take_counting(&done, &waits), Ok(10));
+        let times = waits.jobs();
+        assert_eq!(times.jobs, 2);
+        assert!(times.served >= Duration::from_millis(40), "{times:?}");
+        assert!(times.queued >= Duration::from_millis(25), "{times:?}");
+        assert!(times.completed >= Duration::from_millis(40), "{times:?}");
+        // Nothing was waited for: both had finished when taken.
+        assert_eq!(waits.read().0, 0);
     }
 }

@@ -145,6 +145,70 @@ impl Machine {
         }
     }
 
+    /// What the fast path did since the last call (task-d62): the
+    /// acknowledgements a follower sent. The reasons a command missed the
+    /// fast path are taken one by one ([`Machine::take_missed_fast`]).
+    pub fn take_fast_path_counts(&mut self) -> coord_consensus::FastPathCounts {
+        match self {
+            Machine::Leader(_) => coord_consensus::FastPathCounts::default(),
+            Machine::Follower(m) => m.take_fast_path_counts(),
+        }
+    }
+
+    /// What the fast path did since [`Machine::take_fast_path_counts`]
+    /// was last called (task-d62).
+    pub fn fast_path_counts(&self) -> coord_consensus::FastPathCounts {
+        match self {
+            Machine::Leader(_) => coord_consensus::FastPathCounts::default(),
+            Machine::Follower(m) => m.fast_path_counts(),
+        }
+    }
+
+    /// Why `command`, established on the slow path, missed the fast one
+    /// (task-d62), taken; None when the role holds no reason for it.
+    pub fn take_missed_fast(&mut self, command: &CommandId) -> Option<coord_consensus::MissedFast> {
+        match self {
+            Machine::Leader(m) => m.take_missed_fast(command),
+            Machine::Follower(m) => m.take_missed_fast(command),
+        }
+    }
+
+    /// Keep what a leader commits for [`Machine::take_learned`]
+    /// (task-d62); a follower commits nothing from its own leading.
+    pub fn observe_learning(&mut self) {
+        if let Machine::Leader(m) = self {
+            m.observe_learning();
+        }
+    }
+
+    /// What a leader committed since the last call (task-d62).
+    pub fn take_learned(&mut self) -> Vec<CommandId> {
+        match self {
+            Machine::Leader(m) => m.take_learned(),
+            Machine::Follower(_) => Vec::new(),
+        }
+    }
+
+    /// The pre-acceptances this replica holds that the leader has not
+    /// ordered, and those it has ordered a later command past (task-d62).
+    /// None for a leader, which orders what it pre-accepts: its own path
+    /// log's suffix is not left unsynchronized by anyone else.
+    pub fn unordered(&self) -> (usize, std::collections::BTreeSet<CommandId>) {
+        match self {
+            Machine::Leader(_) => (0, std::collections::BTreeSet::new()),
+            Machine::Follower(m) => m.table().unordered(),
+        }
+    }
+
+    /// For a leader, the commands its own path logs hold pending, which it
+    /// never synchronizes (task-d68); nothing for a follower.
+    pub fn leader_log_pending(&self) -> usize {
+        match self {
+            Machine::Leader(m) => m.table().pending_in_logs(),
+            Machine::Follower(_) => 0,
+        }
+    }
+
     /// Send the voters, again, the proposals they have not voted on
     /// (task-d07), and the commit frontier (task-d09). Only a leader has
     /// proposals to send or a frontier to announce.
@@ -531,6 +595,32 @@ pub struct Node<P: Persistence> {
     /// Commands this replica established, by the path that decided them
     /// (task-d50).
     pub established: Established,
+    /// What the fast path did since boot (task-d62): why each command
+    /// established on the slow path missed it, counted as its
+    /// establishment is, and the acknowledgements of every role this
+    /// replica left.
+    fast_path: coord_consensus::FastPathCounts,
+    /// From learned to released, per command this replica led (task-d62).
+    release: crate::learned::ReleaseTiming,
+    /// When each pre-acceptance the leader ordered a later command past
+    /// was first seen (task-d62).
+    unordered_since: std::collections::BTreeMap<CommandId, std::time::Instant>,
+}
+
+/// The pre-acceptances a replica holds that the leader has not ordered
+/// (task-d62), as last observed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Unordered {
+    /// Pre-acceptances the leader has not ordered.
+    pub pending: u64,
+    /// Of them, those it has ordered a later command past.
+    pub reordered: u64,
+    /// How long the oldest of those has been seen, at the observation's
+    /// resolution.
+    pub oldest: std::time::Duration,
+    /// For a leader, the commands its own path log holds pending
+    /// (task-d68).
+    pub leader_log: u64,
 }
 
 /// Commands a replica established since boot, by the learning path that
@@ -566,7 +656,7 @@ impl<P: Persistence> Node<P> {
         // lowerings make durable for the machine's batches is handed back.
         applier.share_foreign();
         let boot = applier.store().boot();
-        Node {
+        let mut node = Node {
             machine: Some(machine),
             applier,
             outbox: Outbox::new(boot),
@@ -589,7 +679,12 @@ impl<P: Persistence> Node<P> {
             releases: VecDeque::new(),
             resends: coord_consensus::ResendCounts::default(),
             established: Established::default(),
-        }
+            fast_path: coord_consensus::FastPathCounts::default(),
+            release: crate::learned::ReleaseTiming::default(),
+            unordered_since: std::collections::BTreeMap::new(),
+        };
+        node.machine_mut().observe_learning();
+        node
     }
 
     /// Whether a command's turn has come and this replica holds its
@@ -870,6 +965,7 @@ impl<P: Persistence> Node<P> {
         }
         let counts = self.machine_mut().take_resend_counts();
         self.resends.add(&counts);
+        self.leave_role();
         let machine = self.machine.take().expect("a node always holds a machine");
         let (machine, effects) = match machine {
             Machine::Follower(f) => {
@@ -893,7 +989,62 @@ impl<P: Persistence> Node<P> {
             }
         };
         self.machine = Some(machine);
+        self.machine_mut().observe_learning();
         self.carry_out(effects, at).map(Some)
+    }
+
+    /// Keep what the role about to be replaced counted (task-d62). The
+    /// commands it had learned and not released are not timed: the role
+    /// that would release them is going.
+    fn leave_role(&mut self) {
+        let counts = self.machine_mut().take_fast_path_counts();
+        self.fast_path.add(&counts);
+        self.release.clear();
+    }
+
+    /// What the fast path did since boot (task-d62).
+    pub fn fast_path_counts(&self) -> coord_consensus::FastPathCounts {
+        let mut counts = self.fast_path;
+        counts.add(&self.machine().fast_path_counts());
+        counts
+    }
+
+    /// From learned to released, over the commands this replica led
+    /// (task-d62).
+    pub const fn release_split(&self) -> crate::learned::ReleaseSplit {
+        self.release.split()
+    }
+
+    /// Look at the pre-acceptances this replica holds that the leader
+    /// has not ordered, at `now` (task-d62). The age of one the leader
+    /// ordered a later command past runs from the first observation that
+    /// saw it, so it is as fine as the observations are frequent.
+    pub fn observe_unordered(&mut self, now: std::time::Instant) -> Unordered {
+        let (pending, reordered) = self.machine().unordered();
+        self.unordered_since.retain(|c, _| reordered.contains(c));
+        for command in &reordered {
+            self.unordered_since.entry(*command).or_insert(now);
+        }
+        Unordered {
+            leader_log: self.machine().leader_log_pending() as u64,
+            pending: pending as u64,
+            reordered: reordered.len() as u64,
+            oldest: self
+                .unordered_since
+                .values()
+                .min()
+                .map_or(std::time::Duration::ZERO, |since| {
+                    now.saturating_duration_since(*since)
+                }),
+        }
+    }
+
+    /// Stamp what the leader committed since the last stamp (task-d62).
+    fn stamp_learned(&mut self) {
+        let learned = self.machine_mut().take_learned();
+        if !learned.is_empty() {
+            self.release.learned(learned, std::time::Instant::now());
+        }
     }
 
     /// Give up the lead without having been deposed, so that this replica
@@ -911,6 +1062,7 @@ impl<P: Persistence> Node<P> {
         }
         let counts = self.machine_mut().take_resend_counts();
         self.resends.add(&counts);
+        self.leave_role();
         let Some(Machine::Leader(l)) = self.machine.take() else {
             unreachable!("checked above")
         };
@@ -1121,6 +1273,7 @@ impl<P: Persistence> Node<P> {
 
     /// Carry out `effects`, and everything they lead to.
     fn carry_out(&mut self, effects: Vec<Effect>, ballot: &Ballot) -> Result<Outbound, DriveError> {
+        self.stamp_learned();
         let mut out = Outbound::default();
         let mut queue = effects;
         self.absorb_foreign(&mut queue);
@@ -1141,6 +1294,7 @@ impl<P: Persistence> Node<P> {
             }
             release = false;
             self.rounds += 1;
+            self.stamp_learned();
             let (round, next) = self.one_round(queue, ballot)?;
             out.absorb(round);
             queue = next;
@@ -1256,11 +1410,15 @@ impl<P: Persistence> Node<P> {
                 // establishment too would disclose an outcome before the
                 // release rule had admitted it.
                 Effect::Established(result) => {
+                    let command = result.command();
                     if result.fast_path() {
                         self.established.fast += 1;
                     } else {
                         self.established.slow += 1;
+                        let reason = self.machine_mut().take_missed_fast(&command);
+                        self.fast_path.missed(reason);
                     }
+                    self.release.released(&command, std::time::Instant::now());
                 }
                 Effect::Released(_) => unreachable!("routed to the collector above"),
                 #[expect(
@@ -1571,6 +1729,8 @@ impl<P: Persistence> Node<P> {
             // held until the group has materialized: a release, a send
             // and a result all wait for the group (task-d47).
             let effects = self.machine_mut().applied(command, &outcome)?;
+            self.release.applied(&command, std::time::Instant::now());
+            self.stamp_learned();
             // At a floor boundary the view is exactly the command's: the
             // apply returned once its batch was readable, and only a
             // command moves the frontier (task-d27). A retry answered from
@@ -1610,6 +1770,7 @@ impl<P: Persistence> Node<P> {
         held: &mut Vec<Effect>,
         ballot: &Ballot,
     ) -> Result<Outbound, DriveError> {
+        self.stamp_closed(held);
         if !self.applier.pipelined() {
             return self.close_group_waiting(held, ballot);
         }
@@ -1759,6 +1920,7 @@ impl<P: Persistence> Node<P> {
         held: &mut Vec<Effect>,
         ballot: &Ballot,
     ) -> Result<Outbound, DriveError> {
+        self.stamp_closed(held);
         let applier = &mut self.applier;
         Self::measured(self.recorder.as_deref(), Stage::Journal, || {
             applier.finish_group()
@@ -1772,6 +1934,16 @@ impl<P: Persistence> Node<P> {
         let effects = core::mem::take(held);
         out.absorb(self.carry_out(effects, ballot)?);
         Ok(out)
+    }
+
+    /// The group whose commands established `held` closes now (task-d62).
+    fn stamp_closed(&mut self, held: &[Effect]) {
+        let now = std::time::Instant::now();
+        for effect in held {
+            if let Effect::Established(result) = effect {
+                self.release.closed(&result.command(), now);
+            }
+        }
     }
 
     /// The driver's account of an apply that failed.

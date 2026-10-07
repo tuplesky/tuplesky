@@ -434,6 +434,11 @@ pub struct PeerPlane {
 }
 
 impl PeerPlane {
+    /// What this node's transport carried between voters (task-d62).
+    pub fn traffic(&self) -> coord_transport::PeerTraffic {
+        self.transport.peer_traffic()
+    }
+
     /// The plane over `transport`, for the voters in `peers`.
     pub fn new(
         transport: Transport,
@@ -973,6 +978,9 @@ pub struct Domain<P: Persistence> {
     /// How long this loop has waited, and when it next prints a
     /// snapshot (task-d45).
     pacing: Pacing,
+    /// The pre-acceptances the voter held that the leader had not ordered,
+    /// at the last interval snapshot (task-d62).
+    unordered: coord_daemon::metrics::UnorderedPreAcceptances,
     /// Notified by the voter's materializer thread each time a projection
     /// commit finishes (task-d52), so the loop takes it back and releases
     /// what waited on it. `None` where commits run on this thread.
@@ -1569,6 +1577,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             budgets,
             recorder,
             pacing: Pacing::default(),
+            unordered: coord_daemon::metrics::UnorderedPreAcceptances::default(),
             materialized: None,
             pipeline_waits: None,
             read_orders: Vec::new(),
@@ -1611,7 +1620,8 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     /// interval since the last printed snapshot (task-d45).
     fn cost(&self) -> coord_daemon::metrics::Measure<coord_daemon::metrics::Cost> {
         use coord_daemon::metrics::{
-            Cost, Cpu, Interval, Measure, PipelineWaits, Scheduling, Unavailable, Wait,
+            Cost, Cpu, Interval, Jobs, Measure, PipelineWaits, Scheduling, Traffic, Unavailable,
+            Wait,
         };
         let Backing::Voting(voter) = &self.backing else {
             // A process without a voter applies what it serves, but the
@@ -1673,6 +1683,24 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             established_fast: voter.node().established.fast,
             established_slow: voter.node().established.slow,
             reads: reads(&voter.read_counts()),
+            fast_path: fast_path(&voter.node().fast_path_counts()),
+            unordered: self.unordered,
+            release: release(&voter.node().release_split()),
+            traffic: self.plane.as_ref().map_or(
+                Measure::Unavailable(Unavailable::NotInstrumented),
+                |plane| {
+                    let t = plane.traffic();
+                    Measure::Observed(Traffic {
+                        sent_frames: t.sent_frames,
+                        sent_bytes: t.sent_bytes,
+                        sent_streams: t.sent_streams,
+                        sent_lost: t.sent_lost,
+                        received_frames: t.received_frames,
+                        received_bytes: t.received_bytes,
+                        received_streams: t.received_streams,
+                    })
+                },
+            ),
             cpu,
             waits: self.pipeline_waits.as_ref().map_or(
                 Measure::Unavailable(Unavailable::NotInstrumented),
@@ -1681,9 +1709,20 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                         let (count, time) = waits.read();
                         Wait { count, time }
                     };
+                    let jobs = |waits: &coord_storage::Waits| {
+                        let times = waits.jobs();
+                        Jobs {
+                            count: times.jobs,
+                            queued: times.queued,
+                            served: times.served,
+                            completed: times.completed,
+                        }
+                    };
                     Measure::Observed(PipelineWaits {
                         appender: wait(appender),
                         materializer: wait(materializer),
+                        appender_jobs: jobs(appender),
+                        materializer_jobs: jobs(materializer),
                     })
                 },
             ),
@@ -1698,6 +1737,15 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         };
         if self.pacing.due.is_some_and(|due| now < due) {
             return;
+        }
+        if let Backing::Voting(voter) = &mut self.backing {
+            let seen = voter.node_mut().observe_unordered(now);
+            self.unordered = coord_daemon::metrics::UnorderedPreAcceptances {
+                pending: seen.pending,
+                reordered: seen.reordered,
+                oldest: seen.oldest,
+                leader_log: seen.leader_log,
+            };
         }
         let snapshot = self.metrics(&roles);
         match serde_json::to_string(&snapshot) {
@@ -4693,6 +4741,30 @@ fn resends(counts: &coord_consensus::ResendCounts) -> coord_daemon::metrics::Res
         late: counts.late,
         handed_off: counts.handed_off,
         duplicate_votes: counts.duplicate_votes,
+    }
+}
+
+/// The snapshot's reading of what the fast path did (task-d62).
+fn fast_path(counts: &coord_consensus::FastPathCounts) -> coord_daemon::metrics::FastPath {
+    coord_daemon::metrics::FastPath {
+        missed_path: counts.missed_path,
+        missed_deps: counts.missed_deps,
+        missed_missing: counts.missed_missing,
+        missed_slow_first: counts.missed_slow_first,
+        missed_unclassified: counts.missed_unclassified,
+        acks: counts.acks,
+        acks_reordered: counts.acks_reordered,
+    }
+}
+
+/// The snapshot's reading of the leader's waits from learned to released
+/// (task-d62).
+fn release(split: &coord_daemon::learned::ReleaseSplit) -> coord_daemon::metrics::Release {
+    coord_daemon::metrics::Release {
+        commands: split.commands,
+        predecessors: split.predecessors,
+        group: split.group,
+        projection: split.projection,
     }
 }
 

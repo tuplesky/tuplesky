@@ -9882,3 +9882,124 @@ most likely; the voters' logs are in its artifact, which this container
 cannot fetch. task-d67 decides when a follower lets go of such a
 pre-acceptance, and task-d62 counts them.
 
+
+## What a command costs and why its fast path failed: the first counts
+
+task-d62's first part is in `metrics` and in `command_cost.py`'s second
+table. Counting only: no voter decides, sends or orders anything
+differently.
+
+- **Why a command missed the fast path** (`cost.fast_path`). Each command
+  a voter establishes on the slow path is classified when it executes,
+  from the votes that voter counted by then, and counted when its
+  establishment is, so the five add up to `established_slow`: `path`, a
+  fast-set acknowledgement saw another conflict path; `deps`, the path
+  but other direct dependencies; `missing`, an acknowledgement the
+  quorum needed had not arrived; `slow_first`, the fast quorum formed
+  after the slow one decided; `unclassified`, a command the voter did not
+  decide from its own votes (a follower executing the leader's commit)
+  or a run forced onto the slow path. Read at execution, later than the
+  decision, `missing` is an acknowledgement that had not come even then,
+  and one that agreed and came late is `slow_first`.
+- **An acknowledgement made under a `reordered` marker** is counted by
+  its sender (`acks_reordered`, beside `acks`), not by the leader. The
+  acknowledgement does not say so, and saying it would change the wire
+  form of every acknowledgement; the leader counts it under `path`.
+- **The pre-acceptances a voter holds that the leader has not ordered**
+  (`cost.unordered`): how many, how many the leader has ordered a later
+  command past, and how long the oldest of those has been held, from the
+  first interval snapshot that saw it. One the next synchronization
+  orders is gone by the next snapshot; task-d67's orphan shows as an age
+  that grows with the run.
+- **From learned to released** (`cost.release`), per command the leader
+  committed from its own votes: committed to applied (predecessors and
+  the loop reaching it), applied to its group closing, and the group
+  closing to the release (the projection's commit). Summed, with the
+  commands timed.
+- **The read waits**, which are cumulative from arrival, are taken apart
+  by the summary: the confirmation, the index after it, the answer after
+  the index, with reads per round and reads held behind their snapshot
+  per read.
+
+On the orphan of the section above (`fast_path.rs`, five voters, an
+orphan at n2, then 20 commands), the leader names `path` for all 20 of
+its slow establishments and nothing else; n2 sent 26 acknowledgements,
+19 of them under the marker, and holds one pre-acceptance the leader
+ordered later commands past. The first command after the orphan missed
+by the orphan alone, in n2's pending suffix, before anything was
+ordered past it. n3 sent 25 and none under a marker.
+
+### The second part: frames, streams and the storage threads
+
+- **Peer traffic** (`cost.traffic`), counted by the transport for the
+  peer class only: frames, bytes and streams sent and received, and
+  frames lost to a failed open or write. Bytes are the frame header and
+  payload, not QUIC's framing. Every peer frame is its own stream today,
+  so streams equal frames; task-d61 is read against this.
+- **The journal's and the materializer's jobs** (`cost.waits`,
+  `appender_jobs`, `materializer_jobs`): each job is stamped when it is
+  sent, so the summary splits its life into queued (sent to taken),
+  served (taken to done) and completed (done to the loop taking the
+  outcome).
+- **A leader's own path log** (`cost.unordered.leader_log`): the
+  commands in its pending suffix. A leader holds no pre-acceptance it
+  has not ordered, so it reports 0 there, and this length beside it.
+
+A local run (five voters on one host, replay profile, stores on disk, 30
+callers, 20,000 measured operations, `put=30,get=50,contended=20`, 862
+completed a second):
+
+| node | fast share | path / deps / missing / slow first | acks (reordered) | peer frames per command sent / received | journal ms per command queued / served / completed | projection ms per command queued / served / completed |
+| --- | --- | --- | --- | --- | --- | --- |
+| n1 (leader) | 3.9% | 9282 / 165 / 264 / 48 | -- | 9.96 / 7.89 | 0.10 / 0.78 / 0.30 | 0.13 / 0.57 / 0.36 |
+| n2 (fast set) | 4.2% | 9349 / 169 / 178 / 32 | 10150 (1976) | 8.48 / 6.49 | 0.11 / 0.81 / 0.30 | 0.14 / 0.56 / 0.30 |
+| n3 (fast set) | 4.1% | 9376 / 164 / 172 / 26 | 10150 (2137) | 8.47 / 6.49 | 0.10 / 0.80 / 0.31 | 0.15 / 0.55 / 0.32 |
+| n4 | 3.9% | 9224 / 164 / 334 / 36 | -- | 4.47 / 7.49 | 0.11 / 0.82 / 0.33 | 0.16 / 0.56 / 0.30 |
+| n5 | 3.8% | 9208 / 165 / 356 / 35 | -- | 4.47 / 7.48 | 0.10 / 0.84 / 0.36 | 0.15 / 0.51 / 0.26 |
+
+- The reasons add up to each voter's slow establishments, and `path` is
+  nearly all of them. About one fast-set acknowledgement in five was made
+  under a `reordered` marker, so most `path` misses are paths the
+  follower chained in another order without a marker.
+- No follower held a pre-acceptance the leader had not ordered at the
+  last snapshot.
+- Streams sent equal frames sent on every voter: about ten streams a
+  command at the leader, eight and a half at a fast-set follower.
+- On the leader, a command waited 1.76 ms for its predecessors, 0.90 ms
+  for its group to close and 7.80 ms for the projection's commit. A read
+  waited 6.82 ms to be confirmed, 10.83 ms more for the index and 6.91 ms
+  more for its answer, at 2.32 reads a round and 1.09 held behind their
+  snapshot per read.
+- This run's leader reported its 10,150 commands as unordered before the
+  count was split: the leader's own pending suffix, which led to the
+  next finding.
+
+### The fast path after a leader change (task-d68)
+
+`fast_path.rs`'s `fast_after_a_leader_change` drives five voters through
+a number of commands, moves the leader, and counts the fast decisions
+after the change. Under the counts above, every command after a change
+is slow, all `path` at the new leader, for as many commands as the old
+ballot ordered, and one more: 3 commands under the genesis leader leave
+the next 4 slow, 20 leave 21, 40 leave 41, with either the old leader's
+fast-set neighbor or a voter outside its fast set winning.
+
+A follower takes a synchronization as its new prefix only when its
+leader sequence number is above the highest it has taken. A new leader
+numbers its proposals from zero, and nothing resets a follower's highest
+at the ballot change, so until the new numbers pass the old ones each
+follower chains from the old ballot's head and every acknowledgement it
+sends disagrees with the leader's path.
+
+The same trace shows the leader's own log: a leader appends each command
+it proposes to its path log and never synchronizes it, and retiring a
+command does not take it out of the pending suffix. It grows by one a
+command led and is cleared at the role change.
+
+task-d68 plans the fix, with a design step first: what a follower's
+synchronized prefix is across ballots. `the_fast_path_resumes_after_a_leader_change`
+is its acceptance and is ignored until then; it fails today with 0 of
+20 fast after 40 commands under the old leader.
+
+Not yet in task-d62: the matched workload and the runner rows, which are
+three pairs each.

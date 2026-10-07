@@ -199,7 +199,9 @@ pub use summary::{
     DurableLedger, MAX_PAGE_ASK, MAX_PAGE_ENTRIES, MAX_REPORT_PAGES, PageError, ReportAssembler,
     ReportPage, ServedReport, paginate,
 };
-pub use vote::{FastAck, Learned, SlowAck, Vote, VoteError, VoteSet};
+pub use vote::{
+    FastAck, FastPathCounts, Learned, MissedFast, MissedLog, SlowAck, Vote, VoteError, VoteSet,
+};
 
 /// Crate role marker used by the dependency-policy check.
 pub const CRATE_ROLE: &str = "core";

@@ -248,6 +248,35 @@ async fn voters_negotiate_roles_and_exchange_frames_with_bound_provenance() {
     assert_eq!(stats.frames, 1);
     assert_eq!(stats.queue_wait.count, 1);
     assert_eq!(stats.credit_wait.count, 1);
+    // The node's peer totals (task-d62): a frame each way, a stream each,
+    // its bytes the frame's on both ends, and the refused sends above
+    // never reached a link.
+    let (to_b, to_a) = (
+        evidence_frame(b"vote-from-a").unwrap().len() as u64,
+        evidence_frame(b"ack-from-b").unwrap().len() as u64,
+    );
+    let sent = a.peer_traffic();
+    assert_eq!(
+        (
+            sent.sent_frames,
+            sent.sent_streams,
+            sent.sent_bytes,
+            sent.sent_lost
+        ),
+        (1, 1, to_b, 0)
+    );
+    assert_eq!(
+        (
+            sent.received_frames,
+            sent.received_streams,
+            sent.received_bytes
+        ),
+        (1, 1, to_a)
+    );
+    let heard = b.peer_traffic();
+    assert_eq!((heard.received_frames, heard.received_bytes), (1, to_b));
+    assert_eq!((heard.sent_frames, heard.sent_bytes), (1, to_a));
+    assert_eq!(c.peer_traffic(), coord_transport::PeerTraffic::default());
 }
 
 /// A raw client endpoint presenting `id`'s certificate, for driving the
