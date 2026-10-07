@@ -590,3 +590,32 @@ fn a_strict_publication_spends_nothing_on_the_projections_sync() {
     assert_eq!(published.phases.sync, std::time::Duration::ZERO);
     assert!(published.retired);
 }
+
+/// An image produced off the domain thread (task-d51) represents what
+/// was materialized when it was pinned, and the projection's own cadence
+/// has usually made that durable by the time it is published. Then the
+/// publication forces no sync, and a crash after it still rolls the
+/// projection back no further than `C`.
+#[test]
+fn a_publication_already_durable_at_its_checkpoint_forces_no_sync() {
+    let profile = ProjectionProfile::Replay(never());
+    let mut world = World::new(profile);
+    world.commit_each(3);
+    world.store.sync_projections().unwrap();
+    let pointer = world.pointer();
+    assert_eq!(world.projection_durable(), pointer.represented);
+    // Working commits after the pin, as the domain keeps committing
+    // while the image is written.
+    world.commit_each(2);
+    assert!(world.projection_durable() < world.materialized());
+    let published = world.store.publish_checkpoint(A, &pointer).unwrap();
+    assert_eq!(published.phases.sync, std::time::Duration::ZERO);
+    assert!(published.retired);
+    assert!(world.projection_durable() >= pointer.represented);
+    assert!(
+        world.projection_durable() < world.materialized(),
+        "the working commits after the pin stay working"
+    );
+    let next = crash_and_attach(world, profile, pointer.represented).unwrap();
+    assert_recovered(&next, 5);
+}

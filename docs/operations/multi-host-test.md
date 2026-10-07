@@ -120,7 +120,11 @@ What `--hosts` changes, and nothing else does:
   section's other fields are written at the daemon's defaults. Without the
   flag the harness reads `COORD_HARNESS_CHECKPOINT_AFTER_RECORDS`, and
   refuses a value that does not parse. `harness.json` records it as
-  `checkpoint_after_records` when set.
+  `checkpoint_after_records` when set. Without it a voter takes the
+  daemon's default, which follows the journal profile (task-d51): 4,096
+  records under strict; under replay, 65,536 records and 30 s since the
+  last publication, whichever comes later. The harness leaves
+  `checkpoint_after_seconds` at that default.
 
 Without `--hosts`, `--issuer-listen`, `--edge-host`, a journal profile and a
 checkpoint interval, provisioning writes exactly what it always has;
