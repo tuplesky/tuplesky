@@ -215,6 +215,13 @@ scenario step exports it as `COORD_HARNESS_CHECKPOINT_AFTER_RECORDS`, which
 carry with the harness of task-d55, and a carry without it keeps the
 default. The TupleSky summary's title then ends in ", checkpoint every N"
 (", no checkpoints" for 0).
+The `voter-workers` input sets each TupleSky voter's tokio worker count
+through jepsen.tuplesky's `--voter-workers`, which starts `coordd` with
+`TOKIO_WORKER_THREADS`; empty keeps tokio's default of one worker per
+runner core, which each of the co-located voters takes. It needs a
+`jepsen-ref` with the option (tuplesky/jepsen's
+`claude/voter-tokio-workers`), and the title then ends in ", N tokio
+workers per voter".
 Each publication's `checkpoint` line in `coordd.log` says how long it held
 the domain thread and how long each of its steps took, and each restart's
 `replayed` line how many records it replayed and how long that took.
@@ -430,13 +437,26 @@ of lines. `scripts/ci/jepsen_summary.py` reads the test's store
   the node containers' processes included, and groups them by name: the
   servers under test (`coordd`, `etcd`, `swiftpaxos`), their Jepsen
   clients (`coord-jepsen`, `swiftpaxos-jepsen`), Jepsen's JVM, and
-  docker, containerd and ssh. Everything else is the host's busy time less
-  those, the kernel's interrupts included. The table takes the samples
+  docker, containerd and ssh. Steal, the time the VM was runnable while
+  its hypervisor ran something else, is its own row. Everything else is
+  the host's busy time less those and steal, the kernel's interrupts
+  included. The table takes the samples
   around the first invocation and the final heal (or the last operation),
   and gives each group's CPU seconds, cores and milliseconds per completed
   operation, so a client's cost is a reading rather than a subtraction. A
   process that exits between two samples loses at most a second of its
   time. The samples are in the store as `cpu-samples.csv`;
+* for the TupleSky job, the leader's loop against the host's idle: the
+  sampler also reads each `coordd`'s main thread, where the domain loop
+  runs, and its tokio workers (`tokio-runtime-w`, the transport), from
+  their `schedstat`. Second by second, the leader is the voter whose loop
+  used the most CPU, and the table gives its loop's CPU and run queue (time
+  ready to run and waiting for a CPU), the host's idle and steal, as a mean
+  and over the quarter of seconds with the least and the most idle, with
+  the correlation of run queue and idle: when they rise and fall together,
+  the demand comes in bursts shorter than a second. A line after it gives
+  the voters' tokio workers' CPU and run queue per operation. The samples
+  are in the store as `cpu-samples-threads.csv`;
 * for the TupleSky job, one row per voter from its `coordd.log`: boots,
   the position it last recovered at, the highest position it executed by
   the end (read from its store by `coord-jepsen-executed --last`, so a

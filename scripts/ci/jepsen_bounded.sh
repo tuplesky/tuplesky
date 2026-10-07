@@ -11,9 +11,11 @@
 # with the node-side command it waits on. Exits with the command's status
 # (124 when the bound was hit).
 #
-# With JEPSEN_CPU_SAMPLES set to a path, cpu_sampler.py writes where the
-# runner's CPU goes, once a second, to it while the command runs, for the
-# summary's Runner CPU table.
+# With JEPSEN_CPU_SAMPLES set to a path (ending .csv), cpu_sampler.py writes
+# where the runner's CPU goes, once a second, to it while the command runs,
+# and each coordd's domain loop and tokio workers to the same path with
+# -threads before the .csv, for the summary's Runner CPU and leader's loop
+# tables.
 set -u
 
 if [ $# -lt 4 ] || [ "$3" != "--" ]; then
@@ -46,7 +48,8 @@ watchdog=$!
 
 sampler=
 if [ -n "${JEPSEN_CPU_SAMPLES:-}" ]; then
-  python3 "$(dirname "$0")/cpu_sampler.py" --out "$JEPSEN_CPU_SAMPLES" &
+  python3 "$(dirname "$0")/cpu_sampler.py" --out "$JEPSEN_CPU_SAMPLES" \
+    --threads "${JEPSEN_CPU_SAMPLES%.csv}-threads.csv" &
   sampler=$!
 fi
 

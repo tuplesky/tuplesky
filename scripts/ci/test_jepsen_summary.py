@@ -483,6 +483,69 @@ class RunnerCpuTests(unittest.TestCase):
     def test_a_row_that_does_not_parse_drops_the_table(self):
         self.assertNotIn("Runner CPU", self.summary(self.SAMPLES + "garbage,1,2,3,4,5,6,7\n"))
 
+    def test_steal_is_its_own_row_and_not_everything_else(self):
+        samples = "".join(
+            line.rstrip("\n") + ("," + steal if i else ",steal_s") + "\n"
+            for i, (line, steal) in enumerate(zip(self.SAMPLES.splitlines(), ("", "0.00", "1.00", "5.00", "9.00")))
+        )
+        text = self.summary(samples)
+        self.assertIn("| everything else (the kernel's interrupts included) | 7.0 | 0.17 | 7000.00 |", text)
+        self.assertIn("| steal (the VM runnable, its hypervisor running something else) | 5.0 | 0.12 | 5000.00 |", text)
+        self.assertIn("| **the host, busy** | 82.0 | 2.00 | 82000.00 |", text)
+
+
+class LeaderLoopTests(unittest.TestCase):
+    """The leader's loop against the host's idle, from the sampler's
+    thread rows: two voters, n1's loop the busier in the first second and
+    n2's in the second, over the samples around the workload (10:00:00.5
+    to 10:00:41.5, with one at 10:00:20 between)."""
+
+    SAMPLES = (
+        "time,host_busy_s,host_total_s,cpus,servers_s,clients_s,jvm_s,plumbing_s,steal_s\n"
+        "2026-09-27 10:00:00.500000,0.00,0.00,4,0.00,0.00,0.00,0.00,0.00\n"
+        "2026-09-27 10:00:20.000000,58.50,78.00,4,20.00,4.00,10.00,1.00,1.95\n"
+        "2026-09-27 10:00:41.500000,144.50,164.00,4,40.00,8.00,20.00,2.00,1.95\n"
+    )
+    THREADS = (
+        "time,pid,start,loop_cpu_s,loop_runq_s,workers_cpu_s,workers_runq_s,workers\n"
+        "2026-09-27 10:00:00.500000,101,7,1.0,1.0,1.0,1.0,4\n"
+        "2026-09-27 10:00:00.500000,102,7,1.0,1.0,1.0,1.0,4\n"
+        "2026-09-27 10:00:20.000000,101,7,10.75,20.5,5.0,9.0,4\n"
+        "2026-09-27 10:00:20.000000,102,7,2.0,2.0,3.0,3.0,4\n"
+        "2026-09-27 10:00:41.500000,101,7,11.75,21.5,7.0,11.0,4\n"
+        "2026-09-27 10:00:41.500000,102,7,23.5,2.0,9.0,13.0,4\n"
+    )
+
+    def summary(self, threads):
+        with tempfile.TemporaryDirectory() as store:
+            for name, text in (("jepsen.log", LOG), ("results.edn", RESULTS), ("cpu-samples.csv", self.SAMPLES)):
+                with open(os.path.join(store, name), "w") as f:
+                    f.write(text)
+            if threads is not None:
+                with open(os.path.join(store, "cpu-samples-threads.csv"), "w") as f:
+                    f.write(threads)
+            return js.summarize(store, ["n1", "n2"], "Jepsen")
+
+    def test_the_leader_is_the_busiest_loop_in_each_second(self):
+        text = self.summary(self.THREADS)
+        self.assertIn("once a second over the 2 seconds between the samples around the workload", text)
+        # 19.5 s then 21.5 s: idle 1.00 then 0.00 cores; steal 0.10 then
+        # 0; the leader n1 (500 ms/s of CPU, 1000 ms/s queued) then n2
+        # (1000 ms/s of CPU, none queued).
+        self.assertIn("| host idle (cores) | 0.50 | 0.00 | 1.00 |", text)
+        self.assertIn("| steal (cores) | 0.05 | 0.00 | 0.10 |", text)
+        self.assertIn("| leader's loop CPU (ms/s) | 750 | 1000 | 500 |", text)
+        self.assertIn("| leader's loop run queue (ms/s) | 500 | 0 | 1000 |", text)
+        self.assertIn("The voters' tokio workers (2 voters, 4 each): CPU 14.0 s (0.34 cores, 14000.00 ms per operation), "
+                      "run queue 22.0 s (0.54 cores, 22000.00 ms per operation).", text)
+
+    def test_a_correlation_needs_three_seconds(self):
+        self.assertIn("second by second: -.", self.summary(self.THREADS))
+
+    def test_no_thread_samples_no_table(self):
+        self.assertNotIn("leader's loop and the host's idle", self.summary(None))
+        self.assertNotIn("leader's loop and the host's idle", self.summary(self.THREADS + "garbage\n" + "x,1,2,3,4,5,6,7\n"))
+
 
 if __name__ == "__main__":
     unittest.main()

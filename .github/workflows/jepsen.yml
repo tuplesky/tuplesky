@@ -72,6 +72,9 @@ on:
       checkpoint-after-records:
         description: "Journal records each TupleSky voter holds past its last local checkpoint before publishing the next (task-d55); 0 never publishes; empty for the profile's default (4096 under strict; 65536 and 30 s under replay, task-d51)"
         default: ""
+      voter-workers:
+        description: "Tokio worker threads per TupleSky voter (TOKIO_WORKER_THREADS, through jepsen.tuplesky's --voter-workers); empty for tokio's default of one per runner core, which each co-located voter takes"
+        default: ""
       swiftpaxos:
         description: "Faults for the SwiftPaxos baseline (pause, partition, packet; kill ends its cluster), none, or skip to not run it; empty for the scenario's"
         default: ""
@@ -113,6 +116,7 @@ env:
   IN_STORE: ${{ inputs.store }}
   IN_PROFILE: ${{ inputs.profile }}
   IN_CHECKPOINT_AFTER_RECORDS: ${{ inputs.checkpoint-after-records }}
+  IN_VOTER_WORKERS: ${{ inputs.voter-workers }}
   NODES: ${{ inputs.nodes || '5' }}
   ETCD_VERSION: ${{ inputs.etcd-version || 'latest' }}
   # jepsen-io/etcd, pinned; its head when the baseline was added.
@@ -233,6 +237,14 @@ jobs:
         # harness from before it.
         run: |
           wan=(); if [ "$WAN" != none ]; then wan=(--wan "$WAN"); fi
+          workers=()
+          if [ -n "$IN_VOTER_WORKERS" ]; then
+            if ! grep -q -- '--voter-workers' src/jepsen/tuplesky.clj; then
+              echo "::error::tuplesky/jepsen@$JEPSEN_REF has no --voter-workers; dispatch with a jepsen-ref that has it, or no voter-workers"
+              exit 1
+            fi
+            workers=(--voter-workers "$IN_VOTER_WORKERS")
+          fi
           export JEPSEN_CPU_SAMPLES="$RUNNER_TEMP/cpu-samples.csv"
           "$GITHUB_WORKSPACE/tuplesky/scripts/ci/jepsen_bounded.sh" \
             $((TIME_LIMIT + 1200)) "$RUNNER_TEMP/cluster/nodes" -- lein run test \
@@ -246,7 +258,8 @@ jobs:
             --rate "$RATE" \
             --recovery-time "$RECOVERY_TIME" \
             --concurrency "$CONCURRENCY" \
-            ${wan[@]+"${wan[@]}"}
+            ${wan[@]+"${wan[@]}"} \
+            ${workers[@]+"${workers[@]}"}
       - name: Read how far each voter executed
         if: always()
         # Each voter's highest executed position at the end, from its store
@@ -270,10 +283,10 @@ jobs:
         # voter, in the job summary; each voter's last 400 lines follow here.
         run: |
           if [ -d jepsen/tuplesky/store/latest ]; then
-            cp "$RUNNER_TEMP/cpu-samples.csv" jepsen/tuplesky/store/latest/ 2>/dev/null || true
+            cp "$RUNNER_TEMP"/cpu-samples*.csv jepsen/tuplesky/store/latest/ 2>/dev/null || true
             python3 tuplesky/scripts/ci/jepsen_summary.py jepsen/tuplesky/store/latest \
               --nodes-file "$RUNNER_TEMP/cluster/nodes" --profile "$PROFILE" \
-              --title "TupleSky: $WORKLOAD, $NEMESIS$TITLE_SUFFIX$STORE_SUFFIX$PROFILE_SUFFIX$CHECKPOINT_SUFFIX"
+              --title "TupleSky: $WORKLOAD, $NEMESIS$TITLE_SUFFIX$STORE_SUFFIX$PROFILE_SUFFIX$CHECKPOINT_SUFFIX${IN_VOTER_WORKERS:+, $IN_VOTER_WORKERS tokio workers per voter}"
           else
             echo "No Jepsen store: the test did not start." >> "$GITHUB_STEP_SUMMARY"
           fi
@@ -564,7 +577,7 @@ jobs:
         if: always()
         run: |
           if [ -d etcd-test/store/latest ]; then
-            cp "$RUNNER_TEMP/cpu-samples.csv" etcd-test/store/latest/ 2>/dev/null || true
+            cp "$RUNNER_TEMP"/cpu-samples*.csv etcd-test/store/latest/ 2>/dev/null || true
             python3 tuplesky/scripts/ci/jepsen_summary.py etcd-test/store/latest \
               --nodes-file "$RUNNER_TEMP/cluster/nodes" --title "etcd $ETCD_VERSION: $WORKLOAD, $NEMESIS$TITLE_SUFFIX$STORE_SUFFIX"
           else
@@ -702,7 +715,7 @@ jobs:
         if: always()
         run: |
           if [ -d jepsen/swiftpaxos/store/latest ]; then
-            cp "$RUNNER_TEMP/cpu-samples.csv" jepsen/swiftpaxos/store/latest/ 2>/dev/null || true
+            cp "$RUNNER_TEMP"/cpu-samples*.csv jepsen/swiftpaxos/store/latest/ 2>/dev/null || true
             python3 tuplesky/scripts/ci/jepsen_summary.py jepsen/swiftpaxos/store/latest \
               --nodes-file "$RUNNER_TEMP/cluster/nodes" --title "SwiftPaxos: register, $SWIFTPAXOS_NEMESIS$TITLE_SUFFIX"
           else

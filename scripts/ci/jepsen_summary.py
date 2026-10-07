@@ -12,7 +12,9 @@ directory (`store/latest`) and writes what a reader looks for first:
   against the profile's (jepsen.tuplesky.wan);
 * each node's final reads, which say whether the domain served again;
 * where the runner's CPU went over the workload, by process group, when
-  the job sampled it (`cpu-samples.csv` from `cpu_sampler.py`);
+  the job sampled it (`cpu-samples.csv` from `cpu_sampler.py`), and, for a
+  TupleSky run, the leader's loop against the host's idle second by second
+  and the voters' tokio workers (`cpu-samples-threads.csv`);
 * the commonest failure reasons;
 * the faults, in order;
 * for a TupleSky run, one row per voter from its `coordd.log`: boots,
@@ -40,7 +42,7 @@ directory (`store/latest`) and writes what a reader looks for first:
 
 The Markdown goes to `$GITHUB_STEP_SUMMARY` when it is set, and to standard
 output either way (in a folded group on a runner). It reads only
-`jepsen.log`, `results.edn`, `cpu-samples.csv` and `n*/coordd.log`; a
+`jepsen.log`, `results.edn`, `cpu-samples*.csv` and `n*/coordd.log`; a
 missing file leaves its section out. Exit status 0
 unless the store directory does not exist.
 """
@@ -491,7 +493,10 @@ def runner_cpu(rows: list[dict], start: datetime.datetime, end: datetime.datetim
     for key, label in CPU_GROUPS:
         cpu = b.get(f"{key}_s", 0.0) - a.get(f"{key}_s", 0.0)
         cells.append((label, cpu))
-    cells.append(("everything else (the kernel's interrupts included)", busy - sum(c for _, c in cells)))
+    steal = b.get("steal_s", 0.0) - a.get("steal_s", 0.0)
+    cells.append(("everything else (the kernel's interrupts included)", busy - steal - sum(c for _, c in cells)))
+    if "steal_s" in b:
+        cells.append(("steal (the VM runnable, its hypervisor running something else)", steal))
     cells.append(("**the host, busy**", busy))
     idle = (b["host_total_s"] - a["host_total_s"]) - busy
     out = [
@@ -506,6 +511,123 @@ def runner_cpu(rows: list[dict], start: datetime.datetime, end: datetime.datetim
         per = f"{cpu * 1000 / completed:.2f}" if completed else "-"
         out.append(f"| {label} | {cpu:.1f} | {cpu / secs:.2f} | {per} |")
     out.append(f"| idle | {idle:.1f} | {idle / secs:.2f} | - |")
+    out.append("")
+    return out
+
+
+def read_thread_samples(path: str) -> dict:
+    """The rows `cpu_sampler.py --threads` wrote, by their time cell (the
+    same as the main file's row of that sample), each a map from a coordd
+    (pid, start) to its (loop CPU, loop run queue, workers' CPU, workers'
+    run queue, workers) cumulative from its start; {} without the file or
+    with a row that does not parse."""
+    if not os.path.exists(path):
+        return {}
+    by_time: dict = {}
+    try:
+        with open(path) as f:
+            f.readline()
+            for line in f:
+                cells = line.strip().split(",")
+                if len(cells) != 8:
+                    continue
+                key = (int(cells[1]), int(cells[2]))
+                values = tuple(float(c) for c in cells[3:7]) + (int(cells[7]),)
+                when = datetime.datetime.strptime(cells[0], "%Y-%m-%d %H:%M:%S.%f")
+                by_time.setdefault(when, {})[key] = values
+    except (OSError, ValueError):
+        return {}
+    return by_time
+
+
+def pearson(xs: list[float], ys: list[float]) -> float | None:
+    if len(xs) < 3:
+        return None
+    mx, my = sum(xs) / len(xs), sum(ys) / len(ys)
+    sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    sxx = sum((x - mx) ** 2 for x in xs)
+    syy = sum((y - my) ** 2 for y in ys)
+    if sxx <= 0 or syy <= 0:
+        return None
+    return sxy / (sxx * syy) ** 0.5
+
+
+def leader_loop(rows: list[dict], threads: dict, start: datetime.datetime, end: datetime.datetime, completed: int) -> list[str]:
+    """The leader's domain loop against the host's idle, second by second,
+    over the samples that bracket the window, and the voters' tokio
+    workers over it. In each second the leader is the coordd whose loop
+    used the most CPU in it. [] without thread rows bracketing it."""
+    before = [r for r in rows if r["time"] <= start]
+    after = [r for r in rows if r["time"] >= end]
+    if not before or not after:
+        return []
+    window = [r for r in rows if before[-1]["time"] <= r["time"] <= after[0]["time"] and r["time"] in threads]
+    if len(window) < 2:
+        return []
+    seconds = []  # (idle cores, steal cores, leader loop CPU ms/s, leader run queue ms/s)
+    for r0, r1 in zip(window, window[1:]):
+        dt = (r1["time"] - r0["time"]).total_seconds()
+        t0, t1 = threads[r0["time"]], threads[r1["time"]]
+        both = [k for k in t1 if k in t0]
+        if dt <= 0 or not both:
+            continue
+        leader = max(both, key=lambda k: t1[k][0] - t0[k][0])
+        busy = r1["host_busy_s"] - r0["host_busy_s"]
+        idle = (r1["host_total_s"] - r0["host_total_s"]) - busy
+        steal = r1.get("steal_s", 0.0) - r0.get("steal_s", 0.0)
+        seconds.append(
+            (idle / dt, steal / dt, (t1[leader][0] - t0[leader][0]) * 1000 / dt, (t1[leader][1] - t0[leader][1]) * 1000 / dt)
+        )
+    if not seconds:
+        return []
+    first, last = threads[window[0]["time"]], threads[window[-1]["time"]]
+    voters = [k for k in last if k in first]
+    span = (window[-1]["time"] - window[0]["time"]).total_seconds()
+    workers_cpu = sum(last[k][2] - first[k][2] for k in voters)
+    workers_queue = sum(last[k][3] - first[k][3] for k in voters)
+    workers = max((last[k][4] for k in voters), default=0)
+
+    def mean(i):
+        return sum(s[i] for s in seconds) / len(seconds)
+
+    r = pearson([s[3] for s in seconds], [s[0] for s in seconds])
+    out = [
+        f"**The leader's loop and the host's idle** (from `cpu_sampler.py --threads`, once a second over the "
+        f"{len(seconds)} seconds between the samples around the workload; the leader in a second is the voter whose "
+        "domain loop, coordd's main thread, used the most CPU in it; run queue is the time that thread was ready to "
+        "run and waiting for a CPU, from its `schedstat`; idle is the host's idle and iowait; steal is the time the VM "
+        "was runnable and its hypervisor ran something else. If the run queue and the idle rise and fall together, "
+        "the demand comes in bursts shorter than a second)",
+        "",
+        "| Per second | Mean | Lowest quarter of idle | Highest quarter of idle |",
+        "| --- | --- | --- | --- |",
+    ]
+    by_idle = sorted(seconds)
+    q = max(1, len(by_idle) // 4)
+    low, high = by_idle[:q], by_idle[-q:]
+
+    def avg(group, i):
+        return sum(s[i] for s in group) / len(group)
+
+    for label, i, fmt in (
+        ("host idle (cores)", 0, "{:.2f}"),
+        ("steal (cores)", 1, "{:.2f}"),
+        ("leader's loop CPU (ms/s)", 2, "{:.0f}"),
+        ("leader's loop run queue (ms/s)", 3, "{:.0f}"),
+    ):
+        out.append(f"| {label} | {fmt.format(mean(i))} | {fmt.format(avg(low, i))} | {fmt.format(avg(high, i))} |")
+    out.append("")
+    out.append(
+        "Correlation of the leader's run queue with the host's idle, second by second: "
+        + (f"{r:+.2f}." if r is not None else "-.")
+    )
+    if voters and span > 0:
+        per = (lambda v: f"{v * 1000 / completed:.2f} ms per operation") if completed else (lambda v: "-")
+        out.append(
+            f"The voters' tokio workers ({len(voters)} voters, {workers} each): CPU {workers_cpu:.1f} s "
+            f"({workers_cpu / span:.2f} cores, {per(workers_cpu)}), run queue {workers_queue:.1f} s "
+            f"({workers_queue / span:.2f} cores, {per(workers_queue)})."
+        )
     out.append("")
     return out
 
@@ -607,6 +729,9 @@ def summarize(store: str, nodes: list[str], title: str, profile: str | None = No
             until = heal if heal is not None else done[-1].at if done else start
             completed = sum(1 for o in done if start <= o.at <= until)
             out.extend(runner_cpu(rows, start, until, completed))
+            threads = read_thread_samples(os.path.join(store, "cpu-samples-threads.csv"))
+            if threads:
+                out.extend(leader_loop(rows, threads, start, until, completed))
 
         # The final reads: each worker's operations invoked after the last
         # fault operation (the final heal), with what answered them. A
