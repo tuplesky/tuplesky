@@ -272,16 +272,26 @@ def release_of(cost: dict) -> dict:
 def resends_of(cost: dict, executed: int) -> dict:
     """A voter's re-sends and refused duplicate votes per command
     (task-d49): what it re-sent while it led, by reason, and the votes it
-    refused as duplicates. Empty for a binary older than the counts."""
+    refused as duplicates; and per call of the re-send timer, the loop's
+    time in it and the proposals it looked at (task-d59). Empty for a
+    binary older than the counts."""
     resends = cost.get("resends")
     if not isinstance(resends, dict):
         return {}
     resent = resends["decided"] + resends["acknowledged"] + resends["unanswered"]
-    return {
+    reading = {
         "resends": resends,
         "resent_per_command": resent / executed,
         "duplicate_votes_per_command": resends["duplicate_votes"] / executed,
     }
+    # What a call of the re-send timer costs the leader's loop (task-d59),
+    # for a binary that times it and a voter that led.
+    calls = resends.get("calls", 0)
+    if calls and "time" in resends:
+        reading["resend_ms_per_call"] = seconds(resends["time"]) * 1e3 / calls
+        reading["resend_longest_ms"] = seconds(resends["longest"]) * 1e3
+        reading["resend_scanned_per_call"] = resends["scanned"] / calls
+    return reading
 
 
 TAIL = 0.25

@@ -1582,6 +1582,52 @@ fn a_proposal_is_not_resent_before_its_answer_is_due() {
     assert_eq!(counts.duplicate_votes, 0, "{counts:?}");
 }
 
+/// A re-send looks at what each voter has not adopted, not at every
+/// proposal the leader keeps (task-d59).
+///
+/// The leader keeps a proposal until the history sweep, four times the
+/// table's capacity past it, and each call of the re-send timer sorted
+/// all of them and walked them once per voter: on the Jepsen runner,
+/// several milliseconds of the leader's loop four times a second. With
+/// hundreds of proposals executed and adopted by every voter, a call now
+/// looks at none of them; with one voter cut off, at those it has not
+/// adopted.
+#[test]
+fn a_resend_looks_only_past_each_voters_highest_adoption() {
+    let mut cluster = Cluster::with_capacity(83, 256);
+    let mut last = None;
+    for seq in 1..=400 {
+        last = Some(cluster.admit(seq, (seq % 7) as u8));
+        cluster.settle();
+    }
+    assert!(cluster.nodes[2].executed.contains(&last.unwrap()));
+    let before = resend_counts(&cluster, 0);
+    for _ in 0..3 {
+        cluster.resend();
+        cluster.settle();
+    }
+    let counts = resend_counts(&cluster, 0);
+    assert_eq!(counts.calls - before.calls, 3, "{counts:?}");
+    assert_eq!(
+        counts.scanned, before.scanned,
+        "looked at proposals every voter adopted: {counts:?}"
+    );
+    cluster.cut = vec![(0, 2), (2, 0), (1, 2), (2, 1)];
+    for seq in 401..=405 {
+        cluster.admit(seq, 1);
+        cluster.settle();
+    }
+    let before = resend_counts(&cluster, 0);
+    cluster.resend();
+    cluster.settle();
+    let counts = resend_counts(&cluster, 0);
+    assert!(
+        (1..=5).contains(&(counts.scanned - before.scanned)),
+        "looked past r2's highest adoption for other than the five it lacks: {counts:?}"
+    );
+    assert_eq!(cluster.nodes[0].executed.len(), 405);
+}
+
 /// A voter that answers slowly is given longer before a re-send
 /// (task-d49).
 ///
