@@ -10057,3 +10057,29 @@ binary, three pairs with batching off and on, alternated:
   transport and the domain thread. Neither is this task's change; the
   runner rows of this PR size them first.
 
+On the Jepsen runner, three pairs on one AMD EPYC 7763 in one job
+([37644338627](https://github.com/tuplesky/tuplesky/actions/runs/37644338627)),
+replay, throughput, 30 clients, 120 s, stores on disk, the base being the
+same build with `COORDD_PEER_STREAM_FRAMES=1` on every voter, the head
+less the base:
+
+| | mean | range over the three pairs |
+| --- | --- | --- |
+| leader: streams per command | -6.11 (-60%, 10.3 to 4.1) | -6.16 to -6.02 |
+| leader: frames per stream | +1.48 | +1.44 to +1.52 |
+| leader: datagrams per command | -0.12 (-2%) | -0.20 to -0.02 |
+| frames (streams) lost, every voter | 0 (0) | 0 to 0 |
+| leader's loop CPU per command | +0.005 ms | -0.003 to +0.013 |
+| voters' CPU per operation | -0.09 ms (-2%) | -0.14 to -0.05 |
+| `ok`/s | -2.8 | -19.2 to +6.7 |
+| read p99 | 0 ms | -7 to +11 |
+
+- Streams fell 60% with frames per command unchanged and nothing lost,
+  so the change is in how frames are packed, not in what is sent.
+- The CPU and throughput moved inside the pairs' spread. The 9% on the
+  four-core host, where five voters shared four cores, is not seen on the
+  runner; in the runner's profile the transport's symbols are within
+  1.3 µs per command of each other either way.
+- task-d61's acceptance is the streams cut. The change is kept for what
+  QUIC's stream limits and a WAN path care about, not for CPU.
+
