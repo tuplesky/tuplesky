@@ -10152,3 +10152,47 @@ build, this less the base:
   leader's loop is on every operation's path in this closed loop, so a
   microsecond of the leader's is worth more than its share of the
   cluster's CPU.
+
+## The allocator (task-d60, step 1)
+
+`coordd` now sets mimalloc as its global allocator. No call site
+changes. On the Jepsen runner's call-graph profile a third of the leader's
+domain thread was glibc's allocator and copies, spread over every phase,
+most of the allocator's share in glibc's own bin management
+(`_int_malloc`, `unlink_chunk`, `_int_free`, `malloc_consolidate`).
+
+Five voters on one four-core host, replay profile, stores on disk, 30
+callers, 40,000 measured operations, `put=30,get=50,contended=20`, three
+pairs of task-d59's build against this one, alternated:
+
+| | glibc | mimalloc |
+| --- | --- | --- |
+| completed a second | 884, 1060, 1105 | 1217, 1180, 1149 |
+| get p99, ms | 140, 98, 101 | 84, 98, 92 |
+| leader's domain thread, CPU ms per command | 0.515, 0.513, 0.505 | 0.434, 0.432, 0.456 |
+| domain threads, five voters, CPU ms per operation | 1.094, 1.095, 1.075 | 0.923, 0.923, 0.969 |
+| tokio workers, five voters | 0.847, 0.889, 0.874 | 0.746, 0.761, 0.783 |
+| materializers, five voters | 0.416, 0.403, 0.390 | 0.377, 0.377, 0.395 |
+| all threads, CPU ms per operation | 2.572, 2.601, 2.546 | 2.250, 2.257, 2.361 |
+| resident set at the end, per voter, MiB (one pair) | 128 to 144 | 171 to 194 |
+
+- Lower in every pair: the leader's domain thread by 0.070 ms per
+  command (0.081, 0.081, 0.049), and all threads by 0.28 ms per operation,
+  11% (0.32, 0.34, 0.19). Throughput rose 16% on average (+333, +120,
+  +44), the first pair's base the lowest of the six.
+- Every thread kind is cheaper, the transport's tokio workers as much as
+  the domain threads, so the share is the allocator's everywhere, not one
+  loop's.
+- The cost is memory: each voter's resident set at the end of the run was
+  about 46 MiB, a third, higher. mimalloc keeps freed
+  pages in its heaps rather than returning them at once.
+- Faster serving exposed a race in `multi_host`'s restarted-voter test,
+  in the test and not in the daemon. The returned voter's frontend holds a
+  read's result back as pending while it has not yet projected the
+  caller's new session (coord-session's output gate), and the test read
+  once and took the pending outcome for a missing value: about one full
+  run in five failed with mimalloc, none in eighteen without. The test now
+  asks again until it is answered, as a caller resolves, and passed
+  fifteen of fifteen.
+- One host, loopback. The runner pair, with the call-graph profile on one
+  pair, is the acceptance.

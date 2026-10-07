@@ -35,6 +35,15 @@ use std::process::ExitCode;
 use clap::Parser;
 use coord_daemon::{Config, Diagnostics, Lifecycle, QuarantineReason, Readiness, bind_listeners};
 
+/// The daemon's allocator (task-d60). A third of every voter's domain
+/// thread was glibc's allocator and copies, spread over every phase of the
+/// loop rather than one site: many small allocations that live a turn.
+/// mimalloc's size-class heaps with thread-local caches serve those
+/// without glibc's bin management (`_int_malloc`, `unlink_chunk`,
+/// `malloc_consolidate`).
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[derive(Parser)]
 #[command(name = "coordd", about = "TupleSky node daemon (reference preview)")]
 struct Cli {
