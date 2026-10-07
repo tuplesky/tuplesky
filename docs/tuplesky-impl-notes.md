@@ -9634,9 +9634,29 @@ A fourth one-worker run is left out: the host's disk stalled for about
   cores here, so on this host it is not the VM.
 - **Not a default.** One transport worker serves a voter alone on its
   host poorly, and a host's cores are not the voters'. It belongs to
-  whoever co-locates voters: the harness can set it, and a
-  `[transport]` key is the follow-up if the Jepsen runner's six nodes
-  show the same. task-d61 is measured against whichever count that is.
+  whoever co-locates voters, and the Jepsen runner decides whether it
+  carries over.
+
+**On the Jepsen runner it does not.** #98's runner set
+`TOKIO_WORKER_THREADS` on its five voters (six nodes, replay, 120 s, 30
+clients, disk, the default cadence; one run per row except two at the
+default and two at one worker), where the same four cores also carry
+Jepsen's JVM and the shims:
+
+| workers per voter | `ok`/s | read p99 | voters' CPU / op | leader loop CPU / run queue per command | tokio threads' CPU / run queue per op |
+| --- | --- | --- | --- | --- | --- |
+| default (4) | 546, 533 | 72 ms | 2.98–3.28 ms | 0.57–0.70 / 0.86–0.97 ms | 1.42 / 6.96 ms |
+| 2 | 537 | 71 ms | 2.91 ms | 0.62 / 0.88 ms | 1.16 / 4.38 ms |
+| 1 | 374, 450 | 73–85 ms | 3.95–4.07 ms | 0.89–0.94 / 1.11–1.37 ms | 1.55 / 4.14 ms |
+
+- One worker cut the tokio threads' run queue as it did here, but not
+  their CPU, and was 17 to 31% slower. Two matched the default.
+- **Unexplained: the leader's loop costs more CPU per command with one
+  worker** (0.89 to 0.94 ms against 0.57 to 0.70), the opposite of the
+  runs above, where it fell. task-d61's frames-per-turn count is the
+  measurement that would explain it.
+- So no `[transport]` key, and task-d58 and task-d61 are measured at
+  the default count.
 
 ## The local checkpoint off the domain thread
 
@@ -9705,7 +9725,10 @@ round.
   every read due in the pump, and `reads::evaluate` plans each over it.
   Each is due because everything below its index executed, so a
   snapshot pinned after that covers all of them. A read whose position
-  the snapshot has not reached yet is held again, as before.
+  the snapshot has not reached yet is held again, as before. Three
+  voters in one process show it end to end: two reads due in one pump
+  are both served, from one snapshot
+  (`the_reads_due_in_one_pump_are_served_from_one_snapshot`).
 - **A snapshot that was behind is not pinned again until it could
   differ.** A read is due once its index has executed and answerable
   once the projection has committed that far, which is later. The first
