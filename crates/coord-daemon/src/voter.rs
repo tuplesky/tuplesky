@@ -136,6 +136,11 @@ pub struct Voter<P: Persistence> {
     fenced_at: Option<Ballot>,
     /// The reads this voter holds as a leader (task-d50).
     reads: ReadBarrier,
+    /// The completed frontier read just before the last snapshot pinned
+    /// for due reads, when that snapshot was behind one of them
+    /// (task-d58). While the frontier still reads exactly this, a new
+    /// snapshot would show what that one did.
+    reads_behind_at: Option<u64>,
 }
 
 impl<P: Persistence> Voter<P> {
@@ -170,6 +175,7 @@ impl<P: Persistence> Voter<P> {
             fenced: 0,
             fenced_at: None,
             reads: ReadBarrier::new(),
+            reads_behind_at: None,
         }
     }
 
@@ -628,6 +634,7 @@ impl<P: Persistence> Voter<P> {
     pub fn pump_reads(&mut self, now: MonotonicMillis) -> Outbound {
         let mut out = Outbound::default();
         if self.reads.held() == 0 {
+            self.reads_behind_at = None;
             return out;
         }
         let leading = self.leading();
@@ -671,11 +678,37 @@ impl<P: Persistence> Voter<P> {
         for (origin, answer) in refused {
             push_answer(&mut out, origin, &answer);
         }
+        // One snapshot for every read due in this pump (task-d58): each is
+        // due because everything below its index executed, so a snapshot
+        // pinned now covers all of them, and pinning one per read was a
+        // read transaction and a metadata read each. No snapshot (the
+        // projection is mid-commit, or quarantined) holds them all again,
+        // as a snapshot behind their position does.
+        //
+        // A read is due once its index has executed, and answerable once
+        // the projection has committed that far, which is later. Between
+        // the two every pump would pin a snapshot only to find it behind:
+        // ten per read served in the five-voter run. So once one was
+        // behind, none is pinned again until the completed frontier has
+        // moved from what it read before that one: a projection commit
+        // moves it, and nothing else changes what a snapshot shows.
+        // Moved either way, as a reattached projection's could, a new
+        // snapshot is pinned.
+        let reader = self.node.applier().store().reader();
+        let completed = reader.completed();
+        let gated = if due.is_empty() || self.reads_behind_at == Some(completed) {
+            None
+        } else {
+            reader.snapshot().ok()
+        };
         let mut again = Vec::new();
         for held in due {
             let retry_key = held.read.request.retry_key;
             let ballot = held.read.ballot;
-            match evaluate(self.node.applier().store(), &held) {
+            let evaluated = gated
+                .as_ref()
+                .map_or(Evaluated::NotYet, |gated| evaluate(gated, &held));
+            match evaluated {
                 Evaluated::Served(response) => {
                     self.reads.served(&held, now);
                     push_answer(
@@ -698,6 +731,10 @@ impl<P: Persistence> Voter<P> {
                     );
                 }
             }
+        }
+        if gated.is_some() {
+            self.reads.pinned(again.len());
+            self.reads_behind_at = (!again.is_empty()).then_some(completed);
         }
         for held in again.into_iter().rev() {
             self.reads.hold_again(held);

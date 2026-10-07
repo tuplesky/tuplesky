@@ -9596,6 +9596,48 @@ Neither is on the domain thread any more (task-d52, task-d54).
 leader's domain thread is the one that sets the domain's rate, and
 task-d58 and task-d59 together are a third of it.
 
+### Transport workers when the voters share a host
+
+`coordd` builds a multi-threaded tokio runtime without naming its
+worker count, so each voter starts one transport worker per core: five
+voters on a four-core host run twenty, beside five domain threads, five
+materializers and five appenders. On the Jepsen runner the leader's
+domain thread waited for a core about as long as it computed (run queue
+0.9 to 1.1 ms a command against 0.7 of CPU) while the host averaged
+0.8 to 1.0 cores idle, which fits bursts: each proposal wakes four
+followers' transport threads and then their domain threads at once.
+
+`TOKIO_WORKER_THREADS`, which the runtime reads, is the one variable
+here. Same setup as the profile above (release build of task-d51 at
+c76cc96, five voters, one four-core host, stores on disk, replay at its
+default cadence, so no publication in the run, 30 callers, put 30, get
+50, contended 20, 40,000 operations), three runs of each. Run queue and
+involuntary switches are from each thread's `schedstat` and `status`.
+
+| workers per voter | `ok`/s | get p99 | voters' CPU / op | transport CPU / op | transport run queue / op | transport involuntary switches / op | leader loop run queue / op |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| default (4) | 777, 824, 862 | 114–128 ms | 3.25–3.34 ms | 1.09–1.11 ms | 5.4–5.6 ms | 4.1–4.3 | 0.57–0.59 ms |
+| 2 | 878, 890, 910 | 106–116 ms | 3.13–3.23 ms | 1.00–1.04 ms | 4.5 ms | 3.8–3.9 | 0.52–0.55 ms |
+| 1 | 920, 921, 954 | 104–107 ms | 2.98–3.08 ms | 0.82–0.85 ms | 2.6–2.7 ms | 1.8 | 0.45–0.46 ms |
+
+A fourth one-worker run is left out: the host's disk stalled for about
+64 s of it (iowait near all four cores, nothing runnable), and it made
+360 `ok`/s.
+
+- **One worker per voter is about 13% more throughput** here, with a
+  quarter less transport CPU per operation and half its run queue and
+  involuntary switches. Fewer workers park and wake less, which was a
+  fifth of the transport's CPU in the profile.
+- **The leader's own run queue falls a fifth and is still as long as
+  its CPU.** Twenty threads on four cores remain, so the bursts remain;
+  the idle half core is the gap between them. Steal was 0.04 to 0.06
+  cores here, so on this host it is not the VM.
+- **Not a default.** One transport worker serves a voter alone on its
+  host poorly, and a host's cores are not the voters'. It belongs to
+  whoever co-locates voters: the harness can set it, and a
+  `[transport]` key is the follow-up if the Jepsen runner's six nodes
+  show the same. task-d61 is measured against whichever count that is.
+
 ## The local checkpoint off the domain thread
 
 task-d51. task-j06's Jepsen runs measured each publication of the
@@ -9649,3 +9691,99 @@ and the closed loop's tail was those stalls.
   or a reclaimer that panics, still prints it: the pointer is durable,
   and the images it left are the next reclaim's. The `Checkpoint` stage
   samples `loop_ms`.
+
+## Held reads from one snapshot
+
+task-d58. In the five-voter profile
+([above](#a-voters-cpu-per-operation-at-five-voters)) a quarter of the
+leader's domain thread was `Voter::pump_reads`. Every held read that
+came due pinned its own snapshot, every point read on it opened its
+table again, and every read's admission started its own confirmation
+round.
+
+- **One snapshot per pump.** `pump_reads` pins one gated snapshot for
+  every read due in the pump, and `reads::evaluate` plans each over it.
+  Each is due because everything below its index executed, so a
+  snapshot pinned after that covers all of them. A read whose position
+  the snapshot has not reached yet is held again, as before.
+- **A snapshot that was behind is not pinned again until it could
+  differ.** A read is due once its index has executed and answerable
+  once the projection has committed that far, which is later. The first
+  version pinned a snapshot on every pump in between: 210,000 snapshots
+  for 20,339 reads. Now, once a snapshot was behind a due read, the
+  leader keeps the completed frontier it read just before pinning it and
+  pins no new one while the frontier still reads exactly that. A
+  projection commit moves it; nothing else changes what a snapshot
+  shows. A frontier moved either way, as a reattached projection's
+  could, gets a new snapshot. 7,700 to 8,000 snapshots per 20,339
+  reads now.
+- **A snapshot keeps its tables.** `RedbView` opens each collection's
+  table once, on first use, and keeps it for the snapshot's life (redb's
+  `ReadOnlyTable` holds its transaction's guard). A failed open is not
+  kept.
+- **One round in flight.** `ReadBarrier::round_to_start` starts no round
+  while a round of the same ballot started less than
+  `ROUND_IN_FLIGHT_MILLIS` (100 ms) ago. The reads that arrive meanwhile
+  share the next round. A round still covers only the reads that arrived
+  before it started, so a read is never answered by a round already
+  under way (`reads_that_arrive_during_a_round_share_the_next`). A
+  round that has not confirmed in 100 ms no longer holds the next back,
+  and still confirms if its answers come
+  (`a_round_in_flight_too_long_does_not_hold_the_next`). Nothing about
+  when a read is due or what it may return changes.
+- **Counted.** The `metrics` line's `reads` gains `snapshots`, the
+  snapshots pinned for due reads, and `behind`, the due reads held again
+  because theirs was behind them.
+
+### Measured
+
+Same setup as the transport-worker runs above: release builds of
+task-d51 at c76cc96 and of this change on it, five voters on one
+four-core host, stores on disk, replay at its default cadence, 30
+callers, put 30, get 50, contended 20, 40,000 operations. Four baseline
+runs and three of this change, clean, then a pair profiled with
+`perf record -F 199 --call-graph dwarf` on every voter, twice.
+
+| | `ok`/s | get p99 | reads per round | rounds confirmed | read waits: confirm / index / total | leader loop CPU / op | voters' CPU / op |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| task-d51 | 777, 824, 851, 862 | 114–128 ms | 1.00 | 61% | 4.6–4.8 / 17.6–18.3 / 24.6–25.6 ms | 0.41–0.42 ms | 3.25–3.34 ms |
+| task-d58 | 824, 879, 913 | 114–119 ms | 2.18–2.26 | 100% | 6.3–6.8 / 16.6–18.6 / 23.4–26.0 ms | 0.35–0.37 ms | 3.11–3.37 ms |
+
+The leader's domain thread, profiled (samples counted inclusively):
+
+| | run | samples | `pump_reads` | of the thread's CPU | per read |
+| --- | --- | --- | --- | --- | --- |
+| task-d51 | 1 | 1,518 | 24.6% | 16.5 s | 0.200 ms |
+| task-d51 | 2 | 1,404 | 25.0% | 18.1 s | 0.222 ms |
+| task-d58 | 1 | 1,247 | 14.4% | 14.3 s | 0.101 ms |
+| task-d58 | 2 | 1,254 | 10.1% | 14.6 s | 0.073 ms |
+
+- **`pump_reads` per read fell by 59%** on the means of the two pairs,
+  0.211 to 0.087 ms. One run alone was at the line: 0.101 against the
+  0.200 of the first baseline, 49.5%.
+- **What it no longer does.** Pinning a snapshot was 14.2 to 14.6% of
+  the thread and is 3.2 to 3.7%; `open_table` was 9.6 to 10.9% and is
+  3.0 to 3.6%; point reads (`RedbView::get`) were 13.5 to 13.9% and are
+  4.7 to 5.2%.
+- **What is left is per read.** Building the read's authorized view
+  (`load_authorization`, `scan_all`, `build_authorized_view`), 8 to 9%
+  of the thread, is the same in every run: each read plans under its
+  own session's grants.
+- **Rounds.** 9,000 to 9,350 rounds for 20,339 reads, where every read
+  had its own and 39% of them were superseded before they confirmed.
+  A read waits 2 ms longer for its round and no longer in all: its
+  wait for its index to execute is two and a half times as long, and
+  the round overlaps it.
+- **The domain.** The leader's loop costs 15% less per operation. The
+  throughput's range moved up by about 50 operations a second and still
+  overlaps the baseline's; the host's four cores are what these runs
+  are short of, and the leader's loop is not all of them.
+
+**Leader faults.** `scripts/bench/register-faults.sh` on this build,
+one run each, as task-d50 ran it:
+
+| Scenario | Violations | Reads | Writes | Leader after |
+| --- | --- | --- | --- | --- |
+| partition 45 s | 0 | 33,292 (185 at the cut-off leader) | 14,322 | n2 (elected) |
+| pause 5 s, then 40 s | 0 | 48,992 | 21,731 | n2 (elected) |
+| kill and restart, twice | 0 | 21,628 | 9,011 | n1 |

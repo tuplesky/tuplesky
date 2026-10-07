@@ -154,6 +154,17 @@ impl<R: SnapshotSource> GatedReader<R> {
         }
         Ok(GatedView::new(view, meta))
     }
+
+    /// The journal sequence the completed frontier has reached: a
+    /// snapshot pinned now carries a stamp at or below it. One atomic
+    /// load, no snapshot.
+    ///
+    /// Only a completed projection commit moves it, so while it reads
+    /// what it read before a snapshot was pinned, a new snapshot would
+    /// show what that one did (task-d58).
+    pub fn completed(&self) -> u64 {
+        self.frontier.completed()
+    }
 }
 
 #[cfg(test)]
