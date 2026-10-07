@@ -590,6 +590,14 @@ pub struct Reads {
     pub waited_index_ms: u64,
     /// Milliseconds from arrival to the answer, summed.
     pub waited_ms: u64,
+    /// Snapshots pinned to answer reads: one per pump with a read due
+    /// (task-d58).
+    #[serde(default)]
+    pub snapshots: u64,
+    /// Due reads held again because the snapshot pinned for them had not
+    /// reached their position yet (task-d58).
+    #[serde(default)]
+    pub behind: u64,
 }
 
 /// What a leader's re-sends of proposals did (task-d49), cumulative.

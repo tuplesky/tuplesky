@@ -9634,9 +9634,29 @@ A fourth one-worker run is left out: the host's disk stalled for about
   cores here, so on this host it is not the VM.
 - **Not a default.** One transport worker serves a voter alone on its
   host poorly, and a host's cores are not the voters'. It belongs to
-  whoever co-locates voters: the harness can set it, and a
-  `[transport]` key is the follow-up if the Jepsen runner's six nodes
-  show the same. task-d61 is measured against whichever count that is.
+  whoever co-locates voters, and the Jepsen runner decides whether it
+  carries over.
+
+**On the Jepsen runner it does not.** #98's runner set
+`TOKIO_WORKER_THREADS` on its five voters (six nodes, replay, 120 s, 30
+clients, disk, the default cadence; one run per row except two at the
+default and two at one worker), where the same four cores also carry
+Jepsen's JVM and the shims:
+
+| workers per voter | `ok`/s | read p99 | voters' CPU / op | leader loop CPU / run queue per command | tokio threads' CPU / run queue per op |
+| --- | --- | --- | --- | --- | --- |
+| default (4) | 546, 533 | 72 ms | 2.98–3.28 ms | 0.57–0.70 / 0.86–0.97 ms | 1.42 / 6.96 ms |
+| 2 | 537 | 71 ms | 2.91 ms | 0.62 / 0.88 ms | 1.16 / 4.38 ms |
+| 1 | 374, 450 | 73–85 ms | 3.95–4.07 ms | 0.89–0.94 / 1.11–1.37 ms | 1.55 / 4.14 ms |
+
+- One worker cut the tokio threads' run queue as it did here, but not
+  their CPU, and was 17 to 31% slower. Two matched the default.
+- **Unexplained: the leader's loop costs more CPU per command with one
+  worker** (0.89 to 0.94 ms against 0.57 to 0.70), the opposite of the
+  runs above, where it fell. task-d61's frames-per-turn count is the
+  measurement that would explain it.
+- So no `[transport]` key, and task-d58 and task-d61 are measured at
+  the default count.
 
 ## The local checkpoint off the domain thread
 
@@ -9691,3 +9711,102 @@ and the closed loop's tail was those stalls.
   or a reclaimer that panics, still prints it: the pointer is durable,
   and the images it left are the next reclaim's. The `Checkpoint` stage
   samples `loop_ms`.
+
+## Held reads from one snapshot
+
+task-d58. In the five-voter profile
+([above](#a-voters-cpu-per-operation-at-five-voters)) a quarter of the
+leader's domain thread was `Voter::pump_reads`. Every held read that
+came due pinned its own snapshot, every point read on it opened its
+table again, and every read's admission started its own confirmation
+round.
+
+- **One snapshot per pump.** `pump_reads` pins one gated snapshot for
+  every read due in the pump, and `reads::evaluate` plans each over it.
+  Each is due because everything below its index executed, so a
+  snapshot pinned after that covers all of them. A read whose position
+  the snapshot has not reached yet is held again, as before. Three
+  voters in one process show it end to end: two reads due in one pump
+  are both served, from one snapshot
+  (`the_reads_due_in_one_pump_are_served_from_one_snapshot`).
+- **A snapshot that was behind is not pinned again until it could
+  differ.** A read is due once its index has executed and answerable
+  once the projection has committed that far, which is later. The first
+  version pinned a snapshot on every pump in between: 210,000 snapshots
+  for 20,339 reads. Now, once a snapshot was behind a due read, the
+  leader keeps the completed frontier it read just before pinning it and
+  pins no new one while the frontier still reads exactly that. A
+  projection commit moves it; nothing else changes what a snapshot
+  shows. A frontier moved either way, as a reattached projection's
+  could, gets a new snapshot. 7,700 to 8,000 snapshots per 20,339
+  reads now.
+- **A snapshot keeps its tables.** `RedbView` opens each collection's
+  table once, on first use, and keeps it for the snapshot's life (redb's
+  `ReadOnlyTable` holds its transaction's guard). A failed open is not
+  kept.
+- **One round in flight.** `ReadBarrier::round_to_start` starts no round
+  while a round of the same ballot started less than
+  `ROUND_IN_FLIGHT_MILLIS` (100 ms) ago. The reads that arrive meanwhile
+  share the next round. A round still covers only the reads that arrived
+  before it started, so a read is never answered by a round already
+  under way (`reads_that_arrive_during_a_round_share_the_next`). A
+  round that has not confirmed in 100 ms no longer holds the next back,
+  and still confirms if its answers come
+  (`a_round_in_flight_too_long_does_not_hold_the_next`). Nothing about
+  when a read is due or what it may return changes.
+- **Counted.** The `metrics` line's `reads` gains `snapshots`, the
+  snapshots pinned for due reads, and `behind`, the due reads held again
+  because theirs was behind them.
+
+### Measured
+
+Same setup as the transport-worker runs above: release builds of
+task-d51 at c76cc96 and of this change on it, five voters on one
+four-core host, stores on disk, replay at its default cadence, 30
+callers, put 30, get 50, contended 20, 40,000 operations. Four baseline
+runs and three of this change, clean, then a pair profiled with
+`perf record -F 199 --call-graph dwarf` on every voter, twice.
+
+| | `ok`/s | get p99 | reads per round | rounds confirmed | read waits: confirm / index / total | leader loop CPU / op | voters' CPU / op |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| task-d51 | 777, 824, 851, 862 | 114–128 ms | 1.00 | 61% | 4.6–4.8 / 17.6–18.3 / 24.6–25.6 ms | 0.41–0.42 ms | 3.25–3.34 ms |
+| task-d58 | 824, 879, 913 | 114–119 ms | 2.18–2.26 | 100% | 6.3–6.8 / 16.6–18.6 / 23.4–26.0 ms | 0.35–0.37 ms | 3.11–3.37 ms |
+
+The leader's domain thread, profiled (samples counted inclusively):
+
+| | run | samples | `pump_reads` | of the thread's CPU | per read |
+| --- | --- | --- | --- | --- | --- |
+| task-d51 | 1 | 1,518 | 24.6% | 16.5 s | 0.200 ms |
+| task-d51 | 2 | 1,404 | 25.0% | 18.1 s | 0.222 ms |
+| task-d58 | 1 | 1,247 | 14.4% | 14.3 s | 0.101 ms |
+| task-d58 | 2 | 1,254 | 10.1% | 14.6 s | 0.073 ms |
+
+- **`pump_reads` per read fell by 59%** on the means of the two pairs,
+  0.211 to 0.087 ms. One run alone was at the line: 0.101 against the
+  0.200 of the first baseline, 49.5%.
+- **What it no longer does.** Pinning a snapshot was 14.2 to 14.6% of
+  the thread and is 3.2 to 3.7%; `open_table` was 9.6 to 10.9% and is
+  3.0 to 3.6%; point reads (`RedbView::get`) were 13.5 to 13.9% and are
+  4.7 to 5.2%.
+- **What is left is per read.** Building the read's authorized view
+  (`load_authorization`, `scan_all`, `build_authorized_view`), 8 to 9%
+  of the thread, is the same in every run: each read plans under its
+  own session's grants.
+- **Rounds.** 9,000 to 9,350 rounds for 20,339 reads, where every read
+  had its own and 39% of them were superseded before they confirmed.
+  A read waits 2 ms longer for its round and no longer in all: its
+  wait for its index to execute is two and a half times as long, and
+  the round overlaps it.
+- **The domain.** The leader's loop costs 15% less per operation. The
+  throughput's range moved up by about 50 operations a second and still
+  overlaps the baseline's; the host's four cores are what these runs
+  are short of, and the leader's loop is not all of them.
+
+**Leader faults.** `scripts/bench/register-faults.sh` on this build,
+one run each, as task-d50 ran it:
+
+| Scenario | Violations | Reads | Writes | Leader after |
+| --- | --- | --- | --- | --- |
+| partition 45 s | 0 | 33,292 (185 at the cut-off leader) | 14,322 | n2 (elected) |
+| pause 5 s, then 40 s | 0 | 48,992 | 21,731 | n2 (elected) |
+| kill and restart, twice | 0 | 21,628 | 9,011 | n1 |
