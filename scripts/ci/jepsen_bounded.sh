@@ -17,8 +17,8 @@
 # -threads before the .csv, for the summary's Runner CPU and leader's loop
 # tables. With JEPSEN_LEADER_PROFILE set to a path, leader_profile.py
 # profiles the TupleSky leader's domain thread with perf once the workload
-# is under way, into it, with DWARF call graphs when JEPSEN_LEADER_CALLGRAPH
-# is set.
+# is under way, into it, with call graphs by frame pointer when
+# JEPSEN_LEADER_CALLGRAPH is set.
 set -u
 
 if [ $# -lt 4 ] || [ "$3" != "--" ]; then

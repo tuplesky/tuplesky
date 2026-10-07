@@ -791,7 +791,7 @@ def leader_profile_inclusive(path: str, top: int = 30) -> list[str]:
         return []
     return [
         f"<details><summary>The leader's domain thread by symbol with what it called, the {min(top, len(rows))} "
-        "largest (a DWARF call graph)</summary>",
+        "largest (a call graph)</summary>",
         "",
         "| With callees | Own | Object | Symbol |",
         "| --- | --- | --- | --- |",
@@ -915,7 +915,7 @@ def leader_loop_split(path: str, top: int = 25) -> list[str]:
         return []
     s = loop_split(chains)
     out = [
-        "**The leader's domain thread by phase** (a DWARF call graph's samples, each by the first TupleSky "
+        "**The leader's domain thread by phase** (a call graph's samples, each by the first TupleSky "
         "function it ran below the domain loop's turn; percent of the thread's samples, and the allocator's "
         f"part. The stacks reached the loop in {s['reached']:.1f}% of {s['total']:.1f}%.)",
         "",

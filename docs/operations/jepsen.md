@@ -251,10 +251,13 @@ The `leader-profile` input installs `perf` and profiles the leader's
 domain thread in each TupleSky run: `scripts/ci/leader_profile.py` waits
 for the workload to load the busiest loop, lets it settle for 30 s, takes
 that thread (coordd's main thread) and samples it alone for 20 s at
-999 Hz. A paired job also takes one DWARF call graph, at 250 Hz with
-perf's largest stack copy (64 KiB, since the loop runs below the runtime's
-`block_on`), on its first head run, and `call-graph` takes one on every
-run. It gives each symbol's share with everything it called
+999 Hz. `call-graph` also takes the call graph on every run, by frame
+pointer: every build in the job, a pair's base included, is made with
+`-C force-frame-pointers=yes`, and the kernel's stack limit is raised to
+1024 frames. DWARF unwinding from a copied stack stopped short of the
+domain loop, below the runtime's `block_on`, in nine samples of ten, even
+with perf's largest copy. A frame in a library built without frame
+pointers (libc's allocator) hides its own caller. The call graph gives each symbol's share with everything it called
 (`leader-profile-inclusive.txt`) and every sample's folded stack
 (`leader-profile-chains.txt`). From the stacks, the run's summary and the
 pair table split the loop by phase, the first TupleSky function a sample

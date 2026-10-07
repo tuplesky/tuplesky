@@ -14,9 +14,13 @@ the thread and the window. The containers share the host's kernel, so the
 host's `perf` sees their threads, and it reads `coordd`'s symbols through
 the process's own mount namespace.
 
-With --call-graph, `perf record` unwinds each sample's stack from DWARF
-(the release build carries debug line tables) at 250 Hz rather than 999,
-since each sample copies the stack; FILE gets the same flat report, and
+With --call-graph, `perf record` walks each sample's stack by its frame
+pointers (`--call-graph fp`), so `coordd` must be built with them
+(`-C force-frame-pointers=yes`): DWARF unwinding from a copied stack
+stopped short of the domain loop, below the runtime's `block_on`, in nine
+samples of ten. A frame in a library built without them (libc's allocator)
+hides its caller, and the walk resumes at the caller's caller. FILE gets
+the same flat report, and
 FILE with -inclusive before its extension gets each symbol's share with
 everything it called (`perf report --children`), which splits the loop's
 time by caller rather than by the function that happened to be running,
@@ -37,12 +41,6 @@ import signal
 import subprocess
 import sys
 import time
-
-
-# Bytes of stack each call-graph sample copies, perf's largest: the domain
-# loop runs inside the runtime's `block_on`, below futures large enough that
-# perf's default 8 KiB leaves most stacks short of the loop.
-STACK = 65528
 
 
 def loops() -> dict:
@@ -79,7 +77,7 @@ def main() -> int:
     parser.add_argument("--call-graph", action="store_true")
     args = parser.parse_args()
     if args.frequency is None:
-        args.frequency = 250 if args.call_graph else 999
+        args.frequency = 999
 
     stopping = False
 
@@ -125,7 +123,7 @@ def main() -> int:
     data = args.out + ".data"
     record = subprocess.run(
         ["sudo", "-n", "perf", "record", "-F", str(args.frequency), "-t", str(pid), "-o", data]
-        + (["--call-graph", f"dwarf,{STACK}"] if args.call_graph else [])
+        + (["--call-graph", "fp"] if args.call_graph else [])
         + ["--", "sleep", str(args.seconds)],
         capture_output=True,
         text=True,
@@ -150,7 +148,7 @@ def main() -> int:
     by_object = ", ".join(f"{' '.join(line.split()[1:])} {line.split()[0]}" for line in objects[:6] if line.split())
     header = (
         f"leader thread {pid}, {used / span:.2f} of a core over the {span} s before, sampled at "
-        f"{args.frequency} Hz{' with DWARF call graphs' if args.call_graph else ''} from {started} to {ended} UTC; "
+        f"{args.frequency} Hz{' with call graphs by frame pointer' if args.call_graph else ''} from {started} to {ended} UTC; "
         f"{samples}"
     )
     if args.call_graph:
@@ -161,7 +159,6 @@ def main() -> int:
             f.write(header + "; each symbol with everything it called, then its own share\n" + "\n".join(inclusive) + "\n")
         with open(f"{stem}-chains.{ext}" if dot else args.out + "-chains", "w") as f:
             f.write(header + "; each symbol, then its stacks from the root, in percent of the samples\n" + "\n".join(chains) + "\n")
-    # A call graph's samples carry their stacks, hundreds of megabytes.
     subprocess.run(["sudo", "-n", "rm", "-f", data], capture_output=True)
     write(
         header + "\n"
