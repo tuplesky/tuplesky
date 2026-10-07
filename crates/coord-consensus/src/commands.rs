@@ -677,6 +677,21 @@ impl CommandTable {
         self.keys.get(key).map(|k| &k.log)
     }
 
+    /// The pre-acceptances in this replica's path logs the leader has not
+    /// ordered (task-d62): how many, and those the leader has ordered a
+    /// later command past ([`PathLog::reordered`]), which keep this
+    /// replica's paths off the leader's until each is ordered or leaves.
+    /// A walk over every key's pending suffix, for a reading, not a turn.
+    pub fn unordered(&self) -> (usize, BTreeSet<CommandId>) {
+        let mut pending = BTreeSet::new();
+        let mut reordered = BTreeSet::new();
+        for state in self.keys.values() {
+            pending.extend(state.log.pending().iter().copied());
+            reordered.extend(state.log.reordered().iter().copied());
+        }
+        (pending.len(), reordered)
+    }
+
     /// The leader ordered `command` at `seqnum` with these per-key path
     /// digests: align this replica's logs so later commands' paths follow
     /// the leader's order (prototype `recordLeaderHash`/`updateLogs`).

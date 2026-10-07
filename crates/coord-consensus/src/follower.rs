@@ -57,7 +57,9 @@ use crate::rows::{
 };
 use crate::summary::DurableLedger;
 use crate::summary::PageError;
-use crate::vote::{FastAck, SlowAck, Vote, VoteError, VoteSet};
+use crate::vote::{
+    FastAck, FastPathCounts, MissedFast, MissedLog, SlowAck, Vote, VoteError, VoteSet,
+};
 
 /// Static configuration of a follower.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -458,6 +460,12 @@ pub struct Follower {
     /// threshold and put a second batch on the lane while one is
     /// outstanding.
     payloads_answered: u64,
+    /// What this replica's fast path did, until the driver takes it
+    /// (task-d62).
+    fast_counts: FastPathCounts,
+    /// Why each command established on the slow path missed the fast
+    /// one, until the driver counts it (task-d62).
+    missed: MissedLog,
     /// The commands the outstanding payload ask named that have not been
     /// answered yet. Each ask replaces it.
     payloads_asked: alloc::collections::BTreeSet<CommandId>,
@@ -734,6 +742,8 @@ impl Follower {
             served_payloads: payloads.keys().copied().collect(),
             payload_cursor: 0,
             payloads_answered: 0,
+            fast_counts: FastPathCounts::default(),
+            missed: MissedLog::default(),
             payloads_asked: alloc::collections::BTreeSet::new(),
             payloads,
             durable_payloads: BTreeMap::new(),
@@ -916,6 +926,8 @@ impl Follower {
             served_payloads: state.served_payloads,
             payload_cursor: 0,
             payloads_answered: 0,
+            fast_counts: FastPathCounts::default(),
+            missed: MissedLog::default(),
             payloads_asked: alloc::collections::BTreeSet::new(),
             ledger: state.ledger,
             learner: state.learner,
@@ -2287,6 +2299,35 @@ impl Follower {
         self.payloads_answered
     }
 
+    /// Why `command`, established on the slow path, missed the fast one,
+    /// from the votes this replica counted (task-d62). None in a run
+    /// forced onto the slow path, or for a command it holds no proposal
+    /// of: one it executed from a commit it did not learn itself.
+    fn missed_fast(&self, command: &CommandId) -> Option<MissedFast> {
+        if self.learner.mode() != LearningMode::Full {
+            return None;
+        }
+        self.votes.get(command)?.missed_fast()
+    }
+
+    /// Why `command` missed the fast path, taken once its establishment
+    /// is counted (task-d62); None if it was not held.
+    pub fn take_missed_fast(&mut self, command: &CommandId) -> Option<MissedFast> {
+        self.missed.take(command)
+    }
+
+    /// What this replica's fast path did since
+    /// [`Follower::take_fast_path_counts`] was last called (task-d62).
+    pub const fn fast_path_counts(&self) -> FastPathCounts {
+        self.fast_counts
+    }
+
+    /// What this replica's fast path did since this was last called
+    /// (task-d62).
+    pub fn take_fast_path_counts(&mut self) -> FastPathCounts {
+        core::mem::take(&mut self.fast_counts)
+    }
+
     /// The durable payload of an initialized command.
     pub fn payload(&self, command: &CommandId) -> Option<&PayloadRecordV1> {
         self.payloads.get(command)
@@ -2311,6 +2352,11 @@ impl Follower {
             self.config.quorum.ballot(),
             outcome,
         )?;
+        // Read before the history sweep can take its votes.
+        if !result.fast_path() {
+            let reason = self.missed_fast(&command);
+            self.missed.note(command, reason, self.config.capacity);
+        }
         let mut effects = alloc::vec![Effect::Established(result)];
         // Executed is supplied: a selection that waited on it may go on.
         if let Some(c) = self.campaign.as_mut() {
@@ -3569,6 +3615,16 @@ impl Follower {
         // promised away is an acceptance the candidate's selection cannot
         // see (task-d12). Admission itself is fenced in `on_admitted`.
         if self.in_fast_set() && self.may_vote() {
+            // Whether a command reordered behind a synchronization held
+            // this replica's path when it computed this one (task-d62):
+            // then no leader path equals it.
+            let reordered = init.paths.iter().any(|(key, _)| {
+                self.table
+                    .log(key)
+                    .is_some_and(|log| !log.reordered().is_empty())
+            });
+            self.fast_counts.acks += 1;
+            self.fast_counts.acks_reordered += u64::from(reordered);
             let ack = FastAck {
                 replica: self.config.identity.replica,
                 ballot: self.config.quorum.ballot(),

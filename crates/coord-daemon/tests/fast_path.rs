@@ -424,3 +424,59 @@ fn the_fast_path_resumes_after_a_pre_acceptance_the_leader_never_ordered() {
         );
     }
 }
+
+/// What the counters of task-d62 say about that orphan: the leader names
+/// a path mismatch for every command after it, its reasons add up to its
+/// slow establishments, the fast-set follower holding it counts its own
+/// acknowledgements as sent under a `reordered` marker, and holds one
+/// pre-acceptance the leader ordered later commands past.
+#[test]
+fn the_counts_name_the_orphan_that_stopped_the_fast_path() {
+    let mut cluster = Cluster::new();
+    for _ in 0..5 {
+        cluster.command();
+    }
+    cluster.submit_to(&[1]);
+    cluster.settle();
+    for _ in 0..20 {
+        cluster.command();
+    }
+
+    let leader = cluster.voters[0].node();
+    let established = leader.established;
+    let missed = leader.fast_path_counts();
+    assert_eq!((established.fast, established.slow), (5, 20));
+    assert_eq!(
+        missed.missed_path
+            + missed.missed_deps
+            + missed.missed_missing
+            + missed.missed_slow_first
+            + missed.missed_unclassified,
+        established.slow,
+        "every slow establishment has one reason: {missed:?}"
+    );
+    assert_eq!(missed.missed_path, 20, "{missed:?}");
+    // The leader sends no fast acknowledgement: its proposal is its own.
+    assert_eq!((missed.acks, missed.acks_reordered), (0, 0));
+    let release = leader.release_split();
+    assert_eq!(release.commands, 25, "{release:?}");
+
+    let holder = cluster.voters[1].node().fast_path_counts();
+    assert_eq!(holder.acks, 26, "{holder:?}");
+    // The first command after the orphan missed by the orphan alone, in
+    // its pending suffix: nothing was ordered past it yet, so no marker.
+    // Every later one was ordered past it.
+    assert_eq!(holder.acks_reordered, 19, "{holder:?}");
+    let other = cluster.voters[2].node().fast_path_counts();
+    assert_eq!((other.acks, other.acks_reordered), (25, 0), "{other:?}");
+
+    let now = std::time::Instant::now();
+    let unordered = cluster.voters[1].node_mut().observe_unordered(now);
+    assert_eq!((unordered.pending, unordered.reordered), (1, 1));
+    let later = cluster.voters[1]
+        .node_mut()
+        .observe_unordered(now + std::time::Duration::from_secs(3));
+    assert_eq!(later.oldest, std::time::Duration::from_secs(3));
+    let elsewhere = cluster.voters[2].node_mut().observe_unordered(now);
+    assert_eq!((elsewhere.pending, elsewhere.reordered), (0, 0));
+}

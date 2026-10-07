@@ -9882,3 +9882,53 @@ most likely; the voters' logs are in its artifact, which this container
 cannot fetch. task-d67 decides when a follower lets go of such a
 pre-acceptance, and task-d62 counts them.
 
+
+## What a command costs and why its fast path failed: the first counts
+
+task-d62's first part is in `metrics` and in `command_cost.py`'s second
+table. Counting only: no voter decides, sends or orders anything
+differently.
+
+- **Why a command missed the fast path** (`cost.fast_path`). Each command
+  a voter establishes on the slow path is classified when it executes,
+  from the votes that voter counted by then, and counted when its
+  establishment is, so the five add up to `established_slow`: `path`, a
+  fast-set acknowledgement saw another conflict path; `deps`, the path
+  but other direct dependencies; `missing`, an acknowledgement the
+  quorum needed had not arrived; `slow_first`, the fast quorum formed
+  after the slow one decided; `unclassified`, a command the voter did not
+  decide from its own votes (a follower executing the leader's commit)
+  or a run forced onto the slow path. Read at execution, later than the
+  decision, `missing` is an acknowledgement that had not come even then,
+  and one that agreed and came late is `slow_first`.
+- **An acknowledgement made under a `reordered` marker** is counted by
+  its sender (`acks_reordered`, beside `acks`), not by the leader. The
+  acknowledgement does not say so, and saying it would change the wire
+  form of every acknowledgement; the leader counts it under `path`.
+- **The pre-acceptances a voter holds that the leader has not ordered**
+  (`cost.unordered`): how many, how many the leader has ordered a later
+  command past, and how long the oldest of those has been held, from the
+  first interval snapshot that saw it. One the next synchronization
+  orders is gone by the next snapshot; task-d67's orphan shows as an age
+  that grows with the run.
+- **From learned to released** (`cost.release`), per command the leader
+  committed from its own votes: committed to applied (predecessors and
+  the loop reaching it), applied to its group closing, and the group
+  closing to the release (the projection's commit). Summed, with the
+  commands timed.
+- **The read waits**, which are cumulative from arrival, are taken apart
+  by the summary: the confirmation, the index after it, the answer after
+  the index, with reads per round and reads held behind their snapshot
+  per read.
+
+On the orphan of the section above (`fast_path.rs`, five voters, an
+orphan at n2, then 20 commands), the leader names `path` for all 20 of
+its slow establishments and nothing else; n2 sent 26 acknowledgements,
+19 of them under the marker, and holds one pre-acceptance the leader
+ordered later commands past. The first command after the orphan missed
+by the orphan alone, in n2's pending suffix, before anything was
+ordered past it. n3 sent 25 and none under a marker.
+
+Not in this part: per-command peer frames, bytes and streams; the
+journal's and the materializer's queue and service times; the matched
+workload; and the runner rows, which are three pairs each.

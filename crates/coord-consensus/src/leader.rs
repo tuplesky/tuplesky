@@ -46,7 +46,7 @@ use crate::rows::{
 };
 use crate::speculation::{ReleaseGate, Speculation, SpeculationRequest, TentativeOutcome};
 use crate::summary::DurableLedger;
-use crate::vote::{FastAck, SlowAck, Vote, VoteError, VoteSet};
+use crate::vote::{FastAck, MissedFast, MissedLog, SlowAck, Vote, VoteError, VoteSet};
 
 /// The single conservative conflict key: every command in a domain
 /// conflicts with every other (design Section 3, reference contract).
@@ -493,6 +493,12 @@ pub struct Leader {
     answered: BTreeMap<(CommandId, ReplicaId), (u64, u64)>,
     /// What the re-sends did, until the driver takes it (task-d49).
     counts: ResendCounts,
+    /// Why each command established on the slow path missed the fast
+    /// one, until the driver counts it (task-d62).
+    missed: MissedLog,
+    /// The commands committed since the driver last took them, while it
+    /// asked for them (task-d62).
+    learned: Option<Vec<CommandId>>,
 }
 
 /// This leader's adoption of its own order, published and waiting on the
@@ -569,6 +575,8 @@ impl Leader {
             latency: BTreeMap::new(),
             answered: BTreeMap::new(),
             counts: ResendCounts::default(),
+            missed: MissedLog::default(),
+            learned: None,
             config,
             boot: None,
             alloc: None,
@@ -703,6 +711,8 @@ impl Leader {
             latency: BTreeMap::new(),
             answered: BTreeMap::new(),
             counts: ResendCounts::default(),
+            missed: MissedLog::default(),
+            learned: None,
         };
         // Dependency order among the entries: a command follows every
         // dependency that is itself an entry. A cycle is an invariant
@@ -1651,6 +1661,11 @@ impl Leader {
             self.config.quorum.ballot(),
             outcome,
         )?;
+        // Read before the history sweep can take its votes.
+        if !result.fast_path() {
+            let reason = self.missed_fast(&command);
+            self.missed.note(command, reason, self.config.capacity);
+        }
         self.learn();
         self.forget_history();
         // A command whose result was released speculatively is already
@@ -1689,7 +1704,28 @@ impl Leader {
     }
 
     fn learn(&mut self) {
-        self.learner.commit_learned(&mut self.table, &self.votes);
+        let committed = self.learner.commit_learned(&mut self.table, &self.votes);
+        if let Some(learned) = self.learned.as_mut() {
+            learned.extend(committed);
+        }
+    }
+
+    /// Keep the commands this leader commits from its votes until
+    /// [`Leader::take_learned`] takes them (task-d62): a driver timing
+    /// how long a command takes from learned to released starts here.
+    /// Off unless asked for, since a caller that never takes them would
+    /// hold every command.
+    pub fn observe_learning(&mut self) {
+        self.learned.get_or_insert_with(Vec::new);
+    }
+
+    /// The commands committed from votes since this was last called,
+    /// in commit order (task-d62); empty unless observed.
+    pub fn take_learned(&mut self) -> Vec<CommandId> {
+        self.learned
+            .as_mut()
+            .map(core::mem::take)
+            .unwrap_or_default()
     }
 
     /// Unexecuted proposals in the leader's order.
@@ -3032,6 +3068,23 @@ impl Leader {
     /// What the re-sends did since this was last called (task-d49).
     pub fn take_resend_counts(&mut self) -> ResendCounts {
         core::mem::take(&mut self.counts)
+    }
+
+    /// Why `command`, established on the slow path, missed the fast one,
+    /// from the votes this leader counted (task-d62). None in a run
+    /// forced onto the slow path, or for a command it holds no proposal
+    /// of.
+    fn missed_fast(&self, command: &CommandId) -> Option<MissedFast> {
+        if self.learner.mode() != LearningMode::Full {
+            return None;
+        }
+        self.votes.get(command)?.missed_fast()
+    }
+
+    /// Why `command` missed the fast path, taken once its establishment
+    /// is counted (task-d62); None if it was not held.
+    pub fn take_missed_fast(&mut self, command: &CommandId) -> Option<MissedFast> {
+        self.missed.take(command)
     }
 }
 

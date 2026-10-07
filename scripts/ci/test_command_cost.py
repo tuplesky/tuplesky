@@ -105,6 +105,60 @@ class ReduceTests(unittest.TestCase):
         self.assertAlmostEqual(reads["mean_served_ms"], 4.0)
         self.assertNotIn("reads", cost.per_command("n1", snapshot()))
 
+    def test_the_read_waits_are_taken_apart_into_three(self):
+        snap = snapshot()
+        snap["cost"]["Observed"]["reads"] = {
+            "served": 200, "refused": 0, "rounds": 80, "confirmed": 80,
+            "waited_confirm_ms": 100, "waited_index_ms": 600, "waited_ms": 800,
+            "snapshots": 90, "behind": 220,
+        }
+        reads = cost.per_command("n1", snap)["reads"]
+        self.assertAlmostEqual(reads["mean_after_confirm_ms"], 2.5)
+        self.assertAlmostEqual(reads["mean_after_index_ms"], 1.0)
+        self.assertAlmostEqual(reads["reads_per_round"], 2.5)
+        self.assertAlmostEqual(reads["behind_per_read"], 1.1)
+        self.assertAlmostEqual(reads["snapshots_per_read"], 0.45)
+
+    def test_why_the_fast_path_missed_is_read_and_summed_when_reported(self):
+        snap = snapshot()
+        observed = snap["cost"]["Observed"]
+        observed["established_fast"] = 5
+        observed["established_slow"] = 20
+        observed["fast_path"] = {
+            "missed_path": 15, "missed_deps": 1, "missed_missing": 2,
+            "missed_slow_first": 1, "missed_unclassified": 1,
+            "acks": 26, "acks_reordered": 19,
+        }
+        observed["unordered"] = {"pending": 1, "reordered": 1, "oldest": duration(30)}
+        observed["release"] = {
+            "commands": 20, "predecessors": duration(0.04), "group": duration(0.02),
+            "projection": duration(0.1),
+        }
+        reading = cost.per_command("n1", snap)
+        paths = reading["fast_path"]
+        self.assertEqual(paths["missed"]["path"], 15)
+        self.assertTrue(paths["reasons_sum"])
+        self.assertEqual((paths["acks"], paths["acks_reordered"]), (26, 19))
+        self.assertEqual(reading["unordered"]["oldest_seconds"], 30)
+        self.assertAlmostEqual(reading["release"]["predecessors_ms"], 2.0)
+        self.assertAlmostEqual(reading["release"]["projection_ms"], 5.0)
+        observed["fast_path"]["missed_path"] = 14
+        self.assertFalse(cost.per_command("n1", snap)["fast_path"]["reasons_sum"])
+        self.assertNotIn("release", cost.per_command("n1", snapshot()))
+
+    def test_a_run_with_no_fast_decision_is_a_finding(self):
+        def voter(fast):
+            snap = snapshot()
+            snap["cost"]["Observed"]["established_fast"] = fast
+            snap["cost"]["Observed"]["established_slow"] = 100 - fast
+            return cost.per_command("n1", snap)
+        self.assertEqual(cost.findings_of([voter(0), voter(0)]),
+                         ["no voter decided a command on the fast path"])
+        self.assertEqual(cost.findings_of([voter(0), voter(4)]), [])
+        table = cost.paths_table({"runs": [
+            {"callers": 10, "voters": [voter(0)], "findings": ["no fast decision"]}]})
+        self.assertIn("**finding** | no fast decision", table)
+
     def test_cpu_is_read_per_command_when_reported(self):
         snap = snapshot(executed=200)
         snap["cost"]["Observed"]["cpu"] = {
