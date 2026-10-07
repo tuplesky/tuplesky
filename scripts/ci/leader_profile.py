@@ -19,7 +19,10 @@ With --call-graph, `perf record` unwinds each sample's stack from DWARF
 since each sample copies the stack; FILE gets the same flat report, and
 FILE with -inclusive before its extension gets each symbol's share with
 everything it called (`perf report --children`), which splits the loop's
-time by caller rather than by the function that happened to be running.
+time by caller rather than by the function that happened to be running,
+and FILE with -chains gets every sample's stack, folded, under the symbol
+it was in (`perf report -g folded`), for the summary's split of the loop
+by phase and of the allocator by caller.
 
 Exits 0 whatever happens: a profile that cannot be taken (no `perf`, no
 permission, no load before SIGTERM) leaves FILE saying why, and the test
@@ -34,6 +37,12 @@ import signal
 import subprocess
 import sys
 import time
+
+
+# Bytes of stack each call-graph sample copies, perf's largest: the domain
+# loop runs inside the runtime's `block_on`, below futures large enough that
+# perf's default 8 KiB leaves most stacks short of the loop.
+STACK = 65528
 
 
 def loops() -> dict:
@@ -116,7 +125,7 @@ def main() -> int:
     data = args.out + ".data"
     record = subprocess.run(
         ["sudo", "-n", "perf", "record", "-F", str(args.frequency), "-t", str(pid), "-o", data]
-        + (["--call-graph", "dwarf"] if args.call_graph else [])
+        + (["--call-graph", f"dwarf,{STACK}"] if args.call_graph else [])
         + ["--", "sleep", str(args.seconds)],
         capture_output=True,
         text=True,
@@ -125,10 +134,10 @@ def main() -> int:
     if record.returncode != 0:
         write(f"No profile: perf record failed ({record.returncode}): {record.stderr.strip()[-500:]}\n")
         return 0
-    def report(fields: str, limit: str, children: bool = False) -> tuple[list[str], str]:
+    def report(fields: str, limit: str, children: bool = False, graph: str = "none") -> tuple[list[str], str]:
         done = subprocess.run(
-            ["sudo", "-n", "perf", "report", "-i", data, "--stdio", "-F", fields, "--percent-limit", limit]
-            + (["--children", "-g", "none"] if children else ["--no-children"]),
+            ["sudo", "-n", "perf", "report", "-i", data, "--stdio", "-F", fields, "--percent-limit", limit, "-g", graph]
+            + (["--children"] if children else ["--no-children"]),
             capture_output=True,
             text=True,
         )
@@ -146,9 +155,14 @@ def main() -> int:
     )
     if args.call_graph:
         inclusive, _ = report("overhead_children,overhead,dso,sym", "0.5", children=True)
+        chains, _ = report("overhead,dso,sym", "0", graph="folded,0,caller,function,percent")
         stem, dot, ext = args.out.rpartition(".")
         with open(f"{stem}-inclusive.{ext}" if dot else args.out + "-inclusive", "w") as f:
             f.write(header + "; each symbol with everything it called, then its own share\n" + "\n".join(inclusive) + "\n")
+        with open(f"{stem}-chains.{ext}" if dot else args.out + "-chains", "w") as f:
+            f.write(header + "; each symbol, then its stacks from the root, in percent of the samples\n" + "\n".join(chains) + "\n")
+    # A call graph's samples carry their stacks, hundreds of megabytes.
+    subprocess.run(["sudo", "-n", "rm", "-f", data], capture_output=True)
     write(
         header + "\n"
         f"by object: {by_object}\n"

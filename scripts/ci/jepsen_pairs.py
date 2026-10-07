@@ -53,6 +53,9 @@ class Run:
     # The same profile's inclusive shares (a symbol and what it calls), from
     # the one run of a job profiled with a call graph; empty otherwise.
     inclusive: list = field(default_factory=list)
+    # That run's samples as folded stacks, for the loop's phases and the
+    # allocator's callers.
+    chains: list = field(default_factory=list)
     fast_share: float | None = None
     path_share: float | None = None
     frames_per_cmd: float | None = None
@@ -152,6 +155,7 @@ def read_run(label: str, store: str) -> Run:
 
     run.profile = read_profile(os.path.join(store, "leader-profile.txt"))
     run.inclusive = read_inclusive(os.path.join(store, "leader-profile-inclusive.txt"))
+    run.chains = js.read_chains(os.path.join(store, "leader-profile-chains.txt"))
     rows = js.read_cpu_samples(os.path.join(store, "cpu-samples.csv"))
     if rows and start is not None and completed:
         before = [r for r in rows if r["time"] <= start]
@@ -223,6 +227,41 @@ def inclusive_tables(runs: list[Run], top: int = 30) -> list[str]:
                 f"| `{symbol.replace('|', '/')}` | `{obj}` | {children / 100 * run.leader_loop * 1000:.1f} "
                 f"| {own / 100 * run.leader_loop * 1000:.1f} |"
             )
+        out.append("")
+    return out
+
+
+def split_tables(runs: list[Run], top: int = 20) -> list[str]:
+    """The call-graph run's loop by phase and its allocator by caller, in
+    microseconds per command: each one's share of the leader thread's
+    samples times that run's loop CPU per command."""
+    out = []
+    for i, run in enumerate(runs, 1):
+        if not run.chains or not run.leader_loop:
+            continue
+        s = js.loop_split(run.chains)
+        us = run.leader_loop * 1000 / 100
+        out += [
+            f"**The leader's loop by phase** (run {i}, {run.label}: each sample by the first TupleSky function it ran "
+            f"below the domain loop's turn; microseconds per command, of its {run.leader_loop * 1000:.0f}; the stacks "
+            f"reached the loop in {s['reached']:.1f}% of the samples)",
+            "",
+            "| Phase | µs per command | Allocator (µs) |",
+            "| --- | --- | --- |",
+        ]
+        for phase, share in s["phases"].most_common(top):
+            out.append(f"| `{phase.replace('|', '/')}` | {share * us:.1f} | {s['phase_alloc'][phase] * us:.1f} |")
+        out += [
+            "",
+            f"**The leader's allocator by caller** (run {i}, {run.label}: {s['alloc'] * us:.1f} µs per command in "
+            "`malloc`, `free`, `realloc` and kin or under Rust's allocator calls, by the innermost TupleSky function "
+            "on the stack)",
+            "",
+            "| Caller | µs per command |",
+            "| --- | --- |",
+        ]
+        for owner, share in s["owners"].most_common(top):
+            out.append(f"| `{owner.replace('|', '/')}` | {share * us:.1f} |")
         out.append("")
     return out
 
@@ -343,6 +382,7 @@ def render(runs: list[Run], title: str) -> str:
         out.append("No base and head ran side by side, so there is no pair to compare.")
         return "\n".join(out) + "\n"
     out.extend(profile_table(runs))
+    out.extend(split_tables(runs))
     out.extend(inclusive_tables(runs))
     return "\n".join(out) + "\n"
 

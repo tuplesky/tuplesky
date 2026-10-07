@@ -635,3 +635,38 @@ class LeaderProfileTests(unittest.TestCase):
 
     def test_no_profile_no_block(self):
         self.assertEqual(js.leader_profile("/nonexistent/leader-profile.txt"), [])
+        self.assertEqual(js.leader_loop_split("/nonexistent/leader-profile-chains.txt"), [])
+
+    def test_folded_stacks_split_by_phase_and_allocator_caller(self):
+        run = "main;tokio::runtime::Runtime::block_on;coordd::serve::Domain<P>::run::{{closure}}"
+        turn = run + ";coordd::serve::Domain<P>::turn::{{closure}} (inlined)"
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "leader-profile-chains.txt")
+            with open(path, "w") as f:
+                f.write(
+                    "leader thread 7, call graph; each symbol, then its stacks\n"
+                    "    40.00%  coordd  [.] coord_consensus::leader::Leader::resend_unvoted\n"
+                    f"40.00% {turn};coord_daemon::voter::Voter<P>::resend_proposals (inlined);"
+                    "coord_consensus::leader::Leader::resend_unvoted\n"
+                    "    30.00%  libc.so.6  [.] malloc\n"
+                    f"20.00% {turn};coord_daemon::voter::Voter<P>::pump_reads;"
+                    "coord_daemon::reads::Reads::due;alloc::vec::Vec<T>::push;__rust_alloc;malloc\n"
+                    f"10.00% {run};coordd::serve::Domain<P>::carry;<alloc::vec::Vec<T> as core::clone::Clone>::clone;malloc\n"
+                    "    20.00%  libc.so.6  [.] 0x00000000001621f8\n"
+                    f"15.00% {turn};coord_daemon::voter::Voter<P>::pump_reads;alloc::raw_vec::finish_grow;"
+                    "alloc::alloc::realloc (inlined);0x00000000001621f8\n"
+                    "5.00% 0x00000000001621f8\n"
+                )
+            split = js.loop_split(js.read_chains(path))
+            text = "\n".join(js.leader_loop_split(path))
+        self.assertAlmostEqual(split["reached"], 85.0)
+        self.assertAlmostEqual(split["alloc"], 45.0)
+        self.assertAlmostEqual(split["phases"]["coord_daemon::voter::Voter<P>::pump_reads"], 35.0)
+        self.assertAlmostEqual(split["owners"]["coord_daemon::reads::Reads::due"], 20.0)
+        # A Rust allocator frame marks an unresolved libc address as allocation.
+        self.assertAlmostEqual(split["owners"]["coord_daemon::voter::Voter<P>::pump_reads"], 15.0)
+        self.assertIn("The stacks reached the loop in 85.0% of 90.0%.", text)
+        self.assertIn("| `coord_daemon::voter::Voter<P>::resend_proposals` | 40.00% | 0.00% |", text)
+        self.assertIn("| `coordd::serve::Domain<P>::carry` | 10.00% | 10.00% |", text)
+        self.assertIn("| `(the stack did not unwind to the loop)` | 5.00% | 0.00% |", text)
+        self.assertIn("| `coord_daemon::reads::Reads::due` | 20.00% |", text)

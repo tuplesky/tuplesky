@@ -132,6 +132,22 @@ class PairTests(unittest.TestCase):
         self.assertIn("(run 2, head, the job's call-graph profile; microseconds per command, of its 500)", text)
         self.assertIn("| `coord_daemon::voter::Voter<P>::pump_reads` | `coordd` | 100.0 | 50.0 |", text)
 
+    def test_a_call_graph_run_is_split_by_phase_per_command(self):
+        turn = "coordd::serve::Domain<P>::run::{{closure}};coordd::serve::Domain<P>::turn::{{closure}}"
+        with open(os.path.join(self.runs[1].store, "leader-profile-chains.txt"), "w") as f:
+            f.write("leader thread 1, call graph\n"
+                    "    60.00%  libc.so.6  [.] malloc\n"
+                    f"60.00% {turn};coord_daemon::voter::Voter<P>::pump_reads;malloc\n"
+                    "    40.00%  coordd  [.] coord_consensus::leader::Leader::resend_unvoted\n"
+                    f"40.00% {turn};coord_daemon::voter::Voter<P>::resend_proposals;"
+                    "coord_consensus::leader::Leader::resend_unvoted\n")
+        runs = [jp.read_run(r.label, r.store) for r in self.runs]
+        text = jp.render(runs, "Paired")
+        # 60% and 40% of the run's 500 µs per command.
+        self.assertIn("| `coord_daemon::voter::Voter<P>::pump_reads` | 300.0 | 300.0 |", text)
+        self.assertIn("| `coord_daemon::voter::Voter<P>::resend_proposals` | 200.0 | 0.0 |", text)
+        self.assertIn("(run 2, head: 300.0 µs per command in", text)
+
     def test_runs_that_are_not_side_by_side_are_not_paired(self):
         text = jp.render([self.runs[0], self.runs[3]], "Paired")
         self.assertIn("no pair to compare", text)

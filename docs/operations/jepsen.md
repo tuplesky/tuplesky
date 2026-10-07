@@ -251,12 +251,16 @@ The `leader-profile` input installs `perf` and profiles the leader's
 domain thread in each TupleSky run: `scripts/ci/leader_profile.py` waits
 for the workload to load the busiest loop, lets it settle for 30 s, takes
 that thread (coordd's main thread) and samples it alone for 20 s at
-999 Hz. A paired job also takes one DWARF call graph, at 250 Hz, on its
-first head run, and `call-graph` takes one on every run: it gives each
-symbol's share with everything it called (`leader-profile-inclusive.txt`),
-which the run's summary and the pair table show, so the loop's time splits
-by caller (reads, resends, the outbox) rather than by the function that
-happened to be running. The summary gives the thread, the window, its samples by object
+999 Hz. A paired job also takes one DWARF call graph, at 250 Hz with
+perf's largest stack copy (64 KiB, since the loop runs below the runtime's
+`block_on`), on its first head run, and `call-graph` takes one on every
+run. It gives each symbol's share with everything it called
+(`leader-profile-inclusive.txt`) and every sample's folded stack
+(`leader-profile-chains.txt`). From the stacks, the run's summary and the
+pair table split the loop by phase, the first TupleSky function a sample
+ran below the domain loop's turn (reads, resends, the outbox), and the
+allocator's samples by the innermost TupleSky function that called it, and
+say how many stacks unwound as far as the loop. The summary gives the thread, the window, its samples by object
 (`coordd`, libc, the kernel) and the symbols that held most of them; the full report is `leader-profile.txt` in the store.
 
 The `voter-workers` input sets each TupleSky voter's tokio worker count

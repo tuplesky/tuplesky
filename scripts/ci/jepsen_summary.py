@@ -802,6 +802,143 @@ def leader_profile_inclusive(path: str, top: int = 30) -> list[str]:
     ]
 
 
+CHAIN_ENTRY = re.compile(r"^\s+([\d.]+)%\s+(\S+)\s+\[[.k]\]\s+(.+?)\s*$")
+CHAIN = re.compile(r"^([\d.]+)%\s+(\S.*)$")
+ALLOCATOR = {
+    "malloc", "free", "cfree", "realloc", "calloc", "__libc_malloc", "__libc_free", "__libc_realloc",
+    "__libc_calloc", "_int_malloc", "_int_free", "_int_realloc", "__rust_alloc", "__rust_dealloc", "__rust_realloc",
+}
+# Rust's way into the allocator: a sample under one of these is the
+# allocator's even where libc's own frames are bare addresses.
+ALLOC_FRAMES = (
+    "__rust_alloc", "__rust_dealloc", "__rust_realloc", "__rdl_alloc", "__rdl_dealloc", "__rdl_realloc",
+    "alloc::alloc::alloc", "alloc::alloc::dealloc", "alloc::alloc::realloc", "as core::alloc::Allocator>",
+)
+LIBRARY = ("alloc::", "core::", "std::", "hashbrown::", "__rust", "__GI_", "__libc", "_int_", "tcache", "checked_request")
+# The domain loop's frames, innermost first: a sample's phase is the first
+# TupleSky function it called below the innermost of them.
+LOOP_FRAMES = ("Domain<P>::turn", "Domain<P>::run")
+
+
+def frame(name: str) -> str:
+    return name.removesuffix(" (inlined)").strip()
+
+
+def read_chains(path: str) -> list:
+    """A call-graph profile's samples as folded stacks: (leaf symbol, share
+    of the thread's samples in percent, frames from the root to the leaf),
+    from `perf report --no-children -g folded,0,caller`; [] without one."""
+    out = []
+    try:
+        with open(path) as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return out
+    leaf = None
+    for line in lines[1:]:
+        m = CHAIN_ENTRY.match(line)
+        if m:
+            leaf = frame(m[3])
+            continue
+        m = CHAIN.match(line)
+        if m and leaf is not None:
+            out.append((leaf, float(m[1]), [frame(f) for f in m[2].split(";")]))
+    return out
+
+
+def allocating(leaf: str, frames: list[str]) -> bool:
+    return leaf.split("@")[0] in ALLOCATOR or any(a in f for f in frames for a in ALLOC_FRAMES)
+
+
+def own(name: str) -> bool:
+    return name.lstrip("<").startswith("coord")
+
+
+def loop_phase(frames: list[str]) -> str | None:
+    """The first TupleSky function below the domain loop's innermost frame,
+    or the loop's own frame when it called none; None when the unwound stack
+    never reached the loop."""
+    for anchor in LOOP_FRAMES:
+        at = [i for i, f in enumerate(frames) if anchor in f]
+        if at:
+            below = [f for f in frames[at[-1] + 1 :] if own(f)]
+            return below[0] if below else frames[at[-1]]
+    return None
+
+
+def alloc_owner(frames: list[str]) -> str:
+    """The innermost TupleSky function on an allocator sample's stack, else
+    its innermost frame outside the allocator and the standard library."""
+    for f in reversed(frames):
+        if own(f):
+            return f
+    for f in reversed(frames):
+        bare = f.lstrip("<")
+        if f.split("@")[0] not in ALLOCATOR and not bare.startswith(LIBRARY) and not bare.startswith("0x"):
+            return f
+    return "(no frame outside the allocator)"
+
+
+def loop_split(chains: list) -> dict:
+    """The thread's samples by the loop's phase and the allocator's samples
+    by their owner, each in percent of the thread's samples."""
+    phases, owners = collections.Counter(), collections.Counter()
+    phase_alloc = collections.Counter()
+    total = reached = alloc = 0.0
+    for leaf, share, frames in chains:
+        total += share
+        phase = loop_phase(frames)
+        if phase is None:
+            phase = "(the stack did not unwind to the loop)"
+        else:
+            reached += share
+        phases[phase] += share
+        if allocating(leaf, frames):
+            alloc += share
+            phase_alloc[phase] += share
+            owners[alloc_owner(frames)] += share
+    return {
+        "total": total,
+        "reached": reached,
+        "alloc": alloc,
+        "phases": phases,
+        "phase_alloc": phase_alloc,
+        "owners": owners,
+    }
+
+
+def leader_loop_split(path: str, top: int = 25) -> list[str]:
+    """The call-graph profile's samples by the loop's phase, and the
+    allocator's by the TupleSky function that called it; [] without one."""
+    chains = read_chains(path)
+    if not chains:
+        return []
+    s = loop_split(chains)
+    out = [
+        "**The leader's domain thread by phase** (a DWARF call graph's samples, each by the first TupleSky "
+        "function it ran below the domain loop's turn; percent of the thread's samples, and the allocator's "
+        f"part. The stacks reached the loop in {s['reached']:.1f}% of {s['total']:.1f}%.)",
+        "",
+        "| Phase | Samples | Allocator |",
+        "| --- | --- | --- |",
+    ]
+    for phase, share in s["phases"].most_common(top):
+        out.append(f"| `{phase.replace('|', '/')}` | {share:.2f}% | {s['phase_alloc'][phase]:.2f}% |")
+    out += [
+        "",
+        f"**The leader's allocator by caller** ({s['alloc']:.2f}% of the thread's samples in "
+        "`malloc`, `free`, `realloc` and kin or under Rust's allocator calls, by the innermost TupleSky function "
+        "on the stack)",
+        "",
+        "| Caller | Samples |",
+        "| --- | --- |",
+    ]
+    for owner, share in s["owners"].most_common(top):
+        out.append(f"| `{owner.replace('|', '/')}` | {share:.2f}% |")
+    out.append("")
+    return out
+
+
 def node_of(op: Op, nodes: list[str]) -> str:
     """Jepsen binds worker thread N to node N mod the node count."""
     m = WORKER.match(op.thread)
@@ -905,6 +1042,7 @@ def summarize(store: str, nodes: list[str], title: str, profile: str | None = No
 
         out.extend(leader_profile(os.path.join(store, "leader-profile.txt")))
         out.extend(leader_profile_inclusive(os.path.join(store, "leader-profile-inclusive.txt")))
+        out.extend(leader_loop_split(os.path.join(store, "leader-profile-chains.txt")))
 
         # The final reads: each worker's operations invoked after the last
         # fault operation (the final heal), with what answered them. A
