@@ -4706,6 +4706,8 @@ fn reads(counts: &coord_daemon::reads::ReadCounts) -> coord_daemon::metrics::Rea
         waited_confirm_ms: counts.waited_confirm_ms,
         waited_index_ms: counts.waited_index_ms,
         waited_ms: counts.waited_ms,
+        snapshots: counts.snapshots,
+        behind: counts.behind,
     }
 }
 

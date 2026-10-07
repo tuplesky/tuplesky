@@ -389,29 +389,61 @@ pub struct RedbReader {
     quarantined: bool,
 }
 
+/// A table of a read transaction, opened.
+type ReadTable = redb::ReadOnlyTable<&'static [u8], &'static [u8]>;
+
 /// A pinned cross-table snapshot.
+///
+/// Each table is opened on its first read and kept for the snapshot's
+/// life (task-d58). Opening one walks the transaction's table tree, and a
+/// snapshot that serves several reads -- a pump's held reads, a view
+/// built from sessions, policy and grants -- used to walk it again for
+/// every point read: 11% of the leader's domain thread in the five-voter
+/// profile. A table opened in a read transaction is that transaction's
+/// state of it, so keeping it changes nothing a read can see.
 pub struct RedbView {
     txn: redb::ReadTransaction,
+    tables: [std::cell::OnceCell<ReadTable>; Collection::ALL.len()],
+}
+
+impl RedbView {
+    fn new(txn: redb::ReadTransaction) -> Self {
+        RedbView {
+            txn,
+            tables: std::array::from_fn(|_| std::cell::OnceCell::new()),
+        }
+    }
+
+    /// `c`'s table, opened once. A failed open is not kept: the next
+    /// read tries again and fails the same way.
+    fn table(&self, c: CollectionId) -> Result<&ReadTable, EngineError> {
+        let collection = collection(c)?;
+        let slot = Collection::ALL
+            .iter()
+            .position(|known| *known == collection)
+            .expect("a registered collection is in the registry");
+        if let Some(table) = self.tables[slot].get() {
+            return Ok(table);
+        }
+        let table = self
+            .txn
+            .open_table(table_definition(collection))
+            .map_err(table_error)?;
+        Ok(self.tables[slot].get_or_init(|| table))
+    }
 }
 
 impl OrderedRead for RedbView {
     fn get(&self, c: CollectionId, key: &[u8]) -> Result<Option<Vec<u8>>, EngineError> {
-        let table = self
-            .txn
-            .open_table(table_definition(collection(c)?))
-            .map_err(table_error)?;
-        Ok(table
+        Ok(self
+            .table(c)?
             .get(key)
             .map_err(storage_error)?
             .map(|g| g.value().to_vec()))
     }
 
     fn scan_page(&self, c: CollectionId, request: &ScanRequest) -> Result<RowPage, EngineError> {
-        let table = self
-            .txn
-            .open_table(table_definition(collection(c)?))
-            .map_err(table_error)?;
-        scan(&table, request)
+        scan(self.table(c)?, request)
     }
 }
 
@@ -426,7 +458,7 @@ impl SnapshotSource for RedbReader {
             redb::TransactionError::Storage(s) => storage_error(s),
             other => EngineError::new(ErrorClass::Busy, redact(&other)),
         })?;
-        Ok(RedbView { txn })
+        Ok(RedbView::new(txn))
     }
 }
 

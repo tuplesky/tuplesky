@@ -380,6 +380,8 @@ fn a_rendered_snapshot_carries_no_secret_or_key_shaped_text() {
                 waited_confirm_ms: 450,
                 waited_index_ms: 2700,
                 waited_ms: 2800,
+                snapshots: 280,
+                behind: 12,
             },
             cpu: Measure::Observed(Cpu {
                 domain: Duration::from_secs(25),

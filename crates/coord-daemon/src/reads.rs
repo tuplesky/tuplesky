@@ -20,7 +20,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use coord_collector::{MonotonicMillis, ReadAnswerV1, ReadOutcomeV1, ReadRefusal, ReadV1};
 use coord_state::{PlanLimits, plan};
 use coord_storage::retry::{self, Admission, RetryBinding};
-use coord_storage::{Persistence, ViewBudget, build_authorized_view};
+use coord_storage::{GatedView, ViewBudget, build_authorized_view};
+use coord_store_api::engine::OrderedRead;
 use coord_types::CommandId;
 use coord_types::ids::{Ballot, ExecutionPosition, ReplicaId};
 use coord_types::logical_v1::LogicalRequest;
@@ -36,6 +37,13 @@ pub const READS_HELD: usize = 4096;
 /// is not going to, or the leader is too far behind its own proposals
 /// to answer sooner than the ordered path would.
 pub const READ_WAIT_MILLIS: u64 = 1_000;
+
+/// How long a confirmation round in flight keeps the next one from
+/// starting, in milliseconds (task-d58). Past it the round is presumed
+/// lost for that purpose only: it still confirms if its answers come.
+/// Well under [`READ_WAIT_MILLIS`], so one lost answer costs a read this
+/// much, not its whole wait.
+pub const ROUND_IN_FLIGHT_MILLIS: u64 = 100;
 
 pub use coord_collector::servable;
 
@@ -102,6 +110,10 @@ pub struct ReadCounts {
     /// Over the reads served: milliseconds from arrival until served,
     /// summed.
     pub waited_ms: u64,
+    /// Snapshots pinned to answer reads (task-d58).
+    pub snapshots: u64,
+    /// Due reads held again because their snapshot was behind them.
+    pub behind: u64,
 }
 
 /// The reads a leader holds, and the rounds that confirm them.
@@ -173,7 +185,17 @@ impl ReadBarrier {
     }
 
     /// The round to start now, if a held read arrived after the last one
-    /// started. Its number is what the caller sends in `ReadConfirm`.
+    /// started and no round of `ballot` is in flight. Its number is what
+    /// the caller sends in `ReadConfirm`.
+    ///
+    /// One round at a time (task-d58). A read covered only by a round
+    /// started after it arrived, a round per arrival was a round per
+    /// read: four requests and four answers at five voters, and a third
+    /// of them superseded before they confirmed. Waiting for the round in
+    /// flight lets every read that arrives meanwhile share the next one,
+    /// and the wait overlaps the read's wait for its index to execute,
+    /// which is the longer. A round in flight past
+    /// [`ROUND_IN_FLIGHT_MILLIS`] does not hold the next one back.
     ///
     /// Where the leader alone is a slow quorum (`slow_size` one, a
     /// single voter), the round confirms as it starts: nothing else's
@@ -189,6 +211,13 @@ impl ReadBarrier {
             .iter()
             .any(|h| h.read.ballot == ballot && h.after_round >= self.next_round);
         if !uncovered {
+            return None;
+        }
+        let in_flight = self.rounds.values().any(|r| {
+            r.ballot == ballot
+                && now.get().saturating_sub(r.started.get()) < ROUND_IN_FLIGHT_MILLIS
+        });
+        if in_flight {
             return None;
         }
         let round = self.next_round;
@@ -308,6 +337,13 @@ impl ReadBarrier {
         self.held.push_front(held);
     }
 
+    /// Count a snapshot pinned to answer the reads due in one pump, and
+    /// how many of them it was behind.
+    pub fn pinned(&mut self, behind: usize) {
+        self.counts.snapshots += 1;
+        self.counts.behind += behind as u64;
+    }
+
     /// Count `held` served at `now`, and how long it waited.
     pub fn served(&mut self, held: &Held, now: MonotonicMillis) {
         let since = |at: Option<MonotonicMillis>| {
@@ -351,8 +387,12 @@ pub enum Evaluated {
     NotServable,
 }
 
-/// Plan `held` over one gated snapshot of `store` at or past its
-/// required position.
+/// Plan `held` over `gated`, a snapshot at or past its required
+/// position.
+///
+/// The snapshot is the caller's, so that every read due in one pump is
+/// planned over one (task-d58): each is due because everything below its
+/// index executed, and a snapshot taken after that covers all of them.
 ///
 /// The same view, planner and encoding the ordered path executes a read
 /// with (`Applier::apply_bound`), so a served answer carries the bytes
@@ -363,11 +403,8 @@ pub enum Evaluated {
 /// ordered path must retire behind, and so is any plan that is not a range result: a refusal is an
 /// outcome the ordered path records, and recording it is not this
 /// path's to skip.
-pub fn evaluate<P: Persistence>(store: &P, held: &Held) -> Evaluated {
+pub fn evaluate<V: OrderedRead>(gated: &GatedView<V>, held: &Held) -> Evaluated {
     let Some(required) = held.required else {
-        return Evaluated::NotYet;
-    };
-    let Ok(gated) = store.reader().snapshot() else {
         return Evaluated::NotYet;
     };
     if gated.meta().frontier.execution_position < required {
@@ -407,7 +444,7 @@ pub fn evaluate<P: Persistence>(store: &P, held: &Held) -> Evaluated {
     }
     let session = request.retry_key.session_id;
     let Ok(view) = build_authorized_view(
-        &gated,
+        gated,
         logical.namespace,
         &session,
         logical,
@@ -686,5 +723,64 @@ mod tests {
         let (due, refused) = barrier.take_due(leading(b, 3), later, |_| true, at(5));
         assert!(due.is_empty());
         assert_eq!(refusal_of(&refused[0].1), Some(ReadRefusal::Expired));
+    }
+
+    /// Reads that arrive while a round is in flight start none of their
+    /// own; the next round, started once that one confirms, covers them
+    /// all, and the round under way answers none of them (task-d58).
+    #[test]
+    fn reads_that_arrive_during_a_round_share_the_next() {
+        let b = ballot(1);
+        let mut barrier = ReadBarrier::new();
+        barrier
+            .admit(Origin::Local, read(1, b, range()), leading(b, 3), T0)
+            .unwrap();
+        let first = barrier.round_to_start(b, 2, T0).unwrap();
+        for seq in 2..=4 {
+            barrier
+                .admit(Origin::Local, read(seq, b, range()), leading(b, 4), T0)
+                .unwrap();
+            assert_eq!(
+                barrier.round_to_start(b, 2, T0),
+                None,
+                "one round in flight at a time"
+            );
+        }
+        barrier.on_confirmed(ReplicaId([2; 16]), b, first, 2);
+        let (due, _) = barrier.take_due(leading(b, 4), T0, |_| true, at(5));
+        assert_eq!(due.len(), 1, "the round under way answers only what preceded it");
+        assert_eq!(due[0].read.request.retry_key.request_sequence.get(), 1);
+        let second = barrier.round_to_start(b, 2, T0).unwrap();
+        barrier.on_confirmed(ReplicaId([3; 16]), b, second, 2);
+        let (due, _) = barrier.take_due(leading(b, 4), T0, |_| true, at(5));
+        assert_eq!(due.len(), 3, "the next round covers every read that waited");
+        assert_eq!(barrier.counts.rounds, 2);
+    }
+
+    /// A round that has not confirmed in [`ROUND_IN_FLIGHT_MILLIS`] does
+    /// not hold the next one back: a lost answer costs a read that long,
+    /// not its whole wait.
+    #[test]
+    fn a_round_in_flight_too_long_does_not_hold_the_next() {
+        let b = ballot(1);
+        let mut barrier = ReadBarrier::new();
+        barrier
+            .admit(Origin::Local, read(1, b, range()), leading(b, 3), T0)
+            .unwrap();
+        let first = barrier.round_to_start(b, 2, T0).unwrap();
+        let soon = T0.plus(ROUND_IN_FLIGHT_MILLIS - 1);
+        barrier
+            .admit(Origin::Local, read(2, b, range()), leading(b, 4), soon)
+            .unwrap();
+        assert_eq!(barrier.round_to_start(b, 2, soon), None);
+        let late = T0.plus(ROUND_IN_FLIGHT_MILLIS);
+        let second = barrier.round_to_start(b, 2, late).unwrap();
+        assert!(second > first);
+        // The first still confirms if its answer comes, and covers only
+        // the read before it.
+        barrier.on_confirmed(ReplicaId([2; 16]), b, first, 2);
+        let (due, _) = barrier.take_due(leading(b, 4), late, |_| true, at(5));
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].read.request.retry_key.request_sequence.get(), 1);
     }
 }
