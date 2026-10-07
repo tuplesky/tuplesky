@@ -10123,3 +10123,32 @@ pairs of #150's build against this one, alternated:
 - Throughput and get p99 moved inside the pairs' spread on this host,
   whose p99.9 is half a second either way. The runner pair, with the
   leader's read p99, is the acceptance.
+
+On the Jepsen runner, three pairs on one AMD EPYC 7763 in one job
+([37680512691](https://github.com/tuplesky/tuplesky/actions/runs/37680512691)),
+replay, throughput, 30 clients, 120 s, stores on disk, against task-d61's
+build, this less the base:
+
+| | mean | range over the three pairs |
+| --- | --- | --- |
+| leader's loop CPU per command | -0.078 ms (-9%) | -0.084 to -0.067 |
+| leader's excess over a follower | -0.065 ms (-29%) | -0.081 to -0.056 |
+| followers' loop CPU per command | -0.013 ms | -0.026 to -0.003 |
+| voters' CPU per operation | -0.17 ms (-4%) | -0.19 to -0.13 |
+| `ok`/s | +21.3 (+5%) | +15.9 to +26.8 |
+| read p99 | -1 ms | -4 to +6 |
+
+- `Leader::resend_unvoted` went from 56 µs per command in the profile
+  to under its 0.2% cut: at about 333 commands a second on the leader and
+  four calls a second, about 4 to 5 ms a call before.
+- A call looks at 20 to 22 proposals and takes 0.09 to 0.11 ms (the
+  longest 2.2 to 4.1 ms). Every call ends with the commit-frontier
+  announcement (`announce_committed`, task-d09), a `Committed` frame
+  encoded and published to each voter, and that, not the walk, is most of
+  its time; the longest calls are the ones that also re-sent.
+- The leader's read p99 did not move. A 4 to 5 ms stall four times a
+  second is about 2% of the loop's time, under a p99 near 80 ms.
+- A leader-only cut of 78 µs per command raised `ok`/s by 5%: the
+  leader's loop is on every operation's path in this closed loop, so a
+  microsecond of the leader's is worth more than its share of the
+  cluster's CPU.
