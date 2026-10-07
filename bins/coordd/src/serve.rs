@@ -944,6 +944,8 @@ pub struct Domain<P: Persistence> {
     /// When this leader last sent its voters the proposals they had not
     /// voted on (task-d07).
     resent: Option<std::time::Instant>,
+    /// How long those calls took, in all and the longest (task-d59).
+    resend_time: (std::time::Duration, std::time::Duration),
     /// When this voter's campaign last asked for the report pages it
     /// lacks (task-d28).
     pages_asked: Option<std::time::Instant>,
@@ -1576,6 +1578,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             expiry: None,
             asked: None,
             resent: None,
+            resend_time: Default::default(),
             pages_asked: None,
             parked: coord_daemon::parked::Parked::new(PARKED_HOLD, PARKED_EVIDENCE),
             settle_cursor: 0,
@@ -1704,7 +1707,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             busy,
             uptime: now.saturating_duration_since(self.started),
             recent,
-            resends: resends(&voter.resend_counts()),
+            resends: resends(&voter.resend_counts(), self.resend_time),
             established_fast: voter.node().established.fast,
             established_slow: voter.node().established.slow,
             reads: reads(&voter.read_counts()),
@@ -2907,7 +2910,11 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 .is_none_or(|at| now.duration_since(at) >= RESEND_INTERVAL)
             {
                 self.resent = Some(now);
-                out.absorb(voter.resend_proposals()?);
+                let sends = voter.resend_proposals();
+                let took = now.elapsed();
+                self.resend_time.0 += took;
+                self.resend_time.1 = self.resend_time.1.max(took);
+                out.absorb(sends?);
             }
         } else {
             self.resent = None;
@@ -4776,8 +4783,15 @@ fn say_fenced_stop(what: &str) {
 }
 
 /// The snapshot's reading of a leader's re-send counts (task-d49).
-fn resends(counts: &coord_consensus::ResendCounts) -> coord_daemon::metrics::Resends {
+fn resends(
+    counts: &coord_consensus::ResendCounts,
+    (time, longest): (std::time::Duration, std::time::Duration),
+) -> coord_daemon::metrics::Resends {
     coord_daemon::metrics::Resends {
+        calls: counts.calls,
+        scanned: counts.scanned,
+        time,
+        longest,
         deferred: counts.deferred,
         decided: counts.decided,
         acknowledged: counts.acknowledged,

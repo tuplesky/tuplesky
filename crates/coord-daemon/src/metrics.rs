@@ -779,6 +779,20 @@ pub struct Resends {
     pub handed_off: u64,
     /// Votes refused as duplicates, fast or slow.
     pub duplicate_votes: u64,
+    /// Calls of the leader's re-send timer that looked for something to
+    /// send (task-d59), every 250 ms while it leads.
+    #[serde(default)]
+    pub calls: u64,
+    /// Proposals those calls looked at, over every voter (task-d59).
+    #[serde(default)]
+    pub scanned: u64,
+    /// The domain loop's time in those calls (task-d59), in all: the
+    /// loop does nothing else meanwhile.
+    #[serde(default)]
+    pub time: Duration,
+    /// The longest of those calls (task-d59).
+    #[serde(default)]
+    pub longest: Duration,
 }
 
 impl Resends {

@@ -84,6 +84,21 @@ class ReduceTests(unittest.TestCase):
         self.assertAlmostEqual(reading["resent_per_command"], 0.06)
         self.assertAlmostEqual(reading["duplicate_votes_per_command"], 0.04)
         self.assertNotIn("resent_per_command", cost.per_command("n1", snapshot()))
+        self.assertNotIn("resend_ms_per_call", reading)
+
+    def test_a_resend_call_is_read_per_call_when_timed(self):
+        snap = snapshot()
+        snap["cost"]["Observed"]["resends"] = {
+            "deferred": 0, "decided": 0, "acknowledged": 0, "unanswered": 0,
+            "lost": 0, "late": 0, "handed_off": 0, "duplicate_votes": 0,
+            "calls": 40, "scanned": 200,
+            "time": {"secs": 0, "nanos": 2_000_000},
+            "longest": {"secs": 0, "nanos": 300_000},
+        }
+        reading = cost.per_command("n1", snap)
+        self.assertAlmostEqual(reading["resend_ms_per_call"], 0.05)
+        self.assertAlmostEqual(reading["resend_longest_ms"], 0.3)
+        self.assertAlmostEqual(reading["resend_scanned_per_call"], 5.0)
 
     def test_the_fast_path_share_is_read_when_reported(self):
         snap = snapshot()
