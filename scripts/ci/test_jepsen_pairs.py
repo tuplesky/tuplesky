@@ -12,7 +12,7 @@ def op(ts, worker, kind, f="read"):
     return f"2026-09-27 {ts}{{GMT}}\tINFO\t[jepsen worker {worker}] jepsen.print: {worker}\t:{kind}\t:{f}\tnil\n"
 
 
-def metrics(served, executed, loop_s, process_s):
+def metrics(served, executed, loop_s, process_s, streams=None):
     cost = {
         "executed": executed,
         "busy": {"secs": 1, "nanos": 0},
@@ -21,6 +21,14 @@ def metrics(served, executed, loop_s, process_s):
         "reads": {"served": served, "refused": 0, "rounds": served, "confirmed": served, "waited_ms": 0},
         "cpu": {"Observed": {"domain": {"secs": 0, "nanos": int(loop_s * 1e9)}, "process": {"secs": process_s, "nanos": 0}}},
     }
+    if streams is not None:
+        cost.update(
+            established_fast=100,
+            established_slow=900,
+            fast_path={"missed_path": 810, "missed_deps": 90},
+            traffic={"Observed": {"sent_frames": 10000, "sent_streams": streams, "sent_lost": 64 if streams < 5000 else 2,
+                                  "sent_lost_streams": 1 if streams < 5000 else 2, "datagrams_sent": 5000}},
+        )
     return "metrics " + json.dumps({"stages": [], "cost": {"Observed": cost}}) + "\n"
 
 
@@ -98,6 +106,31 @@ class PairTests(unittest.TestCase):
         # Base: 20% of 0.6 and 0.7 ms, 130 µs; head: 10% of 0.5 ms, 50 µs.
         self.assertIn("| `coord_consensus::leader::Leader::resend_unvoted` | `coordd` | 130.0 | 50.0 | -80.0 |", text)
         self.assertIn("| `malloc` | `libc.so.6` | 32.5 | 25.0 | -7.5 |", text)
+
+    def test_traffic_and_fast_path_by_pair(self):
+        root = self.tmp.name
+        runs = []
+        for name, label, streams in (("t1", "base", 10000), ("t2", "head", 3100)):
+            path = store(root, name, 50, 0.6, 2)
+            with open(os.path.join(path, "n1", "coordd.log"), "w") as f:
+                f.write(metrics(4, 1000, 0.6, 2, streams))
+            runs.append(jp.read_run(label, path))
+        self.assertAlmostEqual(runs[1].frames_per_stream, 10000 / 3100)
+        text = jp.render(runs, "Paired")
+        self.assertIn("| 1 | base | 10.0% | 90.0% | 10.00 | 10.00 | 1.00 | 5.00 | 2 | 2 |", text)
+        self.assertIn("| 2 | head | 10.0% | 90.0% | 10.00 | 3.10 | 3.23 | 5.00 | 64 | 1 |", text)
+        self.assertIn("| 1 | +0.0% (+0.0%) | +0.0% (+0.0%) | +0.00 (+0.0%) | -6.90 (-69.0%) | +2.23 (+222.6%) "
+                      "| +0.00 (+0.0%) | +62 (+3100.0%) | -1 (-50.0%) |", text)
+
+    def test_a_call_graph_run_is_costed_with_its_callees(self):
+        with open(os.path.join(self.runs[1].store, "leader-profile-inclusive.txt"), "w") as f:
+            f.write("leader thread 1, call graph\n"
+                    "    60.00%     2.00%  coordd  [.] coordd::serve::Domain<P>::run\n"
+                    "    20.00%    10.00%  coordd  [.] coord_daemon::voter::Voter<P>::pump_reads\n")
+        runs = [jp.read_run(r.label, r.store) for r in self.runs]
+        text = jp.render(runs, "Paired")
+        self.assertIn("(run 2, head, the job's call-graph profile; microseconds per command, of its 500)", text)
+        self.assertIn("| `coord_daemon::voter::Voter<P>::pump_reads` | `coordd` | 100.0 | 50.0 |", text)
 
     def test_runs_that_are_not_side_by_side_are_not_paired(self):
         text = jp.render([self.runs[0], self.runs[3]], "Paired")

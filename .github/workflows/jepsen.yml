@@ -82,9 +82,9 @@ on:
         description: "How many base and head pairs, when pair-base is set (the order alternates from pair to pair)"
         default: "3"
       leader-profile:
-        description: "Profile the TupleSky leader's domain thread with perf for 20 s in each run's workload, into its summary"
+        description: "Profile the TupleSky leader's domain thread with perf for 20 s in each run's workload, into its summary: true (flat; a paired job also takes one call graph, on its first head run), call-graph (DWARF call graphs at 250 Hz), or false"
         type: choice
-        options: ["false", "true"]
+        options: ["false", "true", "call-graph"]
         default: "false"
       swiftpaxos:
         description: "Faults for the SwiftPaxos baseline (pause, partition, packet; kill ends its cluster), none, or skip to not run it; empty for the scenario's"
@@ -226,7 +226,7 @@ jobs:
             cp "$RUNNER_TEMP/head-bin/$b" "$GITHUB_WORKSPACE/tuplesky/target/release/" 2>/dev/null || true
           done
       - name: Install perf
-        if: env.IN_LEADER_PROFILE == 'true'
+        if: env.IN_LEADER_PROFILE != 'false'
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq --no-install-recommends "linux-tools-$(uname -r)" linux-tools-common \
@@ -313,18 +313,22 @@ jobs:
             ${wan[@]+"${wan[@]}"}
             ${workers[@]+"${workers[@]}"})
           ci="$GITHUB_WORKSPACE/tuplesky/scripts/ci"
-          # One test with the binaries in $1, its samples and profile in $2.
+          # One test with the binaries in $1, its samples and profile in $2,
+          # a call graph when $3 is "graph".
           run_one() {
-            local bin=$1 dir=$2
-            shift 2
+            local bin=$1 dir=$2 graph=$3
+            shift 3
             mkdir -p "$dir"
             export JEPSEN_CPU_SAMPLES="$dir/cpu-samples.csv"
-            if [ "$IN_LEADER_PROFILE" = true ]; then export JEPSEN_LEADER_PROFILE="$dir/leader-profile.txt"; fi
+            unset JEPSEN_LEADER_PROFILE JEPSEN_LEADER_CALLGRAPH
+            if [ "$IN_LEADER_PROFILE" != false ]; then export JEPSEN_LEADER_PROFILE="$dir/leader-profile.txt"; fi
+            if [ "$IN_LEADER_PROFILE" != false ] && [ "$graph" = graph ]; then export JEPSEN_LEADER_CALLGRAPH=1; fi
             "$ci/jepsen_bounded.sh" $((TIME_LIMIT + 1200)) "$RUNNER_TEMP/cluster/nodes" -- \
               "${common[@]}" --bin-dir "$bin" "$@"
           }
           if [ -z "$IN_PAIR_BASE" ]; then
-            run_one "$GITHUB_WORKSPACE/tuplesky/target/release" "$RUNNER_TEMP"
+            graph=flat; if [ "$IN_LEADER_PROFILE" = call-graph ]; then graph=graph; fi
+            run_one "$GITHUB_WORKSPACE/tuplesky/target/release" "$RUNNER_TEMP" "$graph"
             exit $?
           fi
           # Paired: base and head in turn on this runner, the order
@@ -349,11 +353,15 @@ jobs:
             for side in $order; do
               n=$((n + 1))
               dir="$RUNNER_TEMP/run-$n"
+              # One call graph a job, on the first head run.
+              graph=flat
+              if [ "$side" = head ] && [ "$i" = 1 ]; then graph=graph; fi
+              if [ "$IN_LEADER_PROFILE" = call-graph ]; then graph=graph; fi
               if [ "$side" = base ]; then
-                run_one "$base_bin" "$dir" ${base_args[@]+"${base_args[@]}"} || rc=$?
+                run_one "$base_bin" "$dir" "$graph" ${base_args[@]+"${base_args[@]}"} || rc=$?
                 name=$base_name
               else
-                run_one "$head_bin" "$dir" || rc=$?
+                run_one "$head_bin" "$dir" "$graph" || rc=$?
                 name=$head_sha
               fi
               store=$(readlink -f store/latest || true)
@@ -362,7 +370,7 @@ jobs:
                 continue
               fi
               previous=$store
-              cp "$dir"/cpu-samples* "$dir"/leader-profile.txt "$store"/ 2>/dev/null || true
+              cp "$dir"/cpu-samples* "$dir"/leader-profile*.txt "$store"/ 2>/dev/null || true
               for db in "$store"/n*/domain.redb; do
                 [ -e "$db" ] || continue
                 cp "$db" "$RUNNER_TEMP/scratch.redb"
@@ -402,7 +410,7 @@ jobs:
         # voter, in the job summary; each voter's last 400 lines follow here.
         run: |
           if [ -d jepsen/tuplesky/store/latest ]; then
-            cp "$RUNNER_TEMP"/cpu-samples* "$RUNNER_TEMP"/leader-profile.txt jepsen/tuplesky/store/latest/ 2>/dev/null || true
+            cp "$RUNNER_TEMP"/cpu-samples* "$RUNNER_TEMP"/leader-profile*.txt jepsen/tuplesky/store/latest/ 2>/dev/null || true
             python3 tuplesky/scripts/ci/jepsen_summary.py jepsen/tuplesky/store/latest \
               --nodes-file "$RUNNER_TEMP/cluster/nodes" --profile "$PROFILE" \
               --title "TupleSky: $WORKLOAD, $NEMESIS$TITLE_SUFFIX$STORE_SUFFIX$PROFILE_SUFFIX$CHECKPOINT_SUFFIX${IN_VOTER_WORKERS:+, $IN_VOTER_WORKERS tokio workers per voter}"
@@ -410,7 +418,10 @@ jobs:
             echo "No Jepsen store: the test did not start." >> "$GITHUB_STEP_SUMMARY"
           fi
       - name: Show each voter's log
-        if: always()
+        # Not for a paired job: the API returns only a log's last 5000
+        # lines, which the runs' summaries and the pair table need; every
+        # run's voter logs are in the uploaded store.
+        if: always() && env.IN_PAIR_BASE == ''
         # Jepsen copies each voter's coordd.log into the test's store before
         # tearing the cluster down. Printed here, without the periodic
         # metrics lines, so a run can be read from its job log alone.

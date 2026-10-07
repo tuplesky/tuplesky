@@ -170,6 +170,10 @@ class Voter:
     # (took_ms, loop_ms or None before task-d51), and the failed ones.
     checkpoints: list = field(default_factory=list)
     checkpoints_failed: int = 0
+    # The longest the oldest unordered pre-acceptance had been held, over
+    # every `metrics` line of every boot (task-d62), in seconds, with the
+    # line's uptime; None before task-d62.
+    oldest_unordered: tuple[float, float] | None = None
 
 
 @dataclass
@@ -210,6 +214,15 @@ class Cost:
     # theirs had not reached their position (task-d58); None before it.
     snapshots: int | None = None
     behind: int | None = None
+    # task-d62's counts, as the line reports them (empty before it): why
+    # each slow command missed the fast path and the acknowledgements sent,
+    # the pre-acceptances the leader has not ordered, learned to released
+    # on the leader, and the peer plane's traffic (None where it is not
+    # instrumented).
+    fast_path: dict = field(default_factory=dict)
+    unordered: dict = field(default_factory=dict)
+    release: dict = field(default_factory=dict)
+    traffic: dict | None = None
 
 
 def seconds(d) -> float:
@@ -241,6 +254,10 @@ def parse_cost(snapshot: dict) -> Cost | None:
         confirmed=reads.get("confirmed", 0),
         snapshots=reads.get("snapshots"),
         behind=reads.get("behind"),
+        fast_path=cost.get("fast_path") or {},
+        unordered=cost.get("unordered") or {},
+        release=cost.get("release") or {},
+        traffic=(cost.get("traffic") or {}).get("Observed") if isinstance(cost.get("traffic"), dict) else None,
         fast=cost.get("established_fast", 0),
         slow=cost.get("established_slow", 0),
         cpu=(seconds(cpu.get("domain")), seconds(cpu.get("process"))) if isinstance(cpu, dict) else None,
@@ -349,6 +366,10 @@ def parse_voter(lines) -> Voter:
                 snapshot = json.loads(line[len("metrics "):])
                 v.stages = parse_stages(snapshot)
                 v.cost = parse_cost(snapshot)
+                if v.cost and v.cost.unordered:
+                    held = seconds(v.cost.unordered.get("oldest"))
+                    if v.oldest_unordered is None or held > v.oldest_unordered[0]:
+                        v.oldest_unordered = (held, v.cost.uptime)
                 observed = (snapshot.get("frontiers") or {}).get("Observed")
                 if isinstance(observed, dict):
                     v.frontiers = observed
@@ -695,6 +716,92 @@ def leader_profile(path: str, top: int = 30) -> list[str]:
     return out
 
 
+def fast_path_table(voters: dict) -> list[str]:
+    """task-d62's counts per voter, from its last `metrics` line: why its
+    slow commands missed the fast path (the reasons must add up to its
+    slow ones), its acknowledgements, the pre-acceptances the leader has
+    not ordered, learned to released on the leader, and its peer traffic.
+    A run in which no voter established anything on the fast path is said
+    as a finding. [] before task-d62."""
+    costs = [(node, v) for node, v in voters.items() if v.cost and v.cost.fast_path]
+    if not costs:
+        return []
+    out = []
+    fast = sum(v.cost.fast for _, v in costs)
+    slow = sum(v.cost.slow for _, v in costs)
+    if slow and not fast:
+        out += [f"**Finding: no voter established a command on the fast path** ({slow} slow, 0 fast).", ""]
+    out += [
+        "**Fast path and traffic** (task-d62's counts, each voter's last boot, from the same `metrics` line; a slow "
+        "command's reason is read from the voter's own votes when it executes, so the reasons add up to its slow "
+        "commands; acknowledgements under a marker are those it sent while its path log held a reordered entry; "
+        "unordered are its pre-acceptances the leader has not ordered, the reordered ones those it ordered a later "
+        "command past, held is the oldest of those, now and at most over the run; learned to released is the "
+        "leader's wait for predecessors, the group's close and the projection's commit, per command; traffic is "
+        "the peer plane's, sent, per executed command)",
+        "",
+        "| Node | Fast | Slow | Path / deps / missing / slow first / unclassified | Reasons add up | Acks (under a marker) "
+        "| Unordered (reordered) | Held now / at most (s) | Own path log | Learned to released, ms: predecessors / group / projection "
+        "| Frames / streams / datagrams per command | Frames per stream | Lost frames (streams) |",
+        "| --- " * 13 + "|",
+    ]
+    for node, v in costs:
+        c, fp, un = v.cost, v.cost.fast_path, v.cost.unordered
+        reasons = [fp.get(k, 0) for k in ("missed_path", "missed_deps", "missed_missing", "missed_slow_first", "missed_unclassified")]
+        adds = "yes" if sum(reasons) == c.slow else f"**no** ({sum(reasons)} of {c.slow})"
+        acks = f"{fp.get('acks', 0)} ({fp.get('acks_reordered', 0)})"
+        held_now = seconds(un.get("oldest"))
+        held_max = v.oldest_unordered[0] if v.oldest_unordered else held_now
+        rel = c.release
+        n = rel.get("commands", 0)
+        released = (
+            " / ".join(f"{seconds(rel.get(k)) * 1000 / n:.2f}" for k in ("predecessors", "group", "projection")) if n else "-"
+        )
+        t = c.traffic
+        if t and c.executed:
+            per = " / ".join(f"{t.get(k, 0) / c.executed:.2f}" for k in ("sent_frames", "sent_streams", "datagrams_sent"))
+            per_stream = f"{t['sent_frames'] / t['sent_streams']:.2f}" if t.get("sent_streams") else "-"
+            lost = f"{t.get('sent_lost', 0)} ({t.get('sent_lost_streams', 0)})"
+        else:
+            per, per_stream, lost = "-", "-", "-"
+        out.append(
+            f"| {node} | {c.fast} | {c.slow} | {' / '.join(str(r) for r in reasons)} | {adds} | {acks} "
+            f"| {un.get('pending', 0)} ({un.get('reordered', 0)}) | {held_now:.1f} / {held_max:.1f} | {un.get('leader_log', 0)} "
+            f"| {released} | {per} | {per_stream} | {lost} |"
+        )
+    out.append("")
+    return out
+
+
+def leader_profile_inclusive(path: str, top: int = 30) -> list[str]:
+    """A call-graph profile's symbols by their share with everything they
+    called, then their own, in a folded block; [] without one."""
+    try:
+        with open(path) as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return []
+    rows = []
+    for line in lines[1:]:
+        cells = line.split()
+        if len(cells) >= 4 and cells[0].endswith("%") and cells[1].endswith("%"):
+            symbol = " ".join(cells[4:] if cells[3] in ("[.]", "[k]") else cells[3:])
+            rows.append(f"| {cells[0]} | {cells[1]} | `{cells[2]}` | `{symbol.replace('|', '/')}` |")
+    if not rows:
+        return []
+    return [
+        f"<details><summary>The leader's domain thread by symbol with what it called, the {min(top, len(rows))} "
+        "largest (a DWARF call graph)</summary>",
+        "",
+        "| With callees | Own | Object | Symbol |",
+        "| --- | --- | --- | --- |",
+        *rows[:top],
+        "",
+        "</details>",
+        "",
+    ]
+
+
 def node_of(op: Op, nodes: list[str]) -> str:
     """Jepsen binds worker thread N to node N mod the node count."""
     m = WORKER.match(op.thread)
@@ -797,6 +904,7 @@ def summarize(store: str, nodes: list[str], title: str, profile: str | None = No
                 out.extend(leader_loop(rows, threads, start, until, completed))
 
         out.extend(leader_profile(os.path.join(store, "leader-profile.txt")))
+        out.extend(leader_profile_inclusive(os.path.join(store, "leader-profile-inclusive.txt")))
 
         # The final reads: each worker's operations invoked after the last
         # fault operation (the final heal), with what answered them. A
@@ -1075,6 +1183,7 @@ def summarize(store: str, nodes: list[str], title: str, profile: str | None = No
                         row += f" {c.snapshots} | {per_read} | {c.behind or 0} |"
                 out.append(row)
             out.append("")
+            out.extend(fast_path_table(voters))
     return "\n".join(out) + "\n"
 
 

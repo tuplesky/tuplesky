@@ -1,4 +1,5 @@
 """Tests for the Jepsen job summary."""
+import json
 import os
 import tempfile
 import unittest
@@ -554,6 +555,58 @@ class LeaderLoopTests(unittest.TestCase):
 
 
 
+def d62_metrics(fast, slow, reasons, oldest_s, uptime_s, traffic=True):
+    path, deps, missing, slow_first, unclassified = reasons
+    cost = {
+        "executed": 1000,
+        "busy": {"secs": 1, "nanos": 0},
+        "uptime": {"secs": uptime_s, "nanos": 0},
+        "recent": {"Unavailable": "NotInstrumented"},
+        "established_fast": fast,
+        "established_slow": slow,
+        "reads": {"served": 0, "refused": 0, "rounds": 0, "confirmed": 0, "waited_ms": 0},
+        "fast_path": {"missed_path": path, "missed_deps": deps, "missed_missing": missing,
+                      "missed_slow_first": slow_first, "missed_unclassified": unclassified,
+                      "acks": 900, "acks_reordered": 180},
+        "unordered": {"pending": 3, "reordered": 1, "oldest": {"secs": oldest_s, "nanos": 0}, "leader_log": 7},
+        "release": {"commands": 1000, "predecessors": {"secs": 1, "nanos": 760000000},
+                    "group": {"secs": 0, "nanos": 900000000}, "projection": {"secs": 7, "nanos": 800000000}},
+        "traffic": {"Observed": {"sent_frames": 9960, "sent_bytes": 1, "sent_streams": 3100, "sent_lost": 64,
+                                 "sent_lost_streams": 1, "received_frames": 1, "received_bytes": 1,
+                                 "received_streams": 1, "datagrams_sent": 5090}}
+        if traffic else {"Unavailable": "NotInstrumented"},
+    }
+    return "metrics " + json.dumps({"stages": [], "cost": {"Observed": cost}}) + "\n"
+
+
+class FastPathTests(unittest.TestCase):
+    def summary(self, n1, n2):
+        with tempfile.TemporaryDirectory() as store:
+            for name, text in (("jepsen.log", LOG), ("results.edn", RESULTS)):
+                with open(os.path.join(store, name), "w") as f:
+                    f.write(text)
+            for node, text in (("n1", n1), ("n2", n2)):
+                os.makedirs(os.path.join(store, node))
+                with open(os.path.join(store, node, "coordd.log"), "w") as f:
+                    f.write(text)
+            return js.summarize(store, ["n1", "n2"], "Jepsen")
+
+    def test_reasons_held_release_and_traffic(self):
+        text = self.summary(
+            d62_metrics(40, 960, (900, 20, 30, 10, 0), 12, 60) + d62_metrics(40, 960, (900, 20, 30, 10, 0), 2, 120),
+            d62_metrics(0, 1000, (900, 20, 30, 10, 0), 0, 120, traffic=False),
+        )
+        self.assertIn("| n1 | 40 | 960 | 900 / 20 / 30 / 10 / 0 | yes | 900 (180) | 3 (1) | 2.0 / 12.0 | 7 "
+                      "| 1.76 / 0.90 / 7.80 | 9.96 / 3.10 / 5.09 | 3.21 | 64 (1) |", text)
+        self.assertIn("| n2 | 0 | 1000 | 900 / 20 / 30 / 10 / 0 | **no** (960 of 1000) |", text)
+        self.assertNotIn("no voter established", text)
+
+    def test_a_run_with_no_fast_decision_is_a_finding(self):
+        line = d62_metrics(0, 960, (900, 20, 30, 10, 0), 0, 60)
+        self.assertIn("**Finding: no voter established a command on the fast path** (1920 slow, 0 fast).",
+                      self.summary(line, line))
+
+
 class LeaderProfileTests(unittest.TestCase):
     def test_the_header_objects_and_symbols(self):
         with tempfile.TemporaryDirectory() as d:
@@ -570,6 +623,15 @@ class LeaderProfileTests(unittest.TestCase):
         self.assertIn("Its samples by object: coordd 61.20%, libc.so.6 22.10%.", text)
         self.assertIn("| 7.17% | `coordd` | `coord_consensus::leader::Leader::resend_unvoted` |", text)
         self.assertIn("| 1.81% | `[kernel.kallsyms]` | `irqentry_exit_to_user_mode` |", text)
+
+    def test_a_call_graph_gives_shares_with_callees(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "leader-profile-inclusive.txt")
+            with open(path, "w") as f:
+                f.write("leader thread 7, call graph\n    60.00%     2.00%  coordd  [.] coordd::serve::Domain<P>::run\n")
+            text = "\n".join(js.leader_profile_inclusive(path))
+        self.assertIn("| 60.00% | 2.00% | `coordd` | `coordd::serve::Domain<P>::run` |", text)
+        self.assertEqual(js.leader_profile_inclusive(os.path.join(d, "none.txt")), [])
 
     def test_no_profile_no_block(self):
         self.assertEqual(js.leader_profile("/nonexistent/leader-profile.txt"), [])

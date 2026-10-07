@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Profile the leader's domain loop thread while a Jepsen test runs.
 
-    scripts/ci/leader_profile.py --out FILE [--settle SECONDS] [--seconds SECONDS]
+    scripts/ci/leader_profile.py --out FILE [--settle SECONDS] [--seconds SECONDS] [--call-graph]
 
 Polls every `coordd`'s main thread (where the domain loop runs, in the
 runtime's `block_on`) once a second from the host's `/proc`. Once the
@@ -13,6 +13,13 @@ held it, by their own share of the samples, to FILE, under a header naming
 the thread and the window. The containers share the host's kernel, so the
 host's `perf` sees their threads, and it reads `coordd`'s symbols through
 the process's own mount namespace.
+
+With --call-graph, `perf record` unwinds each sample's stack from DWARF
+(the release build carries debug line tables) at 250 Hz rather than 999,
+since each sample copies the stack; FILE gets the same flat report, and
+FILE with -inclusive before its extension gets each symbol's share with
+everything it called (`perf report --children`), which splits the loop's
+time by caller rather than by the function that happened to be running.
 
 Exits 0 whatever happens: a profile that cannot be taken (no `perf`, no
 permission, no load before SIGTERM) leaves FILE saying why, and the test
@@ -59,8 +66,11 @@ def main() -> int:
     parser.add_argument("--out", required=True)
     parser.add_argument("--settle", type=float, default=30.0)
     parser.add_argument("--seconds", type=float, default=20.0)
-    parser.add_argument("--frequency", type=int, default=999)
+    parser.add_argument("--frequency", type=int)
+    parser.add_argument("--call-graph", action="store_true")
     args = parser.parse_args()
+    if args.frequency is None:
+        args.frequency = 250 if args.call_graph else 999
 
     stopping = False
 
@@ -105,8 +115,9 @@ def main() -> int:
     started = now()
     data = args.out + ".data"
     record = subprocess.run(
-        ["sudo", "-n", "perf", "record", "-F", str(args.frequency), "-t", str(pid), "-o", data,
-         "--", "sleep", str(args.seconds)],
+        ["sudo", "-n", "perf", "record", "-F", str(args.frequency), "-t", str(pid), "-o", data]
+        + (["--call-graph", "dwarf"] if args.call_graph else [])
+        + ["--", "sleep", str(args.seconds)],
         capture_output=True,
         text=True,
     )
@@ -114,10 +125,10 @@ def main() -> int:
     if record.returncode != 0:
         write(f"No profile: perf record failed ({record.returncode}): {record.stderr.strip()[-500:]}\n")
         return 0
-    def report(fields: str, limit: str) -> tuple[list[str], str]:
+    def report(fields: str, limit: str, children: bool = False) -> tuple[list[str], str]:
         done = subprocess.run(
-            ["sudo", "-n", "perf", "report", "-i", data, "--stdio", "--no-children", "-F", fields,
-             "--percent-limit", limit],
+            ["sudo", "-n", "perf", "report", "-i", data, "--stdio", "-F", fields, "--percent-limit", limit]
+            + (["--children", "-g", "none"] if children else ["--no-children"]),
             capture_output=True,
             text=True,
         )
@@ -128,9 +139,18 @@ def main() -> int:
     symbols, samples = report("overhead,dso,sym", "0.2")
     objects, _ = report("overhead,dso", "0")
     by_object = ", ".join(f"{' '.join(line.split()[1:])} {line.split()[0]}" for line in objects[:6] if line.split())
-    write(
+    header = (
         f"leader thread {pid}, {used / span:.2f} of a core over the {span} s before, sampled at "
-        f"{args.frequency} Hz from {started} to {ended} UTC; {samples}\n"
+        f"{args.frequency} Hz{' with DWARF call graphs' if args.call_graph else ''} from {started} to {ended} UTC; "
+        f"{samples}"
+    )
+    if args.call_graph:
+        inclusive, _ = report("overhead_children,overhead,dso,sym", "0.5", children=True)
+        stem, dot, ext = args.out.rpartition(".")
+        with open(f"{stem}-inclusive.{ext}" if dot else args.out + "-inclusive", "w") as f:
+            f.write(header + "; each symbol with everything it called, then its own share\n" + "\n".join(inclusive) + "\n")
+    write(
+        header + "\n"
         f"by object: {by_object}\n"
         + "\n".join(symbols)
         + "\n"

@@ -237,14 +237,26 @@ followers' and the leader's excess over them. With `leader-profile`, it
 also costs each symbol of the leader's profile per command (its share of
 the thread's samples times the run's loop CPU per command, since a share
 alone moves when the loop's total does) and gives the base's and the
-head's side by side. Each run's store is in the
+head's side by side. A second group of the pair table gives task-d62's
+and task-d61's counts: the leader's fast share and the share of its slow
+commands that missed on their path, its peer frames, streams and datagrams
+sent per command and frames per stream, and the frames lost over every
+voter with the streams they were lost on. A paired job prints no voter
+logs (the API returns only a job log's last 5000 lines, which the runs'
+summaries and the pair table need); every run's logs are in the store.
+Each run's store is in the
 uploaded archive, and the divergence check covers every run.
 
 The `leader-profile` input installs `perf` and profiles the leader's
 domain thread in each TupleSky run: `scripts/ci/leader_profile.py` waits
 for the workload to load the busiest loop, lets it settle for 30 s, takes
 that thread (coordd's main thread) and samples it alone for 20 s at
-999 Hz. The summary gives the thread, the window, its samples by object
+999 Hz. A paired job also takes one DWARF call graph, at 250 Hz, on its
+first head run, and `call-graph` takes one on every run: it gives each
+symbol's share with everything it called (`leader-profile-inclusive.txt`),
+which the run's summary and the pair table show, so the loop's time splits
+by caller (reads, resends, the outbox) rather than by the function that
+happened to be running. The summary gives the thread, the window, its samples by object
 (`coordd`, libc, the kernel) and the symbols that held most of them; the full report is `leader-profile.txt` in the store.
 
 The `voter-workers` input sets each TupleSky voter's tokio worker count
@@ -480,6 +492,17 @@ of lines. `scripts/ci/jepsen_summary.py` reads the test's store
   operation, so a client's cost is a reading rather than a subtraction. A
   process that exits between two samples loses at most a second of its
   time. The samples are in the store as `cpu-samples.csv`;
+* for the TupleSky job, from task-d62 on, the fast path and traffic per
+  voter: its fast and slow commands, why each slow one missed (path,
+  dependencies, missing, slow first, unclassified) and whether those add
+  up to its slow ones, its acknowledgements and how many went under a
+  `reordered` marker, its pre-acceptances the leader has not ordered with
+  the oldest one's age now and at most over the run (an age that grows
+  from the start of a run without faults is run E's stuck fast path, the
+  first finding task-d67 answers), its own path log, learned to released
+  on the leader, and its peer frames, streams and datagrams sent per
+  command with the frames and streams lost. A run in which no voter
+  established anything on the fast path is said as a finding;
 * for the TupleSky job, the leader's loop against the host's idle: the
   sampler also reads each `coordd`'s main thread, where the domain loop
   runs, and its tokio threads (`tokio-rt-worker`: the runtime's workers,

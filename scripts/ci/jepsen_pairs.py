@@ -50,6 +50,17 @@ class Run:
     # (object, symbol) -> share of the leader thread's samples, in percent;
     # empty without a profile.
     profile: dict = field(default_factory=dict)
+    # The same profile's inclusive shares (a symbol and what it calls), from
+    # the one run of a job profiled with a call graph; empty otherwise.
+    inclusive: list = field(default_factory=list)
+    fast_share: float | None = None
+    path_share: float | None = None
+    frames_per_cmd: float | None = None
+    streams_per_cmd: float | None = None
+    frames_per_stream: float | None = None
+    datagrams_per_cmd: float | None = None
+    lost_frames: int | None = None
+    lost_streams: int | None = None
 
     @property
     def leader_excess(self) -> float | None:
@@ -67,6 +78,18 @@ MEASURES = (
     ("leader_loop", "Leader's loop CPU per command (ms)", "{:.3f}"),
     ("followers_loop", "Followers' loop CPU per command (ms)", "{:.3f}"),
     ("leader_excess", "Leader's excess per command (ms)", "{:.3f}"),
+)
+
+# task-d62's and task-d61's measures, in their table's order.
+TRAFFIC = (
+    ("fast_share", "Leader's fast share", "{:.1%}"),
+    ("path_share", "Leader's slow, missed on path", "{:.1%}"),
+    ("frames_per_cmd", "Leader's frames sent per command", "{:.2f}"),
+    ("streams_per_cmd", "Leader's streams sent per command", "{:.2f}"),
+    ("frames_per_stream", "Leader's frames per stream", "{:.2f}"),
+    ("datagrams_per_cmd", "Leader's datagrams sent per command", "{:.2f}"),
+    ("lost_frames", "Lost frames, all voters", "{:.0f}"),
+    ("lost_streams", "Lost streams, all voters", "{:.0f}"),
 )
 
 
@@ -111,8 +134,24 @@ def read_run(label: str, store: str) -> Run:
         run.leader_loop = leader.cpu[0] * 1000 / leader.executed
         if followers:
             run.followers_loop = sum(c.cpu[0] * 1000 / c.executed for c in followers) / len(followers)
+        if leader.fast + leader.slow:
+            run.fast_share = leader.fast / (leader.fast + leader.slow)
+        if leader.fast_path and leader.slow:
+            run.path_share = leader.fast_path.get("missed_path", 0) / leader.slow
+        t = leader.traffic
+        if t:
+            run.frames_per_cmd = t.get("sent_frames", 0) / leader.executed
+            run.streams_per_cmd = t.get("sent_streams", 0) / leader.executed
+            run.datagrams_per_cmd = t.get("datagrams_sent", 0) / leader.executed
+            if t.get("sent_streams"):
+                run.frames_per_stream = t["sent_frames"] / t["sent_streams"]
+        traffic = [c.traffic for c in costs if c.traffic]
+        if traffic:
+            run.lost_frames = sum(t.get("sent_lost", 0) for t in traffic)
+            run.lost_streams = sum(t.get("sent_lost_streams", 0) for t in traffic)
 
     run.profile = read_profile(os.path.join(store, "leader-profile.txt"))
+    run.inclusive = read_inclusive(os.path.join(store, "leader-profile-inclusive.txt"))
     rows = js.read_cpu_samples(os.path.join(store, "cpu-samples.csv"))
     if rows and start is not None and completed:
         before = [r for r in rows if r["time"] <= start]
@@ -140,6 +179,51 @@ def read_profile(path: str) -> dict:
             out[(cells[1], symbol)] = out.get((cells[1], symbol), 0.0) + float(cells[0].rstrip("%"))
         except ValueError:
             continue
+    return out
+
+
+def read_inclusive(path: str) -> list:
+    """A call-graph profile's rows: (inclusive %, self %, object, symbol),
+    as `perf report --children` sorts them; [] without one."""
+    out = []
+    try:
+        with open(path) as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return out
+    for line in lines:
+        cells = line.split()
+        if len(cells) < 4 or not cells[0].endswith("%") or not cells[1].endswith("%"):
+            continue
+        symbol = " ".join(cells[4:] if cells[3] in ("[.]", "[k]") else cells[3:])
+        try:
+            out.append((float(cells[0].rstrip("%")), float(cells[1].rstrip("%")), cells[2], symbol))
+        except ValueError:
+            continue
+    return out
+
+
+def inclusive_tables(runs: list[Run], top: int = 30) -> list[str]:
+    """The call-graph run's symbols by inclusive cost per command: its
+    share of the leader thread's samples, the symbol and what it called,
+    times that run's loop CPU per command."""
+    out = []
+    for i, run in enumerate(runs, 1):
+        if not run.inclusive or not run.leader_loop:
+            continue
+        out += [
+            f"**The leader's loop by symbol, with what it calls** (run {i}, {run.label}, the job's call-graph profile; "
+            f"microseconds per command, of its {run.leader_loop * 1000:.0f})",
+            "",
+            "| Symbol | Object | With callees (µs) | Own (µs) |",
+            "| --- | --- | --- | --- |",
+        ]
+        for children, own, obj, symbol in run.inclusive[:top]:
+            out.append(
+                f"| `{symbol.replace('|', '/')}` | `{obj}` | {children / 100 * run.leader_loop * 1000:.1f} "
+                f"| {own / 100 * run.leader_loop * 1000:.1f} |"
+            )
+        out.append("")
     return out
 
 
@@ -201,32 +285,25 @@ def delta(base, head, fmt: str) -> str:
     return f"{text} ({d / base:+.1%})" if base else text
 
 
-def render(runs: list[Run], title: str) -> str:
-    out = [f"## {title}", ""]
-    out.append(
-        "**Each run** (in the order the job ran them; the leader is the voter whose read barrier served reads, "
-        "its excess is its loop's CPU per command less the followers' mean)"
-    )
-    out.append("")
-    out.append("| Run | Build | " + " | ".join(h for _, h, _ in MEASURES) + " |")
-    out.append("| --- " * (len(MEASURES) + 2) + "|")
+def group_tables(runs: list[Run], paired: list, measures, heading: str) -> list[str]:
+    """One group of measures: a row per run, then each pair's difference
+    and the mean, smallest and largest over the pairs."""
+    out = [heading, ""]
+    out.append("| Run | Build | " + " | ".join(h for _, h, _ in measures) + " |")
+    out.append("| --- " * (len(measures) + 2) + "|")
     for i, run in enumerate(runs, 1):
-        out.append(f"| {i} | {run.label} | " + " | ".join(cell(getattr(run, a), f) for a, _, f in MEASURES) + " |")
+        out.append(f"| {i} | {run.label} | " + " | ".join(cell(getattr(run, a), f) for a, _, f in measures) + " |")
     out.append("")
-    paired = pairs(runs)
     if not paired:
-        out.append("No base and head ran side by side, so there is no pair to compare.")
-        return "\n".join(out) + "\n"
-    out.append("**The head against the base, pair by pair** (head less base; a pair ran on one runner)")
-    out.append("")
-    out.append("| Pair | " + " | ".join(h for _, h, _ in MEASURES) + " |")
-    out.append("| --- " * (len(MEASURES) + 1) + "|")
+        return out
+    out.append("| Pair (head less base) | " + " | ".join(h for _, h, _ in measures) + " |")
+    out.append("| --- " * (len(measures) + 1) + "|")
     for i, (base, head) in enumerate(paired, 1):
         out.append(
-            f"| {i} | " + " | ".join(delta(getattr(base, a), getattr(head, a), f) for a, _, f in MEASURES) + " |"
+            f"| {i} | " + " | ".join(delta(getattr(base, a), getattr(head, a), f) for a, _, f in measures) + " |"
         )
     summary = []
-    for a, _, f in MEASURES:
+    for a, _, f in measures:
         ds = [getattr(h, a) - getattr(b, a) for b, h in paired if getattr(b, a) is not None and getattr(h, a) is not None]
         if not ds:
             summary.append("-")
@@ -235,7 +312,38 @@ def render(runs: list[Run], title: str) -> str:
         summary.append(f"{'+' if mean >= 0 else '-'}{f.format(abs(mean))} ({f.format(min(ds))} to {f.format(max(ds))})")
     out.append(f"| mean (smallest to largest) of {len(paired)} | " + " | ".join(summary) + " |")
     out.append("")
+    return out
+
+
+def render(runs: list[Run], title: str) -> str:
+    out = [f"## {title}", ""]
+    paired = pairs(runs)
+    out.extend(
+        group_tables(
+            runs,
+            paired,
+            MEASURES,
+            "**Throughput and CPU** (each run in the order the job ran them, then the head less the base pair by "
+            "pair, a pair on one runner; the leader is the voter whose read barrier served reads, its excess is its "
+            "loop's CPU per command less the followers' mean)",
+        )
+    )
+    if any(getattr(r, a) is not None for r in runs for a, _, _ in TRAFFIC):
+        out.extend(
+            group_tables(
+                runs,
+                paired,
+                TRAFFIC,
+                "**Fast path and traffic** (task-d62's counts from each voter's last `metrics` line: the leader's "
+                "fast share and the share of its slow commands that missed on their path, its peer frames, streams "
+                "and datagrams sent per command; lost frames and the streams they were lost on, over every voter)",
+            )
+        )
+    if not paired:
+        out.append("No base and head ran side by side, so there is no pair to compare.")
+        return "\n".join(out) + "\n"
     out.extend(profile_table(runs))
+    out.extend(inclusive_tables(runs))
     return "\n".join(out) + "\n"
 
 
