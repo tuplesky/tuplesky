@@ -9596,6 +9596,48 @@ Neither is on the domain thread any more (task-d52, task-d54).
 leader's domain thread is the one that sets the domain's rate, and
 task-d58 and task-d59 together are a third of it.
 
+### Transport workers when the voters share a host
+
+`coordd` builds a multi-threaded tokio runtime without naming its
+worker count, so each voter starts one transport worker per core: five
+voters on a four-core host run twenty, beside five domain threads, five
+materializers and five appenders. On the Jepsen runner the leader's
+domain thread waited for a core about as long as it computed (run queue
+0.9 to 1.1 ms a command against 0.7 of CPU) while the host averaged
+0.8 to 1.0 cores idle, which fits bursts: each proposal wakes four
+followers' transport threads and then their domain threads at once.
+
+`TOKIO_WORKER_THREADS`, which the runtime reads, is the one variable
+here. Same setup as the profile above (release build of task-d51 at
+c76cc96, five voters, one four-core host, stores on disk, replay at its
+default cadence, so no publication in the run, 30 callers, put 30, get
+50, contended 20, 40,000 operations), three runs of each. Run queue and
+involuntary switches are from each thread's `schedstat` and `status`.
+
+| workers per voter | `ok`/s | get p99 | voters' CPU / op | transport CPU / op | transport run queue / op | transport involuntary switches / op | leader loop run queue / op |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| default (4) | 777, 824, 862 | 114–128 ms | 3.25–3.34 ms | 1.09–1.11 ms | 5.4–5.6 ms | 4.1–4.3 | 0.57–0.59 ms |
+| 2 | 878, 890, 910 | 106–116 ms | 3.13–3.23 ms | 1.00–1.04 ms | 4.5 ms | 3.8–3.9 | 0.52–0.55 ms |
+| 1 | 920, 921, 954 | 104–107 ms | 2.98–3.08 ms | 0.82–0.85 ms | 2.6–2.7 ms | 1.8 | 0.45–0.46 ms |
+
+A fourth one-worker run is left out: the host's disk stalled for about
+64 s of it (iowait near all four cores, nothing runnable), and it made
+360 `ok`/s.
+
+- **One worker per voter is about 13% more throughput** here, with a
+  quarter less transport CPU per operation and half its run queue and
+  involuntary switches. Fewer workers park and wake less, which was a
+  fifth of the transport's CPU in the profile.
+- **The leader's own run queue falls a fifth and is still as long as
+  its CPU.** Twenty threads on four cores remain, so the bursts remain;
+  the idle half core is the gap between them. Steal was 0.04 to 0.06
+  cores here, so on this host it is not the VM.
+- **Not a default.** One transport worker serves a voter alone on its
+  host poorly, and a host's cores are not the voters'. It belongs to
+  whoever co-locates voters: the harness can set it, and a
+  `[transport]` key is the follow-up if the Jepsen runner's six nodes
+  show the same. task-d61 is measured against whichever count that is.
+
 ## The local checkpoint off the domain thread
 
 task-d51. task-j06's Jepsen runs measured each publication of the
