@@ -214,8 +214,7 @@ impl ReadBarrier {
             return None;
         }
         let in_flight = self.rounds.values().any(|r| {
-            r.ballot == ballot
-                && now.get().saturating_sub(r.started.get()) < ROUND_IN_FLIGHT_MILLIS
+            r.ballot == ballot && now.get().saturating_sub(r.started.get()) < ROUND_IN_FLIGHT_MILLIS
         });
         if in_flight {
             return None;
@@ -748,7 +747,11 @@ mod tests {
         }
         barrier.on_confirmed(ReplicaId([2; 16]), b, first, 2);
         let (due, _) = barrier.take_due(leading(b, 4), T0, |_| true, at(5));
-        assert_eq!(due.len(), 1, "the round under way answers only what preceded it");
+        assert_eq!(
+            due.len(),
+            1,
+            "the round under way answers only what preceded it"
+        );
         assert_eq!(due[0].read.request.retry_key.request_sequence.get(), 1);
         let second = barrier.round_to_start(b, 2, T0).unwrap();
         barrier.on_confirmed(ReplicaId([3; 16]), b, second, 2);

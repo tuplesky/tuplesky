@@ -183,14 +183,20 @@ fn a_snapshot_keeps_its_tables_and_sees_only_its_own_state() {
             Some(b"1".to_vec()),
             "the kept table is the snapshot's"
         );
-        assert_eq!(pinned.get(Collection::KvCurrentV1.id(), b"b").unwrap(), None);
+        assert_eq!(
+            pinned.get(Collection::KvCurrentV1.id(), b"b").unwrap(),
+            None
+        );
         let page = pinned
             .scan_page(Collection::KvCurrentV1.id(), &ScanRequest::all(10, 1 << 20))
             .unwrap();
         assert_eq!(page.rows.len(), 1);
     }
     // Another table of the same snapshot opens on its own first read.
-    assert_eq!(pinned.get(Collection::EventsV1.id(), b"none").unwrap(), None);
+    assert_eq!(
+        pinned.get(Collection::EventsV1.id(), b"none").unwrap(),
+        None
+    );
     let fresh = reader.snapshot().unwrap();
     assert_eq!(
         fresh.get(Collection::KvCurrentV1.id(), b"a").unwrap(),
