@@ -202,6 +202,14 @@ class Cost:
     # Seconds the domain loop's thread was runnable and waiting for a CPU
     # (task-d55); None before it, or where coordd could not read it.
     run_queue: float | None = None
+    # The read barrier's confirmation rounds started and confirmed
+    # (task-d50).
+    rounds: int = 0
+    confirmed: int = 0
+    # Snapshots pinned to answer reads, and due reads held again because
+    # theirs had not reached their position (task-d58); None before it.
+    snapshots: int | None = None
+    behind: int | None = None
 
 
 def seconds(d) -> float:
@@ -229,6 +237,10 @@ def parse_cost(snapshot: dict) -> Cost | None:
         served=reads.get("served", 0),
         refused=reads.get("refused", 0),
         waited_ms=reads.get("waited_ms", 0),
+        rounds=reads.get("rounds", 0),
+        confirmed=reads.get("confirmed", 0),
+        snapshots=reads.get("snapshots"),
+        behind=reads.get("behind"),
         fast=cost.get("established_fast", 0),
         slow=cost.get("established_slow", 0),
         cpu=(seconds(cpu.get("domain")), seconds(cpu.get("process"))) if isinstance(cpu, dict) else None,
@@ -940,6 +952,7 @@ def summarize(store: str, nodes: list[str], title: str, profile: str | None = No
             syncs = any(c.syncs is not None for _, c in costs)
             waits = any(c.waits for _, c in costs)
             queue = any(c.run_queue is not None for _, c in costs)
+            snaps = reads and any(c.snapshots is not None for _, c in costs)
             out.append(
                 "**Domain loop** (each voter's last boot, from the same `metrics` line; busy is time the loop "
                 "spent working rather than waiting for an event, store syncs included; fast path is the share of the "
@@ -951,7 +964,10 @@ def summarize(store: str, nodes: list[str], title: str, profile: str | None = No
                    "that was still running" if waits else "")
                 + ("; run queue is the time the loop's thread was ready to run and waiting for a CPU, so busy less "
                    "loop CPU, waits and run queue is the loop blocked in a call on its own thread" if queue else "")
-                + ("; reads are those its read barrier answered or refused as leader" if reads else "")
+                + ("; reads are those its read barrier answered or refused as leader, and rounds the confirmation "
+                   "rounds it started, with the share that confirmed" if reads else "")
+                + ("; snapshots are those pinned to answer reads, one per pump with a read due since task-d58, and "
+                   "held behind counts due reads held again because their snapshot had not reached them" if snaps else "")
                 + ")"
             )
             out.append("")
@@ -965,11 +981,14 @@ def summarize(store: str, nodes: list[str], title: str, profile: str | None = No
             if queue:
                 head += " Loop run queue per command (ms) |"
             if reads:
-                head += " Reads served | Reads refused | Mean read wait (ms) |"
+                head += " Reads served | Reads refused | Mean read wait (ms) | Rounds | Reads per round | Rounds confirmed |"
+            if snaps:
+                head += " Snapshots | Snapshots per read | Held behind |"
             out.append(head)
             out.append(
                 "| --- "
-                * (8 + (1 if syncs else 0) + (2 if cpu else 0) + (2 if waits else 0) + (1 if queue else 0) + (3 if reads else 0))
+                * (8 + (1 if syncs else 0) + (2 if cpu else 0) + (2 if waits else 0) + (1 if queue else 0) + (6 if reads else 0)
+                   + (3 if snaps else 0))
                 + "|"
             )
             for node, c in costs:
@@ -993,6 +1012,14 @@ def summarize(store: str, nodes: list[str], title: str, profile: str | None = No
                 if reads:
                     wait = f"{c.waited_ms / c.served:.1f}" if c.served else "-"
                     row += f" {c.served} | {c.refused} | {wait} |"
+                    row += f" {c.rounds} | {c.served / c.rounds:.2f} |" if c.rounds else " 0 | - |"
+                    row += f" {c.confirmed / c.rounds:.0%} |" if c.rounds else " - |"
+                if snaps:
+                    if c.snapshots is None:
+                        row += " - | - | - |"
+                    else:
+                        per_read = f"{c.snapshots / c.served:.2f}" if c.served else "-"
+                        row += f" {c.snapshots} | {per_read} | {c.behind or 0} |"
                 out.append(row)
             out.append("")
     return "\n".join(out) + "\n"

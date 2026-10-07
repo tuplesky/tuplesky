@@ -54,7 +54,10 @@ touches one key) is a bare Range at the latest revision. Since task-d50 a
 frontend sends it to its leader, which serves it behind a confirmation
 round, and orders it only on a refusal or after 1.5 s; each voter's
 `cost.reads`, in the job summary's Domain loop table, counts what its
-barrier served. A read of more keys is one read-only transaction, which
+barrier served, the confirmation rounds it started (reads per round, and
+the share that confirmed) and, since task-d58, the snapshots it pinned to
+answer them (one per pump with a read due) and the due reads it held again
+because their snapshot had not reached them. A read of more keys is one read-only transaction, which
 is always ordered.
 
 ### What the verdicts promise
