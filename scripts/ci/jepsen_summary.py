@@ -14,7 +14,7 @@ directory (`store/latest`) and writes what a reader looks for first:
 * where the runner's CPU went over the workload, by process group, when
   the job sampled it (`cpu-samples.csv` from `cpu_sampler.py`), and, for a
   TupleSky run, the leader's loop against the host's idle second by second
-  and the voters' tokio workers (`cpu-samples-threads.csv`);
+  and the voters' tokio threads (`cpu-samples-threads.csv`);
 * the commonest failure reasons;
 * the faults, in order;
 * for a TupleSky run, one row per voter from its `coordd.log`: boots,
@@ -624,7 +624,7 @@ def leader_loop(rows: list[dict], threads: dict, start: datetime.datetime, end: 
     if voters and span > 0:
         per = (lambda v: f"{v * 1000 / completed:.2f} ms per operation") if completed else (lambda v: "-")
         out.append(
-            f"The voters' tokio workers ({len(voters)} voters, {workers} each): CPU {workers_cpu:.1f} s "
+            f"The voters' tokio threads, the transport's workers and the blocking pool ({len(voters)} voters, up to {workers} each): CPU {workers_cpu:.1f} s "
             f"({workers_cpu / span:.2f} cores, {per(workers_cpu)}), run queue {workers_queue:.1f} s "
             f"({workers_queue / span:.2f} cores, {per(workers_queue)})."
         )

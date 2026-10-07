@@ -448,14 +448,14 @@ of lines. `scripts/ci/jepsen_summary.py` reads the test's store
   time. The samples are in the store as `cpu-samples.csv`;
 * for the TupleSky job, the leader's loop against the host's idle: the
   sampler also reads each `coordd`'s main thread, where the domain loop
-  runs, and its tokio workers (`tokio-runtime-w`, the transport), from
-  their `schedstat`. Second by second, the leader is the voter whose loop
+  runs, and its tokio threads (`tokio-rt-worker`: the runtime's workers,
+  which run the transport, and its blocking pool), from their `schedstat`. Second by second, the leader is the voter whose loop
   used the most CPU, and the table gives its loop's CPU and run queue (time
   ready to run and waiting for a CPU), the host's idle and steal, as a mean
   and over the quarter of seconds with the least and the most idle, with
   the correlation of run queue and idle: when they rise and fall together,
   the demand comes in bursts shorter than a second. A line after it gives
-  the voters' tokio workers' CPU and run queue per operation. The samples
+  the voters' tokio threads' CPU and run queue per operation. The samples
   are in the store as `cpu-samples-threads.csv`;
 * for the TupleSky job, one row per voter from its `coordd.log`: boots,
   the position it last recovered at, the highest position it executed by

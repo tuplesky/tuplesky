@@ -23,8 +23,11 @@ With --threads, each row also appends one row per `coordd` to that file,
 with the same time: the process's pid and start time, then its main
 thread's CPU and run-queue seconds (`schedstat`'s first two fields; the
 domain loop runs on that thread, in the runtime's `block_on`) and the sum
-of the same over its tokio workers (threads named `tokio-runtime-w`, the
-transport's), with their count. These are cumulative from the process's
+of the same over its tokio threads (named `tokio-rt-worker` by the tokio
+this workspace locks, 1.53, and `tokio-runtime-w` by older ones: the
+runtime's workers, the transport's, and its blocking pool's threads, which
+take the same name), with their
+count. These are cumulative from the process's
 start, so the summary takes differences; a run queue is time a thread was
 ready to run and waiting for a CPU.
 
@@ -52,6 +55,10 @@ GROUPS = (
 NAMES = [name for name, _ in GROUPS]
 GROUP_OF = {comm: name for name, comms in GROUPS for comm in comms}
 TICK = os.sysconf("SC_CLK_TCK")
+# What tokio names its threads, its workers and its blocking pool's alike:
+# 1.53, which the workspace locks, and older ones (`comm` is cut at 15
+# characters).
+TOKIO_THREADS = ("tokio-rt-worker", "tokio-runtime-w")
 
 
 def host() -> tuple[float, float, float]:
@@ -78,7 +85,7 @@ def schedstat(path: str) -> tuple[float, float] | None:
 def loops(pids) -> list[str]:
     """One `--threads` row's cells after the time for each coordd in
     `pids` (pid, start): its main thread's CPU and run queue, then its
-    tokio workers' summed, and their count."""
+    tokio threads' summed, and their count."""
     out = []
     for pid, start in pids:
         main = schedstat(f"/proc/{pid}/schedstat")
@@ -93,7 +100,7 @@ def loops(pids) -> list[str]:
         for tid in tids:
             try:
                 with open(f"/proc/{pid}/task/{tid}/comm") as f:
-                    if f.read().strip() != "tokio-runtime-w":
+                    if f.read().strip() not in TOKIO_THREADS:
                         continue
             except OSError:
                 continue

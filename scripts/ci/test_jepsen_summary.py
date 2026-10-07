@@ -536,7 +536,7 @@ class LeaderLoopTests(unittest.TestCase):
         self.assertIn("| steal (cores) | 0.05 | 0.00 | 0.10 |", text)
         self.assertIn("| leader's loop CPU (ms/s) | 750 | 1000 | 500 |", text)
         self.assertIn("| leader's loop run queue (ms/s) | 500 | 0 | 1000 |", text)
-        self.assertIn("The voters' tokio workers (2 voters, 4 each): CPU 14.0 s (0.34 cores, 14000.00 ms per operation), "
+        self.assertIn("The voters' tokio threads, the transport's workers and the blocking pool (2 voters, up to 4 each): CPU 14.0 s (0.34 cores, 14000.00 ms per operation), "
                       "run queue 22.0 s (0.54 cores, 22000.00 ms per operation).", text)
 
     def test_a_correlation_needs_three_seconds(self):
