@@ -145,6 +145,22 @@ Each lane is a separate connection with its own stream limits, windows and
 queues; a peer pair therefore holds at most one connection per admitted
 lane and direction.
 
+Several frames a stream (task-d61): on the peer plane, a `Hello` may offer
+capability `0x0020` and the acceptor grants it in `HelloAck` when it offers
+it too. Where it is granted, a unidirectional peer stream carries one or
+more `PeerEvidence` frames back to back, at most 256, and ends after the
+last; each frame is unchanged, frames on one stream are delivered in
+order, and frames on different streams are not ordered against each
+other, as before. A stream with no frame, one that ends inside a frame,
+or one with more than 256 frames closes the connection as a protocol
+violation. Where it is not granted, a peer stream carries exactly one
+frame, and a byte after it is a violation. The capability is never
+offered or granted on the API plane.
+
+| Capability | Meaning | Plane |
+|---|---|---|
+| `0x0020` | several peer-evidence frames on one stream, at most 256 | peer |
+
 ## Collector frames (task-33)
 
 The trusted collector (`spec/collector-v1.md`) uses five raw kinds. Two

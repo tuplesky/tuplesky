@@ -165,13 +165,21 @@ def waits_of(cost: dict, executed: int) -> dict:
 def traffic_of(cost: dict, executed: int) -> dict:
     """What a voter's transport carried to and from the other voters, per
     command (task-d62): frames, bytes and streams each way, and frames
-    lost before they were written. Empty for a binary older than the
-    reading."""
+    lost before they were written. Beside them, frames per stream each
+    way, the batching factor (task-d61), and frames lost per stream lost.
+    Empty for a binary older than the reading."""
     traffic = cost.get("traffic")
     if not isinstance(traffic, dict) or "Observed" not in traffic:
         return {}
     traffic = traffic["Observed"]
-    return {"traffic_per_command": {k: v / executed for k, v in traffic.items()}}
+    out = {"traffic_per_command": {k: v / executed for k, v in traffic.items()}}
+    for side in ("sent", "received"):
+        if traffic.get(f"{side}_streams"):
+            out[f"frames_per_stream_{side}"] = (
+                traffic[f"{side}_frames"] / traffic[f"{side}_streams"])
+    if traffic.get("sent_lost_streams"):
+        out["frames_per_lost_stream"] = traffic["sent_lost"] / traffic["sent_lost_streams"]
+    return out
 
 
 def reads_of(cost: dict) -> dict:
@@ -475,15 +483,16 @@ def paths_table(result: dict) -> str:
         "| acks (reordered) | unordered (reordered, oldest s) "
         "| learned to released ms: predecessors/group/projection "
         "| read ms: confirm/after confirm/after index | reads/round | behind/read "
-        "| peer frames/cmd sent/received (streams sent) "
+        "| peer frames/cmd sent/received (streams sent/received) "
+        "| peer datagrams/cmd sent/received (send calls, ACKs sent) "
         "| journal ms/cmd queued/served/completed | projection ms/cmd queued/served/completed |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     dash = "--"
     for run in result["runs"]:
         for finding in run.get("findings", []):
             lines.append(f"| {run['callers']} | **finding** | {finding} "
-                         "| | | | | | | | | | |")
+                         "| | | | | | | | | | | |")
         for v in run["voters"]:
             share = v.get("fast_path_share")
             share = dash if share is None else f"{share:.1%}"
@@ -508,13 +517,17 @@ def paths_table(result: dict) -> str:
             traffic = v.get("traffic_per_command")
             traffic = dash if traffic is None else (
                 f"{traffic['sent_frames']:.2f}/{traffic['received_frames']:.2f} "
-                f"({traffic['sent_streams']:.2f})")
+                f"({traffic['sent_streams']:.2f}/{traffic['received_streams']:.2f})")
+            traffic_cmd = v.get("traffic_per_command")
+            packets = dash if not traffic_cmd or "datagrams_sent" not in traffic_cmd else (
+                f"{traffic_cmd['datagrams_sent']:.2f}/{traffic_cmd['datagrams_received']:.2f} "
+                f"({traffic_cmd['send_calls']:.2f}, {traffic_cmd['acks_sent']:.2f})")
             jobs = lambda side: dash if f"{side}_jobs" not in v else "/".join(
                 f"{v[f'{side}_jobs'][f'{t}_ms_per_command']:.3f}"
                 for t in ("queued", "served", "completed"))
             lines.append(
                 f"| {run['callers']} | {v['node']} | {share} | {missed} | {acks} | {held} "
-                f"| {release} | {waits} | {per_round} | {behind} | {traffic} "
+                f"| {release} | {waits} | {per_round} | {behind} | {traffic} | {packets} "
                 f"| {jobs('appender')} | {jobs('materializer')} |")
     return "\n".join(lines)
 

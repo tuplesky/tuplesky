@@ -150,7 +150,9 @@ class ReduceTests(unittest.TestCase):
         snap = snapshot()
         observed = snap["cost"]["Observed"]
         observed["traffic"] = {"Observed": {
-            "sent_frames": 900, "sent_bytes": 270000, "sent_streams": 900, "sent_lost": 2,
+            "sent_frames": 900, "sent_bytes": 270000, "sent_streams": 300, "sent_lost": 2,
+            "sent_lost_streams": 1, "datagrams_sent": 500, "datagrams_received": 450,
+            "send_calls": 480, "acks_sent": 200, "acks_received": 210,
             "received_frames": 880, "received_bytes": 190000, "received_streams": 880,
         }}
         jobs = lambda n, q, s, c: {"count": n, "queued": duration(q), "served": duration(s),
@@ -166,12 +168,16 @@ class ReduceTests(unittest.TestCase):
         self.assertAlmostEqual(traffic["sent_frames"], 9.0)
         self.assertAlmostEqual(traffic["received_bytes"], 1900.0)
         self.assertAlmostEqual(traffic["sent_lost"], 0.02)
+        self.assertAlmostEqual(reading["frames_per_stream_sent"], 3.0)
+        self.assertAlmostEqual(reading["frames_per_stream_received"], 1.0)
+        self.assertAlmostEqual(reading["frames_per_lost_stream"], 2.0)
         appender = reading["appender_jobs"]
         self.assertAlmostEqual(appender["jobs_per_command"], 0.9)
         self.assertAlmostEqual(appender["served_ms_per_command"], 1.8)
         self.assertAlmostEqual(reading["materializer_jobs"]["completed_ms_per_command"], 0.09)
         table = cost.paths_table({"runs": [{"callers": 1, "voters": [reading]}]})
-        self.assertIn("9.00/8.80 (9.00)", table)
+        self.assertIn("9.00/8.80 (3.00/8.80)", table)
+        self.assertIn("5.00/4.50 (4.80, 2.00)", table)
         self.assertNotIn("traffic_per_command", cost.per_command("n1", snapshot()))
 
     def test_a_run_with_no_fast_decision_is_a_finding(self):

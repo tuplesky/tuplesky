@@ -24,7 +24,8 @@ use tokio::time::{timeout, timeout_at};
 use crate::budget::{Budget, BudgetError, Opens};
 use crate::config::{ALPN_API, ALPN_PEER, Class, Limits, LocalIdentity, TlsProfile};
 use crate::frames::{
-    ControlStream, FrameError, KIND_PEER_EVIDENCE, PEER_EVIDENCE_VERSION, read_frame_within,
+    CAPABILITY_FRAMES_PER_STREAM, ControlStream, FrameError, FrameStream, KIND_PEER_EVIDENCE,
+    MAX_FRAMES_PER_STREAM, PEER_EVIDENCE_VERSION, read_frame_within,
 };
 use crate::identity::{BoundIdentity, IdentityBinder, role_class};
 use crate::lane::{self, Lane, LaneLimits, lane_of_hello, role_lanes};
@@ -444,6 +445,12 @@ struct Peer {
     /// stream is accepted: QUIC flow control then backs the sender up
     /// instead of this side buffering without limit.
     readers: Arc<Semaphore>,
+    /// Whether a stream on this connection may carry several peer
+    /// frames: a peer-plane connection whose two ends granted
+    /// [`CAPABILITY_FRAMES_PER_STREAM`] (task-d61). Both ends read it
+    /// from the same negotiated set, so the sender batches exactly where
+    /// the receiver reads a batch.
+    batched: bool,
 }
 
 impl Peer {
@@ -465,10 +472,14 @@ impl Peer {
             conn,
             class,
             lane,
-            identity,
             close_reason: Mutex::new(None),
             accepted,
             readers: Arc::new(Semaphore::new(readers.max(1) as usize)),
+            batched: class == Class::Peer
+                && identity
+                    .capabilities
+                    .contains(&CAPABILITY_FRAMES_PER_STREAM),
+            identity,
         })
     }
 }
@@ -495,9 +506,35 @@ struct Traffic {
     sent_bytes: AtomicU64,
     sent_streams: AtomicU64,
     sent_lost: AtomicU64,
+    sent_lost_streams: AtomicU64,
     received_frames: AtomicU64,
     received_bytes: AtomicU64,
     received_streams: AtomicU64,
+    /// QUIC's own counts of the peer connections already closed (task-d61);
+    /// those still open are read from the connections themselves.
+    closed: Mutex<Quic>,
+}
+
+/// What QUIC itself sent and received on peer connections: datagrams,
+/// the system calls that sent them, and ACK frames.
+#[derive(Clone, Copy, Debug, Default)]
+struct Quic {
+    datagrams_sent: u64,
+    datagrams_received: u64,
+    send_calls: u64,
+    acks_sent: u64,
+    acks_received: u64,
+}
+
+impl Quic {
+    fn add(&mut self, conn: &quinn::Connection) {
+        let stats = conn.stats();
+        self.datagrams_sent += stats.udp_tx.datagrams;
+        self.datagrams_received += stats.udp_rx.datagrams;
+        self.send_calls += stats.udp_tx.ios;
+        self.acks_sent += stats.frame_tx.acks;
+        self.acks_received += stats.frame_rx.acks;
+    }
 }
 
 impl Traffic {
@@ -505,13 +542,23 @@ impl Traffic {
         counter.fetch_add(n, Ordering::Relaxed);
     }
 
-    fn read(&self) -> PeerTraffic {
+    fn read(&self, open: &[Arc<Peer>]) -> PeerTraffic {
         let load = |c: &AtomicU64| c.load(Ordering::Relaxed);
+        let mut quic = *self.closed.lock().unwrap();
+        for peer in open.iter().filter(|p| p.class == Class::Peer) {
+            quic.add(&peer.conn);
+        }
         PeerTraffic {
+            datagrams_sent: quic.datagrams_sent,
+            datagrams_received: quic.datagrams_received,
+            send_calls: quic.send_calls,
+            acks_sent: quic.acks_sent,
+            acks_received: quic.acks_received,
             sent_frames: load(&self.sent_frames),
             sent_bytes: load(&self.sent_bytes),
             sent_streams: load(&self.sent_streams),
             sent_lost: load(&self.sent_lost),
+            sent_lost_streams: load(&self.sent_lost_streams),
             received_frames: load(&self.received_frames),
             received_bytes: load(&self.received_bytes),
             received_streams: load(&self.received_streams),
@@ -745,7 +792,10 @@ impl Shared {
     }
 
     fn deregister(&self, peer: &Peer) {
-        self.peers.lock().unwrap().remove(&peer.id);
+        let removed = self.peers.lock().unwrap().remove(&peer.id);
+        if removed.is_some() && peer.class == Class::Peer {
+            self.traffic.closed.lock().unwrap().add(&peer.conn);
+        }
         let key = Self::link_key(peer);
         let link = self.links.lock().unwrap().get(&key).cloned();
         if let Some(link) = link {
@@ -928,6 +978,11 @@ impl Dialer {
             .filter(|c| Lane::of_capability(*c).is_none())
             .collect();
         capabilities.push(lane.capability());
+        // Several frames a stream, on the peer plane only, unless this
+        // end is set to send one (task-d61).
+        if role_class(local_role) == Class::Peer && shared.limits.stream_frames > 1 {
+            capabilities.push(CAPABILITY_FRAMES_PER_STREAM);
+        }
         capabilities.sort_unstable();
         capabilities.dedup();
         let hello = MessageV1::Hello(HelloV1 {
@@ -1386,6 +1441,23 @@ impl Transport {
     /// and node budgets; it is handed to QUIC by the lane's sender and
     /// that is all a success ever means.
     pub fn send(&self, to: Destination, group: DomainId, frame: Vec<u8>) -> Result<(), SendError> {
+        self.send_many(to, group, vec![frame])
+            .pop()
+            .unwrap_or(Err(SendError::NotConnected))
+    }
+
+    /// Queue `frames` for `to` in `group`, in order, as one turn's
+    /// (task-d61). Each frame is admitted on its own, exactly as
+    /// [`Self::send`] admits one, and has its own result; the lane's
+    /// sender is woken once, after the last, so a link that carries
+    /// several frames a stream takes what this turn queued together.
+    pub fn send_many(
+        &self,
+        to: Destination,
+        group: DomainId,
+        frames: Vec<Vec<u8>>,
+    ) -> Vec<Result<(), SendError>> {
+        let refused = |n: usize, e: SendError| (0..n).map(|_| Err(e.clone())).collect();
         let (key, lane) = match to {
             Destination::Replica {
                 replica,
@@ -1393,56 +1465,59 @@ impl Transport {
                 lane,
             } => (LinkKey::Replica(replica, incarnation), lane),
             Destination::Connection(id) => {
-                let peer = self
-                    .shared
-                    .peers
-                    .lock()
-                    .unwrap()
-                    .get(&id)
-                    .cloned()
-                    .ok_or(SendError::NotConnected)?;
+                let peer = self.shared.peers.lock().unwrap().get(&id).cloned();
+                let Some(peer) = peer else {
+                    return refused(frames.len(), SendError::NotConnected);
+                };
                 (Shared::link_key(&peer), peer.lane)
             }
         };
-        let link = self
-            .shared
-            .links
-            .lock()
-            .unwrap()
-            .get(&key)
-            .cloned()
-            .ok_or(SendError::NotConnected)?;
-        let bytes = frame.len();
-        for budget in [&link.budget, self.shared.node_budget.as_ref()] {
-            if let Err(BudgetError::TooLarge { bytes, limit }) = budget.check(lane, bytes) {
-                return Err(SendError::TooLarge { bytes, limit });
-            }
-        }
+        let link = self.shared.links.lock().unwrap().get(&key).cloned();
+        let Some(link) = link else {
+            return refused(frames.len(), SendError::NotConnected);
+        };
         let mut state = link.lanes[lane.index()].lock().unwrap();
         if state.peer.is_none() {
-            return Err(SendError::NotConnected);
+            return refused(frames.len(), SendError::NotConnected);
         }
-        let result = state.queue.push(Queued {
-            group,
-            frame,
-            enqueued: Instant::now(),
-        });
-        match result {
-            Ok(()) => {
-                state.stats.queued = state.queue.len();
-                drop(state);
-                link.notify[lane.index()].notify_one();
-                Ok(())
-            }
-            Err(QueueError::GroupFull) => {
-                state.stats.refused += 1;
-                Err(SendError::QueueFull { lane })
-            }
-            Err(QueueError::TooManyGroups) => {
-                state.stats.refused += 1;
-                Err(SendError::TooManyGroups { lane })
-            }
+        let now = Instant::now();
+        let mut queued = false;
+        let results = frames
+            .into_iter()
+            .map(|frame| {
+                let bytes = frame.len();
+                for budget in [&link.budget, self.shared.node_budget.as_ref()] {
+                    if let Err(BudgetError::TooLarge { bytes, limit }) = budget.check(lane, bytes) {
+                        return Err(SendError::TooLarge { bytes, limit });
+                    }
+                }
+                let result = state.queue.push(Queued {
+                    group,
+                    frame,
+                    enqueued: now,
+                });
+                match result {
+                    Ok(()) => {
+                        queued = true;
+                        Ok(())
+                    }
+                    Err(QueueError::GroupFull) => {
+                        state.stats.refused += 1;
+                        Err(SendError::QueueFull { lane })
+                    }
+                    Err(QueueError::TooManyGroups) => {
+                        state.stats.refused += 1;
+                        Err(SendError::TooManyGroups { lane })
+                    }
+                }
+            })
+            .collect();
+        state.stats.queued = state.queue.len();
+        drop(state);
+        if queued {
+            link.notify[lane.index()].notify_one();
         }
+        results
     }
 
     /// Queue the same frame for several replicas on one lane. Each
@@ -1473,7 +1548,15 @@ impl Transport {
 
     /// What this node's transport carried between voters (task-d62).
     pub fn peer_traffic(&self) -> PeerTraffic {
-        self.shared.traffic.read()
+        let open: Vec<Arc<Peer>> = self
+            .shared
+            .peers
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect();
+        self.shared.traffic.read(&open)
     }
 
     /// Accounting of one lane of a replica link, with the path RTT.
@@ -1685,25 +1768,52 @@ impl Transport {
 async fn sender_loop(shared: Arc<Shared>, link: Arc<Link>, peer: Arc<Peer>) {
     let lane = peer.lane;
     let idx = lane.index();
+    // How much one stream carries (task-d61): what is queued, up to the
+    // configured frames and bytes, where the link grants it; one frame
+    // elsewhere. The bytes never exceed what either budget can hold, so
+    // a batch is never refused as too large when its frames were not.
+    let (most_frames, most_bytes) = if peer.batched {
+        (
+            shared.limits.stream_frames.clamp(1, MAX_FRAMES_PER_STREAM),
+            shared
+                .limits
+                .stream_bytes
+                .min(link.budget.limit(lane))
+                .min(shared.node_budget.limit(lane)),
+        )
+    } else {
+        (1, 0)
+    };
     loop {
-        let next = {
+        let batch = {
             let mut state = link.lanes[idx].lock().unwrap();
             if state.peer.as_ref().is_none_or(|p| p.id != peer.id) {
                 return;
             }
-            let next = state.queue.pop();
-            state.stats.queued = state.queue.len();
-            if let Some(q) = &next {
+            let mut batch: Vec<Queued> = Vec::new();
+            let mut bytes = 0;
+            while batch.len() < most_frames {
+                // The first frame goes whatever its size; a later one
+                // only if the stream still has room for it.
+                match state.queue.next_len() {
+                    Some(len) if batch.is_empty() || bytes + len <= most_bytes => {}
+                    _ => break,
+                }
+                let Some(q) = state.queue.pop() else { break };
                 state.stats.queue_wait.record(q.enqueued.elapsed());
+                bytes += q.frame.len();
+                batch.push(q);
             }
-            next
+            state.stats.queued = state.queue.len();
+            batch
         };
-        let Some(queued) = next else {
+        if batch.is_empty() {
             link.notify[idx].notified().await;
             continue;
-        };
+        }
         let picked = Instant::now();
-        let bytes = queued.frame.len();
+        let frames = batch.len() as u64;
+        let bytes: usize = batch.iter().map(|q| q.frame.len()).sum();
         let Ok(dest_permit) = link.budget.acquire(lane, bytes).await else {
             continue;
         };
@@ -1711,6 +1821,17 @@ async fn sender_loop(shared: Arc<Shared>, link: Arc<Link>, peer: Arc<Peer>) {
             continue;
         };
         let open_permit = link.opens.acquire().await;
+        // A batch is lost whole: a refused stream loses every frame in
+        // it, and they are counted as frames lost, so a saturated peer
+        // does not read as a quiet one.
+        let lost = || {
+            let mut state = link.lanes[idx].lock().unwrap();
+            state.stats.refused += frames;
+            if peer.class == Class::Peer {
+                Traffic::add(&shared.traffic.sent_lost, frames);
+                Traffic::add(&shared.traffic.sent_lost_streams, 1);
+            }
+        };
         // An API lane advertises no unidirectional streams and its peer
         // consumes bidirectional ones, so opening a uni stream there
         // would wait for credit that never comes and lose the frame.
@@ -1727,39 +1848,36 @@ async fn sender_loop(shared: Arc<Shared>, link: Arc<Link>, peer: Arc<Peer>) {
             _ => {
                 // The connection is gone or credit never came: a transport
                 // loss, counted, never buffered.
-                let mut state = link.lanes[idx].lock().unwrap();
-                state.stats.refused += 1;
-                if peer.class == Class::Peer {
-                    Traffic::add(&shared.traffic.sent_lost, 1);
-                }
+                lost();
                 continue;
             }
         };
         {
             let mut state = link.lanes[idx].lock().unwrap();
             state.stats.credit_wait.record(picked.elapsed());
-            state.stats.frames += 1;
+            state.stats.frames += frames;
             state.stats.bytes += bytes as u64;
         }
         if peer.class == Class::Peer {
             Traffic::add(&shared.traffic.sent_streams, 1);
-            Traffic::add(&shared.traffic.sent_frames, 1);
+            Traffic::add(&shared.traffic.sent_frames, frames);
             Traffic::add(&shared.traffic.sent_bytes, bytes as u64);
         }
         // The deadline covers the write and the finish too. A peer that
         // completes the open and then grants no more flow-control credit
         // would otherwise leave the write pending forever and stall this
-        // lane's sender behind it.
+        // lane's sender behind it. One write for the batch: the frames
+        // go to QUIC as they are, without being copied together.
+        let mut chunks: Vec<bytes::Bytes> = batch
+            .into_iter()
+            .map(|q| bytes::Bytes::from(q.frame))
+            .collect();
         let written = timeout(shared.limits.frame_timeout, async {
-            send.write_all(&queued.frame).await.is_ok() && send.finish().is_ok()
+            send.write_all_chunks(&mut chunks).await.is_ok() && send.finish().is_ok()
         })
         .await;
         if written != Ok(true) {
-            let mut state = link.lanes[idx].lock().unwrap();
-            state.stats.refused += 1;
-            if peer.class == Class::Peer {
-                Traffic::add(&shared.traffic.sent_lost, 1);
-            }
+            lost();
             continue;
         }
         // The bytes stay counted against both budgets until the peer
@@ -1995,7 +2113,12 @@ async fn negotiate_incoming(
         .as_slice()
         .iter()
         .copied()
-        .filter(|c| shared.capabilities.contains(c))
+        .filter(|c| {
+            shared.capabilities.contains(c)
+                || (*c == CAPABILITY_FRAMES_PER_STREAM
+                    && class == Class::Peer
+                    && shared.limits.stream_frames > 1)
+        })
         .collect();
     granted.push(lane.capability());
     granted.sort_unstable();
@@ -2132,61 +2255,109 @@ async fn watch_control(peer: Arc<Peer>, mut control: ControlStream) {
 async fn read_uni(
     shared: Arc<Shared>,
     peer: Arc<Peer>,
-    mut recv: RecvStream,
+    recv: RecvStream,
     permit: tokio::sync::OwnedSemaphorePermit,
 ) {
     let _held = permit;
-    match read_frame_within(
-        &mut recv,
-        shared.limits.frame_timeout,
-        true,
-        Some((&shared.receive_budget, peer.lane)),
-    )
-    .await
-    {
-        Ok(frame) => {
-            // The frame reader checks lengths and class limits, not what
-            // the frame is. A peer stream carries peer evidence of a
-            // version this build understands and nothing else; anything
-            // else is a protocol violation and closes the connection
-            // rather than reaching consensus as authenticated input.
-            if frame.kind != KIND_PEER_EVIDENCE || frame.version != PEER_EVIDENCE_VERSION {
-                let reason = CloseReason::Malformed(format!(
-                    "peer frame kind {:#06x} version {}",
-                    frame.kind, frame.version
-                ));
-                *peer.close_reason.lock().unwrap() = Some(reason.clone());
-                peer.conn.close(VarInt::from_u32(reason.code() as u32), b"");
+    let budget = Some((&shared.receive_budget, peer.lane));
+    // A link that granted several frames a stream reads them until the
+    // stream ends (task-d61); any other reads exactly one, and a byte
+    // after it is a violation, as it always was.
+    if !peer.batched {
+        let mut recv = recv;
+        match read_frame_within(&mut recv, shared.limits.frame_timeout, true, budget).await {
+            Ok(frame) => {
+                let _ = deliver_peer_frame(&shared, &peer, frame).await;
+            }
+            Err(FrameError::Stream(_)) => {}
+            Err(e) => close_on(&peer, frame_reason(e)),
+        }
+        return;
+    }
+    let mut stream = FrameStream::new(recv);
+    let mut read = 0usize;
+    loop {
+        match stream.next_frame(shared.limits.frame_timeout, budget).await {
+            Ok(Some(frame)) => {
+                read += 1;
+                if read > MAX_FRAMES_PER_STREAM {
+                    close_on(
+                        &peer,
+                        CloseReason::Malformed(format!(
+                            "more than {MAX_FRAMES_PER_STREAM} frames on a peer stream"
+                        )),
+                    );
+                    return;
+                }
+                if !deliver_peer_frame(&shared, &peer, frame).await {
+                    return;
+                }
+            }
+            // An empty stream carried no frame at all: as truncated as
+            // one that ended inside its frame.
+            Ok(None) if read == 0 => {
+                close_on(&peer, frame_reason(FrameError::Truncated));
                 return;
             }
-            Traffic::add(&shared.traffic.received_frames, 1);
-            Traffic::add(
-                &shared.traffic.received_bytes,
-                (coord_types::wire_v1::HEADER_LEN + frame.payload.len()) as u64,
-            );
-            let (Some(replica), Some(incarnation)) =
-                (peer.identity.replica, peer.identity.incarnation)
-            else {
+            Ok(None) | Err(FrameError::Stream(_)) => return,
+            Err(e) => {
+                close_on(&peer, frame_reason(e));
                 return;
-            };
-            shared
-                .emit(TransportEvent::PeerFrame {
-                    connection: peer.id,
-                    lane: peer.lane,
-                    provenance: PeerProvenance::from_transport(replica, incarnation, peer.id.0),
-                    kind: frame.kind,
-                    version: frame.version,
-                    payload: frame.payload,
-                })
-                .await;
-        }
-        Err(FrameError::Stream(_)) => {}
-        Err(e) => {
-            let reason = frame_reason(e);
-            *peer.close_reason.lock().unwrap() = Some(reason.clone());
-            peer.conn.close(VarInt::from_u32(reason.code() as u32), b"");
+            }
         }
     }
+}
+
+/// Hand one frame read from a peer stream inward, or close the
+/// connection if it is not peer evidence this build reads. Whether to
+/// read on.
+async fn deliver_peer_frame(
+    shared: &Shared,
+    peer: &Peer,
+    frame: coord_types::wire_v1::Frame,
+) -> bool {
+    // The frame reader checks lengths and class limits, not what the
+    // frame is. A peer stream carries peer evidence of a version this
+    // build understands and nothing else; anything else is a protocol
+    // violation and closes the connection rather than reaching
+    // consensus as authenticated input.
+    if frame.kind != KIND_PEER_EVIDENCE || frame.version != PEER_EVIDENCE_VERSION {
+        close_on(
+            peer,
+            CloseReason::Malformed(format!(
+                "peer frame kind {:#06x} version {}",
+                frame.kind, frame.version
+            )),
+        );
+        return false;
+    }
+    Traffic::add(&shared.traffic.received_frames, 1);
+    Traffic::add(
+        &shared.traffic.received_bytes,
+        (coord_types::wire_v1::HEADER_LEN + frame.payload.len()) as u64,
+    );
+    let (Some(replica), Some(incarnation)) = (peer.identity.replica, peer.identity.incarnation)
+    else {
+        return false;
+    };
+    shared
+        .emit(TransportEvent::PeerFrame {
+            connection: peer.id,
+            lane: peer.lane,
+            provenance: PeerProvenance::from_transport(replica, incarnation, peer.id.0),
+            kind: frame.kind,
+            version: frame.version,
+            payload: frame.payload,
+        })
+        .await;
+    true
+}
+
+/// Record why `peer` is being closed and close it.
+fn close_on(peer: &Peer, reason: CloseReason) {
+    let code = reason.code();
+    *peer.close_reason.lock().unwrap() = Some(reason);
+    peer.conn.close(VarInt::from_u32(code as u32), b"");
 }
 
 /// Close `peer` when its credential ends, when the credential this end
