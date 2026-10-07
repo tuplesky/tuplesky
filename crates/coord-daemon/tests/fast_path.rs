@@ -121,9 +121,9 @@ fn identity(me: u8) -> ConfigurationIdentity {
     }
 }
 
-/// Three voters, fast set {0, 1}: the fast path needs the leader and
-/// follower 1, so follower 1's acknowledgement is one the caller's
-/// completion depends on.
+/// Five voters under `coordd`'s `c2_default`: the fast set is the leader
+/// and the next two (n2 and n3 under n1), all three of which must agree,
+/// so an acknowledgement from n2 is one every fast decision depends on.
 fn quorum() -> BallotConfiguration {
     BallotConfiguration::c2_default(epoch(), ballot(), (0..N).map(r).collect()).unwrap()
 }
