@@ -1155,6 +1155,7 @@ def read_syscalls(path: str) -> tuple[int | None, dict]:
     m = re.match(r"leader process (\d+),", lines[0]) if lines else None
     if not m:
         return None, {}
+    window = re.search(r"\(([\d.]+) s\)", lines[0])
     threads: dict = {}
     for line in lines[1:]:
         cells = line.split(",")
@@ -1168,8 +1169,26 @@ def read_syscalls(path: str) -> tuple[int | None, dict]:
         event = cells[3].removeprefix("syscalls:sys_enter_")
         if not tid.isdigit():
             continue
+        if event == "task-clock" and isinstance(value, float):
+            value = task_clock_ms(value, cells[2].strip(), float(window[1]) if window else None)
         threads.setdefault(int(tid), (comm, {}))[1][event] = value
     return int(m[1]), threads
+
+
+# perf's units for `task-clock`, in milliseconds: msec in some versions,
+# ns in others.
+CLOCK_UNITS = {"msec": 1.0, "ms": 1.0, "usec": 1e-3, "us": 1e-3, "nsec": 1e-6, "ns": 1e-6, "sec": 1e3, "s": 1e3}
+
+
+def task_clock_ms(value: float, unit: str, window_s: float | None) -> float:
+    """A thread's `task-clock` in milliseconds, by perf's unit; with none
+    given, nanoseconds where milliseconds would mean more than 1024 cores
+    over the window."""
+    if unit in CLOCK_UNITS:
+        return value * CLOCK_UNITS[unit]
+    if window_s and value > window_s * 1000 * 1024:
+        return value * 1e-6
+    return value
 
 
 def uncounted(threads: dict) -> dict:

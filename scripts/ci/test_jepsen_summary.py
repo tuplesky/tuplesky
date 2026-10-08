@@ -732,6 +732,19 @@ class TransportTests(unittest.TestCase):
         self.assertAlmostEqual(kinds["`appender`"][2]["futex"], 0.25)
         self.assertEqual(js.syscalls_per_command(os.path.join("/nonexistent", "x"), 500.0), ({}, None))
 
+    def test_task_clock_in_nanoseconds(self):
+        # The runner's perf gives task-clock in ns, where 6.8 gave msec.
+        text = TRANSPORT_SYSCALLS.replace("1000.00,msec,task-clock", "1000000000,ns,task-clock").replace(
+            "1500.00,msec,task-clock", "1500000000,,task-clock")
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "leader-profile-syscalls.txt")
+            with open(path, "w") as f:
+                f.write(text)
+            kinds, commands = js.syscalls_per_command(path, 500.0)
+        self.assertAlmostEqual(commands, 2000.0)
+        self.assertAlmostEqual(kinds["tokio threads"][2]["futex"], 5.0)
+        self.assertAlmostEqual(kinds["tokio threads"][1], 1000.0)
+
     def test_calls_perf_did_not_count_are_said_not_zero(self):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "leader-profile-syscalls.txt")
