@@ -243,7 +243,7 @@ head's side by side. A second group of the pair table gives task-d62's
 and task-d61's counts: the leader's fast share and the share of its slow
 commands that missed on their path, its peer frames, streams and datagrams
 sent per command and frames per stream, and the frames lost over every
-voter with the streams they were lost on. A third gives task-d59's
+voter with the streams they were lost on. Where the build counts them (task-d70), a group gives the leader's peer send calls and ACK frames per command and, over every voter, the peer plane's datagrams and the api plane's datagrams, send calls and ACK frames sent and received per command. A third gives task-d59's
 re-send timer on the leader, where the build has it: a call's time on the
 loop, mean and longest, and the proposals it looked at, with the leader
 profile's share of `Leader::resend_unvoted` costed per command for any

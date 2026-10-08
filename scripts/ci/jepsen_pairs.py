@@ -94,6 +94,18 @@ class Run:
     datagrams_per_cmd: float | None = None
     lost_frames: int | None = None
     lost_streams: int | None = None
+    # task-d70's QUIC counts: the leader's peer send calls and ACK frames
+    # per command, and every voter's peer and api datagrams, api send calls
+    # and api ACK frames, each over its own executed commands, summed.
+    send_calls_per_cmd: float | None = None
+    acks_sent_per_cmd: float | None = None
+    acks_received_per_cmd: float | None = None
+    peer_datagrams_all: float | None = None
+    api_datagrams_sent_all: float | None = None
+    api_datagrams_received_all: float | None = None
+    api_send_calls_all: float | None = None
+    api_acks_sent_all: float | None = None
+    api_acks_received_all: float | None = None
 
     @property
     def leader_excess(self) -> float | None:
@@ -152,6 +164,20 @@ TRAFFIC = (
     ("datagrams_per_cmd", "Leader's datagrams sent per command", "{:.2f}"),
     ("lost_frames", "Lost frames, all voters", "{:.0f}"),
     ("lost_streams", "Lost streams, all voters", "{:.0f}"),
+)
+
+
+# task-d70's measures: datagrams, send calls and ACK frames on both planes.
+ACKS = (
+    ("send_calls_per_cmd", "Leader's peer send calls per command", "{:.2f}"),
+    ("acks_sent_per_cmd", "Leader's peer ACKs sent per command", "{:.2f}"),
+    ("acks_received_per_cmd", "Leader's peer ACKs received per command", "{:.2f}"),
+    ("peer_datagrams_all", "Peer datagrams sent per command, all voters", "{:.2f}"),
+    ("api_datagrams_sent_all", "Api datagrams sent per command, all voters", "{:.2f}"),
+    ("api_datagrams_received_all", "Api datagrams received per command, all voters", "{:.2f}"),
+    ("api_send_calls_all", "Api send calls per command, all voters", "{:.2f}"),
+    ("api_acks_sent_all", "Api ACKs sent per command, all voters", "{:.2f}"),
+    ("api_acks_received_all", "Api ACKs received per command, all voters", "{:.2f}"),
 )
 
 
@@ -239,6 +265,16 @@ def read_run(label: str, store: str) -> Run:
             run.resend_ms_per_call = js.seconds(r["time"]) * 1e3 / r["calls"]
             run.resend_longest_ms = js.seconds(r.get("longest")) * 1e3
             run.resend_scanned_per_call = r.get("scanned", 0) / r["calls"]
+        if t and "send_calls" in t:
+            run.send_calls_per_cmd = t["send_calls"] / leader.executed
+            run.acks_sent_per_cmd = t.get("acks_sent", 0) / leader.executed
+            run.acks_received_per_cmd = t.get("acks_received", 0) / leader.executed
+        counted = [(c.traffic, c.executed) for c in costs if c.traffic and c.executed]
+        if counted and all("datagrams_sent" in tr for tr, _ in counted):
+            run.peer_datagrams_all = sum(tr["datagrams_sent"] / n for tr, n in counted)
+        if counted and all(isinstance(tr.get("api"), dict) for tr, _ in counted):
+            for key in ("datagrams_sent", "datagrams_received", "send_calls", "acks_sent", "acks_received"):
+                setattr(run, f"api_{key}_all", sum(tr["api"].get(key, 0) / n for tr, n in counted))
         traffic = [c.traffic for c in costs if c.traffic]
         if traffic:
             run.lost_frames = sum(t.get("sent_lost", 0) for t in traffic)
@@ -563,6 +599,13 @@ def render(runs: list[Run], title: str) -> str:
             )
         )
     for measures, heading in (
+        (
+            ACKS,
+            "**Acknowledgements and the two planes** (task-d70's QUIC counts from each voter's last `metrics` line: "
+            "the leader's peer send calls and ACK frames per command; then over every voter, each over its own "
+            "commands and summed, the peer plane's datagrams and the api plane's datagrams, send calls and ACK "
+            "frames, the callers' and collectors' connections)",
+        ),
         (
             PROFILE,
             "**Allocator and copies** (task-d60: the leader's flat profile, each group's share of its samples times "

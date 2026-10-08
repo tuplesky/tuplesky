@@ -233,6 +233,29 @@ class PairTests(unittest.TestCase):
         self.assertIn("| `futex`, tokio threads | 2.00 | 0.83 | -1.17 |", text)
         self.assertIn("| tokio: send (`sendmsg` and the kernel's UDP send) (µs) | 150.0 | 125.0 | -25.0 |", text)
 
+    def test_acknowledgements_and_the_two_planes(self):
+        for run, acks in zip(self.runs[:2], (1500, 500)):
+            for node, served in (("n1", 4), ("n2", 0)):
+                text = metrics(served, 1000, 0.6, 2, streams=4000)
+                cost = json.loads(text[len("metrics "):])
+                traffic = cost["cost"]["Observed"]["traffic"]["Observed"]
+                traffic.update(send_calls=6000, acks_sent=acks, acks_received=acks,
+                               api={"datagrams_sent": 3000, "datagrams_received": 2000, "send_calls": 3000,
+                                    "acks_sent": 1000, "acks_received": acks})
+                with open(os.path.join(run.store, node, "coordd.log"), "w") as f:
+                    f.write("metrics " + json.dumps(cost) + "\n")
+        runs = [jp.read_run(r.label, r.store) for r in self.runs[:2]]
+        self.assertAlmostEqual(runs[0].send_calls_per_cmd, 6.0)
+        # Two voters, each 5000 peer datagrams over its 1000 commands.
+        self.assertAlmostEqual(runs[0].peer_datagrams_all, 10.0)
+        self.assertAlmostEqual(runs[1].api_acks_received_all, 1.0)
+        text = jp.render(runs, "Paired")
+        self.assertIn("Acknowledgements and the two planes", text)
+        self.assertIn("| 1 | base | 6.00 | 1.50 | 1.50 | 10.00 | 6.00 | 4.00 | 6.00 | 2.00 | 3.00 |", text)
+        self.assertIn("| 1 | +0.00 (+0.0%) | -1.00 (-66.7%) | -1.00 (-66.7%) |", text)
+        # Before task-d70 there is no api block: the group's api columns stay empty.
+        self.assertIsNone(self.runs[2].api_send_calls_all)
+
     def test_runs_that_are_not_side_by_side_are_not_paired(self):
         text = jp.render([self.runs[0], self.runs[3]], "Paired")
         self.assertIn("no pair to compare", text)
