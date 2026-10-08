@@ -1468,10 +1468,9 @@ def window_cost(boot: Boot, began: datetime.datetime, ended: datetime.datetime) 
     """A boot's loop CPU and commands over a profile's window: the
     difference between its last `metrics` reading at or before the window
     and its first at or after it (its last, where it was killed before
-    one), each timed as the boot's start plus the reading's uptime. That
-    later reading alone where none came before the window (counted from
-    the boot's start); None without a start time, or without a command
-    executed between the two."""
+    one), each timed as the boot's start plus the reading's uptime. None
+    without a start time, without a reading on either side, or without a
+    command executed between the two."""
     if boot.started is None:
         return None
     try:
@@ -1483,10 +1482,8 @@ def window_cost(boot: Boot, began: datetime.datetime, ended: datetime.datetime) 
     after = [c for at, c in timed if at >= ended]
     # Killed before a reading after the window: its last reading.
     last = after[0] if after else boot.cost
-    if last is None or not last.cpu:
+    if last is None or not last.cpu or not before:
         return None
-    if not before:
-        return last
     first = before[-1]
     if last.executed <= first.executed:
         return None

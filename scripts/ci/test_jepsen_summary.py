@@ -116,6 +116,10 @@ class ParseTests(unittest.TestCase):
             v = js.parse_voter([start("10:00:00"), boot, at(50, 2, 400), at(65, 4, 700), start("10:03:00"), boot])
             window = js.sampled_cost(v, path)
             self.assertEqual((window.cpu[0], window.executed), (2.0, 300))
+            # No reading before the window: the first after it counts from
+            # the boot's start, so it is left uncosted.
+            v = js.parse_voter([start("10:00:55"), boot, at(40, 2, 400)])
+            self.assertIsNone(js.sampled_cost(v, path))
             # No command between the readings either side: left uncosted.
             v = js.parse_voter([start("10:00:00"), boot, at(50, 2, 400), at(90, 3, 400)])
             self.assertIsNone(js.sampled_cost(v, path))
