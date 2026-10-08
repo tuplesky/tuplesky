@@ -732,6 +732,19 @@ class TransportTests(unittest.TestCase):
         self.assertAlmostEqual(kinds["`appender`"][2]["futex"], 0.25)
         self.assertEqual(js.syscalls_per_command(os.path.join("/nonexistent", "x"), 500.0), ({}, None))
 
+    def test_calls_perf_did_not_count_are_said_not_zero(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "leader-profile-syscalls.txt")
+            with open(path, "w") as f:
+                f.write(TRANSPORT_SYSCALLS.splitlines()[0] + "\n"
+                        "coordd-100,1000.00,msec,task-clock,1000000000,100.00,0.050,CPUs utilized\n"
+                        "coordd-100,<not supported>,,syscalls:sys_enter_futex,0,100.00,,\n"
+                        "tokio-rt-worker-101,<not supported>,,syscalls:sys_enter_futex,0,100.00,,\n")
+            kinds, _ = js.syscalls_per_command(path, 500.0)
+            note = js.syscall_note(path)
+        self.assertIsNone(kinds["domain loop"][2]["futex"])
+        self.assertEqual(note[0], "perf counted none of these system calls: `futex` (<not supported>)")
+
     def test_the_tokio_threads_by_what_they_did(self):
         chains = js.read_chains_from_lines(TRANSPORT_CHAINS)
         kinds, parking = js.transport_split(chains)
@@ -754,8 +767,9 @@ class TransportTests(unittest.TestCase):
                 f.write("\n".join(TRANSPORT_CHAINS) + "\n")
             voters = {"n1": js.parse_voter([d59_metrics(4, 0.5)])}
             text = "\n".join(js.transport_tables(d, voters))
-        self.assertIn("| domain loop | 1 | 500.0 | 1.00 | 0.00 | 0.00 | 0.00 | 0.00 |", text)
-        self.assertIn("| tokio threads | 2 | 1000.0 | 5.00 | 2.00 | 1.00 | 0.00 | 0.00 |", text)
+        # The file has no epoll or write lines: not counted, not none.
+        self.assertIn("| domain loop | 1 | 500.0 | 1.00 | 0.00 | 0.00 | - | - |", text)
+        self.assertIn("| tokio threads | 2 | 1000.0 | 5.00 | 2.00 | 1.00 | - | - |", text)
         # 30% of the tokio threads' 1000 µs per command.
         self.assertIn("| crypto (packet protection) | 300.0 |", text)
         self.assertIn("| `tokio::runtime::park::Inner::unpark` | 200.0 |", text)

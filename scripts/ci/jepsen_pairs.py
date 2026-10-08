@@ -74,6 +74,12 @@ class Run:
     # threads' samples by what they did, in µs per command.
     threads: dict = field(default_factory=dict)
     transport: dict = field(default_factory=dict)
+    # Of those, the parking and waking by caller and quinn's other work by
+    # function, in µs per command; and perf's words for the system calls
+    # it did not count.
+    parking: dict = field(default_factory=dict)
+    quic_other: dict = field(default_factory=dict)
+    uncounted: dict = field(default_factory=dict)
     # The voters' memory (task-d60): the mean and largest resident set of
     # the coordd processes alive at the last sample, and the largest
     # high-water mark of any, in MiB; None without the sampler's file.
@@ -243,11 +249,16 @@ def read_run(label: str, store: str) -> Run:
     run.chains = js.read_chains(os.path.join(store, "leader-profile-chains.txt"))
     run.follower_chains = js.read_chains(os.path.join(store, "follower-profile-chains.txt"))
     if run.leader_loop:
-        run.threads, _ = js.syscalls_per_command(os.path.join(store, "leader-profile-syscalls.txt"), run.leader_loop * 1000)
-        split, _ = js.transport_split(js.read_chains(os.path.join(store, "transport-profile-chains.txt")))
+        counts = os.path.join(store, "leader-profile-syscalls.txt")
+        run.threads, _ = js.syscalls_per_command(counts, run.leader_loop * 1000)
+        run.uncounted = js.uncounted(js.read_syscalls(counts)[1])
+        chains = js.read_chains(os.path.join(store, "transport-profile-chains.txt"))
+        split, parking = js.transport_split(chains)
         tokio_us = run.threads.get("tokio threads", (0, None))[1]
         if split and tokio_us:
             run.transport = {kind: share * tokio_us / 100 for kind, share in split.items()}
+            run.parking = {caller: share * tokio_us / 100 for caller, share in parking.items()}
+            run.quic_other = {name: share * tokio_us / 100 for name, share in js.quic_other(chains).items()}
     mem = js.memory_summary(js.read_memory(os.path.join(store, "cpu-samples-memory.csv")))
     if mem:
         run.rss_end_mean, run.rss_end_max, run.hwm_max = mem["end_mean"], mem["end_max"], mem["hwm_max"]
@@ -389,7 +400,9 @@ def transport_table(runs: list[Run]) -> list[str]:
     for kind in sorted(kinds, key=lambda k: (k != "domain loop", k != "tokio threads", k)):
         rows.append((f"{kind}: CPU (µs)", [r.threads[kind][1] if kind in r.threads else None for _, r in shown], "{:.1f}"))
     for column, _ in js.SYSCALL_COLUMNS:
-        rows.append((f"`{column}`, all threads", [sum(v[2][column] for v in r.threads.values()) for _, r in shown], "{:.2f}"))
+        rows.append((f"`{column}`, all threads",
+                     [None if any(v[2][column] is None for v in r.threads.values()) else sum(v[2][column] for v in r.threads.values())
+                      for _, r in shown], "{:.2f}"))
         rows.append((f"`{column}`, tokio threads",
                      [r.threads["tokio threads"][2][column] if "tokio threads" in r.threads else None for _, r in shown],
                      "{:.2f}"))
@@ -415,6 +428,25 @@ def transport_table(runs: list[Run]) -> list[str]:
             cells.append(("+" if head - base >= 0 else "") + fmt.format(head - base) if base is not None and head is not None else "-")
         out.append(f"| {name} | " + " | ".join(cells) + " |")
     out.append("")
+    for i, r in shown:
+        if r.uncounted:
+            out += [f"Run {i}: perf counted none of these system calls: "
+                    + ", ".join(f"`{e}` ({w})" for e, w in sorted(r.uncounted.items())), ""]
+    for field_, title, head in (
+        ("parking", "The tokio threads' parking and waking by caller (the innermost Rust frame above the system call)", "Caller"),
+        ("quic_other", "The tokio threads' other QUIC work by function (the innermost quinn frame)", "Function"),
+    ):
+        names = []
+        for _, r in shown:
+            names += [n for n in sorted(getattr(r, field_), key=lambda n: -getattr(r, field_)[n])[:8] if n not in names]
+        if not names:
+            continue
+        out += [f"**{title}** (µs per command)", "",
+                f"| {head} | " + " | ".join(f"Run {i}, {r.label}" for i, r in shown) + " |",
+                "| --- " * (1 + len(shown)) + "|"]
+        for n in names:
+            out.append(f"| `{n.replace('|', '/')}` | " + " | ".join(f"{getattr(r, field_).get(n, 0.0):.1f}" for _, r in shown) + " |")
+        out.append("")
     return out
 
 

@@ -1144,8 +1144,9 @@ def parking_caller(frames: list[str]) -> str:
 def read_syscalls(path: str) -> tuple[int | None, dict]:
     """`leader_profile.py`'s per-thread counts: the leader's pid and each
     thread's (comm, {event: value}) by tid, with the system calls under
-    their own names and `task-clock` in milliseconds; (None, {}) without
-    them."""
+    their own names and `task-clock` in milliseconds, or perf's word for a
+    count it did not take (`<not supported>`, `<not counted>`); (None, {})
+    without them."""
     try:
         with open(path) as f:
             lines = f.read().splitlines()
@@ -1161,12 +1162,32 @@ def read_syscalls(path: str) -> tuple[int | None, dict]:
             continue
         comm, _, tid = cells[0].rpartition("-")
         try:
-            value = float(cells[1])
+            value: float | str = float(cells[1])
         except ValueError:
-            continue
+            value = cells[1].strip() or "(empty)"
         event = cells[3].removeprefix("syscalls:sys_enter_")
+        if not tid.isdigit():
+            continue
         threads.setdefault(int(tid), (comm, {}))[1][event] = value
     return int(m[1]), threads
+
+
+def uncounted(threads: dict) -> dict:
+    """The events perf counted for no thread, each with its word for why."""
+    words: dict = {}
+    counted = set()
+    for comm, ev in threads.values():
+        for event, value in ev.items():
+            if isinstance(value, float):
+                counted.add(event)
+            else:
+                words.setdefault(event, value)
+    return {event: word for event, word in words.items() if event not in counted}
+
+
+def count(ev: dict, name: str) -> float:
+    value = ev.get(name, 0.0)
+    return value if isinstance(value, float) else 0.0
 
 
 def thread_kind(comm: str, tid: int, pid: int) -> str:
@@ -1188,14 +1209,15 @@ SYSCALL_COLUMNS = (
 
 def syscalls_per_command(path: str, leader_us: float | None) -> tuple[dict, float | None]:
     """The leader's threads by kind over the profile's window: {kind:
-    (threads, CPU µs per command, {column: calls per command})}, the
-    commands in the window being the domain loop's CPU in it over its CPU
-    per command; and the window's commands. ({}, None) without the counts
-    or the loop's cost."""
+    (threads, CPU µs per command, {column: calls per command, None where
+    perf counted none of the column's calls})}, the commands in the window
+    being the domain loop's CPU in it over its CPU per command; and the
+    window's commands. ({}, None) without the counts or the loop's cost."""
     pid, threads = read_syscalls(path)
     if pid is None or not leader_us:
         return {}, None
-    loop_ms = sum(ev.get("task-clock", 0.0) for tid, (comm, ev) in threads.items() if tid == pid)
+    missing = uncounted(threads)
+    loop_ms = sum(count(ev, "task-clock") for tid, (comm, ev) in threads.items() if tid == pid)
     commands = loop_ms * 1000 / leader_us
     if commands <= 0:
         return {}, None
@@ -1204,12 +1226,24 @@ def syscalls_per_command(path: str, leader_us: float | None) -> tuple[dict, floa
         kind = thread_kind(comm, tid, pid)
         n, cpu, calls = kinds.get(kind, (0, 0.0, collections.Counter()))
         for column, names in SYSCALL_COLUMNS:
-            calls[column] += sum(ev.get(name, 0.0) for name in names)
-        kinds[kind] = (n + 1, cpu + ev.get("task-clock", 0.0), calls)
+            calls[column] += sum(count(ev, name) for name in names)
+        kinds[kind] = (n + 1, cpu + count(ev, "task-clock"), calls)
+    lost = {c for c, names in SYSCALL_COLUMNS if all(name in missing or not any(name in ev for _, ev in threads.values())
+                                                     for name in names)}
     return {
-        kind: (n, cpu * 1000 / commands, {c: calls[c] / commands for c, _ in SYSCALL_COLUMNS})
+        kind: (n, cpu * 1000 / commands, {c: None if c in lost else calls[c] / commands for c, _ in SYSCALL_COLUMNS})
         for kind, (n, cpu, calls) in kinds.items()
     }, commands
+
+
+def syscall_note(path: str) -> list[str]:
+    """A line saying which system calls perf did not count, in its words;
+    [] when it counted them all."""
+    _, threads = read_syscalls(path)
+    missing = uncounted(threads)
+    if not missing:
+        return []
+    return [f"perf counted none of these system calls: " + ", ".join(f"`{e}` ({w})" for e, w in sorted(missing.items())), ""]
 
 
 def transport_split(chains: list) -> tuple[collections.Counter, collections.Counter]:
@@ -1229,6 +1263,18 @@ def transport_split(chains: list) -> tuple[collections.Counter, collections.Coun
     return kinds, parking
 
 
+def quic_other(chains: list) -> collections.Counter:
+    """The tokio threads' "QUIC, other" samples by the innermost quinn
+    frame on the stack, in percent of those threads' samples."""
+    total = sum(share for _, share, _ in chains)
+    out = collections.Counter()
+    for leaf, share, frames in chains:
+        if total and transport_kind(leaf, frames).startswith("QUIC, other"):
+            name = next((f for f in [leaf] + list(reversed(frames)) if "quinn" in f), "(none)")
+            out[name] += share * 100 / total
+    return out
+
+
 def transport_tables(store: str, voters: dict, top: int = 10) -> list[str]:
     """The leader's tokio threads (the transport's workers and the blocking
     pool): their CPU and system calls per command beside the loop's and
@@ -1236,8 +1282,16 @@ def transport_tables(store: str, voters: dict, top: int = 10) -> list[str]:
     graph's samples by kind and their parking and waking by caller, in µs
     per command; [] without the profile."""
     leader_us, _ = loop_per_command(voters)
-    kinds, commands = syscalls_per_command(os.path.join(store, "leader-profile-syscalls.txt"), leader_us)
+    counts = os.path.join(store, "leader-profile-syscalls.txt")
+    kinds, commands = syscalls_per_command(counts, leader_us)
     out = []
+    try:
+        with open(counts) as f:
+            first = f.readline().strip()
+    except OSError:
+        first = ""
+    if first.startswith("No counts"):
+        out += [f"The leader's threads' system calls: {first}", ""]
     if kinds:
         order = sorted(kinds, key=lambda k: (k != "domain loop", k != "tokio threads", -kinds[k][1]))
         out += [
@@ -1248,14 +1302,17 @@ def transport_tables(store: str, voters: dict, top: int = 10) -> list[str]:
             "| Threads | Count | CPU per command (µs) | " + " | ".join(f"{c} per command" for c, _ in SYSCALL_COLUMNS) + " |",
             "| --- " * (3 + len(SYSCALL_COLUMNS)) + "|",
         ]
+        cell = lambda v: "-" if v is None else f"{v:.2f}"
         for kind in order:
             n, cpu, calls = kinds[kind]
-            out.append(f"| {kind} | {n} | {cpu:.1f} | " + " | ".join(f"{calls[c]:.2f}" for c, _ in SYSCALL_COLUMNS) + " |")
+            out.append(f"| {kind} | {n} | {cpu:.1f} | " + " | ".join(cell(calls[c]) for c, _ in SYSCALL_COLUMNS) + " |")
         total_cpu = sum(v[1] for v in kinds.values())
-        totals = {c: sum(v[2][c] for v in kinds.values()) for c, _ in SYSCALL_COLUMNS}
+        totals = {c: None if any(v[2][c] is None for v in kinds.values()) else sum(v[2][c] for v in kinds.values())
+                  for c, _ in SYSCALL_COLUMNS}
         out.append(f"| **all** | {sum(v[0] for v in kinds.values())} | {total_cpu:.1f} | "
-                   + " | ".join(f"{totals[c]:.2f}" for c, _ in SYSCALL_COLUMNS) + " |")
+                   + " | ".join(cell(totals[c]) for c, _ in SYSCALL_COLUMNS) + " |")
         out.append("")
+        out.extend(syscall_note(os.path.join(store, "leader-profile-syscalls.txt")))
     chains = read_chains(os.path.join(store, "transport-profile-chains.txt"))
     split, parking = transport_split(chains)
     if split:
@@ -1284,6 +1341,17 @@ def transport_tables(store: str, voters: dict, top: int = 10) -> list[str]:
             ]
             for caller, share in parking.most_common(top):
                 out.append(f"| `{caller.replace('|', '/')}` | {fmt.format(share * k)} |")
+            out.append("")
+        other = quic_other(chains)
+        if other:
+            out += [
+                f"**The tokio threads' other QUIC work by function** (the innermost quinn frame on the stack; {unit})",
+                "",
+                "| Function | Cost |",
+                "| --- | --- |",
+            ]
+            for name, share in other.most_common(top):
+                out.append(f"| `{name.replace('|', '/')}` | {fmt.format(share * k)} |")
             out.append("")
     return out
 
