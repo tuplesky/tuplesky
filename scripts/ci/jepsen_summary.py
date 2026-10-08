@@ -136,6 +136,8 @@ class Boot:
     executed: str = "-"
     # (records, from, through, took_ms, attach_ms), or None without the line.
     replayed: tuple | None = None
+    # The `cost` reading of this boot's last `metrics` line, or None.
+    cost: "Cost | None" = None
 
 
 @dataclass
@@ -378,6 +380,8 @@ def parse_voter(lines) -> Voter:
                 snapshot = json.loads(line[len("metrics "):])
                 v.stages = parse_stages(snapshot)
                 v.cost = parse_cost(snapshot)
+                if v.boot_rows:
+                    v.boot_rows[-1].cost = v.cost
                 if v.cost and v.cost.cpu:
                     boot_cpu = v.cost.cpu[1]
                 if v.cost and v.cost.unordered:
@@ -1319,7 +1323,8 @@ def transport_tables(store: str, voters: dict, top: int = 10) -> list[str]:
     graph's samples by kind and their parking and waking by caller, in µs
     per command; [] without the profile."""
     # The same process as the leader's profile, which names its voter.
-    leader_us, _ = loop_per_command(voters, leader=profiled_node(os.path.join(store, "leader-profile.txt")))
+    leader_us, _ = loop_per_command(voters, leader=profiled_node(os.path.join(store, "leader-profile.txt")),
+                                    sampled=sampled_costs(voters, store))
     counts = os.path.join(store, "leader-profile-syscalls.txt")
     kinds, commands = syscalls_per_command(counts, leader_us)
     out = []
@@ -1420,25 +1425,78 @@ def resend_table(voters: dict) -> list[str]:
     return out
 
 
-def loop_per_command(voters: dict, follower: str | None = None, leader: str | None = None) -> tuple[float | None, float | None]:
+def loop_per_command(voters: dict, follower: str | None = None, leader: str | None = None,
+                     sampled: dict | None = None) -> tuple[float | None, float | None]:
     """The leader's loop CPU per command and a follower's, in
     microseconds: `leader`'s and `follower`'s own where they name voters
     (the voters a profile sampled), else the voter whose read barrier
     served reads and the other voters' mean; None where the line has no
-    CPU."""
-    costs = {n: v.cost for n, v in voters.items() if v.cost and v.cost.cpu and v.cost.executed}
+    CPU. `sampled` (from sampled_costs) gives a named voter's cost at the
+    boot its profile sampled, None where that boot is not known."""
+    usable = lambda c: c if c and c.cpu and c.executed else None
+    costs = {n: v.cost for n, v in voters.items() if usable(v.cost)}
+    sampled = sampled or {}
     if not costs:
         return None, None
-    leader = costs[leader] if leader in costs else max(costs.values(), key=lambda c: (c.served, c.cpu[0] / c.executed))
-    if follower in costs and costs[follower] is not leader:
-        own = costs[follower]
-        return leader.cpu[0] / leader.executed * 1e6, own.cpu[0] / own.executed * 1e6
-    followers = [c for c in costs.values() if c is not leader]
+    per = lambda c: c.cpu[0] / c.executed * 1e6 if c else None
+    if leader in sampled:
+        lead = usable(sampled[leader])
+    elif leader in costs:
+        lead = costs[leader]
+    else:
+        lead = max(costs.values(), key=lambda c: (c.served, c.cpu[0] / c.executed))
+    if follower in sampled:
+        return per(lead), per(usable(sampled[follower]))
+    if follower in costs and costs[follower] is not lead:
+        return per(lead), per(costs[follower])
+    followers = [c for n, c in costs.items() if c is not lead and n != leader]
     mean = sum(c.cpu[0] / c.executed for c in followers) / len(followers) * 1e6 if followers else None
-    return leader.cpu[0] / leader.executed * 1e6, mean
+    return per(lead), mean
 
 
 PROFILED_NODE = re.compile(r"^\w+ thread \d+ \(([^)\s]+)\)")
+
+
+PROFILE_WINDOW = re.compile(r" from (\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) to (\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) UTC")
+
+
+def sampled_cost(voter: Voter, path: str) -> "Cost | None":
+    """The cost of the boot a profile sampled, from that boot's last
+    `metrics` line: a voter's only boot (its last line, where no boot is
+    logged), or the one started last before the profile's window, by the
+    "Jepsen starting" times (the runner's clock, as the window's). None
+    where the boot is not known: a boot without a start time, or a
+    restart within the window."""
+    boots = voter.boot_rows
+    if len(boots) <= 1:
+        return voter.cost
+    try:
+        with open(path) as f:
+            m = PROFILE_WINDOW.search(f.readline())
+    except OSError:
+        return None
+    if not m or any(b.started is None for b in boots):
+        return None
+    began, ended = m[1], m[2]
+    before = [i for i, b in enumerate(boots) if b.started <= began]
+    if not before:
+        return None
+    i = before[-1]
+    if i + 1 < len(boots) and boots[i + 1].started <= ended:
+        return None
+    return boots[i].cost
+
+
+def sampled_costs(voters: dict, store: str) -> dict:
+    """{node: its cost at the boot its profile sampled, or None}, for the
+    voters the leader's and the follower's profiles name."""
+    out = {}
+    for name in ("leader-profile.txt", "follower-profile-chains.txt"):
+        path = os.path.join(store, name)
+        node = profiled_node(path)
+        if node in voters:
+            out[node] = sampled_cost(voters[node], path)
+    return out
 
 
 def profiled_node(path: str) -> str | None:
@@ -1488,7 +1546,8 @@ def leader_and_follower(store: str, voters: dict, top: int = 20) -> list[str]:
     The follower's cost is the sampled voter's own where its profile names
     it, since the profile samples the busiest follower alone."""
     node = profiled_node(os.path.join(store, "follower-profile-chains.txt"))
-    leader_us, follower_us = loop_per_command(voters, node, profiled_node(os.path.join(store, "leader-profile.txt")))
+    leader_us, follower_us = loop_per_command(voters, node, profiled_node(os.path.join(store, "leader-profile.txt")),
+                                              sampled_costs(voters, store))
     sampled = node if node in voters else None
     lead = read_chains(os.path.join(store, "leader-profile-chains.txt"))
     follow = read_chains(os.path.join(store, "follower-profile-chains.txt"))

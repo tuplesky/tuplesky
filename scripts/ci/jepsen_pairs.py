@@ -251,16 +251,17 @@ def read_run(label: str, store: str) -> Run:
         completed = 0
 
     costs = []
-    by_node = {}
+    voters = {}
+    leader = None
     process_cpu = 0.0
     for node in sorted(os.listdir(store)):
         path = os.path.join(store, node, "coordd.log")
         if os.path.exists(path):
             with open(path, encoding="utf-8", errors="replace") as f:
                 voter = js.parse_voter(f.readlines())
+            voters[node] = voter
             if voter.cost and voter.cost.cpu and voter.cost.executed:
                 costs.append(voter.cost)
-                by_node[node] = voter.cost
             # Over every boot: a restarted voter's last boot holds only
             # what it used since the restart.
             process_cpu += voter.process_cpu or 0.0
@@ -307,14 +308,18 @@ def read_run(label: str, store: str) -> Run:
     run.inclusive = read_inclusive(os.path.join(store, "leader-profile-inclusive.txt"))
     run.chains = js.read_chains(os.path.join(store, "leader-profile-chains.txt"))
     run.follower_chains = js.read_chains(os.path.join(store, "follower-profile-chains.txt"))
+    # Each profiled voter at the boot its profile sampled: a voter killed
+    # and restarted since then has a later boot's cost as its last.
+    sampled = js.sampled_costs(voters, store)
+    usable = lambda c: c is not None and c.cpu and c.executed
     lead = js.profiled_node(os.path.join(store, "leader-profile.txt"))
-    if lead in by_node:
+    if lead in sampled and usable(sampled[lead]):
         run.sampled_leader = lead
-        run.sampled_leader_loop = by_node[lead].cpu[0] * 1000 / by_node[lead].executed
+        run.sampled_leader_loop = sampled[lead].cpu[0] * 1000 / sampled[lead].executed
     node = js.profiled_node(os.path.join(store, "follower-profile-chains.txt"))
-    if node in by_node and node != lead and (lead or by_node[node] is not leader):
+    if node in sampled and usable(sampled[node]) and node != lead and (lead or sampled[node] is not leader):
         run.sampled_follower = node
-        run.sampled_follower_loop = by_node[node].cpu[0] * 1000 / by_node[node].executed
+        run.sampled_follower_loop = sampled[node].cpu[0] * 1000 / sampled[node].executed
     if run.profile_loop:
         counts = os.path.join(store, "leader-profile-syscalls.txt")
         run.threads, _ = js.syscalls_per_command(counts, run.profile_loop * 1000)

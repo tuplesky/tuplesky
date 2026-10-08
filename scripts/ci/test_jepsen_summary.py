@@ -85,6 +85,24 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(v.process_cpu, 13.0)
         self.assertIsNone(js.parse_voter([boot]).process_cpu)
 
+    def test_a_profile_is_costed_at_the_boot_it_sampled(self):
+        metrics = next(line for line in VOTER.splitlines() if '"cost"' in line)
+        reading = lambda secs: metrics.replace('"domain":{"secs":3', f'"domain":{{"secs":{secs}')
+        start = lambda at: f"2026-10-08 {at} Jepsen starting  /opt/tuplesky/coordd --config coordd.toml"
+        boot = "coordd domain=tuplesky-harness roles=[Voter] phase=starting votes=true"
+        header = "leader thread 7 (n1), 0.90 of a core over the 5 s before, sampled at 99 Hz from 2026-10-08 10:01:00 to 2026-10-08 10:01:20 UTC; Samples: 1K\n"
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "leader-profile.txt")
+            with open(path, "w") as f:
+                f.write(header)
+            # Killed and restarted after the window: the first boot's cost.
+            v = js.parse_voter([start("10:00:00"), boot, reading(2), reading(4), start("10:02:00"), boot, reading(1)])
+            self.assertEqual(v.cost.cpu[0], 1.0)
+            self.assertEqual(js.sampled_cost(v, path).cpu[0], 4.0)
+            # Restarted within the window: not known.
+            v = js.parse_voter([start("10:00:00"), boot, reading(4), start("10:01:10"), boot, reading(1)])
+            self.assertIsNone(js.sampled_cost(v, path))
+
     def test_voter_counts_sum_each_boots_highest(self):
         v = js.parse_voter(VOTER.splitlines(keepends=True))
         self.assertEqual(v.boots, 2)
