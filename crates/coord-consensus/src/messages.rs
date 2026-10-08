@@ -132,7 +132,7 @@ impl CatchUpEntry {
     /// The length of its encoding: what it costs a page against
     /// [`MAX_CATCH_UP_BYTES`].
     pub fn encoded_len(&self) -> usize {
-        postcard::to_allocvec(self).map_or(usize::MAX, |bytes| bytes.len())
+        postcard::experimental::serialized_size(self).unwrap_or(usize::MAX)
     }
 }
 

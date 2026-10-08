@@ -189,9 +189,14 @@ impl CommandId {
     /// Derive the identity. The request must be valid and canonical.
     pub fn derive(retry_key: &RetryKey, request: &LogicalRequest) -> Result<Self, ValidationError> {
         let payload = request.canonical_bytes()?;
-        Ok(CommandId(
-            HashDomain::CommandId.digest(&[&retry_key.canonical_bytes(), &payload]),
-        ))
+        Ok(Self::from_canonical(retry_key, &payload))
+    }
+
+    /// Derive the identity from a request's canonical bytes, already
+    /// checked to be canonical (as `RequestV1::logical` checks them): what
+    /// [`CommandId::derive`] computes, without encoding the request again.
+    pub fn from_canonical(retry_key: &RetryKey, canonical: &[u8]) -> Self {
+        CommandId(HashDomain::CommandId.digest(&[&retry_key.canonical_bytes(), canonical]))
     }
 
     /// Borrow the raw digest bytes.

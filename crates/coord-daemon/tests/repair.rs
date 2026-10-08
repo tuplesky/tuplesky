@@ -362,7 +362,7 @@ impl Cluster {
         Cluster {
             voters: (0..3).map(voter).collect(),
             parked: (0..3).map(|_| Parked::new(HOLD, depth)).collect(),
-            collector: Collector::new(CollectorConfig {
+            collector: Collector::traced(CollectorConfig {
                 quorum: quorum(),
                 max_pending: 16,
                 max_resolved: 16,
@@ -1385,7 +1385,7 @@ fn a_retry_under_other_facts_is_answered_from_the_record() {
     assert_eq!(w.releases.len(), 1);
 
     // A frontend that restarted: nothing of the first answer is left.
-    w.collector = Collector::new(CollectorConfig {
+    w.collector = Collector::traced(CollectorConfig {
         quorum: quorum(),
         max_pending: 16,
         max_resolved: 16,
@@ -1446,7 +1446,7 @@ fn another_request_under_a_bound_key_ends_with_a_conflict() {
     w.settle();
     assert_eq!(w.releases.len(), 1);
 
-    w.collector = Collector::new(CollectorConfig {
+    w.collector = Collector::traced(CollectorConfig {
         quorum: quorum(),
         max_pending: 16,
         max_resolved: 16,

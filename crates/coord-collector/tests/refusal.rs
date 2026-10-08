@@ -94,7 +94,7 @@ fn admitted(seq: u64) -> (CommandId, AdmittedRequest) {
 }
 
 fn collector(max_pending: usize) -> Collector {
-    Collector::new(CollectorConfig {
+    Collector::traced(CollectorConfig {
         quorum: quorum(ballot(0, 0)),
         max_pending,
         max_resolved: max_pending,
@@ -350,4 +350,45 @@ fn a_ballot_change_asks_for_every_entry_again() {
     let commands: BTreeSet<CommandId> = asked.iter().map(|f| f.command).collect();
     assert_eq!(commands, BTreeSet::from([a, b]));
     assert_eq!(c.half_established().len(), 2);
+}
+
+/// The golden trace is kept only by a collector made to keep it: the
+/// daemon's collector never reads its trace, so one made with `new`
+/// records nothing however many transitions it makes (task-d60), and
+/// the same transitions on a traced collector are all recorded.
+#[test]
+fn only_a_traced_collector_keeps_its_trace() {
+    let run = |mut c: Collector| {
+        let command = submit(&mut c, 1);
+        let bound = CommandId(Digest32([9; 32]));
+        c.on_evidence(
+            from(2),
+            refused(command, SubmissionRefusal::OtherCommand { bound }),
+        )
+        .unwrap();
+        c.settle_conflict_from_record(command, bound).unwrap();
+        assert!(!c.is_pending(&command));
+        c
+    };
+    let config = || CollectorConfig {
+        quorum: quorum(ballot(0, 0)),
+        max_pending: 4,
+        max_resolved: 4,
+        max_undelivered_bytes: usize::MAX,
+    };
+    let mut plain = run(Collector::new(config()));
+    assert!(plain.trace().is_empty());
+    assert!(plain.take_trace().is_empty());
+    let mut traced = run(Collector::traced(config()));
+    assert!(matches!(
+        traced.trace(),
+        [
+            CollectorEvent::Submitted { .. },
+            CollectorEvent::VoterRefused { .. },
+            ..
+        ]
+    ));
+    let taken = traced.take_trace();
+    assert!(taken.len() >= 3, "{taken:?}");
+    assert!(traced.trace().is_empty());
 }
