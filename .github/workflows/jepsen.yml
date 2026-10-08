@@ -494,18 +494,19 @@ jobs:
           done
       - name: Fail on a divergence stop
         if: always()
-        # A voter that stops because the domain's commands diverged is a
-        # safety tripwire firing, whatever Elle concludes about the history
-        # the clients saw: the job fails, so it is not left for someone to
-        # notice in the digest.
+        # A voter that stops because the domain's commands diverged, or
+        # because recovery selected a dependency cycle no quorum's order
+        # can produce, is a safety tripwire firing, whatever Elle concludes
+        # about the history the clients saw: the job fails, so it is not
+        # left for someone to notice in the digest.
         run: |
           shopt -s nullglob
           # Every run's voters: a paired job leaves one store per run.
-          stops=$(grep -HE 'this node stopped: (release-record-mismatch|incompatible-admission)\(' \
+          stops=$(grep -HE 'this node stopped: (release-record-mismatch|incompatible-admission|recovery-cycle)\(' \
             jepsen/tuplesky/store/*/[0-9]*/n*/coordd.log || true)
           if [ -n "$stops" ]; then
             echo "$stops" | cut -c1-300
-            echo "::error::A voter stopped on a divergence (above); the execution order around it is in the step before."
+            echo "::error::A voter stopped on a divergence or a recovery cycle (above); the execution order around it is in the step before."
             exit 1
           fi
       - name: Pack the Jepsen store

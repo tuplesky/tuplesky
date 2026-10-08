@@ -135,8 +135,8 @@ The Jepsen side is `jepsen.tuplesky`, in the `tuplesky/` directory of the
 * Workloads: Elle list-append and rw-register (strict serializability),
   and a Knossos cas-register. Faults: kill, pause, partition and clock,
   through Jepsen's combined nemesis package. Any `panicked at` in a
-  voter's log fails the test, and a divergence stop in one fails the job
-  (below).
+  voter's log fails the test, and a divergence or recovery-cycle stop in
+  one fails the job (below).
 
 It runs under Jepsen in the `jepsen` workflow, below. The environment
 it was written in could not reach Clojars, so that is where it runs.
@@ -639,8 +639,8 @@ copy taken while `coordd` commits could read one commit's header and pages
 a later commit reused; a killed store is a crash image, which `redb`
 recovers to its last commit.
 
-When a voter stops on a command (`release-record-mismatch(..)` or
-`incompatible-admission(..)`):
+When a voter stops on a command (`release-record-mismatch(..)`,
+`incompatible-admission(..)` or `recovery-cycle(..)`):
 
 * the job prints every voter's `executed_v1` rows within 8 positions of
   it, as `position revision digest command` (the digest is the result
