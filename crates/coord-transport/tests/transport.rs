@@ -1153,6 +1153,19 @@ async fn a_caller_asks_a_question_and_reads_the_answer_on_the_same_stream() {
     let answer = answered.expect("the caller read its answer");
     assert_eq!(answer.kind, KIND_SESSION_BIND_ACK);
     assert_eq!(answer.payload, b"you are");
+    // A caller's datagrams are the api plane's, counted apart from the
+    // peer plane's (task-d70), and read the same way apart from the
+    // transport.
+    let traffic = node.traffic_reader().read();
+    assert!(
+        traffic.api.datagrams_sent > 0 && traffic.api.datagrams_received > 0,
+        "{traffic:?}"
+    );
+    assert_eq!(
+        (traffic.datagrams_sent, traffic.datagrams_received),
+        (0, 0),
+        "no peer connection"
+    );
 }
 
 /// An answer above its kind's class limit is refused as a bound, not
@@ -2809,6 +2822,32 @@ async fn linked(a: Limits, b: Limits) -> (Fixture, Transport, Transport) {
         assert!(matches!(event(t).await, TransportEvent::Connected { .. }));
     }
     (f, ta, tb)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_acknowledgement_cadence_asked_of_a_peer_still_delivers() {
+    // task-d70: both ends ask the other to acknowledge after eight
+    // packets or two milliseconds. What is sent and received is unchanged;
+    // only when QUIC acknowledges it moves.
+    let cadence = Limits {
+        ack_frequency: Some(coord_transport::AckFrequency {
+            threshold: 8,
+            max_delay: Duration::from_millis(2),
+        }),
+        ..limits()
+    };
+    let (_f, a, mut b) = linked(cadence, cadence).await;
+    for round in 0..5 {
+        let sent = a.send_many(dest(1, Lane::Control), DOMAIN, numbered(10));
+        assert!(sent.iter().all(Result::is_ok), "round {round}: {sent:?}");
+        assert_eq!(payloads(&mut b, 10).await, said(10));
+    }
+    let (out, heard) = (a.peer_traffic(), b.peer_traffic());
+    assert_eq!((out.sent_frames, out.sent_lost), (50, 0));
+    assert_eq!(heard.received_frames, 50);
+    assert!(out.datagrams_sent > 0 && heard.datagrams_received > 0);
+    // Peer links are not the api plane's.
+    assert_eq!(out.api, coord_transport::Datagrams::default());
 }
 
 #[tokio::test(flavor = "multi_thread")]

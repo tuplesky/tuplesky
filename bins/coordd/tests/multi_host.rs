@@ -242,10 +242,12 @@ async fn a_voter_started_after_the_first_write_serves_reads() {
     let mut late = Caller::connect(&run, &provisioned, &minter, 2, 1)
         .await
         .expect("a caller bound at the late voter");
+    // A fresh session's first read at the late voter can be held back as
+    // pending until the voter has projected the session, as at a returned
+    // voter: it is asked again until it is answered (`read_value`).
     assert_eq!(
-        late.ask(&get(&provisioned, b"early"), Duration::from_secs(30))
-            .await,
-        Answer::Established,
+        read_value(&mut late, &provisioned, b"early").await,
+        Some(b"placed".to_vec()),
         "a read through the voter started late was not served:\n-- 1 --\n{}\n-- 2 --\n{}\n-- 3 --\n{}",
         voters[0].said(),
         voters[1].said(),
