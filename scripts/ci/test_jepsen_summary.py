@@ -75,6 +75,16 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(js.parse_results(RESULTS), ("false", [":G1a", ":lost-update"]))
         self.assertEqual(js.parse_results(""), ("missing", []))
 
+    def test_process_cpu_sums_each_boots_last_reading(self):
+        metrics = next(line for line in VOTER.splitlines() if '"cost"' in line)
+        reading = lambda secs: metrics.replace('"process":{"secs":8', f'"process":{{"secs":{secs}')
+        boot = "coordd domain=tuplesky-harness roles=[Voter] phase=starting votes=true"
+        # The first boot's 5 s is its last reading; the second's counter
+        # starts again, and its last reading is 8 s.
+        v = js.parse_voter([boot, reading(2), reading(5), boot, reading(3), reading(8)])
+        self.assertEqual(v.process_cpu, 13.0)
+        self.assertIsNone(js.parse_voter([boot]).process_cpu)
+
     def test_voter_counts_sum_each_boots_highest(self):
         v = js.parse_voter(VOTER.splitlines(keepends=True))
         self.assertEqual(v.boots, 2)

@@ -11,10 +11,12 @@ over the job does not favour one side). For every run it reads, with
 `jepsen_summary.py`'s own parsers:
 
 * `ok` a second and the read p99, from `jepsen.log`;
-* the voters' process CPU per completed operation, the leader's loop CPU
-  per command and the followers' mean, and the leader's excess over them
-  (what only the leader does, reads most of it), from each voter's last
-  `metrics` line; the leader is the voter whose read barrier served reads;
+* the voters' process CPU per completed operation, summed over each
+  voter's boots (each boot's last `metrics` line), and the leader's loop
+  CPU per command and the followers' mean, and the leader's excess over
+  them (what only the leader does, reads most of it), from each voter's
+  last `metrics` line; the leader is the voter whose read barrier served
+  reads;
 * the servers' CPU per operation from the runner's samples, when there
   are any;
 * the leader's profile (`leader-profile.txt`, from `leader_profile.py`),
@@ -250,6 +252,7 @@ def read_run(label: str, store: str) -> Run:
 
     costs = []
     by_node = {}
+    process_cpu = 0.0
     for node in sorted(os.listdir(store)):
         path = os.path.join(store, node, "coordd.log")
         if os.path.exists(path):
@@ -258,9 +261,12 @@ def read_run(label: str, store: str) -> Run:
             if voter.cost and voter.cost.cpu and voter.cost.executed:
                 costs.append(voter.cost)
                 by_node[node] = voter.cost
+            # Over every boot: a restarted voter's last boot holds only
+            # what it used since the restart.
+            process_cpu += voter.process_cpu or 0.0
     if costs:
         if completed:
-            run.voters_cpu_per_op = sum(c.cpu[1] for c in costs) * 1000 / completed
+            run.voters_cpu_per_op = process_cpu * 1000 / completed
         leader = max(costs, key=lambda c: (c.served, c.cpu[0] / c.executed))
         followers = [c for c in costs if c is not leader]
         run.leader_loop = leader.cpu[0] * 1000 / leader.executed

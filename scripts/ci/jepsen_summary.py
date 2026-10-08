@@ -175,6 +175,11 @@ class Voter:
     # every `metrics` line of every boot (task-d62), in seconds, with the
     # line's uptime; None before task-d62.
     oldest_unordered: tuple[float, float] | None = None
+    # The whole process's CPU seconds over every boot: each boot's last
+    # `metrics` reading, summed, since the counter starts again at each
+    # start (a killed boot's CPU after its last line is missing); None
+    # without a reading.
+    process_cpu: float | None = None
 
 
 @dataclass
@@ -360,6 +365,8 @@ def parse_voter(lines) -> Voter:
     base: dict | None = None
     # The time on the last "Jepsen starting" line, until a boot takes it.
     started: str | None = None
+    # The process CPU of the boots before this one, and this one's last.
+    earlier_cpu, boot_cpu = 0.0, None
 
     def since_start():
         for k, n in boot.items():
@@ -372,6 +379,8 @@ def parse_voter(lines) -> Voter:
                 snapshot = json.loads(line[len("metrics "):])
                 v.stages = parse_stages(snapshot)
                 v.cost = parse_cost(snapshot)
+                if v.cost and v.cost.cpu:
+                    boot_cpu = v.cost.cpu[1]
                 if v.cost and v.cost.unordered:
                     held = seconds(v.cost.unordered.get("oldest"))
                     if v.oldest_unordered is None or held > v.oldest_unordered[0]:
@@ -390,6 +399,8 @@ def parse_voter(lines) -> Voter:
             continue
         if line.startswith("coordd domain="):
             v.boots += 1
+            if boot_cpu is not None:
+                earlier_cpu, boot_cpu = earlier_cpu + boot_cpu, None
             v.boot_rows.append(Boot(started=started))
             started = None
             for k, n in boot.items():
@@ -428,6 +439,8 @@ def parse_voter(lines) -> Voter:
         v.counts[k] = v.counts.get(k, 0) + n
     if base is not None:
         since_start()
+    if boot_cpu is not None or earlier_cpu:
+        v.process_cpu = earlier_cpu + (boot_cpu or 0.0)
     return v
 
 
