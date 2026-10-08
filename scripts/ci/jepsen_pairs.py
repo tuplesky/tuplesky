@@ -47,6 +47,11 @@ class Run:
     leader_loop: float | None = None
     followers_loop: float | None = None
     servers_cpu_per_op: float | None = None
+    # From the sampler's per-thread file: the voters' domain loops and their
+    # tokio threads (the transport's workers and the blocking pool), CPU ms
+    # per operation over the workload.
+    loops_cpu_per_op: float | None = None
+    workers_cpu_per_op: float | None = None
     # (object, symbol) -> share of the leader thread's samples, in percent;
     # empty without a profile.
     profile: dict = field(default_factory=dict)
@@ -119,6 +124,8 @@ MEASURES = (
     ("read_p99", "read p99 (ms)", "{:.0f}"),
     ("voters_cpu_per_op", "Voters' CPU per op (ms)", "{:.2f}"),
     ("servers_cpu_per_op", "Servers' CPU per op, sampled (ms)", "{:.2f}"),
+    ("loops_cpu_per_op", "Voters' domain loops, CPU per op (ms)", "{:.2f}"),
+    ("workers_cpu_per_op", "Voters' tokio threads, CPU per op (ms)", "{:.2f}"),
     ("leader_loop", "Leader's loop CPU per command (ms)", "{:.3f}"),
     ("followers_loop", "Followers' loop CPU per command (ms)", "{:.3f}"),
     ("leader_excess", "Leader's excess per command (ms)", "{:.3f}"),
@@ -239,6 +246,13 @@ def read_run(label: str, store: str) -> Run:
         after = [r for r in rows if r["time"] >= until]
         if before and after:
             run.servers_cpu_per_op = (after[0]["servers_s"] - before[-1]["servers_s"]) * 1000 / completed
+            threads = js.read_thread_samples(os.path.join(store, "cpu-samples-threads.csv"))
+            first, last = threads.get(before[-1]["time"]), threads.get(after[0]["time"])
+            if first and last:
+                voters = [k for k in last if k in first]
+                if voters:
+                    run.loops_cpu_per_op = sum(last[k][0] - first[k][0] for k in voters) * 1000 / completed
+                    run.workers_cpu_per_op = sum(last[k][2] - first[k][2] for k in voters) * 1000 / completed
     return run
 
 

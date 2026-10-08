@@ -232,7 +232,9 @@ favours neither side. Each run gets its own summary as it ends, and
 `scripts/ci/jepsen_pairs.py` then gives one row per run and the head's
 difference from the base pair by pair, with the mean, smallest and
 largest: `ok`/s, read p99, the voters' CPU per operation, the servers'
-sampled CPU per operation, and the leader's loop CPU per command, the
+sampled CPU per operation split into the voters' domain loops and their
+tokio threads (from `cpu-samples-threads.csv`, over the same workload
+window), and the leader's loop CPU per command, the
 followers' and the leader's excess over them. With `leader-profile`, it
 also costs each symbol of the leader's profile per command (its share of
 the thread's samples times the run's loop CPU per command, since a share

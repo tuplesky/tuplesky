@@ -84,10 +84,10 @@ class PairTests(unittest.TestCase):
 
     def test_the_table_gives_each_pair_and_the_mean(self):
         text = jp.render(self.runs, "Paired")
-        self.assertIn("| 1 | base | 0.4 | 50 | 1000.00 | - | 0.600 | 0.400 | 0.200 |", text)
+        self.assertIn("| 1 | base | 0.4 | 50 | 1000.00 | - | - | - | 0.600 | 0.400 | 0.200 |", text)
         # Pair 1: read p99 40 against 50; pair 2: 30 against 60.
-        self.assertIn("| 1 | +0.0 (+0.1%) | -10 (-20.0%) | +0.00 (+0.0%) | - | -0.100 (-16.7%) | +0.000 (+0.0%) | -0.100 (-50.0%) |", text)
-        self.assertIn("| 2 | +0.0 (+0.3%) | -30 (-50.0%) | -500.00 (-50.0%) | - | -0.200 (-28.6%) |", text)
+        self.assertIn("| 1 | +0.0 (+0.1%) | -10 (-20.0%) | +0.00 (+0.0%) | - | - | - | -0.100 (-16.7%) | +0.000 (+0.0%) | -0.100 (-50.0%) |", text)
+        self.assertIn("| 2 | +0.0 (+0.3%) | -30 (-50.0%) | -500.00 (-50.0%) | - | - | - | -0.200 (-28.6%) |", text)
         self.assertIn("| mean (smallest to largest) of 2 | +0.0 (0.0 to 0.0) | -20 (-30 to -10) |", text)
 
     def test_profiles_are_costed_per_command_by_build(self):
@@ -192,6 +192,26 @@ class PairTests(unittest.TestCase):
         self.assertIn("| 1 | -95.0 (-79.2%) | -10.0 (-16.7%) |", text)
         self.assertIn("| 1 | base | 130 | 130 | 140 |", text)
         self.assertIn("| 1 | +45 (+34.6%) | +45 (+34.6%) | +45 (+32.1%) |", text)
+
+    def test_the_loops_and_tokio_threads_over_the_workload(self):
+        path = self.runs[0].store
+        with open(os.path.join(path, "cpu-samples.csv"), "w") as f:
+            f.write("time,host_busy_s,host_total_s,cpus,servers_s,steal_s\n"
+                    "2026-09-27 09:59:59.000000,0,0,4,10,0\n"
+                    "2026-09-27 10:00:11.000000,0,0,4,14,0\n")
+        # Two voters; a third that started mid-run has no first sample.
+        with open(os.path.join(path, "cpu-samples-threads.csv"), "w") as f:
+            f.write("time,pid,start,loop_cpu_s,loop_runq_s,workers_cpu_s,workers_runq_s,workers\n"
+                    "2026-09-27 09:59:59.000000,1,1,1.0,0,2.0,0,8\n"
+                    "2026-09-27 09:59:59.000000,2,1,1.0,0,2.0,0,8\n"
+                    "2026-09-27 10:00:11.000000,1,1,1.6,0,2.8,0,8\n"
+                    "2026-09-27 10:00:11.000000,2,1,1.2,0,2.4,0,8\n"
+                    "2026-09-27 10:00:11.000000,3,5,9.0,0,9.0,0,8\n")
+        run = jp.read_run("base", path)
+        # Four completed reads: 4 s, 0.8 s and 1.2 s over them.
+        self.assertAlmostEqual(run.servers_cpu_per_op, 1000.0)
+        self.assertAlmostEqual(run.loops_cpu_per_op, 200.0)
+        self.assertAlmostEqual(run.workers_cpu_per_op, 300.0)
 
     def test_runs_that_are_not_side_by_side_are_not_paired(self):
         text = jp.render([self.runs[0], self.runs[3]], "Paired")
