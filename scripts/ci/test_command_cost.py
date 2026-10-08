@@ -169,6 +169,8 @@ class ReduceTests(unittest.TestCase):
             "sent_lost_streams": 1, "datagrams_sent": 500, "datagrams_received": 450,
             "send_calls": 480, "acks_sent": 200, "acks_received": 210,
             "received_frames": 880, "received_bytes": 190000, "received_streams": 880,
+            "api": {"datagrams_sent": 400, "datagrams_received": 390, "send_calls": 395,
+                    "acks_sent": 150, "acks_received": 160},
         }}
         jobs = lambda n, q, s, c: {"count": n, "queued": duration(q), "served": duration(s),
                                    "completed": duration(c)}
@@ -183,6 +185,8 @@ class ReduceTests(unittest.TestCase):
         self.assertAlmostEqual(traffic["sent_frames"], 9.0)
         self.assertAlmostEqual(traffic["received_bytes"], 1900.0)
         self.assertAlmostEqual(traffic["sent_lost"], 0.02)
+        self.assertAlmostEqual(traffic["api_datagrams_sent"], 4.0)
+        self.assertAlmostEqual(traffic["api_acks_sent"], 1.5)
         self.assertAlmostEqual(reading["frames_per_stream_sent"], 3.0)
         self.assertAlmostEqual(reading["frames_per_stream_received"], 1.0)
         self.assertAlmostEqual(reading["frames_per_lost_stream"], 2.0)

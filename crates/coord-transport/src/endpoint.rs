@@ -510,11 +510,21 @@ struct Traffic {
     received_frames: AtomicU64,
     received_bytes: AtomicU64,
     received_streams: AtomicU64,
-    /// QUIC's own counts of the peer connections already closed (task-d61);
-    /// those still open are read from the connections themselves.
-    closed: Mutex<Quic>,
-    /// The same of the api connections already closed (task-d70).
-    closed_api: Mutex<Quic>,
+    /// QUIC's own counts of the connections already closed (task-d61,
+    /// task-d70); those still open are read from the connections
+    /// themselves.
+    ///
+    /// Taken before the connection table, by a reading and by a
+    /// connection leaving it alike, so a connection is counted once: as
+    /// open or as closed, never both and never neither.
+    closed: Mutex<Closed>,
+}
+
+/// [`Quic`] counts of closed connections, per class.
+#[derive(Clone, Copy, Debug, Default)]
+struct Closed {
+    peer: Quic,
+    api: Quic,
 }
 
 /// What QUIC itself sent and received on one class of connections:
@@ -556,16 +566,17 @@ impl Traffic {
         counter.fetch_add(n, Ordering::Relaxed);
     }
 
-    fn read(&self, open: &[Arc<Peer>]) -> PeerTraffic {
+    fn read(&self, peers: &Mutex<HashMap<ConnectionId, Arc<Peer>>>) -> PeerTraffic {
         let load = |c: &AtomicU64| c.load(Ordering::Relaxed);
-        let mut quic = *self.closed.lock().unwrap();
-        let mut api = *self.closed_api.lock().unwrap();
-        for peer in open {
+        let closed = self.closed.lock().unwrap();
+        let (mut quic, mut api) = (closed.peer, closed.api);
+        for peer in peers.lock().unwrap().values() {
             match peer.class {
                 Class::Peer => quic.add(&peer.conn),
                 Class::Api => api.add(&peer.conn),
             }
         }
+        drop(closed);
         PeerTraffic {
             api: api.into(),
             datagrams_sent: quic.datagrams_sent,
@@ -685,8 +696,7 @@ struct Tls {
 
 impl Shared {
     fn read_traffic(&self) -> PeerTraffic {
-        let open: Vec<Arc<Peer>> = self.peers.lock().unwrap().values().cloned().collect();
-        self.traffic.read(&open)
+        self.traffic.read(&self.peers)
     }
 
     /// The client configuration a dial of `class` presents now, and when
@@ -830,13 +840,17 @@ impl Shared {
     }
 
     fn deregister(&self, peer: &Peer) {
+        // The counts lock before the table's, as a reading takes them
+        // (`Traffic::closed`).
+        let mut closed = self.traffic.closed.lock().unwrap();
         let removed = self.peers.lock().unwrap().remove(&peer.id);
         if removed.is_some() {
             match peer.class {
-                Class::Peer => self.traffic.closed.lock().unwrap().add(&peer.conn),
-                Class::Api => self.traffic.closed_api.lock().unwrap().add(&peer.conn),
+                Class::Peer => closed.peer.add(&peer.conn),
+                Class::Api => closed.api.add(&peer.conn),
             }
         }
+        drop(closed);
         let key = Self::link_key(peer);
         let link = self.links.lock().unwrap().get(&key).cloned();
         if let Some(link) = link {
