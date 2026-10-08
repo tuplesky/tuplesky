@@ -72,6 +72,10 @@ class Run:
     # The sampled follower's own loop CPU per command (ms), where its
     # profile names its voter; the phase tables scale its shares by it.
     sampled_follower: str | None = None
+    # The voter the leader's profile sampled, and its own loop CPU per
+    # command (ms), where the profile names it.
+    sampled_leader: str | None = None
+    sampled_leader_loop: float | None = None
     sampled_follower_loop: float | None = None
     # The leader's threads in a call-graph run: by kind, (threads, CPU µs
     # per command, {system call: calls per command}); and its tokio
@@ -112,6 +116,13 @@ class Run:
     api_acks_received_all: float | None = None
 
     @property
+    def profile_loop(self) -> float | None:
+        """The loop CPU per command (ms) the leader's profiles scale by: the
+        sampled voter's own where its profile names it, which need not be
+        the voter that served reads at the end, else the leader's."""
+        return self.sampled_leader_loop or self.leader_loop
+
+    @property
     def leader_excess(self) -> float | None:
         if self.leader_loop is None or self.followers_loop is None:
             return None
@@ -120,10 +131,10 @@ class Run:
     def _profile_us(self, match) -> float | None:
         """The flat profile's symbols that `match` (a bare name), costed per
         command on the leader's loop; None without a profile."""
-        if not self.profile or self.leader_loop is None:
+        if not self.profile or self.profile_loop is None:
             return None
         share = sum(v for (_, sym), v in self.profile.items() if match(js.bare(sym)))
-        return share / 100 * self.leader_loop * 1000
+        return share / 100 * self.profile_loop * 1000
 
     @property
     def alloc_us(self) -> float | None:
@@ -140,9 +151,9 @@ class Run:
     @property
     def resend_profile_us(self) -> float | None:
         share = self.profile.get(RESEND_SYMBOL)
-        if share is None or self.leader_loop is None:
+        if share is None or self.profile_loop is None:
             return None
-        return share / 100 * self.leader_loop * 1000
+        return share / 100 * self.profile_loop * 1000
 
 
 # The measures, in the tables' order: (attribute, heading, format).
@@ -290,13 +301,17 @@ def read_run(label: str, store: str) -> Run:
     run.inclusive = read_inclusive(os.path.join(store, "leader-profile-inclusive.txt"))
     run.chains = js.read_chains(os.path.join(store, "leader-profile-chains.txt"))
     run.follower_chains = js.read_chains(os.path.join(store, "follower-profile-chains.txt"))
+    lead = js.profiled_node(os.path.join(store, "leader-profile.txt"))
+    if lead in by_node:
+        run.sampled_leader = lead
+        run.sampled_leader_loop = by_node[lead].cpu[0] * 1000 / by_node[lead].executed
     node = js.profiled_node(os.path.join(store, "follower-profile-chains.txt"))
-    if node in by_node and costs and by_node[node] is not leader:
+    if node in by_node and node != lead and (lead or by_node[node] is not leader):
         run.sampled_follower = node
         run.sampled_follower_loop = by_node[node].cpu[0] * 1000 / by_node[node].executed
-    if run.leader_loop:
+    if run.profile_loop:
         counts = os.path.join(store, "leader-profile-syscalls.txt")
-        run.threads, _ = js.syscalls_per_command(counts, run.leader_loop * 1000)
+        run.threads, _ = js.syscalls_per_command(counts, run.profile_loop * 1000)
         run.uncounted = js.uncounted(js.read_syscalls(counts)[1])
         chains = js.read_chains(os.path.join(store, "transport-profile-chains.txt"))
         split, parking = js.transport_split(chains)
@@ -372,19 +387,19 @@ def inclusive_tables(runs: list[Run], top: int = 30) -> list[str]:
     times that run's loop CPU per command."""
     out = []
     for i, run in enumerate(runs, 1):
-        if not run.inclusive or not run.leader_loop:
+        if not run.inclusive or not run.profile_loop:
             continue
         out += [
             f"**The leader's loop by symbol, with what it calls** (run {i}, {run.label}, the job's call-graph profile; "
-            f"microseconds per command, of its {run.leader_loop * 1000:.0f})",
+            f"microseconds per command, of its {run.profile_loop * 1000:.0f})",
             "",
             "| Symbol | Object | With callees (µs) | Own (µs) |",
             "| --- | --- | --- | --- |",
         ]
         for children, own, obj, symbol in run.inclusive[:top]:
             out.append(
-                f"| `{symbol.replace('|', '/')}` | `{obj}` | {children / 100 * run.leader_loop * 1000:.1f} "
-                f"| {own / 100 * run.leader_loop * 1000:.1f} |"
+                f"| `{symbol.replace('|', '/')}` | `{obj}` | {children / 100 * run.profile_loop * 1000:.1f} "
+                f"| {own / 100 * run.profile_loop * 1000:.1f} |"
             )
         out.append("")
     return out
@@ -396,13 +411,13 @@ def split_tables(runs: list[Run], top: int = 20) -> list[str]:
     samples times that run's loop CPU per command."""
     out = []
     for i, run in enumerate(runs, 1):
-        if not run.chains or not run.leader_loop:
+        if not run.chains or not run.profile_loop:
             continue
         s = js.loop_split(run.chains)
-        us = run.leader_loop * 1000 / 100
+        us = run.profile_loop * 1000 / 100
         out += [
             f"**The leader's loop by phase** (run {i}, {run.label}: each sample by the first TupleSky function it ran "
-            f"below the domain loop's turn; microseconds per command, of its {run.leader_loop * 1000:.0f}; the stacks "
+            f"below the domain loop's turn; microseconds per command, of its {run.profile_loop * 1000:.0f}; the stacks "
             f"reached the loop in {s['reached']:.1f}% of the samples)",
             "",
             "| Phase | µs per command | Allocator (µs) |",
@@ -426,7 +441,7 @@ def split_tables(runs: list[Run], top: int = 20) -> list[str]:
         # from before that is named gives the followers' mean.
         follower_ms = run.sampled_follower_loop or run.followers_loop
         follower_us = follower_ms * 1000 if follower_ms else None
-        comparison = js.phase_comparison(run.chains, run.follower_chains, run.leader_loop * 1000, follower_us, top,
+        comparison = js.phase_comparison(run.chains, run.follower_chains, run.profile_loop * 1000, follower_us, top,
                                          run.sampled_follower)
         if comparison:
             out += [f"(run {i}, {run.label})", ""] + comparison
@@ -555,7 +570,7 @@ def profile_table(runs: list[Run], top: int = 20) -> list[str]:
     cut in a run counts as 0 there)."""
     builds = {}
     for label in ("base", "head"):
-        profiled = [r for r in runs if r.label == label and r.profile and r.leader_loop]
+        profiled = [r for r in runs if r.label == label and r.profile and r.profile_loop]
         if profiled:
             builds[label] = profiled
     if len(builds) < 2:
@@ -565,7 +580,7 @@ def profile_table(runs: list[Run], top: int = 20) -> list[str]:
         for r in profiled:
             keys |= set(r.profile)
     cost = {
-        label: {k: sum(r.profile.get(k, 0.0) / 100 * r.leader_loop for r in profiled) / len(profiled) for k in keys}
+        label: {k: sum(r.profile.get(k, 0.0) / 100 * r.profile_loop for r in profiled) / len(profiled) for k in keys}
         for label, profiled in builds.items()
     }
     ranked = sorted(keys, key=lambda k: max(cost["base"][k], cost["head"][k]), reverse=True)[:top]

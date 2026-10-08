@@ -279,6 +279,15 @@ class PairTests(unittest.TestCase):
         self.assertEqual(runs[0].sampled_follower, "n2")
         self.assertAlmostEqual(runs[0].sampled_follower_loop, 0.4)
         self.assertIsNone(runs[1].sampled_follower)
+        # Nor does either leader profile: they scale by the read-serving leader.
+        self.assertEqual(runs[0].profile_loop, runs[0].leader_loop)
+        with open(os.path.join(self.runs[0].store, "leader-profile.txt"), "w") as f:
+            f.write("leader thread 2 (n2), 0.30 of a core over the 5 s before; Samples: 5K\n")
+        named = jp.read_run("base", self.runs[0].store)
+        # Named, the profile scales by n2's own loop, though n1 served the reads.
+        self.assertEqual(named.sampled_leader, "n2")
+        self.assertAlmostEqual(named.profile_loop, 0.4)
+        self.assertAlmostEqual(named.leader_loop, 0.6)
         text = jp.render(runs, "Paired")
         self.assertIn("The follower's loop by symbol", text)
         # Shares of the sampled follower's own samples, not scaled by the

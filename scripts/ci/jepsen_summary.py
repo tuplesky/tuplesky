@@ -1305,7 +1305,8 @@ def transport_tables(store: str, voters: dict, top: int = 10) -> list[str]:
     the other threads', from the per-thread counts, then their call
     graph's samples by kind and their parking and waking by caller, in µs
     per command; [] without the profile."""
-    leader_us, _ = loop_per_command(voters)
+    # The same process as the leader's profile, which names its voter.
+    leader_us, _ = loop_per_command(voters, leader=profiled_node(os.path.join(store, "leader-profile.txt")))
     counts = os.path.join(store, "leader-profile-syscalls.txt")
     kinds, commands = syscalls_per_command(counts, leader_us)
     out = []
@@ -1406,15 +1407,16 @@ def resend_table(voters: dict) -> list[str]:
     return out
 
 
-def loop_per_command(voters: dict, follower: str | None = None) -> tuple[float | None, float | None]:
-    """The leader's loop CPU per command (the voter whose read barrier
-    served reads) and a follower's, in microseconds: `follower`'s own
-    where it names a voter, else the followers' mean; None where the line
-    has no CPU."""
+def loop_per_command(voters: dict, follower: str | None = None, leader: str | None = None) -> tuple[float | None, float | None]:
+    """The leader's loop CPU per command and a follower's, in
+    microseconds: `leader`'s and `follower`'s own where they name voters
+    (the voters a profile sampled), else the voter whose read barrier
+    served reads and the other voters' mean; None where the line has no
+    CPU."""
     costs = {n: v.cost for n, v in voters.items() if v.cost and v.cost.cpu and v.cost.executed}
     if not costs:
         return None, None
-    leader = max(costs.values(), key=lambda c: (c.served, c.cpu[0] / c.executed))
+    leader = costs[leader] if leader in costs else max(costs.values(), key=lambda c: (c.served, c.cpu[0] / c.executed))
     if follower in costs and costs[follower] is not leader:
         own = costs[follower]
         return leader.cpu[0] / leader.executed * 1e6, own.cpu[0] / own.executed * 1e6
@@ -1473,7 +1475,7 @@ def leader_and_follower(store: str, voters: dict, top: int = 20) -> list[str]:
     The follower's cost is the sampled voter's own where its profile names
     it, since the profile samples the busiest follower alone."""
     node = profiled_node(os.path.join(store, "follower-profile-chains.txt"))
-    leader_us, follower_us = loop_per_command(voters, node)
+    leader_us, follower_us = loop_per_command(voters, node, profiled_node(os.path.join(store, "leader-profile.txt")))
     sampled = node if node in voters else None
     lead = read_chains(os.path.join(store, "leader-profile-chains.txt"))
     follow = read_chains(os.path.join(store, "follower-profile-chains.txt"))
