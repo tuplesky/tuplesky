@@ -1969,7 +1969,7 @@ impl Leader {
 
     /// Sends still waiting for durability.
     pub fn pending_sends(&self) -> usize {
-        self.outbox.as_ref().map_or(0, |o| o.pending().len())
+        self.outbox.as_ref().map_or(0, |o| o.held())
     }
 
     fn outstanding(&self) -> Vec<BarrierId> {
