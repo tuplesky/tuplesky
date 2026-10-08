@@ -15,6 +15,7 @@
 //! bounds and the latter re-derives the digest, so no field can change after
 //! sealing.
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
 
@@ -321,13 +322,18 @@ impl postcard::ser_flavors::Flavor for Append<'_> {
 }
 
 /// An immutable complete record.
+///
+/// The body is shared: a sealed record never changes, and the storage
+/// path holds the same record in the group it appends and in what it
+/// materializes, so a clone is a reference count rather than a copy of
+/// every update (task-d60).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JournalRecordV1 {
     format: u16,
     origin: RecordOrigin,
     seq: LocalJournalSeq,
     predecessor: Digest32,
-    body: RecordBody,
+    body: Arc<RecordBody>,
     digest: Digest32,
 }
 
@@ -490,7 +496,7 @@ impl JournalRecordV1 {
             origin: draft.origin,
             seq: draft.seq,
             predecessor: draft.predecessor,
-            body: draft.body,
+            body: Arc::new(draft.body),
             digest,
         };
         if record.encoded_len()? > MAX_RECORD_BYTES {
@@ -516,7 +522,7 @@ impl JournalRecordV1 {
         self.predecessor
     }
     /// Body.
-    pub const fn body(&self) -> &RecordBody {
+    pub fn body(&self) -> &RecordBody {
         &self.body
     }
     /// Digest over format, origin, sequence, predecessor and body.
@@ -635,7 +641,7 @@ impl JournalRecordV1 {
             origin: wire.origin,
             seq: wire.seq,
             predecessor: wire.predecessor,
-            body: wire.body,
+            body: Arc::new(wire.body),
             digest: wire.digest,
         })
     }

@@ -185,6 +185,10 @@ fn encoded_len_and_encode_into_agree_with_encode() {
         r.encode_into(&mut buf).unwrap();
         expect.extend_from_slice(&bytes);
         assert_eq!(buf, expect);
+        // A clone shares the body rather than copying its updates.
+        let clone = r.clone();
+        assert!(std::ptr::eq(clone.body(), r.body()));
+        assert_eq!(&clone, r);
     }
 }
 
