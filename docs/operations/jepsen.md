@@ -550,9 +550,10 @@ of lines. `scripts/ci/jepsen_summary.py` reads the test's store
   order;
 * each node back serving after each fault: the seconds from each
   fault's end (a restart, a resume or a heal) to the first `ok` through
-  every node, with the slowest node's median and most over the run.
-  Faults overlap, so a node another fault still holds counts that one
-  too;
+  every node of an operation invoked after it, with the slowest node's
+  median and most over the run. Faults overlap, so a node another fault
+  still holds counts that one too, and the final heal's ends are left to
+  the final reads, since nothing is invoked between them;
 * in every job, where the runner's CPU went over the workload (Runner
   CPU): `jepsen_bounded.sh` runs `scripts/ci/cpu_sampler.py` beside the
   test, which reads every process's CPU time from `/proc` once a second,

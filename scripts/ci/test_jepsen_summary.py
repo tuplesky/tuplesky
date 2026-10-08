@@ -186,10 +186,9 @@ class SummaryTests(unittest.TestCase):
         self.assertIn("| `:txn` | 1 | 1000 | 1000 | 1000 | 1000 |", self.text)
 
     def test_each_node_back_serving_after_a_fault_ends(self):
-        # The start at 10:00:40 ends the kill: n1's next `ok` is 62 s later,
-        # and n2 never serves again.
-        self.assertIn("| `:start` | 39 | 62.0 | never | never (n2) |", self.text)
-        self.assertIn("**Back serving after a fault:** after each of 1 fault ends, a node never served again.", self.text)
+        # The start at 10:00:40 is the final heal, after the workload's
+        # last invocation: the final reads tell what followed it.
+        self.assertNotIn("Back serving", self.text)
 
     def test_back_serving_takes_the_slowest_nodes_median(self):
         at = lambda s: datetime.datetime(2026, 9, 27, 10, 0, s)
@@ -201,11 +200,14 @@ class SummaryTests(unittest.TestCase):
         client = [inv(0, 0), inv(0, 1), op(1, 0), op(1, 1), inv(9, 1), inv(12, 0), op(12, 0), op(12, 1),
                   inv(14, 1), op(14, 1), inv(31, 0), op(31, 0), inv(32, 1), op(32, 1)]
         nemesis = [nem(2, ":pause"), nem(3, ":pause"), nem(10, ":resume"), nem(11, ":resume"),
-                   nem(20, ":start-partition"), nem(21, ":start-partition"), nem(29, ":stop-partition"), nem(30, ":stop-partition")]
+                   nem(20, ":start-partition"), nem(21, ":start-partition"), nem(29, ":stop-partition"), nem(30, ":stop-partition"),
+                   # The final heal, after the last invocation: left out.
+                   nem(40, ":resume"), nem(41, ":resume")]
         text = "\n".join(js.back_serving(client, nemesis, ["n1", "n2"], at(0)))
         self.assertIn("median 2.0 s, at most 3.0 s (n2, after `:resume` at +11 s)", text)
         self.assertIn("| `:resume` | 11 | 1.0 | 3.0 | 3.0 (n2) |", text)
         self.assertIn("| `:stop-partition` | 30 | 1.0 | 2.0 | 2.0 (n2) |", text)
+        self.assertNotIn("| `:resume` | 41 |", text)
 
     def test_final_reads_pair_invocations_after_the_heal(self):
         self.assertIn("1 of 2 nodes served a final read", self.text)

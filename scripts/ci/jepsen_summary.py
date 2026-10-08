@@ -1562,12 +1562,17 @@ FAULT_ENDS = (":start", ":resume", ":stop-partition", ":stop-packet")
 def back_serving(client: list[Op], nemesis: list[Op], nodes: list[str], start) -> list[str]:
     """Each node's first `ok` after each fault ended: the seconds from the
     end operation's completion to the first `ok` through that node of an
-    operation invoked after it. Faults overlap, so a node another fault
-    still holds counts that one too."""
+    operation invoked after it, for the ends within the workload (the
+    final heal's are the final reads'). Faults overlap, so a node another
+    fault still holds counts that one too."""
     if not nodes:
         return []
     pairs = [(nemesis[i], nemesis[i + 1] if i + 1 < len(nemesis) else None) for i in range(0, len(nemesis), 2)]
     ends = [(inv.f, (res or inv).at) for inv, res in pairs if inv.f in FAULT_ENDS]
+    # Nothing is invoked between the final heal and the final reads, so an
+    # end after the workload's last invocation is the final reads' to tell.
+    workload = [o.at for o in client if o.type == "invoke" and o.at < nemesis[-1].at]
+    ends = [(f, at) for f, at in ends if workload and at < workload[-1]]
     if not ends:
         return []
     # Each `ok` with its invocation: a worker's operations are sequential,
