@@ -287,7 +287,7 @@ reads at the end; a profile from before that names none falls back on
 that voter and the followers' mean. That CPU per command is the profile's
 window's: the boot that ran over it (a voter killed and restarted since
 has a later boot's last line), between its `metrics` readings either
-side of the window, each timed as the boot's "Jepsen starting" time plus
+side of the window (its last, where it was killed first), each timed as the boot's "Jepsen starting" time plus
 the reading's uptime. A restart within the window leaves the profile
 uncosted. A 10 s DWARF sample of the leader
 follows (`leader-profile-alloc-chains.txt`): it unwinds out of libc's

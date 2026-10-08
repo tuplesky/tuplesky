@@ -1467,10 +1467,11 @@ PROFILE_WINDOW = re.compile(r" from (\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) to (\d{4}-\
 def window_cost(boot: Boot, began: datetime.datetime, ended: datetime.datetime) -> "Cost | None":
     """A boot's loop CPU and commands over a profile's window: the
     difference between its last `metrics` reading at or before the window
-    and its first at or after it, each timed as the boot's start plus the
-    reading's uptime. The first reading after the window where none came
-    before it (counted from the boot's start), and the boot's last where
-    none came after (it was killed first); None without a start time."""
+    and its first at or after it (its last, where it was killed before
+    one), each timed as the boot's start plus the reading's uptime. That
+    later reading alone where none came before the window (counted from
+    the boot's start); None without a start time, or without a command
+    executed between the two."""
     if boot.started is None:
         return None
     try:
@@ -1480,12 +1481,15 @@ def window_cost(boot: Boot, began: datetime.datetime, ended: datetime.datetime) 
     timed = [(start + datetime.timedelta(seconds=c.uptime), c) for c in boot.readings if c.cpu]
     before = [c for at, c in timed if at <= began]
     after = [c for at, c in timed if at >= ended]
-    if not after:
-        return boot.cost
-    last = after[0]
-    if not before or last.executed <= before[-1].executed:
+    # Killed before a reading after the window: its last reading.
+    last = after[0] if after else boot.cost
+    if last is None or not last.cpu:
+        return None
+    if not before:
         return last
     first = before[-1]
+    if last.executed <= first.executed:
+        return None
     return replace(last, executed=last.executed - first.executed,
                    cpu=(last.cpu[0] - first.cpu[0], last.cpu[1] - first.cpu[1]))
 

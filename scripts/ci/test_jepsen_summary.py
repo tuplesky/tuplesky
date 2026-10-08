@@ -110,6 +110,11 @@ class ParseTests(unittest.TestCase):
             v = js.parse_voter([start("10:00:00"), boot, at(50, 2, 400), at(90, 5, 1000), at(300, 60, 2000)])
             window = js.sampled_cost(v, path)
             self.assertEqual((window.cpu[0], window.executed), (3.0, 600))
+            # Killed within the window, before a reading after it: from the
+            # reading before it to its last.
+            v = js.parse_voter([start("10:00:00"), boot, at(50, 2, 400), at(65, 4, 700), start("10:03:00"), boot])
+            window = js.sampled_cost(v, path)
+            self.assertEqual((window.cpu[0], window.executed), (2.0, 300))
 
     def test_voter_counts_sum_each_boots_highest(self):
         v = js.parse_voter(VOTER.splitlines(keepends=True))
