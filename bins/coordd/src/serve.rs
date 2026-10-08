@@ -5090,14 +5090,17 @@ fn endpoint(
         limits.stream_frames = frames.max(1);
     }
     // The acknowledgement cadence asked of every peer and caller
-    // (task-d70), from the environment for the same reason, on both
-    // planes: `<threshold>,<max delay in microseconds>`. Unset, QUIC's own.
+    // (task-d70), overridden from the environment for the same reason, on
+    // both planes: `<threshold>`, `<threshold>,<max delay in
+    // microseconds>`, or `off` for QUIC's own cadence, the control.
+    // Unset, the transport's default.
     if let Ok(value) = std::env::var("COORDD_ACK_FREQUENCY") {
         match ack_frequency(&value) {
-            Some(ack) => limits.ack_frequency = Some(ack),
+            Some(ack) => limits.ack_frequency = ack,
             None => eprintln!(
-                "COORDD_ACK_FREQUENCY={value:?} is not <threshold>,<max delay in microseconds>: \
-                 QUIC's own acknowledgement cadence is kept"
+                "COORDD_ACK_FREQUENCY={value:?} is not <threshold>, \
+                 <threshold>,<max delay in microseconds> or off: \
+                 the default acknowledgement cadence is kept"
             ),
         }
     }
@@ -5105,14 +5108,25 @@ fn endpoint(
         .map_err(|e| TransportError::Endpoint(format!("{e:?}")))
 }
 
-/// An acknowledgement cadence written `<threshold>,<max delay in
-/// microseconds>` (task-d70).
-fn ack_frequency(value: &str) -> Option<coord_transport::AckFrequency> {
-    let (threshold, delay) = value.split_once(',')?;
-    Some(coord_transport::AckFrequency {
+/// An acknowledgement cadence written `<threshold>`, which keeps the
+/// peer's own delay, `<threshold>,<max delay in microseconds>`, or `off`,
+/// which asks nothing (task-d70). `None` is a malformed value.
+fn ack_frequency(value: &str) -> Option<Option<coord_transport::AckFrequency>> {
+    let value = value.trim();
+    if value == "off" {
+        return Some(None);
+    }
+    let (threshold, delay) = match value.split_once(',') {
+        Some((threshold, delay)) => (
+            threshold,
+            Some(std::time::Duration::from_micros(delay.trim().parse().ok()?)),
+        ),
+        None => (value, None),
+    };
+    Some(Some(coord_transport::AckFrequency {
         threshold: threshold.trim().parse().ok()?,
-        max_delay: std::time::Duration::from_micros(delay.trim().parse().ok()?),
-    })
+        max_delay: delay,
+    }))
 }
 
 /// Why the endpoint could not be built.
@@ -5968,15 +5982,36 @@ mod tests {
     }
 
     #[test]
-    fn an_acknowledgement_cadence_is_a_threshold_and_a_delay() {
+    fn an_acknowledgement_cadence_is_a_threshold_and_a_delay_or_off() {
+        use coord_transport::AckFrequency;
         assert_eq!(
             super::ack_frequency("4, 2000"),
-            Some(coord_transport::AckFrequency {
+            Some(Some(AckFrequency {
                 threshold: 4,
-                max_delay: std::time::Duration::from_millis(2),
-            })
+                max_delay: Some(std::time::Duration::from_millis(2)),
+            }))
         );
-        for malformed in ["", "4", "4,", ",2000", "four,2000", "4,2ms", "-1,2000"] {
+        // A threshold alone keeps the peer's own delay.
+        assert_eq!(
+            super::ack_frequency("8"),
+            Some(Some(AckFrequency {
+                threshold: 8,
+                max_delay: None,
+            }))
+        );
+        assert_eq!(super::ack_frequency("8"), Some(Some(AckFrequency::DEFAULT)));
+        // `off` asks nothing: QUIC's own cadence, the control.
+        assert_eq!(super::ack_frequency(" off "), Some(None));
+        for malformed in [
+            "",
+            "4,",
+            ",2000",
+            "four,2000",
+            "4,2ms",
+            "-1,2000",
+            "of",
+            "none",
+        ] {
             assert_eq!(super::ack_frequency(malformed), None, "{malformed:?}");
         }
     }

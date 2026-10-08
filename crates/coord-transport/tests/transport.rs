@@ -2827,15 +2827,30 @@ async fn linked(a: Limits, b: Limits) -> (Fixture, Transport, Transport) {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_acknowledgement_cadence_asked_of_a_peer_still_delivers() {
     // task-d70: both ends ask the other to acknowledge after eight
-    // packets or two milliseconds. What is sent and received is unchanged;
-    // only when QUIC acknowledges it moves.
-    let cadence = Limits {
+    // packets or two milliseconds, then at the default and with nothing
+    // asked. What is sent and received is unchanged; only when QUIC
+    // acknowledges it moves.
+    let short = Limits {
         ack_frequency: Some(coord_transport::AckFrequency {
             threshold: 8,
-            max_delay: Duration::from_millis(2),
+            max_delay: Some(Duration::from_millis(2)),
         }),
         ..limits()
     };
+    let asked_nothing = Limits {
+        ack_frequency: None,
+        ..limits()
+    };
+    assert_eq!(
+        Limits::default().ack_frequency,
+        Some(coord_transport::AckFrequency::DEFAULT)
+    );
+    for cadence in [short, limits(), asked_nothing] {
+        delivers_at(cadence).await;
+    }
+}
+
+async fn delivers_at(cadence: Limits) {
     let (_f, a, mut b) = linked(cadence, cadence).await;
     for round in 0..5 {
         let sent = a.send_many(dest(1, Lane::Control), DOMAIN, numbered(10));
