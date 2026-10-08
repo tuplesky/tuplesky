@@ -477,20 +477,24 @@ jobs:
         # fetched.
         run: |
           shopt -s nullglob
-          store=jepsen/tuplesky/store/latest
-          prefixes=$(cat "$store"/n*/coordd.log 2>/dev/null \
-            | grep -oE 'this node stopped: [a-z-]+\([0-9a-f]+\)' \
-            | sed -E 's/.*\(([0-9a-f]+)\)/\1/' | sort -u)
-          for prefix in $prefixes; do
-            echo "::group::Every voter's execution order around $prefix (position revision digest command)"
-            for db in "$store"/n*/domain.redb; do
-              node=$(basename "$(dirname "$db")")
-              echo "--- $node"
-              cp "$db" "$RUNNER_TEMP/$node.redb"
-              "$GITHUB_WORKSPACE/tuplesky/target/release/coord-jepsen-executed" \
-                "$RUNNER_TEMP/$node.redb" --around "$prefix" --span 8 || true
+          # Every run's store, as the next step reads: a paired job leaves
+          # one per run, and an earlier run's stop is as much a stop.
+          for store in jepsen/tuplesky/store/*/[0-9]*/; do
+            store=${store%/}
+            prefixes=$(cat "$store"/n*/coordd.log 2>/dev/null \
+              | grep -oE 'this node stopped: [a-z-]+\([0-9a-f]+\)' \
+              | sed -E 's/.*\(([0-9a-f]+)\)/\1/' | sort -u)
+            for prefix in $prefixes; do
+              echo "::group::Every voter's execution order around $prefix in $store (position revision digest command)"
+              for db in "$store"/n*/domain.redb; do
+                node=$(basename "$(dirname "$db")")
+                echo "--- $node"
+                cp "$db" "$RUNNER_TEMP/$node.redb"
+                "$GITHUB_WORKSPACE/tuplesky/target/release/coord-jepsen-executed" \
+                  "$RUNNER_TEMP/$node.redb" --around "$prefix" --span 8 || true
+              done
+              echo "::endgroup::"
             done
-            echo "::endgroup::"
           done
       - name: Fail on a divergence stop
         if: always()
