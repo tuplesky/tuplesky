@@ -286,6 +286,40 @@ struct RecordWireV1 {
     digest: Digest32,
 }
 
+/// [`RecordWireV1`] borrowed from a record: the same fields in the same
+/// order, so the same bytes, encoded without copying the body (task-d60).
+#[derive(Serialize)]
+#[serde(rename = "RecordWireV1")]
+struct RecordWireRefV1<'a> {
+    format: u16,
+    origin: &'a RecordOrigin,
+    seq: LocalJournalSeq,
+    predecessor: Digest32,
+    body: &'a RecordBody,
+    digest: Digest32,
+}
+
+/// A postcard flavor that appends to a caller's buffer.
+struct Append<'a>(&'a mut Vec<u8>);
+
+impl postcard::ser_flavors::Flavor for Append<'_> {
+    type Output = ();
+
+    fn try_extend(&mut self, data: &[u8]) -> postcard::Result<()> {
+        self.0.extend_from_slice(data);
+        Ok(())
+    }
+
+    fn try_push(&mut self, data: u8) -> postcard::Result<()> {
+        self.0.push(data);
+        Ok(())
+    }
+
+    fn finalize(self) -> postcard::Result<()> {
+        Ok(())
+    }
+}
+
 /// An immutable complete record.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JournalRecordV1 {
@@ -535,22 +569,35 @@ impl JournalRecordV1 {
         Ok(())
     }
 
-    /// Encoded length in bytes.
+    fn wire(&self) -> RecordWireRefV1<'_> {
+        RecordWireRefV1 {
+            format: self.format,
+            origin: &self.origin,
+            seq: self.seq,
+            predecessor: self.predecessor,
+            body: &self.body,
+            digest: self.digest,
+        }
+    }
+
+    /// Encoded length in bytes, counted without encoding.
     pub fn encoded_len(&self) -> Result<usize, RecordError> {
-        Ok(self.encode()?.len())
+        postcard::experimental::serialized_size(&self.wire()).map_err(|_| RecordError::TooLarge)
     }
 
     /// Durable encoding.
     pub fn encode(&self) -> Result<Vec<u8>, RecordError> {
-        let wire = RecordWireV1 {
-            format: self.format,
-            origin: self.origin,
-            seq: self.seq,
-            predecessor: self.predecessor,
-            body: self.body.clone(),
-            digest: self.digest,
-        };
-        postcard::to_allocvec(&wire).map_err(|_| RecordError::TooLarge)
+        postcard::to_allocvec(&self.wire()).map_err(|_| RecordError::TooLarge)
+    }
+
+    /// Append the durable encoding to `buf`, the bytes [`Self::encode`]
+    /// returns. On an error `buf` is left as it was.
+    pub fn encode_into(&self, buf: &mut Vec<u8>) -> Result<(), RecordError> {
+        let start = buf.len();
+        postcard::serialize_with_flavor(&self.wire(), Append(buf)).map_err(|_| {
+            buf.truncate(start);
+            RecordError::TooLarge
+        })
     }
 
     /// Decode exactly: bounds are checked before nested allocation is

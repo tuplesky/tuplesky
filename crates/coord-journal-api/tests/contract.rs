@@ -171,6 +171,23 @@ fn chained_records_verify_and_round_trip_exactly() {
     assert!(records[4].body().updates().is_empty());
 }
 
+/// The three ways to encode a record agree (task-d60): `encoded_len`
+/// counts without encoding and `encode_into` appends after what a buffer
+/// already holds, and both give exactly what `encode` gives, which the
+/// frozen fixture pins.
+#[test]
+fn encoded_len_and_encode_into_agree_with_encode() {
+    let mut buf = vec![0xee; 3];
+    let mut expect = buf.clone();
+    for r in &stream() {
+        let bytes = r.encode().unwrap();
+        assert_eq!(r.encoded_len().unwrap(), bytes.len());
+        r.encode_into(&mut buf).unwrap();
+        expect.extend_from_slice(&bytes);
+        assert_eq!(buf, expect);
+    }
+}
+
 type VerifyCase = (fn(&mut RecordExpectation), RecordError);
 
 #[test]
