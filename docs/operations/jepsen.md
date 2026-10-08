@@ -284,7 +284,12 @@ sampled (the node container's hostname), so the leader's profiles and
 the follower's phases are costed at the sampled voters' own loop CPU per
 command, which after a change of leader need not be the voter that served
 reads at the end; a profile from before that names none falls back on
-that voter and the followers' mean. A 10 s DWARF sample of the leader
+that voter and the followers' mean. That CPU per command is the profile's
+window's: the boot that ran over it (a voter killed and restarted since
+has a later boot's last line), between its `metrics` readings either
+side of the window, each timed as the boot's "Jepsen starting" time plus
+the reading's uptime. A restart within the window leaves the profile
+uncosted. A 10 s DWARF sample of the leader
 follows (`leader-profile-alloc-chains.txt`): it unwinds out of libc's
 allocator, which the frame-pointer walk cannot, and names the TupleSky
 function that allocated. A profiled job, flat or `call-graph`, builds the

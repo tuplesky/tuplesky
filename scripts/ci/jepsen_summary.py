@@ -56,7 +56,7 @@ import math
 import os
 import re
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 # `jepsen.log` in the store: "%d{ISO8601}{GMT}\t%p\t[%t] %c: %m".
 FILE_LINE = re.compile(
@@ -138,6 +138,8 @@ class Boot:
     replayed: tuple | None = None
     # The `cost` reading of this boot's last `metrics` line, or None.
     cost: "Cost | None" = None
+    # Every `cost` reading of this boot, in order.
+    readings: list = field(default_factory=list)
 
 
 @dataclass
@@ -382,6 +384,8 @@ def parse_voter(lines) -> Voter:
                 v.cost = parse_cost(snapshot)
                 if v.boot_rows:
                     v.boot_rows[-1].cost = v.cost
+                    if v.cost:
+                        v.boot_rows[-1].readings.append(v.cost)
                 if v.cost and v.cost.cpu:
                     boot_cpu = v.cost.cpu[1]
                 if v.cost and v.cost.unordered:
@@ -1460,31 +1464,63 @@ PROFILED_NODE = re.compile(r"^\w+ thread \d+ \(([^)\s]+)\)")
 PROFILE_WINDOW = re.compile(r" from (\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) to (\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) UTC")
 
 
+def window_cost(boot: Boot, began: datetime.datetime, ended: datetime.datetime) -> "Cost | None":
+    """A boot's loop CPU and commands over a profile's window: the
+    difference between its last `metrics` reading at or before the window
+    and its first at or after it, each timed as the boot's start plus the
+    reading's uptime. The first reading after the window where none came
+    before it (counted from the boot's start), and the boot's last where
+    none came after (it was killed first); None without a start time."""
+    if boot.started is None:
+        return None
+    try:
+        start = datetime.datetime.strptime(boot.started, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+    timed = [(start + datetime.timedelta(seconds=c.uptime), c) for c in boot.readings if c.cpu]
+    before = [c for at, c in timed if at <= began]
+    after = [c for at, c in timed if at >= ended]
+    if not after:
+        return boot.cost
+    last = after[0]
+    if not before or last.executed <= before[-1].executed:
+        return last
+    first = before[-1]
+    return replace(last, executed=last.executed - first.executed,
+                   cpu=(last.cpu[0] - first.cpu[0], last.cpu[1] - first.cpu[1]))
+
+
 def sampled_cost(voter: Voter, path: str) -> "Cost | None":
-    """The cost of the boot a profile sampled, from that boot's last
-    `metrics` line: a voter's only boot (its last line, where no boot is
-    logged), or the one started last before the profile's window, by the
-    "Jepsen starting" times (the runner's clock, as the window's). None
-    where the boot is not known: a boot without a start time, or a
-    restart within the window."""
+    """The loop CPU and commands a profile sampled: the boot running over
+    its window, the one started last before it by the "Jepsen starting"
+    times (the runner's clock, as the window's), over the window itself
+    (window_cost). A voter's last line where no boot is logged, or its
+    only boot's where it is not timed; None where the boot is not known:
+    a boot without a start time, or a restart within the window."""
     boots = voter.boot_rows
-    if len(boots) <= 1:
+    if not boots:
         return voter.cost
     try:
         with open(path) as f:
             m = PROFILE_WINDOW.search(f.readline())
     except OSError:
-        return None
-    if not m or any(b.started is None for b in boots):
-        return None
+        m = None
+    if not m:
+        return boots[0].cost if len(boots) == 1 else None
     began, ended = m[1], m[2]
-    before = [i for i, b in enumerate(boots) if b.started <= began]
-    if not before:
-        return None
-    i = before[-1]
-    if i + 1 < len(boots) and boots[i + 1].started <= ended:
-        return None
-    return boots[i].cost
+    if len(boots) == 1:
+        i = 0
+    else:
+        if any(b.started is None for b in boots):
+            return None
+        before = [i for i, b in enumerate(boots) if b.started <= began]
+        if not before:
+            return None
+        i = before[-1]
+        if i + 1 < len(boots) and boots[i + 1].started <= ended:
+            return None
+    at = lambda t: datetime.datetime.strptime(t, "%Y-%m-%d %H:%M:%S")
+    return window_cost(boots[i], at(began), at(ended)) or boots[i].cost
 
 
 def sampled_costs(voters: dict, store: str) -> dict:
