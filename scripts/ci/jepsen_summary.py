@@ -1157,6 +1157,7 @@ def read_syscalls(path: str) -> tuple[int | None, dict]:
         return None, {}
     window = re.search(r"\(([\d.]+) s\)", lines[0])
     threads: dict = {}
+    clocks: list = []
     for line in lines[1:]:
         cells = line.split(",")
         if len(cells) < 4 or "-" not in cells[0]:
@@ -1170,8 +1171,12 @@ def read_syscalls(path: str) -> tuple[int | None, dict]:
         if not tid.isdigit():
             continue
         if event == "task-clock" and isinstance(value, float):
-            value = task_clock_ms(value, cells[2].strip(), float(window[1]) if window else None)
+            clocks.append((int(tid), value, cells[2].strip()))
         threads.setdefault(int(tid), (comm, {}))[1][event] = value
+    # One unit for the file: perf prints every thread's the same way.
+    largest = max((v for _, v, unit in clocks if not unit), default=0.0)
+    for tid, value, unit in clocks:
+        threads[tid][1]["task-clock"] = task_clock_ms(value, unit, largest, float(window[1]) if window else None)
     return int(m[1]), threads
 
 
@@ -1180,13 +1185,13 @@ def read_syscalls(path: str) -> tuple[int | None, dict]:
 CLOCK_UNITS = {"msec": 1.0, "ms": 1.0, "usec": 1e-3, "us": 1e-3, "nsec": 1e-6, "ns": 1e-6, "sec": 1e3, "s": 1e3}
 
 
-def task_clock_ms(value: float, unit: str, window_s: float | None) -> float:
+def task_clock_ms(value: float, unit: str, largest: float, window_s: float | None) -> float:
     """A thread's `task-clock` in milliseconds, by perf's unit; with none
-    given, nanoseconds where milliseconds would mean more than 1024 cores
-    over the window."""
+    given, nanoseconds where the file's largest unmarked value read as
+    milliseconds would mean more than 1024 cores over the window."""
     if unit in CLOCK_UNITS:
         return value * CLOCK_UNITS[unit]
-    if window_s and value > window_s * 1000 * 1024:
+    if window_s and largest > window_s * 1000 * 1024:
         return value * 1e-6
     return value
 

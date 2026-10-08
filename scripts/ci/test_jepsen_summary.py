@@ -734,8 +734,12 @@ class TransportTests(unittest.TestCase):
 
     def test_task_clock_in_nanoseconds(self):
         # The runner's perf gives task-clock in ns, where 6.8 gave msec.
-        text = TRANSPORT_SYSCALLS.replace("1000.00,msec,task-clock", "1000000000,ns,task-clock").replace(
-            "1500.00,msec,task-clock", "1500000000,,task-clock")
+        text = TRANSPORT_SYSCALLS.replace("1000.00,msec,task-clock", "1000000000,,task-clock").replace(
+            "1500.00,msec,task-clock", "1500000000,,task-clock").replace(
+            "500.00,msec,task-clock", "500000000,,task-clock").replace(
+            # A thread that ran 10 ms: as small as milliseconds would be,
+            # read by the file's unit, not its own size.
+            "100.00,msec,task-clock", "10000000,,task-clock")
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "leader-profile-syscalls.txt")
             with open(path, "w") as f:
@@ -744,6 +748,7 @@ class TransportTests(unittest.TestCase):
         self.assertAlmostEqual(commands, 2000.0)
         self.assertAlmostEqual(kinds["tokio threads"][2]["futex"], 5.0)
         self.assertAlmostEqual(kinds["tokio threads"][1], 1000.0)
+        self.assertAlmostEqual(kinds["`appender`"][1], 5.0)
 
     def test_calls_perf_did_not_count_are_said_not_zero(self):
         with tempfile.TemporaryDirectory() as d:
