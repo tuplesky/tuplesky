@@ -202,15 +202,14 @@ def client(i):
 
 def leader():
     # Each log keeps every ballot its voter ever led, so the leader is
-    # the voter that announced the highest one.
-    who, highest = 1, -1
+    # the voter that announced the highest one. Ballots order by number,
+    # then by leader, and voter n is provisioned as replica [n; 16].
+    highest = (-1, 1)
     for n in (1, 2, 3):
         for line in said(n).splitlines():
             if line.startswith("this voter leads ballot"):
-                ballot = int(line.split()[-1])
-                if ballot > highest:
-                    who, highest = n, ballot
-    return who
+                highest = max(highest, (int(line.split()[-1]), n))
+    return highest[1]
 
 
 def nemesis():
