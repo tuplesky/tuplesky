@@ -230,8 +230,8 @@ impl Session {
             session: SessionId(session),
             connects: 0,
         };
-        let within = this.timing.connect;
-        this.connect(within).await.map_err(OpenError)?;
+        let by = Instant::now() + this.timing.connect;
+        this.connect(by).await.map_err(OpenError)?;
         Ok(this)
     }
 
@@ -246,12 +246,12 @@ impl Session {
         u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 
-    /// Dial the frontend and bind this session's credential on it, each
-    /// within `within`. The SDK re-sends whatever it had in flight once
-    /// the binding holds.
-    async fn connect(&mut self, within: Duration) -> Result<(), String> {
+    /// Dial the frontend and bind this session's credential on it, both
+    /// by `by`. The SDK re-sends whatever it had in flight once the
+    /// binding holds.
+    async fn connect(&mut self, by: Instant) -> Result<(), String> {
         let connection = tokio::time::timeout(
-            within,
+            by.saturating_duration_since(Instant::now()),
             self.transport.connect(
                 self.target.address,
                 &self.target.server_name,
@@ -287,7 +287,11 @@ impl Session {
                 .map_err(|e| format!("bind frame: {e:?}"))?;
             let answer = self
                 .transport
-                .request(connection, frame, within)
+                .request(
+                    connection,
+                    frame,
+                    by.saturating_duration_since(Instant::now()),
+                )
                 .await
                 .map_err(|e| format!("bind: {e:?}"))?;
             coord_session::decode_bind_ack(&answer).map_err(|e| format!("bind ack: {e:?}"))
@@ -377,8 +381,8 @@ impl Session {
             if self.connection.is_none() {
                 // A reconnect and its pause spend the operation's budget,
                 // not their own.
-                let left = deadline.saturating_duration_since(Instant::now());
-                if let Err(e) = self.connect(self.timing.connect.min(left)).await {
+                let by = deadline.min(Instant::now() + self.timing.connect);
+                if let Err(e) = self.connect(by).await {
                     last = e;
                     let left = deadline.saturating_duration_since(Instant::now());
                     tokio::time::sleep(Duration::from_millis(250).min(left)).await;
