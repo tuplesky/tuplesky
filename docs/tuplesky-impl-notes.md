@@ -10152,3 +10152,98 @@ build, this less the base:
   leader's loop is on every operation's path in this closed loop, so a
   microsecond of the leader's is worth more than its share of the
   cluster's CPU.
+
+## The allocator (task-d60, step 1)
+
+`coordd` now sets mimalloc as its global allocator. No call site
+changes. On the Jepsen runner's call-graph profile a third of the leader's
+domain thread was glibc's allocator and copies, spread over every phase,
+most of the allocator's share in glibc's own bin management
+(`_int_malloc`, `unlink_chunk`, `_int_free`, `malloc_consolidate`).
+
+Five voters on one four-core host, replay profile, stores on disk, 30
+callers, 40,000 measured operations, `put=30,get=50,contended=20`, three
+pairs of task-d59's build against this one, alternated:
+
+| | glibc | mimalloc |
+| --- | --- | --- |
+| completed a second | 884, 1060, 1105 | 1217, 1180, 1149 |
+| get p99, ms | 140, 98, 101 | 84, 98, 92 |
+| leader's domain thread, CPU ms per command | 0.515, 0.513, 0.505 | 0.434, 0.432, 0.456 |
+| domain threads, five voters, CPU ms per operation | 1.094, 1.095, 1.075 | 0.923, 0.923, 0.969 |
+| tokio workers, five voters | 0.847, 0.889, 0.874 | 0.746, 0.761, 0.783 |
+| materializers, five voters | 0.416, 0.403, 0.390 | 0.377, 0.377, 0.395 |
+| all threads, CPU ms per operation | 2.572, 2.601, 2.546 | 2.250, 2.257, 2.361 |
+| resident set at the end, per voter, MiB (one pair) | 128 to 144 | 171 to 194 |
+
+- Lower in every pair: the leader's domain thread by 0.070 ms per
+  command (0.081, 0.081, 0.049), and all threads by 0.28 ms per operation,
+  11% (0.32, 0.34, 0.19). Throughput rose 16% on average (+333, +120,
+  +44), the first pair's base the lowest of the six.
+- Every thread kind is cheaper, the transport's tokio workers as much as
+  the domain threads, so the share is the allocator's everywhere, not one
+  loop's.
+- The cost is memory: each voter's resident set at the end of the run was
+  about 46 MiB, a third, higher. mimalloc keeps freed
+  pages in its heaps rather than returning them at once.
+- Faster serving exposed a race in `multi_host`'s restarted-voter test,
+  in the test and not in the daemon. The returned voter's frontend holds a
+  read's result back as pending while it has not yet projected the
+  caller's new session (coord-session's output gate), and the test read
+  once and took the pending outcome for a missing value: about one full
+  run in five failed with mimalloc, none in eighteen without. The test now
+  asks again until it is answered, as a caller resolves, and passed
+  fifteen of fifteen.
+- One host, loopback. The runner pair, with the call-graph profile on one
+  pair, is the acceptance.
+
+On the Jepsen runner: five voters, replay, throughput, 30 clients, three
+pairs a job against task-d59's build (each pair's base the same commit, so
+the pair isolates this one). Job 1 (37704463298) on an AMD EPYC 7763 with
+the call-graph profile on its first pair; job 2 (37707115702) on an AMD
+EPYC 9V45, about 1.6 times faster per operation, with a flat profile and
+the voters' sampled CPU split into their domain loops and their tokio
+threads. Head less base, mean (smallest to largest) of three:
+
+| | job 1, EPYC 7763 | job 2, EPYC 9V45 |
+| --- | --- | --- |
+| `ok`/s | +18.1 (+8.0 to +23.9), +4% | +5.7 (-4.1 to +16.2), +1% |
+| voters' CPU per operation, ms | -0.21 (-0.31 to -0.16) of 4.28, -4.9% | -0.15 (-0.27 to -0.04) of 2.74, -5.5% |
+| voters' domain loops, CPU ms per operation | not split | -0.10 (-0.14 to -0.06) of 1.04, -9.6% |
+| voters' tokio threads, CPU ms per operation | not split | -0.04 (-0.08 to -0.01) of 1.15, -3.5% |
+| leader's loop, ms per command | -0.074 (-0.083 to -0.064), -10.2% | -0.047 (-0.065 to -0.032), -10.5% |
+| followers' loop, ms per command | -0.052 (-0.060 to -0.047), -9.2% | -0.032 (-0.045 to -0.020), -8.7% |
+| leader's allocator, profiled, µs per command | -49.2 (-56.1 to -42.4), -30 to -38% | not readable (Debian nodes) |
+| leader's `memcmp` / `memmove`, profiled, µs per command | -2.4 / -0.1 | not readable |
+| voters' resident set at the end, mean, MiB | +54 (+35 to +89) | +34 (+31 to +37) |
+| voters' high-water mark, largest, MiB | +62 (+36 to +105), head up to 263 | +51 (+47 to +55), head up to 273 |
+
+- Kept. Every loop is lower in all six pairs, by about a tenth on the
+  leader and the followers on both CPUs, the same cut as the local pair's
+  0.070 ms on the leader, and the allocator's share of the leader fell
+  with it. The voters' CPU per operation fell by about half what the
+  local pair showed: the domain loops and the tokio threads make up
+  nearly all of job 2's cut, and the tokio threads fell 3.5% on the
+  runner against about 12% locally, so the shortfall is on the
+  transport's side, not in the loops. Three pairs set the sign, not the
+  size to 0.1 ms: the six run from -0.04 to -0.31 ms.
+- The memory cost is about 34 MiB of resident set per voter, a fifth on
+  top of about 170 MiB, near the local pair's 46, and up to 51 MiB of
+  high-water mark. It is kept as measured: a deployment that needs it
+  smaller bounds it with `MIMALLOC_PURGE_DELAY` or the `v2` feature,
+  and either is a pair of its own.
+- What is left of the allocator on the leader is about 100 µs per
+  command, the largest symbol mimalloc's allocation fast path
+  (`_mi_page_malloc_zero`, 46 µs of self time): the number of
+  allocations, not their bookkeeping. Step 2's sites are the head's
+  largest callers: `BallotConfiguration::clone` 7.8 µs, the journal
+  record's encoder 6.2, `RedbView::table` 6.1, `pump_reads` 4.8, the
+  loop's closure 4.8, `trace::hex` 4.6, `Leader::propose` 3.8.
+- `memcmp`, 44 to 52 µs per command on the leader, is 25 to 30 µs in the
+  leader's own bookkeeping (`step`, `learn`, `executed_below`, `applied`,
+  `commit_learned`, `propose`) and 5 to 6 in `pump_reads`: map probes on
+  32-byte keys, inlined, so the stack does not name the map. redb's own
+  lookups are 3 to 4. `memmove`, 38 to 43, is mostly inlined into the
+  domain loop's closure (7 to 12 µs), where each peer's send is
+  dispatched; that fits the per-voter copy of each broadcast frame, but
+  the stack cannot prove it, and it is confirmed before it is cut.

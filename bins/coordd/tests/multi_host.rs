@@ -293,22 +293,33 @@ async fn a_voter_killed_under_the_replay_profile_comes_back_and_serves() {
 /// The value a read of one key came back with: `None` for a read that
 /// was not established or found nothing.
 async fn read_value(caller: &mut Caller, provisioned: &Provisioned, key: &[u8]) -> Option<Vec<u8>> {
-    match caller
-        .call(&get(provisioned, key), Duration::from_secs(30))
-        .await
-    {
-        Ok(coord_sdk::Outcome::Established { result, .. }) => {
-            match postcard::from_bytes::<coord_state::Response>(&result)
-                .ok()?
-                .outcome
-            {
-                coord_state::Outcome::Range { items, .. } => {
-                    items.first().map(|item| item.entry.value.clone())
-                }
-                _ => None,
+    // A node that has not yet projected the caller's session holds a
+    // read's result back as pending rather than refusing it, and the
+    // caller resolves (coord-session's output gate): a voter that has
+    // just come back can hold a fresh session's first read that way. A
+    // read is asked again, as a new invocation, until it is answered.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        match caller
+            .call(&get(provisioned, key), Duration::from_secs(30))
+            .await
+        {
+            Ok(coord_sdk::Outcome::Established { result, .. }) => {
+                return match postcard::from_bytes::<coord_state::Response>(&result)
+                    .ok()?
+                    .outcome
+                {
+                    coord_state::Outcome::Range { items, .. } => {
+                        items.first().map(|item| item.entry.value.clone())
+                    }
+                    _ => None,
+                };
             }
+            Ok(coord_sdk::Outcome::Unknown) if std::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            _ => return None,
         }
-        _ => None,
     }
 }
 
@@ -423,7 +434,9 @@ async fn takes_back_a_restarted_voter(name: &str, journal: JournalPlan) {
     voters[2].start(3, false);
     // The restarted voter reports the projection's durable frontier
     // apart from what it has applied exactly when it runs the replay
-    // profile.
+    // profile. The harness writes the log from its own thread, so the
+    // startup snapshot can reach it just after `start` returns.
+    voters[2].waits_until(30, since[2], |said| !startup_metrics(said).is_empty());
     let restarted = startup_metrics(voters[2].said().get(since[2]..).unwrap_or_default());
     let frontiers = restarted
         .first()
