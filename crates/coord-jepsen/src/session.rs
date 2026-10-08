@@ -114,12 +114,16 @@ pub(crate) fn parse_id(hex: &str) -> Result<[u8; 16], OpenError> {
 }
 
 /// Resolve `host:port`, IP literal or DNS name.
-async fn resolve(address: &str) -> Result<SocketAddr, OpenError> {
-    tokio::net::lookup_host(address)
-        .await
-        .map_err(|e| material("frontend address", e))?
-        .next()
-        .ok_or_else(|| OpenError(format!("`{address}` resolves to nothing")))
+async fn resolve(address: &str, by: Instant) -> Result<SocketAddr, OpenError> {
+    tokio::time::timeout(
+        by.saturating_duration_since(Instant::now()),
+        tokio::net::lookup_host(address),
+    )
+    .await
+    .map_err(|_| OpenError(format!("resolving `{address}` timed out")))?
+    .map_err(|e| material("frontend address", e))?
+    .next()
+    .ok_or_else(|| OpenError(format!("`{address}` resolves to nothing")))
 }
 
 impl Session {
@@ -152,6 +156,9 @@ impl Session {
         instance: u16,
         timing: Timing,
     ) -> Result<Session, OpenError> {
+        // One deadline for the whole opening: the lookup, the dial and
+        // the bind.
+        let by = Instant::now() + timing.connect;
         let node = provisioned
             .voters
             .get(voter)
@@ -160,7 +167,7 @@ impl Session {
         let domain = DomainId(parse_id(&provisioned.domain)?);
         let namespace = NamespaceId(parse_id(&provisioned.namespace)?);
         let target = Target {
-            address: resolve(&node.api).await?,
+            address: resolve(&node.api, by).await?,
             server_name: provisioned.server_name.clone(),
             replica: ReplicaId(parse_id(&node.node)?),
         };
@@ -230,7 +237,6 @@ impl Session {
             session: SessionId(session),
             connects: 0,
         };
-        let by = Instant::now() + this.timing.connect;
         this.connect(by).await.map_err(OpenError)?;
         Ok(this)
     }
