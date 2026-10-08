@@ -271,15 +271,14 @@ class PairTests(unittest.TestCase):
             with open(os.path.join(run.store, "follower-profile-chains.txt"), "w") as f:
                 f.write("header\n" + text)
         runs = [jp.read_run(r.label, r.store) for r in self.runs[:2]]
-        self.assertAlmostEqual(runs[0].followers_loop, 0.4)
-        us = runs[1].followers_loop * 1000
         text = jp.render(runs, "Paired")
         self.assertIn("The follower's loop by symbol", text)
-        # Base: 60% and 40% of 400 µs; the head holds 10% of its own.
-        self.assertIn(f"| `coord_core::outbox::Outbox::release` | 240.0 | {us * 0.1:.1f} | {us * 0.1 - 240:.1f} |", text)
-        self.assertIn(f"| `mi_free` | 160.0 | 0.0 | -160.0 |", text)
+        # Shares of the sampled follower's own samples, not scaled by the
+        # followers' mean loop cost.
+        self.assertIn("| `coord_core::outbox::Outbox::release` | 60.00% | 10.00% | -50.00 |", text)
+        self.assertIn("| `mi_free` | 40.00% | 0.00% | -40.00 |", text)
         # With what it calls: all of the base's samples, a tenth of the head's.
-        self.assertIn(f"| `coord_core::outbox::Outbox::release` and what it calls | 400.0 | {us * 0.1:.1f} |", text)
+        self.assertIn("| `coord_core::outbox::Outbox::release` and what it calls | 100.00% | 10.00% | -90.00 |", text)
 
     def test_runs_that_are_not_side_by_side_are_not_paired(self):
         text = jp.render([self.runs[0], self.runs[3]], "Paired")

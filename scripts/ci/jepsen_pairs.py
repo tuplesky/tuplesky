@@ -488,22 +488,24 @@ def transport_table(runs: list[Run]) -> list[str]:
 
 def follower_symbols(runs: list[Run], top: int = 15) -> list[str]:
     """The call-graph runs' follower by symbol, side by side: each leaf
-    symbol's share of the follower thread's samples times the followers'
-    mean loop CPU per command, and, whatever their rank, each `Outbox`
-    method with everything it calls (task-d69)."""
-    shown = [(i, r) for i, r in enumerate(runs, 1) if r.follower_chains and r.followers_loop]
+    symbol's share of the follower thread's samples, and, whatever their
+    rank, each `Outbox` method with everything it calls (task-d69).
+
+    In shares, not microseconds per command: the profile samples one
+    follower, the busiest, and nothing here says which voter it was, so
+    the followers' mean loop cost is not its own."""
+    shown = [(i, r) for i, r in enumerate(runs, 1) if r.follower_chains]
     if not shown:
         return []
     own_: list = []
     whole: list = []
     for _, r in shown:
-        us = r.followers_loop * 1000 / 100
         leaves: dict = {}
         outbox: dict = {}
         for leaf, share, frames in r.follower_chains:
-            leaves[leaf] = leaves.get(leaf, 0.0) + share * us
+            leaves[leaf] = leaves.get(leaf, 0.0) + share
             for name in {f for f in frames + [leaf] if "outbox::Outbox::" in f}:
-                outbox[name] = outbox.get(name, 0.0) + share * us
+                outbox[name] = outbox.get(name, 0.0) + share
         own_.append(leaves)
         whole.append(outbox)
     names = []
@@ -514,9 +516,8 @@ def follower_symbols(runs: list[Run], top: int = 15) -> list[str]:
     labels = [r.label for _, r in shown]
     paired = sorted(labels) == ["base", "head"]
     out = [
-        "**The follower's loop by symbol** (the call-graph runs: each symbol's own share of the follower thread's "
-        "samples times the followers' mean loop CPU per command, then each `Outbox` method with what it calls; "
-        "microseconds per command)",
+        "**The follower's loop by symbol** (the call-graph runs' sampled follower, the busiest: each symbol's own "
+        "share of the thread's samples, then each `Outbox` method with what it calls; percent of the samples)",
         "",
         "| Symbol | " + " | ".join(f"Run {i}, {r.label}" for i, r in shown) + (" | Head less base |" if paired else " |"),
         "| --- " * (1 + len(shown) + (1 if paired else 0)) + "|",
@@ -524,10 +525,10 @@ def follower_symbols(runs: list[Run], top: int = 15) -> list[str]:
     rows = [(f"`{n.replace('|', '/')}`", [leaves.get(n, 0.0) for leaves in own_]) for n in names]
     rows += [(f"`{n.replace('|', '/')}` and what it calls", [outbox.get(n, 0.0) for outbox in whole]) for n in outbox_names]
     for name, values in rows:
-        cells = [f"{v:.1f}" for v in values]
+        cells = [f"{v:.2f}%" for v in values]
         if paired:
             d = values[labels.index("head")] - values[labels.index("base")]
-            cells.append(("+" if d >= 0 else "") + f"{d:.1f}")
+            cells.append(("+" if d >= 0 else "") + f"{d:.2f}")
         out.append(f"| {name} | " + " | ".join(cells) + " |")
     out.append("")
     return out
