@@ -16,7 +16,7 @@ directory (`store/latest`) and writes what a reader looks for first:
   TupleSky run, the leader's loop against the host's idle second by second
   and the voters' tokio threads (`cpu-samples-threads.csv`);
 * the commonest failure reasons;
-* the faults, in order;
+* the faults, in order, and each node's first `ok` after each fault ended;
 * for a TupleSky run, one row per voter from its `coordd.log`: boots,
   where it last recovered, its last role and the refusals and stops that
   mark the failures seen so far;
@@ -49,6 +49,7 @@ unless the store directory does not exist.
 from __future__ import annotations
 
 import argparse
+import bisect
 import collections
 import datetime
 import json
@@ -1541,6 +1542,63 @@ def node_of(op: Op, nodes: list[str]) -> str:
     return nodes[int(m[1]) % len(nodes)]
 
 
+# The nemesis operations that end a fault: a kill's restart, a pause's
+# resume, a partition's heal and a packet fault's end.
+FAULT_ENDS = (":start", ":resume", ":stop-partition", ":stop-packet")
+
+
+def back_serving(client: list[Op], nemesis: list[Op], nodes: list[str], start) -> list[str]:
+    """Each node's first `ok` after each fault ended: the seconds from the
+    end operation's completion to the first `ok` through that node. Faults
+    overlap, so a node another fault still holds counts that one too."""
+    if not nodes:
+        return []
+    pairs = [(nemesis[i], nemesis[i + 1] if i + 1 < len(nemesis) else None) for i in range(0, len(nemesis), 2)]
+    ends = [(inv.f, (res or inv).at) for inv, res in pairs if inv.f in FAULT_ENDS]
+    if not ends:
+        return []
+    oks = collections.defaultdict(list)
+    for o in client:
+        if o.type == "ok":
+            oks[node_of(o, nodes)].append(o.at)
+    rows, slowest = [], []
+    for f, at in ends:
+        took = {}
+        for node in nodes:
+            i = bisect.bisect_right(oks[node], at)
+            took[node] = (oks[node][i] - at).total_seconds() if i < len(oks[node]) else None
+        cells = [f"{took[n]:.1f}" if took[n] is not None else "never" for n in nodes]
+        # A node that never served again is the slowest.
+        worst = max(((took[n], n) for n in nodes), key=lambda t: math.inf if t[0] is None else t[0])
+        slowest.append((worst, f, at))
+        w = f"{worst[0]:.1f} ({worst[1]})" if worst[0] is not None else f"never ({worst[1]})"
+        rows.append(f"| `{f}` | {(at - start).seconds} | " + " | ".join(cells) + f" | {w} |")
+    timed = sorted(w[0] for w, _, _ in slowest if w[0] is not None)
+    never = len(slowest) - len(timed)
+    out = []
+    if timed:
+        (most, node), f, at = max(((w, f, at) for w, f, at in slowest if w[0] is not None), key=lambda x: x[0][0])
+        out.append(
+            f"**Back serving after a fault:** the slowest node's first `ok` after each of {len(timed)} fault ends, "
+            f"median {percentile(timed, 0.5):.1f} s, at most {most:.1f} s ({node}, after `{f}` at "
+            f"+{(at - start).seconds} s)" + (f"; after {never} more, a node never served again" if never else "") + "."
+        )
+    else:
+        out.append(f"**Back serving after a fault:** after each of {len(ends)} fault ends, a node never served again.")
+    out += [
+        "",
+        "<details><summary>Each node's first <code>ok</code> after each fault's end (s)</summary>",
+        "",
+        "| End | + s | " + " | ".join(nodes) + " | Slowest |",
+        "| --- " * (len(nodes) + 3) + "|",
+        *rows,
+        "",
+        "</details>",
+        "",
+    ]
+    return out
+
+
 def reason(op: Op) -> str:
     """Why an operation was not ok, short: a client that could not start
     reads as its exception type and message rather than the whole map."""
@@ -1713,6 +1771,8 @@ def summarize(store: str, nodes: list[str], title: str, profile: str | None = No
         out.append("")
         out.append("</details>")
         out.append("")
+
+        out.extend(back_serving(client, nemesis, nodes, start))
 
     if network:
         where = f"; clients beside {'the first node' if clients == 'first' else 'each node'}" if clients else ""

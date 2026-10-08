@@ -548,6 +548,11 @@ of lines. `scripts/ci/jepsen_summary.py` reads the test's store
   which says whether the domain served again;
 * the commonest reasons an operation was not `ok`, and the faults in
   order;
+* each node back serving after each fault: the seconds from each
+  fault's end (a restart, a resume or a heal) to the first `ok` through
+  every node, with the slowest node's median and most over the run.
+  Faults overlap, so a node another fault still holds counts that one
+  too;
 * in every job, where the runner's CPU went over the workload (Runner
   CPU): `jepsen_bounded.sh` runs `scripts/ci/cpu_sampler.py` beside the
   test, which reads every process's CPU time from `/proc` once a second,

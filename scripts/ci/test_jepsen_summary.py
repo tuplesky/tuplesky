@@ -1,4 +1,5 @@
 """Tests for the Jepsen job summary."""
+import datetime
 import json
 import os
 import tempfile
@@ -173,6 +174,24 @@ class SummaryTests(unittest.TestCase):
         # One ok before the heal at +39 s; the final read after it is left out.
         self.assertIn("**Throughput:** 1 `ok` in 39 s until the final heal, 0.0 `ok`/s", self.text)
         self.assertIn("| `:txn` | 1 | 1000 | 1000 | 1000 | 1000 |", self.text)
+
+    def test_each_node_back_serving_after_a_fault_ends(self):
+        # The start at 10:00:40 ends the kill: n1's next `ok` is 62 s later,
+        # and n2 never serves again.
+        self.assertIn("| `:start` | 39 | 62.0 | never | never (n2) |", self.text)
+        self.assertIn("**Back serving after a fault:** after each of 1 fault ends, a node never served again.", self.text)
+
+    def test_back_serving_takes_the_slowest_nodes_median(self):
+        at = lambda s: datetime.datetime(2026, 9, 27, 10, 0, s)
+        op = lambda s, w, t="ok", f=":txn": js.Op(at(s), f"jepsen worker {w}", str(w), t, f, "", "")
+        nem = lambda s, f: js.Op(at(s), "jepsen nemesis", ":nemesis", "info", f, "", "")
+        client = [op(1, 0), op(1, 1), op(12, 0), op(14, 1), op(31, 0), op(32, 1)]
+        nemesis = [nem(2, ":pause"), nem(3, ":pause"), nem(10, ":resume"), nem(11, ":resume"),
+                   nem(20, ":start-partition"), nem(21, ":start-partition"), nem(29, ":stop-partition"), nem(30, ":stop-partition")]
+        text = "\n".join(js.back_serving(client, nemesis, ["n1", "n2"], at(0)))
+        self.assertIn("median 2.0 s, at most 3.0 s (n2, after `:resume` at +11 s)", text)
+        self.assertIn("| `:resume` | 11 | 1.0 | 3.0 | 3.0 (n2) |", text)
+        self.assertIn("| `:stop-partition` | 30 | 1.0 | 2.0 | 2.0 (n2) |", text)
 
     def test_final_reads_pair_invocations_after_the_heal(self):
         self.assertIn("1 of 2 nodes served a final read", self.text)
