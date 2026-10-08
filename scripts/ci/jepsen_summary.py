@@ -49,7 +49,6 @@ unless the store directory does not exist.
 from __future__ import annotations
 
 import argparse
-import bisect
 import collections
 import datetime
 import json
@@ -1562,24 +1561,32 @@ FAULT_ENDS = (":start", ":resume", ":stop-partition", ":stop-packet")
 
 def back_serving(client: list[Op], nemesis: list[Op], nodes: list[str], start) -> list[str]:
     """Each node's first `ok` after each fault ended: the seconds from the
-    end operation's completion to the first `ok` through that node. Faults
-    overlap, so a node another fault still holds counts that one too."""
+    end operation's completion to the first `ok` through that node of an
+    operation invoked after it. Faults overlap, so a node another fault
+    still holds counts that one too."""
     if not nodes:
         return []
     pairs = [(nemesis[i], nemesis[i + 1] if i + 1 < len(nemesis) else None) for i in range(0, len(nemesis), 2)]
     ends = [(inv.f, (res or inv).at) for inv, res in pairs if inv.f in FAULT_ENDS]
     if not ends:
         return []
+    # Each `ok` with its invocation: a worker's operations are sequential,
+    # so an invocation's answer is that worker's next completion. Only an
+    # operation invoked after a fault ended says the node serves again; one
+    # held across it may be answered from before.
     oks = collections.defaultdict(list)
+    invoked = {}
     for o in client:
-        if o.type == "ok":
-            oks[node_of(o, nodes)].append(o.at)
+        if o.type == "invoke":
+            invoked[o.thread] = o.at
+        elif (at := invoked.pop(o.thread, None)) is not None and o.type == "ok":
+            oks[node_of(o, nodes)].append((at, o.at))
     rows, slowest = [], []
     for f, at in ends:
         took = {}
         for node in nodes:
-            i = bisect.bisect_right(oks[node], at)
-            took[node] = (oks[node][i] - at).total_seconds() if i < len(oks[node]) else None
+            after = [done for began, done in oks[node] if began > at]
+            took[node] = (min(after) - at).total_seconds() if after else None
         cells = [f"{took[n]:.1f}" if took[n] is not None else "never" for n in nodes]
         # A node that never served again is the slowest.
         worst = max(((took[n], n) for n in nodes), key=lambda t: math.inf if t[0] is None else t[0])

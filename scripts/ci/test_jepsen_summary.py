@@ -195,7 +195,11 @@ class SummaryTests(unittest.TestCase):
         at = lambda s: datetime.datetime(2026, 9, 27, 10, 0, s)
         op = lambda s, w, t="ok", f=":txn": js.Op(at(s), f"jepsen worker {w}", str(w), t, f, "", "")
         nem = lambda s, f: js.Op(at(s), "jepsen nemesis", ":nemesis", "info", f, "", "")
-        client = [op(1, 0), op(1, 1), op(12, 0), op(14, 1), op(31, 0), op(32, 1)]
+        inv = lambda s, w: op(s, w, "invoke")
+        # n2's operation invoked at 9, during the pause, and answered at 12
+        # is held across the resume: not evidence that n2 serves again.
+        client = [inv(0, 0), inv(0, 1), op(1, 0), op(1, 1), inv(9, 1), inv(12, 0), op(12, 0), op(12, 1),
+                  inv(14, 1), op(14, 1), inv(31, 0), op(31, 0), inv(32, 1), op(32, 1)]
         nemesis = [nem(2, ":pause"), nem(3, ":pause"), nem(10, ":resume"), nem(11, ":resume"),
                    nem(20, ":start-partition"), nem(21, ":start-partition"), nem(29, ":stop-partition"), nem(30, ":stop-partition")]
         text = "\n".join(js.back_serving(client, nemesis, ["n1", "n2"], at(0)))
