@@ -10322,3 +10322,44 @@ one pair:
   transport's workers are 41% of that (task-d70).
 
 Kept.
+
+## The outbox's release walk (task-d69)
+
+A local call-graph profile of five voters on task-d60's second PR put
+`Outbox::release` at 5 to 7% of every follower's loop, most of it its own
+time. It ran at every round of every turn, drained every held send into
+new lists to check its ballot and barriers, and the same round walked the
+held sends again to count the withheld ones: per-event work that grows
+with what is held, task-d46's shape.
+
+A held send is now filed under the one fact it still waits for (its
+newest required barrier not yet durable, or the journal sequence its
+context names), a completion re-files only what was filed under it, and
+a release hands over the ready list in publication order. The ballot and
+failure checks are made again on every held send only when the ballot
+changed or a barrier failed since the last release. A debug build
+compares every release with the full walk, and the protocol simulator's
+rows at 100 seeds are identical, row for row, to the walk's.
+
+Five voters on one four-core host, replay profile, stores on disk, 30
+callers, 40,000 measured operations, three pairs of task-d60's second PR
+against this one, alternated. The host was slower again than for the
+second PR's own pairs, so each pair is read against itself:
+
+| | step 2 | task-d69 |
+| --- | --- | --- |
+| completed a second | 783, 757, 783 | 805, 789, 787 |
+| followers' domain threads, CPU ms per command (mean of four) | 0.507, 0.536, 0.532 | 0.498, 0.501, 0.525 |
+| leader's domain thread, CPU ms per command | 0.642, 0.685, 0.666 | 0.627, 0.633, 0.651 |
+| domain threads, five voters, CPU ms per operation | 1.343, 1.426, 1.408 | 1.321, 1.329, 1.386 |
+| tokio workers, five voters | 1.054, 1.146, 1.135 | 1.089, 1.065, 1.121 |
+
+- Lower in every pair: the followers' loop by 0.017 ms per command on
+  average (3%; 0.009, 0.035, 0.007), the leader's by 0.027, and the five
+  domain threads by 0.047 ms per operation. Throughput is higher in every
+  pair. The leader holds sends too (its acknowledgements wait on every
+  batch before them), so it gains as well.
+- The cut is about half of what the profile put on the walk. The pairs
+  move by as much as the host does between them, so the runner pair, with
+  the call graph to show `Outbox::release` gone from the follower's
+  profile, is the acceptance.
