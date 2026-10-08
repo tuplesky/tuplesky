@@ -324,11 +324,21 @@ given by the innermost Rust frame above the system call. The summary gives the t
 
 The `voter-workers` input sets each TupleSky voter's tokio worker count
 through jepsen.tuplesky's `--voter-workers`, which starts `coordd` with
-`TOKIO_WORKER_THREADS`; empty keeps tokio's default of one worker per
-runner core, which each of the co-located voters takes. It needs a
-`jepsen-ref` with the option (tuplesky/jepsen's
-`claude/voter-tokio-workers`), and the title then ends in ", N tokio
-workers per voter".
+`TOKIO_WORKER_THREADS`. Its default, and every scheduled and pull-request
+run's, is 2: five voters on a 4-CPU runner oversubscribe tokio's one worker
+per core, and two cut the voters' tokio CPU per operation by 8%, all of it
+the workers parking and waking each other (#155's pair 2). `default`
+keeps tokio's one per runner core. It needs a `jepsen-ref` with the option
+(tuplesky/jepsen's `claude/voter-tokio-workers` and branches on it); with
+one without, the run warns and keeps tokio's default, and the title, which
+otherwise ends in ", N tokio workers per voter", drops the count.
+`voter-env` gives every voter of every run one more variable through
+`--voter-env` (such as `COORDD_ACK_FREQUENCY=8,25000`), and the title says
+", with NAME=VALUE". `key-count` sets the keys in play at once in the
+append and wr workloads (Elle's `key-count`, 3 by default; each key retires
+after its share of writes and a fresh one takes its place) through
+`--key-count`, and the title says ", N keys"; with the register workload it
+is refused.
 Each publication's `checkpoint` line in `coordd.log` says how long it held
 the domain thread and how long each of its steps took, and each restart's
 `replayed` line how many records it replayed and how long that took.

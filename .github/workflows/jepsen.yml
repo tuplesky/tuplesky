@@ -73,7 +73,13 @@ on:
         description: "Journal records each TupleSky voter holds past its last local checkpoint before publishing the next (task-d55); 0 never publishes; empty for the profile's default (4096 under strict; 65536 and 30 s under replay, task-d51)"
         default: ""
       voter-workers:
-        description: "Tokio worker threads per TupleSky voter (TOKIO_WORKER_THREADS, through jepsen.tuplesky's --voter-workers); empty for tokio's default of one per runner core, which each co-located voter takes"
+        description: "Tokio worker threads per TupleSky voter (TOKIO_WORKER_THREADS, through jepsen.tuplesky's --voter-workers): 2, the job's standard (five voters on a 4-CPU runner), or default for tokio's one per runner core, which each co-located voter takes"
+        default: "2"
+      voter-env:
+        description: "An environment variable every TupleSky voter starts with in every run, as NAME=VALUE (through jepsen.tuplesky's --voter-env), such as COORDD_ACK_FREQUENCY=8,25000; empty for none"
+        default: ""
+      key-count:
+        description: "Keys in play at once in TupleSky's append or wr workload (Elle's key-count, through jepsen.tuplesky's --key-count); empty for the harness's 3"
         default: ""
       pair-base:
         description: "Run TupleSky in pairs on one runner against this base: a tuplesky ref (a branch, a tag or a full commit SHA, which actions/checkout needs whole) built beside the head, or env:NAME=VALUE for the head's own build with that variable on every voter; empty for one run"
@@ -129,7 +135,11 @@ env:
   IN_STORE: ${{ inputs.store }}
   IN_PROFILE: ${{ inputs.profile }}
   IN_CHECKPOINT_AFTER_RECORDS: ${{ inputs.checkpoint-after-records }}
-  IN_VOTER_WORKERS: ${{ inputs.voter-workers }}
+  # Scheduled and pull-request runs have no inputs: two workers, the
+  # job's standard, as a dispatch's default.
+  IN_VOTER_WORKERS: ${{ inputs.voter-workers || '2' }}
+  IN_VOTER_ENV: ${{ inputs.voter-env }}
+  IN_KEY_COUNT: ${{ inputs.key-count }}
   IN_PAIR_BASE: ${{ inputs.pair-base }}
   IN_PAIRS: ${{ inputs.pairs || '3' }}
   IN_LEADER_PROFILE: ${{ inputs.leader-profile || 'false' }}
@@ -316,13 +326,32 @@ jobs:
         # harness from before it.
         run: |
           wan=(); if [ "$WAN" != none ]; then wan=(--wan "$WAN"); fi
-          workers=()
-          if [ -n "$IN_VOTER_WORKERS" ]; then
-            if ! grep -q -- '--voter-workers' src/jepsen/tuplesky.clj; then
-              echo "::error::tuplesky/jepsen@$JEPSEN_REF has no --voter-workers; dispatch with a jepsen-ref that has it, or no voter-workers"
+          voter=()
+          if [ -n "$VOTER_WORKERS" ]; then
+            if grep -q -- '--voter-workers' src/jepsen/tuplesky.clj; then
+              voter=(--voter-workers "$VOTER_WORKERS")
+            else
+              # The standard two workers need a harness that sets them; a
+              # harness without the option runs tokio's default, and the
+              # titles drop the count.
+              echo "::warning::tuplesky/jepsen@$JEPSEN_REF has no --voter-workers; the voters run tokio's default worker count"
+              WORKERS_SUFFIX=""
+              echo "WORKERS_SUFFIX=" >> "$GITHUB_ENV"
+            fi
+          fi
+          if [ -n "$VOTER_ENV" ]; then
+            if ! grep -q -- '--voter-env' src/jepsen/tuplesky.clj; then
+              echo "::error::tuplesky/jepsen@$JEPSEN_REF has no --voter-env; dispatch with a jepsen-ref that has it, or no voter-env"
               exit 1
             fi
-            workers=(--voter-workers "$IN_VOTER_WORKERS")
+            voter+=(--voter-env "$VOTER_ENV")
+          fi
+          if [ -n "$KEY_COUNT" ]; then
+            if ! grep -q -- '--key-count' src/jepsen/tuplesky.clj; then
+              echo "::error::tuplesky/jepsen@$JEPSEN_REF has no --key-count; dispatch with a jepsen-ref that has it, or no key-count"
+              exit 1
+            fi
+            voter+=(--key-count "$KEY_COUNT")
           fi
           common=(lein run test
             --nodes-file "$RUNNER_TEMP/cluster/nodes"
@@ -335,7 +364,7 @@ jobs:
             --recovery-time "$RECOVERY_TIME"
             --concurrency "$CONCURRENCY"
             ${wan[@]+"${wan[@]}"}
-            ${workers[@]+"${workers[@]}"})
+            ${voter[@]+"${voter[@]}"})
           ci="$GITHUB_WORKSPACE/tuplesky/scripts/ci"
           # One test with the binaries in $1, its samples and profile in $2,
           # a call graph when $3 is "graph".
@@ -402,12 +431,12 @@ jobs:
               done
               python3 "$ci/jepsen_summary.py" "$store" \
                 --nodes-file "$RUNNER_TEMP/cluster/nodes" --profile "$PROFILE" \
-                --title "TupleSky: $WORKLOAD, $NEMESIS$TITLE_SUFFIX$STORE_SUFFIX$PROFILE_SUFFIX$CHECKPOINT_SUFFIX: pair $i, $side ($name)" || true
+                --title "TupleSky: $WORKLOAD, $NEMESIS$TITLE_SUFFIX$STORE_SUFFIX$PROFILE_SUFFIX$CHECKPOINT_SUFFIX$WORKERS_SUFFIX$TUPLESKY_SUFFIX: pair $i, $side ($name)" || true
               runs+=("$side=$store")
             done
           done
           python3 "$ci/jepsen_pairs.py" \
-            --title "TupleSky pairs: $head_sha (head) against $base_name (base), $WORKLOAD, $NEMESIS$TITLE_SUFFIX$STORE_SUFFIX$PROFILE_SUFFIX$CHECKPOINT_SUFFIX" \
+            --title "TupleSky pairs: $head_sha (head) against $base_name (base), $WORKLOAD, $NEMESIS$TITLE_SUFFIX$STORE_SUFFIX$PROFILE_SUFFIX$CHECKPOINT_SUFFIX$WORKERS_SUFFIX$TUPLESKY_SUFFIX" \
             ${runs[@]+"${runs[@]}"} || true
           exit $rc
       - name: Read how far each voter executed
@@ -436,7 +465,7 @@ jobs:
             cp "$RUNNER_TEMP"/cpu-samples* "$RUNNER_TEMP"/leader-profile*.txt "$RUNNER_TEMP"/follower-profile*.txt "$RUNNER_TEMP"/transport-profile*.txt jepsen/tuplesky/store/latest/ 2>/dev/null || true
             python3 tuplesky/scripts/ci/jepsen_summary.py jepsen/tuplesky/store/latest \
               --nodes-file "$RUNNER_TEMP/cluster/nodes" --profile "$PROFILE" \
-              --title "TupleSky: $WORKLOAD, $NEMESIS$TITLE_SUFFIX$STORE_SUFFIX$PROFILE_SUFFIX$CHECKPOINT_SUFFIX${IN_VOTER_WORKERS:+, $IN_VOTER_WORKERS tokio workers per voter}"
+              --title "TupleSky: $WORKLOAD, $NEMESIS$TITLE_SUFFIX$STORE_SUFFIX$PROFILE_SUFFIX$CHECKPOINT_SUFFIX$WORKERS_SUFFIX$TUPLESKY_SUFFIX"
           else
             echo "No Jepsen store: the test did not start." >> "$GITHUB_STEP_SUMMARY"
           fi
