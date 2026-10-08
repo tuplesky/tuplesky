@@ -95,6 +95,15 @@ def loops() -> dict:
     return out
 
 
+def node_of(pid: int) -> str | None:
+    """The node a coordd runs on: its container's hostname (each Jepsen
+    node is a container named and hostnamed after the node), so a profile
+    says which voter it sampled; None where it cannot be read."""
+    done = subprocess.run(["sudo", "-n", "cat", f"/proc/{pid}/root/etc/hostname"], capture_output=True, text=True)
+    name = done.stdout.strip()
+    return name if done.returncode == 0 and name and " " not in name else None
+
+
 def now() -> str:
     return f"{datetime.datetime.now(datetime.timezone.utc):%Y-%m-%d %H:%M:%S}"
 
@@ -197,7 +206,8 @@ def main() -> int:
             objects, _ = report(data, "overhead,dso", "0")
         by_object = ", ".join(f"{' '.join(line.split()[1:])} {line.split()[0]}" for line in objects[:6] if line.split())
         who = (
-            f"{role} thread {tid}, {used / span:.2f} of a core over the {span} s before"
+            f"{role} thread {tid}{f' ({node})' if (node := node_of(tid)) else ''}, {used / span:.2f} of a core over "
+            f"the {span} s before"
             if used is not None
             else f"{role}: the tokio threads ({', '.join(comms)}) of the leader's process {tid}, pooled"
         )

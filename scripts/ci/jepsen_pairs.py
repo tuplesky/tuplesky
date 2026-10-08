@@ -69,6 +69,10 @@ class Run:
     resend_scanned_per_call: float | None = None
     # The follower's call graph beside the leader's, in a call-graph run.
     follower_chains: list = field(default_factory=list)
+    # The sampled follower's own loop CPU per command (ms), where its
+    # profile names its voter; the phase tables scale its shares by it.
+    sampled_follower: str | None = None
+    sampled_follower_loop: float | None = None
     # The leader's threads in a call-graph run: by kind, (threads, CPU µs
     # per command, {system call: calls per command}); and its tokio
     # threads' samples by what they did, in µs per command.
@@ -234,6 +238,7 @@ def read_run(label: str, store: str) -> Run:
         completed = 0
 
     costs = []
+    by_node = {}
     for node in sorted(os.listdir(store)):
         path = os.path.join(store, node, "coordd.log")
         if os.path.exists(path):
@@ -241,6 +246,7 @@ def read_run(label: str, store: str) -> Run:
                 voter = js.parse_voter(f.readlines())
             if voter.cost and voter.cost.cpu and voter.cost.executed:
                 costs.append(voter.cost)
+                by_node[node] = voter.cost
     if costs:
         if completed:
             run.voters_cpu_per_op = sum(c.cpu[1] for c in costs) * 1000 / completed
@@ -284,6 +290,10 @@ def read_run(label: str, store: str) -> Run:
     run.inclusive = read_inclusive(os.path.join(store, "leader-profile-inclusive.txt"))
     run.chains = js.read_chains(os.path.join(store, "leader-profile-chains.txt"))
     run.follower_chains = js.read_chains(os.path.join(store, "follower-profile-chains.txt"))
+    node = js.profiled_node(os.path.join(store, "follower-profile-chains.txt"))
+    if node in by_node and costs and by_node[node] is not leader:
+        run.sampled_follower = node
+        run.sampled_follower_loop = by_node[node].cpu[0] * 1000 / by_node[node].executed
     if run.leader_loop:
         counts = os.path.join(store, "leader-profile-syscalls.txt")
         run.threads, _ = js.syscalls_per_command(counts, run.leader_loop * 1000)
@@ -412,8 +422,12 @@ def split_tables(runs: list[Run], top: int = 20) -> list[str]:
         for owner, share in s["owners"].most_common(top):
             out.append(f"| `{owner.replace('|', '/')}` | {share * us:.1f} |")
         out.append("")
-        follower_us = run.followers_loop * 1000 if run.followers_loop else None
-        comparison = js.phase_comparison(run.chains, run.follower_chains, run.leader_loop * 1000, follower_us, top)
+        # The sampled follower's own cost where its voter is known; a run
+        # from before that is named gives the followers' mean.
+        follower_ms = run.sampled_follower_loop or run.followers_loop
+        follower_us = follower_ms * 1000 if follower_ms else None
+        comparison = js.phase_comparison(run.chains, run.follower_chains, run.leader_loop * 1000, follower_us, top,
+                                         run.sampled_follower)
         if comparison:
             out += [f"(run {i}, {run.label})", ""] + comparison
         out.extend(js.copies_table(run.chains, us))

@@ -1406,30 +1406,50 @@ def resend_table(voters: dict) -> list[str]:
     return out
 
 
-def loop_per_command(voters: dict) -> tuple[float | None, float | None]:
+def loop_per_command(voters: dict, follower: str | None = None) -> tuple[float | None, float | None]:
     """The leader's loop CPU per command (the voter whose read barrier
-    served reads) and the followers' mean, in microseconds; None where the
-    line has no CPU."""
-    costs = [v.cost for v in voters.values() if v.cost and v.cost.cpu and v.cost.executed]
+    served reads) and a follower's, in microseconds: `follower`'s own
+    where it names a voter, else the followers' mean; None where the line
+    has no CPU."""
+    costs = {n: v.cost for n, v in voters.items() if v.cost and v.cost.cpu and v.cost.executed}
     if not costs:
         return None, None
-    leader = max(costs, key=lambda c: (c.served, c.cpu[0] / c.executed))
-    followers = [c for c in costs if c is not leader]
+    leader = max(costs.values(), key=lambda c: (c.served, c.cpu[0] / c.executed))
+    if follower in costs and costs[follower] is not leader:
+        own = costs[follower]
+        return leader.cpu[0] / leader.executed * 1e6, own.cpu[0] / own.executed * 1e6
+    followers = [c for c in costs.values() if c is not leader]
     mean = sum(c.cpu[0] / c.executed for c in followers) / len(followers) * 1e6 if followers else None
     return leader.cpu[0] / leader.executed * 1e6, mean
 
 
-def phase_comparison(lead: list, follow: list, leader_us: float | None, follower_us: float | None, top: int = 20) -> list[str]:
+PROFILED_NODE = re.compile(r"^\w+ thread \d+ \(([^)\s]+)\)")
+
+
+def profiled_node(path: str) -> str | None:
+    """The node a profile sampled, from its header (`follower thread 12
+    (n3), ...`); None for a profile that does not name it."""
+    try:
+        with open(path) as f:
+            m = PROFILED_NODE.match(f.readline())
+    except OSError:
+        return None
+    return m[1] if m else None
+
+
+def phase_comparison(lead: list, follow: list, leader_us: float | None, follower_us: float | None, top: int = 20,
+                     follower: str | None = None) -> list[str]:
     """The leader's and a follower's loops by phase, side by side in
     microseconds per command, with the difference; [] without both."""
     if not (lead and follow and leader_us and follower_us):
         return []
     a, b = loop_split(lead), loop_split(follow)
+    whose = f"on the sampled follower, {follower}" if follower else "on the followers' mean"
     phases = sorted(set(a["phases"]) | set(b["phases"]), key=lambda k: -max(a["phases"][k] * leader_us, b["phases"][k] * follower_us))
     out = [
         f"**The leader's loop beside a follower's, by phase** (both sampled over the same 20 s by frame pointer; "
         f"microseconds per command: each phase's share of its thread's samples times its loop's CPU per command, "
-        f"{leader_us:.0f} on the leader and {follower_us:.0f} on the followers' mean; the stacks reached the loop "
+        f"{leader_us:.0f} on the leader and {follower_us:.0f} {whose}; the stacks reached the loop "
         f"in {a['reached']:.1f}% and {b['reached']:.1f}%)",
         "",
         "| Phase | Leader (µs) | Follower (µs) | Leader less follower (µs) |",
@@ -1446,13 +1466,18 @@ def phase_comparison(lead: list, follow: list, leader_us: float | None, follower
 def leader_and_follower(store: str, voters: dict, top: int = 20) -> list[str]:
     """The leader's and the follower's loops by phase side by side, in
     microseconds per command (each phase's share times its loop's CPU per
-    command, the followers' mean for the follower), with the difference:
+    command, the sampled follower's own for the follower), with the difference:
     the leader's own part of each phase. Then the allocator's callers from
-    the leader's DWARF sample. [] without the profiles."""
-    leader_us, follower_us = loop_per_command(voters)
+    the leader's DWARF sample. [] without the profiles.
+
+    The follower's cost is the sampled voter's own where its profile names
+    it, since the profile samples the busiest follower alone."""
+    node = profiled_node(os.path.join(store, "follower-profile-chains.txt"))
+    leader_us, follower_us = loop_per_command(voters, node)
+    sampled = node if node in voters else None
     lead = read_chains(os.path.join(store, "leader-profile-chains.txt"))
     follow = read_chains(os.path.join(store, "follower-profile-chains.txt"))
-    out = phase_comparison(lead, follow, leader_us, follower_us, top)
+    out = phase_comparison(lead, follow, leader_us, follower_us, top, sampled)
     out.extend(copies_table(lead, leader_us / 100 if leader_us else None))
     out.extend(children_table(follow, follower_us / 100 if follower_us else None, "follower"))
     alloc = read_chains(os.path.join(store, "leader-profile-alloc-chains.txt"))

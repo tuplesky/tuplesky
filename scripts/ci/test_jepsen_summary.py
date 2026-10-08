@@ -638,6 +638,24 @@ class ResendAndFollowerTests(unittest.TestCase):
         self.assertIn("| `coord_daemon::voter::Voter<P>::pump_reads` | 80.0 |", text)
 
 
+    def test_the_sampled_follower_is_costed_at_its_own_loop(self):
+        # n3 is slower than n2: the profile sampled n3, so its phases are
+        # costed at its 900 µs, not the followers' mean of 750.
+        voters = self.voters(d59_metrics(500, 0.8), d59_metrics(0, 0.6), d59_metrics(0, 0.9))
+        run = "main;coordd::serve::Domain<P>::run::{{closure}}"
+        with tempfile.TemporaryDirectory() as store:
+            with open(os.path.join(store, "leader-profile-chains.txt"), "w") as f:
+                f.write("leader thread 1 (n1), 0.30 of a core\n    100.00%  coordd  [.] x\n"
+                        f"100.00% {run};coord_daemon::node::Node<P>::settle;x\n")
+            with open(os.path.join(store, "follower-profile-chains.txt"), "w") as f:
+                f.write("follower thread 3 (n3), 0.25 of a core over the 5 s before\n    100.00%  coordd  [.] x\n"
+                        f"100.00% {run};coord_daemon::node::Node<P>::settle;x\n")
+            self.assertEqual(js.profiled_node(os.path.join(store, "follower-profile-chains.txt")), "n3")
+            text = "\n".join(js.leader_and_follower(store, voters))
+        self.assertIn("900 on the sampled follower, n3", text)
+        self.assertIn("| `coord_daemon::node::Node<P>::settle` | 800.0 | 900.0 | -100.0 |", text)
+
+
 class MemoryAndCopiesTests(unittest.TestCase):
     def test_each_voter_at_its_end_and_its_peak(self):
         with tempfile.TemporaryDirectory() as d:

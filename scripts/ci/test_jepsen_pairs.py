@@ -270,7 +270,15 @@ class PairTests(unittest.TestCase):
         for run, text in zip(self.runs[:2], chains):
             with open(os.path.join(run.store, "follower-profile-chains.txt"), "w") as f:
                 f.write("header\n" + text)
+        with open(os.path.join(self.runs[0].store, "follower-profile-chains.txt")) as f:
+            named = f.read().replace("header", "follower thread 2 (n2), 0.25 of a core", 1)
+        with open(os.path.join(self.runs[0].store, "follower-profile-chains.txt"), "w") as f:
+            f.write(named)
         runs = [jp.read_run(r.label, r.store) for r in self.runs[:2]]
+        # The base's profile names its voter; the head's does not.
+        self.assertEqual(runs[0].sampled_follower, "n2")
+        self.assertAlmostEqual(runs[0].sampled_follower_loop, 0.4)
+        self.assertIsNone(runs[1].sampled_follower)
         text = jp.render(runs, "Paired")
         self.assertIn("The follower's loop by symbol", text)
         # Shares of the sampled follower's own samples, not scaled by the

@@ -279,7 +279,10 @@ say how many stacks unwound as far as the loop. A `call-graph` run also
 samples the busiest follower's loop over the same 20 s
 (`follower-profile*.txt`), and the summary sets the two side by side by
 phase in microseconds per command, with the difference, which is the
-leader's own part of each phase. A 10 s DWARF sample of the leader
+leader's own part of each phase. Each profile's header names the node it
+sampled (the node container's hostname), so the follower's phases are
+costed at that voter's own loop CPU per command; a profile from before
+that names none falls back on the followers' mean. A 10 s DWARF sample of the leader
 follows (`leader-profile-alloc-chains.txt`): it unwinds out of libc's
 allocator, which the frame-pointer walk cannot, and names the TupleSky
 function that allocated. A profiled job, flat or `call-graph`, builds the
