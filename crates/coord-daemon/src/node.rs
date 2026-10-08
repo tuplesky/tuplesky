@@ -1241,7 +1241,7 @@ impl<P: Persistence> Node<P> {
 
     /// Sends waiting on a barrier that is not durable yet.
     pub fn held(&self) -> usize {
-        self.outbox.pending().len()
+        self.outbox.held()
     }
 
     /// How many sends this node has ever had to hold back, and how many
@@ -1446,12 +1446,8 @@ impl<P: Persistence> Node<P> {
         if persisted && (!self.grouped || self.flushing) {
             self.lower_queued(&mut next)?;
         }
-        for waiting in self.outbox.pending() {
-            self.withheld += 1;
-            if waiting.to == self.frontend {
-                self.withheld_evidence += 1;
-            }
-        }
+        self.withheld += self.outbox.held() as u64;
+        self.withheld_evidence += self.outbox.held_to(&self.frontend) as u64;
         // Whatever became durable in this round releases the sends that
         // were waiting on it -- including sends published in this very
         // round, which is why the release happens after the flush.

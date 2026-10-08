@@ -237,11 +237,7 @@ fn old_messages_cannot_lower_a_recovered_promise() {
     assert!(storage.durable_rows().is_empty());
     let mut outbox = Outbox::new(b2);
     outbox.publish(e.reply);
-    assert_eq!(
-        outbox.pending().len(),
-        0,
-        "a send from another boot is dropped"
-    );
+    assert_eq!(outbox.held(), 0, "a send from another boot is dropped");
     assert!(matches!(
         outbox.take_dropped().as_slice(),
         [(_, ReleaseError::WrongBoot)]

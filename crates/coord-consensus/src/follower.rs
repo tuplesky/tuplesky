@@ -3227,7 +3227,7 @@ impl Follower {
 
     /// Sends still waiting for durability.
     pub fn pending_sends(&self) -> usize {
-        self.outbox.as_ref().map_or(0, |o| o.pending().len())
+        self.outbox.as_ref().map_or(0, |o| o.held())
     }
 
     /// Whether this follower may still vote in the configured ballot: it
