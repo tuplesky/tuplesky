@@ -644,7 +644,10 @@ pub struct Collector {
     /// `RESULT_TOO_LARGE` whatever it replaced.
     resolved: BTreeMap<RetryKey, (CommandId, ResponseV1, Said)>,
     resolved_order: VecDeque<RetryKey>,
-    trace: Vec<CollectorEvent>,
+    /// The golden event trace, kept only by a collector made with
+    /// [`Collector::traced`]: it grows with every transition and nothing
+    /// in the daemon reads it.
+    trace: Option<Vec<CollectorEvent>>,
     /// Envelope bytes reserved by commands that still owe a
     /// destination. The sum of every pending entry's `reserved`, kept
     /// incrementally so admission is a comparison rather than a walk.
@@ -664,7 +667,7 @@ impl Collector {
             bindings: BTreeMap::new(),
             resolved: BTreeMap::new(),
             resolved_order: VecDeque::new(),
-            trace: Vec::new(),
+            trace: None,
             undelivered_bytes: 0,
             offer_cursor: 0,
         }
@@ -691,14 +694,25 @@ impl Collector {
         self.pending.contains_key(command)
     }
 
-    /// The transitions so far.
-    pub fn trace(&self) -> &[CollectorEvent] {
-        &self.trace
+    /// A collector under `config` that keeps its golden event trace,
+    /// for the tests and differential runs that read it.
+    pub fn traced(config: CollectorConfig) -> Self {
+        Collector {
+            trace: Some(Vec::new()),
+            ..Collector::new(config)
+        }
     }
 
-    /// Take the transitions so far.
+    /// The transitions so far: empty unless made with
+    /// [`Collector::traced`].
+    pub fn trace(&self) -> &[CollectorEvent] {
+        self.trace.as_deref().unwrap_or_default()
+    }
+
+    /// Take the transitions so far: empty unless made with
+    /// [`Collector::traced`].
     pub fn take_trace(&mut self) -> Vec<CollectorEvent> {
-        std::mem::take(&mut self.trace)
+        self.trace.as_mut().map(std::mem::take).unwrap_or_default()
     }
 
     /// Submit an admitted request at `now`, the monotonic reading its
@@ -737,14 +751,14 @@ impl Collector {
         let sequence = key.request_sequence.get();
         if let Some(bound) = self.bindings.get(&key).copied() {
             if bound != command {
-                self.trace.push(CollectorEvent::Refused {
+                record(&mut self.trace, || CollectorEvent::Refused {
                     sequence,
                     reason: "request-identity-conflict".into(),
                 });
                 return Err(SubmitRefusal::RequestIdentityConflict { bound });
             }
             if let Some((_, response, _)) = self.resolved.get(&key) {
-                self.trace.push(CollectorEvent::Retained {
+                record(&mut self.trace, || CollectorEvent::Retained {
                     command: command_hex(&command),
                     sequence,
                 });
@@ -754,7 +768,7 @@ impl Collector {
                 entry.attached = true;
                 entry.timed_out = false;
                 entry.deadline = deadline(since, request.deadline_ms);
-                self.trace.push(CollectorEvent::Attached {
+                record(&mut self.trace, || CollectorEvent::Attached {
                     command: command_hex(&command),
                     sequence,
                 });
@@ -764,7 +778,7 @@ impl Collector {
             // moved past it; it is new work again under the same identity.
         }
         if self.pending.len() >= self.config.max_pending {
-            self.trace.push(CollectorEvent::Refused {
+            record(&mut self.trace, || CollectorEvent::Refused {
                 sequence,
                 reason: "backpressure".into(),
             });
@@ -787,7 +801,7 @@ impl Collector {
         // because by then it may be anywhere.
         let bytes = frame.len();
         if self.undelivered_bytes.saturating_add(bytes) > self.config.max_undelivered_bytes {
-            self.trace.push(CollectorEvent::Refused {
+            record(&mut self.trace, || CollectorEvent::Refused {
                 sequence,
                 reason: "undelivered-bytes".into(),
             });
@@ -829,7 +843,7 @@ impl Collector {
                 },
             },
         );
-        self.trace.push(CollectorEvent::Submitted {
+        record(&mut self.trace, || CollectorEvent::Submitted {
             command: command_hex(&command),
             sequence,
             targets: targets.iter().map(replica_hex).collect(),
@@ -956,7 +970,7 @@ impl Collector {
             if targets.is_empty() {
                 continue;
             }
-            self.trace.push(CollectorEvent::Reoffered {
+            record(&mut self.trace, || CollectorEvent::Reoffered {
                 command: command_hex(&command),
                 targets: targets.iter().map(replica_hex).collect(),
             });
@@ -1002,7 +1016,7 @@ impl Collector {
                 entry.from_record = true;
             }
             spent += voters.len();
-            self.trace.push(CollectorEvent::Solicited {
+            record(&mut self.trace, || CollectorEvent::Solicited {
                 command: command_hex(command),
                 times: entry.solicited,
             });
@@ -1149,26 +1163,24 @@ impl Collector {
         } else if let Some(entry) = self.pending.get_mut(&command) {
             entry.votes.add(vote).map_err(EvidenceError::Vote)
         } else if self.is_resolved(&command) {
-            self.trace
-                .push(evidence_event(&command, &sender, kind, true, None));
+            record(&mut self.trace, || {
+                evidence_event(&command, &sender, kind, true, None)
+            });
             return Ok(Progress::Settled);
         } else {
             Err(EvidenceError::UnknownCommand)
         };
         match result {
             Ok(()) => {
-                self.trace
-                    .push(evidence_event(&command, &sender, kind, true, None));
+                record(&mut self.trace, || {
+                    evidence_event(&command, &sender, kind, true, None)
+                });
                 Ok(self.try_release(command))
             }
             Err(e) => {
-                self.trace.push(evidence_event(
-                    &command,
-                    &sender,
-                    kind,
-                    false,
-                    Some(format!("{e:?}")),
-                ));
+                record(&mut self.trace, || {
+                    evidence_event(&command, &sender, kind, false, Some(format!("{e:?}")))
+                });
                 Err(e)
             }
         }
@@ -1197,13 +1209,15 @@ impl Collector {
             SubmissionRefusal::Forgotten => "forgotten",
         };
         if !self.config.quorum.voters().contains(&sender) {
-            self.trace.push(evidence_event(
-                &command,
-                &sender,
-                "refused",
-                false,
-                Some("not a voter".into()),
-            ));
+            record(&mut self.trace, || {
+                evidence_event(
+                    &command,
+                    &sender,
+                    "refused",
+                    false,
+                    Some("not a voter".into()),
+                )
+            });
             return Err(EvidenceError::NotAVoter { sender });
         }
         if !self.pending.contains_key(&command) {
@@ -1213,7 +1227,7 @@ impl Collector {
                 Err(EvidenceError::UnknownCommand)
             };
         }
-        self.trace.push(CollectorEvent::VoterRefused {
+        record(&mut self.trace, || CollectorEvent::VoterRefused {
             command: command_hex(&command),
             from: replica_hex(&sender),
             reason: reason.into(),
@@ -1241,21 +1255,18 @@ impl Collector {
         let result = self.check_release(sender, &released);
         match result {
             Ok(settled) => {
-                self.trace
-                    .push(evidence_event(&command, &sender, "release", true, None));
+                record(&mut self.trace, || {
+                    evidence_event(&command, &sender, "release", true, None)
+                });
                 if settled {
                     return Ok(Progress::Settled);
                 }
                 Ok(self.try_release(command))
             }
             Err(e) => {
-                self.trace.push(evidence_event(
-                    &command,
-                    &sender,
-                    "release",
-                    false,
-                    Some(format!("{e:?}")),
-                ));
+                record(&mut self.trace, || {
+                    evidence_event(&command, &sender, "release", false, Some(format!("{e:?}")))
+                });
                 Err(e)
             }
         }
@@ -1338,14 +1349,14 @@ impl Collector {
             return Progress::Settled;
         };
         let Some(learned) = entry.votes.learned() else {
-            self.trace.push(CollectorEvent::Held {
+            record(&mut self.trace, || CollectorEvent::Held {
                 command: command_hex(&command),
                 reason: "awaiting-votes".into(),
             });
             return Progress::Held(HoldReason::AwaitingVotes);
         };
         let Some((sender, released)) = entry.released.clone() else {
-            self.trace.push(CollectorEvent::Held {
+            record(&mut self.trace, || CollectorEvent::Held {
                 command: command_hex(&command),
                 reason: "awaiting-release".into(),
             });
@@ -1366,7 +1377,7 @@ impl Collector {
             .saturating_sub(entry.dissemination.reserved);
         let missed = entry.dissemination.missing();
         if !missed.is_empty() {
-            self.trace.push(CollectorEvent::Undisseminated {
+            record(&mut self.trace, || CollectorEvent::Undisseminated {
                 command: command_hex(&command),
                 missed: missed.iter().map(replica_hex).collect(),
             });
@@ -1416,17 +1427,16 @@ impl Collector {
         speculative: bool,
         fast: bool,
     ) -> Progress {
-        let voters: Vec<String> = entry.votes.voted().iter().map(replica_hex).collect();
         let revision = match &response.outcome {
             OutcomeV1::Ok { revision, .. } => revision.map(|r| r.get()),
             _ => None,
         };
         self.retain(entry.retry_key, command, response.clone(), executed);
-        self.trace.push(CollectorEvent::Released {
+        record(&mut self.trace, || CollectorEvent::Released {
             command: command_hex(&command),
             speculative,
             fast,
-            voters,
+            voters: entry.votes.voted().iter().map(replica_hex).collect(),
             revision,
             delivered: entry.attached,
         });
@@ -1526,7 +1536,7 @@ impl Collector {
             (None, false) => return Err(SettleError::Uncorroborated),
         };
         let entry = self.pending.remove(&command).expect("present");
-        self.trace.push(CollectorEvent::SettledFromRecord {
+        record(&mut self.trace, || CollectorEvent::SettledFromRecord {
             command: command_hex(&command),
             corroborated: corroborated.into(),
         });
@@ -1566,7 +1576,7 @@ impl Collector {
             .undelivered_bytes
             .saturating_sub(entry.dissemination.reserved);
         self.bindings.remove(&entry.retry_key);
-        self.trace.push(CollectorEvent::SettledFromRecord {
+        record(&mut self.trace, || CollectorEvent::SettledFromRecord {
             command: command_hex(&command),
             corroborated: "other-command".into(),
         });
@@ -1602,7 +1612,7 @@ impl Collector {
         let command = *self.bindings.get(retry_key)?;
         let entry = self.pending.get_mut(&command)?;
         entry.attached = false;
-        self.trace.push(CollectorEvent::Cancelled {
+        record(&mut self.trace, || CollectorEvent::Cancelled {
             command: command_hex(&command),
         });
         Some(command)
@@ -1620,7 +1630,7 @@ impl Collector {
                 None => Resolution::Unknown,
             },
         };
-        self.trace.push(CollectorEvent::Resolved {
+        record(&mut self.trace, || CollectorEvent::Resolved {
             sequence,
             result: match &resolution {
                 Resolution::Outcome(_) => "outcome",
@@ -1653,7 +1663,7 @@ impl Collector {
             }
         }
         for e in &out {
-            self.trace.push(CollectorEvent::TimedOut {
+            record(&mut self.trace, || CollectorEvent::TimedOut {
                 command: command_hex(&e.command),
             });
         }
@@ -1722,7 +1732,7 @@ impl Collector {
             }
         }
         self.undelivered_bytes = self.undelivered_bytes.saturating_sub(released);
-        self.trace.push(CollectorEvent::Reconfigured {
+        record(&mut self.trace, || CollectorEvent::Reconfigured {
             ballot: quorum.ballot().number,
             reset,
         });
@@ -1750,6 +1760,14 @@ const fn backoff_millis(attempts: u32) -> u64 {
 /// expires; none for a request that named no deadline.
 fn deadline(now: MonotonicMillis, deadline_ms: u32) -> Option<MonotonicMillis> {
     (deadline_ms > 0).then(|| now.plus(u64::from(deadline_ms)))
+}
+
+/// Record a transition, building it only if the trace is kept. A free
+/// function over the field, so recording borrows the trace alone.
+fn record(trace: &mut Option<Vec<CollectorEvent>>, event: impl FnOnce() -> CollectorEvent) {
+    if let Some(trace) = trace {
+        trace.push(event());
+    }
 }
 
 fn evidence_event(

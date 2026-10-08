@@ -110,7 +110,7 @@ fn admitted(seq: u64, op: CanonicalOperation) -> (CommandId, AdmittedRequest) {
 }
 
 fn collector(max_pending: usize, max_undelivered_bytes: usize) -> Collector {
-    Collector::new(CollectorConfig {
+    Collector::traced(CollectorConfig {
         quorum: quorum(3),
         max_pending,
         max_resolved: 16,
