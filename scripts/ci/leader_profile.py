@@ -190,7 +190,7 @@ def main() -> int:
         return [line for line in lines if line.strip() and not line.startswith("#")], samples.lstrip("# ").strip()
 
     def write_profile(out: str, role: str, tid: int, used: float | None, data: str, started: str, ended: str,
-                      comms: tuple[str, ...] = ()) -> None:
+                      comms: tuple[str, ...] = (), node: str | None = None) -> None:
         symbols, samples = report(data, "overhead,dso,sym", "0.2", comms=comms)
         if comms:
             # perf's object report ignores relative percentages; sum the
@@ -206,7 +206,7 @@ def main() -> int:
             objects, _ = report(data, "overhead,dso", "0")
         by_object = ", ".join(f"{' '.join(line.split()[1:])} {line.split()[0]}" for line in objects[:6] if line.split())
         who = (
-            f"{role} thread {tid}{f' ({node})' if (node := node_of(tid)) else ''}, {used / span:.2f} of a core over "
+            f"{role} thread {tid}{f' ({node})' if node else ''}, {used / span:.2f} of a core over "
             f"the {span} s before"
             if used is not None
             else f"{role}: the tokio threads ({', '.join(comms)}) of the leader's process {tid}, pooled"
@@ -238,6 +238,9 @@ def main() -> int:
     # reported for those threads alone, and its threads' system calls.
     if args.call_graph:
         jobs.append(("transport", pid, None, role_path(args.out, "transport")))
+    # Each sampled voter's node, read before the window: a kill in it takes
+    # the process, and its /proc entry, with it.
+    nodes = {tid: node_of(tid) for _, tid, _, _ in jobs}
     started = now()
     running = [(role, tid, u, out, out + ".data",
                 record(tid, out + ".data", graph, args.seconds, args.frequency, whole=role == "transport"))
@@ -265,7 +268,7 @@ def main() -> int:
     for role, tid, u, out, data, proc in running:
         if proc.returncode == 0:
             write_profile(out, role, tid, u, data, started, ended,
-                          comms=TOKIO_THREADS if role == "transport" else ())
+                          comms=TOKIO_THREADS if role == "transport" else (), node=nodes[tid])
         subprocess.run(["sudo", "-n", "rm", "-f", data], capture_output=True)
     if counting is not None:
         _, err = counting.communicate()
