@@ -392,13 +392,13 @@ impl Session {
             let actions = self.client.take_actions();
             let mut sent = false;
             for action in actions {
-                let (connection, frame) = match action {
+                let (connection, frame, resolving) = match action {
                     SdkAction::Send {
                         connection, frame, ..
-                    }
-                    | SdkAction::Resolve {
+                    } => (connection, frame, false),
+                    SdkAction::Resolve {
                         connection, frame, ..
-                    } => (connection, frame),
+                    } => (connection, frame, true),
                     // A reset stream is released when its request future
                     // is dropped, which has already happened.
                     SdkAction::Reset { .. } | SdkAction::Bind { .. } => continue,
@@ -433,6 +433,15 @@ impl Session {
                             // The frontend is still collecting it.
                             last = "pending".into();
                         }
+                    }
+                    Err(coord_transport::RequestError::Timeout) if resolving => {
+                        // The SDK has no deadline for a resolution: it
+                        // waits on its connection until that is lost.
+                        // Dropping it returns the request to unknown, to
+                        // be resolved again once reconnected.
+                        last = "resolve-timeout".into();
+                        self.lost();
+                        break;
                     }
                     Err(coord_transport::RequestError::Timeout) => {
                         last = "timeout".into();
