@@ -10253,7 +10253,7 @@ threads. Head less base, mean (smallest to largest) of three:
 Five cuts, each where the runner's caller table put allocation on the
 voters' loops, none changing a format:
 
-- **The collector's golden trace.** `coordd`'s collector pushed a
+- **The collector's golden trace, a memory leak.** `coordd`'s collector pushed a
   `CollectorEvent`, every identity formatted as hex, for each transition
   (a submission, each voter's evidence, a release), and nothing in the
   daemon drained it: the trace grew for the daemon's life, and its
