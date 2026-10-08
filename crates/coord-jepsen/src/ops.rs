@@ -21,8 +21,8 @@ use coord_state::Response;
 use coord_state::plan::{Outcome, RejectionReason};
 use coord_types::ids::{KvRevision, NamespaceId};
 use coord_types::logical_v1::{
-    BranchOp, CanonicalOperation, Compare, CompareOperand, CompareResult, CompareTarget, KeyRange,
-    LogicalRequest, PutOp, RangeOp, TxnOp,
+    BranchOp, CanonicalOperation, Compare, CompareOperand, CompareResult, CompareTarget,
+    DeleteRangeOp, KeyRange, LogicalRequest, PutOp, RangeOp, TxnOp,
 };
 use serde_json::Value;
 
@@ -93,9 +93,15 @@ impl Codec {
         }))
     }
 
-    /// Put `value` at `key`, unconditionally.
+    /// Put `value` at `key`, unconditionally. A `null` value deletes the
+    /// key: a read reports an absent key as `null`, so `null` is never
+    /// stored and always means absent ([`store`]).
     pub fn write(&self, key: &Value, value: &Value) -> LogicalRequest {
-        self.request(CanonicalOperation::Put(put(self.key(key), value)))
+        self.request(match store(self.key(key), value) {
+            BranchOp::Put(op) => CanonicalOperation::Put(op),
+            BranchOp::DeleteRange(op) => CanonicalOperation::DeleteRange(op),
+            BranchOp::Range(_) => unreachable!("a store is a put or a delete"),
+        })
     }
 
     /// Put `new` at `key` if and only if its current value is `old`.
@@ -103,8 +109,9 @@ impl Codec {
     /// `old` is compared as the stored bytes. Values are written as JSON
     /// text by this codec only, so one value has one encoding. A `null`
     /// `old` is the value a read reports for an absent key, so it is
-    /// compared as absence -- version zero -- and not as the bytes `null`,
-    /// which an absent key never holds.
+    /// compared as absence -- version zero. No key holds the bytes `null`:
+    /// a `null` write deletes ([`store`]), so a key a client set to `null`
+    /// is absent too, and matches.
     pub fn cas(&self, key: &Value, old: &Value, new: &Value) -> LogicalRequest {
         let key = self.key(key);
         let compare = if old.is_null() {
@@ -124,7 +131,7 @@ impl Codec {
         };
         self.request(CanonicalOperation::Txn(TxnOp {
             compares: vec![compare],
-            success: vec![BranchOp::Put(put(key, new))],
+            success: vec![store(key, new)],
             failure: Vec::new(),
         }))
     }
@@ -149,7 +156,7 @@ impl Codec {
                 .collect(),
             success: writes
                 .iter()
-                .map(|(key, value)| BranchOp::Put(put(key.clone(), value)))
+                .map(|(key, value)| store(key.clone(), value))
                 .collect(),
             failure: Vec::new(),
         }))
@@ -172,6 +179,19 @@ fn put(key: Vec<u8>, value: &Value) -> PutOp {
         value: encode(value),
         lease: None,
         prev_kv: false,
+    }
+}
+
+/// Set `key` to `value`: a put, or for `null` a delete, so that `null`
+/// and absent are one state, as a read reports them.
+fn store(key: Vec<u8>, value: &Value) -> BranchOp {
+    if value.is_null() {
+        BranchOp::DeleteRange(DeleteRangeOp {
+            range: KeyRange::exact(key),
+            prev_kv: false,
+        })
+    } else {
+        BranchOp::Put(put(key, value))
     }
 }
 
@@ -310,10 +330,11 @@ pub fn txn_succeeded(response: &Response) -> Result<bool, String> {
     }
 }
 
-/// Whether an established put applied.
+/// Whether an established write applied: a put, or the delete a `null`
+/// write is.
 pub fn put_applied(response: &Response) -> Result<(), String> {
     match &response.outcome {
-        Outcome::Put { .. } => Ok(()),
+        Outcome::Put { .. } | Outcome::Delete { .. } => Ok(()),
         other => Err(refused(other)),
     }
 }
@@ -533,6 +554,35 @@ mod tests {
             target(c.cas(&json!("k"), &json!(1), &json!(2))),
             (CompareTarget::Value, CompareOperand::Bytes(b"1".to_vec()))
         );
+    }
+
+    #[test]
+    fn a_null_write_deletes_so_null_is_always_absent() {
+        let c = codec();
+        assert!(matches!(
+            c.write(&json!("k"), &Value::Null).operation,
+            CanonicalOperation::DeleteRange(DeleteRangeOp { prev_kv: false, .. })
+        ));
+        assert!(matches!(
+            c.write(&json!("k"), &json!(1)).operation,
+            CanonicalOperation::Put(_)
+        ));
+        let success = |request: LogicalRequest| match request.operation {
+            CanonicalOperation::Txn(txn) => txn.success,
+            other => panic!("a transaction, not {other:?}"),
+        };
+        assert!(matches!(
+            success(c.cas(&json!("k"), &json!(1), &Value::Null))[..],
+            [BranchOp::DeleteRange(_)]
+        ));
+        let writes = BTreeMap::from([
+            (c.key(&json!(1)), Value::Null),
+            (c.key(&json!(2)), json!(3)),
+        ]);
+        assert!(matches!(
+            success(c.guarded_write(&BTreeMap::new(), &writes))[..],
+            [BranchOp::DeleteRange(_), BranchOp::Put(_)]
+        ));
     }
 
     #[test]
