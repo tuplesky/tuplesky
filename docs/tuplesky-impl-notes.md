@@ -10301,3 +10301,24 @@ command here, 0.43 to 0.46 then), so the pair is read against itself:
 - One host, loopback. The runner pair, with the call-graph profile on one
   pair, is the acceptance.
 
+
+On the runner (#98, job 37806294502, an Intel Xeon 6973P-C), three pairs
+of step 1's build against this one, replay, throughput, the call graph on
+one pair:
+
+- Every voter's loop is lower in all three pairs: the leader's by 0.035 ms
+  per command (7.2%), the followers' by 7%, the five domain threads by
+  0.08 ms per operation. The tokio threads moved by 0.02 ms, inside the
+  pairs' spread: the local rise was the host.
+- The leader's allocator is 9.5 µs per command lower: the trace, the
+  journal record's encoder and the configuration's clone are gone from
+  its caller table. A follower's `flush_queued` fell from 33.0 to 17.8 µs
+  per command and its `on_frame_from_voter` from 16.5 to 8.3; the largest
+  allocating caller left is `RedbView::table` (5.8 µs).
+- The resident set is 43 MiB per voter lower (21%) and the high-water mark
+  23 MiB: the collector's trace was most of what step 1 had added.
+- `ok`/s rose 1.3%. A 7% cut to every loop barely moves throughput on this
+  CPU: the loops no longer bound it, the voters' total CPU does, and the
+  transport's workers are 41% of that (task-d70).
+
+Kept.
