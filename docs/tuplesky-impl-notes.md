@@ -10196,3 +10196,54 @@ pairs of task-d59's build against this one, alternated:
   fifteen of fifteen.
 - One host, loopback. The runner pair, with the call-graph profile on one
   pair, is the acceptance.
+
+On the Jepsen runner: five voters, replay, throughput, 30 clients, three
+pairs a job against task-d59's build (each pair's base the same commit, so
+the pair isolates this one). Job 1 (37704463298) on an AMD EPYC 7763 with
+the call-graph profile on its first pair; job 2 (37707115702) on an AMD
+EPYC 9V45, about 1.6 times faster per operation, with a flat profile and
+the voters' sampled CPU split into their domain loops and their tokio
+threads. Head less base, mean (smallest to largest) of three:
+
+| | job 1, EPYC 7763 | job 2, EPYC 9V45 |
+| --- | --- | --- |
+| `ok`/s | +18.1 (+8.0 to +23.9), +4% | +5.7 (-4.1 to +16.2), +1% |
+| voters' CPU per operation, ms | -0.21 (-0.31 to -0.16) of 4.28, -4.9% | -0.15 (-0.27 to -0.04) of 2.74, -5.5% |
+| voters' domain loops, CPU ms per operation | not split | -0.10 (-0.14 to -0.06) of 1.04, -9.6% |
+| voters' tokio threads, CPU ms per operation | not split | -0.04 (-0.08 to -0.01) of 1.15, -3.5% |
+| leader's loop, ms per command | -0.074 (-0.083 to -0.064), -10.2% | -0.047 (-0.065 to -0.032), -10.5% |
+| followers' loop, ms per command | -0.052 (-0.060 to -0.047), -9.2% | -0.032 (-0.045 to -0.020), -8.7% |
+| leader's allocator, profiled, µs per command | -49.2 (-56.1 to -42.4), -30 to -38% | not readable (Debian nodes) |
+| leader's `memcmp` / `memmove`, profiled, µs per command | -2.4 / -0.1 | not readable |
+| voters' resident set at the end, mean, MiB | +54 (+35 to +89) | +34 (+31 to +37) |
+| voters' high-water mark, largest, MiB | +62 (+36 to +105), head up to 263 | +51 (+47 to +55), head up to 273 |
+
+- Kept. Every loop is lower in all six pairs, by about a tenth on the
+  leader and the followers on both CPUs, the same cut as the local pair's
+  0.070 ms on the leader, and the allocator's share of the leader fell
+  with it. The voters' CPU per operation fell by about half what the
+  local pair showed: the domain loops and the tokio threads make up
+  nearly all of job 2's cut, and the tokio threads fell 3.5% on the
+  runner against about 12% locally, so the shortfall is on the
+  transport's side, not in the loops. Three pairs set the sign, not the
+  size to 0.1 ms: the six run from -0.04 to -0.31 ms.
+- The memory cost is about 34 MiB of resident set per voter, a fifth on
+  top of about 170 MiB, near the local pair's 46, and up to 51 MiB of
+  high-water mark. It is kept as measured: a deployment that needs it
+  smaller bounds it with `MIMALLOC_PURGE_DELAY` or the `v2` feature,
+  and either is a pair of its own.
+- What is left of the allocator on the leader is about 100 µs per
+  command, the largest symbol mimalloc's allocation fast path
+  (`_mi_page_malloc_zero`, 46 µs of self time): the number of
+  allocations, not their bookkeeping. Step 2's sites are the head's
+  largest callers: `BallotConfiguration::clone` 7.8 µs, the journal
+  record's encoder 6.2, `RedbView::table` 6.1, `pump_reads` 4.8, the
+  loop's closure 4.8, `trace::hex` 4.6, `Leader::propose` 3.8.
+- `memcmp`, 44 to 52 µs per command on the leader, is 25 to 30 µs in the
+  leader's own bookkeeping (`step`, `learn`, `executed_below`, `applied`,
+  `commit_learned`, `propose`) and 5 to 6 in `pump_reads`: map probes on
+  32-byte keys, inlined, so the stack does not name the map. redb's own
+  lookups are 3 to 4. `memmove`, 38 to 43, is mostly inlined into the
+  domain loop's closure (7 to 12 µs), where each peer's send is
+  dispatched; that fits the per-voter copy of each broadcast frame, but
+  the stack cannot prove it, and it is confirmed before it is cut.
