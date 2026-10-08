@@ -69,6 +69,11 @@ class Run:
     resend_scanned_per_call: float | None = None
     # The follower's call graph beside the leader's, in a call-graph run.
     follower_chains: list = field(default_factory=list)
+    # The leader's threads in a call-graph run: by kind, (threads, CPU µs
+    # per command, {system call: calls per command}); and its tokio
+    # threads' samples by what they did, in µs per command.
+    threads: dict = field(default_factory=dict)
+    transport: dict = field(default_factory=dict)
     # The voters' memory (task-d60): the mean and largest resident set of
     # the coordd processes alive at the last sample, and the largest
     # high-water mark of any, in MiB; None without the sampler's file.
@@ -237,6 +242,12 @@ def read_run(label: str, store: str) -> Run:
     run.inclusive = read_inclusive(os.path.join(store, "leader-profile-inclusive.txt"))
     run.chains = js.read_chains(os.path.join(store, "leader-profile-chains.txt"))
     run.follower_chains = js.read_chains(os.path.join(store, "follower-profile-chains.txt"))
+    if run.leader_loop:
+        run.threads, _ = js.syscalls_per_command(os.path.join(store, "leader-profile-syscalls.txt"), run.leader_loop * 1000)
+        split, _ = js.transport_split(js.read_chains(os.path.join(store, "transport-profile-chains.txt")))
+        tokio_us = run.threads.get("tokio threads", (0, None))[1]
+        if split and tokio_us:
+            run.transport = {kind: share * tokio_us / 100 for kind, share in split.items()}
     mem = js.memory_summary(js.read_memory(os.path.join(store, "cpu-samples-memory.csv")))
     if mem:
         run.rss_end_mean, run.rss_end_max, run.hwm_max = mem["end_mean"], mem["end_max"], mem["hwm_max"]
@@ -361,6 +372,49 @@ def split_tables(runs: list[Run], top: int = 20) -> list[str]:
         out.extend(js.copies_table(run.chains, us))
         if follower_us:
             out.extend(js.children_table(run.follower_chains, follower_us / 100, "follower"))
+    return out
+
+
+def transport_table(runs: list[Run]) -> list[str]:
+    """The call-graph runs' leader threads side by side: each kind's CPU
+    and system calls per command, and its tokio threads by what they did,
+    with the head less the base where the runs hold one of each."""
+    shown = [(i, r) for i, r in enumerate(runs, 1) if r.threads]
+    if not shown:
+        return []
+    rows: list = []
+    kinds = []
+    for _, r in shown:
+        kinds += [k for k in r.threads if k not in kinds]
+    for kind in sorted(kinds, key=lambda k: (k != "domain loop", k != "tokio threads", k)):
+        rows.append((f"{kind}: CPU (µs)", [r.threads[kind][1] if kind in r.threads else None for _, r in shown], "{:.1f}"))
+    for column, _ in js.SYSCALL_COLUMNS:
+        rows.append((f"`{column}`, all threads", [sum(v[2][column] for v in r.threads.values()) for _, r in shown], "{:.2f}"))
+        rows.append((f"`{column}`, tokio threads",
+                     [r.threads["tokio threads"][2][column] if "tokio threads" in r.threads else None for _, r in shown],
+                     "{:.2f}"))
+    transport_kinds = []
+    for _, r in shown:
+        transport_kinds += [k for k in sorted(r.transport, key=lambda k: -r.transport[k]) if k not in transport_kinds]
+    for kind in transport_kinds:
+        rows.append((f"tokio: {kind} (µs)", [r.transport.get(kind, 0.0) if r.transport else None for _, r in shown], "{:.1f}"))
+    labels = [r.label for _, r in shown]
+    paired = sorted(labels) == ["base", "head"]
+    out = [
+        "**The leader's threads and its tokio threads** (the call-graph runs: each kind of thread's CPU and system calls "
+        "per command over the profile's window, from `perf stat --per-thread`, then the tokio threads' samples by what "
+        "they did; per command)",
+        "",
+        "| Measure | " + " | ".join(f"Run {i}, {r.label}" for i, r in shown) + (" | Head less base |" if paired else " |"),
+        "| --- " * (1 + len(shown) + (1 if paired else 0)) + "|",
+    ]
+    for name, values, fmt in rows:
+        cells = [fmt.format(v) if v is not None else "-" for v in values]
+        if paired:
+            base, head = values[labels.index("base")], values[labels.index("head")]
+            cells.append(("+" if head - base >= 0 else "") + fmt.format(head - base) if base is not None and head is not None else "-")
+        out.append(f"| {name} | " + " | ".join(cells) + " |")
+    out.append("")
     return out
 
 
@@ -507,6 +561,7 @@ def render(runs: list[Run], title: str) -> str:
         return "\n".join(out) + "\n"
     out.extend(profile_table(runs))
     out.extend(split_tables(runs))
+    out.extend(transport_table(runs))
     out.extend(inclusive_tables(runs))
     return "\n".join(out) + "\n"
 

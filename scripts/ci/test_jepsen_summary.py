@@ -679,6 +679,88 @@ class MemoryAndCopiesTests(unittest.TestCase):
         self.assertIn("| | `(in mi_malloc)` | 500.0 |", children)
 
 
+TRANSPORT_SYSCALLS = """leader process 100, each thread's CPU and system calls, counted from 2026-10-08 10:00:00 to 2026-10-08 10:00:20 UTC (20 s); perf stat -x, --per-thread
+coordd-100,1000.00,msec,task-clock,1000000000,100.00,0.050,CPUs utilized
+tokio-rt-worker-101,1500.00,msec,task-clock,1500000000,100.00,0.075,CPUs utilized
+tokio-rt-worker-102,500.00,msec,task-clock,500000000,100.00,0.025,CPUs utilized
+appender-103,100.00,msec,task-clock,100000000,100.00,0.005,CPUs utilized
+coordd-100,2000,,syscalls:sys_enter_futex,1000000000,100.00,100.000,/sec
+tokio-rt-worker-101,6000,,syscalls:sys_enter_futex,1500000000,100.00,300.000,/sec
+tokio-rt-worker-102,4000,,syscalls:sys_enter_futex,500000000,100.00,200.000,/sec
+appender-103,500,,syscalls:sys_enter_futex,100000000,100.00,25.000,/sec
+tokio-rt-worker-101,3000,,syscalls:sys_enter_sendmsg,1500000000,100.00,150.000,/sec
+tokio-rt-worker-102,1000,,syscalls:sys_enter_sendmmsg,500000000,100.00,50.000,/sec
+tokio-rt-worker-101,2000,,syscalls:sys_enter_recvmsg,1500000000,100.00,100.000,/sec
+"""
+
+TRANSPORT_CHAINS = [
+    "header",
+    "    40.00%  [kernel.kallsyms]  [k] _raw_spin_unlock_irqrestore",
+    "8.00% start_thread;tokio::runtime::task::harness::Harness<T,S>::poll;quinn::connection::State::drive_transmit;"
+    "quinn_proto::connection::Connection::poll_transmit;__libc_sendmsg;__x64_sys_sendmsg;udp_sendmsg;_raw_spin_unlock_irqrestore",
+    "12.00% start_thread;tokio::runtime::scheduler::multi_thread::worker::Context::park_timeout;"
+    "tokio::runtime::scheduler::multi_thread::park::Parker::park;std::sys::sync::condvar::futex::Condvar::wait_timeout;"
+    "syscall;__x64_sys_futex;futex_wait;_raw_spin_unlock_irqrestore",
+    "20.00% start_thread;coord_transport::endpoint::Transport::deliver;tokio::sync::mpsc::chan::Tx<T,S>::send;"
+    "tokio::runtime::park::Inner::unpark;syscall;__x64_sys_futex;futex_wake;_raw_spin_unlock_irqrestore",
+    "    30.00%  coordd  [.] aes_gcm_encrypt_avx512",
+    "30.00% start_thread;quinn_proto::connection::Connection::poll_transmit;ring::aead::seal;aes_gcm_encrypt_avx512",
+    "    20.00%  coordd  [.] quinn_proto::frame::Ack::encode",
+    "10.00% start_thread;quinn_proto::connection::Connection::poll_transmit;quinn_proto::frame::Ack::encode",
+    "10.00% start_thread;quinn_proto::connection::Connection::handle_event;quinn_proto::frame::Ack::encode",
+    "    10.00%  coordd  [.] coord_transport::wire::decode",
+    "10.00% start_thread;tokio::runtime::task::harness::Harness<T,S>::poll;coord_transport::wire::decode",
+]
+
+
+class TransportTests(unittest.TestCase):
+    def test_the_leaders_threads_per_command(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "leader-profile-syscalls.txt")
+            with open(path, "w") as f:
+                f.write(TRANSPORT_SYSCALLS)
+            kinds, commands = js.syscalls_per_command(path, 500.0)
+        # The loop's 1000 ms over its 500 µs per command: 2000 commands.
+        self.assertAlmostEqual(commands, 2000.0)
+        n, cpu, calls = kinds["tokio threads"]
+        self.assertEqual(n, 2)
+        self.assertAlmostEqual(cpu, 1000.0)
+        self.assertAlmostEqual(calls["futex"], 5.0)
+        self.assertAlmostEqual(calls["sends"], 2.0)
+        self.assertAlmostEqual(calls["receives"], 1.0)
+        self.assertAlmostEqual(kinds["domain loop"][1], 500.0)
+        self.assertAlmostEqual(kinds["`appender`"][2]["futex"], 0.25)
+        self.assertEqual(js.syscalls_per_command(os.path.join("/nonexistent", "x"), 500.0), ({}, None))
+
+    def test_the_tokio_threads_by_what_they_did(self):
+        chains = js.read_chains_from_lines(TRANSPORT_CHAINS)
+        kinds, parking = js.transport_split(chains)
+        # The send under quinn's transmit is the send; the cipher under it crypto.
+        self.assertAlmostEqual(kinds["send (`sendmsg` and the kernel's UDP send)"], 8.0)
+        self.assertAlmostEqual(kinds["crypto (packet protection)"], 30.0)
+        self.assertAlmostEqual(kinds["parking and waking (futex, epoll, the I/O driver's waker)"], 32.0)
+        # A frame's caller above it names the QUIC kind, not the leaf alone.
+        self.assertAlmostEqual(kinds["QUIC transmit (quinn's packet building)"], 10.0)
+        self.assertAlmostEqual(kinds["QUIC receive (quinn's packet handling)"], 10.0)
+        self.assertAlmostEqual(kinds["TupleSky: `coord_transport`"], 10.0)
+        self.assertAlmostEqual(parking["tokio::runtime::park::Inner::unpark"], 20.0)
+        self.assertAlmostEqual(parking["tokio::runtime::scheduler::multi_thread::park::Parker::park"], 12.0)
+
+    def test_the_tables_in_microseconds_per_command(self):
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "leader-profile-syscalls.txt"), "w") as f:
+                f.write(TRANSPORT_SYSCALLS)
+            with open(os.path.join(d, "transport-profile-chains.txt"), "w") as f:
+                f.write("\n".join(TRANSPORT_CHAINS) + "\n")
+            voters = {"n1": js.parse_voter([d59_metrics(4, 0.5)])}
+            text = "\n".join(js.transport_tables(d, voters))
+        self.assertIn("| domain loop | 1 | 500.0 | 1.00 | 0.00 | 0.00 | 0.00 | 0.00 |", text)
+        self.assertIn("| tokio threads | 2 | 1000.0 | 5.00 | 2.00 | 1.00 | 0.00 | 0.00 |", text)
+        # 30% of the tokio threads' 1000 µs per command.
+        self.assertIn("| crypto (packet protection) | 300.0 |", text)
+        self.assertIn("| `tokio::runtime::park::Inner::unpark` | 200.0 |", text)
+
+
 class FastPathTests(unittest.TestCase):
     def summary(self, n1, n2):
         with tempfile.TemporaryDirectory() as store:

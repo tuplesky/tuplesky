@@ -743,10 +743,12 @@ def leader_loop(rows: list[dict], threads: dict, start: datetime.datetime, end: 
     return out
 
 
-def leader_profile(path: str, top: int = 30) -> list[str]:
+def leader_profile(path: str, top: int = 30,
+                   title: str = "The leader's domain thread, profiled** (`perf record` on that one thread") -> list[str]:
     """The leader's domain thread, profiled by `leader_profile.py`: its
     header and the symbols that held most of the samples, in a folded
-    block; [] without the file."""
+    block; [] without the file. `title` names another thread's profile in
+    the same form."""
     try:
         with open(path) as f:
             lines = f.read().splitlines()
@@ -759,7 +761,7 @@ def leader_profile(path: str, top: int = 30) -> list[str]:
     if rest and rest[0].startswith("by object: "):
         objects, rest = rest[0], rest[1:]
     rows = [line.split() for line in rest if line.strip()]
-    out = [f"**The leader's domain thread, profiled** (`perf record` on that one thread, from `leader_profile.py`): {header}", ""]
+    out = [f"**{title}, from `leader_profile.py`): {header}", ""]
     if objects:
         out += [f"Its samples {objects}.", ""]
     if not rows:
@@ -1086,6 +1088,206 @@ def loop_split(chains: list) -> dict:
     }
 
 
+# What tokio names its threads (`comm`, cut at 15 characters).
+TOKIO_THREADS = ("tokio-rt-worker", "tokio-runtime-w")
+
+# The tokio threads' samples by what they were doing: the first of these
+# that any frame of a sample's stack matches names it, so a send under
+# quinn's transmit counts as the send and the cipher under either as
+# crypto. Matched on each frame's name, crypto's ignoring case.
+TRANSPORT_KINDS = (
+    ("crypto (packet protection)", ("aes", "gcm", "ghash", "chacha", "poly1305", "ring::aead", "ring_core_",
+                                    "aws_lc", "packetkey", "headerprotectionkey")),
+    ("send (`sendmsg` and the kernel's UDP send)", ("sendmsg", "sendmmsg", "sendto")),
+    ("receive (`recvmsg` and the kernel's UDP receive)", ("recvmsg", "recvmmsg", "recvfrom")),
+    ("parking and waking (futex, epoll, the I/O driver's waker)", ("futex", "epoll_wait", "epoll_pwait", "do_epoll",
+                                                                     "Parker", "park_timeout", "::park", "unpark",
+                                                                     "Condvar", "pthread_cond", "eventfd", "Waker::wake")),
+    ("QUIC transmit (quinn's packet building)", ("poll_transmit", "drive_transmit", "PacketBuilder", "populate_packet",
+                                                "finish_and_track", "space_can_send")),
+    ("QUIC receive (quinn's packet handling)", ("handle_event", "handle_packet", "process_payload", "process_decrypted",
+                                               "decrypt_packet", "handle_first_packet", "PartialDecode", "drive_recv",
+                                               "Endpoint::handle", "Assembler")),
+    ("QUIC, other (timers, streams, connection state)", ("quinn",)),
+)
+
+
+def transport_kind(leaf: str, frames: list[str]) -> str:
+    """What a tokio thread's sample was doing (TRANSPORT_KINDS), the
+    allocator before all, then TupleSky's own code by the crate of its
+    innermost frame, then tokio's scheduler and I/O driver."""
+    if allocating(leaf, frames):
+        return "allocator"
+    stack = [leaf] + list(reversed(frames))
+    for i, (kind, marks) in enumerate(TRANSPORT_KINDS):
+        names = [n.lower() for n in stack] if i == 0 else stack
+        if any(m in n for n in names for m in marks):
+            return kind
+    mine = next((n for n in stack if own(n)), None)
+    if mine:
+        return f"TupleSky: `{mine.lstrip('<').split('::')[0]}`"
+    if any("tokio::" in name for name in stack):
+        return "tokio's scheduler and I/O driver"
+    return "other"
+
+
+def parking_caller(frames: list[str]) -> str:
+    """The innermost Rust frame above a parking sample's system call, past
+    the standard library's and the locks' own: who parked or woke."""
+    for f in reversed(frames):
+        name = f.lstrip("<")
+        if "::" in name and not name.startswith(("std::", "core::", "alloc::", "parking_lot", "lock_api")):
+            return f
+    return "(no Rust frame)"
+
+
+def read_syscalls(path: str) -> tuple[int | None, dict]:
+    """`leader_profile.py`'s per-thread counts: the leader's pid and each
+    thread's (comm, {event: value}) by tid, with the system calls under
+    their own names and `task-clock` in milliseconds; (None, {}) without
+    them."""
+    try:
+        with open(path) as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return None, {}
+    m = re.match(r"leader process (\d+),", lines[0]) if lines else None
+    if not m:
+        return None, {}
+    threads: dict = {}
+    for line in lines[1:]:
+        cells = line.split(",")
+        if len(cells) < 4 or "-" not in cells[0]:
+            continue
+        comm, _, tid = cells[0].rpartition("-")
+        try:
+            value = float(cells[1])
+        except ValueError:
+            continue
+        event = cells[3].removeprefix("syscalls:sys_enter_")
+        threads.setdefault(int(tid), (comm, {}))[1][event] = value
+    return int(m[1]), threads
+
+
+def thread_kind(comm: str, tid: int, pid: int) -> str:
+    if tid == pid:
+        return "domain loop"
+    if comm in TOKIO_THREADS:
+        return "tokio threads"
+    return f"`{comm}`"
+
+
+SYSCALL_COLUMNS = (
+    ("futex", ("futex",)),
+    ("sends", ("sendmsg", "sendmmsg", "sendto")),
+    ("receives", ("recvmsg", "recvmmsg", "recvfrom")),
+    ("epoll", ("epoll_wait", "epoll_pwait")),
+    ("write", ("write",)),
+)
+
+
+def syscalls_per_command(path: str, leader_us: float | None) -> tuple[dict, float | None]:
+    """The leader's threads by kind over the profile's window: {kind:
+    (threads, CPU µs per command, {column: calls per command})}, the
+    commands in the window being the domain loop's CPU in it over its CPU
+    per command; and the window's commands. ({}, None) without the counts
+    or the loop's cost."""
+    pid, threads = read_syscalls(path)
+    if pid is None or not leader_us:
+        return {}, None
+    loop_ms = sum(ev.get("task-clock", 0.0) for tid, (comm, ev) in threads.items() if tid == pid)
+    commands = loop_ms * 1000 / leader_us
+    if commands <= 0:
+        return {}, None
+    kinds: dict = {}
+    for tid, (comm, ev) in threads.items():
+        kind = thread_kind(comm, tid, pid)
+        n, cpu, calls = kinds.get(kind, (0, 0.0, collections.Counter()))
+        for column, names in SYSCALL_COLUMNS:
+            calls[column] += sum(ev.get(name, 0.0) for name in names)
+        kinds[kind] = (n + 1, cpu + ev.get("task-clock", 0.0), calls)
+    return {
+        kind: (n, cpu * 1000 / commands, {c: calls[c] / commands for c, _ in SYSCALL_COLUMNS})
+        for kind, (n, cpu, calls) in kinds.items()
+    }, commands
+
+
+def transport_split(chains: list) -> tuple[collections.Counter, collections.Counter]:
+    """The tokio threads' samples by kind and their parking samples by
+    caller, in percent of those threads' samples (the chains' total, since
+    a report for some of a process's threads gives shares of all of
+    them)."""
+    total = sum(share for _, share, _ in chains)
+    kinds, parking = collections.Counter(), collections.Counter()
+    if not total:
+        return kinds, parking
+    for leaf, share, frames in chains:
+        kind = transport_kind(leaf, frames)
+        kinds[kind] += share * 100 / total
+        if kind.startswith("parking"):
+            parking[parking_caller(frames)] += share * 100 / total
+    return kinds, parking
+
+
+def transport_tables(store: str, voters: dict, top: int = 10) -> list[str]:
+    """The leader's tokio threads (the transport's workers and the blocking
+    pool): their CPU and system calls per command beside the loop's and
+    the other threads', from the per-thread counts, then their call
+    graph's samples by kind and their parking and waking by caller, in µs
+    per command; [] without the profile."""
+    leader_us, _ = loop_per_command(voters)
+    kinds, commands = syscalls_per_command(os.path.join(store, "leader-profile-syscalls.txt"), leader_us)
+    out = []
+    if kinds:
+        order = sorted(kinds, key=lambda k: (k != "domain loop", k != "tokio threads", -kinds[k][1]))
+        out += [
+            f"**The leader's threads, CPU and system calls per command** (`perf stat --per-thread` over the profile's "
+            f"window, {commands:.0f} commands by the domain loop's CPU in it over its {leader_us:.0f} µs per command; "
+            "sends are `sendmsg`, `sendmmsg` and `sendto`, receives their `recv` kin, epoll `epoll_wait` and `epoll_pwait`)",
+            "",
+            "| Threads | Count | CPU per command (µs) | " + " | ".join(f"{c} per command" for c, _ in SYSCALL_COLUMNS) + " |",
+            "| --- " * (3 + len(SYSCALL_COLUMNS)) + "|",
+        ]
+        for kind in order:
+            n, cpu, calls = kinds[kind]
+            out.append(f"| {kind} | {n} | {cpu:.1f} | " + " | ".join(f"{calls[c]:.2f}" for c, _ in SYSCALL_COLUMNS) + " |")
+        total_cpu = sum(v[1] for v in kinds.values())
+        totals = {c: sum(v[2][c] for v in kinds.values()) for c, _ in SYSCALL_COLUMNS}
+        out.append(f"| **all** | {sum(v[0] for v in kinds.values())} | {total_cpu:.1f} | "
+                   + " | ".join(f"{totals[c]:.2f}" for c, _ in SYSCALL_COLUMNS) + " |")
+        out.append("")
+    chains = read_chains(os.path.join(store, "transport-profile-chains.txt"))
+    split, parking = transport_split(chains)
+    if split:
+        tokio_us = kinds.get("tokio threads", (0, None, {}))[1] if kinds else None
+        scale = tokio_us / 100 if tokio_us else None
+        fmt = "{:.1f}" if scale else "{:.2f}%"
+        k = scale or 1.0
+        unit = f"µs per command, of their {tokio_us:.0f}" if scale else "percent of their samples"
+        out += [
+            f"**The leader's tokio threads by what they did** (the transport's workers and the blocking pool, pooled, a "
+            f"call graph over the same window; each sample by the first of these its stack meets from the leaf; {unit})",
+            "",
+            "| Kind | Cost |",
+            "| --- | --- |",
+        ]
+        for kind, share in split.most_common():
+            out.append(f"| {kind} | {fmt.format(share * k)} |")
+        out.append("")
+        if parking:
+            out += [
+                f"**The tokio threads' parking and waking by caller** (the innermost Rust frame above the system call, "
+                f"past the standard library's; {unit})",
+                "",
+                "| Caller | Cost |",
+                "| --- | --- |",
+            ]
+            for caller, share in parking.most_common(top):
+                out.append(f"| `{caller.replace('|', '/')}` | {fmt.format(share * k)} |")
+            out.append("")
+    return out
+
+
 def resend_table(voters: dict) -> list[str]:
     """task-d59's re-send timer on each voter that ran it (the leader): its
     calls, the loop's time in a call on average and at most, and the
@@ -1315,6 +1517,9 @@ def summarize(store: str, nodes: list[str], title: str, profile: str | None = No
         out.extend(voters_memory(read_memory(os.path.join(store, "cpu-samples-memory.csv"))))
 
         out.extend(leader_profile(os.path.join(store, "leader-profile.txt")))
+        out.extend(leader_profile(os.path.join(store, "transport-profile.txt"),
+                                  title="The leader's tokio threads, profiled** (`perf record` on its process, "
+                                        "reported for the transport's workers and the blocking pool"))
         out.extend(leader_profile_inclusive(os.path.join(store, "leader-profile-inclusive.txt")))
         out.extend(leader_loop_split(os.path.join(store, "leader-profile-chains.txt")))
 
@@ -1598,6 +1803,7 @@ def summarize(store: str, nodes: list[str], title: str, profile: str | None = No
             out.extend(fast_path_table(voters))
             out.extend(resend_table(voters))
             out.extend(leader_and_follower(store, voters))
+            out.extend(transport_tables(store, voters))
     return "\n".join(out) + "\n"
 
 

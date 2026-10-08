@@ -294,7 +294,23 @@ pair table's allocator and copies group needs (on Debian, a flat profile
 left them as addresses and the group counted none of them). From the
 call graph the summary and the pair table also give the leader's `memcmp`
 and `memmove` by caller (the innermost TupleSky function and the frame that
-called libc), and the follower's four largest phases by what they call. The summary gives the thread, the window, its samples by object
+called libc), and the follower's four largest phases by what they call.
+A `call-graph` run also profiles the leader's tokio threads (the
+transport's workers and the runtime's blocking pool, `tokio-rt-worker`)
+over the same window: `perf record` on the leader's whole process,
+reported for those threads alone and pooled, since a task moves between
+workers (`transport-profile*.txt`). Beside it `perf stat --per-thread`
+counts each of the leader's threads' CPU and system calls (futex, the UDP
+sends and receives, epoll, write) into `leader-profile-syscalls.txt`. The
+summary and the pair table turn the counts into CPU and calls per command
+for the domain loop, the tokio threads and each other thread (the
+window's commands are the loop's CPU in it over its CPU per command), and
+split the tokio threads' samples by what they did: packet protection,
+the send and receive system calls, parking and waking, quinn's transmit,
+its receive and the rest of quinn, the allocator, TupleSky's own code by
+crate, and tokio's scheduler, each the first kind any frame of a sample's
+stack matches, in that order. The parking and waking samples are also
+given by the innermost Rust frame above the system call. The summary gives the thread, the window, its samples by object
 (`coordd`, libc, the kernel) and the symbols that held most of them; the full report is `leader-profile.txt` in the store.
 
 The `voter-workers` input sets each TupleSky voter's tokio worker count
