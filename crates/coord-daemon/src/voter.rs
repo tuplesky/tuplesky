@@ -946,8 +946,7 @@ fn command_of(frame: &[u8]) -> Option<CommandId> {
     else {
         return None;
     };
-    let logical = request.logical().ok()?;
-    CommandId::derive(&request.retry_key, &logical).ok()
+    request.command().ok().map(|(_, command)| command)
 }
 
 /// A bounded map of command to collector.

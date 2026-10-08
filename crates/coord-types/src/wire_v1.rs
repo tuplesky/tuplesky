@@ -803,6 +803,15 @@ impl RequestV1 {
         }
         Ok(request)
     }
+
+    /// The embedded logical request, verified as [`Self::logical`]
+    /// verifies it, and its command identity derived from the bytes it
+    /// verified: one canonical encoding rather than two (task-d60).
+    pub fn command(&self) -> Result<(LogicalRequest, CommandId), WireError> {
+        let request = self.logical()?;
+        let command = CommandId::from_canonical(&self.retry_key, self.logical.as_slice());
+        Ok((request, command))
+    }
 }
 
 /// Outcome of a request.

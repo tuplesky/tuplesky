@@ -744,9 +744,7 @@ impl Collector {
             Ok([MessageV1::Request(r)]) => r.clone(),
             _ => return Err(SubmitRefusal::Malformed),
         };
-        let logical = request.logical().map_err(|_| SubmitRefusal::Malformed)?;
-        let command = CommandId::derive(&request.retry_key, &logical)
-            .map_err(|_| SubmitRefusal::Malformed)?;
+        let (_, command) = request.command().map_err(|_| SubmitRefusal::Malformed)?;
         let key = request.retry_key;
         let sequence = key.request_sequence.get();
         if let Some(bound) = self.bindings.get(&key).copied() {

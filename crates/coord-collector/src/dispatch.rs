@@ -785,8 +785,10 @@ impl Dispatcher {
         {
             return None;
         }
-        let logical = request.logical().ok().filter(servable)?;
-        let command = CommandId::derive(&request.retry_key, &logical).ok()?;
+        let (logical, command) = request.command().ok()?;
+        if !servable(&logical) {
+            return None;
+        }
         Some((self.collector.quorum().ballot(), command, request.clone()))
     }
 

@@ -2071,8 +2071,7 @@ impl Leader {
             [MessageV1::Request(r)] => r.clone(),
             _ => return None,
         };
-        let logical = request.logical().ok()?;
-        let command = CommandId::derive(&request.retry_key, &logical).ok()?;
+        let (_, command) = request.command().ok()?;
         if self.bindings.get(&request.retry_key) != Some(&command) {
             return None;
         }
