@@ -201,11 +201,15 @@ def client(i):
 
 
 def leader():
-    who = 1
+    # Each log keeps every ballot its voter ever led, so the leader is
+    # the voter that announced the highest one.
+    who, highest = 1, -1
     for n in (1, 2, 3):
         for line in said(n).splitlines():
             if line.startswith("this voter leads ballot"):
-                who = n
+                ballot = int(line.split()[-1])
+                if ballot > highest:
+                    who, highest = n, ballot
     return who
 
 

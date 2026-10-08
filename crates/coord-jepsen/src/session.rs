@@ -230,7 +230,8 @@ impl Session {
             session: SessionId(session),
             connects: 0,
         };
-        this.connect().await.map_err(OpenError)?;
+        let within = this.timing.connect;
+        this.connect(within).await.map_err(OpenError)?;
         Ok(this)
     }
 
@@ -245,11 +246,12 @@ impl Session {
         u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 
-    /// Dial the frontend and bind this session's credential on it. The
-    /// SDK re-sends whatever it had in flight once the binding holds.
-    async fn connect(&mut self) -> Result<(), String> {
+    /// Dial the frontend and bind this session's credential on it, each
+    /// within `within`. The SDK re-sends whatever it had in flight once
+    /// the binding holds.
+    async fn connect(&mut self, within: Duration) -> Result<(), String> {
         let connection = tokio::time::timeout(
-            self.timing.connect,
+            within,
             self.transport.connect(
                 self.target.address,
                 &self.target.server_name,
@@ -285,7 +287,7 @@ impl Session {
                 .map_err(|e| format!("bind frame: {e:?}"))?;
             let answer = self
                 .transport
-                .request(connection, frame, self.timing.connect)
+                .request(connection, frame, within)
                 .await
                 .map_err(|e| format!("bind: {e:?}"))?;
             coord_session::decode_bind_ack(&answer).map_err(|e| format!("bind ack: {e:?}"))
@@ -373,9 +375,13 @@ impl Session {
                 return Answer::Unknown(last);
             }
             if self.connection.is_none() {
-                if let Err(e) = self.connect().await {
+                // A reconnect and its pause spend the operation's budget,
+                // not their own.
+                let left = deadline.saturating_duration_since(Instant::now());
+                if let Err(e) = self.connect(self.timing.connect.min(left)).await {
                     last = e;
-                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    tokio::time::sleep(Duration::from_millis(250).min(left)).await;
                 }
                 continue;
             }
