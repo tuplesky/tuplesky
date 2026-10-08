@@ -29,7 +29,7 @@ use crate::frames::{
 };
 use crate::identity::{BoundIdentity, IdentityBinder, role_class};
 use crate::lane::{self, Lane, LaneLimits, lane_of_hello, role_lanes};
-use crate::sched::{FairQueue, LaneStats, PeerTraffic, QueueError, Queued};
+use crate::sched::{Datagrams, FairQueue, LaneStats, PeerTraffic, QueueError, Queued};
 
 /// Identity of one connection at this endpoint (never reused).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -513,10 +513,12 @@ struct Traffic {
     /// QUIC's own counts of the peer connections already closed (task-d61);
     /// those still open are read from the connections themselves.
     closed: Mutex<Quic>,
+    /// The same of the api connections already closed (task-d70).
+    closed_api: Mutex<Quic>,
 }
 
-/// What QUIC itself sent and received on peer connections: datagrams,
-/// the system calls that sent them, and ACK frames.
+/// What QUIC itself sent and received on one class of connections:
+/// datagrams, the system calls that sent them, and ACK frames.
 #[derive(Clone, Copy, Debug, Default)]
 struct Quic {
     datagrams_sent: u64,
@@ -524,6 +526,18 @@ struct Quic {
     send_calls: u64,
     acks_sent: u64,
     acks_received: u64,
+}
+
+impl From<Quic> for Datagrams {
+    fn from(quic: Quic) -> Self {
+        Datagrams {
+            datagrams_sent: quic.datagrams_sent,
+            datagrams_received: quic.datagrams_received,
+            send_calls: quic.send_calls,
+            acks_sent: quic.acks_sent,
+            acks_received: quic.acks_received,
+        }
+    }
 }
 
 impl Quic {
@@ -545,10 +559,15 @@ impl Traffic {
     fn read(&self, open: &[Arc<Peer>]) -> PeerTraffic {
         let load = |c: &AtomicU64| c.load(Ordering::Relaxed);
         let mut quic = *self.closed.lock().unwrap();
-        for peer in open.iter().filter(|p| p.class == Class::Peer) {
-            quic.add(&peer.conn);
+        let mut api = *self.closed_api.lock().unwrap();
+        for peer in open {
+            match peer.class {
+                Class::Peer => quic.add(&peer.conn),
+                Class::Api => api.add(&peer.conn),
+            }
         }
         PeerTraffic {
+            api: api.into(),
             datagrams_sent: quic.datagrams_sent,
             datagrams_received: quic.datagrams_received,
             send_calls: quic.send_calls,
@@ -563,6 +582,20 @@ impl Traffic {
             received_bytes: load(&self.received_bytes),
             received_streams: load(&self.received_streams),
         }
+    }
+}
+
+/// What a [`Transport`] carried, read apart from it
+/// ([`Transport::traffic_reader`]).
+#[derive(Clone)]
+pub struct TrafficReader {
+    shared: Arc<Shared>,
+}
+
+impl TrafficReader {
+    /// The same as [`Transport::peer_traffic`].
+    pub fn read(&self) -> PeerTraffic {
+        self.shared.read_traffic()
     }
 }
 
@@ -651,6 +684,11 @@ struct Tls {
 }
 
 impl Shared {
+    fn read_traffic(&self) -> PeerTraffic {
+        let open: Vec<Arc<Peer>> = self.peers.lock().unwrap().values().cloned().collect();
+        self.traffic.read(&open)
+    }
+
     /// The client configuration a dial of `class` presents now, and when
     /// the credential in it ends.
     fn client_tls(&self, class: Class) -> (Arc<QuicClientConfig>, u64) {
@@ -793,8 +831,11 @@ impl Shared {
 
     fn deregister(&self, peer: &Peer) {
         let removed = self.peers.lock().unwrap().remove(&peer.id);
-        if removed.is_some() && peer.class == Class::Peer {
-            self.traffic.closed.lock().unwrap().add(&peer.conn);
+        if removed.is_some() {
+            match peer.class {
+                Class::Peer => self.traffic.closed.lock().unwrap().add(&peer.conn),
+                Class::Api => self.traffic.closed_api.lock().unwrap().add(&peer.conn),
+            }
         }
         let key = Self::link_key(peer);
         let link = self.links.lock().unwrap().get(&key).cloned();
@@ -1078,6 +1119,7 @@ fn server_config(
         &LaneLimits::floor(&limits.lanes),
         limits.idle_timeout,
         limits.keep_alive,
+        limits.ack_frequency,
     )
     .map_err(TransportError::Tls)?;
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server));
@@ -1163,8 +1205,13 @@ impl Transport {
             &limits,
         )?;
         let lane_config = |i: usize| {
-            lane::transport_config(&limits.lanes[i], limits.idle_timeout, limits.keep_alive)
-                .map_err(TransportError::Tls)
+            lane::transport_config(
+                &limits.lanes[i],
+                limits.idle_timeout,
+                limits.keep_alive,
+                limits.ack_frequency,
+            )
+            .map_err(TransportError::Tls)
         };
         let lane_transport: [Arc<quinn::TransportConfig>; 4] = [
             lane_config(0)?,
@@ -1546,17 +1593,19 @@ impl Transport {
             .collect()
     }
 
-    /// What this node's transport carried between voters (task-d62).
+    /// What this node's transport carried between voters (task-d62), and
+    /// the datagrams of its api connections (task-d70).
     pub fn peer_traffic(&self) -> PeerTraffic {
-        let open: Vec<Arc<Peer>> = self
-            .shared
-            .peers
-            .lock()
-            .unwrap()
-            .values()
-            .cloned()
-            .collect();
-        self.shared.traffic.read(&open)
+        self.shared.read_traffic()
+    }
+
+    /// A reader of [`Transport::peer_traffic`] that can be kept apart from
+    /// the transport, by a runtime that is handed the transport only to
+    /// serve on it.
+    pub fn traffic_reader(&self) -> TrafficReader {
+        TrafficReader {
+            shared: self.shared.clone(),
+        }
     }
 
     /// Accounting of one lane of a replica link, with the path RTT.

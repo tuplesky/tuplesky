@@ -921,6 +921,9 @@ pub struct Domain<P: Persistence> {
     /// The other voters, where this process votes. `None` for a process
     /// that does not, and for a domain with nobody else in it.
     plane: Option<PeerPlane>,
+    /// What the api plane's transport carried, read beside the peer
+    /// plane's (task-d70). Taken when the loop starts serving on it.
+    api_traffic: Option<coord_transport::TrafficReader>,
     /// The other voters, as somewhere to submit to. Empty for a domain
     /// with nobody else in it, and for a process whose frontend holds no
     /// collector credential to submit with.
@@ -1574,6 +1577,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             housekeeping: None,
             durable_projection: None,
             plane: None,
+            api_traffic: None,
             links: CollectorLinks::new(Vec::new()),
             expiry: None,
             asked: None,
@@ -1718,6 +1722,11 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 Measure::Unavailable(Unavailable::NotInstrumented),
                 |plane| {
                     let t = plane.traffic();
+                    let api = self
+                        .api_traffic
+                        .as_ref()
+                        .map(|reader| reader.read().api)
+                        .unwrap_or_default();
                     Measure::Observed(Traffic {
                         sent_frames: t.sent_frames,
                         sent_bytes: t.sent_bytes,
@@ -1732,6 +1741,13 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                         received_frames: t.received_frames,
                         received_bytes: t.received_bytes,
                         received_streams: t.received_streams,
+                        api: coord_daemon::metrics::Datagrams {
+                            datagrams_sent: api.datagrams_sent,
+                            datagrams_received: api.datagrams_received,
+                            send_calls: api.send_calls,
+                            acks_sent: api.acks_sent,
+                            acks_received: api.acks_received,
+                        },
                     })
                 },
             ),
@@ -1980,6 +1996,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         // deaf to the domain it had come back to -- and a submission
         // arriving first was always correct anyway, since an unreachable
         // voter contributes nothing and the quorum rule decides.
+        self.api_traffic = Some(transport.traffic_reader());
         let now = std::time::Instant::now();
         if let Some(plane) = &mut self.plane {
             plane.redial.start(now);
@@ -5072,8 +5089,30 @@ fn endpoint(
     {
         limits.stream_frames = frames.max(1);
     }
+    // The acknowledgement cadence asked of every peer and caller
+    // (task-d70), from the environment for the same reason, on both
+    // planes: `<threshold>,<max delay in microseconds>`. Unset, QUIC's own.
+    if let Ok(value) = std::env::var("COORDD_ACK_FREQUENCY") {
+        match ack_frequency(&value) {
+            Some(ack) => limits.ack_frequency = Some(ack),
+            None => eprintln!(
+                "COORDD_ACK_FREQUENCY={value:?} is not <threshold>,<max delay in microseconds>: \
+                 QUIC's own acknowledgement cadence is kept"
+            ),
+        }
+    }
     Transport::with_socket(socket, identity, std::sync::Arc::new(binder), limits)
         .map_err(|e| TransportError::Endpoint(format!("{e:?}")))
+}
+
+/// An acknowledgement cadence written `<threshold>,<max delay in
+/// microseconds>` (task-d70).
+fn ack_frequency(value: &str) -> Option<coord_transport::AckFrequency> {
+    let (threshold, delay) = value.split_once(',')?;
+    Some(coord_transport::AckFrequency {
+        threshold: threshold.trim().parse().ok()?,
+        max_delay: std::time::Duration::from_micros(delay.trim().parse().ok()?),
+    })
 }
 
 /// Why the endpoint could not be built.
@@ -5926,6 +5965,20 @@ mod tests {
         // `owes_flush` already leaves out what waits on the append.
         assert!(flush_due(0, true, true, FLUSH_EVENTS));
         assert!(!flush_due(0, false, true, FLUSH_EVENTS - 1));
+    }
+
+    #[test]
+    fn an_acknowledgement_cadence_is_a_threshold_and_a_delay() {
+        assert_eq!(
+            super::ack_frequency("4, 2000"),
+            Some(coord_transport::AckFrequency {
+                threshold: 4,
+                max_delay: std::time::Duration::from_millis(2),
+            })
+        );
+        for malformed in ["", "4", "4,", ",2000", "four,2000", "4,2ms", "-1,2000"] {
+            assert_eq!(super::ack_frequency(malformed), None, "{malformed:?}");
+        }
     }
 
     #[test]
