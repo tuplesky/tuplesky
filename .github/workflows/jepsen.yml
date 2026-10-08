@@ -287,12 +287,14 @@ jobs:
         run: |
           up=()
           if [ "$STORE" = tmpfs ]; then up=(--tmpfs /opt); fi
-          # A call-graph job runs the nodes on this runner's own Ubuntu,
-          # whose glibc keeps frame pointers (Debian's does not), so the
-          # frame-pointer walk leaves libc's allocator for its caller; and
-          # with glibc's debug symbols, where the jepsen-ref's up.sh can
-          # install them, so libc's local functions are named.
-          if [ "$IN_LEADER_PROFILE" = call-graph ]; then
+          # A profiled job runs the nodes on this runner's own Ubuntu,
+          # whose glibc keeps frame pointers (Debian's does not), so a
+          # call graph's frame-pointer walk leaves libc's allocator for its
+          # caller; and with glibc's debug symbols, where the jepsen-ref's
+          # up.sh can install them, so libc's local functions are named in
+          # a flat profile too (on Debian they are bare addresses, and the
+          # allocator, memcmp and memmove groups miss them).
+          if [ "$IN_LEADER_PROFILE" != false ]; then
             up+=(--base ubuntu:24.04)
             if grep -q -- '--libc-debug' jepsen/tuplesky/docker/up.sh; then up+=(--libc-debug); fi
           fi

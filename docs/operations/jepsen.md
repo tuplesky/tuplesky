@@ -282,14 +282,16 @@ phase in microseconds per command, with the difference, which is the
 leader's own part of each phase. A 10 s DWARF sample of the leader
 follows (`leader-profile-alloc-chains.txt`): it unwinds out of libc's
 allocator, which the frame-pointer walk cannot, and names the TupleSky
-function that allocated. A `call-graph` job builds the node image on
-`ubuntu:24.04`, the runner's own system, whose glibc keeps frame pointers
+function that allocated. A profiled job, flat or `call-graph`, builds the
+node image on `ubuntu:24.04`, the runner's own system, whose glibc keeps frame pointers
 (`malloc` and `free` open with `push %rbp`), so the frame-pointer walk
 leaves the allocator for its caller; on the default Debian image it gave
 out inside libc, and the DWARF sample did no better. With a `jepsen-ref`
 whose `docker/up.sh` takes `--libc-debug`, the image also has glibc's
 debug symbols, so libc's local functions (`_int_malloc`, the variants of
-`memcmp` and `memmove`) are named rather than left as addresses. From the
+`memcmp` and `memmove`) are named rather than left as addresses, which the
+pair table's allocator and copies group needs (on Debian, a flat profile
+left them as addresses and the group counted none of them). From the
 call graph the summary and the pair table also give the leader's `memcmp`
 and `memmove` by caller (the innermost TupleSky function and the frame that
 called libc), and the follower's four largest phases by what they call. The summary gives the thread, the window, its samples by object
