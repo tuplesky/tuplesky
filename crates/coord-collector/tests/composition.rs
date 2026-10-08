@@ -347,7 +347,7 @@ impl World {
     }
 
     fn with_bound(seed: u64, max_pending: usize) -> Self {
-        let collector = Collector::new(CollectorConfig {
+        let collector = Collector::traced(CollectorConfig {
             quorum: quorum(3),
             max_pending,
             max_resolved: 16,
@@ -908,7 +908,7 @@ fn cancellation_preserves_identity_and_outcome_resolution() {
 
 #[test]
 fn voter_identities_are_counted_rather_than_connections() {
-    let mut c = Collector::new(CollectorConfig {
+    let mut c = Collector::traced(CollectorConfig {
         quorum: quorum(3),
         max_pending: 8,
         max_resolved: 8,
@@ -1163,7 +1163,7 @@ fn collection_is_bounded_per_domain_without_evicting_unresolved_work() {
     let (_, a4) = w.submit(2, 4, put(b"d", b"1"));
     assert!(matches!(a4, Action::Respond(_)));
     // Direct collector bound: same refusal.
-    let mut c = Collector::new(CollectorConfig {
+    let mut c = Collector::traced(CollectorConfig {
         quorum: quorum(3),
         max_pending: 1,
         max_resolved: 1,
@@ -1822,7 +1822,7 @@ fn the_default_bound_refuses_nothing_the_protocol_admits() {
 /// the command with other dependencies after the caller was answered.
 #[test]
 fn a_fast_acknowledgement_is_not_counted_as_an_adoption() {
-    let mut c = Collector::new(CollectorConfig {
+    let mut c = Collector::traced(CollectorConfig {
         quorum: quorum(5),
         max_pending: 8,
         max_resolved: 8,
@@ -1929,7 +1929,7 @@ fn a_fast_acknowledgement_is_not_counted_as_an_adoption() {
 #[test]
 fn the_leaders_reply_is_not_its_adoption_at_five_voters() {
     for third in [0u8, 3] {
-        let mut c = Collector::new(CollectorConfig {
+        let mut c = Collector::traced(CollectorConfig {
             quorum: quorum(5),
             max_pending: 8,
             max_resolved: 8,

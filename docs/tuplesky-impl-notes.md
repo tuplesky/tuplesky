@@ -10247,3 +10247,57 @@ threads. Head less base, mean (smallest to largest) of three:
   domain loop's closure (7 to 12 µs), where each peer's send is
   dispatched; that fits the per-voter copy of each broadcast frame, but
   the stack cannot prove it, and it is confirmed before it is cut.
+
+## The allocation sites (task-d60, step 2)
+
+Five cuts, each where the runner's caller table put allocation on the
+voters' loops, none changing a format:
+
+- **The collector's golden trace, a memory leak.** `coordd`'s collector pushed a
+  `CollectorEvent`, every identity formatted as hex, for each transition
+  (a submission, each voter's evidence, a release), and nothing in the
+  daemon drained it: the trace grew for the daemon's life, and its
+  formatting was the profile's `trace::hex`. `Collector::new` now keeps no
+  trace and builds no event; `Collector::traced` keeps it for the tests
+  that read it.
+- **A ballot configuration's voter sets** are shared, so the clone each
+  command's vote set takes is two reference counts, not two trees
+  (`BallotConfiguration::clone`).
+- **A journal record** is encoded from a borrowed wire shape instead of a
+  copy of its body, its length is counted without encoding it (sealing,
+  every group bound), and raft-engine's codec appends straight into its
+  buffer (`JournalRecordV1::encode`).
+- **A sealed record's body** is shared, so the group the storage path
+  appends and the copy it materializes are one body (`StoreUpdate::clone`).
+- **A submission's command** is derived from the payload bytes its
+  canonical check just compared, one encoding instead of two
+  (`canonical_bytes`).
+
+Five voters on one four-core host, replay profile, stores on disk, 30
+callers, 40,000 measured operations, `put=30,get=50,contended=20`, three
+pairs of step 1's build (#152) against this one, alternated. The host was
+slower than for step 1's pairs (the base's leader thread 0.62 ms per
+command here, 0.43 to 0.46 then), so the pair is read against itself:
+
+| | step 1 | step 2 |
+| --- | --- | --- |
+| completed a second | 914, 879, 869 | 925, 867, 858 |
+| leader's domain thread, CPU ms per command | 0.614, 0.619, 0.633 | 0.563, 0.593, 0.602 |
+| domain threads, five voters, CPU ms per operation | 1.290, 1.302, 1.335 | 1.188, 1.251, 1.270 |
+| tokio workers, five voters | 0.905, 0.995, 0.999 | 0.963, 1.029, 1.043 |
+| all threads, CPU ms per operation | 3.035, 3.149, 3.204 | 2.984, 3.151, 3.207 |
+| resident set at the end, per voter, MiB (mean, range) | 177, 178, 176 (168 to 196) | 160, 160, 159 (153 to 172) |
+
+- Lower in every pair: the leader's domain thread by 0.036 ms per command,
+  6% (0.051, 0.026, 0.031), and the five domain threads by 0.073 ms per
+  operation, 6%.
+- All threads did not move (-0.015 ms per operation): the tokio workers
+  rose by about as much as the domain threads fell, in all three pairs.
+  Nothing here touches the transport, so that is read as the host, and
+  the runner pair, with its loop and thread split, settles it.
+- The resident set is 17 MiB lower per voter, in a narrow range, and the
+  high-water mark with it: the trace that grew with every transition is
+  gone. It takes back about half of what step 1 cost locally.
+- One host, loopback. The runner pair, with the call-graph profile on one
+  pair, is the acceptance.
+
