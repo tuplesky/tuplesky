@@ -1499,8 +1499,9 @@ def sampled_cost(voter: Voter, path: str) -> "Cost | None":
     its window, the one started last before it by the "Jepsen starting"
     times (the runner's clock, as the window's), over the window itself
     (window_cost). A voter's last line where no boot is logged, or its
-    only boot's where it is not timed; None where the boot is not known:
-    a boot without a start time, or a restart within the window."""
+    only boot's where it is not timed; None where the boot is not known
+    (a boot without a start time, or a restart within the window) or the
+    window cannot be costed."""
     boots = voter.boot_rows
     if not boots:
         return voter.cost
@@ -1523,8 +1524,10 @@ def sampled_cost(voter: Voter, path: str) -> "Cost | None":
         i = before[-1]
         if i + 1 < len(boots) and boots[i + 1].started <= ended:
             return None
+    if boots[i].started is None:
+        return boots[i].cost
     at = lambda t: datetime.datetime.strptime(t, "%Y-%m-%d %H:%M:%S")
-    return window_cost(boots[i], at(began), at(ended)) or boots[i].cost
+    return window_cost(boots[i], at(began), at(ended))
 
 
 def sampled_costs(voters: dict, store: str) -> dict:
@@ -1594,10 +1597,19 @@ def leader_and_follower(store: str, voters: dict, top: int = 20) -> list[str]:
     out = phase_comparison(lead, follow, leader_us, follower_us, top, sampled)
     out.extend(copies_table(lead, leader_us / 100 if leader_us else None))
     out.extend(children_table(follow, follower_us / 100 if follower_us else None, "follower"))
-    alloc = read_chains(os.path.join(store, "leader-profile-alloc-chains.txt"))
+    alloc_path = os.path.join(store, "leader-profile-alloc-chains.txt")
+    alloc = read_chains(alloc_path)
     if alloc:
         s = loop_split(alloc)
-        scale = leader_us / 100 if leader_us else None
+        # Its own window, after the frame-pointer one, on the same process;
+        # a profile that names no voter falls back as the phases do.
+        leader = profiled_node(os.path.join(store, "leader-profile.txt"))
+        if leader in voters:
+            cost = sampled_cost(voters[leader], alloc_path)
+            alloc_us = cost.cpu[0] / cost.executed * 1e6 if cost and cost.cpu and cost.executed else None
+        else:
+            alloc_us = leader_us
+        scale = alloc_us / 100 if alloc_us else None
         unit = "µs per command" if scale else "percent of the samples"
         out += [
             f"**The leader's allocator by caller, from a DWARF sample** (10 s at 250 Hz after the frame-pointer one; "

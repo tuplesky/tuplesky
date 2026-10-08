@@ -87,34 +87,41 @@ class ParseTests(unittest.TestCase):
 
     def test_a_profile_is_costed_at_the_boot_it_sampled(self):
         metrics = next(line for line in VOTER.splitlines() if '"cost"' in line)
-        reading = lambda secs: metrics.replace('"domain":{"secs":3', f'"domain":{{"secs":{secs}')
-        start = lambda at: f"2026-10-08 {at} Jepsen starting  /opt/tuplesky/coordd --config coordd.toml"
+        # A reading at `up` s of uptime, with the loop's CPU and the commands
+        # executed by then.
+        at = lambda up, cpu, executed: (metrics.replace('"domain":{"secs":3', f'"domain":{{"secs":{cpu}')
+                                        .replace('"uptime":{"secs":10', f'"uptime":{{"secs":{up}')
+                                        .replace('"executed":400,', f'"executed":{executed},'))
+        start = lambda t: f"2026-10-08 {t} Jepsen starting  /opt/tuplesky/coordd --config coordd.toml"
         boot = "coordd domain=tuplesky-harness roles=[Voter] phase=starting votes=true"
         header = "leader thread 7 (n1), 0.90 of a core over the 5 s before, sampled at 99 Hz from 2026-10-08 10:01:00 to 2026-10-08 10:01:20 UTC; Samples: 1K\n"
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "leader-profile.txt")
             with open(path, "w") as f:
                 f.write(header)
-            # Killed and restarted after the window: the first boot's cost.
-            v = js.parse_voter([start("10:00:00"), boot, reading(2), reading(4), start("10:02:00"), boot, reading(1)])
-            self.assertEqual(v.cost.cpu[0], 1.0)
-            self.assertEqual(js.sampled_cost(v, path).cpu[0], 4.0)
-            # Restarted within the window: not known.
-            v = js.parse_voter([start("10:00:00"), boot, reading(4), start("10:01:10"), boot, reading(1)])
-            self.assertIsNone(js.sampled_cost(v, path))
             # One boot, read at 50 s (10:00:50) and 90 s (10:01:30) of
             # uptime, either side of the window, and at 300 s after a
             # change of load: the window's own 3 s over 600 commands.
-            at = lambda up, cpu, executed: (reading(cpu).replace('"uptime":{"secs":10', f'"uptime":{{"secs":{up}')
-                                            .replace('"executed":400,', f'"executed":{executed},'))
             v = js.parse_voter([start("10:00:00"), boot, at(50, 2, 400), at(90, 5, 1000), at(300, 60, 2000)])
             window = js.sampled_cost(v, path)
             self.assertEqual((window.cpu[0], window.executed), (3.0, 600))
+            # Killed and restarted after the window: the first boot's, not
+            # the last line's.
+            v = js.parse_voter([start("10:00:00"), boot, at(50, 2, 400), at(90, 5, 1000),
+                                start("10:02:00"), boot, at(10, 1, 50)])
+            self.assertEqual(v.cost.cpu[0], 1.0)
+            self.assertEqual(js.sampled_cost(v, path).cpu[0], 3.0)
             # Killed within the window, before a reading after it: from the
             # reading before it to its last.
             v = js.parse_voter([start("10:00:00"), boot, at(50, 2, 400), at(65, 4, 700), start("10:03:00"), boot])
             window = js.sampled_cost(v, path)
             self.assertEqual((window.cpu[0], window.executed), (2.0, 300))
+            # No command between the readings either side: left uncosted.
+            v = js.parse_voter([start("10:00:00"), boot, at(50, 2, 400), at(90, 3, 400)])
+            self.assertIsNone(js.sampled_cost(v, path))
+            # Restarted within the window: not known.
+            v = js.parse_voter([start("10:00:00"), boot, at(50, 2, 400), start("10:01:10"), boot, at(10, 1, 50)])
+            self.assertIsNone(js.sampled_cost(v, path))
 
     def test_voter_counts_sum_each_boots_highest(self):
         v = js.parse_voter(VOTER.splitlines(keepends=True))

@@ -292,7 +292,7 @@ the reading's uptime. A restart within the window leaves the profile
 uncosted. A 10 s DWARF sample of the leader
 follows (`leader-profile-alloc-chains.txt`): it unwinds out of libc's
 allocator, which the frame-pointer walk cannot, and names the TupleSky
-function that allocated. A profiled job, flat or `call-graph`, builds the
+function that allocated; it is costed over its own window, the same way. A profiled job, flat or `call-graph`, builds the
 node image on `ubuntu:24.04`, the runner's own system, whose glibc keeps frame pointers
 (`malloc` and `free` open with `push %rbp`), so the frame-pointer walk
 leaves the allocator for its caller; on the default Debian image it gave
