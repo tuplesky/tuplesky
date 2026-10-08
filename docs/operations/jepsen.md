@@ -295,6 +295,9 @@ left them as addresses and the group counted none of them). From the
 call graph the summary and the pair table also give the leader's `memcmp`
 and `memmove` by caller (the innermost TupleSky function and the frame that
 called libc), and the follower's four largest phases by what they call.
+The pair table also sets the call-graph runs' follower side by side by
+symbol, each symbol's own cost per command, with every `Outbox` method and
+what it calls (task-d69).
 A `call-graph` run also profiles the leader's tokio threads (the
 transport's workers and the runtime's blocking pool, `tokio-rt-worker`)
 over the same window: `perf record` on the leader's whole process,

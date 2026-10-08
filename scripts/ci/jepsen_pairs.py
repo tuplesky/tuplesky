@@ -486,6 +486,53 @@ def transport_table(runs: list[Run]) -> list[str]:
     return out
 
 
+def follower_symbols(runs: list[Run], top: int = 15) -> list[str]:
+    """The call-graph runs' follower by symbol, side by side: each leaf
+    symbol's share of the follower thread's samples times the followers'
+    mean loop CPU per command, and, whatever their rank, each `Outbox`
+    method with everything it calls (task-d69)."""
+    shown = [(i, r) for i, r in enumerate(runs, 1) if r.follower_chains and r.followers_loop]
+    if not shown:
+        return []
+    own_: list = []
+    whole: list = []
+    for _, r in shown:
+        us = r.followers_loop * 1000 / 100
+        leaves: dict = {}
+        outbox: dict = {}
+        for leaf, share, frames in r.follower_chains:
+            leaves[leaf] = leaves.get(leaf, 0.0) + share * us
+            for name in {f for f in frames + [leaf] if "outbox::Outbox::" in f}:
+                outbox[name] = outbox.get(name, 0.0) + share * us
+        own_.append(leaves)
+        whole.append(outbox)
+    names = []
+    for leaves in own_:
+        names += [n for n in sorted(leaves, key=lambda n: -leaves[n])[:top] if n not in names]
+    names.sort(key=lambda n: -max(leaves.get(n, 0.0) for leaves in own_))
+    outbox_names = sorted({n for outbox in whole for n in outbox})
+    labels = [r.label for _, r in shown]
+    paired = sorted(labels) == ["base", "head"]
+    out = [
+        "**The follower's loop by symbol** (the call-graph runs: each symbol's own share of the follower thread's "
+        "samples times the followers' mean loop CPU per command, then each `Outbox` method with what it calls; "
+        "microseconds per command)",
+        "",
+        "| Symbol | " + " | ".join(f"Run {i}, {r.label}" for i, r in shown) + (" | Head less base |" if paired else " |"),
+        "| --- " * (1 + len(shown) + (1 if paired else 0)) + "|",
+    ]
+    rows = [(f"`{n.replace('|', '/')}`", [leaves.get(n, 0.0) for leaves in own_]) for n in names]
+    rows += [(f"`{n.replace('|', '/')}` and what it calls", [outbox.get(n, 0.0) for outbox in whole]) for n in outbox_names]
+    for name, values in rows:
+        cells = [f"{v:.1f}" for v in values]
+        if paired:
+            d = values[labels.index("head")] - values[labels.index("base")]
+            cells.append(("+" if d >= 0 else "") + f"{d:.1f}")
+        out.append(f"| {name} | " + " | ".join(cells) + " |")
+    out.append("")
+    return out
+
+
 def profile_table(runs: list[Run], top: int = 20) -> list[str]:
     """Each symbol's mean cost per command on the leader's loop, by build:
     its share of the thread's samples times the run's loop CPU per command,
@@ -637,6 +684,7 @@ def render(runs: list[Run], title: str) -> str:
     out.extend(profile_table(runs))
     out.extend(split_tables(runs))
     out.extend(transport_table(runs))
+    out.extend(follower_symbols(runs))
     out.extend(inclusive_tables(runs))
     return "\n".join(out) + "\n"
 
