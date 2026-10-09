@@ -268,8 +268,6 @@ impl ReadBarrier {
         self.rounds.retain(|n, _| *n > round);
     }
 
-    /// Whether `held` may be answered from `ballot`'s confirmation.
-
     /// The reads that may be planned now, and the refusals due.
     ///
     /// A read is due once a round started after it arrived has
