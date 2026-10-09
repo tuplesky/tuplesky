@@ -10363,3 +10363,75 @@ second PR's own pairs, so each pair is read against itself:
   move by as much as the host does between them, so the runner pair, with
   the call graph to show `Outbox::release` gone from the follower's
   profile, is the acceptance.
+
+## The leader's lookups and held reads (task-d60, step 3)
+
+The plan took the leader's `memmove` to be the per-voter copy of each
+broadcast frame and asked for it to be confirmed before it was cut. One
+local profile run with the clone `#[inline(never)]` did not confirm it:
+the clone was 0.43% of the leader's domain thread, about 2 µs per
+command. Most of the `memmove` was `Voter::pump_reads`: every pump of the
+read barrier moved every held read, request and all, into a new queue or
+the due list (1.8% in that run, about 10 µs per command). So the shared
+broadcast buffer is not taken, and step 3 is three other changes:
+
+- The leader's maps that are only looked up or retained (`proposals`,
+  `votes`, `resent`, `answered`) and the command table's lookup-only sets
+  (`executed`, `history`, `recent_set`) are hash maps keyed by the command
+  identity (`coord_consensus::digest`). A command identity is a BLAKE3
+  digest, so the hasher reads only its first sixteen bytes, and a lookup
+  is one probe and one comparison where the ordered map compared 32-byte
+  keys at every level. Every map iterated to produce an effect stays a
+  `BTreeMap`, since the machines are deterministic by their order; the
+  learner takes a lookup rather than the map. The map is `hashbrown`
+  0.17.1, already in the lock, with default features off, since the crate
+  is `no_std`.
+- The hasher is keyed (Codex's review). Unkeyed, a caller who picks
+  request contents could grind identities whose first bytes agree and
+  crowd one probe sequence, and the executed history is not bounded by the
+  command table. Each map takes a process key when it is built and keeps
+  it, and mixes it into every write with a folded multiply (wyhash's and
+  foldhash's core); `coordd` draws the key from the operating system at
+  start (`seed_digest_maps`, through the standard library's randomly keyed
+  hasher). Nothing iterates these maps, so the key changes no output: the
+  simulator's rows are identical with it.
+- Held reads are boxed, and a pump that neither refuses one nor finds one
+  due updates them in place and moves nothing.
+- A voter decoded and hashed every submission (`voter::command_of`) only
+  to file where its evidence is owed, and the machine then derived the
+  same identity. Each machine now keeps the command its last admitted
+  request became and the voter reads it; it decodes the frame itself only
+  where the machine refuses the request before deriving (no boot, sealed,
+  not leading, fenced). A debug build compares the two on every
+  submission.
+
+The protocol simulator's rows at 100 seeds are identical, row for row, to
+task-d69's.
+
+Five voters on one four-core host, replay profile, stores on disk, 30
+callers, 40,000 measured operations, three pairs of task-d69 against this
+one, alternated:
+
+| | task-d69 | step 3 |
+| --- | --- | --- |
+| completed a second | 873, 911, 900 | 902, 905, 944 |
+| `get` p99, ms | 114, 111, 109 | 105, 107, 105 |
+| leader's domain thread, CPU ms per command | 0.570, 0.563, 0.557 | 0.515, 0.505, 0.500 |
+| followers' domain threads, CPU ms per command (mean of four) | 0.459, 0.450, 0.446 | 0.446, 0.442, 0.429 |
+| domain threads, five voters, CPU ms per operation | 1.209, 1.192, 1.179 | 1.158, 1.146, 1.117 |
+| tokio workers, five voters | 1.000, 0.967, 0.991 | 0.994, 0.996, 0.949 |
+| all threads, five voters | 3.075, 3.000, 3.012 | 3.016, 2.995, 2.894 |
+
+- The leader's loop is lower in every pair, by 55 to 58 µs per command
+  (10%), the followers' by 3% (they gain the hashed table sets and the
+  submission's command), and the five domain threads by 0.053 ms per
+  operation (4%). The tokio threads do not move.
+- A fourth pair under `perf record -g` (task-d69 at 0.583 ms per command
+  for the leader, step 3 at 0.502) read the leader's thread: `pump_reads`
+  fell from 15.0% to 11.5% of it and its copies from 3.4% to under 0.2%;
+  `Learner::commit_learned` (3.5%) and `voter::command_of` (1.1%) are
+  gone; the thread's `memcmp` fell from 6.0% to 4.5% and its `memmove`
+  from 8.6% to 5.8%. The largest `memcmp` caller left is
+  `CommandTable::phase_of` on the table's records, which are iterated and
+  stay ordered.
+- The runner's pair, with the call graph on one pair, is the acceptance.

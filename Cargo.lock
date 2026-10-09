@@ -642,6 +642,7 @@ dependencies = [
  "coord-sim",
  "coord-store-api",
  "coord-types",
+ "hashbrown 0.17.1",
  "postcard",
  "serde",
  "serde_json",

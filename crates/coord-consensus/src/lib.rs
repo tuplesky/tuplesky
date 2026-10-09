@@ -120,6 +120,7 @@ pub mod ballot;
 pub mod campaign;
 pub mod catch_up;
 pub mod commands;
+pub mod digest;
 pub mod feature;
 pub mod floor;
 pub mod follower;
