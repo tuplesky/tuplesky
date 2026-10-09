@@ -15,6 +15,11 @@ role = "production"
 name = "coordd"
 path = "src/main.rs"
 
+[features]
+# See coord-daemon's feature of the same name: the register check's
+# negative control, never built for anything else.
+skip-read-confirmation = ["coord-daemon/skip-read-confirmation"]
+
 [dependencies]
 coord-daemon.workspace = true
 coord-membership.workspace = true
@@ -45,6 +50,8 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "si
 rcgen.workspace = true
 reqwest.workspace = true
 rustls.workspace = true
+# The global allocator (task-d60).
+mimalloc.workspace = true
 
 [dev-dependencies]
 coord-sdk.workspace = true
@@ -70,6 +77,10 @@ serde_json.workspace = true
 # daemon itself.
 coord-harness.workspace = true
 coord-wan-bench.workspace = true
+# The Jepsen client shim, driven against a running domain; test-only too.
+coord-jepsen.workspace = true
 time.workspace = true
 axum.workspace = true
 coord-authn.workspace = true
+# A dial against real listeners of both planes (task-d16).
+coord-transport-testkit.workspace = true

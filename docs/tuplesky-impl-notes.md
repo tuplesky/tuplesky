@@ -2506,11 +2506,50 @@ outside it looked exactly like a domain that had stopped accepting
 sessions, which is why it took a counter to see.
 
 The bias is a budget now: after `PEER_BEFORE_API` consecutive peer
-events the caller's plane is polled first for one turn. 64 is high
+events the caller's plane is polled first for one turn. 8 is high
 enough that the ordering still holds for the case it is for -- a burst
 of votes for one command, a recovery summary -- and low enough that a
 caller waits for a bounded number of frames rather than for the domain
 to go quiet.
+
+It was 64 until task-d33, and a bound is not the only thing the number
+sets: it is also the caller's plane's *share* while the peer plane never
+goes quiet, one event in `PEER_BEFORE_API + 1`. A replica catching up
+keeps it busy for a minute at a time. Counted per second in
+`a_replica_that_falls_behind_catches_up_without_starving_its_own_catch_up`
+under load, one voter took 200 to 400 peer events a second and 2 to 7 of
+its callers', where the other two took 40 to 80. That plane carries more
+than callers: it is where the other frontends' collectors submit and
+where the evidence for this node's own collector comes back. So a
+caller's request sat 36 seconds in the transport before the loop read it,
+and evidence the other voters sent in 150 ms reached the collector 28
+seconds later; the answer came just after the caller's 45 seconds. Four
+copies at a time on four cores, the test failed 8 runs of 28 at 64 and
+none of 20 at 8, and the runs finished in 73 to 87 seconds rather than 85
+to 104.
+
+Most of what kept that plane busy was the leader asking again for what
+it already had. `resend_unvoted` (task-d07) sent every voter its first
+16 unadopted proposals, with the leader's own adoption of each, on every
+call of `coordd`'s 250 ms timer, and a voter that is behind -- or whose
+adoptions are queued behind this leader's own work -- lacks the same 16
+on every call. Each came back as an adoption the leader refused as a
+duplicate: 4096 to 16383 of them in the leader's log in the runs that
+failed, in CI and locally, and a follower that had kept no evidence
+adopted the proposal again and wrote the row again. The leader's control
+lane to the voter that was behind filled, and what it dropped then was
+the fresh proposals and commits that would have let that voter catch up:
+a loop that feeds itself, which is why the test's time on CI is bimodal,
+44 to 62 seconds on four runs and 117 and 123 on two. The gap between
+two re-sends of one proposal to one voter now doubles, from one call to
+`RESEND_BACKOFF_CAP` (4), and the window is still the first 16 so that a
+proposal waiting out its gap does not hand its place to a later one. The
+first re-send is as prompt as before, and 4 calls is one second, which
+is `STILL_FOR`: a proposal that really was lost is sent again before its
+voter decides it is stuck and fetches a peer's executed history on the
+bulk lane. A cap of 16 did that once in 8 runs. Two copies of each build
+at a time on four cores, 8 runs each, the runs finished in 100 to 107
+seconds against 109 to 120 for the build without it, every round.
 
 On the same sequence of eleven rows against one standing domain:
 
@@ -3717,6 +3756,16 @@ ledger, or a durable "executed" answer is a protocol decision for
 `coord-consensus`, and this change does not make it. The plan now owns
 it as task-d05, a prerequisite of task-64.
 
+**A limit of this change: a campaign that is making progress is still
+abandoned.** The election timer gives a campaign until its ceiling
+(16 s). A candidate still gathering payloads when that passes is
+replaced by the next ballot, which starts from scratch, even if it had
+most of what it needed. With the whole history to fetch at eight
+payloads an answer, that is how a restarted voter campaigned for ever
+in the Jepsen runs. With task-d05 a campaign fetches only the live
+window, so it is short and this rarely matters. It is recorded here
+because task-d05 removes it in practice, not by design.
+
 ## A request bound that bounded nothing
 
 The task-c01 follow-up. `limits.max_request_bytes` sized the collector's
@@ -3801,3 +3850,6516 @@ The tests:
   so what refuses it is the pin and not the signature.
 - A `coord-membership` test covers the PEM round trip, a wrong key, and
   a key on another curve.
+
+## A retired command stays its key's latest
+
+task-d06, from finding 1 of the Jepsen client (#98). The client's run
+was `:valid? false`: G1a, a lost update, incompatible orders on about
+twenty keys, and a PL-1 cycle, all through one follower. The pause stress
+driver reproduced it without Jepsen, in ballot 0 with no election. A
+follower acknowledged about thirty appends as `ok` and served reads
+showing them, while the other voters read a different continuation from
+the same point; its log then showed `release-record-mismatch` for one
+command, past two thousand times.
+
+**Cause.** Every command is initialized on the conservative key, and
+depends on that key's latest command. That is what makes the chain total.
+`CommandTable::retire` cleared the key's latest when it retired it.
+`initialize` reclaims -- retiring every executed record -- exactly when
+the table is full, and before it computes the dependencies. So the first
+command a full leader proposed named no dependency at all.
+
+- On the leader nothing looked wrong: everything it retired had executed
+  there.
+- A follower still behind the command that should have been named (a
+  payload missing, its own table full, a proposal dropped) found the new
+  command committed and ready, with nothing ordering it after the
+  backlog, and executed it first.
+- Same committed set, two execution orders: a fork right after the common
+  prefix.
+
+The review proposed a ten-line test that decides it. Before the fix, the
+command initialized after a reclaim had no dependencies.
+
+**Fix.** `retire` keeps the key's latest.
+- A replica that already executed it reads the tombstone as EXECUTED.
+- A lagging replica waits until it has executed it, which is the order
+  every replica must keep.
+- The tombstone of a command that is still some key's latest is never
+  evicted by the recency bound, so the guards always answer for what the
+  next proposal on that key names. There is at most one per key, and each
+  goes in its turn once a newer command has taken its key.
+
+**The same break at an election.** The review of #99 found the chain
+broken a second way. A key's latest command is written by `initialize`,
+which on a follower runs when a payload arrives, so a follower's latest
+is the last payload to reach it, in arrival order, not the leader's
+proposal order. `accept` and `adopt` never move it. A follower that wins
+re-proposes the recovered order through `repropose`, which only accepts,
+so its first fresh proposal named whatever payload had reached it last.
+That can be a command in the middle of the recovered order. A voter
+holding the tail committed but without its payload then found the fresh
+command ready and executed it first: the same fork as the reclaim, at a
+ballot change. `Leader::from_recovered` already computed the tail, to
+chain the re-proposed set after it, and did not store it. Now it
+anchors the tail as the conservative key's latest (`CommandTable::anchor`,
+the third place that writes it, beside `initialize` and `restore`), so
+the first fresh command of a ballot depends on it.
+
+`restore` rebuilds the latest as the record nothing else depends on, and
+picks the largest identity if there are several. The review suggested
+asserting there is exactly one. That does not hold for every table a
+restart can find. A follower's record starts with the dependencies of
+its own arrival order and takes the leader's when it accepts, so before
+every record has been accepted the two orders can give two tails, or
+none. So there is no assertion there.
+
+**Divergence stops the node.** A `release-record-mismatch` means the
+leader's release of a command and this node's own execution record of it
+disagree, so this node executed the committed commands in another order.
+It used to be a recurring log line. Now `settle_from_records` returns it
+at once, sending none of the deliveries it had settled in that pass from
+the same record. The serve loop then stops right there, with
+`this node stopped: release-record-mismatch(<id>) ...`, before it
+re-offers, re-dials or takes another event, so no retry is answered from
+that record after the mismatch is seen. A first version recorded the
+mismatch and stopped at the top of the next pass, which left the rest of
+the batch and one event in between (review of #99). The decision is
+`coord_daemon::settle::offer`. It stops at the first mismatch and returns
+the command, and returns nothing that pass had settled. `serve.rs` stops
+the node on that answer. Since task-d17 the stop also says what it
+compared; see "A divergence stop says what it compared".
+
+**What the frontend trusts.** Two paths answer a caller from this node's
+own execution record rather than from the leader's release, and both are
+sound only if every replica executes the committed commands in one
+order. This task is what makes that hold when a table reclaims.
+- `settle_from_records`: when the collector holds a command's votes but
+  not its release, it answers with the local response, and nothing
+  cross-checks it.
+- `retained_answer`: it answers a retry from the local record before
+  admission.
+
+The mismatch stop covers only the case where a release is held and
+disagrees. The votes-only case has nothing to compare against.
+
+### What the tests show
+
+- `graph.rs` `the_command_after_a_reclaim_still_depends_on_the_last_one`:
+  the review's test. A table at capacity, every record executed, one more
+  initialize: its dependency is the last command, which is retired and
+  answered for by its tombstone.
+- `graph.rs` `a_keys_latest_tombstone_outlives_the_bound`: a quiet key's
+  latest keeps its tombstone through many retirements on a busy key, and
+  the next command on it passes the guard. Once superseded, it goes in
+  its turn.
+- `activation.rs` `a_follower_behind_a_full_leader_executes_in_the_leaders_order`:
+  r2 never gets command 32's payload, and the full leader proposes 33
+  after a reclaim. Without the fix, r2 executes 33 before 32. With it, r2
+  waits, and once the payload arrives it executes both in the leader's
+  order.
+- `activation.rs` `a_new_leaders_first_command_follows_the_recovered_tail`:
+  the review's election case. r2 receives C's payload before B's, while
+  the leader ordered B then C. r1 holds C committed, without its payload.
+  r2 wins. Without the anchor, D names B, and r1 executes B, D where r2
+  executes B, C. With it, D names C, r1 waits for C's payload, and every
+  voter executes B, C, D.
+- `settle.rs` `a_mismatch_ends_the_turn_and_sends_nothing` and
+  `a_turn_without_a_mismatch_sends_what_settled`: `offer`'s stop, and
+  what it sends when nothing disagrees. `repair.rs`
+  `a_record_the_release_contradicts_stops_the_turn` stages the mismatch
+  through a real collector holding the leader's release. The
+  contradicting record stops the turn and settles nothing, and the true
+  record settles the command.
+- `graph.rs`
+  `a_hot_key_keeps_working_after_its_executed_predecessor_is_retired`
+  pinned the old rule: after the key's latest was retired, the next
+  command depended on nothing. It now requires the dependency on the
+  retired latest.
+
+### What is left
+
+- A follower that missed a proposal never learns the command, and holds
+  everything after it until a Sync. That is finding 3, now task-d07.
+- Recovery carries the whole history (task-d05). Past the tombstone
+  window, a lagging replica meets that limit as a stall, not as a fork.
+- A replica that already forked is not repaired by this change. The
+  divergence stop keeps it from answering from its record.
+
+## Recovery bounded by what the voters executed
+
+task-d05, from the Jepsen client's runs on #98. No run served past its
+first election. Every node served about 80 transactions per 20 s until
+the first fault that cost the leader or the quorum. From then on the
+domain served nothing, through healing and restarts. The `ok` counts
+measured how long the random fault schedule took to reach an election,
+not anything about the fixes.
+
+### The table capacity is configuration
+
+`coordd` gave both voter configurations a command table of 64, with
+nothing to change it. Recovery names the whole history, and a candidate
+must hold the whole selection. So past about twice that many executed
+commands, a voter cannot tell retired history from unknown commands. It
+asks for payloads it executed long ago, eight to an answer, and cannot
+hold them anyway. With 387 commands executed, a restarted voter's
+campaign counted 330 missing payloads and never bound.
+
+`limits.command_table_capacity` now sets it.
+- The default is 1024 (1000 since task-d20, below).
+- The accepted range is 32 to 1536 (1000 since task-d20). A value
+  outside it is refused at start, naming the setting.
+- The maximum comes from the Sync, not from memory. A report names up to
+  about twice the table: its live records and its tombstones. A Sync is
+  selected from a majority of reports, and it is written as one row
+  (about 2 MiB) and sent as one frame (4 MiB). At 1536 a worst-case Sync
+  for five voters is about 1.6 MiB. `compose.rs`
+  `the_largest_table_gives_a_sync_that_fits_a_row_and_a_frame` builds
+  that worst case and writes it.
+- The default is near the ceiling on purpose. A worst-case Sync at 1024
+  is already about two thirds of a row, and the default is what the
+  fault runs exercise, so it is set as high as leaves room for a
+  majority's reports to vary.
+- It is a local setting, and voters of one domain may differ. No
+  replicated result depends on it, so it is not one of the security
+  gate's switches (design 20.5).
+
+### Recovery is bounded by what the voters executed
+
+The design choice among the plan's three candidates is the third: a
+durable "executed" answer, plus a report that leaves out history.
+
+**The executed answer.** `CommandTable` keeps the identity of every
+command it executed and retired, however long ago. The tombstones stay a
+recency window (what the replica still keeps *about* a command); the new
+set only answers "did this replica execute it". `phase_of` answers
+EXECUTED from it. `restore_executed` fills it from the executed-identity
+rows, including rows whose dependency record is gone. It costs one
+identity per executed command, and is the one thing here that still
+grows with the history.
+
+**Recovery reads that answer from `executed_v1` itself.** It used to
+find executed identities only through the dependency rows, and a
+checkpoint trim removes those for an executed prefix while keeping its
+executed rows. A restarted voter then answered "unknown" for every
+trimmed command. A record written after the trim that names one -- the
+first proposal after a reclaim names the retired latest -- failed the
+execution guard as `DependencyUnknown`, on every restart, since the
+state is durable. That is how two voters of the #98 stress run stopped
+for good. `read_protocol` now pages through `executed_v1` and returns
+the identities without a dependency row as `history`, and `coordd`
+restores them first. The scan is paged, and grows with the history just
+as the set does, until the same floor lets `executed_v1` forget a
+prefix.
+
+**The closure stops at that answer too.** Executing a command walks its
+closure, and the walk stopped only at a retired command still in the
+tombstone window. A restart retires everything it executed at once --
+about 2,000 commands in the `--fault leader` runs, against a capacity of
+1024 -- and the window then holds the last `capacity` of them. A record
+still live after the restart can reach further back than that: the
+guards answered EXECUTED for the command it reached, and the walk called
+it unknown. Executing that record failed as `DependencyUnknown` on every
+restart, which is the `--fault leader` stop that remained after the fix
+above; it needs no checkpoint. The walk now stops at any command this
+replica executed.
+
+Checked with #98's `shim-stress.py`, on #98's head with and without this
+change:
+- **Without it**, `--fault leader`: voter 1 stopped on every restart with
+  `DependencyUnknown`, and the final read was not served (exit 2).
+- **With it**:
+  - `--fault leader`, three runs: exit 0 every time, no voter stopped,
+    and no anomaly;
+  - `--fault majority`, one run: exit 0 as well.
+
+**History is left out of reports.** A command is *forgotten* when this
+replica executed it and retired it longer ago than its last `capacity`
+retirements. That window is kept apart from the tombstones: those also
+keep every key's latest command for the guards, however old, so with
+commands on ever new keys they grow with the keys, and a report bounded
+by them would too. (The domain uses one conservative key today.) A report
+leaves forgotten commands out, so it names what the voter has not
+executed, and what it executed recently. A Sync, selected from a
+majority of reports, is bounded the same way. A voter that has not
+executed a command every majority reporter forgot is further behind than
+recovery carries anyone; it catches up by the checkpoint path.
+
+**Executed means committed.** A commit is not written as a row, so a
+durable record says ACCEPT for a command long executed. Reports now say
+COMMIT for every command the reporter executed, and the selection
+installs it as committed wherever it goes. Before, it went out as
+ACCEPT: the new leader proposed it again and waited for votes from
+voters that had executed and retired it, which had no record to vote
+from. A follower that receives a proposal for a command it executed and
+retired now drops it rather than holding it for ever.
+
+**A new leader proposes nothing it executed.** A selected command
+installed as committed that the leader already executed has nothing left
+to decide. Re-proposing it only spent the lanes: the Jepsen run's leader
+re-proposed about 350 commands in one pass, and the lanes refused the
+ones that mattered along with them.
+
+**Memory follows the window.** When a voter's durable ledger outgrows
+four times its table, it drops the durable records, payloads, served
+payloads, proposals, votes and adoption orders of forgotten commands. A
+restarted voter retires everything it executed, in execution order, and
+sweeps at once: every dependency row comes back as a record, and it
+used to report all of them to the first candidate that asked, which
+after a kill is straight away.
+
+**A candidate that far behind does not lead.** The selection names what
+it lacks only as a dependency of the oldest command it carries, since
+every reporter left that command out. Before binding, a candidate checks
+every dependency of a selected entry: one that the selection does not
+carry and the candidate has not committed means it is behind every
+reporter's window. Bound and won, the ballot would have a leader that can
+never execute again. Its execution was guarded, so this was never a
+wrong result, but it was a domain without a working leader. The
+candidate abandons the campaign, records `Behind`, and does not campaign
+again this boot; a voter that is not behind leads instead.
+
+**Restarts stay swept.** A restarted voter sweeps what it forgot as it
+restores its execution frontier, and `coordd` then restores the payload
+rows. Those used to come back in full, a payload per command ever
+executed until the next sweep. Forgotten commands' payloads now stay out.
+
+### Liveness gaps found on the way
+
+- **A new leader served only its own proposals' payloads.** A recovered
+  command it had no reason to propose again (one it executed) was never
+  served, and a voter lacking it asked for ever. The leader now keeps the
+  payloads it recovered as servable.
+- **A Sync ahead of the promise was refused.** The Sync is published once.
+  A voter whose promise for that ballot was still to come refused it, and
+  was then promised to a ballot it could never synchronize to. A leader
+  receiving it before its own deposing promise dropped it the same way.
+  Both now keep the highest such Sync, and only from its ballot's leader,
+  and install it once the promise is durable. Kept by arrival instead, a
+  lower Sync arriving second replaced the higher one, which was then
+  lost. This had been hidden: the new leader's re-proposals used to
+  bring such a voter back as a side effect.
+- **A voter with a long history could not start again.** Recovery charged
+  every protocol row, payload and executed row to one `ViewBudget`, and
+  `coordd` passes the schema's (10,000 rows, 16 MiB) and treats a
+  recovery error as fatal. In the five-node Jepsen run the ballot-1
+  leader ended every restart on `protocol rows exceed the recovery
+  budget` (#98). Nothing in `coordd` trims protocol rows yet: its
+  housekeeping publishes local checkpoints (task-j04), which retire
+  journal prefixes, and the quorum floor that lets a trim remove the
+  dependency rows of an executed prefix (task-53) is not wired in. So a
+  voter holds one dependency row per command it saw, and any long run
+  crosses 10,000. That budget exists for the execution path, where an
+  overrun is a replicated result; recovery is not one. `read_protocol`
+  now reads every row the store holds, a page at a time within the
+  budget, as the executed identities already were. What it keeps is what
+  the machine keeps for the life of the process anyway.
+
+### What the tests show
+
+- `graph.rs` `an_executed_command_is_answered_for_long_after_its_tombstone_went`:
+  forty commands through a table of two. The tombstones stay bounded, and
+  every command still reads as EXECUTED.
+- `activation.rs`
+  `an_election_after_more_history_than_the_table_holds_asks_for_nothing_executed`:
+  400 commands at capacity 32, then a follower restart and a leader loss.
+  - A follower's report stays at about twice the table, restarted or not.
+  - The candidate wins in one campaign and asks for no payload of a
+    command every voter executed.
+  - The Sync names at most four times the table.
+  - The new ballot serves.
+  - Negative controls: without the executed answer the cluster never
+    settles; without the report window a follower reports 112 commands
+    where the bound is 65.
+- `activation.rs` `a_sync_ahead_of_the_promise_is_installed_once_the_promise_is_made`:
+  r1's promise request is held back until r2 has won and published its
+  Sync. r1 then synchronizes and serves. Without the fix it stays
+  unsynchronized.
+- `graph.rs` `history_on_distinct_keys_is_forgotten_past_the_window`:
+  forty commands, each on its own key, through a table of four. Every one
+  keeps its tombstone as its key's latest, and only the last four are
+  still reported. Negative control: bounded by the tombstones, all forty
+  are.
+- `activation.rs` `a_candidate_behind_every_reporters_window_does_not_win`:
+  r2 misses 200 commands, the leader goes, and r2 campaigns first. It
+  does not win and does not campaign again; r1 leads, and the next
+  command executes. Negative control: without the check, r2 wins and the
+  cluster never settles.
+- `activation.rs` `a_leader_keeps_the_highest_sync_ahead_of_it`: Syncs of
+  ballots 2 and then 1, and one of ballot 3 relayed by a voter that does
+  not lead it, leave ballot 2's kept. Negative control: kept by arrival,
+  the relayed one is kept.
+- `graph.rs` `a_closure_stops_at_history_older_than_the_tombstones`: six
+  commands executed and retired through a table of two, and a committed
+  seventh that depends on the first. Its closure completes. Negative
+  control: stopping only at tombstones, it fails as `DependencyUnknown`.
+- `trim.rs` `a_record_that_names_a_trimmed_command_executes_after_a_restart`:
+  a trim removes commands 7 and 8's dependency rows, and command 9,
+  written after it, names 8. Recovery returns 7 and 8 as executed, and a
+  table restored as `coordd` restores one executes 9. Negative control:
+  read through the dependency rows alone, 7 and 8 are unknown.
+- `trim.rs` `a_voter_with_more_protocol_rows_than_the_schema_budget_recovers`:
+  11,000 dependency rows recover under the schema budget, and pages of
+  seven rows read the same records. Negative control: the old read fails
+  it with the Jepsen run's error. `recovery.rs`
+  `recovery_reads_every_row_however_many_pages_it_takes` (was
+  `recovery_charges_every_row_against_one_byte_budget`, which pinned the
+  cap): 32 rows under a 1 KiB page read the same records and payloads as
+  one page.
+- The election test above also restores payloads the way `coordd` does,
+  and a restarted follower holds no more payloads than records. Negative
+  control: restoring every payload row fails it.
+- The deterministic cluster's `settle` is now bounded, so a cluster that
+  cannot converge fails with a message instead of hanging the test run.
+
+### What is left
+
+- The executed-identity set, and the `executed_v1` scan that restores
+  it, grow by one identity per command. So do the protocol rows, and
+  recovery's memory and time with them. A floor that lets them forget a
+  prefix every voter executed needs task-53's checkpoint path wired into
+  `coordd`, which it is not.
+- History is swept from `applied`, so a leader that stops executing keeps
+  a ledger above the sweep bound until its next execution. It is
+  harmless: nothing is added to it meanwhile.
+- A voter further behind than every majority reporter's window is not
+  brought up by recovery, and nothing else brings it up yet. The
+  checkpoint path is what should.
+- Bringing a candidate that far behind up before it leads, rather than
+  standing it down (above), is future work with the rest of the
+  checkpoint path.
+- Proposals a voter never received (task-d07).
+
+## A proposal is sent until every voter has voted on it
+
+task-d07, cause 2 of "no domain serves past its first election" (#98), and
+the Jepsen client's finding 3. The protocol assumes a proposal reaches
+every voter. The transport drops a frame by design when a lane is full
+or the peer is not linked yet, and nothing sent a proposal again. A voter
+that missed one held everything after it, since every later proposal
+depends on it through the conservative key, and executed nothing more
+until a Sync realigned it. Writes still succeeded where the leader
+answered them; reads through that voter waited for ever.
+
+Three triggers were known:
+- a voter not linked yet when the proposal went out: the last voters
+  started, in the Jepsen runs;
+- a frame a full lane refused: a new leader re-proposed its whole
+  selection in one pass, and a 64-frame control lane refused dozens;
+- a re-proposal that reached a follower before its Sync, refused as
+  `FencedByPromise`.
+
+### The re-send
+
+- **`Leader::resend_unvoted(per_voter)`** sends each voter, again, the
+  durable proposals of the ballot it has not adopted. They go oldest
+  first, at most `RESEND_PER_VOTER` (16) per voter per call, as the same
+  proposal: the same sequence number, dependencies, paths and admission.
+  The admission is now kept in `Proposal`, so a re-send is the same
+  proposal even after the leader's record was retired.
+- **What a voter lacks is read from its adoption acknowledgements.**
+  Only those say it received a proposal. A fast acknowledgement goes
+  out when the payload arrives, with no sequence number, proposal or
+  not. Counted as a vote, it credited a fast-set voter with a proposal
+  it never received and with every one before it. The chain is total,
+  so a voter that adopted a proposal holds every earlier one, and only
+  proposals after the latest it adopted are sent. One it never
+  acknowledges -- a command it executed and keeps no record of -- stops
+  being sent once it adopts a later one. (task-d15 narrows this: only a
+  proposal the leader has committed stops being sent. See "A leader asks
+  again for every vote it still needs".)
+- **A duplicate proposal is re-acknowledged.** A follower that receives
+  a proposal it already adopted or holds publishes to the leader, again,
+  what it acknowledged for that command in this ballot. It is the same
+  frames, under the context and barriers they were first published
+  with. A lost acknowledgement used to be as final as a lost proposal:
+  with one voter down, the command never committed.
+- **Across a restart too.** What a follower published is kept for its
+  boot, so a restarted one had nothing to publish again. When nothing is
+  kept, a duplicate proposal of an adoption restored from the rows is
+  adopted again: the same row is written, and acknowledged once it is
+  durable. A proposal for a command the follower has decided --
+  committed or executed, retired or not -- is answered with an adoption
+  acknowledgement to the leader alone, and only when it carries the
+  dependencies and admission of the follower's durable record. Decided,
+  the command's dependencies are those; a command it keeps no durable
+  record of any more is left alone. Nothing is written for it, and no
+  frontend is sent evidence of it.
+- **A new leader publishes its re-proposals in batches.**
+  `from_recovered` makes every re-proposal durable, but publishes only
+  the first `REPROPOSE_BATCH` (32). The re-send delivers the rest,
+  oldest first, as votes come back.
+- **`coordd` drives it.** A leader calls it every `RESEND_INTERVAL`
+  (250 ms), from the serve loop, and wakes for it on a quiet domain,
+  since the voter it re-sends to is the one not sending.
+- **The numbers.** 250 ms is tuned for a release build. A debug build's
+  adoption can take longer, so there a re-send often races the first
+  vote; the duplicate is answered from what was kept, which costs a
+  frame. `REPROPOSE_BATCH` (32) and `RESEND_PER_VOTER` (16) together
+  stay under the 64-frame control lane to a voter, with room left for
+  the leader's other traffic on it.
+
+### The regression the shim test found
+
+With the first version of this change carried on #98,
+`jepsen_shim::each_operation_does_what_its_line_says` failed every time:
+the first read through voter 2 stayed pending. Traced with temporary
+logging:
+- The domain's first proposal goes out before the followers are linked,
+  and neither receives it. Before this change the collector's re-offer
+  made the leader republish it to every voter until it was learned.
+- The re-send sent it to voter 3 only. Voter 2 is in the fast set and had
+  fast-acknowledged the command when its payload arrived, and that
+  counted as having voted on it.
+- Voter 3 adopted it, the leader learned the command from that, and
+  republishing stopped. Voter 2 never got the proposal, held everything
+  after it, and never executed the session that the read waits for.
+
+Counting only adoption acknowledgements closes it: the whole shim test
+file passed 10 of 10 runs, where it had failed on the first run before.
+
+### What the tests show
+
+- `activation.rs`:
+  - `a_voter_linked_after_a_proposal_went_out_learns_it_from_the_resend`:
+    r2 misses c1's proposal. Before the re-send, it has executed nothing;
+    after it, every voter executes c1, c2.
+  - `a_fast_acknowledgement_does_not_stand_for_the_proposal`: r1, in
+    the fast set, receives c1's payload but not its proposal. Negative
+    control: counting its fast acknowledgement as a vote, r1 never
+    executes c1.
+  - `a_lost_acknowledgement_is_published_again_on_a_resend`: with r1
+    down, r2's acknowledgement is dropped. The command commits only once
+    the re-send draws the re-acknowledgement. Negative control: without
+    the re-acknowledgement it never commits.
+  - `a_lost_acknowledgement_is_published_again_after_the_voter_restarts`:
+    the same, with r2 restarted after executing c2 and before the re-send.
+    Negative control: without the acknowledgement for an executed
+    command, c2 never commits on r0.
+  - `a_restored_adoption_is_acknowledged_again_on_a_resend`: the same,
+    with r2 restarted before it executed c2. Negative control: without
+    adopting again, c2 never commits on r0.
+  - `a_proposal_refused_ahead_of_the_promise_is_sent_again`: the new
+    ballot's first command reaches r1 before r1 promised. After its Sync,
+    r1 lacks it until the re-send.
+  - `a_new_leader_publishes_its_reproposals_in_batches_and_all_arrive`:
+    69 commands to propose again, and the first pass to a follower is 32.
+    All 69 arrive through the re-send. Negative control: publishing all
+    at once sends 69.
+- `multi_host.rs` `a_voter_started_after_the_first_write_serves_reads`:
+  the decisive case, with real daemons. Voters 1 and 2 serve a write,
+  voter 3 starts afterwards, and a read through voter 3 is served.
+  Negative control: with the serve loop's re-send removed, the read is
+  not served.
+
+### What is left
+
+- A voter that never votes (it is gone) is sent up to 16 proposals per
+  interval, and they are dropped at its unlinked lane. It is bounded, not
+  free.
+- The one re-send that does not converge on its own: in a quiet domain,
+  a proposal for a command the voter has no ledger record of any more
+  (swept as history, or trimmed with a checkpoint's prefix) draws no
+  answer from `acknowledge_decided`. It is re-sent to that voter every
+  interval until the voter adopts a later proposal. That is one small
+  frame per 250 ms, within the 16 per voter. (After task-d15, a proposal
+  the leader has not committed is re-sent past that point too.)
+- `shim-stress.py --fault leader` and `--fault majority`, and the Jepsen
+  workflow, were run on #98 with this branch's code carried byte for
+  byte, not on this branch itself. The stress runs pass (4 of 4, exit 0).
+  The Jepsen run is `:valid? true`, but the five-node domain still stops
+  serving for minutes after partitions and pauses. That is open on #98,
+  and no cause has been traced to this task.
+
+## The leader carries the decision to every voter
+
+task-d09, the root cause of the five-node Jepsen stall that remained with
+task-d05 through task-d07 carried (#98). A follower commits a command
+only from the acknowledgements it receives itself: its `VoteSet` needs
+the leader's proposal and a majority's adoptions, or the fast set's
+evidence. Every acknowledgement is published once, to every voter, on a
+lane that refuses a frame when its queue is full, and nothing publishes a
+missed one to that follower again. No message carried a decision from
+the leader to a follower outside an election's Sync.
+
+With three voters that never showed: the leader's proposal and the
+follower's own adoption are already a majority, which is why the
+three-voter stress runs passed. With five, a follower needs two of its
+peers' acknowledgements as well. In the Jepsen runs a ring partition left
+two followers seeing the leader and one peer that was paused or cut off
+itself:
+- they adopted every command and could commit none of them;
+- the chain is total (task-d06), so nothing after the first missed
+  quorum could commit either;
+- within a table's worth they refused every payload as backpressure;
+- the leader lost both votes, and the domain served nothing to the end
+  of the run, through the heal.
+
+### The frontier
+
+- **`Leader::committed_through`** is the highest sequence number of the
+  ballot whose whole prefix is committed at the leader with its batch
+  durable. Every sequence number below the next went to a proposal of
+  the ballot, and one no longer in `proposals` was forgotten, which only
+  happens to a command executed long ago.
+- **`Leader::announce_committed`** sends it to every other voter as
+  `ProtocolMessage::Committed { ballot, through }`. `Machine::
+  resend_unvoted` calls it after the re-send, so `coordd` sends it every
+  `RESEND_INTERVAL` (250 ms). The frame is a few bytes and carries the
+  whole frontier, so a dropped one is repaired by the next; it needs no
+  barrier, since the frontier counts only durable batches. It is the
+  last variant, so the payload-transfer discriminants stay where
+  `is_payload_transfer` expects them.
+- **A follower commits what it adopted up to it.** Only a frontier from
+  the leader of the follower's current ballot is taken, and it is reset
+  with the ballot. Every durable adoption of that ballot at or below it
+  is committed, in sequence order. `learn` alternates this with the
+  acknowledgement rule until neither commits anything more.
+- **Why it is sound.** The leader's commit is a decision under the
+  crash-fault model. An adoption here took the dependencies of that
+  leader's proposal with that sequence number, which is what its commit
+  was over. Only a durable adoption counts, as only a durable adoption
+  counts as this replica's vote. The frontier commits nothing the
+  follower did not adopt: a command it holds initialized without the
+  proposal stays where it is.
+- **An adoption carries the proposal's admission.** A proposal that
+  arrived before the payload was held, and adopted once a payload was
+  bound, even one under other attested facts. `on_proposal` compared the
+  admissions only when the payload came first. Adopted, the command
+  committed from the frontier, or from the leader's proposal and two
+  peers' acknowledgements, and executed under facts the quorum never
+  admitted (Codex, on #103). A held proposal whose admission differs from
+  the bound payload's is not adopted, and not admitted past a full
+  table's capacity either.
+
+### A follower that took other facts rebinds to the leader's
+
+Refusing such a proposal left the voter stalled on that command, and
+with the chain total, on everything after it. The conflict is routine,
+not an attack:
+- Every presentation of a command mints its own admission receipt. The
+  receipt id mixes the collector's clock and a counter, and the
+  admission digest binds the receipt id and the admission time.
+- A submitter that presents again after a lost link therefore reaches
+  the voters under facts the leader never saw. A voter that missed the
+  first presentation takes the second, and then meets the leader's
+  proposal under the first.
+
+So a follower now fetches the leader's facts and binds them in place of
+its own, while nothing has been accepted over them:
+- **Held, not dropped.** A proposal under other facts than a record at
+  PRE-ACCEPT is held and reported as `AdmissionConflict`, whichever
+  arrived first. It is not counted in the vote set, which may have bound
+  the other facts. Past PRE-ACCEPT the record's facts are the ones this
+  replica acknowledged adopting, and the proposal is refused as before.
+- **Asked for as missing.** The command counts as a missing payload, and
+  as a due one once the leader's frontier covers it, so the paced ask
+  names it.
+- **Rebound.** A transferred payload under the held proposal's facts
+  rebinds the record (`CommandTable::rebind`, only at PRE-ACCEPT). The
+  payload and dependency rows are written again under the new facts in
+  one batch, so a restart restores the record as rebound. The old
+  payload is no longer served, and the new one is once durable. The vote
+  set starts again from the proposal. Then the proposal is adopted, and
+  the frontier commits it.
+- **What is replaced** is this replica's local order, which adoption
+  replaces anyway, and its fast acknowledgement under the other facts.
+  No quorum counts that acknowledgement: every learning predicate needs
+  the leader's proposal, and a vote set counts nothing under facts other
+  than the ones it bound.
+
+### A full table admits the command whose turn has come
+
+The first version of the tests found a second stall behind the first.
+- The frontier committed the eight commands the follower had adopted,
+  and they executed.
+- The payloads it then asked for arrived in no particular order, and
+  the table filled again with later commands.
+- None of those can be adopted before the next command in the chain,
+  and that one was refused as backpressure. So were its later
+  retries, for ever.
+
+In the Jepsen runs the same happens with submissions: new commands'
+payloads reach a follower that is behind and fill its table ahead of the
+commands it needs. Two changes close it.
+- **Admission.** A payload whose held proposal has every dependency at
+  least ACCEPT here initializes past the table's capacity
+  (`CommandTable::initialize_beyond_capacity`, `turn_has_come`). It is
+  adopted at once, and its adoption is the vote the leader may be
+  waiting for. This is the one place the table's bound is crossed on
+  purpose. How far is bounded by the chain of held proposals each of
+  whose dependencies is adopted before it, and the held proposals are
+  bounded: at most `HELD_PROPOSAL_SLACK` (four) tables' worth. The
+  commands admitted are the ones execution needs next, so committing
+  and executing them is what shrinks the table again.
+- **Not only once the leader has committed it.** The first version
+  admitted such a command only within the leader's commit frontier.
+  With a majority of followers full, that frontier never moved: the
+  leader could not commit the command without their votes, and they
+  would not adopt it until it had. The five-node Jepsen run on
+  `7f62f17` stopped at 265 s with no fault active and three followers
+  refusing proposals as backpressure in the thousands, which is this;
+  `a_command_whose_turn_has_come_is_admitted_before_the_leader_commits_it`
+  reproduces it deterministically.
+- **The ask.** A follower's bounded payload ask names first, and in the
+  leader's order, the held proposals whose payload it lacks and whose
+  turn has come or which the frontier covers: half the ask, so the
+  rotation through the rest still moves. Before, the one command whose
+  turn had come was reached once per rotation through a missing set of
+  thousands.
+
+### A restarted follower asks for the proposals it adopted
+
+A follower killed with adoptions in flight comes back with them at
+ACCEPT, restored from the rows with no sequence number. The row names no
+ballot, and every ballot numbers its proposals from zero, so nothing
+durable says which of the leader's sequence numbers an adoption was, and
+the frontier cannot commit it. The leader counted its acknowledgements
+before the kill and never re-sends them. With the chain total, nothing
+the follower adopts afterwards commits either, until the next election.
+Jepsen's kill nemesis makes this routine.
+- **The ask.** Each time the leader's frontier arrives, a follower that
+  holds such adoptions asks the leader for their proposals:
+  `ProtocolMessage::ProposalRequest { ballot, commands }`. It names at
+  most `MAX_PROPOSAL_ASK` (16) and rotates through the rest, as the
+  payload ask does. So it is paced by the leader's re-send timer and
+  needs no timer of its own.
+- **The answer.** The leader sends each durable proposal of the ballot
+  that it names, byte for byte as a re-send would. A command it did not
+  propose in the ballot gets no answer and waits for the next Sync, as
+  before.
+- **Adopted again.** The follower takes the answer as any duplicate
+  proposal: an adoption with nothing kept and below COMMIT is adopted
+  again (task-d07), this time with its sequence number. The frontier
+  then commits it.
+
+### What the tests show
+
+`crates/coord-consensus/tests/frontier.rs` runs five voters, so a follower
+needs its peers:
+- `a_follower_that_hears_only_the_leader_executes_what_it_commits`: r3
+  receives every proposal and no peer's acknowledgement. The re-send
+  alone leaves it at ACCEPT on all ten commands; the frontier executes
+  them.
+- `two_followers_cut_from_their_peers_both_execute`: the ring partition,
+  with r3 and r4.
+- `a_follower_whose_table_filled_while_it_could_not_learn_catches_up`:
+  a table of eight, 32 commands, backpressure on r3; it executes all 32
+  in the leader's order.
+- `a_follower_asks_first_for_what_the_leader_committed_in_its_order`:
+  r3 holds 32 proposals without their payloads; its first ask leads with
+  the one whose turn has come.
+- `a_command_whose_turn_has_come_is_admitted_before_the_leader_commits_it`:
+  three of four followers' tables of eight fill with later commands
+  before the one they all depend on, which reaches only the leader and
+  r1. Every voter executes all nine.
+- `the_frontier_commits_nothing_the_follower_did_not_adopt`: r3 receives
+  payloads and no proposals; the frontier reaches it and nothing moves
+  past PRE-ACCEPT, until the proposals do.
+- `a_follower_restarted_with_adoptions_in_flight_executes_what_the_leader_commits`:
+  r3 adopts six commands and commits none. It is killed and restarted
+  under the same leader, and three more follow; it executes all nine.
+- `a_follower_that_took_a_command_under_other_facts_after_its_proposal_rebinds`:
+  the proposal reaches r3 before r3's own submission, which carries
+  another admission receipt. r3 reports the conflict, rebinds to the
+  leader's facts and executes the command and three more under them.
+  The durable row names the leader's facts, and a restart restores its
+  payload.
+- `a_follower_that_took_a_command_under_other_facts_before_its_proposal_rebinds`:
+  the same with r3's submission first.
+- `a_frontier_from_another_voter_is_ignored`, and
+  `the_leaders_frontier_stops_at_the_first_command_it_has_not_committed`
+  (three of five voters down: the frontier stays, then moves once they
+  are back).
+
+Negative controls, each run and failing:
+- with a follower that ignores the frontier, six of the first seven
+  fail; the leader's own frontier test is the one that passes;
+- without the proposal ask, the restart test executes nothing on r3;
+- without the admission check at adoption, r3 executes the conflicting
+  facts in both rebind tests;
+- without the rebind, r3 executes nothing in either;
+- without admission past capacity, the full-table test executes the
+  first eight and stops;
+- with admission past capacity only within the frontier, no voter
+  executes anything in the three-full-followers test;
+- without the ordered ask, the ask test leads with other commands.
+
+### What is left
+
+- **Restored adoptions from an earlier ballot.** An adoption the
+  current leader never proposed gets no answer to the ask, and waits for
+  the next Sync. The ask keeps naming it, within its bound.
+- **Rate.** Repair is still task-d07's 16 proposals per voter per 250 ms,
+  each re-sent with a doubling gap of up to four calls since task-d33,
+  and payloads 8 per ask from the leader alone. task-d10 makes both
+  flow-controlled.
+- **A voter behind the leader's retention** has no path back without a
+  checkpoint: task-d08.
+- **Acceptance on Jepsen.** The five-node Jepsen run is task-d09's
+  acceptance and has not run with this change; it needs #98 to carry it.
+
+## A promise is not a leader
+
+task-d10's first commit, from the five-node Jepsen run on #98. After all
+five voters were killed, the one furthest behind campaigned for ballots 2
+to 6 and was promised each one. Its machine then found itself behind
+every reporter and stood down without a Sync (task-d05), so it never led.
+The two voters that promised it followed those ballots and did not
+campaign. The domain served nothing from then on.
+
+`coordd` counted a voter as led when the ballot it promised named another
+voter it held a link to (task-d01). A candidate collects its promises
+before it knows whether it can bind a selection, so a promise is not yet a
+leader, and one whose candidate stood down held every voter that promised
+it for as long as the link held.
+- **The rule.** A voter has a leader when it leads, or when the leader
+  its promised ballot names is linked and that ballot has synchronized
+  here -- the ballot it votes in, the one whose Sync it adopted, is the one
+  it promised -- or has had the ceiling (16 s) to do so, counted from when
+  this voter first saw the promise (`Election::led`).
+- **Why the ceiling and not the patience.** The first version gave a
+  promise only the patience (1 s). A Sync is not a round trip behind the
+  promise: the candidate collects a report from a majority, paged, and
+  binds its selection durably first, which under load takes longer. Voters
+  then campaigned over live candidates, and in five `--fault random` runs
+  the ballots duelled to between 10 and 46, against 2 to 8 without the
+  rule. The ceiling is what a candidate already gives its own campaign
+  before replacing it (`observe`'s `finishing`), so a promise now gets the
+  same.
+- **The candidate's side** is unchanged: its own campaign is its
+  `campaigning` flag, and a stood-down candidate does not campaign again
+  (task-d05).
+
+### What the tests show
+
+`bins/coordd/src/election.rs`:
+- `a_promise_that_never_synchronizes_is_a_leader_only_for_the_ceiling`:
+  the rule's cases. A promise of ballot 3 while still voting in ballot 2
+  is a leader until the ceiling and not after; a new promise starts its
+  own allowance; the link still matters.
+- `a_voter_whose_promise_does_not_synchronize_campaigns_after_the_ceiling`:
+  stepped through the schedule, a voter held by a promise that never
+  synchronizes campaigns only after the ceiling, and one whose Sync comes
+  just inside it never does.
+
+### What is left
+
+- The five-node Jepsen run is the acceptance, and has not run with this.
+- The rest of task-d10: flow-controlled catch-up and a campaign that is
+  making progress kept past its ceiling.
+
+## A Sync leaves no acceptance of an earlier ballot
+
+task-d11, from the three-voter stress runs on #98. With #100, #103 and
+#104 carried, the one unserved final read left was a domain whose every
+campaign failed as `IncompatibleAccepted`: two reports held one command at
+ACCEPT under the same synchronized ballot with different dependencies.
+The same stall ended a run on the build before any of those changes.
+
+A ballot's leader proposes a command once, so one of the two acceptances
+was not that ballot's. A voter installs a Sync's entries and nothing
+else (`Follower::activate`), and its report labels every record with the
+ballot it last synchronized. So:
+1. A voter adopts x under ballot 0 and is restarted; its table holds x at
+   ACCEPT from its rows.
+2. Ballot 1 is selected without its report and re-proposes x, and the new
+   leader and another voter adopt x under the order ballot 1 gives it.
+3. The voter installs ballot 1's Sync, which does not carry x as an entry.
+   x stays at ACCEPT with ballot 0's dependencies.
+4. Its report for ballot 2 says x was accepted under ballot 1. Beside the
+   other voter's report, `select` raises `IncompatibleAccepted` on every
+   campaign. Without it, `select` installs ballot 0's dependencies as
+   ballot 1's decision.
+
+- **The fix.** At the first installation of a Sync (`on_sync`, not the
+  idempotent re-activation after a restart), every record at ACCEPT that
+  the decision does not carry as an entry is demoted to PRE-ACCEPT. The
+  demoted rows go into the batch of the synchronized-ballot row and the
+  promise, and the ledger stages each of them under that barrier, so a
+  restart cannot bring an acceptance back beside the new marker. The
+  table follows once the batch is durable (`CommandTable::demote`).
+- **Kept:** the payload and the dependencies, which at PRE-ACCEPT decide
+  nothing and which adoption under the new ballot replaces. A record the
+  voter has committed is a decision and stays.
+- **Not kept: the path.** A report carries PRE-ACCEPT entries into the
+  next selection's fast-path analysis (`possible_fast_decisions`), under
+  the synchronized ballot's label. With that ballot's leader absent and
+  the demoted voter its only fast-set reporter, the path x had under
+  ballot 0 would read as evidence that ballot 1 decided x fast, and the
+  selection would promote ballot 0's dependencies (Codex, #105). A
+  demoted record's path is `demoted_path()`, a single-part digest that no
+  initialization computes, and the analysis counts no record with it. A
+  fast set's member that did not pre-accept a command in the ballot rules
+  out a fast decision of it there, so the analysis loses nothing it
+  needed.
+- **Not an acceptance of the new ballot.** A duplicate Sync that arrives
+  while the first one's marker is becoming durable activates the new
+  ballot early, and a proposal of that ballot can be adopted before the
+  marker is durable. That adoption takes the command out of the pending
+  demotions, since its own row follows the marker's batch; otherwise the
+  table would drop to PRE-ACCEPT under a durable ACCEPT row (Codex, #105).
+- **Why only at the first installation.** An acceptance written after the
+  Sync is the new ballot's own. After a restart the marker's batch has
+  already demoted what it had to, and demoting again would take back a
+  vote that counted.
+- **A candidate** installs its own Sync through the same `on_sync` once
+  its selection is durable, so a winning leader's table is demoted the
+  same way.
+- **Not the other way.** Committing such a record because a selected
+  entry depends on it would be wrong: an omission says a majority
+  executed the command, not under which dependencies, and a voter that
+  missed a whole ballot can hold an acceptance of a command the next
+  ballot re-proposed and decided differently. That voter is behind every
+  window, which is task-d08's.
+
+### What the tests show
+
+`activation.rs` `a_sync_leaves_no_acceptance_of_an_earlier_ballot`:
+r1 adopts x after a under ballot 0 and is restarted, then installs a
+ballot-1 Sync that re-proposes x. Its report for ballot 2 has x at
+PRE-ACCEPT under ballot 1, and a selection over it and a ballot-1
+acceptance of x with other dependencies completes with those. The same
+holds after another restart. Ballot 1 is r0's, so r1 is in its fast set,
+and a selection by r2 over r1's report and a report of ballot 0 does not
+select x as a fast decision of ballot 1. Negative controls: without the
+demotion, the report says ballot 0's acceptance is ballot 1's, and the
+selection fails as `IncompatibleAccepted`; with the demotion keeping the
+path, or with the analysis counting `demoted_path()`, the second
+selection takes x with ballot 0's dependencies.
+
+`a_sync_demotes_no_acceptance_of_its_own_ballot`: r1's marker batch is
+held back while a proposal of ballot 1 and a duplicate Sync arrive; r1
+adopts x under ballot 1, then the marker and the adoption become durable
+in that order, and x stays at ACCEPT with ballot 1's dependencies.
+Negative control: without the adoption leaving the pending demotions, the
+marker demotes it.
+
+### What is left
+
+- A winning leader whose own acceptance of a command was demoted
+  re-proposes it with `demoted_path()` as its path, so no fast
+  acknowledgement matches it and the command is learned on the slow
+  path. Before, it carried the leader's path from the
+  earlier ballot, which no follower's acknowledgement in the new ballot
+  was computed against either.
+- The stress runs with this carried are the acceptance.
+
+## A new leader chains after what it executed
+
+task-d12, from a three-voter stress run's `release-record-mismatch` and a
+five-node Jepsen run's lost appends on #98. Both were one fork, made by a
+new leader.
+
+task-d06 made a new leader anchor the conservative key at the recovered
+order's tail before it proposes anything new. `Leader::from_recovered`
+then chained `decision.reproposed` after the entries, in identity order,
+and moved the anchor to every command it knew, whether or not it proposed
+it. `phase_of` answers `Executed` for a command in history with no record,
+and `select` puts every row of a report behind the source ballot in
+`reproposed`. So a selection over a behind reporter's rows anchored the key
+at the largest identity among old commands the leader had executed and
+retired, and the first fresh proposal depended on that command alone.
+Every voter holds the same dependencies for it, and a voter that ran it
+beside the commands after the old anchor had no edge to order them by.
+
+- **The stress run.** The stopped node executed a ballot-3 proposal whose
+  only dependency had executed at position 12; it ran it at position 1179
+  and the other two at 2149, and 161 digests differed after that. The
+  same run's ballot 8 forked on the same old command.
+- **The Jepsen run.** Two ballot-1 leaders left two voters about a
+  thousand rows behind the ballot the next leader recovered from. That
+  leader's fresh proposals forked, and a behind voter executed them before
+  its backlog, against a key that was still empty there. The appends are
+  guarded, so its guard held and it answered `ok`; on the main line the
+  same commands ran against a key with a hundred elements, the guard
+  failed and they had no effect.
+- **Two more hazards in the same loop.** A command the leader had at
+  Commit or beyond was re-proposed chained after the anchor rather than
+  with its decided dependencies. With no entries, the anchor started
+  empty and the first re-proposal depended on nothing.
+
+### The fix
+
+- A re-proposed command the new leader has at Commit or beyond is neither
+  chained nor re-proposed: it was decided in an earlier ballot, with the
+  dependencies it has here. Re-proposing decided commands with their
+  decided dependencies would let a behind voter adopt them again, but a
+  proposal of a decided command is a new mechanism; catch-up is
+  task-d08's.
+- The chain starts at the recovered order's last command the leader has
+  not executed. Else it starts at the last command the leader committed
+  and has not executed yet (`CommandTable::committed_tail`, the committed
+  record no other committed record depends on): execution follows the
+  dependencies, so that command comes after everything the leader
+  executed, and every other voter may have executed it already. Else at
+  the last command it executed (`CommandTable::last_executed`, kept by
+  `execute` and `restore_executed`).
+- On a restart, that last command is the last one replayed. coordd
+  replays history, then the executed commands with rows. Both were read
+  back in identity order; `read_history` now sorts by each row's execution
+  position, as the executed rows already were, so what comes back last is
+  what executed last.
+- **The collector compares a late release with its answer.** A collector
+  that answered from this node's record, with the votes counted and the
+  release not yet in, took the release when it came as settled without
+  looking at it. That is why the Jepsen run's forked voter answered seven
+  times and never stopped. The collector now keeps the result digest with
+  each answer, and a release for a command it already answered must agree
+  with the response and the digest. A difference is `AnsweredOtherwise`,
+  and coordd stops on it as it does on `release-record-mismatch`. That
+  does not prevent the first wrong answer; it stops the node from going
+  on.
+
+**Liveness.** A voter that holds a decided command the Sync omits is at
+PRE-ACCEPT after task-d11 and learns the decision only by catch-up
+(task-d08). Before task-d11 it sat at ACCEPT with no commit coming, so
+nothing regresses.
+
+### What the tests show
+
+`activation.rs`:
+- `a_fresh_proposal_follows_the_tail_not_an_executed_reproposal`: six
+  executed commands on one key, and a selection with no entries that
+  re-proposes the second. The new leader's first fresh proposal depends on
+  the sixth, and the second is not proposed again.
+- `a_reproposal_with_no_entry_to_follow_follows_the_executed_tail`: an
+  undecided command only the new leader holds is re-proposed after the
+  executed tail, not with no dependencies.
+- `a_new_leader_chains_after_what_it_committed_and_has_not_executed`:
+  r2 commits three commands and executes none of them while the others
+  execute all six. As the new leader, with nothing re-proposed and with
+  one of the three re-proposed, its fresh proposal follows the sixth.
+- `a_restarted_candidate_with_no_entries_chains_after_what_it_executed`:
+  the candidate is restarted from its executed commands alone, with no
+  rows to rebuild the tail from, wins and chains after its tail.
+- `reproposals_follow_the_recovered_order_not_identity_order` (task-d06)
+  had re-proposed a command the new leader had executed, which is this
+  bug. It now holds the entries unexecuted and the re-proposed command
+  undecided, and still checks the recovered order.
+
+`trim.rs` `a_trimmed_history_comes_back_in_the_order_it_executed`: the
+trimmed prefix's positions are rewritten so identity order is the reverse
+of position order, and the history reads back by position; a table
+restored from it names the last executed command.
+
+`repair.rs` `a_late_release_that_contradicts_the_answer_is_refused`: the
+release is lost, the collector settles from the votes and the record,
+and the release arrives afterwards. It settles when the record agreed,
+and is refused as `AnsweredOtherwise` when the record had another
+response, or the same response under another digest.
+
+Negative controls: without the Commit skip, the first test fails; with
+the chain starting only at the entries' tail, the second; with the
+chain skipping the committed tail, the committed-not-executed test (at
+`076d218` its case with nothing re-proposed passed, and an anchor at the
+last executed command alone breaks it); with
+`restore_executed` not keeping the last command, the restart test; with
+the history in identity order, the trim test; with
+`check_release` as it was, the response fork is accepted, and without the
+digest comparison, the digest fork is.
+
+### From review
+
+- **Every committed tail.** A live table commits only after a command's
+  dependencies, but a restarted one takes each record's phase from its
+  row: a command installed from a Sync comes back at COMMIT, while one
+  committed from votes left its row at ACCEPT. Two committed records then
+  look last, and nothing says which is. `committed_tails` returns them
+  all and `anchor_all` makes the next command on the key depend on every
+  one of them, once (Codex, #106).
+- **The whole execution.** A late release is compared with the execution
+  the answer came from: digest, position and revision besides the
+  response. Two executions at different positions can answer with the
+  same bytes, and an answer over the deliverable bound is the same
+  `RESULT_TOO_LARGE` whatever it replaced (Codex, #106).
+- **Nothing after the contradiction.** Once a late release contradicts
+  an answer, `Domain::answer` sends nothing until the pass ends in the
+  stop: not the rest of the voter's batch, the parked frames or what the
+  records settle in the same turn (Codex, #106).
+
+### A commit below the source ballot is a decision
+
+The case the chain rule leaves: a new leader that holds a decided command
+only at ACCEPT, having missed the commit, while every reporter that holds
+the decision is behind the source ballot. The source rule sent all of
+those reporters' rows to `reproposed`, so the leader re-proposed the
+command after its tail and decided it a second time; a voter adopting
+that order then reported it beside a commit under one label, which is
+the `IncompatibleAccepted` the stress runs showed.
+
+`select` now takes an entry at COMMIT from any report, executed-as-
+committed ones included, into the selection with its dependencies and
+paths; PRE-ACCEPT and ACCEPT below the source are still re-proposed. A
+commit is a quorum's acceptance of one dependency set, final whatever
+ballot reached it, and the source rule chooses among acceptances. The
+agreement check applies as to any entry, so a below-source commit
+meeting an at-source acceptance under other dependencies is
+`IncompatibleAccepted`: the alarm it should be, where the old rule
+called it stale and kept the acceptance. An at-source copy's sequence
+number and paths outrank a below-source one's, since those are a
+ballot's own.
+
+- The new leader re-proposes such an entry with the decided dependencies
+  where it has not executed it, which is the existing entry path.
+- A behind voter installing the Sync commits those commands without a
+  vote, a partial heal of the task-d11 liveness note.
+- The Sync grows by the behind reporters' commits, bounded by the reports
+  it already reads.
+- The model's `legitimate-phase-differences` scenario had a lower
+  ballot's COMMIT of c2 under other dependencies as stale state; it now
+  holds only stale acceptances (c3 at ACCEPT where the source
+  pre-accepted it, the highest-phase-wins counterexample), and a fourth
+  frozen scenario, `below-source-commit-disagrees`, records the alarm.
+
+`activation.rs` `a_commit_below_the_source_ballot_is_selected_with_its_dependencies`:
+r1 executed x after a; r2 adopted both and, restarted before executing
+them, holds them at ACCEPT; the source report holds neither. x is
+selected at COMMIT with `[a]` and r2, winning, proposes it with `[a]`.
+Against the old rule x is not selected.
+`a_below_source_commit_against_an_acceptance_of_other_dependencies_is_incompatible`:
+the alarm. Against the old rule the selection succeeds.
+
+### A refusal is an execution
+
+A local random-kill stress run with this PR's first three commits carried
+(d12-11) stopped n1 on `release-record-mismatch`. The store dumps give the
+cause:
+
+- A command refused at execution (an admission mismatch, a retry conflict,
+  a window refusal) took its position and wrote no `executed_v1` row; only
+  a bound outcome wrote one. Every voter's executed rows have gaps between
+  positions 691 and 708, n3's again between 2629 and 2651 and n1's at 1338
+  and 1347.
+- After a restart the table held those commands at COMMIT from their
+  dependency rows, not executed. The voter executed them a second time, at
+  new positions, and every position after them moved on that voter only.
+- n3, restarted and then elected, had one of them (`f7b90790`, with no
+  executed row on any voter) as the last recovered entry it had not
+  executed, so its chain started there alone. It re-proposed `3e056e8a`
+  after it; n1, which had not run the commands executed since, executed
+  `3e056e8a` at 1339, where n3 executed it at 2643. n1's collector then held
+  a release for `0d2091fa` that contradicted its record, and stopped.
+
+Two changes:
+
+- **A refusal writes its executed row**, with its position and result
+  digest and no revision, and still nothing under the retry key, so the
+  binding it refused stands. `Applier::apply_refusal` and the admission
+  refusal in `apply_bound` go through `materialize::apply_refused_plan`,
+  which adds that row to the refusal's batch. Checkpoint trims and exports
+  already read `executed_v1` as "this command executed", and now see the
+  refusals as well.
+- **The chain starts after every candidate tail**: the recovered order's
+  last command the leader has not executed, the committed tails and the
+  last command executed. Each is the tail when the table is right, and a
+  dependency on one already behind the tail orders nothing wrongly; any
+  one alone has now been wrong.
+
+`coord-storage/tests/apply.rs` `a_refused_command_is_recorded_as_executed`:
+two refusals, a window refusal and an admission mismatch, each leave an
+executed row with the outcome's position and digest and no retry record,
+and `read_protocol` gives the history back with them in execution order.
+Without `apply_refused_plan` the row is missing.
+`activation.rs` `a_command_that_comes_back_unexecuted_does_not_restart_the_chain`:
+r2 restarts with every executed identity but one, the selection carries
+that one at COMMIT, and r2's first fresh proposal still depends on the
+command it executed last. With the chain starting at the last unexecuted
+entry alone, it depends on the stale command only.
+
+### No acceptance after the promise
+
+With both changes above carried, random-kill runs still stopped a voter
+on `release-record-mismatch` (d12c-1, -7, -9) or failed a campaign as
+`IncompatibleAccepted` (d12c-11), and the reviewer's replay (`--faults
+2,1`: voter 2 restarted, then the ballot-0 leader killed) stopped voter 3
+in 4 of 6 runs. Every one of the four dumps has the same shape:
+
+- The old leader proposed P and then X, which depends on P, and was
+  killed. A voter restarted far behind won the next ballot with its own
+  report and the third voter's.
+- The Sync's entries end exactly at P's position (794, 1415, 780, 1432),
+  and X is in neither its entries nor its re-proposals.
+- The third voter executed X right after P anyway, and the new leader
+  chained its first command after P as well: a fork at P + 1.
+
+The third voter had held X's proposal at the promise, its payload or P's
+acceptance not there yet, so its report was taken without X. During the
+campaign `advance_pending` adopted X once it became ready: it checked the
+seal's fence and not the promise. This replica's own acceptance and the
+old leader's proposal then made a quorum here, and it committed and
+executed X. A command no majority accepted before the promise was
+executed, and no selection could see it.
+
+`advance_pending` adopts nothing while the replica may not vote, and
+activation drops what is held, as it did. A payload that arrives after
+the promise (fetched for a held proposal or a selection) is recorded and
+not acknowledged; admission was fenced already. The outbox already
+dropped the stale-ballot acknowledgement, so what that second gate stops
+is the replica's own vote counting towards the old ballot here.
+
+`follower.rs` `a_proposal_held_across_a_higher_promise_is_not_accepted_after_it`:
+c1 accepted, c2's proposal held for its payload, a promise to ballot 1,
+then c2's payload. c2 stays below ACCEPT and nothing acknowledges it.
+Without the adoption gate c2 reaches COMMIT. The payload gate alone is not
+separated by this test: with the adoption gate in place, c2's own fast
+vote did not complete a fast quorum here.
+
+### A report nobody can supply
+
+The five-node Jepsen runs stalled for good in 3 of 8 runs since this was
+carried (1 of 3 with the promise fence): every campaign, up to ballot 25,
+was refused by the candidate's own machine as `Campaign(HalfInitialized)`,
+naming a far-behind voter (one had last recovered at `executed=762`
+against 2360 on the others). `select` fails that way when a report holds
+a command at ACCEPT or beyond and no report has its payload.
+
+Local stress run d12-15 (three voters) had the same loop, and its stores
+show the shape. n3, at 401 executed against 3092 on n1 and n2, held
+`028f7aae` as an entry of ballot 3's Sync with no record and no payload.
+n1 and n2 had executed it at position 1185 and still held it, but a
+report leaves out what its replica executed long ago (task-d05), so
+neither report named it. n2 could reach only n3, and n3's own report
+held the command, so every campaign from ballot 4 to 16 failed naming n3.
+On the Jepsen runs a voter that retired the command may also have lost
+its payload; the stores there were not reachable.
+
+Two things let the campaign through now:
+
+- `select_with` takes the commands the candidate can supply itself: a
+  command it holds a payload for or executed (`phase_of` answers) is not
+  a dead end. It is selected, and `commit_executed` commits it before
+  binding when the candidate executed it. This is d12-15's n2.
+- `Campaign::try_select` sets a report aside while a majority of reports
+  remains without it. Any majority of promises is a sound basis for the
+  selection: it is the set the candidate would have had if that report
+  had arrived later, so no judgement about the reporter is needed, and
+  nothing is decided twice. The candidate's own report is never set
+  aside, since its own state is what it goes on to lead from.
+
+Both are safe because no acceptance is ever voted without its payload.
+`activate` puts a Sync entry whose payload is missing in `sync_pending`,
+`advance_sync` installs it only once the payload is known,
+`advance_pending` adopts a proposal only with its payload, and there is
+no Sync acknowledgement message at all. So an acceptance that no
+reporter has a payload for was either never decided, or was decided by
+voters that have since executed it and left it out of their reports; by
+quorum intersection, leaving it out of the selection loses nothing.
+
+With neither, the campaign waits for the voters that have not reported
+and fails only once every voter has. A behind voter still cannot execute
+past a command whose payload it never gets; the domain serves around it,
+and catch-up (task-d08, task-d10) is what brings it back.
+
+`activation.rs`:
+
+- `a_campaign_supplies_what_its_candidate_executed`, d12-15's shape:
+  three voters, the candidate and the behind voter only. Nothing supplied,
+  the campaign waits; with the candidate supplying the command, it is
+  selected with the reported dependencies and committed.
+- `a_campaign_selects_without_a_reporter_holding_a_payload_nobody_has`:
+  five voters, one reporting a payload-less acceptance nobody else holds.
+  With three reports the campaign waits instead of failing, with four it
+  selects without that report and without the command, and a candidate
+  whose own report holds it waits and then fails once all five reported.
+  Without the change, the first step fails as `HalfInitialized`.
+
+### What is left
+
+- No reporter holding the decision at all, every voter that had it having
+  retired it, while the candidate holds the command undecided. That
+  candidate is behind by definition; task-d10's rule catches it (a report
+  carries its executed position, and a candidate more than a window
+  behind the source reporters steps aside). Recorded there, not built.
+- A voter set aside for an acceptance nobody can supply cannot execute
+  past it. The domain serves around it; catch-up (task-d08, task-d10)
+  brings it back.
+- A restarted voter's peer dials are refused by the peer's handshake
+  (`aborted by peer: ... error 120: peer doesn't support any known
+  protocol`, TLS `no_application_protocol`), on both lanes. It appears
+  after restarts in all 52 local stress runs; the re-dial usually gets
+  through later. In d12-15 it did not: n2's dials to n1 failed after each
+  of its restarts, to the end of the run, which is why d12-15 needed the
+  candidate to supply the command rather than a report being set aside.
+  A link-layer defect, recorded for task-d03 to root-cause with those
+  logs.
+- A node stopped on a divergence serves again from its store after a
+  restart. task-d13 keeps it stopped until an operator clears it; a
+  diverged node is rebuilt by replacement through membership, not by
+  catch-up (task-d08).
+- The random-kill stress runs and the five-node Jepsen run with this
+  carried are the acceptance.
+
+## A candidate a table behind is refused
+
+Local run rep-d-4 (#106's replay), the reviewer's run 2 on `82e222b` and
+the five-node Jepsen `n2` share one shape: a voter restarts far behind,
+its election timer fires first, it wins, and it cannot serve. In rep-d-4,
+n2 restarted at `executed=339` while n1 was at 679, led ballot 1, and
+executed 64 more commands in the rest of the run while its followers
+reached 1427. A leader asks nobody for payloads (`request_payloads` is
+follower to leader), and what it lacked had been executed and retired by
+the voters that could have sent it. It was stuck, not slow.
+
+The replica cannot tell this from its own state: its rows say ACCEPT for
+commands that were committed in memory, so a restarted table understates
+what is decided. The voters it asks can tell.
+
+### The rule
+
+- `NewLeader` carries the candidate's executed position.
+- A voter whose own executed position is more than its table capacity
+  past the candidate's refuses to promise
+  (`BallotState::refuses_behind`, after every other check a promise
+  makes) and replies `PromiseRefused` naming its own position. A leader
+  applies the same rule.
+- The candidate abandons its campaign on the first refusal, unless its
+  selection is already being bound, and does not campaign again until
+  it has executed as far as the refuser (`FollowerRejection::
+  CampaignRefused`, then `BehindVoters` while it is still short).
+- A voter that refused never promised, so for it the ballot is
+  leaderless and it campaigns after its patience. Nobody waits out the
+  campaign ceiling, and nothing is withdrawn.
+- The refused ballot is remembered (`BallotState::outranked`). The
+  refuser's next campaign goes above it (`Voter::campaign`), and it
+  promises no other candidate's ballot at or below it
+  (`check_candidate`, as `NotHigher`). The refused candidate promised
+  itself that ballot and hears nothing below it, and following the next
+  leader is how it catches up; a lower ballot another voter campaigned
+  for without seeing the refusal must not win (from review).
+- Only a configured voter's refusal is honoured: an observer or learner
+  on the peer plane has no promise to withhold (from review).
+- A leader that refuses a higher ballot as behind steps down and
+  campaigns above it at once (`Voter::follow_machine`, `Node::step_down`,
+  then `Voter::campaign`). A restarted voter's timer can fire before it
+  hears the leader, and rgb-2 and rgb-6 on #98 were that: refused by
+  everyone, it would sit promised above the live ballot, deaf, until an
+  election came along. The cost is an election per refused campaign
+  against a live leader, bounded because the refused voter does not
+  campaign again until it has caught up. Watch for election churn in the
+  runs (from review).
+- The window is `limits.command_table_capacity`, per voter. It is set
+  alike across a domain so that voters judge alike; nothing enforces it,
+  and a voter with a larger table only refuses later.
+
+The most advanced live voter is refused by nobody, so someone can always
+lead. A candidate whose `NewLeader` reaches only voters as far behind as
+itself still leads; that is catch-up's case.
+
+### What the tests show
+
+- `activation.rs`
+  `a_candidate_a_table_behind_is_refused_and_follows_the_voter_that_refused`:
+  a table of 32; r2 stops at 40 while the others go on to 80; r0 dies and
+  r2 campaigns first. r1 refuses with `CandidateBehind { candidate: 40,
+  own: 80 }`, has not promised, and records the ballot as outranked. r2
+  gets `CampaignRefused { by: r1, executed: 80 }`, then `BehindVoters`
+  when asked to campaign again. r1 leads above the refused ballot, r2
+  promises it and follows, and with r0 back the domain serves. With the
+  refusal switched off the test fails: the cluster does not settle.
+- `a_refused_replica_campaigns_again_once_it_executed_as_far_as_the_refuser`:
+  an injected refusal at a position five commands ahead, which r2
+  reaches by following; it campaigns again, and leads, once it has.
+- `a_candidate_behind_every_reporters_window_does_not_win` (task-d05) now
+  sees `CampaignRefused` from r1 rather than its own `Behind`: the
+  refusal comes before the selection. The candidate-side check stays as
+  the backstop for a gap the refusal does not see.
+- `ballot.rs` `a_ballot_refused_as_behind_fences_the_ballots_below_it`:
+  after refusing ballot 5 as behind, another voter's ballot 1 is refused
+  as `NotHigher` naming 5, and ballot 6 is promised. Without the floor,
+  ballot 1 is promised.
+- The second `activation.rs` test also sends the refusal from a replica
+  that is not a voter, naming `ExecutionPosition::MAX`; the campaign
+  goes on. Without the voter check it is abandoned.
+- `voter.rs`
+  `a_live_leader_that_refuses_a_behind_candidate_leads_again_above_it`:
+  three voters, the leader and one follower at 100 and the third at the
+  bootstrap position, which campaigns first. The leader refuses it,
+  steps down, campaigns above the refused ballot and leads again; both
+  followers promise that ballot. Without the step-down the leader stays
+  at ballot 0, below the refused ballot 1, and the refused voter stays
+  deaf.
+- `voter.rs`
+  `a_voter_that_refused_a_behind_candidate_campaigns_above_its_ballot`:
+  the refusal goes out naming the voter's position, no promise does, and
+  its next campaign is above the refused ballot. Without the floor it
+  campaigns at ballot 1, below the refused 5.
+
+### What is left
+
+- A voter more than a table behind still cannot catch up by payload:
+  what it lacks was retired past every peer's table. A checkpoint brings
+  it up (task-d08). Until then it follows and votes, but executes
+  nothing past the gap.
+- When only followers receive the behind voter's `NewLeader` (the
+  leader is partitioned from it), they refuse and fence, and nobody
+  campaigns above the refused ballot: the voter stays deaf, promised
+  above the live leader's ballot, until the next election. It does not
+  disrupt the domain; it is one voter short until then.
+- A cleaner design, for later and not now, removes the whole problem: a
+  candidate promises itself only once the first promise from another
+  voter arrives, so a campaign refused by everyone leaves no promise
+  behind, and nothing needs fencing or leading above.
+- `outranked` and the candidate's refusal position are not durable. A
+  restarted refuser can campaign at or below the refused ballot, which
+  the refused candidate does not promise; the other voters still can. A
+  restarted candidate campaigns again and is refused again.
+
+## A decision names its admission facts
+
+A new leader can hold a command under a presentation other than the
+one its voters accepted: it took a second presentation after its
+restart, and each presentation mints its own admission receipt. Neither
+a report entry nor a Sync entry carried facts, so the leader re-proposed
+the selected entry under its own. The one live follower held the command at ACCEPT
+under the old leader's facts, answered `AdmissionConflict` and never
+voted, since task-d09's rebind covers PRE-ACCEPT only. With the third
+voter out, the entry never reached a majority, and everything chained
+after it waited until the table filled and the leader refused as
+`Backpressure`. With the third voter back the entry commits, but the
+follower holding the other facts stays at ACCEPT on the command for
+good.
+
+This was first taken for the cause of the stress runs raf-2 and repaf-4,
+where a leader republished its lease command until the end. It is not:
+their stores hold every command under one digest on every voter. Those
+runs are a leader that never learned a proposal whose acknowledgement it
+lost, a separate stall.
+
+The same gap let a Sync COMMIT entry make a new leader execute a command,
+without a vote, under facts no quorum accepted. For a session-establishing
+command that writes another receipt identity into replicated state
+(`ConsumeAdmission` in `coord-state`'s planner).
+
+### The rule
+
+- A vote set counts one admission digest, so a decision has one. The
+  selection names it: `ReportEntry` and `SyncEntry` carry the digest the
+  reporter's record holds, and a Sync entry whose payload has not arrived
+  reports the digest its Sync named.
+- Copies at ACCEPT or beyond of one command under different digests are
+  `IncompatibleAdmission` in the selection: a second decision, never a
+  merge. It is checked before the payload check, so a copy without its
+  payload cannot be set aside as half-initialized and leave the other
+  copy to be bound. An acceptance below the source ballot decides nothing and is
+  re-proposed as before, whatever its facts.
+- The named digest comes from the copies the selection takes: an
+  acceptance at the source ballot or a commit at any. A reporter's
+  payload counts as available only under it, and a command counts as
+  supplied to a candidate only when it holds the payload under it, or
+  executed the command. Otherwise the payload
+  is fetched like a missing one and the candidate's record is rebound
+  before binding, so its re-proposals carry the selected facts. A
+  candidate that committed or executed a selected command under other
+  facts stops its campaign as `IncompatibleAdmission`.
+- A voter installing an entry whose digest differs from its record
+  rebinds at PRE-ACCEPT and ACCEPT, fetching the payload under the named
+  facts first, and holds a re-proposal under those facts until it has.
+  A payload under other facts than a selection names is not taken.
+- At COMMIT or beyond, a different digest is two decisions of one
+  command. The voter does not install the entry, reports
+  `IncompatibleAdmission`, and stops voting and executing; a candidate
+  that finds one in its own selection stops the same way. `coordd` then
+  stops the process, as on `release-record-mismatch`, saying
+  `incompatible-admission` and the command.
+- A command executed and retired has no record; it is compared against
+  its payload row where one is kept, by the candidate and by a voter
+  installing a Sync. With none it has nothing to compare. After this
+  change a voter can only have executed a command under other facts than
+  its decision through the path it removes, so `ExecutedRecordV1` is
+  unchanged.
+- The report pages and the Sync carry the digest on the wire; the bound
+  Sync row carries it at schema version 3. A row of version 1 or 2 is
+  refused as corrupt, not read as a selection without facts, so stores
+  are started fresh.
+
+### What the tests show
+
+In `crates/coord-consensus/tests/activation.rs`:
+
+- `a_new_leader_re_proposes_under_the_facts_its_reporters_accepted`: r0
+  proposes X under one presentation's facts and nobody hears it; r1
+  takes a second presentation. With r2 out, r1 campaigns, fetches X under
+  r0's facts, rebinds and re-proposes under them. Both voters execute X
+  and a later Y, and r0 refuses nothing as `AdmissionConflict`. Before,
+  X and Y stayed at ACCEPT on both.
+- `every_voter_executes_a_recovered_command_under_one_set_of_facts`: the
+  same with every voter up. All three execute X under r0's facts; before,
+  r0 stayed at ACCEPT on X for good.
+- `a_command_decided_under_one_set_of_facts_executes_under_them_everywhere`:
+  X is decided and executed by r0 and r1; r2 holds a second presentation,
+  leads after r0 goes down, and executes X under the decided facts.
+  Before, it executed X under its own.
+- `copies_of_one_command_under_two_sets_of_facts_are_incompatible`: a
+  COMMIT under A beside an ACCEPT under B is `IncompatibleAdmission`; an
+  ACCEPT under A below the source beside the source's ACCEPT under B
+  selects B.
+- `a_voter_accepting_under_other_facts_rebinds_to_the_selected_ones`: a
+  voter at ACCEPT under one presentation installs a later Sync naming the
+  other, asks for the payload under the named facts, rebinds and
+  installs.
+- `a_voter_handed_other_facts_for_a_command_it_committed_stops`: a voter
+  that executed X under A and is handed a Sync naming B for it reports
+  `IncompatibleAdmission` and does not execute the committed command
+  waiting after it.
+- `a_voter_handed_other_facts_for_a_command_it_retired_stops`: the same
+  for a command executed and retired, compared against its payload row.
+- `a_proposal_ahead_of_the_selected_payload_does_not_leave_the_sync_waiting`:
+  the new leader's re-proposal under the selected facts arrives before
+  their payload; the payload rebinds the record for both, and the Sync
+  entry installs at once with its own evidence.
+- `a_sync_row_without_admission_facts_is_refused`: rows of versions 1 and
+  2 are refused; the current row round-trips with its facts.
+- The incompatibility test also covers a copy without its payload.
+
+Each has a negative control. With the selection naming no facts, the
+first four fail. With the alarm and the stop switched off, the
+incompatibility test and the stop test fail. With the rebind at
+PRE-ACCEPT only, the ACCEPT rebind test fails. With the conflict found
+only in the merge, the case without a payload is `HalfInitialized`; with
+the retired command skipped, the voter executes on; and without resuming
+the Sync after a proposal's rebind, the entry stays uninstalled.
+
+### What is left
+
+- The stop on a committed mismatch is not durable. A restarted voter
+  does not stop again, since a resumed Sync re-queues only entries below
+  COMMIT; that half is task-d13's durable marker, as for the other
+  stops.
+- A Sync entry that names no facts (no reporter held a payload, and the
+  candidate supplies it by having executed it) is installed under
+  whatever facts a voter holds, as before.
+
+## A leader asks again for every vote it still needs
+
+task-d15. The stress runs raf-2, repaf-4 and rep108-3 ended with a
+leader republishing its lease command until its table filled, while its
+followers went on committing and executing its proposals: in rep108-3,
+`n2` executed its ballot's seqnums 0 to 52 and nothing after, and `n1`
+and `n3` executed all 1077, through position 1432.
+
+### Why the leader never learned seqnum 53
+
+- `Leader::resend_unvoted` (task-d07) sends a voter the durable
+  proposals it has not adopted, and the voter answers each again
+  (`reacknowledge`, or `acknowledge_decided` for a command it committed
+  or executed). So a lost adoption acknowledgement is asked for again.
+- But it sent only proposals after the latest one whose adoption from
+  that voter the leader had counted. The premise, that a voter that
+  adopted a proposal holds every earlier one, is true of the voter. It
+  says nothing about which of its acknowledgements reached the leader.
+- One acknowledgement for 53 lost and one for 54 counted, and 53 was
+  never sent to that voter again. `n1`'s frames to `n2` were refused as
+  `QueueFull` and `n2` could not reach `n1`, so `n3` was the only vote
+  there was. The leader never learned 53, and everything chained after
+  it waited at ACCEPT, the lease command included.
+- The followers did not stall: with three voters, a follower's own
+  adoption and the leader's proposal are a slow quorum, so each commits
+  the leader's proposals on its own.
+
+What lost the one acknowledgement does not matter here: the re-send
+exists so that one lost frame is harmless.
+
+### The rule
+
+- A proposal the leader holds below COMMIT is sent until the voter's
+  adoption of it arrives, however far past it that voter's counted
+  adoptions reach.
+- The skip stays for a proposal the leader has committed. That is the
+  case it was written for: a voter that executed and retired the command
+  may keep no record to answer from, and the leader no longer needs its
+  vote.
+- The budget is unchanged: at most `RESEND_PER_VOTER` (16) per voter per
+  call, oldest first.
+
+### Evidence
+
+- `a_lost_acknowledgement_behind_a_counted_one_is_asked_for_again`: with
+  r1 down, r2's acknowledgement of c2 is lost and its acknowledgement of
+  c3, on the same key, is counted. r0 executes both within four re-send
+  rounds. With task-d07's rule, r0 executes only c1 while r2 executes
+  all three.
+- `a_committed_proposal_behind_a_counted_acknowledgement_is_not_sent_again`:
+  with every voter up, r0 commits c2 on r1's vote, r2's acknowledgement
+  of c2 is lost and its acknowledgement of c3 counted. No proposal goes
+  from r0 to r2 in four re-send rounds. Without the skip, c2 is sent.
+
+### What is left
+
+- A voter that swept a command's record (more than four tables of
+  history later) before its acknowledgement got through cannot answer,
+  and with no other vote the leader cannot learn the command. Closing it
+  would have a follower answer from its executed row, which needs its
+  own argument about which ballot's order it executed under.
+- An uncommitted proposal that stays unanswerable takes one slot of the
+  voter's 16 per round for as long as it does. The chain bounds that to
+  the table the leader cannot move past anyway.
+
+## A dial says why each address failed
+
+task-d16. Every failed peer dial in the Jepsen and stress runs was
+logged as TLS alert 120, in all 52 runs. That alert is by design, and
+it hid the error that mattered.
+
+### Why alert 120 was all a dial said
+
+- A node has two listeners, one per plane, and each offers only its own
+  plane's application protocol. The catalog lists both of a node's
+  addresses without saying which is which, so a dial tries each in turn
+  and the other plane's listener refuses it: TLS alert 120,
+  `no_application_protocol`.
+- `dial` in `serve.rs` kept only the last address's error. When the
+  address that serves the dial's plane was listed first and failed, the
+  other listener's refusal came last, and that was what was logged.
+- So why the peer address failed was discarded. That is the likely
+  reason `n2`'s dials to `n1` never recovered in d12-15, and why `n2`
+  held 1336 frames as `NotConnected` in rep108-3; the logs never showed
+  either.
+
+### The rule
+
+- The transport reports the other plane's refusal as its own error,
+  `TransportError::WrongPlane`, read from the alert the listener closes
+  the handshake with, not as a failure to connect.
+- A dial that reaches no address keeps every address's error, in the
+  order tried (`Unreached`).
+- What is logged is the error of each address that could have served the
+  dial. A `WrongPlane` refusal is left out, so it is not counted as a
+  failure, in the log or in anything that counts its lines. A voter whose
+  every address serves the other plane is said to be that.
+- Which addresses are tried, and in what order, is unchanged, and so is
+  the re-dial schedule.
+
+### Evidence
+
+- `a_dial_to_the_other_planes_listener_is_told_it_is_the_wrong_plane`
+  (`coord-transport`): a voter dialling a peer's api listener gets
+  `WrongPlane`.
+- `a_failed_dial_names_the_peer_addresss_error_not_the_api_listeners_refusal`
+  (`coordd`): a voter listed with a closed peer address and its api
+  address, in either order, is said to have failed on the peer address,
+  and the api address is not named. A voter listed with its api address
+  alone is said to serve the other plane.
+- Negative controls: without the transport reading the alert, both tests
+  fail; with the `WrongPlane` refusal kept in what is said, the `coordd`
+  test fails on the api address being named.
+
+### What is left
+
+- The replay that produced rep108-3 has to be run with this carried to
+  see what the restarted voters' dials really fail on. The fix for that,
+  if any, is its own task.
+
+## A divergence stop says what it compared
+
+task-d17. A five-node Jepsen run stopped n4 on `release-record-mismatch`
+right after it followed a new ballot, and the run kept only
+`coordd.log`: the teardown removed the stores. The stop said the
+command's first four bytes and that n4 "executed the domain's commands
+in another order than the leader", which is what the sentence always
+said, whatever the comparison had found. Nothing more could be read from
+it, and the harness replays did not reproduce it.
+
+### What was compared
+
+- Two checks stop a node on a mismatch: a release the collector holds
+  against this node's own record of the command (task-d06,
+  `settle_from_record`), and a release that arrives after the collector
+  answered against the answer it gave (task-d12, `check_release`).
+- Both now return a `Mismatch`: which check, the full command identity,
+  the release's side and this node's side, and which of the compared
+  fields differ. A side (`Said`) is the position, revision, result digest
+  and response length, and for a release the sender, epoch, ballot and
+  `speculative` flag. This node's side is its record, or the answer it
+  gave; an answer given from an earlier release carries that release's
+  origin, so the collector keeps the sender of each release it holds and
+  retains each answer's `Said` in place of the old `Executed`.
+- The compared fields are the position, revision, result digest and
+  response bytes, as before. The sender, epoch, ballot and flag are
+  shown, not compared. The revision is part of the answer a caller is
+  handed, so on the late-release check a forked revision is a forked
+  response too.
+- `SettleError::Mismatch` and `EvidenceError::AnsweredOtherwise` carry it
+  boxed, and `Settled::Diverged` carries it out of the settle turn.
+
+### What the stop prints
+
+- The first line keeps its prefix, `this node stopped:
+  release-record-mismatch(<8 hex>): `, so anything searching logs for it
+  still finds it. "In another order than the leader" is said only when
+  the positions differ; otherwise the line says the two disagree at the
+  same position.
+- Then: which check, the full command, both sides, which fields differ,
+  this node's ballot, leader and `executed_through` at the stop (unknown
+  when no voter runs in the process), and this node's own `executed_v1`
+  rows within eight positions of either side's position, as `position
+  revision digest command`.
+- The rows are read once, at the stop. `executed_v1` is keyed by command,
+  so the whole table is scanned, paged
+  (`coord_storage::protocol::executed_near`). A store that cannot be
+  read shows no rows and the stop still says what it compared.
+
+### Evidence
+
+- `a_record_the_release_contradicts_stops_the_turn` (`coord-daemon`): a
+  record with forked bytes stops the turn with the held-release check,
+  the record's side with no origin, the release's side from the leader
+  under the counted ballot, `differs` naming the response alone, and the
+  command among the rows the stop would print, all within eight
+  positions.
+- `a_late_release_that_contradicts_the_answer_is_refused`
+  (`coord-daemon`): each fork (response, result digest, position,
+  revision) is refused with the late-release check, both sides, and
+  exactly the fields that fork changed; the revision fork also changes
+  the response.
+- `a_mismatch_ends_the_turn_and_sends_nothing` (`coord-daemon`): the
+  mismatch comes out of the settle turn whole.
+- `a_position_only_mismatch_says_another_order_and_names_the_position`,
+  `a_digest_only_mismatch_does_not_say_another_order` and
+  `a_divergence_stop_keeps_its_prefix` (`coordd`): the wording, the
+  sides, the state and the rows as printed, and the prefix on both
+  checks.
+- Negative control: with "in another order" said whatever differs, the
+  digest-only test fails.
+
+### What is left
+
+- n4's stop in that run is still unexplained. The next runs keep the
+  stores, and a stop there now says what it compared.
+
+## A voter behind by more than a table catches up from a peer's history
+
+task-d08, as decided on #98. The Jepsen runs cut `n2` and `n4` off for
+100 s under load; both came back holding tables of commands they could
+never commit, and refused new work as `Backpressure` to the end of the
+run. The leader re-sends only what its table still holds, so a voter
+behind by more than a table is sent nothing it can use.
+
+### Why not the checkpoint
+
+- The plan's catch-up installed a peer's checkpoint. A checkpoint
+  installs into an empty store only (`install_shared` refuses one with
+  protocol rows), and `attach_with_baseline` replays the journal on top
+  of the baseline it names, so a live voter's generation cannot be
+  swapped under it.
+- Nothing trims `payload_v1`, `executed_v1` or the dependency rows: the
+  reference trim never touches them, so every peer still holds every
+  command a lagging voter lacks. What `n2` and `n4` lacked was a way to
+  ask for them.
+
+### The rule
+
+- A follower that holds work it does not execute, and whose
+  `executed_through` has not moved for a second, asks a peer
+  (`ProtocolMessage::CatchUpRequest`, bulk lane) for what it executed
+  after that frontier: the leader first, then, after two unanswered
+  asks, the other voters in turn (`coord_daemon::catch_up::Pacer`). One
+  page outstanding; the machine asks again at once when a full page is
+  executed, so the pacer is the floor for an ask nobody answered. The
+  pacer registers its next look as a serve-loop deadline, so an idle
+  follower with held work, which has no election deadline, still wakes
+  to ask and to ask again. A voter also asks once after it starts,
+  whatever it holds: a restart forgets the page, and a command whose
+  donor kept no row leaves none here either until it executes, so a
+  voter restarted behind can hold nothing that would prompt an ask. A
+  page taken whole that stops short of the donor's `through` (the
+  command bound or the byte bound) is followed at once.
+- The donor answers only a voter of its configuration, only at a ballot
+  it is synchronized at (it leads it, or follows it with its Sync
+  installed), only while it has not itself stopped, and only up to its
+  own `executed_through`. A page is at most 64 commands and 1 MiB beyond
+  its first, each read from the donor's durable rows: the payload row,
+  the epoch's dependency row if it keeps one, and the executed row
+  (`coord_storage::protocol::catch_up_entry`). The page stops at the
+  first command whose rows it cannot read: never a page with a hole.
+- The donor's position order is read once, from the whole of
+  `executed_v1`, the first time a peer asks, and then kept current from
+  the donor's own executions (`ExecutedOrder::note`); no page rescans the
+  table.
+- The requester drops a page from another ballot or a non-voter
+  (`CatchUpDropped`), and ignores one that does not start at its own
+  frontier or arrives while a page is in hand. It keeps the page's
+  contiguous prefix whose payloads rehash to their identities and whose
+  dependency rows name that payload's admission.
+- Each command is installed as a decided commit under task-d14's rules:
+  executed here already is a divergence; a record at COMMIT or beyond
+  under other facts is `IncompatibleAdmission` and halts; below COMMIT
+  under other facts it is rebound. A missing record is created past the
+  table's capacity. The donor's dependencies replace whatever this voter
+  recorded, unless it had committed the command itself, and must all be
+  executed here already. The payload and dependency rows are written in
+  one batch, and the command executes only once that batch is durable.
+  A batch that fails (a fence at a higher promise refuses it) puts the
+  entry back at the head of the page and installs it again; a page
+  answered at a ballot the voter has since left is dropped instead.
+- Where the donor keeps no dependency row, the command is installed with
+  no dependencies, this voter's own row is deleted in that batch, and the
+  command goes to history once executed: nothing is reported committed
+  with other than the decided dependencies.
+- While a pulled command waits, `next_executable` offers it alone: it is
+  the command at this voter's next position. Once executed it is retired
+  from the table at once, decided or not: it came in past the table's
+  capacity, and installation does not reclaim, so a voter far behind
+  would otherwise hold its whole missed history in the table.
+- After execution the voter compares position, revision and result
+  digest with the donor's executed row. A difference is
+  `CatchUpDivergence`: the machine executes nothing more, and `coordd`
+  stops as on any divergence, through `describe_divergence` with a third
+  check, `MismatchCheck::CatchUpAgainstDonor`. The first line keeps its
+  prefix; the donor's execution is the release side. Where this voter
+  had executed the command earlier, its side is its own `executed_v1`
+  row.
+- A restart forgets the page. The voter asks again from its durable
+  frontier; a pulled command whose commit was durable executes as any
+  committed command does, without the comparison, and the executed row
+  keeps anything from executing twice.
+
+### Where held and abandoned records go
+
+- A record whose command the domain decided drains through catch-up: a
+  submission this voter initialized and could never learn, a proposal it
+  held without its dependencies, or an acceptance a Sync demoted is
+  installed over, executed and retired. The tests below show the table
+  empty of unexecuted records afterwards, and no more `Backpressure`.
+- A record whose command the domain never decided does not. That is a
+  submission that reached only this voter, or proposals a leader made
+  that no quorum saw, such as `n2`'s ballot-1 proposals when its
+  collector could reach no other voter. It leaves the table only when
+  the command is decided: the collector's re-offer (task-64) while the
+  caller is still waiting, a caller's retry, or a later selection that
+  carries it. Until then it counts toward the table's capacity, and the
+  voter asks for catch-up once a second and is answered with nothing.
+- Evicting such a record needs its own argument. A Sync that did not
+  carry it shows the command undecided before that ballot, but the
+  table's rule is that nothing unresolved is evicted, and the key index
+  names the record as the next command's local dependency. It is left
+  to its own task rather than folded in here.
+
+### Evidence
+
+- `coord-consensus` `tests/catch_up.rs`, five voters and a table of
+  eight, r4 cut off for five tables' worth and brought back under load:
+  - `a_voter_past_a_full_table_catches_up_and_its_table_drains`, four
+    seeds: r4's table is full (it refused for `Backpressure`), it
+    executes the leader's history in the leader's order, holds nothing
+    unexecuted afterwards, and takes two tables' worth of new work
+    without `Backpressure`.
+  - `nothing_caught_up_is_reported_committed_with_other_than_the_decided_deps`:
+    every dependency row r4 holds at COMMIT or beyond names the leader's
+    dependencies, and the leader holds a row for it.
+  - `a_page_from_another_ballot_or_a_stranger_is_dropped`: both are
+    refused as `CatchUpDropped` and execute nothing; the same page from
+    a voter at the ballot is taken.
+  - `a_pulled_command_executed_otherwise_stops_the_voter`: another
+    result digest on the second pulled command stops r4 with both sides,
+    and nothing more executes.
+  - `a_restart_in_the_middle_of_a_page_resumes_without_executing_twice`:
+    three of a page executed, a restart, and catch-up from the durable
+    frontier; no command executes twice and the history is the leader's.
+  - `a_command_the_donor_keeps_no_row_of_goes_to_history`: executed at
+    the donor's position, no record and no dependency row left.
+  - `a_failed_installation_is_installed_again`: two failed installation
+    batches, and r4 still catches up; with the entry left waiting on the
+    failed batch it wedges and the test fails.
+  - `a_page_short_of_the_donors_frontier_is_followed_at_once`: a page
+    of three, with no pacer, and r4 still catches up.
+  - Negative controls: with pages refused on arrival, the first six
+    fail; with only a 64-command page followed at once, the short-page
+    test fails; with executed pulled commands left in the table, the
+    drain test finds 60 records in a table of 8.
+- `coord-daemon` `tests/catch_up.rs`,
+  `a_follower_cut_off_for_thirty_seconds_serves_within_ten_of_the_heal`:
+  three voters over model-engine stores, a table of eight, r2 cut off
+  for 30 simulated seconds at 20 operations a second (600 commands
+  behind), then healed under the same load. Within 10 s it has executed
+  as far as the leader and holds nothing unexecuted; it takes new work
+  without `Backpressure`; and its `executed_v1` rows are the leader's,
+  row for row. Negative control: with the pacer's ask dropped, r2 is at
+  61 of 861 after 10 s and the test fails.
+- `coord-daemon` `catch_up::tests`: the position order, the pacer, and
+  the deadline it registers (`the_pacer_says_when_it_next_has_to_look`).
+- `a_catch_up_mismatch_names_the_catch_up_check` and
+  `a_divergence_stop_keeps_its_prefix` (`coordd`): the third check's
+  wording, and the prefix on all three.
+
+### What is left
+
+- Once quorum-certified forgetting (task-52, task-53) is wired, a voter
+  behind that floor cannot pull below it; the forgetting task decides
+  how it comes back.
+- The donor's first read of its order is O(history), in time and in
+  memory (32 bytes a command). A durable position index would remove it,
+  and is out of scope.
+- A donor that executed in another order than the domain is not caught
+  here: the requester trusts one peer's order at one ballot, as it
+  trusts that ballot's Sync. The donor's own divergence stops are what
+  catch it.
+- A pulled command whose decided dependencies name a command this voter
+  executed and has since forgotten (more than a table's retirements ago,
+  and no key's latest) is refused as `CatchUpNotInstalled`, and catch-up
+  stops there.
+- Records whose commands were never decided, above.
+- The two-voter 100 s partition and the 30 s follower partition are to
+  be run on `coordd` and in Jepsen with this carried; the job's
+  `coord-jepsen-executed --last` is #98's.
+
+## A Sync never lowers a durable promise
+
+task-d18, from the checklist review (items D1 and D4). A voter that had
+promised P1 durably accepted a `NewLeader` for P3 and queued the promise
+row `{P3}`. P1's delayed Sync then passed `Follower::on_sync`: its ballot
+equalled the durable promise, and unlike `may_vote` it never looked at a
+promise in flight. `BallotState::mark_synced` built `{promised: P1,
+synced: P1}` and queued it after the P3 row. The journal applies rows in
+order, so the durable promise ended at P1 after the voter had published
+`Promise(P3)`, and a crash brought it back willing to vote in P1. This
+happens at any cluster size.
+
+### The rule
+
+- A Sync of the promised ballot that arrives while a higher promise is in
+  flight is held in `Follower::sync_behind_promise`, as a Sync ahead of
+  the promise is held in `early_sync`. After every storage event it is
+  dropped (`SyncSuperseded`) once a higher promise is durable, and
+  installed once no higher promise is in flight, which means every higher
+  promise's row failed. On `coordd` that last branch is effectively dead:
+  after a higher promise's row fails, the store fence stays at that
+  promise, so the released Sync's batch is refused and surfaces as
+  `SyncNotDurable`. It is kept for a store without that fence.
+- A duplicate Sync of the ballot already synchronized and active
+  converges without change before the hold, so it is not held behind a
+  promise and reported superseded later (from review).
+- Every write of the promise row carries the highest promise already
+  queued for disk (`BallotState::highest_queued`). A promise from
+  `on_new_leader` carries a ballot above it by construction. A Sync's row
+  carries the bound itself, so it can never fall below a promise in
+  flight, even if a later change lets one through. The seal writes its
+  own row, not the promise row.
+- Nothing changes in the commit rule, the Sync's selection or any row
+  format.
+- The promise row written from `on_new_leader` and the in-memory
+  `synced` rest on the ordered-journal contract: rows land in the order
+  they were queued, and a batch fails only when the store fence refuses
+  it. On `coordd` the fence is the only source of a failed batch, so a
+  Sync batch cannot fail while a later promise row lands. A store where
+  batches fail independently is task-d29's failure model, and carrying a
+  durable `synced` instead would move `synced` backwards on the common
+  path.
+- The held Sync is not persisted. A crash while it is held loses it, as
+  the path before this change lost the Sync row queued behind the P3 row;
+  the recovered promise is then P1 with nothing sent for P3 (`Promise` is
+  `SendWhenDurable`). The leader's re-ask sends the Sync again (see
+  What is left), and task-d10's ceiling bounds the wait.
+
+### Evidence
+
+- `a_sync_behind_a_promise_in_flight_does_not_lower_the_durable_promise`
+  (`coord-consensus`, `activation`): the checklist review's probe. At
+  `d4bd28c` the durable row reads `promised: (1, 2)` after `Promise(3,
+  0)` was published. It passes now.
+- `a_duplicate_sync_of_the_active_ballot_is_not_held_behind_a_promise`
+  (`activation`): a Sync of the active ballot repeated while a higher
+  promise is in flight writes nothing and is not reported superseded.
+  With the duplicate check back after the hold it fails, naming the
+  `SyncSuperseded` rejection.
+- `no_order_of_two_promises_and_a_sync_lowers_the_durable_promise`
+  (`activation`): a model of every order of `NewLeader` for P1 and P3,
+  P1's Sync, and each queued row completing durably or failing, in
+  journal order (92 complete orders). After every step, the durable
+  promise is at least every ballot a `Promise` was published for. P1's
+  Sync is never installed behind P3's live promise. Some orders install
+  it after P3's row failed, and some drop it after P3's row landed.
+- Negative control: with the change to `src` reverted, both tests fail.
+
+### What is left
+
+- The protocol oracle of task-d30 checks the same property on the real
+  machines under a simulated network.
+- A voter that promised a ballot but never received its Sync is sent
+  it again by task-d33's findings (#130, `b975923`), above this change
+  in the stack. Such a voter has not voted, so it is not in the
+  leader's `joined`, and each re-send tick sends it `NewLeader`. It
+  answers with `promise_again`, which repeats the promise when
+  `bound() == promised() == ballot` and `synced != ballot`. The leader
+  answers the repeated promise with the Sync it leads from
+  (`on_late_promise`). The tests are
+  `a_late_voter_whose_sync_was_lost_is_sent_it_again` and
+  `a_campaign_time_voter_whose_sync_was_lost_is_sent_it_again`
+  (`activation`). A Sync whose marker batch failed is installed again
+  through task-d24's `sync_unwritten` (#122). So the deferral needs no
+  task of its own; an earlier version of this note said such a voter is
+  not re-Synced, which read the `joined` loop backwards (from review).
+
+## Only adoptions count toward the slow majority
+
+task-d19, from the checklist review (items P5, P6 and S6).
+`VoteSet::learned` and `learned_slow` used to count a fast-set member's
+fast acknowledgement toward the slow majority when its dependencies
+equalled the leader's, as the prototype's `acceptFastAndSlowAck` does.
+Recovery keeps a PRE-ACCEPT only through the possible-fast rule, which
+needs every reporting fast-set member to hold the command with the same
+path.
+
+Take five voters with fast set {r0, r1, r2}:
+1. x is learned from r0's proposal, r1's fast acknowledgement and r3's
+   adoption.
+2. r2 recovers from r1, r2 and r4. The one member of the deciding quorum
+   among them is r1, at PRE-ACCEPT.
+3. r2 re-proposes x with new dependencies, although the collector may
+   already have released its result.
+
+With three voters the fast set is a majority, and the possible-fast rule
+covers the case.
+
+### The rule
+
+- Only adoption acknowledgements count toward the slow majority. The fast
+  predicate is unchanged.
+- A slow decision is now `slow_size` durable ACCEPT copies at its ballot,
+  the leader's own among them once its acceptance row is durable (see
+  "The leader's own adoption" below). Any majority of reports holds one
+  of them, and selection keeps ACCEPT at the source.
+- Recovery could not be made to keep the pre-accept instead. At five
+  voters, {r1, r2, r4} can hold two fast-set pre-accepts of one command
+  with different dependencies, and no leader or ACCEPT copy to choose
+  between them.
+- Every learner uses `VoteSet`, so the change reaches all of them: the
+  leader's, the followers' `commit_learned` and the collector's release.
+- The cost is latency only. Every non-leader already adopts and sends its
+  adoption acknowledgement, and `adopted_by` and the re-send already
+  counted adoptions only.
+- The mapping row is now `[EXT: stricter]`. The paper's recovery appendix
+  was not consulted. The rule stands without it because it counts a
+  subset of the evidence the source counts.
+
+### Evidence
+
+- `a_slow_decision_counting_a_fast_ack_survives_recovery`
+  (`coord-consensus`, `model`): the review's probe. Its first assertion
+  was that x is learned, which at `d4bd28c` it was, and the selection
+  then re-proposed x. It now asserts that r1's fast acknowledgement
+  learns nothing. Once r1 adopts, x is learned, and recovery from r1, r2
+  and r4 selects x with `[y]`.
+- `every_learned_decision_is_selected_by_every_recovering_majority`
+  (`model`): at three and five voters, it covers every combination of
+  what each non-leader did with x:
+  - nothing;
+  - pre-accepted with the leader's dependencies or others;
+  - adopted, after a fast acknowledgement of either kind or none.
+
+  For each combination whose vote set learns x, it tries every majority
+  of reports and every new leader among them, and `select` keeps x with
+  the learned dependencies. With the old rule it fails at five voters on
+  exactly the review's case, `[Pre(true), None, Adopted(None), None]`
+  recovered from {r1, r2, r4}.
+- `a_fast_acknowledgement_is_not_counted_as_an_adoption`
+  (`coord-collector`, `composition`): the leader's release, its reply,
+  r1's fast acknowledgement with the leader's dependencies over another
+  path, and r3's adoption are held as `AwaitingVotes`. r1's adoption and
+  then the leader's own release it. It fails with the old rule.
+
+### The five-node stop, read again
+
+`release-record-mismatch(c96f0e70)` (`docs/operations/jepsen.md`, run
+36382738086) stopped `n4` while it followed ballot 2, led by `n5` after
+`n1`, the leader of ballot 1, was killed. That is the shape this fix
+removes:
+1. A command decided in ballot 1 by counting a fast acknowledgement is
+   committed and executed by `n4` under the leader's dependencies.
+2. Ballot 2 recovers from a majority without `n1` and re-proposes it
+   with others.
+3. `n5`'s release then contradicts `n4`'s record.
+
+The run kept no stores, so the command's order on each voter cannot be
+read, and the stop is not shown to have had this cause. The conclusion
+recorded: consistent with this bug, and not reproducible from what was
+kept. Five-node Jepsen results stay provisional until this change is
+carried to #98. A recurrence with this change carried would be a
+different cause, and the stores are now kept.
+
+### The leader's own adoption
+
+The first version of this change still counted the leader for its
+proposal. Codex's review of #116 found that wrong as well:
+- The leader's proposal row is PRE-ACCEPT. It writes its ACCEPT row in a
+  separate batch, once the dependency guard passes.
+- The followers' adoptions can make a majority with the proposal while
+  that batch is still in flight. A crash that loses it restarts the
+  leader at PRE-ACCEPT.
+- At three voters, the leader and the voter that did not adopt then form
+  a majority with no ACCEPT copy. At five, so do the leader and two
+  non-adopters. Recovery re-proposes the command with other dependencies
+  after its result may have been released.
+
+The fix is vicaya's option 1 (#116):
+- The leader acknowledges its own order like any voter. `Leader::adopt_own`
+  publishes a `SlowAck` to the voters and the frontend.
+- The acknowledgement requires the batch carrying the leader's ACCEPT row
+  and every batch submitted before it. That batch is the acceptance batch
+  for a fresh proposal, and the proposal batch for a re-proposal, which
+  writes its ACCEPT row there.
+- It is kept for re-offer beside the leader's reply. The leader counts it
+  in its own vote set when the batch is durable.
+- If an earlier batch it waited on fails, the outbox drops the
+  publication. It is then published again over what is still in flight.
+- `resend_unvoted` and `serve_proposals` send it again with the proposal,
+  once the leader has counted it. A voter that missed the first send
+  otherwise lacks the leader's copy.
+- `VoteSet` accepts the leader's `SlowAck`, so `VoteError::LeaderSlowAck`
+  is gone, and `learned_slow` counts `slow_size` adoptions with no +1 for
+  the proposal. Every learner uses `VoteSet`: the leader, the followers
+  and the collector.
+
+The cost:
+- A slow decision now waits for the leader's acceptance row to become
+  durable, or for one more follower adoption.
+- A single voter learns slowly only through its own acknowledgement, so
+  its commit now waits for its acceptance row. It used to commit on the
+  proposal row.
+
+Evidence:
+- `every_learned_decision_is_selected_by_every_recovering_majority` also
+  varies the leader's state: its acceptance durable, reported at ACCEPT
+  with its adoption counted, or not, reported at PRE-ACCEPT with its
+  proposal only.
+  - Restoring the old count (non-leader adoptions + 1) fails it at three
+    voters on `leader_adopted=false, [Adopted(None), None]` recovered from
+    {r0, r2}. Restricted to five voters, it fails on
+    `[Adopted(None), Adopted(None), None, None]` from {r0, r3, r4}.
+  - A fast decision whose leader holds only its proposal row needs the
+    source leader counted among the fast-set members to be recovered. #116
+    skips it, and #118 (item 1) adds that rule and checks it here too:
+    with #118, the model passes with the skip removed.
+- `the_leaders_reply_is_not_its_adoption_at_five_voters`
+  (`coord-collector`, `composition`): the leader's release and reply plus
+  two adoptions stay `AwaitingVotes`, and the leader's `SlowAck` or a
+  third adoption releases.
+- The leader, follower and activation tests deliver the leader's
+  acknowledgement where they relied on the proposal. The golden
+  `leader_normal.json` gains the two acknowledgements released when the
+  acceptance rows become durable.
+- Still to measure: the d30 simulator rows (#119) with this change
+  merged, and the slow-path latency on the stress driver at three voters
+  with the next carry.
+
+## A recovery cycle is an invariant violation
+
+task-d21, from the checklist review. When the entries a new leader
+re-proposes depended on each other in a cycle, the ordering loop in
+`Leader::from_recovered` stopped without an error and left the rest
+unproposed, so the ballot waited on commands no one would propose. Every
+later campaign sees the same reports, so a named error that failed the
+campaign would only have made the stall loud. The question was whether
+such a cycle can be reached.
+
+### The argument
+
+A Sync's entries come from three sources (`recovery::select`):
+- **(A) At-source acceptances:** ACCEPT or COMMIT copies from reports at
+  the source ballot S.
+- **(C) Below-source commits (task-d12):** COMMIT copies from reports
+  below S.
+- **(F) Possible-fast candidates:** PRE-ACCEPT copies that every
+  reporting fast-set member holds with one path. They are added only
+  when the source leader is not among the reporters, and only for
+  commands not already an entry.
+
+Edges run from a command to each of its dependencies that is itself an
+entry. The argument rests on four facts:
+1. **Guards at every reporter.** `guard_accept` admits ACCEPT only when
+   every dependency is at least ACCEPT locally. `guard_commit` admits
+   COMMIT only when every dependency is committed. A report is one
+   replica's table at one cut, so a reporter holding c at ACCEPT holds
+   each of c's dependencies at ACCEPT or above, and a reporter holding c
+   at COMMIT holds each at COMMIT or above.
+2. **One order per ballot.** Every ACCEPT copy at S carries dependencies
+   that S's leader proposed:
+   - an adoption copies the leader's proposal;
+   - an entry installed from S's own Sync carries the selected
+     dependencies, which S's leader re-proposes unchanged;
+   - an acceptance left from an earlier ballot and not carried by the
+     Sync is demoted at installation (task-d11).
+
+   S's leader proposes Sync entries in `entry_order`, the re-proposed
+   commands as a chain after the recovered tails, and fresh commands
+   after those. So every edge among its proposals points from a later
+   proposal to an earlier one, provided S's own Sync was acyclic. The
+   base case, the genesis ballot, has no Sync. That gives induction on
+   ballots.
+3. **Agreement of earlier decisions.** A command committed in an earlier
+   ballot has one dependency set wherever it is committed. This is the
+   safety property itself, taken as the induction hypothesis.
+4. **One local order per replica.** A PRE-ACCEPT's dependencies are the
+   commands before it in that replica's log.
+
+The cases:
+- **No edge leaves the COMMIT entries for a non-COMMIT one.** By fact 1,
+  a COMMIT copy's dependencies are committed at the same reporter, so
+  they are COMMIT entries or not entries at all.
+- **No cycle among COMMIT entries.** By fact 3, each command's
+  dependencies are the same wherever it is committed. By fact 1, at one
+  reporter a dependency is committed before its dependent, so a cycle
+  would need a command committed before itself.
+- **No edge from an at-source ACCEPT entry to a possible-fast
+  candidate.** By fact 1, an ACCEPT copy's dependencies are at ACCEPT
+  or above at the same reporter, so they are entries of kind (A) or
+  (C), never candidates.
+- **No cycle among (A) entries.** By fact 2, all their dependencies come
+  from one leader's order.
+- **No cycle among candidates.** All candidates are held by every
+  reporting fast-set member, and there is at least one such member. By
+  fact 4, that member's log orders them all.
+
+So a cycle would have to cross between kinds, and every crossing is ruled
+out above: edges go from candidates to (A) or (C), from (A) to (A) or
+(C), and from (C) only to (C). The graph is acyclic.
+
+Fact 2 needs one more thing, which the code gives: one dependency set
+per command per ballot. The slow-path re-send reuses the proposal's
+dependencies, and a reporter's ACCEPT copy comes from adoption or from
+Sync installation under `guard_accept`, both carrying the leader's
+dependencies. The soft spot is fact 3: the (C) cases assume that
+committed dependencies agree, which is the safety property itself. So
+the argument proves that a cycle implies a guard bypassed or an earlier
+safety violation, not that a cycle is impossible. That is the reason to
+halt, and the halt is the same class of stop as task-d14's two decisions
+for one command (from review).
+
+### The rule
+
+- `recovery::entry_order` is the one ordering, and `Leader::from_recovered`
+  uses it.
+- A cycle is an invariant violation, not a failed campaign. The candidate
+  checks its selection before binding the Sync. On a cycle it binds
+  nothing, proposes nothing, records `RecoveryCycle` with every entry no
+  order keeps, and halts. `coordd` stops with `this node stopped:
+  recovery-cycle(<8 hex>)`, the number of such entries, and the first
+  eight in full.
+- A leader handed a cyclic selection anyway, from a Sync row bound before
+  this check existed, proposes nothing and is not leading.
+- A follower checks every selection it would keep or install the same
+  way: a Sync it is sent, before anything of it is held, persisted or
+  installed, and the Sync row it restarts from, before any entry is
+  queued. On a cycle it halts naming the commands, and `coordd` stops as
+  above. A leader of this build never sends one, so only another build
+  or a corrupt peer can; installing the acyclic part would execute what
+  the rest of the domain may never (Codex review).
+- Nothing changes in what is selected.
+- Halting is the right strength. Any resolution drops an edge that some
+  reporter accepted under its guard (fact 1), so resolving would choose
+  which invariant to break. Two consequences follow and are accepted for
+  an invariant violation:
+  - The candidate closes its campaign only after its promise row is
+    durable, so the next campaign after task-d10's ceiling selects the
+    same reports and halts too. The domain stops one node per campaign
+    until an operator acts.
+  - The check in `on_sync` lets one Sync from a foreign build halt every
+    follower that receives it.
+
+### Evidence
+
+- `a_selection_with_a_dependency_cycle_halts_the_candidate_naming_the_commands`
+  (`coord-consensus`, `activation`): a candidate that receives a
+  constructed report, with a and b accepted at genesis and each depending
+  on the other, binds no Sync, publishes nothing and halts with both
+  named. The campaign is closed, not retried.
+- `a_leader_handed_a_cyclic_selection_proposes_nothing` (`activation`):
+  `entry_order` returns the cycle, and `from_recovered` emits no effects
+  and is not leading.
+- `a_follower_sent_a_cyclic_sync_halts_before_installing_any_of_it`
+  and `a_follower_restarting_from_a_cyclic_sync_row_stays_halted`
+  (`activation`): a promised follower sent such a Sync persists nothing,
+  stays at its synchronized ballot and halts with both named; restarted
+  from the row, it queues neither entry and is halted. Both fail without
+  the check.
+- `a_recovery_cycle_stop_names_the_commands` (`coordd`): the stop's
+  prefix, the count, and the first eight entries in full. The serve
+  loop's stop itself (`serve.rs`) is exercised only through
+  `describe_recovery_cycle`, as task-d14's two-decisions stop it copies
+  is. `halt_on_cycle` sets the generic stop flag, and both `coordd` and
+  the simulator's oracle check `recovery_cycle()` first, so a cycle is
+  not reported as an incompatible admission.
+- Before this change, the candidate bound such a Sync, and the new leader
+  proposed nothing of the cycle and everything else.
+
+### What is left
+
+- The argument is on paper. task-d30's protocol oracle runs the real
+  machines under faults at three and five voters, and any cycle there
+  stops a node by this rule and fails the run.
+
+## What the protocol simulator found in recovery
+
+task-d34. task-d30's simulator drives the real `Leader` and `Follower`
+machines at three and five voters. It loses, duplicates, reorders and
+holds back messages, completes journal batches at random times, and
+crashes, restarts and campaigns nodes. Its oracle checks one execution
+order, promises never lowered, and one dependency set per command across
+the frontend's learning and every replica's execution. Its first runs
+found the decisions below lost or contradicted by recovery. Each was
+traced to its cause, and each has a deterministic test that fails
+without its change.
+
+### The findings
+
+1. **The source leader's report made the possible-fast rule skip
+   itself.**
+   - The leader's reply to the frontend waits for its proposal batch,
+     which records the command at PRE-ACCEPT (and a proposal row nothing
+     reads). The leader's own ACCEPT row is a later batch.
+   - A leader that crashed between the two reported PRE-ACCEPT. A
+     selection that heard the source leader returned from the rule
+     early, since "its rows are authoritative", and re-proposed a
+     command the frontend had learned fast.
+   - Now the source leader is one of the fast-set members the rule
+     reads. Test:
+     `a_fast_decision_survives_a_leader_that_crashed_before_its_accept_row`.
+2. **A fast acknowledgement could carry the leader's path and other
+   dependencies.**
+   - A follower that received the leader's proposal before the payload
+     has the leader's digests in its logs (`record_leader_path`). When
+     the payload arrives, its fast acknowledgement carries that path
+     beside dependencies computed from its own log.
+   - The fast predicate compared paths only, so it learned the command
+     with the leader's dependencies, which the member had not recorded.
+     Recovery then rebuilt it from the member's.
+   - Fast learning, and the rule's candidates, now also require the
+     same dependency set: `[EXT: stricter]`. Tests:
+     `a_fast_acknowledgement_with_the_leaders_path_and_other_dependencies_decides_nothing`
+     and
+     `members_agreeing_on_a_path_but_not_on_dependencies_decide_nothing_fast`.
+3. **task-d11 demoted only what a Sync leaves out.**
+   - An earlier ballot's acceptance that the Sync carries with other
+     dependencies stayed at ACCEPT until the entry was installed, which
+     waits for dependencies and payloads.
+   - A report taken meanwhile presented it under the new synchronized
+     ballot, and the next selection halted on `IncompatibleAccepted`.
+   - It is now demoted in the same install batch. Test:
+     `a_sync_demotes_an_acceptance_it_carries_with_other_dependencies`.
+4. **A report could omit the synchronized selection.**
+   - Installing an entry removed it from the pending set when its batch
+     was queued, while the report reads the durable ledger. Between the
+     two, the report said the command was only pre-accepted, under the
+     ballot whose selection had accepted it.
+   - A Sync whose row landed after a higher promise's (superseded) was
+     neither installed nor reported, although the promise row said this
+     replica was synchronized to it.
+   - The synchronized ballot's selection is now kept once its row is
+     durable, and read back from that row on restart. The report takes
+     each of its entries over a durable record that is not past it, or
+     that orders the command otherwise, facts included. A superseded
+     Sync's entries are held for installation, as a restart would resume
+     them. Tests:
+     `a_report_takes_the_selection_over_an_installation_still_in_flight`
+     and `a_superseded_sync_still_has_its_selection_reported`.
+   - The Codex review found two gaps in that overlay. A record at the
+     selected phase with the same dependencies but another presentation
+     kept its own admission, so a report carrying the selection's facts
+     made the next selection `IncompatibleAdmission`. And a replaced
+     admission kept the record's `payload_present`, so a selection could
+     count this replica as a supplier of a payload it does not hold. The
+     selected facts now replace the record's whenever the record is not
+     past the selected phase, and the payload is reported absent until
+     the rebind of task-d14 lands. Test:
+     `a_report_names_the_selected_facts_and_no_payload_held_under_others`.
+5. **The rule's conflict check passed vacuously.**
+   - A candidate was checked against conflicting adopted commands
+     through the member's own records, so a decided command the member
+     never held passed, and the candidate was kept ahead of it with the
+     member's order.
+   - Now:
+     - a command the selection orders after the candidate constrains
+       nothing;
+     - an earlier ballot's decision the member does not hold may have
+       been executed and forgotten, and constrains nothing;
+     - an at-source command the member does not hold rules the
+       candidate out.
+   - Tests:
+     `a_candidate_its_member_ordered_without_an_accepted_command_is_not_kept`
+     and
+     `a_candidate_whose_member_forgot_an_earlier_ballots_decision_is_kept`.
+6. **A follower's ledger ignored batches it staged as leader.**
+   - The follower applied a completion to its ledger only for batches it
+     was waiting on. A batch its leader role staged and that completed
+     after a deposition was lost to its reports, and a later commit
+     landed on stale dependencies.
+   - The follower's ledger now covers every staged batch, as the
+     leader's did. Test:
+     `a_batch_staged_as_leader_reaches_the_followers_ledger`.
+
+The simulator also caught two infidelities of its own, fixed there and
+not here:
+- It delivered frames across a crash, which a connection per stream
+  does not.
+- It let an execution outrun earlier journal batches, which `coordd`'s
+  single-writer apply does not.
+
+### F7: a path from an order the replica does not hold
+
+A fast decision failed when its only reporting fast-set member had
+recorded the leader's path for commands it had not adopted:
+- `record_leader_path` ran when a proposal arrived. It aligned the
+  per-key logs to the leader's order while the record kept its own
+  dependencies.
+- A command pre-accepted after that took the leader's path over this
+  replica's own history, so an equal path no longer meant an equal
+  history.
+- With the leader absent, recovery could not rebuild the fast decision's
+  ancestors from the member's records. The rule refused them and, with
+  them, the decided command.
+
+Two options were put to review. vicaya chose the second on #118:
+- The logs follow the leader's order only when the replica takes it as
+  its own: at adoption (`advance_pending`) and at a Sync's installation,
+  which already paired the alignment with `adopt`. Not when a proposal
+  arrives.
+- A fast acknowledgement's path, and a record's reported path, come from
+  those logs only. A fast acknowledgement stays evidence of the replica's
+  own durable history, the principle task-d19 applies to the slow path.
+- The first option, where a pre-accepted record takes the leader's
+  dependencies, needed a durable PRE-ACCEPT rewrite on every arrival and
+  changed what a PRE-ACCEPT record means.
+- The cost is fast-path rate when payloads reach a member in another
+  order than the leader's proposals.
+- The mapping row for `recordLeaderHash` is `[EXT: stricter]`.
+
+Evidence:
+- `a_proposal_that_is_not_adopted_leaves_the_path_log_alone`
+  (`follower`): the leader orders cz, c0, c1. A replica that never held
+  cz pre-accepts c0, takes c0's proposal (held for cz), then pre-accepts
+  c1. c1's path is the one a replica that never saw the proposal
+  computes. It fails with the arrival-time alignment.
+- task-d30's simulator (#119), with task-d19's leader adoption merged:
+  - 40 seeds: every one of 400 runs passes, against 2 failures before
+    this change.
+  - 100 seeds: 2 of 1,000 fail, against 8.
+  - Catch-up at the default seeds: all 120 pass, against 1 failure.
+- Still owed: the fast-path rate before and after on the stress driver.
+  The two remaining failures at 1,000 runs are the two cases below.
+
+Aligning at adoption left two more ways for a path to name a history the
+records do not hold. task-d30's simulator found both at row 10, three
+voters, without catch-up (seeds 52 and 86):
+- **A command left behind a synchronization.** Aligning a log to one
+  command leaves every command the replica pre-accepted before it in the
+  pending suffix, now placed after it. Their records still hold the
+  dependencies they were pre-accepted with, without it. The log now keeps
+  those commands as reordered. Until each is synchronized itself, or
+  executed and retired, its head is `reordered_path` of the true one,
+  which no leader path equals. Test:
+  `a_command_left_behind_a_synchronization_keeps_the_head_off_the_leaders`
+  (`graph`).
+- **A new leader's anchor.** A new leader anchors its first fresh
+  proposal after the recovered order's tails, and its path log went on
+  digesting its own appends, which need not pass through them. In seed
+  52 the leader installed 454d from its Sync, and its path for 65da
+  skipped 454d while its dependencies named it. r2 had never held 454d,
+  and its appends were the same. It reached the same path for 65da with
+  other dependencies, then an equal path and equal dependencies for 81be.
+  The collector learned 81be fast over two histories, and recovery
+  without the leader re-proposed it after 454d. `anchor_all` now
+  re-anchors the log at `anchored_path` of the tails, which a follower
+  reaches only by synchronizing to a path chained from it. Test:
+  `a_leaders_path_follows_the_tails_it_anchors_after` (`graph`).
+- Both tests fail without their change. With both, task-d30's rows run
+  clean at 1,000 seeds (100 per row and size), with catch-up and
+  without.
+- Cost: after a leader change, a follower's fast acknowledgements match
+  again only once it has adopted one fresh proposal. A pre-accepted
+  command reordered behind a synchronization holds its replica's head
+  off the leader's until its own order arrives. A command retired while
+  still in a log's pending suffix stays there: `PathLog::forget` clears
+  only its reordered mark, so the next `sync_known` marks it reordered
+  again, and that key's head stays off the leader's until a restart
+  rebuilds the log.
+
+### Item 5: a member that forgot an at-source command
+
+The possible-fast rule dropped a candidate when a conflicting command
+accepted at the source ballot, and not ordered after it, was missing from
+the member's records. That case is reachable. A member executes a and
+then f, both accepted at the source ballot. It retires both, which
+nothing stops while a later command is still pre-accepted. Its
+pre-acceptance of x names f. Its report then holds x, but not f or a.
+The rule refused x, which may have been decided fast, and that is the
+unsafe direction.
+
+History does not need to travel in the report: the member's own records
+already say what its order put before x. The rule now also keeps x when
+the missing command is in x's closure over the member's records. It also
+keeps x when the missing command was decided before a command in that
+closure that the member no longer holds. Such a command was executed
+there after everything the selection orders before it. A missing command
+reached neither way still drops the candidate.
+
+Test:
+`a_candidate_whose_member_forgot_an_at_source_command_it_ordered_first_is_kept`
+(`model`). It fails without the change, and its second half keeps the
+drop for a command the forgotten one says nothing about.
+
+Residual: a retired ancestor the selection no longer carries, because
+every reporter forgot it, reaches nothing further. A candidate behind it
+can still be dropped. That drop does not depend on the new rule:
+`prefix_decided` (`recovery.rs`) already drops a candidate whose
+member's prefix names a command that is neither selected nor a
+candidate, whatever the rule above decides.
+
+### Re-proposals after the entries that follow them
+
+Found on #122's branch at 100 seeds (row 10, three voters, seed 58). The
+fork predates the failing ballot:
+- b17's selection kept 0db8 at ACCEPT with dependency 9a0f, which it
+  re-proposed rather than selected. ef62 and 15a3 followed 0db8.
+- The new leader chained its re-proposals after the recovered tail:
+  9a0f, then a95c, b135 and ff68 after it. 0db8 and a95c both followed
+  9a0f, two branches of one key's order, and the voters executed ff68
+  and 0db8 in different orders.
+- Chaining the re-proposals after such an entry instead makes a cycle
+  with the command it waits on.
+- The entry itself was re-proposed before its dependency, and the
+  acceptance guard refused it.
+
+`Leader::from_recovered` now:
+- leaves out of the first chain every entry that follows a re-proposed
+  command;
+- re-proposes such an entry right after the last re-proposed command it
+  follows;
+- goes on with the chain after the last of those entries.
+
+Test: `reproposals_go_on_after_the_entries_that_follow_them`
+(`activation`). It requires every two of the commands to be ordered and
+none to be on a cycle, and it fails without the change.
+
+A re-proposed command this leader already holds at or past COMMIT keeps
+the dependencies it was decided with and is not proposed again. The
+entries that follow it are still proposed, right after it, and the chain
+goes on after them. Skipped along with it, as they first were, they were
+proposed nowhere: followers installed them at ACCEPT with nothing to vote
+on, the leader never committed them, and everything chained after them
+waited. The reachable case is a reporter behind the source ballot
+re-proposing a command the at-source voters retired. Test:
+`entries_that_follow_a_reproposed_command_the_leader_executed_are_proposed`
+(`activation`), which fails without the change.
+
+The selection that re-proposed 9a0f had a cause of its own. r2 held 9a0f
+and 65b2 at ACCEPT through b10's selection, and its b11 and b16 reports
+named them. Their payloads reached it while it campaigned for b17. Each
+then installed, which took it out of the pending set, and its row was
+not durable yet, so the durable ledger did not name it either. The
+report overlaid the synchronized selection only on commands the ledger
+named, so r2's own report left both out, and b17 re-proposed them. The
+report now overlays the whole synchronized selection; what the replica
+executed and forgot is still left out. Test:
+`a_selected_entry_installing_from_a_late_payload_is_reported`
+(`activation`), which fails without the change. An entry both pending
+and selected is reported once; it was pushed twice.
+
+### An older Sync's pending entries
+
+Found by task-d30's simulator (row 2, five voters, seed 0) once the
+leader's own adoption (#116) was merged. A voter restarted with an older
+Sync still installing, took a newer one, and activation added the newer
+entries beside the older ones. The older entry's payload then arrived,
+and it installed at ACCEPT from the older selection, at the newer
+synchronized ballot and over the demotion. The next campaign stopped on
+`IncompatibleAccepted`. A Sync's activation, and a Sync held for
+installation because a higher promise overtook its row, now clear what
+an older one left pending. task-d20's `replace_sync_pending` supersedes
+this where it lands. Tests (`activation`), each failing without the
+change:
+- `an_older_syncs_pending_entry_does_not_install_after_a_newer_sync`;
+- `an_older_syncs_pending_entry_does_not_install_after_a_superseded_newer_sync`.
+
+### A deposed leader's selection
+
+Found on #122's branch at 100 seeds (row 2, three voters, seed 45):
+- A leader can win with a selection naming a command whose payload it
+  does not hold. `Leader::repropose` skips a placeholder, so nothing is
+  proposed for it.
+- Deposed, it became a follower that did not carry its own Sync, since
+  `RecoveredState` had no place for it. Its reports under the
+  synchronized ballot omitted the command.
+- When the payload came, it pre-accepted the command afresh and reported
+  that PRE-ACCEPT at the source ballot. The next selection re-proposed a
+  command another voter had executed.
+
+The leader now keeps the selection it leads from. `into_recovered`
+hands it on as `RecoveredState::synced_selection`, and
+`Follower::from_recovered` resumes it as a restart resumes the durable
+Sync row: entries it has not installed are pending, and reports name the
+selected facts.
+
+The leader's own report overlays that selection too, through the same
+`overlay_selected` the follower uses. The report a deposed leader owes is
+often built while it still leads, from its rows alone. Seed 45's was: its
+re-proposal of the command was not durable yet, so the report showed its
+older PRE-ACCEPT under the synchronized ballot.
+
+Test: `a_deposed_leader_keeps_its_selection_for_what_it_never_proposed`
+(`activation`). It fails at the leader's report without the overlay, and
+at the follower's without the carried selection.
+
+## The real replica machines under a protocol oracle
+
+task-d30. `coord-sim` ran only reference actors, and the multi-node tests
+that run `Leader` and `Follower` drop messages by hand for a few seeds.
+`crates/coord-consensus/tests/protocol_sim.rs` runs the real machines at
+three and five voters, table capacity 32, under one seeded schedule
+(`coord_sim::rng::NamedStreams`), and checks a protocol oracle after
+every step.
+
+### The simulator
+
+- **Machines as `coordd` runs them:**
+  - full learning;
+  - the role changes a won campaign or a deposition asks for
+    (`Node::change_role`);
+  - restarts rebuilt from durable rows only, at the synchronized ballot,
+    as `main.rs` builds them;
+  - the leader's re-send and the follower's payload asks on a timer.
+- **The network:**
+  - Delivers in any order, loses and duplicates, and holds some frames
+    back until a later campaign (old-ballot messages).
+  - Each frame is its own stream of a connection, so a crash ends what
+    was in flight to or from the crashed node. That includes frames
+    already delivered to a peer's buffer and not yet read, which is
+    stronger than a real crash: a stale frame from a dead node arriving
+    after its death is under-tested.
+- **Storage:**
+  - Each node's journal completes its batches in submission order at
+    times of the schedule's choosing. A crash loses what is not durable.
+  - An execution first flushes the journal, since `coordd` applies
+    through the same single-writer journal and waits for its batch.
+- **Scenarios:** the checklist's failure-test matrix rows 1 (fill
+  capacity, fail the leader), 2 (different tentative sets), 3 (dense
+  conflicts, early missing dependency), 4 (acknowledgement before
+  payload, repeated; the checklist's "hold expires" has no machine timer
+  to fire here, so the row is the acknowledgement before the payload,
+  presented again) and 10 (delayed old-ballot messages), as knob
+  presets. Each is run for 12 seeds at each size by default;
+  `PROTOCOL_SIM_SEEDS` raises that.
+- **Replay:** `PROTOCOL_SIM_ONE=row,voters,seed` with
+  `PROTOCOL_SIM_TRACE=1` replays one seed and prints its trace:
+  deliveries, completions, executions, campaigns, the reports a winning
+  campaign selected from, and what the frontend learned.
+
+### The oracle
+
+1. **One order.** Every replica executes a prefix of one sequence.
+2. **Promises never lowered.** A node's durable promise row never
+   decreases and is never below a ballot it published `Promise` for.
+3. **One dependency set per command.** The set a shadow collector learned
+   it with (`VoteSet::learned` over what reached the frontend) equals the
+   set each replica executed it with. The shadow counts a leader reply
+   under the admission the command was submitted under, as the real
+   collector does, not under whichever acknowledgement came first.
+4. **No halt.** No replica stops on two decisions, a recovery cycle or
+   `IncompatibleAccepted`.
+5. **Every learned decision executes.** After the fault schedule every
+   node comes back and loss, duplication, crashes and admissions stop.
+   The domain then runs, with an election whenever nothing executes for
+   6,000 steps, until what the frontend learned has executed, for at most
+   60,000 steps. Oracle 3 compares a decision only when a replica
+   executes it, so a decision learned from a durable majority, dropped by
+   the next selection and never re-proposed, passed the other four.
+   - One stall is counted rather than failed: every follower's table is
+     full and refuses work (`Backpressure`), so nothing more is proposed
+     or executed. That is task-d24's gap (table room for recovery, #122,
+     above this branch), and the exemption goes when it is merged up. At
+     the default seeds, 6 of 120 runs end that way; at 40 seeds, 32 of
+     400. No run fails the oracle otherwise.
+- **Coverage.** Each row checks, at each size, that more runs learned a
+  decision than learned none, or the frontend's oracles are vacuous.
+  Row 3 at five voters learns nothing in 4 of 12 runs, and rows 1 and 2
+  in 1 and 4: admissions there reach too few voters for a quorum before
+  the schedule ends. A per-run minimum would fail those rows as defined.
+
+Seeds that once failed are kept in
+`fixtures/protocol_sim/seeds.json` and replayed on every run.
+
+### Evidence
+
+- **At the default seeds** (12 per row and size, 120 runs), every row
+  passes with task-d34, and the kept seeds pass.
+- **With task-d18 reverted** (40 seeds per row and size, 400 runs): 85
+  runs fail the promise check, against none in the baseline.
+- **With task-d19 reverted** (same seeds): 28 runs fail, 5 of them at
+  five voters. The baseline has 6 failures, 2 at five voters.
+- **Before task-d34:** the simulator found its six defects, each kept as
+  a seed.
+
+### What is left
+
+- At 100 seeds per row and size, 14 of 1,000 runs still failed. The
+  sampled traces show the design question recorded under task-d34 (a
+  fast decision whose only reporting fast-set member recorded the
+  leader's path for commands it had not adopted) and further
+  stale-acceptance cases. So rows 1 to 4 and 10 pass at the default
+  seeds, not at every seed.
+- **With the leader's own adoption (#116, option 1) merged:**
+  - Default seeds: all 120 runs pass.
+  - 40 seeds: 2 of 400 runs fail, against 6 before.
+  - 100 seeds: 8 of 1,000 fail, against 14.
+  - Catch-up at the default seeds: 1 of 120 fails, against 3.
+  - Every remaining failure is row 10 (delayed old-ballot messages) at
+    three voters, a command executed with two dependency sets.
+  - The merge moved one schedule onto a stale-Sync case:
+    `IncompatibleAccepted` at row 2, five voters, seed 0, now a kept
+    seed. A voter restarted with an older Sync still installing, took a
+    newer one, and `activate` added the newer entries beside the older
+    ones. The older entry then wrote the old ballot's ACCEPT back over
+    the demotion. `activate` now clears what an older Sync left pending,
+    the part of task-d20's `replace_sync_pending` this branch needs. The
+    fix is task-d34's, with its tests ("An older Sync's pending
+    entries"); this branch keeps the seed.
+- **With #118's F7 decision merged as well** (path logs aligned only at
+  adoption and a Sync's installation):
+  - Catch-up is on by default (`PROTOCOL_SIM_NO_CATCH_UP` turns it off),
+    as `coordd`'s pacer always runs.
+  - With catch-up: the default seeds and 100 seeds per row and size pass,
+    all 1,000 runs.
+  - Without catch-up, before #118's last two path changes: 40 seeds
+    pass (400 runs), and 100 seeds fail 2 of 1,000 (row 10, three
+    voters, seeds 52 and 86).
+  - Seed 52, traced with the path each proposal and fast
+    acknowledgement carries: b1's leader installed 454d from its own
+    Sync and anchored its first fresh proposal, 65da, after it. Its path
+    log still digested only its own appends, so 65da's path skipped 454d
+    while its dependencies named it. r2 never held 454d, pre-accepted
+    65da with `<b002>` and reached the same path. It then fast-acknowledged
+    81be with the leader's path and dependencies over another history.
+    With the leader absent, recovery re-proposed 81be after 454d.
+  - Seed 86 is a command pre-accepted ahead of one the log was then
+    aligned to, left behind it in the log without it in its record.
+  - Both are fixed on #118 (see "F7: a path from an order the replica
+    does not hold"). With them, and #118 item 5, 100 seeds per row and
+    size pass, all 1,000 runs, with catch-up and without.
+- Budgets and progress after healing are task-d33's oracles.
+- **Catch-up.** A follower's timer asks its leader for executed
+  history, as `coordd`'s pacer does, and the donor's page is served from
+  its durable rows. A pulled command executed otherwise than its donor is
+  an oracle failure.
+  - At the default seeds it serves about 14,000 pages, executes about
+    1,300 pulled commands, and finds no catch-up divergence.
+  - It was off by default while it reached the fast-path gap that #116
+    and #118 closed.
+- Row 1 counts leader crashes and fails if a run of it crashed none.
+
+## Bounded reports and Syncs
+
+task-d20, from the checklist review (item R2).
+
+`MAX_COMMAND_TABLE_CAPACITY` (1536) rested on one test that sized a Sync
+from three disjoint reports whose entries carried no admission digest.
+Four things made the real worst case larger:
+- A campaign selects over every complete report it holds, up to five,
+  not over a majority.
+- Entries carry an admission digest since task-d14.
+- Nothing bounded what a report carried.
+- `sync_pending` was never cleared between Syncs, so a voter behind
+  across failed ballots reported every earlier selection beside the
+  later one, and each Sync selected from its report grew with them.
+
+The candidate bound the Sync with `sync_update(..).expect("bounded")`,
+and every installer wrote it the same way, so a Sync over the row limit
+ended the process in the middle of an election.
+
+### What changed
+
+- **One selection pending.** A Sync whose row is durable replaces what
+  earlier Syncs left pending (`replace_sync_pending`), activated or
+  superseded, and the placeholders the superseded entries made go with
+  them unless a held proposal waits on the command (Codex review: kept,
+  repeated failed ballots filled the table with slots nothing fills).
+  Its selection is the synchronized ballot's, and it
+  supersedes the earlier ones: a decision of an earlier ballot was
+  accepted by a majority, which the later selection's reports
+  intersect, so it is among the later entries. An earlier entry the
+  later selection leaves out was never decided, and its acceptance was
+  demoted with the later marker (task-d11). What an entry left out
+  costs a voter that far behind is catch-up (task-d08), not recovery.
+- **A bound on reports.** `max_report_entries(capacity)` is twice the
+  capacity: the live records and the retirement window. A campaign
+  applies it at the domain's largest capacity (`MAX_REPORT_ENTRIES`, from
+  `MAX_TABLE_CAPACITY`, which `coord_daemon`'s limit now is), not at its
+  own table. Voters of one domain may be configured differently, and a
+  voter with a small table legitimately reports more than twice it when
+  a leader with a larger one ordered commands past its limit (Codex
+  review). A campaign sets
+  aside a report past it while a majority remains without it, as it
+  sets aside a half-initialized one (task-d12), since any majority of
+  promises is a sound basis for the selection. It never sets aside its
+  own. It fails as `RecoveryError::ReportTooLarge`, naming the reporter,
+  when its own report is past the bound, or when every voter reported
+  and too few fit. A voter that holds more than the bound is far behind,
+  with a large selection still to install. Setting its report aside
+  costs liveness only when a majority is that far behind, which is
+  task-d32's case.
+- **A measured capacity limit.** A worst-case entry has its admission
+  digest, one dependency, the conservative key's path and the largest
+  sequence number. It encodes in 208 bytes (240 with two dependencies),
+  and the row, the stricter of the row and the frame, takes 10,180 of
+  them. Five disjoint reports of `2 x capacity` entries fit at a
+  capacity of 1018 at most. `MAX_COMMAND_TABLE_CAPACITY` is now 1000,
+  and the default, which may not exceed it, is 1000 instead of 1024.
+- **A named refusal.** `bounded_sync_update` checks the Sync against its
+  frame and its row before anything is written.
+  - The candidate refuses the campaign as `RecoveryError::SyncTooLarge`
+    with the entry count, the size and the limit. This is what a
+    selection past the measured worst case meets, for instance one
+    whose entries carry more dependencies.
+  - A follower sent such a Sync refuses it as
+    `FollowerRejection::SyncTooLarge` before marking anything. A
+    candidate of this build never binds one.
+  - A Sync that fits its frame but not its row is reported with the
+    row's size.
+- **Nothing installs while a marker is in flight** (review). Between a
+  Sync's marker being issued, with the demotions computed then, and its
+  durability, a payload for an older Sync's entry that the new one left
+  out installed that entry at ACCEPT, journaled after the marker and
+  never demoted. The next report named it at ACCEPT at the new ballot,
+  and the acceptance guard kept it as decided. `advance_sync` now
+  installs nothing while `sync_barrier` is set; activation replaces what
+  is pending, so nothing is lost. Test:
+  `a_payload_arriving_while_a_sync_marker_is_in_flight_installs_nothing`
+  (`activation`), which fails without the change.
+
+Nothing changes in what is selected, or in the Sync format.
+
+### Evidence
+
+- `the_largest_table_gives_a_sync_that_fits_a_row_and_a_frame`
+  (`coord-daemon`, `compose`):
+  - Five disjoint reports of `max_report_entries(1000)` worst-case
+    entries go through `select`, which gives 10,000 entries.
+  - `bounded_sync_update` takes the result.
+  - At the old maximum it would be 15,360 entries, and at the old
+    default 10,240. Neither fits.
+- `a_sync_past_its_row_refuses_the_campaign_by_name` (`compose`): a
+  12,000-entry selection is `SyncTooLarge`, with its size over its
+  limit, and nothing panics.
+- `a_campaign_sets_aside_a_report_past_its_bound_and_names_it`
+  (`activation`) covers three cases:
+  - a report one entry past the bound is set aside, and the selection
+    is made from the majority without it;
+  - the candidate's own oversize report fails as `ReportTooLarge`;
+  - with every voter reported and too few fitting, the campaign fails
+    naming the first oversize reporter.
+- `a_voter_behind_across_failed_ballots_reports_one_ballots_worth`
+  (`activation`): three promised ballots whose Syncs' entries never get
+  their payloads. The report names only the third Sync's entries. It
+  fails without `replace_sync_pending`, when the report names all nine.
+- The same test checks that the earlier Syncs' placeholders are gone.
+  It fails without their removal.
+- `a_report_past_twice_the_candidates_own_table_is_taken`
+  (`activation`): a candidate with a 32-slot table selects over a 74-entry
+  report. It fails with the bound taken from the candidate's own table.
+- `a_follower_sent_a_sync_past_its_row_refuses_it_by_name`
+  (`activation`): a 16,000-entry Sync is refused, named, with nothing
+  written and the synchronized ballot unchanged. Before this change the
+  write panicked.
+
+## A lost report page is asked for again
+
+task-d28, from the checklist review (item R3). A voter published each
+page of its recovery report once, on a lane that drops when full, and
+nothing asked for a missing page. The candidate counts a report only
+when every page arrived, so one lost page cost that voter's report for
+the whole ballot, and with a majority short the ballot itself. A voter
+that regenerated its report for the same ballot would not help either:
+a new report is another snapshot, and the assembler refuses pages of two
+snapshots from one replica as inconsistent.
+
+### What changed
+
+- **Pages kept.** A voter keeps the pages of the report it last sent a
+  candidate (`ServedReport`), one report at a time. The pages go across
+  its role changes with the report it owes, since a leader promising a
+  higher ballot is deposed before the candidate asks.
+- **Asked for again.** `ReportPageRequest { ballot, pages }` is a new
+  protocol message. The candidate sends it on an interval while its
+  campaign selects (`request_report_pages`, driven by `coordd` at the
+  re-send interval, with that interval in the domain's next deadline so
+  a quiet domain still wakes for it, and by the protocol simulator's
+  timers).
+  - It goes to each voter that promised and whose report is incomplete.
+  - It names the missing pages, at most `MAX_PAGE_ASK` (16), or none
+    when no page has arrived, which asks for the first pages.
+  - The voter answers only the candidate its report went to, for that
+    ballot, from the same version.
+- **Bounded assembler.** A campaign refuses a report announcing more
+  pages than `MAX_REPORT_ENTRIES` entries take, plus one. The extra page
+  is slack: 8 pages of 256 already hold 2,048 entries, so a report just
+  past the bound assembles without it. What the bound admits is up to
+  2,304 entries, and the campaign refuses what is past the bound by name
+  (task-d20). The pages held are one campaign's, since a new campaign
+  replaces the old one, plus the one report the voter serves (from
+  review).
+- **Pacing.** The first ask goes out one re-send interval after the
+  campaign starts, which gives the published pages 250 ms to arrive. The
+  worst case is `MAX_PAGE_ASK` duplicate pages per voter per interval,
+  idempotent at the assembler, and shares no budget with the leader's
+  proposal re-send. Report pages and their requests ride the control
+  lane, the lane that dropped the original page, so a 16-page answer can
+  drop again; the retry converges, and a smaller ask would be gentler.
+
+The report format is unchanged. A build that paginates smaller would
+announce more pages and be refused `OutOfBounds`, as an older build that
+ignores the request is left to the ballot's time-out.
+
+### Evidence
+
+- `a_campaign_completes_in_its_ballot_with_a_page_of_each_report_lost`
+  (`coord-consensus`, `activation`):
+  - Three voters, with r2 campaigning. The report pages from r0, the
+    leader until then, and from r1 are each dropped once.
+  - The campaign does not complete on its own.
+  - After one `request_report_pages`, both voters answer and r2 leads
+    the ballot it campaigned for. r0 answers after its change of role.
+- `interrupted_campaigns_leave_the_candidates_memory_flat`
+  (`activation`):
+  - Fifty campaigns, each interrupted with one voter's report half
+    delivered, leave one page held every time.
+  - A report announcing more pages than the bound is refused and holds
+    nothing.
+- The protocol simulator's rows pass at the default seeds with the new
+  timer.
+
+## Table room for recovery work
+
+task-d24, from the checklist review (item R4), taking up task-d08's
+residual on records decided nowhere (its requirement 7). Work that
+finishes or recovers admitted commands could be refused by a full table.
+- A Sync entry's placeholder was dropped silently under backpressure, and
+  the payload that followed went through the bounded path, so only
+  catch-up could bring the entry in.
+- A record no Sync selected and no history named kept its slot until the
+  command was decided somewhere. With one voter gone for good, that could
+  be never.
+
+### What changed
+
+- **A reserved share.** A bounded table admits new work only up to its
+  capacity less one part in `RECOVERY_RESERVE_PARTS` (8). Sync entries
+  and pulled commands enter a full table: a Sync's placeholders through
+  `expect_beyond_capacity`, and its payloads as a command whose turn has
+  come does.
+  - What one eighth is sized for (review): recovery work ignores the
+    bound, so the reserve is what lets a voter admitted to seven eighths
+    hold one catch-up window (`MAX_CATCH_UP_COMMANDS`, 64) or its
+    placeholders and still report within twice the table: 875 + 125 +
+    1,000 retired = 2,000 at the largest table. Below a table of 512
+    the reserve is smaller than a window and the beyond-capacity path
+    carries the rest; at the smallest table, 32, it is 4. A Sync's
+    entries are made to fit by the release rule and the Sync's cap, not
+    by the reserve.
+- **Release of records decided nowhere.** In the Sync's own install
+  batch, as task-d11 puts its demotions there, some undecided records are
+  released:
+  - which: those this voter's report for the ballot named, that the
+    Sync neither selected nor re-proposed, and that no selected entry
+    depends on. The last clause is redundant and kept as a guard: a
+    record a kept entry depends on is itself kept, a followed
+    re-proposal, or executed and retired, which needs catch-up whatever
+    happens to the local record. It changes no outcome, but keeps a
+    selection-completeness bug (the open task-d19 item) from becoming a
+    lost payload (review);
+  - their dependency rows and payload rows are deleted;
+  - the table releases them and repairs the key index once the batch is
+    durable. A key whose latest command was released takes that
+    command's own dependencies (`CommandTable::release`);
+  - the ledger removes them only when the batch is durable
+    (`DurableLedger::stage_removal`), so a report never loses a durable
+    record early;
+  - a voter restarted between its report and the Sync rebuilds the cut
+    from its undecided durable records while its promise is ahead of its
+    synchronized ballot. Nothing is admitted or adopted after a promise,
+    so those are the records the report named;
+  - the cut is kept until the marker's batch is durable (review). It was
+    taken when the release set was computed, so a failed batch lost it.
+    The Sync sent again then found the ballot already synchronized in
+    memory, activated over rows that were never written, and released
+    nothing, so the table stayed full for the boot. A ballot whose marker
+    failed now installs again when its Sync comes again: marker,
+    demotions and releases;
+  - it covers what a Sync left out for size (below) as it covers
+    anything else the Sync neither selects nor re-proposes. Such a
+    command was to be re-proposed, so it was decided nowhere, and the
+    collector offers it again (O1).
+- **A Sync within the bound** (review of task-d20, decided on #120). A
+  report is bounded at `MAX_REPORT_ENTRIES`, twice the largest table, and
+  a report overlays the synchronized selection. The selection's
+  re-proposals were not bounded, though: five disjoint reports gave a
+  legal Sync of five reports' worth. Every voter that took its
+  re-proposals reported past the bound until they executed. If the new
+  leader crashed first, every later campaign failed on its own report,
+  at every ballot, with no exit.
+  - A Sync now carries at most `MAX_REPORT_ENTRIES` commands
+    (`within_bound`, applied by `select_with`): every kept entry, then
+    re-proposals in identity order, the re-proposed set's order, which is
+    deterministic and is not the order the leader proposes them in,
+    until the bound.
+  - A re-proposal a kept entry depends on goes first, wherever it falls
+    in that order. The new leader re-proposes such an entry right after
+    it, so leaving it out would leave the entry waiting for a proposal
+    nobody makes.
+  - What does not fit is released at installation by the rule above and
+    offered again by the collector.
+  - Why the kept entries fit within twice the table. A kept entry is an
+    acceptance or commit at the source ballot, a commit below it, or a
+    possible fast decision of the source ballot. Each is in the source
+    leader's order:
+    - its acceptances and fast candidates are its own proposals;
+    - a commit of an earlier ballot was carried into it by the Sync it
+      was selected with, since a decision is kept by every later
+      selection.
+  - A reporter names such a command until it executed it and the
+    command left its retirement window. So the kept entries are the
+    source leader's live records and its window, twice its table, plus
+    what a reporter behind that window still holds.
+  - The last is a voter far behind, task-d08's and task-d32's case.
+    Kept entries are never cut, since one may be decided: a selection
+    whose kept entries alone pass the bound carries them all, and its
+    row bound (`SyncTooLarge`) still applies. A Sync refused that way on
+    its kept entries alone fails every election by construction, since
+    every later campaign keeps the same entries. It is reachable only
+    above about 27 dependencies per entry on average over 2,000 entries;
+    its owner is task-d32 (review of task-d20).
+  - A voter that takes a capped Sync's re-proposals holds only what the
+    Sync names, having released the rest of what it reported, so its
+    report for the next ballot is within the bound.
+- **A report past the page bound is named** (review of task-d28). A
+  report announcing more pages than `MAX_REPORT_ENTRIES` entries take,
+  plus one, had each page refused as `OutOfBounds`. Its voter counted as
+  not yet reported, and the campaign waited for the election's ceiling.
+  With the Sync capped, such a report is a defect.
+  - A verified page of one now records its reporter as past the bound
+    (`PageError::PastBound`), and nothing of it is held or asked for
+    again.
+  - The campaign sets it aside as it sets aside a report too large.
+  - Once every voter has answered and too few fit, the campaign fails
+    as `RecoveryError::ReportPastPages`, naming the reporter, its pages
+    and the limit.
+  - A page that does not verify says nothing about its reporter and is
+    still `OutOfBounds`.
+- **Recovering a capped Sync** (review). The test of a leader crashing
+  right after such a Sync found three defects that stopped recovery at
+  that size; none is the cap's, and each stops a smaller selection more
+  slowly.
+  - A candidate at its admission limit refused the payloads its own
+    selection needed. A fetched payload enters the table as an admitted
+    request does, and only a Sync's installed entries were let past the
+    limit. The candidate asked again for ever and never bound. A command
+    its own campaign selected now enters a full table as a Sync's entry
+    does (`on_request`), since it finishes admitted work.
+  - The outbox rescanned every send's requirements at every completion.
+    A leader's own acknowledgement requires every batch submitted before
+    its own, so a new leader re-proposing 2,000 commands held sends
+    requiring up to 2,000 barriers each, and each completion walked their
+    durable prefixes: cubic in the selection. The failed-barrier scan is
+    skipped when nothing failed, and the newest barrier is checked first,
+    so a send still waiting costs one lookup (`Outbox::release`). Which
+    sends are released, and when, is unchanged.
+  - `entry_order` placed entries by repeated scans, one per dependency
+    level, and a candidate asks it again at each step of its payload
+    fetches. It is one walk of the dependency graph now, with the same
+    order and the same commands on a cycle
+    (`entry_order_is_the_order_of_placing_by_passes`).
+- **The path log.** A released command left its keys' path logs too
+  (Codex review). Kept, the next command's path was hashed through it,
+  so this voter's fast acknowledgements disagreed with the other voters'
+  for that key, and repeated releases grew the log. `PathLog::remove`
+  takes it out and recomputes the head. Test:
+  `a_released_command_leaves_the_path_log`, which fails without the
+  removal.
+  - It was held until #116's leader adoption and #118's path-log
+    alignment (F7) landed: with the voters' acknowledgements agreeing
+    again, the simulator reached the fast-path gap those close. With
+    both merged, the default seeds pass.
+  - At 100 seeds per row and size, 2 of 1,000 runs fail on this branch
+    with or without the removal: row 2 (three voters, seed 45) and
+    row 10 (three voters, seed 58), an execution-order divergence. The
+    branch below passes all 1,000.
+  - Seed 45, traced: the leader of b7 selected ab51 at ACCEPT without
+    holding its payload. `Leader::repropose` skips a placeholder, and
+    the leader ignores `PayloadResponse`, so it never wrote the ACCEPT
+    row. Deposed, it became a follower that did not carry its own Sync.
+    When the payload arrived it pre-accepted ab51 afresh, reported that
+    PRE-ACCEPT at the source ballot, and the next selection re-proposed
+    a command another voter had executed.
+  - That is the role change, not the release. task-d34 now carries a
+    deposed leader's selection into its follower, and the leader's own
+    report overlays it; seed 45 passes.
+  - Seed 58 was two recovery defects, both fixed on #118 (see
+    "Re-proposals after the entries that follow them"). r2's own report
+    left out entries of its synchronized selection whose late payloads
+    were installing. The selection then re-proposed 9a0f while keeping
+    0db8 at ACCEPT after it, and the re-proposal chain forked at 9a0f.
+  - With both, this branch passes all 1,000 runs, with catch-up and
+    without.
+- **The argument.** The Sync is selected from a majority's reports, and
+  selection keeps every command a quorum of an earlier ballot could have
+  decided (at five voters only with task-d19). So a command it leaves out
+  was not decided below its ballot. A later decision reaches this voter
+  as any command does, through the leader or catch-up, and no voter
+  outside the majority is waited for. This rests on selection being
+  complete: the open task-d19 review item, the leader's own acceptance
+  row, is a gap in that premise and has to close with it.
+
+### Two departures from the task text, and why
+
+- **Only what the report named.** The task releases every record present
+  at installation. The protocol simulator's neighbour test
+  `a_proposal_refused_ahead_of_the_promise_is_sent_again` shows why not:
+  1. The new leader proposes c2 after binding its Sync.
+  2. c2's payload reaches a voter before that voter has even promised,
+     so c2 is in its table and in its late report.
+  3. The selection, bound without that report, does not name c2.
+
+  Admission is fenced once a voter promises, so the records its report
+  named for the ballot are the ones the selection could have spoken for.
+  That is the rule used.
+- **The payload goes too.** Kept beside no record, a later proposal of
+  the command found the payload present, never asked for it and never
+  bound it again, so the voter stalled on it. With the row deleted, the
+  voter is as if it never held the command, and the proposal fetches the
+  payload as any missing one, before and after a restart.
+
+Both are justified (review). The selection can speak only for what the
+promising majority reported, and admission is fenced from the promise,
+so the cut is exactly what a selection could have covered; the restart
+rebuild (`undecided()` while promised and synchronized differ) is a
+superset only by records nothing could have added. In the c2 example, c2
+is in the late voter's report, so it is released there too, and it
+comes back through the re-sent proposal and a payload fetch, which is
+what the second departure makes work: `missing_payloads` keys on absent
+payloads, so a kept payload row would never be fetched again.
+
+### A late payload for a command the Sync releases
+
+A payload answer reaches `on_request` without the promise fence. One for
+an entry an older Sync left pending, which the newer Sync omits, could
+arrive between the newer marker's issue and its durability: the command
+was still pending, so it was initialized beyond capacity, and its payload
+and dependency rows landed after the batch that deletes them. At
+durability the table and the payloads dropped it, but the ledger and the
+disk kept it. No acceptance leaked, since a voter does not vote while
+its promise and active ballot differ, but the slot came back at the next
+restart until the next Sync released it again. A payload for a command
+the in-flight marker releases is now not taken (`on_payload`); a later
+selection that names it asks for it again (review).
+
+### Evidence
+
+- `a_voter_with_a_full_table_installs_a_syncs_entries_and_executes_them`
+  (`activation`):
+  - New admission stops at `capacity - capacity / 8` with `Backpressure`.
+  - A Sync re-proposes everything held and selects three commands the
+    voter lacks, at COMMIT.
+  - Their payloads arrive, the entries are installed in the full table,
+    and all three execute.
+  - It fails without the beyond-capacity placeholder and payload path.
+- `records_decided_nowhere_are_released_by_the_next_sync` (`activation`):
+  - A table full of records admitted nowhere else, then promised and
+    reported.
+  - The Sync selects one record and re-proposes another. The rest leave
+    the table and the ledger, payloads included, and the two stay.
+  - New work is admitted again without `Backpressure`.
+  - It fails without the release.
+- `a_voter_restarted_before_the_sync_still_releases_what_it_leaves_out`
+  (`activation`): the voter is killed after its promise and brought back
+  from its rows, and the delayed Sync still releases the records it
+  leaves out, after which new work is admitted. It fails without the
+  rebuilt cut.
+- `releasing_the_latest_command_hands_the_key_back_to_its_predecessor`
+  (`graph`): the next command on the key depends on the released one's
+  predecessor, and a committed record is not released.
+- `a_voter_whose_report_came_after_the_selection_drains_its_table`
+  (`activation`): the acceptance's reachable shape.
+  - Five voters. r1's table is full of commands only it pre-accepted.
+  - The old leader goes for good, and r1's report page is lost on its
+    way to r2. So r2 selects from r2, r3 and r4.
+  - r1 installs the Sync, releases every record, and takes and executes
+    new work without `Backpressure`.
+  - With three voters and one gone, the two left are a majority, both
+    reports are used, and nothing is released. That is why the plan's
+    earlier wording, "with one voter permanently absent", named a shape
+    that releases nothing.
+- `five_disjoint_full_reports_give_a_sync_within_the_bound`
+  (`activation`): five disjoint reports of `MAX_REPORT_ENTRIES` entries
+  select a Sync of exactly that many commands, which fits its row.
+  - A kept entry that depends on the last command in identity order
+    keeps that re-proposal.
+  - The rest are the first in identity order.
+  - Without the cap the Sync names 10,000.
+- `a_payload_for_a_command_the_sync_in_flight_releases_writes_nothing`
+  (`activation`): b1's Sync leaves z pending, b2's omits it, and z's
+  payload arrives while b2's marker is in flight. Nothing is written for
+  it, and after durability neither the table, the payloads nor the
+  ledger hold z. Without the gate z's payload and dependency rows are
+  queued after the marker.
+- `a_leader_crash_right_after_a_capped_sync_is_followed_by_a_campaign_that_completes`
+  (`activation`):
+  - Five voters at the largest table. Four each pre-accepted 875
+    commands no other voter holds, so any majority re-proposes at least
+    2,625.
+  - r1's Sync is capped at `MAX_REPORT_ENTRIES`, and r1 holds no more.
+  - Its re-proposals are decided at the runtime's re-send pace and
+    executed nowhere, and then r1 crashes. Each survivor installed the
+    Sync, released some of what it held, and reports within the bound
+    for the next ballot.
+  - r2's campaign completes. The recovered order executes, and new work
+    submitted after it does too.
+  - Without the cap, r1 holds 2,625, every survivor reports 2,625, and
+    r2's campaign fails on its own report as `ReportTooLarge`, the
+    review's failure. Without the candidate's full-table admission, r1's
+    campaign never binds.
+  - The harness's payload timer asks only when nothing is in flight.
+    Asked at every step, as it was, a voter lacking a thousand payloads
+    sent an ask per message delivered, and the answers never caught up.
+    An ask that reaches no live voter is no progress.
+- `a_report_announcing_more_pages_than_the_bound_fails_the_campaign_by_name`
+  (`activation`) covers three cases:
+  - with one voter's report past the page bound, the campaign waits for
+    the rest and does not ask for that report again;
+  - with every voter answered, it fails as `ReportPastPages` naming the
+    first;
+  - with another report in bounds, it selects from the majority without
+    it.
+- `a_sync_sent_again_after_its_marker_failed_still_releases`
+  (`activation`): the marker's batch fails, and the Sync sent again
+  releases what it leaves out. It fails when the cut is taken before the
+  batch is durable, and when a ballot whose marker failed is treated as
+  installed.
+- Existing tests that filled a table to its capacity by admission fill it
+  to the admission limit instead (`follower.rs`, `frontier.rs`), and
+  the two payload-transfer tests of `recovery.rs` use a 32-slot table
+  so that twice the transfer bound still fits under it.
+
+
+## Catch-up installs a window at a time
+
+task-d25, from the checklist review (items B7 and B9). Catch-up
+(task-d08) installed one pulled command, waited for its batch to be
+durable, executed it, and only then installed the next: one durable batch
+and one execution per command. That is about a hundred commands a second
+on the test host, so a voter behind a domain admitting more than that
+never closed its gap.
+
+### What changed
+
+- **A window per batch.** `install_catch_up` installs as many of the
+  page's commands as install cleanly, from its head, in one batch: at
+  most the page, so 64 commands and 1 MiB (`MAX_CATCH_UP_COMMANDS`,
+  `MAX_CATCH_UP_BYTES`). Each command is installed under task-d08's rules
+  unchanged (task-d14's COMMIT-entry rules, the donor's dependencies,
+  let into a full table). A window joins a command only when:
+  - it is at the next position;
+  - every dependency it will execute under is executed here already or
+    earlier in the window;
+  - after the window's first, it names the command before it among
+    those dependencies.
+- **A command the donor kept no row of is a window of its own.** It has
+  no dependencies to name. What would stop a page (a stale ballot or
+  position, a second decision, a command executed here already, a
+  command not installable) ends the window instead, and is dealt with
+  when it is the first of the next window, exactly as before.
+- **Execution.** Only the window's first command is executable, so the
+  window runs in the donor's positions whatever else the table holds.
+  Each execution is compared with the donor's as before. The next
+  window is installed once the last one has run.
+- **Durability and failure.** The batch being durable makes every
+  command of the window executable and its payload servable. A failed
+  batch puts the whole window back at the head of the page, in order,
+  and it is installed again.
+- **The restart path.** A crash in the middle of a window leaves its
+  durable commits behind. The restart executes them through the ordinary
+  learner, with the page and the donor's word gone.
+  - The rule that each command names the one before it is what makes
+    the learner run them in the donor's positions.
+  - At boot the follower takes the commits it restored and has not
+    executed as expected (`SinceBoot`, set by `restore_execution`). It
+    keeps each one's execution, by position. Only a restored commit can
+    be part of a window whose comparison the crash lost, so this is
+    bounded by what the table restored, not by how much executes after
+    the restart. (Codex review: a first version kept at most 64
+    executions and dropped the rest, so a restart that executed more
+    before its first ask never compared them.)
+  - The first ask after a boot starts at the boot frontier rather than
+    at the current one. Each command of a page at a kept position is
+    compared with what was executed there: another command, revision
+    or result digest stops the voter as a `CatchUpDivergence`, as a
+    pulled command's does. The rest of the page is installed as usual.
+  - While anything expected or kept is left, the next ask goes on from
+    where the last page stopped, at once when this replica has executed
+    past it. A donor that can no longer show those rows ends the
+    comparison rather than block catch-up for ever.
+- **No campaign over a window.** A follower with a window installed and
+  not yet executed refuses to campaign (`FollowerRejection::CatchingUp`).
+  A won campaign changes the role, and the window's comparison is the
+  follower's. The window runs as soon as its batch is durable, so this
+  delays a campaign by at most that.
+- **Unchanged.** The page format and the donor's rules (review
+  boundary).
+
+### What this does not cover
+
+- A voter that wins a campaign after a restart and before its first ask
+  forgoes the since-boot comparison: the role change drops it, and a
+  leader does not ask.
+- An execution made durable just before a crash and not yet compared
+  (the materializer's row written, the comparison not yet run) is at or
+  below the boot frontier, so the first ask does not cover it. That gap
+  was task-d08's before this task and is unchanged.
+- Both of these lose detection, not order: order within a window is
+  forced by the predecessor rule, and the first member's position by
+  the dependency closure. Both are carried under task-d08's residual in
+  the plan (review).
+- `taken == 0` calls `done()`, which also fires when the donor simply has
+  nothing newer, so pending comparisons of restored but unexecuted
+  commits are dropped: again a loss of detection, not of order.
+- The window rule and the comparison by position both assume a total
+  order, which holds only while every command carries the conservative
+  key. Relaxing keys would split windows at commands that do not
+  conflict and could raise a false `CatchUpDivergence` on restored
+  ordinary commits. Whoever relaxes the key model owns this: task-d50
+  now (review).
+- The unthrottled `follower-out` run (about 113 appends a second, a
+  follower 3400 behind at its restart), with catch-up's rate reported
+  beside the domain's, is not run here: this environment has neither the
+  driver nor the test host. Its evidence is still owed.
+  - What the tests show is the structure that sets the rate: one durable
+    batch per page instead of one per command.
+  - Whether the domain leaves the execution headroom catch-up needs is
+    task-d26's contract.
+
+### Evidence
+
+- `a_page_installs_as_one_window_in_one_batch` (`catch_up`), over three
+  seeds: a page of a voter left behind goes in as one batch, every
+  command of it is a commit before the first executes, and they execute
+  in the donor's positions.
+- `a_command_the_donor_kept_no_row_of_is_a_window_of_its_own`: a page
+  whose fourth command has no row installs as three windows, the three
+  before it, it, and the rest, and executes in the donor's positions.
+- `a_crash_at_every_point_of_a_window_resumes_without_executing_twice`:
+  a crash before the window's batch is durable, and after each of its
+  commands executes. Each resumes without executing anything twice and
+  ends with the leader's history, and the first ask after each restart
+  starts at the boot frontier. With the since-boot comparison disabled,
+  this test and the next fail.
+- `a_window_executed_after_a_restart_is_compared_with_the_donor`: the
+  restart executes the rest of a window to another result at its fourth
+  command, and the first page after the boot stops the voter there,
+  naming both executions.
+- `a_voter_holding_a_window_does_not_campaign_until_it_ran`.
+- `every_restored_commit_is_compared_however_many_pages_it_takes`: the
+  restart executes a restored window whose eleventh command differs,
+  the donor's pages carry three commands each, and the comparison goes
+  on page after page until it stops the voter there. It fails when the
+  kept executions are capped below the window.
+- task-d08's eight catch-up tests pass unchanged, as do the protocol
+  simulator and the `coord-daemon` suites.
+
+## Every collector entry the voters refuse ends
+
+task-d22, from the checklist review (items E1, E2, E4, R1, R3, R4, R5
+and A5). A voter answered three refusals with no effect at all:
+- a request under other admission facts than the ones it accepted
+  (`RequestFactsConflict`, and the table's `PayloadConflict`);
+- another payload under a retry key it holds bound
+  (`RequestIdentityConflict`);
+- a duplicate whose payload it no longer holds, because the command went
+  to history.
+
+The collector removes an entry only when it settles. So each such entry
+held one of the domain's pending slots for good, and a session could fill
+all 256 with retries that nothing ever answered. A ballot change voided
+the evidence the collector had counted, and nothing asked for it again. A
+command that had executed under the old ballot produced no evidence under
+the new one and never settled. Evidence addressed to a closed remote
+connection was dropped the same way.
+
+### What changed
+
+- **The voter says why.** The three refusals are answered with
+  `ProtocolMessage::Refused { ballot, command, refusal }`, sent to the
+  frontend that submitted, as any other evidence is.
+  - `SubmissionRefusal::OtherFacts { accepted }`, `OtherCommand { bound }`
+    and `Forgotten` name the three cases.
+  - `OtherCommand` is sent only once the bound command's payload is
+    durable here, since a binding a crash could still undo is no answer
+    about the key.
+  - Nothing is persisted for it. A collector that misses the reply asks
+    again.
+- **The collector settles on it** (`Collector::on_evidence`):
+  - All three hold the entry for the record
+    (`HoldReason::AwaitingRecord`). One voter's refusal is not the
+    domain's decision: a minority voter that saw another presentation of
+    the key first refuses a command a quorum goes on to execute (Codex
+    review). The entry still settles from votes and a release as any
+    other.
+  - For `OtherFacts` and `Forgotten`, only the command's durable record
+    can answer it. This node's record, the same one that already answers
+    a caller's retry, settles it with nothing of the collector's own to
+    corroborate it (`SettledFromRecord { corroborated: "record" }`).
+  - For `OtherCommand`, the record that answers it is this node's record
+    of the retry key bound to another command
+    (`Collector::settle_conflict_from_record`, read in `coordd` through
+    `settle::conflicts_for`). The domain executed that command under the
+    key, and this one is rejected wherever it executes, with nothing
+    mutated. So the entry ends with `REQUEST_IDENTITY_CONFLICT`
+    (`corroborated: "other-command"`). The answer is not kept in the
+    resolved window, so the command's own release, a rejection at its
+    position, is never compared with it.
+  - A refusal from a replica that is not a voter is not counted
+    (`EvidenceError::NotAVoter`).
+- **An entry holding neither half is asked for again.** A pending entry
+  with neither the learning predicate nor the leader's release after
+  `SOLICIT_AFTER_MILLIS` (5 s) is submitted to every voter again
+  (`Collector::due_solicits`, woken for through `next_solicit`).
+  - A voter answers a submission it holds by publishing its evidence
+    again (task-c02's repair) or by saying why it refuses.
+  - From the second time on, the record may settle the entry.
+  - The entry keeps its submission until it settles for this. The
+    delivery obligation still lets go of its copy once every voter has
+    taken it.
+- **A ballot change asks for every entry again at once**, and lets the
+  record settle each (`Collector::reconfigure`). A command executed under
+  the old ballot is then answered from this node's record under the new
+  one.
+- **coordd** sends the solicitations with the re-offers, on the same
+  fan-out and the same offer report, counts them apart
+  (`counts.solicited`), and wakes for the next one. Its record pass
+  (`settle_from_records`) settles every entry the record may settle, as
+  it did for half-held ones.
+- **Unchanged.** What a voter accepts, and the evidence rules (review
+  boundary). A command the collector holds nothing for, that no voter
+  refused and that this node has not executed, is still asked for,
+  never answered from nothing.
+
+### Evidence
+
+- `refused_retries_free_every_pending_slot` (`coord-collector`, `refusal`):
+  256 retries fill every pending slot, and a new submission is refused
+  for backpressure. Each is refused, half as a bound key and half under
+  other facts, and settles. The domain then takes new work.
+- `a_key_bound_to_another_request_ends_the_entry_with_a_conflict`,
+  `other_facts_and_a_forgotten_duplicate_are_answered_from_the_record`,
+  `a_refusal_from_a_stranger_is_not_counted`,
+  `an_entry_holding_nothing_is_asked_for_again_then_settled_from_the_record`,
+  `a_minority_voter_bound_to_another_request_does_not_end_the_entry`
+  and `a_ballot_change_asks_for_every_entry_again` (same file): each
+  refusal kind with its reply and settled entry, and the solicitation
+  schedule.
+- With real voters (`coord-daemon`, `repair`):
+  - `a_retry_under_other_facts_is_answered_from_the_record`: a restarted
+    frontend presents a command again under another receipt. Every
+    voter refuses it and says why, and the entry settles with the first
+    answer, with nothing executed twice.
+  - `another_request_under_a_bound_key_ends_with_a_conflict`: every
+    voter refuses another request under a bound key, the entry waits,
+    and this node's record of the key, bound to the first command, ends
+    it with a conflict.
+  - `a_command_executed_under_a_changed_ballot_settles_under_the_new_one`:
+    every frame to the collector is lost, the leader stops and a
+    follower wins. The entry is asked for again at once and settles from
+    the record under the new ballot.
+  - All three fail without the voters' replies or without the
+    ballot-change rule.
+- The voter-side tests that asserted "no effect" for these refusals
+  (`admission`, `follower`, `replay`) now assert the one reply, to the
+  frontend only. A duplicate with its evidence still replays it, and
+  nothing is replayed for other facts.
+
+### What this does not cover
+
+- Solicitation has its own budget of 16 destinations a turn, beside the
+  re-offers' 16. After a ballot change with 256 entries pending on three
+  voters, the entries are asked for again over 48 turns (256 × 3 / 16),
+  not in one. That is negligible in wall-clock: after `reconfigure` every
+  entry is due at once, the loop's deadline is already past, and the
+  turns run back to back. It is a burst of up to 768 submission frames
+  (review).
+- The budget asks for an entry's voters all at once or not at all, so a
+  configuration of more than 16 voters would never solicit. Moot at three
+  or five voters (task-d31), and said beside the constant.
+- `Pending.frame` now keeps every pending submission until it settles,
+  bounded by `max_pending` × (`max_request` + 128 KiB): the same formula
+  as `undelivered_budget`, so it is within the existing memory budget.
+- The frozen collector trace gains the two new events (`VoterRefused`,
+  `Solicited`), and the frozen fixture is unchanged: its scenario
+  produces neither.
+
+## The resource contract
+
+task-d26, from the checklist review (items A2, B2, B6 and E5). The
+configuration named limits for a request, a response, a session's
+outstanding requests, the table and checkpoints, and nothing more. Several
+structures grew with what arrived or with history rather than with a
+stated bound, and several peaks were never counted. Design Section 13.1
+now states the contract: a limit for each class of resource (memory,
+durable protocol data, application data, a single message, each queue,
+temporary files) and the admission rate. This change adds the bounds the
+contract needed and a test for each.
+
+### What changed
+
+- **Installing a Sync is linear in its entries.** `advance_sync`
+  rescanned every pending entry on each round of installation and again
+  on every payload that arrived. A chain of 200 entries whose payloads
+  arrived last-first took 60,100 examinations.
+  - Each entry that cannot be installed now waits under the one command
+    it waits on first: its own record or facts, or a dependency below
+    ACCEPT.
+  - The table notes every command whose record is created or moves
+    while a Sync is pending (`CommandTable::watch_raises`,
+    `take_raised`). Only the entries waiting on a noted command are
+    examined again, whichever path moved it: a payload, a rebinding, an
+    adoption, a commit, catch-up.
+  - A Sync replaced or restored at boot is examined whole once.
+- **A candidate assembles reports once a majority could be complete.**
+  `Campaign::try_select` runs on every page and promise. Assembling
+  copies every entry of every complete report and digests it again. At
+  five voters, each page of the third report copied the second one whole.
+  It now returns early, with nothing copied, until enough promising
+  voters have every page of their report. A voter whose report announced
+  more pages than the bound counts as having answered: otherwise the
+  early return held a campaign whose voters were all past the bound
+  short of failing on them by name (task-d24's `ReportPastPages`).
+- **A Sync is encoded once.** `bounded_sync_update` cloned the selection
+  to encode the message and again to encode the row. It now encodes the
+  selection once. The frame's size is that encoding plus the Sync's tag,
+  and the row carries the same bytes, because a record of one field
+  encodes as that field.
+- **Retry-key bindings go with their command.** Neither the leader nor
+  the follower ever dropped a binding, and a boot rebuilt one for every
+  payload row there was.
+  - The history sweep now drops the bindings of forgotten commands, and
+    a boot restores none for them.
+  - A retry of a forgotten command is refused as `Forgotten` from the
+    table's executed answer, as it was from its binding, and is never
+    proposed again.
+- **Frames being received have a node budget.** Each stream's reader was
+  bounded by one frame of its class. Many streams at once each held one,
+  so partly arrived frames were bounded only by how many streams a peer
+  may open: 256 control streams of 4 MiB each.
+  - `BudgetLimits::receive_bytes` (64 MiB, with the control reserve)
+    now bounds them across every stream and connection.
+  - A frame takes its whole length once its header is in, and waits for
+    room before its payload is read. A stream therefore never holds part
+    of a frame while waiting for the rest, and QUIC flow control holds
+    the sender back meanwhile.
+  - The wait counts against the frame deadline.
+- **A historical read streams stored versions.** Building a view
+  collected every stored version of every key in a historical range
+  before choosing the one at the revision read. That is every obsolete
+  version garbage collection had not reached yet.
+  - Pages are now folded as they are read. A key's version is final, and
+    charged to the view budget, when the scan moves to the next key.
+  - The charge is the same as before, one row per key read, so the
+    outcome is the same on every replica whatever each has collected.
+- **Admission has a rate.** `limits.max_admitted_per_second`, default
+  1,000, is enforced per frontend as a token bucket with a second's
+  burst. A retry of an outstanding request takes nothing, and a refused
+  request is answered `BACKPRESSURE` ("admission rate").
+  - Catch-up executes up to 64 commands per durable batch (task-d25), so
+    the default leaves a returning voter most of its rate to gain on the
+    domain with. The time it needs is then bounded by its gap.
+  - The default is a design target and a ceiling, not a proved bound
+    (review): the 64-per-10-ms rate it is set under is unmeasured, and
+    task-d33's budget oracle is its check. It gates only client
+    requests, after the session-busy check and before the pending
+    insert; resolves, watches and held retries bypass it, and one bucket
+    per frontend is shared by every session. At the 35 to 100 commands a
+    second a domain sustains today it never binds.
+
+### What this does not cover
+
+- **The executed-history set and the tombstones.** The set holds one
+  identity per command executed, which a Sync and a restart's guards ask
+  about; `CommandTable.history` is inserted into at two sites and never
+  removed from. Bounding it needs the quorum-safe floor below which no
+  recovery can name a command. The plan now names the owners (review):
+  task-d46 retires the in-memory history above the floor continuously,
+  this set and the per-key tombstones with it; task-d27 owns every
+  durable row of an executed command below the floor and disk headroom
+  (#133). The task's long run, memory flat in history once admission
+  stops, therefore waits on those two: every other structure here is
+  flat in history already.
+- **The callers' plane carries more than admissions** (review of
+  task-d33). It carries this node's collector evidence too, so a fixed
+  share of the loop for that plane (`PEER_BEFORE_API`) throttles answers
+  along with new requests. Two shapes of fix: evidence to the collector
+  on a lane with the peer plane's priority, or a per-turn budget that
+  drains both planes. A follow-up of this contract, not yet owned.
+- **`limits.max_response_bytes` is not wired to the planner.** The
+  planner's response limit decides a replicated result, so it is schema,
+  8 MiB on every replica; the setting is what this node buffers, and the
+  capability check requires it to cover that.
+- **Measured catch-up rate.** The admission default is set against the
+  catch-up design rather than a measurement on the test host. task-d33's
+  budget and progress oracles are where the two are held against each
+  other.
+
+### Evidence
+
+- `a_sync_installs_in_time_linear_in_its_entries`: 200 chained entries,
+  payloads last-first, at most 4 examinations an entry. The old scan
+  fails it at 60,100.
+- `a_campaign_assembles_its_reports_once_a_majority_is_held`: five
+  voters, two reports paged two entries a page, one assembly.
+- `the_largest_table_gives_a_sync_that_fits_a_row_and_a_frame` and
+  `a_sync_past_its_row_refuses_the_campaign_by_name` now also check that
+  the row is the record's and that the size named is the frame's.
+- `bindings_are_bounded_by_the_commands_kept_not_by_history`: 400
+  commands through a table of 32, bindings at most 192 on every voter
+  and after a restart, and a retry of the first command not proposed
+  again. Without the sweep, the leader held 400.
+- `frames_being_received_hold_no_more_than_the_receive_budget`: six
+  400 KiB frames half sent under a 1 MiB budget. At most 1 MiB is held,
+  at least two frames are received side by side, and all six arrive.
+- `admission_is_bounded_by_its_rate_and_a_retry_takes_nothing`: the
+  burst, the refusal, a retry passing, the refill, and the cap on the
+  refill.
+
+## Three or five voters, and the source ballot's own fast set
+
+task-d31, from the checklist review. The configuration validator accepted
+epochs of one, two and four voters, while the design allows three or five
+and has no fast quorum for two or four. Recovery computed the source
+ballot's fast set with `c2_default` whatever the ballot ran under, while
+`verify_ballot` accepts C1 or any valid C2 set. A ballot with another fast
+set would therefore be recovered against the wrong one. Every production
+path builds `c2_default` today, so the mismatch could not happen yet, and
+this change keeps it from happening once one does not.
+
+### What changed
+
+- **Voter counts.** An epoch has three or five voters, or one for the
+  single-voter test profile.
+  - `GroupConfigurationV1::validate_shape` refuses two and four
+    (`ConfigError::UnsupportedVoterCount`). That covers every genesis and
+    handoff record the configuration chain takes.
+  - `Membership::from_genesis`, which coordd places a node with, refuses
+    them too (`MembershipError::UnsupportedVoterCount`,
+    `supported_voter_count`).
+  - `coord-harness` refuses `--voters 2` or `4` before provisioning
+    anything.
+- **One voter is the test profile.** A single-voter domain lets one
+  process carry a request through consensus in a test, and no deployment
+  survives the loss of its only voter.
+  - coordd's `place` refuses one in a build without debug assertions,
+    which is what ships, naming the profile. This is the same rule
+    config.rs applies to its test-only switches.
+  - Every existing single-voter test is a test build and runs as before:
+    the 23 single-voter domains of `bins/coordd/tests/cli.rs` and the
+    unit tests of `serve.rs`.
+  - So coordd's test suite is debug-only: `cargo test --release -p
+    coordd` fails those single-voter tests by design. No workflow runs
+    it; the only release build is the Kubernetes certification, on three
+    voters (review).
+  - The single-voter domains of `coord-daemon`, `coord-consensus`,
+    `coord-collector` and `coord-checkpoint` tests are built from the
+    libraries, never through coordd's placement, and are unaffected.
+- **The source ballot's fast set.** `recovery::select_from` takes the
+  configuration each source ballot ran under, where the candidate knows
+  it, and applies the possible-fast rule to that ballot's fast set.
+  - A configuration of another ballot, epoch or voter set is not taken for
+    the source's.
+  - Unknown, the default rule applies, as before.
+  - A campaign knows the configuration its candidate ran under
+    (`Campaign::knowing`). That ballot is the likeliest source of the
+    selection.
+  - The wiring of `Campaign::knowing` has no behavioural test, and none
+    is possible yet: `activate` always builds `c2_default`, so no
+    production ballot runs another fast set before task-m01. The rule
+    itself is tested on `select_from` (review).
+  - The C1 rule cannot qualify two values: it needs `fast_size −
+    unreported` agreeing reports, and twice that exceeds the reports
+    whenever there are more than `2n − 2·fast_size`, which holds for
+    three voters with a fast set of three and five with four.
+- **A resize is 3 → 5 in one handoff.** Refusing four voters means no
+  epoch passes through four, which matches task-d41's equal-count
+  replacement: a voter is replaced, and the count changes only by a
+  handoff that goes straight from three to five (review).
+- **Tests that used unsupported counts** now use a supported one:
+  - the catalog tests move from two voters to three;
+  - the fabricated-handoff case changes a voter's incarnation instead of
+    dropping a voter;
+  - the second genesis manifest has five voters instead of four.
+
+### Evidence
+
+- `possible_fast_decisions_follow_the_source_ballots_own_fast_set`
+  (`coord-consensus`, `model`): with the source ballot's own fast set
+  {r0, r2}, r2's pre-acceptance is kept as a possible fast decision. The
+  default set, {r0, r1}, re-proposes it, and a configuration of another
+  ballot is ignored.
+- `a_manifest_of_two_or_four_voters_is_refused` (`coord-membership`,
+  `catalog`) and the two new cases in `coord-types`' `config_v1`
+  validation table.
+- `a_single_voter_domain_is_refused_by_a_release_build` (`coordd`
+  unit): a test build runs one voter, a release build refuses it by
+  name, and three and five run in either.
+
+## What a client is told of its outcome
+
+task-d23. Three answers told a client less than the domain knew, or
+something else:
+- **A withheld result read as not admitted.** The output gate answered
+  `NOT_ADMITTED` when it would not disclose an executed command's
+  result, and so did `coordd`'s answer from the retained record. The SDK
+  maps `NOT_ADMITTED` to a definite failure and throws its credential
+  away, so a write that happened was reported as one that did not.
+- **A resolve read only the collector's memory.** An outcome evicted
+  from the resolved window, or asked of a frontend that never saw the
+  request, was `Unknown` while the node held the executed record.
+- **`Unknown` was final in the SDK.** `retry()` after it replayed the
+  stored `Unknown` and sent nothing.
+
+What changed:
+- **Two appended codes.**
+  - `OUTPUT_WITHHELD` (`0x0007`): the command executed and its result
+    is not disclosed. The gate's denials use it, and so does the
+    retained-record answer: for a result the session may not read, and
+    for a session that may no longer execute when the retry row shows
+    the command executed. A session that may not execute, with nothing
+    executed, is still `NOT_ADMITTED`, as is every refusal at the door.
+  - `RESULT_RETIRED` (`0x0008`): the sequence is at or below its client
+    instance's retirement floor, and no result is kept.
+- **A resolve asks the durable record first.** A `ResolveRequest` names
+  no request, and a result is gated against the request it answers, so
+  `coordd` reads the request from its payload row for the command. It
+  takes only a row under the invocation's own retry key whose request
+  derives the command's identity again.
+  - The executed result goes out through the output gate, as a
+    retained answer to a request does.
+  - Without the payload row nothing is handed out, and the collector
+    answers from its memory.
+  - Past the floor the answer is `RESULT_RETIRED`, which needs no
+    request.
+  - A session that is retired, or whose trust rule is disabled, is
+    answered `NoSession` before `retry::resolve` reads its floor, and
+    retirement deleted the retry rows the floor covers. The floor row
+    stays, so a resolve at or below it is answered `RESULT_RETIRED` from
+    that row, not left to a collector that may have evicted the outcome
+    (Codex on #128).
+- **The SDK** gains `Outcome::Withheld` and `Outcome::Retired`, both
+  final. Neither invalidates the credential, and `retry()` replays them
+  without sending. `retry()` after `Unknown` submits the same invocation
+  again, same identity and same bytes, and the domain answers it from
+  its record where it executed. The Go adapter already sent the
+  identical request again after `Unknown`. It maps `0x0007` to
+  `PermissionDenied` with its own message and `0x0008` to `DataLoss`.
+
+Tests:
+- `coordd` (`a_caller_bound_on_a_node_that_is_behind_is_admitted_not_refused`,
+  extended). A resolve through a frontend that never saw the request
+  returns the executed result from the record. Without the payload row
+  it is left to the collector. Past the floor it is retired. With the
+  session retired, a request and a resolve of an executed command are
+  withheld, never not admitted.
+- `coord-sdk`: `a_retry_after_unknown_submits_the_same_invocation_again`
+  and `a_withheld_result_and_a_retired_one_are_their_own_outcomes`.
+- `coord-session`: every gate denial the binding tests check is now
+  `OUTPUT_WITHHELD`. A foreign session's request, refused at the door,
+  is still `NOT_ADMITTED`.
+
+Residual: a resolve of an executed command whose payload row this node
+no longer keeps is answered from the collector's memory, `Unknown` when
+that is gone too. The client's next step is the same either way:
+submitting the invocation again reaches the retained record with the
+request in hand.
+
+## The failure and obligation contract
+
+task-d29. Design Section 5.5 indexes, in one place, what may fail, what
+each of the eight transitions leaves owed, and who owes it. Each of the
+thirteen obligations has an owner, a trigger, an escalation, and named
+tests in which that owner acts after the fault the row covers. The
+section ends with the conditional argument for why the work completes.
+
+- **Checklist gaps it closes.** A1: the failure model. A3: the
+  transitions, and retirement for bindings and the collector window.
+  A5: an owner and escalation for every obligation, where task-d22 gave
+  refused entries theirs. B9: the argument. G1: retirement justified by
+  what can still ask, not by recency alone.
+- **Two rows are narrower than their obligation.**
+  - O10: a voter behind a floor that moved on is refused what it cannot
+    prove, and bringing it back is task-d32.
+  - O11: a failed barrier stopping a running voter is shown on the
+    journal, the engine and the composed node, not inside a domain.
+    Mixed-fault qualification covers it there.
+- **The harness refusal (G5).**
+  - The certification harness initialized any node directory without
+    state, so a voter whose disk was wiped came back as an empty voter
+    under its old identity. Section 5.4 forbids exactly that.
+  - `initialize_node` now writes an `initialized` marker next to the
+    state it created. A marker without state is `RunError::StateLost`,
+    and nothing is initialized. A directory with state and no marker
+    gets the marker, so directories created before this change keep
+    working.
+  - `a_voter_whose_state_is_gone_is_refused_not_initialized_again`
+    drives it with a stand-in `coordd`.
+  - The marker lives in the node's bundle, so it goes when the whole
+    bundle does. A bundle copied again from the provisioning host then
+    has neither state nor marker, exactly like one that never ran, and
+    `coord-harness start` initialized it (Codex review on #129). A start
+    now never initializes: `resume_node` refuses a voter without state as
+    `RunError::NotInitialized` and runs nothing, and only
+    `coord-harness start --init`, which the runbook reserves for a voter's
+    first start, runs `initialize_node`. The harness cannot tell the two
+    bundles apart, so the operator's intent is the evidence, as with
+    `coordd init` itself. `a_start_never_initializes_a_voter_without_state`
+    covers the refusal. `multi-host-local.sh` and the `multi_host` tests
+    start each voter with `--init` once and restart it without.
+  - A partial `coordd init` that leaves a `state/` directory still reads
+    as initialized on the next start. That predates this task and is
+    recorded, not fixed here (review).
+- **From review of the contract.** O14, leader establishment, is a row
+  of its own, since Step 2 of the liveness argument rests on it, and
+  Step 2 now states the two conditions the code supplies: a promise
+  counts as a leader only until the ceiling, and a campaign still under
+  way at the ceiling is replaced. O1 cites the re-dial trigger's test,
+  O6 the payload asks a peer never answers, and O12 the one test of a
+  stop surviving restart; the rest of that is task-d13's. O10's two
+  owed halves are named: task-d27's second part for the stop, task-d32
+  for the return.
+
+## What the simulator's budget and progress oracles found
+
+task-d33 gives the protocol simulator two new oracles. One checks each
+node's resource budgets every step. The other stops the faults and gives
+the domain a bounded number of synchronous rounds to settle everything it
+admitted. Built as the plan asked, with no production change beyond hooks,
+they failed on the tree as it stood. The fixes are here, each with a unit
+test that fails without it; the oracles and the new rows follow on top.
+Seeds are `row, voters, seed` of `protocol_sim`.
+
+### Safety: what a selection keeps as possibly learned fast
+
+Five of these were two dependency sets for one command: the frontend
+learned it fast, and a later selection re-proposed it with other
+dependencies. One was `IncompatibleAccepted`.
+
+- **An ancestor pre-accepted on the member's own path** (14,3,10). The
+  candidate check dropped a command whose member held an adopted ancestor
+  under another path than the leader's. A leader synchronization re-bases
+  the member's log after that ancestor, while its record keeps the path it
+  was pre-accepted with. So a member whose path for the candidate is the
+  leader's can hold an ancestor under another path, and that is no
+  evidence either way. Only the order counts: the ancestor is in the
+  member's closure.
+  `a_candidate_is_kept_when_its_member_pre_accepted_an_ancestor_on_its_own_path`.
+- **A held command before one the member retired** (14,3,79; also 12,3,9).
+  The member's closure of the candidate stops at a command it executed and
+  retired. A conflicting command it still holds, which the selection orders
+  before the retired one, was in neither the closure nor after the
+  candidate, so the candidate was dropped. That command was executed there
+  before the retired one, so before the candidate. The rule that already
+  covered such a command when the member no longer held it
+  (`forgotten_before`, task-d34) now covers it held too.
+  `a_candidate_is_kept_when_a_held_command_precedes_one_its_member_retired`.
+- **A dependency no ballot decided** (4,3,85; 10,3,31). The leader
+  proposes x with the dependencies it knows, decided or not, and a fast
+  quorum decides x with them. In 4,3,85 the source leader had re-proposed
+  f, and no quorum accepted it; in 10,3,31, d was accepted by the leader
+  alone. The rule that every command of the candidate's closure be
+  decided, from task-28, dropped x. An undecided command in that closure
+  no longer does, when x's own dependencies, followed through what the
+  selection keeps (and past an undecided command, through the member's
+  record of it), reach it: the selection re-proposes it and orders x
+  after it (task-d34's re-proposal chain).
+  `a_candidate_is_kept_over_a_dependency_a_sync_demoted`.
+- **A member's stale record of an undecided command** (10,3,31). The
+  source leader accepted d after an adopted command a, while the member
+  kept its own pre-acceptance of d, which names nothing. Walked over the
+  member's records, x's closure missed a, and x was dropped. A candidate
+  that follows a command this selection re-proposes now counts as ordered
+  after an adopted command that follows no re-proposal itself: the
+  re-proposals are chained after the recovered order, and x after them.
+  An adopted command that waits on a re-proposal too counts only if x's
+  own dependencies, through what the selection keeps, reach it; else only
+  a command with no conflict passes. Counting every adopted command kept
+  a candidate that no ballot decided (2,3,3), and two conflicting commands
+  then followed the same re-proposal unordered. Reading the member's
+  records for such a command did the same (3,3,70; 1,5,14): the order
+  they give runs through the undecided command, which is re-proposed under
+  other dependencies.
+  `a_candidate_after_an_undecided_command_is_kept_over_the_members_stale_record`,
+  `a_candidate_is_not_ordered_after_an_adopted_command_that_waits_on_the_same_reproposal`.
+- **A dependency the member retired past its window** (12,3,9, once
+  retirement went in execution order, below). x was decided fast after
+  f, which the member had executed and retired longer ago than its report
+  names, so no report held f and the rule that x's closure be decided
+  dropped x. A member at the source ballot has released nothing (only a
+  later Sync releases) and pre-accepts only after commands it holds, so a
+  command in its closure that it no longer holds is history there, before
+  x. `a_candidate_after_a_command_its_member_retired_past_the_window_is_kept`.
+- **A candidate judged before the one it follows was dropped** (10,3,31,
+  in the other order). The rule dropped candidates one at a time, in the
+  order their identities sort. x, judged while d was still a candidate,
+  failed on the member's stale record of d and was dropped for good; d
+  was dropped after it, and x would then have passed. Each pass now
+  judges every candidate against the same set and drops first the
+  failing ones that follow no other failing candidate; a set of failing
+  candidates that all follow one another goes together. The test above
+  runs both orders.
+- **An adopted command ordered after a candidate through another
+  candidate** (#130 review). With x a candidate after w, y a candidate
+  after x and a adopted after y, the rule asked whether the selection
+  orders a after x through the adopted entries alone. It stopped at y and
+  judged x against a as if a came first, and x was dropped with y after
+  it. It now follows the dependencies of the candidates still kept too: a
+  kept candidate is selected with the dependencies it was reported with,
+  and each pass judges every candidate against the candidates that pass
+  keeps, so the order read through one is the order the selection ends
+  with. `a_command_adopted_after_a_candidate_follows_what_that_candidate_follows`.
+- **A member's order read through its stale record of a decided
+  command** (10,5,67, found under #131's oracles). The member had
+  pre-accepted d after a, and c after d; the selection committed d after
+  w and adopted a after d. Over the member's records, c's closure reached
+  a through d, so a passed as ordered before c. But d executes after w,
+  not after a: the selection kept c after d beside a after d, two
+  commands of one key that neither orders, and two voters executed them
+  in different orders. Whether an adopted command precedes the candidate
+  is now read over the member's records except through a command the
+  selection holds, which is followed by the selection's dependencies. The
+  member's own closure stays the evidence of its path, for the rule that
+  the candidate's closure be decided: a stale record there still shows
+  that the member's path is not the leader's.
+  `a_candidate_is_not_ordered_after_an_adopted_command_through_a_stale_record`.
+- **A report that overlaid its selection on a decision** (5,3,39). A voter
+  synchronized at a selection holding x at ACCEPT then pulled x's decision
+  of a later ballot, with other dependencies. Its report overlaid the
+  selection on the record and, since x was executed, reported the
+  selection's acceptance as its commit. The next selection found two
+  decisions of x. The overlay now leaves out a command the replica has
+  committed under other dependencies than the selection's.
+  `a_pulled_decision_is_reported_over_the_selection_the_voter_held`
+  (`catch_up`).
+- **A report that left out a commit its own selection made** (2,3,12).
+  Leaving out every committed command was too wide. Installing a
+  selection commits its committed entries in the table at once. The
+  ledger keeps the record from before the Sync until the installation's
+  row is durable. A deposed candidate promised the next ballot in that
+  window and reported the pre-acceptance at the ballot its own selection
+  had established. The next selection re-proposed two commands it had
+  committed, and chained a third after one of them: two decisions at one
+  position. A command committed under the selection's own dependencies is
+  overlaid again.
+  `a_report_takes_a_committed_selection_over_an_installation_still_in_flight`.
+
+### Safety: an executed command taken again as new work
+
+- **A retired command under an unbound key** (14,3,0, found once the
+  progress oracle re-offered what its collector could not yet answer,
+  #131 review). A voter that executed two presentations under one retry
+  key, the second as the identity refusal, restarted into a tie and left
+  the key unbound. A reclaim then retired the command inside the window.
+  A re-offer of it found no binding, no record and a command not yet
+  `forgotten`, so the leader initialized it as new work and proposed it:
+  the frontend learned it a second time, after other dependencies.
+  Admission now refuses every command the table retired, forgotten or
+  inside the window (`CommandTable::retired`), as `Forgotten`, on the
+  leader and the follower alike.
+  `an_executed_command_retired_with_its_key_unbound_is_not_taken_again`,
+  which fails on either path with its guard reverted.
+
+### Safety: an order the new leader forked
+
+- **An entry after a command the leader committed** (4,3,11 of task-d30's
+  row 4; it showed only once a voter the campaign missed could join the
+  ballot). The selection re-proposed r, which the new leader had already
+  committed, and carried x accepted after r. An entry after a re-proposed
+  command waits for that command's re-proposal (task-d34), but a
+  committed command is not proposed again. So x was never proposed, and
+  the re-proposals chained after r without it: two branches of one key's
+  order. The voters that held both commits executed them in one order.
+  The late voter had only one of them committed, and executed it first.
+  An entry now waits only on a re-proposed command the leader has not
+  committed. `an_entry_after_a_command_the_leader_committed_is_in_the_chain`.
+
+### Safety: a report that left out what its replica had just executed
+
+- **Retirement in identity order** (3,3,22). A deposed leader reclaimed
+  more executed records at once than the window its report names: records
+  let in past the table's capacity, and a recovery's reserve, make that
+  possible. They retired in the order their identities sort, so a command
+  it had executed a moment before went into the window and out of it in
+  the same reclaim, and its report left it out as history. The candidate,
+  far behind, still held it pre-accepted, re-proposed it, and the voters
+  executed two decisions of one command. A replica refuses a candidate
+  behind it only once it has executed a table's capacity of commands
+  past it (task-d10), and the window has to count the same thing: a
+  reclaim now retires in the order the commands executed.
+  `a_reclaim_retires_in_the_order_commands_executed` (`graph`).
+
+### Progress: work admitted and never finished
+
+- **A command a candidate took in after cutting its report** (5,3,3; also
+  5,3,9, 4,3,3 and 12,3,7). A proposal's payload arrived while its holder
+  campaigned. It was pre-accepted and fenced from any acknowledgement, and
+  it is in no selection of that campaign. Every retry then found it
+  initialized and was answered as a duplicate, so nothing ever proposed
+  it. The leader the candidate becomes now proposes what arrived after its
+  own report (`RecoveredState::arrived`) after the recovered order.
+  `a_command_a_candidate_took_in_after_its_report_is_proposed_when_it_leads`.
+- **An identity bound to another presentation** (14,3,5 and 14,3,3; also
+  14,5,3 and 14,5,4). A follower that took one request under a retry key
+  first refused, as an identity conflict, the payload of the leader's
+  proposal of another request under the same key. The proposal, and
+  everything after it, waited for ever. The same happened to a campaign's
+  own selection. First presentation wins at the leader: a payload fetched
+  for a proposal, a Sync entry or the campaign's selection now takes the
+  binding over. `a_follower_takes_the_leaders_presentation_of_an_identity_it_bound_otherwise`.
+  Both payload rows stay under the key, so a restart binds the key to the
+  command the table holds furthest along, and leaves a tie unbound for
+  the next exact presentation to bind; it used to bind whichever command
+  sorted last.
+  `a_binding_taken_over_for_the_leaders_presentation_survives_a_restart`.
+  A takeover removes a binding whatever phase its command is at, so
+  consensus can decide a second presentation under a key whose first
+  already executed: at three voters, A took d first, the leader's c
+  displaced it and executed, the leader died, A's report re-proposed d,
+  and C's takeover displaced k→c for d's payload. What keeps "at most the
+  first presentation" is the retry row at execution: `retry::admit`
+  finds the key's record naming c and answers `Conflict`, so d executes
+  as the identity refusal (`RetryConflict`, the outcome task-d22
+  settles on). The cost is a decided-then-refused command. Displacing
+  only a binding whose command is below COMMIT, and skipping such a
+  re-proposal, would save that round and is left for later: the refusal
+  at execution is the guarantee either way. A tie left unbound after a
+  restart likewise admits a third payload under the key as a new command
+  (it used to be refused as `OtherCommand`), which the retry row refuses
+  at execution the same way. It must not admit either executed
+  presentation again, which the next section's guard ensures.
+- **A release that missed a row in flight** (4,5,6). A Sync deleted the
+  row of a command it released only if the row was already durable. The
+  installation of an earlier Sync's entry, written after the release was
+  decided, became durable beside the marker. Every later report named that
+  acceptance, as a dependency no selection carried, and every campaign
+  stopped as `Behind`. The deletion now follows a row still in flight
+  (`DurableLedger::written`). That the deletion lands after the write it
+  follows rests on journal sequence numbers following submission order:
+  the journaled store queues a domain's submissions first in, first out
+  and numbers their records in that order.
+  `a_released_command_whose_row_was_in_flight_is_not_reported`.
+- **A candidate with a full table.** It refused, for backpressure, the
+  payloads its own selection waited on. A domain whose voters all held
+  full tables elected no one. Those payloads enter a full table, as a
+  Sync's entries do (task-d24), while the selection is unbound. The
+  review of task-d24 found the same refusal and fixed it there first
+  ("Recovering a capped Sync"); this is the condition kept.
+  `a_candidate_with_a_full_table_takes_its_selections_payloads`.
+- **A campaign superseded by a promise.** A voter's own campaign for a
+  lower ballot went on standing in for a campaign in progress after it
+  promised another voter's, and a voter holding one takes no catch-up
+  page. It is dropped. `a_campaign_superseded_by_a_promise_is_dropped`.
+- **History to fetch after a promise.** A voter that promised a leader
+  ahead of it held nothing unexecuted and asked for nothing. It now
+  counts the leader's frontier as history to fetch.
+  `a_promise_to_a_leader_ahead_leaves_history_to_fetch`.
+- **A voter the campaign missed.** A voter cut off while the campaign ran
+  never heard of the new ballot. The leader's proposals were foreign to
+  it, and a quiet domain sent it nothing at all. The leader's re-send now
+  asks every voter that has not voted in its ballot, and answers a late
+  promise with its Sync. A voter that promised and has not synchronized
+  answers the ask with its promise again, so a lost Sync is sent again.
+  A voter the campaign heard from is not counted either (#130 review):
+  its Sync is one unacknowledged frame, and counted as following at the
+  campaign it was never asked again if that frame was lost. The leader
+  counts only itself until a voter votes in its ballot. A voter that
+  installed the Sync with nothing to vote on yet ignores the ask instead
+  of refusing it, so a quiet domain costs one `NewLeader` per idle voter
+  per re-send tick until the first command. A promise is not repeated
+  while a higher one is in flight: that promise voids it. (A Sync that
+  answers a repeated promise is already held behind a higher promise in
+  flight, `on_sync`, task-d18.)
+  `a_voter_the_campaign_missed_is_prepared_by_the_leader_and_follows`,
+  `a_late_voter_whose_sync_was_lost_is_sent_it_again`,
+  `a_campaign_time_voter_whose_sync_was_lost_is_sent_it_again`,
+  `a_promise_is_not_repeated_below_one_in_flight` (`ballot`).
+- **A donor that served only its own ballot.** A voter refused as behind
+  asks for history at the ballot it last synchronized. Donors answered only
+  at their own, so it stayed behind. `coordd` now serves any ballot of the
+  epoch at or before the donor's own (`Machine::synchronized_at_or_after`).
+  `a_donor_serves_a_voter_at_an_earlier_ballot` (`coord-daemon`).
+- **A campaign that assembled on every message.** It re-assembled every
+  complete report on every page, promise and payload, and got the same
+  wait at a cost that grew with the reports. It now assembles again only
+  when another report completed or something it waits on arrived.
+  `a_waiting_campaign_assembles_again_only_when_something_moved`.
+
+### Evidence
+
+- Each test above fails with its fix reverted and passes with it.
+- `cargo test --workspace`, clippy with `-D warnings`, `cargo fmt` and the
+  docs check are clean.
+- The oracles and rows that found these are the next change (task-d33).
+  With every fix here, its rows 1 to 14 run clean at 100 seeds per row
+  and size, three and five voters (2,000 runs).
+
+## Budgets and progress after healing, in the simulator
+
+task-d33 adds two oracles to task-d30's simulator: a budget oracle and a
+progress oracle. It also adds the failure-test matrix rows that exercise
+them. What the oracles found on the tree as it stood is fixed in the change
+below this one ("What the simulator's budget and progress oracles found").
+
+### The budget oracle
+
+After every step, every limit of the resource contract (design Section
+13.1) that the machines hold is checked at its peak. Capacity is 32, and
+`max_report_entries` is the report bound of task-d20.
+
+- **Table.**
+  - Records never exceed capacity plus the most entries (and
+    re-proposals) of any one Sync the node was given, its own selection
+    included, plus the most commands of any one catch-up page it was
+    given: both enter a full table. The most is kept across restarts:
+    the table reloads the rows earlier recovery work wrote, while the
+    Sync row that brought them may have gone. The bound used to be five reports' worth of
+    entries, eleven times the capacity, which caught nothing short of a
+    runaway (#131 review).
+  - A fresh admission never lands past the reserve.
+  - Tombstones never exceed capacity plus the conservative keys.
+- **Ledger and bindings.** Durable records and retry-key bindings never
+  exceed six tables. The history sweep (task-d26) runs once they pass
+  four; the peak is those four, the live table, and the retirement
+  window the sweep goes down to.
+- **Held proposals.** Never more than `HELD_PROPOSAL_SLACK` tables.
+- **Campaigns.**
+  - Report pages held never exceed what the promising voters' reports
+    fill.
+  - Assemblies never exceed the promises that could complete a majority,
+    plus the payloads and executions that arrived while the selection
+    waited (`Campaign::supply_moves`).
+- **Syncs.**
+  - A Sync never carries more than five reports' worth of entries.
+  - The entries examined while installing one never exceed four times the
+    Sync's size (task-d26).
+- **Frames and journal records.** A frame is at most 4 MiB. A journal
+  record is at most 4,096 updates and 4 MiB, counted as the journal
+  admits a batch: sixteen bytes more per update, 64 per batch and 512 for
+  the record's header. At capacity 32 with one-byte keys neither bound is
+  approached: both checks are vacuous at this scale, and there for a
+  larger one.
+
+### The progress oracle
+
+After the fault schedule, the faults stop and admission pauses:
+- every node restarts, the live ones too, so what the domain settles
+  from there it settles from durable rows, not from tables and journal
+  writes a restart would discard;
+- nothing is lost, duplicated or held back;
+- campaigns happen only as `coordd`'s election makes them, with per-voter
+  backoff and jitter;
+- the donor rule and pacer of catch-up are `coordd`'s.
+
+The domain then runs in synchronous rounds, and has 400 of them to reach a
+leader, with every admitted command settled, every decision the frontend
+learned or a voter executed in the one order, and every voter at the same
+execution position with nothing left it could execute. A decision learned
+from a durable majority that the next selection dropped fails the second.
+- **Settled** is what the collector can answer, from what it received:
+  - the decision, learned from the evidence; or
+  - the record of its own node, once the entry is one only the record
+    answers. It becomes one when the collector asks for it again, or a
+    voter refuses it as `Forgotten` or as bound to another command, as
+    `Collector::half_established` has it. `coordd` then settles it from
+    its node's executed rows, or as a conflict when those rows bind the key
+    to another command that executed.
+  Each command's collector is on the node that took the caller's request.
+  What the simulator knows another node executed answers nothing (#131
+  review: it used to count, so a voter that ignored or wrongly refused a
+  re-offer would have passed).
+- **Re-offers.** Every eight rounds the frontend offers what has not
+  settled again (Section 5.5, O1).
+- **Campaigns.** A campaign that a majority holds, whose promisers
+  neither restarted nor promised another ballot, must complete within 48
+  rounds (task-d28's re-ask).
+
+### The rows
+
+- **Row 5.** Client or collector dies mid-dissemination.
+  - Admissions reach a few nodes.
+  - The collector restarts and forgets what it counted.
+  - The client presents the command again to a few more.
+- **Row 9.** Repeated interrupted elections.
+  - Frequent campaigns, and a candidate crashed while it campaigns.
+  - History long enough to pass the sweeps, so a budget that grows with
+    ballots or with history shows.
+  - While healing, each voter's first report page to each campaign is
+    lost once. The faults have stopped otherwise, so a campaign completes
+    within the ceiling only if it asks for a lost page again.
+- **Row 12.** Loss beyond the repair-cache window. Most evidence to the
+  frontend is lost, so a command settles from the record of its execution
+  or not at all.
+- **Row 14.** Lost responses and retries under one identity.
+  - Evidence to the frontend is lost.
+  - Commands are presented again, some with another payload under the
+    same retry key.
+
+Each runs at three and five voters, beside task-d30's rows 1 to 4 and 10.
+
+Healing restarts every node; a leader it takes down is not counted as a
+leader crash of the schedule's, so row 1's check that its schedule
+crashed a leader still means something.
+
+### What the oracles catch
+
+Each of the four earlier fixes the task names was taken out, and the rows
+run at their default seeds:
+
+| Taken out | Caught by |
+| --- | --- |
+| task-d22: refusals said to the frontend | Row 14, every seed at three voters: not healed, the retries under a bound key never settled. |
+| task-d28: a lost report page asked for again | Row 9, most seeds at three and five voters: a campaign a majority held did not complete within the ceiling. |
+| task-d24: the table's recovery reserve | Row 14, every seed: a fresh admission landed in the reserve. |
+| task-d26: the history sweep | Row 9, every seed: the ledger and the bindings went past their budget. |
+
+Before the page loss while healing, taking out task-d28's re-ask was
+caught by no row: healing starts no campaign that has lost a page, and
+the campaigns of the faulty phase were superseded before the ceiling.
+
+Counting only what the collector received also found a safety bug. Once
+executed commands it had not answered were re-offered, row 14 at three
+voters, seed 0, had a leader take one of them again as new work. The
+leader had retired it inside the window with its key left unbound. The
+fix, `CommandTable::retired`, is in the findings change.
+
+### Diagnostics
+
+- `PROTOCOL_SIM_WATCH=<4 hex digits>` traces one command.
+  - What each report said of it when a campaign decided, and whether the
+    selection kept it.
+  - The same when a campaign ended without deciding.
+  - With `PROTOCOL_SIM_WATCH_ALL=1`, every report and the selection.
+- `PROTOCOL_SIM_WATCH_PHASE=<4 hex digits>` traces every change of one
+  command's phase or dependencies at each node.
+- `PROTOCOL_SIM_TRACE_LINES` sizes the trace kept (4,000 lines by default).
+- A heal failure names each unsettled command's phase at every node.
+
+### Evidence
+
+- Every row passes 100 seeds at three and five voters
+  (`PROTOCOL_SIM_SEEDS=100`, about 17 minutes); 12 seeds by default.
+- The seventeen seeds that failed on the way, under the oracles or as
+  the recovery rule was narrowed, are kept in
+  `fixtures/protocol_sim/seeds.json` and replayed by default.
+
+## The applier's lowerings and the protocol's barriers
+
+Found while planning task-d27, whose floor batches go through the same
+store as the protocol's and the application's.
+
+- **Two allocators, one sequence.** The protocol machine and the applier
+  each allocated barriers for the same boot, both from one, and a store
+  tells barriers apart only by that sequence. A lowering takes one batch
+  per domain. So when a vote was still queued under the sequence the
+  applier issued next, the vote's `Materialized` completed the command:
+  it was reported applied while its own batch was still queued. A
+  catch-up window, one protocol barrier for many commands, lets the
+  application's count reach the protocol's. The applier now takes the
+  upper half of the sequences (`APPLICATION_BARRIERS`), and a protocol
+  allocator stops short of it.
+- **What the applier lowered for others was dropped.** Completing a
+  command lowers whatever is queued, and reconciling settles whatever
+  was uncertain, the protocol's batches with the application's. Both
+  outcomes were thrown away, so a vote or promise made durable there
+  never released the send waiting on it, until a new ballot or a
+  restart. The applier now keeps those facts (`Applier::take_foreign`),
+  and the node hands them to the outbox and the machine right after the
+  command's own outcome, then releases what they made durable. After,
+  not before, and that is an observation, not a mechanism: `applied`
+  depends on none of those facts, so the order is safe, but delivered
+  ahead of the outcome, under load a lagging voter's callers went
+  unanswered in
+  `a_replica_that_falls_behind_catches_up_without_starving_its_own_catch_up`
+  (18 of 24 runs, four at a time on four cores, against 3 of 16 on the
+  base and 4 of 24 with them delivered after), and why is not
+  established. See the open item below.
+- **Only a shared applier keeps them.** A node calls
+  `Applier::share_foreign`; an applier that stands alone (coordctl,
+  coord-login, coord-sts, the kine tests) keeps none of those facts,
+  since nothing would ever take them and it would hold every one for
+  its whole life. `an_applier_standing_alone_keeps_no_other_batchs_facts`
+  (coord-storage, `composed`) fails with them kept.
+- **An uncertain append waited for a command.** The node surfaced an
+  indeterminate lowering as a failed round and never reconciled it. The
+  domain then refused every protocol batch as not ready, and only the
+  applier's reconcile, when a command next executed, cleared it: on a
+  follower whose next command waited on the very vote that append
+  carried, nothing did. The node now reconciles at once, as the applier
+  does, and fails the round only if the outcome is still unknown.
+- Tests: `a_protocol_batch_lowered_by_an_application_is_neither_taken_for_it_nor_lost`
+  (coord-storage, `composed`) fails with the allocator shared ("the
+  command's batch is queued") and with the facts dropped ("the vote's
+  durability was dropped");
+  `a_vote_whose_append_ended_uncertain_is_reconciled_and_released`
+  (coord-daemon, `node`) fails without the node's reconcile ("group
+  outcome indeterminate").
+
+### Open: a result the leader executed while not leading
+
+`Leader::applied` releases a result only `if self.is_leading() &&
+!released`, and nothing retries a release it skipped. A command that
+executes while the leader's promise row is in flight is then never
+answered by this node: the collector's re-solicitation re-publishes the
+voters' evidence, not the leader's release, so its caller waits out its
+timeout. This is the likeliest reason the delivery order above matters,
+and the likeliest cause of the base's own 3 of 16 loaded failures of
+`a_replica_that_falls_behind_...`, which are a liveness gap independent
+of the barrier change, not an accepted flake. Before the order is
+written down as a mechanism: count, per apply, the facts delivered and
+the results `applied` did not release because the leader was not
+leading, reproduce the loaded failures with those counts, and root-cause
+them.
+
+Also open, pre-existing and now leaned on: after `JournalUncertain →
+Present`, a record sits in `pending` unmaterialized until the next
+flush, and the applier's loop can meet `StaleBase → Replan` up to eight
+times and return `Diverged` (`apply.rs`). Trimming under task-d27 relies
+on the reconcile, so this is settled before the trim lands.
+
+## Agreeing a forgetting floor in coordd
+
+task-d27's first part: the voters agree a floor, and nothing is
+forgotten below it yet. Trimming, the behind-floor stop and reclaiming
+sessions and retry records by an executed command come after it. Off by
+default (`[floor] enabled = false`).
+
+- **A common boundary.** A floor needs a majority promising the same
+  checkpoint, so every voter exports at the same positions: every
+  `FLOOR_INTERVAL` (4,096) executed positions, right after the command
+  at that position is applied. `Applier::apply` returns only once the
+  command's own batch is readable, and nothing but a command moves the
+  execution frontier, so the export is at exactly that position. Voters
+  that executed the same commands produce the same root; in the
+  three-voter test all three do. The interval is the schema's, not a
+  setting: a boundary derived from each voter's own setting would agree
+  only by coincidence. It moves into replicated policy with the
+  intervals.
+- **Durable before told.** The image is kept first (`SharedImageStore`:
+  verified from its encoded chunks, written to a pending directory,
+  synced, renamed into place). Then the readiness row is journaled
+  through `record_readiness`, which refuses a promise that goes back or
+  competes. The `FloorReadiness` message waits in the outbox on that
+  row's barrier, like any vote. The floor's batches take barriers from a
+  third sequence space (`RUNTIME_BARRIERS`), so the applier hands their
+  facts on rather than keeping them as its own.
+- **A peer's promise is its own.** A readiness is taken only from the
+  voter it names, over that voter's authenticated link, and recorded
+  through the same rules. It is also checked against the promise held
+  in memory, because the row that would refuse it may still be in the
+  journal and not yet in the view.
+- **Activation.** When a majority's promises name one checkpoint, the
+  certificate (`ActivatedFloorV1`) is journaled on each voter that holds
+  them. `TrimmedFloorV1`, the fence before deletions, is not published:
+  nothing is deleted yet. A restart reads back the promises and the
+  certificate, so a voter neither promises below itself nor forgets a
+  floor.
+- **The epoch a floor is agreed in** is the one its checkpoints name:
+  the configuration the store's frontier was reached under. Until a
+  reconfiguration executes, that is the initial one, whatever the
+  membership's epoch, as it is for every record the journal stamps
+  (`Persistence::follow_ballot`). Agreed in the membership's epoch, every
+  promise was refused as an origin mismatch.
+- **Disk.** Before an export, the images' filesystem must have
+  `headroom_bytes` free (1 GiB by default) beyond the last image's size,
+  read with `rustix::fs::statvfs`. Short of it, the boundary is refused
+  and said so, and no promise is made. Only images a standing promise
+  names are kept: this voter's latest, and the activated floor's.
+- **An image outlives the rows that name it.** A new promise or
+  activation supersedes older images, but until its batch is durable
+  the older rows are what a crash leaves. So superseded images are
+  reclaimed only once the outbox reports the superseding batch durable
+  (`Floor::settle`, at the end of each `carry_out`). After a batch
+  fails, nothing is reclaimed until a restart reads the rows back: a
+  later batch's images are no longer what the rows name. On reopening, the image this voter's latest durable
+  promise names is read back and verified
+  (`SharedImageStore::verify`). Missing or damaged, the voter does not
+  start: it would advertise a promise it cannot keep.
+- **This voter's promise counts once it is durable.** A promise is held
+  in memory from the turn it is made, so a peer's promise is checked
+  against it, but an activation counts it only once the promise's batch
+  is durable (`Floor::settle`), and the activation it completes is
+  journaled then. A failed batch rolls this voter's promise and the
+  activated floor back to the durable rows. A boundary is due only at
+  the execution frontier: a retry answered from the record carries its
+  original position, which the frontier is past, and exports nothing.
+- **Inline, and capped.** The export (`export_shared`: every row of the
+  common collections, every chunk in memory), the image's write
+  (`SharedImageStore::keep`: re-encode, verify, an fsync per 1 MiB
+  chunk, a rename) and the readiness row all run synchronously in
+  `Domain::turn`, the task that also drains peer frames, timers and
+  requests. That is O(common state) in reads, memory and written bytes
+  at every boundary, on every voter at the same position; while it runs
+  the domain neither serves nor answers a peer, and past the election's
+  1 s patience a new ballot fences the floor's batches. Measured with
+  redb at the default 64 MiB cache, release build, on one 4-core
+  container (`measure_the_inline_boundary`, coord-checkpoint's export
+  tests, ignored): 16 MiB of common state 0.16 s, 32 MiB 0.29 s, 48 MiB
+  0.49 s, 64 MiB 0.69 s, 128 MiB 1.6 s, 384 MiB 11 s (the export about
+  10 ms per MiB, the fsynced write the rest). 1 GiB did not fit the
+  container's disk beside its image; linear from 384 MiB it is about
+  30 s. So a floor refuses to start over `INLINE_EXPORT_CAP_BYTES`,
+  32 MiB of key and value bytes in the collections an export reads,
+  counted at `Floor::open` and only as far as the cap. A domain that
+  grows past it while running stops promising once an image is over the
+  cap (`FloorRefusal::OverCap`), and the next start refuses. The cap
+  goes when the export moves off the serving loop (task-d27's second
+  part). Measuring found the redb adapter's paged scan quadratic: each
+  page started at the interval's edge and skipped to the cursor, so
+  once the rows outgrew the cache 384 MiB took 152 s to export. The
+  cursor now narrows the range itself, and a conformance check holds
+  every adapter to a cursor outside the interval.
+- **When a voter's floor does not reopen.** `coordd` does not start,
+  and says why. Over the cap: set `[floor] enabled = false`; the voter
+  serves, and its promises and any activated floor stay in its store,
+  read back when the floor is enabled again. The image this voter
+  promised is missing or damaged: the refusal names its root. A peer
+  whose latest promise is the same boundary holds the same image under
+  the same 64-hex name (equal common state exports equal bytes), so
+  with `coordd` stopped, copy that directory from the peer's images
+  directory into this voter's; the reopening verifies it again before
+  it is trusted. If no peer holds it, disabling the floor leaves a
+  durable promise this voter no longer backs. That is harmless while
+  nothing trims (this part: nothing reads a peer's image or forgets
+  below a floor), and it is not once trimming lands: then the way back
+  is replacing the voter through membership (task-d41) with a fresh
+  store. Never delete the readiness or activation rows by hand; they
+  are in the common hash.
+- **Its own directory.** The floor's images and the local checkpoints
+  each reclaim every 64-hex directory their own store does not keep. A
+  configuration that gives both one directory, or puts one inside the
+  other, is refused (`ConfigError::SharedDirectory`). `coordd` compares
+  the canonical paths again at start, so a link cannot join them.
+- **Not yet.** A promise sent while the voter's ballot changes is
+  dropped with the other sends of the old ballot. A voter that missed a
+  peer's promise activates from the next boundary's. Neither blocks
+  anything, because nothing depends on the floor until trimming does.
+- Tests (coord-daemon, `floor`):
+  - `three_voters_agree_a_floor_at_each_boundary` fails without the
+    voter recording its peers' promises.
+  - `a_promise_is_taken_only_from_the_voter_it_names` fails without the
+    sender check.
+  - `a_restarted_voter_reads_back_its_promise_and_its_floor` fails
+    without the read-back.
+  - `a_voter_short_of_headroom_promises_nothing_and_two_still_activate`.
+  - `a_superseded_image_is_kept_until_the_batch_that_supersedes_it_is_durable`
+    fails when images are reclaimed as the rows are made.
+  - `a_failed_batch_reclaims_nothing`.
+  - `a_voter_whose_promised_image_is_lost_does_not_reopen_its_floor`
+    fails without the read-back verification; it also reopens from the
+    image copied from a peer, named by the refusal.
+  - `an_own_promise_whose_batch_failed_counts_for_nothing` fails
+    without the rollback; `a_superseded_image_is_kept_until_the_batch_that_supersedes_it_is_durable`
+    fails when the own promise counts before its batch is durable.
+  - `a_position_behind_the_frontier_is_no_boundary`.
+  - `common_state_over_the_inline_cap_refuses_the_floor_at_start`.
+  - `the_floor_keeps_its_images_apart_from_the_local_checkpoints`
+    (config).
+
+## What a command costs every voter
+
+task-d45: the counters the throughput tasks (task-d46 through task-d49)
+are measured by, and a CI job that fails when they regress.
+
+- **On an interval.** `coordd` prints its metrics snapshot every
+  `[metrics] interval_seconds` (10 by default; 0 turns it off) as well as
+  at start and when serving ends, which a killed daemon never reaches.
+  The snapshot is printed at the top of a pass, before the pass's work,
+  so a pass that never ends does not take the interval with it, and the
+  report's deadline is one of the loop's wake-ups, so an idle voter
+  prints too.
+- **`cost`** is a voter's reading, since its domain loop started:
+  commands executed; lowerings (a `JournaledStore` flush or reconcile
+  that appended or committed anything, counted in the store, so the
+  node's turns, `apply` and reconcile are all in it); journal appends
+  and projection commits; journal syncs, read from raft-engine's own
+  `WriteStats.syncs` (`JournalEngine::syncs`; an engine that does not
+  count them reports `NotInstrumented`, never zero); the loop's busy
+  time and uptime; and `recent`, the busy time and commands executed
+  since the last printed snapshot. A process without a voter reports
+  `NotThisRole`.
+- **Busy time** is the loop's running time less its waits in the
+  `select` that takes its next event. Measuring the waits rather than
+  the work means no path through a pass can be missed. On tmpfs it
+  tracks the domain thread's CPU time within 5% (the thread's
+  `utime + stime`, read from `/proc`, against `busy` on the same run);
+  on a disk it also counts the syncs the loop waits on, which is the
+  point.
+- **Checked against `strace`.** One voter of a three-voter domain on
+  tmpfs, traced for `fdatasync` on its journal and its store while a
+  single caller ran 1,000 operations, the count taken between two
+  snapshot writes the trace also saw: 1,553 journal syncs by the
+  snapshot's count and 1,553 by `strace`; the store's `fdatasync`s
+  3,109 against two per projection commit, 3,106 (redb syncs twice per
+  durable commit).
+
+### The gate
+
+`scripts/bench/command-cost.sh` stands up a three-voter domain on tmpfs
+for each caller count (1 and 10), offers 2,500 operations closed-loop
+after 100 of warm-up, with a snapshot every second, and lets each voter
+print one more after the load ends. The mix is the bench's default
+without its scans: a scan reads from a random key to the end of the key
+space, so it costs more as the puts fill it, which is the application's
+state growing and not the per-turn work the gate guards.
+`scripts/ci/command_cost.py` reduces each voter's snapshots to
+per-command readings and `gate` compares them with
+`scripts/ci/command-cost-baseline.json`: the busiest voter's busy time
+per command over the run and over the last quarter of the commands it
+executed, the largest of any voter's last quarter over its first three,
+and the busiest voter's journal syncs per command.
+Completed commands a second are reported and never gated. The `command cost` job in
+`build-test.yml` runs it on every change that is not docs-only.
+
+- **A fixed number of operations, not 60 s.** The cost of a command
+  grows with the history before it (task-d46): on this container the
+  busiest voter's busy time per command was 4.4 ms read 10 s into a run
+  and 6.6 ms read at its end, 2,500 operations later. A run of fixed
+  length measures a different history on a faster machine. And at
+  60 s's worth today (9,000 operations at one caller) one voter fell
+  behind -- 2,334 commands executed against the others' 9,102, at 97%
+  busy -- after which its per-command readings measure its backlog.
+  2,500 operations is the most every voter keeps up with on a 4-core
+  runner today.
+- **The last quarter.** A whole-run average spreads work that grows
+  with history over commands that ran while it was short; the last
+  quarter is read at the largest history the run reaches, from three
+  quarters of a voter's final count to the first snapshot at it. A
+  snapshot rarely lands on three quarters, so the busy time there is
+  interpolated between the snapshots on either side, as if each command
+  between them cost the same. Opening the window at the first snapshot
+  past three quarters instead, as the gate first did, made the window
+  anywhere from 7% to 46% of the run at a second between snapshots, and
+  on a runner past about 650 commands a second at one caller the
+  quarter fell between two snapshots and the reading was absent (#98's
+  carry of 6a8dd83, three of three repeats).
+- **Negative control.** A third `missing_payloads` call per pass of the
+  domain loop (`coordd` already makes two; it chains every key of
+  `held`, `sync_pending` and `adopted` and sorts them). Three repeats
+  per caller count on this container: the busiest voter fell behind,
+  and the medians of its readings were 9.5 ms (whole run) and 28.7 ms
+  (last quarter) at one caller, and 11.6 and 31.9 ms at ten, with 3.40
+  syncs per command there -- against at most 7.6, 15.0, 8.0 and
+  14.7 ms, and 3.08 syncs, in four runs without it. Gated against
+  those four runs' largest readings, the control fails 9 of the 10
+  readings and three repeats without it pass. A scan of every record of the
+  command table per pass instead raised the whole-run readings by only
+  11% and 3%: that table is bounded by its capacity, and a scan of it
+  is cheap beside a turn. After task-d46 the extra `missing_payloads`
+  call reads indexes and costs little, so the control is now task-d46's
+  own learner change undone (the learner reading every vote set and
+  every record again). On the mix without scans, three repeats per
+  caller count read 3.11 and 4.96 ms (whole run, last quarter) and a
+  ratio of 1.97 at one caller, and 3.04 and 4.84 ms and 1.98 at ten,
+  and the gate fails all six readings against the baseline below.
+- **Repeats.** Without a change, the busiest voter's readings moved by
+  up to 19% over the whole run and 37% over the last quarter between
+  four runs on this container. So each caller count runs three times
+  and the gate compares the median.
+- **The baseline** holds, per caller count, the largest reading seen
+  in the job's own runs on its runner, with margins of 25% (busy over
+  the run), 30% (busy over the last quarter, and the ratio) and 10%
+  (syncs). Before task-d46, on the `ubuntu-24.04` runner one voter fell
+  behind in every repeat (1,098 to 1,749 of 2,602 commands executed,
+  12.6 to 17.1 ms per command). task-d46 moved it down, from that job's
+  run on its own head with the mix without scans and the interpolated
+  window (build-test run 36908805251): 1.32 and 1.45 ms and a ratio of
+  1.19 at one caller, 1.46 and 1.65 ms and 1.19 at ten, 3.00 syncs per
+  command. Every voter's ratio in that run was 1.08 to 1.19. Against it
+  the learner revert's medians (3.11 and 4.96 ms and 1.97 at one caller,
+  3.04 and 4.84 ms and 1.98 at ten, read on this container) fail all
+  six readings; the ratio limit is 1.55 at both caller counts.
+- **The ratio** of a voter's last quarter to its first three is what
+  grows when the cost of a command grows with history, and it needs no
+  machine to compare with: a faster runner moves both readings, not
+  their ratio. Two choices in it:
+  - *Per voter.* The largest last quarter over the largest first three,
+    taken from two voters, would hide a follower whose cost grew under a
+    leader busier throughout.
+  - *Over the first three quarters, not the whole run.* The whole run
+    holds the last quarter on both sides of the division: a cost
+    growing linearly from c to 2c reads 1.25 against it and 1.36
+    against the first three, and `test_command_cost.py` pins the
+    second.
+- **What an unchanged run's ratio is.** With the interpolated window,
+  unchanged code on this container reads 1.09 to 1.20 at one caller and
+  1.13 to 1.20 at ten, every voter alike, and 1.16 to 1.24 with local
+  checkpoints off: about the 1.1 to 1.2 of the long runs. Read from the
+  first snapshot past three quarters, the same logs read 1.14 to 1.41,
+  and the high ones were the narrow windows: the last second of a run
+  costs about 1.5 ms a command against 1.2 before it, and a window of 7%
+  of the run is mostly that second. An earlier account here put the
+  1.3 to 1.5 down to a short run never reaching a history sweep; the
+  warm-up that was to show it, 5,000 commands past the first sweep,
+  reads 1.07 to 1.29 interpolated, no lower than without it, so that
+  account was wrong. The learner revert reads 1.77 to 2.04 on the same
+  window (medians of the largest voter 1.97 at one caller and 1.98 at
+  ten).
+- **Two limits of the window.** The first three quarters' busy time is
+  read from a snapshot's cumulative count, so it includes the voter's
+  busy time before its first command (boot, and the 100 warm-up
+  operations). On a 2,600-command run that is a few percent of it, and it
+  lowers the ratio: it can hide a little growth, never invent any.
+  Subtracting the first snapshot's busy time and count from both sides
+  removes it if that ever matters. And the reading is absent again on a
+  runner that executes three quarters of the run inside the first
+  snapshot interval, about 2,000 commands a second at one caller; a
+  snapshot more often than once a second would remove that.
+- **Noise.** An unchanged run on this container once read 2.35 ms over
+  the last quarter at ten callers against the runner's 1.67, and a
+  re-run read within the baseline. No local checkpoint falls in that
+  window (each run's exports land between executed 900 and 1,340, and
+  the last quarter starts past 1,950), so that reading was the
+  container's load, not a growth; the margins stay at 30% and a change
+  that moves them says why.
+
+## Per-event work that does not grow with history
+
+task-d46. The consensus machines kept executed entries in their maps
+until the history sweep (capacity × `HISTORY_SWEEP`), and several of
+them read every entry on each turn or event, so a command cost more the
+more had run before it. Each such read is now an index kept as the
+maps change, read for what changed.
+
+- **The learner** examines the records at ACCEPT
+  (`CommandTable::in_accept`, entered where a record reaches ACCEPT and
+  left lazily) instead of every vote set, executed history included,
+  and finds the next command to execute among the committed records
+  (`in_commit`) instead of every record. `commit_through_leader` reads
+  the same set. `in_commit` keeps only records with a payload, as
+  `records()` did, so the candidates are the same commands in the same
+  order. `missing_payloads` chains its sets in any order: it sorts and
+  deduplicates what they yield.
+- **A follower's missing payloads** are three sets kept with the maps:
+  adopted and held commands with no payload (`adopted_lacking`,
+  `held_lacking`), and held commands that may await a rebind
+  (`rebinds`, filtered when read). `coordd` asks twice per pass; a
+  follower that had fallen behind spent 29 of 40 stack samples there,
+  over up to `HELD_PROPOSAL_SLACK` tables of held proposals.
+- **A follower's adoptions** are driven by what changed. A held proposal
+  that cannot be adopted waits under the one command it waits on first,
+  as task-d26 keeps pending Sync entries, and the table notes for the
+  follower every command whose record is created or moves
+  (`watch_moves`). `advance_pending` examines the proposals held since
+  its last call and those waiting on a noted command, where it read
+  every held proposal on every submission, proposal and rebind (its
+  callers: `on_request`, `on_proposal` and `rebind`).
+- **The leader's proposals** are indexed by barrier (`on_storage` found
+  one by a linear scan) and by what is unsettled, not both durable and
+  executed (`unexecuted_in_order`, `committed_through`,
+  `advance_pending` and `adopt_own` read every proposal).
+- **Decisions unchanged.** The protocol simulator folds each node's
+  executed order and each decided command's dependencies into a digest
+  (`Stats.decisions`). At `PROTOCOL_SIM_SEEDS=100` every row's digest is
+  the same as before task-d46, after each change. Debug assertions
+  compare each index with the scan it replaces in every test.
+
+### Measured
+
+On tmpfs on this container, three voters, the `command cost` bench
+(2,500 operations, the default mix):
+
+| callers | completed/s before | after | busiest voter's busy ms/cmd before | after | its last quarter before | after |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 145-147 | 413-443 | 6.4-7.6 | 1.42-1.52 | 10.8-15.0 | 1.71-2.09 |
+| 10 | 128-150 | 603-628 | 7.2-7.5 | 1.47-1.52 | 11.2-14.6 | 1.90-2.48 |
+
+Three runs each, before and after. The ceiling at ten callers rose about
+four-fold.
+
+Over a long run (100,000 operations at one caller and 150,000 at ten,
+the default mix without its scans: a scan reads from a random key to
+the end of the key space, so it costs more as the puts fill it, which
+is the application's state and not this task's), each follower's busy
+time per command over the 15 s up to 20 s and up to 280 s:
+
+| callers | local checkpoints | at 20 s | at 280 s | ratio | completed per 30 s |
+| --- | --- | --- | --- | --- | --- |
+| 1 | off | 1.52, 1.47 | 1.77, 1.77 | 1.16, 1.20 | 9,388 to 11,178, no trend |
+| 10 | off | 1.41, 1.41 | 1.60, 1.54 | 1.14, 1.10 | 14,449 to 17,436, no trend |
+| 1 | every 4,096 records (the default) | 1.47, 1.46 | 2.76, 3.00 | 1.88, 2.05 | 10,702 falling to 6,812 |
+| 10 | every 4,096 records | 1.44, 1.42 | 3.29, 2.80 | 2.28, 1.97 | 15,404 falling to 9,223 |
+
+Before task-d46, the plan's measurement of the same thread grew four- to
+five-fold over 90 s at one caller.
+
+### Open: the local checkpoint on the domain thread
+
+With local checkpoints at their default (`checkpoint_after_records =
+4096`), the cost per command still grows, and the growth is task-j04's
+local checkpoint. `Domain::maintain` publishes one each time the
+journal runs 4,096 records past the last, on the domain thread, and
+`export_local` traverses the whole projection to write it. The
+projection grows with every executed command (its MVCC revisions,
+`executed_v1` and payload rows), so each export costs more than the
+last: 1.1 to 1.3 s of the domain thread's busy time on average over the
+run above, about 2.5 s near its end, at 365,000 projection records,
+during which the voter takes no event. Late in the run a third of a
+leader's busy samples are in `export_local`. Off, the run meets the
+acceptance; on, it does not, and a voter falls 9,000 commands behind.
+
+That is outside this task's boundary (the consensus machines and the
+loop's call sites, no change to what is durable), so task-d46's
+acceptance is measured with local checkpoints off and the export is
+task-d51's: export from task-d37's read snapshot off the domain thread,
+so the loop only selects the image, trims and reclaims. Pacing exports
+by the projection's size instead would keep the export cost per command
+constant, at the price of a journal (and a restart's replay) that grows
+with the state, so the plan does not take it. Until task-d51, task-62's
+throughput rows run with `checkpoint_after_records = 0` and say so. Each
+publication's `checkpoint` line carries `took_ms`, so a run that left
+them on shows the stall in the voter's log.
+
+### Open: a voter that stops executing
+
+Under ten callers, before the held-proposal indexes and on task-d45's
+base alike, one voter stopped executing for good while the other two
+went on: executed 43,923 at 93 s and nothing after, at 99% busy,
+refusing as backpressure, while both peers logged its control lane
+full. On task-d45's base, at one caller, the same at 2,334 commands.
+Its samples were in `missing_payloads`: a voter that falls behind holds
+many proposals, and reading them all on every pass kept it from
+draining its peers' frames, which were dropped, re-sent and dropped
+again. With the indexes it no longer stops, in the runs above; with
+the local checkpoint on, a voter still falls behind (the 2.5 s stalls)
+and catches up slowly. What lets a voter that has fallen behind catch
+up, rather than only not stop, is task-d49's: a re-send window full of
+proposals the voter already acknowledged starves the one it lost.
+
+**An intermittent on the same pressure.** On d891e9c (build-test run
+36900303341, `rust (x86_64)`, job 110497626808),
+`a_replica_that_falls_behind_catches_up_without_starving_its_own_catch_up`
+failed its assertion that no voter ever logs a full bulk lane: one logged
+`QueueFull { lane: Bulk }` for 64 frames and counting, recovered after
+96, and every caller was answered. The consensus code was the same as on
+the green runs either side of it (7830ff1 and 6a8dd83), the test passed
+6 of 6 times on this container, and it took 52 s on the runner beside
+the 338 s activation test. What the assertion measures is re-sends and
+catch-up answers competing for a loaded voter's lanes, which is
+task-d49's subject, so it is left as it is. A later failure of the same
+assertion is counted here rather than analyzed again.
+
+### Not done here
+
+- **Continuous retirement.** The maps are still swept when the ledger
+  passes capacity × `HISTORY_SWEEP`, which is one O(n) pass every few
+  thousand executions; amortized constant, not bounded per execution.
+  The executed-history set and per-key tombstones stay unbounded, and
+  `CommandTable::retire` still reads every key's state for each
+  tombstone it evicts.
+- **The leader's re-send** (`resend_unvoted`, `committed_through` in
+  `announce_committed`) still sorts every durable proposal each tick.
+  task-d49 rewrites that window.
+- **A follower behind on a contended key.** `PathLog::sync_known`
+  re-chains the digest over the key's whole unsynchronized suffix, so
+  each adoption costs that suffix. The digest is the path evidence
+  voters compare, so its definition stays; only a follower that is
+  behind pays it.
+
+## Where a command's time goes after task-d46
+
+A profile of each voter's domain thread at #136's head (2d9a1d1), taken
+to decide what the throughput tasks after task-d46 must include. Three
+voters on loopback; `coord-wan-bench`, closed loop, the gate's mix
+without scans.
+
+**Stores on tmpfs, ten callers.** `perf record -e cpu-clock --call-graph
+dwarf` on each voter for 12 s of a 15,000-operation run, 602 completed a
+second under the profiler. The domain thread is the process's main
+thread and took 68 to 70% of the process's CPU samples; the four
+transport workers took the rest. Its busy time is about 1.15 ms a
+command. Attributed by the outermost frame of each part (7,365 samples
+over three voters):
+
+| part | share of the domain thread | about, per command |
+| --- | --- | --- |
+| projection: redb write transaction | 36.0% | 0.41 ms |
+| of which the commit (`commit_durable`) | 23.8% | 0.27 ms |
+| `Learner::established` (leader and follower) | 24.5% | 0.28 ms |
+| the rest of consensus | 11.0% | 0.13 ms |
+| storage around the projection (`apply_bound`, lowering) | 7.2% | 0.08 ms |
+| journal (`append_group`, sealing records) | 5.8% | 0.07 ms |
+| the loop itself, transport sends, collector, codec, other | 15.5% | 0.18 ms |
+
+- **`Learner::established`** walks the executed command's whole
+  dependency closure (`closure_step`), through every executed record
+  still in the table, and `EstablishedResult::establish` then checks the
+  result for duplicates pairwise and drops it. The table holds up to its
+  capacity (1,000) of executed records, so the walk is hundreds of
+  records per execution, and the check quadratic in them; the
+  closure is read by nothing else. It probably also accounts for an
+  unchanged 2,600-command run's ratio of 1.1 to 1.2 in task-d45's gate,
+  since the table fills over the first thousand commands; task-d53's
+  runs will say. task-d53.
+- **The projection's commit** costs the same per transaction whatever it
+  carries (flushing pages, the page cache, the allocator), so task-d47's
+  groups divide it.
+
+**Stores on a disk.** The same bench with the stores on the container's
+disk (0.3 to 0.4 ms per `fdatasync`), one run each at 1, 10 and 50
+callers: 159, 165 and 171 completed a second, flat, at 5.4 to 5.9 ms of
+busy time per command and 76 to 78% busy. From the stage counters: two
+journal writes per command, 1.5 ms each; one materialization, 1.8 ms;
+0.65 to 0.9 ms for everything else. Three syncs per command in series on
+the domain thread, at every concurrency.
+
+**What follows.**
+- After task-d47 and task-d48 a group still costs the domain thread its
+  journal sync, then its projection commit and sync, then every
+  command's execution, in series. With about 2.5 ms a sync on the
+  Jepsen runner's disk and 0.6 ms of CPU a command left on the thread, a
+  group of k commands takes 5 + 0.6k ms: about 1,400 commands a second
+  at k = 50, which is etcd's rate on that runner, with fifty clients'
+  worth of grouping needed to get there. With execution and the
+  projection on an applier thread, the domain thread's share is
+  2.5 + 0.4k ms, past 1,500 a second from about k = 10. So the pipelined
+  applier is the fifth task: task-d52.
+- task-d53 takes the closure walk out first; it is a quarter of the CPU
+  and independent of the storage work.
+
+**task-d53, measured.** `Learner::established` now walks only what has
+not executed; the guard makes that the command's direct dependencies.
+- **Busy time.** `command-cost.sh`, the binary before and after
+  alternated twice on this container, three repeats per caller count
+  each (medians of six):
+
+  | callers | busiest voter's busy ms/cmd | completed/s | ratio |
+  | --- | --- | --- | --- |
+  | 1 | 1.36 → 1.05 (−23%) | 452 → 545 | 1.13 → 1.05 |
+  | 10 | 1.29 → 0.95 (−26%) | 713 → 969 | 1.20 → 1.07 |
+
+- **The ratio.** The unchanged ratio of task-d45's gate falls to about
+  1.05, so the closure walk was what made it 1.1 to 1.2: the table filled
+  over the first thousand commands of a run.
+- **The profile** at ten callers: `Learner::established` is 0.5% of the
+  domain thread, from 24.5%. The projection's redb transaction is now
+  46% of it, the rest of consensus 15%, the storage around the
+  projection 9% and the journal 5%.
+
+## Lowering in groups
+
+task-d47. `coordd` lowered one domain's queued batches one at a time,
+and each executed command's application batch on its own as well: at
+every concurrency about three syncs a command on every voter, in series
+on the domain thread. A voter now lowers what is ready together.
+
+- **The journal group** (`JournaledDomain::append`) takes every queued
+  transition of a stream that fits its bounds, 64 records or 256 KiB,
+  as one raft-engine entry of chained records, synced once. Each record
+  keeps its own barrier, sequence and predecessor digest, so
+  `JournalDurable` still names each batch, and a vote is still justified
+  by its own record's final durable state (17.3.3). An uncertain entry
+  is reconciled all or none.
+- **The flush.** `coordd`'s loop leaves what its rounds persist queued,
+  and flushes once no event is ready, or 64 batches are queued, or 64
+  events have passed with something owed (`FLUSH_QUEUED`,
+  `FLUSH_EVENTS`). A flush is:
+  1. *stage*: the commands whose turn has come are applied as one
+     execution group, at most 32 (`GROUP_COMMANDS`). Each is planned
+     over the projection with the group's earlier writes laid over it
+     (`RecoveryCut` with the group's overlay); planning reads no
+     protocol, payload or checkpoint row, so it does not matter that
+     those are not yet materialized;
+  2. *journal*: the group's application batches and the protocol's
+     queued batches go into one journal append, without materializing;
+  3. what that append released -- votes, proposals, commits -- goes out;
+  4. *finish*: the group is materialized, one projection commit, and its
+     results, sends and watch events go out. They are held until then,
+     never before.
+  When nothing can execute, the flush materializes what it journaled
+  itself, so the projection does not fall behind the journal.
+- **Recovery.** A group journaled but not materialized is replayed from
+  the journal at boot, as one batch was. A refused projection commit is
+  redone from the same plan, not replanned.
+
+**Which thread syncs.** All of it is still the domain thread's: the
+journal sync, the projection commit and execution, in series. Grouping
+divides the syncs among the commands of a flush; it does not take them
+off the thread. That is task-d52's.
+
+**task-j05 is not implemented**, so its fault points do not exist. This
+task brings its own tests at the same boundary:
+- `composed.rs`: a group of commands lowers once and leaves the same
+  projection, results and revisions as applying them one at a time; a
+  boot that ends between a group's journal sync and its projection
+  commit recovers every command of the group from the journal; a
+  refused projection commit of a group is redone, not replanned.
+- `journaled.rs`: an uncertain entry of several records reconciles all
+  or none.
+- `node.rs`: a vote and a proposal go out only after the flush that
+  journals them; the commands ready together execute as one group; a
+  staged group is journaled by the flush and answered only by finish.
+- **Negative control:** a driver that reports a record journal-durable
+  before journaling it -- a release moved ahead of its sync -- fails the
+  vote and proposal tests.
+
+### Measured
+
+Three voters on loopback, `scripts/bench/command-cost.sh` (2,500
+operations, the gate's mix without scans, three repeats per caller
+count), task-d46's binary and this task's alternated twice; medians of
+six. Stores on the container's disk (`STATE_ROOT`, 0.3 to 0.4 ms an
+`fdatasync`):
+
+| callers | completed/s, task-d46 → task-d47 | journal syncs per command per voter | projection commits per command |
+| --- | --- | --- | --- |
+| 10 | 209.6 → 687.8 (3.28×; 202–216 → 676–720) | 3.00 → 0.51–0.64 | 3.00 → 0.34–0.38 |
+| 1 | 188.3 → 227.5 (183–193 → 225–237) | 3.00 → leader 3.00, followers 2.00–2.16 | 3.00 → 2.00 |
+
+At fifty callers on disk (5,000 operations, one run each): 138.3 → 754.5
+completed a second, 0.17 to 0.19 journal syncs and 0.11 to 0.13
+projection commits a command per voter. Single runs on this container
+vary by a quarter: task-d46 read 182.8 in an earlier run.
+
+Stores on tmpfs, the gate's own setting, against task-d53's binary (this
+task's base), three repeats each, medians:
+
+| callers | completed/s | busiest voter's busy ms/cmd | syncs per command per voter | ratio |
+| --- | --- | --- | --- | --- |
+| 10 | 805.3 → 1170.5 | 1.14 → 0.75 | 3.00 → 0.54–0.67 | 1.04–1.12 → 1.01–1.11 |
+| 1 | 456.6 → 511.1 | 1.29 → 1.10 | 3.00 → leader 3.00, followers 1.96–2.30 | 0.81–1.14 → 0.97–1.15 |
+
+Every reading is inside the `command cost` gate's limits, which are
+upper bounds; the baseline stays task-d46's until the runner's readings
+of this task are in.
+
+- **At ten callers** a flush holds a few commands and their protocol
+  batches, and the voters are busy about half the time: the rest is the
+  round trip. The leader (n1) syncs a little more often than the
+  followers.
+- **At one caller** there is little to group: the leader still syncs
+  three times a command, and every voter commits the projection twice
+  rather than three times.
+- The first version of this task executed after the flush's journal
+  append and materialized in the same step, so the votes a flush
+  released waited for the group's projection commit too: 546.6 a second
+  at ten callers, 2.81×. Sending what the append released before
+  materializing is the difference.
+
+## The projection's commit under the journal
+
+task-d48. Each projection commit took two `fdatasync`s: redb's two-phase
+commit syncs the new commit slot and its pages, then flips the header to
+it and syncs again. Under the journal the projection now commits in one
+phase: one sync, with redb's checksums detecting a commit a crash tore.
+Section 17.3.4 is amended with why that is safe, the residual it leaves,
+and the invariants any later change to the projection's durability must
+keep.
+
+- **Where it is set.** `LocalEngine::commit_under_journal`, which the
+  journaled coordinator calls when it attaches an engine, before replay.
+  Only `RedbEngine` acts on it. An engine not under the journal (the
+  strict single-store reference, a restore's fill, a checkpoint's
+  install target, the lifecycle's own records) keeps two-phase commit.
+  There is no operator switch.
+- **Still durable at every commit.** `Materialized` is reported only once
+  the commit's sync has returned; quick-repair stays off.
+
+**Tests.** task-j05's fault points do not exist (task-j05 is not
+implemented), so the evidence is task-09's fault backend and the
+composed store:
+- `coord-redb-faultkit`'s crash matrix runs in both modes: a crash after
+  every write and sync of a five-commit workload, with nothing,
+  everything, or a seeded torn and reordered subset of the unsynced tail
+  surviving, reopens at an acknowledged state or the commit after it,
+  never a partial one. The subprocess-death test (real files, `abort()`)
+  runs in both modes too.
+- `a_commit_under_the_journal_syncs_once_and_otherwise_twice`: the
+  backend's own count of syncs, 2 a commit in two phases and 1 in one.
+- `a_one_phase_commit_torn_under_its_header_rolls_back_to_the_commit_before`:
+  the residual, built on purpose. The crash image is the synced state
+  plus the header the third commit wrote, naming its new slot, and none
+  of the pages that slot names. redb opens it at the second commit. The
+  control opens the same header with its pages at the third.
+- `journaled_real.rs`,
+  `a_crash_anywhere_in_a_one_phase_projection_commit_recovers_the_journals_state`:
+  raft-engine and redb composed, the projection crashed after every one
+  of its writes and syncs under the three tails. The next boot's rows,
+  executed rows included, are exactly those of the same journal replayed
+  into an empty projection.
+
+### Recovery
+
+Quick-repair is off in both modes, so a crash costs the same full repair
+either way: redb walks the file verifying checksums and rebuilds its
+allocator. One-phase commit adds only the rollback when the newest slot
+fails, which is the walk it does anyway. `recovery_time.rs` (ignored; run
+by hand) fills a database a MiB a commit, copies the file while it is
+open after its last commit -- a crash image, since redb clears its
+recovery mark only on a clean close -- and times opening the copy. On
+the container's disk:
+
+| MiB written | file MiB | commit | commits took s | reopen after crash s |
+| --- | --- | --- | --- | --- |
+| 64 | 257 | two phases | 0.82 | 0.48 |
+| 64 | 257 | one phase | 0.66 | 0.49 |
+| 256 | 1028 | two phases | 3.00 | 2.00 |
+| 256 | 1028 | one phase | 3.07 | 1.90 |
+| 512 | 2056 | two phases | 6.62 | 3.24 |
+| 512 | 2056 | one phase | 6.33 | 2.94 |
+
+About 1.5 s per GiB of file in both modes. That is what a node's restart
+pays before it replays the journal, whatever the commit mode.
+
+### Measured
+
+**Syncs.** The voters run under `strace -f -c`, one ten-caller run of
+the `command cost` bench on the container's disk with each binary:
+`fdatasync` calls per executed command per voter fall from 1.58-1.65 to
+1.21-1.25. Each is the voter's journal syncs plus its projection
+commits, counted twice before and once after (under strace, task-d47's voters
+made 0.65 to 0.77 journal syncs and 0.42 to 0.48 commits a command, and
+task-d48's 0.71 to 0.80 and 0.44 to 0.51).
+So a projection commit is now one sync, measured at the system call.
+
+**Throughput.** `scripts/bench/command-cost.sh` on the container's disk,
+task-d47's binary and this task's alternated three times, three
+repeats per caller count each, medians of nine:
+
+| callers | completed/s, task-d47 → task-d48 | the leader's busy ms/cmd |
+| --- | --- | --- |
+| 10 | 508.5 → 531.0 (+4%) | 1.76-2.34 → 1.79-1.89 (one stalled run aside) |
+| 1 | 158.6 → 186.2 (+17%) | 5.5-6.0 → 4.6-5.1 |
+
+- **The disk was slower than for task-d47's readings.** task-d47 read
+  687.8 at ten callers there and 508.5 here, the same binary on the
+  same container. Comparisons hold only within one alternation.
+- **One of task-d48's ten-caller runs read 259.3.** Every voter's
+  journal stage (the journal sync and the projection commit) took 30 s
+  where the run beside it took 3.8, the longest step 1.38 s, with the
+  same counts of syncs and commits. All three voters stalled at once on
+  the disk they share. It is in the median.
+- **At one caller** a command costs the leader three journal syncs and
+  two projection commits in series, so a sync less a commit shows: 17%.
+  **At ten callers** the voters are busy under 60% of the time and a
+  projection commit is 0.35 a command, so one sync less a commit is
+  about 0.1 ms of a 1.8 ms command: 4%.
+- **What bounds it now** is not the projection's sync: at ten callers a
+  voter is idle 40% of the time, waiting on the round trip that the
+  journal sync and the commit sit in, in series on the domain thread.
+  That is task-d52's. task-j06's replay profile stays optional.
+
+On tmpfs the readings are inside the `command cost` gate's margins
+(1,051 to 1,240 completed a second at ten callers, 0.71 to 0.82 busy ms
+a command); a sync costs nothing there, so the change does not show.
+
+## The projection's commit off the domain thread
+
+task-d52. After task-d47 and task-d48 a group still cost the domain
+thread its journal sync, then its projection commit and that commit's
+sync, then the next group's execution, in series. The projection's
+commit now runs on a thread of its own, the materializer. The domain
+thread journals a group and goes on executing while the group commits.
+
+- **The hand-off** (`JournaledStore::hand_off`). A domain's engine is
+  lent to the materializer with the durable records one commit takes,
+  and taken back with the outcome. The commit is the same transaction
+  with the same guards as before. Each domain has at most one commit
+  out, so its commits keep the journal's order. What the domain
+  journals meanwhile waits behind the commit that is out, and goes out
+  as the next one when that commit is back.
+- **Facts and results wait for the outcome.**
+  - `Materialized` is reported only once the outcome is taken back.
+  - A group's results, sends and watch events are held in the node
+    (`Node::settle`) until the projection has committed through the
+    group's last position. The rule is the one task-d47 kept for a
+    group materialized on the domain thread.
+  - The materializer's waker wakes `coordd`'s loop to take an outcome
+    back.
+- **Planning over a group in flight.** The next group is planned over
+  the projection's snapshot with the rows of every group still in
+  flight laid over it, oldest first. This is task-d47's group overlay,
+  extended across groups. A snapshot that already holds some of those
+  groups reads the same, because their rows are the ones it holds and
+  every later write is laid over them again. The base the store checks
+  is still its queued frontier.
+- **The read gate.**
+  - The materializer moves a domain's gate as its commit returns.
+  - A commit's rows are visible a moment before that. A reader that
+    pins a snapshot in that moment waits for the commit to return
+    rather than being refused (`Frontier::begin_commit`).
+  - A commit that fails leaves the gate where it was, and the reader is
+    refused as before.
+- **The bound.** Past 256 durable records owed to the projection, the
+  domain thread waits for the commit out (`PIPELINE_RECORDS`). The
+  learner is held there, not dropped.
+- **What stays on the domain thread.**
+  - Execution itself: planning, admission and the retry layer. Only
+    the commit moved. It was the part with the syncs, and in the
+    profile after task-d46 it was the largest share of the CPU. Moving
+    execution as well would need the machines' `applied` to come back
+    from another thread, and the plan's review boundary allows it, but
+    it is not done here.
+  - Checkpoint publication, a floor boundary and a full queue take the
+    commit out back and commit on the domain thread, as before.
+
+**Recovery.** A boot that ends with a commit out recovers like any
+other, from the journal and the projection's own stamp. That holds
+whether the commit had not started or had returned without its outcome
+being taken back. `into_parts` takes every lent engine back without
+looking at its outcome, as a crash would.
+
+**Tests.**
+- `coord-storage`, `tests/pipelined.rs`, with a manual materializer:
+  - a hand-off reports `Materialized` only once taken back, and lends
+    the records journaled behind it next;
+  - a commit refused definitely gives its records back ahead of those
+    behind it;
+  - an indeterminate commit settles from the stamp, and only the
+    records it took;
+  - checkpoint publication takes the commit out back first;
+  - a boot that ends with a commit handed over and not started, after
+    a commit and before its outcome is taken back, and with records
+    journaled behind a commit out, recovers the journal's rows.
+- `view.rs`: a snapshot of a commit still returning waits for the
+  gate, and one of a commit that failed is refused.
+- `coord-daemon`, `tests/node.rs`:
+  - a group's results wait for its commit while the next group
+    executes over it;
+  - a pipelined node sends the collector the same frames, records the
+    same results and reaches the same revision as one that commits on
+    its own thread;
+  - a boot that ends with a commit handed over, in the middle of a
+    group, or before a commit is taken back answers every journaled
+    command's retry key from the recovered projection.
+- **Negative control.** Releasing a group's results when it is handed
+  off rather than when its commit is back fails
+  `pipelined_a_groups_results_wait_for_its_projection_commit_while_execution_goes_on`.
+
+### Measured
+
+`scripts/bench/command-cost.sh` on the container's disk, task-d48's
+binary and this task's alternated twice, three repeats per caller count
+each, medians of six:
+
+| callers | completed/s, task-d48 → task-d52 | leader busy ms/cmd | leader journal appends/cmd |
+| --- | --- | --- | --- |
+| 10 | 543.3 → 529.1 | 1.81 → 1.79 | 0.63 → 0.84 |
+| 50 | 861.3 → 948.2 (+10%) | 1.18 → 1.04 (−11%) | 0.22 → 0.24 |
+
+- **At ten callers nothing moved**, within this disk's noise (task-d52's
+  six runs read 507 to 582). The commits left the domain thread, but
+  the thread then flushed smaller groups: 0.84 journal appends a
+  command where it made 0.63. Each append is a sync on the domain
+  thread, and with the projection syncing on the same disk beside it
+  an append took about 1.4 ms. The plan's acceptance was that busy
+  time per command at ten callers falls by at least the projection's
+  share. **This run does not meet it.**
+- **At fifty callers** the groups are large enough that the extra
+  appends cost little, and taking the commit off the thread shows:
+  throughput up 10%, and the leader's busy time per command down 11%.
+- **The domain thread is not what bounds throughput here.** In every
+  run each voter's domain thread is busy 40 to 60% of the time. During
+  a fifty-caller run the container's four cores were 75 to 78% busy:
+  three voters, their network threads, the materializers and fifty
+  callers. What is left is latency: the round trips a command waits
+  through (task-d49's re-sends, task-d50's slow path) and the journal
+  sync that is still on the domain thread.
+- **Not measured here:** the Jepsen runner. That is where the plan's
+  comparison with etcd is made.
+
+## Re-sending a proposal once its answer is due
+
+task-d49. With one caller a leader refused at least 8,192 duplicate
+votes in 100 s for about 4,000 commands. Each duplicate was an
+adoption the voter had already sent, answered again because the leader
+had re-sent the proposal while the first answer was on its way: the
+re-send went out on the first call of the 250 ms timer after the
+proposal, however recent, to every voter whose adoption had not
+arrived. Each one was another step on a domain thread that was already
+the bottleneck.
+
+- **Age.** `Leader::resend_unvoted` re-sends a proposal to a voter only
+  once an interval of calls has passed since its last send, the first
+  send included: the call count is stamped on the proposal when its
+  batch is durable and its first send released (`Proposal::sent`). A
+  re-proposal held back from a new leader's first batch has no first
+  send; it goes out on the next call, counted as `deferred`, unless its
+  batch is refused and presented again first, which sends it to every
+  voter and so publishes it (#141).
+- **The interval is the voter's.** It is the 99th percentile of the
+  calls the voter's latest 128 adoptions took to arrive, between one
+  call and `RESEND_INTERVAL_CAP` (four, one second, as task-d33's
+  back-off cap and for its reason). An adoption that arrived before
+  the next call took none, so a voter that answers within a call keeps
+  today's floor: re-sent on the second call after a send at the
+  earliest, a quarter to half a second. An adoption of a proposal that
+  was re-sent may answer either send, so it is not a sample until a
+  second copy arrives and shows the first was late (Karn's rule).
+  Without those, a voter slower than its interval would be re-sent to
+  every time and its interval would never learn it is slow.
+- **The window is what is due.** It was the voter's first sixteen
+  proposals not adopted, and one waiting out its back-off kept its
+  place. Sixteen proposals whose answers were on their way, or lost
+  behind a full lane, kept a lost proposal after them from ever being
+  sent again. The window is now the voter's first sixteen proposals
+  that are due.
+- **A decided proposal is mostly left to catch-up once it is old.** A
+  proposal the leader decided needs no vote; it is re-sent for the
+  voter, which holds everything ordered after a proposal it lacks. It
+  is re-sent at its back-off only until `RESEND_HANDOFF_CALLS` (eight,
+  two seconds) after its first send: at the floor interval, one, two
+  and four calls after it. By then a voter that still lacks it and holds
+  work behind it has had its frontier still for twice
+  `catch_up::STILL_FOR` and has asked a peer for executed history,
+  which carries the command (task-d08). After that it is handed off:
+  re-sent only as a trickle, one handed-off proposal a voter a call,
+  each one eight calls apart, so a voter that is far behind is sent at
+  most four of them a second. The trickle is for a voter catch-up does
+  not reach: one that missed both the submission and the proposal
+  through an outage holds no work behind the command, and on a quiet
+  domain nothing arrives after it to make it ask (#141; the first cut
+  stopped re-sending outright, and such a voter never got the command).
+  A proposal that is not decided is never handed off: its vote may be
+  the one the leader still needs (task-d15).
+- **A duplicate costs its lookup.** A refused vote returns before the
+  learner runs, on the leader and the follower: nothing was counted,
+  so nothing new can be learned.
+- **Counted by reason.** Each re-send is classified when it goes out:
+  decided, acknowledged on the fast path, or unanswered. Answers that
+  came back twice after a re-send are `late`, the other answers to a
+  re-send `lost`, and every refused duplicate vote is counted exactly.
+  They are in the metrics snapshot's `cost.resends`, over every ballot
+  the voter led, and `scripts/ci/command_cost.py` reports re-sends and
+  duplicate votes per command.
+
+**Not as planned.** The plan asked to re-send only what the voter has
+not acknowledged "on the fast path or the slow". A fast acknowledgement
+goes out when the payload arrives, proposal or not (task-d07), and
+`a_fast_acknowledgement_does_not_stand_for_the_proposal` is the case
+where crediting it leaves a voter without a proposal for good. So a
+fast acknowledgement still does not take a proposal out of the window.
+What keeps such a re-send from being a duplicate is its age: in a
+fault-free run nothing is due. Re-sends counted as acknowledged or
+decided are what the snapshot shows if that stops holding.
+
+The plan's negative control, counting only slow adoptions, does not
+apply as stated for the same reason. The ones run here, each by hand
+and reverted:
+
+- re-sending on the first call regardless of age fails
+  `a_proposal_is_not_resent_before_its_answer_is_due`;
+- taking the window before asking what is due fails
+  `a_lost_proposal_is_resent_with_a_full_window_ahead_of_it`;
+- holding the interval at the floor fails
+  `a_slow_voter_is_given_its_own_interval`;
+- stopping re-sends at the hand-off fails
+  `a_voter_that_missed_a_command_through_a_long_outage_gets_it_on_a_quiet_domain`
+  and `a_decided_proposal_is_trickled_once_old`;
+- not publishing a re-proposal presented again fails
+  `a_held_back_reproposal_presented_again_is_not_sent_again_at_once`
+  ("sent again on the next call, as a first send").
+
+### Measured
+
+`scripts/bench/command-cost.sh` on the container's disk, task-d52's
+binary and this task's alternated twice, three repeats per caller count
+each, medians of six. The duplicate votes for task-d52 are a lower
+bound: its voters log a refusal only at powers of two, and the bound
+adds each voter's largest. This task's are exact, from the snapshot.
+
+| callers | completed/s, task-d52 → task-d49 | leader busy ms/cmd | duplicate votes per command |
+| --- | --- | --- | --- |
+| 1 | 187.8 → 189.0 | 3.16 → 3.12 | ≥ 0.049 → 0 |
+| 10 | 532.2 → 532.5 | 1.77 → 1.76 | ≥ 0.196 → 0 |
+| 50 | 896.8 → 876.1 | 1.10 → 1.11 | ≥ 0.193 → 0 |
+
+- **No duplicate vote at all**, in any of the 18 runs, against at least
+  5% to 20% of commands before. Every run re-sent two proposals, both
+  counted unanswered and answered as lost: the domain's first
+  proposals, which go out before the followers are linked (task-d07's
+  case). None was counted acknowledged or decided.
+- **Throughput and busy time did not move**, within this disk's noise.
+  A refused duplicate was already cheap, and the domain thread is not
+  what bounds these runs (task-d52's notes).
+- **On tmpfs** the command-cost gate passes, with no duplicate vote at
+  1, 10 or 50 callers.
+
+**A paused voter** (`scripts/bench/pause-voter.sh`, ten callers, 20,000
+operations on tmpfs, the third voter stopped five seconds in for five
+seconds), two runs of each binary:
+
+- The paused voter **executes again within 0.03 to 0.06 s** of being
+  continued, with either binary: its frontier has been still for longer
+  than `STILL_FOR`, so it asks for executed history on its first turn,
+  and the first page is a round trip away. The bound is that round trip
+  plus one turn of the voter's loop; the re-send interval does not enter
+  it, since catch-up and not the re-send carries what it missed.
+- In the first cut's runs, which stopped re-sending a decided proposal
+  at the hand-off, the leader re-sent 1,252 and 1,312 decided proposals
+  in all, and handed 1,043 and 1,087 of them off to catch-up. It refused
+  at least 9,216 frames to the paused voter. Most of those were refused
+  while it was stopped, and they were fresh proposals and
+  acknowledgements at the full command rate, not re-sends.
+- **The lane drained in some runs and not in others, with either
+  binary.** In the first session neither binary drained it while the load
+  lasted. The leader's refusals to the voter rose again 6 to 11 s after
+  it was continued, and when the bench ended the voter was still 5,000
+  to 9,000 commands behind: catching up from history, it executed about
+  560 commands a second while the domain executed 800. In a later
+  session, with the trickle, the old binary and the new one alternated
+  twice each, and every run caught up while the load lasted:
+
+  | binary | caught up after continue (s) | refusals last rose after continue (s) | refused to the voter, at least |
+  | --- | --- | --- | --- |
+  | stop at the hand-off | 4.26, 6.06 | 19.02, 16.35 | 8,960, 8,960 |
+  | trickle | 7.83, 5.68 | 8.13, 6.34 | 9,344, 9,344 |
+
+  Two earlier runs with the trickle caught up after 7.25 and 4.11 s,
+  and their refusals last rose 15.65 and 6.91 s after continue. They
+  re-sent 1,434 and 1,497 decided proposals and handed off 49 and 50.
+  The trickle counts a proposal handed off only when it is first
+  trickled, so it is not comparable to the first cut's count.
+  What differs between the two sessions is not explained, and two runs
+  a side do not separate the binaries. **The plan's acceptance, a
+  bound on the lane draining, is not shown.** A voter that is behind
+  needs the fresh traffic to it held back while it catches up, or a
+  catch-up path faster than the domain. That is outside the re-send
+  window.
+- `a_replica_that_falls_behind_catches_up_without_starving_its_own_catch_up`:
+  see the PR.
+
+### Not done here
+
+- **Submissions presented again.** Followers still refuse a submission
+  the collector offers again as `Duplicate(command)`: 64 to 128 of
+  2,651 commands at fifty callers. That is the collector's re-offering
+  (task-c02, task-64), not a vote.
+- **The lane counters.** `coordd` reports its lanes' frames and
+  refusals as `NotInstrumented`; the pause script reads refusals from
+  the log's powers of two.
+
+## Reads off the slow path
+
+task-d50. A Range was a command: ordered, journaled and synced twice,
+and executed like a write. At ten callers on this container's disk its
+operation took 16 ms at the median, as long as a put. The amendment
+(design Section 6.3) serves it from the leader instead, behind a
+confirmation of its ballot.
+
+- **The barrier.** A frontend with a voter beside it sends a Range
+  without an explicit revision to the leader of the ballot it follows
+  (`ReadV1`). The leader takes its highest proposed sequence number as
+  the read index, starts a confirmation round after the read arrived
+  (`ReadConfirm`), and serves the read once a slow quorum including
+  itself has confirmed that round, everything it proposed below the
+  index has executed, and its snapshot has materialized that far. It
+  plans the Range with the ordered path's own admission check, view and
+  planner, so the answer carries the bytes the ordered path would have
+  recorded at that state (`ReadAnswerV1`). A refusal, an answer from
+  anyone but that leader, or no answer within 1.5 s orders the read.
+- **Why it is linearizable.** A write that completed before the read
+  arrived was learned, so a leader proposed it. If that was this leader
+  in this ballot, it is below the index. If it was an earlier ballot,
+  this ballot's first proposal follows it in the total chain. A higher
+  ballot that could have ordered a later write needed a quorum of
+  promises, and every quorum meets the one that confirmed this ballot
+  after the read arrived: a voter confirms only the ballot it promised,
+  so the round could not have confirmed if a higher one had been
+  promised by a quorum first.
+- **A session's window.** A read served this way records nothing, so it
+  retires nothing; only an ordered command moves its client's floor, by
+  at most 64 sequences. A session that read through the leader alone
+  walked out of its 1024-wide window and was then refused everything,
+  ordered requests included (the first register run: a quarter of the
+  reads were `RetryOutOfWindow`). Past half the window from the floor
+  the leader now leaves the read to the ordered path, which retires
+  behind it: about one read in 64 of a read-only session is ordered.
+  `a_session_that_only_reads_is_served_past_its_window` reads 2,600
+  times on one session; without the guard it is refused at read 1,089.
+- **The fast path stays as it is** (the amendment's decision). With
+  reads off the chain the leader's fast-path share at ten callers rose
+  from 6% to 28%; at one caller it is 99%.
+
+### Linearizability under leader faults
+
+`coord-register` (crates/coord-wan-bench) drives four registers through
+every frontend, two callers each, about a third of the operations
+writes of a value no other write puts, and checks the history
+(`register::check`): writes in revision order agree with real time, and
+every read saw a value some write put, at its revision, invoked before
+the read completed, no older than any write or read that completed
+before the read was invoked, and older than any write invoked after it
+completed. An operation whose outcome the caller never learned may or
+may not have happened. Twelve unit tests on constructed histories,
+each rule broken once.
+
+`scripts/bench/register-faults.sh` stands up a three-voter domain and
+faults its leader while the workload runs:
+
+| Scenario | Runs | Violations | Reads | Writes | Leader after |
+|---|---|---|---|---|---|
+| partition 45 s | 2 | 0, 0 | 28,225, 28,993 | 12,109, 12,423 | n2 (elected) |
+| pause 5 s, then 40 s | 2 | 0, 0 | 42,694, 36,539 | 18,875, 16,194 | n2 (elected) |
+| kill and restart, twice | 2 | 0, 0 | 19,870, 19,621 | 8,243, 8,122 | n1 (ballots 1, 2) |
+| partition 45 s, `skip-read-confirmation` | 1 | **260** | 30,994 | 13,096 | n2 |
+
+- **Partition.** The leader's daemon sockets are cut off from the other
+  voters' with iptables; its own callers still reach it, and only read,
+  five times a second. The other frontends' callers do nothing for two
+  seconds either side of the cut, so the leader holds no proposal it
+  cannot commit. The others notice at the transport's 30 s idle timeout
+  and elect a leader. With the round the cut-off leader serves nothing
+  during the cut (its frontend completed 170 and 188 reads in the
+  run); without it, it answers from the state it had, and the check
+  finds 260 stale reads, all at its frontend (rule 4: "a read ... saw
+  revision 3702; revision 5450 had completed before it").
+- **The negative control needs the quiet.** In the first cut of the
+  scenario the writing frontends kept going; the cut-off leader then
+  always held an ordered read or a write it could not commit, its index
+  never executed, and even without the round it served nothing stale.
+  That is the index doing its part, not the round.
+- **Pause.** A 5 s pause is shorter than the idle timeout: nobody else
+  campaigns, and the reads wait it out. The 40 s pause is longer: the
+  others elect n2 and the stopped voter comes back still believing it
+  leads.
+- **Kill.** The killed leader, started again five seconds later,
+  campaigned and won the next ballot before the others noticed it was
+  gone, both times. A voter taking over from a killed leader is the
+  pause run's case.
+- Unknown outcomes: up to 1,677 reads in a pause run (each a caller
+  waiting out its 5 s deadline on the stopped leader's frontend), up to
+  33 writes in a kill run. The register caller gives an unknown outcome
+  up (`Client::abandon`); forgetting it would hold its session's
+  acknowledged prefix, and the session would be refused a window later.
+
+### Measured
+
+This container's disk, the default mix without scans (55% gets),
+2,500 operations, d49b and d50 alternated, two rounds of three repeats;
+medians of the six:
+
+| Callers | Build | Get service p50 | Get whole p50 | Put service p50 | Completed/s |
+|---|---|---|---|---|---|
+| 1 | d49b | 4.09 ms | 13.19 ms | 4.78 ms | 213 |
+| 1 | d50 | 0.83 ms | 6.23 ms | 4.68 ms | 376 |
+| 10 | d49b | 16.21 ms | 34.20 ms | 16.49 ms | 591 |
+| 10 | d50 | 10.81 ms | 23.32 ms | 12.73 ms | 835 |
+
+Per run, the get service p50 at ten callers was 15.7 to 17.6 ms on
+d49b and 10.4 to 11.5 ms on d50; at one caller 4.0 to 4.3 and 0.8 to
+0.9 ms.
+
+Where a served read's time goes, from `cost.reads` on the leader in one
+instrumented run at ten callers (1,492 served, none refused): 2.4 ms on
+average until its confirmation round was seen confirmed, 5.2 ms until
+everything below its index had also executed, 7.8 ms until it was
+answered, the last 2.6 ms the snapshot materializing that far. At one
+caller all three are 0.4 ms. The rest of the 10.8 ms service time is
+the hop from the two frontends that are not the leader's.
+
+**The acceptance at ten callers is not met.** A read there is not one
+round trip plus the leader's queue: it waits for the writes in flight
+when it arrived to execute, and for their projection. Either is a
+follow-up:
+
+- **A lower index.** Every proposal below the index is waited for,
+  committed or not, because a command the collector learned on the fast
+  path may have completed without the leader knowing it was committed.
+  A read needs only the writes that may have completed before it
+  arrived. Bounding those without the leader learning the fast path's
+  outcomes is a protocol change.
+- **The executed state rather than the projection.** The read is
+  planned over the materialized snapshot, which the applier commits off
+  the domain thread (task-d52). Planning it over what has executed but
+  not yet materialized needs a view of the applier's pending batch.
+
+The command-cost gate (tmpfs, three repeats) is within the baseline's
+margins: busy time per executed command 1.15 to 1.19 ms at one caller
+and 1.04 to 1.11 ms at ten on the leader, against a baseline of 1.32
+and 1.46. Executed commands per run fell from about 2,600 to 1,110,
+since reads are no longer commands.
+
+### Not done here
+
+- **A frontend without a voter** still orders every read: it follows no
+  ballot, so it does not know whom to ask. `[reads] path = "ordered"`
+  turns the barrier off everywhere.
+- **Reads at an explicit revision, and transactions,** are ordered as
+  before. Every Range without one is served, scans included; only
+  point reads were measured.
+- **The Jepsen client's runs** are the external evidence (by the owner
+  of #98).
+
+## The journal's appends off the domain thread
+
+task-d54. After task-d50 the Jepsen runs put the leader's domain loop at
+82 to 88% busy at six nodes on the runner's disk, about 2.7 ms a
+command, and about 1.2 ms of that in the journal's `fdatasync` on the
+loop's own thread. The loop could take in nothing while it synced, so a
+group held only what had arrived during the previous sync, about 1.6
+commands. Section 17.3.3 already draws the append on a shared journal
+worker; task-j03 ran it inline.
+
+The domain thread now seals a group, reserves each stream's entry and
+lends the journal with the group to an appender thread
+(`JournaledStore::pipeline_journal`, `ThreadAppender`). The appender
+runs the synced append and wakes the loop on the materializer's
+`Notify`. The loop takes the journal back with the outcome and
+completes, fails or leaves uncertain each entry exactly as an inline
+append does. That code is the same `complete_group` both paths call.
+
+- **One group out at a time.** What queues meanwhile is the next group,
+  so groups are written in the order they were sealed and a stream's
+  records chain as before. A stream with its entry out is not idle and
+  could not seal another anyway.
+- **The outcome is the loop's.** `JournalDurable` is reported only from
+  a take-back on the loop's thread. A proposal is the leader's vote, and
+  it still leaves only after its rows are durable.
+- **Who waits.** Anything that reads or writes the journal on the loop's
+  thread waits for an append that is out and takes it back first:
+  reconcile, checkpoint publication, drain, flush, attach,
+  `journal_mut`.
+  - `recovery_cut` and `recovery_baseline` take `&self` and cannot wait.
+    While the journal is lent they refuse with `JournalLent`. Both run
+    only at start-up, before it is lent.
+  - An indeterminate outcome taken back where its report cannot reach
+    the caller, as in a checkpoint publication, marks the next report
+    indeterminate, so that caller reconciles.
+- **The next group is lent from the flush, not the wake.** The first
+  version had `Node::settle` take the append back and lend the next
+  group at once.
+  - The wake is a high-priority branch of the loop, ahead of the events
+    that arrived during the sync. Lent there, a group held what had been
+    read when the wake came. On the container's disk at fifty callers
+    the leader then appended 0.58 groups a command, against 0.48 inline.
+  - Settle now only takes the append back. The runtime's flush is the
+    loop's lowest-priority branch, taken once no event is ready, and it
+    lends the next group. That is the batching an inline sync gave, when
+    everything that arrived during it went to the flush after it.
+- **A fence waits for the append out.** A group out is in no frontier
+  until it is taken back: `seal_group` takes it out of the queue, and
+  only `complete_group` advances the journaled frontier. A fence that
+  ran while it was out tested what was queued behind it against the
+  frontier before it, refused an application of the current ballot as
+  not extending, and moved the queued frontier back past the group, so
+  the next application was planned on a base the projection refuses.
+  `Voter::fence` therefore journals what is queued with
+  `Node::flush_journaled`, which waits for each append out on the loop's
+  thread, as a flush that appended inline did, and `JournaledStore::fence`
+  takes any append out back before it reads a frontier. A fence is rare;
+  the wait is the one an inline flush made anyway.
+- **Under back-pressure the next group is still lent.** `Node::make_room`
+  waits for the append out and lends the next group rather than
+  appending inline, so the loop waits for one sync, not two.
+- **A take-back is never dropped.** When sealing the next group fails
+  after an append was taken back, what the append made durable goes to
+  the next report, as any other stage's failure leaves it.
+- **The loop's waits are counted.** `ThreadAppender` and
+  `ThreadMaterializer` count a take that found the job still running,
+  and the time it blocked, in a shared `Waits`. The `metrics` line's
+  `cost.waits` reports both, so busy time less the loop's CPU time is
+  read as waits on the pipeline threads and whatever else blocked the
+  loop, rather than assumed to be syncs. The manual pipelines the tests
+  drive never block, and the store itself reads no clock.
+- **Nothing is owed while an append is out.** `Voter::owes_flush` does
+  not count batches queued behind one, since a flush then moves nothing.
+  `Node::lower_queued` stops when a lowering moves nothing.
+- **The applier.** A group's append may now come back after the group
+  was handed off, so the applier checks the barriers of every group in
+  flight for a lost batch. `Applier::drain` journals a group that was
+  handed off while an append was out.
+
+### Measured
+
+`scripts/bench/command-cost.sh` on the container's disk, three voters,
+2,500 operations a run. task-d50's binary (1ada606) alternated with this
+task's, three repeats per caller count each time. The baseline ran four
+times (12 runs), the first version twice and the final one twice (6
+runs each). Medians:
+
+| callers | | completed/s | leader busy ms/cmd | leader appends/cmd | leader commits/cmd | follower busy ms/cmd | leader domain CPU ms/cmd |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 10 | task-d50 | 1,090 (884–1,171) | 1.94 | 1.51 | 0.88 | 1.73 | -- |
+| 10 | lent at the wake | 1,062 (998–1,140) | 1.26 | 1.30 | 1.10 | 0.86 | 0.75 |
+| 10 | task-d54 | 1,071 (1,020–1,149) | 1.23 (−37%) | 1.06 (−30%) | 1.00 | 0.82 (−53%) | 0.74 |
+| 50 | task-d50 | 1,862 (1,602–1,995) | 1.22 | 0.48 | 0.27 | 1.09 | -- |
+| 50 | lent at the wake | 1,784 (1,599–1,930) | 1.12 | 0.58 | 0.45 | 0.84 | 0.75 |
+| 50 | task-d54 | 1,809 (1,690–1,960) | 1.10 (−10%) | 0.36 (−25%) | 0.35 | 0.81 (−26%) | 0.76 |
+
+- **The loop's time per command falls, and the groups grow.** On the
+  leader, busy time falls 37% at ten callers. Followers fall 53%, since
+  their loops did little but sync. Journal appends per command fall by
+  a quarter to a third.
+- **Throughput does not move on this container.** The spread of the
+  runs is wider than any difference. The domain loops were not what
+  bounded it: at task-d50 the leader's loop was 28 to 36% busy. What
+  bounds a command here is the chain of syncs it waits through: the
+  leader's proposal, the followers' votes, the execution group's
+  journal append and the projection's commit. task-d54 takes those syncs
+  off the loop and leaves them on the command's path. The plan's
+  acceptance is on the Jepsen runner, where the leader's loop was what
+  saturated: busy time per command at six nodes on disk down by the
+  journal's share, and journal syncs below 0.2 a command.
+- **CPU beside busy.** On the leader, the domain thread's CPU is about
+  0.75 ms a command of its 1.1 to 1.2 ms busy. The rest is time the loop
+  spends working without being on a CPU: page faults, reads of the
+  projection, the materializer's drain. The process as a whole uses
+  2.0 ms a command at ten callers and 1.5 ms at fifty.
+- **The command-cost gate** (tmpfs, one and ten callers, three repeats)
+  is within the baseline's margins.
+
+## The projection's working commits
+
+task-j06, promoted from optional on #98 (5962787328). After task-d54 the
+leader's loop at six nodes on the runner's disk was 48% busy at the same
+throughput, and the disk rows' p50 sat about 26 ms above tmpfs. A write
+waits through three syncs: the leader's journal, the follower's journal
+and the projection's commit. The replay-backed profile takes the third
+one off the write's path. It is named (`journal.profile =
+"journaled-replay-v1"`) and off by default; strict stays the default
+until task-j05's composed matrix.
+
+- **A capability, not a mode.** `WriteTxn::commit_working` sits beside
+  `commit_durable`, whose contract is unchanged; its default is
+  `commit_durable`, a stronger success. redb's is a `Durability::None`
+  commit. `LocalEngine::WORKING_STATE` says whether an engine has the
+  capability for real, and `JournaledStore::replay_projection` refuses
+  the profile over one that does not. fjall keeps the defaults.
+- **What redb does with a working commit.** It is visible to every
+  reader at once. Its pages stay in redb's write cache, so the file sees
+  no write until the next durable commit, and a crash loses whole
+  working commits and never part of one. The crash matrix shows it: a
+  crash image that keeps every write the process issued still lacks the
+  working commits after the last durable one. A clean close of the
+  database is a durable commit, so a node stopped cleanly loses nothing.
+- **When a commit is durable.** `DurableCadence` makes the next commit
+  durable after `commits` working commits or `records` records applied
+  (64 and 4096 by default). `coordd` bounds the time too, at
+  `projection_durable_ms` (100), in two halves: every half interval it
+  asks for the next commit to be durable, and a request still waiting at
+  the next half has met no commit, so the domain is idle and its loop
+  makes the projection durable itself (`sync_idle_projections`, one
+  empty durable commit). The loop has a deadline for it while anything
+  is volatile, so an idle domain wakes for it. Without that half the
+  bound held only while commands kept coming, and a domain that went
+  quiet kept its working commits volatile until the next command, the
+  next checkpoint or the stop. A checkpoint publication makes the
+  projection durable before it appends the pointer and retires the
+  prefix: the pointer retires the journal through `C`, and a crash
+  afterwards takes the projection back to its last durable commit,
+  which must not be below `C`. A clean stop calls `sync_projections`.
+  The materializer's jobs carry the same decision as the inline path, so
+  the cadence counts every commit wherever it runs.
+- **Two frontiers.** `M` and `Materialized` are what is applied and
+  visible: reads, the gate and resolves follow them. The projection's
+  durable commit is `projection_durable`, and the metrics line carries it
+  under the replay profile. A crash moves `M` back to it, and the attach
+  replays the journal above it before the domain serves. That keeps the
+  invariants task-d48 listed: a resolve is answered from a projection
+  that has replayed everything journaled.
+- **Validation at start.** `coordd` checks the projection a boot found
+  before attaching it (`JournaledStore::validate_projection`). Its stamp
+  must be at or past the selected baseline and must name the record the
+  journal holds there: the next record's predecessor digest, or the
+  record's own digest at the head. If it fails, the generation is
+  restaged (`Generation::stage_reinstall`, which carries obligations
+  because the image is this node's own) and the baseline's image is
+  installed (`install_local`, which now admits a staging's six identity
+  rows when the image holds the same ones, and nothing else). The
+  incarnation may differ, by the rule a selected generation is opened
+  under: an adoption (task-58) advances the manifest alone, so the
+  projection and every image published from it keep the incarnation
+  they were created under, at or below the one the reinstall stages
+  with, and the install writes the image's back. A reinstall stopped
+  after activation and before the replay leaves a projection at `C`
+  that continues the journal, so the next start keeps it and replays.
+  The attach then replays `(C, J]`.
+  Without a baseline the node refuses to serve: the genesis rows were
+  written before the journal existed, so a replay into an empty
+  projection could not rebuild them. The attach refuses the same
+  projections itself, as `ProjectionInvalid`, so a caller that skips
+  the check cannot serve one.
+- **Switching profiles** needs nothing. The profile is not recorded
+  anywhere durable, and the attach replays the journal above the stamp
+  under either profile. A node started strict after a replay run
+  replays what its last run left working.
+- **What is not shown here.** The faultkit matrices crash the projection
+  at each of its writes and syncs, one of them around a checkpoint
+  publication with no cadence at all, so that only the publication's
+  forced sync is durable; they do not crash the journal, which is
+  task-j05's. SIGKILL under the Jepsen kill nemesis, the boot replay
+  time and the 6-node disk rows with the profile on are the #98 owner's
+  runs, after #143's fence fix.
+
+## What a publication, a restart and the loop's thread are measured as
+
+task-j06's Jepsen runs at six nodes left three readings missing, and task-d55 adds them.
+
+- **A publication's steps.** Each `checkpoint` line carries `took_ms` and the time of each step in task-j04's order: `export_ms` (pinning the snapshot and producing the image), `write_ms` (the image file and its directory, synced), `drain_ms` (taking back a lent append or projection commit), `sync_ms` (the replay profile's forced durable commit; zero under strict), `append_ms` (the pointer, synced), `retire_ms` (the journal's compaction) and `reclaim_ms`. Under the replay profile the publications took twice the strict profile's time on the domain thread, 818 ms at the longest, and these say which step that was. The `Checkpoint` stage takes each publication as one sample, and a failed one as a refusal. A publication with nothing new to represent is neither.
+- **A restart's replay.** `owed=0` on the `storage` line says the replay was complete, not what it cost. The attach records where the projection was found and the journal's durable head, and the time between them. `coordd` prints `replayed records= from= through= took_ms= attach_ms=` after `storage`. `attach_ms` includes a reinstall from the baseline's image, which `took_ms` does not. The `Recovery` stage takes the replay as its one sample a start, on the startup snapshot and on the serving loop's.
+- **The domain thread's scheduling.** The leader's busy time less its loop CPU was 1.41 ms a command under replay, with no pipeline wait counted. `cost.cpu.domain_scheduling` carries the thread's run-queue time (`schedstat`'s second field) and its voluntary and involuntary context switches (`status`), cumulative like the rest of the cost. Run-queue time is the host's cores; a voluntary switch is a blocking call on the loop's own thread.
+- **The interval a run needs.** `coord-harness provision --checkpoint-after-records N` (or `COORD_HARNESS_CHECKPOINT_AFTER_RECORDS`) sets every voter's interval, so one Jepsen run can say how much of the replay profile's tail is the publication before task-d51 moves it.
+
+## A voter's CPU per operation at five voters
+
+The review of task-d55's Jepsen runs on #98 found the runner saturated:
+its 4 cores divided by about 6.1 ms of CPU an operation, of which the
+five voters' `cost.cpu.process` was 4.09 ms and everything else, by
+subtraction, about 2.0 ms. etcd and its client cost at most 2.2 to
+2.3 ms on the same runner. This profile asked how the voters' part
+splits, and what the load generator costs when it is one process.
+
+**The run.** #145's head (570fc01), release build. Five voters from
+`coord-harness` on one four-core container, stores on its disk, the
+replay profile with `checkpoint_after_records = 65536`.
+`coord-wan-bench` drives it with 30 callers over five frontends,
+closed loop, put 30, get 50, contended 20, for 40,000 operations after
+500 of warm-up. Two runs: one clean, and one with
+`perf record -F 199 --call-graph dwarf` on every voter for 20 s of the
+middle. Each process's and each thread's user and system time is read
+from `/proc` at the start and the end.
+
+**Throughput and the host.** 676 operations a second clean, 602 under
+the profiler. The host was 3.10 cores busy, 0.36 in I/O wait and 0.46
+idle, so the voters here are not short of cores the way the runner's
+are.
+
+**Where the CPU goes, clean run, per operation:**
+
+| | leader | each follower | five voters |
+| --- | --- | --- | --- |
+| domain thread | 0.55 ms | 0.32 ms | 1.83 ms (43%) |
+| transport threads (`tokio-rt-worker`) | 0.34 ms | 0.26 ms | 1.38 ms (32%) |
+| materializer | 0.16 ms | 0.15 ms | 0.74 ms (17%) |
+| appender | 0.06 ms | 0.06 ms | 0.31 ms (7%) |
+| process | 1.10 ms | 0.79 ms | 4.26 ms |
+
+- **The voters cost the same here as on the runner:** 4.26 ms an
+  operation here, 4.09 there. So this host measures the daemon's part
+  of the runner's arithmetic.
+- **The load generator cost 0.20 ms an operation**, 8.1 s of CPU over
+  the profiled run: one process, one QUIC endpoint, 30 sessions. On the
+  runner the harness's share is about 2.0 ms, ten times as much, which
+  is the case for #98's one shim process.
+- **The voters alone are near twice etcd with its client.** That is the
+  daemon's part of the gap.
+
+**The leader's domain thread** (1,454 samples, counted inclusively):
+
+| what | share | about, per operation |
+| --- | --- | --- |
+| `Voter::pump_reads`: held reads served | 25.0% | 0.14 ms |
+| of which pinning a snapshot (`GatedReader::snapshot`) | 16.4% | |
+| of which point reads (`RedbView::get`) | 13.7% | |
+| `Leader::step` | 18.7% | 0.10 ms |
+| of which `resend_unvoted` | 8.7% | 0.05 ms |
+| `run_executions` (the apply's bound) | 10.1% | 0.06 ms |
+| the journal's group | 5.0% | 0.03 ms |
+| the allocator (`malloc`, `realloc`, `free`) | 25.2% | |
+| the scheduler and futexes | 6.7% | |
+
+- **A held read pins its own snapshot.** A read that comes due under
+  task-d50 is evaluated from a fresh redb read transaction, and the
+  gate reads the durable metadata to prove its stamp (11.8% of the
+  thread). Then every point read opens its table again: `open_table`
+  is 11.0% of the thread on its own. One snapshot per pump, and a
+  snapshot that keeps its tables, is task-d58.
+- **The re-send sorts every proposal on every flush.**
+  `resend_unvoted` collects the durable proposals, sorts them and scans
+  them once per voter, and three quarters of its time is its own.
+  task-d59.
+- **Allocation has no single owner.** `malloc` and `realloc` are
+  reached from encoding into vectors that grow as they are written
+  (journal records, store envelopes, postcard frames), from the
+  outbox's release and from the read path's tables. task-d60 measures
+  an allocator first, then sizes the encoders.
+
+**A follower's domain thread** (866 samples): `Follower::step` 23.8%,
+`run_executions` 16.5% (`apply_bound` 12.9%), the journal 10.5% (its
+record's encoding 5.3%), `Outbox::release` 7.3%, and the allocator
+32.4%, inclusive. Nothing in it waits on a read, which is why a
+follower's thread costs 0.32 ms to the leader's 0.55.
+
+**The transport threads** cost a voter a third of its CPU. On the
+leader (882 samples): QUIC's per-packet work (`quinn_proto`) 23.8%,
+`sendmsg` 15.0%, parking and waking 19.4%, frame encoding 6.2%,
+`rustls` 5.3%, the cipher itself 4.8%, `recvmsg` 2.2%. A follower's
+are the same shape: 22.1%, 13.4%, 26.4%, 4.9%, 3.9%, 3.4%, 3.4%, with
+the allocator 11.1%. The cost is per frame and per packet, not per
+byte, and the cipher is not it. task-d61 counts frames per command and
+sends what one turn has for one peer as one write.
+
+**The materializer** is 54 to 60% in redb's commit (its `fsync` 12 to
+13%, its freed-page bookkeeping 8 to 10%) and 39% applying the rows.
+**The appender** is 39% in `fsync`, 51% in the write and 33% encoding.
+Neither is on the domain thread any more (task-d52, task-d54).
+
+**What follows.** task-d58 through task-d61, after task-d51. The
+leader's domain thread is the one that sets the domain's rate, and
+task-d58 and task-d59 together are a third of it.
+
+### Transport workers when the voters share a host
+
+`coordd` builds a multi-threaded tokio runtime without naming its
+worker count, so each voter starts one transport worker per core: five
+voters on a four-core host run twenty, beside five domain threads, five
+materializers and five appenders. On the Jepsen runner the leader's
+domain thread waited for a core about as long as it computed (run queue
+0.9 to 1.1 ms a command against 0.7 of CPU) while the host averaged
+0.8 to 1.0 cores idle, which fits bursts: each proposal wakes four
+followers' transport threads and then their domain threads at once.
+
+`TOKIO_WORKER_THREADS`, which the runtime reads, is the one variable
+here. Same setup as the profile above (release build of task-d51 at
+c76cc96, five voters, one four-core host, stores on disk, replay at its
+default cadence, so no publication in the run, 30 callers, put 30, get
+50, contended 20, 40,000 operations), three runs of each. Run queue and
+involuntary switches are from each thread's `schedstat` and `status`.
+
+| workers per voter | `ok`/s | get p99 | voters' CPU / op | transport CPU / op | transport run queue / op | transport involuntary switches / op | leader loop run queue / op |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| default (4) | 777, 824, 862 | 114–128 ms | 3.25–3.34 ms | 1.09–1.11 ms | 5.4–5.6 ms | 4.1–4.3 | 0.57–0.59 ms |
+| 2 | 878, 890, 910 | 106–116 ms | 3.13–3.23 ms | 1.00–1.04 ms | 4.5 ms | 3.8–3.9 | 0.52–0.55 ms |
+| 1 | 920, 921, 954 | 104–107 ms | 2.98–3.08 ms | 0.82–0.85 ms | 2.6–2.7 ms | 1.8 | 0.45–0.46 ms |
+
+A fourth one-worker run is left out: the host's disk stalled for about
+64 s of it (iowait near all four cores, nothing runnable), and it made
+360 `ok`/s.
+
+- **One worker per voter is about 13% more throughput** here, with a
+  quarter less transport CPU per operation and half its run queue and
+  involuntary switches. Fewer workers park and wake less, which was a
+  fifth of the transport's CPU in the profile.
+- **The leader's own run queue falls a fifth and is still as long as
+  its CPU.** Twenty threads on four cores remain, so the bursts remain;
+  the idle half core is the gap between them. Steal was 0.04 to 0.06
+  cores here, so on this host it is not the VM.
+- **Not a default.** One transport worker serves a voter alone on its
+  host poorly, and a host's cores are not the voters'. It belongs to
+  whoever co-locates voters, and the Jepsen runner decides whether it
+  carries over.
+
+**On the Jepsen runner it does not.** #98's runner set
+`TOKIO_WORKER_THREADS` on its five voters (six nodes, replay, 120 s, 30
+clients, disk, the default cadence; one run per row except two at the
+default and two at one worker), where the same four cores also carry
+Jepsen's JVM and the shims:
+
+| workers per voter | `ok`/s | read p99 | voters' CPU / op | leader loop CPU / run queue per command | tokio threads' CPU / run queue per op |
+| --- | --- | --- | --- | --- | --- |
+| default (4) | 546, 533 | 72 ms | 2.98–3.28 ms | 0.57–0.70 / 0.86–0.97 ms | 1.42 / 6.96 ms |
+| 2 | 537 | 71 ms | 2.91 ms | 0.62 / 0.88 ms | 1.16 / 4.38 ms |
+| 1 | 374, 450 | 73–85 ms | 3.95–4.07 ms | 0.89–0.94 / 1.11–1.37 ms | 1.55 / 4.14 ms |
+
+- One worker cut the tokio threads' run queue as it did here, but not
+  their CPU, and was 17 to 31% slower. Two matched the default.
+- **Unexplained: the leader's loop costs more CPU per command with one
+  worker** (0.89 to 0.94 ms against 0.57 to 0.70), the opposite of the
+  runs above, where it fell. task-d61's frames-per-turn count is the
+  measurement that would explain it.
+- So no `[transport]` key, and task-d58 and task-d61 are measured at
+  the default count.
+
+## The local checkpoint off the domain thread
+
+task-d51. task-j06's Jepsen runs measured each publication of the
+local checkpoint at 170 to 250 ms of the domain thread at 65,536
+records, almost all of it the export and the image write (task-d55),
+and the closed loop's tail was those stalls.
+
+- **The split.** `LocalBaseline::pin_local` pins the snapshot on the
+  domain thread. It is the gated reader's (task-11), the same pin
+  task-d37's scrub will take, and what is committed after it is not in
+  it. `Pinned::write` produces the image from it and writes it, on a
+  thread named `checkpoint`. It touches neither the projection's writer
+  nor the journal. `LocalBaseline::finish_local` runs back on the domain
+  thread once the image and its directory are durable: the pointer and
+  the retirement. `reclaim_local`, step 5, runs on the `checkpoint`
+  thread again once the pointer is durable: removing the superseded
+  image is a directory of unlinks and a sync, 28 to 64 ms at 50,000
+  records here. task-j04's order is kept. `publish_local` is still all
+  of it in a row, for a caller with no thread to spare.
+- **The forced projection sync** under the replay profile is skipped
+  when the projection is already durable at the represented position,
+  which the profile's own cadence has usually made it by the time an
+  image produced off the thread is published.
+- **What the domain thread waits for.** Nothing. It checks the writer
+  each turn, finishes the publication once the image is written, and
+  starts the next only after the reclaim: at most one publication is in
+  flight.
+- **The bound.** A read of the snapshot after 60 s fails the export as
+  abandoned. The snapshot is released and nothing is written.
+- **Why an image produced while the domain serves is still its
+  baseline.** Under one origin, a position names one projection state,
+  because the projection is the journal's prefix applied in order. So
+  an image of (origin, represented) stays valid whatever is committed
+  after the pin, provided the origin is still the domain's at the
+  finish and `C <= M` holds there. `finish_local` checks the first and
+  `publish_checkpoint` the second. An image of a domain reattached from
+  a peer's baseline meanwhile (task-d08) has another origin and is not
+  published (`BaselineError::Superseded`); the next publication's
+  reclaim removes it. A reinstall from this node's own image keeps the
+  origin, replays to the same state, and happens at attach.
+- **The cadence.** Unset, `checkpoint_after_records` is 4,096 under the
+  strict profile and 65,536 under the replay profile, and the new
+  `checkpoint_after_seconds` is none under strict and 30 under replay.
+  Where both apply, both have to have passed. A configuration that
+  names either keeps it.
+- **The line.** `checkpoint` gains `loop_ms`, what the publication held
+  the domain thread for (the pin, the pointer and the retirement), and
+  `pin_ms`.
+  `took_ms` is now from the pin to the end of the reclaim, most of it
+  off the thread, and the line is printed then. A reclaim that fails,
+  or a reclaimer that panics, still prints it: the pointer is durable,
+  and the images it left are the next reclaim's. The `Checkpoint` stage
+  samples `loop_ms`.
+
+## Held reads from one snapshot
+
+task-d58. In the five-voter profile
+([above](#a-voters-cpu-per-operation-at-five-voters)) a quarter of the
+leader's domain thread was `Voter::pump_reads`. Every held read that
+came due pinned its own snapshot, every point read on it opened its
+table again, and every read's admission started its own confirmation
+round.
+
+- **One snapshot per pump.** `pump_reads` pins one gated snapshot for
+  every read due in the pump, and `reads::evaluate` plans each over it.
+  Each is due because everything below its index executed, so a
+  snapshot pinned after that covers all of them. A read whose position
+  the snapshot has not reached yet is held again, as before. Three
+  voters in one process show it end to end: two reads due in one pump
+  are both served, from one snapshot
+  (`the_reads_due_in_one_pump_are_served_from_one_snapshot`).
+- **A snapshot that was behind is not pinned again until it could
+  differ.** A read is due once its index has executed and answerable
+  once the projection has committed that far, which is later. The first
+  version pinned a snapshot on every pump in between: 210,000 snapshots
+  for 20,339 reads. Now, once a snapshot was behind a due read, the
+  leader keeps the completed frontier it read just before pinning it and
+  pins no new one while the frontier still reads exactly that. A
+  projection commit moves it; nothing else changes what a snapshot
+  shows. A frontier moved either way, as a reattached projection's
+  could, gets a new snapshot. 7,700 to 8,000 snapshots per 20,339
+  reads now.
+- **A snapshot keeps its tables.** `RedbView` opens each collection's
+  table once, on first use, and keeps it for the snapshot's life (redb's
+  `ReadOnlyTable` holds its transaction's guard). A failed open is not
+  kept.
+- **One round in flight.** `ReadBarrier::round_to_start` starts no round
+  while a round of the same ballot started less than
+  `ROUND_IN_FLIGHT_MILLIS` (100 ms) ago. The reads that arrive meanwhile
+  share the next round. A round still covers only the reads that arrived
+  before it started, so a read is never answered by a round already
+  under way (`reads_that_arrive_during_a_round_share_the_next`). A
+  round that has not confirmed in 100 ms no longer holds the next back,
+  and still confirms if its answers come
+  (`a_round_in_flight_too_long_does_not_hold_the_next`). Nothing about
+  when a read is due or what it may return changes.
+- **Counted.** The `metrics` line's `reads` gains `snapshots`, the
+  snapshots pinned for due reads, and `behind`, the due reads held again
+  because theirs was behind them.
+
+### Measured
+
+Same setup as the transport-worker runs above: release builds of
+task-d51 at c76cc96 and of this change on it, five voters on one
+four-core host, stores on disk, replay at its default cadence, 30
+callers, put 30, get 50, contended 20, 40,000 operations. Four baseline
+runs and three of this change, clean, then a pair profiled with
+`perf record -F 199 --call-graph dwarf` on every voter, twice.
+
+| | `ok`/s | get p99 | reads per round | rounds confirmed | read waits: confirm / index / total | leader loop CPU / op | voters' CPU / op |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| task-d51 | 777, 824, 851, 862 | 114–128 ms | 1.00 | 61% | 4.6–4.8 / 17.6–18.3 / 24.6–25.6 ms | 0.41–0.42 ms | 3.25–3.34 ms |
+| task-d58 | 824, 879, 913 | 114–119 ms | 2.18–2.26 | 100% | 6.3–6.8 / 16.6–18.6 / 23.4–26.0 ms | 0.35–0.37 ms | 3.11–3.37 ms |
+
+The leader's domain thread, profiled (samples counted inclusively):
+
+| | run | samples | `pump_reads` | of the thread's CPU | per read |
+| --- | --- | --- | --- | --- | --- |
+| task-d51 | 1 | 1,518 | 24.6% | 16.5 s | 0.200 ms |
+| task-d51 | 2 | 1,404 | 25.0% | 18.1 s | 0.222 ms |
+| task-d58 | 1 | 1,247 | 14.4% | 14.3 s | 0.101 ms |
+| task-d58 | 2 | 1,254 | 10.1% | 14.6 s | 0.073 ms |
+
+- **`pump_reads` per read fell by 59%** on the means of the two pairs,
+  0.211 to 0.087 ms. One run alone was at the line: 0.101 against the
+  0.200 of the first baseline, 49.5%.
+- **What it no longer does.** Pinning a snapshot was 14.2 to 14.6% of
+  the thread and is 3.2 to 3.7%; `open_table` was 9.6 to 10.9% and is
+  3.0 to 3.6%; point reads (`RedbView::get`) were 13.5 to 13.9% and are
+  4.7 to 5.2%.
+- **What is left is per read.** Building the read's authorized view
+  (`load_authorization`, `scan_all`, `build_authorized_view`), 8 to 9%
+  of the thread, is the same in every run: each read plans under its
+  own session's grants.
+- **Rounds.** 9,000 to 9,350 rounds for 20,339 reads, where every read
+  had its own and 39% of them were superseded before they confirmed.
+  A read waits 2 ms longer for its round and no longer in all: its
+  wait for its index to execute is two and a half times as long, and
+  the round overlaps it.
+- **Held behind.** A due read was held behind its snapshot 21,923 to
+  22,438 times per 20,339 reads here, 1.08 to 1.10 per read, and on the
+  Jepsen runner 1.07 to 1.21 (#98, 6032679507): about once per read in
+  both places, the projection's commit trailing execution. Snapshots per
+  read were 0.38 to 0.39 here and 0.53 to 0.55 there. A read held behind
+  costs the pump that finds it so only the snapshot's frontier check
+  (`evaluate` returns at its first line), and no new snapshot until the
+  completed frontier moves, so the churn is the snapshots, 3.2 to 3.7% of
+  the leader's thread here.
+- **The domain.** The leader's loop costs 15% less per operation. The
+  throughput's range moved up by about 50 operations a second and still
+  overlaps the baseline's; the host's four cores are what these runs
+  are short of, and the leader's loop is not all of them.
+
+**Leader faults.** `scripts/bench/register-faults.sh` on this build,
+one run each, as task-d50 ran it:
+
+| Scenario | Violations | Reads | Writes | Leader after |
+| --- | --- | --- | --- | --- |
+| partition 45 s | 0 | 33,292 (185 at the cut-off leader) | 14,322 | n2 (elected) |
+| pause 5 s, then 40 s | 0 | 48,992 | 21,731 | n2 (elected) |
+| kill and restart, twice | 0 | 21,628 | 9,011 | n1 |
+
+## A fast-set follower held off the leader's path
+
+Run E on #98 (37576818613: five voters, one boot each, no faults, the
+default worker count) made no fast decision in 46,000 commands. The
+six other runs of the same day, on the same commit and runner type,
+made 3.5 to 11%:
+
+| run | fast | the leader's first proposal |
+| --- | --- | --- |
+| A | 4.7% | |
+| B (one worker) | 11.1% | |
+| C (two workers) | 5.3% | |
+| D (one worker) | 3.5% | |
+| E | **0** | `ProposalRepublished` |
+| #147, 1 | 3.9% | |
+| #147, 2 | 7.2% | |
+
+Every voter of E counts the same: `established_fast` 0. Its leader is
+the only one of the seven whose log shows `ProposalRepublished` at
+startup: it proposed its first command, the lease authority's epoch,
+before its peers were connected (`peers connected=0 of 4`,
+`voters submittable=0 of 4`), and presented it again later. That
+places the run's first client commands in the same window, where a
+frontend's collector reaches some voters and not the leader.
+
+**The mechanism**, reproduced in one process
+(`crates/coord-daemon/tests/fast_path.rs`: five voters over the
+reference store, the fast set `coordd` builds, the leader and the next
+two):
+
+- A follower appends a command to its path log when it pre-accepts it.
+  A command the leader never orders is never synchronized there, and a
+  record leaves the log only when it executes or a durable Sync releases
+  it (task-d24).
+- The next command the leader orders marks it reordered (task-d34's
+  F7). From then on the follower's head is `reordered_path`, which no
+  leader path equals, so every acknowledgement it sends fails the fast
+  predicate until the next election.
+- With the fast set the leader and two followers, one such follower is
+  enough.
+
+| one put, never presented again, reached | fast, of the next 40 |
+| --- | --- |
+| every voter | 40 |
+| n4 only, outside the fast set | 40 |
+| n4 and n5 | 40 |
+| n2 only, in the fast set | **0** |
+| n2 and n3 | **0** |
+
+A lost first service command reproduces it too, by another route: the
+followers hold every later proposal until it arrives, the leader's
+table fills, and the commands it then refuses for room are pre-accepted
+at the followers and never ordered. With 60 commands before the
+republication, none of the 176 commands established was fast, the 120
+after it included; with 20, the table did not fill, and 39 of the 40
+after it were fast.
+
+E's leader refused nothing for room, so its orphan came the first way,
+most likely; the voters' logs are in its artifact, which this container
+cannot fetch. task-d67 decides when a follower lets go of such a
+pre-acceptance, and task-d62 counts them.
+
+
+## What a command costs and why its fast path failed: the first counts
+
+task-d62's first part is in `metrics` and in `command_cost.py`'s second
+table. Counting only: no voter decides, sends or orders anything
+differently.
+
+- **Why a command missed the fast path** (`cost.fast_path`). Each command
+  a voter establishes on the slow path is classified when it executes,
+  from the votes that voter counted by then, and counted when its
+  establishment is, so the five add up to `established_slow`: `path`, a
+  fast-set acknowledgement saw another conflict path; `deps`, the path
+  but other direct dependencies; `missing`, an acknowledgement the
+  quorum needed had not arrived; `slow_first`, the fast quorum formed
+  after the slow one decided; `unclassified`, a command the voter did not
+  decide from its own votes (a follower executing the leader's commit)
+  or a run forced onto the slow path. Read at execution, later than the
+  decision, `missing` is an acknowledgement that had not come even then,
+  and one that agreed and came late is `slow_first`.
+- **An acknowledgement made under a `reordered` marker** is counted by
+  its sender (`acks_reordered`, beside `acks`), not by the leader. The
+  acknowledgement does not say so, and saying it would change the wire
+  form of every acknowledgement; the leader counts it under `path`.
+- **The pre-acceptances a voter holds that the leader has not ordered**
+  (`cost.unordered`): how many, how many the leader has ordered a later
+  command past, and how long the oldest of those has been held, from the
+  first interval snapshot that saw it. One the next synchronization
+  orders is gone by the next snapshot; task-d67's orphan shows as an age
+  that grows with the run.
+- **From learned to released** (`cost.release`), per command the leader
+  committed from its own votes: committed to applied (predecessors and
+  the loop reaching it), applied to its group closing, and the group
+  closing to the release (the projection's commit). Summed, with the
+  commands timed.
+- **The read waits**, which are cumulative from arrival, are taken apart
+  by the summary: the confirmation, the index after it, the answer after
+  the index, with reads per round and reads held behind their snapshot
+  per read.
+
+On the orphan of the section above (`fast_path.rs`, five voters, an
+orphan at n2, then 20 commands), the leader names `path` for all 20 of
+its slow establishments and nothing else; n2 sent 26 acknowledgements,
+19 of them under the marker, and holds one pre-acceptance the leader
+ordered later commands past. The first command after the orphan missed
+by the orphan alone, in n2's pending suffix, before anything was
+ordered past it. n3 sent 25 and none under a marker.
+
+### The second part: frames, streams and the storage threads
+
+- **Peer traffic** (`cost.traffic`), counted by the transport for the
+  peer class only: frames, bytes and streams sent and received, and
+  frames lost to a failed open or write. Bytes are the frame header and
+  payload, not QUIC's framing. Every peer frame is its own stream today,
+  so streams equal frames; task-d61 is read against this.
+- **The journal's and the materializer's jobs** (`cost.waits`,
+  `appender_jobs`, `materializer_jobs`): each job is stamped when it is
+  sent, so the summary splits its life into queued (sent to taken),
+  served (taken to done) and completed (done to the loop taking the
+  outcome).
+- **A leader's own path log** (`cost.unordered.leader_log`): the
+  commands in its pending suffix. A leader holds no pre-acceptance it
+  has not ordered, so it reports 0 there, and this length beside it.
+
+A local run (five voters on one host, replay profile, stores on disk, 30
+callers, 20,000 measured operations, `put=30,get=50,contended=20`, 862
+completed a second):
+
+| node | fast share | path / deps / missing / slow first | acks (reordered) | peer frames per command sent / received | journal ms per command queued / served / completed | projection ms per command queued / served / completed |
+| --- | --- | --- | --- | --- | --- | --- |
+| n1 (leader) | 3.9% | 9282 / 165 / 264 / 48 | -- | 9.96 / 7.89 | 0.10 / 0.78 / 0.30 | 0.13 / 0.57 / 0.36 |
+| n2 (fast set) | 4.2% | 9349 / 169 / 178 / 32 | 10150 (1976) | 8.48 / 6.49 | 0.11 / 0.81 / 0.30 | 0.14 / 0.56 / 0.30 |
+| n3 (fast set) | 4.1% | 9376 / 164 / 172 / 26 | 10150 (2137) | 8.47 / 6.49 | 0.10 / 0.80 / 0.31 | 0.15 / 0.55 / 0.32 |
+| n4 | 3.9% | 9224 / 164 / 334 / 36 | -- | 4.47 / 7.49 | 0.11 / 0.82 / 0.33 | 0.16 / 0.56 / 0.30 |
+| n5 | 3.8% | 9208 / 165 / 356 / 35 | -- | 4.47 / 7.48 | 0.10 / 0.84 / 0.36 | 0.15 / 0.51 / 0.26 |
+
+- The reasons add up to each voter's slow establishments, and `path` is
+  nearly all of them. About one fast-set acknowledgement in five was made
+  under a `reordered` marker, so most `path` misses are paths the
+  follower chained in another order without a marker.
+- No follower held a pre-acceptance the leader had not ordered at the
+  last snapshot.
+- Streams sent equal frames sent on every voter: about ten streams a
+  command at the leader, eight and a half at a fast-set follower.
+- On the leader, a command waited 1.76 ms for its predecessors, 0.90 ms
+  for its group to close and 7.80 ms for the projection's commit. A read
+  waited 6.82 ms to be confirmed, 10.83 ms more for the index and 6.91 ms
+  more for its answer, at 2.32 reads a round and 1.09 held behind their
+  snapshot per read.
+- This run's leader reported its 10,150 commands as unordered before the
+  count was split: the leader's own pending suffix, which led to the
+  next finding.
+
+### The fast path after a leader change (task-d68)
+
+`fast_path.rs`'s `fast_after_a_leader_change` drives five voters through
+a number of commands, moves the leader, and counts the fast decisions
+after the change. Under the counts above, every command after a change
+is slow, all `path` at the new leader, for as many commands as the old
+ballot ordered, and one more: 3 commands under the genesis leader leave
+the next 4 slow, 20 leave 21, 40 leave 41, with either the old leader's
+fast-set neighbor or a voter outside its fast set winning.
+
+A follower takes a synchronization as its new prefix only when its
+leader sequence number is above the highest it has taken. A new leader
+numbers its proposals from zero, and nothing resets a follower's highest
+at the ballot change, so until the new numbers pass the old ones each
+follower chains from the old ballot's head and every acknowledgement it
+sends disagrees with the leader's path.
+
+The same trace shows the leader's own log: a leader appends each command
+it proposes to its path log and never synchronizes it, and retiring a
+command does not take it out of the pending suffix. It grows by one a
+command led and is cleared at the role change.
+
+task-d68 plans the fix, with a design step first: what a follower's
+synchronized prefix is across ballots. `the_fast_path_resumes_after_a_leader_change`
+is its acceptance and is ignored until then; it fails today with 0 of
+20 fast after 40 commands under the old leader.
+
+Not yet in task-d62: the matched workload and the runner rows, which are
+three pairs each.
+
+## Several frames a stream (task-d61): streams fell, packets hardly did
+
+task-d61 puts what one turn queues for one peer on one QUIC stream, where
+both ends of the link offer capability `0x0020` (`spec/wire-v1.md`), and
+encodes a leader's proposal once for every voter it goes to. A link where
+either end does not offer it carries one frame a stream, as before; a
+stream carries at most 256 frames and 256 KiB, and never more than either
+byte budget can hold. Each frame is still admitted, refused and delivered
+on its own; frames on one stream are delivered in order, and frames on
+different streams are, as before, not ordered against each other. A
+stream that cannot be opened or written loses every frame it carried,
+counted as frames lost and as a stream lost, so a saturated peer does not
+read as a quiet one.
+
+The transport now also reports QUIC's own counts on peer connections:
+datagrams each way, the system calls that sent them, and ACK frames each
+way. `COORDD_PEER_STREAM_FRAMES=1` sends one frame a stream from the same
+binary, a measurement lever and not configuration.
+
+Five voters on one four-core host, replay profile, stores on disk, 30
+callers, 20,000 measured operations, `put=30,get=50,contended=20`, one
+binary, three pairs with batching off and on, alternated:
+
+| | off | on |
+| --- | --- | --- |
+| completed a second | 893, 850, 916 | 900, 928, 931 |
+| tokio workers' CPU ms per operation, five voters | 1.043, 1.153, 1.081 | 0.999, 1.005, 0.975 |
+| all threads' CPU ms per operation | 3.202, 3.346, 3.186 | 3.099, 3.097, 3.075 |
+| leader: frames / streams per command sent | 10.0 / 10.0 | 10.0 / 3.1 |
+| fast-set follower: frames / streams per command sent | 8.5 / 8.5 | 8.5 / 2.0 |
+| leader: datagrams sent / send calls / ACK frames sent per command | 5.37 / 5.04 / 1.61 | 5.09 / 4.79 / 1.53 |
+| fast-set follower: datagrams sent per command | 3.54 | 3.25 |
+
+- Streams fell by the batching factor, three to four times. The
+  transport threads' CPU fell by 9% in every pair, and the throughput
+  rose by 4%.
+- Datagrams fell by 5 to 7% only. The leader already sent about two frames
+  a datagram before: QUIC packs the frames of streams written together
+  into one packet, so a turn's frames to a peer were sharing packets
+  already, and what batching took away is the work per stream, not per
+  packet.
+- A `perf` profile of the leader's tokio workers (20 s at 199 Hz, one run
+  each way, two builds) agrees: QUIC's own work went from 22.8% of the
+  samples to 18.8% and the stream opening, accepting and reading from 16.3%
+  to 14.5%, while `sendmsg` stayed at about 15% and parking and waking at
+  about 32%. Counted with `perf stat`, the leader made 5.5 `sendmsg`, 5.5
+  `recvmmsg` and 11 `futex` calls a command either way.
+- What is left is per packet and per wake-up. Fewer packets needs fewer
+  turns a command (each turn sends what it has to each peer) or fewer
+  ACK-only packets; fewer wake-ups needs fewer events between the
+  transport and the domain thread. Neither is this task's change; the
+  runner rows of this PR size them first.
+
+On the Jepsen runner, three pairs on one AMD EPYC 7763 in one job
+([37644338627](https://github.com/tuplesky/tuplesky/actions/runs/37644338627)),
+replay, throughput, 30 clients, 120 s, stores on disk, the base being the
+same build with `COORDD_PEER_STREAM_FRAMES=1` on every voter, the head
+less the base:
+
+| | mean | range over the three pairs |
+| --- | --- | --- |
+| leader: streams per command | -6.11 (-60%, 10.3 to 4.1) | -6.16 to -6.02 |
+| leader: frames per stream | +1.48 | +1.44 to +1.52 |
+| leader: datagrams per command | -0.12 (-2%) | -0.20 to -0.02 |
+| frames (streams) lost, every voter | 0 (0) | 0 to 0 |
+| leader's loop CPU per command | +0.005 ms | -0.003 to +0.013 |
+| voters' CPU per operation | -0.09 ms (-2%) | -0.14 to -0.05 |
+| `ok`/s | -2.8 | -19.2 to +6.7 |
+| read p99 | 0 ms | -7 to +11 |
+
+- Streams fell 60% with frames per command unchanged and nothing lost,
+  so the change is in how frames are packed, not in what is sent.
+- The CPU and throughput moved inside the pairs' spread. The 9% on the
+  four-core host, where five voters shared four cores, is not seen on the
+  runner; in the runner's profile the transport's symbols are within
+  1.3 µs per command of each other either way.
+- task-d61's acceptance is the streams cut. The change is kept for what
+  QUIC's stream limits and a WAN path care about, not for CPU.
+
+
+## The leader's re-send past each voter's adoption (task-d59)
+
+The leader's domain loop calls `Leader::resend_unvoted` once every 250 ms.
+Each call sorted every durable proposal the leader keeps until the history
+sweep, thousands of them, and walked them once per voter to find what that
+voter had not adopted. The leader now keeps the durable proposals in
+sequence order as they become durable and as they are replaced or swept,
+and each voter's highest adoption as adoptions are counted. A call looks
+past that, and before it only at the unsettled proposals, which hold every
+undecided one. What a call sends is unchanged: in debug builds every call
+is checked against the sorted walk. The metrics report the calls, the
+proposals they looked at, and the loop's time in them, in all and the
+longest.
+
+Five voters on one four-core host, replay profile, stores on disk, 30
+callers, 40,000 measured operations, `put=30,get=50,contended=20`, three
+pairs of #150's build against this one, alternated:
+
+| | #150 | this |
+| --- | --- | --- |
+| completed a second | 885, 906, 891 | 867, 875, 906 |
+| get p99, ms | 116, 111, 111 | 120, 119, 109 |
+| leader's domain thread, CPU ms per command | 0.698, 0.704, 0.713 | 0.675, 0.691, 0.650 |
+| leader: re-send calls | -- | 208, 207, 200 |
+| leader: ms per call (longest) | -- | 0.109 (4.3), 0.094 (1.8), 0.080 (1.5) |
+| leader: proposals looked at per call | -- | 26.6, 24.8, 26.9 |
+
+- The leader's domain thread is 0.033 ms per command cheaper on average,
+  lower in every pair (0.023, 0.013 and 0.063). At about 890 commands a
+  second and four calls a second that is about 7 ms a call, the size the
+  runner's profile gave the old walk.
+- A call now looks at about 26 proposals over four voters, and takes 0.08
+  to 0.11 ms of wall time on the loop. That time is the whole of
+  `Node::resend_proposals`, the sends it hands to the transport included,
+  on a host where five voters share four cores; the longest calls, 1.5 to
+  4.3 ms, are most likely the thread being descheduled.
+- Throughput and get p99 moved inside the pairs' spread on this host,
+  whose p99.9 is half a second either way. The runner pair, with the
+  leader's read p99, is the acceptance.
+
+On the Jepsen runner, three pairs on one AMD EPYC 7763 in one job
+([37680512691](https://github.com/tuplesky/tuplesky/actions/runs/37680512691)),
+replay, throughput, 30 clients, 120 s, stores on disk, against task-d61's
+build, this less the base:
+
+| | mean | range over the three pairs |
+| --- | --- | --- |
+| leader's loop CPU per command | -0.078 ms (-9%) | -0.084 to -0.067 |
+| leader's excess over a follower | -0.065 ms (-29%) | -0.081 to -0.056 |
+| followers' loop CPU per command | -0.013 ms | -0.026 to -0.003 |
+| voters' CPU per operation | -0.17 ms (-4%) | -0.19 to -0.13 |
+| `ok`/s | +21.3 (+5%) | +15.9 to +26.8 |
+| read p99 | -1 ms | -4 to +6 |
+
+- `Leader::resend_unvoted` went from 56 µs per command in the profile
+  to under its 0.2% cut: at about 333 commands a second on the leader and
+  four calls a second, about 4 to 5 ms a call before.
+- A call looks at 20 to 22 proposals and takes 0.09 to 0.11 ms (the
+  longest 2.2 to 4.1 ms). Every call ends with the commit-frontier
+  announcement (`announce_committed`, task-d09), a `Committed` frame
+  encoded and published to each voter, and that, not the walk, is most of
+  its time; the longest calls are the ones that also re-sent.
+- The leader's read p99 did not move. A 4 to 5 ms stall four times a
+  second is about 2% of the loop's time, under a p99 near 80 ms.
+- A leader-only cut of 78 µs per command raised `ok`/s by 5%: the
+  leader's loop is on every operation's path in this closed loop, so a
+  microsecond of the leader's is worth more than its share of the
+  cluster's CPU.
+
+## The allocator (task-d60, step 1)
+
+`coordd` now sets mimalloc as its global allocator. No call site
+changes. On the Jepsen runner's call-graph profile a third of the leader's
+domain thread was glibc's allocator and copies, spread over every phase,
+most of the allocator's share in glibc's own bin management
+(`_int_malloc`, `unlink_chunk`, `_int_free`, `malloc_consolidate`).
+
+Five voters on one four-core host, replay profile, stores on disk, 30
+callers, 40,000 measured operations, `put=30,get=50,contended=20`, three
+pairs of task-d59's build against this one, alternated:
+
+| | glibc | mimalloc |
+| --- | --- | --- |
+| completed a second | 884, 1060, 1105 | 1217, 1180, 1149 |
+| get p99, ms | 140, 98, 101 | 84, 98, 92 |
+| leader's domain thread, CPU ms per command | 0.515, 0.513, 0.505 | 0.434, 0.432, 0.456 |
+| domain threads, five voters, CPU ms per operation | 1.094, 1.095, 1.075 | 0.923, 0.923, 0.969 |
+| tokio workers, five voters | 0.847, 0.889, 0.874 | 0.746, 0.761, 0.783 |
+| materializers, five voters | 0.416, 0.403, 0.390 | 0.377, 0.377, 0.395 |
+| all threads, CPU ms per operation | 2.572, 2.601, 2.546 | 2.250, 2.257, 2.361 |
+| resident set at the end, per voter, MiB (one pair) | 128 to 144 | 171 to 194 |
+
+- Lower in every pair: the leader's domain thread by 0.070 ms per
+  command (0.081, 0.081, 0.049), and all threads by 0.28 ms per operation,
+  11% (0.32, 0.34, 0.19). Throughput rose 16% on average (+333, +120,
+  +44), the first pair's base the lowest of the six.
+- Every thread kind is cheaper, the transport's tokio workers as much as
+  the domain threads, so the share is the allocator's everywhere, not one
+  loop's.
+- The cost is memory: each voter's resident set at the end of the run was
+  about 46 MiB, a third, higher. mimalloc keeps freed
+  pages in its heaps rather than returning them at once.
+- Faster serving exposed a race in `multi_host`'s restarted-voter test,
+  in the test and not in the daemon. The returned voter's frontend holds a
+  read's result back as pending while it has not yet projected the
+  caller's new session (coord-session's output gate), and the test read
+  once and took the pending outcome for a missing value: about one full
+  run in five failed with mimalloc, none in eighteen without. The test now
+  asks again until it is answered, as a caller resolves, and passed
+  fifteen of fifteen.
+- One host, loopback. The runner pair, with the call-graph profile on one
+  pair, is the acceptance.
+
+On the Jepsen runner: five voters, replay, throughput, 30 clients, three
+pairs a job against task-d59's build (each pair's base the same commit, so
+the pair isolates this one). Job 1 (37704463298) on an AMD EPYC 7763 with
+the call-graph profile on its first pair; job 2 (37707115702) on an AMD
+EPYC 9V45, about 1.6 times faster per operation, with a flat profile and
+the voters' sampled CPU split into their domain loops and their tokio
+threads. Head less base, mean (smallest to largest) of three:
+
+| | job 1, EPYC 7763 | job 2, EPYC 9V45 |
+| --- | --- | --- |
+| `ok`/s | +18.1 (+8.0 to +23.9), +4% | +5.7 (-4.1 to +16.2), +1% |
+| voters' CPU per operation, ms | -0.21 (-0.31 to -0.16) of 4.28, -4.9% | -0.15 (-0.27 to -0.04) of 2.74, -5.5% |
+| voters' domain loops, CPU ms per operation | not split | -0.10 (-0.14 to -0.06) of 1.04, -9.6% |
+| voters' tokio threads, CPU ms per operation | not split | -0.04 (-0.08 to -0.01) of 1.15, -3.5% |
+| leader's loop, ms per command | -0.074 (-0.083 to -0.064), -10.2% | -0.047 (-0.065 to -0.032), -10.5% |
+| followers' loop, ms per command | -0.052 (-0.060 to -0.047), -9.2% | -0.032 (-0.045 to -0.020), -8.7% |
+| leader's allocator, profiled, µs per command | -49.2 (-56.1 to -42.4), -30 to -38% | not readable (Debian nodes) |
+| leader's `memcmp` / `memmove`, profiled, µs per command | -2.4 / -0.1 | not readable |
+| voters' resident set at the end, mean, MiB | +54 (+35 to +89) | +34 (+31 to +37) |
+| voters' high-water mark, largest, MiB | +62 (+36 to +105), head up to 263 | +51 (+47 to +55), head up to 273 |
+
+- Kept. Every loop is lower in all six pairs, by about a tenth on the
+  leader and the followers on both CPUs, the same cut as the local pair's
+  0.070 ms on the leader, and the allocator's share of the leader fell
+  with it. The voters' CPU per operation fell by about half what the
+  local pair showed: the domain loops and the tokio threads make up
+  nearly all of job 2's cut, and the tokio threads fell 3.5% on the
+  runner against about 12% locally, so the shortfall is on the
+  transport's side, not in the loops. Three pairs set the sign, not the
+  size to 0.1 ms: the six run from -0.04 to -0.31 ms.
+- The memory cost is about 34 MiB of resident set per voter, a fifth on
+  top of about 170 MiB, near the local pair's 46, and up to 51 MiB of
+  high-water mark. It is kept as measured: a deployment that needs it
+  smaller bounds it with `MIMALLOC_PURGE_DELAY` or the `v2` feature,
+  and either is a pair of its own.
+- What is left of the allocator on the leader is about 100 µs per
+  command, the largest symbol mimalloc's allocation fast path
+  (`_mi_page_malloc_zero`, 46 µs of self time): the number of
+  allocations, not their bookkeeping. Step 2's sites are the head's
+  largest callers: `BallotConfiguration::clone` 7.8 µs, the journal
+  record's encoder 6.2, `RedbView::table` 6.1, `pump_reads` 4.8, the
+  loop's closure 4.8, `trace::hex` 4.6, `Leader::propose` 3.8.
+- `memcmp`, 44 to 52 µs per command on the leader, is 25 to 30 µs in the
+  leader's own bookkeeping (`step`, `learn`, `executed_below`, `applied`,
+  `commit_learned`, `propose`) and 5 to 6 in `pump_reads`: map probes on
+  32-byte keys, inlined, so the stack does not name the map. redb's own
+  lookups are 3 to 4. `memmove`, 38 to 43, is mostly inlined into the
+  domain loop's closure (7 to 12 µs), where each peer's send is
+  dispatched; that fits the per-voter copy of each broadcast frame, but
+  the stack cannot prove it, and it is confirmed before it is cut.
+
+## The allocation sites (task-d60, step 2)
+
+Five cuts, each where the runner's caller table put allocation on the
+voters' loops, none changing a format:
+
+- **The collector's golden trace, a memory leak.** `coordd`'s collector pushed a
+  `CollectorEvent`, every identity formatted as hex, for each transition
+  (a submission, each voter's evidence, a release), and nothing in the
+  daemon drained it: the trace grew for the daemon's life, and its
+  formatting was the profile's `trace::hex`. `Collector::new` now keeps no
+  trace and builds no event; `Collector::traced` keeps it for the tests
+  that read it.
+- **A ballot configuration's voter sets** are shared, so the clone each
+  command's vote set takes is two reference counts, not two trees
+  (`BallotConfiguration::clone`).
+- **A journal record** is encoded from a borrowed wire shape instead of a
+  copy of its body, its length is counted without encoding it (sealing,
+  every group bound), and raft-engine's codec appends straight into its
+  buffer (`JournalRecordV1::encode`).
+- **A sealed record's body** is shared, so the group the storage path
+  appends and the copy it materializes are one body (`StoreUpdate::clone`).
+- **A submission's command** is derived from the payload bytes its
+  canonical check just compared, one encoding instead of two
+  (`canonical_bytes`).
+
+Five voters on one four-core host, replay profile, stores on disk, 30
+callers, 40,000 measured operations, `put=30,get=50,contended=20`, three
+pairs of step 1's build (#152) against this one, alternated. The host was
+slower than for step 1's pairs (the base's leader thread 0.62 ms per
+command here, 0.43 to 0.46 then), so the pair is read against itself:
+
+| | step 1 | step 2 |
+| --- | --- | --- |
+| completed a second | 914, 879, 869 | 925, 867, 858 |
+| leader's domain thread, CPU ms per command | 0.614, 0.619, 0.633 | 0.563, 0.593, 0.602 |
+| domain threads, five voters, CPU ms per operation | 1.290, 1.302, 1.335 | 1.188, 1.251, 1.270 |
+| tokio workers, five voters | 0.905, 0.995, 0.999 | 0.963, 1.029, 1.043 |
+| all threads, CPU ms per operation | 3.035, 3.149, 3.204 | 2.984, 3.151, 3.207 |
+| resident set at the end, per voter, MiB (mean, range) | 177, 178, 176 (168 to 196) | 160, 160, 159 (153 to 172) |
+
+- Lower in every pair: the leader's domain thread by 0.036 ms per command,
+  6% (0.051, 0.026, 0.031), and the five domain threads by 0.073 ms per
+  operation, 6%.
+- All threads did not move (-0.015 ms per operation): the tokio workers
+  rose by about as much as the domain threads fell, in all three pairs.
+  Nothing here touches the transport, so that is read as the host, and
+  the runner pair, with its loop and thread split, settles it.
+- The resident set is 17 MiB lower per voter, in a narrow range, and the
+  high-water mark with it: the trace that grew with every transition is
+  gone. It takes back about half of what step 1 cost locally.
+- One host, loopback. The runner pair, with the call-graph profile on one
+  pair, is the acceptance.
+
+
+On the runner (#98, job 37806294502, an Intel Xeon 6973P-C), three pairs
+of step 1's build against this one, replay, throughput, the call graph on
+one pair:
+
+- Every voter's loop is lower in all three pairs: the leader's by 0.035 ms
+  per command (7.2%), the followers' by 7%, the five domain threads by
+  0.08 ms per operation. The tokio threads moved by 0.02 ms, inside the
+  pairs' spread: the local rise was the host.
+- The leader's allocator is 9.5 µs per command lower: the trace, the
+  journal record's encoder and the configuration's clone are gone from
+  its caller table. A follower's `flush_queued` fell from 33.0 to 17.8 µs
+  per command and its `on_frame_from_voter` from 16.5 to 8.3; the largest
+  allocating caller left is `RedbView::table` (5.8 µs).
+- The resident set is 43 MiB per voter lower (21%) and the high-water mark
+  23 MiB: the collector's trace was most of what step 1 had added.
+- `ok`/s rose 1.3%. A 7% cut to every loop barely moves throughput on this
+  CPU: the loops no longer bound it, the voters' total CPU does, and the
+  transport's workers are 41% of that (task-d70).
+
+Kept.
+
+## The outbox's release walk (task-d69)
+
+A local call-graph profile of five voters on task-d60's second PR put
+`Outbox::release` at 5 to 7% of every follower's loop, most of it its own
+time. It ran at every round of every turn, drained every held send into
+new lists to check its ballot and barriers, and the same round walked the
+held sends again to count the withheld ones: per-event work that grows
+with what is held, task-d46's shape.
+
+A held send is now filed under the one fact it still waits for (its
+newest required barrier not yet durable, or the journal sequence its
+context names), a completion re-files only what was filed under it, and
+a release hands over the ready list in publication order. The ballot and
+failure checks are made again on every held send only when the ballot
+changed or a barrier failed since the last release. A debug build
+compares every release with the full walk, and the protocol simulator's
+rows at 100 seeds are identical, row for row, to the walk's.
+
+Five voters on one four-core host, replay profile, stores on disk, 30
+callers, 40,000 measured operations, three pairs of task-d60's second PR
+against this one, alternated. The host was slower again than for the
+second PR's own pairs, so each pair is read against itself:
+
+| | step 2 | task-d69 |
+| --- | --- | --- |
+| completed a second | 783, 757, 783 | 805, 789, 787 |
+| followers' domain threads, CPU ms per command (mean of four) | 0.507, 0.536, 0.532 | 0.498, 0.501, 0.525 |
+| leader's domain thread, CPU ms per command | 0.642, 0.685, 0.666 | 0.627, 0.633, 0.651 |
+| domain threads, five voters, CPU ms per operation | 1.343, 1.426, 1.408 | 1.321, 1.329, 1.386 |
+| tokio workers, five voters | 1.054, 1.146, 1.135 | 1.089, 1.065, 1.121 |
+
+- Lower in every pair: the followers' loop by 0.017 ms per command on
+  average (3%; 0.009, 0.035, 0.007), the leader's by 0.027, and the five
+  domain threads by 0.047 ms per operation. Throughput is higher in every
+  pair. The leader holds sends too (its acknowledgements wait on every
+  batch before them), so it gains as well.
+- The cut is about half of what the profile put on the walk. The pairs
+  move by as much as the host does between them, so the runner pair, with
+  the call graph to show `Outbox::release` gone from the follower's
+  profile, is the acceptance.

@@ -19,7 +19,9 @@
 //! ([`coord_collector::Collector::settle_from_record`]), and it is the
 //! collector that decides whether its own evidence corroborates it.
 
-use coord_storage::codecs::RetryRecordV1;
+use coord_collector::Mismatch;
+use coord_storage::codecs::{ExecutedRecordV1, RetryRecordV1};
+use coord_storage::views::ViewBudget;
 use coord_storage::{Applier, Persistence};
 use coord_types::{CommandId, RetryKey};
 
@@ -71,4 +73,102 @@ pub fn records_for<P: Persistence>(
             (record.command_id == command).then_some((command, record))
         })
         .collect()
+}
+
+/// The half-established commands whose retry key this node's store holds
+/// bound to another command, with that command (task-d22): the domain
+/// executed the other one under the key, and these are rejected wherever
+/// they execute. Read from one snapshot, as [`records_for`].
+pub fn conflicts_for<P: Persistence>(
+    applier: &Applier<P>,
+    half: impl IntoIterator<Item = (CommandId, RetryKey)>,
+) -> Vec<(CommandId, CommandId)> {
+    let Ok(gated) = applier.store().reader().snapshot() else {
+        return Vec::new();
+    };
+    half.into_iter()
+        .filter_map(|(command, key)| {
+            let record = coord_storage::retry::lookup(gated.view(), &key).ok()??;
+            (record.command_id != command).then_some((command, record.command_id))
+        })
+        .collect()
+}
+
+/// What one turn of settling from records sends, or the command that
+/// stopped it.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Settled<D> {
+    /// Every record was offered.
+    Offered {
+        /// The commands the collector accepted a record for.
+        settled: u64,
+        /// What goes out.
+        deliveries: Vec<D>,
+    },
+    /// The collector holds a release this node's own record of the
+    /// command contradicts (task-d06). This node executed the domain's
+    /// commands in another order than the leader, so nothing it read
+    /// from that record this turn goes out, and nothing after the
+    /// mismatch is offered. What was compared comes with it (task-d17).
+    Diverged(Box<Mismatch>),
+}
+
+/// Offer each of `records` to `settle` in turn, and say what goes out.
+///
+/// `settle` is the collector's own decision
+/// ([`coord_collector::Dispatcher::settle_from_record`] in `coordd`).
+/// A refusal for want of corroboration, or of a command no longer
+/// pending, is ordinary and passed over. A mismatch is not: it ends the
+/// turn at once, and the deliveries already settled in it are dropped
+/// with it, since they come from the same execution record.
+pub fn offer<D>(
+    records: impl IntoIterator<Item = (CommandId, RetryRecordV1)>,
+    mut settle: impl FnMut(CommandId, &RetryRecordV1) -> Result<Option<D>, coord_collector::SettleError>,
+) -> Settled<D> {
+    let mut settled = 0;
+    let mut deliveries = Vec::new();
+    for (command, record) in records {
+        match settle(command, &record) {
+            Ok(delivery) => {
+                settled += 1;
+                deliveries.extend(delivery);
+            }
+            Err(coord_collector::SettleError::Mismatch(mismatch)) => {
+                return Settled::Diverged(mismatch);
+            }
+            Err(_) => {}
+        }
+    }
+    Settled::Offered {
+        settled,
+        deliveries,
+    }
+}
+
+/// How far either side of a stopped command's two positions the stop
+/// shows this node's executed rows (task-d17).
+pub const NEAR_POSITIONS: u64 = 8;
+
+/// This node's `executed_v1` rows within [`NEAR_POSITIONS`] of where it
+/// executed `mismatch`'s command and of where the leader's release put
+/// it, in position order (task-d17).
+///
+/// Read once, when the node stops on the mismatch, so that the stop
+/// shows the order this node executed in around the command. A store
+/// that cannot be read shows nothing, and the stop still says what it
+/// compared.
+pub fn executed_near<P: Persistence>(
+    applier: &Applier<P>,
+    mismatch: &Mismatch,
+) -> Vec<(CommandId, ExecutedRecordV1)> {
+    let Ok(gated) = applier.store().reader().snapshot() else {
+        return Vec::new();
+    };
+    coord_storage::protocol::executed_near(
+        gated.view(),
+        &[mismatch.own.position, mismatch.release.position],
+        NEAR_POSITIONS,
+        ViewBudget::default(),
+    )
+    .unwrap_or_default()
 }

@@ -1395,6 +1395,12 @@ impl Caller {
 
     /// One `Range` of exactly `key`, as a client would send it.
     fn range(&self, sequence: u64, key: &[u8]) -> Vec<u8> {
+        self.range_acking(sequence, key, 0)
+    }
+
+    /// One `Range` of exactly `key` that acknowledges every result
+    /// through `ack_through`.
+    fn range_acking(&self, sequence: u64, key: &[u8], ack_through: u64) -> Vec<u8> {
         let mut logical = coord_types::logical_v1::LogicalRequest::new(
             coord_types::ids::NamespaceId([0x5e; 16]),
             coord_types::logical_v1::CanonicalOperation::Range(coord_types::logical_v1::RangeOp {
@@ -1407,8 +1413,13 @@ impl Caller {
         );
         logical.canonicalize();
         coord_types::wire_v1::MessageV1::Request(
-            coord_types::wire_v1::RequestV1::new(self.invocation(sequence), &logical, 0, 0)
-                .expect("bounded"),
+            coord_types::wire_v1::RequestV1::new(
+                self.invocation(sequence),
+                &logical,
+                0,
+                ack_through,
+            )
+            .expect("bounded"),
         )
         .encode()
         .expect("bounded")
@@ -1724,6 +1735,93 @@ async fn a_request_is_served_end_to_end_by_the_voter_in_this_process() {
     );
 }
 
+/// The cost a daemon reports outlives the daemon (task-d45).
+///
+/// A snapshot printed only at a clean end is the one a killed daemon
+/// never prints, and a killed daemon is what a fault run and a stuck
+/// node leave behind. With an interval, the last interval's counters
+/// are in the log whatever ended the process: here SIGKILL, after it
+/// executed the caller's session and three writes.
+///
+/// The counts are checked for what they must be, not for exact values:
+/// every command this voter executed was lowered at least once, every
+/// lowering wrote a journal group or a projection commit, and the
+/// journal synced at least once per group it appended.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_killed_daemon_leaves_its_last_intervals_cost_in_its_log() {
+    let dir = workspace("cost-on-kill");
+    let ca = credentials(&dir, 1, coord_types::wire_v1::PeerRole::Voter);
+    genesis_of(&dir, 1, Some(&ca.node_spki));
+    let ring = sts_keys(&dir);
+    let path = config_only(&dir);
+    let mut text = std::fs::read_to_string(&path).expect("read config");
+    text.push_str("\n[metrics]\ninterval_seconds = 1\n");
+    std::fs::write(&path, text).expect("write config");
+
+    assert_eq!(run(&path, &["init"]).code, Some(0));
+    let mut daemon = start(&path);
+    let caller = Caller::bind(&daemon, &ca, &ring, [0x46; 16]).await;
+    for sequence in 1..=3u64 {
+        ask(&caller.connection, &caller.put(sequence, b"k", b"v"))
+            .await
+            .expect("the daemon answered the write");
+    }
+    // An interval snapshot after the work: the first one of a run has
+    // no interval behind it, so this waits for one that has.
+    let executed = |line: &str| -> Option<u64> {
+        let snapshot: serde_json::Value =
+            serde_json::from_str(line.strip_prefix("metrics ")?).ok()?;
+        let cost = &snapshot["cost"]["Observed"];
+        cost["recent"]["Observed"].is_object().then_some(())?;
+        cost["executed"].as_u64()
+    };
+    assert!(
+        daemon.waits_until(10, |said| said.lines().filter_map(executed).any(|n| n >= 4)),
+        "no interval snapshot counted the session and the three writes:\n{}",
+        daemon.said()
+    );
+
+    // SIGKILL: nothing at the end of the run is printed.
+    daemon.child.kill().expect("killed");
+    daemon.child.wait().expect("reaped");
+    std::thread::sleep(Duration::from_millis(200));
+    let said = daemon.said();
+    assert!(
+        !said.contains("the api plane ended"),
+        "the daemon ended cleanly, so this is not a killed daemon's log"
+    );
+    let last = said
+        .lines()
+        .rfind(|line| line.starts_with("metrics "))
+        .expect("a snapshot was printed before the kill");
+    let snapshot: serde_json::Value =
+        serde_json::from_str(last.strip_prefix("metrics ").expect("prefixed")).expect("json");
+    let cost = &snapshot["cost"]["Observed"];
+    let count = |field: &str| {
+        cost[field]
+            .as_u64()
+            .unwrap_or_else(|| panic!("{field}: {last}"))
+    };
+    assert!(count("executed") >= 4, "{last}");
+    assert!(count("lowerings") >= count("executed"), "{last}");
+    assert!(
+        count("lowerings") <= count("journal_appends") + count("projection_commits"),
+        "a lowering was counted that wrote nothing: {last}"
+    );
+    let syncs = cost["journal_syncs"]["Observed"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("the raft-engine journal counts its syncs: {last}"));
+    assert!(syncs >= count("journal_appends"), "{last}");
+    assert!(
+        cost["recent"]["Observed"].is_object(),
+        "an interval snapshot carries its interval: {last}"
+    );
+    assert!(
+        cost["busy"]["secs"].as_u64().is_some() && cost["uptime"]["secs"].as_u64().is_some(),
+        "{last}"
+    );
+}
+
 /// The same invocation is answered the same way after a restart.
 ///
 /// The daemon stops, the process that held the collector's retained
@@ -1833,6 +1931,47 @@ async fn a_read_retried_after_a_restart_gets_its_retained_result() {
         again.outcome, first.outcome,
         "a read retried after a restart was not given its retained result"
     );
+}
+
+/// A session that only reads keeps being served past its window.
+///
+/// A read the leader serves without ordering it records nothing and so
+/// retires nothing; only an ordered command moves the session's floor.
+/// A session that read through the leader alone walked its sequence out
+/// of its 1024-wide window and was then refused everything, ordered
+/// requests included (task-d50). Past half the window the leader now
+/// leaves the read to the ordered path, which retires behind it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_that_only_reads_is_served_past_its_window() {
+    let dir = workspace("read-window");
+    let ca = credentials(&dir, 1, coord_types::wire_v1::PeerRole::Voter);
+    genesis_of(&dir, 1, Some(&ca.node_spki));
+    let ring = sts_keys(&dir);
+    let path = config_only(&dir);
+    assert_eq!(run(&path, &["init"]).code, Some(0));
+    let daemon = start(&path);
+    let caller = Caller::bind(&daemon, &ca, &ring, [0x47; 16]).await;
+    ask(&caller.connection, &caller.put(1, b"k", b"v"))
+        .await
+        .expect("the daemon answered the write");
+    for sequence in 2..=2600u64 {
+        let answer = ask(
+            &caller.connection,
+            &caller.range_acking(sequence, b"k", sequence - 1),
+        )
+        .await
+        .unwrap_or_else(|| panic!("read {sequence} was not answered\n{}", daemon.said()));
+        let response = response_of(&answer);
+        let coord_types::wire_v1::OutcomeV1::Ok { result, .. } = &response.outcome else {
+            panic!("read {sequence} was not answered with a result: {response:?}");
+        };
+        let read: coord_state::Response =
+            postcard::from_bytes(result.as_slice()).expect("the read's result decodes");
+        assert!(
+            matches!(read.outcome, coord_state::Outcome::Range { .. }),
+            "read {sequence} was answered {read:?}"
+        );
+    }
 }
 
 /// A restarted replica comes back owing what it already owed.
@@ -3420,6 +3559,27 @@ async fn a_node_publishes_its_own_baseline_and_comes_back_on_it() {
             "the daemon never published a recovery checkpoint\n{}",
             daemon.said()
         );
+        // And it says how long each of its steps took, so a run whose
+        // publications grow shows which step grew (task-d55).
+        let said = daemon.said();
+        let line = said
+            .lines()
+            .find(|line| line.starts_with("checkpoint ") && line.contains("retired=true"))
+            .expect("the publication's line");
+        for phase in [
+            " took_ms=",
+            " loop_ms=",
+            " pin_ms=",
+            " export_ms=",
+            " write_ms=",
+            " drain_ms=",
+            " sync_ms=",
+            " append_ms=",
+            " retire_ms=",
+            " reclaim_ms=",
+        ] {
+            assert!(line.contains(phase), "no{phase} in {line}");
+        }
         response_of(&answer)
     };
 
@@ -4418,12 +4578,33 @@ async fn a_node_reports_bounded_secret_free_metrics() {
             .unwrap_or_else(|| panic!("no {name} reading:\n{rendered}"))["metrics"]
             .clone()
     };
-    for recorded in ["Admission", "Journal", "Materialization"] {
+    for recorded in [
+        "Admission",
+        "Journal",
+        "Materialization",
+        "Checkpoint",
+        "Recovery",
+    ] {
         assert!(
             reading(recorded).get("Observed").is_some(),
             "{recorded} is recorded by this daemon but was not observed:\n{rendered}"
         );
     }
+    // The restart replayed its journal before the report, and the report
+    // has that replay as its one recovery sample (task-d55).
+    assert_eq!(
+        reading("Recovery").pointer("/Observed/completed"),
+        Some(&serde_json::json!(1)),
+        "the boot's replay is not the recovery stage's sample:\n{rendered}"
+    );
+    let replay = said
+        .lines()
+        .find(|line| line.starts_with("replayed records="))
+        .unwrap_or_else(|| panic!("the daemon never said what it replayed:\n{said}"));
+    assert!(
+        replay.contains(" took_ms=") && replay.contains(" attach_ms="),
+        "{replay}"
+    );
     for unrecorded in ["FanOut", "ClientTransit", "EvidenceLearning"] {
         assert_eq!(
             reading(unrecorded)

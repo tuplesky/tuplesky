@@ -10,12 +10,31 @@
 //! * fast: the leader's proposal plus fast-set members whose dependency
 //!   path digest equals the leader's (prototype client `accept`: checksum
 //!   equality), `fast_size` members in total including the leader;
-//! * slow: the leader's proposal plus adoption acknowledgements (a slow
-//!   acknowledgement, or a fast acknowledgement whose dependency set equals
-//!   the leader's; prototype `acceptFastAndSlowAck`), `slow_size` members
-//!   in total including the leader.
+//! * slow: the leader's proposal plus `slow_size` adoption
+//!   acknowledgements, each a durable ACCEPT copy at the ballot, from any
+//!   voters, the leader's own included. Only adoptions count (task-d19).
+//!   The prototype's `acceptFastAndSlowAck` also counts a fast
+//!   acknowledgement whose dependency set equals the leader's; that is
+//!   stricter here (`[EXT: stricter]` in the source mapping). At five
+//!   voters a slow decision counting a fast-set member's fast
+//!   acknowledgement is not always visible to recovery: a recovering
+//!   majority can hold two fast-set pre-accepts of one command with
+//!   different dependencies and neither the leader nor an ACCEPT copy, and
+//!   then cannot tell which of them was decided.
+//!
+//!   The leader is not counted for its proposal either. Its proposal row
+//!   is PRE-ACCEPT and its acceptance is a separate batch, which a crash
+//!   can lose after the followers' adoptions made a majority with it: the
+//!   restarted leader then reports the command at PRE-ACCEPT, and a
+//!   recovering majority of it and the non-adopters holds no ACCEPT copy
+//!   (task-d19, Codex review). So the leader acknowledges its own order
+//!   like any adopter, with a slow acknowledgement published once its
+//!   acceptance row is durable (`[EXT]` in the source mapping). A slow
+//!   decision is then `slow_size` durable ACCEPT copies at its ballot,
+//!   every majority of reports holds one, and selection keeps ACCEPT at
+//!   the source ballot.
 
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::vec::Vec;
 
 use coord_types::CommandId;
@@ -132,8 +151,6 @@ pub enum VoteError {
     WrongCommand,
     /// The sender already voted for this command in this ballot.
     Duplicate,
-    /// The leader must send a proposal, not an adoption acknowledgement.
-    LeaderSlowAck,
     /// A non-leader vote carried a leader sequence number.
     ForgedProposal,
     /// The leader proposal carried no sequence number; the leader assigns
@@ -265,10 +282,10 @@ impl VoteSet {
                     self.fast.insert(replica, ack);
                 }
             }
+            // The leader's own adoption counts like anyone's: it says the
+            // leader's acceptance row is durable, which its proposal does
+            // not (task-d19).
             Vote::Slow(_) => {
-                if is_leader {
-                    return Err(VoteError::LeaderSlowAck);
-                }
                 if !self.slow.insert(replica) {
                     return Err(VoteError::Duplicate);
                 }
@@ -279,44 +296,188 @@ impl VoteSet {
     }
 
     /// The conservative slow predicate only (task-24 learner): the leader
-    /// proposal adopted by a majority including the leader.
+    /// proposal adopted by a majority.
+    ///
+    /// Only adoption acknowledgements count toward that majority, never a
+    /// fast acknowledgement, whatever dependencies it carries, and never
+    /// the leader's proposal by itself (task-d19): an adoption is a
+    /// durable ACCEPT copy at this ballot, which any later majority of
+    /// recovery reports holds and selection keeps, and neither a fast-set
+    /// member's PRE-ACCEPT nor the leader's proposal row is. The leader
+    /// counts once its own adoption, published when its acceptance row is
+    /// durable, has arrived.
     pub fn learned_slow(&self) -> Option<Learned> {
         let leader = self.leader.as_ref()?;
-        let mut adopting: BTreeSet<ReplicaId> = self.slow.clone();
-        adopting.extend(
-            self.fast
-                .values()
-                .filter(|a| same_set(&a.deps, &leader.deps))
-                .map(|a| a.replica),
-        );
-        (adopting.len() + 1 >= self.config.slow_size()).then(|| Learned::Slow {
+        (self.slow.len() >= self.config.slow_size()).then(|| Learned::Slow {
             deps: leader.deps.clone(),
         })
+    }
+
+    /// Whether `replica` has acknowledged the leader's proposal of this
+    /// command: an adoption acknowledgement, which a follower publishes
+    /// only once it holds the proposal.
+    ///
+    /// A fast acknowledgement does not say as much. A follower publishes
+    /// it when the payload arrives, with no sequence number, before and
+    /// independently of any proposal, so it is no evidence that the
+    /// proposal ever reached that follower (task-d07).
+    pub fn adopted_by(&self, replica: &ReplicaId) -> bool {
+        self.slow.contains(replica)
     }
 
     /// The learning predicate over the counted votes. Fast learning is
     /// preferred when both hold; both need the leader proposal.
     pub fn learned(&self) -> Option<Learned> {
         let leader = self.leader.as_ref()?;
-        let agreeing_paths = self.fast.values().filter(|a| a.path == leader.path).count();
+        let agreeing_paths = self
+            .fast
+            .values()
+            .filter(|a| a.path == leader.path && same_set(&a.deps, &leader.deps))
+            .count();
         if agreeing_paths + 1 >= self.config.fast_size() {
             return Some(Learned::Fast {
                 deps: leader.deps.clone(),
             });
         }
-        let mut adopting: BTreeSet<ReplicaId> = self.slow.clone();
-        adopting.extend(
-            self.fast
-                .values()
-                .filter(|a| same_set(&a.deps, &leader.deps))
-                .map(|a| a.replica),
-        );
-        if adopting.len() + 1 >= self.config.slow_size() {
-            return Some(Learned::Slow {
-                deps: leader.deps.clone(),
-            });
+        self.learned_slow()
+    }
+
+    /// Why the fast predicate fails over the votes counted so far
+    /// (task-d62), or `None` with no leader proposal to compare with.
+    ///
+    /// Read when a command decided on the slow path executes, it says
+    /// what the fast path lacked by then, which is later than the slow
+    /// decision: acknowledgements that agreed and arrived after it make
+    /// [`MissedFast::SlowFirst`], since the predicate then holds. The
+    /// others look at the fast set less the leader. When too few of its
+    /// acknowledgements are absent for them to make up the quorum, a
+    /// disagreeing one decided it: [`MissedFast::Path`] if any differed
+    /// in its path, else [`MissedFast::Deps`]. Otherwise an absent one
+    /// did: [`MissedFast::Missing`].
+    pub fn missed_fast(&self) -> Option<MissedFast> {
+        let leader = self.leader.as_ref()?;
+        if matches!(self.learned(), Some(Learned::Fast { .. })) {
+            return Some(MissedFast::SlowFirst);
         }
-        None
+        let (mut agree, mut absent, mut path) = (0usize, 0usize, 0usize);
+        for replica in self.config.fast_set() {
+            if *replica == leader.replica {
+                continue;
+            }
+            match self.fast.get(replica) {
+                None => absent += 1,
+                Some(a) if a.path != leader.path => path += 1,
+                Some(a) if !same_set(&a.deps, &leader.deps) => {}
+                Some(_) => agree += 1,
+            }
+        }
+        let needed = self.config.fast_size().saturating_sub(1);
+        Some(if agree + absent >= needed {
+            MissedFast::Missing
+        } else if path > 0 {
+            MissedFast::Path
+        } else {
+            MissedFast::Deps
+        })
+    }
+}
+
+/// Why a command was not decided on the fast path (task-d62).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MissedFast {
+    /// A fast-set acknowledgement saw another conflict path than the
+    /// leader's. One sent while a `reordered` marker held its sender's
+    /// path is one of these: the acknowledgement does not say so, and
+    /// its sender counts it ([`FastPathCounts::acks_reordered`]).
+    Path,
+    /// A fast-set acknowledgement saw the leader's path but other direct
+    /// dependencies.
+    Deps,
+    /// A fast-set acknowledgement the quorum needed had not arrived when
+    /// the command executed.
+    Missing,
+    /// The fast quorum formed after the slow one had decided.
+    SlowFirst,
+}
+
+/// What a voter's fast path did (task-d62), counted since its role
+/// began; the role hands them over and starts again.
+///
+/// The `missed_*` counts classify every command the voter established
+/// on the slow path, so they add up to those commands; a command whose
+/// votes this voter did not count, or a run forced onto the slow path,
+/// is [`FastPathCounts::missed_unclassified`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FastPathCounts {
+    /// [`MissedFast::Path`].
+    pub missed_path: u64,
+    /// [`MissedFast::Deps`].
+    pub missed_deps: u64,
+    /// [`MissedFast::Missing`].
+    pub missed_missing: u64,
+    /// [`MissedFast::SlowFirst`].
+    pub missed_slow_first: u64,
+    /// Established on the slow path with no reason this voter could read.
+    pub missed_unclassified: u64,
+    /// Fast acknowledgements this voter sent as a fast-set follower.
+    pub acks: u64,
+    /// Of them, those sent while a command reordered behind a
+    /// synchronization held this voter's path off every leader path: each
+    /// disagrees with the leader in its path, whatever else it saw.
+    pub acks_reordered: u64,
+}
+
+impl FastPathCounts {
+    /// Count a command established on the slow path, for `reason`.
+    pub const fn missed(&mut self, reason: Option<MissedFast>) {
+        match reason {
+            Some(MissedFast::Path) => self.missed_path += 1,
+            Some(MissedFast::Deps) => self.missed_deps += 1,
+            Some(MissedFast::Missing) => self.missed_missing += 1,
+            Some(MissedFast::SlowFirst) => self.missed_slow_first += 1,
+            None => self.missed_unclassified += 1,
+        }
+    }
+
+    /// Add `other`'s counts to these.
+    pub const fn add(&mut self, other: &FastPathCounts) {
+        self.missed_path += other.missed_path;
+        self.missed_deps += other.missed_deps;
+        self.missed_missing += other.missed_missing;
+        self.missed_slow_first += other.missed_slow_first;
+        self.missed_unclassified += other.missed_unclassified;
+        self.acks += other.acks;
+        self.acks_reordered += other.acks_reordered;
+    }
+}
+
+/// The reasons of commands established on the slow path, held from the
+/// role's execution of each until its driver counts the establishment
+/// (task-d62): a driver holding a group's establishments until the group
+/// materializes counts one when it carries it out, and the reason waits
+/// here for it.
+///
+/// Bounded: past `bound` the oldest is dropped, and its command, if its
+/// establishment is ever carried out, counts as unclassified.
+#[derive(Clone, Debug, Default)]
+pub struct MissedLog {
+    held: VecDeque<(CommandId, Option<MissedFast>)>,
+}
+
+impl MissedLog {
+    /// Hold `reason` for `command`, established on the slow path.
+    pub fn note(&mut self, command: CommandId, reason: Option<MissedFast>, bound: usize) {
+        while self.held.len() >= bound.max(1) {
+            self.held.pop_front();
+        }
+        self.held.push_back((command, reason));
+    }
+
+    /// The reason held for `command`, taken. Establishments are carried
+    /// out in the order they were made, so it is near the front.
+    pub fn take(&mut self, command: &CommandId) -> Option<MissedFast> {
+        let at = self.held.iter().position(|(c, _)| c == command)?;
+        self.held.remove(at).and_then(|(_, reason)| reason)
     }
 }
 

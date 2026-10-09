@@ -33,9 +33,9 @@ use std::collections::{BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use coord_collector::{
-    Collector, CollectorConfig, CollectorEvent, EvidenceError, HoldReason, KIND_EVIDENCE,
-    KIND_RELEASE, MonotonicMillis, Progress, Release, SettleError, Submitted, decode_evidence,
-    decode_release,
+    Collector, CollectorConfig, CollectorEvent, Differs, EvidenceError, HoldReason, KIND_EVIDENCE,
+    KIND_RELEASE, MismatchCheck, MonotonicMillis, Progress, Release, SettleError, Submitted,
+    decode_evidence, decode_release,
 };
 use coord_consensus::{
     BallotConfiguration, ConfigurationIdentity, Follower, FollowerConfig, Leader, LeaderConfig,
@@ -48,7 +48,9 @@ use coord_core::outbox::BarrierAllocator;
 use coord_daemon::mailbox::{Ingress, IngressBudget};
 use coord_daemon::node::{Machine, Node, Outbound};
 use coord_daemon::parked::Parked;
-use coord_daemon::settle::records_for;
+use coord_daemon::settle::{
+    NEAR_POSITIONS, Settled, conflicts_for, executed_near, offer, records_for,
+};
 use coord_daemon::voter::{Origin, Voter};
 use coord_membership::genesis::{GenesisManifest, VoterSeed};
 use coord_membership::membership::Membership;
@@ -58,8 +60,9 @@ use coord_storage::{Applier, GroupLimits, StoreWorker};
 use coord_store_testkit::model::ModelEngine;
 use coord_types::identity::Digest32;
 use coord_types::ids::{
-    Ballot, ClientInstanceId, ClusterId, ConfigurationEpoch, DomainId, NamespaceId, PolicyRuleId,
-    PrincipalId, ReplicaId, ReplicaIncarnation, RequestSequence, SessionId,
+    Ballot, ClientInstanceId, ClusterId, ConfigurationEpoch, DomainId, ExecutionPosition,
+    KvRevision, NamespaceId, PolicyRuleId, PrincipalId, ReplicaId, ReplicaIncarnation,
+    RequestSequence, SessionId,
 };
 use coord_types::logical_v1::{CanonicalOperation, LogicalRequest, PutOp};
 use coord_types::wire_v1::{Frame, MessageV1, PeerRole, RequestV1};
@@ -273,7 +276,13 @@ fn logical(sequence: u64) -> LogicalRequest {
 /// One admitted client request, as the collector's admission gate
 /// hands it to the collector.
 fn admitted(sequence: u64) -> AdmittedRequest {
-    let request = RequestV1::new(retry_key(sequence), &logical(sequence), 0, 0).unwrap();
+    admitted_as(sequence, &logical(sequence), 7)
+}
+
+/// `sequence`'s retry key over `logical`, under the admission receipt
+/// `receipt`.
+fn admitted_as(sequence: u64, logical: &LogicalRequest, receipt: u8) -> AdmittedRequest {
+    let request = RequestV1::new(retry_key(sequence), logical, 0, 0).unwrap();
     AdmittedRequest {
         receipt: AdmissionReceipt::submitting(
             VerifierToken::for_boundary(),
@@ -283,7 +292,7 @@ fn admitted(sequence: u64) -> AdmittedRequest {
                 session: SESSION,
                 rule_generation: 1,
                 scope_ceiling: u32::MAX,
-                receipt_id: Digest32([7; 32]),
+                receipt_id: Digest32([receipt; 32]),
                 admitted_at_ticks: 0,
             },
         ),
@@ -316,6 +325,9 @@ enum Lose {
     Nothing,
     /// Every release the leader publishes.
     Releases,
+    /// Every frame, evidence and releases alike: what a frontend whose
+    /// connections all closed would have missed.
+    Everything,
 }
 
 /// Three voters, the collector that submitted to them, and the frontend
@@ -332,6 +344,9 @@ struct Cluster {
     progress: Vec<(u8, Progress)>,
     rejected: Vec<(u8, EvidenceError)>,
     releases: Vec<Release>,
+    /// Releases lost on the way, from which voter, in the order the
+    /// voters published them: a test may deliver them late.
+    lost: Vec<(usize, Frame)>,
     /// Frames that reached the collector, per voter, by kind.
     counted: Vec<(u8, u16)>,
     /// How many frames each voter parked since the count was last
@@ -347,7 +362,7 @@ impl Cluster {
         Cluster {
             voters: (0..3).map(voter).collect(),
             parked: (0..3).map(|_| Parked::new(HOLD, depth)).collect(),
-            collector: Collector::new(CollectorConfig {
+            collector: Collector::traced(CollectorConfig {
                 quorum: quorum(),
                 max_pending: 16,
                 max_resolved: 16,
@@ -359,6 +374,7 @@ impl Cluster {
             progress: Vec::new(),
             rejected: Vec::new(),
             releases: Vec::new(),
+            lost: Vec::new(),
             counted: Vec::new(),
             published: vec![0; 3],
             down: None,
@@ -434,6 +450,9 @@ impl Cluster {
     /// One frame reaches the collector under the voter's committed
     /// identity.
     fn hand_to_collector(&mut self, from: usize, f: &Frame) {
+        if self.lose == Lose::Everything {
+            return;
+        }
         let prov = self.voters[from].provenance();
         let result = match f.kind {
             KIND_EVIDENCE => self
@@ -441,6 +460,7 @@ impl Cluster {
                 .on_evidence(prov, decode_evidence(f).expect("evidence")),
             KIND_RELEASE => {
                 if self.lose == Lose::Releases {
+                    self.lost.push((from, f.clone()));
                     return;
                 }
                 self.collector
@@ -552,8 +572,10 @@ impl Cluster {
             vec![
                 Progress::Held(HoldReason::AwaitingVotes),
                 Progress::Held(HoldReason::AwaitingVotes),
+                Progress::Held(HoldReason::AwaitingVotes),
             ],
-            "the leader's reply and its release both reached the collector, and it holds them: {:?}",
+            "the leader's reply, its own adoption (task-d19) and its release all reached \
+             the collector, and it holds them: {:?}",
             self.progress
         );
         for i in 1..3 {
@@ -799,6 +821,7 @@ fn a_refused_repair_falls_back_to_the_durable_record() {
         .settle_from_record(
             command,
             record.result_digest,
+            record.position,
             record.revision,
             &record.response,
         )
@@ -820,6 +843,7 @@ fn a_refused_repair_falls_back_to_the_durable_record() {
         w.collector.settle_from_record(
             command,
             record.result_digest,
+            record.position,
             record.revision,
             &record.response
         ),
@@ -861,6 +885,7 @@ fn a_lost_release_is_settled_from_the_durable_record() {
         .settle_from_record(
             command,
             record.result_digest,
+            record.position,
             record.revision,
             &record.response,
         )
@@ -894,11 +919,226 @@ fn the_record_alone_settles_nothing() {
     // No settle: the followers never answer, the leader never executes.
     assert!(w.collector.half_established().is_empty());
     assert_eq!(
-        w.collector
-            .settle_from_record(command, Digest32([0; 32]), None, b""),
+        w.collector.settle_from_record(
+            command,
+            Digest32([0; 32]),
+            ExecutionPosition::ZERO,
+            None,
+            b""
+        ),
         Err(SettleError::Uncorroborated)
     );
     assert!(w.collector.is_pending(&command));
+}
+
+/// A record the leader's release contradicts stops the turn (task-d06).
+///
+/// The collector holds the leader's release, and this node's own record
+/// of the command says something else: the node executed the domain's
+/// commands in another order than the leader. The turn ends there with
+/// what was compared (task-d17), and nothing is settled from the record.
+/// The same record, read correctly, settles the command, so it is the
+/// contradiction and not the path that stops it.
+#[test]
+fn a_record_the_release_contradicts_stops_the_turn() {
+    let mut w = Cluster::new(256);
+    w.run_to_half_held(1);
+    let command = w.command(1);
+    let records = records_for(w.voters[0].node().applier(), [(command, retry_key(1))]);
+    assert_eq!(records.len(), 1);
+    let mut forked = records[0].1.clone();
+    forked.response.push(0xff);
+    let mut offered = 0;
+    let turn = offer(
+        [(command, forked.clone()), (command, forked.clone())],
+        |c, r| {
+            offered += 1;
+            w.collector
+                .settle_from_record(c, r.result_digest, r.position, r.revision, &r.response)
+                .map(Some)
+        },
+    );
+    let Settled::Diverged(mismatch) = turn else {
+        panic!("the turn did not stop: {turn:?}");
+    };
+    assert_eq!(mismatch.command, command);
+    assert_eq!(mismatch.check, MismatchCheck::HeldReleaseAgainstRecord);
+    // This node's side is its record, which nobody released; the other
+    // is the leader's release, under the ballot this collector counts.
+    assert_eq!(mismatch.own.release, None);
+    assert_eq!(mismatch.own.position, forked.position);
+    assert_eq!(mismatch.own.result_digest, forked.result_digest);
+    assert_eq!(mismatch.own.response_len, forked.response.len());
+    let origin = mismatch.release.release.expect("the release's origin");
+    assert_eq!(origin.sender, w.voters[0].provenance().from());
+    assert_eq!(origin.ballot, w.collector.quorum().ballot());
+    assert_eq!(mismatch.release.position, records[0].1.position);
+    assert_eq!(mismatch.release.response_len, records[0].1.response.len());
+    assert_eq!(
+        mismatch.differs,
+        Differs {
+            response: true,
+            ..Differs::default()
+        },
+        "only the bytes were forked"
+    );
+    // What the stop shows of this node's own execution around the two
+    // positions: here, the command itself where this node executed it.
+    let rows = executed_near(w.voters[0].node().applier(), &mismatch);
+    assert!(
+        rows.iter()
+            .any(|(c, r)| *c == command && r.position == forked.position),
+        "{rows:?}"
+    );
+    assert!(rows.iter().all(|(_, r)| {
+        [mismatch.own.position, mismatch.release.position]
+            .iter()
+            .any(|p| p.get().abs_diff(r.position.get()) <= NEAR_POSITIONS)
+    }));
+    assert_eq!(offered, 1, "nothing is offered after the mismatch");
+    assert!(w.collector.is_pending(&command), "nothing was settled");
+    let turn = offer(records, |c, r| {
+        w.collector
+            .settle_from_record(c, r.result_digest, r.position, r.revision, &r.response)
+            .map(Some)
+    });
+    let Settled::Offered {
+        settled: 1,
+        deliveries,
+    } = turn
+    else {
+        panic!("the true record did not settle: {turn:?}");
+    };
+    assert!(matches!(deliveries[..], [Progress::Released(_)]));
+    assert!(!w.collector.is_pending(&command));
+}
+
+/// A release that arrives after the command was answered from this node's
+/// record, and says something else, is refused by name (task-d12).
+///
+/// The votes arrived and the release did not, so the collector answered
+/// the caller from this node's own record. When this node executed the
+/// command where the leader did, the late release agrees and settles
+/// nothing further. When it did not -- here, a record with another response,
+/// then one with the same response under another result digest, at
+/// another position, or with another revision -- the caller was told
+/// something the domain did not decide, and the release is refused with
+/// what was compared so the node can stop on it and say so (task-d17):
+/// both sides, and exactly the fields the fork changed.
+#[test]
+fn a_late_release_that_contradicts_the_answer_is_refused() {
+    let digest_of = |w: &Cluster| {
+        let (_, f) = w.lost.last().expect("the release was lost");
+        decode_release(f)
+            .expect("release")
+            .established()
+            .result_digest()
+    };
+    for fork in [0, 1, 2, 3, 4] {
+        let mut w = Cluster::new(256);
+        w.lose = Lose::Releases;
+        let submit = w.submit(1);
+        let command = w.command(1);
+        for i in 0..3 {
+            w.deliver_submission(i, &submit);
+        }
+        w.settle();
+        assert_eq!(w.executed(), [1, 1, 1]);
+        assert!(!w.lost.is_empty(), "the leader released and it was lost");
+        let half = w.collector.half_established();
+        assert_eq!(half, vec![(command, retry_key(1))]);
+        let mut record = records_for(w.voters[0].node().applier(), half)
+            .pop()
+            .expect("a record")
+            .1;
+        assert_eq!(record.result_digest, digest_of(&w));
+        match fork {
+            1 => record.response.push(0xff),
+            2 => record.result_digest.0[0] ^= 1,
+            3 => record.position = ExecutionPosition::new(record.position.get() + 1).unwrap(),
+            4 => {
+                record.revision =
+                    Some(KvRevision::new(record.revision.map_or(1, |r| r.get() + 1)).unwrap());
+            }
+            _ => {}
+        }
+        let progress = w
+            .collector
+            .settle_from_record(
+                command,
+                record.result_digest,
+                record.position,
+                record.revision,
+                &record.response,
+            )
+            .expect("settled from the votes and the record");
+        assert!(matches!(progress, Progress::Released(_)), "{progress:?}");
+
+        w.lose = Lose::Nothing;
+        let late: Vec<(usize, Frame)> = std::mem::take(&mut w.lost);
+        let answers: Vec<_> = late
+            .iter()
+            .map(|(from, f)| {
+                let prov = w.voters[*from].provenance();
+                w.collector
+                    .on_release(prov, decode_release(f).expect("release"))
+            })
+            .collect();
+        // The revision is part of the answer a caller is handed, so a
+        // fork of the revision is a fork of the response too.
+        let differs = match fork {
+            0 => {
+                assert!(
+                    answers.iter().all(|a| *a == Ok(Progress::Settled)),
+                    "{answers:?}"
+                );
+                continue;
+            }
+            1 => Differs {
+                response: true,
+                ..Differs::default()
+            },
+            2 => Differs {
+                result_digest: true,
+                ..Differs::default()
+            },
+            3 => Differs {
+                position: true,
+                ..Differs::default()
+            },
+            _ => Differs {
+                revision: true,
+                response: true,
+                ..Differs::default()
+            },
+        };
+        assert!(!answers.is_empty());
+        for (answer, (from, frame)) in answers.iter().zip(&late) {
+            let Err(EvidenceError::AnsweredOtherwise(mismatch)) = answer else {
+                panic!("fork {fork}: {answer:?}");
+            };
+            assert_eq!(mismatch.command, command);
+            assert_eq!(mismatch.check, MismatchCheck::LateReleaseAgainstAnswer);
+            assert_eq!(mismatch.differs, differs, "fork {fork}");
+            // The answer was given from the record, which nobody released.
+            assert_eq!(mismatch.own.release, None);
+            assert_eq!(mismatch.own.position, record.position);
+            assert_eq!(mismatch.own.revision, record.revision);
+            assert_eq!(mismatch.own.result_digest, record.result_digest);
+            assert_eq!(mismatch.own.response_len, record.response.len());
+            let origin = mismatch.release.release.expect("the release's origin");
+            assert_eq!(origin.sender, w.voters[*from].provenance().from());
+            assert_eq!(origin.ballot, w.collector.quorum().ballot());
+            let released = decode_release(frame).expect("release");
+            assert_eq!(
+                mismatch.release.result_digest,
+                released.established().result_digest()
+            );
+            assert_eq!(mismatch.release.position, released.established().position());
+            assert_eq!(mismatch.release.response_len, released.response().len());
+            assert_eq!(origin.speculative, released.speculative());
+        }
+    }
 }
 
 /// A follower that campaigns while the leader is away leads the next
@@ -1059,4 +1299,198 @@ fn a_leader_that_missed_the_election_authorizes_nothing() {
     w.settle();
     assert!(w.releases.iter().any(|r| r.command == command));
     assert_eq!(&w.executed()[1..], [2, 2]);
+}
+
+/// A command that executed under a ballot that changed before any of its
+/// evidence reached the collector settles under the new one (task-d22).
+///
+/// Everything the voters published for the command was lost, the leader
+/// stopped and a follower won the next ballot. The new ballot produces no
+/// evidence for a command already executed, and a duplicate of the
+/// submission replays none across the ballot change, so nothing was ever
+/// going to arrive. The ballot change asks for the entry again at once and
+/// lets this node's durable record settle it.
+#[test]
+fn a_command_executed_under_a_changed_ballot_settles_under_the_new_one() {
+    let mut w = Cluster::new(256);
+    w.lose = Lose::Everything;
+    let submit = w.submit(1);
+    let command = w.command(1);
+    for i in 0..3 {
+        w.deliver_submission(i, &submit);
+    }
+    w.settle();
+    assert_eq!(w.executed(), [1, 1, 1]);
+    assert!(w.collector.is_pending(&command));
+    assert!(w.collector.half_established().is_empty());
+
+    // The leader stops and a follower wins the next ballot.
+    w.down = Some(0);
+    let (campaigned, out) = w.voters[1]
+        .campaign()
+        .expect("stepped")
+        .expect("a follower campaigns");
+    w.carry(1, out);
+    w.settle();
+    assert!(w.voters[1].leads());
+    w.lose = Lose::Nothing;
+    w.collector.reconfigure(
+        BallotConfiguration::c2_default(epoch(), campaigned, (0..3).map(r).collect()).unwrap(),
+    );
+
+    // Asked for again at once: the survivors answer the duplicate, and
+    // nothing they can say settles it.
+    let asked = w.collector.due_solicits(MonotonicMillis::new(1), 16);
+    assert_eq!(asked.len(), 1);
+    assert_eq!(asked[0].command, command);
+    for i in 1..3 {
+        w.deliver_submission(i, &asked[0].frame);
+    }
+    w.settle();
+    assert!(w.collector.is_pending(&command));
+
+    // The record settles it, under the new ballot.
+    let half = w.collector.half_established();
+    assert_eq!(half, vec![(command, retry_key(1))]);
+    let records = records_for(w.voters[1].node().applier(), half);
+    let (_, record) = &records[0];
+    let progress = w
+        .collector
+        .settle_from_record(
+            command,
+            record.result_digest,
+            record.position,
+            record.revision,
+            &record.response,
+        )
+        .expect("settled");
+    assert!(matches!(progress, Progress::Released(_)), "{progress:?}");
+    assert!(!w.collector.is_pending(&command));
+}
+
+/// A retry under other admission facts, through a frontend that no longer
+/// holds the first answer: every voter refuses it and says so, and the
+/// entry is answered from the durable record of the command (task-d22).
+/// Before, the refusal produced nothing, and the entry held its slot for
+/// good.
+#[test]
+fn a_retry_under_other_facts_is_answered_from_the_record() {
+    let mut w = Cluster::new(256);
+    let first = w.submit(1);
+    let command = w.command(1);
+    for i in 0..3 {
+        w.deliver_submission(i, &first);
+    }
+    w.settle();
+    assert_eq!(w.releases.len(), 1);
+
+    // A frontend that restarted: nothing of the first answer is left.
+    w.collector = Collector::traced(CollectorConfig {
+        quorum: quorum(),
+        max_pending: 16,
+        max_resolved: 16,
+        max_undelivered_bytes: usize::MAX,
+    });
+    let Submitted::FanOut(retry) = w
+        .collector
+        .submit(MonotonicMillis::ZERO, &admitted_as(1, &logical(1), 8))
+        .expect("submitted")
+    else {
+        panic!("new work here");
+    };
+    assert_eq!(retry.command, command);
+    w.progress.clear();
+    for i in 0..3 {
+        w.deliver_submission(i, &retry.frame);
+    }
+    w.settle();
+    assert_eq!(w.executed(), [1, 1, 1], "nothing executed twice");
+    assert!(
+        w.progress
+            .iter()
+            .any(|(_, p)| *p == Progress::Held(HoldReason::AwaitingRecord)),
+        "no voter said why: {:?} {:?}",
+        w.progress,
+        w.rejected
+    );
+    let half = w.collector.half_established();
+    assert_eq!(half, vec![(command, retry_key(1))]);
+    let records = records_for(w.voters[0].node().applier(), half);
+    let (_, record) = &records[0];
+    let progress = w
+        .collector
+        .settle_from_record(
+            command,
+            record.result_digest,
+            record.position,
+            record.revision,
+            &record.response,
+        )
+        .expect("settled");
+    let Progress::Released(release) = progress else {
+        panic!("{progress:?}");
+    };
+    assert_eq!(release.response, w.releases[0].response, "the same answer");
+}
+
+/// Another request under a retry key the voters hold bound: every voter
+/// refuses it and says so, and the entry ends with a conflict rather than
+/// holding its slot (task-d22).
+#[test]
+fn another_request_under_a_bound_key_ends_with_a_conflict() {
+    let mut w = Cluster::new(256);
+    let first = w.submit(1);
+    for i in 0..3 {
+        w.deliver_submission(i, &first);
+    }
+    w.settle();
+    assert_eq!(w.releases.len(), 1);
+
+    w.collector = Collector::traced(CollectorConfig {
+        quorum: quorum(),
+        max_pending: 16,
+        max_resolved: 16,
+        max_undelivered_bytes: usize::MAX,
+    });
+    // The same key over other bytes: another command.
+    let other = logical(2);
+    let Submitted::FanOut(retry) = w
+        .collector
+        .submit(MonotonicMillis::ZERO, &admitted_as(1, &other, 7))
+        .expect("submitted")
+    else {
+        panic!("new work here");
+    };
+    assert_ne!(retry.command, w.command(1));
+    w.releases.clear();
+    for i in 0..3 {
+        w.deliver_submission(i, &retry.frame);
+    }
+    w.settle();
+    assert_eq!(w.executed(), [1, 1, 1], "nothing executed");
+    // Every voter refused it; one voter's word ends nothing (Codex
+    // review), so the entry waits for this node's record of the key.
+    assert!(w.releases.is_empty(), "{:?}", w.releases);
+    assert!(w.collector.is_pending(&retry.command));
+    let half = w.collector.half_established();
+    assert!(
+        records_for(w.voters[0].node().applier(), half.clone()).is_empty(),
+        "no record of this command"
+    );
+    let conflicts = conflicts_for(w.voters[0].node().applier(), half);
+    assert_eq!(conflicts, vec![(retry.command, w.command(1))]);
+    let (command, bound) = conflicts[0];
+    let Progress::Released(release) = w
+        .collector
+        .settle_conflict_from_record(command, bound)
+        .expect("settled")
+    else {
+        panic!("released");
+    };
+    assert!(matches!(
+        release.response.outcome,
+        coord_types::wire_v1::OutcomeV1::Err { code, .. }
+            if code == coord_types::wire_v1::codes::REQUEST_IDENTITY_CONFLICT
+    ));
+    assert_eq!(w.collector.pending(), 0);
 }

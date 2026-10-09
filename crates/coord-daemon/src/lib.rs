@@ -66,10 +66,13 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod catch_up;
 pub mod config;
 pub mod diagnostics;
 pub mod fanout;
+pub mod floor;
 pub mod identity;
+pub mod learned;
 pub mod lifecycle;
 pub mod listen;
 pub mod mailbox;
@@ -77,6 +80,7 @@ pub mod metrics;
 pub mod node;
 pub mod parked;
 pub mod pending;
+pub mod reads;
 pub mod role;
 pub mod serve;
 pub mod settle;
@@ -84,7 +88,10 @@ pub mod startup;
 pub mod supervise;
 pub mod voter;
 
-pub use config::{Config, ConfigError, Limits, ListenConfig, RenewalConfig, capability_covers};
+pub use config::{
+    Config, ConfigError, Limits, ListenConfig, ReadPath, ReadsConfig, RenewalConfig,
+    capability_covers,
+};
 pub use diagnostics::{Diagnostics, Redacted};
 pub use fanout::{
     Dispatched, LocalIngress, NotQueued, PeerFanOut, Queued, Route, Saturated, dispatch,

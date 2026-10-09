@@ -490,6 +490,30 @@ impl Generation {
         stage_with_lock(&root, lock, identity, options)
     }
 
+    /// Stage the next generation of this root to reinstall this node's own
+    /// local recovery image into (task-j06, Section 17.16.4), keeping the
+    /// root lock as [`Generation::stage_next`] does.
+    ///
+    /// Unlike an install, the selected generation may hold protocol
+    /// obligations: the image is this node's own state at the baseline,
+    /// promises and votes included, so they are carried, not replaced.
+    /// The selected generation is kept until the staging is activated;
+    /// a crash before that boots it again.
+    pub fn stage_reinstall(
+        self,
+        identity: StoreIdentity,
+        options: OpenOptions,
+    ) -> Result<InactiveGeneration, OpenError> {
+        let root = self
+            .directory
+            .parent()
+            .ok_or_else(|| OpenError::Corrupt("generation directory has no root".into()))?
+            .to_path_buf();
+        let (engine, lock, _) = self.into_parts();
+        drop(engine);
+        InactiveGeneration::stage_migration_with_lock(&root, lock, identity, options)
+    }
+
     /// Remove every generation directory of this root except the selected
     /// one, reclaiming replaced and abandoned stagings. Only safe once the
     /// selection is durable, which it is for an open generation: this reads

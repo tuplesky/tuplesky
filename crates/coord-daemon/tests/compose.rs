@@ -909,3 +909,238 @@ fn a_renewal_issuer_is_https_or_an_allowed_loopback_address() {
         Err(ConfigError::Parse(_))
     ));
 }
+
+/// The command table's capacity is configuration, within bounds
+/// (task-d05).
+///
+/// Nothing sets it and a voter gets the raised default; a value inside
+/// the bounds is taken as written; one outside them is refused and the
+/// setting is named, rather than a voter starting with a table that
+/// cannot reclaim or cannot be allocated.
+#[test]
+fn the_command_table_capacity_is_configuration_within_bounds() {
+    use coord_daemon::config::{
+        DEFAULT_COMMAND_TABLE_CAPACITY, MAX_COMMAND_TABLE_CAPACITY, MIN_COMMAND_TABLE_CAPACITY,
+    };
+    let unset = Config::parse(&base_config("")).unwrap();
+    assert_eq!(
+        unset.limits.command_table_capacity,
+        DEFAULT_COMMAND_TABLE_CAPACITY
+    );
+    let limits = |capacity: usize| {
+        base_config(&format!(
+            "\n[limits]\nmax_request_bytes = 2097152\nmax_response_bytes = 8388608\n\
+             max_outstanding_per_session = 256\nmax_live_subscriptions = 4096\n\
+             command_table_capacity = {capacity}\n"
+        ))
+    };
+    for capacity in [MIN_COMMAND_TABLE_CAPACITY, 1000, MAX_COMMAND_TABLE_CAPACITY] {
+        let config = Config::parse(&limits(capacity)).unwrap();
+        assert_eq!(config.limits.command_table_capacity, capacity);
+    }
+    for capacity in [
+        0,
+        MIN_COMMAND_TABLE_CAPACITY - 1,
+        MAX_COMMAND_TABLE_CAPACITY + 1,
+    ] {
+        assert_eq!(
+            Config::parse(&limits(capacity)),
+            Err(ConfigError::OutOfRange {
+                field: "limits.command_table_capacity",
+                min: MIN_COMMAND_TABLE_CAPACITY as u64,
+                max: MAX_COMMAND_TABLE_CAPACITY as u64,
+            }),
+            "{capacity}"
+        );
+    }
+}
+
+/// The largest configured table still gives a Sync that can be written
+/// as one row and sent as one frame (task-d05, measured again in
+/// task-d20).
+///
+/// A campaign selects over every complete report it holds, up to five,
+/// and a report carries at most `max_report_entries` of its table's
+/// capacity: its live records and its retirement window. The worst case
+/// is five such reports with nothing in common, every entry with the
+/// admission digest it has carried since task-d14, one dependency and the
+/// largest sequence number; `select` makes the Sync, and the row it is
+/// bound in takes it. A capacity whose worst case did not fit would fail
+/// at the moment an election binds its selection, which is the worst
+/// moment to find out; past it, the campaign is refused by name
+/// (`a_sync_past_its_row_refuses_the_campaign_by_name`).
+#[test]
+fn the_largest_table_gives_a_sync_that_fits_a_row_and_a_frame() {
+    use coord_consensus::{
+        BallotConfiguration, Phase, RecoveryReport, ReportEntry, bounded_sync_update,
+        max_report_entries, select,
+    };
+    use coord_daemon::config::MAX_COMMAND_TABLE_CAPACITY;
+    use coord_types::CommandId;
+    use coord_types::identity::Digest32;
+    use coord_types::ids::{Ballot, ConfigurationEpoch, ReplicaId};
+
+    let per_report = max_report_entries(MAX_COMMAND_TABLE_CAPACITY);
+    let id = |n: usize| {
+        let mut d = [0xffu8; 32];
+        d[..8].copy_from_slice(&(n as u64).to_be_bytes());
+        CommandId(Digest32(d))
+    };
+    let epoch = ConfigurationEpoch::new(u64::MAX).unwrap();
+    let voters: Vec<ReplicaId> = (0..5u8).map(|i| ReplicaId([0xf0 + i; 16])).collect();
+    let new = Ballot {
+        epoch,
+        number: u64::MAX,
+        leader: voters[0],
+    };
+    let source = Ballot {
+        epoch,
+        number: u64::MAX - 1,
+        leader: voters[1],
+    };
+    let config =
+        BallotConfiguration::c2_default(epoch, new, voters.iter().copied().collect()).unwrap();
+    let reports: Vec<RecoveryReport> = voters
+        .iter()
+        .enumerate()
+        .map(|(v, replica)| RecoveryReport {
+            replica: *replica,
+            ballot: new,
+            committed_ballot: source,
+            entries: (0..per_report)
+                .map(|n| {
+                    let n = v * per_report + n;
+                    ReportEntry {
+                        command: id(n),
+                        phase: Phase::Commit,
+                        deps: vec![id(n + 5 * per_report)],
+                        path: Digest32([0xff; 32]),
+                        paths: vec![(b"*".to_vec(), Digest32([0xff; 32]))],
+                        seqnum: u64::MAX,
+                        keys: vec![b"*".to_vec()],
+                        payload_present: true,
+                        admission: Some(Digest32([0xff; 32])),
+                    }
+                })
+                .collect(),
+        })
+        .collect();
+    let decision = select(&config, &reports).unwrap();
+    assert_eq!(decision.entries.len(), 5 * per_report);
+    let update = bounded_sync_update(epoch, &decision)
+        .expect("a worst-case Sync fits one row and one frame");
+    // Encoded once, the row is still the record's (task-d26).
+    assert_eq!(
+        update,
+        coord_consensus::sync_update(
+            epoch,
+            &coord_consensus::SyncRecordV1 {
+                decision: decision.clone()
+            }
+        )
+        .unwrap()
+    );
+}
+
+/// task-d20: a selection whose Sync does not fit its row is refused with
+/// its size, not written: the write used to end the process in the middle
+/// of an election.
+#[test]
+fn a_sync_past_its_row_refuses_the_campaign_by_name() {
+    use coord_consensus::{Phase, RecoveryError, SyncDecision, SyncEntry, bounded_sync_update};
+    use coord_types::CommandId;
+    use coord_types::identity::Digest32;
+    use coord_types::ids::{Ballot, ConfigurationEpoch, ReplicaId};
+
+    let id = |n: usize| {
+        let mut d = [0xffu8; 32];
+        d[..8].copy_from_slice(&(n as u64).to_be_bytes());
+        CommandId(Digest32(d))
+    };
+    let ballot = Ballot {
+        epoch: ConfigurationEpoch::new(u64::MAX).unwrap(),
+        number: u64::MAX,
+        leader: ReplicaId([0xff; 16]),
+    };
+    let entries = 12_000;
+    let decision = SyncDecision {
+        ballot,
+        source_ballot: ballot,
+        entries: (0..entries)
+            .map(|n| {
+                (
+                    id(n),
+                    SyncEntry {
+                        command: id(n),
+                        phase: Phase::Commit,
+                        deps: vec![id(n + entries)],
+                        path: Digest32([0xff; 32]),
+                        paths: vec![(b"*".to_vec(), Digest32([0xff; 32]))],
+                        seqnum: u64::MAX,
+                        admission: Some(Digest32([0xff; 32])),
+                    },
+                )
+            })
+            .collect(),
+        reproposed: Default::default(),
+    };
+    match bounded_sync_update(ballot.epoch, &decision) {
+        Err(RecoveryError::SyncTooLarge {
+            entries: n,
+            bytes,
+            limit,
+        }) => {
+            assert_eq!(n, entries);
+            assert!(bytes > limit, "{bytes} <= {limit}");
+            // The frame fits and the row does not, so the size named is
+            // the row's (task-d20 review): the selection's own encoding,
+            // counted once (task-d26), which the frame carries after the
+            // message's tag.
+            let frame = coord_consensus::ProtocolMessage::Sync(decision.clone())
+                .encode()
+                .len();
+            assert_eq!(
+                bytes,
+                postcard::to_allocvec(&decision).expect("encodes").len()
+            );
+            assert!(bytes < frame, "{bytes} >= {frame}");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// task-j06: the replay-backed projection profile is named, never a
+/// default, and its durable-commit cadence has no zero bound.
+#[test]
+fn the_replay_profile_is_opt_in_and_its_cadence_is_bounded() {
+    use coord_daemon::config::{JOURNAL_PROFILE, JOURNAL_REPLAY_PROFILE};
+
+    let strict = Config::parse(&base_config("")).unwrap();
+    assert_eq!(strict.journal.profile, JOURNAL_PROFILE);
+    assert!(!strict.journal.replays_projection());
+
+    let named = base_config("").replace(
+        "[journal]\nroot",
+        &format!("[journal]\nprofile = \"{JOURNAL_REPLAY_PROFILE}\"\nroot"),
+    );
+    let replay = Config::parse(&named).unwrap();
+    assert!(replay.journal.replays_projection());
+    assert_eq!(replay.journal.projection_durable_commits, 64);
+    assert_eq!(replay.journal.projection_durable_records, 4096);
+    assert_eq!(replay.journal.projection_durable_ms, 100);
+
+    for field in [
+        "projection_durable_commits",
+        "projection_durable_records",
+        "projection_durable_ms",
+    ] {
+        let zero = named.replace("[journal]\n", &format!("[journal]\n{field} = 0\n"));
+        assert!(
+            matches!(
+                Config::parse(&zero),
+                Err(ConfigError::OutOfRange { field: f, .. }) if f.ends_with(field)
+            ),
+            "{field} = 0 was accepted"
+        );
+    }
+}

@@ -17,10 +17,11 @@ use std::collections::BTreeMap;
 
 use coord_authn::ClockHealth;
 use coord_checkpoint::local::LocalLimits;
-use coord_checkpoint::{LocalBaseline, LocalCheckpointStore};
+use coord_checkpoint::{BaselineError, LocalBaseline, LocalCheckpointStore, Publication, Written};
 use coord_collector::ingress::is_collector;
 use coord_collector::wire::{
-    KIND_EVIDENCE, KIND_RELEASE, KIND_SUBMIT, decode_evidence, decode_release,
+    KIND_EVIDENCE, KIND_READ, KIND_READ_ANSWER, KIND_RELEASE, KIND_SUBMIT, decode_evidence,
+    decode_read_answer, decode_release,
 };
 use coord_collector::{
     Admission, AdmissionLimits, Collector, CollectorConfig, Dispatcher, MonotonicMillis,
@@ -139,6 +140,10 @@ pub struct Counts {
     /// that had not taken it. Not second submissions: the same
     /// envelope, the same command identity.
     pub reoffered: u64,
+    /// Submissions of pending commands that held neither half of a
+    /// release, sent to every voter again to ask for their evidence
+    /// (task-d22).
+    pub solicited: u64,
     /// Submissions this node's own voter refused at its door.
     pub refused: u64,
     /// Results the collector released to a waiting caller.
@@ -259,10 +264,24 @@ impl Frontend {
                 // setting used to size the collector's undelivered bytes
                 // and bound nothing a caller sent.
                 max_request_bytes: config.limits.max_request_bytes,
+                max_admitted_per_second: Some(config.limits.max_admitted_per_second),
             },
         );
-        let dispatcher =
+        let mut dispatcher =
             Dispatcher::new(admission, collector, config.limits.max_live_subscriptions);
+        // A frontend with a voter beside it follows that voter's ballot,
+        // so it knows who leads; one without does not, and orders every
+        // read (task-d50).
+        dispatcher.set_leader_reads(
+            local.is_some() && config.reads.path == coord_daemon::ReadPath::Leader,
+        );
+        if cfg!(feature = "skip-read-confirmation") {
+            eprintln!(
+                "coordd: built with skip-read-confirmation, the register check's negative \
+                 control: a leader serves reads without confirming its ballot, and they are \
+                 not linearizable"
+            );
+        }
         let frontend = BoundFrontend::new(
             dispatcher,
             BindingConfig {
@@ -390,6 +409,15 @@ impl Default for Budgets {
     }
 }
 
+/// What became of one frame handed to [`PeerPlane::send_turn`].
+type Sent = (
+    coord_core::effect::PeerId,
+    Result<(), coord_transport::SendError>,
+);
+
+/// A voter and the lane a turn's frames go to it on.
+type Route = (coord_core::effect::PeerId, coord_transport::Lane);
+
 /// The other voters of this domain, and the connections held to them.
 ///
 /// Dialling is best effort and never a precondition. A voter this
@@ -415,6 +443,11 @@ pub struct PeerPlane {
 }
 
 impl PeerPlane {
+    /// What this node's transport carried between voters (task-d62).
+    pub fn traffic(&self) -> coord_transport::PeerTraffic {
+        self.transport.peer_traffic()
+    }
+
     /// The plane over `transport`, for the voters in `peers`.
     pub fn new(
         transport: Transport,
@@ -500,40 +533,56 @@ impl PeerPlane {
         self.transport.linked(peer.replica, peer.incarnation, lane)
     }
 
-    /// Queue one protocol frame for a voter.
-    fn send(
-        &self,
-        to: coord_core::effect::PeerId,
-        message: &[u8],
-    ) -> Result<(), coord_transport::SendError> {
-        // A machine publishes the consensus message; the frame around it
-        // is the transport's vocabulary, put on here. A peer stream
-        // carries exactly this kind, and the reader on the other end
-        // refuses anything else rather than handing it to consensus.
-        let frame = coord_transport::evidence_frame(message)
-            .map_err(|_| coord_transport::SendError::NotConnected)?;
-        // Catch-up traffic goes down the bulk lane, and everything the
-        // protocol needs to make progress goes down the control one.
-        // They are separated because they compete: a replica fetching
-        // the content of commands it missed moves whole payloads, and
-        // sharing a queue with proposals and acknowledgements means the
-        // frames it drops when that queue fills are the ones it is
-        // catching up *with*. That is not a hypothesis -- it is what one
-        // voter of three did under a benchmark, permanently.
-        let lane = if coord_consensus::is_payload_transfer(message) {
-            coord_transport::Lane::Bulk
-        } else {
-            coord_transport::Lane::Control
-        };
-        self.transport.send(
-            coord_transport::Destination::Replica {
-                replica: to.replica,
-                incarnation: to.incarnation,
-                lane,
-            },
-            self.domain,
-            frame,
-        )
+    /// Queue one turn's protocol frames for the voters they name, each
+    /// with its own result.
+    ///
+    /// What the turn has for one voter on one lane is handed to the
+    /// transport in one call, in the order the turn made it, so a link
+    /// that carries several frames a stream sends it together (task-d61).
+    /// Each frame is still admitted, and refused, on its own.
+    fn send_turn(&self, frames: Vec<(coord_core::effect::PeerId, Vec<u8>)>) -> Vec<Sent> {
+        let mut results = Vec::with_capacity(frames.len());
+        let mut turn: Vec<(Route, Vec<Vec<u8>>)> = Vec::new();
+        for (to, message) in frames {
+            // A machine publishes the consensus message; the frame around
+            // it is the transport's vocabulary, put on here. A peer stream
+            // carries exactly this kind, and the reader on the other end
+            // refuses anything else rather than handing it to consensus.
+            let Ok(frame) = coord_transport::evidence_frame(&message) else {
+                results.push((to, Err(coord_transport::SendError::NotConnected)));
+                continue;
+            };
+            // Catch-up traffic goes down the bulk lane, and everything the
+            // protocol needs to make progress goes down the control one.
+            // They are separated because they compete: a replica fetching
+            // the content of commands it missed moves whole payloads, and
+            // sharing a queue with proposals and acknowledgements means
+            // the frames it drops when that queue fills are the ones it is
+            // catching up *with*. That is not a hypothesis -- it is what
+            // one voter of three did under a benchmark, permanently.
+            let lane = if coord_consensus::is_payload_transfer(&message) {
+                coord_transport::Lane::Bulk
+            } else {
+                coord_transport::Lane::Control
+            };
+            match turn.iter_mut().find(|(key, _)| *key == (to, lane)) {
+                Some((_, queued)) => queued.push(frame),
+                None => turn.push(((to, lane), vec![frame])),
+            }
+        }
+        for ((to, lane), queued) in turn {
+            let sent = self.transport.send_many(
+                coord_transport::Destination::Replica {
+                    replica: to.replica,
+                    incarnation: to.incarnation,
+                    lane,
+                },
+                self.domain,
+                queued,
+            );
+            results.extend(sent.into_iter().map(|result| (to, result)));
+        }
+        results
     }
 }
 
@@ -824,6 +873,15 @@ pub async fn first_leaf_expired(
         .unwrap_or(Principal::Node)
 }
 
+/// Resolves when `materialized` is notified; never, without one
+/// (task-d52).
+async fn notified(materialized: Option<&tokio::sync::Notify>) {
+    match materialized {
+        Some(notify) => notify.notified().await,
+        None => std::future::pending().await,
+    }
+}
+
 /// A renewal attempt that ended, and which of `renewals` it was; or
 /// nothing for ever while none is out -- a `select!` arm that resolved at
 /// once would spin the loop.
@@ -856,9 +914,16 @@ pub struct Domain<P: Persistence> {
     frontend: Frontend,
     /// This node's own recovery baseline, where it keeps one.
     housekeeping: Option<Housekeeping>,
+    /// How long a working projection commit may wait for a durable one
+    /// under the replay-backed profile, and when one was last asked for
+    /// (task-j06). `None` under the strict profile.
+    durable_projection: Option<(std::time::Duration, std::time::Instant)>,
     /// The other voters, where this process votes. `None` for a process
     /// that does not, and for a domain with nobody else in it.
     plane: Option<PeerPlane>,
+    /// What the api plane's transport carried, read beside the peer
+    /// plane's (task-d70). Taken when the loop starts serving on it.
+    api_traffic: Option<coord_transport::TrafficReader>,
     /// The other voters, as somewhere to submit to. Empty for a domain
     /// with nobody else in it, and for a process whose frontend holds no
     /// collector credential to submit with.
@@ -879,6 +944,14 @@ pub struct Domain<P: Persistence> {
     /// that ask was for, so a partial answer is not mistaken for a
     /// complete one.
     asked: Option<(std::time::Instant, u64, u64)>,
+    /// When this leader last sent its voters the proposals they had not
+    /// voted on (task-d07).
+    resent: Option<std::time::Instant>,
+    /// How long those calls took, in all and the longest (task-d59).
+    resend_time: (std::time::Duration, std::time::Duration),
+    /// When this voter's campaign last asked for the report pages it
+    /// lacks (task-d28).
+    pages_asked: Option<std::time::Instant>,
     /// Evidence this voter has produced for commands whose submitter it
     /// does not know yet, oldest first.
     parked: coord_daemon::parked::Parked,
@@ -886,6 +959,24 @@ pub struct Domain<P: Persistence> {
     /// left off, so a command that cannot settle here does not keep the
     /// ones behind it from being looked at.
     settle_cursor: usize,
+    /// A command whose late release contradicted the answer this node
+    /// already gave from its own record (task-d12), with what was
+    /// compared (task-d17). The serve loop stops on it as it stops on a
+    /// record contradicting a held release.
+    answered_otherwise: Option<Box<coord_collector::Mismatch>>,
+    /// A command this voter holds two decisions of (task-d14). The serve
+    /// loop stops on it as it stops on a release-record mismatch.
+    admission_halt: Option<CommandId>,
+    /// The entries of a selection no order keeps (task-d21).
+    cycle_halt: Option<Vec<CommandId>>,
+    /// A command this voter pulled from a peer's executed history and
+    /// executed otherwise than that peer (task-d08). The serve loop stops
+    /// on it as it stops on a release-record mismatch.
+    caught_up_otherwise: Option<Box<coord_collector::Mismatch>>,
+    /// When this voter asks a peer for what it is missing (task-d08).
+    catch_up: coord_daemon::catch_up::Pacer,
+    /// Catch-up pages taken, as last said (task-d08).
+    catch_up_said: u64,
     /// Peers this node currently cannot queue a frame for, and how many
     /// frames it has dropped for each since it last could. Kept so the
     /// condition is said once when it starts and once when it ends,
@@ -907,11 +998,33 @@ pub struct Domain<P: Persistence> {
     /// Peer events taken since the last caller's event, so the peer
     /// plane's priority cannot become the caller plane's starvation.
     peer_streak: u32,
+    /// Events taken since the voter last flushed (task-d47).
+    since_flush: u32,
     budgets: Budgets,
     /// This run's stage accounting (task-61), shared with the voter's
     /// node so the journal and materialization points record into the
     /// same cells the snapshot reads.
     recorder: std::sync::Arc<coord_daemon::metrics::Recorder>,
+    /// How long this loop has waited, and when it next prints a
+    /// snapshot (task-d45).
+    pacing: Pacing,
+    /// The pre-acceptances the voter held that the leader had not ordered,
+    /// at the last interval snapshot (task-d62).
+    unordered: coord_daemon::metrics::UnorderedPreAcceptances,
+    /// Notified by the voter's materializer thread each time a projection
+    /// commit finishes (task-d52), so the loop takes it back and releases
+    /// what waited on it. `None` where commits run on this thread.
+    materialized: Option<std::sync::Arc<tokio::sync::Notify>>,
+    /// Where the loop's blocking takes from the appender's and the
+    /// materializer's threads are counted (task-d54), in that order.
+    /// `None` where neither thread runs.
+    pipeline_waits: Option<(
+        std::sync::Arc<coord_storage::Waits>,
+        std::sync::Arc<coord_storage::Waits>,
+    )>,
+    /// What reads the leader read barrier did not serve came to, waiting
+    /// for a turn that can send it (task-d50).
+    read_orders: Vec<coord_collector::Action>,
     /// Dials out after the first ones, one task each (task-d03). A dial is
     /// mostly waiting -- an absent voter costs a whole handshake timeout
     /// -- so it runs beside the loop rather than inside it, and ends with
@@ -931,6 +1044,8 @@ pub struct Domain<P: Persistence> {
     role_said: Option<(coord_types::ids::Ballot, bool)>,
     /// How many fenced transitions this voter has said it refused.
     fenced_said: u64,
+    /// The floor's counts last reported (task-d27).
+    floor_said: coord_daemon::floor::FloorCounts,
     /// What a peer's frame or a collector's submission was refused by
     /// this voter's own fence for, where the refusal stops the voter
     /// (`DriveError::Fenced`). Those paths only log a `DriveError`, so the
@@ -965,11 +1080,16 @@ struct Dialled {
 /// Admission is recorded where the frontend decides a caller's frame;
 /// the journal and materialization are recorded by the voter's node,
 /// around the flush of a round's protocol transitions and around the
-/// application of each executable command. Every other stage has no
-/// point in this build and is reported as not instrumented rather than
-/// as a zero: a count nobody took is not a count of nothing.
-pub const INSTRUMENTED: [coord_daemon::metrics::Stage; 3] = [
+/// application of each executable command. A checkpoint is recorded
+/// around each local publication, and recovery is the boot's replay of
+/// the journal into the projection, one sample a start (task-d55). Every
+/// other stage has no point in this build and is reported as not
+/// instrumented rather than as a zero: a count nobody took is not a
+/// count of nothing.
+pub const INSTRUMENTED: [coord_daemon::metrics::Stage; 5] = [
     coord_daemon::metrics::Stage::Admission,
+    coord_daemon::metrics::Stage::Checkpoint,
+    coord_daemon::metrics::Stage::Recovery,
     coord_daemon::metrics::Stage::Journal,
     coord_daemon::metrics::Stage::Materialization,
 ];
@@ -981,12 +1101,13 @@ pub const INSTRUMENTED: [coord_daemon::metrics::Stage; 3] = [
 /// journal and materialization points are the voter's node's, so a
 /// process with no voter (`voting` false) records neither, and reports
 /// both as not instrumented rather than as observed zeroes -- which they
-/// would be the day its serving applier materializes something.
+/// would be the day its serving applier materializes something. Every
+/// process attaches its storage and keeps its own checkpoints.
 pub fn recorder(voting: bool) -> coord_daemon::metrics::Recorder {
     if voting {
         coord_daemon::metrics::Recorder::instrumenting(&INSTRUMENTED)
     } else {
-        coord_daemon::metrics::Recorder::instrumenting(&INSTRUMENTED[..1])
+        coord_daemon::metrics::Recorder::instrumenting(&INSTRUMENTED[..3])
     }
 }
 
@@ -1055,6 +1176,54 @@ impl Deadline for coord_daemon::parked::Parked {
     }
 }
 
+/// The domain loop's own accounting (task-d45): how long it has waited
+/// for something to do, and when it next prints a snapshot.
+///
+/// Busy time is the loop's running time less its waits, which is what a
+/// voter's domain thread is doing: its work and the syncs it waits on.
+/// Measured as waits rather than as work because the waits are the one
+/// place the loop yields, so no path through a pass can be missed.
+#[derive(Default)]
+struct Pacing {
+    /// Time spent waiting for an event since the loop started.
+    idle: std::time::Duration,
+    /// When the current wait began, while the loop is waiting.
+    waiting_since: Option<std::time::Instant>,
+    /// Between printed snapshots, and the roles they are printed for.
+    every: Option<(std::time::Duration, coord_daemon::role::RoleSet)>,
+    /// When the next snapshot is due.
+    due: Option<std::time::Instant>,
+    /// The last printed snapshot's instant, busy time, executed count
+    /// and the domain thread's CPU time: where the current interval
+    /// began.
+    last: Option<(
+        std::time::Instant,
+        std::time::Duration,
+        u64,
+        Option<std::time::Duration>,
+    )>,
+}
+
+impl Pacing {
+    /// The loop is about to wait.
+    fn wait(&mut self) {
+        self.waiting_since = Some(std::time::Instant::now());
+    }
+
+    /// The loop is working again; a wait that was running ends here.
+    fn woke(&mut self) {
+        if let Some(since) = self.waiting_since.take() {
+            self.idle += since.elapsed();
+        }
+    }
+
+    /// Time spent working between `started` and `now`.
+    fn busy(&self, started: std::time::Instant, now: std::time::Instant) -> std::time::Duration {
+        now.saturating_duration_since(started)
+            .saturating_sub(self.idle)
+    }
+}
+
 /// How often a node repeats a request for a payload it is waiting on.
 ///
 /// Bounded by time rather than by events for the same reason the ask
@@ -1062,6 +1231,12 @@ impl Deadline for coord_daemon::parked::Parked {
 /// the first time -- its own proposal was not durable yet -- and nothing
 /// else is going to happen on an idle domain to prompt a second try.
 const PAYLOAD_RETRY: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// How often a leader sends its voters, again, the proposals they have
+/// not voted on (task-d07). Longer than a round trip on any link this
+/// serves, so a vote on its way is not answered with a second copy, and
+/// short enough that a voter that missed a proposal is not held long.
+const RESEND_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Something in a domain that has work due at a time rather than on an
 /// event.
@@ -1108,8 +1283,11 @@ struct Reoffers<'a> {
 
 impl Deadline for Reoffers<'_> {
     fn next_deadline(&self) -> Option<std::time::Instant> {
-        self.dispatcher
-            .next_due()
+        // A re-offer, or a command due to be asked for again (task-d22).
+        [self.dispatcher.next_due(), self.dispatcher.next_solicit()]
+            .into_iter()
+            .flatten()
+            .min()
             .map(|at| self.started + std::time::Duration::from_millis(at.get()))
     }
 }
@@ -1180,6 +1358,12 @@ const UNDELIVERABLE_SAID_AT: u64 = 64;
 /// crowd out the work it exists to enable. This is the whole of what a
 /// turn spends on it; what is still owed after that is owed on the next
 /// turn, on the collector's schedule.
+///
+/// Solicitation spends the same number of destinations a turn on its own
+/// (`due_solicits`), an entry's voters all at once or not at all: a
+/// configuration of more than 16 voters would never solicit. Voter counts
+/// are three or five (task-d31), so this is moot today, and has to change
+/// with this bound if that does.
 const OFFERS_PER_TURN: usize = 16;
 
 /// How many peer events in a row are taken before the caller's plane is
@@ -1190,7 +1374,35 @@ const OFFERS_PER_TURN: usize = 16;
 /// recovery summary is not much more -- and low enough that a caller's
 /// request waits for a bounded number of peer frames rather than for
 /// the domain to go quiet.
-const PEER_BEFORE_API: u32 = 64;
+///
+/// Bounded is not enough: it is also the caller's plane's *share* when
+/// the peer plane never goes quiet, which is what a replica catching up
+/// does to it. At 64 a voter taking 200 to 400 peer events a second
+/// took 2 to 7 of its callers', and those include its collector's
+/// submissions from the other frontends and the evidence coming back to
+/// its own; a request then sat 36 seconds in the transport before this
+/// loop read it (task-d33).
+const PEER_BEFORE_API: u32 = 8;
+
+/// Queued batches at which the loop lowers before it takes another event
+/// (task-d47): a full journal group (`GroupLimits::DEFAULT`).
+const FLUSH_QUEUED: usize = 64;
+
+/// Events the loop takes before it flushes what they left owed, however
+/// many more are ready (task-d47).
+const FLUSH_EVENTS: u32 = 64;
+
+/// Whether the loop lowers before it takes another event: a full journal
+/// group's worth is queued, or a run of events left a flush owed.
+///
+/// Nothing queued can be journaled while an append is out on the
+/// appender's thread (task-d54), so a full group behind one is not a
+/// reason to flush: the flush would move nothing, and with events still
+/// arriving it would run after every one of them. The appender's wake
+/// takes the append back, and the flush after it lends the group.
+const fn flush_due(queued: usize, appending: bool, owed: bool, since_flush: u32) -> bool {
+    (queued >= FLUSH_QUEUED && !appending) || (owed && since_flush >= FLUSH_EVENTS)
+}
 
 /// Whether the caller's plane is polled before the peer plane this
 /// turn, given how many peer events have been taken since the last
@@ -1273,10 +1485,76 @@ struct Housekeeping {
     /// housekeeping that can make an incident worse. Raised, it retries
     /// as the journal grows instead.
     floor: u64,
+    /// The least time between two publications, beside `after`: under
+    /// the replay profile both have to have passed (task-d51). An image
+    /// copies the whole projection, so a cadence by records alone costs
+    /// a run time quadratic in its length; by time as well, a busy
+    /// domain publishes once an interval and a restart replays at most
+    /// an interval's records.
+    every: Option<std::time::Duration>,
+    /// When the last publication completed, or this domain was composed.
+    last: std::time::Instant,
     limits: LocalLimits,
+    /// The image being produced off the domain thread, at most one.
+    export: Option<Export>,
     /// Publications and failures so far (diagnostic).
     done: (u64, u64),
 }
+
+/// A publication in progress off the domain thread (task-d51).
+struct Export {
+    /// When the snapshot was pinned.
+    started: std::time::Instant,
+    /// What it has cost the domain thread so far: the pin, then the
+    /// pointer and the retirement.
+    on_loop: std::time::Duration,
+    job: Job,
+}
+
+/// The step of a publication that is running on its own thread.
+enum Job {
+    /// Steps 1 and 2: producing the image and writing it.
+    Write(std::thread::JoinHandle<Result<Written, BaselineError>>),
+    /// Step 5, once the pointer is durable: removing what it supersedes.
+    /// The publication is kept here as well, so that a reclaimer that
+    /// panics still leaves it accounted as the durable one it is.
+    Reclaim(
+        std::thread::JoinHandle<(Publication, Result<(), BaselineError>)>,
+        Box<Publication>,
+    ),
+}
+
+impl Job {
+    fn is_finished(&self) -> bool {
+        match self {
+            Job::Write(worker) => worker.is_finished(),
+            Job::Reclaim(worker, _) => worker.is_finished(),
+        }
+    }
+}
+
+/// Run step 5 on a thread of its own: removing an image is a directory
+/// tree's worth of unlinks and a sync, tens of milliseconds at 65,536
+/// records, and nothing on the domain thread waits for it.
+fn spawn_reclaim(
+    images: LocalCheckpointStore,
+    mut publication: Publication,
+) -> std::io::Result<std::thread::JoinHandle<(Publication, Result<(), BaselineError>)>> {
+    std::thread::Builder::new()
+        .name("checkpoint".into())
+        .spawn(move || {
+            let reclaimed = coord_checkpoint::reclaim_local(&images, &mut publication);
+            (publication, reclaimed)
+        })
+}
+
+/// How long an image may take to produce before it is abandoned
+/// (task-d51). The snapshot is held while it is produced, and the
+/// engine cannot reuse pages freed meanwhile, so the file grows with
+/// what is written for as long as it takes; an export that has not
+/// finished in this long is given up rather than left to grow it. The
+/// longest seen on the Jepsen runner was 2.5 s, at 365,000 records.
+const EXPORT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl<P: Persistence + LocalBaseline> Domain<P> {
     /// Compose `frontend` over `backing`.
@@ -1297,12 +1575,23 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             backing,
             frontend,
             housekeeping: None,
+            durable_projection: None,
             plane: None,
+            api_traffic: None,
             links: CollectorLinks::new(Vec::new()),
             expiry: None,
             asked: None,
+            resent: None,
+            resend_time: Default::default(),
+            pages_asked: None,
             parked: coord_daemon::parked::Parked::new(PARKED_HOLD, PARKED_EVIDENCE),
             settle_cursor: 0,
+            answered_otherwise: None,
+            admission_halt: None,
+            cycle_halt: None,
+            caught_up_otherwise: None,
+            catch_up: coord_daemon::catch_up::Pacer::default(),
+            catch_up_said: 0,
             undeliverable: BTreeMap::new(),
             no_plane_said: false,
             recurring: Recurring::default(),
@@ -1313,11 +1602,217 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             election,
             role_said: None,
             fenced_said: 0,
+            floor_said: coord_daemon::floor::FloorCounts::default(),
             fenced_stop: None,
             peer_streak: 0,
+            since_flush: 0,
             budgets,
             recorder,
+            pacing: Pacing::default(),
+            unordered: coord_daemon::metrics::UnorderedPreAcceptances::default(),
+            materialized: None,
+            pipeline_waits: None,
+            read_orders: Vec::new(),
         }
+    }
+
+    /// Wake when `materialized` is notified, and take back what the
+    /// voter's materializer committed (task-d52).
+    #[must_use]
+    pub fn wake_on_materialized(
+        mut self,
+        materialized: std::sync::Arc<tokio::sync::Notify>,
+    ) -> Self {
+        self.materialized = Some(materialized);
+        self
+    }
+
+    /// Report the loop's blocking takes from the voter's appender and
+    /// materializer threads in its cost (task-d54).
+    #[must_use]
+    pub fn count_pipeline_waits(
+        mut self,
+        appender: std::sync::Arc<coord_storage::Waits>,
+        materializer: std::sync::Arc<coord_storage::Waits>,
+    ) -> Self {
+        self.pipeline_waits = Some((appender, materializer));
+        self
+    }
+
+    /// Print a snapshot every `every` while serving, for `roles`
+    /// (task-d45). Without it the only snapshots are the ones at start
+    /// and at a clean end, and a killed daemon's log has neither.
+    pub fn report_every(&mut self, every: std::time::Duration, roles: coord_daemon::role::RoleSet) {
+        let now = std::time::Instant::now();
+        self.pacing.every = Some((every, roles));
+        self.pacing.due = Some(now + every);
+    }
+
+    /// What this voter's work has cost since the loop started, with the
+    /// interval since the last printed snapshot (task-d45).
+    fn cost(&self) -> coord_daemon::metrics::Measure<coord_daemon::metrics::Cost> {
+        use coord_daemon::metrics::{
+            Cost, Cpu, Interval, Jobs, Measure, PipelineWaits, Scheduling, Traffic, Unavailable,
+            Wait,
+        };
+        let Backing::Voting(voter) = &self.backing else {
+            // A process without a voter applies what it serves, but the
+            // cost this reports is a voter's: per command it executed in
+            // the domain's order.
+            return Measure::Unavailable(Unavailable::NotThisRole);
+        };
+        let Some(storage) = self.backing.applier().store().cost() else {
+            return Measure::Unavailable(Unavailable::NotInstrumented);
+        };
+        let now = std::time::Instant::now();
+        let executed = voter.node().executed;
+        let busy = self.pacing.busy(self.started, now);
+        // This runs on the domain loop's thread, so the calling thread's
+        // CPU time is the loop's.
+        let domain_cpu = crate::cpu::this_thread();
+        let recent = match self.pacing.last {
+            Some((at, busy_then, executed_then, cpu_then)) => Measure::Observed(Interval {
+                span: now.saturating_duration_since(at),
+                busy: busy.saturating_sub(busy_then),
+                executed: executed.saturating_sub(executed_then),
+                domain_cpu: match (domain_cpu, cpu_then) {
+                    (Some(cpu), Some(then)) => Measure::Observed(cpu.saturating_sub(then)),
+                    _ => Measure::Unavailable(Unavailable::NotInstrumented),
+                },
+            }),
+            None => Measure::Unavailable(Unavailable::NoSamples),
+        };
+        let cpu = match (domain_cpu, crate::cpu::process()) {
+            (Some(domain), Some(process)) => Measure::Observed(Cpu {
+                domain,
+                process,
+                domain_scheduling: crate::cpu::this_thread_scheduling().map_or(
+                    Measure::Unavailable(Unavailable::NotInstrumented),
+                    |s| {
+                        Measure::Observed(Scheduling {
+                            run_queue: s.run_queue,
+                            voluntary: s.voluntary,
+                            involuntary: s.involuntary,
+                        })
+                    },
+                ),
+            }),
+            _ => Measure::Unavailable(Unavailable::NotInstrumented),
+        };
+        Measure::Observed(Cost {
+            executed,
+            lowerings: storage.lowering.lowerings,
+            journal_appends: storage.lowering.appends,
+            journal_syncs: storage.journal_syncs.map_or(
+                Measure::Unavailable(Unavailable::NotInstrumented),
+                Measure::Observed,
+            ),
+            projection_commits: storage.lowering.commits,
+            busy,
+            uptime: now.saturating_duration_since(self.started),
+            recent,
+            resends: resends(&voter.resend_counts(), self.resend_time),
+            established_fast: voter.node().established.fast,
+            established_slow: voter.node().established.slow,
+            reads: reads(&voter.read_counts()),
+            fast_path: fast_path(&voter.node().fast_path_counts()),
+            unordered: self.unordered,
+            release: release(&voter.node().release_split()),
+            traffic: self.plane.as_ref().map_or(
+                Measure::Unavailable(Unavailable::NotInstrumented),
+                |plane| {
+                    let t = plane.traffic();
+                    let api = self
+                        .api_traffic
+                        .as_ref()
+                        .map(|reader| reader.read().api)
+                        .unwrap_or_default();
+                    Measure::Observed(Traffic {
+                        sent_frames: t.sent_frames,
+                        sent_bytes: t.sent_bytes,
+                        sent_streams: t.sent_streams,
+                        sent_lost: t.sent_lost,
+                        sent_lost_streams: t.sent_lost_streams,
+                        datagrams_sent: t.datagrams_sent,
+                        datagrams_received: t.datagrams_received,
+                        send_calls: t.send_calls,
+                        acks_sent: t.acks_sent,
+                        acks_received: t.acks_received,
+                        received_frames: t.received_frames,
+                        received_bytes: t.received_bytes,
+                        received_streams: t.received_streams,
+                        api: coord_daemon::metrics::Datagrams {
+                            datagrams_sent: api.datagrams_sent,
+                            datagrams_received: api.datagrams_received,
+                            send_calls: api.send_calls,
+                            acks_sent: api.acks_sent,
+                            acks_received: api.acks_received,
+                        },
+                    })
+                },
+            ),
+            cpu,
+            waits: self.pipeline_waits.as_ref().map_or(
+                Measure::Unavailable(Unavailable::NotInstrumented),
+                |(appender, materializer)| {
+                    let wait = |waits: &coord_storage::Waits| {
+                        let (count, time) = waits.read();
+                        Wait { count, time }
+                    };
+                    let jobs = |waits: &coord_storage::Waits| {
+                        let times = waits.jobs();
+                        Jobs {
+                            count: times.jobs,
+                            queued: times.queued,
+                            served: times.served,
+                            completed: times.completed,
+                        }
+                    };
+                    Measure::Observed(PipelineWaits {
+                        appender: wait(appender),
+                        materializer: wait(materializer),
+                        appender_jobs: jobs(appender),
+                        materializer_jobs: jobs(materializer),
+                    })
+                },
+            ),
+        })
+    }
+
+    /// Print a snapshot if one is due, and start the next interval.
+    fn report_if_due(&mut self) {
+        let now = std::time::Instant::now();
+        let Some((every, roles)) = self.pacing.every.clone() else {
+            return;
+        };
+        if self.pacing.due.is_some_and(|due| now < due) {
+            return;
+        }
+        if let Backing::Voting(voter) = &mut self.backing {
+            let seen = voter.node_mut().observe_unordered(now);
+            self.unordered = coord_daemon::metrics::UnorderedPreAcceptances {
+                pending: seen.pending,
+                reordered: seen.reordered,
+                oldest: seen.oldest,
+                leader_log: seen.leader_log,
+            };
+        }
+        let snapshot = self.metrics(&roles);
+        match serde_json::to_string(&snapshot) {
+            Ok(rendered) => eprintln!("metrics {rendered}"),
+            Err(e) => eprintln!("the metrics snapshot could not be rendered: {e}"),
+        }
+        let executed = match &self.backing {
+            Backing::Voting(voter) => voter.node().executed,
+            Backing::Serving(_) => 0,
+        };
+        self.pacing.last = Some((
+            now,
+            self.pacing.busy(self.started, now),
+            executed,
+            crate::cpu::this_thread(),
+        ));
+        self.pacing.due = Some(now + every);
     }
 
     /// A bounded, secret-free metrics snapshot of this node (task-61).
@@ -1347,6 +1842,12 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 journal,
                 materialized,
                 checkpoint,
+                projection_durable: self
+                    .backing
+                    .applier()
+                    .store()
+                    .projection_durable()
+                    .map(|seq| seq.get()),
             }),
             None => Measure::Unavailable(Unavailable::Quarantined),
         };
@@ -1387,20 +1888,59 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             frontiers,
             view_age: Measure::Unavailable(Unavailable::NotInstrumented),
             engine_pressure: Measure::Unavailable(Unavailable::NoBound),
+            cost: self.cost(),
         }
     }
 
     /// Publish this node's recovery baseline into `images` once the
     /// journal has run `after` records past the last one.
-    pub fn with_checkpoints(mut self, images: LocalCheckpointStore, after: u64) -> Self {
+    /// Under the replay profile, `every` is the least time between two
+    /// (task-d51).
+    pub fn with_checkpoints(
+        mut self,
+        images: LocalCheckpointStore,
+        after: u64,
+        every: Option<std::time::Duration>,
+    ) -> Self {
         self.housekeeping = Some(Housekeeping {
             images,
             after,
             floor: after,
+            every,
+            last: std::time::Instant::now(),
             limits: LocalLimits::default(),
+            export: None,
             done: (0, 0),
         });
         self
+    }
+
+    /// Record the boot's replay of the journal into the projection, which
+    /// ran before this domain existed, as its recovery stage (task-d55).
+    #[must_use]
+    pub fn recovered_in(self, took: std::time::Duration) -> Self {
+        use coord_daemon::metrics::Stage;
+        self.recorder.entered(Stage::Recovery);
+        self.recorder.completed(Stage::Recovery, took);
+        self
+    }
+
+    /// Ask for a durable projection commit at least every `every` under
+    /// the replay-backed profile (task-j06): the time bound beside the
+    /// store's own count of commits and records.
+    pub fn with_durable_projection_every(mut self, every: std::time::Duration) -> Self {
+        self.durable_projection = Some((every, std::time::Instant::now()));
+        self
+    }
+
+    /// Make every working projection commit durable, for a clean stop
+    /// (task-j06): a start after it replays nothing the projection had
+    /// applied. A failure is said and left: the journal still holds every
+    /// record, and the next start replays them.
+    pub fn sync_projections(&mut self) {
+        if let Err(e) = self.backing.applier_mut().store_mut().sync_projections() {
+            eprintln!("the projection could not be made durable at the stop: {e}");
+        }
     }
 
     /// Baselines published, and cycles that failed.
@@ -1456,6 +1996,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         // deaf to the domain it had come back to -- and a submission
         // arriving first was always correct anyway, since an unreachable
         // voter contributes nothing and the quorum rule decides.
+        self.api_traffic = Some(transport.traffic_reader());
         let now = std::time::Instant::now();
         if let Some(plane) = &mut self.plane {
             plane.redial.start(now);
@@ -1471,6 +2012,11 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             None
         };
         loop {
+            // Whatever woke the loop, it is working again; and a snapshot
+            // due goes out before the work, so a pass that never ends
+            // does not take the interval's counters with it.
+            self.pacing.woke();
+            self.report_if_due();
             // The leaf this node presents first, every pass: a node whose
             // leaf has expired serves nothing more on it, however much
             // work is queued (task-d02).
@@ -1481,6 +2027,19 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             // stops the voter here, as one met on a turn does below.
             if let Some(what) = self.fenced_stop.take() {
                 say_fenced_stop(&what);
+                return;
+            }
+            // A full journal group's worth queued is lowered now, whatever
+            // else is ready, and so is whatever a run of events left owed:
+            // events that queue nothing -- votes the leader counts, a
+            // busy follower's acknowledgements -- would otherwise keep a
+            // command that is ready from executing for as long as they
+            // kept arriving (task-d47).
+            let owed = matches!(&self.backing, Backing::Voting(v) if v.owes_flush());
+            let appending = matches!(&self.backing, Backing::Voting(v) if v.appending());
+            if flush_due(self.queued(), appending, owed, self.since_flush)
+                && self.stops_on_flush(transport)
+            {
                 return;
             }
             let progressed = match self.turn(transport).await {
@@ -1499,7 +2058,37 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             // source, so nothing will wake the loop on its behalf.
             self.pump_watches(&ClockHealth::healthy(clock(), CLOCK_UNCERTAINTY_SECONDS))
                 .await;
-            self.settle_from_records();
+            // A release this node's own execution contradicts stops it
+            // here, before anything else this pass can answer a caller
+            // from that execution (task-d06).
+            if let Some(mismatch) = self.settle_from_records() {
+                say_diverged(&self.divergence(&mismatch));
+                return;
+            }
+            // The same, found the other way round: a release that came
+            // after this node had already answered from its record, and
+            // says something else (task-d12). The caller was already told
+            // the wrong thing; nothing more is.
+            if let Some(mismatch) = self.answered_otherwise.take() {
+                say_diverged(&self.divergence(&mismatch));
+                return;
+            }
+            // A command pulled from a peer's executed history that this
+            // voter executed otherwise than that peer (task-d08).
+            if let Some(mismatch) = self.caught_up_otherwise.take() {
+                say_diverged(&self.divergence(&mismatch));
+                return;
+            }
+            // Two decisions of one command, found at a Sync or in this
+            // voter's own selection (task-d14).
+            if let Some(cycle) = self.cycle_halt.take() {
+                say_recovery_cycle(&cycle);
+                return;
+            }
+            if let Some(command) = self.admission_halt.take() {
+                say_two_decisions(&short_hex(&command));
+                return;
+            }
             // A submission a destination could not take is offered
             // again here, on the collector's schedule and within a
             // per-turn budget. It goes after the voter's own turn and
@@ -1562,6 +2151,11 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             // share without giving up the ordering that makes the
             // domain progress.
             let api_first = poll_api_first(self.peer_streak);
+            let owes_flush = matches!(&self.backing, Backing::Voting(v) if v.owes_flush());
+            let materialized = self.materialized.clone();
+            // Waiting from here: the select below returns at once when
+            // there is work, and otherwise this is the loop's idle time.
+            self.pacing.wait();
             let arrived = if api_first {
                 tokio::select! {
                     biased;
@@ -1571,9 +2165,29 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                     // voter that cannot progress waits rather than
                     // spins.
                     () = std::future::ready(()), if progressed => continue,
+                    // A projection commit has finished: what waited on it
+                    // -- a group's results and watch events -- goes out,
+                    // and the materializer gets the next (task-d52).
+                    () = notified(materialized.as_deref()) => {
+                        self.pacing.woke();
+                        if self.stops_on_settle(transport) {
+                            return;
+                        }
+                        continue;
+                    }
                     () = tokio::time::sleep(PAYLOAD_RETRY), if waiting_for_content => continue,
                     event = transport.next_event() => event.map(Arrived::Api),
                     peer = next_peer_event(self.plane.as_mut()) => peer.map(Arrived::Peer),
+                    // No event is ready: what the events so far queued is
+                    // lowered as one group before the loop waits (task-d47).
+                    () = std::future::ready(()), if owes_flush => {
+                        // Work, not waiting: it is counted as busy.
+                        self.pacing.woke();
+                        if self.stops_on_flush(transport) {
+                            return;
+                        }
+                        continue;
+                    }
                     Some(done) = self.dials.join_next_with_id(), if !self.dials.is_empty() => {
                         self.dialled(done);
                         continue;
@@ -1592,9 +2206,27 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 tokio::select! {
                     biased;
                     () = std::future::ready(()), if progressed => continue,
+                    // A projection commit has finished: what waited on it
+                    // -- a group's results and watch events -- goes out,
+                    // and the materializer gets the next (task-d52).
+                    () = notified(materialized.as_deref()) => {
+                        self.pacing.woke();
+                        if self.stops_on_settle(transport) {
+                            return;
+                        }
+                        continue;
+                    }
                     () = tokio::time::sleep(PAYLOAD_RETRY), if waiting_for_content => continue,
                     peer = next_peer_event(self.plane.as_mut()) => peer.map(Arrived::Peer),
                     event = transport.next_event() => event.map(Arrived::Api),
+                    () = std::future::ready(()), if owes_flush => {
+                        // Work, not waiting: it is counted as busy.
+                        self.pacing.woke();
+                        if self.stops_on_flush(transport) {
+                            return;
+                        }
+                        continue;
+                    }
                     Some(done) = self.dials.join_next_with_id(), if !self.dials.is_empty() => {
                         self.dialled(done);
                         continue;
@@ -1610,13 +2242,16 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                     () = sleep, if wake.is_some() => continue,
                 }
             };
+            self.pacing.woke();
             match arrived {
                 Some(Arrived::Api(event)) => {
                     self.peer_streak = 0;
+                    self.since_flush = self.since_flush.saturating_add(1);
                     self.on_transport(transport, event, &clock).await;
                 }
                 Some(Arrived::Peer(event)) => {
                     self.peer_streak = self.peer_streak.saturating_add(1);
+                    self.since_flush = self.since_flush.saturating_add(1);
                     self.on_peer_plane(transport, event);
                 }
                 None => return,
@@ -1691,7 +2326,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                             outcome.reached = false;
                             outcome
                                 .error
-                                .get_or_insert_with(|| format!("{lane:?}: {e:?}"));
+                                .get_or_insert_with(|| format!("{lane:?}: {e}"));
                         }
                     }
                     outcome
@@ -1731,7 +2366,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                     plane: Plane::Collector,
                     index: i,
                     reached: result.is_ok(),
-                    error: result.err().map(|e| format!("{e:?}")),
+                    error: result.err().map(|e| e.to_string()),
                 }
             });
             self.dialling.insert(task.id(), (Plane::Collector, i));
@@ -2034,10 +2669,64 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             .election
             .as_ref()
             .and_then(crate::election::Election::next_deadline);
-        [expiry, parked, reoffer, redial, renewal, election]
-            .into_iter()
-            .flatten()
-            .min()
+        // A leader re-sends on its interval whether or not anything
+        // arrives: the voter it is re-sending to is the one not sending.
+        let resend = match &self.backing {
+            Backing::Voting(voter) if voter.leads() => self.resent.map(|at| at + RESEND_INTERVAL),
+            _ => None,
+        };
+        // A follower holding work it does not execute asks a peer once
+        // its frontier has been still for a while, and again if nobody
+        // answers; on an idle domain nothing else would wake it to
+        // (task-d08).
+        let catch_up = match &self.backing {
+            Backing::Voting(voter) if !voter.leads() => self.catch_up.next_deadline(),
+            _ => None,
+        };
+        // A campaign asks again for the report pages it lacks on the same
+        // interval, and a lost page or answer leaves nothing to arrive
+        // (task-d28, Codex review).
+        let pages = match &self.backing {
+            Backing::Voting(voter) if voter.node().machine().campaigning() => {
+                self.pages_asked.map(|at| at + RESEND_INTERVAL)
+            }
+            _ => None,
+        };
+        // A snapshot is due on its interval, and an idle domain is the
+        // one whose counters an operator is asking about (task-d45).
+        let report = self.pacing.due.filter(|_| self.pacing.every.is_some());
+        // A read whose leader has not answered is ordered at its deadline
+        // (task-d50), and nothing arrives to say the deadline has passed.
+        let read = self
+            .frontend
+            .frontend
+            .dispatcher()
+            .next_read_deadline()
+            .map(|at| self.started + std::time::Duration::from_millis(at.get()));
+        // A working projection commit is made durable within its bound
+        // on an idle domain too, and nothing arrives to say it is due
+        // (task-j06).
+        let durable_projection = self
+            .durable_projection
+            .filter(|_| self.backing.applier().store().projection_volatile())
+            .map(|(every, last)| last + every / 2);
+        [
+            expiry,
+            parked,
+            reoffer,
+            redial,
+            renewal,
+            election,
+            resend,
+            catch_up,
+            pages,
+            report,
+            read,
+            durable_projection,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     /// Authority epochs proposed, expiry candidates proposed, and leases
@@ -2048,6 +2737,76 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             .map_or((0, 0, 0), |e| (e.done.0, e.done.1, e.armed()))
     }
 
+    /// Batches the voter's rounds left queued for a flush (task-d47).
+    fn queued(&self) -> usize {
+        match &self.backing {
+            Backing::Voting(voter) => voter.queued(),
+            Backing::Serving(_) => 0,
+        }
+    }
+
+    /// Lower what the voter's rounds left queued as one group and send
+    /// what that released (task-d47). Returns whether the voter must
+    /// stop: it cannot make its transitions durable, or it is fenced.
+    fn stops_on_flush(&mut self, api: &Transport) -> bool {
+        self.since_flush = 0;
+        let Backing::Voting(voter) = &mut self.backing else {
+            return false;
+        };
+        // What the journal append released goes out before the execution
+        // group's projection commit, and the group's results after it.
+        let journaled = voter.flush();
+        if self.stops_on(api, journaled) {
+            return true;
+        }
+        let Backing::Voting(voter) = &mut self.backing else {
+            unreachable!("checked above");
+        };
+        let finished = voter.finish();
+        self.stops_on(api, finished)
+    }
+
+    /// Take back what the voter's materializer committed and send what
+    /// that released (task-d52). Returns whether the voter must stop.
+    fn stops_on_settle(&mut self, api: &Transport) -> bool {
+        let Backing::Voting(voter) = &mut self.backing else {
+            return false;
+        };
+        let settled = voter.settle();
+        self.stops_on(api, settled)
+    }
+
+    /// Send one step of a flush's output, or report why the voter stops.
+    fn stops_on(
+        &mut self,
+        api: &Transport,
+        step: Result<coord_daemon::Outbound, DriveError>,
+    ) -> bool {
+        let now = self.now_millis();
+        let Backing::Voting(voter) = &mut self.backing else {
+            return false;
+        };
+        match step {
+            Ok(mut out) => {
+                // A flush or a materialization may be what a held read
+                // waited for (task-d50).
+                out.absorb(voter.pump_reads(now));
+                let provenance = voter.provenance();
+                self.frontend.follow(voter.node().machine().active());
+                self.carry(api, out, provenance);
+                false
+            }
+            Err(DriveError::Fenced(what)) => {
+                say_fenced_stop(&what);
+                true
+            }
+            Err(e) => {
+                eprintln!("this voter cannot make its transitions durable: {e}");
+                true
+            }
+        }
+    }
+
     /// Give the voter its turn: the local submissions it is owed, then
     /// whatever applying those produced.
     ///
@@ -2055,6 +2814,12 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     /// to come back rather than wait.
     async fn turn(&mut self, api: &Transport) -> Result<bool, DriveError> {
         self.maintain();
+        // Reads whose leader did not answer in time are ordered instead
+        // (task-d50), on a serving node as on a voting one.
+        let now = self.now_millis();
+        let expired = self.frontend.frontend.dispatcher_mut().expire_reads(now);
+        self.read_orders.extend(expired);
+        self.send_read_orders(api);
         let Backing::Voting(voter) = &mut self.backing else {
             return Ok(false);
         };
@@ -2063,19 +2828,26 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         // leader for its patience, or an operator asked, and follow
         // whatever ballot the machine has moved to by any path.
         if let Some(election) = self.election.as_mut() {
-            let ballot = voter.ballot();
             let me = voter.provenance().from();
             let (held, voters) = self
                 .plane
                 .as_ref()
                 .map_or((0, 1), |p| (p.reachable(), p.peers.len() + 1));
-            let led = voter.leads()
-                || (ballot.leader != me
-                    && self.plane.as_ref().is_some_and(|p| {
-                        p.peers
-                            .iter()
-                            .any(|peer| peer.replica == ballot.leader && p.holds(peer))
-                    }));
+            let machine = voter.node().machine();
+            let promised = machine.promised();
+            let linked = self.plane.as_ref().is_some_and(|p| {
+                p.peers
+                    .iter()
+                    .any(|peer| peer.replica == promised.leader && p.holds(peer))
+            });
+            let led = election.led(
+                voter.leads(),
+                me,
+                promised,
+                machine.active(),
+                linked,
+                std::time::Instant::now(),
+            );
             let majority = (held + 1) * 2 > voters;
             let campaigning = voter.node().machine().campaigning();
             if let Some(why) =
@@ -2094,7 +2866,11 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             }
         }
         out.absorb(voter.follow_machine()?);
-        out.absorb(voter.execute()?);
+        // Lowering in groups, commands are applied when the loop flushes,
+        // with whatever else became executable by then (task-d47).
+        if !voter.node().lowers_in_groups() {
+            out.absorb(voter.execute()?);
+        }
         // A command whose identity this replica learned from evidence
         // and whose content nobody sent it. Execution stops at it
         // rather than going past it, so what unblocks the domain is
@@ -2141,6 +2917,57 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         } else {
             self.asked = None;
         }
+        // A proposal a voter never received -- not linked yet, refused by
+        // a full lane, or ahead of its Sync -- is sent again by the
+        // leader, paced, until the voter has voted on it (task-d07).
+        if voter.leads() {
+            let now = std::time::Instant::now();
+            if self
+                .resent
+                .is_none_or(|at| now.duration_since(at) >= RESEND_INTERVAL)
+            {
+                self.resent = Some(now);
+                let sends = voter.resend_proposals();
+                let took = now.elapsed();
+                self.resend_time.0 += took;
+                self.resend_time.1 = self.resend_time.1.max(took);
+                out.absorb(sends?);
+            }
+        } else {
+            self.resent = None;
+        }
+        // A report page is published once, on a lane that drops when
+        // full: a campaign asks the voters that promised it for the pages
+        // that have not arrived, paced like the re-send (task-d28).
+        if voter.node().machine().campaigning() {
+            let now = std::time::Instant::now();
+            if self
+                .pages_asked
+                .is_none_or(|at| now.duration_since(at) >= RESEND_INTERVAL)
+            {
+                self.pages_asked = Some(now);
+                out.absorb(voter.request_report_pages()?);
+            }
+        } else {
+            self.pages_asked = None;
+        }
+        // A voter that holds work it does not execute, and has not moved
+        // for a while, asks a peer for the commands it executed after
+        // this voter's frontier: the leader first, then the others
+        // (task-d08). One page at a time; a full one is followed by the
+        // next ask as soon as it is executed, by the machine itself.
+        out.absorb(voter.catch_up(&mut self.catch_up, std::time::Instant::now())?);
+        let (pages, pulled) = voter.node().machine().catch_up_counts();
+        if pages > self.catch_up_said {
+            if self.catch_up_said == 0 || pages % 64 == 0 {
+                eprintln!(
+                    "this voter is catching up from a peer's executed history: \
+                     {pages} page(s), {pulled} command(s) so far, executed through {}",
+                    voter.node().machine().executed_through()
+                );
+            }
+            self.catch_up_said = pages;
+        }
         // Expiry is the leader's to schedule, and every candidate it
         // produces is conditional: nothing here decides that a key
         // goes, only that the cluster should be asked.
@@ -2167,6 +2994,32 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 fenced - self.fenced_said
             );
             self.fenced_said = fenced;
+        }
+        // A floor boundary refused is said with its reason, and a promise
+        // or an activation with where the floor stands (task-d27).
+        if let Some(floor) = voter.node().floor()
+            && floor.counts != self.floor_said
+        {
+            let counts = floor.counts;
+            if counts.refused > self.floor_said.refused
+                && let Some(refusal) = floor.last_refusal()
+            {
+                eprintln!("this voter refused a floor boundary: {refusal}");
+            }
+            if counts.promised > self.floor_said.promised
+                || counts.activated > self.floor_said.activated
+            {
+                eprintln!(
+                    "floor promised={} activated={} heard={} rejected={}",
+                    floor.promised().map_or(0, |p| p.get()),
+                    floor
+                        .activated()
+                        .map_or(0, |a| a.boundary.execution_position.get()),
+                    counts.heard,
+                    counts.rejected,
+                );
+            }
+            self.floor_said = counts;
         }
         let role = (voter.ballot(), voter.leads());
         if self.role_said != Some(role) {
@@ -2207,6 +3060,31 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 eprintln!("this voter's machine refused: {why} ({n} so far)");
             }
         }
+        // Two decisions of one command: the machine votes and executes
+        // nothing more, and the serve loop stops rather than leave a node
+        // up that answers nothing (task-d14).
+        // A dependency cycle in a selection is an invariant violation, not
+        // a failed campaign (task-d21): it stops the node like two
+        // decisions do, and says which commands.
+        if let Some(cycle) = voter.node().machine().recovery_cycle() {
+            self.cycle_halt = Some(cycle.to_vec());
+        } else if let Some(command) = voter.node().machine().halted() {
+            self.admission_halt = Some(command);
+        }
+        // A pulled command this voter executed otherwise than its donor:
+        // the machine executes nothing more, and the serve loop stops
+        // (task-d08).
+        if self.caught_up_otherwise.is_none()
+            && let Some(divergence) = voter.node().machine().catch_up_divergence()
+        {
+            self.caught_up_otherwise = Some(Box::new(coord_daemon::catch_up::mismatch(
+                voter.node().applier(),
+                divergence,
+                voter.node().machine().identity().epoch,
+            )));
+        }
+        // What this turn executed may be what a held read waited for.
+        out.absorb(voter.pump_reads(now));
         self.carry(api, out, provenance);
         // A submission is the only thing that can say where this voter's
         // evidence for a command belongs, so whatever was waiting for
@@ -2231,46 +3109,217 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     /// node whose checkpoints have been failing for a week is a node
     /// whose disk is filling, and that is an operator's to see.
     fn maintain(&mut self) {
-        let Some(housekeeping) = &self.housekeeping else {
+        // The time bound on a working projection commit (task-j06), in
+        // two halves. Every half interval the next projection commit is
+        // asked to be durable, which costs nothing: whichever thread
+        // makes it, a busy domain makes it soon. A request still waiting
+        // at the next half has met no commit at all, so the domain is
+        // idle, and the projection is made durable here -- one empty
+        // durable commit on a thread with nothing else to do. Either way
+        // a working commit is durable within the interval.
+        if let Some((every, last)) = &mut self.durable_projection {
+            let now = std::time::Instant::now();
+            if now.duration_since(*last) >= *every / 2 {
+                *last = now;
+                let store = self.backing.applier_mut().store_mut();
+                // A failure is said and left, as at the stop: the journal
+                // holds every record, and the next commit says whether
+                // the engine can still commit at all.
+                if let Err(e) = store.sync_idle_projections() {
+                    eprintln!("the idle projection could not be made durable: {e}");
+                }
+                store.request_durable_projection();
+            }
+        }
+        let Some(mut housekeeping) = self.housekeeping.take() else {
             return;
         };
+        self.publish(&mut housekeeping);
+        self.housekeeping = Some(housekeeping);
+    }
+
+    /// The local checkpoint's turn (task-j04, task-d51): collect an image
+    /// that has been written, or start one that is due.
+    ///
+    /// The image is produced and written on a thread of its own from a
+    /// snapshot pinned here, and the domain goes on serving meanwhile.
+    /// This thread keeps the steps that order the publication: the pin,
+    /// then once the image and its directory are durable the pointer and
+    /// the retirement, in task-j04's order. The reclaim runs off it again
+    /// once the pointer is durable. A publication
+    /// costs it a pin and a pointer's sync, not the projection's size.
+    fn publish(&mut self, housekeeping: &mut Housekeeping) {
+        use coord_daemon::metrics::Stage;
         if housekeeping.after == 0 {
             return;
         }
-        let (after, floor, limits) = (housekeeping.after, housekeeping.floor, housekeeping.limits);
-        let gap = self.backing.applier().store().unreclaimed();
-        if gap < floor {
+        if let Some(export) = &housekeeping.export {
+            if !export.job.is_finished() {
+                return;
+            }
+            let Export {
+                started,
+                mut on_loop,
+                job,
+            } = housekeeping.export.take().expect("just seen");
+            match job {
+                // The image is durable: the pointer and the retirement,
+                // here, then the reclaim off the thread again.
+                Job::Write(worker) => {
+                    let written = worker.join().unwrap_or_else(|_| {
+                        eprintln!("the checkpoint writer panicked");
+                        Err(BaselineError::Abandoned)
+                    });
+                    let finishing = std::time::Instant::now();
+                    let outcome = written.and_then(|written| {
+                        self.backing.applier_mut().store_mut().finish_local(written)
+                    });
+                    on_loop += finishing.elapsed();
+                    match outcome {
+                        Ok(publication) => {
+                            match spawn_reclaim(housekeeping.images.clone(), publication.clone()) {
+                                Ok(worker) => {
+                                    housekeeping.export = Some(Export {
+                                        started,
+                                        on_loop,
+                                        job: Job::Reclaim(worker, Box::new(publication)),
+                                    });
+                                }
+                                // No thread to spare: the images stay
+                                // until the next publication reclaims
+                                // them, which is the safe direction.
+                                Err(e) => {
+                                    eprintln!("the superseded images were not reclaimed: {e}");
+                                    self.published(housekeeping, publication, started, on_loop);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            self.recorder.refused(Stage::Checkpoint);
+                            housekeeping.done.1 += 1;
+                            let gap = self.backing.applier().store().unreclaimed();
+                            housekeeping.floor = gap.saturating_add(housekeeping.after);
+                            eprintln!(
+                                "this node could not publish a recovery checkpoint after {} ms: {e}",
+                                started.elapsed().as_millis()
+                            );
+                        }
+                    }
+                }
+                // The pointer is durable whatever the reclaim did: a
+                // failure, or a reclaimer that panicked, leaves images on
+                // disk for the next publication to remove, not a failed
+                // publication.
+                Job::Reclaim(worker, unreclaimed) => {
+                    let publication = match worker.join() {
+                        Ok((publication, Ok(()))) => publication,
+                        Ok((publication, Err(e))) => {
+                            eprintln!("the superseded images were not reclaimed: {e}");
+                            publication
+                        }
+                        Err(_) => {
+                            eprintln!(
+                                "the superseded images were not reclaimed: the reclaimer panicked"
+                            );
+                            *unreclaimed
+                        }
+                    };
+                    self.published(housekeeping, publication, started, on_loop);
+                }
+            }
             return;
         }
-        let images = housekeeping.images.clone();
-        let outcome = self
-            .backing
-            .applier_mut()
-            .store_mut()
-            .publish_local(&images, &limits);
-        let housekeeping = self.housekeeping.as_mut().expect("just borrowed");
-        match outcome {
-            Ok(Some(published)) => {
-                housekeeping.done.0 += 1;
-                housekeeping.floor = after;
-                eprintln!(
-                    "checkpoint represented={} retired={} reclaimed={}",
-                    published.represented.get(),
-                    published.retired,
-                    published.reclaimed
-                );
+        let gap = self.backing.applier().store().unreclaimed();
+        if gap < housekeeping.floor {
+            return;
+        }
+        if housekeeping
+            .every
+            .is_some_and(|every| housekeeping.last.elapsed() < every)
+        {
+            return;
+        }
+        let started = std::time::Instant::now();
+        let pinned = self.backing.applier_mut().store_mut().pin_local();
+        match pinned {
+            Ok(Some(pinned)) => {
+                self.recorder.entered(Stage::Checkpoint);
+                let pin = started.elapsed();
+                let (images, limits) = (housekeeping.images.clone(), housekeeping.limits);
+                let deadline = started + EXPORT_DEADLINE;
+                let worker = std::thread::Builder::new()
+                    .name("checkpoint".into())
+                    .spawn(move || pinned.write(&images, &limits, Some(deadline)));
+                match worker {
+                    Ok(worker) => {
+                        housekeeping.export = Some(Export {
+                            started,
+                            on_loop: pin,
+                            job: Job::Write(worker),
+                        });
+                    }
+                    Err(e) => {
+                        self.recorder.refused(Stage::Checkpoint);
+                        housekeeping.done.1 += 1;
+                        housekeeping.floor = gap.saturating_add(housekeeping.after);
+                        eprintln!("this node could not start a recovery checkpoint: {e}");
+                    }
+                }
             }
             // Nothing new to represent: the projection has materialized
             // nothing since the last baseline, so an image would select
             // the same state and retire nothing. Not a failure, and not
             // worth a line.
-            Ok(None) => housekeeping.floor = after,
+            Ok(None) => housekeeping.floor = housekeeping.after,
             Err(e) => {
+                self.recorder.entered(Stage::Checkpoint);
+                self.recorder.refused(Stage::Checkpoint);
                 housekeeping.done.1 += 1;
-                housekeeping.floor = gap.saturating_add(after);
-                eprintln!("this node could not publish a recovery checkpoint: {e}");
+                housekeeping.floor = gap.saturating_add(housekeeping.after);
+                eprintln!(
+                    "this node could not publish a recovery checkpoint after {} ms: {e}",
+                    started.elapsed().as_millis()
+                );
             }
         }
+    }
+
+    /// Account a completed publication and say what it cost.
+    fn published(
+        &self,
+        housekeeping: &mut Housekeeping,
+        published: Publication,
+        started: std::time::Instant,
+        on_loop: std::time::Duration,
+    ) {
+        use coord_daemon::metrics::Stage;
+        let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+        // The stage samples what the publication held this thread for;
+        // `took_ms` is the whole of it, most of it on other threads.
+        self.recorder.completed(Stage::Checkpoint, on_loop);
+        housekeeping.done.0 += 1;
+        housekeeping.floor = housekeeping.after;
+        housekeeping.last = std::time::Instant::now();
+        let phases = &published.phases;
+        eprintln!(
+            "checkpoint represented={} retired={} reclaimed={} took_ms={} \
+             loop_ms={:.1} pin_ms={:.1} export_ms={:.1} write_ms={:.1} \
+             drain_ms={:.1} sync_ms={:.1} append_ms={:.1} retire_ms={:.1} \
+             reclaim_ms={:.1}",
+            published.represented.get(),
+            published.retired,
+            published.reclaimed,
+            started.elapsed().as_millis(),
+            ms(on_loop),
+            ms(phases.pin),
+            ms(phases.export),
+            ms(phases.write),
+            ms(phases.journal.drain),
+            ms(phases.journal.sync),
+            ms(phases.journal.append),
+            ms(phases.journal.retire),
+            ms(phases.reclaim),
+        );
     }
 
     /// Carry out what a voter's round asked for.
@@ -2280,9 +3329,23 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     /// there is no local acknowledgement, and one co-located voter is
     /// one voter's worth of evidence.
     fn carry(&mut self, api: &Transport, out: coord_daemon::Outbound, provenance: PeerProvenance) {
+        // A read's answer goes to the collector that sent the read, and
+        // to no other (task-d50).
+        for (origin, bytes) in out.reads {
+            match origin {
+                coord_daemon::voter::Origin::Connection(id) => {
+                    self.return_to_collector(api, id, &bytes);
+                }
+                coord_daemon::voter::Origin::Local => match one_frame(&bytes) {
+                    Ok(frame) => self.on_frame_from_voter(provenance, &frame),
+                    Err(_) => self.frontend.counts.unserved += 1,
+                },
+            }
+        }
         for frame in out.frontend {
             self.hand_to_collector(api, provenance, &frame);
         }
+        let mut turn = Vec::with_capacity(out.peer.len());
         for (to, frame) in out.peer {
             // Which generation of that node may receive it is the
             // committed configuration's answer, settled here on the way
@@ -2302,7 +3365,20 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 self.frontend.counts.not_a_voter += 1;
                 continue;
             };
-            match self.plane.as_ref().map(|p| p.send(to, &frame)) {
+            turn.push((to, frame));
+        }
+        // The turn's frames for one voter go to the transport together
+        // (task-d61); what became of each is counted as before.
+        let sent: Vec<_> = match self.plane.as_ref() {
+            Some(plane) => plane
+                .send_turn(turn)
+                .into_iter()
+                .map(|(to, result)| (to, Some(result)))
+                .collect(),
+            None => turn.into_iter().map(|(to, _)| (to, None)).collect(),
+        };
+        for (to, result) in sent {
+            match result {
                 // Admitted to the lane's queue. Not a vote and not a
                 // delivery: what the peer does with it is the peer's,
                 // and the collector counts the evidence.
@@ -2370,6 +3446,87 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         // its own report.
         self.frontend.counts.unserved +=
             (out.arm.len() + out.cancel.len() + out.views.len() + out.entropy.len()) as u64;
+        self.send_read_orders(api);
+    }
+
+    /// Send a read to the leader its collector follows (task-d50): to
+    /// the voter in this process when it leads, and otherwise over the
+    /// link to the leader, as a submission goes. A read that cannot be
+    /// sent is ordered at once rather than left to its deadline.
+    fn send_read(&mut self, api: &Transport, plan: coord_collector::ReadPlan) {
+        let now = self.now_millis();
+        if let Backing::Voting(voter) = &mut self.backing
+            && voter.provenance().from() == plan.leader
+        {
+            let out = match one_frame(&plan.frame) {
+                Ok(frame) => voter.on_read(&frame, coord_daemon::voter::Origin::Local, now),
+                Err(_) => coord_daemon::Outbound::default(),
+            };
+            let provenance = voter.provenance();
+            self.carry(api, out, provenance);
+            return;
+        }
+        let fan_out = coord_collector::FanOut {
+            command: plan.command,
+            retry_key: plan.retry_key,
+            targets: vec![plan.leader],
+            frame: plan.frame.into(),
+        };
+        let out = fanout::dispatch(&self.frontend.membership, api, None, &fan_out);
+        if out.queued.is_empty()
+            && let Some(action) = self
+                .frontend
+                .frontend
+                .dispatcher_mut()
+                .order_read(now, &plan.retry_key)
+        {
+            self.read_orders.push(action);
+            self.send_read_orders(api);
+        }
+    }
+
+    /// Carry out what ordering a read the barrier did not serve asked for
+    /// (task-d50): a submission to fan out, or an answer.
+    fn send_read_orders(&mut self, api: &Transport) {
+        for action in std::mem::take(&mut self.read_orders) {
+            match action {
+                coord_collector::Action::FanOut(plan) => {
+                    let command = plan.command;
+                    let out = fanout::dispatch(
+                        &self.frontend.membership,
+                        api,
+                        self.frontend
+                            .local
+                            .as_ref()
+                            .map(|l| l as &dyn fanout::LocalIngress),
+                        &plan,
+                    );
+                    self.record_offer(command, &out);
+                }
+                coord_collector::Action::Respond(delivery) => self.answer(delivery),
+                // Attached to an ordering already under way: its release
+                // finds the stream.
+                _ => {}
+            }
+        }
+    }
+
+    /// A current read a collector in another process sent this voter as
+    /// the leader it follows (task-d50).
+    fn on_remote_read(
+        &mut self,
+        api: &Transport,
+        frame: &Frame,
+        from: coord_transport::ConnectionId,
+    ) {
+        let now = self.now_millis();
+        let Backing::Voting(voter) = &mut self.backing else {
+            self.frontend.counts.unserved += 1;
+            return;
+        };
+        let out = voter.on_read(frame, coord_daemon::voter::Origin::Connection(from.0), now);
+        let provenance = voter.provenance();
+        self.carry(api, out, provenance);
     }
 
     /// One frame a voter addressed to the trusted collector: to
@@ -2512,7 +3669,20 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             .frontend
             .dispatcher_mut()
             .due_offers(now, OFFERS_PER_TURN);
-        for plan in due {
+        // And the commands that have held neither half of a release long
+        // enough, submitted to every voter again to ask for what they
+        // said (task-d22). The same fan-out and the same offer report: a
+        // voter that took the submission answers it again.
+        let solicits = self
+            .frontend
+            .frontend
+            .dispatcher_mut()
+            .due_solicits(now, OFFERS_PER_TURN);
+        let plans = due
+            .into_iter()
+            .map(|plan| (plan, false))
+            .chain(solicits.into_iter().map(|plan| (plan, true)));
+        for (plan, solicit) in plans {
             let command = plan.command;
             let out = fanout::dispatch(
                 &self.frontend.membership,
@@ -2523,12 +3693,16 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                     .map(|l| l as &dyn fanout::LocalIngress),
                 &plan,
             );
-            self.frontend.counts.reoffered += 1;
+            if solicit {
+                self.frontend.counts.solicited += 1;
+            } else {
+                self.frontend.counts.reoffered += 1;
+            }
             self.record_offer(command, &out);
             // Said, and said less as it goes on: a re-offer is delivery
             // backpressure being worked off, which an operator wants to
             // know is happening without a line per attempt.
-            if let Some(n) = self.recurring.seen("reoffered") {
+            if !solicit && let Some(n) = self.recurring.seen("reoffered") {
                 eprintln!(
                     "this collector offered a submission again to a voter that could not take it ({n} so far)"
                 );
@@ -2590,51 +3764,84 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     ///
     /// Bounded per turn, and cheap when nothing is half held, which is
     /// nearly always.
-    fn settle_from_records(&mut self) {
+    ///
+    /// Returns what was compared for the command whose leader's release
+    /// and this node's own execution record disagree, if one does
+    /// (task-d06, task-d17). That is replicas
+    /// executing the same committed commands in different orders, and
+    /// every answer this node's frontend gives from its own record -- a
+    /// retry, a delivery whose half was lost -- then comes from a state
+    /// the domain did not decide. So nothing this pass settled goes out,
+    /// and the caller stops the node.
+    #[must_use]
+    fn settle_from_records(&mut self) -> Option<Box<coord_collector::Mismatch>> {
         let half = self.frontend.frontend.dispatcher_mut().half_established();
         if half.is_empty() {
-            return;
+            return None;
         }
-        let mut deliveries = Vec::new();
         // Bounded per turn and rotated across turns: the bound is on
         // this turn's reads, and the rotation is what keeps it from
         // becoming a bound on which commands are ever read.
         let (this_turn, cursor) =
             coord_daemon::settle::window(half, self.settle_cursor, SETTLE_PER_TURN);
         self.settle_cursor = cursor;
+        let conflicts =
+            coord_daemon::settle::conflicts_for(self.backing.applier(), this_turn.iter().copied());
         let records = coord_daemon::settle::records_for(self.backing.applier(), this_turn);
-        for (command, record) in records {
-            match self.frontend.frontend.dispatcher_mut().settle_from_record(
+        // The release this collector holds and what this node executed
+        // disagreeing is not an ordinary outcome: every replica executes
+        // the committed commands in one order, and this node's frontend
+        // answers from its own record of that order. So the node stops
+        // (task-d06) rather than go on answering from it, and nothing
+        // this pass read from the same record goes out.
+        let dispatcher = self.frontend.frontend.dispatcher_mut();
+        match coord_daemon::settle::offer(records, |command, record| {
+            dispatcher.settle_from_record(
                 command,
                 record.result_digest,
+                record.position,
                 record.revision,
                 &record.response,
-            ) {
-                Ok(delivery) => {
-                    self.frontend.counts.settled_from_record += 1;
-                    deliveries.extend(delivery);
+            )
+        }) {
+            coord_daemon::settle::Settled::Offered {
+                settled,
+                deliveries,
+            } => {
+                self.frontend.counts.settled_from_record += settled;
+                for delivery in deliveries {
+                    self.answer(delivery);
                 }
-                // The release this collector holds and what this node
-                // executed disagree. Neither is believed; said, because
-                // it is the one outcome here that is not ordinary.
-                Err(coord_collector::SettleError::Mismatch) => {
-                    let head: String = command.as_bytes()[..4]
-                        .iter()
-                        .map(|b| format!("{b:02x}"))
-                        .collect();
-                    let said = format!("release-record-mismatch({head})");
-                    if let Some(n) = self.recurring.seen(&said) {
-                        eprintln!(
-                            "this node's durable record and the leader's release disagree: {said} ({n} so far)"
-                        );
+                // A key this node's record binds to another command: the
+                // domain executed that one under it (task-d22).
+                for (command, bound) in conflicts {
+                    let dispatcher = self.frontend.frontend.dispatcher_mut();
+                    if let Ok(delivery) = dispatcher.settle_conflict_from_record(command, bound) {
+                        self.frontend.counts.settled_from_record += 1;
+                        if let Some(delivery) = delivery {
+                            self.answer(delivery);
+                        }
                     }
                 }
-                Err(_) => {}
+                None
             }
+            coord_daemon::settle::Settled::Diverged(mismatch) => Some(mismatch),
         }
-        for delivery in deliveries {
-            self.answer(delivery);
-        }
+    }
+
+    /// What a node that stops on `mismatch` says (task-d17): what was
+    /// compared, this node's ballot, leader and execution frontier at the
+    /// stop, and its own executed rows around both positions.
+    fn divergence(&self, mismatch: &coord_collector::Mismatch) -> String {
+        let (ballot, executed_through) = match &self.backing {
+            Backing::Voting(voter) => (
+                voter.ballot(),
+                Some(voter.node().machine().executed_through()),
+            ),
+            Backing::Serving(_) => (self.frontend.frontend.dispatcher().ballot(), None),
+        };
+        let rows = coord_daemon::settle::executed_near(self.backing.applier(), mismatch);
+        describe_divergence(mismatch, ballot, executed_through, &rows)
     }
 
     /// Which collector this voter owes a frame to, where it knows.
@@ -2668,13 +3875,40 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                     .flatten()
             }),
             KIND_RELEASE => decode_release(frame).ok().and_then(|released| {
-                self.frontend
+                match self
+                    .frontend
                     .frontend
                     .dispatcher_mut()
                     .on_release(provenance, released)
-                    .ok()
-                    .flatten()
+                {
+                    Ok(delivery) => delivery,
+                    Err(coord_collector::collector::EvidenceError::AnsweredOtherwise(mismatch)) => {
+                        self.answered_otherwise = Some(mismatch);
+                        None
+                    }
+                    Err(_) => None,
+                }
             }),
+            KIND_READ_ANSWER => {
+                let now = self.now_millis();
+                let resolved = decode_read_answer(frame).ok().and_then(|answer| {
+                    self.frontend.frontend.dispatcher_mut().on_read_answer(
+                        now,
+                        provenance.from(),
+                        answer,
+                    )
+                });
+                match resolved {
+                    Some(coord_collector::ReadResolution::Answer(delivery)) => Some(delivery),
+                    // Ordered instead: sent on the next pass that holds
+                    // the transport.
+                    Some(coord_collector::ReadResolution::Ordered(action)) => {
+                        self.read_orders.push(action);
+                        None
+                    }
+                    None => None,
+                }
+            }
             _ => {
                 self.frontend.counts.unserved += 1;
                 return;
@@ -2718,6 +3952,18 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     /// Answer the caller a delivery belongs to, gated against a fresh
     /// barrier.
     fn answer(&mut self, delivery: coord_collector::Delivery) {
+        // A late release has contradicted an answer this node gave from
+        // its own record (task-d12), or this voter holds two decisions of
+        // one command (task-d14), and the pass ends in the stop. Until it
+        // does, nothing more goes out: not the rest of the voter's batch,
+        // and not what the parked frames or the records settle.
+        if self.answered_otherwise.is_some()
+            || self.admission_halt.is_some()
+            || self.cycle_halt.is_some()
+            || self.caught_up_otherwise.is_some()
+        {
+            return;
+        }
         let policy = StorePolicySource {
             store: self.backing.applier().store(),
             budget: ViewBudget::default(),
@@ -2787,6 +4033,13 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 // one does. Everything else is a client's frame.
                 if frame.kind == KIND_SUBMIT && is_collector(identity.role) {
                     self.on_remote_submission(transport, identity.role, &frame, connection);
+                    drop(responder);
+                    return;
+                }
+                // A collector's read for this voter as the leader it
+                // follows (task-d50): answered on the link, like evidence.
+                if frame.kind == KIND_READ && is_collector(identity.role) {
+                    self.on_remote_read(transport, &frame, connection);
                     drop(responder);
                     return;
                 }
@@ -2869,7 +4122,10 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             TransportEvent::ApiDelivery {
                 provenance, frame, ..
             } => match provenance {
-                Some(provenance) => self.on_frame_from_voter(provenance, &frame),
+                Some(provenance) => {
+                    self.on_frame_from_voter(provenance, &frame);
+                    self.send_read_orders(transport);
+                }
                 // A peer holding no replica identity is not a voter, so
                 // what it delivered is not evidence of anything.
                 None => self.frontend.counts.unserved += 1,
@@ -2907,8 +4163,14 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 // around it is the transport's, and the transport has
                 // already refused any kind or version that is not this
                 // build's peer evidence.
+                let now = MonotonicMillis::new(
+                    u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                );
                 match voter.on_peer(provenance, payload) {
-                    Ok(out) => {
+                    Ok(mut out) => {
+                        // A confirmation, or what the frame executed, may
+                        // be what a held read waited for (task-d50).
+                        out.absorb(voter.pump_reads(now));
                         let provenance = voter.provenance();
                         // Before the frame's output reaches the collector
                         // beside this voter: evidence the step that
@@ -3030,6 +4292,18 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                     &plan,
                 );
                 self.record_offer(command, &out);
+            }
+            Step::Read(plan) => {
+                // Held before the read goes out, as a submission is: the
+                // leader beside this collector answers within this call.
+                if let Some(displaced) =
+                    self.frontend
+                        .pending
+                        .hold(connection.0, plan.retry_key, responder)
+                {
+                    drop(displaced);
+                }
+                self.send_read(transport, *plan);
             }
             Step::Watch {
                 watch_id,
@@ -3252,30 +4526,69 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
 /// tried. The identity expected on the other end is the committed one
 /// throughout, so a certificate that is not this domain's voter at its
 /// committed incarnation fails the handshake whichever address answered.
+///
+/// A dial that reaches no address keeps every address's error, so that
+/// what is said is why the address that serves this plane failed, and
+/// not the other listener's refusal of it (task-d16).
 async fn dial(
     transport: &coord_transport::Dialer,
     peer: &crate::peers::Peer,
     me: Option<coord_types::ids::ReplicaIncarnation>,
     role: coord_types::wire_v1::PeerRole,
     lane: coord_transport::Lane,
-) -> Result<coord_transport::ConnectionId, coord_transport::TransportError> {
+) -> Result<coord_transport::ConnectionId, Unreached> {
     let expected = coord_transport::BoundIdentity {
         role: coord_types::wire_v1::PeerRole::Voter,
         replica: Some(peer.replica),
         incarnation: Some(peer.incarnation),
         capabilities: Vec::new(),
     };
-    let mut last = coord_transport::TransportError::Connect("no address listed".into());
+    let mut failed = Vec::new();
     for (address, server_name) in &peer.addresses {
         match transport
             .connect(*address, server_name, role, me, lane, expected.clone())
             .await
         {
             Ok(connection) => return Ok(connection),
-            Err(e) => last = e,
+            Err(e) => failed.push((*address, e)),
         }
     }
-    Err(last)
+    Err(Unreached(failed))
+}
+
+/// Why a dial reached none of a peer's addresses: each address's own
+/// error, in the order they were tried (task-d16).
+#[derive(Debug)]
+struct Unreached(Vec<(std::net::SocketAddr, coord_transport::TransportError)>);
+
+impl std::fmt::Display for Unreached {
+    /// The failures of the addresses that could have served this dial.
+    ///
+    /// An address that answered for the other plane is left out: a node
+    /// lists both of its listeners without saying which is which, so one
+    /// of them refuses every dial by design, and its refusal says nothing
+    /// about whether the node can be reached. Said in its place, it hid
+    /// the error that did.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.0.is_empty() {
+            return f.write_str("no address listed");
+        }
+        let failures: Vec<_> = self
+            .0
+            .iter()
+            .filter(|(_, e)| !matches!(e, coord_transport::TransportError::WrongPlane))
+            .collect();
+        if failures.is_empty() {
+            return f.write_str("every address listed serves the other plane");
+        }
+        for (i, (address, e)) in failures.into_iter().enumerate() {
+            if i > 0 {
+                f.write_str("; ")?;
+            }
+            write!(f, "{address}: {e:?}")?;
+        }
+        Ok(())
+    }
 }
 
 /// The peer a protocol frame may actually be sent to.
@@ -3297,6 +4610,186 @@ fn addressed(
     })
 }
 
+/// The first four bytes of a command identity, as the stop names it.
+fn short_hex(command: &CommandId) -> String {
+    command.as_bytes()[..4]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Why a node stopped on a release its own execution contradicts.
+fn say_diverged(description: &str) {
+    eprintln!("{description}");
+}
+
+/// What a node that stops on `mismatch` prints (task-d17).
+///
+/// The first line keeps the prefix every earlier stop printed,
+/// `this node stopped: release-record-mismatch(<8 hex>)`, so what
+/// searches for it still finds it; everything after it says what was
+/// compared. "In another order" is said only when the two positions
+/// differ: a disagreement at one position is the command producing
+/// something else there, not the commands being ordered otherwise.
+fn describe_divergence(
+    mismatch: &coord_collector::Mismatch,
+    ballot: coord_types::ids::Ballot,
+    executed_through: Option<coord_types::ids::ExecutionPosition>,
+    rows: &[(CommandId, coord_storage::codecs::ExecutedRecordV1)],
+) -> String {
+    use coord_collector::MismatchCheck;
+    use std::fmt::Write as _;
+    let (check, own_is, theirs, whose) = match mismatch.check {
+        MismatchCheck::HeldReleaseAgainstRecord => (
+            "the leader's release this node held, against this node's own record of the command",
+            "record",
+            "the leader's release of that command",
+            "the leader",
+        ),
+        MismatchCheck::LateReleaseAgainstAnswer => (
+            "a release that arrived after this node answered, against the answer it gave",
+            "answer",
+            "the leader's release of that command",
+            "the leader",
+        ),
+        MismatchCheck::CatchUpAgainstDonor => (
+            "catch-up: the execution a peer served this node with the command, against this \
+             node's own execution of it",
+            "own execution",
+            "the execution of that command a peer served this node to catch up from",
+            "that peer",
+        ),
+    };
+    let why = if mismatch.differs.position {
+        format!("so this node executed the domain's commands in another order than {whose}")
+    } else {
+        format!(
+            "at the same position, so this node's execution of that command produced something \
+             else than {whose}'s"
+        )
+    };
+    let mut out = format!(
+        "this node stopped: release-record-mismatch({}): {theirs} and this node's own execution \
+         of it disagree, {why}. Its store holds a history the domain did not decide, and this \
+         node does not answer from it",
+        short_hex(&mismatch.command)
+    );
+    let differs = mismatch.differs.names();
+    let _ = write!(
+        out,
+        "\n  compared: {check}\n  command: {}\n  release: {}\n  {own_is}: {}\n  differs: {}",
+        coord_collector::trace::command_hex(&mismatch.command),
+        said(&mismatch.release),
+        said(&mismatch.own),
+        if differs.is_empty() {
+            "nothing".to_string()
+        } else {
+            differs.join(", ")
+        },
+    );
+    let _ = write!(
+        out,
+        "\n  this node: ballot {} leader {} executed_through {}",
+        ballot.number,
+        hex4(&ballot.leader),
+        executed_through.map_or_else(
+            || "unknown (no voter runs here)".to_string(),
+            |p| p.to_string()
+        ),
+    );
+    let _ = write!(
+        out,
+        "\n  executed_v1 within {} of positions {} and {} (position revision digest command):",
+        coord_daemon::settle::NEAR_POSITIONS,
+        mismatch.own.position,
+        mismatch.release.position,
+    );
+    if rows.is_empty() {
+        out.push_str("\n    none");
+    }
+    for (command, record) in rows {
+        let _ = write!(
+            out,
+            "\n    {} {} {} {}",
+            record.position,
+            revision_text(record.revision),
+            digest_hex(&record.result_digest),
+            coord_collector::trace::command_hex(command),
+        );
+    }
+    out
+}
+
+/// One side of a mismatch, on one line.
+fn said(said: &coord_collector::Said) -> String {
+    let origin = said.release.map_or_else(
+        || "from this node's record".to_string(),
+        |r| {
+            format!(
+                "sender {} epoch {} ballot {} (leader {}) speculative {}",
+                hex4(&r.sender),
+                r.epoch,
+                r.ballot.number,
+                hex4(&r.ballot.leader),
+                r.speculative,
+            )
+        },
+    );
+    format!(
+        "{origin} position {} revision {} digest {} response {} bytes",
+        said.position,
+        revision_text(said.revision),
+        digest_hex(&said.result_digest),
+        said.response_len,
+    )
+}
+
+/// A revision as a stop prints it: `-` for none.
+fn revision_text(revision: Option<coord_types::ids::KvRevision>) -> String {
+    revision.map_or_else(|| "-".to_string(), |r| r.to_string())
+}
+
+/// Hex of a digest.
+fn digest_hex(digest: &coord_types::identity::Digest32) -> String {
+    digest.0.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Why a node stopped on two decisions of one command.
+fn say_recovery_cycle(commands: &[CommandId]) {
+    eprintln!("{}", describe_recovery_cycle(commands));
+}
+
+/// What a node that halts on a dependency cycle in a selection prints
+/// (task-d21): the prefix, how many entries no order keeps, and the first
+/// eight of them in full.
+fn describe_recovery_cycle(commands: &[CommandId]) -> String {
+    let first = commands.first().map_or_else(String::new, short_hex);
+    let named: Vec<String> = commands
+        .iter()
+        .take(8)
+        .map(|c| c.as_bytes().iter().map(|b| format!("{b:02x}")).collect())
+        .collect();
+    format!(
+        "this node stopped: recovery-cycle({first}): the selection it recovered holds a \
+         dependency cycle among its entries, which no quorum's order can produce. {} entr{} \
+         could not be ordered: {}{}. This node proposes, votes and executes nothing more; the \
+         reports it selected from are in its peers' stores",
+        commands.len(),
+        if commands.len() == 1 { "y" } else { "ies" },
+        named.join(", "),
+        if commands.len() > 8 { ", ..." } else { "" }
+    )
+}
+
+fn say_two_decisions(command: &str) {
+    eprintln!(
+        "this node stopped: incompatible-admission({command}): a selection names other \
+         admission facts for that command than this node committed or executed it under, so \
+         the domain decided it twice. This node votes, executes and answers nothing more; \
+         its store is to be rebuilt from a peer's checkpoint"
+    );
+}
+
 /// Why a voter stopped on its own fence, and what heals it.
 fn say_fenced_stop(what: &str) {
     eprintln!(
@@ -3304,6 +4797,66 @@ fn say_fenced_stop(what: &str) {
          which is at a promise above this voter's ballot. \
          A restart resumes at the promised ballot, as a follower that campaigns"
     );
+}
+
+/// The snapshot's reading of a leader's re-send counts (task-d49).
+fn resends(
+    counts: &coord_consensus::ResendCounts,
+    (time, longest): (std::time::Duration, std::time::Duration),
+) -> coord_daemon::metrics::Resends {
+    coord_daemon::metrics::Resends {
+        calls: counts.calls,
+        scanned: counts.scanned,
+        time,
+        longest,
+        deferred: counts.deferred,
+        decided: counts.decided,
+        acknowledged: counts.acknowledged,
+        unanswered: counts.unanswered,
+        lost: counts.lost(),
+        late: counts.late,
+        handed_off: counts.handed_off,
+        duplicate_votes: counts.duplicate_votes,
+    }
+}
+
+/// The snapshot's reading of what the fast path did (task-d62).
+fn fast_path(counts: &coord_consensus::FastPathCounts) -> coord_daemon::metrics::FastPath {
+    coord_daemon::metrics::FastPath {
+        missed_path: counts.missed_path,
+        missed_deps: counts.missed_deps,
+        missed_missing: counts.missed_missing,
+        missed_slow_first: counts.missed_slow_first,
+        missed_unclassified: counts.missed_unclassified,
+        acks: counts.acks,
+        acks_reordered: counts.acks_reordered,
+    }
+}
+
+/// The snapshot's reading of the leader's waits from learned to released
+/// (task-d62).
+fn release(split: &coord_daemon::learned::ReleaseSplit) -> coord_daemon::metrics::Release {
+    coord_daemon::metrics::Release {
+        commands: split.commands,
+        predecessors: split.predecessors,
+        group: split.group,
+        projection: split.projection,
+    }
+}
+
+/// The snapshot's reading of the read barrier's counts (task-d50).
+fn reads(counts: &coord_daemon::reads::ReadCounts) -> coord_daemon::metrics::Reads {
+    coord_daemon::metrics::Reads {
+        served: counts.served,
+        refused: counts.refused,
+        rounds: counts.rounds,
+        confirmed: counts.confirmed,
+        waited_confirm_ms: counts.waited_confirm_ms,
+        waited_index_ms: counts.waited_index_ms,
+        waited_ms: counts.waited_ms,
+        snapshots: counts.snapshots,
+        behind: counts.behind,
+    }
 }
 
 fn hex4(replica: &coord_types::ids::ReplicaId) -> String {
@@ -3399,13 +4952,21 @@ fn one_frame(bytes: &[u8]) -> Result<Frame, coord_types::wire_v1::WireError> {
     Ok(frame)
 }
 
-/// A refusal of a retained result, in the shape the output gate refuses
-/// a live one it will not disclose.
+/// A refusal to admit a request the record says may not execute.
 fn refusal(command: coord_types::CommandId, detail: &str) -> Option<Vec<u8>> {
+    status(command, coord_collector::codes::NOT_ADMITTED, detail)
+}
+
+/// An executed command's retained result withheld, in the shape the
+/// output gate withholds a live one (task-d23).
+fn withheld(command: coord_types::CommandId, detail: &str) -> Option<Vec<u8>> {
+    status(command, coord_collector::codes::OUTPUT_WITHHELD, detail)
+}
+
+/// A response carrying one frozen code.
+fn status(command: coord_types::CommandId, code: u16, detail: &str) -> Option<Vec<u8>> {
     MessageV1::Response(coord_collector::codes::error_response(
-        command,
-        coord_collector::codes::NOT_ADMITTED,
-        detail,
+        command, code, detail,
     ))
     .encode()
     .ok()
@@ -3517,8 +5078,41 @@ fn endpoint(
     {
         limits.max_connection_age = std::time::Duration::from_millis(ms);
     }
+    // How many frames a peer stream carries (task-d61), set from the
+    // environment so one binary measures with and without batching: a
+    // measurement lever, like the runtime's worker count, and not
+    // configuration. One is a stream a frame, as before task-d61; a peer
+    // that batches then sends this node one frame a stream too.
+    if let Some(frames) = std::env::var("COORDD_PEER_STREAM_FRAMES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        limits.stream_frames = frames.max(1);
+    }
+    // The acknowledgement cadence asked of every peer and caller
+    // (task-d70), from the environment for the same reason, on both
+    // planes: `<threshold>,<max delay in microseconds>`. Unset, QUIC's own.
+    if let Ok(value) = std::env::var("COORDD_ACK_FREQUENCY") {
+        match ack_frequency(&value) {
+            Some(ack) => limits.ack_frequency = Some(ack),
+            None => eprintln!(
+                "COORDD_ACK_FREQUENCY={value:?} is not <threshold>,<max delay in microseconds>: \
+                 QUIC's own acknowledgement cadence is kept"
+            ),
+        }
+    }
     Transport::with_socket(socket, identity, std::sync::Arc::new(binder), limits)
         .map_err(|e| TransportError::Endpoint(format!("{e:?}")))
+}
+
+/// An acknowledgement cadence written `<threshold>,<max delay in
+/// microseconds>` (task-d70).
+fn ack_frequency(value: &str) -> Option<coord_transport::AckFrequency> {
+    let (threshold, delay) = value.split_once(',')?;
+    Some(coord_transport::AckFrequency {
+        threshold: threshold.trim().parse().ok()?,
+        max_delay: std::time::Duration::from_micros(delay.trim().parse().ok()?),
+    })
 }
 
 /// Why the endpoint could not be built.
@@ -3539,13 +5133,22 @@ impl core::fmt::Display for TransportError {
     }
 }
 
-/// What the durable record answers for a request, ahead of admission:
-/// the retained result, gated as a fresh one is, or a refusal from the
-/// record. `None` sends the request on to admission.
+/// What the durable record answers for a request or a resolve, ahead of
+/// admission and of the collector's memory: the retained result, gated
+/// as a fresh one is, or a status from the record. `None` sends the frame
+/// on: a request to admission, a resolve to the collector.
 ///
 /// [`Domain::retained`] with what it reads named: the frontend that holds
 /// the caller's binding and this node's store. Split out so it can be
 /// asked of a frontend bound on a node whose projection is behind.
+///
+/// A resolve is answered from the record too (task-d23). The collector
+/// remembers a bounded window of outcomes, and only those it collected
+/// itself, so an outcome evicted from it, or asked of a frontend that
+/// never saw the request, was `Unknown` while this node held the executed
+/// record. A resolve names no request, and a result is gated against the
+/// request it answers; this node's payload row says what the request was
+/// while it keeps one. Without it, only a retirement is answered here.
 fn retained_answer<P: Persistence>(
     frontend: &mut BoundFrontend,
     store: &P,
@@ -3555,10 +5158,15 @@ fn retained_answer<P: Persistence>(
 ) -> Option<Vec<u8>> {
     use coord_storage::retry::Resolution;
 
-    let MessageV1::Request(request) = decode(frame).ok()? else {
-        return None;
+    let (key, command, logical, resolving) = match decode(frame).ok()? {
+        MessageV1::Request(request) => {
+            let logical = request.logical().ok()?;
+            let command = coord_types::CommandId::derive(&request.retry_key, &logical).ok()?;
+            (request.retry_key, command, Some(logical), false)
+        }
+        MessageV1::ResolveRequest(resolve) => (resolve.retry_key, resolve.command_id, None, true),
+        _ => return None,
     };
-    let key = request.retry_key;
     // The connection must be bound, and bound to the session whose
     // invocation this is. A retained result belongs to a session,
     // and reading one is not something an unbound caller -- or a
@@ -3567,32 +5175,88 @@ fn retained_answer<P: Persistence>(
     if !binding.active(health) || binding.session != key.session_id {
         return None;
     }
-    let logical = request.logical().ok()?;
-    let command = coord_types::CommandId::derive(&key, &logical).ok()?;
-    let resolved = {
+    let (logical, resolved, executed, below_floor) = {
         let gated = store.reader().snapshot().ok()?;
-        resolve_retained(gated.view(), key, command, &logical).ok()??
+        let view = gated.view();
+        let logical = logical.or_else(|| requested(view, key, command));
+        let resolved = match &logical {
+            Some(logical) => resolve_retained(view, key, command, logical).ok()??,
+            // Nothing to gate a result against: whatever the record holds
+            // is not handed out, and only a retirement, which needs no
+            // request, is answered -- the floor's own, or one read below
+            // for a session that may no longer execute.
+            None => match resolve_retained_unread(view, key, command).ok()?? {
+                known @ (Resolution::Retired { .. } | Resolution::NoSession) => known,
+                _ => return None,
+            },
+        };
+        let executed = matches!(resolved, Resolution::NoSession)
+            && coord_storage::retry::lookup(view, &key)
+                .ok()
+                .flatten()
+                .is_some_and(|record| record.command_id == command);
+        // A session that may no longer execute is answered `NoSession`
+        // before its floor is read, and retirement deleted the rows it
+        // covered. The floor row is still durable, and a sequence at or
+        // below it was retired: that is known here, whatever the
+        // collector still remembers. To a request as to a resolve: a
+        // sequence at or below the floor never executes again (`admit`
+        // answers it `TooOld`), and one that did executed with its row
+        // deleted, so `NOT_ADMITTED` could name a command that ran.
+        let below_floor = matches!(resolved, Resolution::NoSession)
+            && !executed
+            && coord_storage::retry::floor(view, &key.session_id, &key.client_instance_id, 0)
+                .ok()
+                .is_some_and(|floor| key.request_sequence <= floor.floor);
+        (logical, resolved, executed, below_floor)
     };
     let record = match resolved {
         Resolution::Result(record) => record,
         // The command executed, and this caller may not have what it
-        // produced -- or may not execute at all any more. The same
-        // refusal the output gate gives a live result it will not
-        // disclose; the command is not proposed a second time.
+        // produced -- or may not execute at all any more. The status the
+        // output gate gives a live result it will not disclose; the
+        // command is not proposed a second time, and it is not reported
+        // as never admitted (task-d23).
+        Resolution::Unauthorized => {
+            return withheld(command, "output not authorized by current policy");
+        }
+        Resolution::NoSession if executed => {
+            return withheld(command, "the session may no longer read this result");
+        }
+        // The session may no longer execute, and nothing says this
+        // command ran: at or below the floor it is retired, to a request
+        // and to a resolve; above it, a request is not admitted and a
+        // resolve is left to the collector's memory.
+        Resolution::NoSession if below_floor => {
+            return status(
+                command,
+                coord_collector::codes::RESULT_RETIRED,
+                "retired: the result is no longer kept",
+            );
+        }
+        Resolution::NoSession if resolving => return None,
         Resolution::NoSession => {
             return refusal(command, "the session may no longer execute");
         }
-        Resolution::Unauthorized => {
-            return refusal(command, "output not authorized by current policy");
+        // Retired below the floor: to a resolve, the outcome is no longer
+        // retrievable (task-d23). A request goes on to admission, which
+        // decides a retired sequence at the command's own position.
+        Resolution::Retired { .. } if resolving => {
+            return status(
+                command,
+                coord_collector::codes::RESULT_RETIRED,
+                "retired: the result is no longer kept",
+            );
         }
-        // Not executed, retired below the floor, or a retry key bound
-        // to another payload: replicated execution decides each of
-        // those at the command's own position, not this node from a
-        // record that is not this command's.
+        // Not executed, or a retry key bound to another payload:
+        // replicated execution, or the collector for a resolve, decides
+        // each of those, not this node from a record that is not this
+        // command's.
         Resolution::Pending | Resolution::Retired { .. } | Resolution::Conflict { .. } => {
             return None;
         }
     };
+    let logical = logical?;
     let response = coord_types::wire_v1::ResponseV1 {
         command_id: command,
         outcome: coord_types::wire_v1::OutcomeV1::Ok {
@@ -3613,6 +5277,62 @@ fn retained_answer<P: Persistence>(
         Delivered::Answer(delivery) => Some(delivery.frame),
         Delivered::Unbound { .. } => None,
     }
+}
+
+/// The request an invocation made, from this node's payload row for
+/// `command` (task-d23): only a row under the invocation's own retry key,
+/// whose request derives the command's identity again.
+///
+/// The row's `admission` is not consulted: re-deriving the identity from
+/// the key and the request binds the bytes, whichever admission carried
+/// them.
+fn requested<V: coord_store_api::OrderedRead>(
+    view: &V,
+    key: RetryKey,
+    command: CommandId,
+) -> Option<coord_types::logical_v1::LogicalRequest> {
+    let bytes = view
+        .get(
+            coord_store_api::Collection::PayloadV1.id(),
+            &coord_consensus::rows::payload_key(&command),
+        )
+        .ok()??;
+    let payload = coord_consensus::rows::decode_payload(&bytes).ok()?;
+    if payload.retry_key != key {
+        return None;
+    }
+    let logical: coord_types::logical_v1::LogicalRequest =
+        postcard::from_bytes(&payload.logical).ok()?;
+    (CommandId::derive(&key, &logical).ok()? == command).then_some(logical)
+}
+
+/// [`resolve_retained`] without the request: nothing is authorized, so a
+/// retained result reads as `Unauthorized` and is never handed out.
+fn resolve_retained_unread<V: coord_store_api::OrderedRead>(
+    view: &V,
+    key: RetryKey,
+    command: CommandId,
+) -> Result<Option<coord_storage::retry::Resolution>, coord_store_api::EngineError> {
+    use coord_storage::retry::RetryBinding;
+    if view
+        .get(
+            coord_store_api::Collection::SessionV1.id(),
+            &coord_storage::codecs::session_key(&key.session_id),
+        )?
+        .is_none()
+    {
+        return Ok(None);
+    }
+    coord_storage::retry::resolve(
+        view,
+        &RetryBinding {
+            retry_key: key,
+            command_id: command,
+            retires: None,
+        },
+        |_| false,
+    )
+    .map(Some)
 }
 
 /// What this node's record says about the invocation `key` names, before
@@ -3677,8 +5397,9 @@ mod tests {
     use coord_types::ids::{ReplicaId, ReplicaIncarnation};
 
     use super::{
-        PAYLOAD_RETRY, PEER_BEFORE_API, RECURRING_REASONS, Recurring, SAID_IN_FULL, addressed,
-        ask_for_payloads_now, payload_batch_size, poll_api_first,
+        FLUSH_EVENTS, FLUSH_QUEUED, PAYLOAD_RETRY, PEER_BEFORE_API, RECURRING_REASONS, Recurring,
+        SAID_IN_FULL, addressed, ask_for_payloads_now, flush_due, payload_batch_size,
+        poll_api_first,
     };
 
     /// A session this node has not projected yet is "not yet", not a
@@ -4014,6 +5735,193 @@ mod tests {
             "{:?}",
             response.outcome
         );
+
+        // task-d23: a resolve is answered from the record too.
+        let answer = |frontend: &mut BoundFrontend,
+                      store: &StoreWorker<ModelEngine>,
+                      frame: &Frame|
+         -> Option<OutcomeV1> {
+            let bytes = super::retained_answer(frontend, store, &health, CONNECTION, frame)?;
+            match decode_stream(&bytes).unwrap().as_slice() {
+                [MessageV1::Response(response)] => Some(response.outcome.clone()),
+                other => panic!("{other:?}"),
+            }
+        };
+        let code_of = |outcome: Option<OutcomeV1>| match outcome {
+            Some(OutcomeV1::Err { code, .. }) => Some(code),
+            other => panic!("{other:?}"),
+        };
+        let invocation = |sequence: u64| {
+            let key = RetryKey {
+                request_sequence: RequestSequence::new(sequence).unwrap(),
+                ..retry
+            };
+            (key, CommandId::derive(&key, &logical).unwrap())
+        };
+        let resolve_frame = |key: RetryKey, command: CommandId| {
+            frame_of(
+                &MessageV1::ResolveRequest(coord_types::wire_v1::ResolveRequestV1 {
+                    retry_key: key,
+                    command_id: command,
+                })
+                .encode()
+                .unwrap(),
+            )
+        };
+        let request_frame = |key: RetryKey| {
+            frame_of(
+                &MessageV1::Request(RequestV1::new(key, &logical, 0, 0).unwrap())
+                    .encode()
+                    .unwrap(),
+            )
+        };
+        let mut write = |store: &mut StoreWorker<ModelEngine>, updates| {
+            store
+                .submit(PersistBatch {
+                    barrier: barriers.allocate(),
+                    base: Some(store.application_base()),
+                    updates,
+                })
+                .unwrap();
+            assert_eq!(store.flush().unwrap().committed, 1);
+        };
+        // The executed record of an invocation this frontend never saw,
+        // and the payload row that says what it asked. The retained
+        // outcome is a denial, which any caller may have replayed.
+        let executed = |key: RetryKey, command: CommandId, payload: bool| {
+            let response = postcard::to_allocvec(&Response {
+                revision: KvRevision::new(3).unwrap(),
+                outcome: Outcome::ErrPermissionDenied,
+            })
+            .unwrap();
+            let mut updates = vec![coord_core::StoreUpdate {
+                collection: coord_store_api::Collection::RetryV1.id(),
+                key: coord_storage::codecs::retry_key(&key),
+                value: Some(
+                    coord_storage::codecs::encode_retry(&coord_storage::codecs::RetryRecordV1 {
+                        command_id: command,
+                        position: coord_types::ids::ExecutionPosition::new(3).unwrap(),
+                        revision: None,
+                        result_digest: coord_storage::retry::result_digest(&response),
+                        response,
+                    })
+                    .unwrap(),
+                ),
+            }];
+            if payload {
+                updates.push(
+                    coord_consensus::rows::payload_update(
+                        &command,
+                        &coord_consensus::PayloadRecordV1 {
+                            retry_key: key,
+                            logical: logical.canonical_bytes().unwrap(),
+                            admission: None,
+                            ack_through: 0,
+                        },
+                    )
+                    .unwrap(),
+                );
+            }
+            updates
+        };
+        write(
+            &mut store,
+            coord_storage::policy::bootstrap_session(&SESSION, ALICE, 4, true).unwrap(),
+        );
+        let (key2, command2) = invocation(2);
+        write(&mut store, executed(key2, command2, true));
+        // Asked of a frontend that never saw the request: the executed
+        // result, from the record, through the output gate.
+        let resolved = answer(&mut frontend, &store, &resolve_frame(key2, command2));
+        assert!(
+            matches!(&resolved, Some(OutcomeV1::Ok { .. })),
+            "{resolved:?}"
+        );
+        // Without the payload row nothing can be gated, and the collector
+        // answers from its memory.
+        let (key3, command3) = invocation(3);
+        write(&mut store, executed(key3, command3, false));
+        assert_eq!(
+            answer(&mut frontend, &store, &resolve_frame(key3, command3)),
+            None
+        );
+        // Past the retirement floor: retired, not unknown.
+        write(
+            &mut store,
+            vec![coord_core::StoreUpdate {
+                collection: coord_store_api::Collection::RetryFloorV1.id(),
+                key: coord_storage::codecs::retry_floor_key(&SESSION, &retry.client_instance_id),
+                value: Some(
+                    coord_storage::codecs::encode_retry_floor(
+                        &coord_storage::codecs::RetryFloorV1 {
+                            floor: RequestSequence::new(4).unwrap(),
+                            width: 4,
+                        },
+                    )
+                    .unwrap(),
+                ),
+            }],
+        );
+        let (key4, command4) = invocation(4);
+        assert_eq!(
+            code_of(answer(
+                &mut frontend,
+                &store,
+                &resolve_frame(key4, command4)
+            )),
+            Some(coord_collector::codes::RESULT_RETIRED)
+        );
+        // Retired again, the session may not read what the command it
+        // executed produced: withheld, to a request and to a resolve,
+        // and never reported as not admitted.
+        write(
+            &mut store,
+            coord_storage::policy::bootstrap_session(&SESSION, ALICE, 4, false).unwrap(),
+        );
+        let (key5, command5) = invocation(5);
+        write(&mut store, executed(key5, command5, true));
+        assert_eq!(
+            code_of(answer(&mut frontend, &store, &request_frame(key5))),
+            Some(coord_collector::codes::OUTPUT_WITHHELD)
+        );
+        assert_eq!(
+            code_of(answer(
+                &mut frontend,
+                &store,
+                &resolve_frame(key5, command5)
+            )),
+            Some(coord_collector::codes::OUTPUT_WITHHELD)
+        );
+        // A session that may no longer execute is refused before its
+        // floor is read, and retirement deleted the row: what the floor
+        // covers is still retired, not left to the collector's memory.
+        assert_eq!(
+            code_of(answer(
+                &mut frontend,
+                &store,
+                &resolve_frame(key4, command4)
+            )),
+            Some(coord_collector::codes::RESULT_RETIRED)
+        );
+        // And to a request re-sent at or below the floor, say by a client
+        // restored from before its acknowledgement: retired too. Not
+        // admitted would tell it a write that may have happened did not.
+        assert_eq!(
+            code_of(answer(&mut frontend, &store, &request_frame(key4))),
+            Some(coord_collector::codes::RESULT_RETIRED)
+        );
+        // Above the floor, with no record, nothing is known here; a
+        // request there is not admitted, since the session may no longer
+        // execute.
+        let (key6, command6) = invocation(6);
+        assert_eq!(
+            answer(&mut frontend, &store, &resolve_frame(key6, command6)),
+            None
+        );
+        assert_eq!(
+            code_of(answer(&mut frontend, &store, &request_frame(key6))),
+            Some(coord_collector::codes::NOT_ADMITTED)
+        );
     }
 
     /// Held evidence registers when it is due to be let go.
@@ -4045,6 +5953,34 @@ mod tests {
     /// 4560 api events and then not one more while its peer arm took
     /// another 80000, and every caller bound to that frontend waited
     /// out its deadline against a node that was otherwise working.
+    /// A full group queued behind an append that is out is not a flush
+    /// (task-d54): it could move nothing until the append is back.
+    #[test]
+    fn a_full_group_behind_an_append_out_is_not_flushed() {
+        assert!(flush_due(FLUSH_QUEUED, false, false, 0));
+        assert!(!flush_due(FLUSH_QUEUED, true, false, 0));
+        assert!(!flush_due(FLUSH_QUEUED * 4, true, false, 0));
+        assert!(!flush_due(FLUSH_QUEUED - 1, false, false, FLUSH_EVENTS));
+        // A flush owed after a run of events is owed whatever is out:
+        // `owes_flush` already leaves out what waits on the append.
+        assert!(flush_due(0, true, true, FLUSH_EVENTS));
+        assert!(!flush_due(0, false, true, FLUSH_EVENTS - 1));
+    }
+
+    #[test]
+    fn an_acknowledgement_cadence_is_a_threshold_and_a_delay() {
+        assert_eq!(
+            super::ack_frequency("4, 2000"),
+            Some(coord_transport::AckFrequency {
+                threshold: 4,
+                max_delay: std::time::Duration::from_millis(2),
+            })
+        );
+        for malformed in ["", "4", "4,", ",2000", "four,2000", "4,2ms", "-1,2000"] {
+            assert_eq!(super::ack_frequency(malformed), None, "{malformed:?}");
+        }
+    }
+
     #[test]
     fn the_peer_planes_priority_is_bounded_so_a_caller_is_never_starved() {
         // Ordinary: the peer plane goes first, which is the ordering
@@ -4060,7 +5996,12 @@ mod tests {
         // recovery summary -- and small enough that a caller waits for
         // a bounded number of frames rather than for the domain to go
         // quiet.
-        assert!((8..=1024).contains(&PEER_BEFORE_API));
+        //
+        // And it is the caller's plane's share when the peer plane never
+        // goes quiet: one event in `PEER_BEFORE_API + 1`. At 64 a
+        // catching-up replica's callers got 2 to 7 events a second and
+        // waited out their deadlines on answers already on the wire.
+        assert!((8..=16).contains(&PEER_BEFORE_API));
     }
 
     /// A condition that keeps happening is said in full a few times and
@@ -4352,5 +6293,359 @@ mod tests {
             .expect("ends at the moved deadline")
             .expect("no panic");
         assert!(super::unix_millis() >= now + 600);
+    }
+
+    /// A dial that reaches none of a voter's addresses says why the one
+    /// that serves its plane failed, whichever order they are listed in
+    /// (task-d16).
+    ///
+    /// The voter's api address answers every peer dial with the other
+    /// plane's refusal (TLS alert 120). A dial kept only the last
+    /// address's error, so a catalog that listed the peer address first
+    /// logged that refusal and discarded why the peer address itself had
+    /// failed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_dial_names_the_peer_addresss_error_not_the_api_listeners_refusal() {
+        use coord_transport::{Class, Lane, Limits, Transport, TransportError};
+        use coord_transport_testkit::{TestBinder, TestCa};
+        use coord_types::ids::{ClusterId, DomainId};
+        use coord_types::wire_v1::PeerRole;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        const CLUSTER: ClusterId = ClusterId([1; 16]);
+        const DOMAIN: DomainId = DomainId([2; 16]);
+        let limits = Limits {
+            handshake_timeout: Duration::from_millis(500),
+            ..Limits::default()
+        };
+        let ca = TestCa::new();
+        let target = ca.issue(
+            "node-0",
+            ReplicaId([0; 16]),
+            ReplicaIncarnation::new(1).unwrap(),
+            PeerRole::Voter,
+        );
+        let me = ca.issue(
+            "node-1",
+            ReplicaId([1; 16]),
+            ReplicaIncarnation::new(1).unwrap(),
+            PeerRole::Voter,
+        );
+        let mut binder = TestBinder::new(CLUSTER, DOMAIN);
+        binder.register(&target);
+        binder.register(&me);
+        let binder = Arc::new(binder);
+        // The target's api listener, and a peer address nothing answers.
+        let mut local = target.local(&ca, CLUSTER, DOMAIN, vec![1, 2]);
+        local.serves = Some(Class::Api);
+        let api = Transport::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            local,
+            binder.clone(),
+            limits,
+        )
+        .unwrap();
+        let api_address = api.local_addr().unwrap();
+        let closed = std::net::UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let dialer = Transport::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            me.local(&ca, CLUSTER, DOMAIN, vec![1, 2]),
+            binder,
+            limits,
+        )
+        .unwrap();
+
+        for addresses in [[closed, api_address], [api_address, closed]] {
+            let peer = crate::peers::Peer {
+                replica: target.replica,
+                incarnation: target.incarnation,
+                addresses: addresses
+                    .iter()
+                    .map(|a| (*a, target.name.clone()))
+                    .collect(),
+            };
+            let unreached = super::dial(
+                &dialer.dialer(),
+                &peer,
+                Some(me.incarnation),
+                PeerRole::Voter,
+                Lane::Control,
+            )
+            .await
+            .expect_err("nothing serves the peer plane");
+            // Both addresses were tried, and the api listener's answer
+            // was the refusal of the other plane.
+            assert_eq!(unreached.0.len(), 2);
+            assert!(
+                unreached
+                    .0
+                    .iter()
+                    .any(|(address, e)| *address == api_address
+                        && matches!(e, TransportError::WrongPlane))
+            );
+            let said = unreached.to_string();
+            assert!(
+                said.starts_with(&format!("{closed}: ")),
+                "{addresses:?}: {said}"
+            );
+            assert!(!said.contains(&api_address.to_string()), "{said}");
+        }
+
+        // A voter all of whose addresses serve the other plane is said to
+        // be that, not a connection failure.
+        let peer = crate::peers::Peer {
+            replica: target.replica,
+            incarnation: target.incarnation,
+            addresses: vec![(api_address, target.name.clone())],
+        };
+        let unreached = super::dial(
+            &dialer.dialer(),
+            &peer,
+            Some(me.incarnation),
+            PeerRole::Voter,
+            Lane::Control,
+        )
+        .await
+        .expect_err("the api listener serves no peer dial");
+        assert_eq!(
+            unreached.to_string(),
+            "every address listed serves the other plane"
+        );
+    }
+
+    /// The pieces of a divergence stop's description (task-d17).
+    mod divergence {
+        use coord_collector::{Differs, Mismatch, MismatchCheck, ReleaseOrigin, Said};
+        use coord_storage::codecs::ExecutedRecordV1;
+        use coord_types::CommandId;
+        use coord_types::identity::Digest32;
+        use coord_types::ids::{
+            Ballot, ConfigurationEpoch, ExecutionPosition, KvRevision, ReplicaId,
+        };
+
+        pub(super) const COMMAND: CommandId = CommandId(Digest32([0xab; 32]));
+
+        fn ballot(number: u64, leader: u8) -> Ballot {
+            Ballot {
+                epoch: ConfigurationEpoch::new(1).unwrap(),
+                number,
+                leader: ReplicaId([leader; 16]),
+            }
+        }
+
+        fn at(position: u64) -> ExecutionPosition {
+            ExecutionPosition::new(position).unwrap()
+        }
+
+        /// A mismatch on `check`, where the release and this node agree
+        /// except on what `fork` changes on this node's side.
+        pub(super) fn mismatch(check: MismatchCheck, fork: impl FnOnce(&mut Said)) -> Mismatch {
+            let release = Said {
+                release: Some(ReleaseOrigin {
+                    sender: ReplicaId([5; 16]),
+                    epoch: ConfigurationEpoch::new(1).unwrap(),
+                    ballot: ballot(2, 5),
+                    speculative: true,
+                }),
+                position: at(122),
+                revision: Some(KvRevision::new(40).unwrap()),
+                result_digest: Digest32([0x11; 32]),
+                response_len: 9,
+            };
+            let mut own = Said {
+                release: None,
+                ..release
+            };
+            fork(&mut own);
+            Mismatch {
+                command: COMMAND,
+                check,
+                release,
+                own,
+                differs: Differs {
+                    position: release.position != own.position,
+                    revision: release.revision != own.revision,
+                    result_digest: release.result_digest != own.result_digest,
+                    response: release.response_len != own.response_len,
+                },
+            }
+        }
+
+        pub(super) fn describe(mismatch: &Mismatch) -> String {
+            let rows = [120, 121, 122, 123].map(|p| {
+                (
+                    CommandId(Digest32([u8::try_from(p).unwrap(); 32])),
+                    ExecutedRecordV1 {
+                        position: at(p),
+                        revision: None,
+                        result_digest: Digest32([0x22; 32]),
+                    },
+                )
+            });
+            super::super::describe_divergence(mismatch, ballot(2, 5), Some(at(123)), &rows)
+        }
+    }
+
+    /// A stop whose release and record disagree only on the position says
+    /// the commands were executed in another order, and says which field
+    /// differs (task-d17).
+    #[test]
+    fn a_position_only_mismatch_says_another_order_and_names_the_position() {
+        use coord_collector::MismatchCheck;
+        let m = divergence::mismatch(MismatchCheck::HeldReleaseAgainstRecord, |own| {
+            own.position = coord_types::ids::ExecutionPosition::new(121).unwrap();
+        });
+        let said = divergence::describe(&m);
+        let first = said.lines().next().unwrap();
+        assert!(first.contains("in another order than the leader"), "{said}");
+        assert!(said.contains("\n  differs: position\n"), "{said}");
+        assert!(
+            said.contains(
+                "\n  compared: the leader's release this node held, against this node's own \
+                 record of the command\n"
+            ),
+            "{said}"
+        );
+        assert!(
+            said.contains(&format!(
+                "\n  command: {}\n",
+                coord_collector::trace::command_hex(&divergence::COMMAND)
+            )),
+            "{said}"
+        );
+        // Both sides, the release with where it came from and the record
+        // with nothing to say about that.
+        assert!(
+            said.contains(
+                "\n  release: sender 05050505 epoch 1 ballot 2 (leader 05050505) speculative \
+                 true position 122 revision 40 digest 1111"
+            ),
+            "{said}"
+        );
+        assert!(
+            said.contains("\n  record: from this node's record position 121 revision 40"),
+            "{said}"
+        );
+        assert!(said.contains(" response 9 bytes"), "{said}");
+        assert!(
+            said.contains("\n  this node: ballot 2 leader 05050505 executed_through 123\n"),
+            "{said}"
+        );
+        assert!(
+            said.contains(
+                "\n  executed_v1 within 8 of positions 121 and 122 (position revision digest \
+                 command):\n    120 - 2222"
+            ),
+            "{said}"
+        );
+        assert_eq!(said.lines().filter(|l| l.starts_with("    12")).count(), 4);
+    }
+
+    /// A stop whose release and answer disagree only on the result digest
+    /// does not say the commands were ordered otherwise: at one position,
+    /// the command produced something else (task-d17).
+    #[test]
+    fn a_digest_only_mismatch_does_not_say_another_order() {
+        use coord_collector::MismatchCheck;
+        let m = divergence::mismatch(MismatchCheck::LateReleaseAgainstAnswer, |own| {
+            own.result_digest = coord_types::identity::Digest32([0x33; 32]);
+        });
+        let said = divergence::describe(&m);
+        assert!(!said.contains("another order"), "{said}");
+        assert!(
+            said.lines()
+                .next()
+                .unwrap()
+                .contains("disagree, at the same position,"),
+            "{said}"
+        );
+        assert!(said.contains("\n  differs: result digest\n"), "{said}");
+        assert!(
+            said.contains(
+                "\n  compared: a release that arrived after this node answered, against the \
+                 answer it gave\n"
+            ),
+            "{said}"
+        );
+        assert!(
+            said.contains("\n  answer: from this node's record "),
+            "{said}"
+        );
+    }
+
+    /// A command pulled from a peer's executed history that this node
+    /// executed otherwise stops it under the same prefix, and the stop
+    /// names catch-up as what was compared and the peer as the other side
+    /// (task-d08).
+    #[test]
+    fn a_catch_up_mismatch_names_the_catch_up_check() {
+        use coord_collector::MismatchCheck;
+        let m = divergence::mismatch(MismatchCheck::CatchUpAgainstDonor, |own| {
+            own.result_digest = coord_types::identity::Digest32([0x33; 32]);
+        });
+        let said = divergence::describe(&m);
+        let first = said.lines().next().unwrap();
+        assert!(
+            first.starts_with("this node stopped: release-record-mismatch(abababab): "),
+            "{said}"
+        );
+        assert!(
+            first.contains("the execution of that command a peer served this node to catch up"),
+            "{said}"
+        );
+        assert!(first.contains("something else than that peer's"), "{said}");
+        assert!(said.contains("\n  compared: catch-up: "), "{said}");
+        assert!(said.contains("\n  differs: result digest\n"), "{said}");
+        assert!(said.contains("\n  release: sender 05050505 "), "{said}");
+        assert!(
+            said.contains("\n  own execution: from this node's record "),
+            "{said}"
+        );
+    }
+
+    /// Whatever the stop goes on to say, its first line starts as every
+    /// earlier stop's did, so what searches logs for it still finds it
+    /// (task-d17).
+    #[test]
+    fn a_divergence_stop_keeps_its_prefix() {
+        use coord_collector::MismatchCheck;
+        for check in [
+            MismatchCheck::HeldReleaseAgainstRecord,
+            MismatchCheck::LateReleaseAgainstAnswer,
+            MismatchCheck::CatchUpAgainstDonor,
+        ] {
+            let m = divergence::mismatch(check, |own| own.response_len += 1);
+            let said = divergence::describe(&m);
+            assert!(
+                said.starts_with("this node stopped: release-record-mismatch(abababab): "),
+                "{said}"
+            );
+            assert!(said.contains("\n  differs: response\n"), "{said}");
+        }
+    }
+
+    /// task-d21: a recovery-cycle stop names its prefix, how many entries
+    /// could not be ordered, and the first eight in full.
+    #[test]
+    fn a_recovery_cycle_stop_names_the_commands() {
+        let commands: Vec<super::CommandId> = (0..10u8)
+            .map(|i| super::CommandId(coord_types::identity::Digest32([0xc0 + i; 32])))
+            .collect();
+        let said = super::describe_recovery_cycle(&commands[..2]);
+        assert!(
+            said.starts_with("this node stopped: recovery-cycle(c0c0c0c0): "),
+            "{said}"
+        );
+        assert!(said.contains("2 entries could not be ordered"), "{said}");
+        assert!(said.contains(&"c1".repeat(32)), "{said}");
+        let said = super::describe_recovery_cycle(&commands);
+        assert!(said.contains("10 entries"), "{said}");
+        assert!(said.contains(&"c7".repeat(32)), "{said}");
+        assert!(!said.contains(&"c8".repeat(32)), "{said}");
+        assert!(said.contains(", ..."), "{said}");
     }
 }

@@ -1,0 +1,951 @@
+# Jepsen tests through the native client (docs/operations/jepsen.md).
+#
+# Stands a domain up across a cluster of Debian containers on this runner,
+# one voter per container, and runs the `jepsen.tuplesky` test from the
+# `tuplesky/jepsen` repository against it with this runner as the control
+# node. Each Jepsen process drives the domain through `coord-jepsen`.
+#
+# Beside it, on a runner of its own, `etcd-baseline` runs Jepsen's own etcd
+# test (jepsen-io/etcd) against etcd on the same cluster, with the same
+# workload, faults, time limit, concurrency, rate and fault interval, so a
+# run's throughput and fault behaviour have a baseline to compare with.
+# `swiftpaxos-baseline` does the same for SwiftPaxos (imdea-software/swiftpaxos),
+# the reference implementation of the protocol TupleSky's consensus follows,
+# with the `jepsen.swiftpaxos` test from the same repository: linearizable
+# registers (SwiftPaxos has no transactions), and pause and partition only,
+# since a killed SwiftPaxos replica cannot rejoin.
+#
+# A run's scenario sets the load, the faults and the network for all three
+# (scripts/ci/jepsen_scenario.sh): `faults` (the default, and the weekly and
+# pull-request runs), `throughput` (no faults, unthrottled clients, the most
+# each system sustains), `wan` (three simulated regions, with packet faults
+# on top: jepsen.tuplesky.wan) and `wan-throughput`.
+#
+# Like the Kubernetes certification, this is a qualification run and not
+# part of `CI`: it is dispatched, weekly, or run once for a pull request
+# that changes the Jepsen harness itself. A Jepsen run that finds an anomaly or a crash is
+# doing its job; its store directory is uploaded either way.
+name: jepsen
+
+on:
+  workflow_dispatch:
+    inputs:
+      jepsen-ref:
+        description: Branch, tag or commit of tuplesky/jepsen to run
+        default: main
+      scenario:
+        description: "faults (kill, pause, partition at 20/s), throughput (no faults, unthrottled, register), wan (three simulated regions, packet faults) or wan-throughput"
+        type: choice
+        options: [faults, throughput, wan, wan-throughput]
+        default: faults
+      workload:
+        description: "append, wr or register; empty for the scenario's"
+        default: ""
+      nemesis:
+        description: "Comma-separated faults (kill, pause, partition, packet), or none; empty for the scenario's. Not clock: the containers share this runner's clock."
+        default: ""
+      wan:
+        description: "The network between the nodes: none, regions, or one-way milliseconds between every two; empty for the scenario's"
+        default: ""
+      time-limit:
+        description: "Seconds of workload before healing; empty for the scenario's (300, or 120 for throughput)"
+        default: ""
+      concurrency:
+        description: "Clients, as a number or a multiple of the nodes such as 5n; empty for the scenario's (2n, or 10n for throughput)"
+        default: ""
+      nodes:
+        description: Voters (containers), 3 or 5
+        default: "5"
+      etcd-version:
+        description: "etcd for the baseline: a version such as 3.7.2, latest (the newest stable release), or none to skip it"
+        default: latest
+      store:
+        description: "Where TupleSky's voters and etcd keep their stores: disk, or tmpfs to measure without the runner's disk"
+        type: choice
+        options: [disk, tmpfs]
+        default: disk
+      profile:
+        description: "TupleSky's journal profile: strict, or replay (task-j06: projection commits made durable on a cadence and replayed after a crash; not a default)"
+        type: choice
+        options: [strict, replay]
+        default: strict
+      checkpoint-after-records:
+        description: "Journal records each TupleSky voter holds past its last local checkpoint before publishing the next (task-d55); 0 never publishes; empty for the profile's default (4096 under strict; 65536 and 30 s under replay, task-d51)"
+        default: ""
+      voter-workers:
+        description: "Tokio worker threads per TupleSky voter (TOKIO_WORKER_THREADS, through jepsen.tuplesky's --voter-workers): 2, the job's standard (five voters on a 4-CPU runner), or default for tokio's one per runner core, which each co-located voter takes"
+        default: "2"
+      voter-env:
+        description: "An environment variable every TupleSky voter starts with in every run, as NAME=VALUE (through jepsen.tuplesky's --voter-env), such as COORDD_ACK_FREQUENCY=8,25000; empty for none"
+        default: ""
+      key-count:
+        description: "Keys in play at once in TupleSky's append or wr workload (Elle's key-count, through jepsen.tuplesky's --key-count); empty for the harness's 3"
+        default: ""
+      key-dist:
+        description: "How TupleSky's append or wr workload picks among those keys (Elle's key-dist, through jepsen.tuplesky's --key-dist): uniform, or exponential (a few hot keys); empty for the harness's exponential"
+        default: ""
+      pair-base:
+        description: "Run TupleSky in pairs on one runner against this base: a tuplesky ref (a branch, a tag or a full commit SHA, which actions/checkout needs whole) built beside the head, or env:NAME=VALUE for the head's own build with that variable on every voter; empty for one run"
+        default: ""
+      pairs:
+        description: "How many base and head pairs, when pair-base is set (the order alternates from pair to pair)"
+        default: "3"
+      leader-profile:
+        description: "Profile the TupleSky leader's domain thread with perf for 20 s in each run's workload, into its summary: true (flat), call-graph (call graphs by frame pointer, on the first pair's runs in a paired job, with every build in the job made with frame pointers; also the busiest follower, the leader's tokio threads and its threads' system calls), or false"
+        type: choice
+        options: ["false", "true", "call-graph"]
+        default: "false"
+      swiftpaxos:
+        description: "Faults for the SwiftPaxos baseline (pause, partition, packet; kill ends its cluster), none, or skip to not run it; empty for the scenario's"
+        default: ""
+  # A change to the Jepsen harness itself runs it once, on the pull
+  # request, with the defaults. Not a required check.
+  pull_request:
+    paths:
+      - .github/workflows/jepsen.yml
+      - crates/coord-jepsen/**
+      - scripts/ci/cpu_sampler.py
+      - scripts/ci/jepsen_bounded.sh
+      - scripts/ci/jepsen_pairs.py
+      - scripts/ci/leader_profile.py
+      - scripts/ci/jepsen_scenario.sh
+      - scripts/ci/jepsen_summary.py
+  schedule:
+    # Weekly, after the Kubernetes certification.
+    - cron: "17 6 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: jepsen-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # Scheduled runs have no inputs; these are the dispatch defaults. The
+  # load, faults and network come from the scenario, in each job's first
+  # step (scripts/ci/jepsen_scenario.sh); a non-empty input overrides it.
+  JEPSEN_REF: ${{ inputs.jepsen-ref || 'main' }}
+  SCENARIO: ${{ inputs.scenario || 'faults' }}
+  IN_WORKLOAD: ${{ inputs.workload }}
+  IN_NEMESIS: ${{ inputs.nemesis }}
+  IN_WAN: ${{ inputs.wan }}
+  IN_TIME_LIMIT: ${{ inputs.time-limit }}
+  IN_CONCURRENCY: ${{ inputs.concurrency }}
+  IN_SWIFTPAXOS: ${{ inputs.swiftpaxos }}
+  IN_STORE: ${{ inputs.store }}
+  IN_PROFILE: ${{ inputs.profile }}
+  IN_CHECKPOINT_AFTER_RECORDS: ${{ inputs.checkpoint-after-records }}
+  # Scheduled and pull-request runs have no inputs: two workers, the
+  # job's standard, as a dispatch's default.
+  IN_VOTER_WORKERS: ${{ inputs.voter-workers || '2' }}
+  IN_VOTER_ENV: ${{ inputs.voter-env }}
+  IN_KEY_COUNT: ${{ inputs.key-count }}
+  IN_KEY_DIST: ${{ inputs.key-dist }}
+  IN_PAIR_BASE: ${{ inputs.pair-base }}
+  IN_PAIRS: ${{ inputs.pairs || '3' }}
+  IN_LEADER_PROFILE: ${{ inputs.leader-profile || 'false' }}
+  NODES: ${{ inputs.nodes || '5' }}
+  ETCD_VERSION: ${{ inputs.etcd-version || 'latest' }}
+  # jepsen-io/etcd, pinned; its head when the baseline was added.
+  ETCD_TEST_REPO: jepsen-io/etcd
+  ETCD_TEST_REF: b47cc401f27bfb7c28afd9ac088b5f0dca4501b8
+  LEIN_VERSION: 2.11.2
+  LEIN_SHA256: f83e3de252cb09d301f18f1912acffa807b54c1c9a96772ae63847a946032bd4
+
+jobs:
+  jepsen:
+    name: jepsen (docker cluster)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      # A call-graph profile walks the leader's stack by its frame pointers:
+      # DWARF unwinding from a copied stack stopped short of the domain loop
+      # in nine samples of ten, below the runtime's block_on. Every build in
+      # the job, a pair's base included, takes them, so a pair compares like
+      # with like.
+      RUSTFLAGS: ${{ inputs.leader-profile == 'call-graph' && '-C force-frame-pointers=yes' || '' }}
+      # The C the build compiles through `cc` too (mimalloc's, task-d60),
+      # which Rust's flag does not reach: without it the walk gives out
+      # inside the allocator.
+      CFLAGS: ${{ inputs.leader-profile == 'call-graph' && '-fno-omit-frame-pointer' || '' }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          path: tuplesky
+          persist-credentials: false
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          repository: tuplesky/jepsen
+          ref: ${{ env.JEPSEN_REF }}
+          path: jepsen
+          persist-credentials: false
+      - name: Choose the scenario's settings
+        run: |
+          tuplesky/scripts/ci/jepsen_scenario.sh
+          cat "$GITHUB_ENV"
+          . <(grep -E '^(SCENARIO|NEMESIS|SWIFTPAXOS_NEMESIS|WAN|RATE)=' "$GITHUB_ENV")
+          # The scenarios other than faults need jepsen.tuplesky.wan and
+          # --rate 0 (tuplesky/jepsen#4).
+          if [ ! -f jepsen/tuplesky/src/jepsen/tuplesky/wan.clj ] && \
+             { [ "$SCENARIO" != faults ] || [ "$WAN" != none ] || [ "$RATE" = 0 ] || \
+               [[ ",$NEMESIS,$SWIFTPAXOS_NEMESIS," == *,packet,* ]]; }; then
+            echo "::error::tuplesky/jepsen@$JEPSEN_REF has no jepsen.tuplesky.wan; dispatch with a jepsen-ref that has it (tuplesky/jepsen#4), or the faults scenario"
+            exit 1
+          fi
+      - name: Load the kernel's traffic shaping
+        # --wan and the packet fault shape each node's egress with a prio
+        # qdisc, netem bands and u32 filters. The containers share this
+        # runner's kernel, which loads them; the cloud kernel keeps netem in
+        # its extra modules.
+        run: |
+          if [ "$WAN" != none ] || [[ ",$NEMESIS," == *,packet,* ]]; then
+            sudo modprobe -a sch_prio sch_netem cls_u32 || {
+              sudo apt-get update -qq
+              sudo apt-get install -y -qq --no-install-recommends "linux-modules-extra-$(uname -r)"
+              sudo modprobe -a sch_prio sch_netem cls_u32
+            }
+            lsmod | grep -E '^(sch_prio|sch_netem|cls_u32) '
+          fi
+      - name: Install the exact Rust toolchain from rust-toolchain.toml
+        working-directory: tuplesky
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: tuplesky
+          key: jepsen
+      - name: Build the daemon, the harness and the Jepsen client
+        working-directory: tuplesky
+        run: cargo build --locked --release -p coordd -p coord-harness -p coord-jepsen
+      - name: Keep the head's binaries
+        if: env.IN_PAIR_BASE != ''
+        run: |
+          mkdir -p "$RUNNER_TEMP/head-bin"
+          for b in coordd coord-harness coord-jepsen coord-jepsen-executed; do
+            cp "tuplesky/target/release/$b" "$RUNNER_TEMP/head-bin/" 2>/dev/null || true
+          done
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        if: env.IN_PAIR_BASE != '' && !startsWith(env.IN_PAIR_BASE, 'env:')
+        with:
+          ref: ${{ inputs.pair-base }}
+          path: tuplesky-base
+          persist-credentials: false
+      - name: Build the pair's base
+        # Into the head's target directory, so the dependencies the two
+        # share are not built twice; the head's binaries are put back after.
+        if: env.IN_PAIR_BASE != '' && !startsWith(env.IN_PAIR_BASE, 'env:')
+        working-directory: tuplesky-base
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          echo "base: $IN_PAIR_BASE at $(git rev-parse --short HEAD)"
+          # A product branch has no coord-jepsen (it is this PR's); the
+          # base then runs the head's shim, which only the client uses.
+          shim=(); if [ -d crates/coord-jepsen ]; then shim=(-p coord-jepsen); fi
+          cargo build --locked --release -p coordd -p coord-harness ${shim[@]+"${shim[@]}"} \
+            --target-dir "$GITHUB_WORKSPACE/tuplesky/target"
+          mkdir -p "$RUNNER_TEMP/base-bin"
+          for b in coordd coord-harness coord-jepsen coord-jepsen-executed; do
+            cp "$GITHUB_WORKSPACE/tuplesky/target/release/$b" "$RUNNER_TEMP/base-bin/" 2>/dev/null || true
+            cp "$RUNNER_TEMP/head-bin/$b" "$GITHUB_WORKSPACE/tuplesky/target/release/" 2>/dev/null || true
+          done
+      - name: Install perf
+        if: env.IN_LEADER_PROFILE != 'false'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends "linux-tools-$(uname -r)" linux-tools-common \
+            || sudo apt-get install -y -qq --no-install-recommends linux-tools-azure linux-tools-common \
+            || echo "::warning::perf could not be installed; the leader's profile will say so"
+          sudo perf --version || true
+          # The loop runs a few dozen frames deep in the runtime; keep whole stacks.
+          sudo sysctl -w kernel.perf_event_max_stack=1024 || true
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.m2/repository
+            ~/.lein/self-installs
+          key: jepsen-m2-${{ hashFiles('jepsen/jepsen/project.clj', 'jepsen/tuplesky/project.clj') }}
+          restore-keys: jepsen-m2-
+      - name: Install Leiningen and this repository's Jepsen
+        run: |
+          # Jepsen's perf checker plots with gnuplot, and Elle renders an
+          # anomaly's cycle with graphviz; without them a clean history is
+          # reported :unknown.
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends gnuplot-nox graphviz
+          # JDK 21: Jepsen compiles its Java sources with `--release 21`.
+          # The lein script runs `java` from PATH (the runner's default is
+          # 17), not JAVA_HOME's, so both PATH and JAVA_CMD name it.
+          echo "JAVA_HOME=$JAVA_HOME_21_X64" >> "$GITHUB_ENV"
+          echo "JAVA_CMD=$JAVA_HOME_21_X64/bin/java" >> "$GITHUB_ENV"
+          echo "$JAVA_HOME_21_X64/bin" >> "$GITHUB_PATH"
+          export JAVA_HOME=$JAVA_HOME_21_X64
+          export JAVA_CMD=$JAVA_HOME_21_X64/bin/java
+          export PATH="$JAVA_HOME_21_X64/bin:$PATH"
+          java -version
+          mkdir -p "$HOME/bin"
+          curl -fsSL -o "$HOME/bin/lein" \
+            "https://raw.githubusercontent.com/technomancy/leiningen/$LEIN_VERSION/bin/lein"
+          echo "$LEIN_SHA256  $HOME/bin/lein" | sha256sum -c -
+          chmod +x "$HOME/bin/lein"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          (cd jepsen/jepsen && "$HOME/bin/lein" install)
+      - name: Run the Jepsen project's unit tests
+        working-directory: jepsen/tuplesky
+        run: lein test
+      - name: Stand the cluster up
+        # With store tmpfs, /opt, which holds each voter's binary and store
+        # (/opt/tuplesky), is a tmpfs. Not /opt/tuplesky itself: the test
+        # removes that at setup, and a mount point cannot be removed.
+        run: |
+          up=()
+          if [ "$STORE" = tmpfs ]; then up=(--tmpfs /opt); fi
+          # A profiled job runs the nodes on this runner's own Ubuntu,
+          # whose glibc keeps frame pointers (Debian's does not), so a
+          # call graph's frame-pointer walk leaves libc's allocator for its
+          # caller; and with glibc's debug symbols, where the jepsen-ref's
+          # up.sh can install them, so libc's local functions are named in
+          # a flat profile too (on Debian they are bare addresses, and the
+          # allocator, memcmp and memmove groups miss them).
+          if [ "$IN_LEADER_PROFILE" != false ]; then
+            up+=(--base ubuntu:24.04)
+            if grep -q -- '--libc-debug' jepsen/tuplesky/docker/up.sh; then up+=(--libc-debug); fi
+          fi
+          jepsen/tuplesky/docker/up.sh --nodes "$NODES" --dir "$RUNNER_TEMP/cluster" \
+            ${up[@]+"${up[@]}"}
+      - name: Deploy a domain on it and put a write through every voter
+        run: |
+          jepsen/tuplesky/docker/smoke.sh --dir "$RUNNER_TEMP/cluster" \
+            --bin-dir "$GITHUB_WORKSPACE/tuplesky/target/release"
+      - name: Run the Jepsen test
+        working-directory: jepsen/tuplesky
+        # Bounded at the time limit plus 20 minutes for setup, healing,
+        # the final reads and the checkers: a test whose final phase hangs
+        # fails here instead of holding the job, and every later run of
+        # this concurrency group, until the job's own timeout. A minute
+        # before the bound it prints every JVM's threads and each node's
+        # processes, to say where it hung.
+        # --wan only with a profile, so the faults scenario runs on a
+        # harness from before it.
+        run: |
+          wan=(); if [ "$WAN" != none ]; then wan=(--wan "$WAN"); fi
+          voter=()
+          if [ -n "$VOTER_WORKERS" ]; then
+            if grep -q -- '--voter-workers' src/jepsen/tuplesky.clj; then
+              voter=(--voter-workers "$VOTER_WORKERS")
+            else
+              # The standard two workers need a harness that sets them; a
+              # harness without the option runs tokio's default, and the
+              # titles drop the count.
+              echo "::warning::tuplesky/jepsen@$JEPSEN_REF has no --voter-workers; the voters run tokio's default worker count"
+              WORKERS_SUFFIX=""
+              echo "WORKERS_SUFFIX=" >> "$GITHUB_ENV"
+            fi
+          fi
+          if [ -n "$VOTER_ENV" ]; then
+            if ! grep -q -- '--voter-env' src/jepsen/tuplesky.clj; then
+              echo "::error::tuplesky/jepsen@$JEPSEN_REF has no --voter-env; dispatch with a jepsen-ref that has it, or no voter-env"
+              exit 1
+            fi
+            voter+=(--voter-env "$VOTER_ENV")
+          fi
+          if [ -n "$KEY_COUNT" ]; then
+            if ! grep -q -- '--key-count' src/jepsen/tuplesky.clj; then
+              echo "::error::tuplesky/jepsen@$JEPSEN_REF has no --key-count; dispatch with a jepsen-ref that has it, or no key-count"
+              exit 1
+            fi
+            voter+=(--key-count "$KEY_COUNT")
+          fi
+          if [ -n "$KEY_DIST" ]; then
+            if ! grep -q -- '--key-dist' src/jepsen/tuplesky.clj; then
+              echo "::error::tuplesky/jepsen@$JEPSEN_REF has no --key-dist; dispatch with a jepsen-ref that has it, or no key-dist"
+              exit 1
+            fi
+            voter+=(--key-dist "$KEY_DIST")
+          fi
+          common=(lein run test
+            --nodes-file "$RUNNER_TEMP/cluster/nodes"
+            --ssh-private-key "$RUNNER_TEMP/cluster/id_ed25519"
+            --username root
+            --workload "$WORKLOAD"
+            --nemesis "$NEMESIS"
+            --time-limit "$TIME_LIMIT"
+            --rate "$RATE"
+            --recovery-time "$RECOVERY_TIME"
+            --concurrency "$CONCURRENCY"
+            ${wan[@]+"${wan[@]}"}
+            ${voter[@]+"${voter[@]}"})
+          ci="$GITHUB_WORKSPACE/tuplesky/scripts/ci"
+          # One test with the binaries in $1, its samples and profile in $2,
+          # a call graph when $3 is "graph".
+          run_one() {
+            local bin=$1 dir=$2 graph=$3
+            shift 3
+            mkdir -p "$dir"
+            export JEPSEN_CPU_SAMPLES="$dir/cpu-samples.csv"
+            unset JEPSEN_LEADER_PROFILE JEPSEN_LEADER_CALLGRAPH
+            if [ "$IN_LEADER_PROFILE" != false ]; then export JEPSEN_LEADER_PROFILE="$dir/leader-profile.txt"; fi
+            if [ "$IN_LEADER_PROFILE" != false ] && [ "$graph" = graph ]; then export JEPSEN_LEADER_CALLGRAPH=1; fi
+            "$ci/jepsen_bounded.sh" $((TIME_LIMIT + 1200)) "$RUNNER_TEMP/cluster/nodes" -- \
+              "${common[@]}" --bin-dir "$bin" "$@"
+          }
+          if [ -z "$IN_PAIR_BASE" ]; then
+            graph=flat; if [ "$IN_LEADER_PROFILE" = call-graph ]; then graph=graph; fi
+            run_one "$GITHUB_WORKSPACE/tuplesky/target/release" "$RUNNER_TEMP" "$graph"
+            exit $?
+          fi
+          # Paired: base and head in turn on this runner, the order
+          # alternating from pair to pair, each run summarized as it ends,
+          # then the head's difference from the base pair by pair.
+          head_bin="$RUNNER_TEMP/head-bin" base_bin="$RUNNER_TEMP/base-bin" base_args=()
+          head_sha=$(git -C "$GITHUB_WORKSPACE/tuplesky" rev-parse --short HEAD)
+          case $IN_PAIR_BASE in
+            env:*)
+              if ! grep -q -- '--voter-env' src/jepsen/tuplesky.clj; then
+                echo "::error::tuplesky/jepsen@$JEPSEN_REF has no --voter-env; dispatch with a jepsen-ref that has it"
+                exit 1
+              fi
+              base_bin=$head_bin base_args=(--voter-env "${IN_PAIR_BASE#env:}")
+              base_name="$head_sha with ${IN_PAIR_BASE#env:}" ;;
+            *)
+              base_name="$IN_PAIR_BASE at $(git -C "$GITHUB_WORKSPACE/tuplesky-base" rev-parse --short HEAD)" ;;
+          esac
+          rc=0 n=0 runs=() previous=""
+          for i in $(seq 1 "$IN_PAIRS"); do
+            if [ $((i % 2)) = 1 ]; then order="base head"; else order="head base"; fi
+            for side in $order; do
+              n=$((n + 1))
+              dir="$RUNNER_TEMP/run-$n"
+              # The call graph on the first pair's two runs: the rest of the
+              # pairs keep the flat profile, which costs the loop less.
+              graph=flat; if [ "$IN_LEADER_PROFILE" = call-graph ] && [ "$i" = 1 ]; then graph=graph; fi
+              if [ "$side" = base ]; then
+                run_one "$base_bin" "$dir" "$graph" ${base_args[@]+"${base_args[@]}"} || rc=$?
+                name=$base_name
+              else
+                run_one "$head_bin" "$dir" "$graph" || rc=$?
+                name=$head_sha
+              fi
+              store=$(readlink -f store/latest || true)
+              if [ -z "$store" ] || [ "$store" = "$previous" ]; then
+                echo "::warning::pair $i, $side: the test left no store"
+                continue
+              fi
+              previous=$store
+              cp "$dir"/cpu-samples* "$dir"/leader-profile*.txt "$dir"/follower-profile*.txt "$dir"/transport-profile*.txt "$store"/ 2>/dev/null || true
+              for db in "$store"/n*/domain.redb; do
+                [ -e "$db" ] || continue
+                cp "$db" "$RUNNER_TEMP/scratch.redb"
+                "$head_bin/coord-jepsen-executed" "$RUNNER_TEMP/scratch.redb" --last \
+                  > "$(dirname "$db")/executed-at-end" || true
+              done
+              python3 "$ci/jepsen_summary.py" "$store" \
+                --nodes-file "$RUNNER_TEMP/cluster/nodes" --profile "$PROFILE" \
+                --title "TupleSky: $WORKLOAD, $NEMESIS$TITLE_SUFFIX$STORE_SUFFIX$PROFILE_SUFFIX$CHECKPOINT_SUFFIX$WORKERS_SUFFIX$TUPLESKY_SUFFIX: pair $i, $side ($name)" || true
+              runs+=("$side=$store")
+            done
+          done
+          python3 "$ci/jepsen_pairs.py" \
+            --title "TupleSky pairs: $head_sha (head) against $base_name (base), $WORKLOAD, $NEMESIS$TITLE_SUFFIX$STORE_SUFFIX$PROFILE_SUFFIX$CHECKPOINT_SUFFIX$WORKERS_SUFFIX$TUPLESKY_SUFFIX" \
+            ${runs[@]+"${runs[@]}"} || true
+          exit $rc
+      - name: Read how far each voter executed
+        if: always() && env.IN_PAIR_BASE == ''
+        # Each voter's highest executed position at the end, from its store
+        # (a crash image, jepsen.tuplesky.db's log-files kills coordd first),
+        # for the summary's "Executed at end" column: a voter left behind
+        # shows here even when its log says nothing. Read from a scratch
+        # copy, since opening a crash image lets redb repair it.
+        run: |
+          shopt -s nullglob
+          for db in jepsen/tuplesky/store/latest/n*/domain.redb; do
+            dir=$(dirname "$db")
+            node=$(basename "$dir")
+            cp "$db" "$RUNNER_TEMP/$node-last.redb"
+            "$GITHUB_WORKSPACE/tuplesky/target/release/coord-jepsen-executed" \
+              "$RUNNER_TEMP/$node-last.redb" --last > "$dir/executed-at-end" || true
+            echo "$node: $(head -c 200 "$dir/executed-at-end")"
+          done
+      - name: Summarize the run
+        if: always() && env.IN_PAIR_BASE == ''
+        # The verdict, counts, final reads per node, faults and one row per
+        # voter, in the job summary; each voter's last 400 lines follow here.
+        run: |
+          if [ -d jepsen/tuplesky/store/latest ]; then
+            cp "$RUNNER_TEMP"/cpu-samples* "$RUNNER_TEMP"/leader-profile*.txt "$RUNNER_TEMP"/follower-profile*.txt "$RUNNER_TEMP"/transport-profile*.txt jepsen/tuplesky/store/latest/ 2>/dev/null || true
+            python3 tuplesky/scripts/ci/jepsen_summary.py jepsen/tuplesky/store/latest \
+              --nodes-file "$RUNNER_TEMP/cluster/nodes" --profile "$PROFILE" \
+              --title "TupleSky: $WORKLOAD, $NEMESIS$TITLE_SUFFIX$STORE_SUFFIX$PROFILE_SUFFIX$CHECKPOINT_SUFFIX$WORKERS_SUFFIX$TUPLESKY_SUFFIX"
+          else
+            echo "No Jepsen store: the test did not start." >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Show each voter's log
+        # Not for a paired job: the API returns only a log's last 5000
+        # lines, which the runs' summaries and the pair table need; every
+        # run's voter logs are in the uploaded store.
+        if: always() && env.IN_PAIR_BASE == ''
+        # Jepsen copies each voter's coordd.log into the test's store before
+        # tearing the cluster down. Printed here, without the periodic
+        # metrics lines, so a run can be read from its job log alone.
+        run: |
+          shopt -s nullglob
+          for log in jepsen/tuplesky/store/latest/n*/coordd.log; do
+            node=$(basename "$(dirname "$log")")
+            echo "::group::$node coordd.log (last 400 lines, without metrics)"
+            grep -v '^metrics ' "$log" | tail -n 400
+            echo "::endgroup::"
+          done
+          # Each voter's last metrics line, whole: the summary reduces it,
+          # and the artifact is not always reachable from where a run is read.
+          echo "::group::Each voter's last metrics line"
+          for log in jepsen/tuplesky/store/latest/n*/coordd.log; do
+            node=$(basename "$(dirname "$log")")
+            echo "$node $(grep '^metrics ' "$log" | tail -n 1)"
+          done
+          echo "::endgroup::"
+      - name: Show every voter's execution order around a stop
+        if: always()
+        # A voter that stops on a command, a release contradicting its own
+        # execution or two decisions of one command, names it by an id
+        # prefix. Each voter's store comes with its log (jepsen.tuplesky.db's
+        # log-files kills coordd first, so it is a crash image), and the
+        # rows around that command on every voter show where their orders
+        # split, or where one command's results differ, from the job log
+        # alone. Each store is dumped from a scratch copy: opening a crash
+        # image lets redb repair it, and the packed store keeps the bytes as
+        # fetched.
+        run: |
+          shopt -s nullglob
+          # Every run's store, as the next step reads: a paired job leaves
+          # one per run, and an earlier run's stop is as much a stop.
+          for store in jepsen/tuplesky/store/*/[0-9]*/; do
+            store=${store%/}
+            prefixes=$(cat "$store"/n*/coordd.log 2>/dev/null \
+              | grep -oE 'this node stopped: [a-z-]+\([0-9a-f]+\)' \
+              | sed -E 's/.*\(([0-9a-f]+)\)/\1/' | sort -u)
+            for prefix in $prefixes; do
+              echo "::group::Every voter's execution order around $prefix in $store (position revision digest command)"
+              for db in "$store"/n*/domain.redb; do
+                node=$(basename "$(dirname "$db")")
+                echo "--- $node"
+                cp "$db" "$RUNNER_TEMP/$node.redb"
+                "$GITHUB_WORKSPACE/tuplesky/target/release/coord-jepsen-executed" \
+                  "$RUNNER_TEMP/$node.redb" --around "$prefix" --span 8 || true
+              done
+              echo "::endgroup::"
+            done
+          done
+      - name: Fail on a divergence stop
+        if: always()
+        # A voter that stops because the domain's commands diverged, or
+        # because recovery selected a dependency cycle no quorum's order
+        # can produce, is a safety tripwire firing, whatever Elle concludes
+        # about the history the clients saw: the job fails, so it is not
+        # left for someone to notice in the digest.
+        run: |
+          shopt -s nullglob
+          # Every run's voters: a paired job leaves one store per run.
+          stops=$(grep -HE 'this node stopped: (release-record-mismatch|incompatible-admission|recovery-cycle)\(' \
+            jepsen/tuplesky/store/*/[0-9]*/n*/coordd.log || true)
+          if [ -n "$stops" ]; then
+            echo "$stops" | cut -c1-300
+            echo "::error::A voter stopped on a divergence or a recovery cycle (above); the execution order around it is in the step before."
+            exit 1
+          fi
+      - name: Pack the Jepsen store
+        if: always()
+        # Jepsen names each run's directory by its start time, and
+        # upload-artifact refuses a path with a colon in it, so the store
+        # travels as one archive. Not the provisioned run directory: it
+        # holds the domain's fixture keys and bundles. The histories,
+        # results and each voter's log are in the test's own directory.
+        run: |
+          if [ -d jepsen/tuplesky/store ]; then
+            tar czf "$RUNNER_TEMP/jepsen-store.tgz" --exclude=tuplesky-runs \
+              -C jepsen/tuplesky store
+          fi
+      - name: Upload the Jepsen store
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: jepsen-store-${{ env.SCENARIO }}-${{ env.WORKLOAD }}
+          path: ${{ runner.temp }}/jepsen-store.tgz
+          retention-days: 14
+          if-no-files-found: warn
+      - name: Take the cluster down
+        if: always()
+        run: jepsen/tuplesky/docker/down.sh --dir "$RUNNER_TEMP/cluster"
+
+  etcd-baseline:
+    name: etcd baseline (docker cluster)
+    if: ${{ (inputs.etcd-version || 'latest') != 'none' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          path: tuplesky
+          persist-credentials: false
+          sparse-checkout: scripts/ci
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          repository: tuplesky/jepsen
+          ref: ${{ env.JEPSEN_REF }}
+          path: jepsen
+          persist-credentials: false
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          repository: ${{ env.ETCD_TEST_REPO }}
+          ref: ${{ env.ETCD_TEST_REF }}
+          path: etcd-test
+          persist-credentials: false
+      - name: Choose the scenario's settings
+        run: |
+          tuplesky/scripts/ci/jepsen_scenario.sh
+          cat "$GITHUB_ENV"
+          . <(grep -E '^(SCENARIO|NEMESIS|SWIFTPAXOS_NEMESIS|WAN|RATE)=' "$GITHUB_ENV")
+          # The scenarios other than faults need jepsen.tuplesky.wan and
+          # --rate 0 (tuplesky/jepsen#4).
+          if [ ! -f jepsen/tuplesky/src/jepsen/tuplesky/wan.clj ] && \
+             { [ "$SCENARIO" != faults ] || [ "$WAN" != none ] || [ "$RATE" = 0 ] || \
+               [[ ",$NEMESIS,$SWIFTPAXOS_NEMESIS," == *,packet,* ]]; }; then
+            echo "::error::tuplesky/jepsen@$JEPSEN_REF has no jepsen.tuplesky.wan; dispatch with a jepsen-ref that has it (tuplesky/jepsen#4), or the faults scenario"
+            exit 1
+          fi
+      - name: Load the kernel's traffic shaping
+        # --wan and the packet fault shape each node's egress with a prio
+        # qdisc, netem bands and u32 filters. The containers share this
+        # runner's kernel, which loads them; the cloud kernel keeps netem in
+        # its extra modules.
+        run: |
+          if [ "$WAN" != none ] || [[ ",$NEMESIS," == *,packet,* ]]; then
+            sudo modprobe -a sch_prio sch_netem cls_u32 || {
+              sudo apt-get update -qq
+              sudo apt-get install -y -qq --no-install-recommends "linux-modules-extra-$(uname -r)"
+              sudo modprobe -a sch_prio sch_netem cls_u32
+            }
+            lsmod | grep -E '^(sch_prio|sch_netem|cls_u32) '
+          fi
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.m2/repository
+            ~/.lein/self-installs
+          key: jepsen-etcd-m2-${{ hashFiles('etcd-test/project.clj') }}
+          restore-keys: jepsen-etcd-m2-
+      - name: Install Leiningen
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends gnuplot-nox graphviz
+          echo "JAVA_HOME=$JAVA_HOME_21_X64" >> "$GITHUB_ENV"
+          echo "JAVA_CMD=$JAVA_HOME_21_X64/bin/java" >> "$GITHUB_ENV"
+          echo "$JAVA_HOME_21_X64/bin" >> "$GITHUB_PATH"
+          mkdir -p "$HOME/bin"
+          curl -fsSL -o "$HOME/bin/lein" \
+            "https://raw.githubusercontent.com/technomancy/leiningen/$LEIN_VERSION/bin/lein"
+          echo "$LEIN_SHA256  $HOME/bin/lein" | sha256sum -c -
+          chmod +x "$HOME/bin/lein"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+      - name: Choose the etcd version
+        run: |
+          # `latest` is the highest stable (x.y.z) release tag of etcd-io/etcd,
+          # read when the job runs; anything else must be a version.
+          if [ "$ETCD_VERSION" = latest ]; then
+            ETCD_VERSION=$(git ls-remote --tags --refs https://github.com/etcd-io/etcd.git 'v*' \
+              | sed -n 's#.*refs/tags/v\([0-9]*\.[0-9]*\.[0-9]*\)$#\1#p' | sort -V | tail -n 1)
+          fi
+          if ! [[ "$ETCD_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::not an etcd version: '$ETCD_VERSION'"; exit 1
+          fi
+          echo "ETCD_VERSION=$ETCD_VERSION" >> "$GITHUB_ENV"
+          echo "etcd baseline: etcd $ETCD_VERSION, $ETCD_TEST_REPO@$ETCD_TEST_REF" >> "$GITHUB_STEP_SUMMARY"
+      - name: Let the etcd test start etcd 3.6 and later
+        working-directory: etcd-test
+        # The test passes --enable-v2, which etcd 3.6 removed ("flag provided
+        # but not defined"). The workloads here use only the v3 API.
+        run: sed -i '/^[[:space:]]*:--enable-v2$/d' src/jepsen/etcd/db.clj
+      - name: Let the etcd test pause etcd by process name
+        working-directory: etcd-test
+        # cu/grepkill! runs `pgrep -f etcd | xargs kill -stop` in a
+        # `bash -c` naming etcd. pgrep can list the pipeline's own xargs
+        # while it is still a fork of that bash, and xargs then stops
+        # itself: the pause never returns and holds the nemesis, so no
+        # start, resume or heal follows (runs 36323935964, 36365926073,
+        # 36368134612). cu/signal! is pkill by process name, which matches
+        # only etcd itself, as jepsen.tuplesky.db pauses coordd.
+        run: |
+          python3 - src/jepsen/etcd/db.clj <<'PY'
+          import sys
+          path = sys.argv[1]
+          src = open(path).read()
+          edits = [
+              ('(cu/grepkill! :stop "etcd")', '(cu/signal! "etcd" "STOP")'),
+              ('(cu/grepkill! :cont "etcd")', '(cu/signal! "etcd" "CONT")'),
+          ]
+          for old, new in edits:
+              if src.count(old) != 1:
+                  sys.exit(f"etcd db.clj no longer has: {old!r}")
+              src = src.replace(old, new)
+          open(path, "w").write(src)
+          PY
+          grep -n 'cu/signal!' src/jepsen/etcd/db.clj
+      - name: Give the etcd test the TupleSky test's kill schedule and network
+        # The combined nemesis draws kill/start and pause/resume from one
+        # mix, so a start can wait minutes after a kill. jepsen.tuplesky
+        # staggers the two on their own (jepsen.tuplesky.nemesis); the
+        # baseline loads the same namespace so both tests keep one schedule.
+        # With jepsen.tuplesky.wan, it also takes the same --wan profile
+        # and packet fault: a --wan option, :packet among its faults, and
+        # the WAN nemesis in place of Jepsen's packet package.
+        run: |
+          mkdir -p etcd-test/src/jepsen/tuplesky
+          cp jepsen/tuplesky/src/jepsen/tuplesky/nemesis.clj etcd-test/src/jepsen/tuplesky/
+          wan=false
+          if [ -f jepsen/tuplesky/src/jepsen/tuplesky/wan.clj ]; then
+            cp jepsen/tuplesky/src/jepsen/tuplesky/wan.clj etcd-test/src/jepsen/tuplesky/
+            wan=true
+          fi
+          python3 - etcd-test/src/jepsen "$wan" <<'PY'
+          import sys
+          root, wan = sys.argv[1], sys.argv[2] == "true"
+          def edit(path, edits):
+              src = open(path).read()
+              for old, new in edits:
+                  if src.count(old) != 1:
+                      sys.exit(f"{path} no longer has: {old!r}")
+                  src = src.replace(old, new)
+              open(path, "w").write(src)
+          packages = "(tn/separate-db-faults opts (nc/nemesis-packages opts))"
+          if wan:
+              packages = f"(tn/with-wan opts {packages})"
+          edit(f"{root}/etcd/nemesis.clj", [
+              ("            [jepsen.nemesis [combined :as nc]",
+               "            [jepsen.tuplesky.nemesis :as tn]\n"
+               "            [jepsen.nemesis [combined :as nc]"),
+              ("    (-> (nc/nemesis-packages opts)", f"    (-> {packages}"),
+          ])
+          if wan:
+              edit(f"{root}/etcd.clj", [
+                  ("    :clock :member})", "    :clock :member :packet})"),
+                  ("                         :interval  (:nemesis-interval opts)})",
+                   "                         :wan       (:wan opts)\n"
+                   "                         :interval  (:nemesis-interval opts)})"),
+                  ('   [nil "--nemesis-interval SECONDS"',
+                   '   [nil "--wan PROFILE" "none, regions, or one-way milliseconds (jepsen.tuplesky.wan)"\n'
+                   '    :parse-fn #(jepsen.tuplesky.wan/parse-spec %)]\n\n'
+                   '   [nil "--nemesis-interval SECONDS"'),
+              ])
+          PY
+          grep -n 'tn/' etcd-test/src/jepsen/etcd/nemesis.clj
+          grep -n 'wan' etcd-test/src/jepsen/etcd.clj || true
+      - name: Stand the cluster up
+        # With store tmpfs, /opt, which holds etcd's binary and data
+        # directory (/opt/etcd), is a tmpfs.
+        run: |
+          tmpfs=()
+          if [ "$STORE" = tmpfs ]; then tmpfs=(--tmpfs /opt); fi
+          jepsen/tuplesky/docker/up.sh --nodes "$NODES" --dir "$RUNNER_TEMP/cluster" \
+            ${tmpfs[@]+"${tmpfs[@]}"}
+      - name: Run the etcd test
+        working-directory: etcd-test
+        # The tuplesky test's rate, fault interval (30 s) and operations per
+        # register (100) rather than the etcd test's defaults (200/s, 5 s,
+        # 200); unthrottled is a rate of 100000/s here, since the etcd test
+        # takes no 0. Bounded as the tuplesky test is, with the same dump
+        # before the bound: two etcd runs stopped on a :pause :all that
+        # never returned, one of them for 84 minutes after its time limit.
+        run: |
+          wan=(); if [ "$WAN" != none ]; then wan=(--wan "$WAN"); fi
+          export JEPSEN_CPU_SAMPLES="$RUNNER_TEMP/cpu-samples.csv"
+          "$GITHUB_WORKSPACE/tuplesky/scripts/ci/jepsen_bounded.sh" \
+            $((TIME_LIMIT + 1200)) "$RUNNER_TEMP/cluster/nodes" -- lein run test \
+            --nodes-file "$RUNNER_TEMP/cluster/nodes" \
+            --ssh-private-key "$RUNNER_TEMP/cluster/id_ed25519" \
+            --username root \
+            --version "$ETCD_VERSION" \
+            --workload "$WORKLOAD" \
+            --nemesis "$NEMESIS" \
+            --nemesis-interval 30 \
+            --ops-per-key 100 \
+            --rate "$ETCD_RATE" \
+            --time-limit "$TIME_LIMIT" \
+            --concurrency "$CONCURRENCY" \
+            ${wan[@]+"${wan[@]}"}
+      - name: Summarize the run
+        if: always()
+        run: |
+          if [ -d etcd-test/store/latest ]; then
+            cp "$RUNNER_TEMP"/cpu-samples* etcd-test/store/latest/ 2>/dev/null || true
+            python3 tuplesky/scripts/ci/jepsen_summary.py etcd-test/store/latest \
+              --nodes-file "$RUNNER_TEMP/cluster/nodes" --title "etcd $ETCD_VERSION: $WORKLOAD, $NEMESIS$TITLE_SUFFIX$STORE_SUFFIX"
+          else
+            echo "No Jepsen store: the test did not start." >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Pack the Jepsen store
+        if: always()
+        run: |
+          if [ -d etcd-test/store ]; then
+            tar czf "$RUNNER_TEMP/jepsen-store.tgz" -C etcd-test store
+          fi
+      - name: Upload the Jepsen store
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: jepsen-store-etcd-${{ env.SCENARIO }}-${{ env.WORKLOAD }}
+          path: ${{ runner.temp }}/jepsen-store.tgz
+          retention-days: 14
+          if-no-files-found: warn
+      - name: Take the cluster down
+        if: always()
+        run: jepsen/tuplesky/docker/down.sh --dir "$RUNNER_TEMP/cluster"
+
+  swiftpaxos-baseline:
+    name: SwiftPaxos baseline (docker cluster)
+    if: ${{ (inputs.swiftpaxos || 'pause,partition') != 'skip' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          path: tuplesky
+          persist-credentials: false
+          sparse-checkout: scripts/ci
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          repository: tuplesky/jepsen
+          ref: ${{ env.JEPSEN_REF }}
+          path: jepsen
+          persist-credentials: false
+      - name: Check the harness has the SwiftPaxos test
+        run: |
+          if [ ! -d jepsen/swiftpaxos ]; then
+            echo "::error::tuplesky/jepsen@$JEPSEN_REF has no swiftpaxos project (tuplesky/jepsen#2 adds it); dispatch with that branch as jepsen-ref, or swiftpaxos: skip"
+            exit 1
+          fi
+      - name: Choose the scenario's settings
+        run: |
+          tuplesky/scripts/ci/jepsen_scenario.sh
+          cat "$GITHUB_ENV"
+          . <(grep -E '^(SCENARIO|NEMESIS|SWIFTPAXOS_NEMESIS|WAN|RATE)=' "$GITHUB_ENV")
+          # The scenarios other than faults need jepsen.tuplesky.wan and
+          # --rate 0 (tuplesky/jepsen#4).
+          if [ ! -f jepsen/tuplesky/src/jepsen/tuplesky/wan.clj ] && \
+             { [ "$SCENARIO" != faults ] || [ "$WAN" != none ] || [ "$RATE" = 0 ] || \
+               [[ ",$NEMESIS,$SWIFTPAXOS_NEMESIS," == *,packet,* ]]; }; then
+            echo "::error::tuplesky/jepsen@$JEPSEN_REF has no jepsen.tuplesky.wan; dispatch with a jepsen-ref that has it (tuplesky/jepsen#4), or the faults scenario"
+            exit 1
+          fi
+      - name: Load the kernel's traffic shaping
+        # --wan and the packet fault shape each node's egress with a prio
+        # qdisc, netem bands and u32 filters. The containers share this
+        # runner's kernel, which loads them; the cloud kernel keeps netem in
+        # its extra modules.
+        run: |
+          if [ "$WAN" != none ] || [[ ",$SWIFTPAXOS_NEMESIS," == *,packet,* ]]; then
+            sudo modprobe -a sch_prio sch_netem cls_u32 || {
+              sudo apt-get update -qq
+              sudo apt-get install -y -qq --no-install-recommends "linux-modules-extra-$(uname -r)"
+              sudo modprobe -a sch_prio sch_netem cls_u32
+            }
+            lsmod | grep -E '^(sch_prio|sch_netem|cls_u32) '
+          fi
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.m2/repository
+            ~/.lein/self-installs
+            ~/go/pkg/mod
+          key: jepsen-swiftpaxos-m2-${{ hashFiles('jepsen/jepsen/project.clj', 'jepsen/swiftpaxos/project.clj', 'jepsen/swiftpaxos/build.sh') }}
+          restore-keys: jepsen-swiftpaxos-m2-
+      - name: Build SwiftPaxos and its Jepsen client
+        # From the tuplesky/swiftpaxos fork (upstream plus the client, in
+        # cmd/swiftpaxos-jepsen), at the commit jepsen/swiftpaxos/build.sh pins.
+        run: |
+          go version
+          jepsen/swiftpaxos/build.sh "$RUNNER_TEMP/swiftpaxos-bin" | tee "$RUNNER_TEMP/swiftpaxos-build.txt"
+          echo "SwiftPaxos baseline: $(tail -n 1 "$RUNNER_TEMP/swiftpaxos-build.txt" | sed 's/.* from //'), faults $SWIFTPAXOS_NEMESIS" >> "$GITHUB_STEP_SUMMARY"
+      - name: Install Leiningen and this repository's Jepsen
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends gnuplot-nox graphviz
+          echo "JAVA_HOME=$JAVA_HOME_21_X64" >> "$GITHUB_ENV"
+          echo "JAVA_CMD=$JAVA_HOME_21_X64/bin/java" >> "$GITHUB_ENV"
+          echo "$JAVA_HOME_21_X64/bin" >> "$GITHUB_PATH"
+          export JAVA_HOME=$JAVA_HOME_21_X64
+          export JAVA_CMD=$JAVA_HOME_21_X64/bin/java
+          export PATH="$JAVA_HOME_21_X64/bin:$PATH"
+          mkdir -p "$HOME/bin"
+          curl -fsSL -o "$HOME/bin/lein" \
+            "https://raw.githubusercontent.com/technomancy/leiningen/$LEIN_VERSION/bin/lein"
+          echo "$LEIN_SHA256  $HOME/bin/lein" | sha256sum -c -
+          chmod +x "$HOME/bin/lein"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          (cd jepsen/jepsen && "$HOME/bin/lein" install)
+      - name: Run the Jepsen project's unit tests
+        working-directory: jepsen/swiftpaxos
+        run: lein test
+      - name: Stand the cluster up
+        run: jepsen/tuplesky/docker/up.sh --nodes "$NODES" --dir "$RUNNER_TEMP/cluster"
+      - name: Deploy SwiftPaxos on it and put a write and a read through every replica
+        run: |
+          jepsen/swiftpaxos/docker/smoke.sh --dir "$RUNNER_TEMP/cluster" \
+            --bin-dir "$RUNNER_TEMP/swiftpaxos-bin"
+      - name: Run the SwiftPaxos test
+        working-directory: jepsen/swiftpaxos
+        # The TupleSky test's time limit, fault interval, rate, concurrency
+        # and network, bounded the same way.
+        run: |
+          wan=(); if [ "$WAN" != none ]; then wan=(--wan "$WAN"); fi
+          export JEPSEN_CPU_SAMPLES="$RUNNER_TEMP/cpu-samples.csv"
+          "$GITHUB_WORKSPACE/tuplesky/scripts/ci/jepsen_bounded.sh" \
+            $((TIME_LIMIT + 1200)) "$RUNNER_TEMP/cluster/nodes" -- lein run test \
+            --nodes-file "$RUNNER_TEMP/cluster/nodes" \
+            --ssh-private-key "$RUNNER_TEMP/cluster/id_ed25519" \
+            --username root \
+            --bin-dir "$RUNNER_TEMP/swiftpaxos-bin" \
+            --nemesis "$SWIFTPAXOS_NEMESIS" \
+            --nemesis-interval 30 \
+            --rate "$RATE" \
+            --time-limit "$TIME_LIMIT" \
+            --concurrency "$SWIFTPAXOS_CONCURRENCY" \
+            ${wan[@]+"${wan[@]}"}
+      - name: Summarize the run
+        if: always()
+        run: |
+          if [ -d jepsen/swiftpaxos/store/latest ]; then
+            cp "$RUNNER_TEMP"/cpu-samples* jepsen/swiftpaxos/store/latest/ 2>/dev/null || true
+            python3 tuplesky/scripts/ci/jepsen_summary.py jepsen/swiftpaxos/store/latest \
+              --nodes-file "$RUNNER_TEMP/cluster/nodes" --title "SwiftPaxos: register, $SWIFTPAXOS_NEMESIS$SWIFTPAXOS_TITLE_SUFFIX"
+          else
+            echo "No Jepsen store: the test did not start." >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Show each replica's log and the master's
+        if: always()
+        run: |
+          shopt -s nullglob
+          store=jepsen/swiftpaxos/store/latest
+          # The master's log is listed as a pattern too, so nullglob drops
+          # it when the test never started.
+          for log in "$store"/n*/replica.log "$store"/control/master.lo[g]; do
+            echo "::group::$log (last 200 lines)"
+            tail -n 200 "$log"
+            echo "::endgroup::"
+          done
+      - name: Pack the Jepsen store
+        if: always()
+        run: |
+          if [ -d jepsen/swiftpaxos/store ]; then
+            tar czf "$RUNNER_TEMP/jepsen-store.tgz" -C jepsen/swiftpaxos store
+          fi
+      - name: Upload the Jepsen store
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: jepsen-store-swiftpaxos-${{ env.SCENARIO }}-register
+          path: ${{ runner.temp }}/jepsen-store.tgz
+          retention-days: 14
+          if-no-files-found: warn
+      - name: Take the cluster down
+        if: always()
+        run: jepsen/tuplesky/docker/down.sh --dir "$RUNNER_TEMP/cluster"

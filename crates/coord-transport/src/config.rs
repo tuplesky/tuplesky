@@ -81,6 +81,39 @@ pub struct Limits {
     pub lanes: [LaneLimits; 4],
     /// Shared destination and node byte budgets (task-31).
     pub budget: BudgetLimits,
+    /// The most frames a peer lane's sender puts on one stream, where the
+    /// link grants [`crate::CAPABILITY_FRAMES_PER_STREAM`] (task-d61).
+    /// One, and the endpoint does not offer the capability: each frame
+    /// has a stream of its own. Above [`crate::MAX_FRAMES_PER_STREAM`]
+    /// it is that.
+    pub stream_frames: usize,
+    /// The most bytes of frames a peer lane's sender puts on one stream.
+    /// A frame larger than this still goes, alone.
+    pub stream_bytes: usize,
+    /// How often this endpoint asks the other end of each connection to
+    /// acknowledge (task-d70). `None` asks nothing, and QUIC's own cadence
+    /// holds: an ACK every second ack-eliciting packet, within 25 ms.
+    pub ack_frequency: Option<AckFrequency>,
+}
+
+/// The acknowledgement cadence an endpoint asks of its peers, through
+/// QUIC's acknowledgement-frequency extension (task-d70). A peer that
+/// does not support the extension ignores it.
+///
+/// With about one data datagram per peer per command, an acknowledgement
+/// sent after every second packet often has nothing to ride on and
+/// travels as a datagram of its own; a higher threshold and a delay of a
+/// few milliseconds let it wait for the reply that follows. Loss is
+/// detected that much later.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AckFrequency {
+    /// Ack-eliciting packets the peer may receive before it must
+    /// acknowledge: zero acknowledges every packet, one every second.
+    pub threshold: u32,
+    /// The longest the peer may hold an acknowledgement below the
+    /// threshold. QUIC clamps it to at least the peer's `min_ack_delay`
+    /// and at most the greater of the path's RTT and 25 ms.
+    pub max_delay: Duration,
 }
 
 impl Default for Limits {
@@ -98,6 +131,9 @@ impl Default for Limits {
             max_inflight: 64,
             lanes: LaneLimits::DEFAULTS,
             budget: BudgetLimits::default(),
+            stream_frames: 64,
+            stream_bytes: 256 * 1024,
+            ack_frequency: None,
         }
     }
 }

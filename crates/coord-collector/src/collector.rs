@@ -41,11 +41,15 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
 use coord_consensus::{
-    BallotConfiguration, FastAck, Learned, ProtocolMessage, Vote, VoteError, VoteSet,
+    BallotConfiguration, FastAck, Learned, ProtocolMessage, SubmissionRefusal, Vote, VoteError,
+    VoteSet,
 };
 use coord_core::capability::{ReleasedResult, admission_digest};
 use coord_core::event::{AdmittedRequest, PeerProvenance};
-use coord_types::ids::{KvRevision, ReplicaId, SessionId};
+use coord_types::identity::Digest32;
+use coord_types::ids::{
+    Ballot, ConfigurationEpoch, ExecutionPosition, KvRevision, ReplicaId, SessionId,
+};
 use coord_types::wire_v1::{
     BoundedBytes, MessageV1, OutcomeV1, ResolveRequestV1, ResponseV1, decode_stream,
 };
@@ -59,7 +63,7 @@ use crate::wire::{SubmitV1, submit_frame};
 
 /// The largest result a client can actually be handed: an API-class
 /// frame, less room for the response's own fields and the frame header.
-const MAX_DELIVERABLE_RESULT_BYTES: usize =
+pub(crate) const MAX_DELIVERABLE_RESULT_BYTES: usize =
     (coord_types::wire_v1::KindRange::Api.max_frame_length() as usize) - 64 * 1024;
 
 /// What a submission envelope may carry beyond its request's own bytes.
@@ -274,6 +278,19 @@ const OFFER_FLOOR_MILLIS: u64 = 25;
 /// and the acknowledgement would be lost for good.
 pub const OFFER_CEILING_MILLIS: u64 = 1_000;
 
+/// How long a pending command may hold neither half of a release --
+/// neither the learning predicate nor the leader's release -- before it
+/// is submitted to every voter again, in milliseconds (task-d22).
+///
+/// A voter answers a submission it already holds by publishing its
+/// evidence again, or by saying why it refuses it, so asking again is how
+/// an entry whose evidence was lost, dropped with a closed connection or
+/// voided by a ballot change gets it back. Well past the offer ceiling,
+/// so an ordinary command whose evidence is on its way is never asked
+/// twice. From the second time on, the entry may also be settled from
+/// this node's durable record of the command, if it has one.
+pub const SOLICIT_AFTER_MILLIS: u64 = 5 * OFFER_CEILING_MILLIS;
+
 /// What a submission produced.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Submitted {
@@ -307,7 +324,7 @@ pub enum SubmitRefusal {
 }
 
 /// Why evidence was not counted.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EvidenceError {
     /// The acknowledgement claims a replica other than the bound sender.
     SenderMismatch {
@@ -333,6 +350,22 @@ pub enum EvidenceError {
     NotEvidence,
     /// A second, different release for the command.
     ReleaseMismatch,
+    /// A refusal from a replica that is not a voter of the current
+    /// configuration (task-d22).
+    NotAVoter {
+        /// Sender.
+        sender: ReplicaId,
+    },
+    /// The leader's release of a command this collector already answered
+    /// says something else than the answer it gave (task-d12).
+    ///
+    /// The answer came from this node's own record of the command, before
+    /// the release arrived. The two disagree only if this node executed the
+    /// command in another order than the leader, and then the caller was
+    /// told something the domain did not decide. The node stops, as it does
+    /// when a record contradicts a release it holds, and says what it
+    /// compared (task-d17).
+    AnsweredOtherwise(Box<Mismatch>),
 }
 
 /// What a release still waits for.
@@ -342,6 +375,11 @@ pub enum HoldReason {
     AwaitingVotes,
     /// The leader's release-gate result has not arrived.
     AwaitingRelease,
+    /// A voter refused the submission in a way only the command's
+    /// durable record can answer: it holds the command under other
+    /// admission facts, or executed it long ago and forgot its payload
+    /// (task-d22). The entry is settled from this node's record.
+    AwaitingRecord,
 }
 
 /// A released result for a caller.
@@ -403,7 +441,7 @@ pub struct Expired {
 
 /// Why the durable record of a command's execution did not settle it
 /// here (task-c02).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SettleError {
     /// Not pending here: never submitted through this collector, or
     /// already resolved and beyond the retained window.
@@ -415,8 +453,138 @@ pub enum SettleError {
     /// for a command this collector holds nothing for.
     Uncorroborated,
     /// The release this collector holds and the record disagree on what
-    /// the command produced. Neither is believed over the other.
-    Mismatch,
+    /// the command produced. Neither is believed over the other, and both
+    /// are carried out, for the stop to say what it compared (task-d17).
+    Mismatch(Box<Mismatch>),
+}
+
+/// A leader's release of a command and this node's own execution of it,
+/// disagreeing (task-d17).
+///
+/// This node's side is its own record of the command, or the answer this
+/// collector already gave from a record or an earlier release. Both are
+/// carried whole, so a node that stops on the disagreement can say what
+/// it compared rather than only that the comparison failed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Mismatch {
+    /// The command.
+    pub command: CommandId,
+    /// Which comparison it was.
+    pub check: MismatchCheck,
+    /// What the leader's release says.
+    pub release: Said,
+    /// What this node's record, or the answer it gave, says.
+    pub own: Said,
+    /// Which of the compared fields differ.
+    pub differs: Differs,
+}
+
+/// Which comparison a [`Mismatch`] comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MismatchCheck {
+    /// A release this collector holds, against this node's own record of
+    /// the command (task-d06).
+    HeldReleaseAgainstRecord,
+    /// A release that arrived after this collector answered, against the
+    /// answer it gave (task-d12).
+    LateReleaseAgainstAnswer,
+    /// A command this node pulled from a peer's executed history, its own
+    /// execution against the one the peer served with it (task-d08). The
+    /// release side is the donor's execution.
+    CatchUpAgainstDonor,
+}
+
+/// What one side of a [`Mismatch`] says the command produced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Said {
+    /// The release it came from; `None` for this node's own record of the
+    /// command, which nobody released.
+    pub release: Option<ReleaseOrigin>,
+    /// Execution position.
+    pub position: ExecutionPosition,
+    /// KV revision.
+    pub revision: Option<KvRevision>,
+    /// Result digest.
+    pub result_digest: Digest32,
+    /// Length in bytes of the response it carries.
+    pub response_len: usize,
+}
+
+/// Where a released result came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReleaseOrigin {
+    /// The replica that sent the release.
+    pub sender: ReplicaId,
+    /// Its configuration epoch.
+    pub epoch: ConfigurationEpoch,
+    /// Its ballot.
+    pub ballot: Ballot,
+    /// Whether it preceded materialization.
+    pub speculative: bool,
+}
+
+/// Which compared fields of a [`Mismatch`] differ. The release's sender,
+/// epoch, ballot and speculative flag are shown, not compared.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Differs {
+    /// The execution positions.
+    pub position: bool,
+    /// The KV revisions.
+    pub revision: bool,
+    /// The result digests.
+    pub result_digest: bool,
+    /// The response bytes.
+    pub response: bool,
+}
+
+impl Differs {
+    /// Whether any compared field differs.
+    pub const fn any(&self) -> bool {
+        self.position || self.revision || self.result_digest || self.response
+    }
+
+    /// The names of the fields that differ, in a fixed order.
+    pub fn names(&self) -> Vec<&'static str> {
+        [
+            (self.position, "position"),
+            (self.revision, "revision"),
+            (self.result_digest, "result digest"),
+            (self.response, "response"),
+        ]
+        .into_iter()
+        .filter_map(|(differs, name)| differs.then_some(name))
+        .collect()
+    }
+}
+
+impl Said {
+    fn released(sender: ReplicaId, released: &ReleasedResult) -> Self {
+        let established = released.established();
+        Said {
+            release: Some(ReleaseOrigin {
+                sender,
+                epoch: established.epoch(),
+                ballot: established.ballot(),
+                speculative: released.speculative(),
+            }),
+            position: established.position(),
+            revision: established.revision(),
+            result_digest: established.result_digest(),
+            response_len: released.response().len(),
+        }
+    }
+
+    /// The fields of `self` and `other` that differ, the response bytes
+    /// aside: `Said` carries only their length, and the caller compares
+    /// the bytes.
+    fn differs(&self, other: &Said) -> Differs {
+        Differs {
+            position: self.position != other.position,
+            revision: self.revision != other.revision,
+            result_digest: self.result_digest != other.result_digest,
+            response: false,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -429,7 +597,8 @@ struct Pending {
     /// facts did not acknowledge this request.
     admission: coord_types::identity::Digest32,
     votes: VoteSet,
-    released: Option<ReleasedResult>,
+    /// The leader's release, with the replica it came from.
+    released: Option<(ReplicaId, ReleasedResult)>,
     attached: bool,
     deadline: Option<MonotonicMillis>,
     timed_out: bool,
@@ -443,6 +612,20 @@ struct Pending {
     /// is the rule that keeps a client deadline from silently becoming
     /// the lifetime of work the domain has accepted.
     dissemination: Dissemination,
+    /// The submission, kept until the command settles so it can be sent
+    /// again to ask for evidence (task-d22). `dissemination` lets go of
+    /// its copy once every voter has taken it; this is the same bytes.
+    frame: Arc<[u8]>,
+    /// When the entry is next submitted again if it still holds neither
+    /// half of a release (task-d22).
+    solicit_at: MonotonicMillis,
+    /// How many times it has been.
+    solicited: u32,
+    /// Whether this node's durable record of the command may settle it
+    /// with nothing of the collector's own to corroborate it: a voter
+    /// refused it in a way only the record answers, it was asked for
+    /// more than once, or a ballot change voided what it held (task-d22).
+    from_record: bool,
 }
 
 /// The collector of one domain.
@@ -451,9 +634,20 @@ pub struct Collector {
     config: CollectorConfig,
     pending: BTreeMap<CommandId, Pending>,
     bindings: BTreeMap<RetryKey, CommandId>,
-    resolved: BTreeMap<RetryKey, (CommandId, ResponseV1)>,
+    /// Answers given, for retries and resolution, with the execution
+    /// they were given from: a late release is compared with both
+    /// (task-d12), and a stop on the comparison shows both (task-d17).
+    ///
+    /// The response alone does not say where the command executed. Two
+    /// executions at different positions can answer with the same bytes,
+    /// and an answer over the deliverable bound is the same
+    /// `RESULT_TOO_LARGE` whatever it replaced.
+    resolved: BTreeMap<RetryKey, (CommandId, ResponseV1, Said)>,
     resolved_order: VecDeque<RetryKey>,
-    trace: Vec<CollectorEvent>,
+    /// The golden event trace, kept only by a collector made with
+    /// [`Collector::traced`]: it grows with every transition and nothing
+    /// in the daemon reads it.
+    trace: Option<Vec<CollectorEvent>>,
     /// Envelope bytes reserved by commands that still owe a
     /// destination. The sum of every pending entry's `reserved`, kept
     /// incrementally so admission is a comparison rather than a walk.
@@ -473,7 +667,7 @@ impl Collector {
             bindings: BTreeMap::new(),
             resolved: BTreeMap::new(),
             resolved_order: VecDeque::new(),
-            trace: Vec::new(),
+            trace: None,
             undelivered_bytes: 0,
             offer_cursor: 0,
         }
@@ -500,14 +694,25 @@ impl Collector {
         self.pending.contains_key(command)
     }
 
-    /// The transitions so far.
-    pub fn trace(&self) -> &[CollectorEvent] {
-        &self.trace
+    /// A collector under `config` that keeps its golden event trace,
+    /// for the tests and differential runs that read it.
+    pub fn traced(config: CollectorConfig) -> Self {
+        Collector {
+            trace: Some(Vec::new()),
+            ..Collector::new(config)
+        }
     }
 
-    /// Take the transitions so far.
+    /// The transitions so far: empty unless made with
+    /// [`Collector::traced`].
+    pub fn trace(&self) -> &[CollectorEvent] {
+        self.trace.as_deref().unwrap_or_default()
+    }
+
+    /// Take the transitions so far: empty unless made with
+    /// [`Collector::traced`].
     pub fn take_trace(&mut self) -> Vec<CollectorEvent> {
-        std::mem::take(&mut self.trace)
+        self.trace.as_mut().map(std::mem::take).unwrap_or_default()
     }
 
     /// Submit an admitted request at `now`, the monotonic reading its
@@ -517,25 +722,41 @@ impl Collector {
         now: MonotonicMillis,
         admitted: &AdmittedRequest,
     ) -> Result<Submitted, SubmitRefusal> {
+        self.submit_since(now, now, admitted)
+    }
+
+    /// Whether `key` is bound to a command here: one being collected, or
+    /// one whose result is retained.
+    pub fn is_bound(&self, key: &RetryKey) -> bool {
+        self.bindings.contains_key(key)
+    }
+
+    /// Submit at `now` a request admitted at `since`, its client deadline
+    /// measured from `since`: a read that waited on its leader first
+    /// (task-d50) keeps the deadline it was admitted with.
+    pub fn submit_since(
+        &mut self,
+        now: MonotonicMillis,
+        since: MonotonicMillis,
+        admitted: &AdmittedRequest,
+    ) -> Result<Submitted, SubmitRefusal> {
         let request = match decode_stream(&admitted.frame).as_deref() {
             Ok([MessageV1::Request(r)]) => r.clone(),
             _ => return Err(SubmitRefusal::Malformed),
         };
-        let logical = request.logical().map_err(|_| SubmitRefusal::Malformed)?;
-        let command = CommandId::derive(&request.retry_key, &logical)
-            .map_err(|_| SubmitRefusal::Malformed)?;
+        let (_, command) = request.command().map_err(|_| SubmitRefusal::Malformed)?;
         let key = request.retry_key;
         let sequence = key.request_sequence.get();
         if let Some(bound) = self.bindings.get(&key).copied() {
             if bound != command {
-                self.trace.push(CollectorEvent::Refused {
+                record(&mut self.trace, || CollectorEvent::Refused {
                     sequence,
                     reason: "request-identity-conflict".into(),
                 });
                 return Err(SubmitRefusal::RequestIdentityConflict { bound });
             }
-            if let Some((_, response)) = self.resolved.get(&key) {
-                self.trace.push(CollectorEvent::Retained {
+            if let Some((_, response, _)) = self.resolved.get(&key) {
+                record(&mut self.trace, || CollectorEvent::Retained {
                     command: command_hex(&command),
                     sequence,
                 });
@@ -544,8 +765,8 @@ impl Collector {
             if let Some(entry) = self.pending.get_mut(&command) {
                 entry.attached = true;
                 entry.timed_out = false;
-                entry.deadline = deadline(now, request.deadline_ms);
-                self.trace.push(CollectorEvent::Attached {
+                entry.deadline = deadline(since, request.deadline_ms);
+                record(&mut self.trace, || CollectorEvent::Attached {
                     command: command_hex(&command),
                     sequence,
                 });
@@ -555,7 +776,7 @@ impl Collector {
             // moved past it; it is new work again under the same identity.
         }
         if self.pending.len() >= self.config.max_pending {
-            self.trace.push(CollectorEvent::Refused {
+            record(&mut self.trace, || CollectorEvent::Refused {
                 sequence,
                 reason: "backpressure".into(),
             });
@@ -578,7 +799,7 @@ impl Collector {
         // because by then it may be anywhere.
         let bytes = frame.len();
         if self.undelivered_bytes.saturating_add(bytes) > self.config.max_undelivered_bytes {
-            self.trace.push(CollectorEvent::Refused {
+            record(&mut self.trace, || CollectorEvent::Refused {
                 sequence,
                 reason: "undelivered-bytes".into(),
             });
@@ -599,8 +820,12 @@ impl Collector {
                 votes: VoteSet::new(self.config.quorum.clone(), command),
                 released: None,
                 attached: true,
-                deadline: deadline(now, request.deadline_ms),
+                deadline: deadline(since, request.deadline_ms),
                 timed_out: false,
+                frame: Arc::clone(&frame),
+                solicit_at: now.plus(SOLICIT_AFTER_MILLIS),
+                solicited: 0,
+                from_record: false,
                 dissemination: Dissemination {
                     envelope: Some(Arc::clone(&frame)),
                     reserved: bytes,
@@ -616,7 +841,7 @@ impl Collector {
                 },
             },
         );
-        self.trace.push(CollectorEvent::Submitted {
+        record(&mut self.trace, || CollectorEvent::Submitted {
             command: command_hex(&command),
             sequence,
             targets: targets.iter().map(replica_hex).collect(),
@@ -743,7 +968,7 @@ impl Collector {
             if targets.is_empty() {
                 continue;
             }
-            self.trace.push(CollectorEvent::Reoffered {
+            record(&mut self.trace, || CollectorEvent::Reoffered {
                 command: command_hex(&command),
                 targets: targets.iter().map(replica_hex).collect(),
             });
@@ -755,6 +980,51 @@ impl Collector {
             });
         }
         self.offer_cursor = start.wrapping_add(examined);
+        out
+    }
+
+    /// Commands that have held neither half of a release -- neither the
+    /// learning predicate nor the leader's release -- for
+    /// [`SOLICIT_AFTER_MILLIS`], submitted to every voter again, at most
+    /// `budget` destinations in total (task-d22).
+    ///
+    /// A voter answers a submission it holds by publishing its evidence
+    /// again or by saying why it refuses it, so this is how an entry whose
+    /// evidence was lost, dropped with a closed connection or voided by a
+    /// ballot change gets it back. It is not delivery: the offer schedule
+    /// ([`Collector::due_offers`]) is about a voter taking the frame at
+    /// all, and this is about what a voter that took it said. From the
+    /// second time on the entry may be settled from this node's durable
+    /// record ([`Collector::settle_from_record`]).
+    pub fn due_solicits(&mut self, now: MonotonicMillis, budget: usize) -> Vec<FanOut> {
+        let voters: Vec<ReplicaId> = self.config.quorum.voters().iter().copied().collect();
+        let mut out = Vec::new();
+        let mut spent = 0usize;
+        for (command, entry) in &mut self.pending {
+            if spent + voters.len() > budget {
+                break;
+            }
+            if entry.solicit_at > now || entry.released.is_some() || entry.votes.learned().is_some()
+            {
+                continue;
+            }
+            entry.solicit_at = now.plus(SOLICIT_AFTER_MILLIS);
+            entry.solicited = entry.solicited.saturating_add(1);
+            if entry.solicited >= 2 {
+                entry.from_record = true;
+            }
+            spent += voters.len();
+            record(&mut self.trace, || CollectorEvent::Solicited {
+                command: command_hex(command),
+                times: entry.solicited,
+            });
+            out.push(FanOut {
+                command: *command,
+                retry_key: entry.retry_key,
+                targets: voters.clone(),
+                frame: Arc::clone(&entry.frame),
+            });
+        }
         out
     }
 
@@ -815,6 +1085,17 @@ impl Collector {
             .min()
     }
 
+    /// When the next command holding neither half of a release is due to
+    /// be asked for again ([`Collector::due_solicits`]), for the runtime
+    /// to wake on (task-d22).
+    pub fn next_solicit(&self) -> Option<MonotonicMillis> {
+        self.pending
+            .values()
+            .filter(|entry| entry.released.is_none() && entry.votes.learned().is_none())
+            .map(|entry| entry.solicit_at)
+            .min()
+    }
+
     /// Commands that still owe a destination an enqueue (diagnostic).
     pub fn undelivered(&self) -> usize {
         self.pending
@@ -868,6 +1149,9 @@ impl Collector {
             ),
             ProtocolMessage::FastAck(ack) => ("fast-ack", Vote::Fast(ack)),
             ProtocolMessage::SlowAck(ack) => ("slow-ack", Vote::Slow(ack)),
+            ProtocolMessage::Refused {
+                command, refusal, ..
+            } => return self.on_refused(sender, command, refusal),
             _ => return Err(EvidenceError::NotEvidence),
         };
         let command = vote.command();
@@ -877,29 +1161,85 @@ impl Collector {
         } else if let Some(entry) = self.pending.get_mut(&command) {
             entry.votes.add(vote).map_err(EvidenceError::Vote)
         } else if self.is_resolved(&command) {
-            self.trace
-                .push(evidence_event(&command, &sender, kind, true, None));
+            record(&mut self.trace, || {
+                evidence_event(&command, &sender, kind, true, None)
+            });
             return Ok(Progress::Settled);
         } else {
             Err(EvidenceError::UnknownCommand)
         };
         match result {
             Ok(()) => {
-                self.trace
-                    .push(evidence_event(&command, &sender, kind, true, None));
+                record(&mut self.trace, || {
+                    evidence_event(&command, &sender, kind, true, None)
+                });
                 Ok(self.try_release(command))
             }
             Err(e) => {
-                self.trace.push(evidence_event(
-                    &command,
-                    &sender,
-                    kind,
-                    false,
-                    Some(format!("{e:?}")),
-                ));
+                record(&mut self.trace, || {
+                    evidence_event(&command, &sender, kind, false, Some(format!("{e:?}")))
+                });
                 Err(e)
             }
         }
+    }
+
+    /// A voter refused `command` and said why (task-d22).
+    ///
+    /// A retry key the voter holds bound to another command ends the
+    /// entry with a conflict: the caller named another request under a
+    /// key that already has one, which no amount of waiting changes. The
+    /// answer is not kept for the key, so a later release of the command
+    /// is never compared with it; it is what this collector learned, not
+    /// what the domain decided. A command the voter holds under other
+    /// admission facts, or executed so long ago it kept no payload, is
+    /// one only its durable record can answer: the entry is settled from
+    /// this node's record.
+    fn on_refused(
+        &mut self,
+        sender: ReplicaId,
+        command: CommandId,
+        refusal: SubmissionRefusal,
+    ) -> Result<Progress, EvidenceError> {
+        let reason = match refusal {
+            SubmissionRefusal::OtherCommand { .. } => "other-command",
+            SubmissionRefusal::OtherFacts { .. } => "other-facts",
+            SubmissionRefusal::Forgotten => "forgotten",
+        };
+        if !self.config.quorum.voters().contains(&sender) {
+            record(&mut self.trace, || {
+                evidence_event(
+                    &command,
+                    &sender,
+                    "refused",
+                    false,
+                    Some("not a voter".into()),
+                )
+            });
+            return Err(EvidenceError::NotAVoter { sender });
+        }
+        if !self.pending.contains_key(&command) {
+            return if self.is_resolved(&command) {
+                Ok(Progress::Settled)
+            } else {
+                Err(EvidenceError::UnknownCommand)
+            };
+        }
+        record(&mut self.trace, || CollectorEvent::VoterRefused {
+            command: command_hex(&command),
+            from: replica_hex(&sender),
+            reason: reason.into(),
+        });
+        // One voter's word settles nothing, whichever refusal it is. A
+        // voter that bound the key to another request may be a minority
+        // that saw the other presentation first, while a quorum binds and
+        // executes this one (Codex review): only the domain's decided
+        // outcome, this node's durable record of the key, answers it
+        // ([`Collector::settle_from_record`] for this command's own
+        // record, [`Collector::settle_conflict_from_record`] for another's).
+        let entry = self.pending.get_mut(&command).expect("present");
+        entry.from_record = true;
+        Ok(Progress::Held(HoldReason::AwaitingRecord))
     }
 
     /// Take the leader's release-gate result.
@@ -913,21 +1253,18 @@ impl Collector {
         let result = self.check_release(sender, &released);
         match result {
             Ok(settled) => {
-                self.trace
-                    .push(evidence_event(&command, &sender, "release", true, None));
+                record(&mut self.trace, || {
+                    evidence_event(&command, &sender, "release", true, None)
+                });
                 if settled {
                     return Ok(Progress::Settled);
                 }
                 Ok(self.try_release(command))
             }
             Err(e) => {
-                self.trace.push(evidence_event(
-                    &command,
-                    &sender,
-                    "release",
-                    false,
-                    Some(format!("{e:?}")),
-                ));
+                record(&mut self.trace, || {
+                    evidence_event(&command, &sender, "release", false, Some(format!("{e:?}")))
+                });
                 Err(e)
             }
         }
@@ -952,13 +1289,40 @@ impl Collector {
         }
         let command = established.command();
         let Some(entry) = self.pending.get_mut(&command) else {
-            return if self.is_resolved(&command) {
-                Ok(true)
-            } else {
-                Err(EvidenceError::UnknownCommand)
+            // Already answered. A late release is still evidence: the
+            // answer may have come from this node's own record, which
+            // agrees with the leader's only if this node executed the
+            // command where the leader did (task-d12).
+            let answered = self
+                .resolved
+                .values()
+                .find(|(c, _, _)| *c == command)
+                .map(|(_, response, own)| (response.clone(), *own));
+            return match answered {
+                Some((answered, own)) => {
+                    let response =
+                        self.answer_of(command, established.revision(), released.response());
+                    let release = Said::released(sender, released);
+                    let differs = Differs {
+                        response: response != answered,
+                        ..release.differs(&own)
+                    };
+                    if differs.any() {
+                        Err(EvidenceError::AnsweredOtherwise(Box::new(Mismatch {
+                            command,
+                            check: MismatchCheck::LateReleaseAgainstAnswer,
+                            release,
+                            own,
+                            differs,
+                        })))
+                    } else {
+                        Ok(true)
+                    }
+                }
+                None => Err(EvidenceError::UnknownCommand),
             };
         };
-        if let Some(previous) = &entry.released {
+        if let Some((_, previous)) = &entry.released {
             // A final release may follow a speculative one; anything else
             // that differs is a mismatch.
             if previous.established().result_digest() != established.result_digest()
@@ -968,12 +1332,12 @@ impl Collector {
                 return Err(EvidenceError::ReleaseMismatch);
             }
         }
-        entry.released = Some(released.clone());
+        entry.released = Some((sender, released.clone()));
         Ok(false)
     }
 
     fn is_resolved(&self, command: &CommandId) -> bool {
-        self.resolved.values().any(|(c, _)| c == command)
+        self.resolved.values().any(|(c, _, _)| c == command)
     }
 
     /// The release rule: both the collector's learning predicate and the
@@ -983,14 +1347,14 @@ impl Collector {
             return Progress::Settled;
         };
         let Some(learned) = entry.votes.learned() else {
-            self.trace.push(CollectorEvent::Held {
+            record(&mut self.trace, || CollectorEvent::Held {
                 command: command_hex(&command),
                 reason: "awaiting-votes".into(),
             });
             return Progress::Held(HoldReason::AwaitingVotes);
         };
-        let Some(released) = entry.released.clone() else {
-            self.trace.push(CollectorEvent::Held {
+        let Some((sender, released)) = entry.released.clone() else {
+            record(&mut self.trace, || CollectorEvent::Held {
                 command: command_hex(&command),
                 reason: "awaiting-release".into(),
             });
@@ -1011,7 +1375,7 @@ impl Collector {
             .saturating_sub(entry.dissemination.reserved);
         let missed = entry.dissemination.missing();
         if !missed.is_empty() {
-            self.trace.push(CollectorEvent::Undisseminated {
+            record(&mut self.trace, || CollectorEvent::Undisseminated {
                 command: command_hex(&command),
                 missed: missed.iter().map(replica_hex).collect(),
             });
@@ -1019,7 +1383,14 @@ impl Collector {
         let fast = matches!(learned, Learned::Fast { .. });
         let established = released.established();
         let response = self.answer_of(command, established.revision(), released.response());
-        self.finish(command, entry, response, released.speculative(), fast)
+        let executed = Said::released(sender, &released);
+        self.finish(
+            command,
+            entry,
+            (response, executed),
+            released.speculative(),
+            fast,
+        )
     }
 
     /// The response a caller is handed for a result, bounded by what
@@ -1050,21 +1421,20 @@ impl Collector {
         &mut self,
         command: CommandId,
         entry: Pending,
-        response: ResponseV1,
+        (response, executed): (ResponseV1, Said),
         speculative: bool,
         fast: bool,
     ) -> Progress {
-        let voters: Vec<String> = entry.votes.voted().iter().map(replica_hex).collect();
         let revision = match &response.outcome {
             OutcomeV1::Ok { revision, .. } => revision.map(|r| r.get()),
             _ => None,
         };
-        self.retain(entry.retry_key, command, response.clone());
-        self.trace.push(CollectorEvent::Released {
+        self.retain(entry.retry_key, command, response.clone(), executed);
+        record(&mut self.trace, || CollectorEvent::Released {
             command: command_hex(&command),
             speculative,
             fast,
-            voters,
+            voters: entry.votes.voted().iter().map(replica_hex).collect(),
             revision,
             delivered: entry.attached,
         });
@@ -1087,10 +1457,14 @@ impl Collector {
     /// are the ones something arrived for and something else did not,
     /// which is the shape a lost frontend delivery leaves behind, and the
     /// only shape the durable record is consulted for.
+    ///
+    /// Also every entry the record may settle alone (task-d22): one a
+    /// voter refused in a way only the record answers, one asked for
+    /// more than once, and every one a ballot change voided.
     pub fn half_established(&self) -> Vec<(CommandId, RetryKey)> {
         self.pending
             .iter()
-            .filter(|(_, e)| e.votes.learned().is_some() != e.released.is_some())
+            .filter(|(_, e)| e.from_record || e.votes.learned().is_some() != e.released.is_some())
             .map(|(c, e)| (*c, e.retry_key))
             .collect()
     }
@@ -1102,8 +1476,8 @@ impl Collector {
     /// node's own committed state -- the same thing that answers a
     /// caller's retry before anything is submitted -- and it is trusted
     /// here only to complete what the collector already half holds. When
-    /// the release is held, the record must agree with it on the digest
-    /// and the bytes, and then it confirms what the missing votes would
+    /// the release is held, the record must agree with it on the digest,
+    /// the bytes, the position and the revision, and then it confirms what the missing votes would
     /// have: the command executed. When the learning predicate holds, the
     /// record supplies the response the missing release would have
     /// carried. With neither, the record is not used, deliberately: a
@@ -1116,10 +1490,18 @@ impl Collector {
     pub fn settle_from_record(
         &mut self,
         command: CommandId,
-        result_digest: coord_types::identity::Digest32,
+        result_digest: Digest32,
+        position: ExecutionPosition,
         revision: Option<KvRevision>,
         response: &[u8],
     ) -> Result<Progress, SettleError> {
+        let own = Said {
+            release: None,
+            position,
+            revision,
+            result_digest,
+            response_len: response.len(),
+        };
         let Some(entry) = self.pending.get(&command) else {
             return if self.is_resolved(&command) {
                 Ok(Progress::Settled)
@@ -1130,28 +1512,90 @@ impl Collector {
         let learned = entry.votes.learned();
         let fast = matches!(learned, Some(Learned::Fast { .. }));
         let corroborated = match (&entry.released, learned.is_some()) {
-            (Some(released), _) => {
-                if released.established().result_digest() != result_digest
-                    || released.response() != response
-                {
-                    return Err(SettleError::Mismatch);
+            (Some((sender, released)), _) => {
+                let release = Said::released(*sender, released);
+                let differs = Differs {
+                    response: released.response() != response,
+                    ..release.differs(&own)
+                };
+                if differs.any() {
+                    return Err(SettleError::Mismatch(Box::new(Mismatch {
+                        command,
+                        check: MismatchCheck::HeldReleaseAgainstRecord,
+                        release,
+                        own,
+                        differs,
+                    })));
                 }
                 "release"
             }
             (None, true) => "votes",
+            (None, false) if entry.from_record => "record",
             (None, false) => return Err(SettleError::Uncorroborated),
         };
         let entry = self.pending.remove(&command).expect("present");
-        self.trace.push(CollectorEvent::SettledFromRecord {
+        record(&mut self.trace, || CollectorEvent::SettledFromRecord {
             command: command_hex(&command),
             corroborated: corroborated.into(),
         });
         let response = self.answer_of(command, revision, response);
-        Ok(self.finish(command, entry, response, false, fast))
+        Ok(self.finish(command, entry, (response, own), false, fast))
     }
 
-    fn retain(&mut self, key: RetryKey, command: CommandId, response: ResponseV1) {
-        self.resolved.insert(key, (command, response));
+    /// Settle `command` from this node's durable record of its retry key
+    /// naming `bound`, another command (task-d22).
+    ///
+    /// The record is the domain's decision about the key: `bound` was
+    /// executed under it, and a command presented under it with another
+    /// payload is rejected wherever it executes, with nothing mutated. So
+    /// the entry ends with `REQUEST_IDENTITY_CONFLICT`, as a retry of it
+    /// would have been answered before submission. Only an entry the
+    /// record may settle is ended: one a voter refused, or one asked for
+    /// again. The answer is not kept in the resolved window: a release of
+    /// the command, which reports its rejection at its own position, is
+    /// never compared with it.
+    pub fn settle_conflict_from_record(
+        &mut self,
+        command: CommandId,
+        bound: CommandId,
+    ) -> Result<Progress, SettleError> {
+        let Some(entry) = self.pending.get(&command) else {
+            return if self.is_resolved(&command) {
+                Ok(Progress::Settled)
+            } else {
+                Err(SettleError::NotPending)
+            };
+        };
+        if bound == command || !entry.from_record {
+            return Err(SettleError::Uncorroborated);
+        }
+        let entry = self.pending.remove(&command).expect("present");
+        self.undelivered_bytes = self
+            .undelivered_bytes
+            .saturating_sub(entry.dissemination.reserved);
+        self.bindings.remove(&entry.retry_key);
+        record(&mut self.trace, || CollectorEvent::SettledFromRecord {
+            command: command_hex(&command),
+            corroborated: "other-command".into(),
+        });
+        let response = codes::error_response(
+            command,
+            codes::REQUEST_IDENTITY_CONFLICT,
+            "the retry key is bound to another request",
+        );
+        Ok(Progress::Released(Release {
+            retry_key: entry.retry_key,
+            command,
+            session: entry.session,
+            response,
+            speculative: false,
+            fast: false,
+            attached: entry.attached,
+        }))
+    }
+
+    fn retain(&mut self, key: RetryKey, command: CommandId, response: ResponseV1, executed: Said) {
+        self.resolved.insert(key, (command, response, executed));
         self.resolved_order.push_back(key);
         while self.resolved_order.len() > self.config.max_resolved {
             let old = self.resolved_order.pop_front().expect("non-empty");
@@ -1166,7 +1610,7 @@ impl Collector {
         let command = *self.bindings.get(retry_key)?;
         let entry = self.pending.get_mut(&command)?;
         entry.attached = false;
-        self.trace.push(CollectorEvent::Cancelled {
+        record(&mut self.trace, || CollectorEvent::Cancelled {
             command: command_hex(&command),
         });
         Some(command)
@@ -1179,12 +1623,12 @@ impl Collector {
             None => Resolution::Unknown,
             Some(bound) if *bound != request.command_id => Resolution::Conflict { bound: *bound },
             Some(bound) => match self.resolved.get(&request.retry_key) {
-                Some((_, response)) => Resolution::Outcome(response.clone()),
+                Some((_, response, _)) => Resolution::Outcome(response.clone()),
                 None if self.pending.contains_key(bound) => Resolution::Pending,
                 None => Resolution::Unknown,
             },
         };
-        self.trace.push(CollectorEvent::Resolved {
+        record(&mut self.trace, || CollectorEvent::Resolved {
             sequence,
             result: match &resolution {
                 Resolution::Outcome(_) => "outcome",
@@ -1217,7 +1661,7 @@ impl Collector {
             }
         }
         for e in &out {
-            self.trace.push(CollectorEvent::TimedOut {
+            record(&mut self.trace, || CollectorEvent::TimedOut {
                 command: command_hex(&e.command),
             });
         }
@@ -1234,6 +1678,13 @@ impl Collector {
         for (command, entry) in &mut self.pending {
             entry.votes = VoteSet::new(quorum.clone(), *command);
             entry.released = None;
+            // What it held is void and nothing sends it again by itself:
+            // a command that executed under the old ballot produces no
+            // evidence under the new one. So every entry is asked for
+            // again at once, and may be settled from this node's record
+            // (task-d22).
+            entry.solicit_at = MonotonicMillis::ZERO;
+            entry.from_record = true;
             // Delivery follows the committed configuration, the same as
             // evidence does. A replica that is no longer a voter is no
             // longer a destination and stops being owed anything; one
@@ -1279,7 +1730,7 @@ impl Collector {
             }
         }
         self.undelivered_bytes = self.undelivered_bytes.saturating_sub(released);
-        self.trace.push(CollectorEvent::Reconfigured {
+        record(&mut self.trace, || CollectorEvent::Reconfigured {
             ballot: quorum.ballot().number,
             reset,
         });
@@ -1307,6 +1758,14 @@ const fn backoff_millis(attempts: u32) -> u64 {
 /// expires; none for a request that named no deadline.
 fn deadline(now: MonotonicMillis, deadline_ms: u32) -> Option<MonotonicMillis> {
     (deadline_ms > 0).then(|| now.plus(u64::from(deadline_ms)))
+}
+
+/// Record a transition, building it only if the trace is kept. A free
+/// function over the field, so recording borrows the trace alone.
+fn record(trace: &mut Option<Vec<CollectorEvent>>, event: impl FnOnce() -> CollectorEvent) {
+    if let Some(trace) = trace {
+        trace.push(event());
+    }
 }
 
 fn evidence_event(

@@ -8,6 +8,8 @@
 //! | `Submit` `0x0103` | collector to every voter | [`SubmitV1`] |
 //! | `Release` `0x0701` | leader to collector | `ReleasedResult` (postcard) |
 //! | `Evidence` `0x0700` | voter to collector | `ProtocolMessage` (postcard) |
+//! | `Read` `0x0107` | collector to the leader it follows | [`ReadV1`] |
+//! | `ReadAnswer` `0x0702` | leader to collector | [`ReadAnswerV1`] |
 //!
 //! None of these is decodable by the typed `wire_v1` decoder: they are
 //! dispatched by raw kind at the collector boundary, the way peer
@@ -15,6 +17,8 @@
 
 use coord_consensus::ProtocolMessage;
 use coord_core::capability::{AdmissionFacts, ReleasedResult};
+use coord_types::identity::RetryKey;
+use coord_types::ids::Ballot;
 use coord_types::wire_v1::{Frame, RequestV1, WireError, encode_frame};
 use serde::{Deserialize, Serialize};
 
@@ -34,6 +38,71 @@ pub const KIND_RELEASE: u16 = 0x0701;
 pub const KIND_EVIDENCE: u16 = 0x0700;
 /// Schema version of every collector frame.
 pub const VERSION: u16 = 1;
+/// A collector's current read, sent to the leader it follows only
+/// (task-d50; design Section 6.3).
+pub use coord_types::wire_v1::KIND_COLLECTOR_READ as KIND_READ;
+/// The leader's answer to a [`ReadV1`]. In the collector-evidence range
+/// for the reason a release is: the result it carries may be as large as
+/// an established one.
+pub const KIND_READ_ANSWER: u16 = 0x0702;
+
+/// A current read for the leader read barrier (task-d50; design Section
+/// 6.3): the client's request, unchanged, and the ballot whose leader
+/// the collector sent it to.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadV1 {
+    /// The ballot the collector follows. A voter that does not lead it
+    /// refuses.
+    pub ballot: Ballot,
+    /// The client request.
+    pub request: RequestV1,
+}
+
+/// The leader's answer to a [`ReadV1`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadAnswerV1 {
+    /// The invocation answered.
+    pub retry_key: RetryKey,
+    /// The ballot the answering voter was at.
+    pub ballot: Ballot,
+    /// What came of it.
+    pub outcome: ReadOutcomeV1,
+}
+
+/// What came of a [`ReadV1`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReadOutcomeV1 {
+    /// Served: the encoded `coord_state::Response`, the bytes the
+    /// ordered path would have recorded for the same read at the same
+    /// state.
+    Served {
+        /// The encoded response.
+        response: Vec<u8>,
+    },
+    /// Not served by the barrier. The collector orders the read instead:
+    /// a refusal is never an answer to the caller.
+    Refused {
+        /// Why.
+        reason: ReadRefusal,
+    },
+}
+
+/// Why the leader read barrier did not serve a read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ReadRefusal {
+    /// The voter does not lead the ballot the read named.
+    NotLeading,
+    /// The leader has proposed nothing in its ballot yet.
+    NothingProposed,
+    /// The confirmation round did not confirm, or the read waited past
+    /// its bound.
+    Expired,
+    /// The request is not one the barrier serves, or its plan was a
+    /// refusal the ordered path decides.
+    NotServable,
+    /// The leader holds as many reads as it bounds.
+    Busy,
+}
 
 /// The submission: what the admitting verifier attested and the exact
 /// request the client sent (its logical bytes are what identity binds).
@@ -147,5 +216,29 @@ pub fn release_frame(released: &ReleasedResult) -> Result<Vec<u8>, CollectorWire
 /// Decode a released result.
 pub fn decode_release(frame: &Frame) -> Result<ReleasedResult, CollectorWireError> {
     check(frame, KIND_RELEASE)?;
+    exact(&frame.payload)
+}
+
+/// Encode a read.
+pub fn read_frame(read: &ReadV1) -> Result<Vec<u8>, CollectorWireError> {
+    let payload = postcard::to_allocvec(read).map_err(|_| CollectorWireError::TooLarge)?;
+    frame(KIND_READ, &payload)
+}
+
+/// Decode a read.
+pub fn decode_read(frame: &Frame) -> Result<ReadV1, CollectorWireError> {
+    check(frame, KIND_READ)?;
+    exact(&frame.payload)
+}
+
+/// Encode a read's answer.
+pub fn read_answer_frame(answer: &ReadAnswerV1) -> Result<Vec<u8>, CollectorWireError> {
+    let payload = postcard::to_allocvec(answer).map_err(|_| CollectorWireError::TooLarge)?;
+    frame(KIND_READ_ANSWER, &payload)
+}
+
+/// Decode a read's answer.
+pub fn decode_read_answer(frame: &Frame) -> Result<ReadAnswerV1, CollectorWireError> {
+    check(frame, KIND_READ_ANSWER)?;
     exact(&frame.payload)
 }

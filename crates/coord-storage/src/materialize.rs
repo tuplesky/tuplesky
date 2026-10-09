@@ -354,6 +354,22 @@ pub fn complete<P: Persistence>(
     store: &mut P,
     pending: &Pending,
 ) -> Result<ApplyOutcome, EngineError> {
+    complete_sharing(store, pending, None)
+}
+
+/// [`complete`], handing every event that is not `pending`'s own to
+/// `others` when it is given, whatever the outcome.
+///
+/// A lowering moves whatever the store had queued, and on a replica that
+/// is the protocol's batches as well as this one: a vote, a promise, an
+/// adoption. Their `JournalDurable` is what releases the sends waiting on
+/// them, and it comes out of this lowering or out of none. Dropped here,
+/// the send it gated waited until a new ballot or a restart.
+pub(crate) fn complete_sharing<P: Persistence>(
+    store: &mut P,
+    pending: &Pending,
+    mut others: Option<&mut Vec<StorageEvent>>,
+) -> Result<ApplyOutcome, EngineError> {
     let mut events = Vec::new();
     for _ in 0..LOWERINGS {
         let lowered = store.lower()?;
@@ -380,7 +396,12 @@ pub fn complete<P: Persistence>(
                 _ => {}
             }
         }
-        events.extend(lowered.events);
+        for event in lowered.events {
+            match others.as_deref_mut() {
+                Some(others) if event.barrier() != Some(pending.barrier) => others.push(event),
+                _ => events.push(event),
+            }
+        }
         if materialized {
             return Ok(ApplyOutcome::Applied(events));
         }
@@ -417,9 +438,64 @@ pub fn apply_plan<P: Persistence>(
     plan: &ApplyPlan,
     binding: Option<&RetryBinding>,
 ) -> Result<ApplyOutcome, EngineError> {
+    apply_plan_sharing(store, barrier, namespace, plan, binding, None)
+}
+
+/// [`apply_plan`], handing the events that are not the plan's own to
+/// `others` ([`complete_sharing`]).
+pub(crate) fn apply_plan_sharing<P: Persistence>(
+    store: &mut P,
+    barrier: BarrierId,
+    namespace: NamespaceId,
+    plan: &ApplyPlan,
+    binding: Option<&RetryBinding>,
+    others: Option<&mut Vec<StorageEvent>>,
+) -> Result<ApplyOutcome, EngineError> {
     let (batch, kind, pending) = prepare(barrier, namespace, plan, binding)?;
     match submit(store, batch, kind)? {
-        Submitted::Accepted => complete(store, &pending),
+        Submitted::Accepted => complete_sharing(store, &pending, others),
+        Submitted::Replan => Ok(ApplyOutcome::Replan),
+        Submitted::Indeterminate => Ok(ApplyOutcome::Indeterminate),
+    }
+}
+
+/// Apply `plan` as `command`'s refusal: its position and whatever the plan
+/// carries, with `command`'s executed identity and nothing under a retry
+/// key.
+///
+/// A refused command executed like any other. Without its executed row a
+/// restart would find it unexecuted and execute it again, at a position
+/// after everything this voter executed since, which is not where the
+/// other voters executed it (task-d12).
+pub fn apply_refused_plan<P: Persistence>(
+    store: &mut P,
+    barrier: BarrierId,
+    namespace: NamespaceId,
+    plan: &ApplyPlan,
+    command: &coord_types::CommandId,
+) -> Result<ApplyOutcome, EngineError> {
+    apply_refused_plan_sharing(store, barrier, namespace, plan, command, None)
+}
+
+/// [`apply_refused_plan`], handing the events that are not the plan's own
+/// to `others` ([`complete_sharing`]).
+pub(crate) fn apply_refused_plan_sharing<P: Persistence>(
+    store: &mut P,
+    barrier: BarrierId,
+    namespace: NamespaceId,
+    plan: &ApplyPlan,
+    command: &coord_types::CommandId,
+    others: Option<&mut Vec<StorageEvent>>,
+) -> Result<ApplyOutcome, EngineError> {
+    let (mut batch, kind, pending) = prepare(barrier, namespace, plan, None)?;
+    batch.updates.push(crate::retry::executed_update(
+        command,
+        plan.position,
+        plan.revision,
+        pending.result_digest,
+    )?);
+    match submit(store, batch, kind)? {
+        Submitted::Accepted => complete_sharing(store, &pending, others),
         Submitted::Replan => Ok(ApplyOutcome::Replan),
         Submitted::Indeterminate => Ok(ApplyOutcome::Indeterminate),
     }
