@@ -35,6 +35,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::ballot::{BallotState, ConfigurationIdentity, PromiseRejection, ReplicaRole};
 use crate::commands::{CommandTable, InitError};
+use crate::digest::{self, DigestMap};
 use crate::learner::{AppliedOutcome, LearnError, Learner, LearningMode};
 use crate::messages::{MAX_PAYLOAD_TRANSFER, PathAnchors, ProtocolMessage, SubmissionRefusal};
 use crate::phase::Phase;
@@ -416,7 +417,7 @@ pub struct Leader {
     ballots: BallotState,
     table: CommandTable,
     bindings: BTreeMap<RetryKey, CommandId>,
-    proposals: BTreeMap<CommandId, Proposal>,
+    proposals: DigestMap<CommandId, Proposal>,
     /// The proposals not yet both durable and executed, by sequence
     /// number (task-d46): what the per-vote and per-event passes read,
     /// instead of every proposal, which `proposals` keeps until the
@@ -438,7 +439,7 @@ pub struct Leader {
     /// above it only once the proposal it names was swept or its votes
     /// replaced, which [`Leader::adopted_through`] finds and corrects.
     adopted_through: BTreeMap<ReplicaId, (u64, CommandId)>,
-    votes: BTreeMap<CommandId, VoteSet>,
+    votes: DigestMap<CommandId, VoteSet>,
     /// Acknowledgements that reached this leader before it had proposed
     /// the command they are about, held until it does.
     early_votes: BTreeMap<CommandId, Vec<Vote>>,
@@ -466,6 +467,10 @@ pub struct Leader {
     pending_sync: Option<(ReplicaId, SyncDecision)>,
     speculation: Speculation,
     rejections: Vec<Rejection>,
+    /// The command the last admitted request became, once derived
+    /// (task-d60, step 3): the voter files where its evidence is owed
+    /// under it instead of decoding the request a second time.
+    admitted: Option<CommandId>,
     fenced: Option<FenceReason>,
     /// Entries of the selection this leader was handed that no order
     /// keeps: a dependency cycle, which is an invariant violation
@@ -502,7 +507,7 @@ pub struct Leader {
     /// Per proposal and voter it was re-sent to: when it may be re-sent
     /// again, and how often it was. Kept only while the proposal is held
     /// and the voter has not adopted it.
-    resent: BTreeMap<(CommandId, ReplicaId), Resent>,
+    resent: DigestMap<(CommandId, ReplicaId), Resent>,
     /// Per voter, how many calls of `resend_unvoted` its latest adoptions
     /// took to arrive after the proposal's first send, newest last and at
     /// most `RESEND_LATENCY_SAMPLES`: what its re-send interval is taken
@@ -515,7 +520,7 @@ pub struct Leader {
     /// second copy shows the first was the answer to the first send, and
     /// late (task-d49).
     /// Kept one call after the adoption, with the call count it came at.
-    answered: BTreeMap<(CommandId, ReplicaId), (u64, u64)>,
+    answered: DigestMap<(CommandId, ReplicaId), (u64, u64)>,
     /// What the re-sends did, until the driver takes it (task-d49).
     counts: ResendCounts,
     /// Why each command established on the slow path missed the fast
@@ -608,9 +613,9 @@ impl Leader {
             // Every voter of the genesis ballot is in it from the start.
             joined: config.identity.voters.iter().copied().collect(),
             resend_calls: 0,
-            resent: BTreeMap::new(),
+            resent: digest::map(),
             latency: BTreeMap::new(),
-            answered: BTreeMap::new(),
+            answered: digest::map(),
             counts: ResendCounts::default(),
             missed: MissedLog::default(),
             learned: None,
@@ -621,12 +626,12 @@ impl Leader {
             ballots,
             table,
             bindings: BTreeMap::new(),
-            proposals: BTreeMap::new(),
+            proposals: digest::map(),
             unsettled: BTreeSet::new(),
             by_barrier: BTreeMap::new(),
             durable: BTreeSet::new(),
             adopted_through: BTreeMap::new(),
-            votes: BTreeMap::new(),
+            votes: digest::map(),
             early_votes: BTreeMap::new(),
             early_order: VecDeque::new(),
             payloads: BTreeMap::new(),
@@ -640,6 +645,7 @@ impl Leader {
             pending_sync: None,
             speculation: Speculation::new(),
             rejections: Vec::new(),
+            admitted: None,
             fenced: None,
             recovery_cycle: None,
             own_adoptions: BTreeMap::new(),
@@ -718,12 +724,12 @@ impl Leader {
             ballots: state.ballots,
             table: state.table,
             bindings: state.bindings,
-            proposals: BTreeMap::new(),
+            proposals: digest::map(),
             unsettled: BTreeSet::new(),
             by_barrier: BTreeMap::new(),
             durable: BTreeSet::new(),
             adopted_through: BTreeMap::new(),
-            votes: BTreeMap::new(),
+            votes: digest::map(),
             early_votes: BTreeMap::new(),
             early_order: VecDeque::new(),
             own_adoptions: BTreeMap::new(),
@@ -738,6 +744,7 @@ impl Leader {
             pending_sync: None,
             speculation: Speculation::new(),
             rejections: Vec::new(),
+            admitted: None,
             fenced: None,
             recovery_cycle: None,
             replay: crate::replay::EvidenceStore::new(state.capacity),
@@ -748,9 +755,9 @@ impl Leader {
             // frame were lost (task-d33). A vote at this ballot joins it.
             joined: BTreeSet::from([identity.replica]),
             resend_calls: 0,
-            resent: BTreeMap::new(),
+            resent: digest::map(),
             latency: BTreeMap::new(),
-            answered: BTreeMap::new(),
+            answered: digest::map(),
             counts: ResendCounts::default(),
             missed: MissedLog::default(),
             learned: None,
@@ -1739,7 +1746,9 @@ impl Leader {
     }
 
     fn learn(&mut self) {
-        let committed = self.learner.commit_learned(&mut self.table, &self.votes);
+        let committed = self
+            .learner
+            .commit_learned(&mut self.table, |c| self.votes.get(c));
         if let Some(learned) = self.learned.as_mut() {
             learned.extend(committed);
         }
@@ -1998,7 +2007,19 @@ impl Leader {
     }
 
     fn on_admitted(&mut self, frame: &[u8], admission: AdmissionFacts) -> Vec<Effect> {
+        self.admitted = None;
         self.propose(frame, Some(admission))
+    }
+
+    /// Whether an admitted request reaches the derivation of its command
+    /// here: the checks [`Leader::propose`] makes before it decodes.
+    pub fn takes_admission(&self) -> bool {
+        self.boot.is_some() && self.ballots.seal_held().is_none() && self.is_leading()
+    }
+
+    /// The command the last admitted request became, if it was derived.
+    pub const fn admitted(&self) -> Option<CommandId> {
+        self.admitted
     }
 
     /// Propose one of the service's own commands.
@@ -2148,6 +2169,7 @@ impl Leader {
             self.rejections.push(Rejection::MalformedRequest);
             return Vec::new();
         };
+        self.admitted = Some(command);
         let payload = PayloadRecordV1 {
             retry_key: request.retry_key,
             logical: request.logical.as_slice().to_vec(),
@@ -2931,7 +2953,8 @@ impl Leader {
         let responses: Vec<ProtocolMessage> = commands
             .iter()
             .filter(|c| {
-                self.proposals.get(c).is_some_and(|p| p.durable) || self.served_payloads.contains(c)
+                self.proposals.get(*c).is_some_and(|p| p.durable)
+                    || self.served_payloads.contains(c)
             })
             .filter_map(|c| {
                 self.payloads

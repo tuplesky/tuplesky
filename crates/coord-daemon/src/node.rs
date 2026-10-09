@@ -104,6 +104,24 @@ impl Machine {
         }
     }
 
+    /// Whether an admitted request reaches the derivation of its command
+    /// in this machine (task-d60, step 3).
+    pub fn takes_admission(&self) -> bool {
+        match self {
+            Machine::Leader(l) => l.takes_admission(),
+            Machine::Follower(f) => f.takes_admission(),
+        }
+    }
+
+    /// The command the last admitted request became, if this machine
+    /// derived it.
+    pub fn admitted(&self) -> Option<CommandId> {
+        match self {
+            Machine::Leader(l) => l.admitted(),
+            Machine::Follower(f) => f.admitted(),
+        }
+    }
+
     /// Whether this replica is holding a command it knows by identity
     /// and not by content.
     pub fn wants_payloads(&self) -> bool {

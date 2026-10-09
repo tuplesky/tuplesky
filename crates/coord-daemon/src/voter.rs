@@ -569,16 +569,26 @@ impl<P: Persistence> Voter<P> {
             Ok(a) => a,
             Err(e) => return Ok(Err(Refused::NotAdmissible(e))),
         };
-        // The identity the machine will derive, derived the same way. A
-        // retry rebinds it: the same command submitted again through
-        // another collector is owed to that one, and a collector that
-        // went away is not owed anything.
-        if let Some(command) = command_of(&admitted.frame) {
+        // The identity the machine derives, taken from it (task-d60, step
+        // 3), or derived the same way here where the machine refuses the
+        // request before deriving it. A retry rebinds it: the same command
+        // submitted again through another collector is owed to that one,
+        // and a collector that went away is not owed anything.
+        #[cfg(debug_assertions)]
+        let expected = command_of(&admitted.frame);
+        let early = if self.node.machine().takes_admission() {
+            None
+        } else {
+            command_of(&admitted.frame)
+        };
+        let out = self.node.on_event(Event::Admitted(admitted), &self.ballot);
+        let command = early.or_else(|| self.node.machine().admitted());
+        #[cfg(debug_assertions)]
+        debug_assert_eq!(command, expected, "the machine's command is the frame's");
+        if let Some(command) = command {
             self.origins.remember(command, origin);
         }
-        self.node
-            .on_event(Event::Admitted(admitted), &self.ballot)
-            .map(Ok)
+        out.map(Ok)
     }
 
     /// What this voter leads, for the read barrier: `None` unless its

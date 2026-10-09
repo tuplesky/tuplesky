@@ -15,7 +15,7 @@
 //! `Effect::Established`. A leader reply, or any single response, can
 //! never establish anything here.
 
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
 
 use coord_core::capability::{EstablishError, EstablishedResult, EstablishmentEvidence};
@@ -130,10 +130,10 @@ impl Learner {
     /// whose dependencies are committed; repeat while progress is made.
     /// Returns the commands committed. Fast and slow learning yield the
     /// same dependencies (the leader's); only the evidence differs.
-    pub fn commit_learned(
+    pub fn commit_learned<'a>(
         &mut self,
         table: &mut CommandTable,
-        votes: &BTreeMap<CommandId, VoteSet>,
+        votes: impl Fn(&CommandId) -> Option<&'a VoteSet>,
     ) -> Vec<CommandId> {
         let mut committed = Vec::new();
         loop {
@@ -146,7 +146,7 @@ impl Learner {
                 .in_accept()
                 .into_iter()
                 .filter_map(|c| {
-                    let v = votes.get(&c)?;
+                    let v = votes(&c)?;
                     let learned = match self.mode {
                         LearningMode::Full => v.learned(),
                         LearningMode::SlowOnly => v.learned_slow(),
