@@ -119,7 +119,9 @@ pub struct ReadCounts {
 /// The reads a leader holds, and the rounds that confirm them.
 #[derive(Debug, Default)]
 pub struct ReadBarrier {
-    held: VecDeque<Held>,
+    /// Boxed (task-d60, step 3): a pump moves the reads it takes out and
+    /// the ones it holds again, and a held read carries its request.
+    held: VecDeque<Box<Held>>,
     /// The number the next round takes. Rounds are numbered across
     /// ballots, so an answer to a round of another ballot never matches.
     next_round: u64,
@@ -170,7 +172,7 @@ impl ReadBarrier {
         if self.held.len() >= READS_HELD {
             return refuse(self, leading.ballot, ReadRefusal::Busy);
         }
-        self.held.push_back(Held {
+        self.held.push_back(Box::new(Held {
             origin,
             read,
             logical,
@@ -180,7 +182,7 @@ impl ReadBarrier {
             confirmed_at: None,
             due_at: None,
             required: None,
-        });
+        }));
         Ok(())
     }
 
@@ -267,10 +269,6 @@ impl ReadBarrier {
     }
 
     /// Whether `held` may be answered from `ballot`'s confirmation.
-    fn covered(&self, held: &Held, ballot: Ballot) -> bool {
-        self.confirmed
-            .is_some_and(|(b, round)| b == ballot && round >= held.after_round)
-    }
 
     /// The reads that may be planned now, and the refusals due.
     ///
@@ -286,29 +284,19 @@ impl ReadBarrier {
         now: MonotonicMillis,
         executed_below: impl Fn(u64) -> bool,
         executed_through: ExecutionPosition,
-    ) -> (Vec<Held>, Vec<(Origin, ReadAnswerV1)>) {
+    ) -> (Vec<Box<Held>>, Vec<(Origin, ReadAnswerV1)>) {
         let mut due = Vec::new();
         let mut refused = Vec::new();
-        let mut kept = VecDeque::with_capacity(self.held.len());
-        for mut held in core::mem::take(&mut self.held) {
+        // In place first: most pumps neither refuse a read nor find one
+        // due, and then nothing leaves the queue (task-d60, step 3).
+        let mut leaving = false;
+        for held in &mut self.held {
             let ballot = held.read.ballot;
-            let reason = match leading {
-                Some(l) if l.ballot == ballot => None,
-                _ => Some(ReadRefusal::NotLeading),
-            }
-            .or_else(|| {
-                (now.get().saturating_sub(held.arrived.get()) > READ_WAIT_MILLIS)
-                    .then_some(ReadRefusal::Expired)
-            });
-            if let Some(reason) = reason {
-                self.counts.refused += 1;
-                refused.push((
-                    held.origin,
-                    refusal(held.read.request.retry_key, ballot, reason),
-                ));
+            if refusal_of(held, leading, now).is_some() {
+                leaving = true;
                 continue;
             }
-            if held.confirmed_at.is_none() && self.covered(&held, ballot) {
+            if held.confirmed_at.is_none() && covered(self.confirmed, held, ballot) {
                 held.confirmed_at = Some(now);
             }
             if held.required.is_none() && held.confirmed_at.is_some() && executed_below(held.index)
@@ -316,13 +304,26 @@ impl ReadBarrier {
                 held.required = Some(executed_through);
                 held.due_at = Some(now);
             }
-            if held.required.is_some() {
-                due.push(held);
-            } else {
-                kept.push_back(held);
-            }
+            leaving |= held.required.is_some();
         }
-        self.held = kept;
+        if leaving {
+            let mut kept = VecDeque::with_capacity(self.held.len());
+            for held in core::mem::take(&mut self.held) {
+                let ballot = held.read.ballot;
+                if let Some(reason) = refusal_of(&held, leading, now) {
+                    self.counts.refused += 1;
+                    refused.push((
+                        held.origin,
+                        refusal(held.read.request.retry_key, ballot, reason),
+                    ));
+                } else if held.required.is_some() {
+                    due.push(held);
+                } else {
+                    kept.push_back(held);
+                }
+            }
+            self.held = kept;
+        }
         // A round older than any read's wait is not going to answer one.
         self.rounds.retain(|_, r| {
             now.get().saturating_sub(r.started.get()) <= READ_WAIT_MILLIS
@@ -332,7 +333,7 @@ impl ReadBarrier {
     }
 
     /// Hold `held` again: its snapshot has not reached its position yet.
-    pub fn hold_again(&mut self, held: Held) {
+    pub fn hold_again(&mut self, held: Box<Held>) {
         self.held.push_front(held);
     }
 
@@ -358,6 +359,24 @@ impl ReadBarrier {
     pub fn refused(&mut self) {
         self.counts.refused += 1;
     }
+}
+
+/// Whether a round of `ballot` that confirmed covers `held`.
+fn covered(confirmed: Option<(Ballot, u64)>, held: &Held, ballot: Ballot) -> bool {
+    confirmed.is_some_and(|(b, round)| b == ballot && round >= held.after_round)
+}
+
+/// Why `held` is refused now, if it is: its ballot is no longer led,
+/// or it waited past [`READ_WAIT_MILLIS`].
+fn refusal_of(held: &Held, leading: Option<Leading>, now: MonotonicMillis) -> Option<ReadRefusal> {
+    match leading {
+        Some(l) if l.ballot == held.read.ballot => None,
+        _ => Some(ReadRefusal::NotLeading),
+    }
+    .or_else(|| {
+        (now.get().saturating_sub(held.arrived.get()) > READ_WAIT_MILLIS)
+            .then_some(ReadRefusal::Expired)
+    })
 }
 
 /// A refusal answer.
