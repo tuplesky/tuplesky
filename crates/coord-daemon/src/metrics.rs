@@ -571,6 +571,25 @@ pub struct Traffic {
     /// ACK frames QUIC received on peer connections.
     #[serde(default)]
     pub acks_received: u64,
+    /// The same QUIC counts on this node's api connections, callers' and
+    /// collectors' (task-d70), so its datagrams split into its two planes.
+    #[serde(default)]
+    pub api: Datagrams,
+}
+
+/// What QUIC sent and received on one class of connections (task-d70).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Datagrams {
+    /// UDP datagrams sent, acknowledgements included.
+    pub datagrams_sent: u64,
+    /// UDP datagrams received.
+    pub datagrams_received: u64,
+    /// The system calls that sent them.
+    pub send_calls: u64,
+    /// ACK frames sent.
+    pub acks_sent: u64,
+    /// ACK frames received.
+    pub acks_received: u64,
 }
 
 /// A pipeline thread's jobs and their three times (task-d62), summed.

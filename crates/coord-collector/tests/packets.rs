@@ -165,6 +165,10 @@ fn the_fan_out_reaches_every_voter_at_once_and_nobody_relays_it() {
     let mut arrivals: Vec<(usize, u64, Frame, PeerRole)> = Vec::new();
     let mut steps = 0;
     while arrivals.len() < 4 && steps < 50_000 {
+        // The tick a step delivers at: after it, the clock has moved on
+        // to the next wakeup, which depends on every node's timers (an
+        // acknowledgement's delay among them, task-d70), not on the path.
+        let at = w.ticks();
         w.step();
         steps += 1;
         for v in 0..3 {
@@ -181,7 +185,7 @@ fn the_fan_out_reaches_every_voter_at_once_and_nobody_relays_it() {
                     assert_eq!(lane, Lane::Unary);
                     arrivals.push((
                         v,
-                        w.ticks(),
+                        at,
                         Frame {
                             kind,
                             version,
@@ -216,7 +220,7 @@ fn the_fan_out_reaches_every_voter_at_once_and_nobody_relays_it() {
         *max - *min <= 1,
         "arrivals in the same tick over symmetric paths: {ticks:?}"
     );
-    assert!(*min > sent_at);
+    assert!(*min >= sent_at + 10, "no arrival before the path's delay");
     // No voter relayed the submission on any of its links: the frames the
     // voters sent since the handshake are none at all.
     for v in 0..3 {

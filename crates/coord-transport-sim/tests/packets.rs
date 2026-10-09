@@ -166,9 +166,12 @@ fn loss_reorder_duplication_and_mtu_schedules_reproduce_and_keep_the_visible_out
             duplicate_ppm: 200_000,
             ..LinkFaults::default()
         },
+        // The exchange is about a dozen datagrams at the transport's
+        // default acknowledgement cadence (task-d70), so a loss schedule
+        // drops one in ten to be sure of dropping some.
         LinkFaults {
             mtu: 1300,
-            loss_ppm: 50_000,
+            loss_ppm: 100_000,
             ..LinkFaults::default()
         },
     ];
