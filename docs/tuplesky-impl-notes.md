@@ -10146,7 +10146,25 @@ Kept: threshold 8 with the delay left to the peer is the transport's
 default (`AckFrequency::DEFAULT`), on both planes and for every endpoint
 built from `Limits::default()`; `COORDD_ACK_FREQUENCY=off` asks nothing,
 for a control pair, and `<threshold>` or `<threshold>,<µs>` override it.
-It merges after one fault run with it. The worker count is the runner's
+Under faults it held. The runner's fault schedule (kill, pause and
+partition, 300 s, two workers) ran twice with `COORDD_ACK_FREQUENCY` at
+`8,25000`, which is the default's cadence since the peer's own delay is
+25 ms, and twice unset:
+
+| | with it | with it | unset | unset |
+| --- | --- | --- | --- | --- |
+| `:valid?`, final reads, stops | true, 5 of 5, none | true, 5 of 5, none | true, 5 of 5, none | true, 5 of 5, none |
+| republished, whole run / after the final start | 16 / 0 | 0 / 0 | 0 / 0 | 0 / 0 |
+| lost frames | 642 | 2 | 1,278 | 0 |
+| slowest voter back serving after a fault, median / most (s) | 34.0 / 134.0 | 23.3 / 95.1 | 28.0 / 124.5 | 2.2 / 89.9 |
+| `ok`/s until the final heal | 4.9 | 8.4 | 7.5 | 7.4 |
+
+The checks that move (lost frames, republishes, time back serving) move
+as much without the cadence, and the nine earlier fault runs of the
+series, all without it, republished up to 8 times and lost up to 657
+frames on one voter. The spread is the faults' overlap; two runs a side
+cannot show a cadence effect inside it, and nothing points to a later
+loss detection stretching recovery. The worker count is the runner's
 setting from here; the daemon's waits on a reading on a host of its own,
 an open row under task-d66.
 
