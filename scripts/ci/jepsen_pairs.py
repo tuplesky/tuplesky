@@ -75,7 +75,9 @@ class Run:
     # profile names its voter; the phase tables scale its shares by it.
     sampled_follower: str | None = None
     # The voter the leader's profile sampled, and its own loop CPU per
-    # command (ms), where the profile names it.
+    # command (ms) over the profile's window, where the profile names it;
+    # a named profile whose window cannot be costed has no loop and stays
+    # in percent.
     sampled_leader: str | None = None
     sampled_leader_loop: float | None = None
     sampled_follower_loop: float | None = None
@@ -120,9 +122,11 @@ class Run:
     @property
     def profile_loop(self) -> float | None:
         """The loop CPU per command (ms) the leader's profiles scale by: the
-        sampled voter's own where its profile names it, which need not be
-        the voter that served reads at the end, else the leader's."""
-        return self.sampled_leader_loop or self.leader_loop
+        sampled voter's own over the profile's window where its profile
+        names it, which need not be the voter that served reads at the end,
+        and None where that window cannot be costed; else, for a profile
+        that names none, the leader's."""
+        return self.sampled_leader_loop if self.sampled_leader else self.leader_loop
 
     @property
     def leader_excess(self) -> float | None:
@@ -313,13 +317,15 @@ def read_run(label: str, store: str) -> Run:
     sampled = js.sampled_costs(voters, store)
     usable = lambda c: c is not None and c.cpu and c.executed
     lead = js.profiled_node(os.path.join(store, "leader-profile.txt"))
-    if lead in sampled and usable(sampled[lead]):
+    if lead in sampled:
         run.sampled_leader = lead
-        run.sampled_leader_loop = sampled[lead].cpu[0] * 1000 / sampled[lead].executed
+        if usable(sampled[lead]):
+            run.sampled_leader_loop = sampled[lead].cpu[0] * 1000 / sampled[lead].executed
     node = js.profiled_node(os.path.join(store, "follower-profile-chains.txt"))
-    if node in sampled and usable(sampled[node]) and node != lead and (lead or sampled[node] is not leader):
+    if node in sampled and node != lead and (lead or sampled[node] is not leader):
         run.sampled_follower = node
-        run.sampled_follower_loop = sampled[node].cpu[0] * 1000 / sampled[node].executed
+        if usable(sampled[node]):
+            run.sampled_follower_loop = sampled[node].cpu[0] * 1000 / sampled[node].executed
     if run.profile_loop:
         counts = os.path.join(store, "leader-profile-syscalls.txt")
         run.threads, _ = js.syscalls_per_command(counts, run.profile_loop * 1000)
@@ -448,9 +454,10 @@ def split_tables(runs: list[Run], top: int = 20) -> list[str]:
         for owner, share in s["owners"].most_common(top):
             out.append(f"| `{owner.replace('|', '/')}` | {share * us:.1f} |")
         out.append("")
-        # The sampled follower's own cost where its voter is known; a run
-        # from before that is named gives the followers' mean.
-        follower_ms = run.sampled_follower_loop or run.followers_loop
+        # The sampled follower's own cost where its voter is known (None
+        # where its window cannot be costed); a run from before that is
+        # named gives the followers' mean.
+        follower_ms = run.sampled_follower_loop if run.sampled_follower else run.followers_loop
         follower_us = follower_ms * 1000 if follower_ms else None
         comparison = js.phase_comparison(run.chains, run.follower_chains, run.profile_loop * 1000, follower_us, top,
                                          run.sampled_follower)

@@ -78,6 +78,14 @@ class PairTests(unittest.TestCase):
         self.assertAlmostEqual(run.leader_excess, 0.2)
         self.assertIsNone(run.servers_cpu_per_op)
 
+    def test_a_named_profile_whose_window_cannot_be_costed_stays_in_percent(self):
+        run = jp.Run(label="x", store="", leader_loop=0.8)
+        self.assertEqual(run.profile_loop, 0.8)
+        run.sampled_leader = "n2"
+        self.assertIsNone(run.profile_loop)
+        run.sampled_leader_loop = 0.6
+        self.assertEqual(run.profile_loop, 0.6)
+
     def test_pairs_take_either_order(self):
         paired = jp.pairs(self.runs)
         self.assertEqual([(b.store[-1], h.store[-1]) for b, h in paired], [("1", "2"), ("4", "3")])
