@@ -897,7 +897,7 @@ jobs:
             --nemesis-interval 30 \
             --rate "$RATE" \
             --time-limit "$TIME_LIMIT" \
-            --concurrency "$CONCURRENCY" \
+            --concurrency "$SWIFTPAXOS_CONCURRENCY" \
             ${wan[@]+"${wan[@]}"}
       - name: Summarize the run
         if: always()
@@ -905,7 +905,7 @@ jobs:
           if [ -d jepsen/swiftpaxos/store/latest ]; then
             cp "$RUNNER_TEMP"/cpu-samples* jepsen/swiftpaxos/store/latest/ 2>/dev/null || true
             python3 tuplesky/scripts/ci/jepsen_summary.py jepsen/swiftpaxos/store/latest \
-              --nodes-file "$RUNNER_TEMP/cluster/nodes" --title "SwiftPaxos: register, $SWIFTPAXOS_NEMESIS$TITLE_SUFFIX"
+              --nodes-file "$RUNNER_TEMP/cluster/nodes" --title "SwiftPaxos: register, $SWIFTPAXOS_NEMESIS$SWIFTPAXOS_TITLE_SUFFIX"
           else
             echo "No Jepsen store: the test did not start." >> "$GITHUB_STEP_SUMMARY"
           fi

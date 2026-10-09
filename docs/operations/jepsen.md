@@ -172,7 +172,9 @@ multiple of the nodes such as `5n`; a throughput sweep is one run a value.
 Every register workload here runs each key on 2 clients a node, and
 Jepsen refuses a test whose clients do not split evenly into such groups,
 so a register run's count goes up to the next multiple of `2n` (`1n` runs
-as `2n`, `5n` as `6n`) and its summaries' titles say so.
+as `2n`, `5n` as `6n`) and its summaries' titles say so. SwiftPaxos runs
+the register workload whatever the `workload` input, so its count goes up
+the same way on its own while TupleSky's and etcd's stay as given.
 
 The `store` input is `disk` (the default) or `tmpfs`. With `tmpfs`, the
 cluster is stood up with `docker/up.sh --tmpfs` (on tuplesky/jepsen's

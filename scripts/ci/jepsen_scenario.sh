@@ -99,27 +99,42 @@ case $concurrency in
   *n) clients=$(( ${concurrency%n} * nodes )) ;;
   *)  clients=$concurrency ;;
 esac
-raised=""
 group=$(( 2 * nodes ))
-if [ "$workload" = register ] && [ $(( clients % group )) -ne 0 -o "$clients" -eq 0 ]; then
+# A register run's clients, raised to the next multiple of 2n where they
+# are not one already.
+register_clients=$concurrency
+if [ $(( clients % group )) -ne 0 -o "$clients" -eq 0 ]; then
   groups=$(( (clients + group - 1) / group ))
   if [ "$groups" -lt 1 ]; then groups=1; fi
-  raised=" (raised from $concurrency to a multiple of the register workload's 2n)"
-  concurrency=$(( 2 * groups ))n
+  register_clients=$(( 2 * groups ))n
+fi
+raised_note=" (raised from $concurrency to a multiple of the register workload's 2n)"
+# SwiftPaxos runs the register workload whatever TupleSky's and etcd's is.
+swiftpaxos_concurrency=$register_clients
+swiftpaxos_raised=""
+if [ "$register_clients" != "$concurrency" ]; then swiftpaxos_raised=$raised_note; fi
+raised=""
+if [ "$workload" = register ]; then
+  raised=$swiftpaxos_raised
+  concurrency=$register_clients
 fi
 # The TupleSky test waits after the final heal for killed peers to rejoin;
 # with no faults there is nothing to wait for.
 recovery_time=60
 if [ "$nemesis" = none ]; then recovery_time=0; fi
 
-# Appended to each job summary's title, after the system, workload and faults.
-suffix=""
-if [ "$rate" = 0 ]; then
-  suffix+=", unthrottled at $concurrency$raised"
-elif [ -n "${IN_CONCURRENCY:-}" ]; then
-  suffix+=", $concurrency clients$raised"
-fi
-if [ "$wan" != none ]; then suffix+=", wan $wan"; fi
+# Appended to each job summary's title, after the system, workload and
+# faults; SwiftPaxos's names its own clients.
+load_suffix() {
+  if [ "$rate" = 0 ]; then
+    printf ', unthrottled at %s%s' "$1" "$2"
+  elif [ -n "${IN_CONCURRENCY:-}" ]; then
+    printf ', %s clients%s' "$1" "$2"
+  fi
+  if [ "$wan" != none ]; then printf ', wan %s' "$wan"; fi
+}
+suffix=$(load_suffix "$concurrency" "$raised")
+swiftpaxos_suffix=$(load_suffix "$swiftpaxos_concurrency" "$swiftpaxos_raised")
 
 store=${IN_STORE:-disk}
 case $store in
@@ -197,9 +212,11 @@ out=${GITHUB_ENV:-/dev/stdout}
   echo "RATE=$rate"
   echo "ETCD_RATE=$etcd_rate"
   echo "CONCURRENCY=$concurrency"
+  echo "SWIFTPAXOS_CONCURRENCY=$swiftpaxos_concurrency"
   echo "WAN=$wan"
   echo "RECOVERY_TIME=$recovery_time"
   echo "TITLE_SUFFIX=$suffix"
+  echo "SWIFTPAXOS_TITLE_SUFFIX=$swiftpaxos_suffix"
   echo "STORE=$store"
   echo "STORE_SUFFIX=$store_suffix"
   echo "PROFILE=$profile"
