@@ -211,7 +211,7 @@ pub struct CommandTable {
 
 impl CommandTable {
     /// Unbounded table.
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         CommandTable {
             records: BTreeMap::new(),
             keys: BTreeMap::new(),
@@ -231,7 +231,7 @@ impl CommandTable {
     }
 
     /// A table admitting at most `capacity` records (placeholders included).
-    pub const fn with_capacity(capacity: usize) -> Self {
+    pub fn with_capacity(capacity: usize) -> Self {
         CommandTable {
             records: BTreeMap::new(),
             keys: BTreeMap::new(),

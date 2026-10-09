@@ -10378,17 +10378,23 @@ broadcast buffer is not taken, and step 3 is three other changes:
 - The leader's maps that are only looked up or retained (`proposals`,
   `votes`, `resent`, `answered`) and the command table's lookup-only sets
   (`executed`, `history`, `recent_set`) are hash maps keyed by the command
-  identity, with a hasher that folds its first eight bytes
-  (`coord_consensus::digest`). A command identity is a BLAKE3 digest, so
-  a lookup is one probe and one comparison where the ordered map compared
-  32-byte keys at every level. Every map iterated to produce an effect
-  stays a `BTreeMap`, since the machines are deterministic by their order;
-  the learner takes a lookup rather than the map. Every one of these maps
-  is bounded by the command table except the executed history, which only
-  holds identities the leader derived from requests it admitted, so a
-  caller grinding identities into one bucket pays a hash per try. The map
-  is `hashbrown` 0.17.1, already in the lock, with default features off,
-  since the crate is `no_std`.
+  identity (`coord_consensus::digest`). A command identity is a BLAKE3
+  digest, so the hasher reads only its first sixteen bytes, and a lookup
+  is one probe and one comparison where the ordered map compared 32-byte
+  keys at every level. Every map iterated to produce an effect stays a
+  `BTreeMap`, since the machines are deterministic by their order; the
+  learner takes a lookup rather than the map. The map is `hashbrown`
+  0.17.1, already in the lock, with default features off, since the crate
+  is `no_std`.
+- The hasher is keyed (Codex's review). Unkeyed, a caller who picks
+  request contents could grind identities whose first bytes agree and
+  crowd one probe sequence, and the executed history is not bounded by the
+  command table. Each map takes a process key when it is built and keeps
+  it, and mixes it into every write with a folded multiply (wyhash's and
+  foldhash's core); `coordd` draws the key from the operating system at
+  start (`seed_digest_maps`, through the standard library's randomly keyed
+  hasher). Nothing iterates these maps, so the key changes no output: the
+  simulator's rows are identical with it.
 - Held reads are boxed, and a pump that neither refuses one nor finds one
   due updates them in place and moves nothing.
 - A voter decoded and hashed every submission (`voter::command_of`) only
