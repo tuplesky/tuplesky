@@ -259,7 +259,10 @@ Each run's store is in the
 uploaded archive, and the divergence check covers every run.
 
 The `leader-profile` input installs `perf` and profiles the leader's
-domain thread in each TupleSky run: `scripts/ci/leader_profile.py` waits
+domain thread in each TupleSky run, which must run without faults (the
+job refuses one with a nemesis: the profiler takes the leader and the
+follower by their loops' CPU, and a fault can make a recovering voter the
+busiest or move the lead within the window): `scripts/ci/leader_profile.py` waits
 for the workload to load the busiest loop, lets it settle for 30 s, takes
 that thread (coordd's main thread) and samples it alone for 20 s at
 999 Hz. `call-graph` also takes the call graph, by frame pointer, on

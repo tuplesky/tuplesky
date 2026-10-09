@@ -35,8 +35,11 @@
 #                  none
 #   IN_KEY_COUNT   keys in play at once in TupleSky's append or wr
 #                  workload; empty for the harness's 3
+#   IN_LEADER_PROFILE
+#                  false (or empty), true or call-graph; a profile needs
+#                  a run without faults
 #
-# The last three are TupleSky's alone; they are named in its titles
+# The voter inputs are TupleSky's alone; they are named in its titles
 # (WORKERS_SUFFIX, TUPLESKY_SUFFIX).
 #
 # faults:          append; kill, pause, partition (SwiftPaxos: pause,
@@ -171,6 +174,18 @@ if [ -n "$key_count" ]; then
   esac
   tuplesky_suffix+=", $key_count keys"
 fi
+
+# The profiler picks the leader and the follower by their loops' CPU before
+# its window and labels them so; under faults a recovering voter can be the
+# busiest, and either can change role within the window.
+case ${IN_LEADER_PROFILE:-false} in
+  false) ;;
+  *)
+    if [ "$nemesis" != none ]; then
+      echo "leader-profile needs a run without faults (nemesis none), not $nemesis: the roles it samples by CPU do not hold under faults" >&2
+      exit 2
+    fi ;;
+esac
 
 out=${GITHUB_ENV:-/dev/stdout}
 {
