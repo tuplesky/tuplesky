@@ -348,7 +348,10 @@ otherwise ends in ", N tokio workers per voter", drops the count.
 append and wr workloads (Elle's `key-count`, 3 by default; each key retires
 after its share of writes and a fresh one takes its place) through
 `--key-count`, and the title says ", N keys"; with the register workload it
-is refused.
+is refused. `key-dist` sets how they are picked (Elle's `key-dist`):
+`exponential` by default, each key twice as likely as the one before, so
+a few keys stay hot whatever the count; `uniform` spreads the operations
+evenly over them. The title says ", uniform keys".
 Each publication's `checkpoint` line in `coordd.log` says how long it held
 the domain thread and how long each of its steps took, and each restart's
 `replayed` line how many records it replayed and how long that took.

@@ -35,6 +35,8 @@
 #                  none
 #   IN_KEY_COUNT   keys in play at once in TupleSky's append or wr
 #                  workload; empty for the harness's 3
+#   IN_KEY_DIST    how that workload picks among them: uniform or
+#                  exponential; empty for the harness's exponential
 #   IN_LEADER_PROFILE
 #                  false (or empty), true or call-graph; a profile needs
 #                  a run without faults
@@ -190,6 +192,19 @@ if [ -n "$key_count" ]; then
   tuplesky_suffix+=", $key_count keys"
 fi
 
+key_dist=${IN_KEY_DIST:-}
+if [ -n "$key_dist" ]; then
+  case $key_dist in
+    uniform | exponential) ;;
+    *) echo "key-dist must be uniform or exponential, not $key_dist" >&2; exit 2 ;;
+  esac
+  case $workload in
+    append | wr) ;;
+    *) echo "key-dist applies to the append and wr workloads, not $workload" >&2; exit 2 ;;
+  esac
+  tuplesky_suffix+=", $key_dist keys"
+fi
+
 # The profiler picks the leader and the follower by their loops' CPU before
 # its window and labels them so; under faults a recovering voter can be the
 # busiest, and either can change role within the window.
@@ -228,5 +243,6 @@ out=${GITHUB_ENV:-/dev/stdout}
   echo "WORKERS_SUFFIX=$workers_suffix"
   echo "VOTER_ENV=$voter_env"
   echo "KEY_COUNT=$key_count"
+  echo "KEY_DIST=$key_dist"
   echo "TUPLESKY_SUFFIX=$tuplesky_suffix"
 } >> "$out"

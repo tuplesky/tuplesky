@@ -81,6 +81,9 @@ on:
       key-count:
         description: "Keys in play at once in TupleSky's append or wr workload (Elle's key-count, through jepsen.tuplesky's --key-count); empty for the harness's 3"
         default: ""
+      key-dist:
+        description: "How TupleSky's append or wr workload picks among those keys (Elle's key-dist, through jepsen.tuplesky's --key-dist): uniform, or exponential (a few hot keys); empty for the harness's exponential"
+        default: ""
       pair-base:
         description: "Run TupleSky in pairs on one runner against this base: a tuplesky ref (a branch, a tag or a full commit SHA, which actions/checkout needs whole) built beside the head, or env:NAME=VALUE for the head's own build with that variable on every voter; empty for one run"
         default: ""
@@ -140,6 +143,7 @@ env:
   IN_VOTER_WORKERS: ${{ inputs.voter-workers || '2' }}
   IN_VOTER_ENV: ${{ inputs.voter-env }}
   IN_KEY_COUNT: ${{ inputs.key-count }}
+  IN_KEY_DIST: ${{ inputs.key-dist }}
   IN_PAIR_BASE: ${{ inputs.pair-base }}
   IN_PAIRS: ${{ inputs.pairs || '3' }}
   IN_LEADER_PROFILE: ${{ inputs.leader-profile || 'false' }}
@@ -352,6 +356,13 @@ jobs:
               exit 1
             fi
             voter+=(--key-count "$KEY_COUNT")
+          fi
+          if [ -n "$KEY_DIST" ]; then
+            if ! grep -q -- '--key-dist' src/jepsen/tuplesky.clj; then
+              echo "::error::tuplesky/jepsen@$JEPSEN_REF has no --key-dist; dispatch with a jepsen-ref that has it, or no key-dist"
+              exit 1
+            fi
+            voter+=(--key-dist "$KEY_DIST")
           fi
           common=(lein run test
             --nodes-file "$RUNNER_TEMP/cluster/nodes"
