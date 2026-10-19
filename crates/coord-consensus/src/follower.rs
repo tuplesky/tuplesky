@@ -1294,7 +1294,7 @@ impl Follower {
             // What this candidate decided itself, executed long ago and
             // forgotten included: a re-proposal of one is not chained
             // after the recovered order (task-d71).
-            let decided = |c: &CommandId| table.phase_of(c) >= Some(Phase::Commit);
+            let decided = OwnDecisions(table);
             match campaign.try_select_decided(
                 crate::recovery::MAX_REPORT_ENTRIES,
                 supplied,
@@ -4857,5 +4857,18 @@ impl DeterministicMachine for Follower {
             | Event::Entropy { .. }
             | Event::ConnectionClosed { .. } => Vec::new(),
         }
+    }
+}
+
+/// A candidate's own decisions, from its table (task-d71).
+struct OwnDecisions<'a>(&'a CommandTable);
+
+impl crate::recovery::CandidateDecisions for OwnDecisions<'_> {
+    fn decided(&self, command: &CommandId) -> bool {
+        self.0.phase_of(command) >= Some(Phase::Commit)
+    }
+
+    fn executed_before(&self, first: &CommandId, then: &CommandId) -> bool {
+        self.0.executed_before(first, then)
     }
 }

@@ -18,7 +18,9 @@ use coord_types::ids::{Ballot, ReplicaId};
 
 use crate::phase::Phase;
 use crate::quorum::BallotConfiguration;
-use crate::recovery::{RecoveryError, RecoveryReport, SyncDecision, select_decided};
+use crate::recovery::{
+    CandidateDecisions, RecoveryError, RecoveryReport, SyncDecision, select_decided,
+};
 use crate::summary::{PageError, ReportAssembler, ReportPage};
 
 /// The campaign for one ballot.
@@ -270,7 +272,7 @@ impl Campaign {
         report_limit: usize,
         supplied: impl Fn(&CommandId, Option<Digest32>) -> bool,
     ) -> Result<Option<&SyncDecision>, RecoveryError> {
-        self.try_select_decided(report_limit, supplied, |_| false)
+        self.try_select_decided(report_limit, supplied, |_: &CommandId| false)
     }
 
     /// [`Campaign::try_select`], where `decided` names the commands this
@@ -280,7 +282,7 @@ impl Campaign {
         &mut self,
         report_limit: usize,
         supplied: impl Fn(&CommandId, Option<Digest32>) -> bool,
-        decided: impl Fn(&CommandId) -> bool,
+        decided: impl CandidateDecisions,
     ) -> Result<Option<&SyncDecision>, RecoveryError> {
         if self.decision.is_some() {
             return Ok(self.decision.as_ref());

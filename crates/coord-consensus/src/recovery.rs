@@ -358,7 +358,35 @@ pub fn select_from(
     supplied: impl Fn(&CommandId, Option<Digest32>) -> bool,
     source_configuration: impl Fn(&Ballot) -> Option<BallotConfiguration>,
 ) -> Result<SyncDecision, RecoveryError> {
-    select_decided(config, reports, supplied, source_configuration, |_| false)
+    select_decided(
+        config,
+        reports,
+        supplied,
+        source_configuration,
+        &|_: &CommandId| false,
+    )
+}
+
+/// What a candidate knows of its own decisions, beside the reports
+/// (task-d71).
+pub trait CandidateDecisions {
+    /// Whether the candidate committed or executed `command`, retired and
+    /// forgotten included.
+    fn decided(&self, command: &CommandId) -> bool;
+
+    /// Whether the candidate executed `first` before `then`. Execution is
+    /// one order at every voter, so this is the order every voter executes
+    /// the two in. False when the candidate does not know both positions.
+    fn executed_before(&self, first: &CommandId, then: &CommandId) -> bool {
+        let _ = (first, then);
+        false
+    }
+}
+
+impl<F: Fn(&CommandId) -> bool> CandidateDecisions for F {
+    fn decided(&self, command: &CommandId) -> bool {
+        self(command)
+    }
 }
 
 /// [`select_from`], where `decided` names the commands the candidate
@@ -377,7 +405,7 @@ pub fn select_decided(
     reports: &[RecoveryReport],
     supplied: impl Fn(&CommandId, Option<Digest32>) -> bool,
     source_configuration: impl Fn(&Ballot) -> Option<BallotConfiguration>,
-    decided: impl Fn(&CommandId) -> bool,
+    decided: &impl CandidateDecisions,
 ) -> Result<SyncDecision, RecoveryError> {
     let mut seen = BTreeSet::new();
     for r in reports {
@@ -587,7 +615,7 @@ pub fn select_decided(
         reports,
         &mut entries,
         &from_below,
-        &decided,
+        decided,
     );
     for c in entries.keys() {
         reproposed.remove(c);
@@ -672,7 +700,7 @@ fn possible_fast_decisions(
     reports: &[RecoveryReport],
     entries: &mut BTreeMap<CommandId, SyncEntry>,
     from_below: &BTreeSet<CommandId>,
-    decided: &impl Fn(&CommandId) -> bool,
+    decided: &impl CandidateDecisions,
 ) {
     // The fast set of the source ballot: its own configuration where the
     // candidate knows it (task-d31), else the default rule every
@@ -841,6 +869,7 @@ fn possible_fast_decisions(
             || prefix.iter().any(|d| {
                 record(m, d).is_none() && entries.contains_key(d) && after(candidates, d, a)
             })
+            || prefix.iter().any(|d| decided.executed_before(a, d))
     };
     // The commands `deps` reach, followed through the selection and the
     // candidates, that neither holds and a report holds undecided (or,
@@ -862,7 +891,7 @@ fn possible_fast_decisions(
                 stack.extend(e.deps.iter().copied());
             } else if let Some((e, _)) = candidates.get(&d) {
                 stack.extend(e.deps.iter().copied());
-            } else if !decided(&d)
+            } else if !decided.decided(&d)
                 && match member {
                     Some(m) => record(m, &d).is_some_and(|r| r.phase < Phase::Commit),
                     None => reports

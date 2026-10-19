@@ -2061,12 +2061,78 @@ fn a_candidate_after_a_command_the_candidate_decided_is_not_ordered_by_its_repro
     ];
     let decided = |c: &CommandId| *c == d;
     let decision =
-        coord_consensus::select_decided(&cfg, &reports, |_, _| false, |_| None, decided).unwrap();
+        coord_consensus::select_decided(&cfg, &reports, |_, _| false, |_| None, &decided).unwrap();
     assert!(decision.entries.contains_key(&a));
     assert!(
         decision.reproposed.contains(&x),
         "kept {:?}",
         decision.entries.get(&x)
+    );
+}
+
+/// The candidate's own decisions, with the order it executed them in.
+struct Executed(Vec<CommandId>);
+
+impl coord_consensus::CandidateDecisions for Executed {
+    fn decided(&self, command: &CommandId) -> bool {
+        self.0.contains(command)
+    }
+
+    fn executed_before(&self, first: &CommandId, then: &CommandId) -> bool {
+        let at = |c: &CommandId| self.0.iter().position(|e| e == c);
+        matches!((at(first), at(then)), (Some(a), Some(b)) if a < b)
+    }
+}
+
+/// task-d71 (protocol_sim row 14, three voters, seed 11, on task-d67's
+/// branch): c was decided fast after x, which follows d, and the member
+/// executed and retired d while it still holds a, which it executed
+/// before d: reclaim retires in executed order, but skips a record it may
+/// not retire yet. No report holds d, so the member's closure of c stops
+/// there, and a, adopted and conflicting, was not seen before c: c was
+/// re-proposed under other dependencies than the ones it was learned
+/// with. Execution is one order at every voter, so the candidate's own
+/// says a ran before d, and c, which follows d, after it. Executed the
+/// other way, nothing orders a before c, and c is still re-proposed.
+#[test]
+fn a_candidate_after_a_command_executed_after_an_adopted_one_is_kept() {
+    let cfg = config(3, 2, &[2, 0], 2);
+    let (a, d, x, c) = (cmd(1), cmd(2), cmd(3), cmd(4));
+    let reports = vec![
+        report_for(
+            1,
+            ballot(2, 2),
+            1,
+            vec![
+                entry(a, Phase::Commit, &[]),
+                entry(x, Phase::Commit, &[d]),
+                pre_accept_with(c, &[x], 5),
+            ],
+        ),
+        report_for(2, ballot(2, 2), 0, vec![]),
+    ];
+    let select_after = |order: Vec<CommandId>| {
+        coord_consensus::select_decided(&cfg, &reports, |_, _| false, |_| None, &Executed(order))
+            .unwrap()
+    };
+    let decision = select_after(vec![a, d]);
+    assert!(decision.entries.contains_key(&a));
+    assert_eq!(
+        decision.entries.get(&c).map(|e| e.deps.clone()),
+        Some(vec![x]),
+        "reproposed {:?}",
+        decision.reproposed
+    );
+    let decision = select_after(vec![d, a]);
+    assert!(
+        decision.reproposed.contains(&c),
+        "kept {:?}",
+        decision.entries.get(&c)
+    );
+    let decision = select(&cfg, &reports).unwrap();
+    assert!(
+        decision.reproposed.contains(&c),
+        "nothing known, nothing kept"
     );
 }
 

@@ -217,6 +217,11 @@ pub struct CommandTable {
     /// left by [`CommandTable::execute`] and
     /// [`CommandTable::restore_executed`], the only ways out of COMMIT.
     committed: BTreeSet<CommandId>,
+    /// The order this replica executed commands in, as ordinals: one per
+    /// command, retired ones included, the cost `history` already pays
+    /// (task-d71). Execution is one order at every voter, so a candidate
+    /// reads it for every voter's.
+    execution_order: BTreeMap<CommandId, u64>,
 }
 
 impl CommandTable {
@@ -237,6 +242,7 @@ impl CommandTable {
             moved: None,
             accepted: BTreeSet::new(),
             committed: BTreeSet::new(),
+            execution_order: BTreeMap::new(),
         }
     }
 
@@ -257,6 +263,7 @@ impl CommandTable {
             moved: None,
             accepted: BTreeSet::new(),
             committed: BTreeSet::new(),
+            execution_order: BTreeMap::new(),
         }
     }
 
@@ -284,6 +291,7 @@ impl CommandTable {
             moved: None,
             accepted: BTreeSet::new(),
             committed: BTreeSet::new(),
+            execution_order: BTreeMap::new(),
         };
         for (c, r) in records {
             if r.phase == Phase::Accept {
@@ -957,9 +965,26 @@ impl CommandTable {
         self.initialized_mut(&command)?.phase = Phase::Executed;
         self.committed.remove(&command);
         self.last_executed = Some(command);
+        self.note_execution(command);
         self.unretired.push_back(command);
         self.raise(command);
         Ok(())
+    }
+
+    fn note_execution(&mut self, command: CommandId) {
+        let next = self.execution_order.len() as u64;
+        self.execution_order.entry(command).or_insert(next);
+    }
+
+    /// Whether this replica executed `first` before `then` (task-d71).
+    pub fn executed_before(&self, first: &CommandId, then: &CommandId) -> bool {
+        match (
+            self.execution_order.get(first),
+            self.execution_order.get(then),
+        ) {
+            (Some(a), Some(b)) => a < b,
+            _ => false,
+        }
     }
 
     /// The command this replica executed last, if it remembers one.
@@ -1005,6 +1030,7 @@ impl CommandTable {
     pub fn restore_executed(&mut self, command: &CommandId) {
         self.committed.remove(command);
         self.last_executed = Some(*command);
+        self.note_execution(*command);
         self.raise(*command);
         match self.records.get_mut(command) {
             Some(r) if r.payload.is_some() => {
