@@ -6,12 +6,12 @@
 //! the next two). A client command reaches some followers and not the
 //! leader, as one does while the leader's links are still coming up, and
 //! its caller gives up: the leader never orders it. Run E on #98 made no
-//! fast decision at all over 46,000 commands after such a start.
+//! fast decision at all over 46,000 commands after such a start; with the
+//! set-aside rule one command after it is slow.
 //!
-//! Also the fast path after a leader change (task-d68): the new leader's
-//! commands are slow until its sequence numbers pass the old ballot's,
-//! because a follower's synchronized prefix does not move back. That
-//! test is ignored until task-d68 is built.
+//! Also the fast path after a leader change (task-d68): a follower's log
+//! position is scoped to the ballot that numbered it, so the new leader's
+//! first fresh proposal moves it.
 
 use coord_collector::{Collector, CollectorConfig, MonotonicMillis, Submitted};
 use coord_consensus::{
@@ -319,6 +319,28 @@ impl Cluster {
         }
     }
 
+    /// The collector's solicitation, long after every first offer: each
+    /// command it holds unsettled, to every voter again (task-d22).
+    fn solicit_again(&mut self) {
+        let due = self
+            .collector
+            .due_solicits(MonotonicMillis::ZERO.plus(3_600_000), usize::MAX);
+        for fan_out in due {
+            let submit = frame(&fan_out.frame);
+            for replica in &fan_out.targets {
+                let voter = usize::from(replica.0[0]);
+                let Ok(Ok(out)) = self.voters[voter].on_submission(
+                    PeerRole::Frontend,
+                    &submit,
+                    Origin::Connection(7),
+                ) else {
+                    continue;
+                };
+                self.carry(voter, out);
+            }
+        }
+    }
+
     /// One put to every voter, and everything it moves.
     fn command(&mut self) {
         let all: Vec<usize> = (0..usize::from(N)).collect();
@@ -406,37 +428,34 @@ fn an_unordered_pre_acceptance_outside_the_fast_set_leaves_the_fast_path_alone()
     assert_eq!(fast_after_an_orphan(&[3, 4], 40), 40);
 }
 
-/// A command the leader never ordered, at a fast-set follower, must not
+/// A command the leader never ordered, at a fast-set follower, does not
 /// take the fast path away for the rest of the ballot (task-d67).
 ///
-/// Today it does. The follower appended the command to its path log at
-/// pre-acceptance; the leader never orders it, so no synchronization
-/// takes it out, and a table record leaves the log only when it executes
-/// or a Sync releases it (task-d24). The next command the leader orders
-/// marks it reordered, and from then on the follower's head is
-/// `reordered_path`, which no leader path equals: every acknowledgement
-/// it sends fails the fast predicate. With the fast set the leader and
-/// two followers, one such follower is enough. Here 0 of 40 commands
-/// after it are fast, at one fast-set follower or both.
+/// The follower appended the command to its path log at pre-acceptance,
+/// and the leader never orders it. The first synchronization past it sets
+/// it aside: the follower's head stops digesting it, and its record stays.
+/// The command after it depends on it there, as the key's latest, and is
+/// slow; from the one after, the fast path is back. Before the rule
+/// (task-d34's `reordered_path` marker), 0 of 40 were fast, at one
+/// fast-set follower or both.
 #[test]
-#[ignore = "task-d67: fails today, 0 of 40 fast; run with --ignored"]
 fn the_fast_path_resumes_after_a_pre_acceptance_the_leader_never_ordered() {
     for orphaned_at in [&[1][..], &[1, 2]] {
         let fast = fast_after_an_orphan(orphaned_at, 40);
-        assert!(
-            fast > 30,
+        assert_eq!(
+            fast, 39,
             "{fast} of 40 fast after an orphan at {orphaned_at:?}"
         );
     }
 }
 
 /// What the counters of task-d62 say about that orphan: the leader names
-/// a path mismatch for every command after it, its reasons add up to its
-/// slow establishments, the fast-set follower holding it counts its own
-/// acknowledgements as sent under a `reordered` marker, and holds one
-/// pre-acceptance the leader ordered later commands past.
+/// one slow command after it, the one that depends on it at its holder,
+/// its reasons add up to its slow establishments, and the fast-set
+/// follower holding it holds one pre-acceptance set aside, whose age
+/// grows from observation to observation.
 #[test]
-fn the_counts_name_the_orphan_that_stopped_the_fast_path() {
+fn the_counts_name_the_orphan_that_cost_one_fast_decision() {
     let mut cluster = Cluster::new();
     for _ in 0..5 {
         cluster.command();
@@ -450,7 +469,7 @@ fn the_counts_name_the_orphan_that_stopped_the_fast_path() {
     let leader = cluster.voters[0].node();
     let established = leader.established;
     let missed = leader.fast_path_counts();
-    assert_eq!((established.fast, established.slow), (5, 20));
+    assert_eq!((established.fast, established.slow), (24, 1));
     assert_eq!(
         missed.missed_path
             + missed.missed_deps
@@ -460,30 +479,66 @@ fn the_counts_name_the_orphan_that_stopped_the_fast_path() {
         established.slow,
         "every slow establishment has one reason: {missed:?}"
     );
-    assert_eq!(missed.missed_path, 20, "{missed:?}");
+    // Its holder chained it into the path it sent for the next command,
+    // which also names it as a dependency.
+    assert_eq!(missed.missed_path, 1, "{missed:?}");
     // The leader sends no fast acknowledgement: its proposal is its own.
     assert_eq!((missed.acks, missed.acks_reordered), (0, 0));
     let release = leader.release_split();
     assert_eq!(release.commands, 25, "{release:?}");
 
     let holder = cluster.voters[1].node().fast_path_counts();
-    assert_eq!(holder.acks, 26, "{holder:?}");
-    // The first command after the orphan missed by the orphan alone, in
-    // its pending suffix: nothing was ordered past it yet, so no marker.
-    // Every later one was ordered past it.
-    assert_eq!(holder.acks_reordered, 19, "{holder:?}");
+    assert_eq!((holder.acks, holder.acks_reordered), (26, 0), "{holder:?}");
     let other = cluster.voters[2].node().fast_path_counts();
     assert_eq!((other.acks, other.acks_reordered), (25, 0), "{other:?}");
 
     let now = std::time::Instant::now();
     let unordered = cluster.voters[1].node_mut().observe_unordered(now);
     assert_eq!((unordered.pending, unordered.reordered), (1, 1));
+    assert_eq!(unordered.leader_log, 0);
     let later = cluster.voters[1]
         .node_mut()
         .observe_unordered(now + std::time::Duration::from_secs(3));
     assert_eq!(later.oldest, std::time::Duration::from_secs(3));
     let elsewhere = cluster.voters[2].node_mut().observe_unordered(now);
     assert_eq!((elsewhere.pending, elsewhere.reordered), (0, 0));
+    let led = cluster.voters[0].node_mut().observe_unordered(now);
+    assert_eq!(led.leader_log, 0, "a leader's own log keeps no suffix");
+}
+
+/// The rule's edge (task-d67): the orphan presented again, to every
+/// voter, just after its holder set it aside. Its holder answers from its
+/// record, slow, and the leader orders it like any other command: its
+/// synchronization is above the holder's log's position, so the holder's
+/// head moves to the leader's path through it. The command after it
+/// depends on the holder's own latest, not on the orphan, and is slow;
+/// the fast path is back from the one after.
+#[test]
+fn an_orphan_presented_again_after_it_was_set_aside_is_ordered() {
+    let mut cluster = Cluster::new();
+    for _ in 0..5 {
+        cluster.command();
+    }
+    cluster.submit_to(&[1]);
+    cluster.settle();
+    cluster.command();
+    assert_eq!((cluster.fast(), cluster.established()), (5, 6));
+    let now = std::time::Instant::now();
+    let held = cluster.voters[1].node_mut().observe_unordered(now);
+    assert_eq!((held.pending, held.reordered), (1, 1), "set aside");
+
+    cluster.solicit_again();
+    cluster.settle();
+    assert_eq!(cluster.established(), 7, "ordered once presented again");
+    let held = cluster.voters[1].node_mut().observe_unordered(now);
+    assert_eq!((held.pending, held.reordered), (0, 0));
+    let before = cluster.fast();
+    for _ in 0..20 {
+        cluster.command();
+    }
+    assert_eq!(cluster.established(), 27);
+    let fast = cluster.fast() - before;
+    assert!(fast >= 19, "{fast} of 20 fast after the orphan was ordered");
 }
 
 /// `before` commands under the genesis leader n1, a campaign by voter
@@ -515,23 +570,25 @@ fn fast_after_a_leader_change(candidate: usize, before: u64, after: u64) -> (u64
     (established_after - established, fast_after - fast)
 }
 
-/// After a leader change the fast path stays off for as many commands
-/// as the old ballot ordered, and must not (task-d68).
+/// After a leader change the fast path resumes from the new leader's
+/// first fresh proposal (task-d68), whether the new leader was in the
+/// deposed leader's fast set (n3) or not (n5).
 ///
-/// A follower's path log takes a synchronization as its new prefix only
-/// when its sequence number is above the highest it has taken
-/// (`PathLog::sync`). A new leader numbers from zero, and nothing resets
-/// the followers' highest at the ballot change: each follower keeps
-/// chaining its paths from the old ballot's head until the new leader's
-/// numbers pass the old ones, and every acknowledgement it sends until
-/// then disagrees with the leader in its path. Here, 40 commands under
-/// n1 leave the next 40 slow under n5 or n3 alike: 0 of 20 fast.
+/// A log's position is the ballot whose leader numbered it and that
+/// number, so a new leader's first proposal is above everything the old
+/// ballot synchronized. Compared by number alone, as before, 40 commands
+/// under n1 left the next 40 slow under n5 or n3 alike: 0 of 20 fast.
 #[test]
-#[ignore = "task-d68: fails today, 0 of 20 fast after 40 commands under the old leader; run with --ignored"]
 fn the_fast_path_resumes_after_a_leader_change() {
     for candidate in [4, 2] {
         let (established, fast) = fast_after_a_leader_change(candidate, 40, 20);
         assert_eq!(established, 20);
-        assert!(fast > 15, "{fast} of 20 fast under voter {}", candidate + 1);
+        // The one slow command is the one pre-accepted before the first
+        // fresh adoption, the cost the rule names.
+        assert!(
+            fast >= 19,
+            "{fast} of 20 fast under voter {}",
+            candidate + 1
+        );
     }
 }

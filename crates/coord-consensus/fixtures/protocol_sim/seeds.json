@@ -31,5 +31,6 @@
   {"row": 3, "voters": 5, "seed": 158, "found": "task-d71: commands whose turn had come admitted past a follower's capacity"},
   {"row": 3, "voters": 3, "seed": 800, "catch_up": false, "found": "task-d71: a follower past its capacity after a restart, which forgot what it had let past"},
   {"row": 12, "voters": 3, "seed": 387, "catch_up": false, "found": "task-d71: two orders, a candidate after a re-proposal of a command the new leader executed long ago"},
-  {"row": 10, "voters": 3, "seed": 884, "catch_up": false, "found": "task-d71, with the candidate's executed order: a command the new leader executed, kept under a member's stale dependencies, closed a cycle"}
+  {"row": 10, "voters": 3, "seed": 884, "catch_up": false, "found": "task-d71, with the candidate's executed order: a command the new leader executed, kept under a member's stale dependencies, closed a cycle"},
+  {"row": 14, "voters": 3, "seed": 11, "found": "task-d71, on task-d67's branch: a member's closure cut at a command it retired, before an adopted one it executed earlier and still held"}
 ]

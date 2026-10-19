@@ -10363,3 +10363,62 @@ second PR's own pairs, so each pair is read against itself:
   move by as much as the host does between them, so the runner pair, with
   the call graph to show `Outbox::release` gone from the follower's
   profile, is the acceptance.
+
+
+## A path log lets go of what the leader did not order (task-d67, task-d68)
+
+The design step on #157 is built as it reads (Section 4.1): a
+synchronization sets aside every suffix command pre-accepted before its
+command, and the whole suffix when its command is not in it; a position
+is the ballot that numbered it and the number; a Sync's entry never
+moves it; a leader synchronizes each of its own proposals as it makes
+it; a command catch-up installs decided is not appended, and one retired
+while still pending is set aside. task-d34's `reordered_path` marker is
+gone.
+
+One detail the design leaves to the code: a synchronization of a
+command not appended here yet is still held for the append
+(`PathLog::hold`), as before, and only a command the table holds
+initialized is synchronized at once. Applied at arrival, a command
+appended between the synchronization and its own command's append would
+chain from that command's path while its record does not name it, which
+is the history claim F7 guarded against.
+
+**One process** (`crates/coord-daemon/tests/fast_path.rs`, five voters,
+the fast set `coordd` builds):
+
+| | before | this branch |
+| --- | --- | --- |
+| an orphan at n2, fast of the next 40 | 0 | 39 |
+| an orphan at n2 and n3 | 0 | 39 |
+| an orphan at n4, or n4 and n5 | 40 | 40 |
+| 3, 20 or 40 commands under n1, then n5 leads: fast of the next 20 | 0 after 20 or 40 | 19 |
+| the same with n3, in n1's fast set | 0 after 20 or 40 | 19 |
+| a leader's own path log, pending | every command it proposed | 0 |
+
+The one slow command after an orphan is the one its holder pre-accepted
+while the orphan was still its latest on the key, which depends on it;
+after a leader change, the one pre-accepted before the first fresh
+adoption. The orphan presented again by the collector's solicitation
+(task-d22), just after its holder set it aside, is ordered, and the
+next 20 are fast but one.
+
+task-d62's counts change with the marker: `acks_reordered` counted
+acknowledgements sent under it and stays zero now, kept so a reading
+keeps its shape; `unordered.reordered` counts the pre-acceptances set
+aside and still undecided, and `unordered.leader_log` stays zero.
+
+**The protocol simulator** on this branch, with task-d71's row 14 fix
+under it (#158): every row at its usual seeds; and every row at 1,000
+seeds per row and size, with catch-up (1,057 s) and without. Before that
+fix, row 14 at three voters stopped at seed 11 at the usual seeds
+(36aa with two dependency sets).
+
+**Tests that changed with the rule:** task-d34's F7 test is rewritten
+to the set-aside rule (`a_command_left_behind_a_synchronization_is_set_aside`);
+`a_released_reordered_command_frees_the_head` becomes
+`a_released_set_aside_command_leaves_the_counts`; the activation test
+that a Sync installs the selected per-key evidence keeps its record
+assertions and now says the log's position does not move; task-d62's
+counts test reads one slow command, not twenty.
+
