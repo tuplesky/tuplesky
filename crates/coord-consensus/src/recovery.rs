@@ -752,11 +752,20 @@ fn possible_fast_decisions(
             // A record a Sync demoted was pre-accepted in an earlier
             // ballot: no evidence of a fast decision in this one
             // (task-d11).
+            //
+            // Nor is a command the candidate decided itself: it was
+            // decided with the dependencies the candidate committed it
+            // with, and a member behind can still hold a pre-acceptance of
+            // it under others (protocol_sim row 10, three voters, seed
+            // 884, without catch-up). The candidate holds one it has not
+            // retired in its own report, so this is one it executed and
+            // forgot.
             if e.phase != Phase::PreAccept
                 || !e.payload_present
                 || e.path == crate::graph::demoted_path()
                 || entries.contains_key(&e.command)
                 || candidates.contains_key(&e.command)
+                || decided.decided(&e.command)
             {
                 continue;
             }
@@ -1061,7 +1070,13 @@ fn possible_fast_decisions(
                     || awaited.contains(d)
                     || record(first, d).is_none_or(|r| r.path == crate::graph::demoted_path())
             });
-            if !ordered_after_adopted || !prefix_decided {
+            // Nor one whose own dependencies, through what the selection
+            // keeps, come back to it: a command the selection orders after
+            // `c` is also before it, a cycle no decision holds, so `c` was
+            // not decided with these dependencies (row 10, three voters,
+            // seed 884, where a committed command depended on `c`).
+            let closes_cycle = after(&candidates, &c, &c);
+            if !ordered_after_adopted || !prefix_decided || closes_cycle {
                 failing.insert(c);
             }
         }

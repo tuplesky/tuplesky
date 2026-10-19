@@ -2136,6 +2136,66 @@ fn a_candidate_after_a_command_executed_after_an_adopted_one_is_kept() {
     );
 }
 
+/// task-d71 (protocol_sim row 10, three voters, seed 884, without
+/// catch-up): the candidate executed c long ago and forgot it, and a
+/// member behind still holds its own pre-acceptance of c, under other
+/// dependencies than c was decided with. c is no possible fast decision:
+/// it was decided, and the member's record is not that decision.
+#[test]
+fn a_command_the_candidate_decided_is_no_possible_fast_decision() {
+    let cfg = config(3, 2, &[2, 0], 2);
+    let (b, c) = (cmd(1), cmd(2));
+    let reports = vec![
+        report_for(
+            1,
+            ballot(2, 2),
+            1,
+            vec![entry(b, Phase::Commit, &[]), pre_accept_with(c, &[b], 5)],
+        ),
+        report_for(2, ballot(2, 2), 0, vec![entry(b, Phase::Commit, &[])]),
+    ];
+    let kept = select(&cfg, &reports).unwrap();
+    assert_eq!(kept.entries.get(&c).map(|e| e.deps.clone()), Some(vec![b]));
+    let decision =
+        coord_consensus::select_decided(&cfg, &reports, |_, _| false, |_| None, &Executed(vec![c]))
+            .unwrap();
+    assert!(
+        !decision.entries.contains_key(&c),
+        "kept {:?}",
+        decision.entries.get(&c)
+    );
+}
+
+/// task-d71 (the same seed): a candidate whose own dependencies, through
+/// the selection, reach a command the selection orders after it closes a
+/// cycle, so it was not decided with them. Here x was committed after c,
+/// and the member's stale pre-acceptance of c follows b, which follows x.
+#[test]
+fn a_candidate_whose_dependencies_come_back_to_it_is_not_kept() {
+    let cfg = config(3, 2, &[2, 0], 2);
+    let (b, c, x) = (cmd(1), cmd(2), cmd(3));
+    let reports = vec![
+        report_for(
+            1,
+            ballot(2, 2),
+            1,
+            vec![
+                entry(b, Phase::Commit, &[x]),
+                entry(x, Phase::Commit, &[c]),
+                pre_accept_with(c, &[b], 5),
+            ],
+        ),
+        report_for(2, ballot(2, 2), 0, vec![]),
+    ];
+    let decision = select(&cfg, &reports).unwrap();
+    assert!(
+        !decision.entries.contains_key(&c),
+        "kept {:?}",
+        decision.entries.get(&c)
+    );
+    assert!(coord_consensus::entry_order(&decision).is_ok());
+}
+
 /// task-d33 (protocol_sim row 12, three voters, seed 9): x was decided
 /// fast after f, which the member executed and retired past the window
 /// its report names, so no report holds f. A member at the source ballot
