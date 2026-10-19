@@ -145,7 +145,7 @@ pub const RECOVERY_RESERVE_PARTS: usize = 8;
 enum Room {
     /// New admission: up to the capacity less the recovery reserve.
     Admission,
-    /// A command whose turn has come: the reserve too, to the capacity.
+    /// A command whose turn has come: the reserve too, and one past it.
     Reserve,
     /// Recovery work, which the largest Sync and catch-up page bound.
     Unbounded,
@@ -502,10 +502,10 @@ impl CommandTable {
         retired
     }
 
-    /// Whether the table holds its whole capacity, the reserve included,
-    /// after reclaiming what it may.
+    /// Whether the table holds more than its whole capacity, the reserve
+    /// included, after reclaiming what it may.
     fn at_capacity_after_reclaim(&mut self) -> bool {
-        let at = |t: &Self| t.capacity.is_some_and(|c| t.records.len() >= c);
+        let at = |t: &Self| t.capacity.is_some_and(|c| t.records.len() > c);
         if !at(self) {
             return false;
         }
@@ -576,9 +576,8 @@ impl CommandTable {
     /// [`CommandTable::initialize`] past the table's capacity (task-d09).
     ///
     /// For recovery work: a command a Sync selected, or one a catch-up
-    /// page pulls, which the largest Sync and the largest page bound; and
-    /// one command whose turn has come at a time (task-d71). The caller
-    /// vouches for that; the table cannot tell.
+    /// page pulls, which the largest Sync and the largest page bound. The
+    /// caller vouches for that; the table cannot tell.
     pub fn initialize_beyond_capacity(
         &mut self,
         command: CommandId,
@@ -588,18 +587,18 @@ impl CommandTable {
         self.initialize_bounded(command, payload, keys, Room::Unbounded)
     }
 
-    /// [`CommandTable::initialize`] into the recovery reserve, up to the
-    /// capacity and not past it (task-d71).
+    /// [`CommandTable::initialize`] into the recovery reserve, and one
+    /// record past the capacity (task-d71).
     ///
     /// For a command whose turn has come (task-d09): a table full for new
     /// admission holds later commands, none of which can be adopted before
-    /// it, and refused it would hold them out for ever. The reserve is
-    /// room enough, since each such command is adopted at once and
-    /// executes before everything admitted ahead of it. The follower lets
-    /// one past the capacity at a time ([`CommandTable::initialize_beyond_capacity`]),
-    /// for a table recovery work filled; let past whenever its turn came,
-    /// the chain of them was bounded only by the held proposals, eight
-    /// tables' worth (protocol_sim row 3, five voters, seed 158).
+    /// it, and refused it would hold them out for ever. Each such command
+    /// is adopted at once and executes before everything admitted ahead of
+    /// it, so its execution makes the room for the next; one record past
+    /// the capacity lets one in when recovery work filled the table. Let in
+    /// whenever its turn came, the chain of them was bounded only by the
+    /// held proposals, eight tables' worth (protocol_sim row 3, five voters,
+    /// seed 158).
     pub fn initialize_in_reserve(
         &mut self,
         command: CommandId,

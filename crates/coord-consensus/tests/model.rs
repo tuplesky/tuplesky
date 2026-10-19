@@ -2032,6 +2032,44 @@ fn a_candidate_is_kept_beside_an_adopted_command_that_waits_on_another_reproposa
     }
 }
 
+/// task-d71 (protocol_sim row 12, three voters, seed 387, without
+/// catch-up): x follows d in the member's records, and the member, behind,
+/// still holds its own pre-acceptance of d, which the candidate executed
+/// long ago and forgot. No report holds d decided, so the selection
+/// re-proposes d; but the new leader does not chain a command it executed
+/// after the recovered order, and x went out with d alone behind it, on no
+/// order against a, which the candidate executed after d. A command the
+/// candidate decided is no re-proposal x waits on: x is judged as any
+/// candidate is, and a, which conflicts and which the member's order does
+/// not put before x, rules it out.
+#[test]
+fn a_candidate_after_a_command_the_candidate_decided_is_not_ordered_by_its_reproposal() {
+    let cfg = config(3, 2, &[2, 0], 2);
+    let (a, d, x) = (cmd(1), cmd(2), cmd(3));
+    let reports = vec![
+        report_for(
+            1,
+            ballot(2, 2),
+            1,
+            vec![
+                entry(a, Phase::Commit, &[]),
+                pre_accept_with(d, &[], 9),
+                pre_accept_with(x, &[d], 5),
+            ],
+        ),
+        report_for(2, ballot(2, 2), 0, vec![entry(a, Phase::Commit, &[])]),
+    ];
+    let decided = |c: &CommandId| *c == d;
+    let decision =
+        coord_consensus::select_decided(&cfg, &reports, |_, _| false, |_| None, decided).unwrap();
+    assert!(decision.entries.contains_key(&a));
+    assert!(
+        decision.reproposed.contains(&x),
+        "kept {:?}",
+        decision.entries.get(&x)
+    );
+}
+
 /// task-d33 (protocol_sim row 12, three voters, seed 9): x was decided
 /// fast after f, which the member executed and retired past the window
 /// its report names, so no report holds f. A member at the source ballot

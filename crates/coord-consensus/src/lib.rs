@@ -179,7 +179,8 @@ pub use publication::{DurableRecord, Publication};
 pub use quorum::{BallotConfiguration, ConfigurationError, EpochVoters, FastQuorumClass};
 pub use recovery::{
     MAX_REPORT_ENTRIES, MAX_TABLE_CAPACITY, RecoveryError, RecoveryReport, ReportEntry,
-    SyncDecision, SyncEntry, entry_order, max_report_entries, select, select_from, select_with,
+    SyncDecision, SyncEntry, entry_order, max_report_entries, select, select_decided, select_from,
+    select_with,
 };
 pub use replay::{MAX_EVIDENCE_REPAIRS, ReplayRefusal};
 pub use role::{PendingReport, RecoveredState};

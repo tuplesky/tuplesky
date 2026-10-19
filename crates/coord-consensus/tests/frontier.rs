@@ -810,8 +810,8 @@ fn a_command_whose_turn_has_come_is_admitted_before_the_leader_commits_it() {
 }
 
 /// The commands whose turn has come take the recovery reserve, and pass
-/// the capacity one at a time (task-d71, protocol_sim row 3, five voters,
-/// seed 158).
+/// the capacity by one (task-d71, protocol_sim row 3, five voters, seed
+/// 158).
 ///
 /// As above, three followers fill their tables with later commands; then
 /// three commands they all depend on, each after the one before, reach

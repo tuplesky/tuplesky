@@ -358,6 +358,27 @@ pub fn select_from(
     supplied: impl Fn(&CommandId, Option<Digest32>) -> bool,
     source_configuration: impl Fn(&Ballot) -> Option<BallotConfiguration>,
 ) -> Result<SyncDecision, RecoveryError> {
+    select_decided(config, reports, supplied, source_configuration, |_| false)
+}
+
+/// [`select_from`], where `decided` names the commands the candidate
+/// itself committed or executed, retired and forgotten ones included
+/// (task-d71). Reports leave out what their replica executed long ago,
+/// so a voter behind can report its own pre-acceptance of a command the
+/// candidate executed far back, and the selection re-proposes it. The
+/// new leader does not chain such a re-proposal after the recovered
+/// order (`Leader::from_recovered`): it was decided, with other
+/// dependencies. So the possible-fast rule does not count a candidate
+/// that follows one as ordered after the recovered order, as it counts
+/// one that follows a command no ballot decided (protocol_sim row 12,
+/// three voters, seed 387, without catch-up).
+pub fn select_decided(
+    config: &BallotConfiguration,
+    reports: &[RecoveryReport],
+    supplied: impl Fn(&CommandId, Option<Digest32>) -> bool,
+    source_configuration: impl Fn(&Ballot) -> Option<BallotConfiguration>,
+    decided: impl Fn(&CommandId) -> bool,
+) -> Result<SyncDecision, RecoveryError> {
     let mut seen = BTreeSet::new();
     for r in reports {
         if !config.is_voter(&r.replica) {
@@ -566,6 +587,7 @@ pub fn select_from(
         reports,
         &mut entries,
         &from_below,
+        &decided,
     );
     for c in entries.keys() {
         reproposed.remove(c);
@@ -650,6 +672,7 @@ fn possible_fast_decisions(
     reports: &[RecoveryReport],
     entries: &mut BTreeMap<CommandId, SyncEntry>,
     from_below: &BTreeSet<CommandId>,
+    decided: &impl Fn(&CommandId) -> bool,
 ) {
     // The fast set of the source ballot: its own configuration where the
     // candidate knows it (task-d31), else the default rule every
@@ -821,8 +844,9 @@ fn possible_fast_decisions(
     };
     // The commands `deps` reach, followed through the selection and the
     // candidates, that neither holds and a report holds undecided (or,
-    // with `member`, that member holds undecided): the ones the selection
-    // re-proposes.
+    // with `member`, that member holds undecided), and the candidate did
+    // not decide itself: the ones the selection re-proposes and the new
+    // leader chains after the recovered order (task-d71).
     let undecided_reached = |deps: &[CommandId],
                              candidates: &BTreeMap<CommandId, (ReportEntry, usize)>,
                              member: Option<&RecoveryReport>|
@@ -838,12 +862,14 @@ fn possible_fast_decisions(
                 stack.extend(e.deps.iter().copied());
             } else if let Some((e, _)) = candidates.get(&d) {
                 stack.extend(e.deps.iter().copied());
-            } else if match member {
-                Some(m) => record(m, &d).is_some_and(|r| r.phase < Phase::Commit),
-                None => reports
-                    .iter()
-                    .any(|r| record(r, &d).is_some_and(|r| r.phase < Phase::Commit)),
-            } {
+            } else if !decided(&d)
+                && match member {
+                    Some(m) => record(m, &d).is_some_and(|r| r.phase < Phase::Commit),
+                    None => reports
+                        .iter()
+                        .any(|r| record(r, &d).is_some_and(|r| r.phase < Phase::Commit)),
+                }
+            {
                 found.insert(d);
                 if let Some(m) = member
                     && let Some(r) = record(m, &d)

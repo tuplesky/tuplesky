@@ -427,11 +427,6 @@ pub struct Follower {
     /// change for (task-d46). Every held proposal that can be adopted is
     /// here or in `held_waiters` under a command whose change is noted.
     held_check: alloc::collections::BTreeSet<CommandId>,
-    /// The command whose turn had come that this replica last let past
-    /// its capacity (task-d71): the next one goes past only once this one
-    /// has executed, so the table passes the capacity by one such command
-    /// at a time, not by the chain of them.
-    overflow: Option<CommandId>,
     /// The held proposals that cannot be adopted yet, under the one
     /// command each waits on first (`held_blocker`), as task-d26 keeps
     /// pending Sync entries: adopting no longer reads every held proposal
@@ -737,7 +732,6 @@ impl Follower {
             held_lacking: alloc::collections::BTreeSet::new(),
             rebinds: alloc::collections::BTreeSet::new(),
             held_check: alloc::collections::BTreeSet::new(),
-            overflow: None,
             held_waiters: BTreeMap::new(),
             pending: BTreeMap::new(),
             deferred: BTreeMap::new(),
@@ -924,7 +918,6 @@ impl Follower {
             held_lacking: alloc::collections::BTreeSet::new(),
             rebinds: alloc::collections::BTreeSet::new(),
             held_check: alloc::collections::BTreeSet::new(),
-            overflow: None,
             held_waiters: BTreeMap::new(),
             pending: BTreeMap::new(),
             votes: BTreeMap::new(),
@@ -1298,7 +1291,15 @@ impl Follower {
                 }
                 None => table.phase_of(c).is_some(),
             };
-            match campaign.try_select(crate::recovery::MAX_REPORT_ENTRIES, supplied) {
+            // What this candidate decided itself, executed long ago and
+            // forgotten included: a re-proposal of one is not chained
+            // after the recovered order (task-d71).
+            let decided = |c: &CommandId| table.phase_of(c) >= Some(Phase::Commit);
+            match campaign.try_select_decided(
+                crate::recovery::MAX_REPORT_ENTRIES,
+                supplied,
+                decided,
+            ) {
                 Ok(None) => return Vec::new(),
                 Ok(Some(_)) => {}
                 Err(e) => {
@@ -3009,8 +3010,7 @@ impl Follower {
     /// dependency at least ACCEPT here (task-d09).
     ///
     /// Such a command is let into a table full for new admission: into
-    /// the recovery reserve, and past the capacity one at a time
-    /// (task-d71). The table fills with later commands while this replica
+    /// the recovery reserve, and one past the capacity (task-d71). The table fills with later commands while this replica
     /// is behind -- their payloads arrive by submission and transfer in no
     /// particular order -- and none of them can be adopted before the
     /// command whose turn it is.
@@ -3028,13 +3028,14 @@ impl Follower {
     ///
     /// Each command it admits is adopted at once and is the one execution
     /// needs next, so committing and executing it is what makes room for
-    /// the next. Past the capacity -- a table a Sync filled, whose entries
-    /// execute only after it -- one is let in at a time, and the next once
-    /// that one has executed. Let in whenever its turn came, the chain of
-    /// them was bounded only by the held proposals (`HELD_PROPOSAL_SLACK`
-    /// tables' worth), and a follower behind under backpressure held more
-    /// records than its capacity allows (protocol_sim row 3, five voters,
-    /// seed 158).
+    /// the next. One past the capacity, so a table recovery work filled
+    /// still lets the next one in: the room is counted from the table, not
+    /// remembered, so a restart that restores a full table changes nothing.
+    /// Let in whenever its turn came, the chain of them was bounded only by
+    /// the held proposals (`HELD_PROPOSAL_SLACK` tables' worth), and a
+    /// follower behind under backpressure held more records than its
+    /// capacity allows (protocol_sim row 3, five voters, seed 158; three
+    /// voters, seed 800, across a restart).
     ///
     /// Only for the admission the proposal carries: a payload under other
     /// attested facts could not be adopted anyway.
@@ -3556,26 +3557,10 @@ impl Follower {
                 .is_some_and(|d| {
                     d.entries.contains_key(&command) || d.reproposed.contains(&command)
                 });
-            let overflow_done = self.overflow.is_none_or(|c| {
-                self.table.phase_of(&c) >= Some(Phase::Executed)
-                    || self.table.retired(&c)
-                    || self.table.phase_of(&c).is_none()
-            });
-            match self
-                .table
-                .initialize_in_reserve(command, digest, keys.clone())
-            {
-                Err(InitError::Backpressure) if reproposed => {
-                    self.table.initialize_beyond_capacity(command, digest, keys)
-                }
-                Err(InitError::Backpressure) if overflow_done => {
-                    let r = self.table.initialize_beyond_capacity(command, digest, keys);
-                    if r.is_ok() {
-                        self.overflow = Some(command);
-                    }
-                    r
-                }
-                r => r,
+            if reproposed {
+                self.table.initialize_beyond_capacity(command, digest, keys)
+            } else {
+                self.table.initialize_in_reserve(command, digest, keys)
             }
         } else {
             self.table.initialize(command, digest, keys)

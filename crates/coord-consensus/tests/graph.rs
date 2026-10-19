@@ -860,12 +860,12 @@ fn a_reclaim_retires_in_the_order_commands_executed() {
     assert_eq!(remembered, vec![9, 10, 11, 12]);
 }
 
-/// A command whose turn has come takes the recovery reserve and stops at
-/// the capacity (task-d71, protocol_sim row 3, five voters, seed 158).
+/// A command whose turn has come takes the recovery reserve and stops one
+/// past the capacity (task-d71, protocol_sim row 3, five voters, seed 158).
 /// New admission stops an eighth short of it; recovery work alone passes
 /// it, bounded by the largest Sync and catch-up page.
 #[test]
-fn the_reserve_takes_a_command_whose_turn_has_come_up_to_the_capacity() {
+fn the_reserve_takes_a_command_whose_turn_has_come_one_past_the_capacity() {
     let capacity = 16usize;
     let reserve = capacity / coord_consensus::RECOVERY_RESERVE_PARTS;
     let mut t = CommandTable::with_capacity(capacity);
@@ -884,12 +884,12 @@ fn the_reserve_takes_a_command_whose_turn_has_come_up_to_the_capacity() {
         t.initialize(cmd(i), payload(i), vec![alloc_key(i)]).err(),
         Some(InitError::Backpressure)
     );
-    for _ in 0..reserve {
+    for _ in 0..=reserve {
         let i = next();
         t.initialize_in_reserve(cmd(i), payload(i), vec![alloc_key(i)])
             .unwrap();
     }
-    assert_eq!(t.len(), capacity);
+    assert_eq!(t.len(), capacity + 1);
     let i = next();
     assert_eq!(
         t.initialize_in_reserve(cmd(i), payload(i), vec![alloc_key(i)])
@@ -898,7 +898,7 @@ fn the_reserve_takes_a_command_whose_turn_has_come_up_to_the_capacity() {
     );
     t.initialize_beyond_capacity(cmd(i), payload(i), vec![alloc_key(i)])
         .unwrap();
-    assert_eq!(t.len(), capacity + 1);
+    assert_eq!(t.len(), capacity + 2);
 }
 
 fn alloc_key(i: u8) -> Vec<u8> {
