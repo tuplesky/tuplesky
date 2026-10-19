@@ -26,5 +26,7 @@
   {"row": 2, "voters": 3, "seed": 3, "found": "task-d33: a candidate kept over an adopted command that waited on the same re-proposal"},
   {"row": 3, "voters": 3, "seed": 70, "found": "task-d33: a candidate ordered through a command about to be re-proposed"},
   {"row": 1, "voters": 5, "seed": 14, "found": "task-d33: a candidate ordered through a command about to be re-proposed"},
-  {"row": 2, "voters": 3, "seed": 12, "found": "task-d33: a report left out a commit its own selection made"}
+  {"row": 2, "voters": 3, "seed": 12, "found": "task-d33: a report left out a commit its own selection made"},
+  {"row": 5, "voters": 3, "seed": 822, "found": "task-d71: a candidate dropped beside an adopted command that waits last on another re-proposal"},
+  {"row": 3, "voters": 5, "seed": 158, "found": "task-d71: commands whose turn had come admitted past a follower's capacity"}
 ]

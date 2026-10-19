@@ -427,6 +427,11 @@ pub struct Follower {
     /// change for (task-d46). Every held proposal that can be adopted is
     /// here or in `held_waiters` under a command whose change is noted.
     held_check: alloc::collections::BTreeSet<CommandId>,
+    /// The command whose turn had come that this replica last let past
+    /// its capacity (task-d71): the next one goes past only once this one
+    /// has executed, so the table passes the capacity by one such command
+    /// at a time, not by the chain of them.
+    overflow: Option<CommandId>,
     /// The held proposals that cannot be adopted yet, under the one
     /// command each waits on first (`held_blocker`), as task-d26 keeps
     /// pending Sync entries: adopting no longer reads every held proposal
@@ -732,6 +737,7 @@ impl Follower {
             held_lacking: alloc::collections::BTreeSet::new(),
             rebinds: alloc::collections::BTreeSet::new(),
             held_check: alloc::collections::BTreeSet::new(),
+            overflow: None,
             held_waiters: BTreeMap::new(),
             pending: BTreeMap::new(),
             deferred: BTreeMap::new(),
@@ -918,6 +924,7 @@ impl Follower {
             held_lacking: alloc::collections::BTreeSet::new(),
             rebinds: alloc::collections::BTreeSet::new(),
             held_check: alloc::collections::BTreeSet::new(),
+            overflow: None,
             held_waiters: BTreeMap::new(),
             pending: BTreeMap::new(),
             votes: BTreeMap::new(),
@@ -3001,10 +3008,12 @@ impl Follower {
     /// proposal of this ballot, under the admission given, with every
     /// dependency at least ACCEPT here (task-d09).
     ///
-    /// Such a command is let into a full table. The table fills with
-    /// later commands while this replica is behind -- their payloads
-    /// arrive by submission and transfer in no particular order -- and
-    /// none of them can be adopted before the command whose turn it is.
+    /// Such a command is let into a table full for new admission: into
+    /// the recovery reserve, and past the capacity one at a time
+    /// (task-d71). The table fills with later commands while this replica
+    /// is behind -- their payloads arrive by submission and transfer in no
+    /// particular order -- and none of them can be adopted before the
+    /// command whose turn it is.
     /// Refused, that command held every one of them for ever. Admitted,
     /// it is adopted at once, and its adoption is the vote the leader may
     /// be waiting for.
@@ -3017,11 +3026,15 @@ impl Follower {
     /// fault active, three followers refusing every proposal as
     /// backpressure. Admitting what can be adopted is what breaks that.
     ///
-    /// How far the table exceeds its bound: by the chain of held
-    /// proposals each of whose dependencies is adopted before it, and the
-    /// held proposals are bounded (`HELD_PROPOSAL_SLACK` tables' worth).
-    /// The commands it admits are the ones execution needs next, so
-    /// committing and executing them is what shrinks the table again.
+    /// Each command it admits is adopted at once and is the one execution
+    /// needs next, so committing and executing it is what makes room for
+    /// the next. Past the capacity -- a table a Sync filled, whose entries
+    /// execute only after it -- one is let in at a time, and the next once
+    /// that one has executed. Let in whenever its turn came, the chain of
+    /// them was bounded only by the held proposals (`HELD_PROPOSAL_SLACK`
+    /// tables' worth), and a follower behind under backpressure held more
+    /// records than its capacity allows (protocol_sim row 3, five voters,
+    /// seed 158).
     ///
     /// Only for the admission the proposal carries: a payload under other
     /// attested facts could not be adopted anyway.
@@ -3526,13 +3539,46 @@ impl Follower {
                         d.entries.contains_key(&command) || d.reproposed.contains(&command)
                     })
             });
-        let initialized = if recovering || self.turn_has_come(&command, payload.admission_digest())
-        {
-            self.table
-                .initialize_beyond_capacity(command, payload.admission_digest(), keys)
+        let digest = payload.admission_digest();
+        let initialized = if recovering {
+            self.table.initialize_beyond_capacity(command, digest, keys)
+        } else if self.turn_has_come(&command, digest) {
+            // The new leader's re-proposal of a command its synchronized
+            // selection names is recovery work, bounded by that Sync, and
+            // goes past the capacity as the Sync's entries do (task-d71):
+            // let in one at a time, a domain whose re-proposals were
+            // decided and not yet executed stopped adopting them.
+            let synced = self.ballots.synced();
+            let reproposed = self
+                .synced_selection
+                .as_ref()
+                .filter(|d| d.ballot == synced)
+                .is_some_and(|d| {
+                    d.entries.contains_key(&command) || d.reproposed.contains(&command)
+                });
+            let overflow_done = self.overflow.is_none_or(|c| {
+                self.table.phase_of(&c) >= Some(Phase::Executed)
+                    || self.table.retired(&c)
+                    || self.table.phase_of(&c).is_none()
+            });
+            match self
+                .table
+                .initialize_in_reserve(command, digest, keys.clone())
+            {
+                Err(InitError::Backpressure) if reproposed => {
+                    self.table.initialize_beyond_capacity(command, digest, keys)
+                }
+                Err(InitError::Backpressure) if overflow_done => {
+                    let r = self.table.initialize_beyond_capacity(command, digest, keys);
+                    if r.is_ok() {
+                        self.overflow = Some(command);
+                    }
+                    r
+                }
+                r => r,
+            }
         } else {
-            self.table
-                .initialize(command, payload.admission_digest(), keys)
+            self.table.initialize(command, digest, keys)
         };
         let init = match initialized {
             Ok(i) => {

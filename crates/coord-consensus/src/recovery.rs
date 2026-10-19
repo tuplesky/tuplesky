@@ -912,17 +912,32 @@ fn possible_fast_decisions(
                 // An adopted command that waits on a re-proposal too is
                 // not ordered against `c` that way (row 2, seed 3).
                 if awaits_reproposal {
-                    if undecided_reached(&adopted.deps, &candidates, None).is_empty()
-                        || selected_before.contains(&adopted.command)
-                    {
+                    let waits = undecided_reached(&adopted.deps, &candidates, None);
+                    if waits.is_empty() || selected_before.contains(&adopted.command) {
                         return true;
                     }
-                    // It waits on a re-proposal too, and nothing the
-                    // selection keeps orders it before `c`. The member's
-                    // records do not either: the way they order the two
-                    // runs through an undecided command, which is
-                    // re-proposed under other dependencies (row 3, seed
-                    // 70). Only a command with no conflict is exempt.
+                    // It waits on a re-proposal too. Neither command can
+                    // have executed anywhere, since each follows a command
+                    // no ballot decided, so the only order either will
+                    // execute in is the one this selection's re-proposals
+                    // give them, and the member's records of the undecided
+                    // commands, which the re-proposals replace, are no
+                    // evidence of it either way (task-d71). The new leader
+                    // re-proposes the undecided commands one after another
+                    // in identity order, and an entry right after the last
+                    // one it waits on (`Leader::from_recovered`), so two
+                    // entries whose last differs are chained by the
+                    // re-proposals between them, in whichever order: the
+                    // drop that order was read for re-proposed `c` under
+                    // other dependencies than a fast quorum may have
+                    // learned it with (protocol_sim row 5, three voters,
+                    // seed 822). Two entries waiting last on the same one
+                    // are re-proposed beside each other with their own
+                    // dependencies and no edge between them (row 2, seed
+                    // 3), so only a command with no conflict is exempt.
+                    if waits.last() != undecided_reached(&entry.deps, &candidates, None).last() {
+                        return true;
+                    }
                     let keys: Vec<Vec<u8>> = adopted.paths.iter().map(|(k, _)| k.clone()).collect();
                     return !keys.is_empty() && !conflicts(&entry.keys, &keys);
                 }

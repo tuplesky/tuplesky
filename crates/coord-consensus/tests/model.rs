@@ -1986,6 +1986,52 @@ fn a_candidate_is_not_ordered_after_an_adopted_command_that_waits_on_the_same_re
     );
 }
 
+/// task-d71 (protocol_sim row 5, three voters, seed 822): a candidate and
+/// an adopted command that wait last on different re-proposals are both
+/// kept. x was decided fast after e, which no ballot decided, and a,
+/// accepted at the source ballot, waits on d's re-proposal. The new
+/// leader re-proposes d and e one after the other in identity order and
+/// each entry right after the last one it waits on, so the re-proposal
+/// between them chains a and x whichever sorts first, and neither can
+/// have executed anywhere. Dropped, x was re-proposed under other
+/// dependencies than the ones the frontend learned it with.
+#[test]
+fn a_candidate_is_kept_beside_an_adopted_command_that_waits_on_another_reproposal() {
+    let cfg = config(3, 2, &[2, 0], 2);
+    for (a, d, e, x) in [
+        (cmd(1), cmd(2), cmd(3), cmd(4)),
+        (cmd(1), cmd(3), cmd(2), cmd(4)),
+    ] {
+        let undecided = |c: CommandId, deps: &[CommandId]| ReportEntry {
+            payload_present: false,
+            ..pre_accept_with(c, deps, 9)
+        };
+        let reports = vec![
+            report_for(
+                1,
+                ballot(2, 2),
+                1,
+                vec![
+                    entry(a, Phase::Accept, &[d]),
+                    undecided(d, &[]),
+                    undecided(e, &[a]),
+                    pre_accept_with(x, &[e], 5),
+                ],
+            ),
+            report_for(2, ballot(2, 2), 0, vec![]),
+        ];
+        let decision = select(&cfg, &reports).unwrap();
+        assert!(decision.entries.contains_key(&a));
+        assert_eq!(
+            decision.entries.get(&x).map(|e| e.deps.clone()),
+            Some(vec![e]),
+            "reproposed {:?}",
+            decision.reproposed
+        );
+        assert!(decision.reproposed.contains(&d) && decision.reproposed.contains(&e));
+    }
+}
+
 /// task-d33 (protocol_sim row 12, three voters, seed 9): x was decided
 /// fast after f, which the member executed and retired past the window
 /// its report names, so no report holds f. A member at the source ballot

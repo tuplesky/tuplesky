@@ -1842,15 +1842,15 @@ impl Sim {
             let records = table.len();
             // Admitted work stops an eighth short of the capacity; recovery
             // work (a Sync's entries, a candidate's selection, pulled
-            // commands, a command whose turn has come) may pass it, bounded
-            // by the largest Sync and the largest catch-up page this node
-            // was given, and nothing executed is kept past it (task-d24,
-            // design Section 13.1).
+            // commands) may pass it, bounded by the largest Sync and the
+            // largest catch-up page this node was given, and a command
+            // whose turn has come by one at a time (task-d71); nothing
+            // executed is kept past it (task-d24, design Section 13.1).
             let (sync, pulled) = (
                 self.sync_entries[usize::from(i)],
                 self.pulled_entries[usize::from(i)],
             );
-            if records > CAPACITY + sync + pulled {
+            if records > CAPACITY + sync + pulled + 1 {
                 let mut phases: BTreeMap<String, usize> = BTreeMap::new();
                 for (_, r) in table.records() {
                     *phases.entry(format!("{:?}", r.phase)).or_default() += 1;
