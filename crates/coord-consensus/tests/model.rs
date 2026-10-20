@@ -2136,6 +2136,48 @@ fn a_candidate_after_a_command_executed_after_an_adopted_one_is_kept() {
     );
 }
 
+/// task-d71 (#158 review): the member's closure is read through its
+/// records only where they are an order the selection executes. Here e
+/// was committed elsewhere after p, which the candidate decided, executed
+/// and forgot, and the member still holds its own pre-acceptance of p,
+/// after d. That record is no decision: d is reached through it alone,
+/// and the candidate's running a before d says nothing about a before c,
+/// which follows p, which ran before a. Read through it, c was kept with
+/// a, adopted and conflicting, unordered against it.
+#[test]
+fn a_stale_pre_acceptance_orders_nothing_before_a_candidate() {
+    let cfg = config(3, 2, &[2, 0], 2);
+    let (a, d, e, p, c) = (cmd(1), cmd(2), cmd(3), cmd(4), cmd(5));
+    let reports = vec![
+        report_for(
+            1,
+            ballot(2, 2),
+            1,
+            vec![
+                entry(a, Phase::Commit, &[]),
+                pre_accept_with(e, &[], 5),
+                pre_accept_with(p, &[d], 5),
+                pre_accept_with(c, &[e], 5),
+            ],
+        ),
+        report_for(2, ballot(2, 2), 0, vec![entry(e, Phase::Commit, &[p])]),
+    ];
+    let decision = coord_consensus::select_decided(
+        &cfg,
+        &reports,
+        |_, _| false,
+        |_| None,
+        &Executed(vec![p, e, a, d]),
+    )
+    .unwrap();
+    assert!(decision.entries.contains_key(&a));
+    assert!(
+        !decision.entries.contains_key(&c),
+        "kept {:?}",
+        decision.entries.get(&c)
+    );
+}
+
 /// task-d71 (protocol_sim row 10, three voters, seed 884, without
 /// catch-up): the candidate executed c long ago and forgot it, and a
 /// member behind still holds its own pre-acceptance of c, under other
