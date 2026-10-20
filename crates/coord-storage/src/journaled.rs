@@ -533,6 +533,71 @@ pub struct PublishPhases {
     pub append: Duration,
     /// Retiring the prefix the pointer represents.
     pub retire: Duration,
+    /// The calling thread's own time over each step, where the store has
+    /// a [`ThreadClock`] (task-d66): of a step's wall time, what it spent
+    /// on a CPU and what it spent runnable and waiting for one. The rest
+    /// is the thread blocked, on a sync or on a job in flight. `None`
+    /// without a clock, or where it gave no reading.
+    pub thread: Option<PublishThread>,
+}
+
+/// The calling thread's time over each step of a publication, in the
+/// fields of [`PublishPhases`] (task-d66).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PublishThread {
+    /// Over [`PublishPhases::drain`].
+    pub drain: ThreadTime,
+    /// Over [`PublishPhases::sync`].
+    pub sync: ThreadTime,
+    /// Over [`PublishPhases::append`].
+    pub append: ThreadTime,
+    /// Over [`PublishPhases::retire`].
+    pub retire: ThreadTime,
+}
+
+/// How a thread spent some time, as a [`ThreadClock`] reads it: since
+/// the thread started, or between two readings.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ThreadTime {
+    /// On a CPU.
+    pub on_cpu: Duration,
+    /// Runnable and waiting for a CPU.
+    pub run_queue: Duration,
+}
+
+impl ThreadTime {
+    /// The time between `earlier` and this reading.
+    fn since(self, earlier: ThreadTime) -> ThreadTime {
+        ThreadTime {
+            on_cpu: self.on_cpu.saturating_sub(earlier.on_cpu),
+            run_queue: self.run_queue.saturating_sub(earlier.run_queue),
+        }
+    }
+}
+
+/// Reads the calling thread's [`ThreadTime`] since it started, or
+/// nothing where the platform has no reading. The store has no clock of
+/// its own: the binary that runs it knows where to read one.
+pub type ThreadClock = fn() -> Option<ThreadTime>;
+
+/// One step's [`ThreadTime`], read at its start and taken at its end.
+struct Lap {
+    clock: Option<ThreadClock>,
+    start: Option<ThreadTime>,
+}
+
+impl Lap {
+    fn start(clock: Option<ThreadClock>) -> Lap {
+        Lap {
+            clock,
+            start: clock.and_then(|read| read()),
+        }
+    }
+
+    /// The step's time, or `None` when either reading is missing.
+    fn take(self) -> Option<ThreadTime> {
+        Some(self.clock.and_then(|read| read())?.since(self.start?))
+    }
 }
 
 fn alloc_one(record: JournalRecordV1) -> Vec<JournalRecordV1> {
@@ -743,6 +808,8 @@ pub struct JournaledStore<J: JournalEngine, E: LocalEngine> {
     syncs: Option<u64>,
     /// How projections commit (task-j06).
     profile: ProjectionProfile,
+    /// What times a publication's steps on the calling thread (task-d66).
+    thread_clock: Option<ThreadClock>,
 }
 
 /// One stream's entry in a sealed group: the domain, the barrier the
@@ -802,6 +869,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
             cost: LoweringCost::default(),
             syncs: journal.syncs(),
             profile: ProjectionProfile::Strict,
+            thread_clock: None,
             journal: Some(journal),
             appender: None,
             appending: None,
@@ -1349,11 +1417,21 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
         // an append the appender has out; what they completed goes out
         // with the next report.
         let mut phases = PublishPhases::default();
+        let clock = self.thread_clock;
+        let mut thread = PublishThread::default();
+        let mut timed = clock.is_some();
+        let mut lapped = |lap: Lap| {
+            let time = lap.take();
+            timed &= time.is_some();
+            time.unwrap_or_default()
+        };
         let started = Instant::now();
+        let lap = Lap::start(clock);
         let drained = self.drain()?;
         self.deferred_events.extend(drained.events);
         self.deferred_uncertain |= drained.indeterminate;
         phases.drain = started.elapsed();
+        thread.drain = lapped(lap);
         let barrier = BarrierId {
             node_generation: self.incarnation,
             boot_id: self.boot,
@@ -1387,9 +1465,11 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
             && state.projection_durable < pointer.represented
         {
             let started = Instant::now();
+            let lap = Lap::start(clock);
             state.sync_projection()?;
             debug_assert!(state.projection_durable >= pointer.represented);
             phases.sync = started.elapsed();
+            thread.sync = lapped(lap);
         }
         // `C <= M` is what makes the image loadable: an image claiming
         // records the projection has not applied represents obligations
@@ -1401,6 +1481,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
             .publish_checkpoint(pointer.represented)
             .map_err(JournaledError::Frontier)?;
         let started = Instant::now();
+        let lap = Lap::start(clock);
         let seq = state.head.next_seq()?;
         let record = JournalRecordV1::seal(RecordDraft {
             origin: state.origin,
@@ -1459,9 +1540,11 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
             }
         }
         phases.append = started.elapsed();
+        thread.append = lapped(lap);
         // Only now, and never as a condition of the publication.
         let stream = self.domains.get(&domain).expect("attached").origin.stream;
         let started = Instant::now();
+        let lap = Lap::start(clock);
         let retired = self
             .journal
             .as_mut()
@@ -1469,6 +1552,8 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
             .retire_prefix(stream, pointer)
             .is_ok();
         phases.retire = started.elapsed();
+        thread.retire = lapped(lap);
+        phases.thread = timed.then_some(thread);
         Ok(Published {
             published: pointer.represented,
             retired,
@@ -2698,6 +2783,13 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
     /// How projections commit (task-j06).
     pub fn projection_profile(&self) -> ProjectionProfile {
         self.profile
+    }
+
+    /// Time a publication's steps on the calling thread with `clock` from
+    /// now on, as well as by the wall (task-d66): what
+    /// [`PublishPhases::thread`] reports.
+    pub fn time_thread(&mut self, clock: ThreadClock) {
+        self.thread_clock = Some(clock);
     }
 
     /// A domain's projection as a crash would leave it (task-j06): the

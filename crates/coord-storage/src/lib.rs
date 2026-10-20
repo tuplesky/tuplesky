@@ -122,7 +122,8 @@ pub use cut::{CutOverlay, RecoveryCut};
 pub use journaled::{
     AppendDone, AppendJob, Appender, CutError, DomainStatus, FlushReport, JournalLimits,
     JournaledError, JournaledStore, LoweringCost, MaterializeDone, MaterializeJob, Materializer,
-    PublishPhases, Published, Replayed, Submission, SubmitRefused, TransitionKind,
+    PublishPhases, PublishThread, Published, Replayed, Submission, SubmitRefused, ThreadClock,
+    ThreadTime, TransitionKind,
 };
 pub use lowering::{GroupDigest, batch_digest};
 pub use materialize::{

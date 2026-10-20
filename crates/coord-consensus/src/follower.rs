@@ -1291,7 +1291,15 @@ impl Follower {
                 }
                 None => table.phase_of(c).is_some(),
             };
-            match campaign.try_select(crate::recovery::MAX_REPORT_ENTRIES, supplied) {
+            // What this candidate decided itself, executed long ago and
+            // forgotten included: a re-proposal of one is not chained
+            // after the recovered order (task-d71).
+            let decided = OwnDecisions(table);
+            match campaign.try_select_decided(
+                crate::recovery::MAX_REPORT_ENTRIES,
+                supplied,
+                decided,
+            ) {
                 Ok(None) => return Vec::new(),
                 Ok(Some(_)) => {}
                 Err(e) => {
@@ -1913,7 +1921,7 @@ impl Follower {
                 // number, so it also runs for a record already committed
                 // here, whose dependencies are then left alone.
                 self.table
-                    .record_leader_path(command, entry.seqnum, &entry.paths);
+                    .record_leader_path(command, entry.seqnum, None, &entry.paths);
                 // The selected order replaces a local one that is merely
                 // accepted: an ACCEPT record from a lower synchronized
                 // ballot may legally disagree with the chosen entry, and
@@ -2816,7 +2824,7 @@ impl Follower {
         }
         if self.table.phase_of(&command).is_none() {
             let keys = alloc::vec![crate::leader::CONSERVATIVE_KEY.to_vec()];
-            let _ = self.table.initialize_beyond_capacity(command, digest, keys);
+            let _ = self.table.initialize_installed(command, digest, keys);
         }
         let installed = committed
             || (self
@@ -3001,10 +3009,11 @@ impl Follower {
     /// proposal of this ballot, under the admission given, with every
     /// dependency at least ACCEPT here (task-d09).
     ///
-    /// Such a command is let into a full table. The table fills with
-    /// later commands while this replica is behind -- their payloads
-    /// arrive by submission and transfer in no particular order -- and
-    /// none of them can be adopted before the command whose turn it is.
+    /// Such a command is let into a table full for new admission: into
+    /// the recovery reserve, and one past the capacity (task-d71). The table fills with later commands while this replica
+    /// is behind -- their payloads arrive by submission and transfer in no
+    /// particular order -- and none of them can be adopted before the
+    /// command whose turn it is.
     /// Refused, that command held every one of them for ever. Admitted,
     /// it is adopted at once, and its adoption is the vote the leader may
     /// be waiting for.
@@ -3017,11 +3026,16 @@ impl Follower {
     /// fault active, three followers refusing every proposal as
     /// backpressure. Admitting what can be adopted is what breaks that.
     ///
-    /// How far the table exceeds its bound: by the chain of held
-    /// proposals each of whose dependencies is adopted before it, and the
-    /// held proposals are bounded (`HELD_PROPOSAL_SLACK` tables' worth).
-    /// The commands it admits are the ones execution needs next, so
-    /// committing and executing them is what shrinks the table again.
+    /// Each command it admits is adopted at once and is the one execution
+    /// needs next, so committing and executing it is what makes room for
+    /// the next. One past the capacity, so a table recovery work filled
+    /// still lets the next one in: the room is counted from the table, not
+    /// remembered, so a restart that restores a full table changes nothing.
+    /// Let in whenever its turn came, the chain of them was bounded only by
+    /// the held proposals (`HELD_PROPOSAL_SLACK` tables' worth), and a
+    /// follower behind under backpressure held more records than its
+    /// capacity allows (protocol_sim row 3, five voters, seed 158; three
+    /// voters, seed 800, across a restart).
     ///
     /// Only for the admission the proposal carries: a payload under other
     /// attested facts could not be adopted anyway.
@@ -3526,13 +3540,30 @@ impl Follower {
                         d.entries.contains_key(&command) || d.reproposed.contains(&command)
                     })
             });
-        let initialized = if recovering || self.turn_has_come(&command, payload.admission_digest())
-        {
-            self.table
-                .initialize_beyond_capacity(command, payload.admission_digest(), keys)
+        let digest = payload.admission_digest();
+        let initialized = if recovering {
+            self.table.initialize_beyond_capacity(command, digest, keys)
+        } else if self.turn_has_come(&command, digest) {
+            // The new leader's re-proposal of a command its synchronized
+            // selection names is recovery work, bounded by that Sync, and
+            // goes past the capacity as the Sync's entries do (task-d71):
+            // let in one at a time, a domain whose re-proposals were
+            // decided and not yet executed stopped adopting them.
+            let synced = self.ballots.synced();
+            let reproposed = self
+                .synced_selection
+                .as_ref()
+                .filter(|d| d.ballot == synced)
+                .is_some_and(|d| {
+                    d.entries.contains_key(&command) || d.reproposed.contains(&command)
+                });
+            if reproposed {
+                self.table.initialize_beyond_capacity(command, digest, keys)
+            } else {
+                self.table.initialize_in_reserve(command, digest, keys)
+            }
         } else {
-            self.table
-                .initialize(command, payload.admission_digest(), keys)
+            self.table.initialize(command, digest, keys)
         };
         let init = match initialized {
             Ok(i) => {
@@ -3615,16 +3646,7 @@ impl Follower {
         // promised away is an acceptance the candidate's selection cannot
         // see (task-d12). Admission itself is fenced in `on_admitted`.
         if self.in_fast_set() && self.may_vote() {
-            // Whether a command reordered behind a synchronization held
-            // this replica's path when it computed this one (task-d62):
-            // then no leader path equals it.
-            let reordered = init.paths.iter().any(|(key, _)| {
-                self.table
-                    .log(key)
-                    .is_some_and(|log| !log.reordered().is_empty())
-            });
             self.fast_counts.acks += 1;
-            self.fast_counts.acks_reordered += u64::from(reordered);
             let ack = FastAck {
                 replica: self.config.identity.replica,
                 ballot: self.config.quorum.ballot(),
@@ -4007,6 +4029,7 @@ impl Follower {
                 self.table.record_leader_path(
                     command,
                     held.proposal.seqnum.unwrap_or(0),
+                    held.proposal.seqnum.map(|_| held.proposal.ballot),
                     &held.proposal.paths,
                 );
                 // A command already learned or executed (installed from a
@@ -4826,5 +4849,18 @@ impl DeterministicMachine for Follower {
             | Event::Entropy { .. }
             | Event::ConnectionClosed { .. } => Vec::new(),
         }
+    }
+}
+
+/// A candidate's own decisions, from its table (task-d71).
+struct OwnDecisions<'a>(&'a CommandTable);
+
+impl crate::recovery::CandidateDecisions for OwnDecisions<'_> {
+    fn decided(&self, command: &CommandId) -> bool {
+        self.0.phase_of(command) >= Some(Phase::Commit)
+    }
+
+    fn executed_before(&self, first: &CommandId, then: &CommandId) -> bool {
+        self.0.executed_before(first, then)
     }
 }

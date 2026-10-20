@@ -156,8 +156,8 @@ pub use follower::{
     Follower, FollowerConfig, FollowerRejection, HELD_PROPOSAL_SLACK, HeldProposal,
 };
 pub use graph::{
-    Closure, ClosureCursor, ClosureProgress, PathLog, anchored_path, chain, combined_path,
-    demoted_path, empty_path, reordered_path,
+    Closure, ClosureCursor, ClosureProgress, PathLog, Position, anchored_path, chain,
+    combined_path, demoted_path, empty_path,
 };
 pub use handoff::{
     ActivationCertificate, CancellationCertificate, Evidence, HandoffError, InstallRecord,
@@ -178,8 +178,9 @@ pub use phase::{GuardViolation, Phase, guard_accept, guard_commit, guard_execute
 pub use publication::{DurableRecord, Publication};
 pub use quorum::{BallotConfiguration, ConfigurationError, EpochVoters, FastQuorumClass};
 pub use recovery::{
-    MAX_REPORT_ENTRIES, MAX_TABLE_CAPACITY, RecoveryError, RecoveryReport, ReportEntry,
-    SyncDecision, SyncEntry, entry_order, max_report_entries, select, select_from, select_with,
+    CandidateDecisions, MAX_REPORT_ENTRIES, MAX_TABLE_CAPACITY, RecoveryError, RecoveryReport,
+    ReportEntry, SyncDecision, SyncEntry, entry_order, max_report_entries, select, select_decided,
+    select_from, select_with,
 };
 pub use replay::{MAX_EVIDENCE_REPAIRS, ReplayRefusal};
 pub use role::{PendingReport, RecoveredState};

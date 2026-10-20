@@ -2372,6 +2372,43 @@ fn entries_that_follow_a_reproposed_command_the_leader_executed_are_proposed() {
     assert_totally_ordered(&leader, &decision, &[r, x, y]);
 }
 
+/// task-d71 (protocol_sim row 5, three voters, seed 822): two entries
+/// that wait last on different re-proposals are ordered by the
+/// re-proposal between them, whichever identity sorts first. Recovery's
+/// possible-fast rule keeps a candidate beside such an adopted command on
+/// this order; two entries waiting last on the same re-proposal are not
+/// ordered by it, and that rule still re-proposes the candidate.
+#[test]
+fn entries_that_wait_on_different_reproposals_are_ordered() {
+    let mut c = Cluster::new(3);
+    c.no_execute = vec![2];
+    let a = c.admit(1, 1);
+    c.settle();
+    let (d, e, x, y) = (
+        c.admit_at(2, 2, &[2]),
+        c.admit_at(3, 3, &[2]),
+        c.admit_at(4, 4, &[2]),
+        c.admit_at(5, 5, &[2]),
+    );
+    let new = ballot(1, 2);
+    let decision = SyncDecision {
+        ballot: new,
+        source_ballot: ballot(0, 0),
+        entries: BTreeMap::from([
+            (a, accepted_sync_entry(a, vec![])),
+            (x, accepted_sync_entry(x, vec![d])),
+            (y, accepted_sync_entry(y, vec![e])),
+        ]),
+        reproposed: [d, e].into_iter().collect(),
+    };
+    let (leader, _) = Leader::from_recovered(
+        c.nodes[2].role.take().map(role_into_recovered).unwrap(),
+        quorum(new),
+        &decision,
+    );
+    assert_totally_ordered(&leader, &decision, &[a, d, e, x, y]);
+}
+
 fn accepted_sync_entry(command: CommandId, deps: Vec<CommandId>) -> coord_consensus::SyncEntry {
     coord_consensus::SyncEntry {
         command,
@@ -2626,11 +2663,16 @@ fn a_sync_installs_the_selected_per_key_evidence_not_only_the_combined_digest() 
         "the per-key evidence is installed, not only the combined digest"
     );
     assert_eq!(record.synced_seq, Some(7));
-    assert_eq!(
-        f.table().path_head(&key),
-        chosen,
-        "the key's log resumes at the selected order, not the local one"
-    );
+    // The entry takes the command out of the log's suffix, so the head no
+    // longer digests the local order. Numbered in the ballot it was
+    // ordered in, it does not move the log's position (task-d68): the head
+    // is the prefix the log had, and the next fresh proposal this replica
+    // adopts moves it to the new leader's path.
+    let log = f.table().log(&key).expect("touched");
+    assert_eq!(log.pending(), &[] as &[coord_types::CommandId]);
+    assert_eq!(log.position(), None);
+    assert_ne!(f.table().path_head(&key), local, "not the local order");
+    assert_eq!(f.table().path_head(&key), coord_consensus::empty_path());
 }
 
 #[test]

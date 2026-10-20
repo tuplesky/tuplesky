@@ -9,8 +9,10 @@
 //! Read from `/proc`, which needs no unsafe code: a thread's
 //! `schedstat` gives its time on a CPU in nanoseconds, and the process's
 //! `stat` its user and system time in clock ticks, which the kernel
-//! reports to userspace at a fixed 100 a second. Elsewhere there is no
-//! reading, and the snapshot says so rather than reporting zero.
+//! reports to userspace at a fixed 100 a second. A publication's steps
+//! (task-d66) are timed by the thread's CPU clock instead, which `rustix`
+//! reads without unsafe code either. Elsewhere there is no reading, and
+//! the snapshot says so rather than reporting zero.
 
 use std::time::Duration;
 
@@ -22,6 +24,26 @@ const USER_HZ: u64 = 100;
 pub fn this_thread() -> Option<Duration> {
     let schedstat = std::fs::read_to_string("/proc/thread-self/schedstat").ok()?;
     schedstat_times(&schedstat).map(|(on_cpu, _)| on_cpu)
+}
+
+/// The calling thread's time on a CPU and waiting for one since it
+/// started: the clock a publication's steps are timed by (task-d66).
+///
+/// The time on a CPU is the thread's CPU clock, not `schedstat`'s:
+/// that is the scheduler's account as of its last update, which for a
+/// running thread trails by up to a tick (about 4 ms on a runner),
+/// against steps the 10 ms line is drawn under. The run-queue time is
+/// `schedstat`'s, settled each time the thread is put back on a CPU, so
+/// a reading the thread takes itself is never short of a wait.
+pub fn this_thread_time() -> Option<coord_storage::ThreadTime> {
+    let schedstat = std::fs::read_to_string("/proc/thread-self/schedstat").ok()?;
+    let (_, run_queue) = schedstat_times(&schedstat)?;
+    let on_cpu = rustix::time::clock_gettime(rustix::time::ClockId::ThreadCPUTime);
+    let on_cpu = Duration::new(
+        u64::try_from(on_cpu.tv_sec).ok()?,
+        u32::try_from(on_cpu.tv_nsec).ok()?,
+    );
+    Some(coord_storage::ThreadTime { on_cpu, run_queue })
 }
 
 /// How the calling thread was scheduled since it started (task-d55).
@@ -130,6 +152,23 @@ mod tests {
         assert!(after.run_queue >= before.run_queue);
     }
 
+    /// The CPU clock moves with work that `schedstat` may not have
+    /// accounted yet: a millisecond of it reads as a millisecond.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_steps_clock_reads_a_short_step() {
+        let before = this_thread_time().expect("linux has schedstat");
+        let spun = std::time::Instant::now();
+        let mut x = 0u64;
+        while spun.elapsed() < Duration::from_millis(2) {
+            x = std::hint::black_box(x.wrapping_add(1));
+        }
+        let after = this_thread_time().expect("linux has schedstat");
+        let on_cpu = after.on_cpu - before.on_cpu;
+        assert!(on_cpu > Duration::ZERO && on_cpu <= spun.elapsed() + Duration::from_millis(1));
+        assert!(after.run_queue >= before.run_queue);
+    }
+
     #[test]
     #[cfg(target_os = "linux")]
     fn this_threads_cpu_time_grows_with_work() {
@@ -141,6 +180,8 @@ mod tests {
         std::hint::black_box(x);
         let after = this_thread().expect("linux has schedstat");
         assert!(after > before);
+        let time = this_thread_time().expect("linux has schedstat");
+        assert!(time.on_cpu > Duration::ZERO);
         assert!(process().expect("linux has stat") >= Duration::ZERO);
     }
 }

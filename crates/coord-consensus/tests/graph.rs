@@ -9,7 +9,6 @@ use std::collections::BTreeSet;
 use coord_consensus::{
     ClosureProgress, CommandRecord, CommandTable, GuardViolation, InitError, Phase, RetireError,
     anchored_path, chain, decode_dependency, dependency_key, dependency_update, empty_path,
-    reordered_path,
 };
 use coord_store_api::registry::Collection;
 use coord_types::identity::Digest32;
@@ -43,6 +42,20 @@ fn payload(i: u8) -> Digest32 {
 
 fn k(s: &str) -> Vec<Vec<u8>> {
     vec![s.as_bytes().to_vec()]
+}
+
+fn ballot(number: u64) -> Option<Ballot> {
+    Some(Ballot {
+        epoch: ConfigurationEpoch::new(1).unwrap(),
+        number,
+        leader: ReplicaId([0; 16]),
+    })
+}
+
+/// A proposal of the ballot numbered `number`, as the follower adopting it
+/// holds that ballot.
+fn in_ballot(number: u64) -> Option<Ballot> {
+    ballot(number)
 }
 
 #[test]
@@ -105,8 +118,8 @@ fn leader_synchronization_aligns_follower_paths() {
     assert_ne!(follower.path_head(b"key"), leader.path_head(b"key"));
     // The leader's fast acknowledgements (seqnum + path) synchronize the
     // follower's log: its head now equals the leader's.
-    follower.record_leader_path(a, 0, &la.paths);
-    follower.record_leader_path(b, 1, &lb.paths);
+    follower.record_leader_path(a, 0, in_ballot(0), &la.paths);
+    follower.record_leader_path(b, 1, in_ballot(0), &lb.paths);
     assert_eq!(follower.path_head(b"key"), leader.path_head(b"key"));
     // A next command carries equal evidence on both.
     let lc = leader.initialize(c, payload(3), k("key")).unwrap();
@@ -117,23 +130,23 @@ fn leader_synchronization_aligns_follower_paths() {
     let d = cmd(4);
     let ld = leader.initialize(d, payload(4), k("key")).unwrap();
     let mut late = CommandTable::new();
-    late.record_leader_path(d, 3, &ld.paths);
+    late.record_leader_path(d, 3, in_ballot(0), &ld.paths);
     let fd = late.initialize(d, payload(4), k("key")).unwrap();
     assert_eq!(fd.paths, ld.paths);
 }
 
 /// A command pre-accepted ahead of one the leader then ordered first is
-/// left behind it in the log, pre-accepted without it (task-d34, F7).
+/// set aside (task-d34's F7, under task-d67's rule).
 ///
-/// The follower saw x, then y; the leader ordered y, then x. Aligned to y
-/// alone, the follower's log reads y then x, which is the leader's order,
-/// while its record of x still does not depend on y. A fast
-/// acknowledgement of a next command z with that head would claim a
-/// history the follower's records do not hold, and with the leader
-/// absent recovery could not rebuild z's ancestors from them. Until x is
-/// synchronized itself, the head is on no leader path.
+/// The follower saw x, then y; the leader ordered y, then x. Its record of
+/// x does not depend on y, so a log reading y then x would claim a history
+/// the follower's records do not hold, and a fast acknowledgement of a
+/// next command z over it could not be rebuilt from them. Synchronized to
+/// y, the follower sets x aside: its head digests y alone, which every
+/// record on the chain holds in the leader's order. That head is not the
+/// leader's, which is through x, so z is slow, never wrong.
 #[test]
-fn a_command_left_behind_a_synchronization_keeps_the_head_off_the_leaders() {
+fn a_command_left_behind_a_synchronization_is_set_aside() {
     let (x, y, z) = (cmd(1), cmd(2), cmd(3));
     let mut leader = CommandTable::new();
     let ly = leader.initialize(y, payload(2), k("key")).unwrap();
@@ -144,48 +157,198 @@ fn a_command_left_behind_a_synchronization_keeps_the_head_off_the_leaders() {
     assert!(!fx.deps.contains(&y));
     follower.initialize(y, payload(2), k("key")).unwrap();
 
-    follower.record_leader_path(y, 0, &ly.paths);
+    follower.record_leader_path(y, 0, in_ballot(0), &ly.paths);
     let log = follower.log(b"key").unwrap();
-    assert_eq!(log.pending(), &[x]);
-    assert_eq!(log.reordered(), &BTreeSet::from([x]));
-    // Without the rule this is chain(y's anchor, x): the leader's head.
-    assert_eq!(
-        follower.path_head(b"key"),
-        chain(&reordered_path(&ly.paths[0].1), &x)
-    );
+    assert_eq!(log.pending(), &[] as &[CommandId]);
+    assert_eq!(log.set_aside_commands(), &BTreeSet::from([x]));
+    assert_eq!(follower.path_head(b"key"), ly.paths[0].1);
     assert_ne!(follower.path_head(b"key"), leader.path_head(b"key"));
     let lz = leader.initialize(z, payload(3), k("key")).unwrap();
     let mut early = follower.clone();
     let fz = early.initialize(z, payload(3), k("key")).unwrap();
     assert_ne!(fz.path, lz.path, "no fast evidence over x's stale record");
 
-    // Synchronized itself, x takes the leader's order, and the head is the
-    // leader's again.
-    follower.record_leader_path(x, 1, &lx.paths);
-    assert!(follower.log(b"key").unwrap().reordered().is_empty());
+    // The leader's order for x, a set-aside command, is applied as any
+    // other: the head is the leader's again.
+    follower.record_leader_path(x, 1, in_ballot(0), &lx.paths);
+    assert!(
+        follower
+            .log(b"key")
+            .unwrap()
+            .set_aside_commands()
+            .is_empty()
+    );
     assert_eq!(follower.path_head(b"key"), lx.paths[0].1);
     let fz = follower.initialize(z, payload(3), k("key")).unwrap();
     assert_eq!(fz.path, lz.path);
 
     // A synchronization that arrived before its command was appended here
-    // leaves all of the suffix behind it too.
+    // sets aside what was appended before the command, whenever that was.
     let mut late = CommandTable::new();
-    late.record_leader_path(y, 0, &ly.paths);
+    late.record_leader_path(y, 0, in_ballot(0), &ly.paths);
     late.initialize(x, payload(1), k("key")).unwrap();
     late.initialize(y, payload(2), k("key")).unwrap();
-    assert_eq!(late.log(b"key").unwrap().reordered(), &BTreeSet::from([x]));
+    assert_eq!(
+        late.log(b"key").unwrap().set_aside_commands(),
+        &BTreeSet::from([x])
+    );
+    assert_eq!(late.path_head(b"key"), ly.paths[0].1);
     assert_ne!(late.path_head(b"key"), leader.path_head(b"key"));
+}
 
-    // Executed and retired without a synchronization of its own, x holds a
-    // decided order, and it no longer keeps the head off.
-    early.accept(y, vec![]).unwrap();
-    early.accept(x, vec![y]).unwrap();
-    early.commit(y).unwrap();
-    early.commit(x).unwrap();
-    early.execute(y).unwrap();
-    early.execute(x).unwrap();
-    early.retire(&x).unwrap();
-    assert!(early.log(b"key").unwrap().reordered().is_empty());
+/// A pre-acceptance the leader never orders is let go of at the first
+/// synchronization past it (task-d67), and the fast path resumes.
+///
+/// Before the ordered command in the follower's log, the orphan is set
+/// aside at that command's synchronization, and the next command's path
+/// and dependencies are the leader's. After it, as the key's latest
+/// command, the orphan stays: the next command depends on it, which the
+/// leader's does not, so that one is slow, and its own synchronization
+/// sets the orphan aside, so the one after is fast again.
+#[test]
+fn an_orphan_is_set_aside_at_the_first_synchronization_past_it() {
+    let (o, y, z, w) = (cmd(1), cmd(2), cmd(3), cmd(4));
+    let mut leader = CommandTable::new();
+    let ly = leader.initialize(y, payload(2), k("key")).unwrap();
+    let lz = leader.initialize(z, payload(3), k("key")).unwrap();
+    let lw = leader.initialize(w, payload(4), k("key")).unwrap();
+
+    // Before y.
+    let mut before = CommandTable::new();
+    before.initialize(o, payload(1), k("key")).unwrap();
+    before.initialize(y, payload(2), k("key")).unwrap();
+    before.record_leader_path(y, 0, in_ballot(0), &ly.paths);
+    before
+        .adopt(y, ly.deps.clone(), Some(&ly.paths), ly.path)
+        .unwrap();
+    assert_eq!(
+        before.log(b"key").unwrap().set_aside_commands(),
+        &BTreeSet::from([o])
+    );
+    assert_eq!(before.unordered(), (1, BTreeSet::from([o])));
+    let fz = before.initialize(z, payload(3), k("key")).unwrap();
+    assert_eq!((fz.deps, fz.path), (lz.deps.clone(), lz.path));
+    // Its record, phase and dependencies stay.
+    assert_eq!(before.phase_of(&o), Some(Phase::PreAccept));
+
+    // After y: the key's latest.
+    let mut after = CommandTable::new();
+    after.initialize(y, payload(2), k("key")).unwrap();
+    after.initialize(o, payload(1), k("key")).unwrap();
+    after.record_leader_path(y, 0, in_ballot(0), &ly.paths);
+    after
+        .adopt(y, ly.deps.clone(), Some(&ly.paths), ly.path)
+        .unwrap();
+    assert_eq!(after.log(b"key").unwrap().pending(), &[o]);
+    let fz = after.initialize(z, payload(3), k("key")).unwrap();
+    assert_eq!(fz.deps, vec![o], "the next command depends on the orphan");
+    assert_ne!(fz.path, lz.path);
+    after.record_leader_path(z, 1, in_ballot(0), &lz.paths);
+    assert_eq!(
+        after.log(b"key").unwrap().set_aside_commands(),
+        &BTreeSet::from([o])
+    );
+    after
+        .adopt(z, lz.deps.clone(), Some(&lz.paths), lz.path)
+        .unwrap();
+    let fw = after.initialize(w, payload(4), k("key")).unwrap();
+    assert_eq!((fw.deps, fw.path), (lw.deps, lw.path));
+}
+
+/// A command that executes and retires while still in the suffix is set
+/// aside, with every later suffix command (task-d67): retiring it once
+/// left it pending for good, and with task-d34's marker, the head off
+/// every leader path for the rest of the ballot.
+#[test]
+fn a_command_retired_while_pending_is_set_aside() {
+    let (x, y) = (cmd(1), cmd(2));
+    let mut t = CommandTable::new();
+    let ix = t.initialize(x, payload(1), k("key")).unwrap();
+    t.initialize(y, payload(2), k("key")).unwrap();
+    t.accept(x, vec![]).unwrap();
+    t.commit(x).unwrap();
+    t.execute(x).unwrap();
+    t.retire(&x).unwrap();
+    let log = t.log(b"key").unwrap();
+    assert_eq!(log.pending(), &[] as &[CommandId]);
+    assert_eq!(log.set_aside_commands(), &BTreeSet::from([y]));
+    assert_eq!(t.path_head(b"key"), empty_path());
+    assert_ne!(t.path_head(b"key"), ix.paths[0].1);
+}
+
+/// A command catch-up installs decided is not appended (task-d67): its
+/// place is in a leader's prefix, and a synchronization held for it is
+/// applied at the install.
+#[test]
+fn a_command_installed_decided_is_not_appended() {
+    let (x, y) = (cmd(1), cmd(2));
+    let mut leader = CommandTable::new();
+    let lx = leader.initialize(x, payload(1), k("key")).unwrap();
+    let ly = leader.initialize(y, payload(2), k("key")).unwrap();
+    let mut t = CommandTable::new();
+    t.initialize_installed(x, payload(1), k("key")).unwrap();
+    assert_eq!(t.log(b"key").unwrap().pending(), &[] as &[CommandId]);
+    t.record_leader_path(y, 1, in_ballot(0), &ly.paths);
+    t.initialize_installed(y, payload(2), k("key")).unwrap();
+    assert_eq!(t.path_head(b"key"), leader.path_head(b"key"));
+    assert_eq!(t.conflicts(&k("key")), vec![y], "the key's latest moves");
+    let _ = lx;
+}
+
+/// A log's position is the ballot whose leader numbered it and that
+/// number (task-d68): a new leader's first proposal is above everything
+/// an earlier ballot synchronized, and a Sync's entry never moves it.
+#[test]
+fn positions_are_ballot_scoped() {
+    let (a, c, d, e) = (cmd(1), cmd(3), cmd(4), cmd(5));
+    let mut old = CommandTable::new();
+    let la = old.initialize(a, payload(1), k("key")).unwrap();
+    let mut follower = CommandTable::new();
+    follower.initialize(a, payload(1), k("key")).unwrap();
+    follower.record_leader_path(a, 19, in_ballot(0), &la.paths);
+    assert_eq!(follower.path_head(b"key"), la.paths[0].1);
+
+    // The new leader anchors and numbers from zero.
+    let mut new = CommandTable::new();
+    new.anchor_all(b"key", &[a]);
+    let lc = new.initialize(c, payload(3), k("key")).unwrap();
+    new.synchronize_own(c, ballot(1).unwrap(), 0);
+    let fc = follower.initialize(c, payload(3), k("key")).unwrap();
+    assert_ne!(fc.path, lc.path, "pre-accepted before the first adoption");
+    follower.record_leader_path(c, 0, in_ballot(1), &lc.paths);
+    assert_eq!(follower.path_head(b"key"), new.path_head(b"key"));
+    let ld = new.initialize(d, payload(4), k("key")).unwrap();
+    new.synchronize_own(d, ballot(1).unwrap(), 1);
+    let fd = follower.initialize(d, payload(4), k("key")).unwrap();
+    assert_eq!(fd.path, ld.path, "fast from the first fresh adoption");
+
+    // A Sync's entry, numbered in the ballot it was ordered in, takes its
+    // command out and sets aside the rest of the suffix, which chained
+    // through it; the position does not move.
+    let mut synced = CommandTable::new();
+    synced.initialize(e, payload(5), k("key")).unwrap();
+    synced.initialize(d, payload(4), k("key")).unwrap();
+    synced.record_leader_path(e, 40, None, &[(b"key".to_vec(), Digest32([7; 32]))]);
+    let log = synced.log(b"key").unwrap();
+    assert_eq!(log.position(), None);
+    assert_eq!(log.set_aside_commands(), &BTreeSet::from([d]));
+    assert_eq!(synced.path_head(b"key"), empty_path());
+}
+
+/// A leader synchronizes each of its own proposals as it makes it
+/// (task-d68): its head is unchanged and its suffix stays empty.
+#[test]
+fn a_leaders_own_log_keeps_no_suffix() {
+    let mut synced = CommandTable::new();
+    let mut appended = CommandTable::new();
+    for i in 0..10u8 {
+        synced.initialize(cmd(i), payload(i), k("key")).unwrap();
+        synced.synchronize_own(cmd(i), ballot(0).unwrap(), u64::from(i));
+        appended.initialize(cmd(i), payload(i), k("key")).unwrap();
+        assert_eq!(synced.path_head(b"key"), appended.path_head(b"key"));
+    }
+    assert_eq!(synced.pending_in_logs(), 0);
+    assert_eq!(appended.pending_in_logs(), 10);
 }
 
 /// A new leader's first fresh proposal follows the recovered tails, and
@@ -205,7 +368,7 @@ fn a_leaders_path_follows_the_tails_it_anchors_after() {
     let mut follower = CommandTable::new();
     let lb = leader.initialize(b, payload(1), k("key")).unwrap();
     follower.initialize(b, payload(1), k("key")).unwrap();
-    follower.record_leader_path(b, 0, &lb.paths);
+    follower.record_leader_path(b, 0, in_ballot(0), &lb.paths);
     assert_eq!(leader.path_head(b"key"), follower.path_head(b"key"));
 
     leader.anchor_all(b"key", &[t, b]);
@@ -223,7 +386,7 @@ fn a_leaders_path_follows_the_tails_it_anchors_after() {
 
     // Synchronized to the leader's order for x, the follower's paths are
     // the leader's again.
-    follower.record_leader_path(x, 1, &lx.paths);
+    follower.record_leader_path(x, 1, in_ballot(0), &lx.paths);
     let fy = follower.initialize(y, payload(4), k("key")).unwrap();
     assert_eq!(fy.path, ly.path);
 }
@@ -602,18 +765,18 @@ fn applied_synchronizations_are_not_taken_for_early_evidence() {
     let (a, b) = (cmd(1), cmd(2));
     let mut t = CommandTable::new();
     let ia = t.initialize(a, payload(1), k("key")).unwrap();
-    t.record_leader_path(a, 1, &ia.paths);
+    t.record_leader_path(a, 1, in_ballot(0), &ia.paths);
     let before = t.log(b"key").unwrap().clone();
     assert_eq!(before.pending(), &[]);
     assert!(before.applied().contains(&a));
     // The same synchronization again, and an older reordered copy: no
     // change, and no early entry is recorded.
-    t.record_leader_path(a, 1, &ia.paths);
-    t.record_leader_path(a, 0, &[(b"key".to_vec(), Digest32([7; 32]))]);
+    t.record_leader_path(a, 1, in_ballot(0), &ia.paths);
+    t.record_leader_path(a, 0, in_ballot(0), &[(b"key".to_vec(), Digest32([7; 32]))]);
     assert_eq!(t.log(b"key").unwrap(), &before);
     // A genuinely early synchronization is still remembered and applied
     // on append, and forgotten with the command.
-    t.record_leader_path(b, 2, &[(b"key".to_vec(), Digest32([9; 32]))]);
+    t.record_leader_path(b, 2, in_ballot(0), &[(b"key".to_vec(), Digest32([9; 32]))]);
     let ib = t.initialize(b, payload(2), k("key")).unwrap();
     assert_eq!(ib.paths[0].1, Digest32([9; 32]));
     assert_eq!(t.log(b"key").unwrap().pending(), &[]);
@@ -860,6 +1023,47 @@ fn a_reclaim_retires_in_the_order_commands_executed() {
     assert_eq!(remembered, vec![9, 10, 11, 12]);
 }
 
+/// A command whose turn has come takes the recovery reserve and stops one
+/// past the capacity (task-d71, protocol_sim row 3, five voters, seed 158).
+/// New admission stops an eighth short of it; recovery work alone passes
+/// it, bounded by the largest Sync and catch-up page.
+#[test]
+fn the_reserve_takes_a_command_whose_turn_has_come_one_past_the_capacity() {
+    let capacity = 16usize;
+    let reserve = capacity / coord_consensus::RECOVERY_RESERVE_PARTS;
+    let mut t = CommandTable::with_capacity(capacity);
+    let mut n = 0u8;
+    let mut next = || {
+        n += 1;
+        n
+    };
+    for _ in 0..capacity - reserve {
+        let i = next();
+        t.initialize(cmd(i), payload(i), vec![alloc_key(i)])
+            .unwrap();
+    }
+    let i = next();
+    assert_eq!(
+        t.initialize(cmd(i), payload(i), vec![alloc_key(i)]).err(),
+        Some(InitError::Backpressure)
+    );
+    for _ in 0..=reserve {
+        let i = next();
+        t.initialize_in_reserve(cmd(i), payload(i), vec![alloc_key(i)])
+            .unwrap();
+    }
+    assert_eq!(t.len(), capacity + 1);
+    let i = next();
+    assert_eq!(
+        t.initialize_in_reserve(cmd(i), payload(i), vec![alloc_key(i)])
+            .err(),
+        Some(InitError::Backpressure)
+    );
+    t.initialize_beyond_capacity(cmd(i), payload(i), vec![alloc_key(i)])
+        .unwrap();
+    assert_eq!(t.len(), capacity + 2);
+}
+
 fn alloc_key(i: u8) -> Vec<u8> {
     vec![b'k', i]
 }
@@ -1023,23 +1227,29 @@ fn a_released_command_leaves_the_path_log() {
     assert_eq!(after_release.path, without.path);
 }
 
-/// A released command that was reordered behind a synchronization no
-/// longer holds the head off the leader's paths (task-d24 with task-d34):
-/// released, it stands for no history at all.
+/// A released command that was set aside leaves the counts (task-d24 with
+/// task-d67): released, it stands for no history at all.
 #[test]
-fn a_released_reordered_command_frees_the_head() {
+fn a_released_set_aside_command_leaves_the_counts() {
     let (x, y) = (cmd(1), cmd(2));
     let mut leader = CommandTable::new();
     let ly = leader.initialize(y, payload(2), k("key")).unwrap();
     let mut follower = CommandTable::new();
     follower.initialize(x, payload(1), k("key")).unwrap();
     follower.initialize(y, payload(2), k("key")).unwrap();
-    follower.record_leader_path(y, 0, &ly.paths);
+    follower.record_leader_path(y, 0, in_ballot(0), &ly.paths);
     assert_eq!(
-        follower.log(b"key").unwrap().reordered(),
+        follower.log(b"key").unwrap().set_aside_commands(),
         &BTreeSet::from([x])
     );
-    assert!(follower.release(&x));
-    assert!(follower.log(b"key").unwrap().reordered().is_empty());
     assert_eq!(follower.path_head(b"key"), leader.path_head(b"key"));
+    assert!(follower.release(&x));
+    assert!(
+        follower
+            .log(b"key")
+            .unwrap()
+            .set_aside_commands()
+            .is_empty()
+    );
+    assert_eq!(follower.unordered(), (0, BTreeSet::new()));
 }
