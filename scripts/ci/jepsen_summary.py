@@ -104,6 +104,9 @@ RECOVERED = re.compile(r"^recovered .*\bexecuted=(\d+)")
 # thread (`loop_ms`, task-d51; absent before it) and how long it took.
 CHECKPOINT = re.compile(r"^checkpoint represented=\d+ .*\btook_ms=(\d+)")
 LOOP_MS = re.compile(r"\bloop_ms=([\d.]+)")
+# The domain thread's own time over each journal step of a publication,
+# on a CPU and waiting for one (task-d66); `-` where there is no reading.
+THREAD_MS = re.compile(r"\b(drain|sync|append|retire)_(cpu|runq)_ms=([\d.]+|-)")
 CHECKPOINT_FAILED = "could not publish a recovery checkpoint"
 # What the attach replayed from the journal into the projection (task-d55).
 REPLAYED = re.compile(
@@ -174,6 +177,9 @@ class Voter:
     # (took_ms, loop_ms or None before task-d51), and the failed ones.
     checkpoints: list = field(default_factory=list)
     checkpoints_failed: int = 0
+    # Per publication with a thread reading (task-d66): (loop_ms, ms on a
+    # CPU, ms waiting for one), each summed over the four journal steps.
+    checkpoint_threads: list = field(default_factory=list)
     # The longest the oldest unordered pre-acceptance had been held, over
     # every `metrics` line of every boot (task-d62), in seconds, with the
     # line's uptime; None before task-d62.
@@ -426,6 +432,11 @@ def parse_voter(lines) -> Voter:
         if m:
             loop = LOOP_MS.search(line)
             v.checkpoints.append((int(m[1]), float(loop[1]) if loop else None))
+            steps = THREAD_MS.findall(line)
+            if loop and steps and all(ms != "-" for _, _, ms in steps):
+                cpu = sum(float(ms) for _, kind, ms in steps if kind == "cpu")
+                runq = sum(float(ms) for _, kind, ms in steps if kind == "runq")
+                v.checkpoint_threads.append((float(loop[1]), cpu, runq))
         if CHECKPOINT_FAILED in line:
             v.checkpoints_failed += 1
         m = REPLAYED.match(line)
@@ -1995,22 +2006,31 @@ def summarize(store: str, nodes: list[str], title: str, profile: str | None = No
                 "**Checkpoints** (every local checkpoint each voter published, over all its boots, from its "
                 "`checkpoint` lines; on the loop is `loop_ms`, what the publication held the domain thread, which "
                 "task-d51's acceptance bounds at 10 ms; took is from the pin to the end of the reclaim, most of it off "
-                "the loop since task-d51)"
+                "the loop since task-d51; on a CPU and waiting for one are the domain thread's own time over the "
+                "drain, sync, append and retirement (task-d66), the mean and the publication longest on the loop; "
+                "the rest of a step's wall time is the thread blocked)"
             )
             out.append("")
             out.append(
                 "| Node | Published | Failed | Mean on the loop (ms) | Max on the loop (ms) | Over 10 ms on the loop "
-                "| Max took (ms) |"
+                "| Max took (ms) | On a CPU, mean / longest (ms) | Waiting for a core, mean / longest (ms) |"
             )
-            out.append("| --- " * 7 + "|")
+            out.append("| --- " * 9 + "|")
             for node, v in voters.items():
                 loops = [l for _, l in v.checkpoints if l is not None]
                 mean = f"{sum(loops) / len(loops):.1f}" if loops else "-"
                 peak = f"{max(loops):.1f}" if loops else "-"
                 over = str(sum(1 for l in loops if l > 10)) if loops else "-"
                 took = str(max(t for t, _ in v.checkpoints)) if v.checkpoints else "-"
+                cpu = runq = "-"
+                if v.checkpoint_threads:
+                    n = len(v.checkpoint_threads)
+                    _, cpu_longest, runq_longest = max(v.checkpoint_threads, key=lambda t: t[0])
+                    cpu = f"{sum(t[1] for t in v.checkpoint_threads) / n:.1f} / {cpu_longest:.1f}"
+                    runq = f"{sum(t[2] for t in v.checkpoint_threads) / n:.1f} / {runq_longest:.1f}"
                 out.append(
-                    f"| {node} | {len(v.checkpoints)} | {v.checkpoints_failed} | {mean} | {peak} | {over} | {took} |"
+                    f"| {node} | {len(v.checkpoints)} | {v.checkpoints_failed} | {mean} | {peak} | {over} | {took} "
+                    f"| {cpu} | {runq} |"
                 )
             out.append("")
         timed = [(node, name, r) for node, v in voters.items() for name, r in v.stages.items() if r[1] or r[2]]

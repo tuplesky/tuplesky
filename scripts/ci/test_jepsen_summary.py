@@ -490,6 +490,21 @@ class CheckpointTests(unittest.TestCase):
         "write_ms=100.0 drain_ms=2.0 sync_ms=0.0 append_ms=5.0 retire_ms=5.0 reclaim_ms=30.0\n"
         "this node could not publish a recovery checkpoint after 61000 ms: abandoned\n"
     )
+    # task-d66: the domain thread's own time over each step; `-` off Linux.
+    THREADS = (
+        "checkpoint represented=4095 retired=true reclaimed=0 took_ms=171 loop_ms=4.5 pin_ms=0.1 export_ms=77.7 "
+        "write_ms=82.2 drain_ms=0.0 sync_ms=3.8 append_ms=0.2 retire_ms=0.6 reclaim_ms=0.0 "
+        "drain_cpu_ms=0.1 drain_runq_ms=0.0 sync_cpu_ms=0.2 sync_runq_ms=0.1 "
+        "append_cpu_ms=0.1 append_runq_ms=0.0 retire_cpu_ms=0.4 retire_runq_ms=0.1\n"
+        "checkpoint represented=8190 retired=true reclaimed=1 took_ms=240 loop_ms=40.0 pin_ms=0.1 export_ms=90.0 "
+        "write_ms=100.0 drain_ms=30.0 sync_ms=0.0 append_ms=5.0 retire_ms=5.0 reclaim_ms=30.0 "
+        "drain_cpu_ms=1.0 drain_runq_ms=25.0 sync_cpu_ms=0.0 sync_runq_ms=0.0 "
+        "append_cpu_ms=1.5 append_runq_ms=0.5 retire_cpu_ms=2.0 retire_runq_ms=1.0\n"
+        "checkpoint represented=12285 retired=true reclaimed=1 took_ms=200 loop_ms=8.0 pin_ms=0.1 export_ms=90.0 "
+        "write_ms=100.0 drain_ms=2.0 sync_ms=0.0 append_ms=5.0 retire_ms=1.0 reclaim_ms=30.0 "
+        "drain_cpu_ms=- drain_runq_ms=- sync_cpu_ms=- sync_runq_ms=- "
+        "append_cpu_ms=- append_runq_ms=- retire_cpu_ms=- retire_runq_ms=-\n"
+    )
     # Before task-d51 the line has no loop_ms.
     OLD = (
         "checkpoint represented=65527 retired=true reclaimed=0 took_ms=171 export_ms=77.7 write_ms=82.2 "
@@ -512,7 +527,17 @@ class CheckpointTests(unittest.TestCase):
     def test_the_table_reads_the_loop(self):
         text = self.summarize(self.LOG)
         self.assertIn("**Checkpoints**", text)
-        self.assertIn("| n1 | 2 | 1 | 8.5 | 12.5 | 1 | 240 |", text)
+        self.assertIn("| n1 | 2 | 1 | 8.5 | 12.5 | 1 | 240 | - | - |", text)
+
+    def test_the_thread_readings_are_summed_over_the_steps(self):
+        v = js.parse_voter(self.THREADS.splitlines(keepends=True))
+        self.assertEqual(len(v.checkpoints), 3)
+        # The third has no reading, so it is left out of both columns.
+        self.assertEqual(v.checkpoint_threads, [(4.5, 0.8, 0.2), (40.0, 4.5, 26.5)])
+
+    def test_the_table_reads_the_thread_at_the_mean_and_the_longest(self):
+        text = self.summarize(self.THREADS)
+        self.assertIn("| n1 | 3 | 0 | 17.5 | 40.0 | 1 | 240 | 2.6 / 4.5 | 13.3 / 26.5 |", text)
 
     def test_a_line_without_loop_ms_leaves_its_columns_empty(self):
         self.assertIn("| n1 | 1 | 0 | - | - | - | 171 |", self.summarize(self.OLD))

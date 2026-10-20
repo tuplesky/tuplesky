@@ -37,6 +37,10 @@
 #                  workload; empty for the harness's 3
 #   IN_KEY_DIST    how that workload picks among them: uniform or
 #                  exponential; empty for the harness's exponential
+#   IN_KILL_TARGETS
+#                  which voters TupleSky's kills take: leader, or any (or
+#                  empty) for one, a majority or all at random; leader
+#                  needs kill among the faults
 #   IN_LEADER_PROFILE
 #                  false (or empty), true or call-graph; a profile needs
 #                  a run without faults
@@ -205,6 +209,18 @@ if [ -n "$key_dist" ]; then
   tuplesky_suffix+=", $key_dist keys"
 fi
 
+kill_targets=${IN_KILL_TARGETS:-}
+case $kill_targets in
+  "" | any) kill_targets="" ;;
+  leader)
+    if [[ ",$nemesis," != *,kill,* ]]; then
+      echo "kill-targets leader needs kill among the faults, not $nemesis" >&2
+      exit 2
+    fi
+    tuplesky_suffix+=", kills at the leader" ;;
+  *) echo "kill-targets must be leader or any, not $kill_targets" >&2; exit 2 ;;
+esac
+
 # The profiler picks the leader and the follower by their loops' CPU before
 # its window and labels them so; under faults a recovering voter can be the
 # busiest, and either can change role within the window.
@@ -244,5 +260,6 @@ out=${GITHUB_ENV:-/dev/stdout}
   echo "VOTER_ENV=$voter_env"
   echo "KEY_COUNT=$key_count"
   echo "KEY_DIST=$key_dist"
+  echo "KILL_TARGETS=$kill_targets"
   echo "TUPLESKY_SUFFIX=$tuplesky_suffix"
 } >> "$out"

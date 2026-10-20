@@ -84,6 +84,9 @@ on:
       key-dist:
         description: "How TupleSky's append or wr workload picks among those keys (Elle's key-dist, through jepsen.tuplesky's --key-dist): uniform, or exponential (a few hot keys); empty for the harness's exponential"
         default: ""
+      kill-targets:
+        description: "Which voters TupleSky's kills take (through jepsen.tuplesky's --kill-targets): leader (the voter leading the highest ballot, from the voters' logs; needs kill among the faults), or empty for one, a majority or all at random"
+        default: ""
       pair-base:
         description: "Run TupleSky in pairs on one runner against this base: a tuplesky ref (a branch, a tag or a full commit SHA, which actions/checkout needs whole) built beside the head, or env:NAME=VALUE for the head's own build with that variable on every voter; empty for one run"
         default: ""
@@ -144,6 +147,7 @@ env:
   IN_VOTER_ENV: ${{ inputs.voter-env }}
   IN_KEY_COUNT: ${{ inputs.key-count }}
   IN_KEY_DIST: ${{ inputs.key-dist }}
+  IN_KILL_TARGETS: ${{ inputs.kill-targets }}
   IN_PAIR_BASE: ${{ inputs.pair-base }}
   IN_PAIRS: ${{ inputs.pairs || '3' }}
   IN_LEADER_PROFILE: ${{ inputs.leader-profile || 'false' }}
@@ -363,6 +367,13 @@ jobs:
               exit 1
             fi
             voter+=(--key-dist "$KEY_DIST")
+          fi
+          if [ -n "$KILL_TARGETS" ]; then
+            if ! grep -q -- '--kill-targets' src/jepsen/tuplesky.clj; then
+              echo "::error::tuplesky/jepsen@$JEPSEN_REF has no --kill-targets; dispatch with a jepsen-ref that has it, or no kill-targets"
+              exit 1
+            fi
+            voter+=(--kill-targets "$KILL_TARGETS")
           fi
           common=(lein run test
             --nodes-file "$RUNNER_TEMP/cluster/nodes"

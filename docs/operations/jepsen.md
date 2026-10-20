@@ -352,6 +352,12 @@ is refused. `key-dist` sets how they are picked (Elle's `key-dist`):
 `exponential` by default, each key twice as likely as the one before, so
 a few keys stay hot whatever the count; `uniform` spreads the operations
 evenly over them. The title says ", uniform keys".
+`kill-targets: leader` makes every TupleSky kill take the leader, through
+`--kill-targets leader`: the voter that led the highest ballot its
+`coordd.log` names ("this voter leads ballot N"), a best-effort reading
+that still names a dead leader until the next election. It needs `kill`
+among the faults, and the title says ", kills at the leader"; SwiftPaxos
+and etcd keep their random targets.
 Each publication's `checkpoint` line in `coordd.log` says how long it held
 the domain thread and how long each of its steps took, and each restart's
 `replayed` line how many records it replayed and how long that took.
@@ -656,7 +662,11 @@ of lines. `scripts/ci/jepsen_summary.py` reads the test's store
   table: per voter, over its whole log, how many it published and how many
   failed, the mean and the longest `loop_ms` (what a publication held the
   domain thread, task-d51; empty on a build before it), how many held it
-  over task-d51's 10 ms, and the longest `took_ms`;
+  over task-d51's 10 ms, and the longest `took_ms`. Where the lines carry
+  task-d66's thread readings, two more columns give the domain thread's
+  own time over the drain, sync, append and retirement, on a CPU and
+  waiting for a core, each as the mean over the publications and the one
+  longest on the loop (empty off Linux or on a build before task-d66);
 * and, where voters print what their start replayed (task-d55), a Boots
   table with a row for every start of every voter: when Jepsen started
   it; the `replayed` line's records, from and through (where the attach
