@@ -658,6 +658,11 @@ of lines. `scripts/ci/jepsen_summary.py` reads the test's store
   barrier answered or
   refused reads as leader (task-d50), three more columns give the reads
   served, refused, and a served read's mean wait to its answer;
+* and, where more than one ballot was led, a Leaderships table: each
+  ballot in order, its leader, and the commands that leader established
+  fast and slow while it led, over all its boots, with the fast share
+  (task-d67's row of a leader fault). What a voter established between
+  two `metrics` readings goes to the ballot it led at the second;
 * and, where voters publish local checkpoints (task-d55), a Checkpoints
   table: per voter, over its whole log, how many it published and how many
   failed, the mean and the longest `loop_ms` (what a publication held the

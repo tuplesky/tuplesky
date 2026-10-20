@@ -958,6 +958,34 @@ class FastPathTests(unittest.TestCase):
                       self.summary(line, line))
 
 
+class LeadershipTests(unittest.TestCase):
+    """task-d67: each ballot's fast share, before and after a leader change."""
+
+    summary = FastPathTests.summary
+
+    def test_each_ballot_takes_what_its_leader_established_while_it_led(self):
+        m = lambda fast, slow: d62_metrics(fast, slow, (slow, 0, 0, 0, 0), 0, 60)
+        # n1 leads ballot 1, is killed, and leads ballot 3 in its next boot;
+        # n2 leads ballot 2 in between, then follows ballot 3.
+        n1 = ("coordd domain=d roles=[Voter] phase=starting votes=true\n" + m(0, 0)
+              + "this voter leads ballot 1\n" + m(10, 90) + m(30, 170)
+              + "coordd domain=d roles=[Voter] phase=starting votes=true\n"
+              + "this voter follows ballot 2 led by n2\n" + m(0, 0)
+              + "this voter leads ballot 3\n" + m(50, 50))
+        n2 = ("coordd domain=d roles=[Voter] phase=starting votes=true\n" + "this voter follows ballot 1 led by n1\n"
+              + m(0, 0) + "this voter leads ballot 2\n" + m(5, 15)
+              + "this voter follows ballot 3 led by n1\n" + m(5, 15))
+        v = js.parse_voter(n1.splitlines(keepends=True))
+        self.assertEqual(v.leaderships, [[1, 30, 170], [3, 50, 50]])
+        text = self.summary(n1, n2)
+        self.assertIn("**Leaderships**", text)
+        self.assertIn("| 1 | n1 | 30 | 170 | 15.0% |\n| 2 | n2 | 5 | 15 | 25.0% |\n| 3 | n1 | 50 | 50 | 50.0% |", text)
+
+    def test_one_leadership_has_no_table(self):
+        line = "this voter leads ballot 1\n" + d62_metrics(10, 90, (90, 0, 0, 0, 0), 0, 60)
+        self.assertNotIn("**Leaderships**", self.summary(line, "this voter follows ballot 1 led by n1\n"))
+
+
 class LeaderProfileTests(unittest.TestCase):
     def test_the_header_objects_and_symbols(self):
         with tempfile.TemporaryDirectory() as d:

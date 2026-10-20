@@ -184,6 +184,10 @@ class Voter:
     # every `metrics` line of every boot (task-d62), in seconds, with the
     # line's uptime; None before task-d62.
     oldest_unordered: tuple[float, float] | None = None
+    # Every ballot this voter led, in order, as [ballot, fast, slow]: the
+    # commands it established between two `metrics` readings go to the
+    # ballot it led at the second (task-d67's row of a leader fault).
+    leaderships: list = field(default_factory=list)
     # The whole process's CPU seconds over every boot: each boot's last
     # `metrics` reading, summed, since the counter starts again at each
     # start (a killed boot's CPU after its last line is missing); None
@@ -376,6 +380,9 @@ def parse_voter(lines) -> Voter:
     started: str | None = None
     # The process CPU of the boots before this one, and this one's last.
     earlier_cpu, boot_cpu = 0.0, None
+    # The ballot this boot leads, if any, and its last established counts.
+    leading: int | None = None
+    established = (0, 0)
 
     def since_start():
         for k, n in boot.items():
@@ -388,6 +395,11 @@ def parse_voter(lines) -> Voter:
                 snapshot = json.loads(line[len("metrics "):])
                 v.stages = parse_stages(snapshot)
                 v.cost = parse_cost(snapshot)
+                if v.cost:
+                    if leading is not None:
+                        v.leaderships[-1][1] += v.cost.fast - established[0]
+                        v.leaderships[-1][2] += v.cost.slow - established[1]
+                    established = (v.cost.fast, v.cost.slow)
                 if v.boot_rows:
                     v.boot_rows[-1].cost = v.cost
                     if v.cost:
@@ -416,6 +428,7 @@ def parse_voter(lines) -> Voter:
                 earlier_cpu, boot_cpu = earlier_cpu + boot_cpu, None
             v.boot_rows.append(Boot(started=started))
             started = None
+            leading, established = None, (0, 0)
             for k, n in boot.items():
                 v.counts[k] = v.counts.get(k, 0) + n
             if base is not None:
@@ -445,6 +458,10 @@ def parse_voter(lines) -> Voter:
         m = ROLE.search(line)
         if m:
             v.role = m[1]
+            led = re.fullmatch(r"leads ballot (\d+)", m[1])
+            leading = int(led[1]) if led else None
+            if leading is not None and not (v.leaderships and v.leaderships[-1][0] == leading):
+                v.leaderships.append([leading, 0, 0])
         if "this voter" in line and "ballot" in line:
             for b in BALLOT.findall(line):
                 v.ballot = max(v.ballot or 0, int(b))
@@ -811,6 +828,28 @@ def leader_profile(path: str, top: int = 30,
         symbol = " ".join(cells[3:] if cells[2] in ("[.]", "[k]") else cells[2:])
         out.append(f"| {cells[0]} | `{cells[1]}` | `{symbol.replace('|', '/')}` |")
     out += ["", "</details>", ""]
+    return out
+
+
+def leadership_table(voters: dict) -> list[str]:
+    """Each ballot's leader and the commands it established fast and slow
+    while it led, in ballot order, over every boot: the fast share before
+    and after a leader change (task-d67). [] with at most one leadership."""
+    rows = sorted((b, node, fast, slow) for node, v in voters.items() for b, fast, slow in v.leaderships)
+    if len(rows) < 2:
+        return []
+    out = [
+        "**Leaderships** (every ballot a voter led, from its `leads ballot` lines, over all its boots; fast and slow "
+        "are the commands it established while it led, from its `metrics` readings, where what it established between "
+        "two readings goes to the ballot it led at the second)",
+        "",
+        "| Ballot | Leader | Fast | Slow | Fast share |",
+        "| --- " * 5 + "|",
+    ]
+    for b, node, fast, slow in rows:
+        share = f"{fast / (fast + slow):.1%}" if fast + slow else "-"
+        out.append(f"| {b} | {node} | {fast} | {slow} | {share} |")
+    out.append("")
     return out
 
 
@@ -2133,6 +2172,7 @@ def summarize(store: str, nodes: list[str], title: str, profile: str | None = No
                 out.append(row)
             out.append("")
             out.extend(fast_path_table(voters))
+            out.extend(leadership_table(voters))
             out.extend(resend_table(voters))
             out.extend(leader_and_follower(store, voters))
             out.extend(transport_tables(store, voters))
