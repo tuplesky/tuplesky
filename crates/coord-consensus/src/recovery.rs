@@ -816,7 +816,20 @@ fn possible_fast_decisions(
     // ordered before the candidate while the selection ordered both after
     // the same command. The member's own closure stays the evidence of its
     // path (`prefix_decided`).
-    let executed_closure = |m: &RecoveryReport, c: &CommandId| -> BTreeSet<CommandId> {
+    //
+    // Past the selection's entries, a member's record is followed only
+    // where it is an order the selection executes: one at ACCEPT or
+    // above (a leader's), a candidate the selection keeps (alike at every
+    // member), or a command the selection re-proposes (chained after the
+    // recovered order). A pre-acceptance of a command the candidate
+    // decided is none of these: the decision is not the record, and what
+    // the walk reached through it alone the candidate need not follow, so
+    // the candidate's executed order over it says nothing (task-d71, #158
+    // review). The command itself stays in the closure.
+    let executed_closure = |m: &RecoveryReport,
+                            c: &CommandId,
+                            candidates: &BTreeMap<CommandId, (ReportEntry, usize)>|
+     -> BTreeSet<CommandId> {
         let mut seen = BTreeSet::new();
         let mut stack: Vec<CommandId> = record(m, c).map(|e| e.deps.clone()).unwrap_or_default();
         while let Some(d) = stack.pop() {
@@ -825,7 +838,9 @@ fn possible_fast_decisions(
             }
             if let Some(e) = entries.get(&d) {
                 stack.extend(e.deps.iter().copied());
-            } else if let Some(e) = record(m, &d) {
+            } else if let Some(e) = record(m, &d)
+                && (e.phase >= Phase::Accept || candidates.contains_key(&d) || !decided.decided(&d))
+            {
                 stack.extend(e.deps.iter().copied());
             }
         }
@@ -932,7 +947,7 @@ fn possible_fast_decisions(
             let (entry, member) = candidates[&c].clone();
             let first = fast_reporters[member];
             let prefix = closure(first, &c);
-            let ordered = executed_closure(first, &c);
+            let ordered = executed_closure(first, &c, &candidates);
             // The commands no ballot decided that `c` follows, which this
             // selection re-proposes: its own dependencies, followed
             // through what the selection keeps, reach them. The
