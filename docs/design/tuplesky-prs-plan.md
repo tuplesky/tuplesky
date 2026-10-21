@@ -3,7 +3,7 @@
 **Status:** Review proposal, consolidated v1.5.  
 **Date:** 2026-09-24.  
 **Companion:** [TupleSky implementation design](tuplesky-design.md).  
-**Scope:** 166 implementation tasks with stable `task-*` identifiers. The `task-01` through `task-66`, `task-s01` through `task-s04`, `task-j01` through `task-j10`, `task-o01` through `task-o06`, `task-m01` through `task-m05`, `task-c01`, `task-c02`, `task-c03`, `task-d01` through `task-d71` and `task-q01` suffixes and prerequisites are preserved. v1.5 adds `task-d01` through `task-d04` from review of the open implementation PRs and of multi-host readiness, `task-d05` through `task-d17` from the Jepsen client's runs, `task-d18` through `task-d33` from a review against an external SwiftPaxos correctness checklist ([review record](tuplesky-checklist-review.md)), `task-d34` from what the protocol simulator of task-d30 found, `task-d35` through `task-d44` from a review of recovery time and storage integrity (an execution chain, a scrub, and voter replacement through a prepared transition, a staged learner, terminal recovery after the seal, serving across a transition and a running membership install), `task-d45` through `task-d50` from measuring the throughput of the Jepsen client's first unthrottled runs, `task-d51` from task-d46's long runs, `task-d52` and `task-d53` from a profile of the domain thread after task-d46, `task-d54` from the Jepsen runs of task-d50, `task-d55` through `task-d57` from the Jepsen runs of task-j06, `task-d58` through `task-d61` from a profile of five voters' CPU per operation, `task-d62` through `task-d65` from a consolidated review against the reference SwiftPaxos, `task-d66` from the Jepsen runs of task-d51, `task-d67` from a Jepsen run on #98 that made no fast decision, `task-d68` from task-d62's counts after a leader change, `task-d69` from a profile of a follower's loop, `task-d70` from the Jepsen runner's profile of the transport's workers, `task-d71` from the protocol simulator's first 1,000-seed sweep, and moves committed key replacement from `task-58` to `task-m03`; the changes are listed under [Gate checklist and deferred work](#gate-checklist-and-deferred-work). Task IDs are not GitHub pull-request or issue numbers. One implementation PR corresponds to one task; its GitHub-assigned number is recorded separately. No baseline, supplement or separate amendment is needed.
+**Scope:** 171 implementation tasks with stable `task-*` identifiers. The `task-01` through `task-66`, `task-s01` through `task-s04`, `task-j01` through `task-j10`, `task-o01` through `task-o06`, `task-m01` through `task-m05`, `task-c01`, `task-c02`, `task-c03`, `task-d01` through `task-d76` and `task-q01` suffixes and prerequisites are preserved. v1.5 adds `task-d01` through `task-d04` from review of the open implementation PRs and of multi-host readiness, `task-d05` through `task-d17` from the Jepsen client's runs, `task-d18` through `task-d33` from a review against an external SwiftPaxos correctness checklist ([review record](tuplesky-checklist-review.md)), `task-d34` from what the protocol simulator of task-d30 found, `task-d35` through `task-d44` from a review of recovery time and storage integrity (an execution chain, a scrub, and voter replacement through a prepared transition, a staged learner, terminal recovery after the seal, serving across a transition and a running membership install), `task-d45` through `task-d50` from measuring the throughput of the Jepsen client's first unthrottled runs, `task-d51` from task-d46's long runs, `task-d52` and `task-d53` from a profile of the domain thread after task-d46, `task-d54` from the Jepsen runs of task-d50, `task-d55` through `task-d57` from the Jepsen runs of task-j06, `task-d58` through `task-d61` from a profile of five voters' CPU per operation, `task-d62` through `task-d65` from a consolidated review against the reference SwiftPaxos, `task-d66` from the Jepsen runs of task-d51, `task-d67` from a Jepsen run on #98 that made no fast decision, `task-d68` from task-d62's counts after a leader change, `task-d69` from a profile of a follower's loop, `task-d70` from the Jepsen runner's profile of the transport's workers, `task-d71` from the protocol simulator's first 1,000-seed sweep, `task-d72` through `task-d75` from comparing a command's cost with etcd's on one host, `task-d76` from a Jepsen run that killed the leader, and moves committed key replacement from `task-58` to `task-m03`; the changes are listed under [Gate checklist and deferred work](#gate-checklist-and-deferred-work). Task IDs are not GitHub pull-request or issue numbers. One implementation PR corresponds to one task; its GitHub-assigned number is recorded separately. No baseline, supplement or separate amendment is needed.
 
 ## How to use this plan
 
@@ -43,6 +43,8 @@ Reference single-store and fixed-membership compositions are early increments, n
 | task-d69 | From a profile of a follower's loop: the outbox releases what a completion makes releasable, rather than walking every send it holds on every round | After task-d60's second PR; before task-d60's third step; its runner pair |
 | task-d70 | From the Jepsen runner's profile of the transport's workers: fewer datagrams and wakeups per command, through QUIC's acknowledgement cadence, the runtime's worker count and the inbound delivery path | Its two settings as runner pairs first, while task-d69 is written; the inbound path after |
 | task-d71 | From the protocol simulator at 1,000 seeds per row and size: the order recovery's possible-fast rule reads, named once, and a command whose turn has come kept within a follower's capacity | Before task-d67's and task-d68's code PR, which rebases on it; the sweep then runs weekly |
+| task-d72 through task-d75 | From comparing a command's cost with etcd's on one host: a budget for CPU per operation against etcd's at the matched shape, tracked, and three levers under it that leave the order alone: a turn's proposals and acknowledgements to a peer in one frame, acknowledgements to the leader and the frontend only, and work off the leader's loop | task-d72 after task-d63's build and task-d66's job, whose pairs are its first rows; its levers after task-d72, task-d74's design check first, each as a runner pair that adds a row |
+| task-d76 | From a Jepsen run that killed the leader: a new leader whose fixed fast set holds the voter just killed makes almost no fast decision for its term | After task-d72's levers; its design step first |
 | task-q01 | Combined durable WAN/Kine qualification | Required before task-66 |
 
 ```mermaid
@@ -237,6 +239,11 @@ This is a workstream overview; the individual prerequisites are authoritative. O
 | [task-d69](#task-d69) | Release the outbox by what a completion makes releasable | task-d45, task-d46 |
 | [task-d70](#task-d70) | Fewer datagrams and wakeups per command on the transport | task-d61, task-d62 |
 | [task-d71](#task-d71) | Name the order the possible-fast rule reads, and keep the reserve's bound | task-d09, task-d26, task-d33, task-d34 |
+| [task-d72](#task-d72) | Close the gap to etcd on one host | task-d62, task-d63, task-d66 |
+| [task-d73](#task-d73) | Carry a turn's proposals and acknowledgements to a peer in one frame | task-d61, task-d62, task-d72 |
+| [task-d74](#task-d74) | Send acknowledgements to the leader and the frontend only | task-d09, task-d62, task-d72 |
+| [task-d75](#task-d75) | Take work off the leader's domain loop | task-d53, task-d60, task-d72 |
+| [task-d76](#task-d76) | Choose a whole fast set after a failure | task-d31, task-d68 |
 | [task-q01](#task-q01) | Produce the combined durable WAN/Kine qualification report | task-j07, task-j08, task-o06, task-m05, task-63, task-64, task-d45, task-d46, task-d47, task-d48, task-d49, task-d51, task-d52, task-d53 |
 
 ## Task specifications
@@ -2694,6 +2701,9 @@ Write the design amendment first, then implement it:
 
 **Implement:** Every ordered command is initialized with the one `CONSERVATIVE_KEY`, so writes to unrelated keys share one dependency and path history, and an unrelated reordering or an unresolved predecessor holds up the rest. The reference tracks keys apart. Replacing the key with the user's is not a patch: transactions, ranges, leases, policy and session state, revisions, watches and recovery all depend on the total order. With task-d62's fast-path reasons, either keep the total order and cut its cost explicitly, or write and prove a finer model. The counterexamples behind direct-dependency equality and `reordered` (task-d34) stay as tests for whichever invariant replaces them.
 
+- **The decision, recorded** (#98). task-d65's key sweep on the runner (append, 30 clients, `key-count` 3 to 100, exponential keys then uniform) left the leader's fast share flat at 1 to 2% while `guard-failed` fell from 63% to 23%, and task-d67's code left it there: 1.6% at 3 uniform keys and 1.65% at 100. The planner sees the keys and the chain does not. Every command carries the one conservative key, so a fast decision needs each fast-set follower to have pre-accepted every earlier command in the leader's order, and thirty clients from five origins is Section 2.2's fifty-caller case (2%). This confirms Section 2.2's decision: the conservative key stays, and the fast path is not where the runner's time goes (task-d72); one hop it saves is a container round trip, about 0.1 ms.
+- **The finer predicate stays this task's design step**, the WAN item, after task-d63's build and task-d66's job. A fast decision would then fix a command's per-key predecessors instead of its place in one chain, so revision assignment (deterministic application in the total order) and recovery need an order every voter computes alike from per-key dependencies, and ranges, watches, leases and policy still conflict with everything. The consensus layer is already per key (paths per key, multi-key conflicts in recovery), so the cost is the model and its proof, with the simulator's 1,000-seed sweeps as the harness, not the code.
+
 **Acceptance:** A decision recorded with task-d62's numbers. If the model changes, its design amendment and bounded model land before any code, with recovery and retirement tests.
 
 **Review boundary:** A decision and, if any, a design. No code in this task.
@@ -2707,6 +2717,7 @@ Write the design amendment first, then implement it:
 **Implement:** After task-d51 a publication holds the domain thread only for the journal's part: taking the journal back from the appender and the projection's commit from the materializer (the drain), the pointer's synced append, and the retirement. On the Jepsen runner at six nodes and the default cadence, 8 of 15 publications held it over 10 ms, up to 99 ms, and no one step was the cause: the drain was the largest in four (up to 83 ms), the retirement in two (up to 82 ms), the append in two. An asynchronous append alone would leave the other two. The drain waits out a job already in flight, its sync included, and the leader's loop waited for a core about as long as it computed in those runs, so some of each step may be scheduling, not the journal.
 
 - **First, the reading.** Each `checkpoint` line gains the domain thread's own CPU time over the drain, the append and the retirement, beside their wall time, so that a step stretched by waiting for a core is told from one doing the journal's work. It is cheap and rides any carry. If it shows the drain is mostly waiting for a core, the job does not shorten it, and the finding belongs to the voters' scheduling on a shared host, not to this task.
+- **The reading, on the runner** (#98): in every publication over 10 ms, under 2.5 ms of up to 65 ms on the loop was the domain thread on a CPU or waiting for one; the rest was the thread blocked on a sync or on the job in flight. The long publications are the journal's waits, not the host's scheduling, so the job is built.
 - **The reading is built** (this task's first PR): after `reclaim_ms`, `drain_cpu_ms` and `drain_runq_ms`, and the same for `sync`, `append` and `retire`, the domain thread's time on a CPU and waiting for one over each step. The CPU time is the thread's CPU clock: `schedstat`'s trails a running thread by up to a tick, measured up to 4 ms ([notes](../tuplesky-impl-notes.md#a-publications-journal-steps-on-the-domain-threads-own-clock-task-d66)). The runner's reading is next.
 - **Its priority** is below every task that moves `ok`/s: at the default cadence the publications held the loop for under 0.5% of a run. This task is about the 10 ms line.
 - **Then the job.** The pointer's append and the retirement go to the journal worker as one job in the same queue as the groups, behind whatever is in flight, instead of the domain thread taking the journal back for them. The loop is woken with the outcome, as for a group, and the reclaim follows as task-d51's does. task-j04's order is unchanged: the image and its directory durable, then the pointer durable, then the retirement, then the reclaim.
@@ -2740,7 +2751,7 @@ Write the design amendment first, then implement it:
 - `the_fast_path_resumes_after_a_pre_acceptance_the_leader_never_ordered` passes (it is ignored until then), with the orphan at one fast-set follower and at both.
 - task-d30's protocol simulator, every row at its usual seeds, and task-d34's and task-d24's tests, unchanged; a schedule built for the rule's edge (the command presented again just after the follower lets it go) is added and passes.
 - On the Jepsen runner, a run with the voters' links held back at start makes fast decisions at the rate of a run without.
-- On the Jepsen runner, the leader's fast share at 30 clients, at 3 keys and at the conflict-free key count (task-d65's sweep), read against today's 1 to 2%.
+- On the Jepsen runner, the leader's fast share at one caller and at ten, at 100 uniform keys, replay, two workers, read against Section 2.2's 56% and 6%. At 30 clients it stays at Section 2.2's 1 to 2% with this task's code, which is that section's bound, not this task's (task-d65).
 - task-d30's rows keep F7's seeds 52 and 86 when F7's two tests are rewritten to the set-aside rule.
 
 **Review boundary:** When a follower lets go of a pre-acceptance the leader never ordered, and what it acknowledges after. No change to the fast predicate, to the leader's order or to recovery's selection.
@@ -2762,7 +2773,7 @@ Write the design amendment first, then implement it:
 - `the_fast_path_resumes_after_a_leader_change` passes (it is ignored until then), with the new leader inside and outside the deposed leader's fast set.
 - task-d30's protocol simulator, every row at its usual seeds, and task-d34's and task-d24's tests, unchanged.
 - A leader's path log holds a bounded suffix over a long run, read from a count beside task-d62's unordered pre-acceptances.
-- On the Jepsen runner, a run with a leader fault makes fast decisions after the fault at the rate it made them before.
+- On the Jepsen runner, a run with a leader fault makes fast decisions after the fault at the rate it made them before, read on new leaders whose fast set is whole. A fast set holding the voter just killed is task-d76's.
 
 **Review boundary:** How a path log's synchronized prefix moves across ballots, and what a leader keeps of its own. No change to the fast predicate, to the leader's order or to recovery's selection.
 
@@ -2819,6 +2830,97 @@ The design step names the order the rule reads, so a hole is not patched as a fi
 
 **Review boundary:** Recovery selection's possible-fast rule and what the candidate tells it, the table's admission of a command whose turn has come, the simulator's healing oracle without catch-up, the sweep's workflow and the kept seeds. No change to the re-proposal chain, to the report format, or to the fast predicate.
 
+<a id="task-d72"></a>
+### task-d72: Close the gap to etcd on one host
+
+**Prerequisites:** task-d62, task-d63, task-d66 (their pairs are this entry's first rows).  
+**Design:** Section 2.2 (unchanged: the conservative key stays).
+
+**Implement:** The one matched comparison, task-d51's register row at 30 clients, served 422 to 505 `ok`/s against etcd's 1175, at 3.5 to 4.7 ms of server CPU an operation against etcd's 1.39. TupleSky left 0.65 to 1.48 cores idle while the leader's loop queued for a CPU; etcd left 0.04. The order is not the gap, since Raft keeps a total order too. Four costs make the CPU and the latency:
+- **Messages per command, not per turn.** Fast and slow acknowledgements go to every other voter and the frontend, as the reference's do: on the order of forty protocol messages a command at five voters, against Raft's eight, which carry many entries each. task-d61 cut streams per command by 60% and left about nine frames a command at the leader.
+- **Durability per command:** a payload and dependency row, an acceptance row and the execution, in separate batches at every voter, against one WAL append per batch of entries.
+- **The leader's single loop** as the serialization point, and about 690 µs a command on its transport threads after task-d70.
+- **Latency on the closed loop:** 7.8 ms from a group closing to its release, 6.6 of it the projection's commit that task-d63's build removes, and publication stalls of 22 to 65 ms that task-d66's job removes.
+
+This entry is the budget and the record, not a lever:
+- **The measure:** CPU per operation at the matched shape against etcd's 1.39 ms, split by the leader's loop, its transport threads, the journal and the followers, with `ok`/s and p99 beside it.
+- **The target that closes the entry:** CPU per operation at the register row within twice etcd's (2.8 ms), and the `service` shape's p99 within etcd's spread at the same rate. The first rows may revise it, with the reason recorded beside them.
+- **The levers, in order,** each with the number it is expected to move and the pair that checks it: task-d63's build (latency: about 6.6 ms a command on the leader at closed loop), task-d66's job (latency: the stalls), then task-d73, task-d74 and task-d75 (CPU). Only the last three are expected to move CPU per operation.
+- **The record:** the table below, one row a lever, each row a pair on the runner.
+
+| Row | Build | Shape | `ok`/s | Server CPU an operation | Idle cores | Expected to move |
+| --- | --- | --- | --- | --- | --- | --- |
+| Baseline | task-d51's, `145b71b` (#146) | register, 30 clients, six nodes | 422 to 505 (etcd 1175) | 3.5 to 4.7 ms (etcd 1.39) | 0.65 to 1.48 (etcd 0.04) | |
+| task-d63 | | | | | | latency: the projection's commit, about 6.6 ms a command |
+| task-d66 | | | | | | latency: publication stalls of 22 to 65 ms |
+| task-d73 | | | | | | CPU: messages per command |
+| task-d74 | | | | | | CPU: acknowledgements per command |
+| task-d75 | | | | | | CPU: the leader's loop |
+- **The shapes it is read in** (`docs/operations/jepsen.md`): `service`, a fixed rate where the metric is latency and CPU per operation at equal work, on the bridge and under the WAN profile; the append shape run against etcd too, so the multiple quoted has a denominator; and several domains on one cluster, if the harness can start them.
+
+**Acceptance:** This entry's PR records the baseline row and task-d63's and task-d66's rows, with the `service` shape's p50, p99 and CPU per operation beside etcd's at the same rate. task-d73, task-d74 and task-d75 each add their row in their own PR. The entry closes when the target is met, or when each part of the gap that remains is named with its owner.
+
+**Review boundary:** A budget, its measurements and the order of its levers. No change of its own.
+
+<a id="task-d73"></a>
+### task-d73: Carry a turn's proposals and acknowledgements to a peer in one frame
+
+**Prerequisites:** task-d61, task-d62, task-d72.  
+**Design:** Section 11.2 (unchanged: a frame kind behind a peer capability, as task-d61's).
+
+**Implement:** Each command is its own message: a proposal per command to each voter, an acknowledgement per command to each peer. task-d61 put a turn's frames to a peer on one stream and encoded a proposal once, which cut streams, not messages. One frame per peer per turn carrying every proposal the turn moved, and one carrying every acknowledgement, trades latency for the message count: a frame waits for its turn to close, so a command at the head of a turn pays the turn's length. The pair's p99 reads that cost.
+- Behind a peer capability, so a link without it carries what it carries today.
+- The frames hold the same messages: nothing any one proposal or acknowledgement says changes, nor what a vote is evidence of.
+
+**Acceptance:** Three pairs on the runner (replay, throughput): frames and datagrams per command, the transport threads' CPU per operation, `ok`/s and p99. Kept only if the CPU falls and p99 stays within the pairs' spread. A link with the capability on one end only is tested both ways.
+
+**Review boundary:** How a turn's messages to a peer are framed. No change to what a message means, to the protocol or to the fast predicate.
+
+<a id="task-d74"></a>
+### task-d74: Send acknowledgements to the leader and the frontend only
+
+**Prerequisites:** task-d09, task-d62, task-d72.  
+**Design:** Sections 4.1, 4.3 (amended by this task, if a decision reads another follower's votes).
+
+**Implement:** Fast and slow acknowledgements go to every other voter and to the frontend, the reference's pattern (`spec/swiftpaxos-mapping.md`). task-d09 carries the leader's commit decision to every voter, and the frontend learns from its own copy.
+- **First, the design check:** which follower decision reads another follower's votes. Where none does, the broadcast goes. Where one does, the step names it and keeps that copy. One is known: a follower's own learning. `Follower::learn` runs `commit_learned` over the follower's vote sets, which peers' `FastAck` and `SlowAck` fill, and `missed_fast` reads the same sets for the metrics. task-d09's `commit_through_leader` is the other source, so with the broadcast gone a follower learns only from the leader's frontier, one message delay later than now. The frontend keeps learning from the votes it still receives, and recovery reads reports, not votes, so neither moves.
+- **The step records what that delay costs.** The followers' executed frontier lags the leader's by it, and that lag is what task-d10's catch-up, the reports' window and any read served at a follower see.
+- **Then the change,** as a pair.
+
+**Acceptance:** The design check recorded, with every decision it read. The protocol simulator, every row at 1,000 seeds per row and size, with catch-up and without. Three pairs on the runner: messages and datagrams per command, the followers' CPU per operation, the followers' execution lag behind the leader, `ok`/s and p99.
+
+**Review boundary:** Who receives an acknowledgement. No change to the learning predicate, to the fast predicate or to recovery.
+
+<a id="task-d75"></a>
+### task-d75: Take work off the leader's domain loop
+
+**Prerequisites:** task-d53, task-d60, task-d72.  
+**Design:** Section 17.3.3 (unchanged: the domain actor and its workers).
+
+**Implement:** The leader's single loop is the serialization point. On the runner it queued for a CPU while 0.65 to 1.48 cores sat idle. What it does that another thread could is read first, from the per-thread split task-d53's and task-d60's readings give (the leader's loop by phase, the follower beside it), with the idle cores as the evidence that the loop is the bound. Each candidate the reading names is its own PR with its pair.
+
+**Acceptance:** The reading recorded in the notes before any change. Each change a pair on the runner: the leader's loop CPU per command, the idle cores, `ok`/s and p99.
+
+**Review boundary:** What runs on the leader's domain thread. No change to the order the loop decides in, or to the protocol.
+
+<a id="task-d76"></a>
+### task-d76: Choose a whole fast set after a failure
+
+**Prerequisites:** task-d31, task-d68.  
+**Design:** Sections 4.2 and 4.9 (amended by this task); Section 11.7's mixed-version gate.
+
+**Implement:** On the Jepsen runner, in a run whose every kill was at the leader (#98), four of five new leaders ran at 81 to 87% fast. The fifth, n5 in ballot 2, ran at 5.7%. `c2_default` is the leader and the next ⌊N/2⌋ voters in identity order, wrapping, so n5's set was {n5, n1, n2}, and n2, the leader just killed, was down for all but the last 8 s of n5's term. A C2 fast decision needs every member of the set, so a dead member is no fast decision for the term, and at five voters a kill lands in the next leader's set about one time in two. The candidate knows who promised in its campaign.
+- **The choice:** a candidate chooses its C2 set among the voters that promised. That holds at every size that can elect: at three voters, the leader and the other promiser; at five, the leader and two of its promisers. A leader whose member dies later re-chooses by the mechanism Section 4.2 already names, a higher ballot with itself as leader. A set is never re-chosen within a ballot, which Section 4.2 forbids.
+- **The record exists; its carriage does not.** The signed ballot record, `BallotConfigurationV1.fast_set` with a majority's promises over the ballot message, already names a fast set, and `coord-membership` turns it into a C2 configuration. But nothing on the consensus wire carries it. Every production path builds `c2_default` locally: a follower builds it when it adopts a ballot, and that is the only source configuration recovery is given (task-d31's `select_from`, `Campaign::knowing`). A candidate that never adopted the source ballot supplies none, and recovery builds `c2_default` for it. `SyncDecision` carries no fast set.
+- **First, the design step.** It says:
+  - how the ballot record reaches the followers, and the mixed-version gate (Section 11.7) that a new field on the Sync, or a new message, costs: the cost that kept the member's positions out of task-d71's report;
+  - what replaces recovery's rule that a ballot whose configuration is not known ran under the default. Once a chosen set can exist, a candidate that never adopted the source ballot cannot assume the default. So the set is durable at every voter that adopted the ballot and readable from its report, or the campaign refuses until a reporter that held it answers;
+  - why recovery stays sound with it.
+
+**Acceptance:** The design step before code. The protocol simulator, every row at 1,000 seeds per row and size, with catch-up and without. On the runner, a run with every kill at the leader: each new leader's fast share near the others', whichever voter was killed.
+
+**Review boundary:** How a ballot's fast set is chosen and carried. No change to the fast and slow quorum sizes or to the learning predicate.
+
 ## Gate checklist and deferred work
 
 task-s01, task-s02 feed the strict storage reference through task-07. Optional task-s03, task-s04 need not merge to release redb; retired task-s05 through task-s08 are not replaced by migration or mixed-engine support gates. Same-engine crash/restore, common/local checkpoints, safe replacement and schema lifecycle remain requirements.
@@ -2849,8 +2951,10 @@ G3 requires task-43/transitive prerequisites, G4 task-48, G5 checkpoint/replacem
 - **task-d60's second PR** cuts five allocation sites ([notes](../tuplesky-impl-notes.md#the-allocation-sites-task-d60-step-2)): a memory leak is fixed: the collector's golden trace, an unbounded list that grew by one formatted event per transition for the daemon's life and that nothing in `coordd` read (the profile's `trace::hex`), is kept only when asked for; a ballot configuration's voter sets and a sealed journal record's body are shared rather than cloned; a record is encoded without a copy and measured without encoding; and a submission's command is derived from the bytes its canonical check compared. Locally, in three pairs against the first PR: the leader's loop 6% lower and each voter's resident set 17 MiB lower, in every pair; all threads' CPU per operation flat. On the runner, three pairs on an Intel Xeon 6973P-C: every voter's loop 7% lower in all three, the leader's allocator 9.5 µs per command lower (the trace, the journal record's encoder and the configuration's clone gone from its caller table), a follower's `flush_queued` 33 to 18 µs, the tokio threads unchanged, `ok`/s 1.3% higher, and the resident set 43 MiB per voter lower (21%); kept.
 - **A profile of a follower's loop**, local, on that PR, read its five largest functions one level down and found `Outbox::release` at 5 to 7% of it: a walk over every send waiting, on every round. task-d69 indexes the outbox by what a send waits for, ahead of task-d60's third step.
 - **The Jepsen runner's profile of the leader's transport workers**, on three CPUs, put them at 1.1 to 1.4 times the leader's domain loop per command: the UDP send call 19 to 40% of their CPU at 11.7 calls per command, parking and waking 7 to 18% at 17.4 futex and 7.0 `epoll_wait` calls. A 7% cut to every loop moved `ok`/s 1.3%: on the faster runner CPUs the loops no longer bound throughput, the voters' total CPU does, and the transport is 41% of it. task-d70 takes the transport's datagrams and wakeups per command, its two settings first as pairs.
+- **The Jepsen runs of task-d67's code** (#98): after four of five leader changes the new leader ran 81 to 87% fast; the fifth's fixed fast set held the voter just killed, which task-d76 takes. Under load the share stayed at Section 2.2's 1 to 2%, which task-d65 records as confirming that section's decision. The publications over 10 ms spent under 2.5 ms on a CPU or waiting for one, so task-d66's job is built.
+- **Against etcd on one host**, the one matched comparison is 2.5 times behind, at 3.5 to 4.7 ms of server CPU an operation against etcd's 1.39, and none of the gap is the order. task-d72 sets the budget and keeps the record; task-d73 through task-d75 are its levers, after task-d63's build and task-d66's job.
 - **Gating.** task-d45 through task-d49 and task-d51 through task-d53 are prerequisites of task-64 and task-q01, so that the qualification and the combined report measure the protocol rather than these costs. task-d56 is a prerequisite of task-64, as liveness under faults. task-62's remaining rows, and any reference result it publishes again, wait on them and on task-d54 for the same reason. This is stated in task-62 rather than as a prerequisite, since task-62's first runs produced task-c01 and task-c02, which the throughput tasks build on. task-d50, reads and the fast path off the slow path, changes protocol behaviour and waits on its own design amendment.
-- **Design changes.** task-d45 through task-d47, task-d49, task-d51 through task-d56 and task-d58 through task-d62, task-d66, task-d69 and task-d70 do not change the design; task-d71 amends Sections 4.9 and 13.1; task-d67 amends Sections 4.1, 4.7 and 4.9 with its rule, and task-d68 Sections 4.1 and 4.7 with its, and task-d63's release-rule step amends Sections 4.5, 17.3.3 and 17.4; task-d64 amends Sections 4 and 6.4, and task-d65 Section 2.2 if it changes the model. task-d48 amends Section 17.3.4's projection hardening; task-d50 amends Sections 4.5, 6.3 and 17.4; task-d57 amends Sections 2.2, 4.5 and 6.3.
+- **Design changes.** task-d45 through task-d47, task-d49, task-d51 through task-d56 and task-d58 through task-d62, task-d66, task-d69, task-d70, task-d72, task-d73 and task-d75 do not change the design; task-d74 amends Sections 4.1 and 4.3 if a decision reads another follower's votes, and task-d76 amends Section 4.2; task-d71 amends Sections 4.9 and 13.1; task-d67 amends Sections 4.1, 4.7 and 4.9 with its rule, and task-d68 Sections 4.1 and 4.7 with its, and task-d63's release-rule step amends Sections 4.5, 17.3.3 and 17.4; task-d64 amends Sections 4 and 6.4, and task-d65 Section 2.2 if it changes the model. task-d48 amends Section 17.3.4's projection hardening; task-d50 amends Sections 4.5, 6.3 and 17.4; task-d57 amends Sections 2.2, 4.5 and 6.3.
 
 task-j06 is optional and cannot silently relax durable materialization. ReadFence is its own capability gate. Observers do not improve quorum fault tolerance or acquire voting rights by catching up. Interface drift in Kine is resolved at one explicit pin, not mixed across examples. Strict per-output authorization remains authoritative even for regional observers.
 
