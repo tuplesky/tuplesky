@@ -140,6 +140,17 @@ struct KeyState {
 /// Sync's cap, not by the reserve.
 pub const RECOVERY_RESERVE_PARTS: usize = 8;
 
+/// How far an initialization may fill the table.
+#[derive(Clone, Copy)]
+enum Room {
+    /// New admission: up to the capacity less the recovery reserve.
+    Admission,
+    /// A command whose turn has come: the reserve too, and one past it.
+    Reserve,
+    /// Recovery work, which the largest Sync and catch-up page bound.
+    Unbounded,
+}
+
 /// The command table of one replica in one domain.
 #[derive(Clone, Debug, Default)]
 pub struct CommandTable {
@@ -206,6 +217,11 @@ pub struct CommandTable {
     /// left by [`CommandTable::execute`] and
     /// [`CommandTable::restore_executed`], the only ways out of COMMIT.
     committed: BTreeSet<CommandId>,
+    /// The order this replica executed commands in, as ordinals: one per
+    /// command, retired ones included, the cost `history` already pays
+    /// (task-d71). Execution is one order at every voter, so a candidate
+    /// reads it for every voter's.
+    execution_order: BTreeMap<CommandId, u64>,
 }
 
 impl CommandTable {
@@ -226,6 +242,7 @@ impl CommandTable {
             moved: None,
             accepted: BTreeSet::new(),
             committed: BTreeSet::new(),
+            execution_order: BTreeMap::new(),
         }
     }
 
@@ -246,6 +263,7 @@ impl CommandTable {
             moved: None,
             accepted: BTreeSet::new(),
             committed: BTreeSet::new(),
+            execution_order: BTreeMap::new(),
         }
     }
 
@@ -273,6 +291,7 @@ impl CommandTable {
             moved: None,
             accepted: BTreeSet::new(),
             committed: BTreeSet::new(),
+            execution_order: BTreeMap::new(),
         };
         for (c, r) in records {
             if r.phase == Phase::Accept {
@@ -491,6 +510,17 @@ impl CommandTable {
         retired
     }
 
+    /// Whether the table holds more than its whole capacity, the reserve
+    /// included, after reclaiming what it may.
+    fn at_capacity_after_reclaim(&mut self) -> bool {
+        let at = |t: &Self| t.capacity.is_some_and(|c| t.records.len() > c);
+        if !at(self) {
+            return false;
+        }
+        self.reclaim();
+        at(self)
+    }
+
     /// Whether the table is full after reclaiming what it may.
     fn full_after_reclaim(&mut self) -> bool {
         if !self.full() {
@@ -548,14 +578,13 @@ impl CommandTable {
         payload: Digest32,
         keys: Vec<Vec<u8>>,
     ) -> Result<Initialized, InitError> {
-        self.initialize_bounded(command, payload, keys, true)
+        self.initialize_bounded(command, payload, keys, Room::Admission)
     }
 
     /// [`CommandTable::initialize`] past the table's capacity (task-d09).
     ///
-    /// For a command whose turn has come and that is already decided
-    /// elsewhere: a full table of later commands, none of which can be
-    /// adopted before it, would otherwise hold it out for ever. The
+    /// For recovery work: a command a Sync selected, or one a catch-up
+    /// page pulls, which the largest Sync and the largest page bound. The
     /// caller vouches for that; the table cannot tell.
     pub fn initialize_beyond_capacity(
         &mut self,
@@ -563,7 +592,28 @@ impl CommandTable {
         payload: Digest32,
         keys: Vec<Vec<u8>>,
     ) -> Result<Initialized, InitError> {
-        self.initialize_bounded(command, payload, keys, false)
+        self.initialize_bounded(command, payload, keys, Room::Unbounded)
+    }
+
+    /// [`CommandTable::initialize`] into the recovery reserve, and one
+    /// record past the capacity (task-d71).
+    ///
+    /// For a command whose turn has come (task-d09): a table full for new
+    /// admission holds later commands, none of which can be adopted before
+    /// it, and refused it would hold them out for ever. Each such command
+    /// is adopted at once and executes before everything admitted ahead of
+    /// it, so its execution makes the room for the next; one record past
+    /// the capacity lets one in when recovery work filled the table. Let in
+    /// whenever its turn came, the chain of them was bounded only by the
+    /// held proposals, eight tables' worth (protocol_sim row 3, five voters,
+    /// seed 158).
+    pub fn initialize_in_reserve(
+        &mut self,
+        command: CommandId,
+        payload: Digest32,
+        keys: Vec<Vec<u8>>,
+    ) -> Result<Initialized, InitError> {
+        self.initialize_bounded(command, payload, keys, Room::Reserve)
     }
 
     fn initialize_bounded(
@@ -571,7 +621,7 @@ impl CommandTable {
         command: CommandId,
         payload: Digest32,
         keys: Vec<Vec<u8>>,
-        bounded: bool,
+        room: Room,
     ) -> Result<Initialized, InitError> {
         match self.records.get(&command) {
             Some(existing) if existing.payload.is_some() => {
@@ -583,7 +633,12 @@ impl CommandTable {
             }
             Some(_) => {}
             None => {
-                if bounded && self.full_after_reclaim() {
+                let refused = match room {
+                    Room::Admission => self.full_after_reclaim(),
+                    Room::Reserve => self.at_capacity_after_reclaim(),
+                    Room::Unbounded => false,
+                };
+                if refused {
                     return Err(InitError::Backpressure);
                 }
             }
@@ -910,9 +965,26 @@ impl CommandTable {
         self.initialized_mut(&command)?.phase = Phase::Executed;
         self.committed.remove(&command);
         self.last_executed = Some(command);
+        self.note_execution(command);
         self.unretired.push_back(command);
         self.raise(command);
         Ok(())
+    }
+
+    fn note_execution(&mut self, command: CommandId) {
+        let next = self.execution_order.len() as u64;
+        self.execution_order.entry(command).or_insert(next);
+    }
+
+    /// Whether this replica executed `first` before `then` (task-d71).
+    pub fn executed_before(&self, first: &CommandId, then: &CommandId) -> bool {
+        match (
+            self.execution_order.get(first),
+            self.execution_order.get(then),
+        ) {
+            (Some(a), Some(b)) => a < b,
+            _ => false,
+        }
     }
 
     /// The command this replica executed last, if it remembers one.
@@ -958,6 +1030,7 @@ impl CommandTable {
     pub fn restore_executed(&mut self, command: &CommandId) {
         self.committed.remove(command);
         self.last_executed = Some(*command);
+        self.note_execution(*command);
         self.raise(*command);
         match self.records.get_mut(command) {
             Some(r) if r.payload.is_some() => {

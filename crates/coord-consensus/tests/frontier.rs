@@ -134,6 +134,8 @@ struct Cluster {
     asks: Vec<(u8, Vec<CommandId>)>,
     /// The voters' table capacity.
     capacity: usize,
+    /// The most records each node's table held after a delivery.
+    peak: Vec<usize>,
 }
 
 const SETTLE_STEPS: u32 = 200_000;
@@ -185,6 +187,7 @@ impl Cluster {
             announced: Vec::new(),
             asks: Vec::new(),
             capacity,
+            peak: vec![0; VOTERS as usize],
         }
     }
 
@@ -252,6 +255,11 @@ impl Cluster {
         ));
         let effects = self.nodes[to].step(event);
         self.handle(to, effects);
+        let records = match &self.nodes[to].role {
+            Role::Leader(m) => m.table().len(),
+            Role::Follower(m) => m.table().len(),
+        };
+        self.peak[to] = self.peak[to].max(records);
     }
 
     fn settle(&mut self) {
@@ -798,6 +806,43 @@ fn a_command_whose_turn_has_come_is_admitted_before_the_leader_commits_it() {
     all.extend(later);
     for i in 0..VOTERS as usize {
         assert_eq!(cluster.nodes[i].executed, all, "node {i}");
+    }
+}
+
+/// The commands whose turn has come take the recovery reserve, and pass
+/// the capacity by one (task-d71, protocol_sim row 3, five voters, seed
+/// 158).
+///
+/// As above, three followers fill their tables with later commands; then
+/// three commands they all depend on, each after the one before, reach
+/// only the leader and r1. Each is admitted once its turn comes, and the
+/// next one's turn comes as soon as it is adopted, before it executes:
+/// let past the capacity each time, the chain of them grew a follower's
+/// table by every one of them.
+#[test]
+fn commands_whose_turn_has_come_stay_within_the_capacity() {
+    let capacity = 8;
+    let mut cluster = Cluster::new(53, capacity);
+    let full = capacity - capacity / coord_consensus::RECOVERY_RESERVE_PARTS;
+    let later: Vec<CommandId> = (4..=(full as u64 + 3))
+        .map(|n| cluster.admit_to(n, &[2, 3, 4], 9))
+        .collect();
+    cluster.settle();
+    let heads: Vec<CommandId> = (1..=3).map(|n| cluster.admit_to(n, &[0, 1], 9)).collect();
+    cluster.settle_ticking(3);
+    for n in 4..=(full as u64 + 3) {
+        cluster.admit_to(n, &[0, 1], 9);
+    }
+    cluster.settle_ticking(capacity * 4);
+    let mut all = heads;
+    all.extend(later);
+    for i in 0..VOTERS as usize {
+        assert_eq!(cluster.nodes[i].executed, all, "node {i}");
+        assert!(
+            cluster.peak[i] <= capacity + 1,
+            "node {i} held {} records, capacity {capacity}",
+            cluster.peak[i]
+        );
     }
 }
 

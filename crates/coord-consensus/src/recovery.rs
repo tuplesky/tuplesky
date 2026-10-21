@@ -358,6 +358,55 @@ pub fn select_from(
     supplied: impl Fn(&CommandId, Option<Digest32>) -> bool,
     source_configuration: impl Fn(&Ballot) -> Option<BallotConfiguration>,
 ) -> Result<SyncDecision, RecoveryError> {
+    select_decided(
+        config,
+        reports,
+        supplied,
+        source_configuration,
+        &|_: &CommandId| false,
+    )
+}
+
+/// What a candidate knows of its own decisions, beside the reports
+/// (task-d71).
+pub trait CandidateDecisions {
+    /// Whether the candidate committed or executed `command`, retired and
+    /// forgotten included.
+    fn decided(&self, command: &CommandId) -> bool;
+
+    /// Whether the candidate executed `first` before `then`. Execution is
+    /// one order at every voter, so this is the order every voter executes
+    /// the two in. False when the candidate does not know both positions.
+    fn executed_before(&self, first: &CommandId, then: &CommandId) -> bool {
+        let _ = (first, then);
+        false
+    }
+}
+
+impl<F: Fn(&CommandId) -> bool> CandidateDecisions for F {
+    fn decided(&self, command: &CommandId) -> bool {
+        self(command)
+    }
+}
+
+/// [`select_from`], where `decided` names the commands the candidate
+/// itself committed or executed, retired and forgotten ones included
+/// (task-d71). Reports leave out what their replica executed long ago,
+/// so a voter behind can report its own pre-acceptance of a command the
+/// candidate executed far back, and the selection re-proposes it. The
+/// new leader does not chain such a re-proposal after the recovered
+/// order (`Leader::from_recovered`): it was decided, with other
+/// dependencies. So the possible-fast rule does not count a candidate
+/// that follows one as ordered after the recovered order, as it counts
+/// one that follows a command no ballot decided (protocol_sim row 12,
+/// three voters, seed 387, without catch-up).
+pub fn select_decided(
+    config: &BallotConfiguration,
+    reports: &[RecoveryReport],
+    supplied: impl Fn(&CommandId, Option<Digest32>) -> bool,
+    source_configuration: impl Fn(&Ballot) -> Option<BallotConfiguration>,
+    decided: &impl CandidateDecisions,
+) -> Result<SyncDecision, RecoveryError> {
     let mut seen = BTreeSet::new();
     for r in reports {
         if !config.is_voter(&r.replica) {
@@ -566,6 +615,7 @@ pub fn select_from(
         reports,
         &mut entries,
         &from_below,
+        decided,
     );
     for c in entries.keys() {
         reproposed.remove(c);
@@ -650,6 +700,7 @@ fn possible_fast_decisions(
     reports: &[RecoveryReport],
     entries: &mut BTreeMap<CommandId, SyncEntry>,
     from_below: &BTreeSet<CommandId>,
+    decided: &impl CandidateDecisions,
 ) {
     // The fast set of the source ballot: its own configuration where the
     // candidate knows it (task-d31), else the default rule every
@@ -701,11 +752,20 @@ fn possible_fast_decisions(
             // A record a Sync demoted was pre-accepted in an earlier
             // ballot: no evidence of a fast decision in this one
             // (task-d11).
+            //
+            // Nor is a command the candidate decided itself: it was
+            // decided with the dependencies the candidate committed it
+            // with, and a member behind can still hold a pre-acceptance of
+            // it under others (protocol_sim row 10, three voters, seed
+            // 884, without catch-up). The candidate holds one it has not
+            // retired in its own report, so this is one it executed and
+            // forgot.
             if e.phase != Phase::PreAccept
                 || !e.payload_present
                 || e.path == crate::graph::demoted_path()
                 || entries.contains_key(&e.command)
                 || candidates.contains_key(&e.command)
+                || decided.decided(&e.command)
             {
                 continue;
             }
@@ -756,7 +816,20 @@ fn possible_fast_decisions(
     // ordered before the candidate while the selection ordered both after
     // the same command. The member's own closure stays the evidence of its
     // path (`prefix_decided`).
-    let executed_closure = |m: &RecoveryReport, c: &CommandId| -> BTreeSet<CommandId> {
+    //
+    // Past the selection's entries, a member's record is followed only
+    // where it is an order the selection executes: one at ACCEPT or
+    // above (a leader's), a candidate the selection keeps (alike at every
+    // member), or a command the selection re-proposes (chained after the
+    // recovered order). A pre-acceptance of a command the candidate
+    // decided is none of these: the decision is not the record, and what
+    // the walk reached through it alone the candidate need not follow, so
+    // the candidate's executed order over it says nothing (task-d71, #158
+    // review). The command itself stays in the closure.
+    let executed_closure = |m: &RecoveryReport,
+                            c: &CommandId,
+                            candidates: &BTreeMap<CommandId, (ReportEntry, usize)>|
+     -> BTreeSet<CommandId> {
         let mut seen = BTreeSet::new();
         let mut stack: Vec<CommandId> = record(m, c).map(|e| e.deps.clone()).unwrap_or_default();
         while let Some(d) = stack.pop() {
@@ -765,7 +838,9 @@ fn possible_fast_decisions(
             }
             if let Some(e) = entries.get(&d) {
                 stack.extend(e.deps.iter().copied());
-            } else if let Some(e) = record(m, &d) {
+            } else if let Some(e) = record(m, &d)
+                && (e.phase >= Phase::Accept || candidates.contains_key(&d) || !decided.decided(&d))
+            {
                 stack.extend(e.deps.iter().copied());
             }
         }
@@ -818,11 +893,13 @@ fn possible_fast_decisions(
             || prefix.iter().any(|d| {
                 record(m, d).is_none() && entries.contains_key(d) && after(candidates, d, a)
             })
+            || prefix.iter().any(|d| decided.executed_before(a, d))
     };
     // The commands `deps` reach, followed through the selection and the
     // candidates, that neither holds and a report holds undecided (or,
-    // with `member`, that member holds undecided): the ones the selection
-    // re-proposes.
+    // with `member`, that member holds undecided), and the candidate did
+    // not decide itself: the ones the selection re-proposes and the new
+    // leader chains after the recovered order (task-d71).
     let undecided_reached = |deps: &[CommandId],
                              candidates: &BTreeMap<CommandId, (ReportEntry, usize)>,
                              member: Option<&RecoveryReport>|
@@ -838,12 +915,14 @@ fn possible_fast_decisions(
                 stack.extend(e.deps.iter().copied());
             } else if let Some((e, _)) = candidates.get(&d) {
                 stack.extend(e.deps.iter().copied());
-            } else if match member {
-                Some(m) => record(m, &d).is_some_and(|r| r.phase < Phase::Commit),
-                None => reports
-                    .iter()
-                    .any(|r| record(r, &d).is_some_and(|r| r.phase < Phase::Commit)),
-            } {
+            } else if !decided.decided(&d)
+                && match member {
+                    Some(m) => record(m, &d).is_some_and(|r| r.phase < Phase::Commit),
+                    None => reports
+                        .iter()
+                        .any(|r| record(r, &d).is_some_and(|r| r.phase < Phase::Commit)),
+                }
+            {
                 found.insert(d);
                 if let Some(m) = member
                     && let Some(r) = record(m, &d)
@@ -868,7 +947,7 @@ fn possible_fast_decisions(
             let (entry, member) = candidates[&c].clone();
             let first = fast_reporters[member];
             let prefix = closure(first, &c);
-            let ordered = executed_closure(first, &c);
+            let ordered = executed_closure(first, &c, &candidates);
             // The commands no ballot decided that `c` follows, which this
             // selection re-proposes: its own dependencies, followed
             // through what the selection keeps, reach them. The
@@ -912,17 +991,32 @@ fn possible_fast_decisions(
                 // An adopted command that waits on a re-proposal too is
                 // not ordered against `c` that way (row 2, seed 3).
                 if awaits_reproposal {
-                    if undecided_reached(&adopted.deps, &candidates, None).is_empty()
-                        || selected_before.contains(&adopted.command)
-                    {
+                    let waits = undecided_reached(&adopted.deps, &candidates, None);
+                    if waits.is_empty() || selected_before.contains(&adopted.command) {
                         return true;
                     }
-                    // It waits on a re-proposal too, and nothing the
-                    // selection keeps orders it before `c`. The member's
-                    // records do not either: the way they order the two
-                    // runs through an undecided command, which is
-                    // re-proposed under other dependencies (row 3, seed
-                    // 70). Only a command with no conflict is exempt.
+                    // It waits on a re-proposal too. Neither command can
+                    // have executed anywhere, since each follows a command
+                    // no ballot decided, so the only order either will
+                    // execute in is the one this selection's re-proposals
+                    // give them, and the member's records of the undecided
+                    // commands, which the re-proposals replace, are no
+                    // evidence of it either way (task-d71). The new leader
+                    // re-proposes the undecided commands one after another
+                    // in identity order, and an entry right after the last
+                    // one it waits on (`Leader::from_recovered`), so two
+                    // entries whose last differs are chained by the
+                    // re-proposals between them, in whichever order: the
+                    // drop that order was read for re-proposed `c` under
+                    // other dependencies than a fast quorum may have
+                    // learned it with (protocol_sim row 5, three voters,
+                    // seed 822). Two entries waiting last on the same one
+                    // are re-proposed beside each other with their own
+                    // dependencies and no edge between them (row 2, seed
+                    // 3), so only a command with no conflict is exempt.
+                    if waits.last() != undecided_reached(&entry.deps, &candidates, None).last() {
+                        return true;
+                    }
                     let keys: Vec<Vec<u8>> = adopted.paths.iter().map(|(k, _)| k.clone()).collect();
                     return !keys.is_empty() && !conflicts(&entry.keys, &keys);
                 }
@@ -991,7 +1085,13 @@ fn possible_fast_decisions(
                     || awaited.contains(d)
                     || record(first, d).is_none_or(|r| r.path == crate::graph::demoted_path())
             });
-            if !ordered_after_adopted || !prefix_decided {
+            // Nor one whose own dependencies, through what the selection
+            // keeps, come back to it: a command the selection orders after
+            // `c` is also before it, a cycle no decision holds, so `c` was
+            // not decided with these dependencies (row 10, three voters,
+            // seed 884, where a committed command depended on `c`).
+            let closes_cycle = after(&candidates, &c, &c);
+            if !ordered_after_adopted || !prefix_decided || closes_cycle {
                 failing.insert(c);
             }
         }

@@ -2372,6 +2372,43 @@ fn entries_that_follow_a_reproposed_command_the_leader_executed_are_proposed() {
     assert_totally_ordered(&leader, &decision, &[r, x, y]);
 }
 
+/// task-d71 (protocol_sim row 5, three voters, seed 822): two entries
+/// that wait last on different re-proposals are ordered by the
+/// re-proposal between them, whichever identity sorts first. Recovery's
+/// possible-fast rule keeps a candidate beside such an adopted command on
+/// this order; two entries waiting last on the same re-proposal are not
+/// ordered by it, and that rule still re-proposes the candidate.
+#[test]
+fn entries_that_wait_on_different_reproposals_are_ordered() {
+    let mut c = Cluster::new(3);
+    c.no_execute = vec![2];
+    let a = c.admit(1, 1);
+    c.settle();
+    let (d, e, x, y) = (
+        c.admit_at(2, 2, &[2]),
+        c.admit_at(3, 3, &[2]),
+        c.admit_at(4, 4, &[2]),
+        c.admit_at(5, 5, &[2]),
+    );
+    let new = ballot(1, 2);
+    let decision = SyncDecision {
+        ballot: new,
+        source_ballot: ballot(0, 0),
+        entries: BTreeMap::from([
+            (a, accepted_sync_entry(a, vec![])),
+            (x, accepted_sync_entry(x, vec![d])),
+            (y, accepted_sync_entry(y, vec![e])),
+        ]),
+        reproposed: [d, e].into_iter().collect(),
+    };
+    let (leader, _) = Leader::from_recovered(
+        c.nodes[2].role.take().map(role_into_recovered).unwrap(),
+        quorum(new),
+        &decision,
+    );
+    assert_totally_ordered(&leader, &decision, &[a, d, e, x, y]);
+}
+
 fn accepted_sync_entry(command: CommandId, deps: Vec<CommandId>) -> coord_consensus::SyncEntry {
     coord_consensus::SyncEntry {
         command,
