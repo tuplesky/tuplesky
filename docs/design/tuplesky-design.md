@@ -340,7 +340,7 @@ The argument:
 
   At any other node these are as they are today for a node whose projection lags.
 
-The release point is the group's `JournalDurable` as the store reports it. With the journal worker (task-d54) that is the append taken back, not merely handed off. A group definitely not journaled stops the node with its results unreleased, as now.
+The release point is the group's `JournalDurable` as the store reports it. With the journal worker (task-d54) that is the append taken back, not merely handed off. A group definitely not journaled stops the node with its results unreleased, as now. A crash between a release and the projection's commit loses nothing released: under the replay profile the attach replays the group before the domain serves, under the strict profile start-up re-lowers it, and the result is a decision the domain made, which every other voter applies too, so no node released state it will not hold.
 
 What it can buy: in task-d62's run (five voters on one host, replay profile), a command waited 7.80 ms on the leader from its group closing to its release. The journal's job was about 1.2 ms of that (0.10 queued, 0.78 served, 0.30 to completion), and the rest was the projection's commit and its queue.
 
