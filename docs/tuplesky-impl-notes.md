@@ -10407,6 +10407,9 @@ task-d62's counts change with the marker: `acks_reordered` counted
 acknowledgements sent under it and stays zero now, kept so a reading
 keeps its shape; `unordered.reordered` counts the pre-acceptances set
 aside and still undecided, and `unordered.leader_log` stays zero.
+Removing `acks_reordered`, and `unordered.leader_log` with it, is a
+follow-up: `scripts/ci/command_cost.py` reads both, and its reading and
+the metrics line change together.
 
 **The protocol simulator** on this branch, with task-d71's row 14 fix
 under it (#158): every row at its usual seeds; and every row at 1,000
