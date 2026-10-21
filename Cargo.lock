@@ -1155,6 +1155,7 @@ dependencies = [
  "quinn",
  "rcgen",
  "reqwest",
+ "rustix",
  "rustls",
  "rustls-pki-types",
  "serde_json",
