@@ -2242,6 +2242,9 @@ impl Leader {
         let epoch = self.config.identity.epoch;
         let seqnum = self.seqnum;
         self.seqnum += 1;
+        // Ordered as it is proposed: the leader's own logs take it as their
+        // prefix, so their suffix stays empty (task-d68).
+        self.table.synchronize_own(command, ballot, seqnum);
         // The durable row records the phase the command is actually in.
         // The leader's own acceptance of its order is written separately,
         // once the dependency guard passes (see `advance_pending`).

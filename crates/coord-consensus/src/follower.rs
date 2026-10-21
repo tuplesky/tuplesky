@@ -1921,7 +1921,7 @@ impl Follower {
                 // number, so it also runs for a record already committed
                 // here, whose dependencies are then left alone.
                 self.table
-                    .record_leader_path(command, entry.seqnum, &entry.paths);
+                    .record_leader_path(command, entry.seqnum, None, &entry.paths);
                 // The selected order replaces a local one that is merely
                 // accepted: an ACCEPT record from a lower synchronized
                 // ballot may legally disagree with the chosen entry, and
@@ -2824,7 +2824,7 @@ impl Follower {
         }
         if self.table.phase_of(&command).is_none() {
             let keys = alloc::vec![crate::leader::CONSERVATIVE_KEY.to_vec()];
-            let _ = self.table.initialize_beyond_capacity(command, digest, keys);
+            let _ = self.table.initialize_installed(command, digest, keys);
         }
         let installed = committed
             || (self
@@ -3646,16 +3646,7 @@ impl Follower {
         // promised away is an acceptance the candidate's selection cannot
         // see (task-d12). Admission itself is fenced in `on_admitted`.
         if self.in_fast_set() && self.may_vote() {
-            // Whether a command reordered behind a synchronization held
-            // this replica's path when it computed this one (task-d62):
-            // then no leader path equals it.
-            let reordered = init.paths.iter().any(|(key, _)| {
-                self.table
-                    .log(key)
-                    .is_some_and(|log| !log.reordered().is_empty())
-            });
             self.fast_counts.acks += 1;
-            self.fast_counts.acks_reordered += u64::from(reordered);
             let ack = FastAck {
                 replica: self.config.identity.replica,
                 ballot: self.config.quorum.ballot(),
@@ -4038,6 +4029,7 @@ impl Follower {
                 self.table.record_leader_path(
                     command,
                     held.proposal.seqnum.unwrap_or(0),
+                    held.proposal.seqnum.map(|_| held.proposal.ballot),
                     &held.proposal.paths,
                 );
                 // A command already learned or executed (installed from a

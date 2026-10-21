@@ -386,9 +386,7 @@ impl VoteSet {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum MissedFast {
     /// A fast-set acknowledgement saw another conflict path than the
-    /// leader's. One sent while a `reordered` marker held its sender's
-    /// path is one of these: the acknowledgement does not say so, and
-    /// its sender counts it ([`FastPathCounts::acks_reordered`]).
+    /// leader's.
     Path,
     /// A fast-set acknowledgement saw the leader's path but other direct
     /// dependencies.
@@ -421,9 +419,9 @@ pub struct FastPathCounts {
     pub missed_unclassified: u64,
     /// Fast acknowledgements this voter sent as a fast-set follower.
     pub acks: u64,
-    /// Of them, those sent while a command reordered behind a
-    /// synchronization held this voter's path off every leader path: each
-    /// disagrees with the leader in its path, whatever else it saw.
+    /// Of them, those sent while task-d34's `reordered` marker held this
+    /// voter's path off every leader path. The marker is gone (task-d67),
+    /// so this stays zero; it is kept so a reading keeps its shape.
     pub acks_reordered: u64,
 }
 
