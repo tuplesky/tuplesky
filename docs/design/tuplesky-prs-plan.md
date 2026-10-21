@@ -43,7 +43,7 @@ Reference single-store and fixed-membership compositions are early increments, n
 | task-d69 | From a profile of a follower's loop: the outbox releases what a completion makes releasable, rather than walking every send it holds on every round | After task-d60's second PR; before task-d60's third step; its runner pair |
 | task-d70 | From the Jepsen runner's profile of the transport's workers: fewer datagrams and wakeups per command, through QUIC's acknowledgement cadence, the runtime's worker count and the inbound delivery path | Its two settings as runner pairs first, while task-d69 is written; the inbound path after |
 | task-d71 | From the protocol simulator at 1,000 seeds per row and size: the order recovery's possible-fast rule reads, named once, and a command whose turn has come kept within a follower's capacity | Before task-d67's and task-d68's code PR, which rebases on it; the sweep then runs weekly |
-| task-d72 through task-d75 | From comparing a command's cost with etcd's on one host: a budget for CPU per operation against etcd's at the matched shape, tracked, and three levers under it that leave the order alone: a turn's proposals and acknowledgements to a peer in one frame, acknowledgements to the leader and the frontend only, and work off the leader's loop | task-d72 first, as the record; its levers after task-d63's build and task-d66's job, task-d74's design check first, each as a runner pair |
+| task-d72 through task-d75 | From comparing a command's cost with etcd's on one host: a budget for CPU per operation against etcd's at the matched shape, tracked, and three levers under it that leave the order alone: a turn's proposals and acknowledgements to a peer in one frame, acknowledgements to the leader and the frontend only, and work off the leader's loop | task-d72 after task-d63's build and task-d66's job, whose pairs are its first rows; its levers after task-d72, task-d74's design check first, each as a runner pair that adds a row |
 | task-d76 | From a Jepsen run that killed the leader: a new leader whose fixed fast set holds the voter just killed makes almost no fast decision for its term | After task-d72's levers; its design step first |
 | task-q01 | Combined durable WAN/Kine qualification | Required before task-66 |
 
@@ -239,10 +239,10 @@ This is a workstream overview; the individual prerequisites are authoritative. O
 | [task-d69](#task-d69) | Release the outbox by what a completion makes releasable | task-d45, task-d46 |
 | [task-d70](#task-d70) | Fewer datagrams and wakeups per command on the transport | task-d61, task-d62 |
 | [task-d71](#task-d71) | Name the order the possible-fast rule reads, and keep the reserve's bound | task-d09, task-d26, task-d33, task-d34 |
-| [task-d72](#task-d72) | Close the gap to etcd on one host | task-d62 |
-| [task-d73](#task-d73) | Carry a turn's proposals and acknowledgements to a peer in one frame | task-d61, task-d62 |
-| [task-d74](#task-d74) | Send acknowledgements to the leader and the frontend only | task-d09, task-d62 |
-| [task-d75](#task-d75) | Take work off the leader's domain loop | task-d53, task-d60 |
+| [task-d72](#task-d72) | Close the gap to etcd on one host | task-d62, task-d63, task-d66 |
+| [task-d73](#task-d73) | Carry a turn's proposals and acknowledgements to a peer in one frame | task-d61, task-d62, task-d72 |
+| [task-d74](#task-d74) | Send acknowledgements to the leader and the frontend only | task-d09, task-d62, task-d72 |
+| [task-d75](#task-d75) | Take work off the leader's domain loop | task-d53, task-d60, task-d72 |
 | [task-d76](#task-d76) | Choose a whole fast set after a failure | task-d31, task-d68 |
 | [task-q01](#task-q01) | Produce the combined durable WAN/Kine qualification report | task-j07, task-j08, task-o06, task-m05, task-63, task-64, task-d45, task-d46, task-d47, task-d48, task-d49, task-d51, task-d52, task-d53 |
 
@@ -2833,7 +2833,7 @@ The design step names the order the rule reads, so a hole is not patched as a fi
 <a id="task-d72"></a>
 ### task-d72: Close the gap to etcd on one host
 
-**Prerequisites:** task-d62.  
+**Prerequisites:** task-d62, task-d63, task-d66 (their pairs are this entry's first rows).  
 **Design:** Section 2.2 (unchanged: the conservative key stays).
 
 **Implement:** The one matched comparison, task-d51's register row at 30 clients, served 422 to 505 `ok`/s against etcd's 1175, at 3.5 to 4.7 ms of server CPU an operation against etcd's 1.39. TupleSky left 0.65 to 1.48 cores idle while the leader's loop queued for a CPU; etcd left 0.04. The order is not the gap, since Raft keeps a total order too. Four costs make the CPU and the latency:
@@ -2843,22 +2843,32 @@ The design step names the order the rule reads, so a hole is not patched as a fi
 - **Latency on the closed loop:** 7.8 ms from a group closing to its release, 6.6 of it the projection's commit that task-d63's build removes, and publication stalls of 22 to 65 ms that task-d66's job removes.
 
 This entry is the budget and the record, not a lever:
-- **The target:** CPU per operation at the matched shape against etcd's 1.39 ms, split by the leader's loop, its transport threads, the journal and the followers, with `ok`/s and p99 beside it.
-- **The levers, in order,** each with the number it is expected to move and the pair that checks it: task-d63's build (about 6.6 ms a command on the leader at closed loop), task-d66's job (the stalls), then task-d73, task-d74 and task-d75.
-- **The record:** a row in this entry's table after each lever.
+- **The measure:** CPU per operation at the matched shape against etcd's 1.39 ms, split by the leader's loop, its transport threads, the journal and the followers, with `ok`/s and p99 beside it.
+- **The target that closes the entry:** CPU per operation at the register row within twice etcd's (2.8 ms), and the `service` shape's p99 within etcd's spread at the same rate. The first rows may revise it, with the reason recorded beside them.
+- **The levers, in order,** each with the number it is expected to move and the pair that checks it: task-d63's build (latency: about 6.6 ms a command on the leader at closed loop), task-d66's job (latency: the stalls), then task-d73, task-d74 and task-d75 (CPU). Only the last three are expected to move CPU per operation.
+- **The record:** the table below, one row a lever, each row a pair on the runner.
+
+| Row | Build | Shape | `ok`/s | Server CPU an operation | Idle cores | Expected to move |
+| --- | --- | --- | --- | --- | --- | --- |
+| Baseline | task-d51's, `145b71b` (#146) | register, 30 clients, six nodes | 422 to 505 (etcd 1175) | 3.5 to 4.7 ms (etcd 1.39) | 0.65 to 1.48 (etcd 0.04) | |
+| task-d63 | | | | | | latency: the projection's commit, about 6.6 ms a command |
+| task-d66 | | | | | | latency: publication stalls of 22 to 65 ms |
+| task-d73 | | | | | | CPU: messages per command |
+| task-d74 | | | | | | CPU: acknowledgements per command |
+| task-d75 | | | | | | CPU: the leader's loop |
 - **The shapes it is read in** (`docs/operations/jepsen.md`): `service`, a fixed rate where the metric is latency and CPU per operation at equal work, on the bridge and under the WAN profile; the append shape run against etcd too, so the multiple quoted has a denominator; and several domains on one cluster, if the harness can start them.
 
-**Acceptance:** The table filled through task-d75, each row a pair on the runner; the target met, or each part of the gap that remains named with its owner. The `service` shape's p50, p99 and CPU per operation beside etcd's at the same rate.
+**Acceptance:** This entry's PR records the baseline row and task-d63's and task-d66's rows, with the `service` shape's p50, p99 and CPU per operation beside etcd's at the same rate. task-d73, task-d74 and task-d75 each add their row in their own PR. The entry closes when the target is met, or when each part of the gap that remains is named with its owner.
 
 **Review boundary:** A budget, its measurements and the order of its levers. No change of its own.
 
 <a id="task-d73"></a>
 ### task-d73: Carry a turn's proposals and acknowledgements to a peer in one frame
 
-**Prerequisites:** task-d61, task-d62.  
+**Prerequisites:** task-d61, task-d62, task-d72.  
 **Design:** Section 11.2 (unchanged: a frame kind behind a peer capability, as task-d61's).
 
-**Implement:** Each command is its own message: a proposal per command to each voter, an acknowledgement per command to each peer. task-d61 put a turn's frames to a peer on one stream and encoded a proposal once, which cut streams, not messages. One frame per peer per turn carrying every proposal the turn moved, and one carrying every acknowledgement, trades a turn's latency for the message count; the pair says by how much.
+**Implement:** Each command is its own message: a proposal per command to each voter, an acknowledgement per command to each peer. task-d61 put a turn's frames to a peer on one stream and encoded a proposal once, which cut streams, not messages. One frame per peer per turn carrying every proposal the turn moved, and one carrying every acknowledgement, trades latency for the message count: a frame waits for its turn to close, so a command at the head of a turn pays the turn's length. The pair's p99 reads that cost.
 - Behind a peer capability, so a link without it carries what it carries today.
 - The frames hold the same messages: nothing any one proposal or acknowledgement says changes, nor what a vote is evidence of.
 
@@ -2869,21 +2879,22 @@ This entry is the budget and the record, not a lever:
 <a id="task-d74"></a>
 ### task-d74: Send acknowledgements to the leader and the frontend only
 
-**Prerequisites:** task-d09, task-d62.  
+**Prerequisites:** task-d09, task-d62, task-d72.  
 **Design:** Sections 4.1, 4.3 (amended by this task, if a decision reads another follower's votes).
 
 **Implement:** Fast and slow acknowledgements go to every other voter and to the frontend, the reference's pattern (`spec/swiftpaxos-mapping.md`). task-d09 carries the leader's commit decision to every voter, and the frontend learns from its own copy.
-- **First, the design check:** which follower decision reads another follower's votes. Where none does, the broadcast goes. Where one does, the step names it and keeps that copy.
+- **First, the design check:** which follower decision reads another follower's votes. Where none does, the broadcast goes. Where one does, the step names it and keeps that copy. One is known: a follower's own learning. `Follower::learn` runs `commit_learned` over the follower's vote sets, which peers' `FastAck` and `SlowAck` fill, and `missed_fast` reads the same sets for the metrics. task-d09's `commit_through_leader` is the other source, so with the broadcast gone a follower learns only from the leader's frontier, one message delay later than now. The frontend keeps learning from the votes it still receives, and recovery reads reports, not votes, so neither moves.
+- **The step records what that delay costs.** The followers' executed frontier lags the leader's by it, and that lag is what task-d10's catch-up, the reports' window and any read served at a follower see.
 - **Then the change,** as a pair.
 
-**Acceptance:** The design check recorded, with every decision it read. The protocol simulator, every row at 1,000 seeds per row and size, with catch-up and without. Three pairs on the runner: messages and datagrams per command, the followers' CPU per operation, `ok`/s and p99.
+**Acceptance:** The design check recorded, with every decision it read. The protocol simulator, every row at 1,000 seeds per row and size, with catch-up and without. Three pairs on the runner: messages and datagrams per command, the followers' CPU per operation, the followers' execution lag behind the leader, `ok`/s and p99.
 
 **Review boundary:** Who receives an acknowledgement. No change to the learning predicate, to the fast predicate or to recovery.
 
 <a id="task-d75"></a>
 ### task-d75: Take work off the leader's domain loop
 
-**Prerequisites:** task-d53, task-d60.  
+**Prerequisites:** task-d53, task-d60, task-d72.  
 **Design:** Section 17.3.3 (unchanged: the domain actor and its workers).
 
 **Implement:** The leader's single loop is the serialization point. On the runner it queued for a CPU while 0.65 to 1.48 cores sat idle. What it does that another thread could is read first, from the per-thread split task-d53's and task-d60's readings give (the leader's loop by phase, the follower beside it), with the idle cores as the evidence that the loop is the bound. Each candidate the reading names is its own PR with its pair.
@@ -2896,10 +2907,15 @@ This entry is the budget and the record, not a lever:
 ### task-d76: Choose a whole fast set after a failure
 
 **Prerequisites:** task-d31, task-d68.  
-**Design:** Section 4.2 (amended by this task).
+**Design:** Sections 4.2 and 4.9 (amended by this task); Section 11.7's mixed-version gate.
 
 **Implement:** On the Jepsen runner, in a run whose every kill was at the leader (#98), four of five new leaders ran at 81 to 87% fast. The fifth, n5 in ballot 2, ran at 5.7%. `c2_default` is the leader and the next ⌊N/2⌋ voters in identity order, wrapping, so n5's set was {n5, n1, n2}, and n2, the leader just killed, was down for all but the last 8 s of n5's term. A C2 fast decision needs every member of the set, so a dead member is no fast decision for the term, and at five voters a kill lands in the next leader's set about one time in two. The candidate knows who promised in its campaign.
-- **First, the design step.** Either a candidate chooses its C2 set among the voters that promised, or a leader may re-choose when a member is dead, under Section 4.2's rule that the set is fixed within a ballot and another needs a higher ballot. Every production path builds `c2_default` locally, so a chosen set has to reach the followers; task-d31 made recovery read the source fast set from its ballot's configuration, which is the hook. The step says how the set is carried and why recovery stays sound with it.
+- **The choice:** a candidate chooses its C2 set among the voters that promised. That holds at every size that can elect: at three voters, the leader and the other promiser; at five, the leader and two of its promisers. A leader whose member dies later re-chooses by the mechanism Section 4.2 already names, a higher ballot with itself as leader. A set is never re-chosen within a ballot, which Section 4.2 forbids.
+- **The record exists; its carriage does not.** The signed ballot record, `BallotConfigurationV1.fast_set` with a majority's promises over the ballot message, already names a fast set, and `coord-membership` turns it into a C2 configuration. But nothing on the consensus wire carries it. Every production path builds `c2_default` locally: a follower builds it when it adopts a ballot, and that is the only source configuration recovery is given (task-d31's `select_from`, `Campaign::knowing`). A candidate that never adopted the source ballot supplies none, and recovery builds `c2_default` for it. `SyncDecision` carries no fast set.
+- **First, the design step.** It says:
+  - how the ballot record reaches the followers, and the mixed-version gate (Section 11.7) that a new field on the Sync, or a new message, costs: the cost that kept the member's positions out of task-d71's report;
+  - what replaces recovery's rule that a ballot whose configuration is not known ran under the default. Once a chosen set can exist, a candidate that never adopted the source ballot cannot assume the default. So the set is durable at every voter that adopted the ballot and readable from its report, or the campaign refuses until a reporter that held it answers;
+  - why recovery stays sound with it.
 
 **Acceptance:** The design step before code. The protocol simulator, every row at 1,000 seeds per row and size, with catch-up and without. On the runner, a run with every kill at the leader: each new leader's fast share near the others', whichever voter was killed.
 
