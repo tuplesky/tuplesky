@@ -3,13 +3,16 @@
 # its scenario and the inputs that override it, as KEY=VALUE lines for
 # $GITHUB_ENV (standard output without it).
 #
-#   SCENARIO       faults (default), throughput, wan or wan-throughput
+#   SCENARIO       faults (default), throughput, wan, wan-throughput or
+#                  service
 #   IN_WORKLOAD    TupleSky's and etcd's workload; empty for the scenario's
 #   IN_NEMESIS     their faults; empty for the scenario's
 #   IN_SWIFTPAXOS  SwiftPaxos's faults; empty for the scenario's
 #   IN_TIME_LIMIT  seconds of workload; empty for the scenario's
 #   IN_CONCURRENCY clients, a number or a multiple of the nodes (5n);
 #                  empty for the scenario's
+#   IN_RATE        operations a second over all clients, 0 for
+#                  unthrottled; empty for the scenario's
 #   NODES          the cluster's nodes (5), for the register minimum
 #   IN_WAN         the network: none, regions, or one-way milliseconds;
 #                  empty for the scenario's
@@ -33,10 +36,20 @@
 #                  default (or empty) for tokio's one per runner core
 #   IN_VOTER_ENV   NAME=VALUE every TupleSky voter starts with; empty for
 #                  none
-#   IN_KEY_COUNT   keys in play at once in TupleSky's append or wr
-#                  workload; empty for the harness's 3
+#   IN_KEY_COUNT   keys in play at once in the append or wr workload,
+#                  TupleSky's and etcd's; empty for the scenario's (the
+#                  harnesses' 3, or 1000 for service)
 #   IN_KEY_DIST    how that workload picks among them: uniform or
-#                  exponential; empty for the harness's exponential
+#                  exponential; empty for the scenario's (the harnesses'
+#                  exponential, or uniform for service)
+#   IN_READ_RATIO  the share of the wr workload's transactions made
+#                  read-only, TupleSky's and etcd's, from 0 to 1; empty
+#                  for the scenario's (0, Elle's mix, or 0.6 for service:
+#                  about 80% of operations reads)
+#   IN_HOLD_PEER_LINKS
+#                  seconds every TupleSky voter's inbound peer-plane
+#                  traffic is dropped from the workload's start (task-d67's
+#                  start-up row); empty or 0 for none
 #   IN_KILL_TARGETS
 #                  which voters TupleSky's kills take: leader, or any (or
 #                  empty) for one, a majority or all at random; leader
@@ -45,8 +58,9 @@
 #                  false (or empty), true or call-graph; a profile needs
 #                  a run without faults
 #
-# The voter inputs are TupleSky's alone; they are named in its titles
-# (WORKERS_SUFFIX, TUPLESKY_SUFFIX).
+# The voter inputs and the hold are TupleSky's alone; they are named in its
+# titles (WORKERS_SUFFIX, TUPLESKY_SUFFIX). The keys and the read ratio
+# reach etcd's workload too, and are named in both titles (TITLE_SUFFIX).
 #
 # faults:          append; kill, pause, partition (SwiftPaxos: pause,
 #                  partition); 20 operations a second from 2 clients a node,
@@ -58,6 +72,12 @@
 #                  faults (loss, jitter, reordering, duplication,
 #                  corruption, a bandwidth cap) on top.
 # wan-throughput:  throughput's load on three simulated regions.
+# service:         a coordination service's load: wr at about 80% reads
+#                  over 1000 uniform keys; no faults; 300 operations a
+#                  second from 4 clients, 300 s; TupleSky and etcd at the
+#                  same rate, so the comparison is latency and CPU per
+#                  operation at equal work. No SwiftPaxos (it runs only
+#                  the register workload); a wan input gives the WAN row.
 set -euo pipefail
 
 scenario=${SCENARIO:-faults}
@@ -74,8 +94,12 @@ case $scenario in
   wan-throughput)
     workload=register nemesis=none swiftpaxos=none
     time_limit=120 rate=0 concurrency=10n wan=regions ;;
+  service)
+    workload=wr nemesis=none swiftpaxos=skip
+    time_limit=300 rate=300 concurrency=4 wan=none
+    key_count=1000 key_dist=uniform read_ratio=0.6 ;;
   *)
-    echo "::error::unknown scenario '$scenario' (faults, throughput, wan, wan-throughput)" >&2
+    echo "::error::unknown scenario '$scenario' (faults, throughput, wan, wan-throughput, service)" >&2
     exit 1 ;;
 esac
 
@@ -90,6 +114,17 @@ case $concurrency in
     exit 1 ;;
 esac
 wan=${IN_WAN:-$wan}
+# A scenario's keys and read ratio are for the workloads they apply to; a
+# workload input of another drops them.
+case $workload in
+  wr) ;;
+  append) read_ratio="" ;;
+  *) key_count="" key_dist="" read_ratio="" ;;
+esac
+rate=${IN_RATE:-$rate}
+case $rate in
+  "" | *[!0-9]*) echo "::error::rate '$rate' is not a whole number of operations a second (0 for unthrottled)" >&2; exit 1 ;;
+esac
 
 # The etcd test's --rate must be positive; 100000 a second staggers its
 # clients by 10 microseconds on average, which is unthrottled at any
@@ -134,8 +169,13 @@ if [ "$nemesis" = none ]; then recovery_time=0; fi
 load_suffix() {
   if [ "$rate" = 0 ]; then
     printf ', unthrottled at %s%s' "$1" "$2"
-  elif [ -n "${IN_CONCURRENCY:-}" ]; then
-    printf ', %s clients%s' "$1" "$2"
+  else
+    if [ -n "${IN_CONCURRENCY:-}" ] || [ "$scenario" = service ]; then
+      printf ', %s clients%s' "$1" "$2"
+    fi
+    if [ -n "${IN_RATE:-}" ] || [ "$scenario" = service ]; then
+      printf ', %s/s' "$rate"
+    fi
   fi
   if [ "$wan" != none ]; then printf ', wan %s' "$wan"; fi
 }
@@ -184,7 +224,7 @@ if [ -n "$voter_env" ]; then
   tuplesky_suffix+=", with $voter_env"
 fi
 
-key_count=${IN_KEY_COUNT:-}
+key_count=${IN_KEY_COUNT:-${key_count:-}}
 if [ -n "$key_count" ]; then
   case $key_count in
     0 | *[!0-9]*) echo "key-count must be a positive number, not $key_count" >&2; exit 2 ;;
@@ -193,10 +233,10 @@ if [ -n "$key_count" ]; then
     append | wr) ;;
     *) echo "key-count applies to the append and wr workloads, not $workload" >&2; exit 2 ;;
   esac
-  tuplesky_suffix+=", $key_count keys"
+  suffix+=", $key_count keys"
 fi
 
-key_dist=${IN_KEY_DIST:-}
+key_dist=${IN_KEY_DIST:-${key_dist:-}}
 if [ -n "$key_dist" ]; then
   case $key_dist in
     uniform | exponential) ;;
@@ -206,8 +246,31 @@ if [ -n "$key_dist" ]; then
     append | wr) ;;
     *) echo "key-dist applies to the append and wr workloads, not $workload" >&2; exit 2 ;;
   esac
-  tuplesky_suffix+=", $key_dist keys"
+  suffix+=", $key_dist keys"
 fi
+
+read_ratio=${IN_READ_RATIO:-${read_ratio:-}}
+if [ -n "$read_ratio" ]; then
+  if ! [[ $read_ratio =~ ^(0|0?\.[0-9]+|1|1\.0+)$ ]]; then
+    echo "read-ratio must be a number from 0 to 1, not $read_ratio" >&2
+    exit 2
+  fi
+  if [[ $read_ratio =~ ^0?\.?0*$ ]]; then
+    read_ratio=""
+  elif [ "$workload" != wr ]; then
+    echo "read-ratio applies to the wr workload, not $workload" >&2
+    exit 2
+  else
+    suffix+=", read-only ratio $read_ratio"
+  fi
+fi
+
+hold=${IN_HOLD_PEER_LINKS:-0}
+case $hold in
+  0) hold="" ;;
+  *[!0-9]*) echo "hold-peer-links must be a whole number of seconds, not $hold" >&2; exit 2 ;;
+  *) tuplesky_suffix+=", peer links held ${hold} s at start" ;;
+esac
 
 kill_targets=${IN_KILL_TARGETS:-}
 case $kill_targets in
@@ -260,6 +323,8 @@ out=${GITHUB_ENV:-/dev/stdout}
   echo "VOTER_ENV=$voter_env"
   echo "KEY_COUNT=$key_count"
   echo "KEY_DIST=$key_dist"
+  echo "READ_RATIO=$read_ratio"
+  echo "HOLD_PEER_LINKS=$hold"
   echo "KILL_TARGETS=$kill_targets"
   echo "TUPLESKY_SUFFIX=$tuplesky_suffix"
 } >> "$out"

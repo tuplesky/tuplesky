@@ -166,8 +166,10 @@ merged (tuplesky/jepsen#1); a run can name another branch, tag or commit.
 
 The `scenario` input sets the load, the faults and the network for all
 three jobs (`scripts/ci/jepsen_scenario.sh`); a non-empty `workload`,
-`nemesis`, `swiftpaxos`, `wan`, `time-limit` or `concurrency` input
-overrides its value. `concurrency` is Jepsen's: a number of clients, or a
+`nemesis`, `swiftpaxos`, `wan`, `time-limit`, `concurrency` or `rate` input
+overrides its value. `rate` is operations a second over all of a test's
+clients, for every system, and 0 takes the throttle off; a title names it
+(", N/s") when the input or the scenario sets it. `concurrency` is Jepsen's: a number of clients, or a
 multiple of the nodes such as `5n`; a throughput sweep is one run a value.
 Every register workload here runs each key on 2 clients a node, and
 Jepsen refuses a test whose clients do not split evenly into such groups,
@@ -351,7 +353,25 @@ after its share of writes and a fresh one takes its place) through
 is refused. `key-dist` sets how they are picked (Elle's `key-dist`):
 `exponential` by default, each key twice as likely as the one before, so
 a few keys stay hot whatever the count; `uniform` spreads the operations
-evenly over them. The title says ", uniform keys".
+evenly over them. The title says ", uniform keys". `read-ratio` makes
+about that share of the wr workload's transactions read-only, through
+`--read-ratio`: each of its writes becomes a read of the same key. Elle's
+wr transactions pick a read or a write for each operation, half each, so
+0.6 makes about 80% of operations reads; the title says ", read-only
+ratio R". The job writes all three into the etcd test's append and wr
+workloads too, which take no options for them, so etcd runs the same keys
+and the same mix. Runs before the `service` scenario was added kept etcd
+at its 3 exponential keys whatever the input.
+`hold-peer-links` (TupleSky's alone, through `--hold-peer-links`) drops
+every voter's inbound UDP on the peer port for that many seconds from the
+workload's start, while the clients run and the collectors still reach
+every voter on the API plane: a leader's first proposals and the voters'
+votes to each other wait, which is task-d67's start-up row. A hold
+shorter than QUIC's 30 s idle timeout keeps the connections. The title
+says ", peer links held N s at start", and the history's `:hold-peers`
+and `:release-peers` operations mark it. The two TupleSky options need a
+`jepsen-ref` with them (tuplesky/jepsen's `claude/hold-peers-read-ratio`,
+`c4f4650`, and branches on it); a run that asks for one without it stops.
 `kill-targets: leader` makes every TupleSky kill take the leader, through
 `--kill-targets leader`: the voter that led the highest ballot its
 `coordd.log` names ("this voter leads ballot N"), a best-effort reading
@@ -368,6 +388,50 @@ the domain thread and how long each of its steps took, and each restart's
 | `throughput` | register | none | unthrottled, 10 clients a node | the runner's bridge | 120 s |
 | `wan` | append | packet | 20/s, 2 clients a node | three regions | 300 s |
 | `wan-throughput` | register | none | unthrottled, 10 clients a node | three regions | 120 s |
+| `service` | wr, about 80% reads, 1,000 uniform keys | none (no SwiftPaxos) | 300/s, 4 clients | the runner's bridge; `wan: regions` for the WAN row | 300 s |
+
+#### Comparison shapes
+
+`throughput` and the append sweeps are the extremes: register,
+unthrottled, 50 clients and no contention; or 30 closed-loop writers on 3
+to 100 keys. Neither is a coordination service's load. Three shapes read
+TupleSky against etcd on terms that are:
+
+* **`service`:** a fixed total rate both systems can carry, so the
+  comparison is the cost at equal work, the only fair one when etcd
+  saturates the runner and TupleSky does not: p50 and p99 latency at
+  that rate, and CPU per operation, not `ok` a second. A system whose
+  `ok` rate falls short of the 300/s asked has not carried the load, and
+  that is the reading. Under `wan: regions` the protocol's delays show
+  (the clients beside `n1`, as above). One to four clients: `concurrency`
+  1 to 4.
+* **The append shape for etcd:** `workload: append`, `nemesis: none`,
+  `rate: 0`, `concurrency: 30`, and the sweep's `key-count` and
+  `key-dist`, once, so a multiple quoted against etcd for the append
+  sweeps has a denominator of the same shape.
+* **Several domains:** not runnable yet. Ordering is domain-local, so
+  aggregate throughput scales with domains whose leaders sit on different
+  voters, which one etcd cluster cannot do; it is the realistic
+  throughput claim and it has never been run. The harness provisions one
+  domain (`coord-harness provision`, one voter a node on one API and one
+  peer port), and it would take:
+  * provisioning K domains into K directories, each voter of domain i on
+    its own pair of ports, with each domain's voters listed from a
+    different node first so their first leaders spread over the nodes;
+  * `jepsen.tuplesky.db` starting, killing and pausing K voters a node,
+    and collecting each domain's logs and stores;
+  * a client that routes each key to one domain by its hash, with a
+    workload whose every transaction stays in one domain (the register
+    workload, or wr with each transaction's keys drawn from one domain's
+    share), since a transaction across domains is not one TupleSky
+    orders; Elle's check then holds per domain;
+  * a summary that adds `ok` a second and CPU over the domains, and
+    reads each domain's leader.
+
+  On one 4-CPU runner the K domains share its cores, so the scaling to
+  read there is CPU per operation at a fixed rate as K grows, and `ok` a
+  second only up to the runner's CPU; the throughput claim itself wants
+  a larger runner or real hosts.
 
 * **Throughput:** `--rate 0` takes the throttle off in the TupleSky and
   SwiftPaxos tests; each client issues its next operation as soon as the
@@ -458,7 +522,8 @@ and its behaviour under faults have something to be compared with:
   (20 requests a second) and fault interval (30 s) rather than the etcd
   test's defaults (200 and 5 s). The append workload is the same Elle
   list-append over 3 keys, with transactions of up to 4 operations,
-  checked for strict serializability.
+  checked for strict serializability. A run's `key-count`, `key-dist` and
+  `read-ratio` reach the etcd test's workloads too (above).
 * **What differs:** the fault targets are each test's own (etcd's also
   aim at the leader), and after healing the etcd test waits 10 s before
   its final reads, where the TupleSky test waits 60 s.

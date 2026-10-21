@@ -34,9 +34,9 @@ on:
         description: Branch, tag or commit of tuplesky/jepsen to run
         default: main
       scenario:
-        description: "faults (kill, pause, partition at 20/s), throughput (no faults, unthrottled, register), wan (three simulated regions, packet faults) or wan-throughput"
+        description: "faults (kill, pause, partition at 20/s), throughput (no faults, unthrottled, register), wan (three simulated regions, packet faults), wan-throughput, or service (wr at about 80% reads, 1000 uniform keys, 300/s from 4 clients, no faults; etcd at the same rate)"
         type: choice
-        options: [faults, throughput, wan, wan-throughput]
+        options: [faults, throughput, wan, wan-throughput, service]
         default: faults
       workload:
         description: "append, wr or register; empty for the scenario's"
@@ -51,7 +51,10 @@ on:
         description: "Seconds of workload before healing; empty for the scenario's (300, or 120 for throughput)"
         default: ""
       concurrency:
-        description: "Clients, as a number or a multiple of the nodes such as 5n; empty for the scenario's (2n, or 10n for throughput)"
+        description: "Clients, as a number or a multiple of the nodes such as 5n; empty for the scenario's (2n, 10n for throughput, 4 for service)"
+        default: ""
+      rate:
+        description: "Operations a second over all clients, for every system (0 for unthrottled); empty for the scenario's (20, 0 for throughput, 300 for service)"
         default: ""
       nodes:
         description: Voters (containers), 3 or 5
@@ -79,13 +82,19 @@ on:
         description: "An environment variable every TupleSky voter starts with in every run, as NAME=VALUE (through jepsen.tuplesky's --voter-env), such as COORDD_ACK_FREQUENCY=8,25000; empty for none"
         default: ""
       key-count:
-        description: "Keys in play at once in TupleSky's append or wr workload (Elle's key-count, through jepsen.tuplesky's --key-count); empty for the harness's 3"
+        description: "Keys in play at once in the append or wr workload, TupleSky's (through jepsen.tuplesky's --key-count) and etcd's (the job sets its workload's key-count); empty for the scenario's: the harnesses' 3, or 1000 for service"
         default: ""
       key-dist:
-        description: "How TupleSky's append or wr workload picks among those keys (Elle's key-dist, through jepsen.tuplesky's --key-dist): uniform, or exponential (a few hot keys); empty for the harness's exponential"
+        description: "How the append or wr workload picks among those keys, TupleSky's (through --key-dist) and etcd's: uniform, or exponential (a few hot keys); empty for the scenario's: exponential, or uniform for service"
         default: ""
       kill-targets:
         description: "Which voters TupleSky's kills take (through jepsen.tuplesky's --kill-targets): leader (the voter leading the highest ballot, from the voters' logs; needs kill among the faults), or empty for one, a majority or all at random"
+        default: ""
+      read-ratio:
+        description: "The share of the wr workload's transactions made read-only, TupleSky's (through --read-ratio) and etcd's, 0 to 1: 0.6 makes about 80% of operations reads; empty for the scenario's (Elle's mix, or 0.6 for service)"
+        default: ""
+      hold-peer-links:
+        description: "Seconds every TupleSky voter's inbound peer-plane traffic is dropped from the workload's start, the collectors still reaching every voter (through --hold-peer-links; task-d67's start-up row); empty or 0 for none"
         default: ""
       pair-base:
         description: "Run TupleSky in pairs on one runner against this base: a tuplesky ref (a branch, a tag or a full commit SHA, which actions/checkout needs whole) built beside the head, or env:NAME=VALUE for the head's own build with that variable on every voter; empty for one run"
@@ -148,6 +157,9 @@ env:
   IN_KEY_COUNT: ${{ inputs.key-count }}
   IN_KEY_DIST: ${{ inputs.key-dist }}
   IN_KILL_TARGETS: ${{ inputs.kill-targets }}
+  IN_RATE: ${{ inputs.rate }}
+  IN_READ_RATIO: ${{ inputs.read-ratio }}
+  IN_HOLD_PEER_LINKS: ${{ inputs.hold-peer-links }}
   IN_PAIR_BASE: ${{ inputs.pair-base }}
   IN_PAIRS: ${{ inputs.pairs || '3' }}
   IN_LEADER_PROFILE: ${{ inputs.leader-profile || 'false' }}
@@ -374,6 +386,20 @@ jobs:
               exit 1
             fi
             voter+=(--kill-targets "$KILL_TARGETS")
+          fi
+          if [ -n "$READ_RATIO" ]; then
+            if ! grep -q -- '--read-ratio' src/jepsen/tuplesky.clj; then
+              echo "::error::tuplesky/jepsen@$JEPSEN_REF has no --read-ratio; dispatch with a jepsen-ref that has it, or no read-ratio"
+              exit 1
+            fi
+            voter+=(--read-ratio "$READ_RATIO")
+          fi
+          if [ -n "$HOLD_PEER_LINKS" ]; then
+            if ! grep -q -- '--hold-peer-links' src/jepsen/tuplesky.clj; then
+              echo "::error::tuplesky/jepsen@$JEPSEN_REF has no --hold-peer-links; dispatch with a jepsen-ref that has it, or no hold-peer-links"
+              exit 1
+            fi
+            voter+=(--hold-peer-links "$HOLD_PEER_LINKS")
           fi
           common=(lein run test
             --nodes-file "$RUNNER_TEMP/cluster/nodes"
@@ -701,14 +727,17 @@ jobs:
           open(path, "w").write(src)
           PY
           grep -n 'cu/signal!' src/jepsen/etcd/db.clj
-      - name: Give the etcd test the TupleSky test's kill schedule and network
+      - name: Give the etcd test the TupleSky test's kill schedule, network and keys
         # The combined nemesis draws kill/start and pause/resume from one
         # mix, so a start can wait minutes after a kill. jepsen.tuplesky
         # staggers the two on their own (jepsen.tuplesky.nemesis); the
         # baseline loads the same namespace so both tests keep one schedule.
         # With jepsen.tuplesky.wan, it also takes the same --wan profile
         # and packet fault: a --wan option, :packet among its faults, and
-        # the WAN nemesis in place of Jepsen's packet package.
+        # the WAN nemesis in place of Jepsen's packet package. Its append
+        # and wr workloads take the run's key count and distribution, and
+        # its wr workload the read ratio, as jepsen.tuplesky's do; the etcd
+        # test has no options for them, so they are written in.
         run: |
           mkdir -p etcd-test/src/jepsen/tuplesky
           cp jepsen/tuplesky/src/jepsen/tuplesky/nemesis.clj etcd-test/src/jepsen/tuplesky/
@@ -718,7 +747,7 @@ jobs:
             wan=true
           fi
           python3 - etcd-test/src/jepsen "$wan" <<'PY'
-          import sys
+          import os, sys
           root, wan = sys.argv[1], sys.argv[2] == "true"
           def edit(path, edits):
               src = open(path).read()
@@ -736,6 +765,37 @@ jobs:
                "            [jepsen.nemesis [combined :as nc]"),
               ("    (-> (nc/nemesis-packages opts)", f"    (-> {packages}"),
           ])
+          keys = "{:key-count         " + (os.environ.get("KEY_COUNT") or "3")
+          if os.environ.get("KEY_DIST"):
+              keys += "\n                   :key-dist          :" + os.environ["KEY_DIST"]
+          edit(f"{root}/etcd/append.clj", [("{:key-count         3", keys)])
+          wr = [("{:key-count         3", keys)]
+          ratio = os.environ.get("READ_RATIO")
+          if ratio:
+              # jepsen.tuplesky/with-read-ratio, written in: clojure.core's
+              # rand, since this namespace may load before jepsen.random.
+              wr += [
+                  ("(defn workload\n",
+                   "(defn- with-read-ratio\n"
+                   "  \"Makes about `ratio` of the workload's transactions read-only\n"
+                   "  (jepsen.tuplesky/with-read-ratio, from the TupleSky workflow).\"\n"
+                   "  [ratio workload]\n"
+                   "  (update workload :generator\n"
+                   "          (fn [g]\n"
+                   "            (jepsen.generator/map\n"
+                   "              (fn [op]\n"
+                   "                (if (< (rand) ratio)\n"
+                   "                  (update op :value\n"
+                   "                          (fn [txn] (mapv (fn [[f k _ :as mop]]\n"
+                   "                                            (if (= :w f) [:r k nil] mop))\n"
+                   "                                          txn)))\n"
+                   "                  op))\n"
+                   "              g))))\n\n"
+                   "(defn workload\n"),
+                  ("  (assoc (wr/test {", f"  (with-read-ratio {ratio}\n  (assoc (wr/test {{"),
+                  (":client (TxnClient. nil)))", ":client (TxnClient. nil))))"),
+              ]
+          edit(f"{root}/etcd/wr.clj", wr)
           if wan:
               edit(f"{root}/etcd.clj", [
                   ("    :clock :member})", "    :clock :member :packet})"),
@@ -749,6 +809,7 @@ jobs:
               ])
           PY
           grep -n 'tn/' etcd-test/src/jepsen/etcd/nemesis.clj
+          grep -n -A1 ':key-count\|read-ratio' etcd-test/src/jepsen/etcd/{append,wr}.clj
           grep -n 'wan' etcd-test/src/jepsen/etcd.clj || true
       - name: Stand the cluster up
         # With store tmpfs, /opt, which holds etcd's binary and data
@@ -813,7 +874,9 @@ jobs:
 
   swiftpaxos-baseline:
     name: SwiftPaxos baseline (docker cluster)
-    if: ${{ (inputs.swiftpaxos || 'pause,partition') != 'skip' }}
+    # The service scenario skips it: SwiftPaxos runs only the register
+    # workload.
+    if: ${{ (inputs.swiftpaxos || (inputs.scenario == 'service' && 'skip') || 'pause,partition') != 'skip' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
