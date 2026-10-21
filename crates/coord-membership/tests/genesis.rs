@@ -298,12 +298,16 @@ fn a_signed_genesis_initializes_pinned_membership() {
     assert_eq!(init.membership.epoch().get(), 1);
     let again = initialize(&verified, &mut store).unwrap();
     assert!(!again.first_boot);
+    // Five voters, not four: another manifest the design allows
+    // (task-d31).
     let mut other_manifest = manifest.clone();
-    other_manifest.voters.push(VoterSeed {
-        node: hex(&[4; 16]),
-        incarnation: 1,
-        public_key: spki(&voter_certs[0]),
-    });
+    for n in [4u8, 5] {
+        other_manifest.voters.push(VoterSeed {
+            node: hex(&[n; 16]),
+            incarnation: 1,
+            public_key: spki(&voter_certs[0]),
+        });
+    }
     let other_signed = sign_genesis(&other_manifest, &admin.enc).unwrap();
     let other_verified = verify_genesis(&other_signed, &pinned(&admin), 1).unwrap();
     assert!(matches!(

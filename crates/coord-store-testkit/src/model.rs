@@ -83,6 +83,10 @@ struct Shared {
     durable: Rows,
     /// Per-transaction durable flag for lost-on-crash accounting.
     volatile_txns: BTreeSet<u64>,
+    /// Working commits (task-j06) not yet made durable: visible, lost on
+    /// a crash, and persisted, all of them, by the next durable commit or
+    /// `sync_working`, as redb persists its `Durability::None` commits.
+    working_txns: BTreeSet<u64>,
     /// Pending rows of the open transaction (for the early-visibility misbehavior).
     open_pending: Option<Pending>,
     events: Vec<ModelEvent>,
@@ -162,8 +166,11 @@ impl ModelEngine {
     /// Crash and reopen: everything not durable is lost.
     pub fn crash_and_reopen(&mut self) {
         let mut s = self.shared.lock().unwrap();
-        let lost: Vec<u64> = s.volatile_txns.iter().copied().collect();
+        let mut lost: Vec<u64> = s.volatile_txns.iter().copied().collect();
+        lost.extend(s.working_txns.iter().copied());
+        lost.sort_unstable();
         s.volatile_txns.clear();
+        s.working_txns.clear();
         s.visible = s.durable.clone();
         s.open_pending = None;
         s.events.push(ModelEvent::Reopened { lost });
@@ -173,6 +180,18 @@ impl ModelEngine {
     /// Recorded events.
     pub fn events(&self) -> Vec<ModelEvent> {
         self.shared.lock().unwrap().events.clone()
+    }
+
+    /// Visible rows as `(collection, key, value)`: the durable ones and
+    /// every commit since that a crash would lose.
+    pub fn visible_rows(&self) -> Vec<(u16, Vec<u8>, Vec<u8>)> {
+        self.shared
+            .lock()
+            .unwrap()
+            .visible
+            .iter()
+            .map(|((c, k), v)| (*c, k.clone(), v.clone()))
+            .collect()
     }
 
     /// Durable rows as `(collection, key, value)`.
@@ -427,7 +446,17 @@ impl WriteTxn for ModelWrite<'_> {
         Ok(())
     }
 
-    fn commit_durable(mut self) -> Result<(), CommitFailure> {
+    fn commit_durable(self) -> Result<(), CommitFailure> {
+        self.commit(true)
+    }
+
+    fn commit_working(self) -> Result<(), CommitFailure> {
+        self.commit(false)
+    }
+}
+
+impl ModelWrite<'_> {
+    fn commit(mut self, durable: bool) -> Result<(), CommitFailure> {
         self.finished = true;
         let mut s = self.engine.shared.lock().unwrap();
         let script = s.scripts.pop_front().unwrap_or(CommitScript::Durable);
@@ -457,7 +486,15 @@ impl WriteTxn for ModelWrite<'_> {
             CommitScript::Durable => {
                 apply(&mut s.visible, &self.pending, limit);
                 s.events.push(ModelEvent::Visible { txn });
-                if false_durability {
+                if !durable {
+                    s.working_txns.insert(txn);
+                } else if !s.working_txns.is_empty() && !false_durability {
+                    // A durable commit persists the working commits
+                    // before it with its own rows.
+                    s.working_txns.clear();
+                    s.durable = s.visible.clone();
+                    s.events.push(ModelEvent::Durable { txn });
+                } else if false_durability {
                     s.volatile_txns.insert(txn);
                 } else {
                     apply(&mut s.durable, &self.pending, limit);
@@ -481,7 +518,12 @@ impl WriteTxn for ModelWrite<'_> {
             CommitScript::Indeterminate { applied } => {
                 if applied {
                     apply(&mut s.visible, &self.pending, limit);
-                    apply(&mut s.durable, &self.pending, limit);
+                    if !s.working_txns.is_empty() {
+                        s.working_txns.clear();
+                        s.durable = s.visible.clone();
+                    } else {
+                        apply(&mut s.durable, &self.pending, limit);
+                    }
                     s.events.push(ModelEvent::Visible { txn });
                     s.events.push(ModelEvent::Durable { txn });
                 }
@@ -537,5 +579,23 @@ impl LocalEngine for ModelEngine {
             pending: BTreeMap::new(),
             finished: false,
         })
+    }
+
+    const WORKING_STATE: bool = true;
+
+    fn sync_working(&mut self) -> Result<(), CommitFailure> {
+        let mut s = self.shared.lock().unwrap();
+        if !s.working_txns.is_empty() {
+            s.working_txns.clear();
+            s.durable = s.visible.clone();
+        }
+        Ok(())
+    }
+}
+
+impl ModelEngine {
+    /// Working commits (task-j06) not yet made durable.
+    pub fn working_commits(&self) -> usize {
+        self.shared.lock().unwrap().working_txns.len()
     }
 }

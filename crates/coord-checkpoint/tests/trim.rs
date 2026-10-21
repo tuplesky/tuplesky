@@ -1193,6 +1193,104 @@ fn recovery_after_a_trim_knows_how_far_the_store_executed() {
 }
 
 #[test]
+fn a_voter_with_more_protocol_rows_than_the_schema_budget_recovers() {
+    // Recovery charged every protocol row to the schema's view budget
+    // (10,000 rows), and `coordd` treats a recovery error as fatal: a
+    // healthy voter whose history outgrew the budget could never start
+    // again (task-d05; the five-node Jepsen run's ballot-1 leader). The
+    // budget bounds a page; recovery reads every row the store holds.
+    let e = epoch(EPOCH);
+    let owed = ViewBudget::SCHEMA.max_rows as usize + 1_000;
+    let placeholder = CommandRecord {
+        payload: None,
+        ..record(Phase::PreAccept, &[])
+    };
+    let encoded = encode_dependency(&placeholder).unwrap();
+    let mut rows: Vec<Row> = common_rows().into_iter().chain(identity_rows()).collect();
+    for i in 0..owed {
+        let mut id = [0xa5; 32];
+        id[..8].copy_from_slice(&(i as u64).to_be_bytes());
+        rows.push((
+            Collection::ProtocolV1,
+            dependency_key(e, &CommandId(Digest32(id))),
+            encoded.clone(),
+        ));
+    }
+    let mut engine = ModelEngine::new();
+    seed(&mut engine, rows);
+    let view = engine.reader().snapshot().unwrap();
+    let recovered = read_protocol(&view, e, ViewBudget::SCHEMA)
+        .expect("recovery is not bounded by the schema's view budget");
+    assert_eq!(recovered.records.len(), owed, "every row is read");
+    // Pages of any size read the same rows.
+    let paged = read_protocol(
+        &view,
+        e,
+        ViewBudget {
+            max_rows: 7,
+            max_bytes: 4096,
+        },
+    )
+    .unwrap();
+    assert_eq!(paged.records, recovered.records);
+}
+
+#[test]
+fn a_record_that_names_a_trimmed_command_executes_after_a_restart() {
+    // A trim removes the dependency rows of an executed prefix and keeps
+    // its executed rows. Recovery read executed identities only through
+    // the dependency rows, so a trimmed command came back unknown, and a
+    // record written after the trim that names it -- the first proposal
+    // after a reclaim names the retired latest -- failed the execution
+    // guard on every restart (task-d05).
+    let mut engine = trimmable_store();
+    trim_to_completion(&mut engine, &TrimLimits::default());
+    let e = epoch(EPOCH);
+    assert!(
+        !protocol_keys(&engine).contains(&dependency_key(e, &command(8))),
+        "the fixture trims command 8's dependency row"
+    );
+    // Command 9 arrives after the trim, committed, naming command 8.
+    apply(
+        &mut engine,
+        &[
+            StoreUpdate {
+                collection: Collection::ProtocolV1.id(),
+                key: dependency_key(e, &command(9)),
+                value: Some(encode_dependency(&record(Phase::Commit, &[8])).unwrap()),
+            },
+            StoreUpdate {
+                collection: Collection::PayloadV1.id(),
+                key: payload_key(&command(9)),
+                value: Some(encode_payload(&payload_of(9)).unwrap()),
+            },
+        ],
+    );
+    let view = engine.reader().snapshot().unwrap();
+    let recovered = read_protocol(&view, e, ViewBudget::default()).unwrap();
+    for n in [7u8, 8] {
+        assert!(
+            recovered.history.contains(&command(n)),
+            "command {n} was executed, and its executed row says so"
+        );
+    }
+    // A table restored the way `coordd` restores one answers EXECUTED for
+    // the trimmed command, so the record naming it passes the guard.
+    let mut table = coord_consensus::CommandTable::restore(Some(32), recovered.records.clone());
+    for c in recovered
+        .history
+        .iter()
+        .chain(recovered.executed.iter().map(|(c, _)| c))
+    {
+        table.restore_executed(c);
+    }
+    assert_eq!(table.phase_of(&command(8)), Some(Phase::Executed));
+    table
+        .execute(command(9))
+        .expect("a record naming a trimmed command executes");
+}
+
+#[test]
 fn a_trim_keeps_every_dependency_a_retained_command_can_reach() {
     // Pinning only direct dependencies left a retained command able to
     // reach an executed command whose own dependency had been deleted,
@@ -2126,4 +2224,70 @@ fn trimming_never_removes_a_seal_row() {
             "the seal of epoch {epoch_of} was rewritten"
         );
     }
+}
+
+#[test]
+fn a_trimmed_history_comes_back_in_the_order_it_executed() {
+    // A restart replays the executed identities into the table, and the
+    // last one replayed is what a new leader chains its first proposals
+    // after when its selection gives it nothing to follow. Read in key
+    // order, the trimmed history ended at whichever identity sorts
+    // highest, and on a replica with nothing but history the chain forked
+    // there (task-d12).
+    let mut engine = trimmable_store();
+    trim_to_completion(&mut engine, &TrimLimits::default());
+    let e = epoch(EPOCH);
+    let view = engine.reader().snapshot().unwrap();
+    let before = read_protocol(&view, e, ViewBudget::default()).unwrap();
+    assert!(before.history.len() > 1, "the fixture trims a prefix");
+    // The trimmed commands' positions, reversed against their key order
+    // and kept within the prefix they occupy.
+    let mut positions: Vec<ExecutionPosition> = before
+        .history
+        .iter()
+        .map(|c| {
+            let bytes = view
+                .get(Collection::ExecutedV1.id(), &codecs::executed_key(c))
+                .unwrap()
+                .expect("an executed row");
+            codecs::decode_executed(&bytes).unwrap().position
+        })
+        .collect();
+    positions.sort_unstable();
+    let mut by_key = before.history.clone();
+    by_key.sort_unstable();
+    let rewrites: Vec<StoreUpdate> = by_key
+        .iter()
+        .zip(positions.iter().rev())
+        .map(|(c, at)| StoreUpdate {
+            collection: Collection::ExecutedV1.id(),
+            key: codecs::executed_key(c),
+            value: Some(
+                codecs::encode_executed(&ExecutedRecordV1 {
+                    position: *at,
+                    revision: None,
+                    result_digest: Digest32([0; 32]),
+                })
+                .unwrap(),
+            ),
+        })
+        .collect();
+    apply(&mut engine, &rewrites);
+    let view = engine.reader().snapshot().unwrap();
+    let recovered = read_protocol(&view, e, ViewBudget::default()).unwrap();
+    let executed_last = *by_key.first().unwrap();
+    assert_eq!(
+        recovered.history.last(),
+        Some(&executed_last),
+        "history in execution order, not key order: {:?}",
+        recovered.history
+    );
+    // A replica whose every executed row lost its dependency row replays
+    // history alone; its last executed command is the one that executed
+    // last.
+    let mut table = coord_consensus::CommandTable::restore(Some(32), Vec::new());
+    for c in &recovered.history {
+        table.restore_executed(c);
+    }
+    assert_eq!(table.last_executed(), Some(executed_last));
 }

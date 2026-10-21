@@ -239,6 +239,11 @@ impl BoundFrontend {
             (Action::Pending { command }, Some((key, logical))) => {
                 self.remember(*key, *command, logical);
             }
+            // A read sent to the leader barrier is disclosed through the
+            // same gate, with the same metadata (task-d50).
+            (Action::Read(r), Some((key, logical))) => {
+                self.remember(*key, r.command, logical);
+            }
             _ => {}
         }
         let action = match action {
@@ -633,6 +638,10 @@ impl BoundFrontend {
         }
     }
 
+    /// Withhold an executed command's result: `OUTPUT_WITHHELD`, never
+    /// `NOT_ADMITTED` (task-d23). The command was admitted and executed;
+    /// telling the caller it was not would have it take a write that
+    /// happened for one that did not.
     fn deny(&mut self, delivery: Delivery, command: coord_types::CommandId) -> Delivery {
         self.denied += 1;
         Delivery {
@@ -640,7 +649,7 @@ impl BoundFrontend {
             retry_key: delivery.retry_key,
             frame: MessageV1::Response(codes::error_response(
                 command,
-                codes::NOT_ADMITTED,
+                codes::OUTPUT_WITHHELD,
                 "output not authorized by current policy",
             ))
             .encode()

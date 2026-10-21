@@ -57,6 +57,14 @@ the voter published to its frontend peer identity: `LeaderReply`,
 `FastAck` or `SlowAck`. Anything else in an `Evidence` frame is
 `NotEvidence` and is not counted.
 
+A frontend with a voter beside it sends a Range without an explicit
+revision to the leader of the ballot it follows as `Read` (`0x0107`),
+and answers it from that leader's `ReadAnswer` (`0x0702`) only when the
+answer is `Served` and comes from that leader; a refusal, an answer from
+anyone else or no answer within 1.5 s orders the read as a `Submit`
+instead (task-d50). The answer goes through the same output gate as an
+ordered result.
+
 ## Admission
 
 A request enters through the admission interface with the connection's
@@ -228,6 +236,14 @@ as `SettledFromRecord` followed by the `Released` it produced, whose
   outcome; `Pending` while bound and collecting; `Err
   RequestIdentityConflict` when the key is bound to another command;
   `Unknown` for an identity never seen here or beyond the retained window.
+  `coordd` asks its durable record first (task-d23): the executed result,
+  gated against the request its payload row names; `Err OutputWithheld`
+  (`0x0007`) when the caller may not read it; `Err ResultRetired`
+  (`0x0008`) at or below the retirement floor, including for a session
+  retired or whose trust rule is disabled, whose floor row outlives its
+  retry rows. What the record does not
+  settle, and a result whose payload row is gone, is the collector's to
+  answer as above.
 
 ## Ballot changes
 

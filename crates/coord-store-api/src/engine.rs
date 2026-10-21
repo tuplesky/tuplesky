@@ -218,6 +218,25 @@ pub trait WriteTxn: OrderedRead + Sized {
     /// Commit with the whole transaction's qualified durability. This is the
     /// only success an actor may rely on.
     fn commit_durable(self) -> Result<(), CommitFailure>;
+
+    /// Commit atomically and make the transaction visible, without
+    /// waiting for it to be durable (task-j06, Section 17.3.4's
+    /// `journaled-replay`).
+    ///
+    /// A crash may roll the engine back to its last durable commit, never
+    /// into the middle of one: what survives is a prefix of the commits,
+    /// each whole. That is all a caller may assume, so only the journaled
+    /// coordinator calls this, on an engine whose commits the journal
+    /// already holds and replays from the engine's applied stamp, and only
+    /// where [`LocalEngine::WORKING_STATE`] says the engine has the
+    /// capability. [`LocalEngine::sync_working`] makes the working commits
+    /// so far durable.
+    ///
+    /// The default commits durably: an engine without the capability
+    /// returns a stronger success, never a weaker one.
+    fn commit_working(self) -> Result<(), CommitFailure> {
+        self.commit_durable()
+    }
 }
 
 /// Source of pinned cross-collection snapshots.
@@ -243,18 +262,34 @@ pub trait LocalEngine: Send + 'static {
 
     /// Begin the unique write transaction.
     fn begin_write(&mut self) -> Result<Self::Write<'_>, EngineError>;
-}
 
-/// Reserved capability (task-j06): atomic working-state application without
-/// per-transaction sync, valid only under a published durable checkpoint
-/// plus durable redo. Deliberately distinct from [`WriteTxn::commit_durable`];
-/// no engine implements it until that task's qualification.
-pub trait AtomicWorkingState: LocalEngine {
-    /// Apply atomically with visibility but without qualified durability.
-    fn commit_working(
-        &mut self,
-        updates: &[coord_core::effect::StoreUpdate],
-    ) -> Result<(), CommitFailure>;
+    /// The journal is this engine's redo log from now on (task-d48,
+    /// Section 17.3.4): every transition the engine commits is already
+    /// journal-durable, and start-up re-lowers the journal above the
+    /// engine's applied stamp. [`WriteTxn::commit_durable`] stays durable;
+    /// an engine may only change how it detects a commit a crash tore, as
+    /// long as such a commit rolls back to the one before it. Called by
+    /// the journaled coordinator when it attaches the engine; nothing else
+    /// may call it. The default changes nothing.
+    fn commit_under_journal(&mut self) {}
+
+    /// Whether [`WriteTxn::commit_working`] may return before its commit
+    /// is durable (task-j06): the atomic working-state capability of
+    /// Section 17.3.4. An engine without it commits durably whichever
+    /// commit it is asked for, and the journaled coordinator refuses the
+    /// replay-backed profile over it rather than run it as if it had.
+    const WORKING_STATE: bool = false;
+
+    /// Make every working commit so far durable (task-j06): after this
+    /// returns, a crash rolls back no further than the last commit made
+    /// before it. A failure makes nothing durable that was not; the
+    /// working commits stay visible, and the caller retries or stops.
+    ///
+    /// The default has nothing to do: without the capability every
+    /// commit was durable when it returned.
+    fn sync_working(&mut self) -> Result<(), CommitFailure> {
+        Ok(())
+    }
 }
 
 /// Reserved capability (task-j04): publish a durable local checkpoint of the

@@ -54,6 +54,7 @@ claimed as qualification (Section 22.2).
 | proptest | =1.11.0 | std | dev-dependency only |
 | loom | =0.7.2 | default | linked only under `cfg(loom)` (never set in production builds); the policy filters metadata by platform |
 | tempfile | =3.27.0 | default | dev-dependency only |
+| mimalloc (libmimalloc-sys 0.1.49) | =0.1.52 | none (no default) | `coordd`'s global allocator (task-d60); MIT; builds the bundled mimalloc C sources with `cc`: without the `v2` feature that is mimalloc v3.3.2 (`c_src/mimalloc/v3`), so the memory behaviour measured for task-d60 is v3's; the `v2` feature (mimalloc v2.3.2) is the one-line A/B |
 
 Candidates not yet consumed by any crate (quinn, rustls, tokio, fjall, the
 OIDC/JWT/HTTP stack, keyring stores, telemetry, loom, criterion, fuzzing) are
@@ -179,7 +180,10 @@ Observed transitive facts (from the task-01 audit, still true at task-j02):
 | Rust minimum 1.90 | MSRV stays 1.90; exact toolchain 1.94.1 | raft-engine's own `rust-version` is 1.85; all workspace crates check with 1.90.0 |
 | openidconnect 4.0.1, reqwest 0.12.28 and the other unused candidates | Not added yet | Added by first consuming task with exact pins; presence in the index was confirmed on 2026-09-18 |
 | fjall 3.1.10 | Pinned at `=3.1.10` with `default-features = false, features = ["lz4"]` (task-s03) | The candidate resolves as pinned; its graph adds xxhash-rust (BSL-1.0) and varint-rs (0BSD), both permissive and now allowed in `deny.toml` with the reason recorded there. Fjall 3 has no `open_existing`: `Database::open` creates a missing database, so the adapter's lifecycle checks the directory and version marker itself before opening (opening never initializes) |
-| rustls 0.23.44 | Pinned at `=0.23.45` | RUSTSEC-2026-0285 (TLS 1.3 handshake messages accepted across encryption-level boundaries) is patched in 0.23.45; quinn 0.11.11 and quinn-proto 0.11.17 accept it, and no other selection changes |
+| rustls 0.23.44 | Pinned at `=0.23.46` | RUSTSEC-2026-0285 (TLS 1.3 handshake messages accepted across encryption-level boundaries) is patched in 0.23.45, and RUSTSEC-2026-0347 (application data after an ECH rejection), RUSTSEC-2026-0348 (Brotli certificate decompression window) and RUSTSEC-2026-0349 (key-share prediction recorded before authentication) in 0.23.46; quinn 0.11.11 and quinn-proto 0.11.17 accept it, and no other selection changes |
+| quinn-proto 0.11.17 | Pinned at `=0.11.18` | RUSTSEC-2026-0338 (zero-length STREAM frames during unordered reads), RUSTSEC-2026-0340 (a peer's minimum ACK delay with ACK_FREQUENCY) and RUSTSEC-2026-0343 (outgoing datagram buffer accounting) are patched in 0.11.18; quinn 0.11.11 accepts it, and no other selection changes |
+| rustls-webpki 0.103.15 | Locked at 0.103.16 (`cargo update -p rustls-webpki --precise 0.103.16`) | RUSTSEC-2026-0382 (certificate paths through distrusted emSign intermediates) is patched in 0.103.16; a dependency of rustls only, so the lockfile carries it, and no other selection changes |
+| webpki-roots 1.0.9 | Locked at 1.0.10 (`cargo update -p webpki-roots --precise 1.0.10`) | RUSTSEC-2026-0381 (the bundled `emSign ECC Root CA - G3`, which trusts those intermediates) is fixed in 1.0.10, which removes the root; a dependency of reqwest's `rustls-tls-webpki-roots-no-provider` only, so the lockfile carries it, and no other selection changes |
 | `toml` requirement `=1.1.6` | Kept | Resolves to `1.1.6+spec-1.1.0` |
 | Workspace license `FSL-1.1-ALv2` | `deny.toml` ignores private (`publish = false`) crates | Not an SPDX identifier; not a third-party dependency |
 

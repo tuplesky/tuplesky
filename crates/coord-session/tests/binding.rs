@@ -328,8 +328,11 @@ impl Answered for coord_session::Delivered {
     }
 }
 
+/// The gate withheld an executed command's result: `OUTPUT_WITHHELD`,
+/// never `NOT_ADMITTED`, which would tell the caller the command did not
+/// happen (task-d23).
 fn is_denied(d: &Delivery) -> bool {
-    matches!(outcome_of(d), OutcomeV1::Err { code, .. } if code == codes::NOT_ADMITTED)
+    matches!(outcome_of(d), OutcomeV1::Err { code, .. } if code == codes::OUTPUT_WITHHELD)
 }
 
 fn range_outcome(k: &[u8]) -> Outcome {
@@ -463,7 +466,12 @@ fn an_expired_warm_connection_cannot_admit_and_a_rebind_keeps_the_identity() {
         &hub,
         &domain.policy(),
     ) {
-        Ingress::Action(Action::Respond(d)) => assert!(is_denied(&d)),
+        // Refused at the door: nothing was admitted, so this is not a
+        // withheld result.
+        Ingress::Action(Action::Respond(d)) => assert!(matches!(
+            outcome_of(&d),
+            OutcomeV1::Err { code, .. } if code == codes::NOT_ADMITTED
+        )),
         other => panic!("{other:?}"),
     }
 }

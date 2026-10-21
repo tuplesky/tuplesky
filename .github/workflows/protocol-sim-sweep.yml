@@ -1,0 +1,70 @@
+# Protocol simulator sweep (task-d71, design Section 4.9).
+#
+# Every row of task-d30's simulator at 1,000 seeds per row and size, with
+# catch-up and without: ten times task-d34's bar, so the next hole in a
+# recovery rule is found by the runner rather than by hand. CI's default
+# of 12 seeds per row and size stays in `cargo xtask test`. A failing
+# seed is printed with its row and size; replay it with
+# `PROTOCOL_SIM_ONE=row,voters,seed` and `PROTOCOL_SIM_TRACE=1`, and keep
+# it in `crates/coord-consensus/fixtures/protocol_sim/seeds.json` with
+# what it found.
+name: protocol-sim-sweep
+
+on:
+  workflow_dispatch:
+    inputs:
+      seeds:
+        description: "Seeds per row and size"
+        default: "1000"
+  schedule:
+    # Weekly (Sundays 04:41 UTC), apart from CI's Monday run.
+    - cron: "41 4 * * 0"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  sweep:
+    name: row ${{ matrix.row }} (${{ matrix.catch-up }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        row:
+          - row_1_fill_capacity_and_fail_the_leader
+          - row_2_different_maximum_tentative_sets
+          - row_3_dense_conflicts_and_an_early_missing_dependency
+          - row_4_acknowledgement_before_payload_repeated
+          - row_5_client_or_collector_dies_mid_dissemination
+          - row_9_repeated_interrupted_elections
+          - row_10_delayed_old_ballot_messages
+          - row_12_loss_beyond_the_repair_cache_window
+          - row_14_lost_responses_and_retries_under_one_identity
+        catch-up: [catch-up, no-catch-up]
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - name: Install the exact Rust toolchain from rust-toolchain.toml
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          cargo --version && rustc --version
+      - uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1 # v2.8.1
+        with:
+          key: protocol-sim-sweep
+      - name: Build the simulator (release)
+        run: cargo test --locked --release -p coord-consensus --test protocol_sim --no-run
+      - name: Sweep
+        env:
+          PROTOCOL_SIM_SEEDS: ${{ inputs.seeds || '1000' }}
+          NO_CATCH_UP: ${{ matrix.catch-up == 'no-catch-up' && '1' || '' }}
+          ROW: ${{ matrix.row }}
+        run: |
+          if [ -n "$NO_CATCH_UP" ]; then export PROTOCOL_SIM_NO_CATCH_UP=1; fi
+          cargo test --locked --release -p coord-consensus --test protocol_sim -- \
+            --exact "$ROW" --nocapture

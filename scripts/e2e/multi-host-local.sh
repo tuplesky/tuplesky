@@ -94,9 +94,12 @@ meshed() {
     [ "$(last_count "$(log_of "$n")" "voters submittable=" "$from")" = 2 ]
 }
 
+# The first start of a voter initializes it (`--init`); a restart never
+# does, and is refused if the voter's state is gone.
 start_voter() {
   local n=$1
-  "$COORD_HARNESS" start --dir "$RUN_DIR/hosts/h$n" --node "$n" --coordd "$COORDD" \
+  shift
+  "$COORD_HARNESS" start --dir "$RUN_DIR/hosts/h$n" --node "$n" --coordd "$COORDD" "$@" \
     >> "$RUN_DIR/hosts/h$n/start.log" 2>&1 &
   started+=("$!")
 }
@@ -118,7 +121,7 @@ note "provisioning three voters on ${HOST[*]}, issuer and edge on $CLIENT_HOST"
 for n in 1 2 3; do
   mkdir -p "$RUN_DIR/hosts/h$n"
   cp -R "$RUN_DIR/n$n" "$RUN_DIR/hosts/h$n/"
-  start_voter "$n"
+  start_voter "$n" --init
 done
 for n in 1 2 3; do
   wait_for 60 ready_more_than "$n" 0 ||

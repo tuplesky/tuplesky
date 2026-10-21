@@ -147,4 +147,21 @@ pub enum CollectorEvent {
         /// Pending commands whose evidence was dropped.
         reset: usize,
     },
+    /// A voter refused the submission and said why (task-d22).
+    VoterRefused {
+        /// Command.
+        command: String,
+        /// The voter.
+        from: String,
+        /// `other-command`, `other-facts` or `forgotten`.
+        reason: String,
+    },
+    /// A pending command that held neither half of a release was
+    /// submitted to every voter again (task-d22).
+    Solicited {
+        /// Command.
+        command: String,
+        /// How many times it has been, this one included.
+        times: u32,
+    },
 }

@@ -204,6 +204,26 @@ pub fn floor<V: OrderedRead>(
     }
 }
 
+/// The floor of `key`'s client instance, with its window width taken
+/// from the session record when no floor row exists yet; `None` when the
+/// session is unknown. What [`admit`] measures a request's window from,
+/// before the request's own acknowledgement moves it.
+pub fn session_floor<V: OrderedRead>(
+    view: &V,
+    key: &RetryKey,
+) -> Result<Option<RetryFloorV1>, EngineError> {
+    let Some(session) = session_state(view, &key.session_id)? else {
+        return Ok(None);
+    };
+    floor(
+        view,
+        &key.session_id,
+        &key.client_instance_id,
+        session.window,
+    )
+    .map(Some)
+}
+
 /// Retained record for a retry key.
 pub fn lookup<V: OrderedRead>(
     view: &V,
@@ -318,6 +338,30 @@ pub fn result_digest(response: &[u8]) -> Digest32 {
     HashDomain::CommandResult.digest(&[response])
 }
 
+/// The row saying `command` executed, at `position`, with the result
+/// digested as `result_digest`.
+///
+/// Every executed command has one, whether or not its outcome is bound
+/// under a retry key: a restart replays these rows as the commands this
+/// voter executed, and a command without one comes back unexecuted and is
+/// executed again at another position.
+pub fn executed_update(
+    command: &CommandId,
+    position: coord_types::ids::ExecutionPosition,
+    revision: Option<coord_types::ids::KvRevision>,
+    result_digest: Digest32,
+) -> Result<StoreUpdate, EngineError> {
+    Ok(StoreUpdate {
+        collection: Collection::ExecutedV1.id(),
+        key: codecs::executed_key(command),
+        value: Some(codecs::encode_executed(&ExecutedRecordV1 {
+            position,
+            revision,
+            result_digest,
+        })?),
+    })
+}
+
 /// Rows binding a plan to its invocation: the retry record and the
 /// executed identity. Added to the plan's batch by materialization.
 pub fn binding_updates(
@@ -334,22 +378,13 @@ pub fn binding_updates(
         response,
         result_digest: digest,
     };
-    let executed = ExecutedRecordV1 {
-        position,
-        revision,
-        result_digest: digest,
-    };
     let mut updates = vec![
         StoreUpdate {
             collection: Collection::RetryV1.id(),
             key: codecs::retry_key(&binding.retry_key),
             value: Some(codecs::encode_retry(&record)?),
         },
-        StoreUpdate {
-            collection: Collection::ExecutedV1.id(),
-            key: codecs::executed_key(&binding.command_id),
-            value: Some(codecs::encode_executed(&executed)?),
-        },
+        executed_update(&binding.command_id, position, revision, digest)?,
     ];
     if let Some(retires) = binding.retires {
         updates.extend(retirement_updates(&binding.retry_key, retires)?);

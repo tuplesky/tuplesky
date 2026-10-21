@@ -197,6 +197,22 @@ pub struct Placed {
     pub role: PeerRole,
 }
 
+/// A single-voter domain is the test profile (task-d31): its quorum is
+/// the one voter, which lets one process carry a request through
+/// consensus in a test, and which no deployment survives the loss of.
+/// A build without debug assertions, what ships, refuses it; three or
+/// five voters are what the design allows.
+fn single_voter_profile(membership: &Membership, test_build: bool) -> Result<(), IdentityError> {
+    if membership.voter_count() == 1 && !test_build {
+        return Err(IdentityError::Membership {
+            reason: "a single-voter domain is the test profile, refused by a release build: \
+                     commit three or five voters"
+                .into(),
+        });
+    }
+    Ok(())
+}
+
 /// Read the genesis manifest and this node's certificate, and say who
 /// this node is.
 ///
@@ -214,6 +230,7 @@ pub fn place(
         Membership::from_genesis(&manifest).map_err(|e| IdentityError::Membership {
             reason: format!("{e:?}"),
         })?;
+    single_voter_profile(&membership, cfg!(debug_assertions))?;
 
     let (identity, leaf) = leaf_identity(certificate_path)?;
     // The cluster is checked here and not only at the handshake: a node
@@ -389,4 +406,47 @@ fn leaf_identity(
     Err(IdentityError::NoNodeIdentity {
         path: path.to_owned(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use coord_membership::genesis::{VoterSeed, b64url, hex_id};
+
+    fn membership(count: u8) -> Membership {
+        Membership::from_genesis(&GenesisManifest {
+            cluster: hex_id(&[1; 16]),
+            domain: hex_id(&[2; 16]),
+            epoch: 1,
+            voters: (1..=count)
+                .map(|n| VoterSeed {
+                    node: hex_id(&[n; 16]),
+                    incarnation: 1,
+                    public_key: b64url(&[n; 32]),
+                })
+                .collect(),
+            issuer_roots: vec!["cm9vdA".to_owned()],
+            wif_rules: vec![serde_json::json!({ "issuer": "test" })],
+            admin: hex_id(&[9; 16]),
+            protocol_version: 1,
+        })
+        .expect("membership")
+    }
+
+    /// One voter is the test profile: a test build runs it, a release
+    /// build refuses it by name; three and five run in either (task-d31).
+    #[test]
+    fn a_single_voter_domain_is_refused_by_a_release_build() {
+        assert!(single_voter_profile(&membership(1), true).is_ok());
+        let refused = single_voter_profile(&membership(1), false);
+        assert!(
+            matches!(&refused, Err(IdentityError::Membership { reason }) if reason.contains("test profile")),
+            "{refused:?}"
+        );
+        for count in [3, 5] {
+            for test_build in [true, false] {
+                assert!(single_voter_profile(&membership(count), test_build).is_ok());
+            }
+        }
+    }
 }

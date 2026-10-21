@@ -153,6 +153,21 @@ fn record_shape_is_validated() {
         ),
         // Six voters: one past the design's ceiling of five per active
         // configuration.
+        // Two and four voters: no epoch the design allows (task-d31).
+        (
+            GroupConfigurationV1 {
+                voters: (1..=2).map(voter).collect(),
+                ..g.clone()
+            },
+            ConfigError::UnsupportedVoterCount,
+        ),
+        (
+            GroupConfigurationV1 {
+                voters: (1..=4).map(voter).collect(),
+                ..g.clone()
+            },
+            ConfigError::UnsupportedVoterCount,
+        ),
         (
             GroupConfigurationV1 {
                 voters: (1..=6).map(voter).collect(),
@@ -162,14 +177,14 @@ fn record_shape_is_validated() {
         ),
         (
             GroupConfigurationV1 {
-                voters: vec![voter(2), voter(1)],
+                voters: vec![voter(2), voter(1), voter(3)],
                 ..g.clone()
             },
             ConfigError::VotersNotSortedUnique,
         ),
         (
             GroupConfigurationV1 {
-                voters: vec![voter(1), voter(1)],
+                voters: vec![voter(1), voter(1), voter(3)],
                 ..g.clone()
             },
             ConfigError::VotersNotSortedUnique,

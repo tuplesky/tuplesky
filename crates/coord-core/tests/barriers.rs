@@ -72,7 +72,7 @@ fn two_barrier_effect_cannot_release_after_one() {
         outbox.release(&ballot(1, 1)).is_empty(),
         "one of two barriers is not enough"
     );
-    assert_eq!(outbox.pending().len(), 1);
+    assert_eq!(outbox.held(), 1);
     // Materialization is not journal durability.
     assert!(!outbox.observe(&StorageEvent::Materialized {
         barrier_id: b2,
@@ -85,7 +85,7 @@ fn two_barrier_effect_cannot_release_after_one() {
     assert!(
         matches!(&released[0], Effect::SendWhenDurable { requires, .. } if requires == &vec![b1, b2])
     );
-    assert!(outbox.pending().is_empty());
+    assert_eq!(outbox.held(), 0);
     // Releasing again sends nothing twice.
     assert!(outbox.release(&ballot(1, 1)).is_empty());
 }

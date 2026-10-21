@@ -824,3 +824,294 @@ fn decode_pem(pem: &str) -> Vec<u8> {
     }
     out
 }
+
+/// task-j06: the journal profile is part of what is provisioned. The
+/// strict default writes the `[journal]` this harness has always written;
+/// the replay profile and its cadence are written into every voter's,
+/// and the description records the profile so a run is labelled by what
+/// it ran. A cadence without the replay profile, and a cadence of zero,
+/// are refused before anything is written.
+#[test]
+fn the_journal_profile_is_written_into_every_voter_and_recorded() {
+    use coord_harness::domain::{JournalPlan, JournalProfile};
+    let journal_section = |config: &std::path::Path| {
+        let text = std::fs::read_to_string(config).expect("config");
+        let start = text.find("[journal]\n").expect("a journal section");
+        let rest = &text[start..];
+        let end = rest[1..].find("\n[").map_or(rest.len(), |i| i + 1);
+        rest[..end].to_owned()
+    };
+
+    let dir = tempfile::tempdir().expect("a run directory");
+    let out = provision(&Plan::loopback(dir.path().to_path_buf(), 3, 0)).expect("provisioned");
+    assert_eq!(out.journal_profile, JournalProfile::Strict);
+    for node in &out.voters {
+        assert_eq!(
+            journal_section(&node.config),
+            "[journal]\nroot = \"journal\"\nshards = 1\n"
+        );
+    }
+
+    let dir = tempfile::tempdir().expect("a run directory");
+    let out = provision(&Plan {
+        journal: JournalPlan {
+            profile: JournalProfile::Replay,
+            projection_durable_commits: Some(32),
+            projection_durable_records: None,
+            projection_durable_ms: Some(50),
+        },
+        ..Plan::loopback(dir.path().to_path_buf(), 3, 0)
+    })
+    .expect("provisioned");
+    assert_eq!(out.journal_profile, JournalProfile::Replay);
+    assert_eq!(
+        Provisioned::read(dir.path())
+            .expect("the description")
+            .journal_profile,
+        JournalProfile::Replay
+    );
+    for node in &out.voters {
+        assert_eq!(
+            journal_section(&node.config),
+            "[journal]\nroot = \"journal\"\nshards = 1\nprofile = \"journaled-replay-v1\"\n\
+             projection_durable_commits = 32\nprojection_durable_ms = 50\n"
+        );
+    }
+
+    for journal in [
+        JournalPlan {
+            projection_durable_ms: Some(50),
+            ..JournalPlan::default()
+        },
+        JournalPlan {
+            profile: JournalProfile::Replay,
+            projection_durable_records: Some(0),
+            ..JournalPlan::default()
+        },
+    ] {
+        let dir = tempfile::tempdir().expect("a run directory");
+        let error = provision(&Plan {
+            journal: journal.clone(),
+            ..Plan::loopback(dir.path().to_path_buf(), 3, 0)
+        })
+        .expect_err("refused");
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::InvalidInput,
+            "{journal:?}"
+        );
+        assert!(!dir.path().join("harness.json").exists());
+    }
+
+    // A strict description does not name the profile, as one written
+    // before it was recorded did not, and reads back strict; a replay
+    // one names it.
+    let description = |dir: &std::path::Path| -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(dir.join("harness.json")).expect("read"))
+            .expect("json")
+    };
+    let replayed = out.voters[0]
+        .directory
+        .parent()
+        .expect("the run directory")
+        .to_path_buf();
+    assert_eq!(description(&replayed)["journal_profile"], "replay");
+    let dir = tempfile::tempdir().expect("a run directory");
+    provision(&Plan::loopback(dir.path().to_path_buf(), 1, 0)).expect("provisioned");
+    assert!(description(dir.path()).get("journal_profile").is_none());
+    assert_eq!(
+        Provisioned::read(dir.path())
+            .expect("the description")
+            .journal_profile,
+        JournalProfile::Strict
+    );
+}
+
+/// `coord-harness provision` takes the profile from `--journal-profile`,
+/// and without it from `COORD_HARNESS_JOURNAL_PROFILE` -- the route a
+/// driver that runs the harness from its own environment (Jepsen's control
+/// node) has -- with the flag winning, and a value that names no profile
+/// refused rather than read as strict.
+#[test]
+fn the_binary_takes_the_profile_from_its_flag_or_its_environment() {
+    let binary = env!("CARGO_BIN_EXE_coord-harness");
+    let run = |args: &[&str], env: &[(&str, &str)]| {
+        let dir = tempfile::tempdir().expect("a run directory");
+        let mut command = std::process::Command::new(binary);
+        command
+            .arg("provision")
+            .arg("--dir")
+            .arg(dir.path())
+            .arg("--voters")
+            .arg("3")
+            .args(args);
+        for name in [
+            "COORD_HARNESS_JOURNAL_PROFILE",
+            "COORD_HARNESS_PROJECTION_DURABLE_COMMITS",
+            "COORD_HARNESS_PROJECTION_DURABLE_RECORDS",
+            "COORD_HARNESS_PROJECTION_DURABLE_MS",
+            "COORD_HARNESS_CHECKPOINT_AFTER_RECORDS",
+        ] {
+            command.env_remove(name);
+        }
+        command.envs(env.iter().copied());
+        let output = command.output().expect("ran");
+        let config = std::fs::read_to_string(dir.path().join("n1/coordd.toml")).ok();
+        (output.status.success(), config)
+    };
+    let replay = "profile = \"journaled-replay-v1\"";
+
+    let (ok, config) = run(&[], &[]);
+    assert!(ok);
+    assert!(!config.expect("config").contains("profile ="));
+
+    let (ok, config) = run(&["--journal-profile", "replay"], &[]);
+    assert!(ok);
+    assert!(config.expect("config").contains(replay));
+
+    let (ok, config) = run(
+        &[],
+        &[
+            ("COORD_HARNESS_JOURNAL_PROFILE", "replay"),
+            ("COORD_HARNESS_PROJECTION_DURABLE_MS", "25"),
+        ],
+    );
+    assert!(ok);
+    let config = config.expect("config");
+    assert!(config.contains(replay));
+    assert!(config.contains("projection_durable_ms = 25\n"));
+
+    let (ok, config) = run(
+        &["--journal-profile", "strict"],
+        &[("COORD_HARNESS_JOURNAL_PROFILE", "replay")],
+    );
+    assert!(ok);
+    assert!(!config.expect("config").contains("profile ="));
+
+    // A cadence variable that does not parse is refused, flag or not.
+    let (ok, config) = run(
+        &["--journal-profile", "replay"],
+        &[("COORD_HARNESS_PROJECTION_DURABLE_MS", "soon")],
+    );
+    assert!(!ok, "a cadence that does not parse was accepted");
+    assert!(config.is_none());
+    let (ok, config) = run(&[], &[("COORD_HARNESS_JOURNAL_PROFILE", "fast")]);
+    assert!(!ok, "a profile that names nothing was accepted");
+    assert!(config.is_none());
+    // Nor is one that is not text at all read as strict.
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().expect("a run directory");
+        let output = std::process::Command::new(binary)
+            .arg("provision")
+            .arg("--dir")
+            .arg(dir.path())
+            .arg("--voters")
+            .arg("3")
+            .env(
+                "COORD_HARNESS_JOURNAL_PROFILE",
+                std::ffi::OsStr::from_bytes(b"repl\xffay"),
+            )
+            .output()
+            .expect("ran");
+        assert!(
+            !output.status.success(),
+            "a profile that is not text was accepted"
+        );
+        assert!(!dir.path().join("n1/coordd.toml").exists());
+    }
+}
+
+/// task-d55: how far each voter's journal runs past its last local
+/// checkpoint is part of what is provisioned. Without it nothing is
+/// written and the daemon's default stands; with it every voter gets a
+/// `[limits]` carrying it, and the description records it. The binary
+/// takes it from `--checkpoint-after-records` or, as Jepsen's control
+/// node passes it, from `COORD_HARNESS_CHECKPOINT_AFTER_RECORDS`, and
+/// refuses a variable that does not parse.
+#[test]
+fn the_checkpoint_interval_is_written_into_every_voter_and_recorded() {
+    let dir = tempfile::tempdir().expect("a run directory");
+    let out = provision(&Plan::loopback(dir.path().to_path_buf(), 3, 0)).expect("provisioned");
+    assert_eq!(out.checkpoint_after_records, None);
+    for node in &out.voters {
+        let config = std::fs::read_to_string(&node.config).expect("config");
+        assert!(!config.contains("[limits]"), "{config}");
+    }
+    let description: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.path().join("harness.json")).expect("read"))
+            .expect("json");
+    assert!(description.get("checkpoint_after_records").is_none());
+
+    for n in [0, 65_536] {
+        let dir = tempfile::tempdir().expect("a run directory");
+        let out = provision(&Plan {
+            checkpoint_after_records: Some(n),
+            ..Plan::loopback(dir.path().to_path_buf(), 3, 0)
+        })
+        .expect("provisioned");
+        for node in &out.voters {
+            let config = std::fs::read_to_string(&node.config).expect("config");
+            let limits = &config[config.find("\n[limits]\n").expect("a limits section")..];
+            assert!(
+                limits.contains(&format!("\ncheckpoint_after_records = {n}\n")),
+                "{limits}"
+            );
+        }
+        assert_eq!(
+            Provisioned::read(dir.path())
+                .expect("the description")
+                .checkpoint_after_records,
+            Some(n)
+        );
+    }
+
+    let binary = env!("CARGO_BIN_EXE_coord-harness");
+    let run = |args: &[&str], env: &[(&str, &str)]| {
+        let dir = tempfile::tempdir().expect("a run directory");
+        let output = std::process::Command::new(binary)
+            .arg("provision")
+            .arg("--dir")
+            .arg(dir.path())
+            .arg("--voters")
+            .arg("3")
+            .args(args)
+            .env_remove("COORD_HARNESS_CHECKPOINT_AFTER_RECORDS")
+            .envs(env.iter().copied())
+            .output()
+            .expect("ran");
+        let config = std::fs::read_to_string(dir.path().join("n1/coordd.toml")).ok();
+        (output.status.success(), config)
+    };
+    let (ok, config) = run(&["--checkpoint-after-records", "65536"], &[]);
+    assert!(ok);
+    assert!(
+        config
+            .expect("config")
+            .contains("checkpoint_after_records = 65536\n")
+    );
+    let (ok, config) = run(&[], &[("COORD_HARNESS_CHECKPOINT_AFTER_RECORDS", "0")]);
+    assert!(ok);
+    assert!(
+        config
+            .expect("config")
+            .contains("checkpoint_after_records = 0\n")
+    );
+    let (ok, config) = run(
+        &["--checkpoint-after-records", "8192"],
+        &[("COORD_HARNESS_CHECKPOINT_AFTER_RECORDS", "0")],
+    );
+    assert!(ok);
+    assert!(
+        config
+            .expect("config")
+            .contains("checkpoint_after_records = 8192\n")
+    );
+    let (ok, config) = run(&[], &[("COORD_HARNESS_CHECKPOINT_AFTER_RECORDS", "")]);
+    assert!(ok);
+    assert!(!config.expect("config").contains("[limits]"));
+    let (ok, config) = run(&[], &[("COORD_HARNESS_CHECKPOINT_AFTER_RECORDS", "often")]);
+    assert!(!ok, "an interval that does not parse was accepted");
+    assert!(config.is_none());
+}

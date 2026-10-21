@@ -21,6 +21,7 @@ use coord_core::outbox::{BarrierAllocator, Outbox, PendingSend, ReleaseError};
 use coord_journal_api::engine::ReadBudget;
 use coord_journal_api::failure::JournalFailure;
 use coord_journal_api::frontier::CheckpointPointerV1;
+use coord_journal_api::group::GroupLimits;
 use coord_journal_api::record::{
     JournalRecordV1, LifecycleRecordV1, RecordBody, RecordDraft, RecordError, RecordOrigin,
 };
@@ -286,7 +287,7 @@ fn journal_durability_and_materialization_are_separate_facts_and_visibility_foll
 }
 
 #[test]
-fn one_synced_group_write_carries_at_most_one_batch_from_each_stream() {
+fn one_synced_group_write_carries_every_queued_batch_of_each_stream() {
     let mut world = World::with_domains(&[A, B, C]);
     let before = world.store.journal().appends();
     let first = world.protocol(A, ballot(1), promise(1));
@@ -300,30 +301,41 @@ fn one_synced_group_write_carries_at_most_one_batch_from_each_stream() {
         "one grouped engine write for three streams"
     );
     assert_eq!(world.store.journal().appends() - before, 1);
-    assert_eq!(report.journaled, 3);
-    let durable: BTreeSet<BarrierId> = report
+    assert_eq!(report.journaled, 4);
+    // Each batch keeps its own barrier and its own sequence: A's two
+    // records are one entry, completed once, and reported twice
+    // (task-d47).
+    let durable: Vec<(BarrierId, LocalJournalSeq)> = report
         .events
         .iter()
-        .filter_map(StorageEvent::barrier)
+        .filter_map(|event| match event {
+            StorageEvent::JournalDurable {
+                barrier_id,
+                journal_seq,
+            } => Some((*barrier_id, *journal_seq)),
+            _ => None,
+        })
         .collect();
-    assert_eq!(durable, BTreeSet::from([first, other, third]));
-    // The second transition of A stays queued: initially a stream carries
-    // at most one uncompleted authoritative batch.
-    assert_eq!(world.store.queued(A), 1);
-
-    let report = world.store.append_pending().unwrap();
-    assert_eq!(report.journaled, 1);
     assert_eq!(
-        report.events,
-        vec![StorageEvent::JournalDurable {
-            barrier_id: second,
-            journal_seq: seq(4),
-        }]
+        durable,
+        vec![
+            (first, seq(3)),
+            (second, seq(4)),
+            (other, seq(3)),
+            (third, seq(3))
+        ]
     );
-    // Every stream keeps its own sequence space; nothing is derived from
-    // the engine's byte count.
     for domain in [A, B, C] {
-        world.store.materialize().unwrap();
+        assert_eq!(world.store.queued(domain), 0);
+    }
+    assert_eq!(world.store.append_pending().unwrap().appends, 0);
+    // Every stream keeps its own sequence space; nothing is derived from
+    // the engine's byte count. One projection transaction per domain
+    // takes everything that domain journaled.
+    let report = world.store.materialize().unwrap();
+    assert_eq!(report.commits, 3);
+    assert_eq!(report.materialized, 4);
+    for domain in [A, B, C] {
         assert_eq!(
             world.store.frontiers(domain).unwrap().materialized(),
             world.store.frontiers(domain).unwrap().durable()
@@ -331,6 +343,42 @@ fn one_synced_group_write_carries_at_most_one_batch_from_each_stream() {
     }
     assert_eq!(world.store.frontiers(A).unwrap().durable(), seq(4));
     assert_eq!(world.store.frontiers(B).unwrap().durable(), seq(3));
+}
+
+#[test]
+fn a_group_takes_what_its_bounds_allow_and_leaves_the_rest_queued() {
+    let mut world = World::new();
+    let limit = GroupLimits::DEFAULT.max_records;
+    let barriers: Vec<BarrierId> = (0..limit + 6)
+        .map(|n| world.protocol(A, ballot(1), promise(1 + n as u64)))
+        .collect();
+
+    let report = world.store.append_pending().unwrap();
+    assert_eq!(report.appends, 1);
+    assert_eq!(report.journaled, limit);
+    assert_eq!(world.store.queued(A), 6);
+    let report = world.store.append_pending().unwrap();
+    assert_eq!(report.journaled, 6);
+    assert_eq!(world.store.queued(A), 0);
+    // In submission order, at consecutive sequences, across the two
+    // groups.
+    assert_eq!(
+        report.events.last(),
+        Some(&StorageEvent::JournalDurable {
+            barrier_id: *barriers.last().unwrap(),
+            journal_seq: seq(2 + (limit + 6) as u64),
+        })
+    );
+    world.store.materialize().unwrap();
+    let cut = world.store.recovery_cut(A).unwrap();
+    assert_eq!(
+        read_protocol(&cut, epoch(), ViewBudget::default())
+            .unwrap()
+            .promise
+            .unwrap()
+            .promised,
+        ballot(1 + (limit + 5) as u64)
+    );
 }
 
 #[test]
@@ -363,6 +411,7 @@ fn an_ambiguous_append_is_reconciled_from_the_actual_durable_head_and_never_blin
         world
             .store
             .journal_mut()
+            .unwrap()
             .script_append(AppendScript::Indeterminate { applied });
         let report = world.store.append_pending().unwrap();
         assert!(report.indeterminate);
@@ -526,7 +575,11 @@ fn a_recovery_cut_held_behind_materialization_still_summarizes_every_voting_obli
 #[test]
 fn a_late_old_ballot_completion_updates_bookkeeping_but_never_authorizes_a_new_vote() {
     let mut world = World::new();
-    let old = world.protocol(A, ballot(7), promise(7));
+    // Over the ordinary group budget, so it is appended alone and the
+    // transition behind it stays queued (task-d47 groups the rest).
+    let mut large = promise(7);
+    large.push(kv_update(b"big", &vec![0x5a; 400 * 1024]));
+    let old = world.protocol(A, ballot(7), large);
     // A second old-ballot transition is queued but not submitted yet.
     let queued = world.protocol(A, ballot(7), promise(7));
     // The first append is submitted and its outcome is unknown when the
@@ -534,6 +587,7 @@ fn a_late_old_ballot_completion_updates_bookkeeping_but_never_authorizes_a_new_v
     world
         .store
         .journal_mut()
+        .unwrap()
         .script_append(AppendScript::Indeterminate { applied: true });
     let report = world.store.append_pending().unwrap();
     assert!(report.indeterminate);
@@ -1748,4 +1802,43 @@ fn a_carried_stream_that_goes_back_a_generation_is_refused_across_pages() {
         read: ReadBudget::new(1, 1024 * 1024),
         ..JournalLimits::default()
     });
+}
+
+/// An entry of several records whose append ended uncertain is settled
+/// whole by a reconcile: every record durable or none, never a prefix
+/// (task-d47).
+#[test]
+fn an_uncertain_entry_of_several_records_reconciles_all_or_none() {
+    for applied in [true, false] {
+        let mut world = World::new();
+        let barriers: Vec<BarrierId> = (1..=3)
+            .map(|n| world.protocol(A, ballot(1), promise(n)))
+            .collect();
+        world
+            .store
+            .journal_mut()
+            .unwrap()
+            .script_append(AppendScript::Indeterminate { applied });
+        assert!(world.store.append_pending().unwrap().indeterminate);
+        assert_eq!(world.store.status(A), Some(DomainStatus::JournalUncertain));
+
+        let report = world.store.reconcile(A).unwrap();
+        let settled: Vec<BarrierId> = report
+            .events
+            .iter()
+            .filter_map(StorageEvent::barrier)
+            .collect();
+        assert_eq!(settled, barriers, "applied = {applied}");
+        let durable = report
+            .events
+            .iter()
+            .filter(|e| matches!(e, StorageEvent::JournalDurable { .. }))
+            .count();
+        assert_eq!(durable, if applied { 3 } else { 0 }, "applied = {applied}");
+        assert_eq!(world.store.status(A), Some(DomainStatus::Ready));
+        assert_eq!(
+            world.store.frontiers(A).unwrap().durable(),
+            seq(if applied { 5 } else { 2 })
+        );
+    }
 }

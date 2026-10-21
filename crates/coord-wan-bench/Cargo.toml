@@ -23,15 +23,21 @@ path = "src/lib.rs"
 name = "coord-wan-bench"
 path = "src/bin/coord-wan-bench.rs"
 
+[[bin]]
+name = "coord-register"
+path = "src/bin/coord-register.rs"
+
 [dependencies]
 coord-types.workspace = true
 coord-harness.workspace = true
 coord-membership.workspace = true
 coord-sdk.workspace = true
 coord-session.workspace = true
+coord-state.workspace = true
 coord-store-bench.workspace = true
 coord-transport.workspace = true
 clap.workspace = true
+postcard.workspace = true
 rand_chacha.workspace = true
 rand_core.workspace = true
 rustls.workspace = true

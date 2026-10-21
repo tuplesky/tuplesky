@@ -544,6 +544,58 @@ fn an_admission_refusal_finishes_the_command_it_refuses() {
 }
 
 #[test]
+fn a_refused_command_is_recorded_as_executed() {
+    // A refusal took its position and left no executed row, so a restart
+    // read the command back as unexecuted and executed it again at the
+    // next free position. Positions after it shifted on that voter only,
+    // and a new leader it became chained after the stale command (the
+    // d12-11 divergence, task-d12).
+    let mut applier = applier(ModelEngine::new());
+    let (first, first_record) = payload(1, &put(b"before", b"1"));
+    applier.apply(first, &first_record).unwrap();
+    // An out-of-window sequence: refused at admission.
+    let beyond = 1u64 << 40;
+    let (window, window_record) = payload(beyond, &put(b"k", b"v"));
+    let refused_window = applier.apply(window, &window_record).unwrap();
+    // The establishing operation with no admission: refused before any
+    // admission is consulted.
+    let (mismatch, mut mismatch_record) = payload(2, &req(CanonicalOperation::ConsumeAdmission));
+    mismatch_record.admission = None;
+    let refused_mismatch = applier.apply(mismatch, &mismatch_record).unwrap();
+    let gated = applier.store().reader().snapshot().unwrap();
+    use coord_store_api::engine::OrderedRead as _;
+    for (command, outcome) in [(window, &refused_window), (mismatch, &refused_mismatch)] {
+        let bytes = gated
+            .view()
+            .get(
+                coord_store_api::registry::Collection::ExecutedV1.id(),
+                &coord_storage::codecs::executed_key(&command),
+            )
+            .unwrap()
+            .expect("a refused command executed");
+        let row = coord_storage::codecs::decode_executed(&bytes).unwrap();
+        assert_eq!(row.position, outcome.position);
+        assert_eq!(row.revision, None);
+        assert_eq!(row.result_digest, outcome.result_digest);
+    }
+    // Still nothing under the refused command's retry key.
+    assert!(
+        coord_storage::retry::lookup(gated.view(), &retry_key(beyond))
+            .unwrap()
+            .is_none()
+    );
+    // What a restart replays: every executed command, in the order it
+    // executed.
+    let recovered = coord_storage::protocol::read_protocol(
+        gated.view(),
+        ConfigurationEpoch::new(1).unwrap(),
+        ViewBudget::default(),
+    )
+    .unwrap();
+    assert_eq!(recovered.history, vec![first, window, mismatch]);
+}
+
+#[test]
 fn a_planner_valid_response_always_fits_its_retry_record() {
     // The planner allowed responses four times larger than the envelope
     // that stores the retained result, so a response could plan and then

@@ -78,25 +78,33 @@ fn boot_event() -> Event {
 }
 
 fn follower(me: u8) -> Follower {
+    follower_with(me, 16)
+}
+
+fn follower_with(me: u8, capacity: usize) -> Follower {
     let mut f = Follower::new(FollowerConfig {
         identity: identity(me),
         quorum: quorum(),
         genesis: ballot(0, 0),
         frontend: FRONTEND,
-        capacity: 16,
+        capacity,
     });
     f.step(boot_event());
     f
 }
 
 fn leader() -> Leader {
+    leader_with(16)
+}
+
+fn leader_with(capacity: usize) -> Leader {
     let mut l = Leader::new(
         LeaderConfig {
             identity: identity(0),
             quorum: quorum(),
             genesis: ballot(0, 0),
             frontend: FRONTEND,
-            capacity: 16,
+            capacity,
         },
         None,
         ExecutionPosition::ZERO,
@@ -475,6 +483,7 @@ fn old_ballot_work_is_held_across_recovery_and_required_state_survives_a_crash()
         2,
         ProtocolMessage::NewLeader {
             ballot: ballot(1, 2),
+            executed: coord_types::ids::ExecutionPosition::ZERO,
         },
     ));
     let Effect::Persist(pb) = promise[0].clone() else {
@@ -545,7 +554,8 @@ fn old_ballot_work_is_held_across_recovery_and_required_state_survives_a_crash()
             .step(peer(
                 0,
                 ProtocolMessage::NewLeader {
-                    ballot: ballot(0, 0)
+                    ballot: ballot(0, 0),
+                    executed: coord_types::ids::ExecutionPosition::ZERO,
                 }
             ))
             .is_empty()
@@ -666,8 +676,10 @@ fn payload_rows(storage: &StorageModel) -> Vec<(CommandId, coord_consensus::Payl
 #[test]
 fn payload_transfer_is_bounded_in_both_directions_and_still_covers_everything() {
     let bound = coord_consensus::MAX_PAYLOAD_TRANSFER;
-    let mut l = leader();
-    let mut f = follower(2);
+    // Room for twice the bound within new admission, which stops short
+    // of the capacity by the recovery reserve (task-d24).
+    let mut l = leader_with(32);
+    let mut f = follower_with(2, 32);
     // More than the bound and inside the leader's own table capacity, so
     // every one of them really is proposed.
     let wanted = bound * 2;
@@ -753,8 +765,10 @@ fn payload_transfer_is_bounded_in_both_directions_and_still_covers_everything() 
 #[test]
 fn a_late_or_duplicated_payload_answer_does_not_count_as_answering_the_ask() {
     let bound = coord_consensus::MAX_PAYLOAD_TRANSFER;
-    let mut l = leader();
-    let mut f = follower(2);
+    // Room for twice the bound within new admission, which stops short
+    // of the capacity by the recovery reserve (task-d24).
+    let mut l = leader_with(32);
+    let mut f = follower_with(2, 32);
     let wanted = bound * 2;
     for seq in 1..=wanted as u64 {
         let (event, _) = admitted(seq, 1);
@@ -794,14 +808,24 @@ fn a_late_or_duplicated_payload_answer_does_not_count_as_answering_the_ask() {
     assert_eq!(current.len(), b.len());
 
     // A's answers arrive late. They are taken -- the payloads are no
-    // longer missing -- and they do not answer B.
+    // longer missing -- and they do not answer B, except for a command B
+    // asked for as well: the one whose turn has come leads every ask
+    // until its payload arrives (task-d09), and its late answer is an
+    // answer to B too.
+    let both = late
+        .iter()
+        .filter(|m| {
+            matches!(m, ProtocolMessage::PayloadResponse { command, .. } if b.contains(command))
+        })
+        .count() as u64;
+    assert!(both <= 1, "{both} commands in both asks");
     for m in &late {
         f.step(peer(0, m.clone()));
     }
     assert_eq!(f.missing_payloads().len(), wanted - bound);
     assert_eq!(
         f.payloads_answered(),
-        0,
+        both,
         "late answers to a superseded ask counted as answering the current one"
     );
 
@@ -845,7 +869,19 @@ fn payload_transfer_is_recognized_from_the_encoded_discriminant() {
             admission: None,
         },
     };
-    for message in [&request, &response] {
+    // A catch-up exchange is bulk transfer too (task-d08): a page can be
+    // a megabyte, and must not hold up a vote behind it.
+    let catch_up = ProtocolMessage::CatchUpRequest {
+        ballot: ballot(1, 0),
+        after: coord_types::ids::ExecutionPosition::ZERO,
+    };
+    let page = ProtocolMessage::CatchUpPage {
+        ballot: ballot(1, 0),
+        after: coord_types::ids::ExecutionPosition::ZERO,
+        through: coord_types::ids::ExecutionPosition::ZERO,
+        entries: vec![],
+    };
+    for message in [&request, &response, &catch_up, &page] {
         assert!(
             coord_consensus::is_payload_transfer(&message.encode()),
             "payload transfer not recognized: {message:?}"
@@ -854,6 +890,7 @@ fn payload_transfer_is_recognized_from_the_encoded_discriminant() {
     let not_transfer = [
         ProtocolMessage::NewLeader {
             ballot: ballot(1, 0),
+            executed: coord_types::ids::ExecutionPosition::ZERO,
         },
         ProtocolMessage::Promise {
             ballot: ballot(1, 0),
@@ -872,6 +909,101 @@ fn payload_transfer_is_recognized_from_the_encoded_discriminant() {
         assert!(
             !coord_consensus::is_payload_transfer(&message.encode()),
             "not payload transfer, but recognized as it: {message:?}"
+        );
+    }
+}
+
+/// The order a Sync's entries are re-proposed in, as it was first
+/// written: one scan of the entries left, in identity order, per pass,
+/// placing each whose entry dependencies are placed.
+fn entry_order_by_passes(
+    decision: &coord_consensus::SyncDecision,
+) -> Result<Vec<CommandId>, Vec<CommandId>> {
+    let mut order = Vec::new();
+    let mut placed = BTreeSet::new();
+    let mut remaining: Vec<CommandId> = decision.entries.keys().copied().collect();
+    while !remaining.is_empty() {
+        let before = remaining.len();
+        remaining.retain(|c| {
+            let ready = decision.entries[c]
+                .deps
+                .iter()
+                .all(|d| !decision.entries.contains_key(d) || placed.contains(d));
+            if ready {
+                order.push(*c);
+                placed.insert(*c);
+            }
+            !ready
+        });
+        if remaining.len() == before {
+            return Err(remaining);
+        }
+    }
+    Ok(order)
+}
+
+/// task-d24 review: `entry_order` walks the dependency graph once instead
+/// of scanning every entry per pass, and gives the same order, and the
+/// same commands on a cycle, as the scan did: over random graphs with
+/// dependencies on both sides of identity order, outside the entries,
+/// repeated, on the entry itself, and in cycles.
+#[test]
+fn entry_order_is_the_order_of_placing_by_passes() {
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let mut rand = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    let id = |n: u64| {
+        let mut d = [0u8; 32];
+        d[..8].copy_from_slice(&n.to_be_bytes());
+        CommandId(Digest32(d))
+    };
+    for round in 0..500 {
+        let n = 1 + rand() % 40;
+        let cyclic = round % 4 == 0;
+        let mut entries = std::collections::BTreeMap::new();
+        for i in 0..n {
+            let mut deps = Vec::new();
+            for _ in 0..rand() % 4 {
+                // Mostly earlier commands, so most rounds are acyclic;
+                // outside the entries (n..2n) now and then.
+                let d = match rand() % 8 {
+                    0 => n + rand() % n,
+                    1 if cyclic => rand() % n,
+                    _ if i > 0 => rand() % i,
+                    _ => n,
+                };
+                deps.push(if d < n { id(d * 7919 % n) } else { id(d) });
+            }
+            // Identity order is not dependency order: the command's
+            // identity is a permutation of its creation index.
+            let c = id(i * 7919 % n);
+            entries.insert(
+                c,
+                coord_consensus::SyncEntry {
+                    command: c,
+                    phase: Phase::Accept,
+                    deps,
+                    path: Digest32([0; 32]),
+                    paths: vec![],
+                    seqnum: 1,
+                    admission: None,
+                },
+            );
+        }
+        let decision = coord_consensus::SyncDecision {
+            ballot: ballot(1, 1),
+            source_ballot: ballot(0, 0),
+            entries,
+            reproposed: BTreeSet::new(),
+        };
+        assert_eq!(
+            coord_consensus::entry_order(&decision),
+            entry_order_by_passes(&decision),
+            "round {round}"
         );
     }
 }

@@ -24,6 +24,13 @@ pub struct BudgetLimits {
     pub control_reserve: usize,
     /// Stream opens in flight per destination.
     pub max_opens: usize,
+    /// Bytes of frames being received, across every stream and
+    /// connection (task-d26). A frame's whole length is taken once its
+    /// header arrives and given back once it is read, so a stream waits
+    /// for room before reading its payload rather than holding part of
+    /// it: partly arrived frames no longer each hold up to their class
+    /// limit beside every other. The control reserve applies here too.
+    pub receive_bytes: usize,
 }
 
 impl Default for BudgetLimits {
@@ -33,6 +40,7 @@ impl Default for BudgetLimits {
             node_bytes: 64 * 1024 * 1024,
             control_reserve: 2 * 1024 * 1024,
             max_opens: 512,
+            receive_bytes: 64 * 1024 * 1024,
         }
     }
 }

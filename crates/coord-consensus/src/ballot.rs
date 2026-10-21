@@ -22,7 +22,8 @@ use coord_core::event::StorageEvent;
 use coord_core::outbox::{BarrierAllocator, PendingSend};
 use coord_store_api::engine::EngineError;
 use coord_types::ids::{
-    Ballot, ClusterId, ConfigurationEpoch, DomainId, LocalJournalSeq, ReplicaId, ReplicaIncarnation,
+    Ballot, ClusterId, ConfigurationEpoch, DomainId, ExecutionPosition, LocalJournalSeq, ReplicaId,
+    ReplicaIncarnation,
 };
 use serde::{Deserialize, Serialize};
 
@@ -100,6 +101,18 @@ pub enum PromiseRejection {
     Sealed {
         /// The transition this replica sealed for.
         transition: Transition,
+    },
+    /// The candidate is more than a table behind what this replica
+    /// executed (task-d10). A leader that far behind wins and then cannot
+    /// serve: what it lacks was executed and retired by the voters that
+    /// would have to send it, and a leader asks nobody for payloads. The
+    /// refusal is sent back naming `own`, and the candidate does not
+    /// campaign again until it has executed past it.
+    CandidateBehind {
+        /// What the candidate said it executed.
+        candidate: ExecutionPosition,
+        /// What this replica executed.
+        own: ExecutionPosition,
     },
 }
 
@@ -217,6 +230,13 @@ pub struct BallotState {
     /// record, whichever lands first seals the replica, and a later
     /// failure of another copy can neither hide that nor undo it.
     sealing: Vec<(BarrierId, SealRecordV1)>,
+    /// The highest ballot this replica refused as behind (task-d10).
+    /// Its candidate promised itself that ballot and hears nothing below
+    /// it, so the next ballot this replica campaigns for has to be above
+    /// it, or the refused candidate could never follow the domain it has
+    /// to catch up from. Not durable: after a restart only the ballots
+    /// seen since count.
+    outranked: Option<Ballot>,
 }
 
 impl BallotState {
@@ -256,6 +276,7 @@ impl BallotState {
             elections: 0,
             sealed: seal,
             sealing: Vec::new(),
+            outranked: None,
         }
     }
 
@@ -439,20 +460,18 @@ impl BallotState {
         }
     }
 
-    /// Handle `NewLeader { ballot }` from the candidate `from` (its
-    /// authenticated replica and incarnation, which the reply is addressed
-    /// to so a stale incarnation of the candidate never receives it). On
-    /// acceptance the promise row is persisted and the reply is published
-    /// requiring it and `outstanding` (every barrier submitted before this
-    /// cut and not yet complete).
-    pub fn on_new_leader(
-        &mut self,
-        from: PeerId,
-        ballot: Ballot,
-        boot: BootId,
-        alloc: &mut BarrierAllocator,
-        outstanding: &[BarrierId],
-    ) -> Result<PromiseEffects, PromiseRejection> {
+    /// The checks every `NewLeader` must pass before this replica
+    /// promises or refuses anything: no seal, this epoch, a voter naming
+    /// itself as the ballot's leader, this replica a voter, and a ballot
+    /// above everything promised or in flight and above the highest ballot
+    /// refused as behind.
+    ///
+    /// The last is what makes a refusal stick (task-d10). The refused
+    /// candidate promised itself that ballot and hears nothing below it;
+    /// a lower ballot promised here could win without it, and then it
+    /// could never follow the leader it has to catch up from. Refusing
+    /// those as `NotHigher` makes the next winning ballot go above it.
+    fn check_candidate(&self, from: ReplicaId, ballot: Ballot) -> Result<(), PromiseRejection> {
         // The seal comes first. A higher ballot is not an exception to
         // a fence; it is the thing a fence exists to stop. A seal row in
         // flight already binds: the report's cut is taken, and a promise
@@ -460,8 +479,6 @@ impl BallotState {
         if let Some(transition) = self.seal_held() {
             return Err(PromiseRejection::Sealed { transition });
         }
-        let candidate = from;
-        let from = candidate.replica;
         if ballot.epoch != self.identity.epoch {
             return Err(PromiseRejection::WrongEpoch {
                 expected: self.identity.epoch,
@@ -482,10 +499,117 @@ impl BallotState {
                 role: self.identity.role,
             });
         }
-        let bound = self.bound();
+        let mut bound = self.bound();
+        if let Some(refused) = self.outranked
+            && refused.compare_same_epoch(&bound) == Some(core::cmp::Ordering::Greater)
+        {
+            bound = refused;
+        }
         if ballot.compare_same_epoch(&bound) != Some(core::cmp::Ordering::Greater) {
             return Err(PromiseRejection::NotHigher { promised: bound });
         }
+        Ok(())
+    }
+
+    /// Whether to refuse `NewLeader { ballot }` from `from` because the
+    /// candidate, which executed through `candidate`, is more than
+    /// `window` commands behind this replica's `own` (task-d10).
+    ///
+    /// Only a `NewLeader` that would otherwise be promised is refused
+    /// this way; any other rejection is [`BallotState::on_new_leader`]'s
+    /// to give. A refused ballot is remembered as outranked: the next
+    /// campaign here goes above it.
+    pub fn refuses_behind(
+        &mut self,
+        from: ReplicaId,
+        ballot: Ballot,
+        candidate: ExecutionPosition,
+        own: ExecutionPosition,
+        window: u64,
+    ) -> Option<PromiseRejection> {
+        self.check_candidate(from, ballot).ok()?;
+        if own.get() <= candidate.get().saturating_add(window) {
+            return None;
+        }
+        let higher = self
+            .outranked
+            .is_none_or(|o| ballot.compare_same_epoch(&o) == Some(core::cmp::Ordering::Greater));
+        if higher {
+            self.outranked = Some(ballot);
+        }
+        Some(PromiseRejection::CandidateBehind { candidate, own })
+    }
+
+    /// The reply refusing `ballot` to the candidate `to` as behind,
+    /// naming what this replica executed through (task-d10). It needs no
+    /// barrier: nothing was promised or written.
+    pub fn refusal(
+        &self,
+        to: PeerId,
+        ballot: Ballot,
+        boot: BootId,
+        executed: ExecutionPosition,
+    ) -> PendingSend {
+        PendingSend {
+            context: self.context(boot, ballot, LocalJournalSeq::ZERO),
+            requires: Vec::new(),
+            to,
+            frame: ProtocolMessage::PromiseRefused {
+                ballot,
+                replica: self.identity.replica,
+                executed,
+            }
+            .encode(),
+        }
+    }
+
+    /// The promise of `ballot` again, for the candidate `to` that asks for
+    /// it once more (task-d33): this replica promised it and has not
+    /// synchronized to it, so the Sync that answered the promise may have
+    /// been lost, and the leader asks until this replica follows. The row
+    /// is durable already, so the reply requires nothing. Not while a
+    /// higher promise is in flight: that promise voids this one.
+    pub fn promise_again(&self, to: PeerId, ballot: Ballot, boot: BootId) -> Option<PendingSend> {
+        (self.bound() == ballot
+            && self.promised() == ballot
+            && self.synced != ballot
+            && ballot.leader == to.replica)
+            .then(|| PendingSend {
+                context: self.context(boot, ballot, LocalJournalSeq::ZERO),
+                requires: Vec::new(),
+                to,
+                frame: ProtocolMessage::Promise {
+                    ballot,
+                    synced: self.synced,
+                    replica: self.identity.replica,
+                }
+                .encode(),
+            })
+    }
+
+    /// The highest ballot refused as behind, which this replica's next
+    /// campaign has to go above.
+    pub const fn outranked(&self) -> Option<Ballot> {
+        self.outranked
+    }
+
+    /// Handle `NewLeader { ballot }` from the candidate `from` (its
+    /// authenticated replica and incarnation, which the reply is addressed
+    /// to so a stale incarnation of the candidate never receives it). On
+    /// acceptance the promise row is persisted and the reply is published
+    /// requiring it and `outstanding` (every barrier submitted before this
+    /// cut and not yet complete).
+    pub fn on_new_leader(
+        &mut self,
+        from: PeerId,
+        ballot: Ballot,
+        boot: BootId,
+        alloc: &mut BarrierAllocator,
+        outstanding: &[BarrierId],
+    ) -> Result<PromiseEffects, PromiseRejection> {
+        self.check_candidate(from.replica, ballot)?;
+        let candidate = from;
+        let bound = self.bound();
         let barrier = alloc.allocate();
         let record = PromiseRecordV1 {
             promised: ballot,
@@ -593,8 +717,28 @@ impl BallotState {
         }
         self.synced = ballot;
         Ok(PromiseRecordV1 {
-            promised: self.promised,
+            promised: self.highest_queued(),
             synced: self.synced,
         })
+    }
+
+    /// The highest promise already queued for disk: the durable promise or
+    /// the highest promise in flight, whichever is higher.
+    ///
+    /// Every write of the promise row carries it (task-d18). The journal
+    /// applies rows in the order they were queued, so a row carrying less
+    /// than a row queued before it would lower the durable promise below
+    /// one this replica may already have published. A promise row from
+    /// [`BallotState::on_new_leader`] carries a ballot above this bound by
+    /// construction; a Sync's row carries this bound, so it can never fall
+    /// below a promise in flight. (The seal writes its own row, not this
+    /// one.)
+    pub fn highest_queued(&self) -> Ballot {
+        let bound = self.bound();
+        if bound.compare_same_epoch(&self.promised) == Some(core::cmp::Ordering::Greater) {
+            bound
+        } else {
+            self.promised
+        }
     }
 }

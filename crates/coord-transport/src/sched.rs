@@ -85,6 +85,14 @@ impl FairQueue {
         Ok(())
     }
 
+    /// The length of the frame [`Self::pop`] would return next.
+    pub fn next_len(&self) -> Option<usize> {
+        self.ring
+            .iter()
+            .find_map(|group| self.groups.get(group)?.front())
+            .map(|q| q.frame.len())
+    }
+
     /// The next frame, taking groups in turn.
     pub fn pop(&mut self) -> Option<Queued> {
         while let Some(group) = self.ring.pop_front() {
@@ -145,4 +153,65 @@ pub struct LaneStats {
     pub queued: usize,
     /// Path RTT as QUIC estimates it (a separate quantity).
     pub rtt: Duration,
+}
+
+/// What a node's transport carried between voters (task-d62), across
+/// every peer link and lane, cumulative.
+///
+/// A link whose two ends both offer
+/// [`crate::CAPABILITY_FRAMES_PER_STREAM`] carries what was queued for
+/// it together on one stream (task-d61), so frames per stream is the
+/// batching factor; elsewhere each frame has a stream of its own.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PeerTraffic {
+    /// Frames handed to QUIC for a peer.
+    pub sent_frames: u64,
+    /// Their bytes.
+    pub sent_bytes: u64,
+    /// Streams opened to peers.
+    pub sent_streams: u64,
+    /// Frames to a peer lost before they were written: no stream could be
+    /// opened, or the write did not complete.
+    pub sent_lost: u64,
+    /// Streams those frames were lost on: a refused batch loses every
+    /// frame in it, so `sent_lost` over this is the frames lost per
+    /// refused stream (task-d61).
+    pub sent_lost_streams: u64,
+    /// Frames read from peers.
+    pub received_frames: u64,
+    /// Their bytes.
+    pub received_bytes: u64,
+    /// Streams peers opened to this node.
+    pub received_streams: u64,
+    /// UDP datagrams QUIC sent on peer connections, acknowledgements and
+    /// retransmissions included (task-d61): what a frame costs is mostly
+    /// what its packet costs.
+    pub datagrams_sent: u64,
+    /// UDP datagrams QUIC received on peer connections.
+    pub datagrams_received: u64,
+    /// The system calls that sent those datagrams: fewer than the
+    /// datagrams where segmentation offload carries several in one.
+    pub send_calls: u64,
+    /// ACK frames QUIC sent on peer connections.
+    pub acks_sent: u64,
+    /// ACK frames QUIC received on peer connections.
+    pub acks_received: u64,
+    /// The same QUIC counts on api connections, callers' and collectors'
+    /// (task-d70), so a node's datagrams split into its two planes.
+    pub api: Datagrams,
+}
+
+/// What QUIC sent and received on one class of connections (task-d70).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Datagrams {
+    /// UDP datagrams sent, acknowledgements and retransmissions included.
+    pub datagrams_sent: u64,
+    /// UDP datagrams received.
+    pub datagrams_received: u64,
+    /// The system calls that sent the datagrams.
+    pub send_calls: u64,
+    /// ACK frames sent.
+    pub acks_sent: u64,
+    /// ACK frames received.
+    pub acks_received: u64,
 }

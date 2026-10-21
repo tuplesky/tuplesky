@@ -150,6 +150,18 @@ pub fn dependency_update(
     })
 }
 
+/// The update deleting a command's dependency row in an epoch
+/// (task-d08): a command pulled from a peer without the peer's decided
+/// record goes to history, and the record this replica had of it must
+/// not come back after a restart to be reported as that decision.
+pub fn dependency_delete(epoch: ConfigurationEpoch, command: &CommandId) -> StoreUpdate {
+    StoreUpdate {
+        collection: Collection::ProtocolV1.id(),
+        key: dependency_key(epoch, command),
+        value: None,
+    }
+}
+
 /// The immutable canonical command in `payload_v1`, keyed by command
 /// identity: retry key, canonical logical bytes (rehashed on read), and
 /// the admission the command was accepted under.
@@ -302,6 +314,18 @@ pub fn payload_update(
     })
 }
 
+/// The update deleting a command's payload row (task-d24): a record a
+/// Sync released goes with its payload, so the replica is as if it never
+/// held the command, and a later proposal of it fetches the payload as
+/// any missing one is fetched, before and after a restart.
+pub fn payload_delete(command: &CommandId) -> StoreUpdate {
+    StoreUpdate {
+        collection: Collection::PayloadV1.id(),
+        key: payload_key(command),
+        value: None,
+    }
+}
+
 /// The leader's recoverable proposal state for a command.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ProposalRecordV1 {
@@ -366,33 +390,11 @@ pub fn sync_key(epoch: ConfigurationEpoch, ballot: &Ballot) -> Vec<u8> {
 }
 
 /// Schema version of the Sync row. Version 1 carried no path evidence in
-/// its entries; version 2 (task-28) carries the combined digest, the
+/// its entries; version 2 (task-28) added the combined digest, the
 /// per-key digests and the leader sequence number they were synchronized
-/// at, so the layout changed and the version had to change with it.
-pub const SYNC_SCHEMA_VERSION: u16 = 2;
-
-/// A version 1 Sync entry: dependencies only, no path evidence.
-#[derive(Clone, Debug, Deserialize)]
-struct SyncEntryV1 {
-    command: CommandId,
-    phase: crate::phase::Phase,
-    deps: Vec<CommandId>,
-}
-
-/// A version 1 Sync decision.
-#[derive(Clone, Debug, Deserialize)]
-struct SyncDecisionV1 {
-    ballot: Ballot,
-    source_ballot: Ballot,
-    entries: alloc::collections::BTreeMap<CommandId, SyncEntryV1>,
-    reproposed: alloc::collections::BTreeSet<CommandId>,
-}
-
-/// A version 1 Sync row.
-#[derive(Clone, Debug, Deserialize)]
-struct SyncRecordV1Legacy {
-    decision: SyncDecisionV1,
-}
+/// at; version 3 (task-d14) adds the admission digest each entry was
+/// accepted under.
+pub const SYNC_SCHEMA_VERSION: u16 = 3;
 
 /// The durable seal of one replica on one configuration (design
 /// Section 10.3.2).
@@ -451,48 +453,84 @@ pub fn encode_sync(record: &SyncRecordV1) -> Result<Vec<u8>, EngineError> {
     envelope_at(SYNC_KIND, SYNC_SCHEMA_VERSION, record, "sync encode")
 }
 
-/// Decode a Sync row, including one written by a revision that stored the
-/// version 1 layout. A version 1 selection is read back with empty path
-/// evidence, which is what that revision knew: the dependencies it bound
-/// are preserved exactly, and the replica realigns nothing it has no
-/// evidence for. Any other version is refused rather than misread.
+/// Decode a Sync row.
+///
+/// Only the current layout is read. A row of an earlier version names no
+/// admission facts, and reading it as a selection without them would let
+/// the replica install and execute its entries under whichever facts it
+/// happens to hold, which is the divergence version 3 exists to prevent
+/// (task-d14). It is refused as corrupt, loudly, and the store has to be
+/// started fresh.
 pub fn decode_sync(bytes: &[u8]) -> Result<SyncRecordV1, EngineError> {
     let (version, payload) = open(SYNC_KIND, bytes, "sync record")?;
     match version {
         SYNC_SCHEMA_VERSION => decode_exact(&payload, "sync record"),
-        1 => {
-            let legacy: SyncRecordV1Legacy = decode_exact(&payload, "sync record")?;
-            Ok(SyncRecordV1 {
-                decision: SyncDecision {
-                    ballot: legacy.decision.ballot,
-                    source_ballot: legacy.decision.source_ballot,
-                    entries: legacy
-                        .decision
-                        .entries
-                        .into_iter()
-                        .map(|(c, e)| {
-                            (
-                                c,
-                                crate::recovery::SyncEntry {
-                                    command: e.command,
-                                    phase: e.phase,
-                                    deps: e.deps,
-                                    path: crate::graph::empty_path(),
-                                    paths: Vec::new(),
-                                    seqnum: 0,
-                                },
-                            )
-                        })
-                        .collect(),
-                    reproposed: legacy.decision.reproposed,
-                },
-            })
-        }
+        1 | 2 => Err(EngineError::new(
+            ErrorClass::Corrupt,
+            "sync record of a layout without admission facts (before task-d14)",
+        )),
         _ => Err(EngineError::new(
             ErrorClass::Corrupt,
             "sync record of an unsupported schema version",
         )),
     }
+}
+
+/// The update binding `decision`, if its Sync fits both the row it is
+/// written in and the frame it is published in (task-d20); otherwise the
+/// named refusal, with its size.
+///
+/// A Sync is written as one row by the candidate and by every voter that
+/// installs it, and a write that did not fit ended the process in the
+/// middle of an election.
+pub fn bounded_sync_update(
+    epoch: ConfigurationEpoch,
+    decision: &crate::recovery::SyncDecision,
+) -> Result<StoreUpdate, crate::recovery::RecoveryError> {
+    let frame_limit = coord_types::wire_v1::KindRange::ProtocolEvidence.max_frame_length() as usize;
+    let limit = coord_store_api::envelope::MAX_ENVELOPE_PAYLOAD.min(frame_limit);
+    let too_large = |bytes: usize| crate::recovery::RecoveryError::SyncTooLarge {
+        entries: decision.entries.len(),
+        bytes,
+        limit,
+    };
+    // Encoded once (task-d26): the frame is the Sync's tag before these
+    // bytes, and the row's payload is these bytes, a record of one field
+    // encoding as that field. Encoding the message and the record apart
+    // held two copies of the largest structure an election builds beside
+    // their two encodings.
+    let body = postcard::to_allocvec(decision).map_err(|_| too_large(usize::MAX))?;
+    let frame = sync_frame_overhead(decision.ballot) + body.len();
+    if frame > frame_limit {
+        return Err(too_large(frame));
+    }
+    // A row that does not fit is reported with the row's own size, not
+    // the frame's that fitted.
+    let row = body.len();
+    let value = StoreEnvelopeV1 {
+        record_kind: SYNC_KIND,
+        schema_version: SYNC_SCHEMA_VERSION,
+        payload: body,
+    }
+    .encode()
+    .map_err(|_| too_large(row))?;
+    Ok(StoreUpdate {
+        collection: Collection::ProtocolV1.id(),
+        key: sync_key(epoch, &decision.ballot),
+        value: Some(value),
+    })
+}
+
+/// The bytes a Sync frame carries before its selection's encoding.
+fn sync_frame_overhead(ballot: Ballot) -> usize {
+    let empty = crate::recovery::SyncDecision {
+        ballot,
+        source_ballot: ballot,
+        entries: alloc::collections::BTreeMap::new(),
+        reproposed: alloc::collections::BTreeSet::new(),
+    };
+    let body = postcard::to_allocvec(&empty).map_or(0, |b| b.len());
+    crate::messages::ProtocolMessage::Sync(empty).encode().len() - body
 }
 
 /// The update persisting a bound Sync selection.
