@@ -588,8 +588,12 @@ pub struct Node<P: Persistence> {
     staged: Vec<Effect>,
     /// What groups handed to a pipelined store led to, each held until the
     /// projection has committed through its position (task-d52), oldest
-    /// first.
+    /// first. A group's results are not here but in `results`.
     releases: VecDeque<(ExecutionPosition, Vec<Effect>)>,
+    /// The results of groups handed to a pipelined store, each held until
+    /// the group is in the journal (task-d63): released then, before its
+    /// projection commit (design Section 4.5), oldest first.
+    results: VecDeque<(ExecutionPosition, Vec<Effect>)>,
     /// What this replica's re-sends did, over every ballot it led since
     /// boot (task-d49).
     resends: coord_consensus::ResendCounts,
@@ -678,6 +682,7 @@ impl<P: Persistence> Node<P> {
             flushing: false,
             staged: Vec::new(),
             releases: VecDeque::new(),
+            results: VecDeque::new(),
             resends: coord_consensus::ResendCounts::default(),
             established: Established::default(),
             fast_path: coord_consensus::FastPathCounts::default(),
@@ -1515,6 +1520,9 @@ impl<P: Persistence> Node<P> {
                 .barrier()
                 .is_some_and(|barrier| coord_core::outbox::is_application(&barrier))
             {
+                // What it made durable may release the group's results
+                // (task-d63).
+                self.applier.note_journaled(&event);
                 if matches!(
                     event,
                     StorageEvent::Failed {
@@ -1723,8 +1731,9 @@ impl<P: Persistence> Node<P> {
             //
             // Within a group the machine hears the outcome now, which is
             // what lets it name the next command, and what it answers is
-            // held until the group has materialized: a release, a send
-            // and a result all wait for the group (task-d47).
+            // held for the group (task-d47): a result until the group is
+            // in the journal (task-d63), a send and everything else until
+            // it has materialized.
             let effects = self.machine_mut().applied(command, &outcome)?;
             self.release.applied(&command, std::time::Instant::now());
             self.stamp_learned();
@@ -1758,10 +1767,12 @@ impl<P: Persistence> Node<P> {
     /// to once it has materialized (task-d47).
     ///
     /// On a pipelined store (task-d52) the group is journaled and its
-    /// projection commit handed to the materializer, and what it led to is
-    /// held until the projection has committed through it
-    /// ([`Node::settle`]). Execution goes on meanwhile, planning over the
-    /// groups in flight. Past `PIPELINE_RECORDS` owed it waits for them.
+    /// projection commit handed to the materializer. Its results are held
+    /// until it is in the journal, and go out then (task-d63, design
+    /// Section 4.5); everything else it led to is held until the
+    /// projection has committed through it ([`Node::settle`]). Execution
+    /// goes on meanwhile, planning over the groups in flight. Past
+    /// `PIPELINE_RECORDS` owed it waits for them.
     fn close_group(
         &mut self,
         held: &mut Vec<Effect>,
@@ -1779,19 +1790,32 @@ impl<P: Persistence> Node<P> {
         let effects = core::mem::take(held);
         let mut out = match position {
             Some(position) => {
-                self.releases.push_back((position, effects));
+                let (results, rest) = split_results(effects);
+                self.releases.push_back((position, rest));
+                self.results.push_back((position, results));
                 Outbound::default()
             }
             None if self.releases.is_empty() => self.carry_out(effects, ballot)?,
             // Nothing of its own in flight, but what it led to still comes
-            // after what the groups before it led to.
+            // after what the groups before it led to. Its results wait
+            // with that group's, or go now if that group's have gone.
             None => {
+                let (results, rest) = split_results(effects);
                 let last = self.releases.back_mut().expect("checked above");
-                last.1.extend(effects);
-                Outbound::default()
+                last.1.extend(rest);
+                let position = last.0;
+                match self.results.back_mut() {
+                    Some(held) if held.0 == position => {
+                        held.1.extend(results);
+                        Outbound::default()
+                    }
+                    _ if results.is_empty() => Outbound::default(),
+                    _ => self.carry_out(results, ballot)?,
+                }
             }
         };
         out.absorb(self.release_through_settled(ballot)?);
+        out.absorb(self.release_journaled(ballot)?);
         if self.applier.store().unmaterialized() > PIPELINE_RECORDS {
             out.absorb(self.drain(ballot)?);
         }
@@ -1802,15 +1826,19 @@ impl<P: Persistence> Node<P> {
     /// carry out what the groups it completed led to (task-d52).
     ///
     /// The runtime calls this when the materializer says a commit has
-    /// finished, and a flush calls it too. A result, a send or a watch
-    /// event of a group goes out here and never before the projection has
-    /// committed the group: the same rule as a group materialized on this
-    /// thread, kept across the hand-off.
+    /// finished, and a flush calls it too. A send or a watch event of a
+    /// group goes out here and never before the projection has committed
+    /// the group: the same rule as a group materialized on this thread,
+    /// kept across the hand-off.
+    ///
+    /// A group's results go out earlier, once the group is in the journal
+    /// (task-d63, design Section 4.5): from here, from a flush that
+    /// journaled it, or when it is handed off.
     ///
     /// A journal append out on the appender's thread (task-d54) is taken
     /// back here as well, once it has finished: what it made durable
-    /// releases the sends that waited on it and its facts go to the
-    /// machine. What was queued meanwhile is not lent here: the runtime's
+    /// releases the sends that waited on it, the results of the groups it
+    /// journaled, and its facts go to the machine. What was queued meanwhile is not lent here: the runtime's
     /// next flush lends it, once the events that arrived during the sync
     /// have been taken in, so the group holds all of them -- as a sync on
     /// this thread left them all to the flush after it.
@@ -1824,6 +1852,7 @@ impl<P: Persistence> Node<P> {
         }
         if self.applier.pipelined() {
             out.absorb(self.release_through_settled(ballot)?);
+            out.absorb(self.release_journaled(ballot)?);
         }
         Ok(out)
     }
@@ -1847,6 +1876,9 @@ impl<P: Persistence> Node<P> {
             self.unreleased = true;
             out.absorb(self.carry_out(next, ballot)?);
             out.absorb(self.flush(ballot)?);
+        }
+        if self.applier.pipelined() {
+            out.absorb(self.release_journaled(ballot)?);
         }
         Ok(out)
     }
@@ -1875,14 +1907,45 @@ impl<P: Persistence> Node<P> {
         self.release_through(through, ballot)
     }
 
+    /// Release the results of the groups handed off that are now in the
+    /// journal, oldest first (task-d63). What else they led to still waits
+    /// for their projection commit.
+    fn release_journaled(&mut self, ballot: &Ballot) -> Result<Outbound, DriveError> {
+        let Some(through) = self.applier.journaled_through() else {
+            return Ok(Outbound::default());
+        };
+        let mut effects = Vec::new();
+        while self
+            .results
+            .front()
+            .is_some_and(|(position, _)| *position <= through)
+        {
+            let (_, results) = self.results.pop_front().expect("checked above");
+            effects.extend(results);
+        }
+        if effects.is_empty() {
+            return Ok(Outbound::default());
+        }
+        self.carry_out(effects, ballot)
+    }
+
     /// Carry out what the groups handed off through `through` led to, in
-    /// the order they were handed off.
+    /// the order they were handed off: their results first, where they
+    /// are still held, since a committed group is in the journal.
     fn release_through(
         &mut self,
         through: ExecutionPosition,
         ballot: &Ballot,
     ) -> Result<Outbound, DriveError> {
         let mut effects = Vec::new();
+        while self
+            .results
+            .front()
+            .is_some_and(|(position, _)| *position <= through)
+        {
+            let (_, results) = self.results.pop_front().expect("checked above");
+            effects.extend(results);
+        }
         while self
             .releases
             .front()
@@ -1988,6 +2051,15 @@ impl<P: Persistence> Node<P> {
 /// How many times storage facts may produce further effects within one
 /// event before the driver calls it a fault.
 const MAX_ROUNDS: usize = 32;
+
+/// A group's results -- its releases, and the leader's record that each
+/// was established -- apart from everything else it led to, each in its
+/// order (task-d63).
+fn split_results(effects: Vec<Effect>) -> (Vec<Effect>, Vec<Effect>) {
+    effects
+        .into_iter()
+        .partition(|effect| matches!(effect, Effect::Released(_) | Effect::Established(_)))
+}
 
 /// The batch that journals a floor's rows under its own barrier, and,
 /// for this voter's own promise, the sends to its peers that wait on it.

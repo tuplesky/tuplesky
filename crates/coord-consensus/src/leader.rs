@@ -1716,8 +1716,10 @@ impl Leader {
         //
         // It rests on more evidence than the speculative release, not
         // less: the command is committed, its whole prefix has executed
-        // before it, and its result is materialized and durable. That is
-        // why it carries `speculative: false`.
+        // before it, and its result is durable. That is why it carries
+        // `speculative: false`. Durable is the record: in a group on a
+        // pipelined store the release goes out at the group's
+        // `JournalDurable`, before its projection commit (task-d63).
         let released = self.speculation.released(&command);
         self.speculation
             .reconcile(command, outcome.position, outcome.result_digest)
