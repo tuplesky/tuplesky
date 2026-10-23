@@ -10471,3 +10471,70 @@ was the pointer's sync. An earlier build that read `schedstat`'s CPU
 field put a retirement at 0.6 ms on a CPU against 0.5 ms of wall time.
 The runner's reading, at six nodes and the default cadence, is the next
 step, and it decides whether the job is built.
+
+## The pointer and the retirement on the journal worker (task-d66)
+
+The runner's reading put the long publications on the journal's waits,
+so the job is built. A voter no longer takes the journal back to
+publish. `JournaledStore::queue_checkpoint` checks the pointer as
+`publish_checkpoint` does (the domain is ready, the origin is its own,
+`C <= M`) and queues it. The next group the store seals carries it: in
+the domain's entry right after the last transition queued before it, and
+ahead of everything queued since, or as an entry of its own under the
+publication's barrier when nothing else is queued or nothing else fits.
+The store keeps that last transition's barrier with the pointer, so
+nothing that leaves the queue meanwhile moves it. Placed behind the
+whole queue, as it first was, the pointer was never carried by a domain
+whose queue filled every group: the queue holds 256 transitions and a
+group 64, and with no retirement the journal grows (Codex review of
+#164; pinned by `pointer_job.rs::a_pointer_goes_behind_what_was_queued_before_it_and_ahead_of_what_follows`). `AppendJob::run` appends the group and then, only
+if the append succeeded, retires what each pointer in it represents, on
+the appender's thread. Without an appender both run in the lowering that
+writes the group. `C` advances when the group is taken back, and
+`take_published` gives the outcome. So task-j04's order holds: the image
+and its directory durable, then the pointer, then the retirement, then
+the reclaim, which `coordd` still runs on its own thread.
+
+**What the domain thread still does:** the pin, the queue, and taking
+the outcome on a later turn. `JournaledStore::queued` counts a pointer
+the next group may carry, so a domain with nothing else to journal still
+owes a flush, and the runtime's next one writes it. A node that serves
+without voting lowers only when it applies a command, so it publishes
+on its own thread, as before.
+
+**The replay profile:** a group carries the pointer only once the
+projection is durable through `C`. Queueing it asks the next projection
+commit to be durable, and the pointer waits for that commit, the
+materializer's or, on an idle domain, `sync_idle_projections`' within
+half of `projection_durable_ms`. Nothing is forced on the domain thread.
+
+**A group that fails:** definitely, and the prior publication stands;
+with an unknown outcome, and nothing may be assumed or retired, and the
+stream reconciles as for any group. Either way the publication is
+reported failed and the next one is due, as before. A crash with the
+pointer queued, or its group lent and not run, recovers the previous
+baseline; one after the group ran recovers the new one, whose image
+nothing has reclaimed yet (`tests/pointer_job.rs`).
+
+**The `checkpoint` line** gains `queued_ms`: from the queue to the
+outcome, which is the wait for a group and, under the replay profile, for
+the durable commit, then the append and the retirement. `append_ms` and
+`retire_ms` are now the worker's times, and the domain thread's step
+readings are `-`, because it runs none of those steps.
+
+**Locally,** five voters on one host (x86_64, 4 CPUs), replay profile,
+`checkpoint_after_records = 4096` with the replay profile's 30 s interval,
+`coord-wan-bench` with 30 callers and 60,000 measured operations, three
+pairs, base task-d63's build (ms):
+
+| | publications | `loop_ms` p50 | `loop_ms` max | over 10 ms | ok/s |
+| --- | --- | --- | --- | --- | --- |
+| base | 10, 11, 15 | 9.3, 7.5, 4.1 | 24.8, 21.9, 31.2 | 4, 5, 5 | 667, 674, 665 |
+| job | 11, 15, 10 | 0.0, 0.0, 0.0 | 0.1, 0.1, 0.0 | 0, 0, 0 | 672, 660, 691 |
+
+Every publication retired its prefix, in both. On the base the drain was
+up to 18.2 ms, the append up to 16.5 ms and the retirement up to 13.8 ms,
+all on the domain thread. With the job, `queued_ms` was up to 26.6 ms
+and none of it on the domain thread. At this cadence the publications
+were too rare to move `ok`/s, as the plan expected. The runner's two
+runs at six nodes are the acceptance.
