@@ -350,9 +350,9 @@ fn proposals_are_published_with_exact_durable_support_and_match_the_model() {
     assert_eq!(released.len(), 5);
     assert_eq!(leader.table().phase_of(&c1), Some(Phase::Accept));
     assert_eq!(leader.table().phase_of(&c2), Some(Phase::Accept));
-    // The leader's own adoptions wait on the acceptance rows, to two
-    // voters and the frontend each (task-d19).
-    assert_eq!(leader.pending_sends(), 6);
+    // The leader's own adoptions wait on the acceptance rows, to the
+    // frontend each (task-d19), and to no voter (task-d74).
+    assert_eq!(leader.pending_sends(), 2);
     assert!(leader.take_rejections().is_empty());
     let mut acks = Vec::new();
     for (i, event) in durable(&released, 3).into_iter().enumerate() {
@@ -374,8 +374,8 @@ fn proposals_are_published_with_exact_durable_support_and_match_the_model() {
         .collect();
     assert_eq!(
         slow.len(),
-        6,
-        "c1 and c2 adopted by the leader, to all three"
+        2,
+        "c1 and c2 adopted by the leader, to the frontend"
     );
     assert!(leader.votes(&c1).unwrap().adopted_by(&r(0)));
     // The leader's own vote alone learns nothing.
@@ -685,11 +685,20 @@ fn votes_are_collected_but_never_learned_here() {
     };
     // r1 (fast set) agrees on the path; r2 adopts; an observer is refused;
     // a vote whose sender does not match its provenance is refused.
-    assert!(
-        leader
-            .step(peer(1, ProtocolMessage::FastAck(ack(1))))
-            .is_empty()
-    );
+    // r1's agreement decides c1 fast at three voters, and the frontier it
+    // moves is announced in the same step (task-d74), and nothing else.
+    let announced = leader.step(peer(1, ProtocolMessage::FastAck(ack(1))));
+    assert!(!announced.is_empty());
+    for e in &announced {
+        let Effect::SendWhenDurable { to, frame, .. } = e else {
+            panic!("{e:?}")
+        };
+        assert!(to.replica == r(1) || to.replica == r(2));
+        assert!(matches!(
+            ProtocolMessage::decode(frame).unwrap(),
+            ProtocolMessage::Committed { through: 0, .. }
+        ));
+    }
     assert!(
         leader
             .step(peer(

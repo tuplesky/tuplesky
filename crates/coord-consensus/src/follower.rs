@@ -3284,7 +3284,7 @@ impl Follower {
     /// acceptance batches of its prerequisites are all part of what the
     /// acknowledgement claims, so none of them may still be volatile when
     /// it leaves. (The outbox drops a send whose barrier fails.)
-    fn publish_to_voters_and_frontend(
+    fn publish_to_leader_and_frontend(
         &mut self,
         command: CommandId,
         barrier: BarrierId,
@@ -3300,16 +3300,19 @@ impl Follower {
             requires.push(barrier);
         }
         let frame = message.encode();
+        let leader = self.config.quorum.leader();
         let outbox = self.outbox.as_mut().expect("booted");
-        for voter in &self.config.identity.voters {
-            if *voter == self.config.identity.replica {
-                continue;
-            }
+        // The leader counts it; no other voter does (task-d74). A
+        // follower learns from the leader's commit frontier, which the
+        // leader announces in the step that moves it, so a copy to every
+        // other voter was a message per voter a command that nothing
+        // decided on.
+        if leader != self.config.identity.replica {
             outbox.publish(PendingSend {
                 context,
                 requires: requires.clone(),
                 to: PeerId {
-                    replica: *voter,
+                    replica: leader,
                     incarnation: ReplicaIncarnation::ZERO,
                 },
                 frame: frame.clone(),
@@ -3686,7 +3689,7 @@ impl Follower {
                     vote: Vote::Fast(ack.clone()),
                 },
             );
-            self.publish_to_voters_and_frontend(command, barrier, ProtocolMessage::FastAck(ack));
+            self.publish_to_leader_and_frontend(command, barrier, ProtocolMessage::FastAck(ack));
         }
         // A proposal (or Sync entry) that arrived before the payload can now
         // be adopted (once its dependencies allow it).
@@ -4106,7 +4109,7 @@ impl Follower {
                         vote: Vote::Slow(ack.clone()),
                     },
                 );
-                self.publish_to_voters_and_frontend(
+                self.publish_to_leader_and_frontend(
                     command,
                     barrier,
                     ProtocolMessage::SlowAck(ack),
