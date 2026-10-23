@@ -164,6 +164,9 @@ pub struct Applier<P: Persistence> {
     /// Groups handed to a pipelined store and not yet known to have
     /// materialized (task-d52), oldest first.
     inflight: VecDeque<InFlight>,
+    /// The position the projection was last seen committed through, by
+    /// [`Applier::settle`] or a drain (task-d63).
+    committed: Option<coord_types::ids::ExecutionPosition>,
 }
 
 /// A group handed off to a pipelined store's materializer (task-d52).
@@ -177,6 +180,10 @@ struct InFlight {
     /// out when the group is handed off (task-d54), so a lowering that
     /// takes it back later checks it for a lost batch.
     barriers: BTreeSet<BarrierId>,
+    /// Those of `barriers` not yet reported `JournalDurable` (task-d63).
+    /// Empty, the group's outcome is in the journal and its results may
+    /// be released, before its projection commit.
+    unjournaled: BTreeSet<BarrierId>,
     /// Watch publications owed once it has materialized, in order.
     publications: Vec<Publication>,
 }
@@ -195,6 +202,9 @@ struct Group {
     own: Arc<CutOverlay>,
     /// Barriers of the group's batches.
     barriers: BTreeSet<BarrierId>,
+    /// Those of `barriers` not yet reported `JournalDurable` (task-d63):
+    /// a flush may journal a staged group before it is handed off.
+    unjournaled: BTreeSet<BarrierId>,
     /// The application the group's last batch completes. The journal
     /// keeps the batches in order and the projection takes them in that
     /// order, so this one materialized means all of them did.
@@ -261,6 +271,7 @@ impl<P: Persistence> Applier<P> {
             sharing: false,
             group: None,
             inflight: VecDeque::new(),
+            committed: None,
         })
     }
 
@@ -297,6 +308,7 @@ impl<P: Persistence> Applier<P> {
     /// ends it: the commands it holds were already reported applied.
     fn reconcile(&mut self) -> Result<(), ApplyError> {
         let settled = self.store.reconcile()?;
+        self.note_all(&settled.events);
         let group_lost = self
             .group
             .as_ref()
@@ -441,11 +453,13 @@ impl<P: Persistence> Applier<P> {
     /// Journal the open group and hand its projection commit to the
     /// pipelined store's materializer, without waiting for it (task-d52).
     ///
-    /// Returns the execution position the projection must commit before
-    /// what the group's commands led to may be disclosed: the group's
-    /// last command, or, for a group that submitted nothing, the last of
-    /// the groups still in flight. `None` when nothing is owed. Its watch
-    /// publications are held to the same position, and go out from
+    /// Returns the execution position the group's commands are held to:
+    /// the group's last command, or, for a group that submitted nothing,
+    /// the last of the groups still in flight. `None` when nothing is
+    /// owed. Their results may be disclosed once
+    /// [`Applier::journaled_through`] reaches it (task-d63), and what else
+    /// they led to once the projection has committed through it. Its
+    /// watch publications are held to the commit, and go out from
     /// [`Applier::settle`].
     ///
     /// A store that is not pipelined materializes the group here, as
@@ -457,10 +471,11 @@ impl<P: Persistence> Applier<P> {
             self.finish_group()?;
             return Ok(None);
         }
-        let Some(group) = self.group.take() else {
+        let Some(open) = self.group.as_ref() else {
             return Ok(None);
         };
-        let Some(last) = group.last else {
+        let Some(position) = open.last.as_ref().map(|last| last.position) else {
+            let group = self.group.take().expect("open");
             // Nothing of its own to materialize; what it publishes may
             // still name a revision a group in flight wrote.
             if let Some(flight) = self.inflight.back_mut() {
@@ -473,30 +488,37 @@ impl<P: Persistence> Applier<P> {
         // A flush journals a staged group with the protocol's batches;
         // a group closed between flushes is journaled here. One append
         // takes what fits a journal group, so this goes on until the
-        // queue is empty or an append moves nothing.
+        // queue is empty or an append moves nothing. The group stays
+        // open until it is in flight, so what these appends report of it
+        // is noted on it (review of #163): taken first, it was in neither
+        // place, kept every barrier unjournaled, and held every later
+        // group's results to its own commit.
+        let own = open.barriers.clone();
         let mut attempts = self.store.queued() + 1;
         while self.store.queued() > 0 && attempts > 0 {
             let before = self.store.queued();
             let journaled = self.store.journal()?;
             // The append this takes back may be an earlier group's.
             let mut barriers = self.in_flight_barriers();
-            barriers.extend(group.barriers.iter().copied());
+            barriers.extend(own.iter().copied());
             self.take_lowered(journaled, &barriers)?;
             if self.store.queued() >= before {
                 break;
             }
             attempts -= 1;
         }
+        let group = self.group.take().expect("open");
         self.inflight.push_back(InFlight {
-            position: last.position,
+            position,
             own: group.own,
             barriers: group.barriers.clone(),
+            unjournaled: group.unjournaled,
             publications: group.publications,
         });
         let handed = self.store.hand_off()?;
         self.take_lowered(handed, &group.barriers)?;
         self.publish_materialized()?;
-        Ok(Some(last.position))
+        Ok(Some(position))
     }
 
     /// Take back the projection commits a pipelined store's materializer
@@ -550,6 +572,48 @@ impl<P: Persistence> Applier<P> {
         Ok(through)
     }
 
+    /// Note a storage fact about one of this applier's batches, met by a
+    /// lowering this applier did not run: a node's flush journals a staged
+    /// group with the protocol's batches, and an append out on the
+    /// appender's thread is taken back by the node (task-d54). Only
+    /// `JournalDurable` is read (task-d63).
+    pub fn note_journaled(&mut self, event: &StorageEvent) {
+        let StorageEvent::JournalDurable { barrier_id, .. } = event else {
+            return;
+        };
+        if let Some(group) = self.group.as_mut() {
+            group.unjournaled.remove(barrier_id);
+        }
+        for flight in &mut self.inflight {
+            flight.unjournaled.remove(barrier_id);
+        }
+    }
+
+    fn note_all(&mut self, events: &[StorageEvent]) {
+        for event in events {
+            self.note_journaled(event);
+        }
+    }
+
+    /// The execution position through which every group handed off is in
+    /// the journal (task-d63): the projection's committed position, or
+    /// further, through the groups in flight, oldest first, whose every
+    /// batch was reported `JournalDurable`. A group's results may be
+    /// released once it is here, without waiting for its projection
+    /// commit (design Section 4.5); its watch publications, and every
+    /// other effect, still wait for the commit. `None` when nothing has
+    /// been seen committed or journaled.
+    pub fn journaled_through(&self) -> Option<coord_types::ids::ExecutionPosition> {
+        let mut through = self.committed;
+        for flight in &self.inflight {
+            if !flight.unjournaled.is_empty() {
+                break;
+            }
+            through = Some(through.map_or(flight.position, |seen| seen.max(flight.position)));
+        }
+        through
+    }
+
     /// The barriers of every group handed off and not yet materialized.
     fn in_flight_barriers(&self) -> BTreeSet<BarrierId> {
         self.inflight
@@ -563,6 +627,7 @@ impl<P: Persistence> Applier<P> {
     /// the position it has committed through.
     fn publish_materialized(&mut self) -> Result<coord_types::ids::ExecutionPosition, ApplyError> {
         let through = self.store.materialized_through()?;
+        self.committed = Some(self.committed.map_or(through, |seen| seen.max(through)));
         while self
             .inflight
             .front()
@@ -581,6 +646,7 @@ impl<P: Persistence> Applier<P> {
         lowered: crate::persistence::Lowered,
         barriers: &BTreeSet<BarrierId>,
     ) -> Result<(), ApplyError> {
+        self.note_all(&lowered.events);
         let group_lost = lowered.events.iter().any(|e| lost(e, barriers));
         if self.sharing {
             self.foreign.extend(lowered.events);
@@ -590,6 +656,7 @@ impl<P: Persistence> Applier<P> {
         }
         if lowered.indeterminate {
             let settled = self.store.reconcile()?;
+            self.note_all(&settled.events);
             let group_lost = settled.events.iter().any(|e| lost(e, barriers));
             if self.sharing {
                 self.foreign.extend(settled.events);
@@ -706,6 +773,7 @@ impl<P: Persistence> Applier<P> {
                 Arc::make_mut(&mut group.overlay).extend(&updates);
                 Arc::make_mut(&mut group.own).extend(&updates);
                 group.barriers.insert(barrier);
+                group.unjournaled.insert(barrier);
                 group.last = Some(pending);
                 Ok(ApplyOutcome::Applied(Vec::new()))
             }
