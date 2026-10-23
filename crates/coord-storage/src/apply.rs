@@ -471,10 +471,11 @@ impl<P: Persistence> Applier<P> {
             self.finish_group()?;
             return Ok(None);
         }
-        let Some(group) = self.group.take() else {
+        let Some(open) = self.group.as_ref() else {
             return Ok(None);
         };
-        let Some(last) = group.last else {
+        let Some(position) = open.last.as_ref().map(|last| last.position) else {
+            let group = self.group.take().expect("open");
             // Nothing of its own to materialize; what it publishes may
             // still name a revision a group in flight wrote.
             if let Some(flight) = self.inflight.back_mut() {
@@ -487,22 +488,28 @@ impl<P: Persistence> Applier<P> {
         // A flush journals a staged group with the protocol's batches;
         // a group closed between flushes is journaled here. One append
         // takes what fits a journal group, so this goes on until the
-        // queue is empty or an append moves nothing.
+        // queue is empty or an append moves nothing. The group stays
+        // open until it is in flight, so what these appends report of it
+        // is noted on it (review of #163): taken first, it was in neither
+        // place, kept every barrier unjournaled, and held every later
+        // group's results to its own commit.
+        let own = open.barriers.clone();
         let mut attempts = self.store.queued() + 1;
         while self.store.queued() > 0 && attempts > 0 {
             let before = self.store.queued();
             let journaled = self.store.journal()?;
             // The append this takes back may be an earlier group's.
             let mut barriers = self.in_flight_barriers();
-            barriers.extend(group.barriers.iter().copied());
+            barriers.extend(own.iter().copied());
             self.take_lowered(journaled, &barriers)?;
             if self.store.queued() >= before {
                 break;
             }
             attempts -= 1;
         }
+        let group = self.group.take().expect("open");
         self.inflight.push_back(InFlight {
-            position: last.position,
+            position,
             own: group.own,
             barriers: group.barriers.clone(),
             unjournaled: group.unjournaled,
@@ -511,7 +518,7 @@ impl<P: Persistence> Applier<P> {
         let handed = self.store.hand_off()?;
         self.take_lowered(handed, &group.barriers)?;
         self.publish_materialized()?;
-        Ok(Some(last.position))
+        Ok(Some(position))
     }
 
     /// Take back the projection commits a pipelined store's materializer

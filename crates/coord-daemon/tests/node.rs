@@ -1143,6 +1143,40 @@ fn pipelined_a_groups_results_go_out_once_journaled_and_its_projection_commit_fo
     assert_eq!(revision.get() - revision_before.get(), 6);
 }
 
+/// A group closed between flushes, at its command bound, is journaled
+/// when it is handed off, and its results go out then, before its
+/// projection commit (review of #163). The group was taken out of the
+/// open slot before its appends and joined the groups in flight after
+/// them, so the journal's report of it reached neither, and its results,
+/// and every later group's, waited for its commit.
+#[test]
+fn pipelined_a_group_closed_at_its_bound_releases_once_its_hand_off_journals_it() {
+    let mut node = grouped_lone_leader(BootId([14; 16]));
+    let _handle = pipeline(&mut node);
+    let base = node.applier().store().application_base().execution_position;
+    for sequence in 1..=33 {
+        node.on_event(
+            Event::Admitted(admitted_putting(sequence, vec![sequence as u8; 8])),
+            &ballot(),
+        )
+        .expect("admitted");
+        node.flush(&ballot()).expect("flushed");
+    }
+    // The stage closes the first group at 32 commands and hands it off,
+    // journaling it there.
+    let out = node.stage(&ballot()).expect("staged");
+    assert_eq!(
+        releases_in(&out.frontend),
+        32,
+        "the closed group's results go out once its hand-off journals it"
+    );
+    assert_eq!(
+        node.applier().store().materialized_through().unwrap(),
+        base,
+        "before its projection commit"
+    );
+}
+
 /// Pipelined (task-d52), the same commands give the same results, the
 /// same frames to the collector and the same projection as on a node
 /// that commits on its own thread.
