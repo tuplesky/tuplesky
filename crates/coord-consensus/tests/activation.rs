@@ -497,7 +497,11 @@ impl Cluster {
                 continue;
             }
             if let Some(Role::Leader(l)) = self.nodes[i].role.as_mut() {
-                let effects = l.resend_unvoted(coord_consensus::RESEND_PER_VOTER);
+                // As the daemon's re-send timer does: the proposals not
+                // voted on, and the commit frontier again (task-d09), the
+                // one way a follower learns since task-d74.
+                let mut effects = l.resend_unvoted(coord_consensus::RESEND_PER_VOTER);
+                effects.extend(l.announce_committed());
                 self.handle(i, effects);
             }
         }
@@ -1482,8 +1486,9 @@ fn a_lost_acknowledgement_is_published_again_on_a_resend() {
 /// one for c2 is lost and the one for c3 is counted. The re-send used to
 /// skip every proposal at or below the latest one r2's adoption was
 /// counted for, so c2 was never sent again: r0 never learned it and held
-/// c3, chained after it on the same key, at ACCEPT, while r2 committed
-/// both from its own adoption and executed them.
+/// c3, chained after it on the same key, at ACCEPT. r2 committed both
+/// from its own adoption and r0's, and executed them; since task-d74 it
+/// learns from r0's commit frontier, so it waits for r0 as well.
 #[test]
 fn a_lost_acknowledgement_behind_a_counted_one_is_asked_for_again() {
     let mut cluster = Cluster::new(41);
@@ -1501,7 +1506,7 @@ fn a_lost_acknowledgement_behind_a_counted_one_is_asked_for_again() {
         vec![c1],
         "r0 lacks r2's vote on c2"
     );
-    assert_eq!(cluster.nodes[2].executed, vec![c1, c2, c3]);
+    assert_eq!(cluster.nodes[2].executed, vec![c1], "r2 learns from r0");
     cluster.settle_resending(4);
     for i in [0usize, 2] {
         assert_eq!(cluster.nodes[i].executed, vec![c1, c2, c3], "node {i}");
@@ -3886,18 +3891,26 @@ fn a_new_leader_re_proposes_under_the_facts_its_reporters_accepted() {
 /// With every voter up the command committed without the voter that held
 /// other facts, which then stayed at ACCEPT on it for good and executed
 /// nothing after it. Now all three execute it, under one digest.
+///
+/// Which digest is the selection's to name. X was never committed, so a
+/// selection may name either presentation's facts. Since followers
+/// acknowledge to the leader only (task-d74), the messages reach r1 in
+/// another order and its selection names the facts r1 holds, where it
+/// used to name r0's. What the test is for is one digest everywhere.
 #[test]
 fn every_voter_executes_a_recovered_command_under_one_set_of_facts() {
     let mut cluster = Cluster::new(41);
-    let (w, x, accepted, _) = two_presentations(&mut cluster);
+    let (w, x, accepted, other) = two_presentations(&mut cluster);
     cluster.campaign(1, ballot(1, 1));
     cluster.settle_resending(5);
     assert!(matches!(cluster.nodes[1].role, Some(Role::Leader(_))));
     let y = cluster.admit(3, 3);
     cluster.settle_resending(5);
+    let facts = facts_of(&cluster.nodes[0], &x);
+    assert!(facts == Some(accepted) || facts == Some(other), "{facts:?}");
     for i in 0..3 {
         assert_eq!(cluster.nodes[i].executed, vec![w, x, y], "node {i}");
-        assert_eq!(facts_of(&cluster.nodes[i], &x), Some(accepted), "node {i}");
+        assert_eq!(facts_of(&cluster.nodes[i], &x), facts, "node {i}");
     }
 }
 

@@ -210,7 +210,7 @@ fn acknowledged(f: &mut Follower, seq: u64) -> (CommandId, ProtocolMessage) {
         released.extend(f.step(d));
     }
     let sent = sends(&released);
-    assert_eq!(sent.len(), 3, "two peers and the frontend");
+    assert_eq!(sent.len(), 2, "the leader and the frontend (task-d74)");
     let (_, ack) = sent
         .into_iter()
         .find(|(to, _)| *to == FRONTEND.replica)

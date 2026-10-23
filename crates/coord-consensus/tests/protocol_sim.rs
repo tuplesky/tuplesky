@@ -1592,7 +1592,8 @@ impl Sim {
     }
 
     /// The periodic work of `coordd`'s timers: the leader re-sends what
-    /// voters have not voted on, a follower asks its leader for payloads
+    /// voters have not voted on and its commit frontier (task-d09, the one
+    /// way a follower learns since task-d74), a follower asks its leader for payloads
     /// it lacks, a campaign asks for the report pages that have not
     /// arrived (task-d28), and one that holds work it does not execute
     /// asks for the leader's executed history (task-d08's pacer).
@@ -1602,7 +1603,11 @@ impl Sim {
             let at = self.nodes[usize::from(i)].executed.len();
             let donor = self.catch_up_donor(i);
             let effects = match self.nodes[usize::from(i)].role.as_mut() {
-                Some(Role::Leader(l)) => l.resend_unvoted(coord_consensus::RESEND_PER_VOTER),
+                Some(Role::Leader(l)) => {
+                    let mut effects = l.resend_unvoted(coord_consensus::RESEND_PER_VOTER);
+                    effects.extend(l.announce_committed());
+                    effects
+                }
                 Some(Role::Follower(f)) => {
                     let leader = f.quorum().leader();
                     let mut effects = f.request_report_pages();
