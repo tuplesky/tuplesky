@@ -189,7 +189,7 @@ fn a_queued_pointer_rides_the_next_group_and_its_retirement_follows_on_the_worke
     ));
 
     // A transition queued after it: the group carries both, the pointer
-    // last in the domain's entry.
+    // first in the domain's entry, ahead of what was queued after it.
     submit(&mut domain, &mut barriers, b"vote-c2");
     assert_eq!(domain.store().queued(DOMAIN), 1, "the pointer rides along");
     let report = domain.store_mut().append().unwrap();
@@ -252,13 +252,101 @@ fn a_queued_pointer_rides_the_next_group_and_its_retirement_follows_on_the_worke
             _ => None,
         })
         .unwrap();
-    let last = journal.records(stream).last().unwrap();
+    let records = journal.records(stream);
+    let [.., pointer, last] = records else {
+        panic!("the entry's records");
+    };
     assert!(
-        matches!(last.body(), RecordBody::PublishLocalCheckpoint(p) if p.represented == represented),
-        "the pointer is the entry's last record"
+        matches!(pointer.body(), RecordBody::PublishLocalCheckpoint(p) if p.represented == represented),
+        "the pointer goes ahead of the transition queued after it"
     );
+    assert!(!matches!(
+        last.body(),
+        RecordBody::PublishLocalCheckpoint(_)
+    ));
     let (pointer, _) = selected(journal);
     assert_eq!(pointer, Some(publication.pointer));
+}
+
+/// A domain whose queue fills every group still carries its pointer
+/// (review of #164): the pointer goes right after the transitions queued
+/// before it, and what is queued after it waits behind it. Behind the
+/// whole queue, a domain kept busy enough never carried it, and retired
+/// nothing.
+#[test]
+fn a_pointer_goes_behind_what_was_queued_before_it_and_ahead_of_what_follows() {
+    let dir = tempfile::tempdir().unwrap();
+    let images = LocalCheckpointStore::open(dir.path()).unwrap();
+    let mut barriers = BarrierAllocator::new(inc(), BOOT);
+    let (mut domain, _) = published_once(&images, &mut barriers);
+    let group = JournalLimits::default().group.max_records;
+    // More queued than a group holds, before and after the pointer.
+    let before = group + group / 2;
+    for i in 0..before {
+        submit(&mut domain, &mut barriers, format!("before-{i}").as_bytes());
+    }
+    let queued = queue_image(&mut domain, &images);
+    let represented = queued.written.pointer.represented;
+    let mut appended = 0usize;
+    let mut groups = 0usize;
+    let published = loop {
+        // Every turn, more than a group's worth arrives behind it.
+        for i in 0..group + 1 {
+            submit(
+                &mut domain,
+                &mut barriers,
+                format!("after-{groups}-{i}").as_bytes(),
+            );
+        }
+        let report = domain.store_mut().append().unwrap();
+        appended += report.journaled;
+        groups += 1;
+        if let Some(outcome) = domain.take_local(&queued) {
+            break outcome.expect("published");
+        }
+        assert!(
+            groups < 4,
+            "the pointer was overtaken: {appended} records appended"
+        );
+    };
+    assert_eq!(published.represented, represented);
+    assert!(published.retired);
+    assert_eq!(
+        appended,
+        before + 1 + (2 * group - before - 1),
+        "the pointer took its place behind the transitions queued before it"
+    );
+    // In the journal: the pointer right after the last transition queued
+    // before it, and the first one queued after it right after the pointer.
+    let (journal, _) = domain.into_store().into_parts();
+    let stream = journal
+        .events()
+        .iter()
+        .find_map(|e| match e {
+            JournalEvent::Retired { stream, .. } => Some(*stream),
+            _ => None,
+        })
+        .unwrap();
+    let records = journal.records(stream);
+    let at = records
+        .iter()
+        .position(|r| {
+            matches!(r.body(), RecordBody::PublishLocalCheckpoint(p) if p.represented == represented)
+        })
+        .expect("the pointer is in the journal");
+    let key = |r: &coord_journal_api::record::JournalRecordV1| -> Vec<u8> {
+        r.body()
+            .updates()
+            .first()
+            .expect("a transition")
+            .key
+            .clone()
+    };
+    assert_eq!(
+        key(&records[at - 1]),
+        format!("before-{}", before - 1).into_bytes()
+    );
+    assert!(key(&records[at + 1]).starts_with(b"after-"));
 }
 
 #[test]

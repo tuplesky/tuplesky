@@ -10478,10 +10478,16 @@ The runner's reading put the long publications on the journal's waits,
 so the job is built. A voter no longer takes the journal back to
 publish. `JournaledStore::queue_checkpoint` checks the pointer as
 `publish_checkpoint` does (the domain is ready, the origin is its own,
-`C <= M`) and queues it. The next group the store seals carries it: as
-the last record of the domain's entry, once everything queued before it
-fits, or as an entry of its own under the publication's barrier when
-nothing else is queued. `AppendJob::run` appends the group and then, only
+`C <= M`) and queues it. The next group the store seals carries it: in
+the domain's entry right after the last transition queued before it, and
+ahead of everything queued since, or as an entry of its own under the
+publication's barrier when nothing else is queued or nothing else fits.
+The store keeps that last transition's barrier with the pointer, so
+nothing that leaves the queue meanwhile moves it. Placed behind the
+whole queue, as it first was, the pointer was never carried by a domain
+whose queue filled every group: the queue holds 256 transitions and a
+group 64, and with no retirement the journal grows (Codex review of
+#164; pinned by `pointer_job.rs::a_pointer_goes_behind_what_was_queued_before_it_and_ahead_of_what_follows`). `AppendJob::run` appends the group and then, only
 if the append succeeded, retires what each pointer in it represents, on
 the appender's thread. Without an appender both run in the lowering that
 writes the group. `C` advances when the group is taken back, and
