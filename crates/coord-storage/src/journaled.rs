@@ -682,6 +682,11 @@ struct Domain<E: LocalEngine> {
 /// A checkpoint pointer on its way through the journal worker (task-d66).
 struct Queued {
     pointer: CheckpointPointerV1,
+    /// The last transition queued before it, if any: the pointer goes
+    /// right after it in the journal, and nothing queued since goes ahead
+    /// of it (review of #164). A barrier, not a count, so it holds
+    /// whatever leaves the queue meanwhile.
+    behind: Option<BarrierId>,
     /// When it was queued.
     since: Instant,
     stage: QueuedStage,
@@ -792,6 +797,19 @@ impl<E: LocalEngine> Domain<E> {
             return None;
         }
         Some(queued.pointer)
+    }
+
+    /// How many queued transitions go ahead of the queued checkpoint
+    /// pointer: those up to the last one queued before it, or none once
+    /// that one has left the queue.
+    fn checkpoint_ahead(&self) -> usize {
+        let Some(behind) = self.checkpoint.as_ref().and_then(|q| q.behind) else {
+            return 0;
+        };
+        self.queue
+            .iter()
+            .position(|s| s.batch.barrier == behind)
+            .map_or(0, |i| i + 1)
     }
 
     /// The queued checkpoint pointer is in a group now.
@@ -1767,6 +1785,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
         }
         state.checkpoint = Some(Queued {
             pointer: *pointer,
+            behind: state.queue.back().map(|s| s.batch.barrier),
             since: Instant::now(),
             stage: QueuedStage::Waiting,
         });
@@ -2241,10 +2260,10 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
     /// the queue; `None` when nothing is ready. The group is not written:
     /// [`JournaledStore::complete_group`] takes its outcome.
     ///
-    /// A domain's queued checkpoint pointer (task-d66) goes last in its
-    /// entry, once everything queued before it fits, or alone when
-    /// nothing is queued; the retirement each one owes is returned with
-    /// the group, to run after its append.
+    /// A domain's queued checkpoint pointer (task-d66) goes in its entry
+    /// right after the transitions queued before it, ahead of any queued
+    /// since, or alone when nothing is queued; the retirement each one
+    /// owes is returned with the group, to run after its append.
     fn seal_group(&mut self) -> Result<Option<Sealing>, JournaledError> {
         let mut group = GroupWrite::new(self.limits.group);
         let mut sealed: Vec<Sealed> = Vec::new();
@@ -2313,7 +2332,37 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
             let mut predecessor = state.head_digest;
             let mut records: Vec<Durable> = Vec::new();
             let mut bytes = 0usize;
+            // The pointer goes right after the transitions queued before
+            // it, ahead of any queued since: behind them all, a domain
+            // whose queue filled every group never carried it (review of
+            // #164).
+            let ahead = state.checkpoint_ahead();
+            let pointer_first = ahead == 0 && pointer.is_some();
+            let mut pointer = pointer;
+            let mut carried = None;
+            let mut dequeued = 0usize;
             for submission in &state.queue {
+                if dequeued == ahead
+                    && let Some(p) = pointer.take()
+                {
+                    let record = seal_pointer(state, &p, seq, predecessor)?;
+                    let len = record.encoded_len()?;
+                    if group.record_count() + records.len() + 1 > limits.max_records
+                        || group.bytes().saturating_add(bytes).saturating_add(len)
+                            > limits.max_bytes
+                    {
+                        full = true;
+                        break;
+                    }
+                    bytes += len;
+                    seq = record.seq().checked_next().map_err(HeadError::from)?;
+                    predecessor = record.digest();
+                    records.push(Durable {
+                        barrier: None,
+                        record,
+                    });
+                    carried = Some(p);
+                }
                 let record = seal(state, submission, seq, predecessor)?;
                 let len = record.encoded_len()?;
                 if group.record_count() + records.len() + 1 > limits.max_records
@@ -2329,9 +2378,12 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                     barrier: Some(submission.batch.barrier),
                     record,
                 });
+                dequeued += 1;
             }
             if records.is_empty() {
-                if !sealed.is_empty() {
+                // A pointer that goes first and did not fit waits for the
+                // next group, and so does everything queued after it.
+                if !sealed.is_empty() || pointer_first {
                     // The group is full; this stream goes in the next one.
                     break;
                 }
@@ -2359,11 +2411,12 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                 ));
                 break;
             }
-            // The pointer, behind everything queued before it, when all
-            // of that fits and the pointer does as well.
-            let dequeued = records.len();
-            let mut carried = None;
-            if !full && let Some(pointer) = pointer {
+            // The pointer, behind everything queued, when all of that
+            // was queued before it and fits, and the pointer does as well.
+            if !full
+                && dequeued == ahead
+                && let Some(pointer) = pointer
+            {
                 let record = seal_pointer(state, &pointer, seq, predecessor)?;
                 let len = record.encoded_len()?;
                 if group.record_count() + records.len() + 1 > limits.max_records
@@ -2378,6 +2431,17 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                     carried = Some(pointer);
                 }
             }
+            // Only the pointer fitted: an entry of its own, as when nothing
+            // is queued, under the publication's barrier, which a group
+            // holds once.
+            let entry_barrier = if dequeued == 0 {
+                if sealed.iter().any(|(_, b, _)| *b == checkpoint_barrier) {
+                    break;
+                }
+                checkpoint_barrier
+            } else {
+                entry_barrier
+            };
             group.push(GroupEntry::new(
                 entry_barrier,
                 state.origin.stream,
