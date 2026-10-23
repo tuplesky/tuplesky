@@ -2901,6 +2901,8 @@ This entry is the budget and the record, not a lever:
 
 **Implement:** The leader's single loop is the serialization point. On the runner it queued for a CPU while 0.65 to 1.48 cores sat idle. What it does that another thread could is read first, from the per-thread split task-d53's and task-d60's readings give (the leader's loop by phase, the follower beside it), with the idle cores as the evidence that the loop is the bound. Each candidate the reading names is its own PR with its pair.
 
+- **The reading, recorded** ([notes](../tuplesky-impl-notes.md#the-domain-loop-read-task-d75)): on one host the host is the bound, not the leader's loop, and the commands a group carries (1.14 a lowering, 2.2 a journal append) is the lever it points at. The first candidate taken is the settle read (this task's first PR): one snapshot and one lookup a key a turn, and none for a command already found without a record at the same completed frontier.
+
 **Acceptance:** The reading recorded in the notes before any change. Each change a pair on the runner: the leader's loop CPU per command, the idle cores, `ok`/s and p99.
 
 **Review boundary:** What runs on the leader's domain thread. No change to the order the loop decides in, or to the protocol.
