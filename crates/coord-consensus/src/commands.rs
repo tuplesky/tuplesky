@@ -733,8 +733,10 @@ impl CommandTable {
     /// Take back an acceptance of an earlier ballot that a Sync did not
     /// carry: the record returns to PRE-ACCEPT, keeping its payload and
     /// dependencies, which at PRE-ACCEPT decide nothing and which adoption
-    /// replaces (task-d11). Only an ACCEPT is demoted; a commit is a
-    /// decision and stays. Returns whether the record was demoted.
+    /// replaces (task-d11). A pre-acceptance loses its path the same way
+    /// when it was no vote in the ballot a report will label it with
+    /// (task-d74). A commit is a decision and stays.
+    /// Returns whether the record was demoted.
     ///
     /// The path goes too ([`crate::graph::demoted_path`]): it was evidence
     /// about the earlier ballot, and a report labels the record with the
@@ -742,7 +744,10 @@ impl CommandTable {
     /// fast-path analysis take the old order as the new ballot's.
     pub fn demote(&mut self, command: &CommandId) -> bool {
         match self.records.get_mut(command) {
-            Some(record) if record.payload.is_some() && record.phase == Phase::Accept => {
+            Some(record)
+                if record.payload.is_some()
+                    && matches!(record.phase, Phase::PreAccept | Phase::Accept) =>
+            {
                 record.demote();
                 true
             }

@@ -2581,7 +2581,14 @@ fn a_receiving_follower_that_crashes_on_the_marker_still_holds_the_selection() {
     let Effect::Persist(batch) = &bound[0] else {
         panic!("{bound:?}")
     };
-    assert_eq!(batch.updates.len(), 2, "the marker and the selection");
+    // The third row is c1's own ballot-0 pre-acceptance, demoted in the
+    // same batch: until the entry is installed over it, a report labels
+    // it with the new ballot (task-d74).
+    assert_eq!(
+        batch.updates.len(),
+        3,
+        "the marker, the selection and the demotion"
+    );
     // Make that batch durable and crash before anything else happens.
     let durable = coord_core::effect::PersistBatch {
         barrier: batch.barrier,
@@ -3138,6 +3145,171 @@ fn a_sync_leaves_no_acceptance_of_an_earlier_ballot() {
     // the same.
     cluster.crash(1);
     cluster.revive(1, quorum(b1));
+    check(&cluster);
+}
+
+/// A Sync takes the path from a pre-acceptance of an earlier ballot that
+/// it re-proposes (task-d74, found by the protocol simulator).
+///
+/// r1 pre-accepts x under ballot 0, and no decision follows. Ballot 1
+/// re-proposes x, and its leader's proposal of x never reaches r1. A report
+/// is labelled with the synchronized ballot, so r1 reported ballot 0's
+/// pre-acceptance with its path as ballot 1's. A selection whose majority
+/// left out ballot 1's leader read it as a possible fast decision of ballot
+/// 1: with only r1's pre-acceptances to count, two conflicting commands,
+/// one pre-accepted in each ballot and without an edge between them, were
+/// adopted, and the voters executed them in different orders (protocol_sim
+/// row 5, three voters, seeds 376 and 841, and row 3, five voters, seed
+/// 528). A demoted ACCEPT already lost its path (task-d11); the
+/// pre-acceptance now does too, durably with the marker.
+#[test]
+fn a_sync_takes_the_path_from_a_pre_acceptance_it_re_proposes() {
+    let mut cluster = Cluster::new(47);
+    let x = cluster.admit_at(1, 1, &[1]);
+    let before = cluster.nodes[1].follower().report(ballot(1, 0));
+    let entry = before.entries.iter().find(|e| e.command == x).unwrap();
+    assert_eq!(entry.phase, Phase::PreAccept);
+    assert_ne!(entry.path, coord_consensus::demoted_path());
+
+    // Ballot 1 is r0's again, so r1 is in its fast set ({r0, r1}).
+    let b1 = ballot(1, 0);
+    let effects = cluster.nodes[1].step(peer_event(
+        r(0),
+        ProtocolMessage::NewLeader {
+            ballot: b1,
+            executed: coord_types::ids::ExecutionPosition::ZERO,
+        },
+    ));
+    cluster.handle(1, effects);
+    let decision = SyncDecision {
+        ballot: b1,
+        source_ballot: ballot(0, 0),
+        entries: BTreeMap::new(),
+        reproposed: [x].into_iter().collect(),
+    };
+    let effects = cluster.nodes[1].step(peer_event(r(0), ProtocolMessage::Sync(decision)));
+    cluster.handle(1, effects);
+    assert_eq!(cluster.nodes[1].follower().quorum().ballot(), b1);
+
+    let check = |cluster: &Cluster| {
+        // r1 reports for ballot 2, r2's; r1 is the only reporter of ballot
+        // 1 in its fast set, r0 is down and r2 is behind.
+        let q2 = quorum(ballot(2, 2));
+        let ours = cluster.nodes[1].follower().report(ballot(2, 2));
+        assert_eq!(ours.committed_ballot, b1);
+        let entry = ours.entries.iter().find(|e| e.command == x).unwrap();
+        assert_eq!(
+            entry.path,
+            coord_consensus::demoted_path(),
+            "ballot 0's pre-acceptance of x is reported with its path as ballot 1's"
+        );
+        let mut older = ours.clone();
+        older.replica = r(2);
+        older.committed_ballot = ballot(0, 0);
+        older.entries.retain(|e| e.command != x);
+        let selected = coord_consensus::recovery::select(&q2, &[ours, older])
+            .expect("the selection completes");
+        assert!(
+            !selected.entries.contains_key(&x),
+            "ballot 0's pre-acceptance was selected as a fast decision of ballot 1: {:?}",
+            selected.entries.get(&x)
+        );
+        assert!(selected.reproposed.contains(&x));
+    };
+    check(&cluster);
+    // Durable with the marker: a restart before the next report reports
+    // the same.
+    cluster.crash(1);
+    cluster.revive(1, quorum(b1));
+    check(&cluster);
+}
+
+/// A payload recorded while this replica may not vote carries no path
+/// evidence (task-d74, found by the protocol simulator).
+///
+/// r1, in ballot 0's fast set, holds ballot 0's proposal of x without its
+/// payload, promises ballot 1, and only then receives the payload: it
+/// records x, with its own dependencies, and sends no fast
+/// acknowledgement. Its report is labelled with ballot 0, its synchronized
+/// ballot, so it reported x with a path as a fast-set member's
+/// pre-acceptance of ballot 0, and a selection whose majority left out
+/// ballot 0's leader adopted it as a possible fast decision. Two such
+/// records, one recorded before a Sync re-based its log and one after,
+/// were adopted with no edge between them (protocol_sim row 3, three
+/// voters, seed 372; without catch-up, row 10, seed 729, and row 9, seed
+/// 144).
+#[test]
+fn a_payload_recorded_after_a_higher_promise_carries_no_path() {
+    let mut cluster = Cluster::new(47);
+    // r0 leads ballot 0 and proposes x; r1 holds the proposal without the
+    // payload, and r2 hears nothing, so x is decided nowhere.
+    cluster.no_fetch = vec![1];
+    cluster.cut = vec![(0, 2), (2, 0), (1, 2), (2, 1)];
+    let x = cluster.admit_at(1, 1, &[0]);
+    cluster.settle();
+    assert_eq!(cluster.nodes[1].follower().table().phase_of(&x), None);
+    let payload = match cluster.nodes[0].role.as_ref().unwrap() {
+        Role::Leader(l) => l.payload(&x).expect("the leader holds it").clone(),
+        Role::Follower(_) => panic!("r0 leads ballot 0"),
+    };
+    // r1 promises ballot 1, then the payload it lacked arrives.
+    let b1 = ballot(1, 2);
+    let effects = cluster.nodes[1].step(peer_event(
+        r(2),
+        ProtocolMessage::NewLeader {
+            ballot: b1,
+            executed: coord_types::ids::ExecutionPosition::ZERO,
+        },
+    ));
+    cluster.handle(1, effects);
+    assert_eq!(cluster.nodes[1].follower().ballots().promised(), b1);
+    let effects = cluster.nodes[1].step(peer_event(
+        r(0),
+        ProtocolMessage::PayloadResponse {
+            command: x,
+            payload,
+        },
+    ));
+    cluster.handle(1, effects);
+    assert_eq!(
+        cluster.nodes[1].follower().table().phase_of(&x),
+        Some(Phase::PreAccept),
+        "recorded, with r1's own dependencies"
+    );
+    assert!(
+        !cluster
+            .frontend
+            .iter()
+            .any(|(from, m)| *from == r(1)
+                && matches!(m, ProtocolMessage::FastAck(a) if a.command == x)),
+        "no fast acknowledgement after the higher promise"
+    );
+    let check = |cluster: &Cluster| {
+        let q = quorum(ballot(2, 2));
+        let ours = cluster.nodes[1].follower().report(ballot(2, 2));
+        assert_eq!(ours.committed_ballot, ballot(0, 0));
+        let entry = ours.entries.iter().find(|e| e.command == x).unwrap();
+        assert_eq!(entry.phase, Phase::PreAccept);
+        assert_eq!(
+            entry.path,
+            coord_consensus::demoted_path(),
+            "a record that was no vote is reported with a path"
+        );
+        // r1 is the only reporter in ballot 0's fast set ({r0, r1}).
+        let mut theirs = ours.clone();
+        theirs.replica = r(2);
+        theirs.entries.retain(|e| e.command != x);
+        let selected = coord_consensus::recovery::select(&q, &[ours, theirs])
+            .expect("the selection completes");
+        assert!(
+            !selected.entries.contains_key(&x),
+            "a record that was no vote was selected as a fast decision: {:?}",
+            selected.entries.get(&x)
+        );
+    };
+    check(&cluster);
+    cluster.crash(1);
+    cluster.revive(1, quorum(ballot(0, 0)));
     check(&cluster);
 }
 

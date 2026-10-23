@@ -518,7 +518,8 @@ pub struct Follower {
     /// is activated only when that row is durable.
     sync_barrier: Option<(BarrierId, SyncDecision)>,
     /// The acceptances of earlier ballots the in-flight Sync demotes, in
-    /// the batch of its synchronized-ballot row (task-d11).
+    /// the batch of its synchronized-ballot row (task-d11), and the
+    /// pre-acceptances it does not release (task-d74).
     sync_demoted: Vec<CommandId>,
     /// The undecided records the marker in flight releases (task-d24):
     /// released from the table once that batch is durable.
@@ -1639,17 +1640,29 @@ impl Follower {
                     updates.push(crate::rows::payload_delete(command));
                 }
             }
+            // An earlier ballot's acceptance the Sync does not carry as it
+            // stands, and every pre-acceptance it does not release: the
+            // report after the marker labels them with this ballot, and the
+            // next selection must not read their paths as its order
+            // (task-d11, task-d34). Nothing pre-accepted before this ballot
+            // is active was a vote in it, and one an earlier ballot's
+            // leader never ordered, kept, was adopted as a fast decision of
+            // this ballot by a majority that left out its leader (task-d74,
+            // found by the protocol simulator once acknowledgements went to
+            // the leader only). A carried entry is installed over it.
             let demoted: Vec<(CommandId, CommandRecord)> = self
                 .table
                 .records()
                 .filter(|(c, r)| {
                     r.payload.is_some()
                         && !released.contains(c)
-                        && r.phase == Phase::Accept
-                        && decision
-                            .entries
-                            .get(c)
-                            .is_none_or(|e| !crate::vote::same_set(&e.deps, &r.deps))
+                        && (r.phase == Phase::Accept
+                            && decision
+                                .entries
+                                .get(c)
+                                .is_none_or(|e| !crate::vote::same_set(&e.deps, &r.deps))
+                            || r.phase == Phase::PreAccept
+                                && r.path != crate::graph::demoted_path())
                 })
                 .map(|(c, r)| {
                     let mut r = r.clone();
@@ -3614,6 +3627,14 @@ impl Follower {
                 command,
                 accepted: init.payload,
             });
+        }
+        // No fast vote, no path evidence (task-d74): a payload recorded
+        // while this replica may not vote -- after a higher promise, or
+        // before its ballot is active -- is reported under its synchronized
+        // ballot like any record, and kept with its path it read as a
+        // fast-set member's pre-acceptance in that ballot.
+        if !(self.in_fast_set() && self.may_vote()) {
+            self.table.demote(&command);
         }
         let epoch = self.config.identity.epoch;
         let record = self
