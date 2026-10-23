@@ -2857,6 +2857,7 @@ This entry is the budget and the record, not a lever:
 | task-d73 | | | | | | CPU: messages per command |
 | task-d74 | | | | | | CPU: acknowledgements per command |
 | task-d75 | | | | | | CPU: the leader's loop |
+- **The local record** (this entry's PR): the same split on one host, five voters, each build against the one before it, with a profile of the leader and a follower ([notes](../tuplesky-impl-notes.md#the-budget-on-one-host-task-d72)). It does not replace the runner's rows, which the Jepsen testing session runs. It reads what a lever moved before the runner does: of a write's 7.9 to 8.7 ms of the nodes' CPU, a follower costs about 1.6 ms and the leader about 1.9, so the followers carry three quarters of it, and off the domain loops the transport's QUIC threads are a third of each node's CPU and the projection's commits a fifth.
 - **The shapes it is read in** (`docs/operations/jepsen.md`): `service`, a fixed rate where the metric is latency and CPU per operation at equal work, on the bridge and under the WAN profile; the append shape run against etcd too, so the multiple quoted has a denominator; and several domains on one cluster, if the harness can start them.
 
 **Acceptance:** This entry's PR records the baseline row and task-d63's and task-d66's rows, with the `service` shape's p50, p99 and CPU per operation beside etcd's at the same rate. task-d73, task-d74 and task-d75 each add their row in their own PR. The entry closes when the target is met, or when each part of the gap that remains is named with its owner.
