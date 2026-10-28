@@ -10562,6 +10562,15 @@ included.
 - **B:** 60,000, with `checkpoint_after_records = 4096` (and the replay
   profile's 30 s interval), so that publications fall inside the run.
 
+**Rows compare only with rows of the same session, run alternately.**
+The same code reads very differently across sessions on this kind of
+host: this table's plan base runs at 639 to 664 `ok`/s and 8.38 to
+8.65 ms of the nodes' CPU a write, the same code with only #163's and
+#164's fixes on top at 749 to 824 `ok`/s and 6.87 to 7.41 ms in a later
+session of this one (#167's and #168's tables), and the plan base at 918
+to 963 `ok`/s and 5.66 to 6.04 ms in the reviewer's. None of those
+differences is a lever (review of #165).
+
 | Build | Runs | ok/s | put p50 ms | put p99 ms | Nodes' CPU a write | Leader (its loop) | A follower (its loop) | Frames a write | Datagrams a write | Host CPU an op |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | A: plan base `50cc079` | 3 | 639 to 664 | 89.1 to 92.2 | 136.0 to 150.0 | 8.38 to 8.65 | 1.93 to 2.01 (0.81 to 0.85) | 1.61 to 1.66 (0.63 to 0.66) | 35.9 to 36.0 | 14.4 to 14.4 | 4.47 to 4.65 |
@@ -10599,11 +10608,14 @@ with DWARF call graphs. Each thread's share of its process's samples:
 | appender (journal) | 7% | 9% |
 
 - **The transport** spends 38 to 42% of its time in quinn's connection
-  driver and 16 to 18% in `sendmsg` alone. Its cost goes with datagrams
-  and frames, which task-d73 (one frame a peer a turn) and task-d74
-  (acknowledgements to the leader and the frontend only) take down. At
-  five voters a follower in the fast set sends 8.5 frames a write and one
-  outside it 4.5; the leader sends 10.1.
+  driver and 16 to 18% in `sendmsg` alone. At five voters a follower in
+  the fast set sends 8.5 frames a write and one outside it 4.5; the
+  leader sends 10.1. Its cost is not paid per frame, though, as the
+  reading first took it to be (corrected by task-d74's pair, review of
+  #165): #167 halved the frames (36 to 18 a write) for about 4% of the
+  nodes' CPU, about 13 µs a frame sent and received in the reviewer's
+  session, and a fast-set follower sending 8.5 frames a write costs only
+  0.03 ms more than one sending 4.5.
 - **The domain loop**, inclusive: the machine's `step` is about a
   quarter, and the projection's reads on the loop another sixth (redb
   `get`, opening its tables, taking snapshots): the retry lookup, the
@@ -10614,11 +10626,13 @@ with DWARF call graphs. Each thread's share of its process's samples:
   writes, a fifth of each node, for working commits under the replay
   profile.
 
-So the order the plan gives holds here: task-d73 and task-d74 take the
-transport's per-message cost, which is a third of every node, and the
-followers' receiving and handling of every other follower's
-acknowledgements. task-d75's reading of the leader's loop is the
-leader's 40%.
+So the transport's third of every node is mostly not the per-message
+cost task-d73 and task-d74 take. task-d74, measured, is about 4% of the
+nodes' CPU and 6% of a follower's, the largest single lever so far and
+still a small one; task-d73, which removes frames a turn, is worth on
+the order of 1% at that rate. task-d75's reading of the leader's loop is
+the leader's 40%, and what it found is in its own section
+([below](#the-domain-loop-read-task-d75)).
 
 ## The domain loop, read (task-d75)
 
