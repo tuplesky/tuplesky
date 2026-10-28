@@ -120,6 +120,13 @@ pub struct Records {
 /// none (a twentieth of a follower's domain loop). A command that has a
 /// record, or one bound to another command, is read every turn, as
 /// before: what the collector makes of it is the collector's.
+///
+/// What it remembers is bounded by what is still half held, which the
+/// caller says with [`RecordReads::retain`] every turn: on a node whose
+/// store takes no commands -- a frontend-only one -- the frontier never
+/// moves, and every command that was ever half held there for a turn
+/// would otherwise stay remembered for the life of the process (Codex
+/// review of #168).
 #[derive(Debug, Default)]
 pub struct RecordReads {
     /// The completed frontier `absent` was read at.
@@ -129,6 +136,21 @@ pub struct RecordReads {
 }
 
 impl RecordReads {
+    /// Forget every command not in `pending`, the commands still half
+    /// held.
+    pub fn retain(&mut self, pending: impl IntoIterator<Item = CommandId>) {
+        if self.absent.is_empty() {
+            return;
+        }
+        let pending: std::collections::BTreeSet<CommandId> = pending.into_iter().collect();
+        self.absent.retain(|command| pending.contains(command));
+    }
+
+    /// How many commands it remembers as having no record.
+    pub fn remembered(&self) -> usize {
+        self.absent.len()
+    }
+
     /// What the store holds for `half`.
     pub fn read<P: Persistence>(
         &mut self,

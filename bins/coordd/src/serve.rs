@@ -3851,6 +3851,10 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     #[must_use]
     fn settle_from_records(&mut self) -> Option<Box<coord_collector::Mismatch>> {
         let half = self.frontend.frontend.dispatcher_mut().half_established();
+        // What the reads remember is what is still half held (Codex
+        // review of #168).
+        self.settle_reads
+            .retain(half.iter().map(|(command, _)| *command));
         if half.is_empty() {
             return None;
         }
