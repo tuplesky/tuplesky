@@ -190,9 +190,9 @@ impl Machine {
     }
 
     /// The pre-acceptances this replica holds that the leader has not
-    /// ordered, and those it has ordered a later command past (task-d62).
-    /// None for a leader, which orders what it pre-accepts: its own path
-    /// log's suffix is not left unsynchronized by anyone else.
+    /// ordered, and those it has ordered a later command past, which are
+    /// set aside (task-d62, task-d67). None for a leader, which orders
+    /// what it pre-accepts.
     pub fn unordered(&self) -> (usize, std::collections::BTreeSet<CommandId>) {
         match self {
             Machine::Leader(_) => (0, std::collections::BTreeSet::new()),
@@ -200,8 +200,9 @@ impl Machine {
         }
     }
 
-    /// For a leader, the commands its own path logs hold pending, which it
-    /// never synchronizes (task-d68); nothing for a follower.
+    /// For a leader, the commands its own path logs hold pending: none, as
+    /// it synchronizes each proposal as it makes it (task-d68); nothing
+    /// for a follower.
     pub fn leader_log_pending(&self) -> usize {
         match self {
             Machine::Leader(m) => m.table().pending_in_logs(),
@@ -1016,9 +1017,9 @@ impl<P: Persistence> Node<P> {
     }
 
     /// Look at the pre-acceptances this replica holds that the leader
-    /// has not ordered, at `now` (task-d62). The age of one the leader
-    /// ordered a later command past runs from the first observation that
-    /// saw it, so it is as fine as the observations are frequent.
+    /// has not ordered, at `now` (task-d62). The age of one set aside
+    /// (task-d67) runs from the first observation that saw it, so it is as
+    /// fine as the observations are frequent.
     pub fn observe_unordered(&mut self, now: std::time::Instant) -> Unordered {
         let (pending, reordered) = self.machine().unordered();
         self.unordered_since.retain(|c, _| reordered.contains(c));

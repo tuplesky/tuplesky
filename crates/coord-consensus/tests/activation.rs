@@ -2663,11 +2663,16 @@ fn a_sync_installs_the_selected_per_key_evidence_not_only_the_combined_digest() 
         "the per-key evidence is installed, not only the combined digest"
     );
     assert_eq!(record.synced_seq, Some(7));
-    assert_eq!(
-        f.table().path_head(&key),
-        chosen,
-        "the key's log resumes at the selected order, not the local one"
-    );
+    // The entry takes the command out of the log's suffix, so the head no
+    // longer digests the local order. Numbered in the ballot it was
+    // ordered in, it does not move the log's position (task-d68): the head
+    // is the prefix the log had, and the next fresh proposal this replica
+    // adopts moves it to the new leader's path.
+    let log = f.table().log(&key).expect("touched");
+    assert_eq!(log.pending(), &[] as &[coord_types::CommandId]);
+    assert_eq!(log.position(), None);
+    assert_ne!(f.table().path_head(&key), local, "not the local order");
+    assert_eq!(f.table().path_head(&key), coord_consensus::empty_path());
 }
 
 #[test]

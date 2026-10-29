@@ -30,9 +30,10 @@ use alloc::vec::Vec;
 
 use coord_types::CommandId;
 use coord_types::identity::Digest32;
+use coord_types::ids::Ballot;
 use serde::{Deserialize, Serialize};
 
-use crate::graph::{ClosureCursor, ClosureProgress, PathLog, combined_path};
+use crate::graph::{ClosureCursor, ClosureProgress, PathLog, Position, combined_path};
 use crate::phase::{GuardViolation, Phase, guard_accept, guard_commit, guard_execute};
 
 /// A command as this replica knows it.
@@ -141,7 +142,7 @@ struct KeyState {
 pub const RECOVERY_RESERVE_PARTS: usize = 8;
 
 /// How far an initialization may fill the table.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Room {
     /// New admission: up to the capacity less the recovery reserve.
     Admission,
@@ -149,6 +150,11 @@ enum Room {
     Reserve,
     /// Recovery work, which the largest Sync and catch-up page bound.
     Unbounded,
+    /// A command catch-up installs decided: unbounded, and not appended to
+    /// the path logs (task-d67). Its place is in a leader's prefix, which
+    /// the next synchronization's digest covers; appended, it stayed in the
+    /// suffix after it retired.
+    Installed,
 }
 
 /// The command table of one replica in one domain.
@@ -616,6 +622,19 @@ impl CommandTable {
         self.initialize_bounded(command, payload, keys, Room::Reserve)
     }
 
+    /// [`CommandTable::initialize_beyond_capacity`] for a command catch-up
+    /// installs already decided (task-d67): its key's latest moves to it,
+    /// and its path logs do not take it. The paths it returns are the
+    /// heads it was installed at, which the decision's own replace.
+    pub fn initialize_installed(
+        &mut self,
+        command: CommandId,
+        payload: Digest32,
+        keys: Vec<Vec<u8>>,
+    ) -> Result<Initialized, InitError> {
+        self.initialize_bounded(command, payload, keys, Room::Installed)
+    }
+
     fn initialize_bounded(
         &mut self,
         command: CommandId,
@@ -636,7 +655,7 @@ impl CommandTable {
                 let refused = match room {
                     Room::Admission => self.full_after_reclaim(),
                     Room::Reserve => self.at_capacity_after_reclaim(),
-                    Room::Unbounded => false,
+                    Room::Unbounded | Room::Installed => false,
                 };
                 if refused {
                     return Err(InitError::Backpressure);
@@ -653,7 +672,11 @@ impl CommandTable {
                 }
             }
             state.last = Some(command);
-            let digest = state.log.append(command);
+            let digest = if room == Room::Installed {
+                state.log.install(command)
+            } else {
+                state.log.append(command)
+            };
             paths.push((key.clone(), digest));
         }
         let path = combined_path(&paths);
@@ -733,23 +756,32 @@ impl CommandTable {
     }
 
     /// The pre-acceptances in this replica's path logs the leader has not
-    /// ordered (task-d62): how many, and those the leader has ordered a
-    /// later command past ([`PathLog::reordered`]), which keep this
-    /// replica's paths off the leader's until each is ordered or leaves.
-    /// A walk over every key's pending suffix, for a reading, not a turn.
+    /// ordered (task-d62): how many, pending or set aside, and those set
+    /// aside (task-d67), whose leader ordered a later command past them.
+    /// Only undecided ones count: a set-aside command decided since holds
+    /// a decided order. A walk over every key's log, for a reading, not a
+    /// turn.
     pub fn unordered(&self) -> (usize, BTreeSet<CommandId>) {
         let mut pending = BTreeSet::new();
-        let mut reordered = BTreeSet::new();
+        let mut set_aside = BTreeSet::new();
         for state in self.keys.values() {
             pending.extend(state.log.pending().iter().copied());
-            reordered.extend(state.log.reordered().iter().copied());
+            set_aside.extend(
+                state
+                    .log
+                    .set_aside_commands()
+                    .iter()
+                    .filter(|c| self.phase_of(c).is_some_and(|p| p < Phase::Commit))
+                    .copied(),
+            );
         }
-        (pending.len(), reordered)
+        pending.extend(set_aside.iter().copied());
+        (pending.len(), set_aside)
     }
 
     /// How many commands this replica's path logs hold pending, summed
-    /// over keys (task-d68): for a leader, which never synchronizes its
-    /// own log, every command it proposed this ballot.
+    /// over keys (task-d68). A leader synchronizes each of its proposals
+    /// as it makes it, so its own suffix stays empty.
     pub fn pending_in_logs(&self) -> usize {
         self.keys
             .values()
@@ -760,18 +792,35 @@ impl CommandTable {
     /// The leader ordered `command` at `seqnum` with these per-key path
     /// digests: align this replica's logs so later commands' paths follow
     /// the leader's order (prototype `recordLeaderHash`/`updateLogs`).
+    ///
+    /// `numbered_in` is the ballot of a proposal this replica adopts, which
+    /// is the ballot it holds; a Sync's entry passes none, since its number
+    /// is of the ballot it was ordered in, and it never moves a log's
+    /// position (task-d68, [`PathLog::sync`]).
     pub fn record_leader_path(
         &mut self,
         command: CommandId,
         seqnum: u64,
+        numbered_in: Option<Ballot>,
         paths: &[(Vec<u8>, Digest32)],
     ) {
+        let position = numbered_in.map(|ballot| Position {
+            ballot,
+            seq: seqnum,
+        });
+        // Initialized, the command was appended to its logs or installed
+        // decided; otherwise its synchronization waits for the append.
+        let initialized = self
+            .records
+            .get(&command)
+            .is_some_and(|r| r.payload.is_some());
         for (key, digest) in paths {
-            self.keys
-                .entry(key.clone())
-                .or_default()
-                .log
-                .sync(command, seqnum, *digest);
+            let log = &mut self.keys.entry(key.clone()).or_default().log;
+            if initialized {
+                log.sync(command, position, *digest);
+            } else {
+                log.hold(command, position, *digest);
+            }
         }
         // Record the synchronized anchors so the durable row written when
         // the order is adopted carries them: a restored log then resumes
@@ -785,6 +834,25 @@ impl CommandTable {
                     Some(entry) => entry.1 = *digest,
                     None => record.paths.push((key.clone(), *digest)),
                 }
+            }
+        }
+    }
+
+    /// A leader's own proposal of `command`, numbered `seqnum` in `ballot`,
+    /// synchronizes its own logs as it is made (task-d68): the head is
+    /// unchanged, the suffix stays empty, and a deposed leader carries no
+    /// suffix into its follower role. The record is not touched.
+    pub fn synchronize_own(&mut self, command: CommandId, ballot: Ballot, seqnum: u64) {
+        let Some(record) = self.records.get(&command) else {
+            return;
+        };
+        let position = Some(Position {
+            ballot,
+            seq: seqnum,
+        });
+        for (key, digest) in &record.paths {
+            if let Some(state) = self.keys.get_mut(key) {
+                state.log.sync(command, position, *digest);
             }
         }
     }

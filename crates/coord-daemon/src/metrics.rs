@@ -612,33 +612,35 @@ pub struct FastPath {
     pub missed_unclassified: u64,
     /// Fast acknowledgements this voter sent as a fast-set follower.
     pub acks: u64,
-    /// Of them, those sent while a command reordered behind a
-    /// synchronization held its path off every leader path: each counts
-    /// under [`FastPath::missed_path`] at the leader, if it decided
-    /// anything.
+    /// Of them, those sent while task-d34's `reordered` marker held its
+    /// path off every leader path. The marker is gone (task-d67): zero,
+    /// kept so a reading keeps its shape.
     pub acks_reordered: u64,
 }
 
 /// The pre-acceptances a voter holds that the leader has not ordered
 /// (task-d62), at the snapshot. Not cumulative.
 ///
-/// A pre-acceptance the leader ordered a later command past keeps this
-/// voter's path off the leader's until it is ordered or released. One
-/// the next synchronization orders is gone by the next snapshot; one
-/// that stays for the rest of the ballot (task-d67) shows as an age that
-/// grows from snapshot to snapshot.
+/// One the leader ordered a later command past is set aside (task-d67):
+/// its path log lets go of it, so it costs no fast decision after that,
+/// and its record stays until it is decided or a Sync releases it. One
+/// the next synchronization orders is gone by the next snapshot; an
+/// orphan the leader never orders shows as an age that grows from
+/// snapshot to snapshot.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnorderedPreAcceptances {
-    /// Pre-acceptances the leader has not ordered.
+    /// Pre-acceptances the leader has not ordered: pending in a path log,
+    /// or set aside and undecided.
     pub pending: u64,
-    /// Of them, those it has ordered a later command past.
+    /// Of them, those set aside: the leader ordered a later command past
+    /// them (task-d67).
     pub reordered: u64,
     /// How long the oldest of those has been held, from the first
     /// snapshot that saw it.
     pub oldest: Duration,
-    /// For a leader, the commands its own path log holds pending, which it
-    /// never synchronizes (task-d68): every command it proposed this
-    /// ballot, until that is fixed. Zero for a follower.
+    /// For a leader, the commands its own path log holds pending. It
+    /// synchronizes each proposal as it makes it (task-d68), so this stays
+    /// zero. Zero for a follower.
     #[serde(default)]
     pub leader_log: u64,
 }
