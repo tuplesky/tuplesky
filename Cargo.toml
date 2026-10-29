@@ -97,7 +97,7 @@ quinn = { version = "=0.11.11", default-features = false, features = ["runtime-t
 quinn-proto = { version = "=0.11.18", default-features = false, features = ["rustls-aws-lc-rs"] }
 rustls = { version = "=0.23.46", default-features = false, features = ["std", "aws_lc_rs"] }
 rustls-pki-types = { version = "=1.15.1", default-features = false, features = ["std"] }
-tokio = { version = "=1.53.1", default-features = false, features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util"] }
+tokio = { version = "=1.53.3", default-features = false, features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util"] }
 # coordd's global allocator (task-d60): size-class heaps with thread-local
 # caches, for the many small short-lived allocations every voter's loop makes.
 mimalloc = { version = "=0.1.52", default-features = false }
