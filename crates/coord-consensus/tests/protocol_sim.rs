@@ -43,7 +43,9 @@
 //!    (task-d71).
 //!
 //! Scenarios are the checklist's failure-test matrix rows 1 to 5, 9, 10,
-//! 12 and 14, at three and five voters, with table capacity 32. Seeds that
+//! 12 and 14, and rows 16 and 17, which are row 9's with acknowledgements
+//! between followers lost (task-d77), at three and five voters, with table
+//! capacity 32. Seeds that
 //! once failed are kept in `fixtures/protocol_sim/seeds.json` and replayed
 //! on every run.
 
@@ -158,6 +160,11 @@ struct Knobs {
     /// campaign, once: a campaign completes only if it asks for a lost
     /// page again (task-d28).
     heal_page_loss: bool,
+    /// Loss of a `FastAck` or `SlowAck` to a voter other than its ballot's
+    /// leader, while not healing (task-d77). Such a voter learns a commit
+    /// from the leader's frontier alone, as every follower does with
+    /// acknowledgements to the leader only (task-d74).
+    peer_ack_loss: u32,
 }
 
 impl Knobs {
@@ -184,9 +191,11 @@ impl Knobs {
         collector_crash: 0,
         crash_candidate: false,
         heal_page_loss: false,
+        peer_ack_loss: 0,
     };
 
-    /// The checklist's matrix rows 1 to 5, 9, 10, 12 and 14.
+    /// The checklist's matrix rows 1 to 5, 9, 10, 12 and 14, and rows 16
+    /// and 17.
     fn row(row: u8) -> Knobs {
         let base = Knobs { row, ..Knobs::BASE };
         match row {
@@ -280,6 +289,16 @@ impl Knobs {
                 dup: 40_000,
                 ..base
             },
+            // Row 9's elections with every acknowledgement to a follower
+            // lost, and with half of them (task-d77): a follower that
+            // misses a command's commit while a voter that executed it
+            // retires it past its window (seeds 362 and 863 here, 550 and
+            // 633 in row 17, at three voters).
+            16 | 17 => Knobs {
+                row,
+                peer_ack_loss: if row == 16 { 1_000_000 } else { 500_000 },
+                ..Knobs::row(9)
+            },
             _ => unreachable!("not a scenario of the simulator: row {row}"),
         }
     }
@@ -313,7 +332,23 @@ impl Node {
     fn step(&mut self, e: Event) -> Vec<Effect> {
         match self.role.as_mut().expect("alive") {
             Role::Leader(m) => m.step(e),
-            Role::Follower(m) => m.step(e),
+            Role::Follower(m) => {
+                let mut effects = m.step(e);
+                // A campaign waiting on the rows of commands this node
+                // executed and forgot is answered by its runtime from its
+                // durable rows, as `coordd`'s is (task-d77).
+                loop {
+                    let wanted = m.executed_rows_wanted();
+                    if wanted.is_empty() {
+                        break effects;
+                    }
+                    let rows: BTreeMap<CommandId, CommandRecord> =
+                        dependency_rows(&self.storage).into_iter().collect();
+                    effects.extend(
+                        m.executed_rows(wanted.into_iter().map(|c| (c, rows.get(&c).cloned()))),
+                    );
+                }
+            }
         }
     }
 }
@@ -686,6 +721,18 @@ impl Sim {
                             self.at_frontend(i, m);
                         }
                         continue;
+                    }
+                    // An acknowledgement to a voter other than the ballot's
+                    // leader (task-d77).
+                    if !self.healing {
+                        let to_a_follower = match &message {
+                            Ok(ProtocolMessage::FastAck(a)) => a.ballot.leader != to.replica,
+                            Ok(ProtocolMessage::SlowAck(a)) => a.ballot.leader != to.replica,
+                            _ => false,
+                        };
+                        if to_a_follower && self.chance("peer-ack-loss", self.knobs.peer_ack_loss) {
+                            continue;
+                        }
                     }
                     let to = to.replica.0[0];
                     let msg = Msg { from: i, to, frame };
@@ -2554,6 +2601,16 @@ fn row_12_loss_beyond_the_repair_cache_window() {
 #[test]
 fn row_14_lost_responses_and_retries_under_one_identity() {
     run_row(14);
+}
+
+#[test]
+fn row_16_repeated_elections_with_every_acknowledgement_to_a_follower_lost() {
+    run_row(16);
+}
+
+#[test]
+fn row_17_repeated_elections_with_half_the_acknowledgements_to_a_follower_lost() {
+    run_row(17);
 }
 
 /// A seed kept because it once failed.

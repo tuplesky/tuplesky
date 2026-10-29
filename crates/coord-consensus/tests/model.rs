@@ -9,9 +9,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use coord_consensus::{
-    BallotConfiguration, FastAck, GuardViolation, Learned, MissedFast, Phase, RecoveryError,
-    RecoveryReport, ReportEntry, SlowAck, Vote, VoteError, VoteSet, guard_accept, guard_commit,
-    select,
+    BallotConfiguration, CommandRecord, ExecutedFacts, FastAck, GuardViolation, Learned,
+    MissedFast, Phase, RecoveryError, RecoveryReport, ReportEntry, SlowAck, Vote, VoteError,
+    VoteSet, guard_accept, guard_commit, select,
 };
 use coord_types::identity::Digest32;
 use coord_types::ids::*;
@@ -2081,6 +2081,92 @@ impl coord_consensus::CandidateDecisions for Executed {
     fn executed_before(&self, first: &CommandId, then: &CommandId) -> bool {
         let at = |c: &CommandId| self.0.iter().position(|e| e == c);
         matches!((at(first), at(then)), (Some(a), Some(b)) if a < b)
+    }
+}
+
+/// What the candidate executed, and what it holds of each (task-d77).
+struct ExecutedAs(BTreeMap<CommandId, ExecutedFacts>);
+
+impl coord_consensus::CandidateDecisions for ExecutedAs {
+    fn decided(&self, command: &CommandId) -> bool {
+        self.0.contains_key(command)
+    }
+
+    fn executed(&self, command: &CommandId) -> ExecutedFacts {
+        self.0.get(command).cloned().unwrap_or(ExecutedFacts::No)
+    }
+}
+
+/// The durable row of a command executed under `deps`: a commit is not
+/// written as a row, so it says ACCEPT.
+fn executed_row(c: CommandId, deps: &[CommandId]) -> CommandRecord {
+    CommandRecord {
+        phase: Phase::Accept,
+        deps: deps.to_vec(),
+        keys: vec![b"*".to_vec()],
+        payload: Some(Digest32([7; 32])),
+        paths: vec![(b"*".to_vec(), path_of(c, deps))],
+        synced_seq: Some(4),
+        path: path_of(c, deps),
+    }
+}
+
+/// task-d77 (protocol_sim row 9, three voters, seeds 362, 550, 633 and
+/// 863, with peer acknowledgements lost): the candidate executed x after a
+/// long ago and forgot it, so its report leaves x out, and the one voter
+/// behind that reports x holds it at an ACCEPT below the source ballot, or
+/// at PRE-ACCEPT, under other dependencies. Re-proposed, x was decided
+/// again under them and executed there in another order. The candidate's
+/// execution is x's commit: the Sync carries x at COMMIT under the
+/// dependencies and facts of the candidate's row, and re-proposes nothing
+/// of it. Without the row's facts, nothing is re-proposed either: the
+/// selection waits for the row, or is refused when there is none.
+#[test]
+fn a_command_the_candidate_executed_and_forgot_is_carried_at_commit_not_re_proposed() {
+    let cfg = config(3, 2, &[2, 0], 2);
+    let (a, x, y) = (cmd(1), cmd(2), cmd(3));
+    for behind in [
+        // An ACCEPT below the source ballot (seed 362).
+        report_for(1, ballot(2, 2), 0, vec![entry(x, Phase::Accept, &[y])]),
+        // A pre-acceptance at the source ballot (seeds 550 and 633).
+        report_for(1, ballot(2, 2), 1, vec![pre_accept_with(x, &[y], 5)]),
+    ] {
+        let reports = vec![
+            behind,
+            report_for(2, ballot(2, 2), 1, vec![entry(a, Phase::Commit, &[])]),
+        ];
+        let select_knowing = |x_facts: ExecutedFacts| {
+            coord_consensus::select_decided(
+                &cfg,
+                &reports,
+                |_, _| false,
+                |_| None,
+                &ExecutedAs(BTreeMap::from([(x, x_facts)])),
+            )
+        };
+        let decision = select_knowing(ExecutedFacts::With(executed_row(x, &[a]))).unwrap();
+        let carried = decision.entries.get(&x).expect("carried");
+        assert_eq!(carried.phase, Phase::Commit);
+        assert_eq!(carried.deps, vec![a]);
+        assert_eq!(carried.admission, Some(Digest32([7; 32])));
+        assert_eq!(carried.seqnum, 4);
+        assert!(!decision.reproposed.contains(&x));
+        assert_eq!(
+            select_knowing(ExecutedFacts::Unread),
+            Err(RecoveryError::ExecutedRowsUnread { commands: vec![x] })
+        );
+        assert_eq!(
+            select_knowing(ExecutedFacts::WithoutRow),
+            Err(RecoveryError::ExecutedWithoutRow { command: x })
+        );
+        // Not executed here, it is re-proposed, as before.
+        let decision = select_knowing(ExecutedFacts::No).unwrap();
+        assert!(
+            decision.reproposed.contains(&x)
+                || decision.entries.get(&x).is_some_and(|e| e.deps == vec![y]),
+            "neither re-proposed nor kept as reported: {:?}",
+            decision.entries.get(&x)
+        );
     }
 }
 
