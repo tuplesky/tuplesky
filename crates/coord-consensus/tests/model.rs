@@ -1986,6 +1986,258 @@ fn a_candidate_is_not_ordered_after_an_adopted_command_that_waits_on_the_same_re
     );
 }
 
+/// task-d71 (protocol_sim row 5, three voters, seed 822): a candidate and
+/// an adopted command that wait last on different re-proposals are both
+/// kept. x was decided fast after e, which no ballot decided, and a,
+/// accepted at the source ballot, waits on d's re-proposal. The new
+/// leader re-proposes d and e one after the other in identity order and
+/// each entry right after the last one it waits on, so the re-proposal
+/// between them chains a and x whichever sorts first, and neither can
+/// have executed anywhere. Dropped, x was re-proposed under other
+/// dependencies than the ones the frontend learned it with.
+#[test]
+fn a_candidate_is_kept_beside_an_adopted_command_that_waits_on_another_reproposal() {
+    let cfg = config(3, 2, &[2, 0], 2);
+    for (a, d, e, x) in [
+        (cmd(1), cmd(2), cmd(3), cmd(4)),
+        (cmd(1), cmd(3), cmd(2), cmd(4)),
+    ] {
+        let undecided = |c: CommandId, deps: &[CommandId]| ReportEntry {
+            payload_present: false,
+            ..pre_accept_with(c, deps, 9)
+        };
+        let reports = vec![
+            report_for(
+                1,
+                ballot(2, 2),
+                1,
+                vec![
+                    entry(a, Phase::Accept, &[d]),
+                    undecided(d, &[]),
+                    undecided(e, &[a]),
+                    pre_accept_with(x, &[e], 5),
+                ],
+            ),
+            report_for(2, ballot(2, 2), 0, vec![]),
+        ];
+        let decision = select(&cfg, &reports).unwrap();
+        assert!(decision.entries.contains_key(&a));
+        assert_eq!(
+            decision.entries.get(&x).map(|e| e.deps.clone()),
+            Some(vec![e]),
+            "reproposed {:?}",
+            decision.reproposed
+        );
+        assert!(decision.reproposed.contains(&d) && decision.reproposed.contains(&e));
+    }
+}
+
+/// task-d71 (protocol_sim row 12, three voters, seed 387, without
+/// catch-up): x follows d in the member's records, and the member, behind,
+/// still holds its own pre-acceptance of d, which the candidate executed
+/// long ago and forgot. No report holds d decided, so the selection
+/// re-proposes d; but the new leader does not chain a command it executed
+/// after the recovered order, and x went out with d alone behind it, on no
+/// order against a, which the candidate executed after d. A command the
+/// candidate decided is no re-proposal x waits on: x is judged as any
+/// candidate is, and a, which conflicts and which the member's order does
+/// not put before x, rules it out.
+#[test]
+fn a_candidate_after_a_command_the_candidate_decided_is_not_ordered_by_its_reproposal() {
+    let cfg = config(3, 2, &[2, 0], 2);
+    let (a, d, x) = (cmd(1), cmd(2), cmd(3));
+    let reports = vec![
+        report_for(
+            1,
+            ballot(2, 2),
+            1,
+            vec![
+                entry(a, Phase::Commit, &[]),
+                pre_accept_with(d, &[], 9),
+                pre_accept_with(x, &[d], 5),
+            ],
+        ),
+        report_for(2, ballot(2, 2), 0, vec![entry(a, Phase::Commit, &[])]),
+    ];
+    let decided = |c: &CommandId| *c == d;
+    let decision =
+        coord_consensus::select_decided(&cfg, &reports, |_, _| false, |_| None, &decided).unwrap();
+    assert!(decision.entries.contains_key(&a));
+    assert!(
+        decision.reproposed.contains(&x),
+        "kept {:?}",
+        decision.entries.get(&x)
+    );
+}
+
+/// The candidate's own decisions, with the order it executed them in.
+struct Executed(Vec<CommandId>);
+
+impl coord_consensus::CandidateDecisions for Executed {
+    fn decided(&self, command: &CommandId) -> bool {
+        self.0.contains(command)
+    }
+
+    fn executed_before(&self, first: &CommandId, then: &CommandId) -> bool {
+        let at = |c: &CommandId| self.0.iter().position(|e| e == c);
+        matches!((at(first), at(then)), (Some(a), Some(b)) if a < b)
+    }
+}
+
+/// task-d71 (protocol_sim row 14, three voters, seed 11, on task-d67's
+/// branch): c was decided fast after x, which follows d, and the member
+/// executed and retired d while it still holds a, which it executed
+/// before d: reclaim retires in executed order, but skips a record it may
+/// not retire yet. No report holds d, so the member's closure of c stops
+/// there, and a, adopted and conflicting, was not seen before c: c was
+/// re-proposed under other dependencies than the ones it was learned
+/// with. Execution is one order at every voter, so the candidate's own
+/// says a ran before d, and c, which follows d, after it. Executed the
+/// other way, nothing orders a before c, and c is still re-proposed.
+#[test]
+fn a_candidate_after_a_command_executed_after_an_adopted_one_is_kept() {
+    let cfg = config(3, 2, &[2, 0], 2);
+    let (a, d, x, c) = (cmd(1), cmd(2), cmd(3), cmd(4));
+    let reports = vec![
+        report_for(
+            1,
+            ballot(2, 2),
+            1,
+            vec![
+                entry(a, Phase::Commit, &[]),
+                entry(x, Phase::Commit, &[d]),
+                pre_accept_with(c, &[x], 5),
+            ],
+        ),
+        report_for(2, ballot(2, 2), 0, vec![]),
+    ];
+    let select_after = |order: Vec<CommandId>| {
+        coord_consensus::select_decided(&cfg, &reports, |_, _| false, |_| None, &Executed(order))
+            .unwrap()
+    };
+    let decision = select_after(vec![a, d]);
+    assert!(decision.entries.contains_key(&a));
+    assert_eq!(
+        decision.entries.get(&c).map(|e| e.deps.clone()),
+        Some(vec![x]),
+        "reproposed {:?}",
+        decision.reproposed
+    );
+    let decision = select_after(vec![d, a]);
+    assert!(
+        decision.reproposed.contains(&c),
+        "kept {:?}",
+        decision.entries.get(&c)
+    );
+    let decision = select(&cfg, &reports).unwrap();
+    assert!(
+        decision.reproposed.contains(&c),
+        "nothing known, nothing kept"
+    );
+}
+
+/// task-d71 (#158 review): the member's closure is read through its
+/// records only where they are an order the selection executes. Here e
+/// was committed elsewhere after p, which the candidate decided, executed
+/// and forgot, and the member still holds its own pre-acceptance of p,
+/// after d. That record is no decision: d is reached through it alone,
+/// and the candidate's running a before d says nothing about a before c,
+/// which follows p, which ran before a. Read through it, c was kept with
+/// a, adopted and conflicting, unordered against it.
+#[test]
+fn a_stale_pre_acceptance_orders_nothing_before_a_candidate() {
+    let cfg = config(3, 2, &[2, 0], 2);
+    let (a, d, e, p, c) = (cmd(1), cmd(2), cmd(3), cmd(4), cmd(5));
+    let reports = vec![
+        report_for(
+            1,
+            ballot(2, 2),
+            1,
+            vec![
+                entry(a, Phase::Commit, &[]),
+                pre_accept_with(e, &[], 5),
+                pre_accept_with(p, &[d], 5),
+                pre_accept_with(c, &[e], 5),
+            ],
+        ),
+        report_for(2, ballot(2, 2), 0, vec![entry(e, Phase::Commit, &[p])]),
+    ];
+    let decision = coord_consensus::select_decided(
+        &cfg,
+        &reports,
+        |_, _| false,
+        |_| None,
+        &Executed(vec![p, e, a, d]),
+    )
+    .unwrap();
+    assert!(decision.entries.contains_key(&a));
+    assert!(
+        !decision.entries.contains_key(&c),
+        "kept {:?}",
+        decision.entries.get(&c)
+    );
+}
+
+/// task-d71 (protocol_sim row 10, three voters, seed 884, without
+/// catch-up): the candidate executed c long ago and forgot it, and a
+/// member behind still holds its own pre-acceptance of c, under other
+/// dependencies than c was decided with. c is no possible fast decision:
+/// it was decided, and the member's record is not that decision.
+#[test]
+fn a_command_the_candidate_decided_is_no_possible_fast_decision() {
+    let cfg = config(3, 2, &[2, 0], 2);
+    let (b, c) = (cmd(1), cmd(2));
+    let reports = vec![
+        report_for(
+            1,
+            ballot(2, 2),
+            1,
+            vec![entry(b, Phase::Commit, &[]), pre_accept_with(c, &[b], 5)],
+        ),
+        report_for(2, ballot(2, 2), 0, vec![entry(b, Phase::Commit, &[])]),
+    ];
+    let kept = select(&cfg, &reports).unwrap();
+    assert_eq!(kept.entries.get(&c).map(|e| e.deps.clone()), Some(vec![b]));
+    let decision =
+        coord_consensus::select_decided(&cfg, &reports, |_, _| false, |_| None, &Executed(vec![c]))
+            .unwrap();
+    assert!(
+        !decision.entries.contains_key(&c),
+        "kept {:?}",
+        decision.entries.get(&c)
+    );
+}
+
+/// task-d71 (the same seed): a candidate whose own dependencies, through
+/// the selection, reach a command the selection orders after it closes a
+/// cycle, so it was not decided with them. Here x was committed after c,
+/// and the member's stale pre-acceptance of c follows b, which follows x.
+#[test]
+fn a_candidate_whose_dependencies_come_back_to_it_is_not_kept() {
+    let cfg = config(3, 2, &[2, 0], 2);
+    let (b, c, x) = (cmd(1), cmd(2), cmd(3));
+    let reports = vec![
+        report_for(
+            1,
+            ballot(2, 2),
+            1,
+            vec![
+                entry(b, Phase::Commit, &[x]),
+                entry(x, Phase::Commit, &[c]),
+                pre_accept_with(c, &[b], 5),
+            ],
+        ),
+        report_for(2, ballot(2, 2), 0, vec![]),
+    ];
+    let decision = select(&cfg, &reports).unwrap();
+    assert!(
+        !decision.entries.contains_key(&c),
+        "kept {:?}",
+        decision.entries.get(&c)
+    );
+    assert!(coord_consensus::entry_order(&decision).is_ok());
+}
+
 /// task-d33 (protocol_sim row 12, three voters, seed 9): x was decided
 /// fast after f, which the member executed and retired past the window
 /// its report names, so no report holds f. A member at the source ballot

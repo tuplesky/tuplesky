@@ -38,6 +38,9 @@
 //!    record of its execution, or refused for another command bound under
 //!    its retry key that executed. The frontend offers what has not
 //!    settled again, as the collector re-offers (design Section 5.5, O1).
+//!    Only with catch-up on: without it a voter left behind has no means
+//!    to heal, and the sweep without catch-up holds oracles 1 to 5
+//!    (task-d71).
 //!
 //! Scenarios are the checklist's failure-test matrix rows 1 to 5, 9, 10,
 //! 12 and 14, at three and five voters, with table capacity 32. Seeds that
@@ -1842,15 +1845,15 @@ impl Sim {
             let records = table.len();
             // Admitted work stops an eighth short of the capacity; recovery
             // work (a Sync's entries, a candidate's selection, pulled
-            // commands, a command whose turn has come) may pass it, bounded
-            // by the largest Sync and the largest catch-up page this node
-            // was given, and nothing executed is kept past it (task-d24,
-            // design Section 13.1).
+            // commands) may pass it, bounded by the largest Sync and the
+            // largest catch-up page this node was given, and a command
+            // whose turn has come by one record (task-d71); nothing
+            // executed is kept past it (task-d24, design Section 13.1).
             let (sync, pulled) = (
                 self.sync_entries[usize::from(i)],
                 self.pulled_entries[usize::from(i)],
             );
-            if records > CAPACITY + sync + pulled {
+            if records > CAPACITY + sync + pulled + 1 {
                 let mut phases: BTreeMap<String, usize> = BTreeMap::new();
                 for (_, r) in table.records() {
                     *phases.entry(format!("{:?}", r.phase)).or_default() += 1;
@@ -2045,6 +2048,13 @@ impl Sim {
                     .count();
                 return;
             }
+        }
+        // Without catch-up a voter left behind has no way to heal, and the
+        // domain was never meant to: task-d08's pacer is how it does. The
+        // run still holds every safety and budget oracle up to here, which
+        // is what the sweep without catch-up is for (task-d71).
+        if !self.catch_up {
+            return;
         }
         let unsettled = self.unsettled();
         let executed: Vec<usize> = self.nodes.iter().map(|n| n.executed.len()).collect();
@@ -2389,8 +2399,20 @@ fn payload_rows(storage: &StorageModel) -> Vec<(CommandId, coord_consensus::Payl
 /// Run one scenario for one seed; `Err` carries the oracle's (or the
 /// machine's) panic message.
 fn run_one(n: u8, row: u8, seed: u64) -> Result<Stats, String> {
+    run_one_with(n, row, seed, None)
+}
+
+/// [`run_one`], with catch-up set as `catch_up` says rather than as the
+/// environment does: a kept seed found without it is replayed without it.
+fn run_one_with(n: u8, row: u8, seed: u64, catch_up: Option<bool>) -> Result<Stats, String> {
     let knobs = Knobs::row(row);
-    let outcome = catch_unwind(AssertUnwindSafe(|| Sim::new(n, knobs, seed).run()));
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        let mut sim = Sim::new(n, knobs, seed);
+        if let Some(on) = catch_up {
+            sim.catch_up = on;
+        }
+        sim.run()
+    }));
     outcome.map_err(|e| {
         let text = e
             .downcast_ref::<String>()
@@ -2540,6 +2562,10 @@ struct Kept {
     row: u8,
     voters: u8,
     seed: u64,
+    /// Whether the seed found it with catch-up on (task-d71); absent, as
+    /// the environment says.
+    #[serde(default)]
+    catch_up: Option<bool>,
     /// What it found, for the reader.
     #[allow(dead_code)]
     found: String,
@@ -2554,7 +2580,7 @@ fn every_kept_seed_passes() {
     let kept: Vec<Kept> = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
     let failures: Vec<String> = kept
         .iter()
-        .filter_map(|k| run_one(k.voters, k.row, k.seed).err())
+        .filter_map(|k| run_one_with(k.voters, k.row, k.seed, k.catch_up).err())
         .collect();
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
