@@ -472,6 +472,10 @@ pub struct Follower {
     ledger: DurableLedger,
     learner: Learner,
     campaign: Option<Campaign>,
+    /// Durable dependency rows of commands this replica executed and
+    /// forgot, as the runtime read them for the campaign's selection
+    /// (task-d77); `None` for one with no row. Read again by each campaign.
+    executed_rows: BTreeMap<CommandId, Option<CommandRecord>>,
     /// Set when a selection showed this replica further behind than
     /// recovery carries anyone; it does not campaign again this boot.
     behind: Option<CommandId>,
@@ -751,6 +755,7 @@ impl Follower {
             ledger,
             learner: Learner::new(executed_through),
             campaign: None,
+            executed_rows: BTreeMap::new(),
             behind: None,
             behind_voters: None,
             report_due: None,
@@ -934,6 +939,7 @@ impl Follower {
             learner: state.learner,
             deferred: BTreeMap::new(),
             campaign: None,
+            executed_rows: BTreeMap::new(),
             behind: None,
             behind_voters: None,
             // A report owed to a candidate is an obligation of the replica,
@@ -1125,6 +1131,7 @@ impl Follower {
         // The ballot this replica ran under is the likeliest source of the
         // selection: its fast set is the one recovery must look for fast
         // decisions of, whatever it is (task-d31).
+        self.executed_rows.clear();
         self.campaign = Some(
             Campaign::new(config)
                 .bounded(crate::recovery::MAX_REPORT_ENTRIES)
@@ -1295,7 +1302,11 @@ impl Follower {
             // What this candidate decided itself, executed long ago and
             // forgotten included: a re-proposal of one is not chained
             // after the recovered order (task-d71).
-            let decided = OwnDecisions(table);
+            let decided = OwnDecisions {
+                table,
+                ledger: &self.ledger,
+                rows: &self.executed_rows,
+            };
             match campaign.try_select_decided(
                 crate::recovery::MAX_REPORT_ENTRIES,
                 supplied,
@@ -2117,6 +2128,43 @@ impl Follower {
         report_executed_as_committed(&mut report, &self.table);
         report.entries.sort_by_key(|e| e.command);
         report
+    }
+
+    /// Commands this replica executed and forgot whose durable dependency
+    /// rows its campaign's selection waits on (task-d77). The machine does
+    /// not hold them; the runtime reads them from its store, as it serves
+    /// catch-up from them (task-d08), and hands them back with
+    /// [`Follower::executed_rows`].
+    pub fn executed_rows_wanted(&self) -> Vec<CommandId> {
+        let Some(campaign) = self.campaign.as_ref() else {
+            return Vec::new();
+        };
+        if campaign.decision().is_some() {
+            return Vec::new();
+        }
+        campaign
+            .rows_wanted()
+            .iter()
+            .filter(|c| !self.executed_rows.contains_key(c))
+            .copied()
+            .collect()
+    }
+
+    /// The durable dependency rows of commands
+    /// [`Follower::executed_rows_wanted`] named, `None` for one with no
+    /// row, and the campaign tried again with them (task-d77).
+    pub fn executed_rows(
+        &mut self,
+        rows: impl IntoIterator<Item = (CommandId, Option<CommandRecord>)>,
+    ) -> Vec<Effect> {
+        if self.campaign.is_none() {
+            return Vec::new();
+        }
+        self.executed_rows.extend(rows);
+        if let Some(campaign) = self.campaign.as_mut() {
+            campaign.supply_moved();
+        }
+        self.advance_campaign()
     }
 
     /// Commands known by identity (a held proposal) without a payload, or
@@ -4876,15 +4924,49 @@ impl DeterministicMachine for Follower {
     }
 }
 
-/// A candidate's own decisions, from its table (task-d71).
-struct OwnDecisions<'a>(&'a CommandTable);
+/// A candidate's own decisions, from its table (task-d71), and what it
+/// executed them with: its records while it holds them, then its durable
+/// ledger, then the rows the runtime read (task-d77).
+struct OwnDecisions<'a> {
+    table: &'a CommandTable,
+    ledger: &'a DurableLedger,
+    rows: &'a BTreeMap<CommandId, Option<CommandRecord>>,
+}
 
 impl crate::recovery::CandidateDecisions for OwnDecisions<'_> {
     fn decided(&self, command: &CommandId) -> bool {
-        self.0.phase_of(command) >= Some(Phase::Commit)
+        self.table.phase_of(command) >= Some(Phase::Commit)
     }
 
     fn executed_before(&self, first: &CommandId, then: &CommandId) -> bool {
-        self.0.executed_before(first, then)
+        self.table.executed_before(first, then)
+    }
+
+    fn executed(&self, command: &CommandId) -> crate::recovery::ExecutedFacts {
+        use crate::recovery::ExecutedFacts;
+        if let Some(record) = self.table.record(command) {
+            return if record.phase >= Phase::Commit && record.payload.is_some() {
+                ExecutedFacts::With(record.clone())
+            } else {
+                ExecutedFacts::No
+            };
+        }
+        if !self.table.retired(command) {
+            return ExecutedFacts::No;
+        }
+        // A commit is not written as a row, so the row of an executed
+        // command can say ACCEPT; its dependencies are the ones it was
+        // committed and executed with (`report_executed_as_committed`).
+        let row = match self.ledger.record(command) {
+            Some(record) => Some(record),
+            None => match self.rows.get(command) {
+                None => return ExecutedFacts::Unread,
+                Some(row) => row.as_ref(),
+            },
+        };
+        match row {
+            Some(record) if record.payload.is_some() => ExecutedFacts::With(record.clone()),
+            _ => ExecutedFacts::WithoutRow,
+        }
     }
 }

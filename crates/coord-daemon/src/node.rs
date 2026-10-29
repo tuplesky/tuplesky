@@ -832,6 +832,39 @@ impl<P: Persistence> Node<P> {
         self.carry_out(effects, ballot)
     }
 
+    /// Answer a campaign waiting on the rows of commands this node
+    /// executed and forgot (task-d77) from its durable rows, which the
+    /// machine does not hold, as catch-up is served from them (task-d08):
+    /// each command's dependency row, or none where the store keeps no
+    /// executed row, payload or dependency row for it, or cannot be read.
+    fn read_executed_rows(&mut self) -> Vec<Effect> {
+        let Machine::Follower(follower) = self.machine() else {
+            return Vec::new();
+        };
+        let wanted = follower.executed_rows_wanted();
+        if wanted.is_empty() {
+            return Vec::new();
+        }
+        let epoch = self.machine().identity().epoch;
+        let gated = self.applier.store().reader().snapshot().ok();
+        let rows: Vec<_> = wanted
+            .into_iter()
+            .map(|command| {
+                let decided = gated.as_ref().and_then(|g| {
+                    coord_storage::protocol::catch_up_entry(g.view(), epoch, &command)
+                        .ok()
+                        .flatten()
+                        .and_then(|entry| entry.decided)
+                });
+                (command, decided)
+            })
+            .collect();
+        let Machine::Follower(follower) = self.machine_mut() else {
+            return Vec::new();
+        };
+        follower.executed_rows(rows)
+    }
+
     /// Hand the floor what became of its batches, so it reclaims the
     /// images superseded by one that is durable, and only then.
     /// The batch to journal when this voter's own promise, now durable,
@@ -1293,6 +1326,9 @@ impl<P: Persistence> Node<P> {
         for _ in 0..MAX_ROUNDS {
             if queue.is_empty() && !release {
                 queue = self.settle_floor(ballot);
+                if queue.is_empty() {
+                    queue = self.read_executed_rows();
+                }
                 if queue.is_empty() {
                     return Ok(out);
                 }

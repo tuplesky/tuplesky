@@ -33,6 +33,7 @@ use coord_types::identity::Digest32;
 use coord_types::ids::{Ballot, ReplicaId};
 use serde::{Deserialize, Serialize};
 
+use crate::commands::CommandRecord;
 use crate::phase::Phase;
 use crate::quorum::BallotConfiguration;
 use crate::vote::same_set;
@@ -213,6 +214,23 @@ pub enum RecoveryError {
         /// The most a report may announce.
         limit: u32,
     },
+    /// The candidate executed and forgot commands the selection would
+    /// otherwise re-propose, and has not read their durable dependency
+    /// rows yet (task-d77): the campaign waits for them, as it waits for a
+    /// payload, and the runtime reads them.
+    ExecutedRowsUnread {
+        /// The commands whose rows the selection waits on.
+        commands: Vec<CommandId>,
+    },
+    /// The candidate executed a command the selection would otherwise
+    /// re-propose, and keeps no dependency row of it (task-d77): it cannot
+    /// say what the command was decided with, and a re-proposal would
+    /// decide it again under whatever a voter behind holds, so the
+    /// campaign is refused.
+    ExecutedWithoutRow {
+        /// The command.
+        command: CommandId,
+    },
     /// A selection whose Sync does not fit the row it is bound in or the
     /// frame it is published in (task-d20): the campaign is refused
     /// rather than the process ended mid-election.
@@ -381,6 +399,30 @@ pub trait CandidateDecisions {
         let _ = (first, then);
         false
     }
+
+    /// What the candidate executed `command` with, if it executed it
+    /// (task-d77). The selection asks it of every command it would
+    /// re-propose: one the candidate executed is never re-proposed, and is
+    /// carried at COMMIT under these facts instead.
+    fn executed(&self, command: &CommandId) -> ExecutedFacts {
+        let _ = command;
+        ExecutedFacts::No
+    }
+}
+
+/// What a candidate knows of a command it may have executed (task-d77).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExecutedFacts {
+    /// Not executed here, as far as the candidate knows.
+    No,
+    /// Executed, with the record it was decided and executed with: its
+    /// own while the candidate holds one, its durable dependency row once
+    /// it has forgotten it.
+    With(CommandRecord),
+    /// Executed and forgotten, its dependency row not read yet.
+    Unread,
+    /// Executed, and no dependency row is kept for it.
+    WithoutRow,
 }
 
 impl<F: Fn(&CommandId) -> bool> CandidateDecisions for F {
@@ -604,6 +646,47 @@ pub fn select_decided(
                 }
             }
         }
+    }
+    // Never re-propose what the candidate executed (task-d77). A report
+    // leaves out what its replica executed and forgot, so a voter behind
+    // can be the only reporter of a command the candidate executed long
+    // ago, at PRE-ACCEPT or at an ACCEPT below the source; re-proposed,
+    // the command was decided again, under the dependencies that voter
+    // holds or the new leader gives it, and executed there in another
+    // order than the candidate executed it in (protocol_sim row 9, three
+    // voters, seeds 362, 550, 633 and 863, with peer acknowledgements
+    // lost). The candidate's execution is its commit, under the facts it
+    // executed with, so the Sync carries it at COMMIT under them, and
+    // every later selection keeps it by the commit exception above.
+    let mut unread = Vec::new();
+    for command in &reproposed {
+        if entries.contains_key(command) {
+            continue;
+        }
+        match decided.executed(command) {
+            ExecutedFacts::No => {}
+            ExecutedFacts::Unread => unread.push(*command),
+            ExecutedFacts::WithoutRow => {
+                return Err(RecoveryError::ExecutedWithoutRow { command: *command });
+            }
+            ExecutedFacts::With(record) => {
+                entries.insert(
+                    *command,
+                    SyncEntry {
+                        command: *command,
+                        phase: Phase::Commit,
+                        deps: record.deps,
+                        path: record.path,
+                        paths: record.paths,
+                        seqnum: record.synced_seq.unwrap_or(0),
+                        admission: record.payload,
+                    },
+                );
+            }
+        }
+    }
+    if !unread.is_empty() {
+        return Err(RecoveryError::ExecutedRowsUnread { commands: unread });
     }
     let source_config = source_configuration(&source_ballot).filter(|c| {
         c.ballot() == source_ballot && c.epoch() == config.epoch() && c.voters() == config.voters()
