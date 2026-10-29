@@ -313,6 +313,37 @@ Tentative execution uses a copy-on-write overlay over committed state and may ca
 
 Large speculative results may use the ordinary finalized-execution path; label its latency. An established speculative response can precede materialization only when the complete learning predicate determines command, predecessor order, authorization and exact result durably. No extra volatile COMMIT broadcast is assumed to have reached a quorum.
 
+**When a result is released (task-d63).** A command's result is released once three things hold:
+- the leader has learned the command and every predecessor (task-29's gate, unchanged);
+- its application outcome is journal-durable;
+- the frontend's output gate authorizes it.
+
+It does not wait for the projection to commit the group. The other effects keep their point:
+- a watch event, a session or credential signature and any external call wait for the projection's commit (Section 17.4);
+- an `Established` vote and a send that waits on durability wait for what they wait for today.
+
+The argument:
+
+- **Durability.** A group's journal record carries the exact result (Section 17.3.2).
+  - Under the replay profile a released result already rests on the journal alone: the commit that releases it today is a working commit, which a crash loses and the attach replays (Section 17.3.4).
+  - Under the strict profile the commit is durable, but nothing reported depends on that: a commit a crash tears is re-lowered from the journal before the domain serves.
+
+  So under both profiles the journal is the record of every released result, and the projection's commit adds nothing to its durability.
+- **Order.** Nothing is released before the command and its predecessors are learned, so the result is the one every replica, and every later leader, computes from the same history. Recovery puts every learned command ahead of a new ballot's first proposal.
+- **Reads.** Section 6.3's proof needs only that W was learned and proposed before its response completed. It does not use when the response left.
+  - A barrier read waits for its leader's projection through the position the leader had executed. W is executed before its result is planned, so a read after W's response waits for W's materialization; it does not return older state.
+  - An ordered read is planned over the in-flight groups.
+  - A follower serves no current read.
+- **What the projection's commit still gives** is the state's visibility to the node's own local reads. Those are where a released, unmaterialized result can be asked for again, and each waits rather than answering older or `Unknown`:
+  - a retry or a resolve that reaches the node that released the command, and finds no record there, waits for the projection through the command's execution position;
+  - a watch from a revision past the node's materialized one asks for a future revision there, which is a defined error or a bounded wait (Section 6.3).
+
+  At any other node these are as they are today for a node whose projection lags.
+
+The release point is the group's `JournalDurable` as the store reports it. With the journal worker (task-d54) that is the append taken back, not merely handed off. A group definitely not journaled stops the node with its results unreleased, as now. A crash between a release and the projection's commit loses nothing released: under the replay profile the attach replays the group before the domain serves, under the strict profile start-up re-lowers it, and the result is a decision the domain made, which every other voter applies too, so no node released state it will not hold.
+
+What it can buy: in task-d62's run (five voters on one host, replay profile), a command waited 7.80 ms on the leader from its group closing to its release. The journal's job was about 1.2 ms of that (0.10 queued, 0.78 served, 0.30 to completion), and the rest was the projection's commit and its queue.
+
 <a id="s4-6"></a>
 ### 4.6 Performance hypotheses
 
@@ -456,8 +487,8 @@ column says whether it leaves an obligation behind.
 | Durable protocol state: promise, vote, acceptance, Sync rows | Yes: the voter owes them to every recovery report at its cut |
 | Evidence publication: acknowledgements to leader and collector | Yes: the publisher owes them again to a peer that lost them |
 | Decision: a command learned fast or slow | Yes: every voter owes its execution, in the decided order |
-| Application: execution and its atomic retry record | Yes: the record owes the caller its retained result |
-| Response: the collector answers the caller | No: the caller holds the answer; retries are answered from the record |
+| Application: execution and its atomic retry record, journal-durable before the projection applies it (Section 4.5) | Yes: the record owes the caller its retained result; until the projection applies it, the journal and the materializer owe it |
+| Response: the collector answers the caller, once the record is journal-durable (Section 4.5) | No: the caller holds the answer; retries are answered from the record, and at the node that released it wait for its projection to apply it |
 | Retirement: a retry floor or a forgetting floor advances | No new obligation: it discharges the ones below the floor |
 
 Retirement discharges only what nothing can still ask for. The command
@@ -504,7 +535,7 @@ covers.
 | O6 | Carry every possibly decided command into the next ballot | New leader | Election after a leader fault | Recovery selects every learned decision from any majority's reports; a failed campaign is retried under a higher ballot; a selected payload a peer never sends is asked for again, and a late or duplicated answer does not count as the answer | `every_learned_decision_is_selected_by_every_recovering_majority`, `a_fast_decision_survives_a_leader_that_crashed_before_its_accept_row`, `possible_fast_decisions_are_recovered_from_the_fixed_fast_set`, `a_proposal_ahead_of_the_selected_payload_does_not_leave_the_sync_waiting`, `a_late_or_duplicated_payload_answer_does_not_count_as_answering_the_ask` |
 | O7 | Execute every committed command, in the decided order | Every voter | A commit, a Sync, or the leader's frontier | A follower that heard only the leader executes what it commits; the frontier stops at the first command not committed | `a_follower_that_hears_only_the_leader_executes_what_it_commits`, `a_follower_restarted_with_adoptions_in_flight_executes_what_the_leader_commits`, `the_leaders_frontier_stops_at_the_first_command_it_has_not_committed` |
 | O8 | Bring a voter that fell behind back into service | The lagging voter, served by its peers | A full table; a dependency it does not hold; a heal | Paged catch-up, resumable across restarts | `a_voter_past_a_full_table_catches_up_and_its_table_drains`, `a_restart_in_the_middle_of_a_page_resumes_without_executing_twice`, `a_follower_cut_off_for_thirty_seconds_serves_within_ten_of_the_heal` |
-| O9 | Keep an executed invocation's result for its retries | The durable retry record | Execution, atomically with the result | A retry or resolve is answered from the record after any restart, or withheld when the caller may not read it | `a_read_retried_after_a_restart_gets_its_retained_result`, `the_same_invocation_is_answered_the_same_way_after_a_restart`, `a_caller_bound_on_a_node_that_is_behind_is_admitted_not_refused`, `a_retry_after_unknown_submits_the_same_invocation_again` |
+| O9 | Keep an executed invocation's result for its retries | The durable retry record: in the journal until the projection applies it, then in the projection (Section 4.5) | Execution, atomically with the result | A retry or resolve is answered from the record after any restart, waits at the node that released it while only the journal holds it, or is withheld when the caller may not read it | `a_read_retried_after_a_restart_gets_its_retained_result`, `the_same_invocation_is_answered_the_same_way_after_a_restart`, `a_caller_bound_on_a_node_that_is_behind_is_admitted_not_refused`, `a_retry_after_unknown_submits_the_same_invocation_again` |
 | O10 | Retire only what nothing can still ask for | Retry floor; checkpoint floor | A floor advancing | A stale retirement never lowers a floor; a floor is certified by a majority of promises and fences what it covers | `a_stale_retirement_never_lowers_the_floor`, `retired_or_unknown_sessions_and_retired_sequences_never_execute`, `a_majority_of_promises_certifies_the_floor_a_missing_voter_would_have_blocked`, `a_delayed_message_cannot_revive_state_below_the_published_floor`, `a_proposal_that_acknowledges_a_different_floor_is_refused` |
 | O11 | Publish nothing that is not durable | Storage coordinator | A failed sync or reopen | Fail-stop until a reopen succeeds; corruption quarantines and never recovers in place | `sync_failure_inside_a_write_panics_and_fail_stops_until_reopen`, `sync_error_is_indeterminate_and_the_crash_image_is_all_or_nothing`, `failed_reopen_quarantines_the_engine_until_a_reopen_succeeds`, `disk_quarantine_stops_serving_and_never_recovers_in_place` |
 | O12 | Never hold two decisions for one command | Every voter | Facts that contradict what it committed, executed or answered | The voter stops and says what it compared | `a_voter_handed_other_facts_for_a_command_it_committed_stops`, `a_voter_handed_other_facts_for_a_command_it_retired_stops`, `a_pulled_command_executed_otherwise_stops_the_voter`, `a_late_release_that_contradicts_the_answer_is_refused`, `a_follower_restarting_from_a_cyclic_sync_row_stays_halted` |
@@ -1526,7 +1557,7 @@ sequenceDiagram
     Note over A,T: Results also require establishment and authorization
 ```
 
-JournalDurable is not Established; Materialized is not quorum learning. Release only effects whose exact durable prerequisites and current authorization context hold. Section 4.8's recovery cut and logical outbox govern old-ballot work even in the same boot. Observer export can follow established fast results later.
+JournalDurable is not Established; Materialized is not quorum learning. Release only effects whose exact durable prerequisites and current authorization context hold. A result's prerequisites are its learning and its group's JournalDurable (Section 4.5, task-d63); events and credentials also need Materialized. Section 4.8's recovery cut and logical outbox govern old-ballot work even in the same boot. Observer export can follow established fast results later.
 
 <a id="s17-3-4"></a>
 #### 17.3.4 Strict and replay-backed profiles
@@ -1572,7 +1603,7 @@ The pure planner consumes canonical command and owned immutable view at an estab
 
 Validate/journal the complete plan; materialization rechecks its recorded base and atomically applies current/history/events, reverse lease accounting, policy/sessions, retry result, execution mapping and frontiers. Error/read-only outcomes record required execution/retry without fake KV revision. Base mismatch replans, not success against different state.
 
-State/cache/events advance only after atomic application, recoverable journal/checkpoint coverage, establishment and required authorization; strict mode additionally honors selected projection durability. Reader gates prevent premature native visibility. No surviving KV update can lose its corresponding result/index.
+State/cache/events advance only after atomic application, recoverable journal/checkpoint coverage, establishment and required authorization; strict mode additionally honors selected projection durability. Reader gates prevent premature native visibility. A result is released at its group's journal durability, before application (Section 4.5, task-d63); a local read that asks for it again waits for the application, never answers older state. No surviving KV update can lose its corresponding result/index.
 
 A trusted collector may return a fully established speculative response without waiting for another materialization round trip only after exact durable evidence proves result/predecessors/permission. task-29 requires task-27 crash qualification and task-28 full learning. Events and credentials still await irrevocable application. No extra volatile COMMIT quorum is assumed.
 
