@@ -452,6 +452,9 @@ pub fn open_storage_with(
         reason: format!("{e:?}"),
     })?;
     let mut store = store;
+    // A publication's steps run on the domain thread, and its own CPU
+    // and run-queue time over each say what the wall time was (task-d66).
+    store.time_thread(crate::cpu::this_thread_time);
     // The replay-backed profile is set before the domain is attached, so
     // the attach's own replay already commits under it (task-j06).
     if config.journal.replays_projection() {

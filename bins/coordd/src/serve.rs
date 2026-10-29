@@ -3284,11 +3284,31 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         housekeeping.floor = housekeeping.after;
         housekeeping.last = std::time::Instant::now();
         let phases = &published.phases;
+        // The domain thread's own time over the journal's steps, on a CPU
+        // and waiting for one, beside each step's wall time: a step
+        // stretched by waiting for a core is told from one doing the
+        // journal's work (task-d66). `-` where there is no reading.
+        let step = |name: &str, time: Option<coord_storage::ThreadTime>| match time {
+            Some(t) => format!(
+                "{name}_cpu_ms={:.1} {name}_runq_ms={:.1}",
+                ms(t.on_cpu),
+                ms(t.run_queue)
+            ),
+            None => format!("{name}_cpu_ms=- {name}_runq_ms=-"),
+        };
+        let thread = phases.journal.thread;
+        let thread = [
+            step("drain", thread.map(|t| t.drain)),
+            step("sync", thread.map(|t| t.sync)),
+            step("append", thread.map(|t| t.append)),
+            step("retire", thread.map(|t| t.retire)),
+        ]
+        .join(" ");
         eprintln!(
             "checkpoint represented={} retired={} reclaimed={} took_ms={} \
              loop_ms={:.1} pin_ms={:.1} export_ms={:.1} write_ms={:.1} \
              drain_ms={:.1} sync_ms={:.1} append_ms={:.1} retire_ms={:.1} \
-             reclaim_ms={:.1}",
+             reclaim_ms={:.1} {thread}",
             published.represented.get(),
             published.retired,
             published.reclaimed,

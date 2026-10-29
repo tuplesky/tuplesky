@@ -619,3 +619,56 @@ fn a_publication_already_durable_at_its_checkpoint_forces_no_sync() {
     let next = crash_and_attach(world, profile, pointer.represented).unwrap();
     assert_recovered(&next, 5);
 }
+
+/// task-d66: a store given a thread clock times each of a publication's
+/// steps by it, between a reading at the step's start and one at its
+/// end; one without a clock, or whose clock has no reading, says so.
+#[test]
+fn a_publication_times_its_steps_by_the_store_s_thread_clock() {
+    use coord_storage::ThreadTime;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    // Each reading is one more: a step timed by two readings took one.
+    static READS: AtomicU64 = AtomicU64::new(0);
+    fn counting() -> Option<ThreadTime> {
+        let n = READS.fetch_add(1, Ordering::Relaxed);
+        Some(ThreadTime {
+            on_cpu: Duration::from_millis(n),
+            run_queue: Duration::from_millis(2 * n),
+        })
+    }
+    fn unreadable() -> Option<ThreadTime> {
+        None
+    }
+    let one = ThreadTime {
+        on_cpu: Duration::from_millis(1),
+        run_queue: Duration::from_millis(2),
+    };
+
+    let mut world = World::new(ProjectionProfile::Strict);
+    world.store.time_thread(counting);
+    world.commit_each(4);
+    let pointer = world.pointer();
+    let published = world.store.publish_checkpoint(A, &pointer).unwrap();
+    let thread = published.phases.thread.expect("a clock was given");
+    assert_eq!(
+        (thread.drain, thread.append, thread.retire),
+        (one, one, one)
+    );
+    // The strict profile has no sync to time.
+    assert_eq!(thread.sync, ThreadTime::default());
+
+    let mut world = World::new(ProjectionProfile::Strict);
+    world.commit_each(4);
+    let pointer = world.pointer();
+    let published = world.store.publish_checkpoint(A, &pointer).unwrap();
+    assert_eq!(published.phases.thread, None);
+
+    let mut world = World::new(ProjectionProfile::Strict);
+    world.store.time_thread(unreadable);
+    world.commit_each(4);
+    let pointer = world.pointer();
+    let published = world.store.publish_checkpoint(A, &pointer).unwrap();
+    assert_eq!(published.phases.thread, None);
+}

@@ -10425,3 +10425,49 @@ that a Sync installs the selected per-key evidence keeps its record
 assertions and now says the log's position does not move; task-d62's
 counts test reads one slow command, not twenty.
 
+
+## A publication's journal steps on the domain thread's own clock (task-d66)
+
+task-d66's first step is a reading. Each `checkpoint` line now carries,
+after `reclaim_ms`, the domain thread's own time over each of the
+journal's steps: `drain_cpu_ms` and `drain_runq_ms`, then the same for
+`sync`, `append` and `retire`. The first of each pair is time on a CPU,
+the second time runnable and waiting for one. A step's wall time less
+the two is the thread blocked: on a sync, or on a job already in flight
+that the drain waits out. So a drain stretched by a busy host shows as
+run-queue time, one waiting on the journal worker's sync as neither, and
+one doing the journal's work as CPU time. A value is `-` where there is
+no reading (off Linux).
+
+The store has no clock of its own. `coordd` gives it one at open
+(`JournaledStore::time_thread`), so `coord-storage` reads no `/proc`
+file.
+
+**The CPU time is the thread's CPU clock, not `schedstat`'s.** For a
+thread that is running, `/proc/thread-self/schedstat`'s first field is
+the scheduler's account as of its last update and trails by up to a
+tick. Measured here (x86_64, 4 CPUs) against `CLOCK_THREAD_CPUTIME_ID`
+over spins of 0.2 to 50 ms, 20 each, it read up to 4.0 ms short, which
+is too coarse against steps the 10 ms line is drawn under. Its second
+field, the run-queue time, is settled each time the thread is put back
+on a CPU, so a reading the thread takes itself is never short of a
+wait, and that one is kept. The CPU clock comes from `rustix`, already
+pinned for `statvfs`, with its `time` feature: no unsafe code and no new
+crate. task-d54's snapshot cost still reads `schedstat` over intervals
+long enough for the lag not to matter.
+
+**Locally,** three runs of `cli.rs`'s baseline test, one publication
+each (x86_64, 4 CPUs, ms):
+
+| step | wall | on a CPU | waiting for one |
+| --- | --- | --- | --- |
+| drain | 1.1, 2.1, 1.5 | 0.1, 0.1, 0.1 | 0, 0, 0 |
+| append | 1.8, 2.2, 21.1 | 1.5, 1.4, 1.6 | 0, 0, 0 |
+| retire | 0.3, 0.7, 0.5 | 0.2, 0.3, 0.3 | 0, 0, 0 |
+
+The third run's append is what the reading is for: 21 ms of wall
+time, 1.6 ms of it computing and none waiting for a core, so the rest
+was the pointer's sync. An earlier build that read `schedstat`'s CPU
+field put a retirement at 0.6 ms on a CPU against 0.5 ms of wall time.
+The runner's reading, at six nodes and the default cadence, is the next
+step, and it decides whether the job is built.
