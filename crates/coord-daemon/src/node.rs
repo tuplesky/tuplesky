@@ -846,19 +846,7 @@ impl<P: Persistence> Node<P> {
             return Vec::new();
         }
         let epoch = self.machine().identity().epoch;
-        let gated = self.applier.store().reader().snapshot().ok();
-        let rows: Vec<_> = wanted
-            .into_iter()
-            .map(|command| {
-                let decided = gated.as_ref().and_then(|g| {
-                    coord_storage::protocol::catch_up_entry(g.view(), epoch, &command)
-                        .ok()
-                        .flatten()
-                        .and_then(|entry| entry.decided)
-                });
-                (command, decided)
-            })
-            .collect();
+        let rows = crate::catch_up::executed_rows(&self.applier, epoch, wanted);
         let Machine::Follower(follower) = self.machine_mut() else {
             return Vec::new();
         };

@@ -657,7 +657,12 @@ pub fn select_decided(
     // voters, seeds 362, 550, 633 and 863, with peer acknowledgements
     // lost). The candidate's execution is its commit, under the facts it
     // executed with, so the Sync carries it at COMMIT under them, and
-    // every later selection keeps it by the commit exception above.
+    // every later selection keeps it by the commit exception above. It is
+    // a decision of an earlier ballot, as a below-source report's is, to
+    // the possible-fast rule: the rule skips what the candidate decided,
+    // and execution is one order at every voter, so what the candidate
+    // executed precedes every command that rule keeps, at a fast-set
+    // member that executed it and forgot it too (#169 review).
     let mut unread = Vec::new();
     for command in &reproposed {
         if entries.contains_key(command) {
@@ -670,6 +675,7 @@ pub fn select_decided(
                 return Err(RecoveryError::ExecutedWithoutRow { command: *command });
             }
             ExecutedFacts::With(record) => {
+                from_below.insert(*command);
                 entries.insert(
                     *command,
                     SyncEntry {

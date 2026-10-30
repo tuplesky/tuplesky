@@ -2170,6 +2170,49 @@ fn a_command_the_candidate_executed_and_forgot_is_carried_at_commit_not_re_propo
     }
 }
 
+/// task-d77 (#169 review): an entry the selection carries for what the
+/// candidate executed is a decision of an earlier ballot, as a
+/// below-source report's is. The candidate executed x and has not decided
+/// c, and execution is one order at every voter, so x precedes c wherever
+/// c executes; the fast-set member that executed x forgot it, as such a
+/// member does. Read as the source ballot's, x conflicted with c, which
+/// names nothing that places it, and dropped a fast decision of c.
+#[test]
+fn a_command_the_candidate_executed_is_before_every_possible_fast_decision() {
+    let cfg = config(3, 2, &[2, 0], 2);
+    let (x, c) = (cmd(1), cmd(2));
+    let reports = vec![
+        // r0 is behind at ballot 0 and holds x accepted there.
+        report_for(0, ballot(2, 2), 0, vec![entry(x, Phase::Accept, &[])]),
+        // r1, the fast set's other member, executed x and forgot it, and
+        // pre-accepted c at the source ballot.
+        report_for(1, ballot(2, 2), 1, vec![pre_accept_with(c, &[], 5)]),
+        // r2, the candidate, executed x and forgot it too.
+        report_for(2, ballot(2, 2), 1, vec![]),
+    ];
+    let decision = coord_consensus::select_decided(
+        &cfg,
+        &reports,
+        |_, _| false,
+        |_| None,
+        &ExecutedAs(BTreeMap::from([(
+            x,
+            ExecutedFacts::With(executed_row(x, &[])),
+        )])),
+    )
+    .unwrap();
+    assert_eq!(
+        decision.entries.get(&x).map(|e| e.phase),
+        Some(Phase::Commit)
+    );
+    assert_eq!(
+        decision.entries.get(&c).map(|e| e.deps.clone()),
+        Some(vec![]),
+        "reproposed {:?}",
+        decision.reproposed
+    );
+}
+
 /// task-d71 (protocol_sim row 14, three voters, seed 11, on task-d67's
 /// branch): c was decided fast after x, which follows d, and the member
 /// executed and retired d while it still holds a, which it executed
