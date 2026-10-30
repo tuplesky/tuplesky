@@ -204,6 +204,15 @@ pub enum FollowerRejection {
         /// The dependency the selection leaves this replica without.
         missing: CommandId,
     },
+    /// A campaign was not started: this replica's own report holds
+    /// `command` accepted with no payload anywhere, so every selection of
+    /// its ballot fails on it (task-d79). It does not campaign again until
+    /// it installs a Sync, which another voter's campaign selects and
+    /// which releases that acceptance.
+    Unbacked {
+        /// The acceptance no reporter holds a payload for.
+        command: CommandId,
+    },
     /// A campaign was not started: a window of pulled commands is
     /// installed and not yet executed, and its comparison with the donor
     /// is the follower's to make (task-d25). It executes first.
@@ -479,6 +488,10 @@ pub struct Follower {
     /// Set when a selection showed this replica further behind than
     /// recovery carries anyone; it does not campaign again this boot.
     behind: Option<CommandId>,
+    /// Set when a selection failed on this replica's own acceptance of a
+    /// command with no payload anywhere, every voter answered (task-d79);
+    /// cleared when it installs a Sync.
+    unbacked: Option<CommandId>,
     /// The highest position a voter refused this replica's campaign at
     /// (task-d10): it does not campaign again until it has executed that
     /// far. Not durable; a restart campaigns and is refused again.
@@ -757,6 +770,7 @@ impl Follower {
             campaign: None,
             executed_rows: BTreeMap::new(),
             behind: None,
+            unbacked: None,
             behind_voters: None,
             report_due: None,
             served_report: None,
@@ -941,6 +955,7 @@ impl Follower {
             campaign: None,
             executed_rows: BTreeMap::new(),
             behind: None,
+            unbacked: None,
             behind_voters: None,
             // A report owed to a candidate is an obligation of the replica,
             // not of the role it held when the request arrived: dropping it
@@ -1052,6 +1067,11 @@ impl Follower {
         }
         if let Some(missing) = self.behind {
             self.rejections.push(FollowerRejection::Behind { missing });
+            return Vec::new();
+        }
+        if let Some(command) = self.unbacked {
+            self.rejections
+                .push(FollowerRejection::Unbacked { command });
             return Vec::new();
         }
         if !self.catch_up.running.is_empty() {
@@ -1315,6 +1335,22 @@ impl Follower {
                 Ok(None) => return Vec::new(),
                 Ok(Some(_)) => {}
                 Err(e) => {
+                    // Its own acceptance of a command whose payload no
+                    // voter holds, every voter answered: every selection
+                    // of a ballot it leads fails the same way, and its
+                    // rising ballots fenced every other voter's campaign,
+                    // so nobody led (protocol_sim row 10, five voters,
+                    // seed 540, with every acknowledgement to a follower
+                    // lost, catch-up on). It gives the campaign up until a
+                    // Sync another voter selects releases the acceptance.
+                    // Not campaigning is safe by construction; dropping
+                    // the acceptance from its own report instead would
+                    // change what a selection may release.
+                    if let RecoveryError::HalfInitialized { replica, command } = &e
+                        && *replica == self.config.identity.replica
+                    {
+                        self.unbacked = Some(*command);
+                    }
                     self.rejections.push(FollowerRejection::Campaign(e));
                     self.campaign = None;
                     return Vec::new();
@@ -1705,6 +1741,9 @@ impl Follower {
     /// synchronized-ballot row is durable.
     fn activate(&mut self, decision: SyncDecision) -> Vec<Effect> {
         let mut effects = Vec::new();
+        // A Sync installed releases what it leaves out, an acceptance no
+        // payload backed among them (task-d79).
+        self.unbacked = None;
         // The replica that selected this Sync leads the new ballot from
         // here: the role changes only once the ballot is this replica's.
         if decision.ballot.leader == self.config.identity.replica && self.campaign.is_some() {
