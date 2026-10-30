@@ -45,9 +45,10 @@
 //! Scenarios are the checklist's failure-test matrix rows 1 to 5, 9, 10,
 //! 12 and 14, and rows 16 and 17, which are row 9's with acknowledgements
 //! between followers lost (task-d77), at three and five voters, with table
-//! capacity 32. Seeds that
-//! once failed are kept in `fixtures/protocol_sim/seeds.json` and replayed
-//! on every run.
+//! capacity 32. `PROTOCOL_SIM_PEER_ACK_LOSS` (parts per million) sets
+//! that loss in every row (task-d78), as the weekly sweep does. Seeds that
+//! once failed are kept in `fixtures/protocol_sim/seeds.json`, with the
+//! catch-up and the loss they were found under, and replayed on every run.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -2452,7 +2453,23 @@ fn run_one(n: u8, row: u8, seed: u64) -> Result<Stats, String> {
 /// [`run_one`], with catch-up set as `catch_up` says rather than as the
 /// environment does: a kept seed found without it is replayed without it.
 fn run_one_with(n: u8, row: u8, seed: u64, catch_up: Option<bool>) -> Result<Stats, String> {
-    let knobs = Knobs::row(row);
+    run_kept(n, row, seed, catch_up, None)
+}
+
+/// [`run_one_with`], with the loss of acknowledgements to followers set
+/// as `peer_ack_loss` says rather than as the row and the environment do:
+/// a kept seed found under that loss is replayed under it (task-d78).
+fn run_kept(
+    n: u8,
+    row: u8,
+    seed: u64,
+    catch_up: Option<bool>,
+    peer_ack_loss: Option<u32>,
+) -> Result<Stats, String> {
+    let mut knobs = row_knobs(row);
+    if let Some(loss) = peer_ack_loss {
+        knobs.peer_ack_loss = loss;
+    }
     let outcome = catch_unwind(AssertUnwindSafe(|| {
         let mut sim = Sim::new(n, knobs, seed);
         if let Some(on) = catch_up {
@@ -2468,6 +2485,21 @@ fn run_one_with(n: u8, row: u8, seed: u64, catch_up: Option<bool>) -> Result<Sta
             .unwrap_or_default();
         format!("row {row} at {n} voters, seed {seed}: {text}")
     })
+}
+
+/// A row's knobs, with `PROTOCOL_SIM_PEER_ACK_LOSS` (parts per million)
+/// setting the loss of acknowledgements to followers in every row
+/// (task-d78): the weekly sweep runs every row under it, which is what
+/// found row 4's seed 720, and rows 16 and 17 alone would not have.
+fn row_knobs(row: u8) -> Knobs {
+    let mut knobs = Knobs::row(row);
+    if let Some(loss) = std::env::var("PROTOCOL_SIM_PEER_ACK_LOSS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        knobs.peer_ack_loss = loss;
+    }
+    knobs
 }
 
 /// Seeds per scenario and size. `PROTOCOL_SIM_SEEDS` raises it for a
@@ -2623,6 +2655,11 @@ struct Kept {
     /// the environment says.
     #[serde(default)]
     catch_up: Option<bool>,
+    /// The loss of acknowledgements to followers it found it under, in
+    /// parts per million (task-d78); absent, as the row and the
+    /// environment say.
+    #[serde(default)]
+    peer_ack_loss: Option<u32>,
     /// What it found, for the reader.
     #[allow(dead_code)]
     found: String,
@@ -2637,7 +2674,7 @@ fn every_kept_seed_passes() {
     let kept: Vec<Kept> = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
     let failures: Vec<String> = kept
         .iter()
-        .filter_map(|k| run_one_with(k.voters, k.row, k.seed, k.catch_up).err())
+        .filter_map(|k| run_kept(k.voters, k.row, k.seed, k.catch_up, k.peer_ack_loss).err())
         .collect();
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
@@ -2650,6 +2687,6 @@ fn one_seed_from_the_environment() {
         return;
     };
     let v: Vec<u64> = spec.split(',').map(|x| x.trim().parse().unwrap()).collect();
-    let stats = Sim::new(v[1] as u8, Knobs::row(v[0] as u8), v[2]).run();
+    let stats = Sim::new(v[1] as u8, row_knobs(v[0] as u8), v[2]).run();
     println!("{stats:?}");
 }

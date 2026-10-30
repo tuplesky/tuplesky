@@ -882,12 +882,25 @@ fn possible_fast_decisions(
             }
         }
     }
-    // A member's dependency closure of a command (over its own records).
+    // A member's dependency closure of a command (over its own records),
+    // stopped at a command the selection holds decided (task-d78). The
+    // member's record of such a command can be its own pre-acceptance,
+    // which a leader synchronization since re-based its log past: the
+    // record keeps the dependencies it was pre-accepted with, while the
+    // decision ordered the command after others. What the record names
+    // behind it was never in the leader's order before `c`, so it says
+    // nothing of the member's path for `c`. Walked through, it reached a
+    // command no ballot decided and dropped a fast decision of `c`, which
+    // was re-proposed under other dependencies (protocol_sim row 4, three
+    // voters, seed 720, with half the acknowledgements to followers lost
+    // and catch-up on). `executed_closure` reads the same record the same
+    // way for the order check (task-d71).
     let closure = |m: &RecoveryReport, c: &CommandId| -> BTreeSet<CommandId> {
         let mut seen = BTreeSet::new();
         let mut stack: Vec<CommandId> = record(m, c).map(|e| e.deps.clone()).unwrap_or_default();
         while let Some(d) = stack.pop() {
             if seen.insert(d)
+                && !entries.get(&d).is_some_and(|e| e.phase == Phase::Commit)
                 && let Some(e) = record(m, &d)
             {
                 stack.extend(e.deps.iter().copied());
