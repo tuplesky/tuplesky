@@ -490,3 +490,45 @@ fn a_follower_cut_off_for_thirty_seconds_serves_within_ten_of_the_heal() {
     // same positions with the same results.
     assert_eq!(cluster.executed_rows(2), cluster.executed_rows(0));
 }
+
+/// task-d77 (#169 review): a candidate's campaign waits on the dependency
+/// rows of commands it executed and forgot, and the runtime reads them as
+/// a donor reads a page. A command whose rows are still held is answered
+/// with its row, the record catch-up serves; one with no dependency row
+/// under the epoch, or no executed row at all, is answered with none,
+/// which refuses the campaign (`RecoveryError::ExecutedWithoutRow`).
+#[test]
+fn a_campaign_is_answered_a_forgotten_commands_row_from_the_store() {
+    let mut cluster = Cluster::new();
+    for _ in 0..3 {
+        cluster.second();
+    }
+    // r2's table holds eight: most of what it executed is long forgotten.
+    let rows = cluster.executed_rows(2);
+    assert!(rows.len() > CAPACITY * 4, "{} executed", rows.len());
+    let (_, forgotten, _) = rows[0];
+    let follower = cluster.voters[2].node().machine();
+    let Machine::Follower(follower) = follower else {
+        panic!("r2 follows");
+    };
+    assert!(follower.table().forgotten(&forgotten));
+    let applier = cluster.voters[2].node().applier();
+    let held = {
+        let gated = applier.store().reader().snapshot().expect("snapshot");
+        coord_storage::protocol::catch_up_entry(gated.view(), epoch(), &forgotten)
+            .expect("read")
+            .expect("executed and held")
+            .decided
+            .expect("a dependency row")
+    };
+    let never = CommandId(Digest32([0xee; 32]));
+    let answered = coord_daemon::catch_up::executed_rows(applier, epoch(), vec![forgotten, never]);
+    assert_eq!(answered, vec![(forgotten, Some(held)), (never, None)]);
+    // Under another epoch it keeps no dependency row for the command,
+    // although its executed row and payload are there.
+    let other = ConfigurationEpoch::new(2).unwrap();
+    assert_eq!(
+        coord_daemon::catch_up::executed_rows(applier, other, vec![forgotten]),
+        vec![(forgotten, None)]
+    );
+}
