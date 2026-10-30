@@ -900,7 +900,7 @@ fn possible_fast_decisions(
         let mut stack: Vec<CommandId> = record(m, c).map(|e| e.deps.clone()).unwrap_or_default();
         while let Some(d) = stack.pop() {
             if seen.insert(d)
-                && !entries.get(&d).is_some_and(|e| e.phase == Phase::Commit)
+                && entries.get(&d).is_none_or(|e| e.phase != Phase::Commit)
                 && let Some(e) = record(m, &d)
             {
                 stack.extend(e.deps.iter().copied());
