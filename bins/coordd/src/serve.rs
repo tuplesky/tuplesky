@@ -956,6 +956,9 @@ pub struct Domain<P: Persistence> {
     /// left off, so a command that cannot settle here does not keep the
     /// ones behind it from being looked at.
     settle_cursor: usize,
+    /// The store's records for those commands, read once a turn and not
+    /// again for what had none at the same projection (task-d75).
+    settle_reads: coord_daemon::settle::RecordReads,
     /// A command whose late release contradicted the answer this node
     /// already gave from its own record (task-d12), with what was
     /// compared (task-d17). The serve loop stops on it as it stops on a
@@ -1588,6 +1591,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             pages_asked: None,
             parked: coord_daemon::parked::Parked::new(PARKED_HOLD, PARKED_EVIDENCE),
             settle_cursor: 0,
+            settle_reads: Default::default(),
             answered_otherwise: None,
             admission_halt: None,
             cycle_halt: None,
@@ -3847,6 +3851,10 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     #[must_use]
     fn settle_from_records(&mut self) -> Option<Box<coord_collector::Mismatch>> {
         let half = self.frontend.frontend.dispatcher_mut().half_established();
+        // What the reads remember is what is still half held (Codex
+        // review of #168).
+        self.settle_reads
+            .retain(half.iter().map(|(command, _)| *command));
         if half.is_empty() {
             return None;
         }
@@ -3856,9 +3864,8 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         let (this_turn, cursor) =
             coord_daemon::settle::window(half, self.settle_cursor, SETTLE_PER_TURN);
         self.settle_cursor = cursor;
-        let conflicts =
-            coord_daemon::settle::conflicts_for(self.backing.applier(), this_turn.iter().copied());
-        let records = coord_daemon::settle::records_for(self.backing.applier(), this_turn);
+        let coord_daemon::settle::Records { records, conflicts } =
+            self.settle_reads.read(self.backing.applier(), this_turn);
         // The release this collector holds and what this node executed
         // disagreeing is not an ordinary outcome: every replica executes
         // the committed commands in one order, and this node's frontend

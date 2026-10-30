@@ -94,6 +94,105 @@ pub fn conflicts_for<P: Persistence>(
         .collect()
 }
 
+/// What a node's store holds for the half-held commands of one turn,
+/// read from one snapshot: each command's own record, and the commands
+/// whose retry key it holds bound to another command, with that command.
+#[derive(Debug, Default)]
+pub struct Records {
+    /// As [`records_for`] gives them.
+    pub records: Vec<(CommandId, RetryRecordV1)>,
+    /// As [`conflicts_for`] gives them.
+    pub conflicts: Vec<(CommandId, CommandId)>,
+}
+
+/// The read of the half-held commands a domain does every turn
+/// (task-d75): one snapshot and one lookup a key, for the records and the
+/// conflicts both, and no snapshot at all when nothing it would read can
+/// have changed.
+///
+/// A record only appears with a projection commit, and a commit moves
+/// the completed frontier, so a command found with no record stays
+/// without one until the frontier moves: until then it is not looked up
+/// again, and a turn whose commands are all such takes no snapshot. With
+/// a domain serving its callers, nearly every command is half held for
+/// a while before its record appears, and every turn pinned a snapshot,
+/// read the durable metadata and opened the retry table twice to find
+/// none (a twentieth of a follower's domain loop). A command that has a
+/// record, or one bound to another command, is read every turn, as
+/// before: what the collector makes of it is the collector's.
+///
+/// What it remembers is bounded by what is still half held, which the
+/// caller says with [`RecordReads::retain`] every turn: on a node whose
+/// store takes no commands -- a frontend-only one -- the frontier never
+/// moves, and every command that was ever half held there for a turn
+/// would otherwise stay remembered for the life of the process (Codex
+/// review of #168).
+#[derive(Debug, Default)]
+pub struct RecordReads {
+    /// The completed frontier `absent` was read at.
+    at: Option<u64>,
+    /// The commands found with no record at `at`.
+    absent: std::collections::BTreeSet<CommandId>,
+}
+
+impl RecordReads {
+    /// Forget every command not in `pending`, the commands still half
+    /// held.
+    pub fn retain(&mut self, pending: impl IntoIterator<Item = CommandId>) {
+        if self.absent.is_empty() {
+            return;
+        }
+        let pending: std::collections::BTreeSet<CommandId> = pending.into_iter().collect();
+        self.absent.retain(|command| pending.contains(command));
+    }
+
+    /// How many commands it remembers as having no record.
+    pub fn remembered(&self) -> usize {
+        self.absent.len()
+    }
+
+    /// What the store holds for `half`.
+    pub fn read<P: Persistence>(
+        &mut self,
+        applier: &Applier<P>,
+        half: impl IntoIterator<Item = (CommandId, RetryKey)>,
+    ) -> Records {
+        let reader = applier.store().reader();
+        let completed = reader.completed();
+        if self.at != Some(completed) {
+            self.at = Some(completed);
+            self.absent.clear();
+        }
+        let half: Vec<(CommandId, RetryKey)> = half
+            .into_iter()
+            .filter(|(command, _)| !self.absent.contains(command))
+            .collect();
+        let mut out = Records::default();
+        if half.is_empty() {
+            return out;
+        }
+        // Pinned after the frontier was read, so it shows at least what
+        // the frontier says: a record it lacks was not there at `at`
+        // either.
+        let Ok(gated) = reader.snapshot() else {
+            return out;
+        };
+        for (command, key) in half {
+            match coord_storage::retry::lookup(gated.view(), &key) {
+                Ok(Some(record)) if record.command_id == command => {
+                    out.records.push((command, record));
+                }
+                Ok(Some(record)) => out.conflicts.push((command, record.command_id)),
+                Ok(None) => {
+                    self.absent.insert(command);
+                }
+                Err(_) => {}
+            }
+        }
+        out
+    }
+}
+
 /// What one turn of settling from records sends, or the command that
 /// stopped it.
 #[derive(Debug, PartialEq, Eq)]
