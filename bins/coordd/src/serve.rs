@@ -1508,10 +1508,14 @@ struct Export {
     job: Job,
 }
 
-/// The step of a publication that is running on its own thread.
+/// The step of a publication that is running off the domain thread.
 enum Job {
     /// Steps 1 and 2: producing the image and writing it.
     Write(std::thread::JoinHandle<Result<Written, BaselineError>>),
+    /// Steps 3 and 4 on the store's journal worker (task-d66): the
+    /// pointer is queued for the next group, and the retirement follows
+    /// its append there.
+    Pointer(Box<coord_checkpoint::QueuedPointer>),
     /// Step 5, once the pointer is durable: removing what it supersedes.
     /// The publication is kept here as well, so that a reclaimer that
     /// panics still leaves it accounted as the durable one it is.
@@ -1525,6 +1529,8 @@ impl Job {
     fn is_finished(&self) -> bool {
         match self {
             Job::Write(worker) => worker.is_finished(),
+            // Only the store knows: `Domain::publish` asks it.
+            Job::Pointer(_) => true,
             Job::Reclaim(worker, _) => worker.is_finished(),
         }
     }
@@ -3121,16 +3127,21 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         self.housekeeping = Some(housekeeping);
     }
 
-    /// The local checkpoint's turn (task-j04, task-d51): collect an image
-    /// that has been written, or start one that is due.
+    /// The local checkpoint's turn (task-j04, task-d51, task-d66):
+    /// collect an image that has been written or a pointer that has been
+    /// published, or start an image that is due.
     ///
     /// The image is produced and written on a thread of its own from a
     /// snapshot pinned here, and the domain goes on serving meanwhile.
-    /// This thread keeps the steps that order the publication: the pin,
-    /// then once the image and its directory are durable the pointer and
-    /// the retirement, in task-j04's order. The reclaim runs off it again
-    /// once the pointer is durable. A publication
-    /// costs it a pin and a pointer's sync, not the projection's size.
+    /// Once the image and its directory are durable, a voter queues the
+    /// pointer for its store's journal worker, which appends it with the
+    /// next group and retires the prefix after it (task-d66), and this
+    /// thread takes the outcome on a later turn. The reclaim then runs
+    /// off it again. task-j04's order is unchanged: image, pointer,
+    /// retirement, reclaim. A node that serves without voting lowers
+    /// only when it applies, so it appends the pointer and retires here,
+    /// as before. A publication costs this thread a pin and a queue, or
+    /// a pin and a pointer's sync, not the projection's size.
     fn publish(&mut self, housekeeping: &mut Housekeeping) {
         use coord_daemon::metrics::Stage;
         if housekeeping.after == 0 {
@@ -3146,46 +3157,50 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 job,
             } = housekeeping.export.take().expect("just seen");
             match job {
-                // The image is durable: the pointer and the retirement,
-                // here, then the reclaim off the thread again.
+                // The image is durable: the pointer, queued for the
+                // journal worker or published here.
                 Job::Write(worker) => {
                     let written = worker.join().unwrap_or_else(|_| {
                         eprintln!("the checkpoint writer panicked");
                         Err(BaselineError::Abandoned)
                     });
                     let finishing = std::time::Instant::now();
-                    let outcome = written.and_then(|written| {
-                        self.backing.applier_mut().store_mut().finish_local(written)
-                    });
-                    on_loop += finishing.elapsed();
-                    match outcome {
-                        Ok(publication) => {
-                            match spawn_reclaim(housekeeping.images.clone(), publication.clone()) {
-                                Ok(worker) => {
-                                    housekeeping.export = Some(Export {
-                                        started,
-                                        on_loop,
-                                        job: Job::Reclaim(worker, Box::new(publication)),
-                                    });
-                                }
-                                // No thread to spare: the images stay
-                                // until the next publication reclaims
-                                // them, which is the safe direction.
-                                Err(e) => {
-                                    eprintln!("the superseded images were not reclaimed: {e}");
-                                    self.published(housekeeping, publication, started, on_loop);
-                                }
+                    let queue = matches!(self.backing, Backing::Voting(_));
+                    let store = self.backing.applier_mut().store_mut();
+                    if queue {
+                        let queued = written.and_then(|written| store.queue_local(written));
+                        on_loop += finishing.elapsed();
+                        match queued {
+                            Ok(queued) => {
+                                housekeeping.export = Some(Export {
+                                    started,
+                                    on_loop,
+                                    job: Job::Pointer(Box::new(queued)),
+                                });
                             }
+                            Err(e) => self.unpublished(housekeeping, started, &e),
                         }
-                        Err(e) => {
-                            self.recorder.refused(Stage::Checkpoint);
-                            housekeeping.done.1 += 1;
-                            let gap = self.backing.applier().store().unreclaimed();
-                            housekeeping.floor = gap.saturating_add(housekeeping.after);
-                            eprintln!(
-                                "this node could not publish a recovery checkpoint after {} ms: {e}",
-                                started.elapsed().as_millis()
-                            );
+                    } else {
+                        let outcome = written.and_then(|written| store.finish_local(written));
+                        on_loop += finishing.elapsed();
+                        self.pointer_published(housekeeping, outcome, started, on_loop);
+                    }
+                }
+                // The pointer's group may be back.
+                Job::Pointer(queued) => {
+                    let taking = std::time::Instant::now();
+                    let taken = self.backing.applier_mut().store_mut().take_local(&queued);
+                    on_loop += taking.elapsed();
+                    match taken {
+                        Some(outcome) => {
+                            self.pointer_published(housekeeping, outcome, started, on_loop);
+                        }
+                        None => {
+                            housekeeping.export = Some(Export {
+                                started,
+                                on_loop,
+                                job: Job::Pointer(queued),
+                            });
                         }
                     }
                 }
@@ -3267,6 +3282,58 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         }
     }
 
+    /// Steps 3 and 4 are done, here or on the journal worker: the reclaim
+    /// goes off this thread, or the failure is accounted.
+    fn pointer_published(
+        &self,
+        housekeeping: &mut Housekeeping,
+        outcome: Result<Publication, BaselineError>,
+        started: std::time::Instant,
+        on_loop: std::time::Duration,
+    ) {
+        match outcome {
+            Ok(publication) => {
+                match spawn_reclaim(housekeeping.images.clone(), publication.clone()) {
+                    Ok(worker) => {
+                        housekeeping.export = Some(Export {
+                            started,
+                            on_loop,
+                            job: Job::Reclaim(worker, Box::new(publication)),
+                        });
+                    }
+                    // No thread to spare: the images stay until the next
+                    // publication reclaims them, which is the safe
+                    // direction.
+                    Err(e) => {
+                        eprintln!("the superseded images were not reclaimed: {e}");
+                        self.published(housekeeping, publication, started, on_loop);
+                    }
+                }
+            }
+            Err(e) => self.unpublished(housekeeping, started, &e),
+        }
+    }
+
+    /// Account a publication that failed before its pointer was durable:
+    /// the prior one stands, and the next is due once as much more is
+    /// unrepresented.
+    fn unpublished(
+        &self,
+        housekeeping: &mut Housekeeping,
+        started: std::time::Instant,
+        e: &BaselineError,
+    ) {
+        use coord_daemon::metrics::Stage;
+        self.recorder.refused(Stage::Checkpoint);
+        housekeeping.done.1 += 1;
+        let gap = self.backing.applier().store().unreclaimed();
+        housekeeping.floor = gap.saturating_add(housekeeping.after);
+        eprintln!(
+            "this node could not publish a recovery checkpoint after {} ms: {e}",
+            started.elapsed().as_millis()
+        );
+    }
+
     /// Account a completed publication and say what it cost.
     fn published(
         &self,
@@ -3308,7 +3375,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             "checkpoint represented={} retired={} reclaimed={} took_ms={} \
              loop_ms={:.1} pin_ms={:.1} export_ms={:.1} write_ms={:.1} \
              drain_ms={:.1} sync_ms={:.1} append_ms={:.1} retire_ms={:.1} \
-             reclaim_ms={:.1} {thread}",
+             queued_ms={:.1} reclaim_ms={:.1} {thread}",
             published.represented.get(),
             published.retired,
             published.reclaimed,
@@ -3321,6 +3388,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             ms(phases.journal.sync),
             ms(phases.journal.append),
             ms(phases.journal.retire),
+            ms(phases.journal.queued),
             ms(phases.reclaim),
         );
     }

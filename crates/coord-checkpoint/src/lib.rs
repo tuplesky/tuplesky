@@ -96,7 +96,8 @@ pub use handoff::{
     read_installs, record_install, record_local_install, select_certificate,
 };
 pub use maintain::{
-    BaselineError, LocalBaseline, Phases, Pinned, Publication, Written, reclaim_local,
+    BaselineError, LocalBaseline, Phases, Pinned, Publication, QueuedPointer, Written,
+    reclaim_local,
 };
 pub use store::{LocalCheckpointStore, SharedImageStore, StoreError};
 
