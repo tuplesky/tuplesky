@@ -329,7 +329,7 @@ impl BoundFrontend {
                 Ingress::Bound(ack)
             }
             Some(_) => Ingress::Rejected(BindError::SessionDisagrees),
-            None => self.establish(clock, now, connection, binding, ack),
+            None => self.establish(clock, now, connection, binding, ack, policy),
         }
     }
 
@@ -342,6 +342,7 @@ impl BoundFrontend {
         connection: u64,
         binding: Binding,
         ack: Vec<u8>,
+        policy: &dyn PolicySource,
     ) -> Ingress {
         let retry_key = binding.establishment_key(&self.config);
         // The operation carries nothing. Everything about the session
@@ -378,6 +379,24 @@ impl BoundFrontend {
                     },
                 );
                 Ingress::Establishing(Box::new(plan))
+            }
+            // This very establishment already executed and its outcome
+            // is kept: it is settled from that outcome, as the stream
+            // that submitted it was. A released outcome can precede the
+            // snapshot the barrier above reads (a response is released
+            // at journal durability, task-d63), so a second binding
+            // right after the first finds no row yet and would
+            // otherwise be refused a session that exists.
+            Ok(Action::Respond(delivery)) => {
+                let waiting = Establishing {
+                    connection,
+                    binding,
+                    ack,
+                };
+                match self.settle(waiting, delivery, policy) {
+                    Delivered::Answer(answer) => Ingress::Bound(answer.frame),
+                    Delivered::Unbound { reason, .. } => Ingress::Rejected(reason),
+                }
             }
             // Another connection is already establishing this very
             // command. Its outcome is this one's too, but only one
