@@ -7724,7 +7724,7 @@ fn a_commit_a_later_sync_leaves_out_survives_its_installation_and_a_restart() {
         .find(|s| s.ballot == next)
         .expect("ballot 2's Sync row");
     assert!(row.entries.contains_key(&x) && row.entries.contains_key(&y));
-    let restarted = Follower::recover_with_syncs(
+    let mut restarted = Follower::recover_with_syncs(
         config(next),
         Some(coord_consensus::PromiseRecordV1 {
             promised: next,
@@ -7736,6 +7736,26 @@ fn a_commit_a_later_sync_leaves_out_survives_its_installation_and_a_restart() {
         vec![(next, row)],
         ExecutionPosition::ZERO,
     );
+    let report = restarted.report(ballot(3, 1));
+    assert!(at_commit(&report, x, &[d]), "{report:?}");
+    assert!(at_commit(&report, y, &[]), "{report:?}");
+
+    // r0 sends ballot 2's Sync again, as a leader does to a voter whose
+    // promise arrives late: the copy without the carried entries is a
+    // duplicate of the ballot the restart is synchronized to, and replaces
+    // nothing (#173 review).
+    pending.push_back(boot_event(1));
+    pending.push_back(peer_event(
+        r(0),
+        ProtocolMessage::Sync(SyncDecision {
+            ballot: next,
+            source_ballot: synced,
+            entries: BTreeMap::new(),
+            reproposed: BTreeSet::new(),
+        }),
+    ));
+    effects.clear();
+    run(&mut restarted, &mut pending, &mut effects);
     let report = restarted.report(ballot(3, 1));
     assert!(at_commit(&report, x, &[d]), "{report:?}");
     assert!(at_commit(&report, y, &[]), "{report:?}");
