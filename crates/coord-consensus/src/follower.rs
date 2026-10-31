@@ -1569,6 +1569,13 @@ impl Follower {
             return Vec::new();
         }
         if !already_synced {
+            // What this replica holds decided goes down with the Sync it
+            // installs, whichever ballot decided it (task-d80).
+            let decision = self.carry_commits(decision);
+            if let Err(cycle) = crate::recovery::entry_order(&decision) {
+                self.halt_on_cycle(cycle);
+                return Vec::new();
+            }
             // A Sync that does not fit its row is refused before anything
             // of it is marked (task-d20). A candidate of this build never
             // binds one; installing it ended the process at the write.
@@ -1786,6 +1793,62 @@ impl Follower {
         self.adopted.remove(command);
         self.held.remove(command);
         self.note_lacking(*command);
+    }
+
+    /// `decision` with every command this replica holds committed that it
+    /// leaves out, carried at COMMIT under the facts it was committed with
+    /// (task-d80): a pending COMMIT entry of the Sync it replaces, or a
+    /// record committed here and not yet executed.
+    ///
+    /// A commit is a decision, whichever ballot carried it, and nothing
+    /// else keeps it here. It is not written as a row, so a restart reads
+    /// the acceptance back and knows the commit only from the Sync row it
+    /// resumes; the next Sync replaces that row and its pending entries,
+    /// and its marker demotes the acceptance it does not carry and
+    /// releases what it does not name. A Sync leaves such a command out
+    /// when its majority executed and forgot it, or never held it, and
+    /// without catch-up nothing serves it here again. Left so, the voter
+    /// reported a decided command at PRE-ACCEPT, without the one it was
+    /// decided after, and a later selection from voters as far behind
+    /// re-proposed it under other dependencies (protocol_sim row 9, three
+    /// voters, seed 296, with three acknowledgements in four to a
+    /// follower lost and catch-up off). Carried, it is named, so the
+    /// marker neither releases it nor demotes an acceptance under the
+    /// same dependencies; it is written in the Sync row, so a restart
+    /// resumes it; and it is reported at COMMIT, which every later
+    /// selection keeps by the source rule's commit exception.
+    ///
+    /// Only this replica's copy changes. The Sync each voter installs is
+    /// its own row, and no other voter reads it: a candidate's sources are
+    /// fast sets, and its selection is from the reports.
+    fn carry_commits(&self, mut decision: SyncDecision) -> SyncDecision {
+        let mut carried: BTreeMap<CommandId, SyncEntry> = self
+            .sync_pending
+            .iter()
+            .filter(|(c, e)| e.phase == Phase::Commit && !decision.entries.contains_key(c))
+            .map(|(c, e)| (*c, e.clone()))
+            .collect();
+        for (c, r) in self.table.records() {
+            if r.phase == Phase::Commit
+                && !decision.entries.contains_key(c)
+                && !carried.contains_key(c)
+            {
+                carried.insert(
+                    *c,
+                    SyncEntry {
+                        command: *c,
+                        phase: Phase::Commit,
+                        deps: r.deps.clone(),
+                        path: r.path,
+                        paths: r.paths.clone(),
+                        seqnum: r.synced_seq.unwrap_or(0),
+                        admission: r.payload,
+                    },
+                );
+            }
+        }
+        decision.entries.extend(carried);
+        decision
     }
 
     /// Hold `decision`'s entries for installation, in place of whatever an
