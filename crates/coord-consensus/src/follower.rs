@@ -518,6 +518,10 @@ pub struct Follower {
     /// How many times a pending Sync entry was examined for
     /// installation, ever: what installing a Sync cost (task-d26).
     sync_examined: u64,
+    /// The entries and edges `carry_commits` added to the Sync this
+    /// replica installs, ever (task-d80): installation work it gives
+    /// itself, bounded by what it holds committed and not executed.
+    sync_carried: u64,
     /// The admission digest the synchronized selection named for each of
     /// its entries (task-d14). Kept past installation: a payload that
     /// arrives for an entry installed over a placeholder has to be the
@@ -779,6 +783,7 @@ impl Follower {
             sync_waiters: BTreeMap::new(),
             sync_rescan: false,
             sync_examined: 0,
+            sync_carried: 0,
             named_facts: BTreeMap::new(),
             halted: None,
             recovery_cycle: None,
@@ -967,6 +972,7 @@ impl Follower {
             sync_waiters: BTreeMap::new(),
             sync_rescan: false,
             sync_examined: 0,
+            sync_carried: 0,
             named_facts: BTreeMap::new(),
             halted: None,
             recovery_cycle: None,
@@ -1569,6 +1575,15 @@ impl Follower {
             return Vec::new();
         }
         if !already_synced {
+            // What this replica holds decided goes down with the Sync it
+            // installs, whichever ballot decided it (task-d80).
+            let given = sync_work(&decision);
+            let decision = self.carry_commits(decision);
+            self.sync_carried += sync_work(&decision) - given;
+            if let Err(cycle) = crate::recovery::entry_order(&decision) {
+                self.halt_on_cycle(cycle);
+                return Vec::new();
+            }
             // A Sync that does not fit its row is refused before anything
             // of it is marked (task-d20). A candidate of this build never
             // binds one; installing it ended the process at the write.
@@ -1788,6 +1803,62 @@ impl Follower {
         self.note_lacking(*command);
     }
 
+    /// `decision` with every command this replica holds committed that it
+    /// leaves out, carried at COMMIT under the facts it was committed with
+    /// (task-d80): a pending COMMIT entry of the Sync it replaces, or a
+    /// record committed here and not yet executed.
+    ///
+    /// A commit is a decision, whichever ballot carried it, and nothing
+    /// else keeps it here. It is not written as a row, so a restart reads
+    /// the acceptance back and knows the commit only from the Sync row it
+    /// resumes; the next Sync replaces that row and its pending entries,
+    /// and its marker demotes the acceptance it does not carry and
+    /// releases what it does not name. A Sync leaves such a command out
+    /// when its majority executed and forgot it, or never held it, and
+    /// without catch-up nothing serves it here again. Left so, the voter
+    /// reported a decided command at PRE-ACCEPT, without the one it was
+    /// decided after, and a later selection from voters as far behind
+    /// re-proposed it under other dependencies (protocol_sim row 9, three
+    /// voters, seed 296, with three acknowledgements in four to a
+    /// follower lost and catch-up off). Carried, it is named, so the
+    /// marker neither releases it nor demotes an acceptance under the
+    /// same dependencies; it is written in the Sync row, so a restart
+    /// resumes it; and it is reported at COMMIT, which every later
+    /// selection keeps by the source rule's commit exception.
+    ///
+    /// Only this replica's copy changes. The Sync each voter installs is
+    /// its own row, and no other voter reads it: a candidate's sources are
+    /// fast sets, and its selection is from the reports.
+    fn carry_commits(&self, mut decision: SyncDecision) -> SyncDecision {
+        let mut carried: BTreeMap<CommandId, SyncEntry> = self
+            .sync_pending
+            .iter()
+            .filter(|(c, e)| e.phase == Phase::Commit && !decision.entries.contains_key(c))
+            .map(|(c, e)| (*c, e.clone()))
+            .collect();
+        for (c, r) in self.table.records() {
+            if r.phase == Phase::Commit
+                && !decision.entries.contains_key(c)
+                && !carried.contains_key(c)
+            {
+                carried.insert(
+                    *c,
+                    SyncEntry {
+                        command: *c,
+                        phase: Phase::Commit,
+                        deps: r.deps.clone(),
+                        path: r.path,
+                        paths: r.paths.clone(),
+                        seqnum: r.synced_seq.unwrap_or(0),
+                        admission: r.payload,
+                    },
+                );
+            }
+        }
+        decision.entries.extend(carried);
+        decision
+    }
+
     /// Hold `decision`'s entries for installation, in place of whatever an
     /// earlier Sync left pending (task-d20).
     ///
@@ -1799,6 +1870,9 @@ impl Follower {
     /// later selection leaves out was therefore never decided, or was
     /// executed by a reporter and retired, which catch-up serves; its
     /// acceptance, if any, was demoted with the later marker (task-d11).
+    /// Without catch-up nothing serves it, so an earlier entry this
+    /// replica holds at COMMIT is not left to this: `carry_commits` merged
+    /// it into `decision` before the marker (task-d80).
     /// Kept, the earlier entries went into every report after it, so a
     /// voter behind across failed ballots reported more each time, and
     /// the Sync selected from its report grew with them.
@@ -2025,6 +2099,13 @@ impl Follower {
     /// payloads arrive.
     pub const fn sync_examinations(&self) -> u64 {
         self.sync_examined
+    }
+
+    /// The entries and edges this replica carried into the Syncs it
+    /// installed (task-d80), counted as `sync_examinations` is bounded:
+    /// each entry and each of its dependencies once.
+    pub const fn sync_carried(&self) -> u64 {
+        self.sync_carried
     }
 
     /// The command this replica holds two decisions of, if it found one
@@ -4923,6 +5004,15 @@ fn named_facts(decision: &SyncDecision) -> BTreeMap<CommandId, Digest32> {
         .iter()
         .filter_map(|(c, e)| e.admission.map(|d| (*c, d)))
         .collect()
+}
+
+/// A selection's entries and their dependency edges, one unit each.
+fn sync_work(decision: &SyncDecision) -> u64 {
+    decision
+        .entries
+        .values()
+        .map(|e| 1 + e.deps.len() as u64)
+        .sum()
 }
 
 impl DeterministicMachine for Follower {

@@ -1954,7 +1954,9 @@ impl Sim {
                 // Installing a Sync examines an entry once per change to
                 // what it waits on: linear in its entries and edges
                 // (task-d26). A candidate's own selection is installed as
-                // one.
+                // one. What a replica carries into a Sync it was given,
+                // the commits it holds that the Sync leaves out (task-d80),
+                // is installed with it.
                 if let Some(d) = f.campaign_state().and_then(|c| c.decision())
                     && self.selection_counted[usize::from(i)] != Some(d.ballot)
                 {
@@ -1964,7 +1966,7 @@ impl Sim {
                     let most = &mut self.sync_entries[usize::from(i)];
                     *most = (*most).max(entries);
                 }
-                let work = self.sync_work[usize::from(i)];
+                let work = self.sync_work[usize::from(i)] + f.sync_carried();
                 let examinations = f.sync_examinations();
                 if examinations > 4 * work {
                     over.push(format!(
