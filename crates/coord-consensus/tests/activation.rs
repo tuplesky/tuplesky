@@ -7595,3 +7595,161 @@ fn a_candidate_whose_own_acceptance_is_unbacked_waits_for_a_sync() {
         f.take_rejections()
     );
 }
+
+/// task-d80 (protocol_sim row 9, three voters, seed 296, with three
+/// acknowledgements in four to a follower lost and catch-up off): a voter
+/// far behind knew two commands decided only from the Sync it was
+/// synchronized to, one still pending there and one installed and not
+/// executed. The next Sync, selected from two voters that had executed
+/// and forgotten them or never held them, left both out. Installing it
+/// dropped the pending commit, demoted the acceptance under it and
+/// released the other, so the voter reported a decided command at
+/// PRE-ACCEPT, and a later selection from voters as far behind
+/// re-proposed it under other dependencies. A commit now goes down with
+/// the Sync that leaves it out, and is reported at COMMIT, also after a
+/// restart.
+#[test]
+fn a_commit_a_later_sync_leaves_out_survives_its_installation_and_a_restart() {
+    let x = CommandId(Digest32([0x80; 32]));
+    let y = CommandId(Digest32([0x81; 32]));
+    let d = CommandId(Digest32([0x7f; 32]));
+    let admitted = Digest32([8; 32]);
+    let accepted = |deps: Vec<CommandId>| CommandRecord {
+        phase: Phase::Accept,
+        deps,
+        keys: vec![b"k".to_vec()],
+        payload: Some(admitted),
+        paths: Vec::new(),
+        synced_seq: None,
+        path: coord_consensus::empty_path(),
+    };
+    let committed = |command: CommandId, deps: Vec<CommandId>| coord_consensus::SyncEntry {
+        command,
+        phase: Phase::Commit,
+        deps,
+        path: coord_consensus::empty_path(),
+        paths: Vec::new(),
+        seqnum: 1,
+        admission: Some(admitted),
+    };
+    let synced = ballot(1, 0);
+    let first = SyncDecision {
+        ballot: synced,
+        source_ballot: ballot(0, 0),
+        // x waits on d, which this voter does not hold; y installs.
+        entries: [(x, committed(x, vec![d])), (y, committed(y, vec![]))]
+            .into_iter()
+            .collect(),
+        reproposed: BTreeSet::new(),
+    };
+    let rows = vec![(x, accepted(vec![d])), (y, accepted(vec![]))];
+    let config = |b: Ballot| FollowerConfig {
+        identity: identity(1),
+        quorum: quorum(b),
+        genesis: ballot(0, 0),
+        frontend: FRONTEND,
+        capacity: 32,
+    };
+    // Promised ballot 1, whose Sync then arrives and is installed.
+    let mut f = Follower::recover_with_syncs(
+        config(ballot(0, 0)),
+        Some(coord_consensus::PromiseRecordV1 {
+            promised: synced,
+            synced: ballot(0, 0),
+        }),
+        None,
+        rows.clone(),
+        Vec::new(),
+        Vec::new(),
+        ExecutionPosition::ZERO,
+    );
+    let mut effects = Vec::new();
+    let mut pending: VecDeque<Event> = VecDeque::from([
+        boot_event(1),
+        peer_event(r(0), ProtocolMessage::Sync(first)),
+    ]);
+    let run = |f: &mut Follower, pending: &mut VecDeque<Event>, effects: &mut Vec<Effect>| {
+        let mut steps = 0;
+        while let Some(event) = pending.pop_front() {
+            steps += 1;
+            assert!(steps < 1000, "did not settle");
+            let out = f.step(event);
+            pending.extend(durable_events(&out));
+            effects.extend(out);
+        }
+    };
+    run(&mut f, &mut pending, &mut effects);
+    assert_eq!(f.table().phase_of(&x), Some(Phase::Accept), "x installed");
+    assert_eq!(
+        f.table().phase_of(&y),
+        Some(Phase::Commit),
+        "y not installed"
+    );
+
+    // r0 leads ballot 2 from voters that hold neither: its Sync leaves
+    // both out.
+    let next = ballot(2, 0);
+    pending.push_back(peer_event(
+        r(0),
+        ProtocolMessage::NewLeader {
+            ballot: next,
+            executed: ExecutionPosition::ZERO,
+        },
+    ));
+    pending.push_back(peer_event(
+        r(0),
+        ProtocolMessage::Sync(SyncDecision {
+            ballot: next,
+            source_ballot: synced,
+            entries: BTreeMap::new(),
+            reproposed: BTreeSet::new(),
+        }),
+    ));
+    effects.clear();
+    run(&mut f, &mut pending, &mut effects);
+    assert_eq!(f.table().phase_of(&x), Some(Phase::Accept), "x was demoted");
+    assert_eq!(
+        f.table().phase_of(&y),
+        Some(Phase::Commit),
+        "y was released"
+    );
+    let at_commit = |report: &RecoveryReport, command: CommandId, deps: &[CommandId]| {
+        report
+            .entries
+            .iter()
+            .any(|e| e.command == command && e.phase == Phase::Commit && e.deps == deps)
+    };
+    let report = f.report(ballot(3, 1));
+    assert!(at_commit(&report, x, &[d]), "{report:?}");
+    assert!(at_commit(&report, y, &[]), "{report:?}");
+
+    // The Sync row written for ballot 2 carries both, so a restart from
+    // the durable rows reports them as committed too.
+    let row = effects
+        .iter()
+        .filter_map(|e| match e {
+            Effect::Persist(b) => Some(b.updates.iter()),
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|u| u.value.as_ref().and_then(|v| decode_sync(v).ok()))
+        .map(|r| r.decision)
+        .find(|s| s.ballot == next)
+        .expect("ballot 2's Sync row");
+    assert!(row.entries.contains_key(&x) && row.entries.contains_key(&y));
+    let restarted = Follower::recover_with_syncs(
+        config(next),
+        Some(coord_consensus::PromiseRecordV1 {
+            promised: next,
+            synced: next,
+        }),
+        None,
+        rows,
+        Vec::new(),
+        vec![(next, row)],
+        ExecutionPosition::ZERO,
+    );
+    let report = restarted.report(ballot(3, 1));
+    assert!(at_commit(&report, x, &[d]), "{report:?}");
+    assert!(at_commit(&report, y, &[]), "{report:?}");
+}
