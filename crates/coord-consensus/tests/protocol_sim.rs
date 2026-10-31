@@ -43,9 +43,12 @@
 //!    (task-d71).
 //!
 //! Scenarios are the checklist's failure-test matrix rows 1 to 5, 9, 10,
-//! 12 and 14, at three and five voters, with table capacity 32. Seeds that
-//! once failed are kept in `fixtures/protocol_sim/seeds.json` and replayed
-//! on every run.
+//! 12 and 14, and rows 16 and 17, which are row 9's with acknowledgements
+//! between followers lost (task-d77), at three and five voters, with table
+//! capacity 32. `PROTOCOL_SIM_PEER_ACK_LOSS` (parts per million) sets
+//! that loss in every row (task-d78), as the weekly sweep does. Seeds that
+//! once failed are kept in `fixtures/protocol_sim/seeds.json`, with the
+//! catch-up and the loss they were found under, and replayed on every run.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -158,6 +161,11 @@ struct Knobs {
     /// campaign, once: a campaign completes only if it asks for a lost
     /// page again (task-d28).
     heal_page_loss: bool,
+    /// Loss of a `FastAck` or `SlowAck` to a voter other than its ballot's
+    /// leader, while not healing (task-d77). Such a voter learns a commit
+    /// from the leader's frontier alone, as every follower does with
+    /// acknowledgements to the leader only (task-d74).
+    peer_ack_loss: u32,
 }
 
 impl Knobs {
@@ -184,9 +192,11 @@ impl Knobs {
         collector_crash: 0,
         crash_candidate: false,
         heal_page_loss: false,
+        peer_ack_loss: 0,
     };
 
-    /// The checklist's matrix rows 1 to 5, 9, 10, 12 and 14.
+    /// The checklist's matrix rows 1 to 5, 9, 10, 12 and 14, and rows 16
+    /// and 17.
     fn row(row: u8) -> Knobs {
         let base = Knobs { row, ..Knobs::BASE };
         match row {
@@ -280,6 +290,16 @@ impl Knobs {
                 dup: 40_000,
                 ..base
             },
+            // Row 9's elections with every acknowledgement to a follower
+            // lost, and with half of them (task-d77): a follower that
+            // misses a command's commit while a voter that executed it
+            // retires it past its window (seeds 362 and 863 here, 550 and
+            // 633 in row 17, at three voters).
+            16 | 17 => Knobs {
+                row,
+                peer_ack_loss: if row == 16 { 1_000_000 } else { 500_000 },
+                ..Knobs::row(9)
+            },
             _ => unreachable!("not a scenario of the simulator: row {row}"),
         }
     }
@@ -313,7 +333,23 @@ impl Node {
     fn step(&mut self, e: Event) -> Vec<Effect> {
         match self.role.as_mut().expect("alive") {
             Role::Leader(m) => m.step(e),
-            Role::Follower(m) => m.step(e),
+            Role::Follower(m) => {
+                let mut effects = m.step(e);
+                // A campaign waiting on the rows of commands this node
+                // executed and forgot is answered by its runtime from its
+                // durable rows, as `coordd`'s is (task-d77).
+                loop {
+                    let wanted = m.executed_rows_wanted();
+                    if wanted.is_empty() {
+                        break effects;
+                    }
+                    let rows: BTreeMap<CommandId, CommandRecord> =
+                        dependency_rows(&self.storage).into_iter().collect();
+                    effects.extend(
+                        m.executed_rows(wanted.into_iter().map(|c| (c, rows.get(&c).cloned()))),
+                    );
+                }
+            }
         }
     }
 }
@@ -686,6 +722,18 @@ impl Sim {
                             self.at_frontend(i, m);
                         }
                         continue;
+                    }
+                    // An acknowledgement to a voter other than the ballot's
+                    // leader (task-d77).
+                    if !self.healing {
+                        let to_a_follower = match &message {
+                            Ok(ProtocolMessage::FastAck(a)) => a.ballot.leader != to.replica,
+                            Ok(ProtocolMessage::SlowAck(a)) => a.ballot.leader != to.replica,
+                            _ => false,
+                        };
+                        if to_a_follower && self.chance("peer-ack-loss", self.knobs.peer_ack_loss) {
+                            continue;
+                        }
                     }
                     let to = to.replica.0[0];
                     let msg = Msg { from: i, to, frame };
@@ -1592,7 +1640,8 @@ impl Sim {
     }
 
     /// The periodic work of `coordd`'s timers: the leader re-sends what
-    /// voters have not voted on, a follower asks its leader for payloads
+    /// voters have not voted on and its commit frontier (task-d09, the one
+    /// way a follower learns since task-d74), a follower asks its leader for payloads
     /// it lacks, a campaign asks for the report pages that have not
     /// arrived (task-d28), and one that holds work it does not execute
     /// asks for the leader's executed history (task-d08's pacer).
@@ -1602,7 +1651,11 @@ impl Sim {
             let at = self.nodes[usize::from(i)].executed.len();
             let donor = self.catch_up_donor(i);
             let effects = match self.nodes[usize::from(i)].role.as_mut() {
-                Some(Role::Leader(l)) => l.resend_unvoted(coord_consensus::RESEND_PER_VOTER),
+                Some(Role::Leader(l)) => {
+                    let mut effects = l.resend_unvoted(coord_consensus::RESEND_PER_VOTER);
+                    effects.extend(l.announce_committed());
+                    effects
+                }
                 Some(Role::Follower(f)) => {
                     let leader = f.quorum().leader();
                     let mut effects = f.request_report_pages();
@@ -1906,7 +1959,9 @@ impl Sim {
                 // Installing a Sync examines an entry once per change to
                 // what it waits on: linear in its entries and edges
                 // (task-d26). A candidate's own selection is installed as
-                // one.
+                // one. What a replica carries into a Sync it was given,
+                // the commits it holds that the Sync leaves out (task-d80),
+                // is installed with it.
                 if let Some(d) = f.campaign_state().and_then(|c| c.decision())
                     && self.selection_counted[usize::from(i)] != Some(d.ballot)
                 {
@@ -1916,7 +1971,7 @@ impl Sim {
                     let most = &mut self.sync_entries[usize::from(i)];
                     *most = (*most).max(entries);
                 }
-                let work = self.sync_work[usize::from(i)];
+                let work = self.sync_work[usize::from(i)] + f.sync_carried();
                 let examinations = f.sync_examinations();
                 if examinations > 4 * work {
                     over.push(format!(
@@ -2405,7 +2460,23 @@ fn run_one(n: u8, row: u8, seed: u64) -> Result<Stats, String> {
 /// [`run_one`], with catch-up set as `catch_up` says rather than as the
 /// environment does: a kept seed found without it is replayed without it.
 fn run_one_with(n: u8, row: u8, seed: u64, catch_up: Option<bool>) -> Result<Stats, String> {
-    let knobs = Knobs::row(row);
+    run_kept(n, row, seed, catch_up, None)
+}
+
+/// [`run_one_with`], with the loss of acknowledgements to followers set
+/// as `peer_ack_loss` says rather than as the row and the environment do:
+/// a kept seed found under that loss is replayed under it (task-d78).
+fn run_kept(
+    n: u8,
+    row: u8,
+    seed: u64,
+    catch_up: Option<bool>,
+    peer_ack_loss: Option<u32>,
+) -> Result<Stats, String> {
+    let mut knobs = row_knobs(row);
+    if let Some(loss) = peer_ack_loss {
+        knobs.peer_ack_loss = loss;
+    }
     let outcome = catch_unwind(AssertUnwindSafe(|| {
         let mut sim = Sim::new(n, knobs, seed);
         if let Some(on) = catch_up {
@@ -2421,6 +2492,21 @@ fn run_one_with(n: u8, row: u8, seed: u64, catch_up: Option<bool>) -> Result<Sta
             .unwrap_or_default();
         format!("row {row} at {n} voters, seed {seed}: {text}")
     })
+}
+
+/// A row's knobs, with `PROTOCOL_SIM_PEER_ACK_LOSS` (parts per million)
+/// setting the loss of acknowledgements to followers in every row
+/// (task-d78): the weekly sweep runs every row under it, which is what
+/// found row 4's seed 720, and rows 16 and 17 alone would not have.
+fn row_knobs(row: u8) -> Knobs {
+    let mut knobs = Knobs::row(row);
+    if let Some(loss) = std::env::var("PROTOCOL_SIM_PEER_ACK_LOSS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        knobs.peer_ack_loss = loss;
+    }
+    knobs
 }
 
 /// Seeds per scenario and size. `PROTOCOL_SIM_SEEDS` raises it for a
@@ -2556,6 +2642,16 @@ fn row_14_lost_responses_and_retries_under_one_identity() {
     run_row(14);
 }
 
+#[test]
+fn row_16_repeated_elections_with_every_acknowledgement_to_a_follower_lost() {
+    run_row(16);
+}
+
+#[test]
+fn row_17_repeated_elections_with_half_the_acknowledgements_to_a_follower_lost() {
+    run_row(17);
+}
+
 /// A seed kept because it once failed.
 #[derive(Deserialize)]
 struct Kept {
@@ -2566,6 +2662,11 @@ struct Kept {
     /// the environment says.
     #[serde(default)]
     catch_up: Option<bool>,
+    /// The loss of acknowledgements to followers it found it under, in
+    /// parts per million (task-d78); absent, as the row and the
+    /// environment say.
+    #[serde(default)]
+    peer_ack_loss: Option<u32>,
     /// What it found, for the reader.
     #[allow(dead_code)]
     found: String,
@@ -2580,7 +2681,7 @@ fn every_kept_seed_passes() {
     let kept: Vec<Kept> = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
     let failures: Vec<String> = kept
         .iter()
-        .filter_map(|k| run_one_with(k.voters, k.row, k.seed, k.catch_up).err())
+        .filter_map(|k| run_kept(k.voters, k.row, k.seed, k.catch_up, k.peer_ack_loss).err())
         .collect();
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
@@ -2593,6 +2694,6 @@ fn one_seed_from_the_environment() {
         return;
     };
     let v: Vec<u64> = spec.split(',').map(|x| x.trim().parse().unwrap()).collect();
-    let stats = Sim::new(v[1] as u8, Knobs::row(v[0] as u8), v[2]).run();
+    let stats = Sim::new(v[1] as u8, row_knobs(v[0] as u8), v[2]).run();
     println!("{stats:?}");
 }

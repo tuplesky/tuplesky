@@ -204,6 +204,15 @@ pub enum FollowerRejection {
         /// The dependency the selection leaves this replica without.
         missing: CommandId,
     },
+    /// A campaign was not started: this replica's own report holds
+    /// `command` accepted with no payload anywhere, so every selection of
+    /// its ballot fails on it (task-d79). It does not campaign again until
+    /// it installs a Sync, which another voter's campaign selects and
+    /// which releases that acceptance.
+    Unbacked {
+        /// The acceptance no reporter holds a payload for.
+        command: CommandId,
+    },
     /// A campaign was not started: a window of pulled commands is
     /// installed and not yet executed, and its comparison with the donor
     /// is the follower's to make (task-d25). It executes first.
@@ -472,9 +481,17 @@ pub struct Follower {
     ledger: DurableLedger,
     learner: Learner,
     campaign: Option<Campaign>,
+    /// Durable dependency rows of commands this replica executed and
+    /// forgot, as the runtime read them for the campaign's selection
+    /// (task-d77); `None` for one with no row. Read again by each campaign.
+    executed_rows: BTreeMap<CommandId, Option<CommandRecord>>,
     /// Set when a selection showed this replica further behind than
     /// recovery carries anyone; it does not campaign again this boot.
     behind: Option<CommandId>,
+    /// Set when a selection failed on this replica's own acceptance of a
+    /// command with no payload anywhere, every voter answered (task-d79);
+    /// cleared when it installs a Sync.
+    unbacked: Option<CommandId>,
     /// The highest position a voter refused this replica's campaign at
     /// (task-d10): it does not campaign again until it has executed that
     /// far. Not durable; a restart campaigns and is refused again.
@@ -501,6 +518,10 @@ pub struct Follower {
     /// How many times a pending Sync entry was examined for
     /// installation, ever: what installing a Sync cost (task-d26).
     sync_examined: u64,
+    /// The entries and edges `carry_commits` added to the Sync this
+    /// replica installs, ever (task-d80): installation work it gives
+    /// itself, bounded by what it holds committed and not executed.
+    sync_carried: u64,
     /// The admission digest the synchronized selection named for each of
     /// its entries (task-d14). Kept past installation: a payload that
     /// arrives for an entry installed over a placeholder has to be the
@@ -751,7 +772,9 @@ impl Follower {
             ledger,
             learner: Learner::new(executed_through),
             campaign: None,
+            executed_rows: BTreeMap::new(),
             behind: None,
+            unbacked: None,
             behind_voters: None,
             report_due: None,
             served_report: None,
@@ -760,6 +783,7 @@ impl Follower {
             sync_waiters: BTreeMap::new(),
             sync_rescan: false,
             sync_examined: 0,
+            sync_carried: 0,
             named_facts: BTreeMap::new(),
             halted: None,
             recovery_cycle: None,
@@ -934,7 +958,9 @@ impl Follower {
             learner: state.learner,
             deferred: BTreeMap::new(),
             campaign: None,
+            executed_rows: BTreeMap::new(),
             behind: None,
+            unbacked: None,
             behind_voters: None,
             // A report owed to a candidate is an obligation of the replica,
             // not of the role it held when the request arrived: dropping it
@@ -946,6 +972,7 @@ impl Follower {
             sync_waiters: BTreeMap::new(),
             sync_rescan: false,
             sync_examined: 0,
+            sync_carried: 0,
             named_facts: BTreeMap::new(),
             halted: None,
             recovery_cycle: None,
@@ -1048,6 +1075,11 @@ impl Follower {
             self.rejections.push(FollowerRejection::Behind { missing });
             return Vec::new();
         }
+        if let Some(command) = self.unbacked {
+            self.rejections
+                .push(FollowerRejection::Unbacked { command });
+            return Vec::new();
+        }
         if !self.catch_up.running.is_empty() {
             // A window's comparison with its donor is the follower's, and
             // the role change a won campaign is would drop it: the window
@@ -1125,6 +1157,7 @@ impl Follower {
         // The ballot this replica ran under is the likeliest source of the
         // selection: its fast set is the one recovery must look for fast
         // decisions of, whatever it is (task-d31).
+        self.executed_rows.clear();
         self.campaign = Some(
             Campaign::new(config)
                 .bounded(crate::recovery::MAX_REPORT_ENTRIES)
@@ -1295,7 +1328,11 @@ impl Follower {
             // What this candidate decided itself, executed long ago and
             // forgotten included: a re-proposal of one is not chained
             // after the recovered order (task-d71).
-            let decided = OwnDecisions(table);
+            let decided = OwnDecisions {
+                table,
+                ledger: &self.ledger,
+                rows: &self.executed_rows,
+            };
             match campaign.try_select_decided(
                 crate::recovery::MAX_REPORT_ENTRIES,
                 supplied,
@@ -1304,6 +1341,22 @@ impl Follower {
                 Ok(None) => return Vec::new(),
                 Ok(Some(_)) => {}
                 Err(e) => {
+                    // Its own acceptance of a command whose payload no
+                    // voter holds, every voter answered: every selection
+                    // of a ballot it leads fails the same way, and its
+                    // rising ballots fenced every other voter's campaign,
+                    // so nobody led (protocol_sim row 10, five voters,
+                    // seed 540, with every acknowledgement to a follower
+                    // lost, catch-up on). It gives the campaign up until a
+                    // Sync another voter selects releases the acceptance.
+                    // Not campaigning is safe by construction; dropping
+                    // the acceptance from its own report instead would
+                    // change what a selection may release.
+                    if let RecoveryError::HalfInitialized { replica, command } = &e
+                        && *replica == self.config.identity.replica
+                    {
+                        self.unbacked = Some(*command);
+                    }
                     self.rejections.push(FollowerRejection::Campaign(e));
                     self.campaign = None;
                     return Vec::new();
@@ -1522,6 +1575,15 @@ impl Follower {
             return Vec::new();
         }
         if !already_synced {
+            // What this replica holds decided goes down with the Sync it
+            // installs, whichever ballot decided it (task-d80).
+            let given = sync_work(&decision);
+            let decision = self.carry_commits(decision);
+            self.sync_carried += sync_work(&decision) - given;
+            if let Err(cycle) = crate::recovery::entry_order(&decision) {
+                self.halt_on_cycle(cycle);
+                return Vec::new();
+            }
             // A Sync that does not fit its row is refused before anything
             // of it is marked (task-d20). A candidate of this build never
             // binds one; installing it ended the process at the write.
@@ -1694,6 +1756,9 @@ impl Follower {
     /// synchronized-ballot row is durable.
     fn activate(&mut self, decision: SyncDecision) -> Vec<Effect> {
         let mut effects = Vec::new();
+        // A Sync installed releases what it leaves out, an acceptance no
+        // payload backed among them (task-d79).
+        self.unbacked = None;
         // The replica that selected this Sync leads the new ballot from
         // here: the role changes only once the ballot is this replica's.
         if decision.ballot.leader == self.config.identity.replica && self.campaign.is_some() {
@@ -1738,6 +1803,62 @@ impl Follower {
         self.note_lacking(*command);
     }
 
+    /// `decision` with every command this replica holds committed that it
+    /// leaves out, carried at COMMIT under the facts it was committed with
+    /// (task-d80): a pending COMMIT entry of the Sync it replaces, or a
+    /// record committed here and not yet executed.
+    ///
+    /// A commit is a decision, whichever ballot carried it, and nothing
+    /// else keeps it here. It is not written as a row, so a restart reads
+    /// the acceptance back and knows the commit only from the Sync row it
+    /// resumes; the next Sync replaces that row and its pending entries,
+    /// and its marker demotes the acceptance it does not carry and
+    /// releases what it does not name. A Sync leaves such a command out
+    /// when its majority executed and forgot it, or never held it, and
+    /// without catch-up nothing serves it here again. Left so, the voter
+    /// reported a decided command at PRE-ACCEPT, without the one it was
+    /// decided after, and a later selection from voters as far behind
+    /// re-proposed it under other dependencies (protocol_sim row 9, three
+    /// voters, seed 296, with three acknowledgements in four to a
+    /// follower lost and catch-up off). Carried, it is named, so the
+    /// marker neither releases it nor demotes an acceptance under the
+    /// same dependencies; it is written in the Sync row, so a restart
+    /// resumes it; and it is reported at COMMIT, which every later
+    /// selection keeps by the source rule's commit exception.
+    ///
+    /// Only this replica's copy changes. The Sync each voter installs is
+    /// its own row, and no other voter reads it: a candidate's sources are
+    /// fast sets, and its selection is from the reports.
+    fn carry_commits(&self, mut decision: SyncDecision) -> SyncDecision {
+        let mut carried: BTreeMap<CommandId, SyncEntry> = self
+            .sync_pending
+            .iter()
+            .filter(|(c, e)| e.phase == Phase::Commit && !decision.entries.contains_key(c))
+            .map(|(c, e)| (*c, e.clone()))
+            .collect();
+        for (c, r) in self.table.records() {
+            if r.phase == Phase::Commit
+                && !decision.entries.contains_key(c)
+                && !carried.contains_key(c)
+            {
+                carried.insert(
+                    *c,
+                    SyncEntry {
+                        command: *c,
+                        phase: Phase::Commit,
+                        deps: r.deps.clone(),
+                        path: r.path,
+                        paths: r.paths.clone(),
+                        seqnum: r.synced_seq.unwrap_or(0),
+                        admission: r.payload,
+                    },
+                );
+            }
+        }
+        decision.entries.extend(carried);
+        decision
+    }
+
     /// Hold `decision`'s entries for installation, in place of whatever an
     /// earlier Sync left pending (task-d20).
     ///
@@ -1749,6 +1870,9 @@ impl Follower {
     /// later selection leaves out was therefore never decided, or was
     /// executed by a reporter and retired, which catch-up serves; its
     /// acceptance, if any, was demoted with the later marker (task-d11).
+    /// Without catch-up nothing serves it, so an earlier entry this
+    /// replica holds at COMMIT is not left to this: `carry_commits` merged
+    /// it into `decision` before the marker (task-d80).
     /// Kept, the earlier entries went into every report after it, so a
     /// voter behind across failed ballots reported more each time, and
     /// the Sync selected from its report grew with them.
@@ -1977,6 +2101,13 @@ impl Follower {
         self.sync_examined
     }
 
+    /// The entries and edges this replica carried into the Syncs it
+    /// installed (task-d80), counted as `sync_examinations` is bounded:
+    /// each entry and each of its dependencies once.
+    pub const fn sync_carried(&self) -> u64 {
+        self.sync_carried
+    }
+
     /// The command this replica holds two decisions of, if it found one
     /// (task-d14): a Sync, or its own selection, named other admission
     /// facts than it committed or executed the command under. It votes
@@ -2117,6 +2248,43 @@ impl Follower {
         report_executed_as_committed(&mut report, &self.table);
         report.entries.sort_by_key(|e| e.command);
         report
+    }
+
+    /// Commands this replica executed and forgot whose durable dependency
+    /// rows its campaign's selection waits on (task-d77). The machine does
+    /// not hold them; the runtime reads them from its store, as it serves
+    /// catch-up from them (task-d08), and hands them back with
+    /// [`Follower::executed_rows`].
+    pub fn executed_rows_wanted(&self) -> Vec<CommandId> {
+        let Some(campaign) = self.campaign.as_ref() else {
+            return Vec::new();
+        };
+        if campaign.decision().is_some() {
+            return Vec::new();
+        }
+        campaign
+            .rows_wanted()
+            .iter()
+            .filter(|c| !self.executed_rows.contains_key(c))
+            .copied()
+            .collect()
+    }
+
+    /// The durable dependency rows of commands
+    /// [`Follower::executed_rows_wanted`] named, `None` for one with no
+    /// row, and the campaign tried again with them (task-d77).
+    pub fn executed_rows(
+        &mut self,
+        rows: impl IntoIterator<Item = (CommandId, Option<CommandRecord>)>,
+    ) -> Vec<Effect> {
+        if self.campaign.is_none() {
+            return Vec::new();
+        }
+        self.executed_rows.extend(rows);
+        if let Some(campaign) = self.campaign.as_mut() {
+            campaign.supply_moved();
+        }
+        self.advance_campaign()
     }
 
     /// Commands known by identity (a held proposal) without a payload, or
@@ -3284,7 +3452,7 @@ impl Follower {
     /// acceptance batches of its prerequisites are all part of what the
     /// acknowledgement claims, so none of them may still be volatile when
     /// it leaves. (The outbox drops a send whose barrier fails.)
-    fn publish_to_voters_and_frontend(
+    fn publish_to_leader_and_frontend(
         &mut self,
         command: CommandId,
         barrier: BarrierId,
@@ -3300,16 +3468,19 @@ impl Follower {
             requires.push(barrier);
         }
         let frame = message.encode();
+        let leader = self.config.quorum.leader();
         let outbox = self.outbox.as_mut().expect("booted");
-        for voter in &self.config.identity.voters {
-            if *voter == self.config.identity.replica {
-                continue;
-            }
+        // The leader counts it; no other voter does (task-d74). A
+        // follower learns from the leader's commit frontier, which the
+        // leader announces in the step that moves it, so a copy to every
+        // other voter was a message per voter a command that nothing
+        // decided on.
+        if leader != self.config.identity.replica {
             outbox.publish(PendingSend {
                 context,
                 requires: requires.clone(),
                 to: PeerId {
-                    replica: *voter,
+                    replica: leader,
                     incarnation: ReplicaIncarnation::ZERO,
                 },
                 frame: frame.clone(),
@@ -3686,7 +3857,7 @@ impl Follower {
                     vote: Vote::Fast(ack.clone()),
                 },
             );
-            self.publish_to_voters_and_frontend(command, barrier, ProtocolMessage::FastAck(ack));
+            self.publish_to_leader_and_frontend(command, barrier, ProtocolMessage::FastAck(ack));
         }
         // A proposal (or Sync entry) that arrived before the payload can now
         // be adopted (once its dependencies allow it).
@@ -4106,7 +4277,7 @@ impl Follower {
                         vote: Vote::Slow(ack.clone()),
                     },
                 );
-                self.publish_to_voters_and_frontend(
+                self.publish_to_leader_and_frontend(
                     command,
                     barrier,
                     ProtocolMessage::SlowAck(ack),
@@ -4838,6 +5009,15 @@ fn named_facts(decision: &SyncDecision) -> BTreeMap<CommandId, Digest32> {
         .collect()
 }
 
+/// A selection's entries and their dependency edges, one unit each.
+fn sync_work(decision: &SyncDecision) -> u64 {
+    decision
+        .entries
+        .values()
+        .map(|e| 1 + e.deps.len() as u64)
+        .sum()
+}
+
 impl DeterministicMachine for Follower {
     type Event = Event;
     type Effect = Effect;
@@ -4873,15 +5053,49 @@ impl DeterministicMachine for Follower {
     }
 }
 
-/// A candidate's own decisions, from its table (task-d71).
-struct OwnDecisions<'a>(&'a CommandTable);
+/// A candidate's own decisions, from its table (task-d71), and what it
+/// executed them with: its records while it holds them, then its durable
+/// ledger, then the rows the runtime read (task-d77).
+struct OwnDecisions<'a> {
+    table: &'a CommandTable,
+    ledger: &'a DurableLedger,
+    rows: &'a BTreeMap<CommandId, Option<CommandRecord>>,
+}
 
 impl crate::recovery::CandidateDecisions for OwnDecisions<'_> {
     fn decided(&self, command: &CommandId) -> bool {
-        self.0.phase_of(command) >= Some(Phase::Commit)
+        self.table.phase_of(command) >= Some(Phase::Commit)
     }
 
     fn executed_before(&self, first: &CommandId, then: &CommandId) -> bool {
-        self.0.executed_before(first, then)
+        self.table.executed_before(first, then)
+    }
+
+    fn executed(&self, command: &CommandId) -> crate::recovery::ExecutedFacts {
+        use crate::recovery::ExecutedFacts;
+        if let Some(record) = self.table.record(command) {
+            return if record.phase >= Phase::Commit && record.payload.is_some() {
+                ExecutedFacts::With(record.clone())
+            } else {
+                ExecutedFacts::No
+            };
+        }
+        if !self.table.retired(command) {
+            return ExecutedFacts::No;
+        }
+        // A commit is not written as a row, so the row of an executed
+        // command can say ACCEPT; its dependencies are the ones it was
+        // committed and executed with (`report_executed_as_committed`).
+        let row = match self.ledger.record(command) {
+            Some(record) => Some(record),
+            None => match self.rows.get(command) {
+                None => return ExecutedFacts::Unread,
+                Some(row) => row.as_ref(),
+            },
+        };
+        match row {
+            Some(record) if record.payload.is_some() => ExecutedFacts::With(record.clone()),
+            _ => ExecutedFacts::WithoutRow,
+        }
     }
 }
