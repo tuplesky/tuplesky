@@ -2213,6 +2213,61 @@ fn a_command_the_candidate_executed_is_before_every_possible_fast_decision() {
     );
 }
 
+/// task-d78 (protocol_sim row 4, three voters, seed 720, with half the
+/// acknowledgements to followers lost and catch-up on): x was decided
+/// fast after f by {r0, r1}, and r0 executed it. r2 committed f after b,
+/// which a leader synchronization gave it, and r1 still holds its own
+/// pre-acceptance of f, after e, which no ballot decided. The member's
+/// closure of x, the evidence of its path, went through that record to
+/// e, so x was dropped and re-proposed after the re-proposal of e, and r2
+/// executed another command where r0 had executed x. A member's record of
+/// a command the selection holds decided is not the order the selection
+/// executes, and what it names behind it was never in the leader's order
+/// before x: the walk stops there.
+#[test]
+fn a_fast_decision_after_a_command_committed_past_its_members_record_is_kept() {
+    let cfg = config(3, 2, &[2, 0], 1);
+    let (b, e, f, x) = (cmd(1), cmd(2), cmd(3), cmd(4));
+    let reports = vec![
+        report_for(
+            1,
+            ballot(1, 2),
+            0,
+            vec![
+                entry(b, Phase::Commit, &[]),
+                pre_accept_with(e, &[b], 5),
+                pre_accept_with(f, &[e], 6),
+                pre_accept_with(x, &[f], 7),
+            ],
+        ),
+        report_for(
+            2,
+            ballot(1, 2),
+            0,
+            vec![
+                entry(b, Phase::Commit, &[]),
+                ReportEntry {
+                    path: Digest32([6; 32]),
+                    paths: vec![(b"*".to_vec(), Digest32([6; 32]))],
+                    ..entry(f, Phase::Commit, &[b])
+                },
+            ],
+        ),
+    ];
+    let decision = select(&cfg, &reports).unwrap();
+    assert_eq!(
+        decision.entries.get(&f).map(|e| e.deps.clone()),
+        Some(vec![b])
+    );
+    assert_eq!(
+        decision.entries.get(&x).map(|e| e.deps.clone()),
+        Some(vec![f]),
+        "reproposed {:?}",
+        decision.reproposed
+    );
+    assert!(decision.reproposed.contains(&e));
+}
+
 /// task-d71 (protocol_sim row 14, three voters, seed 11, on task-d67's
 /// branch): c was decided fast after x, which follows d, and the member
 /// executed and retired d while it still holds a, which it executed
