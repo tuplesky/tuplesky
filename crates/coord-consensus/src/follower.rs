@@ -518,6 +518,10 @@ pub struct Follower {
     /// How many times a pending Sync entry was examined for
     /// installation, ever: what installing a Sync cost (task-d26).
     sync_examined: u64,
+    /// The entries and edges `carry_commits` added to the Sync this
+    /// replica installs, ever (task-d80): installation work it gives
+    /// itself, bounded by what it holds committed and not executed.
+    sync_carried: u64,
     /// The admission digest the synchronized selection named for each of
     /// its entries (task-d14). Kept past installation: a payload that
     /// arrives for an entry installed over a placeholder has to be the
@@ -779,6 +783,7 @@ impl Follower {
             sync_waiters: BTreeMap::new(),
             sync_rescan: false,
             sync_examined: 0,
+            sync_carried: 0,
             named_facts: BTreeMap::new(),
             halted: None,
             recovery_cycle: None,
@@ -967,6 +972,7 @@ impl Follower {
             sync_waiters: BTreeMap::new(),
             sync_rescan: false,
             sync_examined: 0,
+            sync_carried: 0,
             named_facts: BTreeMap::new(),
             halted: None,
             recovery_cycle: None,
@@ -1571,7 +1577,9 @@ impl Follower {
         if !already_synced {
             // What this replica holds decided goes down with the Sync it
             // installs, whichever ballot decided it (task-d80).
+            let given = sync_work(&decision);
             let decision = self.carry_commits(decision);
+            self.sync_carried += sync_work(&decision) - given;
             if let Err(cycle) = crate::recovery::entry_order(&decision) {
                 self.halt_on_cycle(cycle);
                 return Vec::new();
@@ -2091,6 +2099,13 @@ impl Follower {
     /// payloads arrive.
     pub const fn sync_examinations(&self) -> u64 {
         self.sync_examined
+    }
+
+    /// The entries and edges this replica carried into the Syncs it
+    /// installed (task-d80), counted as `sync_examinations` is bounded:
+    /// each entry and each of its dependencies once.
+    pub const fn sync_carried(&self) -> u64 {
+        self.sync_carried
     }
 
     /// The command this replica holds two decisions of, if it found one
@@ -4989,6 +5004,15 @@ fn named_facts(decision: &SyncDecision) -> BTreeMap<CommandId, Digest32> {
         .iter()
         .filter_map(|(c, e)| e.admission.map(|d| (*c, d)))
         .collect()
+}
+
+/// A selection's entries and their dependency edges, one unit each.
+fn sync_work(decision: &SyncDecision) -> u64 {
+    decision
+        .entries
+        .values()
+        .map(|e| 1 + e.deps.len() as u64)
+        .sum()
 }
 
 impl DeterministicMachine for Follower {
