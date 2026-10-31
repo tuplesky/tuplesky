@@ -7457,3 +7457,128 @@ fn a_leader_crash_right_after_a_capped_sync_is_followed_by_a_campaign_that_compl
         "new work was not served"
     );
 }
+
+/// task-d79 (protocol_sim row 10, five voters, seed 540, with every
+/// acknowledgement to a follower lost and catch-up on): a voter
+/// synchronized to a Sync that accepted x missed the later Syncs that
+/// released it, and no voter holds x's payload, so its installation never
+/// completes and every selection from its own report, which names x at
+/// ACCEPT from that Sync, fails as `HalfInitialized`. Each campaign raised
+/// its ballot and fenced every other voter's, so nobody led. It now gives
+/// the campaign up and does not campaign again until it installs a Sync,
+/// which another voter's campaign selects and which releases x.
+#[test]
+fn a_candidate_whose_own_acceptance_is_unbacked_waits_for_a_sync() {
+    let x = CommandId(Digest32([0x78; 32]));
+    let d = CommandId(Digest32([0x77; 32]));
+    let synced = ballot(1, 0);
+    let accepted = SyncDecision {
+        ballot: synced,
+        source_ballot: ballot(0, 0),
+        entries: core::iter::once((
+            x,
+            coord_consensus::SyncEntry {
+                command: x,
+                phase: Phase::Accept,
+                deps: vec![d],
+                path: coord_consensus::empty_path(),
+                paths: Vec::new(),
+                seqnum: 1,
+                admission: Some(Digest32([7; 32])),
+            },
+        ))
+        .collect(),
+        reproposed: BTreeSet::new(),
+    };
+    let mut f = Follower::recover_with_syncs(
+        FollowerConfig {
+            identity: identity(1),
+            quorum: quorum(synced),
+            genesis: ballot(0, 0),
+            frontend: FRONTEND,
+            capacity: 32,
+        },
+        Some(coord_consensus::PromiseRecordV1 {
+            promised: synced,
+            synced,
+        }),
+        None,
+        Vec::new(),
+        Vec::new(),
+        vec![(synced, accepted)],
+        ExecutionPosition::ZERO,
+    );
+    f.step(boot_event(1));
+    let run = |f: &mut Follower, mut pending: VecDeque<Event>| {
+        let mut steps = 0;
+        while let Some(event) = pending.pop_front() {
+            steps += 1;
+            assert!(steps < 1000, "did not settle");
+            let effects = f.step(event);
+            pending.extend(durable_events(&effects));
+        }
+    };
+    // Every voter answers, and only r1's own report holds x.
+    let new = ballot(2, 1);
+    let mut pending: VecDeque<Event> = durable_events(&f.campaign(new)).into();
+    for i in [0u8, 2] {
+        pending.push_back(peer_event(
+            r(i),
+            ProtocolMessage::Promise {
+                ballot: new,
+                synced,
+                replica: r(i),
+            },
+        ));
+        let report = RecoveryReport {
+            replica: r(i),
+            ballot: new,
+            committed_ballot: synced,
+            entries: vec![],
+        };
+        for page in coord_consensus::paginate(&report, 64) {
+            pending.push_back(peer_event(r(i), ProtocolMessage::ReportPage(page)));
+        }
+    }
+    run(&mut f, pending);
+    assert!(f.campaign_state().is_none(), "the campaign is still open");
+    assert!(f.take_rejections().contains(&FollowerRejection::Campaign(
+        RecoveryError::HalfInitialized {
+            replica: r(1),
+            command: x,
+        }
+    )));
+    // It does not campaign again, so it fences no other voter's ballot.
+    assert!(f.campaign(ballot(3, 1)).is_empty());
+    assert_eq!(
+        f.take_rejections(),
+        vec![FollowerRejection::Unbacked { command: x }]
+    );
+    // r0's campaign wins without it and its Sync leaves x out; installed,
+    // the Sync releases x, and r1 may campaign again.
+    let b3 = ballot(4, 0);
+    let mut pending: VecDeque<Event> = VecDeque::new();
+    pending.push_back(peer_event(
+        r(0),
+        ProtocolMessage::NewLeader {
+            ballot: b3,
+            executed: ExecutionPosition::ZERO,
+        },
+    ));
+    pending.push_back(peer_event(
+        r(0),
+        ProtocolMessage::Sync(SyncDecision {
+            ballot: b3,
+            source_ballot: synced,
+            entries: BTreeMap::new(),
+            reproposed: BTreeSet::new(),
+        }),
+    ));
+    run(&mut f, pending);
+    assert_eq!(f.table().phase_of(&x), None, "x was not released");
+    assert!(
+        !f.campaign(ballot(5, 1)).is_empty(),
+        "{:?}",
+        f.take_rejections()
+    );
+}
