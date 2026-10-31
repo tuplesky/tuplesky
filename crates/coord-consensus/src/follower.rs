@@ -1862,6 +1862,9 @@ impl Follower {
     /// later selection leaves out was therefore never decided, or was
     /// executed by a reporter and retired, which catch-up serves; its
     /// acceptance, if any, was demoted with the later marker (task-d11).
+    /// Without catch-up nothing serves it, so an earlier entry this
+    /// replica holds at COMMIT is not left to this: `carry_commits` merged
+    /// it into `decision` before the marker (task-d80).
     /// Kept, the earlier entries went into every report after it, so a
     /// voter behind across failed ballots reported more each time, and
     /// the Sync selected from its report grew with them.
