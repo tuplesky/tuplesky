@@ -1023,6 +1023,32 @@ fn a_reclaim_retires_in_the_order_commands_executed() {
     assert_eq!(remembered, vec![9, 10, 11, 12]);
 }
 
+/// A command is forgotten only once the table has executed its capacity
+/// past it, whatever order it was retired in (#169 review). Retired ahead
+/// of the commands it executed after, the last command executed left the
+/// window a report names with nothing executed past it: a voter that
+/// forgot it still promised a candidate that never executed it.
+#[test]
+fn a_command_retired_early_is_forgotten_only_a_table_of_executions_later() {
+    let capacity = 4usize;
+    let mut t = CommandTable::with_capacity(capacity);
+    for i in 1..=8u8 {
+        let deps = t
+            .initialize_beyond_capacity(cmd(i), payload(i), vec![alloc_key(i)])
+            .unwrap()
+            .deps;
+        t.accept(cmd(i), deps).unwrap();
+        t.commit(cmd(i)).unwrap();
+        t.execute(cmd(i)).unwrap();
+    }
+    t.retire(&cmd(8)).unwrap();
+    for i in 1..=7u8 {
+        t.retire(&cmd(i)).unwrap();
+    }
+    let remembered: Vec<u8> = (1..=8u8).filter(|i| !t.forgotten(&cmd(*i))).collect();
+    assert_eq!(remembered, vec![4, 5, 6, 7, 8]);
+}
+
 /// A command whose turn has come takes the recovery reserve and stops one
 /// past the capacity (task-d71, protocol_sim row 3, five voters, seed 158).
 /// New admission stops an eighth short of it; recovery work alone passes
