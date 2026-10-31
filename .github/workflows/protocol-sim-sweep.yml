@@ -3,9 +3,10 @@
 # Every row of task-d30's simulator at 1,000 seeds per row and size, with
 # catch-up and without: ten times task-d34's bar, so the next hole in a
 # recovery rule is found by the runner rather than by hand. Each row also
-# runs with half and with every acknowledgement to a follower lost
-# (`PROTOCOL_SIM_PEER_ACK_LOSS`, task-d78), which is the sweep that found
-# row 4's seed 720; rows 16 and 17 run under their own loss. CI's default
+# runs with half, three in four and every acknowledgement to a follower
+# lost (`PROTOCOL_SIM_PEER_ACK_LOSS`, task-d78): half found row 4's seed
+# 720, all found row 10's seed 540, and only three in four found row 9's
+# seed 296 (task-d80); rows 16 and 17 run under their own loss. CI's default
 # of 12 seeds per row and size stays in `cargo xtask test`. A failing
 # seed is printed with its row and size; replay it with
 # `PROTOCOL_SIM_ONE=row,voters,seed` and `PROTOCOL_SIM_TRACE=1`, and keep
@@ -52,14 +53,18 @@ jobs:
           - row_17_repeated_elections_with_half_the_acknowledgements_to_a_follower_lost
         catch-up: [catch-up, no-catch-up]
         # Parts per million; empty is the row's own.
-        peer-ack-loss: ["", "500000", "1000000"]
+        peer-ack-loss: ["", "500000", "750000", "1000000"]
         exclude:
           - row: row_16_repeated_elections_with_every_acknowledgement_to_a_follower_lost
             peer-ack-loss: "500000"
           - row: row_16_repeated_elections_with_every_acknowledgement_to_a_follower_lost
+            peer-ack-loss: "750000"
+          - row: row_16_repeated_elections_with_every_acknowledgement_to_a_follower_lost
             peer-ack-loss: "1000000"
           - row: row_17_repeated_elections_with_half_the_acknowledgements_to_a_follower_lost
             peer-ack-loss: "500000"
+          - row: row_17_repeated_elections_with_half_the_acknowledgements_to_a_follower_lost
+            peer-ack-loss: "750000"
           - row: row_17_repeated_elections_with_half_the_acknowledgements_to_a_follower_lost
             peer-ack-loss: "1000000"
     steps:
