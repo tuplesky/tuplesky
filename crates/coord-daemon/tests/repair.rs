@@ -49,7 +49,7 @@ use coord_daemon::mailbox::{Ingress, IngressBudget};
 use coord_daemon::node::{Machine, Node, Outbound};
 use coord_daemon::parked::Parked;
 use coord_daemon::settle::{
-    NEAR_POSITIONS, Settled, conflicts_for, executed_near, offer, records_for,
+    NEAR_POSITIONS, RecordReads, Settled, conflicts_for, executed_near, offer, records_for,
 };
 use coord_daemon::voter::{Origin, Voter};
 use coord_membership::genesis::{GenesisManifest, VoterSeed};
@@ -759,6 +759,73 @@ fn without_the_repaired_evidence_the_caller_waits_for_ever() {
 /// corroborated by the release it holds. The bound on repairs is the
 /// cheapest way to reach a refusal on a real cluster; `Forgotten` and
 /// `NothingToReplay` take the same path.
+/// The turn's read of the half-held commands (task-d75) finds what
+/// `records_for` and `conflicts_for` find, and a command it found with no
+/// record is found once the projection has committed its execution: not
+/// looking it up again until the completed frontier moves loses nothing.
+#[test]
+fn the_turns_read_finds_a_record_once_the_projection_has_committed_it() {
+    let mut w = Cluster::new(256);
+    let mut reads = RecordReads::default();
+    let half = vec![(w.command(1), retry_key(1))];
+    // Not executed anywhere yet: no record, twice over.
+    for _ in 0..2 {
+        let read = reads.read(w.voters[0].node().applier(), half.clone());
+        assert!(read.records.is_empty() && read.conflicts.is_empty());
+    }
+    let before = w.voters[0].node().applier().store().reader().completed();
+
+    w.run_to_half_held(1);
+    let applier = w.voters[0].node().applier();
+    assert!(
+        applier.store().reader().completed() > before,
+        "the execution's projection commit moved the frontier"
+    );
+    let read = reads.read(applier, half.clone());
+    assert_eq!(read.records, records_for(applier, half.clone()));
+    assert_eq!(read.records.len(), 1, "found once committed");
+    assert_eq!(read.conflicts, conflicts_for(applier, half.clone()));
+    // A command with a record is read every turn.
+    assert_eq!(reads.read(applier, half).records.len(), 1);
+}
+
+/// What the turn's read remembers is bounded by what is still half held
+/// (Codex review of #168). Over a store that commits nothing, as a
+/// frontend-only node's, the completed frontier never moves, so without
+/// the bound every command half held there for a turn stayed remembered
+/// for the life of the process.
+#[test]
+fn the_turns_read_remembers_only_what_is_still_half_held() {
+    let w = Cluster::new(256);
+    let applier = w.voters[0].node().applier();
+    let completed = applier.store().reader().completed();
+    let mut reads = RecordReads::default();
+    let mut most = 0;
+    for turn in 0..64u64 {
+        // A turn's window: sixteen commands this store has no record of,
+        // each half held for this turn only.
+        let half: Vec<(CommandId, RetryKey)> = (0..16)
+            .map(|i| {
+                let sequence = 1_000 + turn * 16 + i;
+                (w.command(sequence), retry_key(sequence))
+            })
+            .collect();
+        reads.retain(half.iter().map(|(command, _)| *command));
+        let read = reads.read(applier, half);
+        assert!(read.records.is_empty() && read.conflicts.is_empty());
+        most = most.max(reads.remembered());
+    }
+    assert_eq!(
+        applier.store().reader().completed(),
+        completed,
+        "nothing committed: the frontier never moved"
+    );
+    assert_eq!(most, 16, "no more than one turn's commands remembered");
+    // Nothing half held: nothing remembered.
+    reads.retain(std::iter::empty());
+    assert_eq!(reads.remembered(), 0);
+}
+
 #[test]
 fn a_refused_repair_falls_back_to_the_durable_record() {
     let mut w = Cluster::new(256);
@@ -1477,8 +1544,15 @@ fn another_request_under_a_bound_key_ends_with_a_conflict() {
         records_for(w.voters[0].node().applier(), half.clone()).is_empty(),
         "no record of this command"
     );
-    let conflicts = conflicts_for(w.voters[0].node().applier(), half);
+    let conflicts = conflicts_for(w.voters[0].node().applier(), half.clone());
     assert_eq!(conflicts, vec![(retry.command, w.command(1))]);
+    // The turn's read (task-d75) finds the same, every turn.
+    let mut reads = RecordReads::default();
+    for _ in 0..2 {
+        let read = reads.read(w.voters[0].node().applier(), half.clone());
+        assert!(read.records.is_empty());
+        assert_eq!(read.conflicts, conflicts);
+    }
     let (command, bound) = conflicts[0];
     let Progress::Released(release) = w
         .collector

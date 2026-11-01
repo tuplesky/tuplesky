@@ -10631,5 +10631,61 @@ cost task-d73 and task-d74 take. task-d74, measured, is about 4% of the
 nodes' CPU and 6% of a follower's, the largest single lever so far and
 still a small one; task-d73, which removes frames a turn, is worth on
 the order of 1% at that rate. task-d75's reading of the leader's loop is
-the leader's 40%, and what it found is in its own section, "The domain
-loop, read (task-d75)", with #168.
+the leader's 40%, and what it found is in its own section
+([below](#the-domain-loop-read-task-d75)).
+
+## The domain loop, read (task-d75)
+
+The reading first, as the plan asks, on the same host and setup as
+task-d72's (five voters on one 4-CPU host, replay profile, 30 callers),
+at #165's head `2f7f511`: `perf` on the leader (n1) and a follower
+outside the fast set (n4), 15 s of a 40,000-operation run at 499 Hz.
+The domain loop is 41% of the leader's samples and 39% of the
+follower's; the shares below are of the loop.
+
+| On the domain loop | Leader | Follower |
+| --- | --- | --- |
+| the machine's `step` | 23% | 23% |
+| applying (`Applier::apply`), with its reads | 8% | 12% |
+| the read barrier (`pump_reads`) | 14% | -- |
+| settling from records (`settle_from_records`): two snapshots and two lookups a key | 3.4% | 5.0% |
+| `GatedReader::snapshot` (a read transaction and `DurableMeta::read`), all callers | 5% | 6.5% |
+| `load_authorization` (a session get, a trust-rule get, a policy scan, every command) | 3.9% | -- |
+| the outbox's filing (`Outbox::filing`, a lookup in a set of every barrier the boot made durable) | 2.1% | 2.3% |
+| B-tree searches, all callers (32-byte command identities) | 19% | -- |
+
+- **The host is the bound, not the leader's loop.** The leader's domain
+  thread was runnable and waiting for a core for 11.9 s of a 29 s run,
+  and the loop's own CPU is 0.68 ms of the leader's 1.65 ms a write. On
+  this host what any node saves goes to every node, so `ok`/s follows
+  the CPU a write, which the runner's separate nodes do not show.
+- **Amortization is the lever this reading points at, more than any one
+  call.** The leader's counters for the same run: 10,150 commands
+  executed, 8,870 lowerings (1.14 commands each), 4,648 journal appends
+  and 4,222 projection commits (2.2 and 2.4 commands each). The appender
+  served an append in 2.4 ms and the materializer a commit in 1.9 ms, a
+  cost a command pays nearly alone. A turn that took every event ready
+  before it lowered would carry more commands a group without waiting
+  on anything; the loop now turns again (`progressed => continue`) as
+  soon as a turn did something.
+- **The fast path is all but absent on this mix:** 239 commands
+  established fast and 9,911 slow, 9,275 of them `missed_path`.
+- **Each candidate is its own PR with its pair.** The first is the
+  settle read, the cheapest to take whole.
+
+**The settle read (this task's first PR).** `RecordReads` reads the
+half-held commands of a turn from one snapshot, with one lookup a key
+for the records and the conflicts both, and does not look up again a
+command it found with no record until the completed frontier moves: a
+record only appears with a projection commit, and a commit moves the
+frontier (task-d58's rule for the read barrier). Three alternating
+pairs, as task-d72's (20,000 operations):
+
+| Build | ok/s | put p50 | put p99 | Leader a write (its loop) | A follower a write (its loop) | All nodes a write |
+| --- | --- | --- | --- | --- | --- | --- |
+| `2f7f511` | 749 to 790 | 73.6 to 76.9 | 119.8 to 122.5 | 1.63 to 1.70 (0.662 to 0.685) | 1.36 to 1.43 (0.526 to 0.553) | 7.08 to 7.41 |
+| the settle read | 758 to 788 | 73.1 to 76.1 | 118.0 to 122.1 | 1.64 to 1.69 (0.649 to 0.679) | 1.35 to 1.41 (0.504 to 0.525) | 7.05 to 7.33 |
+
+A follower's loop falls by 4% (0.538 to 0.516 ms a write, the means),
+the leader's by 1.5%, what the profile's share said; nothing else
+moves outside the spread.
