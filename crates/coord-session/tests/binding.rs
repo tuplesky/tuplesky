@@ -1206,6 +1206,117 @@ fn a_projection_that_is_behind_holds_a_disclosure_instead_of_refusing_it() {
     assert_eq!(f.denied, 1);
 }
 
+/// A second binding of a session whose establishment already executed
+/// is settled from that outcome, also before this node's projection
+/// shows the row.
+///
+/// A result is released once its group is journaled (task-d63), before
+/// the projection commit the bind barrier reads. So a caller that binds
+/// again on a second connection, right after its first binding was
+/// acknowledged, can find no row yet. Its establishment is the same
+/// invocation, which the collector holds resolved, and answering it
+/// from that outcome is what the first connection was answered from.
+/// Refusing it told the caller "bind refused" for a session that
+/// exists (coordd's `a_caller_binds_a_session_against_the_running_daemon`,
+/// once on aarch64).
+#[test]
+fn a_second_binding_after_the_establishment_executed_is_bound_from_its_outcome() {
+    let ring = ring();
+    let hub = WatchHub::new(KvRevision::ZERO, KvRevision::ZERO);
+    let mut f = frontend(&ring);
+    let bind = frame_of(&bind_frame(&token(&ring, SESSION, NOW + 1000)).unwrap());
+    let Ingress::Establishing(plan) = f.on_frame(&clock(NOW), at(NOW), 7, &bind, &hub, &Behind)
+    else {
+        panic!("the first binding did not submit its establishment");
+    };
+    let command = plan.command;
+
+    // The collector establishes it from voter evidence and the leader's
+    // release, as it does a request: that is what retains the outcome.
+    let ballot = Ballot {
+        epoch: ConfigurationEpoch::new(1).unwrap(),
+        number: 0,
+        leader: r(0),
+    };
+    let path = Digest32([1; 32]);
+    let prov = |i: u8| PeerProvenance::from_transport(r(i), ReplicaIncarnation::new(1).unwrap(), 1);
+    let admitted = f
+        .dispatcher()
+        .collector()
+        .admission(&command)
+        .expect("outstanding");
+    f.dispatcher_mut()
+        .on_evidence(
+            prov(0),
+            ProtocolMessage::LeaderReply {
+                ballot,
+                command,
+                seqnum: 1,
+                deps: vec![],
+                path,
+            },
+        )
+        .unwrap();
+    f.dispatcher_mut()
+        .on_evidence(
+            prov(1),
+            ProtocolMessage::FastAck(FastAck {
+                replica: r(1),
+                ballot,
+                command,
+                deps: vec![],
+                paths: vec![],
+                path,
+                admission: admitted,
+                seqnum: None,
+            }),
+        )
+        .unwrap();
+    let response = Response {
+        revision: KvRevision::new(1).unwrap(),
+        outcome: Outcome::SessionCreated { session: SESSION },
+    };
+    let released = ReleasedResult::from_gate(
+        EstablishedResult::establish(EstablishmentEvidence {
+            command,
+            epoch: ConfigurationEpoch::new(1).unwrap(),
+            ballot,
+            position: ExecutionPosition::new(1).unwrap(),
+            closed_predecessors: vec![],
+            result_digest: Digest32([2; 32]),
+            revision: Some(KvRevision::new(1).unwrap()),
+            fast_path: true,
+        })
+        .unwrap(),
+        postcard::to_allocvec(&response).unwrap(),
+        false,
+    );
+    let delivered = f
+        .dispatcher_mut()
+        .on_release(prov(0), released)
+        .unwrap()
+        .expect("the first binding's stream");
+    assert!(matches!(
+        f.deliver(delivered, &Behind),
+        coord_session::Delivered::Answer(_)
+    ));
+    assert!(f.binding(7).is_some(), "the first connection was not bound");
+
+    // The same credential on a second connection, while the projection
+    // still does not show the row.
+    match f.on_frame(&clock(NOW), at(NOW), 8, &bind, &hub, &Behind) {
+        Ingress::Bound(ack) => {
+            let ack = coord_session::decode_bind_ack(&frame_of(&ack)).unwrap();
+            assert_eq!(ack.session, SESSION);
+        }
+        other => panic!("a second binding of an executed establishment was not bound: {other:?}"),
+    }
+    assert!(
+        f.binding(8).is_some(),
+        "the second connection was not bound"
+    );
+}
+
 /// The bind barrier counts as having seen the row. A connection that
 /// bound against a present session and read nothing before that session
 /// was retired gets the real refusal on its first gated read, not a

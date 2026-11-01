@@ -2,7 +2,11 @@
 #
 # Every row of task-d30's simulator at 1,000 seeds per row and size, with
 # catch-up and without: ten times task-d34's bar, so the next hole in a
-# recovery rule is found by the runner rather than by hand. CI's default
+# recovery rule is found by the runner rather than by hand. Each row also
+# runs with half, three in four and every acknowledgement to a follower
+# lost (`PROTOCOL_SIM_PEER_ACK_LOSS`, task-d78): half found row 4's seed
+# 720, all found row 10's seed 540, and only three in four found row 9's
+# seed 296 (task-d80); rows 16 and 17 run under their own loss. CI's default
 # of 12 seeds per row and size stays in `cargo xtask test`. A failing
 # seed is printed with its row and size; replay it with
 # `PROTOCOL_SIM_ONE=row,voters,seed` and `PROTOCOL_SIM_TRACE=1`, and keep
@@ -29,7 +33,7 @@ env:
 
 jobs:
   sweep:
-    name: row ${{ matrix.row }} (${{ matrix.catch-up }})
+    name: row ${{ matrix.row }} (${{ matrix.catch-up }}, peer-ack loss ${{ matrix.peer-ack-loss || 'of the row' }})
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     strategy:
@@ -45,7 +49,24 @@ jobs:
           - row_10_delayed_old_ballot_messages
           - row_12_loss_beyond_the_repair_cache_window
           - row_14_lost_responses_and_retries_under_one_identity
+          - row_16_repeated_elections_with_every_acknowledgement_to_a_follower_lost
+          - row_17_repeated_elections_with_half_the_acknowledgements_to_a_follower_lost
         catch-up: [catch-up, no-catch-up]
+        # Parts per million; empty is the row's own.
+        peer-ack-loss: ["", "500000", "750000", "1000000"]
+        exclude:
+          - row: row_16_repeated_elections_with_every_acknowledgement_to_a_follower_lost
+            peer-ack-loss: "500000"
+          - row: row_16_repeated_elections_with_every_acknowledgement_to_a_follower_lost
+            peer-ack-loss: "750000"
+          - row: row_16_repeated_elections_with_every_acknowledgement_to_a_follower_lost
+            peer-ack-loss: "1000000"
+          - row: row_17_repeated_elections_with_half_the_acknowledgements_to_a_follower_lost
+            peer-ack-loss: "500000"
+          - row: row_17_repeated_elections_with_half_the_acknowledgements_to_a_follower_lost
+            peer-ack-loss: "750000"
+          - row: row_17_repeated_elections_with_half_the_acknowledgements_to_a_follower_lost
+            peer-ack-loss: "1000000"
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
@@ -64,7 +85,9 @@ jobs:
           PROTOCOL_SIM_SEEDS: ${{ inputs.seeds || '1000' }}
           NO_CATCH_UP: ${{ matrix.catch-up == 'no-catch-up' && '1' || '' }}
           ROW: ${{ matrix.row }}
+          PEER_ACK_LOSS: ${{ matrix.peer-ack-loss }}
         run: |
           if [ -n "$NO_CATCH_UP" ]; then export PROTOCOL_SIM_NO_CATCH_UP=1; fi
+          if [ -n "$PEER_ACK_LOSS" ]; then export PROTOCOL_SIM_PEER_ACK_LOSS="$PEER_ACK_LOSS"; fi
           cargo test --locked --release -p coord-consensus --test protocol_sim -- \
             --exact "$ROW" --nocapture

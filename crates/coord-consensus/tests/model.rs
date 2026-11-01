@@ -9,9 +9,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use coord_consensus::{
-    BallotConfiguration, FastAck, GuardViolation, Learned, MissedFast, Phase, RecoveryError,
-    RecoveryReport, ReportEntry, SlowAck, Vote, VoteError, VoteSet, guard_accept, guard_commit,
-    select,
+    BallotConfiguration, CommandRecord, ExecutedFacts, FastAck, GuardViolation, Learned,
+    MissedFast, Phase, RecoveryError, RecoveryReport, ReportEntry, SlowAck, Vote, VoteError,
+    VoteSet, guard_accept, guard_commit, select,
 };
 use coord_types::identity::Digest32;
 use coord_types::ids::*;
@@ -2084,6 +2084,190 @@ impl coord_consensus::CandidateDecisions for Executed {
     }
 }
 
+/// What the candidate executed, and what it holds of each (task-d77).
+struct ExecutedAs(BTreeMap<CommandId, ExecutedFacts>);
+
+impl coord_consensus::CandidateDecisions for ExecutedAs {
+    fn decided(&self, command: &CommandId) -> bool {
+        self.0.contains_key(command)
+    }
+
+    fn executed(&self, command: &CommandId) -> ExecutedFacts {
+        self.0.get(command).cloned().unwrap_or(ExecutedFacts::No)
+    }
+}
+
+/// The durable row of a command executed under `deps`: a commit is not
+/// written as a row, so it says ACCEPT.
+fn executed_row(c: CommandId, deps: &[CommandId]) -> CommandRecord {
+    CommandRecord {
+        phase: Phase::Accept,
+        deps: deps.to_vec(),
+        keys: vec![b"*".to_vec()],
+        payload: Some(Digest32([7; 32])),
+        paths: vec![(b"*".to_vec(), path_of(c, deps))],
+        synced_seq: Some(4),
+        path: path_of(c, deps),
+    }
+}
+
+/// task-d77 (protocol_sim row 9, three voters, seeds 362, 550, 633 and
+/// 863, with peer acknowledgements lost): the candidate executed x after a
+/// long ago and forgot it, so its report leaves x out, and the one voter
+/// behind that reports x holds it at an ACCEPT below the source ballot, or
+/// at PRE-ACCEPT, under other dependencies. Re-proposed, x was decided
+/// again under them and executed there in another order. The candidate's
+/// execution is x's commit: the Sync carries x at COMMIT under the
+/// dependencies and facts of the candidate's row, and re-proposes nothing
+/// of it. Without the row's facts, nothing is re-proposed either: the
+/// selection waits for the row, or is refused when there is none.
+#[test]
+fn a_command_the_candidate_executed_and_forgot_is_carried_at_commit_not_re_proposed() {
+    let cfg = config(3, 2, &[2, 0], 2);
+    let (a, x, y) = (cmd(1), cmd(2), cmd(3));
+    for behind in [
+        // An ACCEPT below the source ballot (seed 362).
+        report_for(1, ballot(2, 2), 0, vec![entry(x, Phase::Accept, &[y])]),
+        // A pre-acceptance at the source ballot (seeds 550 and 633).
+        report_for(1, ballot(2, 2), 1, vec![pre_accept_with(x, &[y], 5)]),
+    ] {
+        let reports = vec![
+            behind,
+            report_for(2, ballot(2, 2), 1, vec![entry(a, Phase::Commit, &[])]),
+        ];
+        let select_knowing = |x_facts: ExecutedFacts| {
+            coord_consensus::select_decided(
+                &cfg,
+                &reports,
+                |_, _| false,
+                |_| None,
+                &ExecutedAs(BTreeMap::from([(x, x_facts)])),
+            )
+        };
+        let decision = select_knowing(ExecutedFacts::With(executed_row(x, &[a]))).unwrap();
+        let carried = decision.entries.get(&x).expect("carried");
+        assert_eq!(carried.phase, Phase::Commit);
+        assert_eq!(carried.deps, vec![a]);
+        assert_eq!(carried.admission, Some(Digest32([7; 32])));
+        assert_eq!(carried.seqnum, 4);
+        assert!(!decision.reproposed.contains(&x));
+        assert_eq!(
+            select_knowing(ExecutedFacts::Unread),
+            Err(RecoveryError::ExecutedRowsUnread { commands: vec![x] })
+        );
+        assert_eq!(
+            select_knowing(ExecutedFacts::WithoutRow),
+            Err(RecoveryError::ExecutedWithoutRow { command: x })
+        );
+        // Not executed here, it is re-proposed, as before.
+        let decision = select_knowing(ExecutedFacts::No).unwrap();
+        assert!(
+            decision.reproposed.contains(&x)
+                || decision.entries.get(&x).is_some_and(|e| e.deps == vec![y]),
+            "neither re-proposed nor kept as reported: {:?}",
+            decision.entries.get(&x)
+        );
+    }
+}
+
+/// task-d77 (#169 review): an entry the selection carries for what the
+/// candidate executed is a decision of an earlier ballot, as a
+/// below-source report's is. The candidate executed x and has not decided
+/// c, and execution is one order at every voter, so x precedes c wherever
+/// c executes; the fast-set member that executed x forgot it, as such a
+/// member does. Read as the source ballot's, x conflicted with c, which
+/// names nothing that places it, and dropped a fast decision of c.
+#[test]
+fn a_command_the_candidate_executed_is_before_every_possible_fast_decision() {
+    let cfg = config(3, 2, &[2, 0], 2);
+    let (x, c) = (cmd(1), cmd(2));
+    let reports = vec![
+        // r0 is behind at ballot 0 and holds x accepted there.
+        report_for(0, ballot(2, 2), 0, vec![entry(x, Phase::Accept, &[])]),
+        // r1, the fast set's other member, executed x and forgot it, and
+        // pre-accepted c at the source ballot.
+        report_for(1, ballot(2, 2), 1, vec![pre_accept_with(c, &[], 5)]),
+        // r2, the candidate, executed x and forgot it too.
+        report_for(2, ballot(2, 2), 1, vec![]),
+    ];
+    let decision = coord_consensus::select_decided(
+        &cfg,
+        &reports,
+        |_, _| false,
+        |_| None,
+        &ExecutedAs(BTreeMap::from([(
+            x,
+            ExecutedFacts::With(executed_row(x, &[])),
+        )])),
+    )
+    .unwrap();
+    assert_eq!(
+        decision.entries.get(&x).map(|e| e.phase),
+        Some(Phase::Commit)
+    );
+    assert_eq!(
+        decision.entries.get(&c).map(|e| e.deps.clone()),
+        Some(vec![]),
+        "reproposed {:?}",
+        decision.reproposed
+    );
+}
+
+/// task-d78 (protocol_sim row 4, three voters, seed 720, with half the
+/// acknowledgements to followers lost and catch-up on): x was decided
+/// fast after f by {r0, r1}, and r0 executed it. r2 committed f after b,
+/// which a leader synchronization gave it, and r1 still holds its own
+/// pre-acceptance of f, after e, which no ballot decided. The member's
+/// closure of x, the evidence of its path, went through that record to
+/// e, so x was dropped and re-proposed after the re-proposal of e, and r2
+/// executed another command where r0 had executed x. A member's record of
+/// a command the selection holds decided is not the order the selection
+/// executes, and what it names behind it was never in the leader's order
+/// before x: the walk stops there.
+#[test]
+fn a_fast_decision_after_a_command_committed_past_its_members_record_is_kept() {
+    let cfg = config(3, 2, &[2, 0], 1);
+    let (b, e, f, x) = (cmd(1), cmd(2), cmd(3), cmd(4));
+    let reports = vec![
+        report_for(
+            1,
+            ballot(1, 2),
+            0,
+            vec![
+                entry(b, Phase::Commit, &[]),
+                pre_accept_with(e, &[b], 5),
+                pre_accept_with(f, &[e], 6),
+                pre_accept_with(x, &[f], 7),
+            ],
+        ),
+        report_for(
+            2,
+            ballot(1, 2),
+            0,
+            vec![
+                entry(b, Phase::Commit, &[]),
+                ReportEntry {
+                    path: Digest32([6; 32]),
+                    paths: vec![(b"*".to_vec(), Digest32([6; 32]))],
+                    ..entry(f, Phase::Commit, &[b])
+                },
+            ],
+        ),
+    ];
+    let decision = select(&cfg, &reports).unwrap();
+    assert_eq!(
+        decision.entries.get(&f).map(|e| e.deps.clone()),
+        Some(vec![b])
+    );
+    assert_eq!(
+        decision.entries.get(&x).map(|e| e.deps.clone()),
+        Some(vec![f]),
+        "reproposed {:?}",
+        decision.reproposed
+    );
+    assert!(decision.reproposed.contains(&e));
+}
+
 /// task-d71 (protocol_sim row 14, three voters, seed 11, on task-d67's
 /// branch): c was decided fast after x, which follows d, and the member
 /// executed and retired d while it still holds a, which it executed
@@ -2133,6 +2317,48 @@ fn a_candidate_after_a_command_executed_after_an_adopted_one_is_kept() {
     assert!(
         decision.reproposed.contains(&c),
         "nothing known, nothing kept"
+    );
+}
+
+/// task-d71 (#158 review): the member's closure is read through its
+/// records only where they are an order the selection executes. Here e
+/// was committed elsewhere after p, which the candidate decided, executed
+/// and forgot, and the member still holds its own pre-acceptance of p,
+/// after d. That record is no decision: d is reached through it alone,
+/// and the candidate's running a before d says nothing about a before c,
+/// which follows p, which ran before a. Read through it, c was kept with
+/// a, adopted and conflicting, unordered against it.
+#[test]
+fn a_stale_pre_acceptance_orders_nothing_before_a_candidate() {
+    let cfg = config(3, 2, &[2, 0], 2);
+    let (a, d, e, p, c) = (cmd(1), cmd(2), cmd(3), cmd(4), cmd(5));
+    let reports = vec![
+        report_for(
+            1,
+            ballot(2, 2),
+            1,
+            vec![
+                entry(a, Phase::Commit, &[]),
+                pre_accept_with(e, &[], 5),
+                pre_accept_with(p, &[d], 5),
+                pre_accept_with(c, &[e], 5),
+            ],
+        ),
+        report_for(2, ballot(2, 2), 0, vec![entry(e, Phase::Commit, &[p])]),
+    ];
+    let decision = coord_consensus::select_decided(
+        &cfg,
+        &reports,
+        |_, _| false,
+        |_| None,
+        &Executed(vec![p, e, a, d]),
+    )
+    .unwrap();
+    assert!(decision.entries.contains_key(&a));
+    assert!(
+        !decision.entries.contains_key(&c),
+        "kept {:?}",
+        decision.entries.get(&c)
     );
 }
 

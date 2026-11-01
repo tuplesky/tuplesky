@@ -10407,6 +10407,9 @@ task-d62's counts change with the marker: `acks_reordered` counted
 acknowledgements sent under it and stays zero now, kept so a reading
 keeps its shape; `unordered.reordered` counts the pre-acceptances set
 aside and still undecided, and `unordered.leader_log` stays zero.
+Removing `acks_reordered`, and `unordered.leader_log` with it, is a
+follow-up: `scripts/ci/command_cost.py` reads both, and its reading and
+the metrics line change together.
 
 **The protocol simulator** on this branch, with task-d71's row 14 fix
 under it (#158): every row at its usual seeds; and every row at 1,000
@@ -10468,3 +10471,165 @@ was the pointer's sync. An earlier build that read `schedstat`'s CPU
 field put a retirement at 0.6 ms on a CPU against 0.5 ms of wall time.
 The runner's reading, at six nodes and the default cadence, is the next
 step, and it decides whether the job is built.
+
+## The pointer and the retirement on the journal worker (task-d66)
+
+The runner's reading put the long publications on the journal's waits,
+so the job is built. A voter no longer takes the journal back to
+publish. `JournaledStore::queue_checkpoint` checks the pointer as
+`publish_checkpoint` does (the domain is ready, the origin is its own,
+`C <= M`) and queues it. The next group the store seals carries it: in
+the domain's entry right after the last transition queued before it, and
+ahead of everything queued since, or as an entry of its own under the
+publication's barrier when nothing else is queued or nothing else fits.
+The store keeps that last transition's barrier with the pointer, so
+nothing that leaves the queue meanwhile moves it. Placed behind the
+whole queue, as it first was, the pointer was never carried by a domain
+whose queue filled every group: the queue holds 256 transitions and a
+group 64, and with no retirement the journal grows (Codex review of
+#164; pinned by `pointer_job.rs::a_pointer_goes_behind_what_was_queued_before_it_and_ahead_of_what_follows`). `AppendJob::run` appends the group and then, only
+if the append succeeded, retires what each pointer in it represents, on
+the appender's thread. Without an appender both run in the lowering that
+writes the group. `C` advances when the group is taken back, and
+`take_published` gives the outcome. So task-j04's order holds: the image
+and its directory durable, then the pointer, then the retirement, then
+the reclaim, which `coordd` still runs on its own thread.
+
+**What the domain thread still does:** the pin, the queue, and taking
+the outcome on a later turn. `JournaledStore::queued` counts a pointer
+the next group may carry, so a domain with nothing else to journal still
+owes a flush, and the runtime's next one writes it. A node that serves
+without voting lowers only when it applies a command, so it publishes
+on its own thread, as before.
+
+**The replay profile:** a group carries the pointer only once the
+projection is durable through `C`. Queueing it asks the next projection
+commit to be durable, and the pointer waits for that commit, the
+materializer's or, on an idle domain, `sync_idle_projections`' within
+half of `projection_durable_ms`. Nothing is forced on the domain thread.
+
+**A group that fails:** definitely, and the prior publication stands;
+with an unknown outcome, and nothing may be assumed or retired, and the
+stream reconciles as for any group. Either way the publication is
+reported failed and the next one is due, as before. A crash with the
+pointer queued, or its group lent and not run, recovers the previous
+baseline; one after the group ran recovers the new one, whose image
+nothing has reclaimed yet (`tests/pointer_job.rs`).
+
+**The `checkpoint` line** gains `queued_ms`: from the queue to the
+outcome, which is the wait for a group and, under the replay profile, for
+the durable commit, then the append and the retirement. `append_ms` and
+`retire_ms` are now the worker's times, and the domain thread's step
+readings are `-`, because it runs none of those steps.
+
+**Locally,** five voters on one host (x86_64, 4 CPUs), replay profile,
+`checkpoint_after_records = 4096` with the replay profile's 30 s interval,
+`coord-wan-bench` with 30 callers and 60,000 measured operations, three
+pairs, base task-d63's build (ms):
+
+| | publications | `loop_ms` p50 | `loop_ms` max | over 10 ms | ok/s |
+| --- | --- | --- | --- | --- | --- |
+| base | 10, 11, 15 | 9.3, 7.5, 4.1 | 24.8, 21.9, 31.2 | 4, 5, 5 | 667, 674, 665 |
+| job | 11, 15, 10 | 0.0, 0.0, 0.0 | 0.1, 0.1, 0.0 | 0, 0, 0 | 672, 660, 691 |
+
+Every publication retired its prefix, in both. On the base the drain was
+up to 18.2 ms, the append up to 16.5 ms and the retirement up to 13.8 ms,
+all on the domain thread. With the job, `queued_ms` was up to 26.6 ms
+and none of it on the domain thread. At this cadence the publications
+were too rare to move `ok`/s, as the plan expected. The runner's two
+runs at six nodes are the acceptance.
+
+
+## The budget on one host (task-d72)
+
+task-d72's rows are runner pairs, and the Jepsen testing session runs
+them. This is the same split on one host, read first, so a lever's pair
+on the runner has a local reading beside it.
+
+**The setup.** Five voters on one host (x86_64, 4 CPUs) over loopback,
+replay profile, stores on disk, provisioned by `coord-harness`;
+`coord-wan-bench` with 30 callers through all five frontends, the mix
+`put=30,get=50,contended=20`, 500 warmup operations. Release builds.
+Each build runs against the one before it, alternately. The nodes'
+figures are each `coordd`'s own counters at the end of the run (its
+process CPU and its domain thread's CPU, over the whole uptime), per
+write command it executed. Reads are served by the read barrier and
+execute nothing, so a write is about half the operations. Host CPU an
+operation is every core's busy time over the run, the bench's own
+included.
+
+- **A:** 20,000 measured operations, no checkpoints.
+- **B:** 60,000, with `checkpoint_after_records = 4096` (and the replay
+  profile's 30 s interval), so that publications fall inside the run.
+
+**Rows compare only with rows of the same session, run alternately.**
+The same code reads very differently across sessions on this kind of
+host: this table's plan base runs at 639 to 664 `ok`/s and 8.38 to
+8.65 ms of the nodes' CPU a write, the same code with only #163's and
+#164's fixes on top at 749 to 824 `ok`/s and 6.87 to 7.41 ms in a later
+session of this one (#167's and #168's tables), and the plan base at 918
+to 963 `ok`/s and 5.66 to 6.04 ms in the reviewer's. None of those
+differences is a lever (review of #165).
+
+| Build | Runs | ok/s | put p50 ms | put p99 ms | Nodes' CPU a write | Leader (its loop) | A follower (its loop) | Frames a write | Datagrams a write | Host CPU an op |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| A: plan base `50cc079` | 3 | 639 to 664 | 89.1 to 92.2 | 136.0 to 150.0 | 8.38 to 8.65 | 1.93 to 2.01 (0.81 to 0.85) | 1.61 to 1.66 (0.63 to 0.66) | 35.9 to 36.0 | 14.4 to 14.4 | 4.47 to 4.65 |
+| A: task-d63 `d53c4a6` | 3 | 654 to 685 | 84.9 to 89.4 | 134.2 to 146.2 | 8.14 to 8.42 | 1.88 to 1.95 (0.78 to 0.81) | 1.57 to 1.62 (0.62 to 0.64) | 36.0 to 36.1 | 14.4 to 14.5 | 4.41 to 4.63 |
+| B: task-d63 `d53c4a6` | 3 | 665 to 674 | 85.6 to 86.6 | 156.1 to 162.9 | 8.17 to 8.34 | 1.87 to 1.94 (0.73 to 0.75) | 1.57 to 1.60 (0.59 to 0.59) | 36.2 to 36.2 | 14.2 to 14.3 | 4.31 to 4.33 |
+| B: task-d66 `a788606` | 3 | 660 to 691 | 83.7 to 87.7 | 156.2 to 164.2 | 7.94 to 8.52 | 1.85 to 1.97 (0.72 to 0.76) | 1.52 to 1.64 (0.57 to 0.61) | 36.2 to 36.2 | 14.2 to 14.3 | 4.21 to 4.48 |
+
+**What it says:**
+- **The host is short of CPU, not of anything else.** 2.9 of its 4 cores
+  are busy, and the leader's domain thread spent 43 s of a 93 s run
+  runnable and waiting for a core. A cost taken off any node is a cost
+  the host has back, so on this host CPU an operation and `ok`/s move
+  together, which the runner's six separate nodes do not show.
+- **task-d63 and task-d66 do not move it**, as the plan said: neither
+  takes CPU off a command. task-d63's release no longer waits for the
+  projection's commit, and here the commit is short against what each
+  command costs. task-d66's publications held the domain thread up to
+  31 ms on the base and none of it with the job, at a cadence too rare
+  to move `ok`/s ([above](#the-pointer-and-the-retirement-on-the-journal-worker-task-d66)).
+- **The followers carry three quarters of the CPU.** A follower costs 1.5
+  to 1.7 ms a write, the leader 1.9 to 2.0; four followers to one leader.
+  About 0.6 ms of a follower's is its domain loop, and the rest its other
+  threads.
+- **36 frames and 14 datagrams a write**, summed over the five nodes.
+
+**A profile** of the leader (n1) and a follower outside the fast set
+(n4), task-d66's build, 15 s of the measured phase at 499 Hz, `perf`
+with DWARF call graphs. Each thread's share of its process's samples:
+
+| Thread | Leader | Follower |
+| --- | --- | --- |
+| domain loop (`coordd`) | 40% | 38% |
+| transport (`tokio-rt-worker`, QUIC) | 34% | 32% |
+| materializer (projection commits) | 19% | 22% |
+| appender (journal) | 7% | 9% |
+
+- **The transport** spends 38 to 42% of its time in quinn's connection
+  driver and 16 to 18% in `sendmsg` alone. At five voters a follower in
+  the fast set sends 8.5 frames a write and one outside it 4.5; the
+  leader sends 10.1. Its cost is not paid per frame, though, as the
+  reading first took it to be (corrected by task-d74's pair, review of
+  #165): #167 halved the frames (36 to 18 a write) for about 4% of the
+  nodes' CPU, about 13 µs a frame sent and received in the reviewer's
+  session, and a fast-set follower sending 8.5 frames a write costs only
+  0.03 ms more than one sending 4.5.
+- **The domain loop**, inclusive: the machine's `step` is about a
+  quarter, and the projection's reads on the loop another sixth (redb
+  `get`, opening its tables, taking snapshots): the retry lookup, the
+  planning view, `load_authorization`'s scan, `DurableMeta::read`. On the
+  leader the read barrier's `pump_reads` is 12%. Allocation is the
+  largest self cost (zeroed pages, 5%), then `memmove`.
+- **The materializer** is redb's page management and the kernel's page
+  writes, a fifth of each node, for working commits under the replay
+  profile.
+
+So the transport's third of every node is mostly not the per-message
+cost task-d73 and task-d74 take. task-d74, measured, is about 4% of the
+nodes' CPU and 6% of a follower's, the largest single lever so far and
+still a small one; task-d73, which removes frames a turn, is worth on
+the order of 1% at that rate. task-d75's reading of the leader's loop is
+the leader's 40%, and what it found is in its own section, "The domain
+loop, read (task-d75)", with #168.

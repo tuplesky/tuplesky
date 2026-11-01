@@ -733,8 +733,10 @@ impl CommandTable {
     /// Take back an acceptance of an earlier ballot that a Sync did not
     /// carry: the record returns to PRE-ACCEPT, keeping its payload and
     /// dependencies, which at PRE-ACCEPT decide nothing and which adoption
-    /// replaces (task-d11). Only an ACCEPT is demoted; a commit is a
-    /// decision and stays. Returns whether the record was demoted.
+    /// replaces (task-d11). A pre-acceptance loses its path the same way
+    /// when it was no vote in the ballot a report will label it with
+    /// (task-d74). A commit is a decision and stays.
+    /// Returns whether the record was demoted.
     ///
     /// The path goes too ([`crate::graph::demoted_path`]): it was evidence
     /// about the earlier ballot, and a report labels the record with the
@@ -742,7 +744,10 @@ impl CommandTable {
     /// fast-path analysis take the old order as the new ballot's.
     pub fn demote(&mut self, command: &CommandId) -> bool {
         match self.records.get_mut(command) {
-            Some(record) if record.payload.is_some() && record.phase == Phase::Accept => {
+            Some(record)
+                if record.payload.is_some()
+                    && matches!(record.phase, Phase::PreAccept | Phase::Accept) =>
+            {
                 record.demote();
                 true
             }
@@ -1245,10 +1250,28 @@ impl CommandTable {
     /// names it, and needs nothing of the report. An unbounded table
     /// keeps every tombstone, and forgets only what it never held a
     /// record of.
+    ///
+    /// A bounded table also waits until it has executed a table's
+    /// capacity of commands past it (#169 review). The window counts
+    /// retirements, and a voter refuses a candidate only once it has
+    /// executed that many past the candidate (task-d10): a command retired
+    /// before others it executed ahead of went out of the window early,
+    /// and a candidate the voter still promised could be one that never
+    /// executed it. Counted in executions too, a voter that forgot a
+    /// command refuses every candidate that has not executed it, which is
+    /// what a selection asks of its own candidate (task-d77). A command
+    /// with no ordinal executed before this boot's first, and the count
+    /// is the window alone, as before.
     pub fn forgotten(&self, command: &CommandId) -> bool {
         self.history.contains(command)
             && match self.capacity {
-                Some(_) => !self.recent_set.contains(command),
+                Some(bound) => {
+                    !self.recent_set.contains(command)
+                        && self.execution_order.get(command).is_none_or(|at| {
+                            let past = (self.execution_order.len() as u64).saturating_sub(at + 1);
+                            past >= bound as u64
+                        })
+                }
                 None => !self.executed.contains(command),
             }
     }

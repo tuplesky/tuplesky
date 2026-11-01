@@ -19,7 +19,7 @@
 
 use std::time::{Duration, Instant};
 
-use coord_consensus::{CatchUpEntry, MAX_CATCH_UP_BYTES, MAX_CATCH_UP_COMMANDS};
+use coord_consensus::{CatchUpEntry, CommandRecord, MAX_CATCH_UP_BYTES, MAX_CATCH_UP_COMMANDS};
 use coord_storage::views::ViewBudget;
 use coord_storage::{Applier, Persistence};
 use coord_types::CommandId;
@@ -159,6 +159,31 @@ pub fn page<P: Persistence>(
         entries.push(entry);
     }
     entries
+}
+
+/// The dependency rows of commands this node executed and its machine
+/// forgot, which a campaign waits on (task-d77), read as a page is: each
+/// command's decided record from catch-up's entry, or none where the store
+/// keeps no executed row, payload or dependency row for it, or cannot be
+/// read. A campaign given none for a command is refused.
+pub fn executed_rows<P: Persistence>(
+    applier: &Applier<P>,
+    epoch: ConfigurationEpoch,
+    wanted: Vec<CommandId>,
+) -> Vec<(CommandId, Option<CommandRecord>)> {
+    let gated = applier.store().reader().snapshot().ok();
+    wanted
+        .into_iter()
+        .map(|command| {
+            let decided = gated.as_ref().and_then(|g| {
+                coord_storage::protocol::catch_up_entry(g.view(), epoch, &command)
+                    .ok()
+                    .flatten()
+                    .and_then(|entry| entry.decided)
+            });
+            (command, decided)
+        })
+        .collect()
 }
 
 /// The stop a catch-up divergence is (task-d08), in the form every

@@ -350,6 +350,12 @@ const LOWERINGS: usize = 64;
 /// which on the journal-first path means the record is safe but the
 /// state nobody can read yet. Reporting an outcome on any of those
 /// publishes a revision the next reader will not find.
+///
+/// A group on a pipelined store discloses its results earlier, at the
+/// group's `JournalDurable` (task-d63, design Section 4.5), because a
+/// result needs only its record; what this waits for is what an outcome
+/// reported here publishes as well, its revision to readers and
+/// watches.
 pub fn complete<P: Persistence>(
     store: &mut P,
     pending: &Pending,

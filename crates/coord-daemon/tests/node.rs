@@ -1055,11 +1055,29 @@ fn retry_key_of(sequence: u64) -> RetryKey {
     }
 }
 
-/// Pipelined (task-d52), a group's results wait for its projection commit
-/// to come back, and execution goes on meanwhile: the next group is
-/// planned over the one still in flight.
+/// The release frames among `frames`: the results the collector was
+/// sent, apart from the leader's evidence.
+fn releases_in(frames: &[Vec<u8>]) -> usize {
+    frames
+        .iter()
+        .filter(|bytes| {
+            let mut reader = coord_types::wire_v1::FrameReader::new();
+            reader.push(bytes).expect("bounded");
+            reader
+                .next_frame()
+                .expect("well formed")
+                .is_some_and(|frame| frame.kind == coord_collector::KIND_RELEASE)
+        })
+        .count()
+}
+
+/// Pipelined (task-d52), a group's results go out once the group is in
+/// the journal, before its projection commit comes back (task-d63,
+/// design Section 4.5); its watch revisions wait for the commit, and
+/// execution goes on meanwhile: the next group is planned over the one
+/// still in flight.
 #[test]
-fn pipelined_a_groups_results_wait_for_its_projection_commit_while_execution_goes_on() {
+fn pipelined_a_groups_results_go_out_once_journaled_and_its_projection_commit_follows() {
     let mut node = grouped_lone_leader(BootId([13; 16]));
     let handle = pipeline(&mut node);
     let revision_before = node.applier().kv_revision().unwrap();
@@ -1070,45 +1088,93 @@ fn pipelined_a_groups_results_wait_for_its_projection_commit_while_execution_goe
 
     let (_, frames) = admit_and_flush(&mut node, 1..=3);
     assert_eq!(node.executed, 3);
-    assert!(
-        frames.is_empty(),
-        "a result went out before its group's projection commit came back"
+    assert_eq!(
+        releases_in(&frames),
+        3,
+        "each result goes out once its group is journaled"
     );
-    assert_eq!(node.awaiting_materialization(), 1);
-    assert_eq!(node.applier().kv_revision().unwrap(), revision_before);
+    assert_eq!(
+        through(&node),
+        base,
+        "before the projection has committed it"
+    );
+    assert_eq!(
+        node.awaiting_materialization(),
+        1,
+        "what else it led to waits"
+    );
+    assert_eq!(
+        node.applier().kv_revision().unwrap(),
+        revision_before,
+        "watches see nothing before the commit"
+    );
     // The commit out when the group closed is the protocol's, lent by a
     // flush while the commands were admitted; the group waits behind it
     // and is lent once it is back.
     assert_eq!(handle.waiting(), 1);
     assert!(handle.run());
     let out = node.settle(&ballot()).expect("settled");
-    assert!(out.frontend.is_empty());
+    assert_eq!(releases_in(&out.frontend), 0);
     assert_eq!(through(&node), base, "the group is not committed yet");
     assert_eq!(handle.waiting(), 1, "the group's commit is out");
 
-    // With the first group out, the next one executes over it.
+    // With the first group out, the next one executes over it, and its
+    // results go out with the first group's commit still out.
     let (_, frames) = admit_and_flush(&mut node, 4..=6);
     assert_eq!(node.executed, 6);
-    assert!(frames.is_empty());
+    assert_eq!(releases_in(&frames), 3);
     assert_eq!(node.awaiting_materialization(), 2);
     assert_eq!(handle.waiting(), 1, "one commit out at a time");
 
-    // The first group's commit returns and is taken back: its results go
-    // out, the second group's do not, and the second group is lent.
+    // The commits come back, and nothing is released a second time.
     assert!(handle.run());
     let first = node.settle(&ballot()).expect("settled");
-    assert!(!first.frontend.is_empty(), "the first group's results");
+    assert_eq!(releases_in(&first.frontend), 0, "released once");
     assert_eq!(through(&node).get(), base.get() + 3);
     assert_eq!(node.awaiting_materialization(), 1);
     assert_eq!(handle.waiting(), 1);
 
     assert!(handle.run());
     let second = node.settle(&ballot()).expect("settled");
-    assert!(!second.frontend.is_empty(), "the second group's results");
+    assert_eq!(releases_in(&second.frontend), 0, "released once");
     assert_eq!(through(&node).get(), base.get() + 6);
     assert_eq!(node.awaiting_materialization(), 0);
     let revision = node.applier().kv_revision().unwrap();
     assert_eq!(revision.get() - revision_before.get(), 6);
+}
+
+/// A group closed between flushes, at its command bound, is journaled
+/// when it is handed off, and its results go out then, before its
+/// projection commit (review of #163). The group was taken out of the
+/// open slot before its appends and joined the groups in flight after
+/// them, so the journal's report of it reached neither, and its results,
+/// and every later group's, waited for its commit.
+#[test]
+fn pipelined_a_group_closed_at_its_bound_releases_once_its_hand_off_journals_it() {
+    let mut node = grouped_lone_leader(BootId([14; 16]));
+    let _handle = pipeline(&mut node);
+    let base = node.applier().store().application_base().execution_position;
+    for sequence in 1..=33 {
+        node.on_event(
+            Event::Admitted(admitted_putting(sequence, vec![sequence as u8; 8])),
+            &ballot(),
+        )
+        .expect("admitted");
+        node.flush(&ballot()).expect("flushed");
+    }
+    // The stage closes the first group at 32 commands and hands it off,
+    // journaling it there.
+    let out = node.stage(&ballot()).expect("staged");
+    assert_eq!(
+        releases_in(&out.frontend),
+        32,
+        "the closed group's results go out once its hand-off journals it"
+    );
+    assert_eq!(
+        node.applier().store().materialized_through().unwrap(),
+        base,
+        "before its projection commit"
+    );
 }
 
 /// Pipelined (task-d52), the same commands give the same results, the
@@ -1278,6 +1344,73 @@ fn pump(
         }
         frames.extend(node.settle(&ballot()).expect("settled").frontend);
     }
+}
+
+/// With the journal lent (task-d54) and the materializer never run, a
+/// group's results wait for the append that journals the group to be
+/// taken back, and not for its projection commit (task-d63): none goes
+/// out while the append is out, every one once it is back, and the
+/// projection has committed none of them.
+#[test]
+fn lending_the_journal_a_groups_results_wait_for_its_append_and_not_its_projection_commit() {
+    let mut node = grouped_lone_leader(BootId([17; 16]));
+    let (commits, appends) = lend_journal(&mut node);
+    let base = node.applier().store().application_base().execution_position;
+    let mut released = 0;
+    // Each command's record is journaled, and the append taken back, so
+    // the leader learns it. The materializer is never run.
+    for sequence in 1..=3 {
+        let out = node
+            .on_event(
+                Event::Admitted(admitted_putting(sequence, vec![sequence as u8; 8])),
+                &ballot(),
+            )
+            .expect("admitted");
+        released += releases_in(&out.frontend);
+        released += releases_in(&node.flush(&ballot()).expect("flushed").frontend);
+        while appends.run() {
+            released += releases_in(&node.settle(&ballot()).expect("settled").frontend);
+        }
+    }
+    assert_eq!(released, 0, "nothing executed yet");
+
+    // The group executes and is lent with its own append still out.
+    let mut out = node.stage(&ballot()).expect("staged");
+    out.absorb(node.flush(&ballot()).expect("flushed"));
+    out.absorb(node.finish(&ballot()).expect("finished"));
+    assert_eq!(node.executed, 3);
+    assert!(
+        node.applier().store().appending(),
+        "the group's append is still out"
+    );
+    assert_eq!(
+        releases_in(&out.frontend),
+        0,
+        "a result went out before its group was journaled"
+    );
+
+    // The append is synced and taken back: the results go out, and the
+    // projection still holds none of the group.
+    let mut frames = Vec::new();
+    while appends.run() {
+        frames.extend(node.settle(&ballot()).expect("settled").frontend);
+    }
+    assert_eq!(releases_in(&frames), 3, "every result once journaled");
+    assert_eq!(
+        node.applier().store().materialized_through().unwrap(),
+        base,
+        "before the projection has committed any of them"
+    );
+    assert!(node.awaiting_materialization() > 0);
+
+    // The commits follow, and nothing is released a second time.
+    let frames = pump(&mut node, &commits, &appends);
+    assert_eq!(releases_in(&frames), 0, "released once");
+    assert_eq!(node.awaiting_materialization(), 0);
+    assert_eq!(
+        node.applier().store().materialized_through().unwrap().get(),
+        base.get() + 3
+    );
 }
 
 /// With the journal lent (task-d54), the leader's proposal waits for the

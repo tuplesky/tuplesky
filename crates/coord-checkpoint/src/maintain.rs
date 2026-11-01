@@ -48,7 +48,7 @@ use coord_journal_api::JournalEngine;
 use coord_journal_api::RecordOrigin;
 use coord_journal_api::frontier::CheckpointPointerV1;
 use coord_storage::JournaledDomain;
-use coord_storage::journaled::{JournaledError, PublishPhases};
+use coord_storage::journaled::{JournaledError, PublishPhases, Published};
 use coord_storage::view::{GatedView, ViewError};
 use coord_store_api::engine::{
     CollectionId, EngineError, ErrorClass, LocalEngine, OrderedRead, RowPage, ScanRequest,
@@ -235,6 +235,15 @@ pub struct Written {
     pub write: Duration,
 }
 
+/// An image whose pointer is queued for the store's journal worker
+/// (task-d66): what [`LocalBaseline::queue_local`] hands back, and what
+/// [`LocalBaseline::take_local`] turns into the publication.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueuedPointer {
+    /// The image whose pointer is queued.
+    pub written: Written,
+}
+
 /// A snapshot whose reads fail once a deadline has passed.
 ///
 /// `export_local` reads a page at a time, so a read that refuses ends
@@ -317,6 +326,18 @@ pub trait LocalBaseline {
     /// pointer and retire the prefix. Step 5 is [`reclaim_local`]'s, and
     /// until it runs the publication says it reclaimed nothing.
     fn finish_local(&mut self, written: Written) -> Result<Publication, BaselineError>;
+
+    /// Steps 3 and 4 off this thread (task-d66): queue the pointer for
+    /// the store's journal worker, which appends it with the next group
+    /// and retires the prefix once the append is synced, in that order.
+    /// Nothing is written here. [`LocalBaseline::take_local`] gives the
+    /// publication, and step 5 follows it as it follows
+    /// [`LocalBaseline::finish_local`].
+    fn queue_local(&mut self, written: Written) -> Result<QueuedPointer, BaselineError>;
+
+    /// The publication `queued` became, once the group that carried its
+    /// pointer is taken back; `None` while that group waits or is out.
+    fn take_local(&mut self, queued: &QueuedPointer) -> Option<Result<Publication, BaselineError>>;
 
     /// Run the publication cycle once, every step on this thread.
     ///
@@ -429,21 +450,51 @@ where
         if self.store().origin(domain) != Some(written.pointer.origin) {
             return Err(BaselineError::Superseded);
         }
-        let pointer = written.pointer;
         // Step 3 and step 4, in that order and inside the journal.
-        let published = self.store_mut().publish_checkpoint(domain, &pointer)?;
-        Ok(Publication {
-            pointer,
-            represented: published.published,
-            retired: published.retired,
-            reclaimed: 0,
-            phases: Phases {
-                pin: written.pin,
-                export: written.export,
-                write: written.write,
-                journal: published.phases,
-                reclaim: Duration::ZERO,
-            },
-        })
+        let published = self
+            .store_mut()
+            .publish_checkpoint(domain, &written.pointer)?;
+        Ok(publication(&written, published))
+    }
+
+    fn queue_local(&mut self, written: Written) -> Result<QueuedPointer, BaselineError> {
+        let domain = self.domain();
+        // The image is still the baseline it claims for the reasons
+        // `finish_local` gives, asked here before the pointer is queued.
+        // The origin cannot change while it is: a reattach replaces the
+        // store's domain, queue and all.
+        if self.store().origin(domain) != Some(written.pointer.origin) {
+            return Err(BaselineError::Superseded);
+        }
+        self.store_mut()
+            .queue_checkpoint(domain, &written.pointer)?;
+        Ok(QueuedPointer { written })
+    }
+
+    fn take_local(&mut self, queued: &QueuedPointer) -> Option<Result<Publication, BaselineError>> {
+        let domain = self.domain();
+        let published = self.store_mut().take_published(domain)?;
+        Some(
+            published
+                .map(|published| publication(&queued.written, published))
+                .map_err(BaselineError::from),
+        )
+    }
+}
+
+/// The publication of the image `written`, its pointer published.
+fn publication(written: &Written, published: Published) -> Publication {
+    Publication {
+        pointer: written.pointer,
+        represented: published.published,
+        retired: published.retired,
+        reclaimed: 0,
+        phases: Phases {
+            pin: written.pin,
+            export: written.export,
+            write: written.write,
+            journal: published.phases,
+            reclaim: Duration::ZERO,
+        },
     }
 }

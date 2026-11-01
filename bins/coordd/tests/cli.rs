@@ -3576,23 +3576,28 @@ async fn a_node_publishes_its_own_baseline_and_comes_back_on_it() {
             " sync_ms=",
             " append_ms=",
             " retire_ms=",
+            " queued_ms=",
             " reclaim_ms=",
         ] {
             assert!(line.contains(phase), "no{phase} in {line}");
         }
-        // And the domain thread's own time over the journal's steps, on a
-        // CPU and waiting for one, read on Linux (task-d66).
+        let value_of = |key: &str| {
+            line.split(key)
+                .nth(1)
+                .and_then(|rest| rest.split_whitespace().next())
+                .unwrap_or_else(|| panic!("no{key} in {line}"))
+        };
+        // A voter publishes its pointer on the journal worker (task-d66):
+        // from the queue to the outcome, the group it rode and the
+        // retirement after it.
+        assert!(value_of(" queued_ms=").parse::<f64>().is_ok(), "{line}");
+        // So the domain thread ran none of the journal's steps, and has
+        // no time of its own over them to give, where on the calling
+        // thread it is read on Linux.
         for step in ["drain", "sync", "append", "retire"] {
             for of in ["cpu", "runq"] {
                 let key = format!(" {step}_{of}_ms=");
-                let value = line
-                    .split(&key)
-                    .nth(1)
-                    .and_then(|rest| rest.split_whitespace().next())
-                    .unwrap_or_else(|| panic!("no{key} in {line}"));
-                if cfg!(target_os = "linux") {
-                    assert!(value.parse::<f64>().is_ok(), "{key}{value} in {line}");
-                }
+                assert_eq!(value_of(&key), "-", "{key} in {line}");
             }
         }
         response_of(&answer)

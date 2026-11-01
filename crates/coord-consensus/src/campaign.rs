@@ -52,6 +52,9 @@ pub struct Campaign {
     /// Configurations of earlier ballots the candidate ran under, the
     /// source ballot's among them if it is known (task-d31).
     sources: Vec<BallotConfiguration>,
+    /// Commands the candidate executed and forgot whose durable
+    /// dependency rows the selection last waited on (task-d77).
+    rows_wanted: Vec<CommandId>,
 }
 
 impl Campaign {
@@ -73,6 +76,7 @@ impl Campaign {
             supply_moved: false,
             supply_moves: 0,
             sources: Vec::new(),
+            rows_wanted: Vec::new(),
         }
     }
 
@@ -183,6 +187,13 @@ impl Campaign {
                 )),
             })
             .collect()
+    }
+
+    /// The commands whose durable dependency rows the selection last
+    /// waited on (task-d77): ones the candidate executed and forgot that a
+    /// voter behind still reports below COMMIT.
+    pub fn rows_wanted(&self) -> &[CommandId] {
+        &self.rows_wanted
     }
 
     /// A payload arrived that the selection may have been waiting on: the
@@ -355,6 +366,12 @@ impl Campaign {
             let source = |b: &Ballot| self.sources.iter().find(|c| c.ballot() == *b).cloned();
             match select_decided(&self.config, &reports, &supplied, source, &decided) {
                 Ok(decision) => break decision,
+                // Rows the runtime reads for the candidate: waited for, as
+                // a payload is (task-d77).
+                Err(RecoveryError::ExecutedRowsUnread { commands }) => {
+                    self.rows_wanted = commands;
+                    return Ok(None);
+                }
                 Err(RecoveryError::HalfInitialized { replica, command }) => {
                     if replica != self.config.leader() && reports.len() > self.config.slow_size() {
                         reports.retain(|r| r.replica != replica);
@@ -368,6 +385,7 @@ impl Campaign {
                 Err(e) => return Err(e),
             }
         };
+        self.rows_wanted.clear();
         self.decision = Some(decision);
         Ok(self.decision.as_ref())
     }

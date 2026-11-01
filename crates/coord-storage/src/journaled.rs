@@ -128,10 +128,13 @@ pub const PROFILE: &str = "journaled-strict-v1";
 const LIFECYCLE_SEQUENCE: u64 = 0;
 /// Barrier sequence of a checkpoint publication. Unlike the lifecycle
 /// sequence it is one a machine's allocator can also hand out, and that
-/// is harmless: [`JournaledStore::publish_checkpoint`] reserves and
-/// completes its head within the one call and records the publication
-/// with `barrier: None`, so no `StorageEvent` ever carries this barrier
-/// and nothing compares it with a machine's.
+/// is harmless: the publication is recorded with `barrier: None`, so no
+/// `StorageEvent` ever carries this barrier and nothing compares it with
+/// a machine's. [`JournaledStore::publish_checkpoint`] reserves and
+/// completes its head within the one call. A pointer queued for the
+/// journal worker (task-d66) is reserved under it for as long as its
+/// group is out, so a group never holds it twice: an entry that would
+/// share it goes in the next group.
 const CHECKPOINT_SEQUENCE: u64 = 1;
 
 /// Bytes reserved for everything a record carries beside its updates:
@@ -355,6 +358,9 @@ pub enum JournaledError {
     /// ([`LocalEngine::WORKING_STATE`]), so the replay-backed profile
     /// cannot run over it (task-j06).
     WorkingStateUnsupported,
+    /// A checkpoint pointer is already queued for the journal worker and
+    /// its outcome has not been taken (task-d66).
+    CheckpointQueued,
 }
 
 impl fmt::Display for JournaledError {
@@ -378,6 +384,9 @@ impl fmt::Display for JournaledError {
             }
             JournaledError::WorkingStateUnsupported => {
                 f.write_str("the projection engine has no working-state capability")
+            }
+            JournaledError::CheckpointQueued => {
+                f.write_str("a checkpoint pointer is already queued for the journal")
             }
         }
     }
@@ -533,6 +542,12 @@ pub struct PublishPhases {
     pub append: Duration,
     /// Retiring the prefix the pointer represents.
     pub retire: Duration,
+    /// For a pointer published on the journal worker (task-d66), from
+    /// its queueing to its group being taken back: the wait for a group
+    /// and, under the replay profile, for the projection to be durable,
+    /// then the append and the retirement, which `append` and `retire`
+    /// time on the worker. Zero for a publication on the calling thread.
+    pub queued: Duration,
     /// The calling thread's own time over each step, where the store has
     /// a [`ThreadClock`] (task-d66): of a step's wall time, what it spent
     /// on a CPU and what it spent runnable and waiting for one. The rest
@@ -658,6 +673,33 @@ struct Domain<E: LocalEngine> {
     working: Working,
     /// What the attach replayed into the projection.
     replayed: Replayed,
+    /// A checkpoint pointer published on the journal worker (task-d66),
+    /// from [`JournaledStore::queue_checkpoint`] to
+    /// [`JournaledStore::take_published`].
+    checkpoint: Option<Queued>,
+}
+
+/// A checkpoint pointer on its way through the journal worker (task-d66).
+struct Queued {
+    pointer: CheckpointPointerV1,
+    /// The last transition queued before it, if any: the pointer goes
+    /// right after it in the journal, and nothing queued since goes ahead
+    /// of it (review of #164). A barrier, not a count, so it holds
+    /// whatever leaves the queue meanwhile.
+    behind: Option<BarrierId>,
+    /// When it was queued.
+    since: Instant,
+    stage: QueuedStage,
+}
+
+/// Where a queued checkpoint pointer is.
+enum QueuedStage {
+    /// Waiting for a group to carry it.
+    Waiting,
+    /// In a group that is sealed and not yet taken back.
+    Sealed,
+    /// Its group was taken back: the publication's outcome.
+    Done(Box<Result<Published, JournaledError>>),
 }
 
 /// What an attach replayed from the journal into a domain's projection,
@@ -735,6 +777,57 @@ impl<E: LocalEngine> Domain<E> {
         self.projection_durable = self.frontiers.materialized();
         self.working = Working::default();
         Ok(())
+    }
+
+    /// The queued checkpoint pointer, when the next group may carry it
+    /// (task-d66): the domain is ready, its head is idle and, under the
+    /// replay profile, its projection is durable through what the
+    /// pointer represents.
+    fn sealable_checkpoint(&self, profile: ProjectionProfile) -> Option<CheckpointPointerV1> {
+        let queued = self.checkpoint.as_ref()?;
+        if !matches!(queued.stage, QueuedStage::Waiting)
+            || self.status != DomainStatus::Ready
+            || self.head.state() != HeadState::Idle
+        {
+            return None;
+        }
+        if matches!(profile, ProjectionProfile::Replay(_))
+            && self.projection_durable < queued.pointer.represented
+        {
+            return None;
+        }
+        Some(queued.pointer)
+    }
+
+    /// How many queued transitions go ahead of the queued checkpoint
+    /// pointer: those up to the last one queued before it, or none once
+    /// that one has left the queue.
+    fn checkpoint_ahead(&self) -> usize {
+        let Some(behind) = self.checkpoint.as_ref().and_then(|q| q.behind) else {
+            return 0;
+        };
+        self.queue
+            .iter()
+            .position(|s| s.batch.barrier == behind)
+            .map_or(0, |i| i + 1)
+    }
+
+    /// The queued checkpoint pointer is in a group now.
+    fn seal_checkpoint(&mut self) {
+        if let Some(queued) = self.checkpoint.as_mut() {
+            queued.stage = QueuedStage::Sealed;
+        }
+    }
+
+    /// The group carrying the checkpoint pointer, if this domain's entry
+    /// did, failed or was left uncertain: so did the publication.
+    fn fail_checkpoint(&mut self, failure: &JournalFailure) {
+        if let Some(queued) = self.checkpoint.as_mut()
+            && matches!(queued.stage, QueuedStage::Sealed)
+        {
+            queued.stage =
+                QueuedStage::Done(Box::new(Err(JournaledError::Journal(failure.clone()))));
+        }
     }
 
     /// Take the front transition out of the queue once it is sealed into a
@@ -815,6 +908,76 @@ pub struct JournaledStore<J: JournalEngine, E: LocalEngine> {
 /// One stream's entry in a sealed group: the domain, the barrier the
 /// entry is reserved under, and its records in order.
 type Sealed = (DomainId, BarrierId, Vec<Durable>);
+
+/// A stream whose prefix a checkpoint pointer in the group retires once
+/// the group is durable (task-d66).
+type Retire = (StorageStreamId, CheckpointPointerV1);
+
+/// A sealed group, its entries, and the retirements it owes.
+type Sealing = (GroupWrite, Vec<Sealed>, Vec<Retire>);
+
+/// What writing a group did: the append's outcome and how long it took,
+/// and each retirement that followed it.
+struct GroupWritten {
+    result: Result<GroupReceipt, JournalFailure>,
+    appended: Duration,
+    retired: Vec<Retired>,
+}
+
+/// One retirement a group's append was followed by (task-d66).
+struct Retired {
+    stream: StorageStreamId,
+    retired: bool,
+    took: Duration,
+}
+
+/// Append `group` with sync before success, then retire what each pointer
+/// it carries represents: only after the append, and only if it succeeded
+/// (Section 17.16.3, steps 3 and 4). On whichever thread has the journal.
+/// A retirement that fails leaves the pointer standing and the prefix to
+/// a later one.
+fn write_group<J: JournalEngine>(
+    journal: &mut J,
+    group: &GroupWrite,
+    retires: &[Retire],
+) -> GroupWritten {
+    let started = Instant::now();
+    let result = journal.append_group(group);
+    let appended = started.elapsed();
+    let mut retired = Vec::new();
+    if result.is_ok() {
+        for (stream, pointer) in retires {
+            let started = Instant::now();
+            let ok = journal.retire_prefix(*stream, pointer).is_ok();
+            retired.push(Retired {
+                stream: *stream,
+                retired: ok,
+                took: started.elapsed(),
+            });
+        }
+    }
+    GroupWritten {
+        result,
+        appended,
+        retired,
+    }
+}
+
+/// A domain's checkpoint pointer, sealed as the record at `seq` after
+/// `predecessor`.
+fn seal_pointer<E: LocalEngine>(
+    state: &Domain<E>,
+    pointer: &CheckpointPointerV1,
+    seq: LocalJournalSeq,
+    predecessor: Digest32,
+) -> Result<JournalRecordV1, JournaledError> {
+    Ok(JournalRecordV1::seal(RecordDraft {
+        origin: state.origin,
+        seq,
+        predecessor,
+        body: RecordBody::PublishLocalCheckpoint(*pointer),
+    })?)
+}
 
 /// Said where the journal is used after [`JournaledStore::await_append`]
 /// has taken it back.
@@ -1109,6 +1272,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                 through: applied.materialized,
                 took: Duration::ZERO,
             },
+            checkpoint: None,
         };
         let started = Instant::now();
         Self::replay(
@@ -1444,6 +1608,11 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
         if state.status != DomainStatus::Ready {
             return Err(JournaledError::NotReady(state.status));
         }
+        // One publication at a time: a pointer queued for the journal
+        // worker (task-d66) is published first.
+        if state.checkpoint.is_some() {
+            return Err(JournaledError::CheckpointQueued);
+        }
         // The image is this incarnation's own. A pointer naming another
         // origin describes storage this node does not have.
         if pointer.origin != state.origin {
@@ -1559,6 +1728,103 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
             retired,
             phases,
         })
+    }
+
+    /// Steps 3 and 4 of the publication order on the journal worker
+    /// (task-d66): queue `pointer` to be made durable by the next group
+    /// the store writes, and the prefix it represents to be retired once
+    /// that append is synced.
+    ///
+    /// Nothing is written here and nothing is waited for. The pointer
+    /// rides the next group as the last record of the domain's entry, or
+    /// as an entry of its own when nothing else is queued, so its append
+    /// is ordered behind whatever is in flight, as any group is. With an
+    /// [`Appender`] the append and the retirement both run on the
+    /// appender's thread, the retirement only after the append
+    /// succeeded; without one, both run in the lowering that writes the
+    /// group. [`JournaledStore::take_published`] gives the outcome, and
+    /// the caller reclaims after it.
+    ///
+    /// The order is [`JournaledStore::publish_checkpoint`]'s. Under the
+    /// replay profile a group carries the pointer only once the
+    /// projection is durable through `C`: where it is not, the next
+    /// projection commit is asked to be durable and the pointer waits
+    /// for it, rather than this thread forcing one.
+    pub fn queue_checkpoint(
+        &mut self,
+        domain: DomainId,
+        pointer: &CheckpointPointerV1,
+    ) -> Result<(), JournaledError> {
+        let profile = self.profile;
+        let state = self
+            .domains
+            .get_mut(&domain)
+            .ok_or(JournaledError::UnknownDomain)?;
+        if state.status != DomainStatus::Ready {
+            return Err(JournaledError::NotReady(state.status));
+        }
+        if state.checkpoint.is_some() {
+            return Err(JournaledError::CheckpointQueued);
+        }
+        if pointer.origin != state.origin {
+            return Err(JournaledError::Quarantined(
+                "a checkpoint pointer of another origin",
+            ));
+        }
+        // `C <= M` is asked now, as `publish_checkpoint` asks it before
+        // writing: `M` only grows, so it still holds when the group is
+        // taken back and the frontier advances.
+        let mut proposed = state.frontiers;
+        proposed
+            .publish_checkpoint(pointer.represented)
+            .map_err(JournaledError::Frontier)?;
+        if matches!(profile, ProjectionProfile::Replay(_))
+            && state.projection_durable < pointer.represented
+        {
+            state.working.requested = true;
+        }
+        state.checkpoint = Some(Queued {
+            pointer: *pointer,
+            behind: state.queue.back().map(|s| s.batch.barrier),
+            since: Instant::now(),
+            stage: QueuedStage::Waiting,
+        });
+        Ok(())
+    }
+
+    /// The outcome of the pointer [`JournaledStore::queue_checkpoint`]
+    /// queued for `domain`, once the group that carried it is taken back
+    /// (task-d66); `None` while it waits for a group or is out, or when
+    /// none is queued.
+    ///
+    /// A domain quarantined before a group carried its pointer never
+    /// will carry it, and that is its outcome. Any other status a domain
+    /// leaves `Ready` for is reconciled, and the pointer waits.
+    pub fn take_published(
+        &mut self,
+        domain: DomainId,
+    ) -> Option<Result<Published, JournaledError>> {
+        let state = self.domains.get_mut(&domain)?;
+        match state.checkpoint.as_ref()?.stage {
+            QueuedStage::Done(_) => {}
+            QueuedStage::Waiting if state.status == DomainStatus::Quarantined => {
+                state.checkpoint = None;
+                return Some(Err(JournaledError::NotReady(state.status)));
+            }
+            QueuedStage::Waiting | QueuedStage::Sealed => return None,
+        }
+        match state.checkpoint.take()?.stage {
+            QueuedStage::Done(outcome) => Some(*outcome),
+            QueuedStage::Waiting | QueuedStage::Sealed => unreachable!("matched above"),
+        }
+    }
+
+    /// Whether `domain` has a checkpoint pointer queued whose outcome
+    /// has not been taken (task-d66).
+    pub fn checkpoint_queued(&self, domain: DomainId) -> bool {
+        self.domains
+            .get(&domain)
+            .is_some_and(|d| d.checkpoint.is_some())
     }
 
     /// Whether `engine`, the projection a boot found, continues `domain`'s
@@ -1748,9 +2014,14 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
             .map(|d| GatedReader::new(d.reader.clone(), d.gate.clone()))
     }
 
-    /// Queued transitions of a domain.
+    /// Queued transitions of a domain, and its checkpoint pointer when
+    /// nothing else is queued and the next group may carry it
+    /// (task-d66): what a lowering would journal.
     pub fn queued(&self, domain: DomainId) -> usize {
-        self.domains.get(&domain).map_or(0, |d| d.queue.len())
+        self.domains.get(&domain).map_or(0, |d| {
+            d.queue.len()
+                + usize::from(d.queue.is_empty() && d.sealable_checkpoint(self.profile).is_some())
+        })
     }
 
     /// Queued bytes of a domain (the backpressure accounting).
@@ -1965,11 +2236,11 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
     /// [`JournaledStore::append_pending`] into `report`, uncharged.
     fn append_pending_into(&mut self, report: &mut FlushReport) -> Result<(), JournaledError> {
         self.await_append_into(report)?;
-        let Some((group, sealed)) = self.seal_group()? else {
+        let Some((group, sealed, retires)) = self.seal_group()? else {
             return Ok(());
         };
-        let result = self.journal.as_mut().expect(HELD).append_group(&group);
-        report.absorb(self.complete_group(sealed, result)?);
+        let written = write_group(self.journal.as_mut().expect(HELD), &group, &retires);
+        report.absorb(self.complete_group(sealed, written)?);
         Ok(())
     }
 
@@ -1988,10 +2259,22 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
     /// group, reserve each stream's entry and take the transitions out of
     /// the queue; `None` when nothing is ready. The group is not written:
     /// [`JournaledStore::complete_group`] takes its outcome.
-    fn seal_group(&mut self) -> Result<Option<(GroupWrite, Vec<Sealed>)>, JournaledError> {
+    ///
+    /// A domain's queued checkpoint pointer (task-d66) goes in its entry
+    /// right after the transitions queued before it, ahead of any queued
+    /// since, or alone when nothing is queued; the retirement each one
+    /// owes is returned with the group, to run after its append.
+    fn seal_group(&mut self) -> Result<Option<Sealing>, JournaledError> {
         let mut group = GroupWrite::new(self.limits.group);
         let mut sealed: Vec<Sealed> = Vec::new();
+        let mut retires: Vec<Retire> = Vec::new();
         let mut full = false;
+        let profile = self.profile;
+        let checkpoint_barrier = BarrierId {
+            node_generation: self.incarnation,
+            boot_id: self.boot,
+            sequence: CHECKPOINT_SEQUENCE,
+        };
         for (id, state) in &mut self.domains {
             if full {
                 break;
@@ -1999,16 +2282,87 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
             if state.status != DomainStatus::Ready || state.head.state() != HeadState::Idle {
                 continue;
             }
+            let pointer = state.sealable_checkpoint(profile);
             let Some(first) = state.queue.front() else {
+                // Only the pointer: an entry of its own, under the
+                // publication's barrier, which a group holds once.
+                let Some(pointer) = pointer else {
+                    continue;
+                };
+                if sealed.iter().any(|(_, b, _)| *b == checkpoint_barrier) {
+                    continue;
+                }
+                let record =
+                    seal_pointer(state, &pointer, state.head.next_seq()?, state.head_digest)?;
+                let limits = group.limits();
+                if group.record_count() + 1 > limits.max_records
+                    || group.bytes().saturating_add(record.encoded_len()?) > limits.max_bytes
+                {
+                    break;
+                }
+                group.push(GroupEntry::new(
+                    checkpoint_barrier,
+                    state.origin.stream,
+                    alloc_one(record.clone()),
+                )?)?;
+                state
+                    .head
+                    .reserve(checkpoint_barrier, NonZeroU32::new(1).expect("non-zero"))?;
+                state.seal_checkpoint();
+                retires.push((state.origin.stream, pointer));
+                sealed.push((
+                    *id,
+                    checkpoint_barrier,
+                    vec![Durable {
+                        barrier: None,
+                        record,
+                    }],
+                ));
                 continue;
             };
             let entry_barrier = first.batch.barrier;
+            // A machine's barrier may share the publication's sequence;
+            // the entry waits for the next group rather than the group
+            // holding it twice.
+            if sealed.iter().any(|(_, b, _)| *b == entry_barrier) {
+                break;
+            }
             let limits = group.limits();
             let mut seq = state.head.next_seq()?;
             let mut predecessor = state.head_digest;
             let mut records: Vec<Durable> = Vec::new();
             let mut bytes = 0usize;
+            // The pointer goes right after the transitions queued before
+            // it, ahead of any queued since: behind them all, a domain
+            // whose queue filled every group never carried it (review of
+            // #164).
+            let ahead = state.checkpoint_ahead();
+            let pointer_first = ahead == 0 && pointer.is_some();
+            let mut pointer = pointer;
+            let mut carried = None;
+            let mut dequeued = 0usize;
             for submission in &state.queue {
+                if dequeued == ahead
+                    && let Some(p) = pointer.take()
+                {
+                    let record = seal_pointer(state, &p, seq, predecessor)?;
+                    let len = record.encoded_len()?;
+                    if group.record_count() + records.len() + 1 > limits.max_records
+                        || group.bytes().saturating_add(bytes).saturating_add(len)
+                            > limits.max_bytes
+                    {
+                        full = true;
+                        break;
+                    }
+                    bytes += len;
+                    seq = record.seq().checked_next().map_err(HeadError::from)?;
+                    predecessor = record.digest();
+                    records.push(Durable {
+                        barrier: None,
+                        record,
+                    });
+                    carried = Some(p);
+                }
                 let record = seal(state, submission, seq, predecessor)?;
                 let len = record.encoded_len()?;
                 if group.record_count() + records.len() + 1 > limits.max_records
@@ -2024,9 +2378,12 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                     barrier: Some(submission.batch.barrier),
                     record,
                 });
+                dequeued += 1;
             }
             if records.is_empty() {
-                if !sealed.is_empty() {
+                // A pointer that goes first and did not fit waits for the
+                // next group, and so does everything queued after it.
+                if !sealed.is_empty() || pointer_first {
                     // The group is full; this stream goes in the next one.
                     break;
                 }
@@ -2054,6 +2411,37 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                 ));
                 break;
             }
+            // The pointer, behind everything queued, when all of that
+            // was queued before it and fits, and the pointer does as well.
+            if !full
+                && dequeued == ahead
+                && let Some(pointer) = pointer
+            {
+                let record = seal_pointer(state, &pointer, seq, predecessor)?;
+                let len = record.encoded_len()?;
+                if group.record_count() + records.len() + 1 > limits.max_records
+                    || group.bytes().saturating_add(bytes).saturating_add(len) > limits.max_bytes
+                {
+                    full = true;
+                } else {
+                    records.push(Durable {
+                        barrier: None,
+                        record,
+                    });
+                    carried = Some(pointer);
+                }
+            }
+            // Only the pointer fitted: an entry of its own, as when nothing
+            // is queued, under the publication's barrier, which a group
+            // holds once.
+            let entry_barrier = if dequeued == 0 {
+                if sealed.iter().any(|(_, b, _)| *b == checkpoint_barrier) {
+                    break;
+                }
+                checkpoint_barrier
+            } else {
+                entry_barrier
+            };
             group.push(GroupEntry::new(
                 entry_barrier,
                 state.origin.stream,
@@ -2065,15 +2453,19 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                 entry_barrier,
                 NonZeroU32::new(count).expect("an entry has records"),
             )?;
-            for _ in 0..records.len() {
+            for _ in 0..dequeued {
                 state.dequeue();
+            }
+            if let Some(pointer) = carried {
+                state.seal_checkpoint();
+                retires.push((state.origin.stream, pointer));
             }
             sealed.push((*id, entry_barrier, records));
         }
         if sealed.is_empty() {
             return Ok(None);
         }
-        Ok(Some((group, sealed)))
+        Ok(Some((group, sealed, retires)))
     }
 
     /// Complete, fail or leave uncertain each sealed entry of a group by
@@ -2081,12 +2473,17 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
     fn complete_group(
         &mut self,
         sealed: Vec<Sealed>,
-        result: Result<GroupReceipt, JournalFailure>,
+        written: GroupWritten,
     ) -> Result<FlushReport, JournaledError> {
         let mut report = FlushReport {
             appends: 1,
             ..FlushReport::default()
         };
+        let GroupWritten {
+            result,
+            appended,
+            retired,
+        } = written;
         match result {
             Ok(receipt) => {
                 report.written = Some(receipt.written);
@@ -2107,16 +2504,45 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                         }
                         state.pending.push(item);
                     }
+                    // The pointer this entry carried is durable, and its
+                    // retirement ran after it (task-d66): the frontier
+                    // advances only now, as on the calling thread.
+                    if let Some(queued) = state.checkpoint.as_mut()
+                        && matches!(queued.stage, QueuedStage::Sealed)
+                    {
+                        let represented = queued.pointer.represented;
+                        let stream = state.origin.stream;
+                        let retire = retired.iter().find(|r| r.stream == stream);
+                        let phases = PublishPhases {
+                            append: appended,
+                            retire: retire.map_or(Duration::ZERO, |r| r.took),
+                            queued: queued.since.elapsed(),
+                            ..PublishPhases::default()
+                        };
+                        let outcome = state
+                            .frontiers
+                            .publish_checkpoint(represented)
+                            .map_err(JournaledError::Frontier)
+                            .map(|()| Published {
+                                published: represented,
+                                retired: retire.is_some_and(|r| r.retired),
+                                phases,
+                            });
+                        queued.stage = QueuedStage::Done(Box::new(outcome));
+                    }
                 }
                 Ok(report)
             }
-            Err(JournalFailure::Definite(_)) => {
+            Err(failure @ JournalFailure::Definite(_)) => {
                 // Specific evidence that nothing was appended: the whole
                 // group's reservations are released and every affected
                 // domain replans from its journaled frontier.
                 for (id, entry_barrier, records) in sealed {
                     let state = self.domains.get_mut(&id).expect("sealed domain attached");
                     state.head.fail_definite(entry_barrier)?;
+                    // Nothing was written: the image is simply unselected
+                    // and the prior publication stands.
+                    state.fail_checkpoint(&failure);
                     for item in records {
                         if let Some(barrier) = item.barrier {
                             report.rejected += 1;
@@ -2132,7 +2558,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                 }
                 Ok(report)
             }
-            Err(JournalFailure::Indeterminate(_)) => {
+            Err(failure @ JournalFailure::Indeterminate(_)) => {
                 // The outcome is unknown. No event claims a completion and
                 // no byte batch is retried: each affected stream refuses
                 // reservations until `reconcile` reads its actual durable
@@ -2141,6 +2567,10 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                 for (id, entry_barrier, records) in sealed {
                     let state = self.domains.get_mut(&id).expect("sealed domain attached");
                     state.head.fail_indeterminate(entry_barrier)?;
+                    // Neither the pointer nor the retirement may be
+                    // assumed; the caller publishes again if it still
+                    // wants to, once the stream is reconciled.
+                    state.fail_checkpoint(&failure);
                     state.inflight = records;
                     state.status = DomainStatus::JournalUncertain;
                 }
@@ -2330,7 +2760,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                 return Err(e);
             }
         };
-        let Some((group, sealed)) = sealed else {
+        let Some((group, sealed, retires)) = sealed else {
             return Ok(report);
         };
         let journal = self.journal.take().expect(HELD);
@@ -2339,7 +2769,11 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
         self.appender
             .as_mut()
             .expect("checked by the caller")
-            .submit(AppendJob { journal, group });
+            .submit(AppendJob {
+                journal,
+                group,
+                retires,
+            });
         Ok(report)
     }
 
@@ -2347,11 +2781,11 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
     /// taken: each entry of the group completed, failed or left uncertain
     /// exactly as an append on this thread would leave it.
     fn take_append(&mut self, done: AppendDone<J>) -> Result<FlushReport, JournaledError> {
-        let AppendDone { journal, result } = done;
+        let AppendDone { journal, written } = done;
         self.syncs = journal.syncs();
         self.journal = Some(journal);
         let sealed = self.appending.take().expect("an append taken back was out");
-        self.complete_group(sealed, result)
+        self.complete_group(sealed, written)
     }
 
     /// Wait for the append the appender has out, if any, and take it back
@@ -3239,10 +3673,12 @@ pub trait Appender<J: JournalEngine>: Send {
 }
 
 /// One synced group append lent to an [`Appender`] (task-d54): the shared
-/// journal and the sealed group it writes.
+/// journal and the sealed group it writes, and the retirement each
+/// checkpoint pointer in it owes after it (task-d66).
 pub struct AppendJob<J: JournalEngine> {
     journal: J,
     group: GroupWrite,
+    retires: Vec<Retire>,
 }
 
 impl<J: JournalEngine> AppendJob<J> {
@@ -3251,12 +3687,17 @@ impl<J: JournalEngine> AppendJob<J> {
         self.group.record_count()
     }
 
-    /// Append the group with sync before success, exactly as
-    /// [`JournaledStore::append_pending`] appends it.
+    /// Append the group with sync before success, then retire what each
+    /// checkpoint pointer it carries represents, exactly as
+    /// [`JournaledStore::append_pending`] does both.
     pub fn run(self) -> AppendDone<J> {
-        let AppendJob { mut journal, group } = self;
-        let result = journal.append_group(&group);
-        AppendDone { journal, result }
+        let AppendJob {
+            mut journal,
+            group,
+            retires,
+        } = self;
+        let written = write_group(&mut journal, &group, &retires);
+        AppendDone { journal, written }
     }
 
     /// The journal back, the append never run.
@@ -3268,13 +3709,13 @@ impl<J: JournalEngine> AppendJob<J> {
 /// An [`AppendJob`] that ran: the journal and the append's outcome.
 pub struct AppendDone<J: JournalEngine> {
     journal: J,
-    result: Result<GroupReceipt, JournalFailure>,
+    written: GroupWritten,
 }
 
 impl<J: JournalEngine> AppendDone<J> {
     /// Whether the append succeeded.
     pub fn appended(&self) -> bool {
-        self.result.is_ok()
+        self.written.result.is_ok()
     }
 
     /// The journal back, outcome unseen.

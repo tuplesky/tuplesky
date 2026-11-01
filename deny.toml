@@ -29,6 +29,13 @@ ignore = [
     # created, held or used anywhere in the workspace (the broker signs with
     # ES256 through aws-lc-rs), so there is no private-key timing to observe.
     { id = "RUSTSEC-2023-0071", reason = "rsa is used by openidconnect for public-key verification only; no RSA private keys exist in the workspace" },
+    # crypto-bigint 0.5.5: secret-dependent branches in operations meant to
+    # be constant-time, fixed only in the 0.7 line. It reaches the graph
+    # solely through openidconnect 4.0.1 (the latest), via elliptic-curve
+    # 0.13 for p256 and p384, which coord-login uses to verify upstream ID
+    # token signatures: public values only. No elliptic-curve secret is
+    # created or used through it (the broker signs ES256 with aws-lc-rs).
+    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5 is used by openidconnect's p256/p384 for signature verification only; no secret scalars pass through it" },
 ]
 
 [licenses]
