@@ -10084,6 +10084,90 @@ less the base:
   QUIC's stream limits and a WAN path care about, not for CPU.
 
 
+## The acknowledgement cadence (task-d70)
+
+`lane::transport_config` asked nothing of QUIC's acknowledgement-frequency
+extension, so every connection acknowledged every second ack-eliciting
+packet within 25 ms. With about one data datagram per peer per command an
+acknowledgement often had nothing to ride on and went alone. task-d70 put
+the cadence behind `COORDD_ACK_FREQUENCY` on both planes and counted the
+api plane's datagrams beside the peer plane's, then took three pairs of
+each setting on the Jepsen runner (#98, replay, throughput, 30 clients,
+the call graph on one pair).
+
+| The lever less unset, mean of 3 | `8,2000` | `8,25000` |
+| --- | --- | --- |
+| `ok`/s | −0.6 | +9.6 (+2%) |
+| Read p99 | +3 ms | −1 ms |
+| Voters' CPU per operation | −0.00 ms of 2.47 | −0.15 ms of 3.87 (−4%) |
+| Voters' tokio threads, CPU per operation | +0.03 ms of 1.10 | −0.14 ms of 1.77 (−8%) |
+| Leader's peer send calls per command | −0.14 | −1.03 (−17%) |
+| Leader's peer ACKs received per command | −17% | −68% |
+| Peer datagrams sent per command, all voters | +0.08 | −3.75 (−18%) |
+| Api datagrams received per command, all voters | +2.12 (+7%) | −5.02 (−17%) |
+| `api_acks_received` per command, all voters | +21% | −53% |
+| Leader's streams per command (the control) | +0.06 | +0.14 |
+
+The two columns ran on different CPUs (an Intel Xeon 6973P-C and an AMD
+EPYC 7763); each pair compares one binary with itself on one runner.
+
+- **The delay was the wrong lever.** Every quinn endpoint advertises a
+  `min_ack_delay` of 1 ms, so every connection takes a requested cadence,
+  and a requested delay of `None` keeps the peer's own `max_ack_delay`,
+  25 ms by default. A 2 ms delay is shorter than that: on the leader's
+  busy peer links the threshold bound first and its ACKs fell, but on the
+  api plane's quiet connections an ACK left alone after 2 ms instead of
+  riding the next request or reply within 25.
+- **The threshold is the lever.** At threshold 8 with QUIC's delay the
+  voters sent a sixth fewer datagrams on both planes. On the leader most
+  of the tokio threads' saving was the send system call (298 against
+  345 µs per command, 9.6 against 11.3 calls); futex and `epoll_wait`
+  hardly moved, so ACKs were not what woke the workers.
+- **The api plane's other end is mostly `coordd`.** The voters' collector
+  links carry every command a non-leader frontend takes to the leader,
+  and both ends run the lever; `api_acks_sent` falling by half is a
+  coordd peer asking it.
+- **Lost frames and streams were 0 in every run.** The runs had no
+  faults, so they say nothing of recovery under loss, which is where a
+  later ACK could show: a loss is learned after as many packets more,
+  within the same 25 ms.
+
+The runtime's worker count, `TOKIO_WORKER_THREADS=2` against the default
+four on the same 4-CPU runners, took the voters' tokio threads' CPU per
+operation down 8% and the voters' 3%, `ok`/s and read p99 flat. On the
+leader its tokio threads made 6.2 futex calls per command against 12.4
+and spent 94 µs parking and waking against 136; the sends, the receives
+and the I/O driver's `epoll_wait` did not move. Five voters with four
+workers each on four CPUs had 6.3 cores' worth of runnable tokio threads
+waiting for 1.2 cores of work, so this is the runner's oversubscription.
+The two levers cut different calls (sends against futex).
+
+Kept: threshold 8 with the delay left to the peer is the transport's
+default (`AckFrequency::DEFAULT`), on both planes and for every endpoint
+built from `Limits::default()`; `COORDD_ACK_FREQUENCY=off` asks nothing,
+for a control pair, and `<threshold>` or `<threshold>,<µs>` override it.
+Under faults it held. The runner's fault schedule (kill, pause and
+partition, 300 s, two workers) ran twice with `COORDD_ACK_FREQUENCY` at
+`8,25000`, which is the default's cadence since the peer's own delay is
+25 ms, and twice unset:
+
+| | with it | with it | unset | unset |
+| --- | --- | --- | --- | --- |
+| `:valid?`, final reads, stops | true, 5 of 5, none | true, 5 of 5, none | true, 5 of 5, none | true, 5 of 5, none |
+| republished, whole run / after the final start | 16 / 0 | 0 / 0 | 0 / 0 | 0 / 0 |
+| lost frames | 642 | 2 | 1,278 | 0 |
+| slowest voter back serving after a fault, median / most (s) | 34.0 / 134.0 | 23.3 / 95.1 | 28.0 / 124.5 | 2.2 / 89.9 |
+| `ok`/s until the final heal | 4.9 | 8.4 | 7.5 | 7.4 |
+
+The checks that move (lost frames, republishes, time back serving) move
+as much without the cadence, and the nine earlier fault runs of the
+series, all without it, republished up to 8 times and lost up to 657
+frames on one voter. The spread is the faults' overlap; two runs a side
+cannot show a cadence effect inside it, and nothing points to a later
+loss detection stretching recovery. The worker count is the runner's
+setting from here; the daemon's waits on a reading on a host of its own,
+an open row under task-d66.
+
 ## The leader's re-send past each voter's adoption (task-d59)
 
 The leader's domain loop calls `Leader::resend_unvoted` once every 250 ms.
