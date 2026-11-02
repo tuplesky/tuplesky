@@ -8,7 +8,7 @@
 
 use std::collections::BTreeSet;
 
-use coord_collector::wire::{ReadV1, decode_read_answer, read_frame};
+use coord_collector::wire::{ReadV1, decode_read_answer, decode_release, read_frame};
 use coord_collector::{Collector, CollectorConfig, MonotonicMillis, ReadOutcomeV1, Submitted};
 use coord_consensus::{
     BallotConfiguration, ConfigurationIdentity, Follower, FollowerConfig, Leader, LeaderConfig,
@@ -243,7 +243,11 @@ fn logical(sequence: u64) -> LogicalRequest {
 /// One admitted client request, as the collector's admission gate
 /// hands it to the collector.
 fn admitted(sequence: u64) -> AdmittedRequest {
-    let request = RequestV1::new(retry_key(sequence), &logical(sequence), 0, 0).unwrap();
+    admitted_request(RequestV1::new(retry_key(sequence), &logical(sequence), 0, 0).unwrap())
+}
+
+/// `request`, admitted as the collector's admission gate hands it on.
+fn admitted_request(request: RequestV1) -> AdmittedRequest {
     AdmittedRequest {
         receipt: AdmissionReceipt::submitting(
             VerifierToken::for_boundary(),
@@ -295,7 +299,7 @@ fn read(sequence: u64) -> Frame {
 
 /// A current read of `k1` and `k2` in one transaction, as the Jepsen
 /// client's read of more than one key is (task-d83).
-fn txn_read(sequence: u64) -> Frame {
+fn txn_logical() -> LogicalRequest {
     let range = |key: &[u8]| {
         BranchOp::Range(RangeOp {
             range: KeyRange {
@@ -317,7 +321,12 @@ fn txn_read(sequence: u64) -> Frame {
         }),
     );
     logical.canonicalize();
-    let request = RequestV1::new(retry_key(sequence), &logical, 0, 0).unwrap();
+    logical
+}
+
+/// [`txn_logical`] as a read for the leader's barrier.
+fn txn_read(sequence: u64) -> Frame {
+    let request = RequestV1::new(retry_key(sequence), &txn_logical(), 0, 0).unwrap();
     frame(
         &read_frame(&ReadV1 {
             ballot: ballot(),
@@ -332,6 +341,9 @@ struct Cluster {
     collector: Collector,
     peers: std::collections::VecDeque<(usize, PeerProvenance, Vec<u8>)>,
     sequence: u64,
+    /// The response bytes of every result a voter released to the
+    /// collector, in order: what the ordered path hands the client.
+    released: Vec<Vec<u8>>,
 }
 
 impl Cluster {
@@ -346,10 +358,16 @@ impl Cluster {
             }),
             peers: std::collections::VecDeque::new(),
             sequence: 0,
+            released: Vec::new(),
         }
     }
 
     fn carry(&mut self, from: usize, out: Outbound) {
+        for bytes in &out.frontend {
+            if let Ok(release) = decode_release(&frame(bytes)) {
+                self.released.push(release.response().to_vec());
+            }
+        }
         for (to, frame) in out.peer {
             let prov = self.voters[from].provenance();
             self.peers
@@ -360,9 +378,14 @@ impl Cluster {
     /// One put, submitted to every voter.
     fn submit(&mut self) {
         self.sequence += 1;
+        self.submit_admitted(&admitted(self.sequence));
+    }
+
+    /// `request` as an ordered command, submitted to every voter.
+    fn submit_admitted(&mut self, request: &AdmittedRequest) {
         let Submitted::FanOut(fan_out) = self
             .collector
-            .submit(MonotonicMillis::ZERO, &admitted(self.sequence))
+            .submit(MonotonicMillis::ZERO, request)
             .expect("submitted")
         else {
             panic!("not new work")
@@ -474,6 +497,7 @@ fn a_read_only_transaction_is_served_at_the_barrier() {
     let [(_, bytes)] = &out.reads[..] else {
         panic!("one answer: {:?}", out.reads.len());
     };
+    let answer_bytes = bytes.clone();
     let answer = decode_read_answer(&frame(bytes)).expect("a read answer");
     let ReadOutcomeV1::Served { response } = answer.outcome else {
         panic!("{answer:?}");
@@ -493,4 +517,28 @@ fn a_read_only_transaction_is_served_at_the_barrier() {
         })
         .collect();
     assert_eq!(keys, vec![vec![b"k1".to_vec()], Vec::new()]);
+
+    // The same transaction as an ordered command, with nothing in
+    // between, is answered with the same bytes: revision, each branch's
+    // items, count and `more` (review, task-d83's acceptance).
+    let served = response_bytes(&answer_bytes);
+    let before = cluster.released.len();
+    let request = RequestV1::new(retry_key(3), &txn_logical(), 0, 0).unwrap();
+    cluster.submit_admitted(&admitted_request(request));
+    cluster.settle();
+    let ordered = &cluster.released[before..];
+    assert_eq!(ordered.len(), 1, "one release for the ordered transaction");
+    assert_eq!(
+        ordered[0], served,
+        "the barrier's bytes are the ordered path's"
+    );
+}
+
+/// The `Response` bytes a served read answer carries.
+fn response_bytes(answer: &[u8]) -> Vec<u8> {
+    let answer = decode_read_answer(&frame(answer)).expect("a read answer");
+    let ReadOutcomeV1::Served { response } = answer.outcome else {
+        panic!("{answer:?}");
+    };
+    response
 }
