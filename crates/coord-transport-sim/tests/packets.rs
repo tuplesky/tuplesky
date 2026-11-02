@@ -166,7 +166,8 @@ fn loss_reorder_duplication_and_mtu_schedules_reproduce_and_keep_the_visible_out
             duplicate_ppm: 200_000,
             ..LinkFaults::default()
         },
-        // Loss enough to drop some of a dozen datagrams: at 5% the check
+        // Loss enough to drop some of a dozen datagrams (about a dozen at
+        // the default acknowledgement cadence, task-d70): at 5% the check
         // below that the schedule lost any turned on one datagram, and
         // quinn-proto 0.11.18 sends one fewer here than 0.11.17 did.
         LinkFaults {
