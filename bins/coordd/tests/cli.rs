@@ -6482,10 +6482,15 @@ async fn the_survivors_of_a_stopped_leader_elect_another_and_it_follows_when_it_
     let stopped = std::time::Instant::now();
     let elected = |said: &str| said.contains("this voter leads ballot 1");
     let followed = |said: &str| said.contains("this voter follows ballot 1");
+    let settled = running[0].waits_until(90, |said| elected(said) || followed(said))
+        && running[1].waits_until(30, |said| elected(said) || followed(said));
+    // Taken once both have settled on ballot 1. The check of which one
+    // leads used to wait 30 s on the first survivor even when the other
+    // led, and that wait was counted here (task-d81's CI, 36 s). Settled,
+    // the leader has said so already, so the first is only looked at.
+    let took = stopped.elapsed();
     assert!(
-        running[0].waits_until(90, |said| elected(said) || followed(said))
-            && running[1].waits_until(30, |said| elected(said) || followed(said))
-            && (running[0].waits_until(30, elected) || running[1].waits_until(1, elected)),
+        settled && (elected(&running[0].said()) || running[1].waits_until(30, elected)),
         "the survivors did not elect a leader:\n-- 2 --\n{}\n-- 3 --\n{}",
         running[0].said(),
         running[1].said()
@@ -6493,9 +6498,10 @@ async fn the_survivors_of_a_stopped_leader_elect_another_and_it_follows_when_it_
     // Within seconds of the kill, not the 30 s a dead process's links
     // took to close before the peer plane's idle timeout (task-d82).
     assert!(
-        stopped.elapsed() < Duration::from_secs(20),
-        "the survivors elected a leader {:?} after the kill",
-        stopped.elapsed()
+        took < Duration::from_secs(20),
+        "the survivors elected a leader {took:?} after the kill:\n-- 2 --\n{}\n-- 3 --\n{}",
+        running[0].said(),
+        running[1].said()
     );
     let leaders = running.iter().filter(|n| elected(&n.said())).count();
     assert_eq!(
