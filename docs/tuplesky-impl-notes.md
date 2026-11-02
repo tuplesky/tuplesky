@@ -10715,8 +10715,41 @@ command's payload, and one application outcome. Syncs that are no group
     to 2.9 ms a command at the leader at 1 caller on the disk. That is
     more than its journal's 1.9 to 2.1 ms.
 
+**At `replay`** (review of #179). The same script, with
+`COORD_HARNESS_JOURNAL_PROFILE=replay`, on the disk and on tmpfs:
+- **The same groups and the same syncs a command.** The leader's are
+  2.90 to 2.91 at 1 caller and 1.04 to 1.10 at 10. The three groups
+  in series at the leader are unchanged.
+- **Each journal sync is faster on the disk.** It is served in 0.48 to
+  0.53 ms at 1 caller and 0.66 to 0.74 ms at 10, against `strict`'s
+  0.66 to 0.71 and about 1.06. A quarter to a third of a journal sync's
+  time under `strict` is the projection's durable commits sharing the
+  disk.
+- **The materializer's commits** take 0.58 to 0.61 ms a command at the
+  leader at 1 caller, against 2.8 to 2.9 ms. There are as many commits,
+  but they are working ones.
+- **The wait from learned to released in the journal** is 0.76 to
+  0.95 ms at 1 caller and 1.29 to 1.44 ms at 10, against 1.13 to 1.22
+  and 1.84 to 1.96.
+- **The `put` service time on the disk:**
+
+  | Callers | Profile | p50 (ms) | p99 (ms) |
+  | --- | --- | --- | --- |
+  | 1 | `replay` | 2.15 to 2.35 | 8.5 to 13.8 |
+  | 1 | `strict` | 3.17 to 3.24 | 7.4 to 14.6 |
+  | 10 | `replay` | 6.5 to 7.1 | 21.0 to 23.8 |
+  | 10 | `strict` | 9.0 to 9.6 | 25.4 to 29.3 |
+
+  On tmpfs `replay`'s p50 is 1.33 to 1.56 ms at 1 caller and 4.2 to
+  4.5 at 10.
+
 **For task-d84.** Merging a turn's groups is not built. The writes that
 take separate syncs at low load are the ones that wait on each other's
 durability, and at load they already share. Neither reaches task-d72's
-`service` p99. What is left on the path is in series, and two levers
-are named for a design step, in the plan's entry.
+`service` p99. What is left on the path is in series. The plan's entry
+names three levers for a design step, in the order review of #179 set.
+The first is a fresh proposal's ACCEPT row in its proposal batch, which
+takes the leader's second sync off the path at low load. The second is
+a result released at a quorum decision. The third, the leader's ACCEPT
+row deferred until the fast path fails, comes only if the fast share
+proves high.
