@@ -648,7 +648,7 @@ Lease administration, reads and policy/session updates advance execution without
 
 A complete current read is served by the leader read barrier, or as an ordered command. The ordered command stays available, and it is the fallback for every case the barrier does not serve. Local leader belief, heartbeat success and application leases are not current-read authority. A confirmation round started after the read arrived is (task-d50). The later ReadFence path in Section 6.9 establishes a request-bound execution point for an observer, and checks applied state and authorization.
 
-The leader read barrier serves a Range without an explicit revision:
+The leader read barrier serves a Range without an explicit revision, and a transaction with no compares and no failure branch whose every branch is such a Range (task-d83). Such a transaction reads its keys and decides nothing; the ordered path would execute its success branch over one state and record no write. Anything else in a transaction, a compare, a failure branch, a write or a historical Range, stays ordered:
 
 1. **Routing.** The frontend sends the read to the leader of the ballot it follows (`ReadV1`, below). A frontend that follows no voter's ballot sends it as an ordered command.
 2. **Read index.** When the read arrives, the leader records its read index: the next sequence number of its ballot. A leader that has proposed nothing in its ballot, or is not leading, refuses.
@@ -664,7 +664,7 @@ Why the barrier is linearizable. Let W be a command whose response completed bef
 - **W was learned in an earlier ballot.** The dependency chain is total (task-d06), and recovery puts every command learned earlier ahead of the ballot's first proposal. A read index above zero makes R wait for at least one proposal of b, and so for W.
 - **W was learned in a higher ballot b'.** A quorum promised b' before W completed, so before R arrived. R's round started after that, and its quorum intersects that one in a voter whose promise is already b', which never answers yes for b.
 
-R reads only executed, and so learned, state. A command concurrent with R may or may not be in it, as in any linearizable read. This is the argument Section 6.9.1 asked of a ReadIndex adaptation. Its evidence is task-d50's: a linearizability check of a register history under faults, and the Jepsen client's.
+R reads only executed, and so learned, state. A command concurrent with R may or may not be in it, as in any linearizable read. A read-only transaction is one R over many keys: every branch is planned over the same snapshot at the same execution point, so the argument, which is about the point R reads at, holds for it as for one Range. This is the argument Section 6.9.1 asked of a ReadIndex adaptation. Its evidence is task-d50's: a linearizability check of a register history under faults, and the Jepsen client's.
 
 Historical pages hold one logical revision across pages. A future revision is a defined error or bounded wait; missing compacted history returns Compacted. Pagination does not pin a physical snapshot forever. A weaker stale-data read must be explicit and still requires fresh authorization under the strict profile. Stale data never authorizes stale policy decisions.
 

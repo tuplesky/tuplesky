@@ -656,8 +656,10 @@ pub struct Release {
     pub predecessors: Duration,
     /// From applied to its execution group closing.
     pub group: Duration,
-    /// From the group closing to the release: the projection committing.
-    pub projection: Duration,
+    /// From the group closing to the release: the group's journal sync,
+    /// which releases it since task-d63 (`projection` before task-d83,
+    /// named for the commit it timed before then).
+    pub journal: Duration,
 }
 
 /// The domain loop's blocking takes from its pipeline threads (task-d54).

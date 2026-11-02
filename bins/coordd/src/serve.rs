@@ -4911,7 +4911,7 @@ fn release(split: &coord_daemon::learned::ReleaseSplit) -> coord_daemon::metrics
         commands: split.commands,
         predecessors: split.predecessors,
         group: split.group,
-        projection: split.projection,
+        journal: split.journal,
     }
 }
 

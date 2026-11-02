@@ -147,7 +147,7 @@ class ReduceTests(unittest.TestCase):
         observed["unordered"] = {"pending": 1, "reordered": 1, "oldest": duration(30)}
         observed["release"] = {
             "commands": 20, "predecessors": duration(0.04), "group": duration(0.02),
-            "projection": duration(0.1),
+            "journal": duration(0.1),
         }
         reading = cost.per_command("n1", snap)
         paths = reading["fast_path"]
@@ -156,7 +156,11 @@ class ReduceTests(unittest.TestCase):
         self.assertEqual((paths["acks"], paths["acks_reordered"]), (26, 19))
         self.assertEqual(reading["unordered"]["oldest_seconds"], 30)
         self.assertAlmostEqual(reading["release"]["predecessors_ms"], 2.0)
-        self.assertAlmostEqual(reading["release"]["projection_ms"], 5.0)
+        self.assertAlmostEqual(reading["release"]["journal_ms"], 5.0)
+        # A binary of before task-d83 names the journal wait `projection`.
+        observed["release"]["projection"] = observed["release"].pop("journal")
+        self.assertAlmostEqual(
+            cost.per_command("n1", snap)["release"]["journal_ms"], 5.0)
         observed["fast_path"]["missed_path"] = 14
         self.assertFalse(cost.per_command("n1", snap)["fast_path"]["reasons_sum"])
         self.assertNotIn("release", cost.per_command("n1", snapshot()))

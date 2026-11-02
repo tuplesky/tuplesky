@@ -252,19 +252,22 @@ def paths_of(cost: dict) -> dict:
 def release_of(cost: dict) -> dict:
     """The leader's mean milliseconds per command from learned to
     released (task-d62): waiting for predecessors to execute, for the
-    group to close, and for the projection to commit it. Empty for a
-    binary older than the reading, or a voter that timed none."""
+    group to close, and for the group's journal sync (task-d63; named
+    `projection` before task-d83, which a binary of before then still
+    reports). Empty for a binary older than the reading, or a voter that
+    timed none."""
     release = cost.get("release")
     if not isinstance(release, dict) or release["commands"] == 0:
         return {}
     commands = release["commands"]
     per = lambda field: seconds(release[field]) * 1000 / commands
+    journal = "journal" if "journal" in release else "projection"
     return {
         "release": {
             "commands": commands,
             "predecessors_ms": per("predecessors"),
             "group_ms": per("group"),
-            "projection_ms": per("projection"),
+            "journal_ms": per(journal),
         }
     }
 
@@ -491,7 +494,7 @@ def paths_table(result: dict) -> str:
     lines = [
         "| callers | node | fast share | missed path/deps/missing/slow first/other "
         "| acks (reordered) | unordered (reordered, oldest s) "
-        "| learned to released ms: predecessors/group/projection "
+        "| learned to released ms: predecessors/group/journal "
         "| read ms: confirm/after confirm/after index | reads/round | behind/read "
         "| peer frames/cmd sent/received (streams sent/received) "
         "| peer datagrams/cmd sent/received (send calls, ACKs sent) "
@@ -515,7 +518,7 @@ def paths_table(result: dict) -> str:
                 f"{held['pending']} ({held['reordered']}, {held['oldest_seconds']:.0f})")
             release = v.get("release")
             release = dash if release is None else "/".join(
-                f"{release[f]:.2f}" for f in ("predecessors_ms", "group_ms", "projection_ms"))
+                f"{release[f]:.2f}" for f in ("predecessors_ms", "group_ms", "journal_ms"))
             reads = v.get("reads")
             waits = dash if reads is None else "/".join(
                 f"{reads[f]:.2f}" for f in
