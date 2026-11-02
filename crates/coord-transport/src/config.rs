@@ -113,6 +113,33 @@ impl Default for Limits {
     }
 }
 
+impl Limits {
+    /// The limits a domain node's endpoints run under, on both planes
+    /// (task-d82).
+    ///
+    /// A killed process closes nothing, so a link to it ends only at the
+    /// idle timeout, and what the link decides waits that long:
+    /// - **The peer plane:** a follower counts itself led while it holds a
+    ///   link to the leader it promised. And a voter restarted under its
+    ///   incarnation is locked out until then, since its peers keep their
+    ///   own connections to the dead process and those win the lane.
+    /// - **The api plane:** a frontend's submission link to a voter is an
+    ///   api connection, and a submission it sends on one to a dead voter
+    ///   waits out the timeout before the link is dialled again.
+    ///
+    /// So a node runs seconds, with a keep-alive that four losses in a row
+    /// do not close. QUIC takes the smaller of the two ends' idle
+    /// timeouts, so a link to a peer of an older build, or a caller on
+    /// the defaults, runs at this one's.
+    pub fn node() -> Self {
+        Limits {
+            idle_timeout: Duration::from_secs(5),
+            keep_alive: Duration::from_secs(1),
+            ..Limits::default()
+        }
+    }
+}
+
 /// A certificate chain and key presented in one direction.
 ///
 /// Separate from [`LocalIdentity`] because a process may be more than

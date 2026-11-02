@@ -3082,3 +3082,133 @@ async fn a_batch_that_cannot_be_sent_is_lost_whole_and_counted_so() {
     );
     assert_eq!(b.peer_traffic().received_frames, 4);
 }
+
+/// A UDP relay a test can black-hole: what a killed process looks like
+/// to its peers, which hear nothing from it again, not even a close.
+struct Relay {
+    addr: std::net::SocketAddr,
+    open: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Relay {
+    /// Packets to `addr` go to `to`, and its answers back to whoever sent
+    /// the last packet, until [`Relay::cut`].
+    async fn to(to: std::net::SocketAddr) -> Relay {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let front = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let back = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        back.connect(to).await.unwrap();
+        let addr = front.local_addr().unwrap();
+        let open = Arc::new(AtomicBool::new(true));
+        let client = Arc::new(std::sync::Mutex::new(None));
+        {
+            let (front, back, open, client) =
+                (front.clone(), back.clone(), open.clone(), client.clone());
+            tokio::spawn(async move {
+                let mut buf = vec![0; 65536];
+                while let Ok((n, from)) = front.recv_from(&mut buf).await {
+                    *client.lock().unwrap() = Some(from);
+                    if open.load(Ordering::SeqCst) {
+                        let _ = back.send(&buf[..n]).await;
+                    }
+                }
+            });
+        }
+        {
+            let open = open.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0; 65536];
+                while let Ok(n) = back.recv(&mut buf).await {
+                    let to = *client.lock().unwrap();
+                    if let Some(to) = to
+                        && open.load(Ordering::SeqCst)
+                    {
+                        let _ = front.send_to(&buf[..n], to).await;
+                    }
+                }
+            });
+        }
+        Relay { addr, open }
+    }
+
+    /// Nothing passes from here on, either way.
+    fn cut(&self) {
+        self.open.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// A voter killed and started again under the same incarnation has its
+/// link back within the peer plane's idle timeout, not the transport's
+/// default (task-d82).
+///
+/// Its peer keeps the connection it dialled to the dead process until
+/// that connection's idle timeout, and the lane rule keeps the one whose
+/// dialler has the lower identity, so the restarted voter's dials lose to
+/// it until then. On the Jepsen runner a leader back within the default
+/// 30 s was locked out that long while its peers promised its ballots.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_voter_restarted_under_its_incarnation_is_linked_again_within_the_peer_idle_timeout() {
+    let limits = || Limits {
+        handshake_timeout: Duration::from_secs(3),
+        frame_timeout: Duration::from_secs(3),
+        ..Limits::node()
+    };
+    let f = fixture(&[PeerRole::Voter, PeerRole::Voter]);
+    let mut a = bind_with(&f, 0, limits());
+    let b = bind_with(&f, 1, limits());
+    // r0 dials r1, as the lower identity's connection is the one a pair
+    // keeps.
+    let relay = Relay::to(b.local_addr().unwrap()).await;
+    a.connect(
+        relay.addr,
+        &f.ids[1].name,
+        PeerRole::Voter,
+        Some(inc(1)),
+        Lane::Control,
+        f.ids[1].expected(),
+    )
+    .await
+    .unwrap();
+    assert!(a.linked(r(1), inc(1), Lane::Control));
+
+    // Killed: nothing more reaches r0 from it.
+    relay.cut();
+    drop(b);
+    let killed = std::time::Instant::now();
+
+    // Started again on another socket, under the same identity, it dials
+    // r0 as coordd's re-dial does (task-d03) until a frame from r0 reaches
+    // it.
+    let mut b = bind_with(&f, 1, limits());
+    let bound = Duration::from_secs(8);
+    let mut reached = false;
+    while killed.elapsed() < bound && !reached {
+        let _ = b
+            .connect(
+                a.local_addr().unwrap(),
+                &f.ids[0].name,
+                PeerRole::Voter,
+                Some(inc(1)),
+                Lane::Control,
+                f.ids[0].expected(),
+            )
+            .await;
+        let _ = a.send(
+            dest(1, Lane::Control),
+            DOMAIN,
+            evidence_frame(b"r0").unwrap(),
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        while let Ok(Some(event)) = tokio::time::timeout_at(deadline, b.next_event()).await {
+            if matches!(event, TransportEvent::PeerFrame { ref payload, .. } if payload == b"r0") {
+                reached = true;
+                break;
+            }
+        }
+        while let Ok(Some(_)) = timeout(Duration::from_millis(1), a.next_event()).await {}
+    }
+    assert!(
+        reached,
+        "r1 restarted was not linked to r0 within {bound:?} of its kill"
+    );
+}
