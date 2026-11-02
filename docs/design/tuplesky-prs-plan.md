@@ -1879,6 +1879,11 @@ Count only adoption acknowledgements toward the slow majority, leaving the fast 
 
 **Throughput (#98, the #173 carry):** the `service` row lost 17% of its rate over 300 s, and the register runs about 10% over 120 s, in base and head alike. A 900 s `service` run with CPU a command and the appender's and materializer's service time per 30 s reads whether cost a command rises with executed history: the executed-history set, the ordinals and the rows Section 13.1 leaves to this task. If it does, this trim is a throughput item as well as a disk one, and moves ahead of task-d84.
 
+**R2, read locally (#174 review; [notes](../tuplesky-impl-notes.md#cost-a-command-over-executed-history-r2-for-task-d27)).** Three voters on one host, `replay`, stores on tmpfs, 750,000 operations at 10 callers, about 304,000 commands executed in 400 s. Each voter's CPU a command per 30 s window:
+- **The domain loop does not grow with history.** At the leader it is 0.48 to 0.53 ms a command in every full window, first to last, and at the followers 0.39 to 0.44.
+- **The process does, and what grows is the local checkpoint publication.** Each publication's export and write rise roughly in proportion to the journal position it represents: 1.0 to 1.3 s and 0.2 to 0.3 s at 73,000 records, 9.3 to 11.0 s and 6.5 to 8.0 s at 790,000. The voters' CPU a command rose 10 to 14% between the first full window and the last, with heavier windows around the publications. The rate held: 24,800 commands in the first window and 24,000 in the last full one.
+- **So the trim is a throughput lever through the publication,** if the exported state grows by the rows this task trims (the payload, executed, dependency and proposal rows) and not by the application's keys. That split, rows exported by kind at two positions, is this task's first reading. Its size on a run's average depends on the run's length and the publication cadence, so it is in the batch (task-d72) with that reading first.
+
 <a id="task-d28"></a>
 ### task-d28: Let a recovery report survive a lost page
 
@@ -2908,7 +2913,7 @@ This entry is the budget and the record, not a lever:
     | C7 | Held reads share one confirmation round | task-d87 | Planned, its reading first | −0.02 to −0.04 | 2.51 to 2.96 |
     | C8 | `load_authorization` once a session | task-d60's third step | Scheduled | about −0.02 | 2.49 to 2.94 |
     | C9 | The api plane's datagrams | task-d88 | Planned, reading R3 first | unknown | |
-    | C10 | The trim, if cost grows with history | task-d27 | Reading R2 | up to −0.18 on a run's average | 2.31 to 2.94 |
+    | C10 | The trim, through the checkpoint publication's growth with history | task-d27 | R2 read: the loop is flat and the publication grows; the rows it exports by kind first | up to −0.18 on a run's average | 2.31 to 2.94 |
 
   - **Projected:** 0.64 to 1.27 ms before overlap. C1, C2 and C3 all cut datagrams, and C3 and C4 both cut commits, so after overlap about 0.6 to 1.1, which puts the row at roughly 2.5 to 3.0 ms before C9. The target needs the middle of that range: nearly every lever, C3, C4 and C10 among them, and their readings are local.
   - **Not levers:** the fast share at 30 clients is Section 2.2's bound (task-d65); fewer send calls than datagrams a peer a turn needs GSO, which quinn-udp uses only within one connection (task-d70), so C1 and C3 are the send-call levers.

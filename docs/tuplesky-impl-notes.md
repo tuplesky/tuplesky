@@ -10717,3 +10717,48 @@ still a small one; task-d73, which removes frames a turn, is worth on
 the order of 1% at that rate. task-d75's reading of the leader's loop is
 the leader's 40%, and what it found is in its own section, "The domain
 loop, read (task-d75)", with #168.
+
+## Cost a command over executed history (R2, for task-d27)
+
+The #173 carry's `service` row lost 17% of its rate over 300 s, and the
+register runs about 10% over 120 s. task-d27's note asks whether cost a
+command rises with executed history (#174 review asked for the reading
+locally, now).
+
+**The setup.** `scripts/bench/command-cost.sh` with `MEASURED=750000`,
+`REPEATS=1`, 10 callers, three voters on one host, `replay`
+(`COORD_HARNESS_JOURNAL_PROFILE=replay`), stores on tmpfs, task-d84's
+branch's release build. About 304,000 commands executed in 400 s. Each
+voter's metrics snapshot every second, reduced to CPU a command per 30 s
+window.
+
+| Window (s) | Commands | Leader: process / domain CPU ms a command | A follower: process / domain |
+| --- | --- | --- | --- |
+| 1 to 31 | 24,813 | 1.345 / 0.490 | 1.151 / 0.404 |
+| 91 to 121 | 24,247 | 1.464 / 0.489 | 1.266 / 0.414 |
+| 181 to 211 | 24,158 | 1.450 / 0.478 | 1.275 / 0.398 |
+| 241 to 271 | 19,682 | 1.892 / 0.526 | 1.671 / 0.439 |
+| 301 to 331 | 24,203 | 1.482 / 0.482 | 1.272 / 0.398 |
+| 361 to 391 | 24,059 | 1.484 / 0.481 | 1.314 / 0.403 |
+
+**What it says:**
+- **The domain loop does not grow with history.** It holds at 0.48 to
+  0.53 ms a command at the leader and 0.39 to 0.44 at a follower, from the
+  first window to the last.
+- **The process grows by 10 to 14%,** and the windows that carry less are
+  the ones around a local checkpoint publication.
+- **A publication grows with the position it represents:**
+
+  | Records represented | Export (s) | Write (s) |
+  | --- | --- | --- |
+  | about 73,000 | 1.0 to 1.3 | 0.2 to 0.3 |
+  | about 318,000 | 4.3 to 5.5 | 1.4 to 2.7 |
+  | about 594,000 | 8.1 to 8.8 | 5.7 to 6.2 |
+  | about 789,000 | 9.3 to 11.0 | 6.5 to 8.0 |
+
+  task-d51 moved the export off the domain thread, which is why the loop
+  stays flat.
+- **For task-d27.** If what the publication exports grows by the rows the
+  trim reclaims (payload, executed, dependency and proposal rows) rather
+  than by the application's keys, the trim bounds it. Its first reading
+  is that split: the rows exported, by kind, at two positions.
