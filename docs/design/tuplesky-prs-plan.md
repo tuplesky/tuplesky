@@ -3,7 +3,7 @@
 **Status:** Review proposal, consolidated v1.5.  
 **Date:** 2026-09-24.  
 **Companion:** [TupleSky implementation design](tuplesky-design.md).  
-**Scope:** 179 implementation tasks with stable `task-*` identifiers. The `task-01` through `task-66`, `task-s01` through `task-s04`, `task-j01` through `task-j10`, `task-o01` through `task-o06`, `task-m01` through `task-m05`, `task-c01`, `task-c02`, `task-c03`, `task-d01` through `task-d84` and `task-q01` suffixes and prerequisites are preserved. v1.5 adds `task-d01` through `task-d04` from review of the open implementation PRs and of multi-host readiness, `task-d05` through `task-d17` from the Jepsen client's runs, `task-d18` through `task-d33` from a review against an external SwiftPaxos correctness checklist ([review record](tuplesky-checklist-review.md)), `task-d34` from what the protocol simulator of task-d30 found, `task-d35` through `task-d44` from a review of recovery time and storage integrity (an execution chain, a scrub, and voter replacement through a prepared transition, a staged learner, terminal recovery after the seal, serving across a transition and a running membership install), `task-d45` through `task-d50` from measuring the throughput of the Jepsen client's first unthrottled runs, `task-d51` from task-d46's long runs, `task-d52` and `task-d53` from a profile of the domain thread after task-d46, `task-d54` from the Jepsen runs of task-d50, `task-d55` through `task-d57` from the Jepsen runs of task-j06, `task-d58` through `task-d61` from a profile of five voters' CPU per operation, `task-d62` through `task-d65` from a consolidated review against the reference SwiftPaxos, `task-d66` from the Jepsen runs of task-d51, `task-d67` from a Jepsen run on #98 that made no fast decision, `task-d68` from task-d62's counts after a leader change, `task-d69` from a profile of a follower's loop, `task-d70` from the Jepsen runner's profile of the transport's workers, `task-d71` from the protocol simulator's first 1,000-seed sweep, `task-d72` through `task-d75` from comparing a command's cost with etcd's on one host, `task-d76` from a Jepsen run that killed the leader, `task-d77` through `task-d81` from the protocol simulator with acknowledgements between followers lost, `task-d82` through `task-d84` from the Jepsen runs of the #173 carry, and moves committed key replacement from `task-58` to `task-m03`; the changes are listed under [Gate checklist and deferred work](#gate-checklist-and-deferred-work). Task IDs are not GitHub pull-request or issue numbers. One implementation PR corresponds to one task; its GitHub-assigned number is recorded separately. No baseline, supplement or separate amendment is needed.
+**Scope:** 185 implementation tasks with stable `task-*` identifiers. The `task-01` through `task-66`, `task-s01` through `task-s04`, `task-j01` through `task-j10`, `task-o01` through `task-o06`, `task-m01` through `task-m05`, `task-c01`, `task-c02`, `task-c03`, `task-d01` through `task-d84`, `task-d86` through `task-d91` and `task-q01` suffixes and prerequisites are preserved. v1.5 adds `task-d01` through `task-d04` from review of the open implementation PRs and of multi-host readiness, `task-d05` through `task-d17` from the Jepsen client's runs, `task-d18` through `task-d33` from a review against an external SwiftPaxos correctness checklist ([review record](tuplesky-checklist-review.md)), `task-d34` from what the protocol simulator of task-d30 found, `task-d35` through `task-d44` from a review of recovery time and storage integrity (an execution chain, a scrub, and voter replacement through a prepared transition, a staged learner, terminal recovery after the seal, serving across a transition and a running membership install), `task-d45` through `task-d50` from measuring the throughput of the Jepsen client's first unthrottled runs, `task-d51` from task-d46's long runs, `task-d52` and `task-d53` from a profile of the domain thread after task-d46, `task-d54` from the Jepsen runs of task-d50, `task-d55` through `task-d57` from the Jepsen runs of task-j06, `task-d58` through `task-d61` from a profile of five voters' CPU per operation, `task-d62` through `task-d65` from a consolidated review against the reference SwiftPaxos, `task-d66` from the Jepsen runs of task-d51, `task-d67` from a Jepsen run on #98 that made no fast decision, `task-d68` from task-d62's counts after a leader change, `task-d69` from a profile of a follower's loop, `task-d70` from the Jepsen runner's profile of the transport's workers, `task-d71` from the protocol simulator's first 1,000-seed sweep, `task-d72` through `task-d75` from comparing a command's cost with etcd's on one host, `task-d76` from a Jepsen run that killed the leader, `task-d77` through `task-d81` from the protocol simulator with acknowledgements between followers lost, `task-d82` through `task-d84` from the Jepsen runs of the #173 carry, `task-d86` through `task-d91` from planning the whole gap to etcd on #174, and moves committed key replacement from `task-58` to `task-m03`; the changes are listed under [Gate checklist and deferred work](#gate-checklist-and-deferred-work). Task IDs are not GitHub pull-request or issue numbers. One implementation PR corresponds to one task; its GitHub-assigned number is recorded separately. No baseline, supplement or separate amendment is needed.
 
 ## How to use this plan
 
@@ -51,6 +51,7 @@ Reference single-store and fixed-membership compositions are early increments, n
 | task-d80 | From an independent sweep at three in four acknowledgements to followers lost, catch-up off (#169): a voter that held a command committed only from the Sync it was synchronized to lost it to the next Sync, which left it out, and a later selection re-proposed it under other dependencies | Before task-d74's routing |
 | task-d81 | From an independent sweep at nine in ten acknowledgements to followers lost, catch-up on (#173): four voters waited for a position only a fifth had executed, which could not lead and which no donor rule let serve them, so nobody led | Liveness; not ahead of other work |
 | task-d82 through task-d84 | From the #173 carry's Jepsen runs (#98): a leader killed and back within the transport's idle timeout left the domain leaderless for 23 to 54 s; the `service` row ordered about seven reads in ten, where the barrier serves only a bare Range; and durability costs about 1.7 journal syncs a command | task-d82 before the next fault series; task-d83 next; task-d84 after task-d74's pairs and the tokio profile task-d73 waits on |
+| task-d86 through task-d91 | From planning the whole gap to etcd before the next performance run (#174): the levers the readings on record name and no task owned, each sized, so the runner measures them as one batch | Each with its reading first where it has one; task-d90's design step started now, as the long pole for p99 |
 | task-q01 | Combined durable WAN/Kine qualification | Required before task-66 |
 
 ```mermaid
@@ -246,7 +247,7 @@ This is a workstream overview; the individual prerequisites are authoritative. O
 | [task-d70](#task-d70) | Fewer datagrams and wakeups per command on the transport | task-d61, task-d62 |
 | [task-d71](#task-d71) | Name the order the possible-fast rule reads, and keep the reserve's bound | task-d09, task-d26, task-d33, task-d34 |
 | [task-d72](#task-d72) | Close the gap to etcd on one host | task-d62, task-d63, task-d66 |
-| [task-d73](#task-d73) | Carry a turn's proposals and acknowledgements to a peer in one frame | task-d61, task-d62, task-d72 |
+| [task-d73](#task-d73) | Take every ready event into a turn before it lowers | task-d61, task-d62, task-d72 |
 | [task-d74](#task-d74) | Send acknowledgements to the leader and the frontend only | task-d09, task-d62, task-d72 |
 | [task-d75](#task-d75) | Take work off the leader's domain loop | task-d53, task-d60, task-d72 |
 | [task-d76](#task-d76) | Choose a whole fast set after a failure | task-d31, task-d68 |
@@ -258,6 +259,12 @@ This is a workstream overview; the individual prerequisites are authoritative. O
 | [task-d82](#task-d82) | Bound a leader's silence below the transport's idle timeout | task-d01, task-d03 |
 | [task-d83](#task-d83) | Serve read-only transactions at the read barrier | task-d50, task-d72 |
 | [task-d84](#task-d84) | One journal sync a turn at every voter | task-d47, task-d54, task-d63, task-d72 |
+| [task-d86](#task-d86) | Fewer projection commits per command | task-d48, task-d52, task-d72 |
+| [task-d87](#task-d87) | Let held reads share one confirmation round | task-d50, task-d58, task-d72 |
+| [task-d88](#task-d88) | Fewer datagrams per command on the api plane | task-d70, task-d74 |
+| [task-d89](#task-d89) | Write a fresh proposal's acceptance in its proposal batch | task-d19, task-d84 |
+| [task-d90](#task-d90) | Release a result once its command is decided at a quorum | task-d06, task-d12, task-d35, task-d63, task-d84 |
+| [task-d91](#task-d91) | Read and cut wake and hop latency | task-d55, task-d72 |
 | [task-q01](#task-q01) | Produce the combined durable WAN/Kine qualification report | task-j07, task-j08, task-o06, task-m05, task-63, task-64, task-d45, task-d46, task-d47, task-d48, task-d49, task-d51, task-d52, task-d53 |
 
 ## Task specifications
@@ -1872,6 +1879,11 @@ Count only adoption acknowledgements toward the slow majority, leaving the fast 
 
 **Throughput (#98, the #173 carry):** the `service` row lost 17% of its rate over 300 s, and the register runs about 10% over 120 s, in base and head alike. A 900 s `service` run with CPU a command and the appender's and materializer's service time per 30 s reads whether cost a command rises with executed history: the executed-history set, the ordinals and the rows Section 13.1 leaves to this task. If it does, this trim is a throughput item as well as a disk one, and moves ahead of task-d84.
 
+**R2, read locally (#174 review; [notes](../tuplesky-impl-notes.md#cost-a-command-over-executed-history-r2-for-task-d27)).** Three voters on one host, `replay`, stores on tmpfs, 750,000 operations at 10 callers, about 304,000 commands executed in 400 s. Each voter's CPU a command per 30 s window:
+- **The domain loop does not grow with history.** At the leader it is 0.48 to 0.53 ms a command in every full window, first to last, and at the followers 0.39 to 0.44.
+- **The process does, and what grows is the local checkpoint publication.** Each publication's export and write rise roughly in proportion to the journal position it represents: 1.0 to 1.3 s and 0.2 to 0.3 s at 73,000 records, 9.3 to 11.0 s and 6.5 to 8.0 s at 790,000. The voters' CPU a command rose 10 to 14% between the first full window and the last, with heavier windows around the publications. The rate held: 24,800 commands in the first window and 24,000 in the last full one.
+- **So the trim is a throughput lever through the publication,** if the exported state grows by the rows this task trims (the payload, executed, dependency and proposal rows) and not by the application's keys. That split, rows exported by kind at two positions, is this task's first reading. Its size on a run's average depends on the run's length and the publication cadence, so it is in the batch (task-d72) with that reading first.
+
 <a id="task-d28"></a>
 ### task-d28: Let a recovery report survive a lost page
 
@@ -2637,6 +2649,8 @@ Write the design amendment first, then implement it:
 - **Step 3, the leader's lookups and a broadcast's copies,** after step 2's pair. The leader's `memcmp` (25 to 30 µs per command, plus 5 to 6 in `pump_reads`) is `BTreeMap` probes on 32-byte keys: the maps the leader only looks up and never iterates to produce an effect (`votes`, `proposals`, `resent`, `answered`, and the table's lookup side) become hash maps with a trivial hasher, a command identity being a uniform digest already, and every map iterated to produce an effect stays a `BTreeMap`, since the machine is deterministic by their order; task-d30's simulator and the model tests are the check. The loop closure's `memmove` (7 to 12 µs) is taken to be the per-voter copy of each broadcast frame, confirmed first with `#[inline(never)]` on the clone for one profile run, and then a `PendingSend` holds a shared buffer. A command is carried from its first decode, where a voter now derives it again in execution and at a submission, and decodes the submission frame again to find it (`voter::command_of`).
 - **A candidate for the shared phases:** `seal` still encodes a record's body once for its digest and the codec encodes the record again into raft-engine's buffer; one pass that hashes and writes together takes an encoding out of `flush_queued` on every voter. It is weighed with the follower's five largest functions read one level down (`run_executions`, `flush_queued`, `on_remote_submission`, `Follower::step`, `lower_once`).
 
+- **Step 3 is scheduled (#174 review).** Its prerequisite, task-d69, has landed, and B-tree searches on 32-byte identities are 19% of the leader's loop in task-d75's reading: 0.04 to 0.07 ms of CPU an operation at the register row. With it, `load_authorization` once a session rather than once a command (3.9% of the leader's loop, about 0.02 ms). Its runner pair is read in the batch job (task-d72).
+
 **Acceptance:** Each step in a pair on the Jepsen runner (three pairs, replay, throughput, the voters' loops and tokio threads read apart, `VmRSS` and `VmHWM`), with the call-graph profile on one pair: the leader's and the followers' loop per command and the voters' CPU per operation fall, and the allocator's share of the leader's thread falls with them, or the step is not kept. Step 1 is expected at 50 to 100 µs per command on every voter if glibc's bin management is what the share is; the copies do not move. Step 1 was kept on the runner's pairs ([notes](../tuplesky-impl-notes.md#the-allocator-task-d60-step-1)): the leader's loop fell 47 to 74 µs per command and the followers' 32 to 52, a tenth, in all six pairs on two CPUs, and the leader's allocator 49 µs; the voters' CPU per operation fell 5%, about half the local pair's, the shortfall in the transport's tokio threads; the cost is about 34 MiB of resident set per voter, kept as measured. Step 2 was kept on the runner's pairs (an Intel Xeon 6973P-C): every voter's loop 7% lower in all three pairs, the leader's allocator 9.5 µs per command lower, the tokio threads unchanged, and the resident set 43 MiB per voter lower, so the collector's trace was most of what step 1 had added. task-d69 comes before step 3.
 
 **Review boundary:** Memory allocation only. No change to any format.
@@ -2739,6 +2753,7 @@ Write the design amendment first, then implement it:
 - **Then the job.** The pointer's append and the retirement go to the journal worker as one job in the same queue as the groups, behind whatever is in flight, instead of the domain thread taking the journal back for them. The loop is woken with the outcome, as for a group, and the reclaim follows as task-d51's does. task-j04's order is unchanged: the image and its directory durable, then the pointer durable, then the retirement, then the reclaim.
 - **The materializer's part.** Under the replay profile the pointer may name a position only once the projection is durable through it (task-d51 skips the sync when it already is). Where it is not, the job waits for the materializer's next durable commit rather than forcing one on the domain thread.
 - **The job is built** (this task's second PR): `JournaledStore::queue_checkpoint` queues the pointer and the next group carries it, right after the transitions queued before it in the domain's entry, ahead of any queued since, or as an entry of its own. The appender runs the append and then the retirement (`AppendJob::run`), and `take_published` gives the outcome once the group is taken back, where `C` advances. Under the replay profile a group carries the pointer only once the projection is durable through `C`; queueing it asks the next commit to be durable. A voter queues its pointer (`LocalBaseline::queue_local`, `take_local`); a node that serves without voting lowers only when it applies, so it publishes on its thread as before. The `checkpoint` line gains `queued_ms`, and the domain thread's step readings are `-` for a pointer it no longer publishes itself ([notes](../tuplesky-impl-notes.md#the-pointer-and-the-retirement-on-the-journal-worker-task-d66)).
+- **An open row: the runtime's worker count.** On the Jepsen runner two workers a voter took 8% of the tokio threads' CPU per operation, all of it parking and waking, with five voters on four CPUs (task-d70); the runner's job runs with two from then on. Whether a dedicated host costs the same (one voter on eight cores gets eight workers for about one and a half cores of work) is read with this task's per-thread reading on a host of its own. If it does, the count becomes a configuration key with a small default, not an environment variable.
 
 **Acceptance:**
 - On the Jepsen runner at six nodes and the default cadence, no `checkpoint` line's `loop_ms` exceeds 10 ms, in two runs.
@@ -2811,6 +2826,8 @@ Write the design amendment first, then implement it:
 - task-d30's protocol simulator, every row at its usual seeds, unchanged.
 - In a pair on the Jepsen runner (three pairs, replay, throughput, the call graph on one pair): the followers' loop per command falls, and `Outbox::release`'s own time leaves the follower's profile.
 
+**The pair**, on the runner (the notes' task-d69 section has the local one), against task-d60's second PR: `Outbox::release` left the follower's profile, its own time 15.0 to 1.6 µs per command and with what it calls 18.2 to 4.1, and the leader's 12.7 to 1.4. The index's upkeep moved to `publish` and `observe` (on the follower 0.4 to 8.1 and 1.1 to 10.2 µs, where the base may have inlined some of theirs into their callers), so the outbox's three entry points cost 19.7 µs per command on the base against 22.4, within one profile's noise; the leader nets −1.8 µs, and every loop is flat (the follower's 331 against 330 µs). At 30 clients without faults little is held and the walk was cheap; what the index removes is the walk's growth with what is held, under a slow journal, a lagging peer or a fenced follower. Kept as is. If `publish` and `observe` ever outweigh the rest of the outbox in a profile, the dense increasing orders allow a cheaper structure than a `BTreeMap`.
+
 **Review boundary:** How the outbox finds the sends a completion releases. No change to what is released, when, or in what order.
 
 <a id="task-d70"></a>
@@ -2821,11 +2838,20 @@ Write the design amendment first, then implement it:
 
 **Implement:** On the Jepsen runner's profile of the leader's transport workers (#98, three CPUs), they cost 1.1 to 1.4 times the leader's domain loop per command, and on the two faster runner CPUs they are the larger part of the voters' CPU per operation. The largest single cost is the UDP send call (19 to 40% of their CPU, 11.7 send calls per command against 6.6 peer datagrams); then parking and waking (7 to 18%; 17.4 futex and 7.0 `epoll_wait` calls per command across the leader's threads, most of it the I/O driver's `epoll_wait` and a worker parking itself); quinn's own work and packet protection are smaller.
 - **Send calls follow datagrams.** quinn-udp sends one `sendmsg` per transmit and batches only with GSO, which coalesces datagrams of one connection that are ready together; a leader's turn sends to each peer on its own connection, so the calls cannot fall below one per peer per turn. What can fall is the number of datagrams.
-- **ACK-only datagrams.** `lane::transport_config` sets no acknowledgement frequency, so quinn acknowledges every second ack-eliciting packet within 25 ms, and with about one data datagram per peer per command the acknowledgement often travels alone. Both ends negotiate QUIC's acknowledgement-frequency extension, so a higher ack-eliciting threshold and a `max_ack_delay` of a few milliseconds lets it ride on the reply that follows; loss detection waits that much longer.
+- **ACK-only datagrams.** `lane::transport_config` sets no acknowledgement frequency, so quinn acknowledges every second ack-eliciting packet within 25 ms, and with about one data datagram per peer per command the acknowledgement often travels alone. Both ends negotiate QUIC's acknowledgement-frequency extension, so a higher ack-eliciting threshold lets it ride on the reply that follows; loss detection waits that much longer. The delay is not the lever: QUIC's own is 25 ms, so a shorter `max_ack_delay` sends an acknowledgement sooner, alone, on a connection with little traffic.
 - **Wakeups follow streams.** Each accepted peer stream is read by its own spawned task, which hands its frames to the lane's channel and wakes the domain thread; the outbound side wakes a sender task, quinn's connection driver and the endpoint driver. The work per event is small and spread over the workers, so most events land on a parked worker.
 - **In order, each a pair:** the runtime's worker count (`TOKIO_WORKER_THREADS=2`, no code); the acknowledgement cadence, behind an environment gate as `COORDD_PEER_STREAM_FRAMES` is, on the peer and API lanes, with the API plane's datagrams counted beside the peer plane's; then, if parking is still where it is, the inbound path without a task per stream (the accept task reads its streams, or a wake hands the domain thread a batch of frames). More commands per turn, a loop waiting a bounded few hundred microseconds for more submissions, would halve datagrams per command at that much latency; it is a trade stated here, not taken.
 
 **Acceptance:** Each lever in a pair on the Jepsen runner (three pairs, replay, throughput, the call graph on one pair, at the default worker count unless the lever is the count): kept only if the tokio threads' CPU per operation falls, `ok`/s does not, and read p99 stays within the pairs' spread; datagrams, send calls, acknowledgement frames, futex and `epoll_wait` per command are reported beside it, and task-d62's streams per command are the control.
+
+**The pairs** ([notes](../tuplesky-impl-notes.md#the-acknowledgement-cadence-task-d70)), on the runner, three each:
+- **The cadence at `8,2000`** (threshold 8, a 2 ms delay): the leader's peer ACKs fell 12 to 17%, but the api plane's rose 21% and its datagrams 4 to 7%, CPU and read p99 flat. 2 ms is shorter than QUIC's own 25 ms, and quinn takes a requested delay on every connection, so on the api plane's quiet connections an ACK left alone sooner.
+- **The cadence at `8,25000`** (threshold 8, QUIC's delay): a sixth of every voter's datagrams (peer −18%, api −17%), two thirds of the leader's peer ACKs and half the api plane's, one send call per command fewer on the leader; the voters' tokio threads −8% CPU per operation, the voters −4%, `ok`/s +2%, every pair the same sign, read p99 flat. Most of the saving is the send system call; futex and `epoll_wait` hardly move.
+- **The runtime's worker count at two** (against four, on 4-CPU runners carrying five voters): the voters' tokio threads −8% CPU per operation, the voters −3%, `ok`/s and read p99 flat. The saving is the workers parking and waking each other (the leader's tokio threads made 6.2 futex calls per command against 12.4); the sends, the receives and the I/O driver's `epoll_wait` are unchanged.
+
+**Kept, as a default:** threshold 8, the delay left to the peer (`AckFrequency::DEFAULT`, `max_delay: None`), on both planes and for every endpoint built from `Limits::default()`, the SDK's included; `COORDD_ACK_FREQUENCY` stays the override, `off` asking nothing (QUIC's own cadence) for a control pair. A higher threshold has little left to take (0.6 of the leader's 5.4 datagrams per command are ACKs at 8) and would learn a loss later on a quiet link. Before it merged it was run under faults (kill, pause and partition, 300 s, two workers; [#98 6071656383](https://github.com/tuplesky/tuplesky/pull/98#issuecomment-6071656383)), two runs at `8,25000`, the same cadence as the default since the peer's own delay is 25 ms, beside two unset: all four `:valid? true` with final reads on all five, no stop and no republish after the final start; lost frames as many without the cadence (1,278 in one unset run) as with it (642 and 2); and the slowest voter serving again after a fault at a most of 95 to 134 s with it and 90 to 125 s without, the medians 2 to 34 s in both, so the faults' overlap and not the cadence sets the spread. The worker count is the runner's setting (five voters on four CPUs oversubscribe the runtime) and not yet the daemon's: an open row under task-d66.
+
+**The third step is scheduled (#174 review),** no longer "if parking is still where it is": it is, at 7 to 18% of the tokio threads. The inbound path without a task per stream (the accept task reads its streams, or a wake hands the domain thread a batch of frames), up to 0.1 ms of CPU an operation at the register row. Its local pair is in its own PR, and its runner pair is read in the batch job (task-d72).
 
 **Review boundary:** QUIC's acknowledgement cadence, the runtime's worker count and the inbound delivery path. No change to what is sent, to the wire format or to the peer capability.
 
@@ -2873,6 +2899,44 @@ This entry is the budget and the record, not a lever:
     - task-d27 too, if the 900 s `service` run shows cost a command rising with history.
     - task-d83 doesn't move this row: its reads are single keys, already at the barrier.
   - **The `service` row's latency:** task-d83 takes its ordered commands from about 1.03 an operation toward 0.4, and task-d84 its syncs. task-d84's reading decides whether merging syncs can reach the p99 at all (task-d84).
+- **The batch (#174 review).** Every lever the readings on record name is planned now and built as one batch, so the next runner job measures the batch, not one lever at a time. Sizes are estimates unless marked measured.
+  - **The register row's CPU,** from the #173 carry's 3.58 ms an operation. On the runner the voters' tokio threads take 1.45 ms, the domain loops 1.28, and the rest about 0.85; locally the rest is mostly the materializer (a fifth of each node) and the appender (7 to 9%).
+
+    | # | Lever | Owner | Status | Size (ms an operation) | Running total (ms) |
+    | --- | --- | --- | --- | --- | --- |
+    | C1 | Threshold 8 as the acknowledgement cadence's default | task-d70's second step (#155) | Built, and merged into the stack with this record | −0.15, measured | 3.43 |
+    | C2 | Acknowledgements to the leader and the frontend only | task-d74 (#167) | Built | about −0.16 (−4.5% locally) | 3.27 |
+    | C3 | A turn takes every ready event before it lowers | task-d73, re-scoped | Planned, reading R1 first | −0.10 to −0.25 | 3.02 to 3.17 |
+    | C4 | Fewer projection commits per command | task-d86 | Planned, reading R1 first | −0.15 to −0.30 | 2.72 to 3.02 |
+    | C5 | The inbound path without a task per stream | task-d70's third step | Scheduled | up to −0.10 | 2.62 to 3.02 |
+    | C6 | The leader's lookups as hash maps, broadcasts from one buffer | task-d60's third step | Scheduled | −0.04 to −0.07 | 2.55 to 2.98 |
+    | C7 | Held reads share one confirmation round | task-d87 | Planned, its reading first | −0.02 to −0.04 | 2.51 to 2.96 |
+    | C8 | `load_authorization` once a session | task-d60's third step | Scheduled | about −0.02 | 2.49 to 2.94 |
+    | C9 | The api plane's datagrams | task-d88 | Planned, reading R3 first | unknown | |
+    | C10 | The trim, through the checkpoint publication's growth with history | task-d27 | R2 read: the loop is flat and the publication grows; the rows it exports by kind first | up to −0.18 on a run's average | 2.31 to 2.94 |
+
+  - **Projected:** 0.64 to 1.27 ms before overlap. C1, C2 and C3 all cut datagrams, and C3 and C4 both cut commits, so after overlap about 0.6 to 1.1, which puts the row at roughly 2.5 to 3.0 ms before C9. The target needs the middle of that range: nearly every lever, C3, C4 and C10 among them, and their readings are local.
+  - **Not levers:** the fast share at 30 clients is Section 2.2's bound (task-d65); fewer send calls than datagrams a peer a turn needs GSO, which quinn-udp uses only within one connection (task-d70), so C1 and C3 are the send-call levers.
+  - **The `service` row's p50 and p99,** 23 and 61 ms against etcd's 2 and 4, read at `replay`:
+
+    | # | Lever | Owner | Status | What it removes |
+    | --- | --- | --- | --- | --- |
+    | L1 | Read-only transactions at the barrier | task-d83 (#176) | Built | ordered commands from 1.03 an operation toward 0.4 |
+    | L2 | The `replay` profile | a run setting | | the projection's fsync from a barrier read's snapshot wait, about 4.4 of its 12.4 ms at `strict` |
+    | L3 | A fresh proposal's acceptance in its proposal batch | task-d89 | Planned, its design step first | one of the leader's three syncs in series at low load, about 2.3 ms on the runner |
+    | L4 | Release at a quorum decision | task-d90 | Its design step started now | the execution group's sync after learning, a 3.69 ms wait in the last run |
+    | L5 | Held reads share one confirmation round | task-d87 | Planned | the 1.2 ms confirmation under load, and leader CPU |
+    | L6 | Wake and hop latency | task-d91 | Planned, reading R4 first | run-queue waits: the tokio threads 15 ms an operation for a core with 1.87 idle, the leader's loop 1.35 ms a command against 0.65 of CPU |
+
+  - **Projected:** a barrier read's 6.9 ms wait for its index is the in-flight writes' latency, so L3 and L4 shorten reads too. After L1 to L4 a write is one sync, at the leader and the followers in parallel, plus about two hops: roughly 3 to 4 ms on the runner before queueing, etcd's shape. p99 within etcd's spread then rests on L6, and perhaps a revised target, decided from the batch's local readings.
+  - **The readings that size the levers no task owned,** all local but R4: R1 for task-d73 and task-d86, R2 for task-d27, R3 for task-d88, and R4 for task-d91, read from the runner's summary on the batch's base side with no extra run (the summary column is the testing session's).
+  - **If the projection falls short** of 2.8 ms or of etcd's p99 once the local readings are in, the target is revised under this entry's clause, with the reason beside it, rather than run again to find out.
+- **How the runner is used from here (#174 review):**
+  - **No more single-lever performance pairs on the runner.** Each lever gets its local pair and its simulator sweep in its own PR. Where a lever's acceptance names a runner pair, the batch job is that pair.
+  - **One batch job, once the batch is projected to close the gap:** this record puts the head at or under 2.8 ms from the local pairs, with task-d89 and task-d90 built, or the target has been revised. The job then confirms the gap closed rather than reporting a step toward it.
+  - **Sides:** the base is the next carry, with #155's default in it, since C1 is measured. The head is that and every other built lever: C2 to C8, L3, L4, and C9 if R3 finds one.
+  - **Runs:** three register pairs, and `service` at `replay` and at `strict` on both sides, with the call graph on one pair, a follower's tokio threads included.
+  - **Before the batch,** only the next carry's leader-kill run. It is not a lever pair: it checks task-d82's liveness target and carries #178's safety fix, and nothing in the batch changes it.
 - **The record:** the table below, one row a lever, each row a pair on the runner.
 
 | Row | Build | Shape | `ok`/s | Server CPU an operation | Idle cores | Expected to move |
@@ -2894,20 +2958,20 @@ This entry is the budget and the record, not a lever:
 **Review boundary:** A budget, its measurements and the order of its levers. No change of its own.
 
 <a id="task-d73"></a>
-### task-d73: Carry a turn's proposals and acknowledgements to a peer in one frame
+### task-d73: Take every ready event into a turn before it lowers
 
 **Prerequisites:** task-d61, task-d62, task-d72.  
-**Design:** Section 11.2 (unchanged: a frame kind behind a peer capability, as task-d61's).
+**Design:** None.
 
-**Implement:** Each command is its own message: a proposal per command to each voter, an acknowledgement per command to each peer. task-d61 put a turn's frames to a peer on one stream and encoded a proposal once, which cut streams, not messages. One frame per peer per turn carrying every proposal the turn moved, and one carrying every acknowledgement, trades latency for the message count: a frame waits for its turn to close, so a command at the head of a turn pays the turn's length. The pair's p99 reads that cost.
-- Behind a peer capability, so a link without it carries what it carries today.
-- The frames hold the same messages: nothing any one proposal or acknowledgement says changes, nor what a vote is evidence of.
+**Implement:** The domain loop turns again as soon as a turn did anything (`progressed => continue`), so a turn lowers and sends what one event moved, and the next event, a moment later, starts another turn. task-d75's counters put it at 1.14 commands a lowering, 2.2 an append and 2.4 a projection commit at the register row. task-d70 says why datagrams and send calls follow: they cannot fall below one per peer per turn, so fewer turns a command is how they fall.
+- **The change:** a turn takes every event already ready on its channels (peer frames, storage completions, submissions, timers due) before it lowers and sends, and then lowers once. It waits on nothing. A turn with nothing more ready lowers at once, so no command waits for one that has not arrived. That is the difference from the bounded wait task-d70 states and does not take.
+- **What it is expected to move (#174 review):** 0.1 to 0.25 ms of CPU an operation at the register row, through fewer lowerings, appends, commits, datagrams and send calls a command. Its larger turns make task-d86's commits larger.
+- **First, the reading (R1, with task-d86):** in a local run at 10 and 30 callers, commands a lowering, an append and a commit, and the materializer's and the appender's CPU per commit and per record. Then the same with the change built.
+- **Re-scoped from a frame kind (#174 review).** This entry's first step, a profile of the voters' tokio threads, is in (#98). With task-d74's pair it says their cost is per packet and per wake-up, about 13 µs a frame, not per frame. So the frame kind behind a peer capability is not built. task-d70's third step, the inbound path without a task per stream, is the same lever on the receiving side.
 
-- **First, a profile of the voters' tokio threads** (the #173 carry's runs, #98). Those threads are now the larger part of a voter's CPU (1.45 ms an operation against the domain loops' 1.28 at the register row), and task-d74's local pair halved frames per write for 4.5% of CPU. So before this is built, a call-graph run at the register row on the current carry gives each thread's CPU and system calls per command and its samples by what they did. If datagrams, system calls or wake-ups dominate, the lever is the transport's sends (segmentation offload, fewer wake-ups), and this entry is re-scoped to it before any frame kind is added.
+**Acceptance:** The reading recorded first, and again with the change. A local pair, then the change in the batch's runner job (task-d72): lowerings, appends, commits, datagrams and send calls a command fall, CPU per operation falls, and p99 stays within the pairs' spread. The protocol simulator's sweep and the model tests pass: the change alters which events share a turn, not the rule applied to any one of them.
 
-**Acceptance:** The profile recorded first. Three pairs on the runner (replay, throughput): frames and datagrams per command, the transport threads' CPU per operation, `ok`/s and p99. Kept only if the CPU falls and p99 stays within the pairs' spread. A link with the capability on one end only is tested both ways.
-
-**Review boundary:** How a turn's messages to a peer are framed. No change to what a message means, to the protocol or to the fast predicate.
+**Review boundary:** How many ready events a turn takes before it lowers. No change to the rules events are handled by, to the protocol or to the wire.
 
 <a id="task-d74"></a>
 ### task-d74: Send acknowledgements to the leader and the frontend only
@@ -3096,11 +3160,106 @@ The change, in two steps:
   - With an append at about 2.3 ms on the runner, two in series are already above etcd's 4 ms p99 before any queueing. etcd has one, its WAL sync, at the leader and the followers in parallel.
   - A barrier read also waits for its index to execute, 6.9 ms in the last run, which is the in-flight writes' latency.
   - If the reading confirms that, meeting the p99 needs one of two things: a design step on whether a result may be released once its command is decided at a quorum, before its own execution group is durable; or the target revised under task-d72's own clause, with the reason beside it.
+  - **Both levers on the path have tasks (#174 review):** a fresh proposal's acceptance in its proposal batch (task-d89), and release at a quorum decision (task-d90).
 - **The merge keeps every ordering Section 17.3.3 states:** an acceptance is durable before its acknowledgement goes out, and an execution before its result is released. A turn whose acceptances and execution share one sync releases neither before it.
 
 **Acceptance:** The reading recorded first. The storage crash tests across the merged group, at every cut. Three pairs on the runner: journal syncs a command, CPU an operation, the `service` row's p50 and p99.
 
 **Review boundary:** How a turn's journal writes are grouped and synced. No change to what is durable before what.
+
+<a id="task-d86"></a>
+### task-d86: Fewer projection commits per command
+
+**Prerequisites:** task-d48, task-d52, task-d72.  
+**Design:** Section 17.3.4 (amended by this task only if a commit cadence reaches `strict`).
+
+**Implement:** Locally the materializer is a fifth of each node, 54 to 60% of it in redb's commit and 8 to 10% in its freed-page bookkeeping (task-d72's profile), so its cost is per commit far more than per record. At the register row a commit holds about 2.4 commands (task-d75's counters).
+- **First, the reading (R1, with task-d73):** at 10 and 30 callers, the materializer's CPU per commit and per record, and commands a lowering, an append and a commit. Then again with task-d73's larger turns, which make commits larger by themselves.
+- **Then, if the cost per commit still leads,** a cadence: a projection that serves no read between commits takes more records a commit, up to a bound of records and time, as task-j06's durable cadence does for its syncs. What it serves (barrier reads, watches, events, a checkpoint) asks for the next commit, so nothing waits on a commit it needs. Under `strict` a deferred commit still makes its records durable before the gate moves.
+- **What it is expected to move (#174 review):** 0.15 to 0.3 ms of CPU an operation at the register row.
+
+**Acceptance:** The reading recorded first. A local pair: commits a command and the materializer's CPU an operation fall, and no read, watch or event waits longer than the bound. The storage crash tests across a deferred commit, at every cut. Its runner pair is read in the batch job (task-d72).
+
+**Review boundary:** When the projection commits and how much a commit holds. No change to what a commit records, to the journal's ordering or to what is durable before a result's release.
+
+<a id="task-d87"></a>
+### task-d87: Let held reads share one confirmation round
+
+**Prerequisites:** task-d50, task-d58, task-d72.  
+**Design:** Section 6.3 (amended by this task only if a round serves a read that arrived after it began).
+
+**Implement:** In the #173 carry's `service` row the read barrier took one confirmation round a read (1.00 reads a round), and `pump_reads` is 14% of the leader's loop in task-d75's reading. Locally at 10 callers, rounds already carry 1.2 to 1.4 reads (task-d84's reading), so sharing exists under load.
+- **First, the reading:** why `service` took one round a read. It is either because its reads, at 4 clients and 300/s, never overlapped a round, or because each read started a round of its own while one was out.
+- **If the second:** a round serves every read held when it starts. A read that arrives while one is out waits for the next, which starts as soon as the one out returns. That keeps the barrier's argument as it is.
+- **If the first:** the lever is the cost of a round in `pump_reads`, not its sharing, and this entry is re-scoped to it.
+- **What it is expected to move (#174 review):** 0.02 to 0.04 ms of CPU an operation at the register row, more at `service`, and the 1.2 ms confirmation under load.
+
+**Acceptance:** The reading recorded first. A model test that a read arriving after a round began is not served by it. A local pair: reads a round and the leader's loop a read. Its runner pair is read in the batch job (task-d72).
+
+**Review boundary:** Which held reads a confirmation round serves. No change to the read index, to the confirmation's quorum or to the barrier's argument.
+
+<a id="task-d88"></a>
+### task-d88: Fewer datagrams per command on the api plane
+
+**Prerequisites:** task-d70, task-d74.  
+**Design:** None.
+
+**Implement:** Over the voters the api plane carried 30.2 datagrams a command against the peer plane's 20.6, and 25.2 against 16.9 at threshold 8 (#155's pairs). That is the submission fanned out to every voter, every remote voter's acknowledgements and the release to the frontend, and the client's own traffic. With task-d74 in, it is the larger plane, and nothing owns it.
+- **First, the reading (R3):** the api plane's frames and datagrams a command by kind (the submission, fast and slow acknowledgements, the release, the client's), at the register row locally.
+- **Then the lever the reading names,** recorded in this entry before it is built.
+
+**Acceptance:** The reading recorded first, with the lever chosen from it. A local pair: the api plane's datagrams a command and the voters' CPU an operation fall. Its runner pair is read in the batch job (task-d72).
+
+**Review boundary:** The api plane's traffic per command. A change to what the frontend learns from is a design step of its own, not this task.
+
+<a id="task-d89"></a>
+### task-d89: Write a fresh proposal's acceptance in its proposal batch
+
+**Prerequisites:** task-d19, task-d84.  
+**Design:** Section 4.7 (amended by this task).
+
+**Implement:** At low load the leader syncs three times a command, each once the one before it is durable: the proposal row, its ACCEPT row (`Leader::advance_pending`), and the execution group (task-d84's reading). A re-proposal already writes its ACCEPT row in its proposal batch (`Proposal::accepts`, task-d19). A fresh proposal writes it once the dependency guard passes, in a batch of its own after the proposal row is durable.
+- **The change (#179 review):** when the guard already passes at proposal time, the fresh proposal's batch carries its ACCEPT row too. At low load every dependency of a new command is long accepted, so it does.
+  - The leader's second sync leaves the path, for fast and slow commands alike, and the execution group has no ACCEPT group to wait behind.
+  - The journal holds what it holds today, one sync earlier, in one atomic batch.
+  - Under load, a command whose prerequisite is still at PRE-ACCEPT keeps today's path.
+- **First, its design step answers:**
+  - Is there a reason, besides the guard, that a fresh proposal's acceptance waits for its own proposal row? `advance_pending` names only the guard.
+  - A prerequisite accepted in memory is in an earlier batch. Is it durable no later than the new one? Batches become durable in submission order, which `adopt_own` relies on.
+  - The leader's fast vote is its proposal, not its table phase.
+- **What it is expected to move:** one of the leader's three syncs in series at low load, about 2.3 ms on the runner.
+
+**Acceptance:** The Section 4.7 step first. Model tests: a fresh proposal whose guard passes carries its ACCEPT row in the proposal batch, and one whose guard fails does not. Recovery from a crash before and after that batch. The protocol simulator, every row at 1,000 seeds per row and size, with catch-up and without. task-d84's local reading again: the leader's protocol groups a command at 1 caller fall from about two to about one. Its runner pair is read in the batch job (task-d72).
+
+**Review boundary:** When a fresh proposal's acceptance row is written. No change to the guard, to the slow quorum or to the wire.
+
+<a id="task-d90"></a>
+### task-d90: Release a result once its command is decided at a quorum
+
+**Prerequisites:** task-d06, task-d12, task-d35, task-d63, task-d84.  
+**Design:** Sections 4.5, 17.3.3 and 17.4 (amended by this task).
+
+**Implement:** A result is released once it is learned and its execution group is durable (task-d63). The group's sync comes after learning, a 3.69 ms wait in the last `service` run, so a write pays two syncs in series where etcd pays one: its WAL sync, at the leader and the followers in parallel. Releasing once the command is decided at a quorum, before its own execution group is durable, takes the second off the path. It is the lever that gives etcd's shape.
+- **The design step first, started now** as the long pole for the p99 (#174 review). It amends Section 17.3.3's ordering of an execution before its result. Its argument: execution order and results are a function of the decided commands (task-d06's chain), so a crash before the execution group is durable replays to the same result.
+- **It also says** what the collector's late-release comparison (task-d12) and the execution chain (task-d35) see across that crash, and why events and watches still wait for Materialized.
+
+**Acceptance:** The design step recorded and reviewed before any code. Crash tests at every cut between the decision, the release and the execution group's durability: the replayed result is the one released. The protocol simulator's sweep. task-d84's local reading again: one sync in series after learning fewer. Its runner pair is read in the batch job (task-d72).
+
+**Review boundary:** When a result may be released. No change to the order of execution, to what is durable before a vote, or to what events and watches wait for.
+
+<a id="task-d91"></a>
+### task-d91: Read and cut wake and hop latency
+
+**Prerequisites:** task-d55, task-d72.  
+**Design:** None.
+
+**Implement:** In the #173 carry's `service` row the voters' tokio threads waited 15 ms an operation for a core while 1.87 cores sat idle, and the leader's loop waited 1.35 ms a command against 0.65 of CPU. Part of every hop's latency is scheduling, and nothing owns it.
+- **First, the reading (R4):** each thread's run-queue delay per wake-up (schedstat's `run_delay` over its timeslices) and wake-ups a command. It needs the runner's VMs, so it is a column of the runner's summary (the testing session's) and is read from the batch's base side, with no extra run. task-d55's `Scheduling` already reads the domain loop's.
+- **Then the lever it names:** fewer wake-ups a hop (task-d70's third step, task-d73), or where the threads run.
+
+**Acceptance:** The reading recorded from the batch's base side, with the lever chosen from it and its local pair.
+
+**Review boundary:** How the voters' threads are woken and scheduled. No change to the protocol or to the wire.
 
 ## Gate checklist and deferred work
 
@@ -3131,11 +3290,11 @@ G3 requires task-43/transitive prerequisites, G4 task-48, G5 checkpoint/replacem
 - **task-d60's first PR** sets mimalloc (v3.3.2) as `coordd`'s global allocator. On the Jepsen runner, six pairs on two CPUs against task-d59's build ([notes](../tuplesky-impl-notes.md#the-allocator-task-d60-step-1)): every voter's loop fell about a tenth, the leader's allocator 49 µs per command, the voters' CPU per operation 5% and the resident set rose about 34 MiB per voter. What is left of the allocator is the number of allocations, so step 2's sites keep their order from the head's caller table; `memcmp` is the leader's map probes and `memmove` likely the per-voter copy of a broadcast, the latter confirmed before it is cut. On the faster runner (an EPYC 9V45) the voters' tokio threads, 1.15 ms of CPU per operation, now cost more than their domain loops, 1.04, and fell 3.5% where the loops fell a tenth: the transport is the larger CPU pool, most of it QUIC's per-packet work, the kernel's send and receive path, and parking and waking, which an allocator does not touch, so a transport worker is profiled next.
 - **task-d60's second PR** cuts five allocation sites ([notes](../tuplesky-impl-notes.md#the-allocation-sites-task-d60-step-2)): a memory leak is fixed: the collector's golden trace, an unbounded list that grew by one formatted event per transition for the daemon's life and that nothing in `coordd` read (the profile's `trace::hex`), is kept only when asked for; a ballot configuration's voter sets and a sealed journal record's body are shared rather than cloned; a record is encoded without a copy and measured without encoding; and a submission's command is derived from the bytes its canonical check compared. Locally, in three pairs against the first PR: the leader's loop 6% lower and each voter's resident set 17 MiB lower, in every pair; all threads' CPU per operation flat. On the runner, three pairs on an Intel Xeon 6973P-C: every voter's loop 7% lower in all three, the leader's allocator 9.5 µs per command lower (the trace, the journal record's encoder and the configuration's clone gone from its caller table), a follower's `flush_queued` 33 to 18 µs, the tokio threads unchanged, `ok`/s 1.3% higher, and the resident set 43 MiB per voter lower (21%); kept.
 - **A profile of a follower's loop**, local, on that PR, read its five largest functions one level down and found `Outbox::release` at 5 to 7% of it: a walk over every send waiting, on every round. task-d69 indexes the outbox by what a send waits for, ahead of task-d60's third step.
-- **The Jepsen runner's profile of the leader's transport workers**, on three CPUs, put them at 1.1 to 1.4 times the leader's domain loop per command: the UDP send call 19 to 40% of their CPU at 11.7 calls per command, parking and waking 7 to 18% at 17.4 futex and 7.0 `epoll_wait` calls. A 7% cut to every loop moved `ok`/s 1.3%: on the faster runner CPUs the loops no longer bound throughput, the voters' total CPU does, and the transport is 41% of it. task-d70 takes the transport's datagrams and wakeups per command, its two settings first as pairs.
+- **The Jepsen runner's profile of the leader's transport workers**, on three CPUs, put them at 1.1 to 1.4 times the leader's domain loop per command: the UDP send call 19 to 40% of their CPU at 11.7 calls per command, parking and waking 7 to 18% at 17.4 futex and 7.0 `epoll_wait` calls. A 7% cut to every loop moved `ok`/s 1.3%: on the faster runner CPUs the loops no longer bound throughput, the voters' total CPU does, and the transport is 41% of it. task-d70 takes the transport's datagrams and wakeups per command, its two settings first as pairs; at threshold 8 with QUIC's own delay the voters sent a sixth fewer datagrams and spent 4% less CPU per operation, and that cadence became the default.
 - **The Jepsen runs of task-d67's code** (#98): after four of five leader changes the new leader ran 81 to 87% fast; the fifth's fixed fast set held the voter just killed, which task-d76 takes. Under load the share stayed at Section 2.2's 1 to 2%, which task-d65 records as confirming that section's decision. The publications over 10 ms spent under 2.5 ms on a CPU or waiting for one, so task-d66's job is built.
 - **Against etcd on one host**, the one matched comparison is 2.5 times behind, at 3.5 to 4.7 ms of server CPU an operation against etcd's 1.39, and none of the gap is the order. task-d72 sets the budget and keeps the record; task-d73 through task-d75 are its levers, after task-d63's build and task-d66's job.
 - **Gating.** task-d45 through task-d49 and task-d51 through task-d53 are prerequisites of task-64 and task-q01, so that the qualification and the combined report measure the protocol rather than these costs. task-d56 is a prerequisite of task-64, as liveness under faults. task-62's remaining rows, and any reference result it publishes again, wait on them and on task-d54 for the same reason. This is stated in task-62 rather than as a prerequisite, since task-62's first runs produced task-c01 and task-c02, which the throughput tasks build on. task-d50, reads and the fast path off the slow path, changes protocol behaviour and waits on its own design amendment.
-- **Design changes.** task-d45 through task-d47, task-d49, task-d51 through task-d56 and task-d58 through task-d62, task-d66, task-d69, task-d70, task-d72, task-d73 and task-d75 do not change the design; task-d74 amends Sections 4.1 and 4.3 if a decision reads another follower's votes, and task-d76 amends Section 4.2; task-d71 amends Sections 4.9 and 13.1, and task-d77 through task-d80 Section 4.9, and task-d81 Section 6.7.3 if it changes which ballot a donor serves at; task-d82 amends Section 11.4 and the O14 row, task-d83 Section 6.3 and task-d84 Section 17.3.3; task-d67 amends Sections 4.1, 4.7 and 4.9 with its rule, and task-d68 Sections 4.1 and 4.7 with its, and task-d63's release-rule step amends Sections 4.5, 17.3.3 and 17.4; task-d64 amends Sections 4 and 6.4, and task-d65 Section 2.2 if it changes the model. task-d48 amends Section 17.3.4's projection hardening; task-d50 amends Sections 4.5, 6.3 and 17.4; task-d57 amends Sections 2.2, 4.5 and 6.3.
+- **Design changes.** task-d45 through task-d47, task-d49, task-d51 through task-d56 and task-d58 through task-d62, task-d66, task-d69, task-d70, task-d72, task-d73, task-d75, task-d88 and task-d91 do not change the design; task-d74 amends Sections 4.1 and 4.3 if a decision reads another follower's votes, and task-d76 amends Section 4.2; task-d71 amends Sections 4.9 and 13.1, and task-d77 through task-d80 Section 4.9, and task-d81 Section 6.7.3 if it changes which ballot a donor serves at; task-d82 amends Section 11.4 and the O14 row, task-d83 Section 6.3 and task-d84 Section 17.3.3; task-d89 amends Section 4.7, and task-d90 Sections 4.5, 17.3.3 and 17.4; task-d86 amends Section 17.3.4 only if a commit cadence reaches `strict`, and task-d87 Section 6.3 only if a round serves a read that arrived after it began; task-d67 amends Sections 4.1, 4.7 and 4.9 with its rule, and task-d68 Sections 4.1 and 4.7 with its, and task-d63's release-rule step amends Sections 4.5, 17.3.3 and 17.4; task-d64 amends Sections 4 and 6.4, and task-d65 Section 2.2 if it changes the model. task-d48 amends Section 17.3.4's projection hardening; task-d50 amends Sections 4.5, 6.3 and 17.4; task-d57 amends Sections 2.2, 4.5 and 6.3.
 
 task-j06 is optional and cannot silently relax durable materialization. ReadFence is its own capability gate. Observers do not improve quorum fault tolerance or acquire voting rights by catching up. Interface drift in Kine is resolved at one explicit pin, not mixed across examples. Strict per-output authorization remains authoritative even for regional observers.
 

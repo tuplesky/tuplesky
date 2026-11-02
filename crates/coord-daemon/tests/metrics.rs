@@ -7,9 +7,9 @@
 use std::time::Duration;
 
 use coord_daemon::metrics::{
-    Cost, Cpu, Durability, FastPath, Frontiers, Headroom, Interval, Jobs, Lane, LaneReading,
-    Latency, MAX_REPORTED_SHARDS, Measure, MetricsSnapshot, PipelineWaits, Reads, Recorder,
-    Release, Resends, Scheduling, ShardIndex, ShardReading, Stage, StageReading, Traffic,
+    Cost, Cpu, Datagrams, Durability, FastPath, Frontiers, Headroom, Interval, Jobs, Lane,
+    LaneReading, Latency, MAX_REPORTED_SHARDS, Measure, MetricsSnapshot, PipelineWaits, Reads,
+    Recorder, Release, Resends, Scheduling, ShardIndex, ShardReading, Stage, StageReading, Traffic,
     Unavailable, UnorderedPreAcceptances, Wait,
 };
 use coord_daemon::role::RoleSet;
@@ -450,6 +450,13 @@ fn a_rendered_snapshot_carries_no_secret_or_key_shaped_text() {
                 received_frames: 8800,
                 received_bytes: 1_900_000,
                 received_streams: 8800,
+                api: Datagrams {
+                    datagrams_sent: 4100,
+                    datagrams_received: 4000,
+                    send_calls: 4050,
+                    acks_sent: 1900,
+                    acks_received: 2000,
+                },
             }),
         }),
     };
