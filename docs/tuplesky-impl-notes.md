@@ -10633,3 +10633,90 @@ still a small one; task-d73, which removes frames a turn, is worth on
 the order of 1% at that rate. task-d75's reading of the leader's loop is
 the leader's 40%, and what it found is in its own section, "The domain
 loop, read (task-d75)", with #168.
+
+## Journal syncs a command, and what each carries (task-d84)
+
+task-d84 was planned as one journal sync a turn for a turn's acceptance
+rows and its execution group. Its entry asks for the reading first: the
+syncs a command and a turn at every voter, which of a turn's writes each
+one carries, the syncs in series on one write's path, and the
+projection's syncs under `strict`.
+
+**The counts.** Each voter's snapshot now says what its journal groups
+held (`Cost::journal_groups`, from the store's `GroupMix`): groups of
+protocol transitions only, of application outcomes only, of both, and
+of neither, and the records of each kind. `command_cost.py table` prints
+them as a third table.
+
+**The setup.** `scripts/bench/command-cost.sh` on task-d84's branch: three
+voters on one host (x86_64, 4 CPUs), strict profile, 2,500 measured
+operations of `put=15,get=55,contended=20,txn=5`. Three runs at each of
+1 and 10 callers, with the stores on tmpfs (the script's default) and
+then on the disk. A journal sync on this disk is served in 0.66 to
+0.71 ms at 1 caller and about 1.06 ms at 10, against 0.03 to 0.04 ms on
+tmpfs.
+
+| | Leader | Fast-set follower | Other follower |
+| --- | --- | --- | --- |
+| Syncs a command, 1 caller (tmpfs; disk) | 2.97; 2.91 to 2.92 | 1.93 to 1.96; 1.98 to 1.99 | 2.38 to 2.41; 2.46 to 2.49 |
+| Syncs a command, 10 callers (tmpfs; disk) | 1.17 to 1.19; 1.12 to 1.14 | 0.94 to 1.02; 1.01 to 1.09 | 1.04 to 1.06; 1.05 to 1.09 |
+| Groups holding both kinds a command, 1 caller (tmpfs; disk) | 0.03; 0.08 to 0.09 | 0.74 to 0.77; 0.98 | 0.29 to 0.30; 0.46 to 0.49 |
+| Groups holding both kinds a command, 10 callers (tmpfs; disk) | 0.34 to 0.37; 0.41 to 0.42 | 0.36 to 0.39; 0.47 to 0.48 | 0.33 to 0.36; 0.44 to 0.46 |
+
+Each voter writes two protocol transitions a command, one with the
+command's payload, and one application outcome. Syncs that are no group
+(the journal's mapping updates and compactions) are 0.001 a command.
+
+**What it says:**
+- **The leader writes three groups a command at 1 caller, and each waits
+  for the one before it.**
+  1. The proposal row: PRE-ACCEPT, with the payload.
+  2. Its ACCEPT row (`Leader::advance_pending`), which is written only once
+     the proposal row is durable. Its durability is the leader's own slow
+     acknowledgement (`Leader::adopt_own`).
+  3. The execution group, once the command is decided.
+
+  The counts show them apart: 1.91 to 1.97 groups of protocol transitions
+  only, one record each, and 0.91 to 0.97 of application outcomes only. No merge can
+  put any two of these in one sync, because each is written only after
+  the one before it is durable.
+- **A follower already shares.** Its second protocol transition goes in
+  one group with the application outcome for 74 to 99% of commands at
+  1 caller on the fast-set follower. task-d47 queues the execution group's
+  batches with the protocol's, and one append takes whatever is queued.
+- **Under load the syncs are already about one a command at every voter.**
+  At 10 callers a group holds 2.0 to 2.5 protocol transitions and 1.7 to
+  2.0 commands, and 29 to 46% of syncs carry both kinds. So what a turn
+  merge would add is small.
+- **The syncs in series on a write's path, at 1 caller on the disk:**
+  - The `put` p50 is 3.17 to 3.24 ms, against 1.69 to 1.71 on tmpfs. That is
+    1.5 ms more, about 2.3 syncs.
+  - The leader's wait from learned to released in its journal is 1.13 to
+    1.22 ms, against 0.21 to 0.22 on tmpfs. That is 1.0 ms more, about 1.5
+    syncs.
+  - So about one sync comes before learning: the proposal row at the
+    leader and the pre-acceptance rows at the followers, in parallel.
+    Then about one and a half come after it: the execution group's own,
+    behind the leader's ACCEPT row when that is the group still out.
+  - The appender has one group out at a time (task-d54). At 95% fast
+    decisions, that ACCEPT row is a write no decision read, and it delays
+    the execution group.
+- **At 10 callers p99 hardly moves with the disk.** The `put` p99 is 21.9
+  to 28.6 ms on tmpfs and 25.4 to 29.3 ms on the disk, and the p50 is
+  4.8 to 5.3 ms against 9.0 to 9.6. Locally, at this load, the tail is
+  set by queueing and CPU, not by syncs. On the runner a sync takes about
+  2.3 ms, so the two or three in series are a larger share there.
+- **The projection under `strict`:**
+  - It commits about once a journal group: 2.8 to 2.9 times a command
+    at the leader at 1 caller, and 1.0 to 1.1 at 10. Each commit uses
+    redb's two-phase durability (Section 17.3.4).
+  - Since task-d63 none of it is on a result's path.
+  - It is on the same disk, though: the materializer's commits take 2.8
+    to 2.9 ms a command at the leader at 1 caller on the disk. That is
+    more than its journal's 1.9 to 2.1 ms.
+
+**For task-d84.** Merging a turn's groups is not built. The writes that
+take separate syncs at low load are the ones that wait on each other's
+durability, and at load they already share. Neither reaches task-d72's
+`service` p99. What is left on the path is in series, and two levers
+are named for a design step, in the plan's entry.

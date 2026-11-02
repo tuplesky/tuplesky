@@ -3098,6 +3098,24 @@ The change, in two steps:
   - If the reading confirms that, meeting the p99 needs one of two things: a design step on whether a result may be released once its command is decided at a quorum, before its own execution group is durable; or the target revised under task-d72's own clause, with the reason beside it.
 - **The merge keeps every ordering Section 17.3.3 states:** an acceptance is durable before its acknowledgement goes out, and an execution before its result is released. A turn whose acceptances and execution share one sync releases neither before it.
 
+- **The reading (task-d84's first PR; [notes](../tuplesky-impl-notes.md#journal-syncs-a-command-and-what-each-carries-task-d84)).**
+  - Three voters on one host, strict, 1 and 10 callers, with the stores on tmpfs and on the disk.
+  - Each voter's snapshot now counts what its journal groups held (`Cost::journal_groups`).
+  - **At 1 caller the leader syncs three times a command, and each sync waits for the one before it:** the proposal row, its ACCEPT row (`Leader::advance_pending`, written once the proposal row is durable), and the execution group.
+  - **Followers already share.** The fast-set follower's second protocol row shares its group with the execution group for 74 to 99% of commands.
+  - **At 10 callers every voter syncs 0.94 to 1.19 times a command,** and 29 to 46% of the groups already carry both kinds (task-d47).
+  - **In series on a write's path:** about one sync before the command is learned and one and a half after it. The execution group waits behind the leader's ACCEPT row, the group still out, since the appender has one group out at a time (task-d54).
+  - **The projection under `strict`:** it commits once a journal group, off the result's path since task-d63, but on the same disk.
+  - **Per turn is not counted.** A group is lent whenever none is out, so its boundary is the previous sync's return, not a turn.
+- **What the reading decides: the merge is not built.**
+  - The syncs that stay separate at low load wait on each other's durability, so no grouping can join them.
+  - At load the groups already share.
+  - Locally at 10 callers, the `put` p99 hardly moves between tmpfs and the disk (21.9 to 28.6 ms against 25.4 to 29.3), so the tail there is queueing and CPU.
+  - Reaching task-d72's p99 needs a design step. Two levers, sized by the reading:
+    - **The leader's ACCEPT row of its own proposal** goes out before a fast decision can form. Deferred until the fast path has failed, it takes one of the leader's three syncs off a fast command, and the group the execution group queues behind. It changes what the leader's journal holds when recovery reads it, so its argument comes first (Section 4).
+    - **A result released once its command is decided at a quorum,** before its own execution group is durable, as this entry first named. That takes the sync after learning off the path.
+  - Which one goes first, or the target revised under task-d72's clause, is for review of this entry. The runner's pair for whichever is built reads the `service` row's p50 and p99 against this reading.
+
 **Acceptance:** The reading recorded first. The storage crash tests across the merged group, at every cut. Three pairs on the runner: journal syncs a command, CPU an operation, the `service` row's p50 and p99.
 
 **Review boundary:** How a turn's journal writes are grouped and synced. No change to what is durable before what.
