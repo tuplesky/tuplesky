@@ -265,7 +265,11 @@ Every transition is recorded as a `CollectorEvent` (`Submitted`,
 `Reoffered`, `Undisseminated`) with identities in lowercase hex. The three
 added in revisions 2 and 3 appear only when a delivery was lost or did not go
 straight through, so the frozen revision-1 scenario produces the same trace it
-always did. The Rust reference trace of the frozen scenario is
+always did. Its voters are part of the scenario, though: since task-d74 a
+follower sends its acknowledgements to the leader and the frontend only, so
+evidence arrives in another order, and the fast release counts the two votes
+that arrived before it rather than all three. No collector rule changed; the
+trace was regenerated then. The Rust reference trace of the frozen scenario is
 `crates/coord-collector/fixtures/collector_trace_v1.json` (regenerate
 deliberately with `COORD_COLLECTOR_WRITE_FIXTURES=1`). The Go collector
 must produce the same trace for the same scenario; differential tests of
