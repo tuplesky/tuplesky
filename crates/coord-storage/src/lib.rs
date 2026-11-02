@@ -120,7 +120,7 @@ pub use apply::{AppliedOutcomeParts, Applier, ApplyError};
 pub use compaction::{GcBudget, GcPlan, HoldGuard, RetentionHolds, plan_gc};
 pub use cut::{CutOverlay, RecoveryCut};
 pub use journaled::{
-    AppendDone, AppendJob, Appender, CutError, DomainStatus, FlushReport, JournalLimits,
+    AppendDone, AppendJob, Appender, CutError, DomainStatus, FlushReport, GroupMix, JournalLimits,
     JournaledError, JournaledStore, LoweringCost, MaterializeDone, MaterializeJob, Materializer,
     PublishPhases, PublishThread, Published, Replayed, Submission, SubmitRefused, ThreadClock,
     ThreadTime, TransitionKind,

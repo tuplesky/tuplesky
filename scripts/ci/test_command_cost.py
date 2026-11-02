@@ -199,6 +199,25 @@ class ReduceTests(unittest.TestCase):
         self.assertIn("5.00/4.50 (4.80, 2.00)", table)
         self.assertNotIn("traffic_per_command", cost.per_command("n1", snapshot()))
 
+    def test_journal_groups_are_read_per_command_when_reported(self):
+        snap = snapshot(executed=100, appends=180, syncs=190)
+        snap["cost"]["Observed"]["journal_groups"] = {
+            "protocol": 90, "application": 60, "both": 20, "other": 10,
+            "protocol_records": 330, "payload_records": 100, "application_records": 100,
+        }
+        reading = cost.per_command("n1", snap)
+        groups = reading["groups_per_command"]
+        self.assertAlmostEqual(groups["protocol"], 0.9)
+        self.assertAlmostEqual(groups["both"], 0.2)
+        self.assertAlmostEqual(groups["not_a_group"], 0.1)
+        self.assertAlmostEqual(reading["protocol_records_per_group"], 3.0)
+        self.assertAlmostEqual(reading["commands_per_execution_group"], 1.25)
+        self.assertAlmostEqual(reading["payload_records_per_command"], 1.0)
+        table = cost.groups_table({"runs": [{"callers": 1, "voters": [reading]}]})
+        self.assertIn("| 1 | n1 | 1.900 | 0.900 | 0.600 | 0.200 | 0.100 | 0.100 "
+                      "| 3.30 (1.00) | 3.00 | 1.25 |", table)
+        self.assertNotIn("groups_per_command", cost.per_command("n1", snapshot()))
+
     def test_a_run_with_no_fast_decision_is_a_finding(self):
         def voter(fast):
             snap = snapshot()

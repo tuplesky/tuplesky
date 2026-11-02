@@ -7,9 +7,9 @@
 use std::time::Duration;
 
 use coord_daemon::metrics::{
-    Cost, Cpu, Durability, FastPath, Frontiers, Headroom, Interval, Jobs, Lane, LaneReading,
-    Latency, MAX_REPORTED_SHARDS, Measure, MetricsSnapshot, PipelineWaits, Reads, Recorder,
-    Release, Resends, Scheduling, ShardIndex, ShardReading, Stage, StageReading, Traffic,
+    Cost, Cpu, Durability, FastPath, Frontiers, Headroom, Interval, Jobs, JournalGroups, Lane,
+    LaneReading, Latency, MAX_REPORTED_SHARDS, Measure, MetricsSnapshot, PipelineWaits, Reads,
+    Recorder, Release, Resends, Scheduling, ShardIndex, ShardReading, Stage, StageReading, Traffic,
     Unavailable, UnorderedPreAcceptances, Wait,
 };
 use coord_daemon::role::RoleSet;
@@ -451,6 +451,15 @@ fn a_rendered_snapshot_carries_no_secret_or_key_shaped_text() {
                 received_bytes: 1_900_000,
                 received_streams: 8800,
             }),
+            journal_groups: JournalGroups {
+                protocol: 3100,
+                application: 2400,
+                both: 500,
+                other: 20,
+                protocol_records: 4300,
+                payload_records: 1200,
+                application_records: 1200,
+            },
         }),
     };
     let rendered = serde_json::to_string(&snapshot).expect("a snapshot renders");

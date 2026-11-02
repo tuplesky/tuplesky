@@ -1710,6 +1710,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 Measure::Observed,
             ),
             projection_commits: storage.lowering.commits,
+            journal_groups: journal_groups(&storage.lowering.groups),
             busy,
             uptime: now.saturating_duration_since(self.started),
             recent,
@@ -4912,6 +4913,19 @@ fn release(split: &coord_daemon::learned::ReleaseSplit) -> coord_daemon::metrics
         predecessors: split.predecessors,
         group: split.group,
         journal: split.journal,
+    }
+}
+
+/// The snapshot's reading of what the journal groups held (task-d84).
+fn journal_groups(mix: &coord_storage::GroupMix) -> coord_daemon::metrics::JournalGroups {
+    coord_daemon::metrics::JournalGroups {
+        protocol: mix.protocol,
+        application: mix.application,
+        both: mix.both,
+        other: mix.other,
+        protocol_records: mix.protocol_records,
+        payload_records: mix.payload_records,
+        application_records: mix.application_records,
     }
 }
 
