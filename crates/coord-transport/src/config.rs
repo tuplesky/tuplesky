@@ -90,6 +90,46 @@ pub struct Limits {
     /// The most bytes of frames a peer lane's sender puts on one stream.
     /// A frame larger than this still goes, alone.
     pub stream_bytes: usize,
+    /// How often this endpoint asks the other end of each connection to
+    /// acknowledge (task-d70). [`AckFrequency::DEFAULT`] by default.
+    /// `None` asks nothing, and QUIC's own cadence holds: an ACK every
+    /// second ack-eliciting packet, within 25 ms.
+    pub ack_frequency: Option<AckFrequency>,
+}
+
+/// The acknowledgement cadence an endpoint asks of its peers, through
+/// QUIC's acknowledgement-frequency extension (task-d70). A peer that
+/// does not support the extension ignores it.
+///
+/// With about one data datagram per peer per command, an acknowledgement
+/// sent after every second packet often has nothing to ride on and
+/// travels as a datagram of its own; a higher threshold lets it wait for
+/// the reply that follows. The delay is best left to the peer: QUIC's own
+/// is 25 ms, so a shorter one sends an acknowledgement sooner, alone, on a
+/// connection with little traffic. At threshold 8 and QUIC's delay the
+/// runner's five voters sent about a sixth fewer datagrams per command and
+/// half the api plane's ACKs, for 4% less CPU per operation (#98). Loss is
+/// learned after as many packets more, within the same 25 ms.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AckFrequency {
+    /// Ack-eliciting packets the peer may receive before it must
+    /// acknowledge: zero acknowledges every packet, one every second.
+    pub threshold: u32,
+    /// The longest the peer may hold an acknowledgement below the
+    /// threshold. `None` keeps the peer's own `max_ack_delay`, QUIC's
+    /// 25 ms unless it says otherwise. QUIC clamps a delay to at least the
+    /// peer's `min_ack_delay` and at most the greater of the path's RTT
+    /// and 25 ms.
+    pub max_delay: Option<Duration>,
+}
+
+impl AckFrequency {
+    /// The cadence asked by default: an ACK after eight ack-eliciting
+    /// packets, within the peer's own delay (task-d70).
+    pub const DEFAULT: AckFrequency = AckFrequency {
+        threshold: 8,
+        max_delay: None,
+    };
 }
 
 impl Default for Limits {
@@ -109,6 +149,7 @@ impl Default for Limits {
             budget: BudgetLimits::default(),
             stream_frames: 64,
             stream_bytes: 256 * 1024,
+            ack_frequency: Some(AckFrequency::DEFAULT),
         }
     }
 }

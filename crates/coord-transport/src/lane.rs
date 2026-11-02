@@ -11,6 +11,8 @@ use std::time::Duration;
 use coord_types::wire_v1::{HelloV1, PeerRole};
 use quinn::VarInt;
 
+use crate::config::AckFrequency;
+
 /// One traffic lane of a peer link.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Lane {
@@ -190,11 +192,13 @@ impl LaneLimits {
 }
 
 /// The QUIC transport configuration of a lane: explicit CUBIC, the
-/// lane's stream limits and windows, keep-alive and idle timeout.
+/// lane's stream limits and windows, keep-alive and idle timeout, and the
+/// acknowledgement cadence asked of the peer, if any (task-d70).
 pub fn transport_config(
     limits: &LaneLimits,
     idle_timeout: Duration,
     keep_alive: Duration,
+    ack_frequency: Option<AckFrequency>,
 ) -> Result<Arc<quinn::TransportConfig>, String> {
     let mut transport = quinn::TransportConfig::default();
     transport
@@ -208,6 +212,13 @@ pub fn transport_config(
         ))
         .keep_alive_interval(Some(keep_alive))
         .congestion_controller_factory(Arc::new(quinn::congestion::CubicConfig::default()));
+    if let Some(ack) = ack_frequency {
+        let mut config = quinn::AckFrequencyConfig::default();
+        config
+            .ack_eliciting_threshold(VarInt::from_u32(ack.threshold))
+            .max_ack_delay(ack.max_delay);
+        transport.ack_frequency_config(Some(config));
+    }
     Ok(Arc::new(transport))
 }
 
