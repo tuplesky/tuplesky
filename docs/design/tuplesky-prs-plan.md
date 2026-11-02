@@ -2862,7 +2862,17 @@ The design step names the order the rule reads, so a hole is not patched as a fi
 This entry is the budget and the record, not a lever:
 - **The measure:** CPU per operation at the matched shape against etcd's 1.39 ms, split by the leader's loop, its transport threads, the journal and the followers, with `ok`/s and p99 beside it.
 - **The target that closes the entry:** CPU per operation at the register row within twice etcd's (2.8 ms), and the `service` shape's p99 within etcd's spread at the same rate. The first rows may revise it, with the reason recorded beside them.
+- **The profile the `service` target is read at: `replay` (#174 review).** etcd's backend commits on an interval, with the WAL the only sync on a request's path, which is `replay`'s shape.
+  - Under `strict`, every projection commit is durable before the snapshot gate moves (`ProjectionProfile::Strict`). So a barrier read's snapshot wait includes the materializer's fsync, about 4.4 of a barrier read's 12.4 ms in the last run.
+  - The `strict` row stays in the record as its own line, read on its own and not against etcd. No lever here owns it.
 - **The levers, in order,** each with the number it is expected to move and the pair that checks it: task-d63's build (latency: about 6.6 ms a command on the leader at closed loop), task-d66's job (latency: the stalls), then task-d73, task-d74 and task-d75 (CPU). Only the last three are expected to move CPU per operation.
+- **Where the gap stands after the #173 carry (#174 review).** No single remaining lever is projected to close either target. Each of these is likely needed:
+  - **The register row's CPU:** 3.58 ms against the target's 2.8, so 22% to go.
+    - The voters' tokio threads are the largest part, at 1.45 ms. task-d74 halved frames a write locally for 4.5% of CPU, so per-frame cost isn't what those threads spend. The tokio-thread profile, with each thread's run-queue delay beside its CPU, comes before task-d73, and task-d73 is re-scoped to what it names.
+    - Then task-d84, whose reading reads the register row's syncs a command first.
+    - task-d27 too, if the 900 s `service` run shows cost a command rising with history.
+    - task-d83 doesn't move this row: its reads are single keys, already at the barrier.
+  - **The `service` row's latency:** task-d83 takes its ordered commands from about 1.03 an operation toward 0.4, and task-d84 its syncs. task-d84's reading decides whether merging syncs can reach the p99 at all (task-d84).
 - **The record:** the table below, one row a lever, each row a pair on the runner.
 
 | Row | Build | Shape | `ok`/s | Server CPU an operation | Idle cores | Expected to move |
@@ -2875,6 +2885,7 @@ This entry is the budget and the record, not a lever:
 | task-d75 | | | | | | CPU: the leader's loop |
 | The #173 carry (task-d63, task-d66, task-d74's recovery fix, task-d75, task-d77 to task-d80) against `259e0b2` | `36fe7d1` (#98) | register, 30 clients, replay, three pairs | 501.5 to 504.2 (base 505.4 to 513.4) | 3.57 to 3.59 ms (base 3.58 to 3.66) | 0.41 to 0.46 | the leader's loop: -4.1 to -6.6%; the domain loops -3.8%; tokio threads unchanged at 1.45 ms an op |
 | `service`, the same carry | `36fe7d1` | wr, 1,000 uniform keys, read-only ratio 0.6, 4 clients at 300/s, strict | 140.0, below the rate (etcd 290.1) | 12.41 ms (etcd 2.86), not at equal work | 1.87 (etcd 2.51) | p50 23 ms and p99 61 ms (etcd 2 and 4): task-d83, task-d84 |
+| `service` at `replay`, the matched comparison | | the same shape, replay | | | | the row the `service` target is read at (the testing session) |
 - **The local record** (this entry's PR): the same split on one host, five voters, each build against the one before it, with a profile of the leader and a follower ([notes](../tuplesky-impl-notes.md#the-budget-on-one-host-task-d72)). It does not replace the runner's rows, which the Jepsen testing session runs. It reads what a lever moved before the runner does: of a write's 7.9 to 8.7 ms of the nodes' CPU, a follower costs about 1.6 ms and the leader about 1.9, so the followers carry three quarters of it, and off the domain loops the transport's QUIC threads are a third of each node's CPU and the projection's commits a fifth.
 - **The shapes it is read in** (`docs/operations/jepsen.md`): `service`, a fixed rate where the metric is latency and CPU per operation at equal work, on the bridge and under the WAN profile; the append shape run against etcd too, so the multiple quoted has a denominator; and several domains on one cluster, if the harness can start them.
 
@@ -3075,7 +3086,13 @@ The change, in two steps:
 **Design:** Section 17.3.3 (amended by this task, if a turn's groups merge).
 
 **Implement:** task-d72 names durability per command as one of the four costs and no lever owns it. In the #173 carry's `service` row (#98) every voter synced its journal 1.6 to 1.8 times a command at 140/s, each append on the leader 2.28 ms served and 0.26 ms queued, and a write's 23 ms p50 is a read and then a write, each paying syncs in series. A turn's acceptance rows and its execution group are separate journal groups. One sync a turn for both, and for the payload rows a turn records, takes the syncs a command toward one a turn.
-- **First, the reading:** journal syncs a turn and a command at every voter, and which of a turn's writes each one carries, from the metrics, so the merge is sized before it is built.
+- **First, the reading:** journal syncs a turn and a command at every voter, and which of a turn's writes each one carries, from the metrics, so the merge is sized before it is built. Besides those (#174 review):
+  - **the syncs in series on one write's path,** from submission to release: the acceptance row before its acknowledgement, then the execution group before release;
+  - **the projection's syncs under `strict`.**
+- **Then the entry says whether merging syncs can reach task-d72's p99.** A merge lowers syncs a command, but not the two in series on one write's path.
+  - With an append at about 2.3 ms on the runner, two in series are already above etcd's 4 ms p99 before any queueing. etcd has one, its WAL sync, at the leader and the followers in parallel.
+  - A barrier read also waits for its index to execute, 6.9 ms in the last run, which is the in-flight writes' latency.
+  - If the reading confirms that, meeting the p99 needs one of two things: a design step on whether a result may be released once its command is decided at a quorum, before its own execution group is durable; or the target revised under task-d72's own clause, with the reason beside it.
 - **The merge keeps every ordering Section 17.3.3 states:** an acceptance is durable before its acknowledgement goes out, and an execution before its result is released. A turn whose acceptances and execution share one sync releases neither before it.
 
 **Acceptance:** The reading recorded first. The storage crash tests across the merged group, at every cut. Three pairs on the runner: journal syncs a command, CPU an operation, the `service` row's p50 and p99.
