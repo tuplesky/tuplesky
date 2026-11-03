@@ -93,6 +93,16 @@ struct Held {
     /// caught up: the client's deadline, or `GATE_HOLD_MILLIS` after the
     /// hold began, whichever is earlier.
     until: MonotonicMillis,
+    /// When the hold began, so a retry that presents another deadline
+    /// moves `until` without moving the hold's own bound.
+    began: MonotonicMillis,
+}
+
+/// When a hold that began at `began` ends: the client's deadline, or
+/// `GATE_HOLD_MILLIS` after it began, whichever is earlier.
+fn hold_until(began: MonotonicMillis, deadline: Option<MonotonicMillis>) -> MonotonicMillis {
+    let bound = began.plus(GATE_HOLD_MILLIS);
+    deadline.map_or(bound, |d| d.min(bound))
 }
 
 /// What the gate decided about one delivery.
@@ -556,8 +566,17 @@ impl BoundFrontend {
         logical: &LogicalRequest,
         deadline: Option<MonotonicMillis>,
     ) {
-        if let Some(existing) = self.requests.get(&key) {
+        if let Some(existing) = self.requests.get_mut(&key) {
             debug_assert_eq!(existing.command, command, "identity decides the metadata");
+            // A retry the dispatcher accepted waits under the deadline it
+            // presented, and so does its disclosure at the gate. What
+            // authorizes the result stays the first request's.
+            existing.deadline = deadline;
+            for held in self.held.iter_mut() {
+                if held.delivery.retry_key == key {
+                    held.until = hold_until(held.began, deadline);
+                }
+            }
             return;
         }
         let info = RequestInfo {
@@ -718,9 +737,7 @@ impl BoundFrontend {
                     .requests
                     .get(&delivery.retry_key)
                     .and_then(|i| i.deadline);
-                let until = deadline.map_or(now.plus(GATE_HOLD_MILLIS), |d| {
-                    d.min(now.plus(GATE_HOLD_MILLIS))
-                });
+                let until = hold_until(now, deadline);
                 // A deadline already passed, or no room: answered as
                 // before the hold, `Pending`. The hold is bounded as the
                 // request metadata it rests on is.
@@ -733,6 +750,7 @@ impl BoundFrontend {
                     session,
                     scope,
                     until,
+                    began: now,
                 });
                 Gated::Held(command)
             }

@@ -1336,6 +1336,58 @@ fn a_held_disclosure_still_behind_at_its_deadline_is_answered_pending() {
     assert!(out.len() == 1 && is_pending(&out[0]));
 }
 
+/// A retry the dispatcher accepts waits under the deadline it presented,
+/// and so does the disclosure the gate holds for it: the first request's
+/// deadline is not the one the caller is now waiting on (#186 review).
+#[test]
+fn a_held_disclosure_waits_under_the_deadline_its_retry_presented() {
+    let ring = ring();
+    let hub = WatchHub::new(KvRevision::ZERO, KvRevision::ZERO);
+    let domain = Domain::new();
+    // The first request named no deadline: the gate's own bound.
+    let (mut f, command) = bound_behind(&ring, &hub, &domain, 0);
+    assert!(matches!(
+        f.deliver_at(
+            at(NOW),
+            delivery(7, 1, command, range_outcome(b"a")),
+            &Behind
+        ),
+        coord_session::Delivered::Held
+    ));
+    assert_eq!(
+        f.next_hold_deadline(),
+        Some(at(NOW).plus(coord_session::GATE_HOLD_MILLIS))
+    );
+
+    // Its retry, 10 ms later, names 50 ms.
+    let mut logical = LogicalRequest::new(NS, range(b"a"));
+    logical.canonicalize();
+    let retry = frame_of(
+        &MessageV1::Request(RequestV1::new(retry_key(1), &logical, 50, 0).unwrap())
+            .encode()
+            .unwrap(),
+    );
+    let accepted = f.on_frame(
+        &clock(NOW),
+        at(NOW).plus(10),
+        7,
+        &retry,
+        &hub,
+        &domain.policy(),
+    );
+    assert!(
+        matches!(
+            accepted,
+            Ingress::Action(Action::Pending { .. } | Action::FanOut(_))
+        ),
+        "the retry was not accepted"
+    );
+    assert_eq!(f.next_hold_deadline(), Some(at(NOW).plus(60)));
+    assert!(f.release_held(at(NOW).plus(59), &Behind).is_empty());
+    let out = f.release_held(at(NOW).plus(60), &Behind);
+    assert!(out.len() == 1 && is_pending(&out[0]));
+}
+
 /// A held disclosure goes with its connection: nobody is waiting for it,
 /// and nothing is written later to a stream that is gone.
 #[test]
