@@ -103,7 +103,7 @@ on:
         description: "How many base and head pairs, when pair-base is set (the order alternates from pair to pair)"
         default: "3"
       leader-profile:
-        description: "Profile the TupleSky leader's domain thread with perf for 20 s in each run's workload, into its summary: true (flat), call-graph (call graphs by frame pointer, on the first pair's runs in a paired job, with every build in the job made with frame pointers; also the busiest follower, the leader's tokio threads and its threads' system calls), or false"
+        description: "Profile the TupleSky leader's domain thread with perf for 20 s in each run's workload, into its summary: true (flat), call-graph (call graphs by frame pointer, on the first pair's runs in a paired job, with every build in the job made with frame pointers; also the busiest follower, the leader's and that follower's tokio threads and their threads' system calls), or false"
         type: choice
         options: ["false", "true", "call-graph"]
         default: "false"
