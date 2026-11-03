@@ -11057,3 +11057,90 @@ behaviour, and `deliver_retained` uses it).
 **The stopgap goes.** `c01a397` had the two leader-restart tests present
 a read again while their node answered `Pending` (`read_projected`). It is
 reverted, and the tests read once.
+
+## A local checkpoint publication's cost a record (task-d92)
+
+R2 found the process's cost a command steps up once local checkpoint
+publications start, and that the step is the publications' own export
+and write. This is the profile task-d92 asked for, and its lever.
+
+**The setup.** R2's: `command-cost.sh` with `MEASURED=750000`, 10
+callers, three voters on one host (x86_64, 4 CPUs), `replay`, stores on
+tmpfs. Every 0.5 s a script looked for a new `checkpoint` thread in a
+follower and ran `perf record -F 199 --call-graph dwarf` on it while it
+lived. Every voter's threads were read from `/proc` each 5 s. The base
+is `df72e28`.
+
+**The profile** (a follower's 13 publications and reclaims, 8,715
+samples), each sample put under the publication step it ran in:
+
+| Step | Share | Of it, the kernel zeroing fresh pages |
+| --- | --- | --- |
+| The export's encode of each chunk (for its length and digest) | 32.6% | 23.5 points |
+| redb's scan | 20.6% | 0.9 points |
+| Writing and syncing the files | 15.6% | |
+| Verifying the image (its encode of each chunk) | 10.1% | |
+| The store's write (its encode of each chunk) | 9.9% | |
+| The export's rows (copied out of each page) | 5.9% | 3.0 points |
+| Dropping the image, and the rest | 5.3% | |
+
+- **Each chunk was encoded three times,** at 53% of the thread
+  together: once by the export, once by `verify_local`, once by the
+  store's write.
+- **Each encode went a byte at a time.** serde serializes a `Vec<u8>`
+  as a sequence, and postcard pushes each `u8` on its own
+  (`serialize_u8` and `Vec::push` under `RowV1`'s fields).
+- **Its buffer grew by doubling,** and the pages each growth faulted in
+  were zeroed by the kernel: 27% of the thread, almost all of it under
+  the export's encode.
+
+**The change** (the image's bytes do not change):
+- `RowV1`'s key and value serialize as bytes. postcard writes a
+  sequence of bytes and bytes alike, a varint length and the bytes, so
+  the encoding is the same; a test pins it against the derived form at
+  every varint width.
+- `ChunkV1::encode` sizes its buffer for the chunk before it writes.
+- `LocalCheckpointStore::write` writes each chunk from the bytes its
+  verification encoded (`verify_local_each`), so a publication encodes
+  a chunk twice, not three times. An image that does not verify leaves
+  no pending directory.
+- The export moves each scanned row into the image instead of copying
+  it, and verification compares keys by slice.
+- Each chunk after the first is encoded into the buffer the one before
+  it used (`ChunkV1::encode_into`), in the export and in verification.
+
+**The pair.** The base against the head, alternating; the head was
+read twice: with the first four changes (head 1), and with the reused
+buffer too (head 2). µs a record is every voter's export and write over
+the records each publication represented; CPU is each voter's process a
+command.
+
+| Side | Publications | Export µs/record | Write µs/record | Total µs/record | Export and write ms a command a voter | Process CPU ms/cmd (n1, n2, n3) |
+| --- | --- | --- | --- | --- | --- | --- |
+| base | 33 | 6.07 | 2.50 | 8.58 | 0.145 | 0.970, 0.834, 0.820 |
+| head 1 | 36 | 4.83 | 0.70 | 5.54 | 0.108 | 0.950, 0.817, 0.802 |
+| base | 33 | 5.89 | 2.07 | 7.96 | 0.135 | 0.959, 0.830, 0.813 |
+| head 1 | 36 | 4.68 | 0.78 | 5.46 | 0.106 | 0.955, 0.820, 0.806 |
+| head 2 | 36 | 4.80 | 0.85 | 5.65 | 0.112 | 0.942, 0.810, 0.797 |
+| base | 33 | 5.40 | 1.92 | 7.33 | 0.124 | 0.968, 0.840, 0.823 |
+| head 2 | 36 | 4.64 | 0.80 | 5.44 | 0.107 | 0.940, 0.810, 0.793 |
+
+**What it says:**
+- **A publication costs about 30% less a record:** 7.33 to 8.58 µs
+  against 5.44 to 5.65. The write falls by two thirds; the export by
+  about a fifth.
+- **The process's CPU a command falls 2 to 3.6% at every voter** with
+  both heads. The head fits three more publications into the same run,
+  because each takes less time; publications stay on the same cadence
+  (records and time), so that is more images, not less work counted.
+- **The reused buffer moves the publication's time within the spread.**
+  Both of its runs read the process about 1% lower than either run of
+  the first head, which is near the spread too; it stays, since it is
+  four lines and removes the faults a chunk.
+- **What leads now** (the head's profile, 1,107 samples): redb's scan,
+  44.5% of the thread, then the export's encode at 26%, nearly all of it
+  zeroing fresh pages (before the reused buffer). The scan is the
+  engine's; it is not this task's.
+- **On the runner,** R2 sized a publication at the register row's
+  length at 0.15 to 0.2 ms an operation over five voters. A third less
+  is about −0.05 ms an operation. The batch's pairs read it.

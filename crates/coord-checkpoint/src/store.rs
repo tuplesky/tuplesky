@@ -46,7 +46,9 @@ use coord_journal_api::frontier::{CheckpointPointerV1, LOCAL_CHECKPOINT_FORMAT_V
 use coord_journal_api::record::RecordOrigin;
 use coord_types::identity::Digest32;
 
-use crate::local::{LocalCheckpointV1, LocalError, LocalManifestV1, verify_local};
+use crate::local::{
+    LocalCheckpointV1, LocalError, LocalManifestV1, verify_local, verify_local_each,
+};
 use crate::manifest::{
     ArtifactError, ChunkV1, MAX_CHUNK_BYTES, MAX_MANIFEST_BYTES, SharedCheckpointV1,
     SharedManifestV1,
@@ -97,6 +99,12 @@ impl fmt::Display for StoreError {
 }
 
 impl std::error::Error for StoreError {}
+
+impl From<LocalError> for StoreError {
+    fn from(e: LocalError) -> Self {
+        StoreError::Invalid(e)
+    }
+}
 
 impl From<io::Error> for StoreError {
     fn from(e: io::Error) -> Self {
@@ -193,7 +201,6 @@ impl LocalCheckpointStore {
     /// under the same name, because the name is the image's own
     /// identity.
     pub fn write(&self, checkpoint: &LocalCheckpointV1) -> Result<CheckpointPointerV1, StoreError> {
-        verify_local(checkpoint).map_err(StoreError::Invalid)?;
         let manifest = checkpoint.manifest.encode()?;
         let checkpoint_id = checkpoint.manifest.root;
         let pending = self.root.join(format!("{PENDING}{}", hex(&checkpoint_id)));
@@ -203,9 +210,16 @@ impl LocalCheckpointStore {
             fs::remove_dir_all(&pending)?;
         }
         fs::create_dir(&pending)?;
-        for chunk in &checkpoint.chunks {
-            let encoded = chunk.encode()?;
-            write_synced(&pending.join(chunk_name(chunk.ordinal)), &encoded)?;
+        // Each chunk is written from the bytes its verification encoded,
+        // so a chunk is encoded once here (task-d92). The image is not
+        // known to verify until the walk returns, and until then it is
+        // only a pending directory, which nothing reads.
+        let written = verify_local_each(checkpoint, |chunk, encoded| {
+            write_synced(&pending.join(chunk_name(chunk.ordinal)), encoded).map_err(StoreError::Io)
+        });
+        if let Err(e) = written {
+            let _ = fs::remove_dir_all(&pending);
+            return Err(e);
         }
         write_synced(&pending.join(MANIFEST), &manifest)?;
         // Every file is durable before the directory is: a directory
