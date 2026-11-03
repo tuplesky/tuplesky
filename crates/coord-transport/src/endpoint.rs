@@ -2226,44 +2226,10 @@ async fn park_control(send: SendStream, conn: quinn::Connection) {
 /// Serve a negotiated connection until it closes.
 async fn serve(shared: Arc<Shared>, peer: Arc<Peer>, control: ControlStream) {
     tokio::spawn(watch_control(peer.clone(), control));
-    let reason = loop {
-        // A reader permit is taken before the stream is accepted, so a
-        // stalled consumer stops acceptance rather than growing a backlog.
-        let permit = peer
-            .readers
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("reader semaphore never closes");
-        match peer.class {
-            Class::Peer => match peer.conn.accept_uni().await {
-                Ok(recv) => {
-                    Traffic::add(&shared.traffic.received_streams, 1);
-                    tokio::spawn(read_uni(shared.clone(), peer.clone(), recv, permit));
-                }
-                Err(e) => break e,
-            },
-            Class::Api if peer.accepted => match peer.conn.accept_bi().await {
-                Ok((send, recv)) => {
-                    tokio::spawn(read_request(
-                        shared.clone(),
-                        peer.clone(),
-                        send,
-                        recv,
-                        permit,
-                    ));
-                }
-                Err(e) => break e,
-            },
-            // This side dialed: streams the peer opens carry its output
-            // to us, never requests of ours to serve.
-            Class::Api => match peer.conn.accept_bi().await {
-                Ok((_send, recv)) => {
-                    tokio::spawn(read_delivery(shared.clone(), peer.clone(), recv, permit));
-                }
-                Err(e) => break e,
-            },
-        }
+    let reason = if peer.class == Class::Peer {
+        serve_peer_streams(&shared, &peer).await
+    } else {
+        serve_api_streams(&shared, &peer).await
     };
     let recorded = peer.close_reason.lock().unwrap().take();
     let reason = recorded.unwrap_or_else(|| match reason {
@@ -2281,6 +2247,98 @@ async fn serve(shared: Arc<Shared>, peer: Arc<Peer>, control: ControlStream) {
             reason,
         })
         .await;
+}
+
+/// The next stream a peer connection opens, once a reader permit is
+/// held for it. The permit is taken before the stream is accepted, so a
+/// stalled consumer stops acceptance rather than growing a backlog.
+async fn next_peer_stream(
+    peer: Arc<Peer>,
+) -> Result<(RecvStream, tokio::sync::OwnedSemaphorePermit), quinn::ConnectionError> {
+    let permit = peer
+        .readers
+        .clone()
+        .acquire_owned()
+        .await
+        .expect("reader semaphore never closes");
+    let recv = peer.conn.accept_uni().await?;
+    Ok((recv, permit))
+}
+
+/// Accept and read a peer connection's streams until it closes, in this
+/// task (task-d70's third step).
+///
+/// A peer stream lives only until its frames are handed inward, so its
+/// reader needs no task of its own: every stream's read is driven here,
+/// beside the accept, rather than spawned. That takes a spawn and a
+/// wake-up across tasks off every stream a voter receives, and the
+/// transport's threads spend their time per packet and per wake-up, not
+/// per frame (task-d73's profile). The bound is unchanged: each read
+/// holds a reader permit until it ends. The accept is one future kept
+/// across the loop, so a read finishing never cancels it.
+///
+/// Reads still in flight when the connection ends are finished on a task
+/// of their own, as they were before, so a frame read in full is still
+/// handed inward.
+async fn serve_peer_streams(shared: &Arc<Shared>, peer: &Arc<Peer>) -> quinn::ConnectionError {
+    use futures_util::StreamExt as _;
+    use futures_util::stream::FuturesUnordered;
+
+    let mut reads = FuturesUnordered::new();
+    let mut accept = Box::pin(next_peer_stream(peer.clone()));
+    let reason = loop {
+        tokio::select! {
+            biased;
+            // A read that is ready is driven first: it is what the
+            // domain waits on, and it frees a permit for the accept.
+            Some(()) = reads.next(), if !reads.is_empty() => {}
+            accepted = &mut accept => match accepted {
+                Ok((recv, permit)) => {
+                    Traffic::add(&shared.traffic.received_streams, 1);
+                    reads.push(read_uni(shared.clone(), peer.clone(), recv, permit));
+                    accept.set(next_peer_stream(peer.clone()));
+                }
+                Err(e) => break e,
+            },
+        }
+    };
+    if !reads.is_empty() {
+        tokio::spawn(async move { while reads.next().await.is_some() {} });
+    }
+    reason
+}
+
+/// Accept an api connection's streams until it closes, each read on a
+/// task of its own: a request stream waits for the domain's answer and
+/// writes it back, so its reader lives as long as the request does.
+async fn serve_api_streams(shared: &Arc<Shared>, peer: &Arc<Peer>) -> quinn::ConnectionError {
+    loop {
+        // A reader permit is taken before the stream is accepted, so a
+        // stalled consumer stops acceptance rather than growing a backlog.
+        let permit = peer
+            .readers
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("reader semaphore never closes");
+        match peer.conn.accept_bi().await {
+            Ok((send, recv)) if peer.accepted => {
+                tokio::spawn(read_request(
+                    shared.clone(),
+                    peer.clone(),
+                    send,
+                    recv,
+                    permit,
+                ));
+            }
+            // This side dialed: streams the peer opens carry its output
+            // to us, never requests of ours to serve.
+            Ok((_send, recv)) => {
+                tokio::spawn(read_delivery(shared.clone(), peer.clone(), recv, permit));
+            }
+            Err(e) => return e,
+        }
+    }
 }
 
 /// Watch the control stream for an orderly `Close`.

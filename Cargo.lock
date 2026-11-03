@@ -1021,6 +1021,7 @@ dependencies = [
  "coord-core",
  "coord-transport-testkit",
  "coord-types",
+ "futures-util",
  "quinn",
  "quinn-proto",
  "rustls",

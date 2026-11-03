@@ -19,6 +19,7 @@ quinn-proto.workspace = true
 rustls.workspace = true
 rustls-pki-types.workspace = true
 tokio.workspace = true
+futures-util.workspace = true
 bytes.workspace = true
 thiserror.workspace = true
 
