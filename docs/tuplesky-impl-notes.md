@@ -10897,3 +10897,55 @@ window.
   of the process's CPU per window. The trim stays the long-run bound, and
   its first reading, the rows exported by kind at two positions, waits
   for it.
+
+## The api plane's frames by kind (R3, for task-d88)
+
+The api plane carried more datagrams than the peer plane in #155's pairs,
+and nothing said what. Each node now counts the frames it hands its
+transport, and takes from it, on api connections, by kind
+(`traffic.api_frames`, read per command by `command_cost.py`). QUIC packs
+frames into datagrams as it sees fit, so datagrams can't be split by
+kind; the frames can.
+
+**The reading.** The batch's head as #185 assembles it (#179 with #178,
+#180, #184, #182 and #186) with these counters. Three voters on one host,
+each a frontend, 30 callers, the default mix, `replay`, stores on tmpfs,
+150,000 operations (2,107 `ok`/s). Per command executed:
+
+| frames a command | n1 (leader) | n2 | n3 | all |
+| --- | --- | --- | --- | --- |
+| submissions sent to a voter elsewhere | 0.98 | 0.49 | 0.53 | 2.00 |
+| reads sent to the leader (task-d50) | 0 | 0.34 | 0.35 | 0.70 |
+| fast acknowledgements returned to a collector | 0 | 0.76 | 0 | 0.76 |
+| slow acknowledgements returned | 0.51 | 0.76 | 0.74 | 2.00 |
+| leader replies returned | 0.51 | 0 | 0 | 0.51 |
+| releases returned | 0.51 | 0 | 0 | 0.51 |
+| read answers returned | 0.70 | 0 | 0 | 0.70 |
+| callers' frames taken | 0.60 | 0.59 | 0.62 | 1.80 |
+| collectors' frames taken | 1.21 | 0.75 | 0.74 | 2.70 |
+| api datagrams sent | 3.65 | 3.19 | 3.12 | 9.97 |
+| peer datagrams sent | 2.39 | 0.94 | 0.74 | 4.07 |
+
+**What it says:**
+- **The api plane is the larger plane, about 10 datagrams a command
+  against the peer plane's 4.** Frames sent on it come to about 9 a
+  command (the submissions, reads and returned frames above, and about
+  one answer a caller's frame, which isn't counted), so about 1.1
+  datagrams a frame. The peer plane sends
+  about 9 frames on 4.1 datagrams, 0.45 a frame.
+- **Why:** task-d61's several frames a stream is granted on the peer
+  plane only, and coordd hands each frame it returns to a collector to
+  the transport alone (`return_to_collector`, one `send` each), where a
+  turn's peer frames go together (`send_turn`). So every frame between a
+  collector and a voter is a stream of its own.
+- **The lever, recorded before it is built:** several frames a stream
+  on links between a collector and a voter, and a turn's frames for one
+  connection handed over together. At the peer plane's batching, the 7.2
+  collector-to-voter frames a command take about 4.7 datagrams fewer,
+  about a third of the voters' sends. The workers' cost follows datagrams
+  (task-d70's third step), so it is sized at −0.15 to −0.4 ms an
+  operation at the register row.
+- **Not this task's:** which frames a collector needs. A follower in
+  the fast quorum returns both its fast and its slow acknowledgement, and
+  the slow one counts only when the fast path does not hold. Changing what a
+  frontend learns from is a design step of its own.
