@@ -10938,8 +10938,23 @@ time for puts.
   about 0.3 ms, and at one caller the put p50 falls 0.1 to 0.3 ms. The
   p99 at one caller under `replay` is worse in both head runs, 8.7 and
   9.8 ms against 5.9 and 8.0, above both base runs. The base's own two
-  runs differ by 2 ms, so two runs a side do not settle it, and the
-  batch's pairs read it again. On the runner's disk a sync is about 2.3 ms, which is the
+  runs differ by 2 ms, so two runs a side do not settle it.
+- **Read again at one caller under `replay` (#180 review):** six more
+  runs a side, alternating, with the same binaries. The host was about
+  40% slower than for the table above (`ok`/s about 530 against 860), so
+  these runs are compared with each other only.
+
+  | side | `ok`/s | put p50 (ms) | put p99 (ms) | CPU/cmd, all voters (ms) |
+  | --- | --- | --- | --- | --- |
+  | base | 475 to 550 | 2.59 to 2.97 | 9.0, 10.1, 10.5, 11.5, 12.2, 14.4 (median 11.0) | 8.50 to 9.27 |
+  | head | 504 to 571 | 2.42 to 2.59 | 6.4, 6.9, 8.8, 9.5, 12.7, 13.9 (median 9.1) | 7.84 to 8.53 |
+
+  The head's p99 isn't worse: its median is lower, and the two sides'
+  ranges overlap. Its p50 and CPU are lower in every pair, and its
+  `ok`/s is higher in five pairs of six. So the first reading's p99 was
+  noise. That fits the change: the gate keeps the leader's commit where
+  it was, after the proposal is durable, so nothing should add latency
+  at one caller. On the runner's disk a sync is about 2.3 ms, which is the
   size the plan gave this lever.
 
 **Checks.** coord-consensus's suites. The protocol simulator at 1,000
