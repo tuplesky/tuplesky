@@ -2001,6 +2001,54 @@ def back_serving(client: list[Op], nemesis: list[Op], nodes: list[str], start) -
     return out
 
 
+# The nemesis operations that start a fault.
+FAULT_STARTS = (":kill", ":pause", ":start-partition", ":start-packet")
+
+
+def domain_gaps(client: list[Op], nemesis: list[Op], start) -> list[str]:
+    """The domain's gap after each fault's start (#175's leader-kill row):
+    the seconds from the start operation's completion to the first `ok`,
+    through any node, of an operation invoked after it; for the starts
+    within the workload."""
+    pairs = [(nemesis[i], nemesis[i + 1] if i + 1 < len(nemesis) else None) for i in range(0, len(nemesis), 2)]
+    starts = [(inv, (res or inv).at, res) for inv, res in pairs if inv.f in FAULT_STARTS]
+    workload = [o.at for o in client if o.type == "invoke" and o.at < nemesis[-1].at] if nemesis else []
+    starts = [(inv, at, res) for inv, at, res in starts if workload and at < workload[-1]]
+    if not starts:
+        return []
+    oks, invoked = [], {}
+    for o in client:
+        if o.type == "invoke":
+            invoked[o.thread] = o.at
+        elif (began := invoked.pop(o.thread, None)) is not None and o.type == "ok":
+            oks.append((began, o.at))
+    rows, gaps = [], []
+    for inv, at, res in starts:
+        after = [done for began, done in oks if began > at]
+        gap = (min(after) - at).total_seconds() if after else None
+        gaps.append(gap)
+        target = clip(res.value, 40) if res is not None and res.f == inv.f else clip(inv.value, 40)
+        rows.append(f"| `{inv.f}` | {(at - start).seconds} | {target} | "
+                    + (f"{gap:.1f}" if gap is not None else "never") + " |")
+    timed = sorted(g for g in gaps if g is not None)
+    never = len(gaps) - len(timed)
+    head = (f"median {percentile(timed, 0.5):.1f} s, at most {timed[-1]:.1f} s" if timed else "none served again")
+    return [
+        f"**The domain's gap after each fault's start:** from each of {len(gaps)} starts to the first `ok` on any "
+        f"node of an operation invoked after it, {head}" + (f"; after {never}, nothing served again" if never and timed else "")
+        + ".",
+        "",
+        "<details><summary>The domain's first <code>ok</code> after each fault's start (s)</summary>",
+        "",
+        "| Start | + s | Target | First `ok` after it (s) |",
+        "| --- | --- | --- | --- |",
+        *rows,
+        "",
+        "</details>",
+        "",
+    ]
+
+
 def reason(op: Op) -> str:
     """Why an operation was not ok, short: a client that could not start
     reads as its exception type and message rather than the whole map."""
@@ -2178,6 +2226,7 @@ def summarize(store: str, nodes: list[str], title: str, profile: str | None = No
         out.append("")
 
         out.extend(back_serving(client, nemesis, nodes, start))
+        out.extend(domain_gaps(client, nemesis, start))
 
     if network:
         where = f"; clients beside {'the first node' if clients == 'first' else 'each node'}" if clients else ""

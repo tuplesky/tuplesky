@@ -250,6 +250,13 @@ class SummaryTests(unittest.TestCase):
         self.assertIn("| `:resume` | 11 | 1.0 | 3.0 | 3.0 (n2) |", text)
         self.assertIn("| `:stop-partition` | 30 | 1.0 | 2.0 | 2.0 (n2) |", text)
         self.assertNotIn("| `:resume` | 41 |", text)
+        # The domain's gap after each start: the pause done at 3, the first
+        # ok of an operation invoked after it at 12; the partition done at
+        # 21, the next at 31.
+        gaps = "\n".join(js.domain_gaps(client, nemesis, at(0)))
+        self.assertIn("from each of 2 starts to the first `ok` on any node of an operation invoked after it", gaps)
+        self.assertIn("| `:pause` | 3 |  | 9.0 |", gaps)
+        self.assertIn("| `:start-partition` | 21 |  | 10.0 |", gaps)
 
     def test_final_reads_pair_invocations_after_the_heal(self):
         self.assertIn("1 of 2 nodes served a final read", self.text)
