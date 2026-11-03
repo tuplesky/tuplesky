@@ -6305,34 +6305,6 @@ async fn peers_admit_a_voters_renewed_leaf() {
     }
 }
 
-/// A `Range` of exactly `key` at `caller`'s node, asked again while the
-/// node answers it `Pending`.
-///
-/// The frontend's output gate answers a read `Pending`, not refused, when
-/// its own node has not yet projected the caller's session. A follower executes a command one
-/// leader turn and a hop after the leader does (task-d74), so a session
-/// bound at a follower just before the read can be that far behind. A
-/// read changes nothing, so a test that wants the value presents it
-/// again, under the same invocation, until the node has caught up.
-async fn read_projected(
-    caller: &Caller,
-    sequence: u64,
-    key: &[u8],
-) -> Option<coord_types::wire_v1::Frame> {
-    let until = std::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        let answer = ask(&caller.connection, &caller.range(sequence, key)).await?;
-        let pending = matches!(
-            response_of(&answer).outcome,
-            coord_types::wire_v1::OutcomeV1::Pending
-        );
-        if !pending || std::time::Instant::now() >= until {
-            return Some(answer);
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-}
-
 /// The value a `Range` of one key answered with, if any.
 fn read_value(answer: &coord_types::wire_v1::Frame) -> Option<Vec<u8>> {
     let response = response_of(answer);
@@ -6433,7 +6405,7 @@ async fn a_leader_restarted_before_it_is_missed_campaigns_rather_than_resuming_i
         Caller::bind(&running[2], &cluster.ca, &cluster.ring, [0x64; 16]).await,
     ];
     for (n, caller) in callers.iter().enumerate() {
-        let read = read_projected(caller, 1, b"k")
+        let read = ask(&caller.connection, &caller.range(1, b"k"))
             .await
             .unwrap_or_else(|| panic!("voter {} did not answer a read", n + 1));
         assert_eq!(
@@ -6451,7 +6423,7 @@ async fn a_leader_restarted_before_it_is_missed_campaigns_rather_than_resuming_i
         coord_types::wire_v1::OutcomeV1::Ok { .. }
     ));
     for (n, caller) in callers.iter().enumerate() {
-        let read = read_projected(caller, 3, b"k")
+        let read = ask(&caller.connection, &caller.range(3, b"k"))
             .await
             .unwrap_or_else(|| panic!("voter {} did not answer a read", n + 1));
         assert_eq!(
@@ -6544,13 +6516,15 @@ async fn the_survivors_of_a_stopped_leader_elect_another_and_it_follows_when_it_
     // the write made under the old leader is still what a read sees
     // before it.
     let after = Caller::bind(&running[0], &cluster.ca, &cluster.ring, [0x50; 16]).await;
-    let read = read_projected(&after, 1, b"k").await.unwrap_or_else(|| {
-        panic!(
-            "the new leader's domain did not answer a read\n-- 2 --\n{}\n-- 3 --\n{}",
-            running[0].said(),
-            running[1].said()
-        )
-    });
+    let read = ask(&after.connection, &after.range(1, b"k"))
+        .await
+        .unwrap_or_else(|| {
+            panic!(
+                "the new leader's domain did not answer a read\n-- 2 --\n{}\n-- 3 --\n{}",
+                running[0].said(),
+                running[1].said()
+            )
+        });
     assert_eq!(read_value(&read).as_deref(), Some(&b"before"[..]));
     let put = ask(&after.connection, &after.put(2, b"k", b"after"))
         .await

@@ -10897,3 +10897,44 @@ window.
   of the process's CPU per window. The trim stays the long-run bound, and
   its first reading, the rows exported by kind at two positions, waits
   for it.
+
+## A disclosure the projection is behind for is held, not answered pending (task-d93)
+
+A follow-up to task-d74 (#167 review). The frontend's output gate reads
+this node's materialized projection, and a session no barrier on this
+node has shown yet is "not yet", not "no" (the section above). The gate
+answered such a disclosure `Pending`. That was rare while every voter
+learned a command from every other voter's acknowledgements. Under
+task-d74's routing a follower learns it from the leader's commit
+frontier, one leader turn and a hop later, so a read right after a bind
+at a follower is answered `Pending` more often. CI on #167's stack
+merge hit it once, in a leader-restart test. The client library reports
+a `Pending` read as unknown, and resolving a read that went to the
+barrier finds nothing, so the application has to read again, and a
+Jepsen history records the read as indeterminate.
+
+**The gate holds the disclosure.** `BoundFrontend::deliver_at` (coordd's
+path for every release) keeps a delivery whose session this node has
+not projected, rather than answering it. `release_held` gates each held
+delivery again against a fresh barrier, and hands out the ones whose
+session the projection now shows, disclosed or refused as the gate
+decides. It answers `Pending` for any still behind at its hold's end:
+the client's own deadline, or `GATE_HOLD_MILLIS` (2 s) after the hold
+began, whichever is earlier. coordd calls it after every flush and every
+settle (`stops_on`), which is when the projection moves, on every turn,
+and at the earliest hold's deadline, which `next_deadline` wakes for. A held
+delivery goes with its connection. The hold is bounded at the frontend's
+request bound, past which it answers `Pending` at once.
+
+**What a release is authorized by doesn't change.** A held delivery is
+gated again when it goes out, against the barrier at that moment. That's
+the same barrier a caller who asked again then would have been gated
+against, and the gate's rules are unchanged. A session a barrier showed
+and no longer shows is still refused, not held. A retained answer isn't
+held, since its caller is answered within the call on the stream it
+retried on; it is answered `Pending` as before (`deliver` keeps that
+behaviour, and `deliver_retained` uses it).
+
+**The stopgap goes.** `c01a397` had the two leader-restart tests present
+a read again while their node answered `Pending` (`read_projected`). It is
+reverted, and the tests read once.
