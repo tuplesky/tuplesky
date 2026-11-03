@@ -2941,7 +2941,7 @@ This entry is the budget and the record, not a lever:
   | --- | --- | --- | --- | --- | --- |
   | C1 | Threshold 8 as the acknowledgement cadence's default | task-d70's second step (#155) | Built, merged | −0.15, measured | 3.43 |
   | C2 | Acknowledgements to the leader and the frontend only | task-d74 (#167) | Built, now on the stack, with L3 stacked on it | about −0.16 (−4.5% locally) | 3.27 |
-  | C3 | A turn takes every ready event before it lowers | task-d73 (#182) | R1: no group ends while events are ready, over 98% of flushes find nothing ready. The bounded wait is not taken | 0 | 3.27 |
+  | C3 | A turn takes every ready event before it lowers | task-d73 (#182) | R1: almost no group ends while events are ready. 97.2 to 99.9% of flushes find nothing ready, and the rest are at most 0.013 a command. The bounded wait is not taken | 0 | 3.27 |
   | C4 | Fewer projection commits per command | task-d86 | Re-sized by R1 (#182): the materializer's cost is about 60 µs a commit and 115 µs a record, so per record more than per commit. Not built; it waits for the runner's group sizes (#98) | −0.03 to −0.09, not in the batch | 3.27 |
   | C5 | The inbound path without a task per stream | task-d70's third step (#183) | Measured, not kept: the tokio workers' share and CPU a command don't move, and their wake-ups fall 3 to 8% | 0 | 3.27 |
   | C6 | The leader's lookups as hash maps, broadcasts from one buffer | task-d60's third step | Not built: B-tree searches are 1 to 2% of a leader's samples locally after task-d75 | −0.02 to −0.04, not in the batch | 3.27 |
