@@ -2714,6 +2714,13 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             .dispatcher()
             .next_read_deadline()
             .map(|at| self.started + std::time::Duration::from_millis(at.get()));
+        // A disclosure the gate holds is answered `Pending` at its
+        // deadline, and nothing arrives to say it has passed (task-d93).
+        let held = self
+            .frontend
+            .frontend
+            .next_hold_deadline()
+            .map(|at| self.started + std::time::Duration::from_millis(at.get()));
         // A working projection commit is made durable within its bound
         // on an idle domain too, and nothing arrives to say it is due
         // (task-j06).
@@ -2733,6 +2740,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             pages,
             report,
             read,
+            held,
             durable_projection,
         ]
         .into_iter()
@@ -2805,6 +2813,10 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 let provenance = voter.provenance();
                 self.frontend.follow(voter.node().machine().active());
                 self.carry(api, out, provenance);
+                // And what a disclosure the gate held waited for: the
+                // projection may now show its caller's session
+                // (task-d93).
+                self.release_held();
                 false
             }
             Err(DriveError::Fenced(what)) => {
@@ -2831,6 +2843,9 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         let expired = self.frontend.frontend.dispatcher_mut().expire_reads(now);
         self.read_orders.extend(expired);
         self.send_read_orders(api);
+        // A held disclosure whose session the projection now shows, or
+        // whose hold has run out (task-d93).
+        self.release_held();
         let Backing::Voting(voter) = &mut self.backing else {
             return Ok(false);
         };
@@ -4064,8 +4079,14 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             store: self.backing.applier().store(),
             budget: ViewBudget::default(),
         };
-        let delivery = match self.frontend.frontend.deliver(delivery, &policy) {
+        let now = self.now_millis();
+        let delivery = match self.frontend.frontend.deliver_at(now, delivery, &policy) {
             Delivered::Answer(delivery) => delivery,
+            // This node has not projected the caller's session yet
+            // (task-d93). The caller's stream stays held, and
+            // `release_held` answers it once the projection shows the
+            // session or the hold's deadline passes.
+            Delivered::Held => return,
             // The session this caller's credential named was not
             // established. Its bind stream ends with no answer, which
             // is the whole of what an unbound caller is told; the
@@ -4088,6 +4109,36 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 return;
             }
         };
+        self.write_answer(delivery);
+    }
+
+    /// The disclosures the frontend's gate held for this node's
+    /// projection that can go out now (task-d93): once the projection
+    /// shows the caller's session, or at the hold's deadline as
+    /// `Pending`.
+    fn release_held(&mut self) {
+        if !self.frontend.frontend.holds_any() {
+            return;
+        }
+        if self.answered_otherwise.is_some()
+            || self.admission_halt.is_some()
+            || self.cycle_halt.is_some()
+            || self.caught_up_otherwise.is_some()
+        {
+            return;
+        }
+        let policy = StorePolicySource {
+            store: self.backing.applier().store(),
+            budget: ViewBudget::default(),
+        };
+        let now = self.now_millis();
+        for delivery in self.frontend.frontend.release_held(now, &policy) {
+            self.write_answer(delivery);
+        }
+    }
+
+    /// Write a gated delivery on the stream its caller is waiting on.
+    fn write_answer(&mut self, delivery: coord_collector::Delivery) {
         match self
             .frontend
             .pending
@@ -5397,7 +5448,8 @@ fn retained_answer<P: Persistence>(
     };
     match frontend.deliver_retained(delivery, command, &logical, &policy) {
         Delivered::Answer(delivery) => Some(delivery.frame),
-        Delivered::Unbound { .. } => None,
+        // A retained result is answered at once, never held.
+        Delivered::Unbound { .. } | Delivered::Held => None,
     }
 }
 
