@@ -117,6 +117,7 @@ def per_command(node: str, snapshot: dict) -> dict:
         **cpu_of(cost, executed),
         **waits_of(cost, executed),
         **traffic_of(cost, executed),
+        **groups_of(cost, executed, syncs["Observed"]),
     }
 
 
@@ -187,6 +188,31 @@ def traffic_of(cost: dict, executed: int) -> dict:
                 traffic[f"{side}_frames"] / traffic[f"{side}_streams"])
     if traffic.get("sent_lost_streams"):
         out["frames_per_lost_stream"] = traffic["sent_lost"] / traffic["sent_lost_streams"]
+    return out
+
+
+def groups_of(cost: dict, executed: int, syncs: int) -> dict:
+    """What the journal groups held (task-d84), per command: groups of
+    protocol transitions only, of application outcomes only, of both, and
+    of neither; and the syncs that were no group, the journal's mapping
+    updates and compactions. Beside them, the records a group carried of
+    each kind, over the groups that carried that kind: protocol
+    transitions, and commands executed, the second the execution group's
+    size. Empty for a binary older than the reading."""
+    groups = cost.get("journal_groups")
+    if not isinstance(groups, dict):
+        return {}
+    kinds = ("protocol", "application", "both", "other")
+    out = {"groups_per_command": {k: groups[k] / executed for k in kinds}}
+    out["groups_per_command"]["not_a_group"] = (syncs - cost["journal_appends"]) / executed
+    out["payload_records_per_command"] = groups["payload_records"] / executed
+    out["protocol_records_per_command"] = groups["protocol_records"] / executed
+    with_protocol = groups["protocol"] + groups["both"]
+    if with_protocol:
+        out["protocol_records_per_group"] = groups["protocol_records"] / with_protocol
+    with_application = groups["application"] + groups["both"]
+    if with_application:
+        out["commands_per_execution_group"] = groups["application_records"] / with_application
     return out
 
 
@@ -553,6 +579,35 @@ def paths_table(result: dict) -> str:
     return "\n".join(lines)
 
 
+def groups_table(result: dict) -> str:
+    """What each voter's journal syncs carried (task-d84), one row per
+    voter per run: syncs a command, split by what the group held, and how
+    many records of each kind a group carried."""
+    lines = [
+        "| callers | node | syncs/cmd | protocol only | application only | both "
+        "| neither | not a group | protocol records/cmd (with payload) "
+        "| protocol records/group | commands/execution group |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+    ]
+    dash = "--"
+    for run in result["runs"]:
+        for v in run["voters"]:
+            groups = v.get("groups_per_command")
+            if groups is None:
+                continue
+            split = " | ".join(f"{groups[k]:.3f}" for k in
+                               ("protocol", "application", "both", "other", "not_a_group"))
+            per_group = v.get("protocol_records_per_group")
+            per_group = dash if per_group is None else f"{per_group:.2f}"
+            size = v.get("commands_per_execution_group")
+            size = dash if size is None else f"{size:.2f}"
+            lines.append(
+                f"| {run['callers']} | {v['node']} | {v['journal_syncs_per_command']:.3f} "
+                f"| {split} | {v['protocol_records_per_command']:.2f} "
+                f"({v['payload_records_per_command']:.2f}) | {per_group} | {size} |")
+    return "\n".join(lines)
+
+
 def per_command_or_dash(voter: dict, field: str) -> str:
     """A per-command reading to three places, or `--` when the binary
     did not report it."""
@@ -596,6 +651,8 @@ def main(argv: list[str]) -> int:
             print(table(result))
             print()
             print(paths_table(result))
+            print()
+            print(groups_table(result))
         else:
             baseline = json.loads(args.baseline.read_text())
             result = json.loads(args.result.read_text())

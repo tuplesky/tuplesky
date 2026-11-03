@@ -3167,6 +3167,38 @@ The change, in two steps:
   - **Both levers on the path have tasks (#174 review):** a fresh proposal's acceptance in its proposal batch (task-d89), and release before the execution group is durable (task-d90).
 - **The merge keeps every ordering Section 17.3.3 states:** an acceptance is durable before its acknowledgement goes out, and an execution before its result is released. A turn whose acceptances and execution share one sync releases neither before it.
 
+- **The reading (task-d84's first PR; [notes](../tuplesky-impl-notes.md#journal-syncs-a-command-and-what-each-carries-task-d84)).**
+  - Three voters on one host, strict, 1 and 10 callers, with the stores on tmpfs and on the disk.
+  - Each voter's snapshot now counts what its journal groups held (`Cost::journal_groups`).
+  - **At 1 caller the leader syncs three times a command, and each sync waits for the one before it:** the proposal row, its ACCEPT row (`Leader::advance_pending`, written once the proposal row is durable), and the execution group.
+  - **Followers already share.** The fast-set follower's second protocol row shares its group with the execution group for 74 to 99% of commands.
+  - **At 10 callers every voter syncs 0.94 to 1.19 times a command,** and 29 to 46% of the groups already carry both kinds (task-d47).
+  - **In series on a write's path:** about one sync before the command is learned and one and a half after it. The execution group waits behind the leader's ACCEPT row, the group still out, since the appender has one group out at a time (task-d54).
+  - **The projection under `strict`:** it commits once a journal group, off the result's path since task-d63, but on the same disk.
+  - **At `replay`, the same groups and the same syncs a command** (review of #179). Each sync on the disk is served in 0.48 to 0.53 ms at 1 caller and 0.66 to 0.74 at 10, against `strict`'s 0.66 to 0.71 and about 1.06. So the projection's durable commits are a quarter to a third of a journal sync's time under `strict`. The `put` p50 on the disk is 2.15 to 2.35 ms at 1 caller and 6.5 to 7.1 at 10, against 3.17 to 3.24 and 9.0 to 9.6.
+  - **Per turn is not counted.** A group is lent whenever none is out, so its boundary is the previous sync's return, not a turn.
+- **What the reading decides: the merge is not built.**
+  - The syncs that stay separate at low load wait on each other's durability, so no grouping can join them.
+  - At load the groups already share.
+  - Locally at 10 callers, the `put` p99 hardly moves between tmpfs and the disk (21.9 to 28.6 ms against 25.4 to 29.3), so the tail there is queueing and CPU.
+  - Reaching task-d72's p99 needs a design step. Three levers, in the order review of #179 set:
+    1. **A fresh proposal's ACCEPT row in its proposal batch, when the dependency guard already passes** (task-d89).
+       - A re-proposal already writes it there (`Proposal::accepts`, task-d19). A fresh proposal writes it once the guard passes, in a batch of its own after the proposal row is durable.
+       - At low load every dependency of a new command is long accepted, so the guard passes at proposal time. The leader's second sync then leaves the path for fast and slow commands alike, and the execution group has no ACCEPT group to wait behind.
+       - The journal holds what it holds today, one sync earlier, in one atomic batch. Under load, a command whose prerequisite is still at PRE-ACCEPT keeps today's path.
+       - **Its step answers:**
+         - Is there a reason, besides the guard, that a fresh proposal's acceptance waits for its own proposal row? `advance_pending` names only the guard.
+         - Is a prerequisite accepted in memory in an earlier batch, and durable no later than the new one? `adopt_own` relies on batches becoming durable in submission order, so it should be.
+         - The leader's fast vote is its proposal, not its table phase.
+    2. **A result released once its command is decided at a quorum and executed in memory,** before its own execution group is durable (task-d90).
+       - This is the lever that gives etcd's shape: one sync in series.
+       - It amends Section 17.3.3's ordering of an execution before its result. Its argument: execution order and results are a function of the decided commands (task-d06's chain), so a crash before the execution group is durable replays to the same result.
+       - It also has to say what the collector's late-release comparison (task-d12) and the execution chain (task-d35) see across that crash.
+    3. **Deferring the leader's ACCEPT row until the fast path has failed,** only if the `service` row's fast share proves high.
+       - It moves a sync from fast commands to slow ones. A slow decision is the leader's durable ACCEPT plus `slow_size − 1` follower copies (task-d19), and deferred, the leader's vote waits for the fast path to fail and then for its own sync.
+       - Under load nearly every command is slow: the register row's leader ran 2.6 to 3.3% fast, and task-d68's row at ten callers 5.8%.
+  - The runner's pair for whichever is built reads the `service` row's p50 and p99 against this reading.
+
 **Acceptance:** The reading recorded first. The storage crash tests across the merged group, at every cut. Three pairs on the runner: journal syncs a command, CPU an operation, the `service` row's p50 and p99.
 
 **Review boundary:** How a turn's journal writes are grouped and synced. No change to what is durable before what.
