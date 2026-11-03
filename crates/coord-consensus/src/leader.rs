@@ -466,6 +466,10 @@ pub struct Leader {
     pending_sync: Option<(ReplicaId, SyncDecision)>,
     speculation: Speculation,
     rejections: Vec<Rejection>,
+    /// The commit frontier last announced to the other voters (task-d74).
+    /// A follower learns only from it, so it goes out in the step that
+    /// moves it.
+    announced: Option<u64>,
     fenced: Option<FenceReason>,
     /// Entries of the selection this leader was handed that no order
     /// keeps: a dependency cycle, which is an invariant violation
@@ -640,6 +644,7 @@ impl Leader {
             pending_sync: None,
             speculation: Speculation::new(),
             rejections: Vec::new(),
+            announced: None,
             fenced: None,
             recovery_cycle: None,
             own_adoptions: BTreeMap::new(),
@@ -738,6 +743,7 @@ impl Leader {
             pending_sync: None,
             speculation: Speculation::new(),
             rejections: Vec::new(),
+            announced: None,
             fenced: None,
             recovery_cycle: None,
             replay: crate::replay::EvidenceStore::new(state.capacity),
@@ -1464,18 +1470,25 @@ impl Leader {
     /// committed.
     pub fn committed_through(&self) -> Option<u64> {
         debug_assert!(self.indexes_agree());
+        self.commit_frontier()
+    }
+
+    /// [`Leader::committed_through`], without the index check: read on
+    /// every peer and storage event (task-d74), where the check, which
+    /// rebuilds every index, would be the whole cost of a debug build.
+    fn commit_frontier(&self) -> Option<u64> {
         // A settled proposal is durable and executed, so the first open
-        // one is unsettled (task-d46).
+        // one is unsettled (task-d46), and `unsettled` is in sequence
+        // order, so the first open one found is the lowest.
         let open = self
             .unsettled
             .iter()
             .map(|(_, c)| &self.proposals[c])
-            .filter(|p| {
+            .find(|p| {
                 !(p.durable
                     && (p.executed || self.table.phase_of(&p.command) >= Some(Phase::Commit)))
             })
-            .map(|p| p.seqnum)
-            .min();
+            .map(|p| p.seqnum);
         match open {
             Some(first) => first.checked_sub(1),
             None => self.seqnum.checked_sub(1),
@@ -1509,6 +1522,25 @@ impl Leader {
             })
     }
 
+    /// Announce the commit frontier if it moved since it was last
+    /// announced (task-d74).
+    ///
+    /// A follower's acknowledgements go to the leader and its frontend
+    /// only, so the frontier is the one way a follower learns that a
+    /// command it adopted is committed. Announced on the re-send timer
+    /// alone, a follower's execution trailed the leader's by up to that
+    /// interval; announced in the step that moves it, by one message.
+    pub fn announce_advanced(&mut self) -> Vec<Effect> {
+        if self.boot.is_none() || !self.is_leading() {
+            return Vec::new();
+        }
+        let through = self.commit_frontier();
+        if through.is_none() || through <= self.announced {
+            return Vec::new();
+        }
+        self.announce_committed()
+    }
+
     /// Tell every other voter this ballot's commit frontier (task-d09).
     ///
     /// Learning is otherwise all-to-all: a follower commits a command
@@ -1534,6 +1566,7 @@ impl Leader {
         let Some(through) = self.committed_through() else {
             return Vec::new();
         };
+        self.announced = Some(through);
         let me = self.config.identity.replica;
         let ballot = self.config.quorum.ballot();
         let context = self.ballots.context(boot, ballot, LocalJournalSeq::ZERO);
@@ -2560,7 +2593,7 @@ impl Leader {
     }
 
     /// Publish this leader's adoption of its own order for `command`, to
-    /// the voters and the frontend, once `barrier` -- the batch carrying
+    /// the frontend, once `barrier` -- the batch carrying
     /// its acceptance row -- and every batch submitted before it are
     /// durable (task-d19; design Section 4.8). It is kept for re-offer
     /// beside the leader's reply, and counted in the leader's own vote set
@@ -2607,20 +2640,8 @@ impl Leader {
         let Some(outbox) = self.outbox.as_mut() else {
             return;
         };
-        for voter in &self.config.identity.voters {
-            if *voter == self.config.identity.replica {
-                continue;
-            }
-            outbox.publish(PendingSend {
-                context,
-                requires: requires.clone(),
-                to: PeerId {
-                    replica: *voter,
-                    incarnation: ReplicaIncarnation::ZERO,
-                },
-                frame: frame.clone(),
-            });
-        }
+        // To the frontend, which counts it, and to no other voter
+        // (task-d74): a follower learns from the commit frontier.
         outbox.publish(PendingSend {
             context,
             requires: requires.clone(),
@@ -3295,7 +3316,13 @@ impl DeterministicMachine for Leader {
                 Vec::new()
             }
             Event::Admitted(request) => self.on_admitted(&request.frame, request.receipt.facts()),
-            Event::Storage(event) => self.on_storage(&event),
+            // What a durable batch or a vote commits is announced in the
+            // same step (task-d74).
+            Event::Storage(event) => {
+                let mut effects = self.on_storage(&event);
+                effects.extend(self.announce_advanced());
+                effects
+            }
             Event::Peer(message) => {
                 // The authenticated sender, at the exact incarnation the
                 // transport bound; replies are addressed to it.
@@ -3303,7 +3330,9 @@ impl DeterministicMachine for Leader {
                     replica: message.provenance().from(),
                     incarnation: message.provenance().incarnation(),
                 };
-                self.on_peer(from, message.frame())
+                let mut effects = self.on_peer(from, message.frame());
+                effects.extend(self.announce_advanced());
+                effects
             }
             Event::Timer(_)
             | Event::Clock(_)
