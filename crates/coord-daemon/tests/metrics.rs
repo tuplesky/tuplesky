@@ -457,6 +457,14 @@ fn a_rendered_snapshot_carries_no_secret_or_key_shaped_text() {
                     acks_sent: 1900,
                     acks_received: 2000,
                 },
+                api_frames: coord_daemon::metrics::ApiFrames {
+                    submissions: 2300,
+                    fast_acks: 2250,
+                    slow_acks: 40,
+                    releases: 1150,
+                    requests: 1200,
+                    ..Default::default()
+                },
             }),
             journal_groups: JournalGroups {
                 protocol: 3100,
@@ -620,6 +628,19 @@ fn every_stage_is_accounted_for_under_every_role() {
 /// A `cpu` reading written before the thread's scheduling was reported
 /// (task-d55) still reads, and says it has no scheduling rather than
 /// zero run-queue time.
+/// A traffic reading from before task-d88's R3 has no frames by kind,
+/// and parses with them zero.
+#[test]
+fn a_traffic_reading_without_api_frames_reads_them_as_zero() {
+    let older = r#"{"sent_frames":1,"sent_bytes":2,"sent_streams":1,"sent_lost":0,
+        "received_frames":1,"received_bytes":2,"received_streams":1}"#;
+    let traffic: Traffic = serde_json::from_str(older).expect("an older reading parses");
+    assert_eq!(
+        traffic.api_frames,
+        coord_daemon::metrics::ApiFrames::default()
+    );
+}
+
 #[test]
 fn a_cpu_reading_without_scheduling_reads_as_not_instrumented() {
     let older = r#"{"domain":{"secs":25,"nanos":0},"process":{"secs":70,"nanos":0}}"#;
