@@ -874,11 +874,12 @@ def fast_path_table(voters: dict) -> list[str]:
         "commands; acknowledgements under a marker are those it sent while its path log held a reordered entry; "
         "unordered are its pre-acceptances the leader has not ordered, the reordered ones those it ordered a later "
         "command past, held is the oldest of those, now and at most over the run; learned to released is the "
-        "leader's wait for predecessors, the group's close and the projection's commit, per command; traffic is "
+        "leader's wait for predecessors, the group's close and its journal sync (the projection's commit before "
+        "task-d63's build, read from `projection` where a build names it so), per command; traffic is "
         "the peer plane's, sent, per executed command)",
         "",
         "| Node | Fast | Slow | Path / deps / missing / slow first / unclassified | Reasons add up | Acks (under a marker) "
-        "| Unordered (reordered) | Held now / at most (s) | Own path log | Learned to released, ms: predecessors / group / projection "
+        "| Unordered (reordered) | Held now / at most (s) | Own path log | Learned to released, ms: predecessors / group / journal "
         "| Frames / streams / datagrams per command | Frames per stream | Lost frames (streams) |",
         "| --- " * 13 + "|",
     ]
@@ -891,9 +892,9 @@ def fast_path_table(voters: dict) -> list[str]:
         held_max = v.oldest_unordered[0] if v.oldest_unordered else held_now
         rel = c.release
         n = rel.get("commands", 0)
-        released = (
-            " / ".join(f"{seconds(rel.get(k)) * 1000 / n:.2f}" for k in ("predecessors", "group", "projection")) if n else "-"
-        )
+        # The third part is `journal` since #176, `projection` before it.
+        parts = (rel.get("predecessors"), rel.get("group"), rel.get("journal", rel.get("projection")))
+        released = " / ".join(f"{seconds(x) * 1000 / n:.2f}" for x in parts) if n else "-"
         t = c.traffic
         if t and c.executed:
             per = " / ".join(f"{t.get(k, 0) / c.executed:.2f}" for k in ("sent_frames", "sent_streams", "datagrams_sent"))

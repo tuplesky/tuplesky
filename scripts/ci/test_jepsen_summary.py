@@ -952,6 +952,14 @@ class FastPathTests(unittest.TestCase):
         self.assertIn("| n2 | 0 | 1000 | 900 / 20 / 30 / 10 / 0 | **no** (960 of 1000) |", text)
         self.assertNotIn("no voter established", text)
 
+    def test_release_reads_the_journal_part_or_the_older_projection(self):
+        # #176 names the third part `journal`; a build before it, `projection`.
+        older = d62_metrics(40, 960, (900, 20, 30, 10, 0), 0, 60)
+        newer = older.replace('"projection":', '"journal":')
+        self.assertNotEqual(older, newer)
+        for line in (older, newer):
+            self.assertIn("| 1.76 / 0.90 / 7.80 |", self.summary(line, line))
+
     def test_a_run_with_no_fast_decision_is_a_finding(self):
         line = d62_metrics(0, 960, (900, 20, 30, 10, 0), 0, 60)
         self.assertIn("**Finding: no voter established a command on the fast path** (1920 slow, 0 fast).",
