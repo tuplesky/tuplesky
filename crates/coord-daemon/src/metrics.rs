@@ -603,6 +603,46 @@ pub struct Traffic {
     /// collectors' (task-d70), so its datagrams split into its two planes.
     #[serde(default)]
     pub api: Datagrams,
+    /// The frames this node sent and took on its api connections, by
+    /// kind (task-d88's R3).
+    #[serde(default)]
+    pub api_frames: ApiFrames,
+}
+
+/// The api plane's frames at one node, by kind (task-d88's R3).
+///
+/// QUIC packs frames into datagrams as it sees fit, so datagrams cannot
+/// be split by kind; the frames can, and over the voters they show what
+/// the plane's datagrams carry. Every count is of frames this node
+/// handed to its transport, or took from it, on an api connection: a
+/// frame to or from a voter in this process does not cross the plane and
+/// is not counted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ApiFrames {
+    /// Submissions this node's collector sent to a voter elsewhere.
+    pub submissions: u64,
+    /// Reads this node's collector sent to a leader elsewhere (task-d50).
+    pub reads: u64,
+    /// Fast acknowledgements this voter returned to a collector
+    /// elsewhere.
+    pub fast_acks: u64,
+    /// Slow acknowledgements returned the same way.
+    pub slow_acks: u64,
+    /// The leader's replies returned the same way.
+    pub leader_replies: u64,
+    /// Other evidence returned the same way.
+    pub other_evidence: u64,
+    /// Releases returned the same way.
+    pub releases: u64,
+    /// Answers to a read returned the same way (task-d50).
+    pub read_answers: u64,
+    /// Frames of any other kind returned the same way.
+    pub other_returned: u64,
+    /// Frames callers sent: requests, resolutions, binds, watch opens.
+    pub requests: u64,
+    /// Submissions and reads collectors elsewhere sent this voter.
+    pub from_collectors: u64,
 }
 
 /// What QUIC sent and received on one class of connections (task-d70).

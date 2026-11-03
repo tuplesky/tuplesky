@@ -158,6 +158,8 @@ pub struct Counts {
     pub unreturnable: u64,
     /// Watches opened.
     pub watches: u64,
+    /// The api plane's frames by kind (task-d88's R3).
+    pub api_frames: coord_daemon::metrics::ApiFrames,
     /// Frames written onto a watch's own stream: events, progress and
     /// closes. A watch that was opened and never pumped is the
     /// difference between this and `watches`.
@@ -1755,6 +1757,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                             acks_sent: api.acks_sent,
                             acks_received: api.acks_received,
                         },
+                        api_frames: self.frontend.counts.api_frames,
                     })
                 },
             ),
@@ -3562,6 +3565,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             frame: plan.frame.into(),
         };
         let out = fanout::dispatch(&self.frontend.membership, api, None, &fan_out);
+        self.frontend.counts.api_frames.reads += out.queued_remote() as u64;
         if out.queued.is_empty()
             && let Some(action) = self
                 .frontend
@@ -3671,7 +3675,10 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             bytes.to_vec(),
         );
         match sent {
-            Ok(()) => self.frontend.counts.returned += 1,
+            Ok(()) => {
+                self.frontend.counts.returned += 1;
+                count_returned(&mut self.frontend.counts.api_frames, bytes);
+            }
             Err(_) => self.frontend.counts.unreturnable += 1,
         }
     }
@@ -3729,6 +3736,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         let counts = &mut self.frontend.counts;
         counts.queued_local += out.queued_local() as u64;
         counts.queued_remote += out.queued_remote() as u64;
+        counts.api_frames.submissions += out.queued_remote() as u64;
         counts.not_a_voter += out.not_a_committed_voter() as u64;
         counts.saturated += out.saturated() as u64;
         counts.unavailable += out.unavailable() as u64;
@@ -4120,6 +4128,13 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 // A collector's submission is a voter's work, not a
                 // caller's request, and it takes the same door a local
                 // one does. Everything else is a client's frame.
+                if (frame.kind == KIND_SUBMIT || frame.kind == KIND_READ)
+                    && is_collector(identity.role)
+                {
+                    self.frontend.counts.api_frames.from_collectors += 1;
+                } else {
+                    self.frontend.counts.api_frames.requests += 1;
+                }
                 if frame.kind == KIND_SUBMIT && is_collector(identity.role) {
                     self.on_remote_submission(transport, identity.role, &frame, connection);
                     drop(responder);
@@ -5041,6 +5056,27 @@ enum Arrived {
 }
 
 /// One frame from bytes, through the reader the transport uses.
+/// Count one frame returned to a collector elsewhere by its kind
+/// (task-d88's R3).
+fn count_returned(counts: &mut coord_daemon::metrics::ApiFrames, bytes: &[u8]) {
+    use coord_consensus::ProtocolMessage as M;
+    let Ok(frame) = one_frame(bytes) else {
+        counts.other_returned += 1;
+        return;
+    };
+    match frame.kind {
+        KIND_EVIDENCE => match M::decode(&frame.payload) {
+            Ok(M::FastAck(_)) => counts.fast_acks += 1,
+            Ok(M::SlowAck(_)) => counts.slow_acks += 1,
+            Ok(M::LeaderReply { .. }) => counts.leader_replies += 1,
+            _ => counts.other_evidence += 1,
+        },
+        KIND_RELEASE => counts.releases += 1,
+        KIND_READ_ANSWER => counts.read_answers += 1,
+        _ => counts.other_returned += 1,
+    }
+}
+
 fn one_frame(bytes: &[u8]) -> Result<Frame, coord_types::wire_v1::WireError> {
     let mut reader = coord_types::wire_v1::FrameReader::new();
     reader.push(bytes)?;
