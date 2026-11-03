@@ -387,7 +387,9 @@ fn proposals_are_published_with_exact_durable_support_and_match_the_model() {
     assert!(leader.take_rejections().is_empty());
     let slow: Vec<_> = sends_of(&released)
         .into_iter()
-        .filter(|m| matches!(m, ProtocolMessage::SlowAck(a) if a.replica == r(0) && a.command == c2))
+        .filter(
+            |m| matches!(m, ProtocolMessage::SlowAck(a) if a.replica == r(0) && a.command == c2),
+        )
         .collect();
     assert_eq!(slow.len(), 3, "c2 adopted by the leader, to all three");
     assert!(leader.votes(&c2).unwrap().adopted_by(&r(0)));
@@ -521,7 +523,11 @@ fn a_rejected_batch_is_presented_again_ahead_of_its_dependents() {
         barrier_id: again[0].barrier,
         journal_seq: LocalJournalSeq::new(1).unwrap(),
     }));
-    assert_eq!(released.len(), 6, "c1's evidence is published: {released:?}");
+    assert_eq!(
+        released.len(),
+        6,
+        "c1's evidence is published: {released:?}"
+    );
     assert!(leader.votes(&c1).unwrap().adopted_by(&r(0)));
 }
 

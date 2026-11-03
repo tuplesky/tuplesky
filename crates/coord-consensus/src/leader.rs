@@ -1754,9 +1754,11 @@ impl Leader {
         // after its batch is durable anyway, since every voter hears of
         // it from the leader's send, which waits on the batch.
         let proposals = &self.proposals;
-        let committed = self.learner.commit_learned_where(&mut self.table, &self.votes, |c| {
-            proposals.get(c).is_none_or(|p| p.durable)
-        });
+        let committed = self
+            .learner
+            .commit_learned_where(&mut self.table, &self.votes, |c| {
+                proposals.get(c).is_none_or(|p| p.durable)
+            });
         if let Some(learned) = self.learned.as_mut() {
             learned.extend(committed);
         }
@@ -3368,8 +3370,8 @@ mod tests {
     use coord_core::capability::{AdmissionReceipt, AttestedAdmission, VerifierToken};
     use coord_core::event::AdmittedRequest;
     use coord_types::ids::{
-        ClientInstanceId, ClusterId, ConfigurationEpoch, DomainId, NamespaceId,
-        RequestSequence, SessionId,
+        ClientInstanceId, ClusterId, ConfigurationEpoch, DomainId, NamespaceId, RequestSequence,
+        SessionId,
     };
     use coord_types::logical_v1::{CanonicalOperation, LogicalRequest, PutOp};
     use coord_types::wire_v1::RequestV1;
@@ -3404,8 +3406,7 @@ mod tests {
                 incarnation: ReplicaIncarnation::new(1).unwrap(),
                 role: ReplicaRole::Voter,
             },
-            quorum: BallotConfiguration::c2(epoch, genesis, voters, [r(0), r(1)].into())
-                .unwrap(),
+            quorum: BallotConfiguration::c2(epoch, genesis, voters, [r(0), r(1)].into()).unwrap(),
             genesis,
             frontend: FRONTEND,
             capacity: 8,

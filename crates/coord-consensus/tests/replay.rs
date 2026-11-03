@@ -346,7 +346,10 @@ fn a_retried_proposal_is_replayed_under_its_retrys_barrier() {
         .map(|(_, m)| m)
         .collect();
     assert!(
-        matches!(to_frontend.first(), Some(ProtocolMessage::LeaderReply { .. })),
+        matches!(
+            to_frontend.first(),
+            Some(ProtocolMessage::LeaderReply { .. })
+        ),
         "the retry's reply reached the frontend: {to_frontend:?}"
     );
     assert_eq!(frontend_only(&l.step(admitted(1, 1, 1).0)), to_frontend);
