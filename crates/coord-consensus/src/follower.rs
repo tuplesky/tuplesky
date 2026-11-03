@@ -1582,6 +1582,23 @@ impl Follower {
             // report it superseded later.
             return Vec::new();
         }
+        if already_synced
+            && self
+                .sync_barrier
+                .as_ref()
+                .is_some_and(|(_, d)| d.ballot == decision.ballot)
+        {
+            // The same Sync again while its marker is being written: the
+            // ballot is synchronized in memory only, and the marker's
+            // durability activates it (task-d85). Activated here, this
+            // replica adopted and acknowledged the new ballot's held
+            // proposals before its row was durable, and the release at
+            // the marker's durability then dropped what it had just
+            // accepted. Its acknowledgement still counted, so a later
+            // selection read a fresh pre-acceptance of a decided command
+            // (protocol_sim row 10, three voters, seed 986).
+            return Vec::new();
+        }
         if self.ballots.promises_in_flight().iter().any(|p| {
             p.ballot.compare_same_epoch(&decision.ballot) == Some(core::cmp::Ordering::Greater)
         }) {
