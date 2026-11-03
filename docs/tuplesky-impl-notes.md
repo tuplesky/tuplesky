@@ -10927,11 +10927,15 @@ head side takes.
 Flushes are a command; n1 is the leader.
 
 **What it says:**
-- **No group ends while events are ready.** More than 98% of flushes
-  find nothing ready. The bound and a full group are under 1.2% at 30
-  callers. So task-d47 already groups what there is, and C3 (task-d72)
-  has nothing left to build.
-- **An append out rarely holds a flush back on tmpfs** (1 to 2.5%). On
+- **Almost no group ends while events are ready.** As shares of each
+  voter's flushes (the table is a command): 99.8 to 99.9% find nothing
+  ready at 10 callers, and 97.2 to 99.0% at 30. The 64-event bound and a
+  full group are the rest: 0.1 to 0.2% at 10 callers and 1.0 to 2.8% at
+  30, at most 0.013 a command. A larger bound could merge only those,
+  about one flush in eighty commands. So task-d47 already groups what
+  there is, and C3 (task-d72) has nothing worth building.
+- **An append out rarely holds a flush back on tmpfs** (1.4 to 2.5% of
+  flushes). On
   the runner's disk, where an append takes about 2.3 ms, the queue
   already grows behind each append.
 - **The materializer's cost is per record more than per commit.** Its
