@@ -5153,8 +5153,7 @@ fn endpoint(
     // The transport's limits are its own (streams, windows, deadlines);
     // the semantic limits the configuration states are the frontend's,
     // and are enforced where the meaning is, not at the framing.
-    #[allow(unused_mut)]
-    let mut limits = coord_transport::Limits::default();
+    let mut limits = coord_transport::Limits::node();
     // A test build can shorten the connection age cap, so the test that
     // shows a capped connection is dialled again (task-d03) does not wait
     // the twelve hours a real one lasts. Compiled out of a release build:

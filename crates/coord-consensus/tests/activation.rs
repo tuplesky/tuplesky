@@ -5840,6 +5840,61 @@ fn a_campaign_completes_in_its_ballot_with_a_page_of_each_report_lost() {
     );
 }
 
+/// task-d82: a campaign asks again for every promise that has not arrived.
+///
+/// A `NewLeader` is published once. On the Jepsen runner a leader
+/// restarted under its incarnation campaigned while its peers were closing
+/// each dial it made, so its `NewLeader`s were lost, and nothing asked
+/// again until the election replaced the campaign at its ceiling, 16 s on.
+/// The re-ask interval that asks for missing report pages (task-d28) now
+/// asks the voters that have not promised for their promise too, once the
+/// candidate's own promise is durable, and nobody once the selection is
+/// made.
+#[test]
+fn a_campaign_asks_again_for_the_promises_that_have_not_arrived() {
+    let new_leaders = |effects: &[Effect]| -> BTreeSet<ReplicaId> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::SendWhenDurable { to, frame, .. } => {
+                    match ProtocolMessage::decode(frame).unwrap() {
+                        ProtocolMessage::NewLeader { .. } => Some(to.replica),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    let mut f = standalone(1, 32);
+    let b = ballot(1, 1);
+    let effects = f.campaign(b);
+    // Before its own promise is durable, nothing is asked again: the first
+    // `NewLeader` waits for that promise too.
+    assert!(new_leaders(&f.request_report_pages()).is_empty());
+    for e in durable_events(&effects) {
+        f.step(e);
+    }
+    assert_eq!(
+        new_leaders(&f.request_report_pages()),
+        [r(0), r(2)].into_iter().collect(),
+        "both voters are asked for their promise again"
+    );
+    f.step(peer_event(
+        r(0),
+        ProtocolMessage::Promise {
+            ballot: b,
+            synced: ballot(0, 0),
+            replica: r(0),
+        },
+    ));
+    assert_eq!(
+        new_leaders(&f.request_report_pages()),
+        [r(2)].into_iter().collect(),
+        "only the voter whose promise has not arrived is asked again"
+    );
+}
+
 /// task-d28: interrupted campaigns leave the candidate holding one
 /// campaign's pages, however many there were; a report announcing more
 /// pages than the bound allows is refused.

@@ -1171,19 +1171,34 @@ impl Follower {
     /// Ask the voters that promised this replica's campaign for the report
     /// pages that have not arrived (task-d28): a page is published once,
     /// on a lane that drops when full, and one lost page used to cost the
-    /// whole ballot. Driven on an interval while the campaign selects;
-    /// nothing is asked once the selection is made.
+    /// whole ballot. And ask the voters that have not promised for their
+    /// promise again (task-d82): a `NewLeader` is published once too.
+    /// Driven on an interval while the campaign selects; nothing is asked
+    /// once the selection is made.
     pub fn request_report_pages(&mut self) -> Vec<Effect> {
         let (Some(campaign), Some(boot)) = (self.campaign.as_ref(), self.boot) else {
             return Vec::new();
         };
         let asks = campaign.missing_pages();
-        if asks.is_empty() {
+        let unpromised = campaign.unpromised();
+        if asks.is_empty() && unpromised.is_empty() {
             return Vec::new();
         }
         let ballot = campaign.ballot();
         let context = self.ballots.context(boot, ballot, LocalJournalSeq::ZERO);
+        let executed = self.learner.executed_through();
         let outbox = self.outbox.as_mut().expect("booted");
+        for voter in unpromised {
+            outbox.publish(PendingSend {
+                context,
+                requires: Vec::new(),
+                to: PeerId {
+                    replica: voter,
+                    incarnation: ReplicaIncarnation::ZERO,
+                },
+                frame: ProtocolMessage::NewLeader { ballot, executed }.encode(),
+            });
+        }
         for (voter, pages) in asks {
             outbox.publish(PendingSend {
                 context,

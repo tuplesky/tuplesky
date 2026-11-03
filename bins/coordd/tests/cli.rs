@@ -6479,13 +6479,27 @@ async fn the_survivors_of_a_stopped_leader_elect_another_and_it_follows_when_it_
     // The genesis leader goes away.
     let leader = running.remove(0);
     drop(leader);
+    let stopped = std::time::Instant::now();
     let elected = |said: &str| said.contains("this voter leads ballot 1");
     let followed = |said: &str| said.contains("this voter follows ballot 1");
+    let settled = running[0].waits_until(90, |said| elected(said) || followed(said))
+        && running[1].waits_until(30, |said| elected(said) || followed(said));
+    // Taken once both have settled on ballot 1. The check of which one
+    // leads used to wait 30 s on the first survivor even when the other
+    // led, and that wait was counted here (task-d81's CI, 36 s). Settled,
+    // the leader has said so already, so the first is only looked at.
+    let took = stopped.elapsed();
     assert!(
-        running[0].waits_until(90, |said| elected(said) || followed(said))
-            && running[1].waits_until(30, |said| elected(said) || followed(said))
-            && (running[0].waits_until(30, elected) || running[1].waits_until(1, elected)),
+        settled && (elected(&running[0].said()) || running[1].waits_until(30, elected)),
         "the survivors did not elect a leader:\n-- 2 --\n{}\n-- 3 --\n{}",
+        running[0].said(),
+        running[1].said()
+    );
+    // Within seconds of the kill, not the 30 s a dead process's links
+    // took to close before the peer plane's idle timeout (task-d82).
+    assert!(
+        took < Duration::from_secs(20),
+        "the survivors elected a leader {took:?} after the kill:\n-- 2 --\n{}\n-- 3 --\n{}",
         running[0].said(),
         running[1].said()
     );
@@ -6547,6 +6561,117 @@ async fn the_survivors_of_a_stopped_leader_elect_another_and_it_follows_when_it_
                 back.said(),
                 running[0].said(),
                 running[1].said()
+            )
+        });
+    assert!(matches!(
+        response_of(&put).outcome,
+        coord_types::wire_v1::OutcomeV1::Ok { .. }
+    ));
+}
+
+/// A leader killed and started again at once leaves the domain without a
+/// leader for seconds, not for the transport's idle timeout (task-d82).
+///
+/// On the Jepsen runner (#98, the #173 carry's leader-kill run) a leader
+/// back within the old 30 s came back still the leader on record. The
+/// survivors had not seen its links end, so neither campaigned, and its
+/// own dials lost the lane to their connections to the dead process until
+/// those timed out: no node served for 67 s at worst. With the peer
+/// plane's idle timeout at seconds, a write is established again within a
+/// few, whichever voter then leads.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_leader_killed_and_started_again_at_once_serves_again_within_seconds() {
+    let dir = workspace("leader-back");
+    let cluster = three_voters(&dir);
+    for config in &cluster.configs {
+        assert_eq!(run(config, &["init"]).code, Some(0));
+    }
+    let mut running: Vec<Running> = cluster.configs.iter().map(|c| start(c)).collect();
+    for node in &running {
+        assert!(
+            node.waits_to_say("voters submittable=2 of 2"),
+            "{}",
+            node.said()
+        );
+    }
+    let caller = Caller::bind(&running[0], &cluster.ca, &cluster.ring, [0x52; 16]).await;
+    let put = ask(&caller.connection, &caller.put(1, b"k", b"before"))
+        .await
+        .expect("the domain established a write under its first leader");
+    assert!(matches!(
+        response_of(&put).outcome,
+        coord_types::wire_v1::OutcomeV1::Ok { .. }
+    ));
+
+    // The highest identity leads, as n5 did on the runner: the pair rule
+    // keeps the connection its lower peers dialled to it, so its own
+    // dials after a restart lose to theirs until those close.
+    let asked = std::process::Command::new("kill")
+        .args(["-USR1", &running[2].child.id().to_string()])
+        .status()
+        .expect("kill runs");
+    assert!(asked.success());
+    assert!(
+        running[2].waits_until(20, |said| said.contains("this voter leads ballot 1")),
+        "voter 3 did not take the lead it was asked to:\n{}",
+        running[2].said()
+    );
+    for node in running.iter().take(2) {
+        assert!(
+            node.waits_until(20, |said| said
+                .contains("this voter follows ballot 1 led by 03030303")),
+            "{}",
+            node.said()
+        );
+    }
+
+    // Killed, and started again at once, well within the old idle timeout.
+    drop(running.remove(2));
+    let killed = std::time::Instant::now();
+    let back = start(&cluster.configs[2]);
+
+    // A voter leads a later ballot within the bound: before the peer
+    // plane's idle timeout was seconds, nobody did for about 30 s.
+    let leads_later = |said: &str| {
+        said.lines().any(|line| {
+            line.strip_prefix("this voter leads ballot ")
+                .and_then(|rest| rest.split_whitespace().next())
+                .and_then(|n| n.parse::<u64>().ok())
+                .is_some_and(|n| n >= 2)
+        })
+    };
+    let bound = Duration::from_secs(15);
+    while killed.elapsed() < bound
+        && !(leads_later(&back.said()) || running.iter().any(|n| leads_later(&n.said())))
+    {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        killed.elapsed() < bound,
+        "no voter led a later ballot within {bound:?} of the leader's kill\n-- 1 --\n{}\n-- 2 --\n{}\n-- 3 --\n{}",
+        running[0].said(),
+        running[1].said(),
+        back.said()
+    );
+
+    // And the domain serves again through a survivor, also within
+    // seconds: a frontend's submission link to the dead voter is an api
+    // connection, and a submission sent on it waited out the same idle
+    // timeout.
+    let serves = Duration::from_secs(20);
+    let put = tokio::time::timeout(
+        serves.saturating_sub(killed.elapsed()),
+        ask(&caller.connection, &caller.put(2, b"k", b"after")),
+    )
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or_else(|| {
+            panic!(
+                "the domain did not establish a write within {serves:?} of the leader's kill\n-- 1 --\n{}\n-- 2 --\n{}\n-- 3 --\n{}",
+                running[0].said(),
+                running[1].said(),
+                back.said()
             )
         });
     assert!(matches!(
