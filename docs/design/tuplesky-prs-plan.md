@@ -3190,7 +3190,7 @@ The change, in two steps:
          - Is there a reason, besides the guard, that a fresh proposal's acceptance waits for its own proposal row? `advance_pending` names only the guard.
          - Is a prerequisite accepted in memory in an earlier batch, and durable no later than the new one? `adopt_own` relies on batches becoming durable in submission order, so it should be.
          - The leader's fast vote is its proposal, not its table phase.
-    2. **A result released once its command is decided at a quorum,** before its own execution group is durable (task-d90).
+    2. **A result released once its command is decided at a quorum and executed in memory,** before its own execution group is durable (task-d90).
        - This is the lever that gives etcd's shape: one sync in series.
        - It amends Section 17.3.3's ordering of an execution before its result. Its argument: execution order and results are a function of the decided commands (task-d06's chain), so a crash before the execution group is durable replays to the same result.
        - It also has to say what the collector's late-release comparison (task-d12) and the execution chain (task-d35) see across that crash.

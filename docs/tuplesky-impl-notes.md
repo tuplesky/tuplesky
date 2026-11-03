@@ -10834,7 +10834,8 @@ durability, and at load they already share. Neither reaches task-d72's
 names three levers for a design step, in the order review of #179 set.
 The first is a fresh proposal's ACCEPT row in its proposal batch, which
 takes the leader's second sync off the path at low load. The second is
-a result released at a quorum decision. The third, the leader's ACCEPT
+a result released once it is decided at a quorum and executed in
+memory, before its execution group is durable. The third, the leader's ACCEPT
 row deferred until the fast path fails, comes only if the fast share
 proves high.
 
