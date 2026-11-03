@@ -1,7 +1,8 @@
 //! task-22 acceptance: golden traces of the leader machine match the
 //! command-table model; every leader reply has exact durable support;
 //! reordered/duplicate client requests cannot bind conflicting payload;
-//! premature accept/commit/execution is blocked while dependencies lag;
+//! premature commit/execution is blocked while dependencies lag (the
+//! acceptance guard's own case is in `leader.rs`'s unit tests);
 //! a higher promise stops proposing; votes are collected, never learned.
 
 use std::collections::BTreeSet;
@@ -207,6 +208,16 @@ fn summarize(effect: &Effect) -> String {
     }
 }
 
+fn sends_of(effects: &[Effect]) -> Vec<ProtocolMessage> {
+    effects
+        .iter()
+        .filter_map(|e| match e {
+            Effect::SendWhenDurable { frame, .. } => Some(ProtocolMessage::decode(frame).unwrap()),
+            _ => None,
+        })
+        .collect()
+}
+
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
@@ -245,7 +256,9 @@ fn proposals_are_published_with_exact_durable_support_and_match_the_model() {
         .unwrap();
 
     // Admit c1: one batch with payload, dependency and proposal rows; no
-    // send yet.
+    // send yet. Nothing precedes c1, so the dependency guard passes when
+    // it is proposed and the dependency row is already ACCEPT: the
+    // leader's acceptance rides in the proposal batch (task-d89).
     let effects = leader.step(e1);
     trace
         .steps
@@ -281,18 +294,26 @@ fn proposals_are_published_with_exact_durable_support_and_match_the_model() {
     let dependency = decode_dependency(batch.updates[1].value.as_ref().unwrap()).unwrap();
     assert_eq!(dependency.deps, m1.deps);
     assert_eq!(dependency.path, m1.path, "path evidence matches the model");
+    assert_eq!(
+        dependency.phase,
+        Phase::Accept,
+        "the guard passed: the row is the leader's acceptance"
+    );
     let proposal = decode_proposal(batch.updates[2].value.as_ref().unwrap()).unwrap();
     assert_eq!(proposal.seqnum, 0);
     assert_eq!(proposal.ballot, ballot(0, 0));
     assert_eq!(
         leader.pending_sends(),
-        3,
-        "two voters and the frontend wait"
+        4,
+        "the proposal to two voters, the reply, and the leader's adoption \
+         to the frontend (task-d74) wait on the batch"
     );
-    assert_eq!(leader.table().phase_of(&c1), Some(Phase::PreAccept));
+    assert_eq!(leader.table().phase_of(&c1), Some(Phase::Accept));
+    assert!(leader.proposal(&c1).unwrap().accepts);
 
     // Admit c2 before c1 is durable: it depends on c1 (conservative
-    // conflicts) and its sends wait on its own batch.
+    // conflicts), which is already ACCEPT here, so c2's guard passes too
+    // and its batch carries its acceptance.
     let effects2 = leader.step(e2);
     trace
         .steps
@@ -300,84 +321,82 @@ fn proposals_are_published_with_exact_durable_support_and_match_the_model() {
     let Effect::Persist(batch2) = &effects2[0] else {
         panic!()
     };
+    let dependency2 = decode_dependency(batch2.updates[1].value.as_ref().unwrap()).unwrap();
+    assert_eq!(dependency2.phase, Phase::Accept);
+    assert_eq!(dependency2.deps, vec![c1]);
     let proposal2 = decode_proposal(batch2.updates[2].value.as_ref().unwrap()).unwrap();
     assert_eq!(proposal2.seqnum, 1);
     assert_eq!(proposal2.deps, vec![c1]);
     assert_eq!(proposal2.path, m2.path);
-    assert_eq!(leader.pending_sends(), 6);
+    assert_eq!(leader.pending_sends(), 8);
+    assert_eq!(leader.table().phase_of(&c2), Some(Phase::Accept));
 
-    // c2's batch becomes durable first: its sends are released (exact
-    // support is its own batch), but c2 cannot enter ACCEPT while c1 lags.
-    let released = leader.step(durable(&effects2, 1).remove(0));
+    // c1's batch becomes durable, as the journal makes a domain's batches
+    // durable, in submission order: its proposal, its reply and its
+    // adoption are released, and nothing more is written.
+    let released = leader.step(durable(&effects, 1).remove(0));
     trace.steps.push((
-        "c2 durable".into(),
+        "c1 durable".into(),
         released.iter().map(summarize).collect(),
     ));
-    assert_eq!(released.len(), 3);
+    assert_eq!(released.len(), 4, "{released:?}");
     for e in &released {
         let Effect::SendWhenDurable { requires, to, .. } = e else {
-            panic!()
+            panic!("only sends: no acceptance row is written later: {e:?}")
         };
-        assert_eq!(requires, &vec![batch2.barrier]);
+        assert_eq!(requires, &vec![batch.barrier]);
         assert!(to.replica == r(1) || to.replica == r(2) || *to == FRONTEND);
     }
     let reply = released
         .iter()
         .find_map(|e| match e {
-            Effect::SendWhenDurable { to, frame, .. } if *to == FRONTEND => Some(frame),
+            Effect::SendWhenDurable { to, frame, .. }
+                if *to == FRONTEND
+                    && matches!(
+                        ProtocolMessage::decode(frame).unwrap(),
+                        ProtocolMessage::LeaderReply { .. }
+                    ) =>
+            {
+                Some(frame)
+            }
             _ => None,
         })
         .unwrap();
     assert!(matches!(
         ProtocolMessage::decode(reply).unwrap(),
-        ProtocolMessage::LeaderReply { command, seqnum: 1, .. } if command == c2
+        ProtocolMessage::LeaderReply { command, seqnum: 0, .. } if command == c1
     ));
-    assert_eq!(
-        leader.table().phase_of(&c2),
-        Some(Phase::PreAccept),
-        "c1 lags"
-    );
-    assert_eq!(leader.table().phase_of(&c1), Some(Phase::PreAccept));
+    assert!(leader.votes(&c1).unwrap().adopted_by(&r(0)));
+    // c2's adoption waits on c1's batch as well as its own (task-d19).
+    assert_eq!(leader.pending_sends(), 4);
+    assert!(!leader.votes(&c2).unwrap().adopted_by(&r(0)));
 
-    // c1 durable: c1 accepts, then c2 (chain advances in one turn).
-    let released = leader.step(durable(&effects, 2).remove(0));
+    // c2's batch: its sends and its adoption go.
+    let released = leader.step(durable(&effects2, 2).remove(0));
     trace.steps.push((
-        "c1 durable".into(),
+        "c2 durable".into(),
         released.iter().map(summarize).collect(),
     ));
-    // Three sends plus the two acceptance rows: the leader's own ACCEPT
-    // is written when the dependency guard passes, not when it proposed.
-    assert_eq!(released.len(), 5);
-    assert_eq!(leader.table().phase_of(&c1), Some(Phase::Accept));
-    assert_eq!(leader.table().phase_of(&c2), Some(Phase::Accept));
-    // The leader's own adoptions wait on the acceptance rows, to the
-    // frontend each (task-d19), and to no voter (task-d74).
-    assert_eq!(leader.pending_sends(), 2);
-    assert!(leader.take_rejections().is_empty());
-    let mut acks = Vec::new();
-    for (i, event) in durable(&released, 3).into_iter().enumerate() {
-        let out = leader.step(event);
-        trace.steps.push((
-            format!("acceptance {} durable", i + 1),
-            out.iter().map(summarize).collect(),
-        ));
-        acks.extend(out);
-    }
+    assert_eq!(released.len(), 4, "{released:?}");
+    assert!(
+        released
+            .iter()
+            .all(|e| matches!(e, Effect::SendWhenDurable { .. }))
+    );
     assert_eq!(leader.pending_sends(), 0);
-    let slow: Vec<_> = acks
-        .iter()
-        .filter_map(|e| match e {
-            Effect::SendWhenDurable { frame, .. } => Some(ProtocolMessage::decode(frame).unwrap()),
-            _ => None,
-        })
-        .filter(|m| matches!(m, ProtocolMessage::SlowAck(a) if a.replica == r(0)))
+    assert!(leader.take_rejections().is_empty());
+    let slow: Vec<_> = sends_of(&released)
+        .into_iter()
+        .filter(
+            |m| matches!(m, ProtocolMessage::SlowAck(a) if a.replica == r(0) && a.command == c2),
+        )
         .collect();
     assert_eq!(
         slow.len(),
-        2,
-        "c1 and c2 adopted by the leader, to the frontend"
+        1,
+        "c2 adopted by the leader, to the frontend only (task-d74)"
     );
-    assert!(leader.votes(&c1).unwrap().adopted_by(&r(0)));
+    assert!(leader.votes(&c2).unwrap().adopted_by(&r(0)));
     // The leader's own vote alone learns nothing.
     assert!(leader.votes(&c1).unwrap().learned_slow().is_none());
     assert_eq!(leader.next_executable(), None);
@@ -445,48 +464,55 @@ fn reordered_and_duplicate_requests_cannot_bind_conflicting_payload() {
 }
 
 #[test]
-fn premature_phases_are_blocked_while_dependencies_lag() {
+fn a_rejected_batch_is_presented_again_ahead_of_its_dependents() {
     let mut leader = booted();
     let (e1, c1) = admitted(1, 1, 1);
     let (e2, c2) = admitted(2, 2, 2);
     let effects1 = leader.step(e1);
     let effects2 = leader.step(e2);
-    // c1's batch is definitely rejected: the same rows are presented again
-    // under a new barrier, so c1 keeps its identity and its dependents;
-    // c2 (durable) still cannot accept because its dependency lags, and
-    // the table refuses commit and execution for both.
+    // Both are accepted with their proposals (task-d89), c2 over c1.
+    assert_eq!(leader.table().phase_of(&c1), Some(Phase::Accept));
+    assert_eq!(leader.table().phase_of(&c2), Some(Phase::Accept));
+    // c1's batch is definitely rejected. The journal then drops every
+    // batch queued behind it as definitely not committed too, so c2's
+    // ACCEPT row is never durable without c1's. Each is presented again,
+    // unchanged and in order, so c1 keeps its identity and its
+    // dependents.
     let Effect::Persist(b1) = &effects1[0] else {
         panic!()
     };
-    let retried = leader.step(Event::Storage(StorageEvent::Failed {
-        barrier_id: b1.barrier,
-        error: StorageError::DefinitelyNotCommitted,
-    }));
-    let [Effect::Persist(again)] = retried.as_slice() else {
-        panic!("the rejected batch is presented again: {retried:?}")
+    let Effect::Persist(b2) = &effects2[0] else {
+        panic!()
     };
-    assert_ne!(again.barrier, b1.barrier, "a fresh barrier");
-    assert_eq!(again.updates, b1.updates, "the same rows, unchanged");
+    let mut again = Vec::new();
+    for barrier in [b1.barrier, b2.barrier] {
+        let retried = leader.step(Event::Storage(StorageEvent::Failed {
+            barrier_id: barrier,
+            error: StorageError::DefinitelyNotCommitted,
+        }));
+        let [Effect::Persist(batch)] = retried.as_slice() else {
+            panic!("the rejected batch is presented again: {retried:?}")
+        };
+        again.push(batch.clone());
+    }
+    assert_ne!(again[0].barrier, b1.barrier, "a fresh barrier");
+    assert_eq!(again[0].updates, b1.updates, "the same rows, unchanged");
+    assert_eq!(again[1].updates, b2.updates);
+    assert!(again[0].barrier < again[1].barrier, "c1's again first");
     assert_eq!(
         leader.take_rejections(),
-        vec![Rejection::ProposalRetried(c1)]
+        vec![
+            Rejection::ProposalRetried(c1),
+            Rejection::ProposalRetried(c2)
+        ]
     );
     let proposal = leader.proposal(&c1).expect("still proposed");
     assert_eq!(proposal.attempts, 2);
     assert!(!proposal.durable);
     assert!(leader.is_leading(), "a definite rejection does not fence");
-    let released = leader.step(durable(&effects2, 1).remove(0));
-    assert_eq!(released.len(), 3, "c2's own evidence is published");
-    assert_eq!(
-        leader.table().phase_of(&c2),
-        Some(Phase::PreAccept),
-        "c1 lags"
-    );
+    // Accepted is not committed or executed: the table refuses both for
+    // c2 while c1 is neither.
     let mut table = leader.table().clone();
-    assert_eq!(
-        table.accept(c2, vec![c1]),
-        Err(GuardViolation::DependencyNotAccepted { dep: c1 })
-    );
     assert_eq!(
         table.commit(c2),
         Err(GuardViolation::DependencyNotCommitted { dep: c1 })
@@ -495,8 +521,18 @@ fn premature_phases_are_blocked_while_dependencies_lag() {
         table.execute(c2),
         Err(GuardViolation::DependencyNotExecuted { dep: c1 })
     );
-    // c1's sends wait on the new barrier instead of the rejected one.
-    assert_eq!(leader.pending_sends(), 3);
+    // Each one's proposal, reply and adoption wait on its new barrier.
+    assert_eq!(leader.pending_sends(), 8);
+    let released = leader.step(Event::Storage(StorageEvent::JournalDurable {
+        barrier_id: again[0].barrier,
+        journal_seq: LocalJournalSeq::new(1).unwrap(),
+    }));
+    assert_eq!(
+        released.len(),
+        4,
+        "c1's evidence is published: {released:?}"
+    );
+    assert!(leader.votes(&c1).unwrap().adopted_by(&r(0)));
 }
 
 #[test]
@@ -532,9 +568,12 @@ fn an_unresolved_proposal_write_stops_the_leader() {
                 error
             })]
         );
-        // The command stays in the table: its rows may exist.
+        // The command stays in the table: its rows may exist. Its
+        // acceptance was in the same batch (task-d89), and its adoption
+        // waits on it, so nothing claims it was durable.
         assert!(leader.proposal(&c1).is_some());
-        assert_eq!(leader.table().phase_of(&c1), Some(Phase::PreAccept));
+        assert_eq!(leader.table().phase_of(&c1), Some(Phase::Accept));
+        assert!(!leader.votes(&c1).unwrap().adopted_by(&r(0)));
         // A further request is refused, naming the promised ballot.
         let (e2, _) = admitted(2, 2, 2);
         assert!(leader.step(e2).is_empty());
@@ -653,10 +692,21 @@ fn a_higher_promise_stops_proposing_and_fences_unreleased_proposals() {
                 && matches!(ProtocolMessage::decode(frame).unwrap(), ProtocolMessage::ReportPage(_))
     ));
     assert_eq!(leader.pending_sends(), 0);
-    assert_eq!(
-        leader.table().phase_of(&c1),
-        Some(Phase::PreAccept),
-        "the cut began before the guard passed: no acceptance is adopted"
+    // c1 was accepted with its proposal (task-d89). Its adoption's sends,
+    // like the proposal's, were obsolete once the promise was durable,
+    // and were dropped (nothing is pending). The row itself was submitted
+    // before the promise and is in the cut the report is taken at, so the
+    // leader counts it in its own vote set, as it counted an acceptance
+    // batch already in flight when a promise arrived.
+    assert_eq!(leader.table().phase_of(&c1), Some(Phase::Accept));
+    assert!(leader.votes(&c1).unwrap().adopted_by(&r(0)));
+    assert!(
+        leader
+            .report(ballot(1, 2))
+            .entries
+            .iter()
+            .any(|e| e.command == c1 && e.phase == Phase::Accept),
+        "the report carries the acceptance the vote counts"
     );
 }
 
@@ -665,7 +715,6 @@ fn votes_are_collected_but_never_learned_here() {
     let mut leader = booted();
     let (e1, c1) = admitted(1, 1, 1);
     let effects = leader.step(e1);
-    let acceptance = leader.step(durable(&effects, 1).remove(0));
     let path = leader.proposal(&c1).unwrap().path;
     let paths = leader.proposal(&c1).unwrap().paths.clone();
     let admitted_under = leader
@@ -685,20 +734,14 @@ fn votes_are_collected_but_never_learned_here() {
     };
     // r1 (fast set) agrees on the path; r2 adopts; an observer is refused;
     // a vote whose sender does not match its provenance is refused.
-    // r1's agreement decides c1 fast at three voters, and the frontier it
-    // moves is announced in the same step (task-d74), and nothing else.
-    let announced = leader.step(peer(1, ProtocolMessage::FastAck(ack(1))));
-    assert!(!announced.is_empty());
-    for e in &announced {
-        let Effect::SendWhenDurable { to, frame, .. } = e else {
-            panic!("{e:?}")
-        };
-        assert!(to.replica == r(1) || to.replica == r(2));
-        assert!(matches!(
-            ProtocolMessage::decode(frame).unwrap(),
-            ProtocolMessage::Committed { through: 0, .. }
-        ));
-    }
+    // r1's agreement makes a fast quorum with the leader's proposal, which
+    // is not durable yet, so nothing is committed or announced (task-d89).
+    assert!(
+        leader
+            .step(peer(1, ProtocolMessage::FastAck(ack(1))))
+            .is_empty()
+    );
+    assert_eq!(leader.table().phase_of(&c1), Some(Phase::Accept));
     assert!(
         leader
             .step(peer(
@@ -734,7 +777,27 @@ fn votes_are_collected_but_never_learned_here() {
         "r2's adoption and the leader's proposal: the leader's acceptance \
          row is not durable yet (task-d19)"
     );
-    leader.step(durable(&acceptance, 2).remove(0));
+    // The proposal batch carries the acceptance row (task-d89). Once it is
+    // durable c1 is decided, and the frontier it moves is announced in the
+    // same step (task-d74), beside the batch's own sends.
+    let durable_step = leader.step(durable(&effects, 1).remove(0));
+    let announced: Vec<_> = durable_step
+        .iter()
+        .filter_map(|e| match e {
+            Effect::SendWhenDurable { to, frame, .. } => {
+                match ProtocolMessage::decode(frame).unwrap() {
+                    ProtocolMessage::Committed { through, .. } => Some((*to, through)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(!announced.is_empty(), "{durable_step:?}");
+    for (to, through) in &announced {
+        assert!(to.replica == r(1) || to.replica == r(2));
+        assert_eq!(*through, 0);
+    }
     let votes = leader.votes(&c1).unwrap();
     assert_eq!(votes.voted(), [r(0), r(1), r(2)].into());
     // The slow predicate holds: the command is committed (task-24), but
@@ -759,6 +822,46 @@ fn votes_are_collected_but_never_learned_here() {
         leader.votes(&unknown).is_none(),
         "a held acknowledgement is not a vote set"
     );
+}
+
+/// A fast quorum that forms before the leader's proposal batch is durable
+/// commits nothing until it is (task-d89). The leader's fast vote is its
+/// proposal, and its acceptance now rides in the same batch, so the table
+/// holds the command at ACCEPT from the start: what keeps the leader from
+/// committing over a volatile proposal is the batch's durability, as it
+/// was when the acceptance waited for it.
+#[test]
+fn an_early_fast_quorum_commits_nothing_before_the_proposal_is_durable() {
+    let mut leader = booted();
+    let (e1, c1) = admitted(1, 1, 1);
+    let effects = leader.step(e1);
+    assert_eq!(leader.table().phase_of(&c1), Some(Phase::Accept));
+    let proposal = leader.proposal(&c1).unwrap();
+    let ack = FastAck {
+        replica: r(1),
+        ballot: ballot(0, 0),
+        command: c1,
+        deps: vec![],
+        paths: proposal.paths.clone(),
+        path: proposal.path,
+        admission: leader.table().record(&c1).and_then(|r| r.payload).unwrap(),
+        seqnum: None,
+    };
+    // r1, the other member of the fast set, saw the submission and agrees.
+    leader.step(peer(1, ProtocolMessage::FastAck(ack)));
+    assert!(
+        leader.votes(&c1).unwrap().learned().is_some(),
+        "the votes alone make a fast quorum"
+    );
+    assert_eq!(
+        leader.table().phase_of(&c1),
+        Some(Phase::Accept),
+        "not committed: the leader's vote is a proposal not yet durable"
+    );
+    assert_eq!(leader.next_executable(), None);
+    leader.step(durable(&effects, 1).remove(0));
+    assert_eq!(leader.table().phase_of(&c1), Some(Phase::Commit));
+    assert_eq!(leader.next_executable(), Some(c1));
 }
 
 /// An acknowledgement that outruns the leader's own proposal still
@@ -935,22 +1038,12 @@ fn the_seal_report_waits_for_an_acceptance_batch_still_in_flight() {
     let mut leader = booted();
     let (e1, c1) = admitted(1, 1, 1);
     let proposed = leader.step(e1);
-    let after = leader.step(durable(&proposed, 1).remove(0));
-    let accepts: Vec<_> = after
-        .iter()
-        .filter_map(|e| match e {
-            Effect::Persist(b) => Some(b.clone()),
-            _ => None,
-        })
-        .collect();
-    let [accept] = accepts.as_slice() else {
-        panic!("the acceptance row is written: {after:?}")
+    // The proposal batch carries the ACCEPT row (task-d89).
+    let [Effect::Persist(accept)] = proposed.as_slice() else {
+        panic!("the proposal batch is written: {proposed:?}")
     };
     assert_eq!(leader.table().phase_of(&c1), Some(Phase::Accept));
-    assert!(
-        leader.proposal(&c1).unwrap().durable,
-        "the proposal batch is no longer outstanding"
-    );
+    assert!(leader.proposal(&c1).unwrap().accepts);
 
     let seal = leader.step(peer(
         2,
