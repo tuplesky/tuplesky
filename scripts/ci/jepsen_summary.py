@@ -105,6 +105,8 @@ RECOVERED = re.compile(r"^recovered .*\bexecuted=(\d+)")
 # A local checkpoint's publication (task-d55), with what it held the domain
 # thread (`loop_ms`, task-d51; absent before it) and how long it took.
 CHECKPOINT = re.compile(r"^checkpoint represented=\d+ .*\btook_ms=(\d+)")
+# What a publication represented and its image's export and write (task-d55).
+CHECKPOINT_IMAGE = re.compile(r"^checkpoint represented=(\d+) .*\bexport_ms=([\d.]+) write_ms=([\d.]+)")
 LOOP_MS = re.compile(r"\bloop_ms=([\d.]+)")
 # The domain thread's own time over each journal step of a publication,
 # on a CPU and waiting for one (task-d66); `-` where there is no reading.
@@ -182,6 +184,8 @@ class Voter:
     # Per publication with a thread reading (task-d66): (loop_ms, ms on a
     # CPU, ms waiting for one), each summed over the four journal steps.
     checkpoint_threads: list = field(default_factory=list)
+    # Each publication's (represented, export ms, write ms), task-d92's C10.
+    checkpoint_images: list = field(default_factory=list)
     # The longest the oldest unordered pre-acceptance had been held, over
     # every `metrics` line of every boot (task-d62), in seconds, with the
     # line's uptime; None before task-d62.
@@ -248,6 +252,11 @@ class Cost:
     # calls, the proposals they looked at, their time on the loop and the
     # longest; empty before task-d49.
     resends: dict = field(default_factory=dict)
+    # Journal groups appended and projection transactions committed
+    # (task-d45), and since task-d84 which writes each group carried.
+    appends: int | None = None
+    commits: int | None = None
+    groups: dict = field(default_factory=dict)
 
 
 def seconds(d) -> float:
@@ -294,6 +303,9 @@ def parse_cost(snapshot: dict) -> Cost | None:
             else None
         ),
         run_queue=seconds(scheduling.get("run_queue")) if isinstance(scheduling, dict) else None,
+        appends=cost.get("journal_appends"),
+        commits=cost.get("projection_commits"),
+        groups=cost.get("journal_groups") if isinstance(cost.get("journal_groups"), dict) else {},
     )
 
 
@@ -447,6 +459,9 @@ def parse_voter(lines) -> Voter:
         if m:
             loop = LOOP_MS.search(line)
             v.checkpoints.append((int(m[1]), float(loop[1]) if loop else None))
+            image = CHECKPOINT_IMAGE.match(line)
+            if image:
+                v.checkpoint_images.append((int(image[1]), float(image[2]), float(image[3])))
             steps = THREAD_MS.findall(line)
             if loop and steps and all(ms != "-" for _, _, ms in steps):
                 cpu = sum(float(ms) for _, kind, ms in steps if kind == "cpu")
@@ -1622,6 +1637,41 @@ def five_way_table(store: str, voters: dict) -> list[str]:
     return out
 
 
+def journal_table(voters: dict) -> list[str]:
+    """Each voter's journal groups and projection commits against its
+    commands, from its last `metrics` line (task-d86's C4), with which
+    writes the groups carried where the line says (task-d84); [] where no
+    line counts them."""
+    rows = [(node, v.cost) for node, v in voters.items()
+            if v.cost and v.cost.executed and v.cost.appends is not None and v.cost.commits is not None]
+    if not rows:
+        return []
+    grouped = any(c.groups for _, c in rows)
+    out = [
+        "**Journal groups and projection commits** (each voter's last boot, from its last `metrics` line: commands "
+        "executed, journal groups appended and projection transactions committed, commands per group and per commit, "
+        "and the journal's synced writes per command"
+        + ("; then the groups by what they carried: protocol transitions only, application outcomes only, both, "
+           "neither (task-d84)" if grouped else "")
+        + ")",
+        "",
+        "| Node | Executed | Journal groups | Commands per group | Projection commits | Commands per commit "
+        "| Journal syncs per command |" + (" Groups: protocol / application / both / other |" if grouped else ""),
+        "| --- " * (7 + (1 if grouped else 0)) + "|",
+    ]
+    for node, c in rows:
+        per = lambda n: f"{c.executed / n:.2f}" if n else "-"
+        syncs = f"{c.syncs / c.executed:.2f}" if c.syncs is not None else "-"
+        line = f"| {node} | {c.executed} | {c.appends} | {per(c.appends)} | {c.commits} | {per(c.commits)} | {syncs} |"
+        if grouped:
+            g = c.groups
+            line += (f" {g.get('protocol', 0)} / {g.get('application', 0)} / {g.get('both', 0)} / {g.get('other', 0)} |"
+                     if g else " - |")
+        out.append(line)
+    out.append("")
+    return out
+
+
 def resend_table(voters: dict) -> list[str]:
     """task-d59's re-send timer on each voter that ran it (the leader): its
     calls, the loop's time in a call on average and at most, and the
@@ -2219,14 +2269,17 @@ def summarize(store: str, nodes: list[str], title: str, profile: str | None = No
                 "task-d51's acceptance bounds at 10 ms; took is from the pin to the end of the reclaim, most of it off "
                 "the loop since task-d51; on a CPU and waiting for one are the domain thread's own time over the "
                 "drain, sync, append and retirement (task-d66), the mean and the publication longest on the loop; "
-                "the rest of a step's wall time is the thread blocked)"
+                "the rest of a step's wall time is the thread blocked; represented is the last publication's, and "
+                "the image's export and write are summed over every publication per 1,000 records represented, "
+                "task-d92's measure)"
             )
             out.append("")
             out.append(
                 "| Node | Published | Failed | Mean on the loop (ms) | Max on the loop (ms) | Over 10 ms on the loop "
-                "| Max took (ms) | On a CPU, mean / longest (ms) | Waiting for a core, mean / longest (ms) |"
+                "| Max took (ms) | On a CPU, mean / longest (ms) | Waiting for a core, mean / longest (ms) "
+                "| Represented, last | Export / write per 1,000 represented (ms) |"
             )
-            out.append("| --- " * 9 + "|")
+            out.append("| --- " * 11 + "|")
             for node, v in voters.items():
                 loops = [l for _, l in v.checkpoints if l is not None]
                 mean = f"{sum(loops) / len(loops):.1f}" if loops else "-"
@@ -2239,11 +2292,20 @@ def summarize(store: str, nodes: list[str], title: str, profile: str | None = No
                     _, cpu_longest, runq_longest = max(v.checkpoint_threads, key=lambda t: t[0])
                     cpu = f"{sum(t[1] for t in v.checkpoint_threads) / n:.1f} / {cpu_longest:.1f}"
                     runq = f"{sum(t[2] for t in v.checkpoint_threads) / n:.1f} / {runq_longest:.1f}"
+                last = image_cost = "-"
+                if v.checkpoint_images:
+                    last = str(v.checkpoint_images[-1][0])
+                    records = sum(r for r, _, _ in v.checkpoint_images)
+                    if records:
+                        export = sum(x for _, x, _ in v.checkpoint_images) * 1000 / records
+                        write = sum(w for _, _, w in v.checkpoint_images) * 1000 / records
+                        image_cost = f"{export:.2f} / {write:.2f}"
                 out.append(
                     f"| {node} | {len(v.checkpoints)} | {v.checkpoints_failed} | {mean} | {peak} | {over} | {took} "
-                    f"| {cpu} | {runq} |"
+                    f"| {cpu} | {runq} | {last} | {image_cost} |"
                 )
             out.append("")
+        out.extend(journal_table(voters))
         timed = [(node, name, r) for node, v in voters.items() for name, r in v.stages.items() if r[1] or r[2]]
         if timed:
             out.append(

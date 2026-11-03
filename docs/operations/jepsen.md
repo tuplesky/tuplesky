@@ -388,7 +388,14 @@ among the faults, and the title says ", kills at the leader"; SwiftPaxos
 and etcd keep their random targets.
 Each publication's `checkpoint` line in `coordd.log` says how long it held
 the domain thread and how long each of its steps took, and each restart's
-`replayed` line how many records it replayed and how long that took.
+`replayed` line how many records it replayed and how long that took. The
+summary's Checkpoints table also gives the last publication's
+`represented` and the image's export and write per 1,000 records
+represented, over every publication (task-d92), and a table after it each
+voter's journal groups and projection commits from its last `metrics`
+line, with commands per group and per commit, the journal's synced writes
+per command and, where the line has them, the groups by what they carried
+(task-d84, task-d86).
 
 | Scenario | Workload | Faults (SwiftPaxos) | Load | Network | Time |
 | --- | --- | --- | --- | --- | --- |

@@ -545,6 +545,25 @@ class CheckpointTests(unittest.TestCase):
     def test_no_publication_no_table(self):
         self.assertNotIn("**Checkpoints**", self.summarize(REPLAY_VOTER))
 
+    def test_the_images_cost_a_record_represented(self):
+        # task-d92's C10: 167.7 ms of export and 182.2 of write over 12,285
+        # records represented, the last publication at 8190.
+        self.assertIn("| n1 | 2 | 1 | 8.5 | 12.5 | 1 | 240 | - | - | 8190 | 13.65 / 14.83 |", self.summarize(self.LOG))
+
+    def test_journal_groups_and_commits_per_command(self):
+        cost = {"executed": 1000, "busy": {"secs": 1, "nanos": 0}, "uptime": {"secs": 60, "nanos": 0},
+                "recent": {"Unavailable": "NotInstrumented"}, "reads": {"served": 0},
+                "journal_appends": 800, "projection_commits": 500, "journal_syncs": {"Observed": 820}}
+        line = "metrics " + json.dumps({"stages": [], "cost": {"Observed": cost}}) + "\n"
+        text = self.summarize(line)
+        self.assertIn("**Journal groups and projection commits**", text)
+        self.assertIn("| n1 | 1000 | 800 | 1.25 | 500 | 2.00 | 0.82 |", text)
+        self.assertNotIn("Groups: protocol", text)
+        # task-d84's groups by what they carried, where the line has them.
+        cost["journal_groups"] = {"protocol": 300, "application": 200, "both": 290, "other": 10}
+        line = "metrics " + json.dumps({"stages": [], "cost": {"Observed": cost}}) + "\n"
+        self.assertIn("| n1 | 1000 | 800 | 1.25 | 500 | 2.00 | 0.82 | 300 / 200 / 290 / 10 |", self.summarize(line))
+
 
 
 class RunnerCpuTests(unittest.TestCase):
