@@ -118,6 +118,7 @@ def per_command(node: str, snapshot: dict) -> dict:
         **waits_of(cost, executed),
         **traffic_of(cost, executed),
         **groups_of(cost, executed, syncs["Observed"]),
+        **({"flushes_per_command": f} if (f := flushes_of(cost, executed)) else {}),
     }
 
 
@@ -214,6 +215,17 @@ def groups_of(cost: dict, executed: int, syncs: int) -> dict:
     if with_application:
         out["commands_per_execution_group"] = groups["application_records"] / with_application
     return out
+
+
+def flushes_of(cost: dict, executed: int) -> dict:
+    """Why the domain loop lowered (task-d73), per command: with nothing
+    more ready, at the event bound, with a full group queued, and of all
+    of them, while an append was out. Empty for a binary older than the
+    reading."""
+    flushes = cost.get("flushes")
+    if not isinstance(flushes, dict) or not executed:
+        return {}
+    return {k: flushes[k] / executed for k in ("idle", "events", "queued", "appending")}
 
 
 def reads_of(cost: dict) -> dict:
@@ -608,6 +620,27 @@ def groups_table(result: dict) -> str:
     return "\n".join(lines)
 
 
+def flushes_table(result: dict) -> str:
+    """Why each voter's loop lowered (task-d73), one row per voter per run:
+    flushes a command by cause, beside commands an append and a commit."""
+    lines = [
+        "| callers | node | idle | event bound | full group | while appending "
+        "| commands/append | commands/commit |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- |",
+    ]
+    for run in result["runs"]:
+        for v in run["voters"]:
+            f = v.get("flushes_per_command")
+            if f is None:
+                continue
+            split = " | ".join(f"{f[k]:.3f}" for k in ("idle", "events", "queued", "appending"))
+            lines.append(
+                f"| {run['callers']} | {v['node']} | {split} "
+                f"| {1 / v['journal_appends_per_command']:.2f} "
+                f"| {1 / v['projection_commits_per_command']:.2f} |")
+    return "\n".join(lines)
+
+
 def per_command_or_dash(voter: dict, field: str) -> str:
     """A per-command reading to three places, or `--` when the binary
     did not report it."""
@@ -653,6 +686,8 @@ def main(argv: list[str]) -> int:
             print(paths_table(result))
             print()
             print(groups_table(result))
+            print()
+            print(flushes_table(result))
         else:
             baseline = json.loads(args.baseline.read_text())
             result = json.loads(args.result.read_text())

@@ -10897,3 +10897,58 @@ window.
   of the process's CPU per window. The trim stays the long-run bound, and
   its first reading, the rows exported by kind at two positions, waits
   for it.
+
+## Why a lowering group ends (task-d73)
+
+task-d47's loop flushes only once no event is ready, after 64 events
+(`FLUSH_EVENTS`), or once `FLUSH_QUEUED` records are queued. task-d73
+counts each flush by its cause, in `Cost::flushes`:
+- `idle`: the `owes_flush` arm, which fires when no event is ready;
+- `events`: the 64-event bound;
+- `queued`: a full group;
+- `appending`: beside any of these, a flush while an append is out.
+
+`command_cost.py table` prints them a command.
+
+**The setup.** Three voters on one host (x86_64, 4 CPUs), `replay`,
+stores on tmpfs, 20,000 operations, at 10 and 30 callers. The binaries
+carry this entry's counters over task-d89's head, the shape the batch's
+head side takes.
+
+| callers | node | idle | event bound | full group | while appending | commands/append | commands/commit |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 10 | n1 | 0.828 | 0.001 | 0.000 | 0.016 | 1.22 | 1.28 |
+| 10 | n2 | 0.969 | 0.001 | 0.000 | 0.024 | 1.05 | 1.12 |
+| 10 | n3 | 1.034 | 0.002 | 0.000 | 0.015 | 0.98 | 1.04 |
+| 30 | n1 | 0.349 | 0.010 | 0.000 | 0.008 | 2.83 | 2.93 |
+| 30 | n2 | 0.507 | 0.005 | 0.000 | 0.009 | 1.98 | 2.08 |
+| 30 | n3 | 0.513 | 0.012 | 0.001 | 0.012 | 1.94 | 2.07 |
+
+Flushes are a command; n1 is the leader.
+
+**What it says:**
+- **Almost no group ends while events are ready.** As shares of each
+  voter's flushes (the table is a command): 99.8 to 99.9% find nothing
+  ready at 10 callers, and 97.2 to 99.0% at 30. The 64-event bound and a
+  full group are the rest: 0.1 to 0.2% at 10 callers and 1.0 to 2.8% at
+  30, at most 0.013 a command. A larger bound could merge only those,
+  about one flush in eighty commands. So task-d47 already groups what
+  there is, and C3 (task-d72) has nothing worth building.
+- **An append out rarely holds a flush back on tmpfs** (1.4 to 2.5% of
+  flushes). On
+  the runner's disk, where an append takes about 2.3 ms, the queue
+  already grows behind each append.
+- **The materializer's cost is per record more than per commit.** Its
+  served time at the leader is 0.167 to 0.171 ms a command at 10 callers
+  and 0.137 to 0.144 at 30. A line through the two gives about 60 µs a
+  commit and 115 µs a record. task-d86's cadence is re-sized from that:
+  −0.03 to −0.09 ms an operation at the register row, against the
+  −0.15 to −0.30 first sized.
+
+**The bounded wait is not taken.** A wait of a few hundred microseconds
+would at most double the groups at 10 callers. That saves about half a
+commit (about 30 µs at the materializer) and half an append a command a
+voter, plus the datagrams a flush sends, which C1 and C2 already cut.
+It adds up to the wait to every command, and the `service` row's p99 is
+what the batch is furthest from. At one caller, where that p99 is read,
+there is nothing to group. The counters stay for the batch's pairs.
