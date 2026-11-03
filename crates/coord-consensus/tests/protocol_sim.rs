@@ -1269,18 +1269,16 @@ impl Sim {
         if let Ok(ProtocolMessage::CatchUpRequest { ballot: b, after }) =
             ProtocolMessage::decode(&msg.frame)
         {
-            // `coordd`'s donor answers only while it is synchronized at
-            // that ballot or a later one of the epoch
-            // (`Node::serve_catch_up`).
-            let at_or_after = |own: Ballot| own.compare_same_epoch(&b).is_some_and(|o| o.is_ge());
-            let synchronized = match &self.nodes[usize::from(msg.to)].role {
-                Some(Role::Leader(l)) => at_or_after(l.config_quorum().ballot()),
-                Some(Role::Follower(f)) => {
-                    f.quorum().ballot() == f.ballots().synced() && at_or_after(f.ballots().synced())
-                }
-                None => false,
+            // `coordd`'s donor answers at any ballot of its epoch
+            // (`Node::serve_catch_up`, task-d81): what it executed is a
+            // prefix of the one executed order, whatever ballot it is
+            // synchronized at.
+            let epoch = match &self.nodes[usize::from(msg.to)].role {
+                Some(Role::Leader(l)) => Some(l.config_quorum().ballot().epoch),
+                Some(Role::Follower(f)) => Some(f.quorum().ballot().epoch),
+                None => None,
             };
-            if !synchronized {
+            if epoch != Some(b.epoch) {
                 return;
             }
             let page = self.page(msg.to, b, after);

@@ -216,7 +216,7 @@ pub fn transport_config(
         let mut config = quinn::AckFrequencyConfig::default();
         config
             .ack_eliciting_threshold(VarInt::from_u32(ack.threshold))
-            .max_ack_delay(Some(ack.max_delay));
+            .max_ack_delay(ack.max_delay);
         transport.ack_frequency_config(Some(config));
     }
     Ok(Arc::new(transport))

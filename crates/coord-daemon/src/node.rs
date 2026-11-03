@@ -332,24 +332,32 @@ impl Machine {
         }
     }
 
-    /// Whether this replica is synchronized at `ballot` or at a later
-    /// ballot of its epoch: what it executed then includes everything
-    /// decided at `ballot`, so it can serve a voter still there its
-    /// executed history (task-d33). A voter that promised a ballot of its
-    /// own the others never followed, and was refused as behind, asks at
-    /// the ballot it last synchronized; a donor answering only its own
-    /// ballot left it behind for good.
-    pub fn synchronized_at_or_after(&self, ballot: &Ballot) -> bool {
-        let at_or_after = |own: Ballot| {
-            own.compare_same_epoch(ballot)
-                .is_some_and(|o| o != core::cmp::Ordering::Less)
+    /// Whether this replica serves a voter's ask, made at `ballot`, for
+    /// the history it executed: at any ballot of its own epoch, whichever
+    /// it is synchronized at (task-d81).
+    ///
+    /// What a replica executed is a prefix of the one executed order:
+    /// each command in it is decided, a decision is the same at every
+    /// voter, and the dependency chain is total (task-d06), so the command
+    /// at each position is too. A page from that prefix is valid at the
+    /// requester's ballot whatever ballot its donor is at; that the donor
+    /// executed everything decided at the requester's ballot is what a
+    /// whole history needs, not a prefix of one. The requester installs
+    /// each pulled command under the Sync-entry rules (task-d14), so a
+    /// second decision still stops it.
+    ///
+    /// A donor used to serve only while synchronized at the asker's
+    /// ballot or a later one (task-d33). A voter that alone executed the
+    /// newest positions but missed the ballot the others installed then
+    /// served none of them, while its campaign's frontier held them back
+    /// from campaigning until they had executed that far (12/5/148,
+    /// 2/3/281).
+    pub fn serves_catch_up_at(&self, ballot: &Ballot) -> bool {
+        let own = match self {
+            Machine::Leader(m) => m.config_quorum().ballot(),
+            Machine::Follower(m) => m.quorum().ballot(),
         };
-        match self {
-            Machine::Leader(m) => at_or_after(m.config_quorum().ballot()),
-            Machine::Follower(m) => {
-                m.quorum().ballot() == m.ballots().synced() && at_or_after(m.ballots().synced())
-            }
-        }
+        own.epoch == ballot.epoch
     }
 
     /// The highest ballot this replica refused to a candidate as behind
@@ -1196,11 +1204,12 @@ impl<P: Persistence> Node<P> {
     /// `ballot` (task-d08).
     ///
     /// Answered only to a voter of this configuration other than this
-    /// one, and only by a donor synchronized at the ballot the requester
-    /// asked at, that has not itself stopped: a page from anyone else, or
-    /// at another ballot, would be dropped by the requester anyway. What
-    /// is served is what this node executed and holds durable rows for,
-    /// no further than its own frontier.
+    /// one, at a ballot of this node's epoch, by a donor that has not
+    /// itself stopped (`Machine::serves_catch_up_at`, task-d81): a page
+    /// from anyone else would be dropped by the requester anyway. The page
+    /// is tagged with the ballot asked at, which the requester checks
+    /// against its own. What is served is what this node executed and
+    /// holds durable rows for, no further than its own frontier.
     pub fn serve_catch_up(
         &mut self,
         from: coord_types::ids::ReplicaId,
@@ -1212,7 +1221,7 @@ impl<P: Persistence> Node<P> {
         let identity = machine.identity();
         if from == identity.replica
             || !identity.voters.contains(&from)
-            || !machine.synchronized_at_or_after(&ballot)
+            || !machine.serves_catch_up_at(&ballot)
             || machine.halted().is_some()
             || machine.catch_up_divergence().is_some()
         {
