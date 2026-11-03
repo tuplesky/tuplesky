@@ -10897,3 +10897,43 @@ window.
   of the process's CPU per window. The trim stays the long-run bound, and
   its first reading, the rows exported by kind at two positions, waits
   for it.
+
+## The inbound path without a task per stream (task-d70, step 3)
+
+The runner's profile put 7 to 18% of the voters' tokio threads in
+parking, and the peer plane spawned a task for every uni stream it
+accepted. The step tried the accept task reading a peer's streams
+itself: one pinned accept future and a `FuturesUnordered` of reads, in a
+biased `select!`, with no spawn a stream (`serve_peer_streams`, commit
+`6bc0ee15`). The API plane kept its task a stream.
+
+**The setup.** Three voters on one host (x86_64, 4 CPUs), `replay`,
+stores on tmpfs, 60,000 operations a run, at 10 and 30 callers, the base
+(`df72e28`) against the head, alternating, three runs a side. Each
+voter's threads were read from `/proc/<pid>/task/*` over 10 s of the
+measured phase. The tokio workers' CPU a command is the process's CPU a
+command times their share of the window. The third run of each pair
+overlapped a short `cargo test` on both sides.
+
+| callers | side | `ok`/s | voters' CPU/cmd (ms) | tokio share | tokio ms/cmd | tokio wake-ups/s (k) | put p50 (ms) | put p99 (ms) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 10 | base | 2300, 2318, 2295 | 2.38, 2.18, 2.22 | 39.6%, 39.4%, 39.6% | 0.94, 0.86, 0.88 | 60.1, 59.7, 59.3 | 3.45, 3.48, 3.50 | 14.5, 9.5, 10.0 |
+| 10 | head | 2324, 2300, 2222 | 2.20, 2.25, 2.31 | 39.4%, 39.5%, 39.4% | 0.87, 0.89, 0.91 | 59.1, 57.2, 55.7 | 3.53, 3.54, 3.65 | 8.3, 9.7, 10.3 |
+| 30 | base | 2715, 3044, 2400 | 1.61, 1.83, 1.60 | 35.4%, 35.2%, 34.7% | 0.57, 0.65, 0.56 | 57.0, 54.2, 54.3 | 7.22, 7.30, 7.67 | 19.6, 20.1, 24.0 |
+| 30 | head | 2894, 2944, 2777 | 1.79, 1.78, 1.85 | 35.2%, 35.2%, 34.5% | 0.63, 0.63, 0.64 | 52.5, 53.6, 48.6 | 7.58, 7.40, 8.37 | 20.1, 19.9, 23.7 |
+
+Wake-ups are the workers' scheduler slices a second, summed over the
+voters.
+
+**What it says:**
+- **The workers' share doesn't move,** and their CPU a command is within
+  the base's spread at both loads. The voters' CPU, `ok`/s and p99 are
+  too.
+- **Their wake-ups fall 3 to 8%, and their CPU doesn't follow.** A task
+  a stream was a few of the wake-ups and little of the work. What is left
+  is most likely per datagram, in quinn's drivers; this pair does not
+  split them.
+- **So the step is not kept.** It would add a dependency
+  (`futures-util`) and a second shape of the accept loop for nothing
+  measurable. The levers that moved the workers cut datagrams, C1 and C2.
+  The workers' run-queue waits are L6's (task-d91, R4).
