@@ -3367,8 +3367,6 @@ mod tests {
     use alloc::collections::BTreeSet;
     use alloc::vec;
 
-    use coord_core::capability::{AdmissionReceipt, AttestedAdmission, VerifierToken};
-    use coord_core::event::AdmittedRequest;
     use coord_types::ids::{
         ClientInstanceId, ClusterId, ConfigurationEpoch, DomainId, NamespaceId, RequestSequence,
         SessionId,
@@ -3423,7 +3421,11 @@ mod tests {
         leader
     }
 
-    fn admitted(seq: u64) -> (Event, CommandId) {
+    /// A put's frame and its command. The tests propose it through
+    /// `propose` without admission facts: minting a receipt is the
+    /// authentication boundary's (`cargo xtask check-deps`), and the
+    /// guard does not read them.
+    fn request(seq: u64) -> (Vec<u8>, CommandId) {
         let retry_key = RetryKey {
             cluster_id: ClusterId([1; 16]),
             domain_id: DomainId([2; 16]),
@@ -3444,19 +3446,7 @@ mod tests {
         let frame = MessageV1::Request(RequestV1::new(retry_key, &request, 0, 0).unwrap())
             .encode()
             .unwrap();
-        let receipt = AdmissionReceipt::submitting(
-            VerifierToken::for_boundary(),
-            AttestedAdmission {
-                cluster: ClusterId([1; 16]),
-                domain: DomainId([2; 16]),
-                session: SessionId([3; 16]),
-                rule_generation: 1,
-                scope_ceiling: u32::MAX,
-                receipt_id: Digest32([9; 32]),
-                admitted_at_ticks: 0,
-            },
-        );
-        (Event::Admitted(AdmittedRequest { receipt, frame }), command)
+        (frame, command)
     }
 
     fn persisted(effects: &[Effect]) -> Vec<PersistBatch> {
@@ -3473,13 +3463,13 @@ mod tests {
     fn a_fresh_proposal_over_a_pre_accepted_prerequisite_writes_its_acceptance_later() {
         let mut leader = booted();
         // A prerequisite held at PRE-ACCEPT, the latest on the key.
-        let (_, held) = admitted(9);
+        let (_, held) = request(9);
         leader
             .table
             .initialize(held, Digest32([7; 32]), vec![CONSERVATIVE_KEY.to_vec()])
             .unwrap();
-        let (event, c) = admitted(1);
-        let proposed = leader.step(event);
+        let (frame, c) = request(1);
+        let proposed = leader.propose(&frame, None);
         let [batch] = persisted(&proposed).try_into().unwrap();
         let row = decode_dependency(batch.updates[1].value.as_ref().unwrap()).unwrap();
         assert_eq!(row.deps, vec![held]);
@@ -3512,8 +3502,8 @@ mod tests {
     #[test]
     fn a_fresh_proposal_whose_guard_passes_carries_its_acceptance() {
         let mut leader = booted();
-        let (event, c) = admitted(1);
-        let proposed = leader.step(event);
+        let (frame, c) = request(1);
+        let proposed = leader.propose(&frame, None);
         let [batch] = persisted(&proposed).try_into().unwrap();
         let row = decode_dependency(batch.updates[1].value.as_ref().unwrap()).unwrap();
         assert_eq!(row.phase, Phase::Accept);
