@@ -282,6 +282,9 @@ struct Chunker {
     current_bytes: usize,
     chunks: Vec<ChunkV1>,
     descriptors: Vec<ChunkDescriptorV1>,
+    /// The buffer each chunk is encoded into to be measured and hashed,
+    /// kept from one chunk to the next (task-d92).
+    scratch: Vec<u8>,
 }
 
 impl Chunker {
@@ -306,9 +309,11 @@ impl Chunker {
         self.current_bytes = 0;
         let ordinal = self.chunks.len() as u32;
         let chunk = ChunkV1 { ordinal, rows };
-        let encoded = chunk.encode().map_err(|_| LocalError::RowTooLarge {
-            collection: chunk.rows[0].collection,
-        })?;
+        let encoded = chunk
+            .encode_into(std::mem::take(&mut self.scratch))
+            .map_err(|_| LocalError::RowTooLarge {
+                collection: chunk.rows[0].collection,
+            })?;
         let first = &chunk.rows[0];
         let last = &chunk.rows[chunk.rows.len() - 1];
         self.descriptors.push(ChunkDescriptorV1 {
@@ -320,6 +325,7 @@ impl Chunker {
             digest: ChunkV1::digest_of(&encoded),
         });
         self.chunks.push(chunk);
+        self.scratch = encoded;
         Ok(())
     }
 }
@@ -357,6 +363,7 @@ pub fn export_local<V: OrderedRead>(
         current_bytes: 0,
         chunks: Vec::new(),
         descriptors: Vec::new(),
+        scratch: Vec::new(),
     };
     let mut summaries = Vec::new();
     for collection in Collection::ALL {
@@ -482,6 +489,7 @@ pub(crate) fn verify_local_each<E: From<LocalError>>(
     }
     let mut counted: Vec<(u64, u64)> = vec![(0, 0); expected.len()];
     let mut previous: Option<(u16, &[u8])> = None;
+    let mut scratch = Vec::new();
     for (index, chunk) in checkpoint.chunks.iter().enumerate() {
         let ordinal = index as u32;
         let descriptor = &manifest.chunks[index];
@@ -492,7 +500,7 @@ pub(crate) fn verify_local_each<E: From<LocalError>>(
             return Err(LocalError::Descriptor { ordinal }.into());
         };
         let encoded = chunk
-            .encode()
+            .encode_into(std::mem::take(&mut scratch))
             .map_err(|_| LocalError::Descriptor { ordinal })?;
         if ChunkV1::digest_of(&encoded) != descriptor.digest {
             return Err(LocalError::ChunkDigest { ordinal }.into());
@@ -519,6 +527,7 @@ pub(crate) fn verify_local_each<E: From<LocalError>>(
             previous = Some(here);
         }
         each(chunk, &encoded)?;
+        scratch = encoded;
     }
     for (summary, (rows, bytes)) in manifest.collections.iter().zip(counted) {
         if summary.rows != rows || summary.bytes != bytes {

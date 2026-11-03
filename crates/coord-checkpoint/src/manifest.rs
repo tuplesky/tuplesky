@@ -253,8 +253,17 @@ impl ChunkV1 {
     /// The buffer is sized for the whole chunk before it is written, so
     /// a chunk of a mebibyte is not grown by doubling (task-d92).
     pub fn encode(&self) -> Result<Vec<u8>, ArtifactError> {
-        let bytes = postcard::to_extend(self, Vec::with_capacity(self.encoded_bound()))
-            .map_err(|_| ArtifactError::TooLarge)?;
+        self.encode_into(Vec::new())
+    }
+
+    /// [`ChunkV1::encode`] into `buffer`, which is cleared first and
+    /// handed back holding the encoding. A caller encoding chunk after
+    /// chunk passes the same buffer back each time, so its pages are
+    /// faulted in once rather than once a chunk (task-d92).
+    pub fn encode_into(&self, mut buffer: Vec<u8>) -> Result<Vec<u8>, ArtifactError> {
+        buffer.clear();
+        buffer.reserve(self.encoded_bound());
+        let bytes = postcard::to_extend(self, buffer).map_err(|_| ArtifactError::TooLarge)?;
         if bytes.len() > MAX_CHUNK_BYTES {
             return Err(ArtifactError::TooLarge);
         }
