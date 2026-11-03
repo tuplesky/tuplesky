@@ -10945,6 +10945,30 @@ each a frontend, 30 callers, the default mix, `replay`, stores on tmpfs,
   about a third of the voters' sends. The workers' cost follows datagrams
   (task-d70's third step), so it is sized at −0.15 to −0.4 ms an
   operation at the register row.
+- **The lever, built and measured, not kept.** The voter grants a
+  collector's api link a new capability (`0x0021`) and sends what it
+  returns to that collector several frames a stream, and coordd hands a
+  step's frames for one connection to the transport together. A
+  stream the collector opens (a submission or a read) still carries one
+  request. The code is on `claude/task-d88-deliveries-per-stream`
+  (`0c5e122`), with its transport tests and its `spec/wire-v1.md` entry.
+  A local pair on the same head, with the lever and without, alternating,
+  four runs a side, 30 callers, `replay`, tmpfs, 50,000 operations:
+
+  | side | `ok`/s | CPU/cmd, all voters (ms) | api datagrams sent/cmd | peer datagrams sent/cmd |
+  | --- | --- | --- | --- | --- |
+  | without | 2476, 2598, 2598, 2605 | 2.393, 2.474, 2.388, 2.262 | 10.47, 10.95, 10.71, 10.48 | 4.21, 4.39, 4.28, 4.17 |
+  | with | 2485, 2594, 2587, 2551 | 2.403, 2.367, 2.278, 2.375 | 9.31, 9.35, 9.20, 9.31 | 4.28, 4.37, 4.33, 4.36 |
+
+  The api plane's datagrams fell 13% (10.65 to 9.29 a command), a third of
+  what the sizing assumed. Only the returned direction is batched, and a
+  step seldom holds more than a frame or two for one collector. The
+  voters' CPU didn't move: the means are 2.379 and 2.356 ms, and two
+  pairs went each way. That's −0.02 ms against the −0.15 to −0.4 it was
+  sized at. A wire capability for no CPU is not worth carrying, so it
+  stays off the stack. Batching the submission direction too would mean
+  answering a collector's requests on a stream other than the one they
+  came on, and this reading gives no reason to expect more from it.
 - **Not this task's:** which frames a collector needs. A follower in
   the fast quorum returns both its fast and its slow acknowledgement, and
   the slow one counts only when the fast path does not hold. Changing what a
