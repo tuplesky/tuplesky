@@ -497,7 +497,11 @@ impl Cluster {
                 continue;
             }
             if let Some(Role::Leader(l)) = self.nodes[i].role.as_mut() {
-                let effects = l.resend_unvoted(coord_consensus::RESEND_PER_VOTER);
+                // As the daemon's re-send timer does: the proposals not
+                // voted on, and the commit frontier again (task-d09), the
+                // one way a follower learns since task-d74.
+                let mut effects = l.resend_unvoted(coord_consensus::RESEND_PER_VOTER);
+                effects.extend(l.announce_committed());
                 self.handle(i, effects);
             }
         }
@@ -1482,8 +1486,9 @@ fn a_lost_acknowledgement_is_published_again_on_a_resend() {
 /// one for c2 is lost and the one for c3 is counted. The re-send used to
 /// skip every proposal at or below the latest one r2's adoption was
 /// counted for, so c2 was never sent again: r0 never learned it and held
-/// c3, chained after it on the same key, at ACCEPT, while r2 committed
-/// both from its own adoption and executed them.
+/// c3, chained after it on the same key, at ACCEPT. r2 committed both
+/// from its own adoption and r0's, and executed them; since task-d74 it
+/// learns from r0's commit frontier, so it waits for r0 as well.
 #[test]
 fn a_lost_acknowledgement_behind_a_counted_one_is_asked_for_again() {
     let mut cluster = Cluster::new(41);
@@ -1501,7 +1506,7 @@ fn a_lost_acknowledgement_behind_a_counted_one_is_asked_for_again() {
         vec![c1],
         "r0 lacks r2's vote on c2"
     );
-    assert_eq!(cluster.nodes[2].executed, vec![c1, c2, c3]);
+    assert_eq!(cluster.nodes[2].executed, vec![c1], "r2 learns from r0");
     cluster.settle_resending(4);
     for i in [0usize, 2] {
         assert_eq!(cluster.nodes[i].executed, vec![c1, c2, c3], "node {i}");
@@ -2213,6 +2218,72 @@ fn a_synchronized_ballot_is_durable_before_anything_of_the_new_one() {
     }));
     assert_eq!(f.quorum().ballot(), new, "activated once durable");
     assert_eq!(f.ballots().synced(), new);
+}
+
+/// task-d85 (found by the protocol simulator, row 10, three voters, seed
+/// 986, half the acknowledgements between followers lost, no catch-up):
+/// a second copy of the Sync whose marker is still being written changes
+/// nothing. It activated the ballot at once, before the row was durable:
+/// the voter adopted the new ballot's held proposals and acknowledged
+/// them, and the release at the marker's durability then dropped those
+/// acceptances, so the voter's next report named a fresh pre-acceptance
+/// of a command its acknowledgement had helped decide.
+#[test]
+fn a_sync_sent_again_while_its_marker_is_written_waits_for_the_marker() {
+    let mut c = Cluster::new(3);
+    let c1 = c.admit(1, 1);
+    c.settle();
+    let new = ballot(1, 2);
+    let mut f = Follower::new(FollowerConfig {
+        identity: identity(1),
+        quorum: quorum(ballot(0, 0)),
+        genesis: ballot(0, 0),
+        frontend: FRONTEND,
+        capacity: 32,
+    });
+    f.step(boot_event(2));
+    let promise = f.step(peer_event(
+        r(2),
+        ProtocolMessage::NewLeader {
+            ballot: new,
+            executed: coord_types::ids::ExecutionPosition::ZERO,
+        },
+    ));
+    for event in durable_events(&promise) {
+        f.step(event);
+    }
+    let decision = SyncDecision {
+        ballot: new,
+        source_ballot: ballot(0, 0),
+        entries: BTreeMap::from([(
+            c1,
+            coord_consensus::SyncEntry {
+                command: c1,
+                phase: Phase::Accept,
+                deps: vec![],
+                path: coord_consensus::empty_path(),
+                paths: Vec::new(),
+                seqnum: 0,
+                admission: None,
+            },
+        )]),
+        reproposed: Default::default(),
+    };
+    let marker = f.step(peer_event(r(2), ProtocolMessage::Sync(decision.clone())));
+    assert_eq!(marker.len(), 1, "the marker's batch: {marker:?}");
+    // The leader's copy again, before the marker is durable.
+    let again = f.step(peer_event(r(2), ProtocolMessage::Sync(decision)));
+    assert!(again.is_empty(), "nothing until the marker: {again:?}");
+    assert_eq!(
+        f.quorum().ballot(),
+        ballot(0, 0),
+        "the new ballot is not active before its row is durable"
+    );
+    assert!(f.table().phase_of(&c1).is_none(), "no entry installed");
+    for event in durable_events(&marker) {
+        f.step(event);
+    }
+    assert_eq!(f.quorum().ballot(), new, "activated once durable");
 }
 
 #[test]
@@ -3315,11 +3386,12 @@ fn a_payload_recorded_after_a_higher_promise_carries_no_path() {
 
 /// A Sync demotes no acceptance of its own ballot (task-d11).
 ///
-/// A duplicate Sync that arrives while the first one's marker is still
-/// becoming durable activates the new ballot early, and a proposal of that
-/// ballot queued before it is adopted. The marker's batch demotes x's
-/// acceptance of ballot 0; when it becomes durable it must not demote the
-/// acceptance of ballot 1 taken since, whose own row follows it.
+/// A proposal of the new ballot arrives while the Sync's marker is still
+/// becoming durable, and so does a duplicate of the Sync. The duplicate
+/// changes nothing (task-d85): the marker's durability activates the
+/// ballot, and the proposal is adopted then. The marker's batch demotes
+/// x's acceptance of ballot 0; it must not demote the acceptance of
+/// ballot 1 taken at activation, whose own row follows it.
 #[test]
 fn a_sync_demotes_no_acceptance_of_its_own_ballot() {
     let mut cluster = Cluster::new(53);
@@ -3348,15 +3420,29 @@ fn a_sync_demotes_no_acceptance_of_its_own_ballot() {
         },
     ));
     cluster.handle(1, effects);
+    // The selection carries a, so the marker does not release it and x's
+    // proposal can be adopted after it.
     let decision = SyncDecision {
         ballot: b1,
         source_ballot: ballot(0, 0),
-        entries: BTreeMap::new(),
+        entries: BTreeMap::from([(
+            a,
+            coord_consensus::SyncEntry {
+                command: a,
+                phase: Phase::Accept,
+                deps: vec![],
+                path: coord_consensus::empty_path(),
+                paths: Vec::new(),
+                seqnum: 0,
+                admission: None,
+            },
+        )]),
         reproposed: [x].into_iter().collect(),
     };
     // The marker's batch, not yet durable.
     let marker = cluster.nodes[1].step(peer_event(r(2), ProtocolMessage::Sync(decision.clone())));
-    // Ballot 1's proposal of x, after a, then the duplicate Sync.
+    // Ballot 1's proposal of x, after a, then the duplicate Sync, both
+    // before the marker is durable.
     let admission = cluster.nodes[1]
         .follower()
         .table()
@@ -3376,13 +3462,14 @@ fn a_sync_demotes_no_acceptance_of_its_own_ballot() {
     };
     let effects = cluster.nodes[1].step(peer_event(r(2), ProtocolMessage::Proposal(proposal)));
     cluster.handle(1, effects);
-    let adoption = cluster.nodes[1].step(peer_event(r(2), ProtocolMessage::Sync(decision)));
-    assert_eq!(cluster.nodes[1].follower().quorum().ballot(), b1);
-    assert_eq!(phase(&cluster), Phase::Accept, "adopted under ballot 1");
+    let again = cluster.nodes[1].step(peer_event(r(2), ProtocolMessage::Sync(decision)));
+    assert!(again.is_empty(), "nothing until the marker: {again:?}");
+    assert_eq!(cluster.nodes[1].follower().quorum().ballot(), ballot(0, 0));
 
-    // The marker, then the adoption, become durable in that order.
+    // The marker becomes durable, which activates ballot 1 and adopts its
+    // proposal; then the adoption becomes durable.
     cluster.handle(1, marker);
-    cluster.handle(1, adoption);
+    assert_eq!(cluster.nodes[1].follower().quorum().ballot(), b1);
     assert_eq!(
         phase(&cluster),
         Phase::Accept,
@@ -3886,18 +3973,26 @@ fn a_new_leader_re_proposes_under_the_facts_its_reporters_accepted() {
 /// With every voter up the command committed without the voter that held
 /// other facts, which then stayed at ACCEPT on it for good and executed
 /// nothing after it. Now all three execute it, under one digest.
+///
+/// Which digest is the selection's to name. X was never committed, so a
+/// selection may name either presentation's facts. Since followers
+/// acknowledge to the leader only (task-d74), the messages reach r1 in
+/// another order and its selection names the facts r1 holds, where it
+/// used to name r0's. What the test is for is one digest everywhere.
 #[test]
 fn every_voter_executes_a_recovered_command_under_one_set_of_facts() {
     let mut cluster = Cluster::new(41);
-    let (w, x, accepted, _) = two_presentations(&mut cluster);
+    let (w, x, accepted, other) = two_presentations(&mut cluster);
     cluster.campaign(1, ballot(1, 1));
     cluster.settle_resending(5);
     assert!(matches!(cluster.nodes[1].role, Some(Role::Leader(_))));
     let y = cluster.admit(3, 3);
     cluster.settle_resending(5);
+    let facts = facts_of(&cluster.nodes[0], &x);
+    assert!(facts == Some(accepted) || facts == Some(other), "{facts:?}");
     for i in 0..3 {
         assert_eq!(cluster.nodes[i].executed, vec![w, x, y], "node {i}");
-        assert_eq!(facts_of(&cluster.nodes[i], &x), Some(accepted), "node {i}");
+        assert_eq!(facts_of(&cluster.nodes[i], &x), facts, "node {i}");
     }
 }
 
