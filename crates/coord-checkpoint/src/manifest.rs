@@ -216,9 +216,19 @@ pub struct RowV1 {
     /// Frozen collection identifier.
     pub collection: u16,
     /// Ordered key bytes.
+    #[serde(serialize_with = "as_bytes")]
     pub key: Vec<u8>,
     /// Value bytes (a `StoreEnvelopeV1` or the collection's frozen value).
+    #[serde(serialize_with = "as_bytes")]
     pub value: Vec<u8>,
+}
+
+/// Serialize a byte vector as bytes rather than as a sequence of `u8`
+/// (task-d92). postcard writes both as a varint length and the bytes
+/// themselves, so the encoding is unchanged; a sequence is pushed one
+/// element at a time, bytes are copied at once. Decoding is untouched.
+fn as_bytes<S: serde::Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_bytes(bytes)
 }
 
 impl RowV1 {
@@ -239,12 +249,25 @@ pub struct ChunkV1 {
 
 impl ChunkV1 {
     /// Portable encoding.
+    ///
+    /// The buffer is sized for the whole chunk before it is written, so
+    /// a chunk of a mebibyte is not grown by doubling (task-d92).
     pub fn encode(&self) -> Result<Vec<u8>, ArtifactError> {
-        let bytes = postcard::to_allocvec(self).map_err(|_| ArtifactError::TooLarge)?;
+        let bytes = postcard::to_extend(self, Vec::with_capacity(self.encoded_bound()))
+            .map_err(|_| ArtifactError::TooLarge)?;
         if bytes.len() > MAX_CHUNK_BYTES {
             return Err(ArtifactError::TooLarge);
         }
         Ok(bytes)
+    }
+
+    /// An upper bound on the encoding's length: the bytes, and each
+    /// varint at its widest (a `u32` and a `usize` take at most 5 and
+    /// 10 bytes, a `u16` 3). Capped at the chunk bound, which an
+    /// encoding past it fails anyway.
+    fn encoded_bound(&self) -> usize {
+        let rows: usize = self.rows.iter().map(|r| 3 + 10 + 10 + r.bytes()).sum();
+        (5 + 10 + rows).min(MAX_CHUNK_BYTES + 1)
     }
 
     /// Exact decoding with the chunk bound checked before allocation.

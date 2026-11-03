@@ -403,7 +403,10 @@ fn traverse<V: OrderedRead>(
     let mut bytes = 0u64;
     loop {
         let page = view.scan_page(id, &request)?;
-        for engine_row in &page.rows {
+        let resume = page.rows.last().map(|last| last.key.clone());
+        // The page is ours, so its rows move into the image rather than
+        // being copied (task-d92).
+        for engine_row in page.rows {
             if engine_row.key.len() > MAX_ROW_KEY_BYTES
                 || engine_row.value.len() > MAX_ROW_VALUE_BYTES
             {
@@ -411,8 +414,8 @@ fn traverse<V: OrderedRead>(
             }
             let row = RowV1 {
                 collection: id.0,
-                key: engine_row.key.clone(),
-                value: engine_row.value.clone(),
+                key: engine_row.key,
+                value: engine_row.value,
             };
             rows += 1;
             bytes += row.bytes() as u64;
@@ -421,8 +424,8 @@ fn traverse<V: OrderedRead>(
         if page.exhausted {
             return Ok((rows, bytes));
         }
-        match page.rows.last() {
-            Some(last) => request.resume_after = Some(last.key.clone()),
+        match resume {
+            Some(last) => request.resume_after = Some(last),
             None => {
                 return Err(EngineError::new(
                     coord_store_api::engine::ErrorClass::Corrupt,
@@ -444,68 +447,82 @@ fn traverse<V: OrderedRead>(
 /// belongs to this incarnation is the pointer's question, not the
 /// artifact's.
 pub fn verify_local(checkpoint: &LocalCheckpointV1) -> Result<(), LocalError> {
+    verify_local_each(checkpoint, |_, _| Ok(()))
+}
+
+/// [`verify_local`], handing each chunk's encoding to `each` once that
+/// chunk has verified, so a caller that writes the image encodes every
+/// chunk once (task-d92). `each` is called in ordinal order; the checks
+/// that span chunks (row order across them and the collections' counts)
+/// finish after the last call, so nothing `each` did is evidence of a
+/// valid image until this returns `Ok`.
+pub(crate) fn verify_local_each<E: From<LocalError>>(
+    checkpoint: &LocalCheckpointV1,
+    mut each: impl FnMut(&ChunkV1, &[u8]) -> Result<(), E>,
+) -> Result<(), E> {
     let manifest = &checkpoint.manifest;
     if manifest.format != LOCAL_CHECKPOINT_FORMAT_V1 {
         return Err(LocalError::UnsupportedFormat {
             format: manifest.format,
-        });
+        }
+        .into());
     }
     if manifest.root != manifest.compute_root() {
-        return Err(LocalError::RootMismatch);
+        return Err(LocalError::RootMismatch.into());
     }
     // Complete, or it is not a local checkpoint: every collection of the
     // registry appears exactly once, in identifier order.
     let expected: Vec<u16> = Collection::ALL.iter().map(|c| c.id().0).collect();
     let present: Vec<u16> = manifest.collections.iter().map(|c| c.collection).collect();
     if present != expected {
-        return Err(LocalError::Incomplete);
+        return Err(LocalError::Incomplete.into());
     }
     if manifest.chunks.len() != checkpoint.chunks.len() {
-        return Err(LocalError::Chunks);
+        return Err(LocalError::Chunks.into());
     }
     let mut counted: Vec<(u64, u64)> = vec![(0, 0); expected.len()];
-    let mut previous: Option<(u16, Vec<u8>)> = None;
+    let mut previous: Option<(u16, &[u8])> = None;
     for (index, chunk) in checkpoint.chunks.iter().enumerate() {
         let ordinal = index as u32;
         let descriptor = &manifest.chunks[index];
         if chunk.ordinal != ordinal || descriptor.ordinal != ordinal {
-            return Err(LocalError::Chunks);
+            return Err(LocalError::Chunks.into());
         }
-        if chunk.rows.is_empty() {
-            return Err(LocalError::Descriptor { ordinal });
-        }
+        let (Some(first), Some(last)) = (chunk.rows.first(), chunk.rows.last()) else {
+            return Err(LocalError::Descriptor { ordinal }.into());
+        };
         let encoded = chunk
             .encode()
             .map_err(|_| LocalError::Descriptor { ordinal })?;
         if ChunkV1::digest_of(&encoded) != descriptor.digest {
-            return Err(LocalError::ChunkDigest { ordinal });
+            return Err(LocalError::ChunkDigest { ordinal }.into());
         }
         if encoded.len() as u32 != descriptor.bytes
             || chunk.rows.len() as u32 != descriptor.rows
-            || (chunk.rows[0].collection, chunk.rows[0].key.clone()) != descriptor.first
-            || (
-                chunk.rows[chunk.rows.len() - 1].collection,
-                chunk.rows[chunk.rows.len() - 1].key.clone(),
-            ) != descriptor.last
+            || (first.collection, first.key.as_slice())
+                != (descriptor.first.0, descriptor.first.1.as_slice())
+            || (last.collection, last.key.as_slice())
+                != (descriptor.last.0, descriptor.last.1.as_slice())
         {
-            return Err(LocalError::Descriptor { ordinal });
+            return Err(LocalError::Descriptor { ordinal }.into());
         }
         for row in &chunk.rows {
-            let here = (row.collection, row.key.clone());
-            if previous.as_ref().is_some_and(|p| *p >= here) {
-                return Err(LocalError::Rows);
+            let here = (row.collection, row.key.as_slice());
+            if previous.is_some_and(|p| p >= here) {
+                return Err(LocalError::Rows.into());
             }
             let Some(slot) = expected.iter().position(|c| *c == row.collection) else {
-                return Err(LocalError::Rows);
+                return Err(LocalError::Rows.into());
             };
             counted[slot].0 += 1;
             counted[slot].1 += row.bytes() as u64;
             previous = Some(here);
         }
+        each(chunk, &encoded)?;
     }
     for (summary, (rows, bytes)) in manifest.collections.iter().zip(counted) {
         if summary.rows != rows || summary.bytes != bytes {
-            return Err(LocalError::Rows);
+            return Err(LocalError::Rows.into());
         }
     }
     Ok(())
