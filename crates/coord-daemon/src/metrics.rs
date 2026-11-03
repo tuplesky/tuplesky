@@ -532,6 +532,27 @@ pub struct Cost {
     /// What the journal groups this voter appended held (task-d84).
     #[serde(default)]
     pub journal_groups: JournalGroups,
+    /// Why the domain loop lowered when it did (task-d73).
+    #[serde(default)]
+    pub flushes: Flushes,
+}
+
+/// Why the domain loop lowered what its events left queued (task-d73),
+/// cumulative, one count a flush. A flush with nothing more ready ends a
+/// group as early as it must; one cut by a bound ends it while events
+/// were still waiting, and is the only kind a longer turn could merge.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Flushes {
+    /// No event was ready (the select's flush arm).
+    pub idle: u64,
+    /// The loop had taken its bound of events since the last flush
+    /// (`FLUSH_EVENTS`), with more possibly ready.
+    pub events: u64,
+    /// A full journal group's worth was queued (`FLUSH_QUEUED`).
+    pub queued: u64,
+    /// Of all of them, the flushes taken while an append was out: what
+    /// they queued waits behind it, and joins the next group (task-d54).
+    pub appending: u64,
 }
 
 /// What a voter's journal groups held, by their records (task-d84),

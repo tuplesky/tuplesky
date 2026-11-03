@@ -222,6 +222,20 @@ class ReduceTests(unittest.TestCase):
                       "| 3.30 (1.00) | 3.00 | 1.25 |", table)
         self.assertNotIn("groups_per_command", cost.per_command("n1", snapshot()))
 
+    def test_flushes_are_read_per_command_when_reported(self):
+        snap = snapshot(executed=100, appends=50)
+        snap["cost"]["Observed"]["flushes"] = {
+            "idle": 80, "events": 5, "queued": 1, "appending": 30,
+        }
+        reading = cost.per_command("n1", snap)
+        flushes = reading["flushes_per_command"]
+        self.assertAlmostEqual(flushes["idle"], 0.8)
+        self.assertAlmostEqual(flushes["events"], 0.05)
+        self.assertAlmostEqual(flushes["appending"], 0.3)
+        table = cost.flushes_table({"runs": [{"callers": 10, "voters": [reading]}]})
+        self.assertIn("| 10 | n1 | 0.800 | 0.050 | 0.010 | 0.300 | 2.00 |", table)
+        self.assertNotIn("flushes_per_command", cost.per_command("n1", snapshot()))
+
     def test_a_run_with_no_fast_decision_is_a_finding(self):
         def voter(fast):
             snap = snapshot()

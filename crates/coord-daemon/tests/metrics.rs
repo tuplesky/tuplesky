@@ -7,10 +7,10 @@
 use std::time::Duration;
 
 use coord_daemon::metrics::{
-    Cost, Cpu, Datagrams, Durability, FastPath, Frontiers, Headroom, Interval, Jobs, JournalGroups,
-    Lane, LaneReading, Latency, MAX_REPORTED_SHARDS, Measure, MetricsSnapshot, PipelineWaits,
-    Reads, Recorder, Release, Resends, Scheduling, ShardIndex, ShardReading, Stage, StageReading,
-    Traffic, Unavailable, UnorderedPreAcceptances, Wait,
+    Cost, Cpu, Datagrams, Durability, FastPath, Flushes, Frontiers, Headroom, Interval, Jobs,
+    JournalGroups, Lane, LaneReading, Latency, MAX_REPORTED_SHARDS, Measure, MetricsSnapshot,
+    PipelineWaits, Reads, Recorder, Release, Resends, Scheduling, ShardIndex, ShardReading, Stage,
+    StageReading, Traffic, Unavailable, UnorderedPreAcceptances, Wait,
 };
 use coord_daemon::role::RoleSet;
 
@@ -466,6 +466,12 @@ fn a_rendered_snapshot_carries_no_secret_or_key_shaped_text() {
                 protocol_records: 4300,
                 payload_records: 1200,
                 application_records: 1200,
+            },
+            flushes: Flushes {
+                idle: 5000,
+                events: 40,
+                queued: 2,
+                appending: 900,
             },
         }),
     };
