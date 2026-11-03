@@ -267,7 +267,7 @@ added in revisions 2 and 3 appear only when a delivery was lost or did not go
 straight through, so the frozen revision-1 scenario produces the same trace it
 always did. The Rust reference trace of the frozen scenario is
 `crates/coord-collector/fixtures/collector_trace_v1.json` (regenerate
-deliberately with `COORD_COLLECTOR_WRITE_FIXTURES=1`). The Go collector
+deliberately with `COORD_COLLECTOR_WRITE_FIXTURES=1`). It was regenerated when the leader's acceptance moved into its proposal batch (task-d89): the leader's adoption now rests on the same batch as its reply and reaches the collector just before it, so one hold reads `awaiting-votes` where it read `awaiting-release`. The events are the same, of the same kinds, and no collector rule changed. The Go collector
 must produce the same trace for the same scenario; differential tests of
 loss, duplication, reordering, recovery and configuration change are
 task-m02.

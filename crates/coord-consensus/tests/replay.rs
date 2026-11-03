@@ -267,16 +267,24 @@ fn a_leader_publishes_its_reply_again_to_the_frontend_only() {
         released.extend(l.step(d));
     }
     let first = sends(&released);
-    assert_eq!(first.len(), 3, "two proposals and the reply");
-    let reply = first
+    // Two proposals and the reply, and the leader's adoption to both
+    // voters and the frontend: its acceptance rides in the proposal batch
+    // (task-d89).
+    assert_eq!(first.len(), 6, "{first:?}");
+    let to_frontend: Vec<ProtocolMessage> = first
         .iter()
-        .find(|(to, _)| *to == FRONTEND.replica)
+        .filter(|(to, _)| *to == FRONTEND.replica)
         .map(|(_, m)| m.clone())
-        .expect("the reply");
-    assert!(matches!(reply, ProtocolMessage::LeaderReply { command, .. } if command == c));
+        .collect();
+    let [reply, adoption] = to_frontend.as_slice() else {
+        panic!("the reply and the adoption: {to_frontend:?}")
+    };
+    assert!(matches!(reply, ProtocolMessage::LeaderReply { command, .. } if *command == c));
+    assert!(matches!(adoption, ProtocolMessage::SlowAck(a) if a.command == c));
 
+    // Both rest on the same durable batch, so a duplicate repairs both.
     let again = frontend_only(&l.step(admitted(1, 1, 1).0));
-    assert_eq!(again, vec![reply]);
+    assert_eq!(again, to_frontend);
     assert_eq!(l.take_rejections(), vec![Rejection::Duplicate(c)]);
     assert_eq!(l.evidence_repairs(&c), 1);
     assert!(
@@ -330,12 +338,21 @@ fn a_retried_proposal_is_replayed_under_its_retrys_barrier() {
     for d in durable_of(&retried, 2) {
         released.extend(l.step(d));
     }
-    let reply = sends(&released)
+    // Its reply and the leader's adoption, which rides in the same batch
+    // (task-d89).
+    let to_frontend: Vec<ProtocolMessage> = sends(&released)
         .into_iter()
-        .find(|(to, _)| *to == FRONTEND.replica)
+        .filter(|(to, _)| *to == FRONTEND.replica)
         .map(|(_, m)| m)
-        .expect("the retry's reply reached the frontend");
-    assert_eq!(frontend_only(&l.step(admitted(1, 1, 1).0)), vec![reply]);
+        .collect();
+    assert!(
+        matches!(
+            to_frontend.first(),
+            Some(ProtocolMessage::LeaderReply { .. })
+        ),
+        "the retry's reply reached the frontend: {to_frontend:?}"
+    );
+    assert_eq!(frontend_only(&l.step(admitted(1, 1, 1).0)), to_frontend);
     assert_eq!(l.take_rejections(), vec![Rejection::Duplicate(c)]);
     assert_eq!(l.evidence_repairs(&c), 1);
 }
