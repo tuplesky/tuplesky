@@ -173,8 +173,10 @@ pub struct Proposal {
     /// Persistence attempts made for this proposal.
     pub attempts: u32,
     /// Whether the batch writes the leader's acceptance too: a
-    /// re-proposal carries its ACCEPT row in the proposal batch, a fresh
-    /// proposal writes it once the dependency guard passes (task-d19).
+    /// re-proposal carries its ACCEPT row in the proposal batch, and so
+    /// does a fresh proposal whose dependency guard passes when it is
+    /// proposed (task-d89); any other fresh proposal writes it once the
+    /// guard passes (task-d19).
     pub accepts: bool,
     /// Whether this command has executed.
     ///
@@ -466,6 +468,10 @@ pub struct Leader {
     pending_sync: Option<(ReplicaId, SyncDecision)>,
     speculation: Speculation,
     rejections: Vec<Rejection>,
+    /// The commit frontier last announced to the other voters (task-d74).
+    /// A follower learns only from it, so it goes out in the step that
+    /// moves it.
+    announced: Option<u64>,
     fenced: Option<FenceReason>,
     /// Entries of the selection this leader was handed that no order
     /// keeps: a dependency cycle, which is an invariant violation
@@ -640,6 +646,7 @@ impl Leader {
             pending_sync: None,
             speculation: Speculation::new(),
             rejections: Vec::new(),
+            announced: None,
             fenced: None,
             recovery_cycle: None,
             own_adoptions: BTreeMap::new(),
@@ -738,6 +745,7 @@ impl Leader {
             pending_sync: None,
             speculation: Speculation::new(),
             rejections: Vec::new(),
+            announced: None,
             fenced: None,
             recovery_cycle: None,
             replay: crate::replay::EvidenceStore::new(state.capacity),
@@ -1464,18 +1472,25 @@ impl Leader {
     /// committed.
     pub fn committed_through(&self) -> Option<u64> {
         debug_assert!(self.indexes_agree());
+        self.commit_frontier()
+    }
+
+    /// [`Leader::committed_through`], without the index check: read on
+    /// every peer and storage event (task-d74), where the check, which
+    /// rebuilds every index, would be the whole cost of a debug build.
+    fn commit_frontier(&self) -> Option<u64> {
         // A settled proposal is durable and executed, so the first open
-        // one is unsettled (task-d46).
+        // one is unsettled (task-d46), and `unsettled` is in sequence
+        // order, so the first open one found is the lowest.
         let open = self
             .unsettled
             .iter()
             .map(|(_, c)| &self.proposals[c])
-            .filter(|p| {
+            .find(|p| {
                 !(p.durable
                     && (p.executed || self.table.phase_of(&p.command) >= Some(Phase::Commit)))
             })
-            .map(|p| p.seqnum)
-            .min();
+            .map(|p| p.seqnum);
         match open {
             Some(first) => first.checked_sub(1),
             None => self.seqnum.checked_sub(1),
@@ -1509,6 +1524,25 @@ impl Leader {
             })
     }
 
+    /// Announce the commit frontier if it moved since it was last
+    /// announced (task-d74).
+    ///
+    /// A follower's acknowledgements go to the leader and its frontend
+    /// only, so the frontier is the one way a follower learns that a
+    /// command it adopted is committed. Announced on the re-send timer
+    /// alone, a follower's execution trailed the leader's by up to that
+    /// interval; announced in the step that moves it, by one message.
+    pub fn announce_advanced(&mut self) -> Vec<Effect> {
+        if self.boot.is_none() || !self.is_leading() {
+            return Vec::new();
+        }
+        let through = self.commit_frontier();
+        if through.is_none() || through <= self.announced {
+            return Vec::new();
+        }
+        self.announce_committed()
+    }
+
     /// Tell every other voter this ballot's commit frontier (task-d09).
     ///
     /// Learning is otherwise all-to-all: a follower commits a command
@@ -1534,6 +1568,7 @@ impl Leader {
         let Some(through) = self.committed_through() else {
             return Vec::new();
         };
+        self.announced = Some(through);
         let me = self.config.identity.replica;
         let ballot = self.config.quorum.ballot();
         let context = self.ballots.context(boot, ballot, LocalJournalSeq::ZERO);
@@ -1741,7 +1776,22 @@ impl Leader {
     }
 
     fn learn(&mut self) {
-        let committed = self.learner.commit_learned(&mut self.table, &self.votes);
+        // A fresh proposal is ACCEPT here as soon as it is proposed when
+        // its guard passes (task-d89), but the leader's fast vote is the
+        // proposal itself: a follower that saw the submission first can
+        // acknowledge before the proposal batch is durable, and a fast
+        // quorum counted over a volatile proposal is one a restarted
+        // leader's report would deny. So nothing this leader proposed is
+        // committed until its batch is durable, as it was when the
+        // acceptance waited for that batch. A re-proposal's votes come
+        // after its batch is durable anyway, since every voter hears of
+        // it from the leader's send, which waits on the batch.
+        let proposals = &self.proposals;
+        let committed = self
+            .learner
+            .commit_learned_where(&mut self.table, &self.votes, |c| {
+                proposals.get(c).is_none_or(|p| p.durable)
+            });
         if let Some(learned) = self.learned.as_mut() {
             learned.extend(committed);
         }
@@ -2248,8 +2298,19 @@ impl Leader {
         // prefix, so their suffix stays empty (task-d68).
         self.table.synchronize_own(command, ballot, seqnum);
         // The durable row records the phase the command is actually in.
-        // The leader's own acceptance of its order is written separately,
-        // once the dependency guard passes (see `advance_pending`).
+        // When the dependency guard already passes -- every prerequisite
+        // is at least ACCEPT here, as at low load, where each one was
+        // accepted long ago -- the leader accepts its own order now, and
+        // the proposal batch carries the ACCEPT row, as a re-proposal's
+        // does (task-d89, design Section 4.7). Its prerequisites' ACCEPT
+        // rows were submitted before this batch, and a domain's journal
+        // seals each record against the one before it, so this row is
+        // never durable before theirs: it claims ACCEPT over no
+        // prerequisite recovery could find below it, exactly as the row
+        // `advance_pending` writes later would. Otherwise the row
+        // is PRE-ACCEPT, and the acceptance is written once the guard
+        // passes (see `advance_pending`).
+        let accepts = self.table.accept(command, init.deps.clone()).is_ok();
         let record = self
             .table
             .record(&command)
@@ -2348,11 +2409,16 @@ impl Leader {
             durable: false,
             updates,
             attempts: 1,
-            accepts: false,
+            accepts,
             executed: false,
             published: true,
             sent: None,
         });
+        // The row is ACCEPT at this ballot: once it is durable, it is this
+        // leader's adoption of its own order.
+        if accepts {
+            self.adopt_own(command, barrier);
+        }
         alloc::vec![persist]
     }
 
@@ -2560,7 +2626,7 @@ impl Leader {
     }
 
     /// Publish this leader's adoption of its own order for `command`, to
-    /// the voters and the frontend, once `barrier` -- the batch carrying
+    /// the frontend, once `barrier` -- the batch carrying
     /// its acceptance row -- and every batch submitted before it are
     /// durable (task-d19; design Section 4.8). It is kept for re-offer
     /// beside the leader's reply, and counted in the leader's own vote set
@@ -2607,20 +2673,8 @@ impl Leader {
         let Some(outbox) = self.outbox.as_mut() else {
             return;
         };
-        for voter in &self.config.identity.voters {
-            if *voter == self.config.identity.replica {
-                continue;
-            }
-            outbox.publish(PendingSend {
-                context,
-                requires: requires.clone(),
-                to: PeerId {
-                    replica: *voter,
-                    incarnation: ReplicaIncarnation::ZERO,
-                },
-                frame: frame.clone(),
-            });
-        }
+        // To the frontend, which counts it, and to no other voter
+        // (task-d74): a follower learns from the commit frontier.
         outbox.publish(PendingSend {
             context,
             requires: requires.clone(),
@@ -3295,7 +3349,13 @@ impl DeterministicMachine for Leader {
                 Vec::new()
             }
             Event::Admitted(request) => self.on_admitted(&request.frame, request.receipt.facts()),
-            Event::Storage(event) => self.on_storage(&event),
+            // What a durable batch or a vote commits is announced in the
+            // same step (task-d74).
+            Event::Storage(event) => {
+                let mut effects = self.on_storage(&event);
+                effects.extend(self.announce_advanced());
+                effects
+            }
             Event::Peer(message) => {
                 // The authenticated sender, at the exact incarnation the
                 // transport bound; replies are addressed to it.
@@ -3303,7 +3363,9 @@ impl DeterministicMachine for Leader {
                     replica: message.provenance().from(),
                     incarnation: message.provenance().incarnation(),
                 };
-                self.on_peer(from, message.frame())
+                let mut effects = self.on_peer(from, message.frame());
+                effects.extend(self.announce_advanced());
+                effects
             }
             Event::Timer(_)
             | Event::Clock(_)
@@ -3320,5 +3382,168 @@ impl Leader {
     /// Barriers of proposals not yet durable, in order.
     pub fn outstanding_barriers(&self) -> Vec<BarrierId> {
         self.outstanding()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The path a fresh proposal takes when its dependency guard fails
+    //! (task-d89): a leader's own proposals are all accepted as they are
+    //! proposed, so only a prerequisite this leader holds at PRE-ACCEPT
+    //! from elsewhere, such as a recovered record, makes it fail. Nothing
+    //! outside the crate can place one, so the test does.
+
+    use alloc::collections::BTreeSet;
+    use alloc::vec;
+
+    use coord_types::ids::{
+        ClientInstanceId, ClusterId, ConfigurationEpoch, DomainId, NamespaceId, RequestSequence,
+        SessionId,
+    };
+    use coord_types::logical_v1::{CanonicalOperation, LogicalRequest, PutOp};
+    use coord_types::wire_v1::RequestV1;
+
+    use super::*;
+    use crate::rows::decode_dependency;
+
+    const FRONTEND: PeerId = PeerId {
+        replica: ReplicaId([0xf0; 16]),
+        incarnation: ReplicaIncarnation::ZERO,
+    };
+
+    fn r(i: u8) -> ReplicaId {
+        ReplicaId([i; 16])
+    }
+
+    fn booted() -> Leader {
+        let epoch = ConfigurationEpoch::new(1).unwrap();
+        let voters: BTreeSet<ReplicaId> = (0..3).map(r).collect();
+        let genesis = Ballot {
+            epoch,
+            number: 0,
+            leader: r(0),
+        };
+        let config = LeaderConfig {
+            identity: ConfigurationIdentity {
+                cluster: ClusterId([1; 16]),
+                domain: DomainId([2; 16]),
+                epoch,
+                voters: voters.clone(),
+                replica: r(0),
+                incarnation: ReplicaIncarnation::new(1).unwrap(),
+                role: ReplicaRole::Voter,
+            },
+            quorum: BallotConfiguration::c2(epoch, genesis, voters, [r(0), r(1)].into()).unwrap(),
+            genesis,
+            frontend: FRONTEND,
+            capacity: 8,
+        };
+        let mut leader = Leader::new(config, None, ExecutionPosition::ZERO);
+        assert!(
+            leader
+                .step(Event::Boot {
+                    boot_id: BootId([1; 16]),
+                    incarnation: ReplicaIncarnation::new(1).unwrap(),
+                })
+                .is_empty()
+        );
+        leader
+    }
+
+    /// A put's frame and its command. The tests propose it through
+    /// `propose` without admission facts: minting a receipt is the
+    /// authentication boundary's (`cargo xtask check-deps`), and the
+    /// guard does not read them.
+    fn request(seq: u64) -> (Vec<u8>, CommandId) {
+        let retry_key = RetryKey {
+            cluster_id: ClusterId([1; 16]),
+            domain_id: DomainId([2; 16]),
+            session_id: SessionId([3; 16]),
+            client_instance_id: ClientInstanceId([4; 16]),
+            request_sequence: RequestSequence::new(seq).unwrap(),
+        };
+        let request = LogicalRequest::new(
+            NamespaceId([5; 16]),
+            CanonicalOperation::Put(PutOp {
+                key: vec![1],
+                value: vec![1],
+                lease: None,
+                prev_kv: false,
+            }),
+        );
+        let command = CommandId::derive(&retry_key, &request).unwrap();
+        let frame = MessageV1::Request(RequestV1::new(retry_key, &request, 0, 0).unwrap())
+            .encode()
+            .unwrap();
+        (frame, command)
+    }
+
+    fn persisted(effects: &[Effect]) -> Vec<PersistBatch> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Persist(b) => Some(b.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_fresh_proposal_over_a_pre_accepted_prerequisite_writes_its_acceptance_later() {
+        let mut leader = booted();
+        // A prerequisite held at PRE-ACCEPT, the latest on the key.
+        let (_, held) = request(9);
+        leader
+            .table
+            .initialize(held, Digest32([7; 32]), vec![CONSERVATIVE_KEY.to_vec()])
+            .unwrap();
+        let (frame, c) = request(1);
+        let proposed = leader.propose(&frame, None);
+        let [batch] = persisted(&proposed).try_into().unwrap();
+        let row = decode_dependency(batch.updates[1].value.as_ref().unwrap()).unwrap();
+        assert_eq!(row.deps, vec![held]);
+        assert_eq!(row.phase, Phase::PreAccept, "the guard failed");
+        assert!(!leader.proposals[&c].accepts);
+        assert_eq!(leader.table.phase_of(&c), Some(Phase::PreAccept));
+        // Only the proposal and the reply wait on the batch: no adoption.
+        assert_eq!(leader.pending_sends(), 3);
+
+        // Durable, and the prerequisite still lags: nothing more.
+        let after = leader.step(Event::Storage(StorageEvent::JournalDurable {
+            barrier_id: batch.barrier,
+            journal_seq: LocalJournalSeq::new(1).unwrap(),
+        }));
+        assert!(persisted(&after).is_empty());
+        assert_eq!(leader.table.phase_of(&c), Some(Phase::PreAccept));
+
+        // Once the prerequisite is accepted, the acceptance is written in
+        // a batch of its own and the adoption waits on it (task-d19).
+        leader.table.accept(held, Vec::new()).unwrap();
+        let accepted = leader.advance_pending();
+        let [accept] = persisted(&accepted).try_into().unwrap();
+        assert_eq!(accept.updates.len(), 1);
+        let row = decode_dependency(accept.updates[0].value.as_ref().unwrap()).unwrap();
+        assert_eq!(row.phase, Phase::Accept);
+        assert_eq!(leader.table.phase_of(&c), Some(Phase::Accept));
+        assert!(leader.own_adoptions.contains_key(&accept.barrier));
+    }
+
+    #[test]
+    fn a_fresh_proposal_whose_guard_passes_carries_its_acceptance() {
+        let mut leader = booted();
+        let (frame, c) = request(1);
+        let proposed = leader.propose(&frame, None);
+        let [batch] = persisted(&proposed).try_into().unwrap();
+        let row = decode_dependency(batch.updates[1].value.as_ref().unwrap()).unwrap();
+        assert_eq!(row.phase, Phase::Accept);
+        assert!(leader.proposals[&c].accepts);
+        assert!(leader.own_adoptions.contains_key(&batch.barrier));
+        // Durable: nothing more is written for it.
+        let after = leader.step(Event::Storage(StorageEvent::JournalDurable {
+            barrier_id: batch.barrier,
+            journal_seq: LocalJournalSeq::new(1).unwrap(),
+        }));
+        assert!(persisted(&after).is_empty(), "{after:?}");
+        assert!(leader.votes[&c].adopted_by(&r(0)));
     }
 }

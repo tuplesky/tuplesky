@@ -232,12 +232,16 @@ fn fast_votes_wait_for_durable_payload_dependencies_and_path() {
     assert_eq!(batch.updates[1].key, dependency_key(epoch(), &c1));
     let row = decode_dependency(batch.updates[1].value.as_ref().unwrap()).unwrap();
     assert_eq!(row.phase, Phase::PreAccept);
-    assert_eq!(fast.pending_sends(), 3, "two voters and the frontend");
+    assert_eq!(
+        fast.pending_sends(),
+        2,
+        "the leader and the frontend, not the other voter (task-d74)"
+    );
     let released = fast.step(durable_of(&effects, 1).remove(0));
     let sent = sends(&released);
-    assert_eq!(sent.len(), 3);
+    assert_eq!(sent.len(), 2);
     for (to, m) in &sent {
-        assert!(*to == r(0) || *to == r(2) || *to == FRONTEND.replica);
+        assert!(*to == r(0) || *to == FRONTEND.replica);
         let ProtocolMessage::FastAck(ack) = m else {
             panic!("{m:?}")
         };
@@ -380,8 +384,8 @@ fn a_proposal_before_the_payload_is_held_against_an_invisible_placeholder() {
         .collect();
     assert_eq!(
         slow.len(),
-        6,
-        "two slow acks to two voters and the frontend"
+        4,
+        "two slow acks to the leader and the frontend (task-d74)"
     );
     assert!(f.take_rejections().is_empty());
 }
@@ -429,7 +433,7 @@ fn conflict_arrival_permutations_converge_on_the_leader_order() {
         for d in durable_of(&effects, 5) {
             acks += sends(&f.step(d)).len();
         }
-        assert_eq!(acks, 6);
+        assert_eq!(acks, 4, "to the leader and the frontend (task-d74)");
         for c in [c1, c2] {
             let adoption = leader_adoption(f, c);
             f.step(adoption);
@@ -480,7 +484,7 @@ fn a_crash_between_state_and_vote_preserves_the_learning_obligation() {
         panic!()
     };
     storage.submit(batch.clone());
-    assert_eq!(f.pending_sends(), 3, "the vote waits");
+    assert_eq!(f.pending_sends(), 2, "the vote waits");
     assert_eq!(storage.crash(), 1);
     let rows = restore_rows(&storage);
     assert!(rows.is_empty());
@@ -518,7 +522,7 @@ fn a_crash_between_state_and_vote_preserves_the_learning_obligation() {
     storage.submit(batch);
     storage.complete(effects_barrier(&effects)).unwrap();
     let released = f.step(durable_of(&effects, 1).remove(0));
-    assert_eq!(sends(&released).len(), 3);
+    assert_eq!(sends(&released).len(), 2, "the leader and the frontend");
     storage.crash();
     let rows = restore_rows(&storage);
     assert_eq!(rows.len(), 1);
@@ -702,7 +706,7 @@ fn an_adoption_acknowledgement_waits_for_the_payload_batch_too() {
         .collect();
     assert_eq!(batches.len(), 2, "payload batch and adoption batch");
     let (payload, adoption) = (batches[0].clone(), batches[1].clone());
-    assert_eq!(f.pending_sends(), 3, "the adoption acknowledgement waits");
+    assert_eq!(f.pending_sends(), 2, "the adoption acknowledgement waits");
     // The adoption batch alone is not enough: the payload row is still
     // volatile, so a crash now would leave an accepted dependency row
     // without the payload it accepted.
@@ -714,14 +718,14 @@ fn an_adoption_acknowledgement_waits_for_the_payload_batch_too() {
         sends(&released).is_empty(),
         "nothing leaves while the payload batch is volatile: {released:?}"
     );
-    assert_eq!(f.pending_sends(), 3);
+    assert_eq!(f.pending_sends(), 2);
     let released = f.step(Event::Storage(StorageEvent::JournalDurable {
         barrier_id: payload.barrier,
         journal_seq: LocalJournalSeq::new(2).unwrap(),
     }));
     assert_eq!(
         sends(&released).len(),
-        3,
+        2,
         "both batches durable: the acknowledgement goes out"
     );
     assert_eq!(f.pending_sends(), 0);

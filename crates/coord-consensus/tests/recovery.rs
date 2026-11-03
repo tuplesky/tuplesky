@@ -280,16 +280,9 @@ fn reports_come_from_durable_state_at_the_cut_not_in_memory_phases() {
         l.report(ballot(1, 2)).entries.is_empty(),
         "pending proposal is not reported"
     );
-    let accepted = l.step(durable_of(&eff).remove(0));
-    // The proposal row is durable; the report says PRE-ACCEPT until the
-    // acceptance the guard allowed is durable too.
-    let entries = l.report(ballot(1, 2)).entries;
-    assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].command, c1);
-    assert_eq!(entries[0].phase, Phase::PreAccept);
-    for event in durable_of(&accepted) {
-        l.step(event);
-    }
+    // The proposal batch carries the leader's acceptance, since nothing
+    // precedes c1 (task-d89): once it is durable the report says ACCEPT.
+    l.step(durable_of(&eff).remove(0));
     let entries = l.report(ballot(1, 2)).entries;
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].command, c1);

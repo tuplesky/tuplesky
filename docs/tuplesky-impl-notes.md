@@ -10953,3 +10953,66 @@ window.
   of the process's CPU per window. The trim stays the long-run bound, and
   its first reading, the rows exported by kind at two positions, waits
   for it.
+
+## A fresh proposal's acceptance in its proposal batch (task-d89)
+
+task-d84's reading had the leader syncing three times a command at one
+caller, each once the one before it was durable: the proposal row, its
+ACCEPT row, and the execution group. When the dependency guard passes as
+the leader proposes, the proposal batch now carries the ACCEPT row
+(design Section 4.7). The leader accepts each of its own proposals as it
+proposes it, so every later command's guard passes too: in steady state
+every fresh proposal takes the merged batch, at any load. Learning starts
+from ACCEPT, so the old order also kept the leader from committing a
+command before its proposal was durable; that gate is now explicit
+(`Learner::commit_learned_where`), and a model test pins it.
+
+**The reading.** task-d84's script, base #179's head (`df72e28`)
+against the head, alternating, two runs a side, three voters on one host,
+stores on the local disk, 2,500 operations at 1 and 10 callers. CPU is
+every voter's process a command, summed. Latency is the bench's `service`
+time for puts.
+
+| profile | callers | side | `ok`/s | leader syncs/cmd | leader protocol groups/cmd | syncs/cmd, voter mean | CPU/cmd, all voters (ms) | put p50 (ms) | put p99 (ms) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| strict | 1 | base | 755, 779 | 2.91 | 2.00 | 2.45 | 6.91, 6.43 | 2.06, 1.86 | 4.11, 4.20 |
+| strict | 1 | head | 831, 785 | 2.00 | 1.00 | 2.13 | 6.00, 6.23 | 1.76, 1.83 | 3.11, 4.60 |
+| strict | 10 | base | 1648, 1632 | 1.14, 1.16 | 0.98, 1.00 | 1.10 | 3.87, 3.90 | 5.55, 5.55 | 14.6, 15.2 |
+| strict | 10 | head | 1714, 1624 | 0.99, 0.98 | 0.66 | 1.03 | 3.59, 3.71 | 5.33, 5.52 | 12.6, 16.2 |
+| replay | 1 | base | 846, 866 | 2.91 | 2.00 | 2.45 | 5.75, 5.68 | 1.68, 1.64 | 5.92, 7.98 |
+| replay | 1 | head | 884, 853 | 2.00 | 1.00 | 2.15 | 5.47, 5.55 | 1.55, 1.57 | 8.73, 9.77 |
+| replay | 10 | base | 1822, 1804 | 1.13, 1.06 | 0.93 | 1.06 | 3.29, 3.32 | 5.09, 5.13 | 15.3, 16.2 |
+| replay | 10 | head | 1780, 1892 | 0.91, 0.90 | 0.61 | 1.01 | 3.35, 3.22 | 5.21, 4.49 | 14.6, 15.6 |
+
+**What it says:**
+- **The leader's second sync is gone.** At one caller its protocol groups
+  fall from two a command to one, and its syncs from 2.91 to 2.00, as
+  task-d84's reading predicted. At ten callers its syncs fall 14 to 18%.
+- **CPU falls with them,** 3 to 10% over the voters at one caller, and
+  flat to 5% at ten.
+- **Latency moves less than a sync.** A sync on this host's disk is
+  about 0.3 ms, and at one caller the put p50 falls 0.1 to 0.3 ms. The
+  p99 at one caller under `replay` is worse in both head runs, 8.7 and
+  9.8 ms against 5.9 and 8.0, above both base runs. The base's own two
+  runs differ by 2 ms, so two runs a side do not settle it.
+- **Read again at one caller under `replay` (#180 review):** six more
+  runs a side, alternating, with the same binaries. The host was about
+  40% slower than for the table above (`ok`/s about 530 against 860), so
+  these runs are compared with each other only.
+
+  | side | `ok`/s | put p50 (ms) | put p99 (ms) | CPU/cmd, all voters (ms) |
+  | --- | --- | --- | --- | --- |
+  | base | 475 to 550 | 2.59 to 2.97 | 9.0, 10.1, 10.5, 11.5, 12.2, 14.4 (median 11.0) | 8.50 to 9.27 |
+  | head | 504 to 571 | 2.42 to 2.59 | 6.4, 6.9, 8.8, 9.5, 12.7, 13.9 (median 9.1) | 7.84 to 8.53 |
+
+  The head's p99 isn't worse: its median is lower, and the two sides'
+  ranges overlap. Its p50 and CPU are lower in every pair, and its
+  `ok`/s is higher in five pairs of six. So the first reading's p99 was
+  noise. That fits the change: the gate keeps the leader's commit where
+  it was, after the proposal is durable, so nothing should add latency
+  at one caller. On the runner's disk a sync is about 2.3 ms, which is the
+  size the plan gave this lever.
+
+**Checks.** coord-consensus's suites. The protocol simulator at 1,000
+seeds a row and size, 13 of 13 with catch-up (1,009 s) and without
+(1,107 s).

@@ -122,8 +122,16 @@ struct Cluster {
     nodes: Vec<Node>,
     seed: u64,
     /// Nodes whose incoming acknowledgements from other followers are
-    /// dropped. The leader's proposals still reach them.
+    /// dropped, and the commit frontier the leader announces in a step
+    /// (task-d74): only the one its re-send timer announces reaches them.
+    /// Since task-d74 no follower sends another an acknowledgement, so
+    /// this is a follower that missed every prompt frontier, which the
+    /// timer's repairs. The leader's proposals still reach them.
     deaf: Vec<u8>,
+    /// Whether the frontier being routed is the re-send timer's.
+    ticking: bool,
+    /// Acknowledgements one follower sent another.
+    between_followers: usize,
     /// Nodes that receive no proposals at all.
     unproposed: Vec<u8>,
     /// Nodes that are down: they send, receive and do nothing.
@@ -182,6 +190,8 @@ impl Cluster {
             nodes,
             seed,
             deaf: Vec::new(),
+            ticking: false,
+            between_followers: 0,
             unproposed: Vec::new(),
             down: Vec::new(),
             announced: Vec::new(),
@@ -221,9 +231,22 @@ impl Cluster {
                         continue;
                     }
                     let message = ProtocolMessage::decode(&frame).unwrap();
+                    if matches!(
+                        message,
+                        ProtocolMessage::FastAck(_) | ProtocolMessage::SlowAck(_)
+                    ) && i != 0
+                        && dest != 0
+                    {
+                        self.between_followers += 1;
+                    }
                     match &message {
                         ProtocolMessage::FastAck(_) | ProtocolMessage::SlowAck(_)
                             if i != 0 && self.deaf.contains(&dest) =>
+                        {
+                            continue;
+                        }
+                        ProtocolMessage::Committed { .. }
+                            if !self.ticking && self.deaf.contains(&dest) =>
                         {
                             continue;
                         }
@@ -351,7 +374,9 @@ impl Cluster {
             panic!("r0 leads")
         };
         let effects = l.announce_committed();
+        self.ticking = true;
         self.handle(0, effects);
+        self.ticking = false;
     }
 
     /// Kill node `i` and bring it back at once from its durable rows, as
@@ -516,6 +541,27 @@ fn a_follower_that_hears_only_the_leader_executes_what_it_commits() {
     for i in 0..VOTERS as usize {
         assert_eq!(cluster.nodes[i].executed, commands, "node {i}");
     }
+}
+
+/// Every follower learns from the leader's commit frontier, announced
+/// in the step that moves it (task-d74): no re-send timer, and no
+/// acknowledgement from one follower to another.
+#[test]
+fn every_follower_executes_from_the_frontier_announced_in_the_step_that_moves_it() {
+    let mut cluster = Cluster::new(19, 64);
+    let commands: Vec<CommandId> = (1..=12).map(|n| cluster.admit(n)).collect();
+    cluster.settle();
+    for i in 0..VOTERS as usize {
+        assert_eq!(cluster.nodes[i].executed, commands, "node {i}");
+    }
+    assert_eq!(
+        cluster.between_followers, 0,
+        "a follower acknowledged to another"
+    );
+    assert!(
+        (1..VOTERS).all(|f| cluster.announced.iter().any(|(to, _)| *to == f)),
+        "the frontier reached every follower"
+    );
 }
 
 /// Two followers cut off from each other's acknowledgements under a live
