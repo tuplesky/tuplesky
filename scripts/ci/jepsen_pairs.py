@@ -91,6 +91,9 @@ class Run:
     # it did not count.
     parking: dict = field(default_factory=dict)
     quic_other: dict = field(default_factory=dict)
+    # The leader's and the profiled follower's tokio threads in the
+    # summary's five parts, µs per command: {role: {part: µs}}.
+    five: dict = field(default_factory=dict)
     uncounted: dict = field(default_factory=dict)
     # The voters' memory (task-d60): the mean and largest resident set of
     # the coordd processes alive at the last sample, and the largest
@@ -337,6 +340,10 @@ def read_run(label: str, store: str) -> Run:
             run.transport = {kind: share * tokio_us / 100 for kind, share in split.items()}
             run.parking = {caller: share * tokio_us / 100 for caller, share in parking.items()}
             run.quic_other = {name: share * tokio_us / 100 for name, share in js.quic_other(chains).items()}
+    for role in ("leader", "follower"):
+        parts, us, _ = js.tokio_side(store, voters, role)
+        if parts and us:
+            run.five[role] = {part: share * us / 100 for part, share in parts.items()}
     mem = js.memory_summary(js.read_memory(os.path.join(store, "cpu-samples-memory.csv")))
     if mem:
         run.rss_end_mean, run.rss_end_max, run.hwm_max = mem["end_mean"], mem["end_max"], mem["hwm_max"]
@@ -494,6 +501,11 @@ def transport_table(runs: list[Run]) -> list[str]:
         transport_kinds += [k for k in sorted(r.transport, key=lambda k: -r.transport[k]) if k not in transport_kinds]
     for kind in transport_kinds:
         rows.append((f"tokio: {kind} (µs)", [r.transport.get(kind, 0.0) if r.transport else None for _, r in shown], "{:.1f}"))
+    for role in ("leader", "follower"):
+        if any(role in r.five for _, r in shown):
+            for part in js.FIVE_WAY:
+                rows.append((f"tokio in five parts, {role}: {part} (µs)",
+                             [r.five[role].get(part, 0.0) if role in r.five else None for _, r in shown], "{:.1f}"))
     labels = [r.label for _, r in shown]
     paired = sorted(labels) == ["base", "head"]
     out = [

@@ -657,6 +657,49 @@ class LeaderLoopTests(unittest.TestCase):
 
 
 
+class WakeupTests(unittest.TestCase):
+    """task-d91's R4: each voter's threads by kind, from the sampler's
+    --wakeups rows around the workload (one operation completed in it)."""
+
+    WAKES = (
+        "time,pid,start,kind,threads,cpu_s,runq_s,slices\n"
+        "2026-09-27 10:00:00.500000,101,7,domain loop,1,1.0,0.5,100\n"
+        "2026-09-27 10:00:00.500000,101,7,tokio threads,2,1.0,1.0,1000\n"
+        "2026-09-27 10:00:00.500000,102,7,domain loop,1,1.0,0.0,100\n"
+        "2026-09-27 10:00:41.500000,102,7,domain loop,1,1.5,0.0,200\n"
+        "2026-09-27 10:00:41.500000,101,7,checkpoint,1,0.1,0.02,10\n"
+        "2026-09-27 10:00:41.500000,101,7,tokio threads,2,2.0,3.0,3000\n"
+        "2026-09-27 10:00:41.500000,101,7,domain loop,1,3.0,1.5,600\n"
+    )
+
+    def summary(self, wakes):
+        with tempfile.TemporaryDirectory() as store:
+            for name, text in (("jepsen.log", LOG), ("results.edn", RESULTS),
+                               ("cpu-samples.csv", LeaderLoopTests.SAMPLES)):
+                with open(os.path.join(store, name), "w") as f:
+                    f.write(text)
+            if wakes is not None:
+                with open(os.path.join(store, "cpu-samples-wakeups.csv"), "w") as f:
+                    f.write(wakes)
+            return js.summarize(store, ["n1", "n2"], "Jepsen")
+
+    def test_each_kind_per_operation_and_per_wakeup_leader_first(self):
+        text = self.summary(self.WAKES)
+        self.assertIn("over the 41 s between the samples around the workload", text)
+        rows = [line for line in text.splitlines() if line.startswith(("| 101", "| 102"))]
+        self.assertEqual(rows, [
+            "| 101 (leader) | domain loop | 1 | 500.00 | 2000 | 4000 | 1000.00 |",
+            "| 101 (leader) | tokio threads | 2 | 2000.00 | 1000 | 500 | 2000.00 |",
+            # A kind first seen inside the window counts from nothing.
+            "| 101 (leader) | checkpoint | 1 | 10.00 | 2000 | 10000 | 20.00 |",
+            "| 102 | domain loop | 1 | 100.00 | 0 | 5000 | 0.00 |",
+        ])
+
+    def test_no_file_or_a_row_that_does_not_parse_no_table(self):
+        self.assertNotIn("Wakeups and the wait for a core", self.summary(None))
+        self.assertNotIn("Wakeups and the wait for a core", self.summary(self.WAKES + "x,1,2,3,4,5,6,7\n"))
+
+
 def d62_metrics(fast, slow, reasons, oldest_s, uptime_s, traffic=True):
     path, deps, missing, slow_first, unclassified = reasons
     cost = {
@@ -928,6 +971,40 @@ class TransportTests(unittest.TestCase):
         # 30% of the tokio threads' 1000 µs per command.
         self.assertIn("| crypto (packet protection) | 300.0 |", text)
         self.assertIn("| `tokio::runtime::park::Inner::unpark` | 200.0 |", text)
+
+    def test_the_five_parts_for_the_leader_and_a_follower(self):
+        follower_counts = ("follower process 200, each thread's CPU and system calls, counted from 2026-10-08 10:00:00 "
+                           "to 2026-10-08 10:00:20 UTC (20 s); perf stat -x, --per-thread\n"
+                           "coordd-200,500.00,msec,task-clock,500000000,100.00,0.025,CPUs utilized\n"
+                           "tokio-rt-worker-201,1000.00,msec,task-clock,1000000000,100.00,0.050,CPUs utilized\n")
+        follower_chains = [
+            "header",
+            "    50.00%  [kernel.kallsyms]  [k] udp_sendmsg",
+            "50.00% start_thread;quinn_proto::connection::Connection::poll_transmit;__libc_sendmsg;udp_sendmsg",
+            "    50.00%  [kernel.kallsyms]  [k] __x64_sys_futex",
+            "50.00% start_thread;tokio::runtime::park::Inner::park;syscall;__x64_sys_futex",
+        ]
+        with tempfile.TemporaryDirectory() as d:
+            for name, text in (("leader-profile-syscalls.txt", TRANSPORT_SYSCALLS),
+                               ("transport-profile-chains.txt", "\n".join(TRANSPORT_CHAINS) + "\n"),
+                               ("follower-profile-syscalls.txt", follower_counts),
+                               ("transport-profile-follower-chains.txt", "\n".join(follower_chains) + "\n")):
+                with open(os.path.join(d, name), "w") as f:
+                    f.write(text)
+            # n1 serves reads, so it leads at 500 µs a command; n2 follows at 250.
+            voters = {"n1": js.parse_voter([d59_metrics(4, 0.5)]), "n2": js.parse_voter([d59_metrics(0, 0.25)])}
+            text = "\n".join(js.transport_tables(d, voters))
+        self.assertIn("**The tokio threads in five parts, leader and follower**", text)
+        # The leader's 1000 µs: send 8%, QUIC 50% (crypto 30, transmit 10,
+        # receive 10), TupleSky's 10%, parking 32%. The follower's 500 µs
+        # (its loop's 500 ms over 250 µs: 2000 commands): send and parking.
+        self.assertIn("| send (`sendmsg` and the kernel's UDP send) | 80.0 (8.0%) | 250.0 (50.0%) |", text)
+        self.assertIn("| QUIC: packet protection and connection state (crypto, quinn's transmit, receive, timers and "
+                      "streams) | 500.0 (50.0%) | 0.0 (0.0%) |", text)
+        self.assertIn("| TupleSky's own code on those threads | 100.0 (10.0%) | 0.0 (0.0%) |", text)
+        self.assertIn("| parking and wake-ups (futex, epoll, the I/O driver's waker) | 320.0 (32.0%) | 250.0 (50.0%) |",
+                      text)
+        self.assertIn("| **all** | 1000.0 | 500.0 |", text)
 
 
 class FastPathTests(unittest.TestCase):

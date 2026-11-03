@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Sample where the runner's CPU goes while a Jepsen test runs.
 
-    scripts/ci/cpu_sampler.py --out FILE [--threads FILE] [--memory FILE] [--interval SECONDS]
+    scripts/ci/cpu_sampler.py --out FILE [--threads FILE] [--memory FILE] [--wakeups FILE] [--interval SECONDS]
 
 Once an interval, until it is sent SIGTERM or SIGINT, this reads every
 process's user and system time from `/proc/<pid>/stat` and the host's from
@@ -35,6 +35,17 @@ With --memory, each row also appends one row per `coordd` to that file:
 the time, its pid and start time, and its resident set (`VmRSS`) and the
 resident set's high-water mark (`VmHWM`) from `/proc/<pid>/status`, in KiB,
 so a run reads each voter's memory at its end and at its peak.
+
+With --wakeups, each row also appends one row per `coordd` and kind of
+thread to that file (task-d91's R4): the time, its pid and start time, the
+kind (`domain loop` for the main thread, `tokio threads`, and the others by
+their name: `appender`, `materializer`, `checkpoint`, else `other`), how
+many such threads it has seen, and their CPU and run-queue seconds and
+timeslices, `schedstat`'s three fields, summed. A timeslice is a turn on a
+CPU, so it counts the thread's wakeups, and the run queue over them is the
+wait for a core per wakeup. A thread that has exited keeps its last
+reading in the sums, so they stay cumulative while short-lived threads (a
+publication's) come and go.
 
 It also writes the host's CPU model, its mean clock when the sampler
 starts and its CPU count to the same path with -host.txt in place of
@@ -97,6 +108,61 @@ def host_info() -> str:
         pass
     mhz = f"{sum(clocks) / len(clocks):.0f}" if clocks else "unknown"
     return f"model={model}\nmhz={mhz}\ncpus={os.cpu_count()}\n"
+
+
+def schedstat3(path: str) -> tuple[float, float, int] | None:
+    """A thread's seconds on a CPU and on a run queue, and its timeslices,
+    from its `schedstat`; None once it is gone."""
+    try:
+        with open(path) as f:
+            on_cpu, queued, slices = f.read().split()[:3]
+    except (OSError, ValueError):
+        return None
+    return int(on_cpu) / 1e9, int(queued) / 1e9, int(slices)
+
+
+# The voter's own named threads, as `comm` gives them.
+NAMED_THREADS = ("appender", "materializer", "checkpoint")
+
+
+def thread_kind(pid: int, tid: int, comm: str) -> str:
+    """The kind a coordd thread is counted under in --wakeups."""
+    if tid == pid:
+        return "domain loop"
+    if comm in TOKIO_THREADS:
+        return "tokio threads"
+    return comm if comm in NAMED_THREADS else "other"
+
+
+def wakeups(pids, seen: dict) -> list[str]:
+    """One `--wakeups` row's cells after the time for each coordd in `pids`
+    (pid, start) and each kind of its threads. `seen` keeps each thread's
+    last reading, (pid, start) -> {tid: (kind, cpu, queued, slices)}, so a
+    thread that exits still counts."""
+    out = []
+    for pid, start in pids:
+        threads = seen.setdefault((pid, start), {})
+        try:
+            tids = os.listdir(f"/proc/{pid}/task")
+        except OSError:
+            continue
+        for tid in tids:
+            try:
+                with open(f"/proc/{pid}/task/{tid}/comm") as f:
+                    comm = f.read().strip()
+            except OSError:
+                continue
+            times = schedstat3(f"/proc/{pid}/task/{tid}/schedstat")
+            if times:
+                threads[int(tid)] = (thread_kind(pid, int(tid), comm),) + times
+        sums: dict = {}
+        for kind, cpu, queued, slices in threads.values():
+            n, c, q, s = sums.get(kind, (0, 0.0, 0.0, 0))
+            sums[kind] = (n + 1, c + cpu, q + queued, s + slices)
+        for kind in sorted(sums):
+            n, c, q, s = sums[kind]
+            out.append(f"{pid},{start},{kind},{n},{c:.4f},{q:.4f},{s}")
+    return out
 
 
 def schedstat(path: str) -> tuple[float, float] | None:
@@ -183,6 +249,7 @@ def main() -> int:
     parser.add_argument("--out", required=True)
     parser.add_argument("--threads")
     parser.add_argument("--memory")
+    parser.add_argument("--wakeups")
     parser.add_argument("--interval", type=float, default=1.0)
     args = parser.parse_args()
 
@@ -208,6 +275,10 @@ def main() -> int:
     mem = open(args.memory, "w") if args.memory else None
     if mem:
         mem.write("time,pid,start,rss_kib,hwm_kib\n")
+    wake = open(args.wakeups, "w") if args.wakeups else None
+    seen: dict = {}
+    if wake:
+        wake.write("time,pid,start,kind,threads,cpu_s,runq_s,slices\n")
     with open(args.out, "w") as out:
         out.write("time,host_busy_s,host_total_s,cpus," + ",".join(f"{n}_s" for n in NAMES) + ",steal_s\n")
         while True:
@@ -239,6 +310,10 @@ def main() -> int:
                 for cells in memory(coordd):
                     mem.write(f"{now:%Y-%m-%d %H:%M:%S.%f},{cells}\n")
                 mem.flush()
+            if wake:
+                for cells in wakeups(coordd, seen):
+                    wake.write(f"{now:%Y-%m-%d %H:%M:%S.%f},{cells}\n")
+                wake.flush()
             first = False
             if stopping:
                 return 0

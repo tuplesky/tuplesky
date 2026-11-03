@@ -46,7 +46,12 @@ of the process's threads' CPU (`task-clock`) and its system calls on the
 transport's and the runtime's paths (futex, the UDP sends and receives,
 epoll, write), into FILE with -syscalls before its extension, as perf
 wrote them; the summary turns them into calls per command by the domain
-loop's own CPU in the window.
+loop's own CPU in the window. The busiest follower's tokio threads are
+profiled the same way over the same window, into the transport profile's
+name with -follower before its extension (transport-profile-follower.txt,
+its -inclusive and -chains beside it), and its threads counted into the
+follower profile's name with -syscalls (follower-profile-syscalls.txt), so
+the summary sets a follower's transport beside the leader's.
 
 Exits 0 whatever happens: a profile that cannot be taken (no `perf`, no
 permission, no load before SIGTERM) leaves FILE saying why, and the test
@@ -209,7 +214,8 @@ def main() -> int:
             f"{role} thread {tid}{f' ({node})' if node else ''}, {used / span:.2f} of a core over "
             f"the {span} s before"
             if used is not None
-            else f"{role}: the tokio threads ({', '.join(comms)}) of the leader's process {tid}, pooled"
+            else f"{role}: the tokio threads ({', '.join(comms)}) of the "
+            f"{'follower' if role.startswith('follower') else 'leader'}'s process {tid}{f' ({node})' if node else ''}, pooled"
         )
         header = (
             f"{who}, sampled at "
@@ -238,24 +244,32 @@ def main() -> int:
     # reported for those threads alone, and its threads' system calls.
     if args.call_graph:
         jobs.append(("transport", pid, None, role_path(args.out, "transport")))
+    # And the follower's tokio threads, the same way, so the transport's
+    # cost on a follower is read beside the leader's.
+    follower = ranked[1][0][0] if args.call_graph and len(ranked) > 1 else None
+    if follower is not None:
+        jobs.append(("follower-transport", follower, None, suffixed(role_path(args.out, "transport"), "follower")))
     # Each sampled voter's node, read before the window: a kill in it takes
     # the process, and its /proc entry, with it.
     nodes = {tid: node_of(tid) for _, tid, _, _ in jobs}
     started = now()
     running = [(role, tid, u, out, out + ".data",
-                record(tid, out + ".data", graph, args.seconds, args.frequency, whole=role == "transport"))
+                record(tid, out + ".data", graph, args.seconds, args.frequency, whole=role.endswith("transport")))
                for role, tid, u, out in jobs]
-    counting = None
+    counting = []
     if args.call_graph:
-        counts = beside("syscalls")
         events = ",".join(["task-clock"] + [f"syscalls:sys_enter_{name}" for name in SYSCALLS])
-        counting = subprocess.Popen(
-            ["sudo", "-n", "perf", "stat", "-x,", "--per-thread", "-e", events, "-p", str(pid), "-o", counts + ".raw",
-             "--", "sleep", str(args.seconds)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
+        targets = [("leader", pid, beside("syscalls"))]
+        if follower is not None:
+            targets.append(("follower", follower, suffixed(follower_path(args.out), "syscalls")))
+        for role, target, counts in targets:
+            counting.append((role, target, counts, subprocess.Popen(
+                ["sudo", "-n", "perf", "stat", "-x,", "--per-thread", "-e", events, "-p", str(target), "-o",
+                 counts + ".raw", "--", "sleep", str(args.seconds)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+            )))
     failed = []
     for role, tid, u, out, data, proc in running:
         _, err = proc.communicate()
@@ -268,21 +282,21 @@ def main() -> int:
     for role, tid, u, out, data, proc in running:
         if proc.returncode == 0:
             write_profile(out, role, tid, u, data, started, ended,
-                          comms=TOKIO_THREADS if role == "transport" else (), node=nodes[tid])
+                          comms=TOKIO_THREADS if role.endswith("transport") else (), node=nodes[tid])
         subprocess.run(["sudo", "-n", "rm", "-f", data], capture_output=True)
-    if counting is not None:
-        _, err = counting.communicate()
+    for role, target, counts, proc in counting:
+        _, err = proc.communicate()
         try:
             with open(counts + ".raw") as f:
                 lines = [line for line in f.read().splitlines() if line.strip() and not line.startswith("#")]
         except OSError:
             lines = []
         with open(counts, "w") as f:
-            if counting.returncode == 0 and lines:
-                f.write(f"leader process {pid}, each thread's CPU and system calls, counted from {started} to {ended} UTC "
-                        f"({args.seconds:g} s); perf stat -x, --per-thread\n" + "\n".join(lines) + "\n")
+            if proc.returncode == 0 and lines:
+                f.write(f"{role} process {target}, each thread's CPU and system calls, counted from {started} to {ended} "
+                        f"UTC ({args.seconds:g} s); perf stat -x, --per-thread\n" + "\n".join(lines) + "\n")
             else:
-                f.write(f"No counts: perf stat failed ({counting.returncode}): {err.strip()[-500:]}\n")
+                f.write(f"No counts: perf stat failed ({proc.returncode}): {err.strip()[-500:]}\n")
         subprocess.run(["sudo", "-n", "rm", "-f", counts + ".raw"], capture_output=True)
 
     # The allocator's callers: libc's allocator keeps no frame pointer, so
@@ -307,6 +321,13 @@ def main() -> int:
                 )
         subprocess.run(["sudo", "-n", "rm", "-f", data], capture_output=True)
     return 0
+
+
+def suffixed(path: str, suffix: str) -> str:
+    """A file beside `path` with -suffix before its extension:
+    transport-profile.txt gives transport-profile-follower.txt."""
+    stem, dot, ext = path.rpartition(".")
+    return f"{stem}-{suffix}.{ext}" if dot else f"{path}-{suffix}"
 
 
 def follower_path(out: str) -> str:

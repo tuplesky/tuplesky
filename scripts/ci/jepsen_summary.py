@@ -14,7 +14,9 @@ directory (`store/latest`) and writes what a reader looks for first:
 * where the runner's CPU went over the workload, by process group, when
   the job sampled it (`cpu-samples.csv` from `cpu_sampler.py`), and, for a
   TupleSky run, the leader's loop against the host's idle second by second
-  and the voters' tokio threads (`cpu-samples-threads.csv`);
+  and the voters' tokio threads (`cpu-samples-threads.csv`); each voter's
+  threads by kind, their wakeups and wait for a core per wakeup
+  (`cpu-samples-wakeups.csv`, task-d91's R4);
 * the commonest failure reasons;
 * the faults, in order, and each node's first `ok` after each fault ended;
 * for a TupleSky run, one row per voter from its `coordd.log`: boots,
@@ -641,6 +643,89 @@ def read_thread_samples(path: str) -> dict:
     return by_time
 
 
+def read_wakeups(path: str) -> dict:
+    """The rows `cpu_sampler.py --wakeups` wrote, by their time cell: each
+    coordd (pid, start) to {kind: (threads, CPU s, run queue s,
+    timeslices)}, cumulative; {} without the file or with a row that does
+    not parse."""
+    if not os.path.exists(path):
+        return {}
+    by_time: dict = {}
+    try:
+        with open(path) as f:
+            f.readline()
+            for line in f:
+                cells = line.strip().split(",")
+                if len(cells) != 8:
+                    continue
+                when = datetime.datetime.strptime(cells[0], "%Y-%m-%d %H:%M:%S.%f")
+                key = (int(cells[1]), int(cells[2]))
+                by_time.setdefault(when, {}).setdefault(key, {})[cells[3]] = (
+                    int(cells[4]), float(cells[5]), float(cells[6]), int(cells[7]))
+    except (OSError, ValueError):
+        return {}
+    return by_time
+
+
+# The order the wakeups table gives a voter's kinds of thread in.
+WAKEUP_KINDS = ("domain loop", "tokio threads", "appender", "materializer", "checkpoint", "other")
+
+
+def wakeup_table(rows: list[dict], wakes: dict, start: datetime.datetime, end: datetime.datetime,
+                 completed: int) -> list[str]:
+    """task-d91's R4: each coordd's kinds of thread over the samples that
+    bracket the window, their wakeups (timeslices) per operation and the
+    wait for a core per wakeup, leader first (the voter whose domain loop
+    used the most CPU over the window); [] without rows bracketing it."""
+    before = [r["time"] for r in rows if r["time"] <= start and r["time"] in wakes]
+    after = [r["time"] for r in rows if r["time"] >= end and r["time"] in wakes]
+    if not before or not after or not completed:
+        return []
+    t0, t1 = wakes[before[-1]], wakes[after[0]]
+    procs = [k for k in t1 if k in t0]
+    if not procs:
+        return []
+
+    def delta(k, kind):
+        a, b = t0[k].get(kind), t1[k].get(kind)
+        if b is None:
+            return None
+        a = a or (0, 0.0, 0.0, 0)
+        return b[0], b[1] - a[1], b[2] - a[2], b[3] - a[3]
+
+    def loop_cpu(k):
+        d = delta(k, "domain loop")
+        return d[1] if d else 0.0
+
+    leader = max(procs, key=loop_cpu)
+    span = (after[0] - before[-1]).total_seconds()
+    out = [
+        f"**Wakeups and the wait for a core, by thread** (task-d91's R4, from `cpu_sampler.py --wakeups` over the "
+        f"{span:.0f} s between the samples around the workload: each `coordd`'s threads by kind, their `schedstat` "
+        "summed; a wakeup is a timeslice, a turn on a CPU; run delay is the time ready to run and waiting for a core; "
+        f"per operation is over the {completed} operations completed in that time; the leader is the voter whose "
+        "domain loop used the most CPU over it)",
+        "",
+        "| Process (pid) | Kind | Threads | Wakeups per operation | Run delay per wakeup (µs) "
+        "| CPU per wakeup (µs) | Run delay per operation (ms) |",
+        "| --- | --- | --- | --- | --- | --- | --- |",
+    ]
+    for k in [leader] + sorted(p for p in procs if p != leader):
+        name = f"{k[0]}{' (leader)' if k == leader else ''}"
+        kinds = sorted(set(t1[k]) | set(t0[k]), key=lambda x: (WAKEUP_KINDS.index(x) if x in WAKEUP_KINDS else 99, x))
+        for kind in kinds:
+            d = delta(k, kind)
+            if not d or d[3] <= 0:
+                continue
+            n, cpu, queued, slices = d
+            out.append(
+                f"| {name} | {kind} | {n} | {slices / completed:.2f} | {queued * 1e6 / slices:.0f} "
+                f"| {cpu * 1e6 / slices:.0f} | {queued * 1000 / completed:.2f} |"
+            )
+    out.append("")
+    return out
+
+
 def read_memory(path: str) -> dict:
     """The rows `cpu_sampler.py --memory` wrote: each coordd (pid, start)
     to its samples, (time, resident set, high-water mark) in MiB, in
@@ -1224,7 +1309,7 @@ def read_syscalls(path: str) -> tuple[int | None, dict]:
             lines = f.read().splitlines()
     except OSError:
         return None, {}
-    m = re.match(r"leader process (\d+),", lines[0]) if lines else None
+    m = re.match(r"(?:leader|follower) process (\d+),", lines[0]) if lines else None
     if not m:
         return None, {}
     window = re.search(r"\(([\d.]+) s\)", lines[0])
@@ -1451,6 +1536,89 @@ def transport_tables(store: str, voters: dict, top: int = 10) -> list[str]:
             for name, share in other.most_common(top):
                 out.append(f"| `{name.replace('|', '/')}` | {fmt.format(share * k)} |")
             out.append("")
+    out.extend(five_way_table(store, voters))
+    return out
+
+
+# The tokio threads' samples in five parts (#98, for task-d73): each of
+# TRANSPORT_KINDS, the allocator and the rest go to one of these.
+FIVE_WAY = (
+    "send (`sendmsg` and the kernel's UDP send)",
+    "receive (`recvmsg` and the kernel's UDP receive)",
+    "QUIC: packet protection and connection state (crypto, quinn's transmit, receive, timers and streams)",
+    "TupleSky's own code on those threads",
+    "parking and wake-ups (futex, epoll, the I/O driver's waker)",
+    "the rest: the allocator, tokio's scheduler and I/O driver, other",
+)
+
+
+def five_way(split: collections.Counter) -> collections.Counter:
+    """`transport_split`'s kinds folded into FIVE_WAY's parts."""
+    out = collections.Counter()
+    for kind, share in split.items():
+        if kind.startswith("send"):
+            part = FIVE_WAY[0]
+        elif kind.startswith("receive"):
+            part = FIVE_WAY[1]
+        elif kind.startswith(("crypto", "QUIC")):
+            part = FIVE_WAY[2]
+        elif kind.startswith("TupleSky"):
+            part = FIVE_WAY[3]
+        elif kind.startswith("parking"):
+            part = FIVE_WAY[4]
+        else:
+            part = FIVE_WAY[5]
+        out[part] += share
+    return out
+
+
+def tokio_side(store: str, voters: dict, role: str) -> tuple[collections.Counter, float | None, str | None]:
+    """One voter's tokio threads in FIVE_WAY's parts, in percent of their
+    samples, their CPU per command from the per-thread counts (None
+    without them) and the voter's node: the leader's (`transport-profile`)
+    or the profiled follower's (`transport-profile-follower`)."""
+    leader = profiled_node(os.path.join(store, "leader-profile.txt"))
+    follower = profiled_node(os.path.join(store, "follower-profile-chains.txt"))
+    lead_us, follow_us = loop_per_command(voters, follower=follower, leader=leader,
+                                          sampled=sampled_costs(voters, store))
+    if role == "leader":
+        chains, counts, loop_us, node = "transport-profile-chains.txt", "leader-profile-syscalls.txt", lead_us, leader
+    else:
+        chains, counts, loop_us, node = ("transport-profile-follower-chains.txt", "follower-profile-syscalls.txt",
+                                         follow_us, follower)
+    split, _ = transport_split(read_chains(os.path.join(store, chains)))
+    kinds, _ = syscalls_per_command(os.path.join(store, counts), loop_us)
+    tokio_us = kinds.get("tokio threads", (0, None, {}))[1] if kinds else None
+    return five_way(split), tokio_us, node
+
+
+def five_way_table(store: str, voters: dict) -> list[str]:
+    """The leader's and the profiled follower's tokio threads side by side
+    in FIVE_WAY's parts, in µs per command where the per-thread counts give
+    their CPU, else in percent of their samples; [] without either
+    profile."""
+    sides = [(role,) + tokio_side(store, voters, role) for role in ("leader", "follower")]
+    sides = [s for s in sides if s[1]]
+    if not sides:
+        return []
+    head = " | ".join(f"{role}{f' ({node})' if node else ''}" for role, _, _, node in sides)
+    out = [
+        "**The tokio threads in five parts, leader and follower** (each voter's transport workers and blocking pool, "
+        "pooled, a call graph over the profile's window, each sample by the first kind its stack meets from the leaf, "
+        "the kinds folded into five parts and the rest; µs per command at each voter's tokio threads' CPU per command "
+        "from its `perf stat --per-thread` counts, with the share of their samples beside it)",
+        "",
+        f"| Part | {head} |",
+        "| --- " * (1 + len(sides)) + "|",
+    ]
+    for part in FIVE_WAY:
+        cells = []
+        for _, split, us, _ in sides:
+            share = split.get(part, 0.0)
+            cells.append(f"{share * us / 100:.1f} ({share:.1f}%)" if us else f"{share:.1f}%")
+        out.append(f"| {part} | " + " | ".join(cells) + " |")
+    out.append("| **all** | " + " | ".join(f"{us:.1f}" if us else "100%" for _, _, us, _ in sides) + " |")
+    out.append("")
     return out
 
 
@@ -1875,6 +2043,9 @@ def summarize(store: str, nodes: list[str], title: str, profile: str | None = No
             threads = read_thread_samples(os.path.join(store, "cpu-samples-threads.csv"))
             if threads:
                 out.extend(leader_loop(rows, threads, start, until, completed))
+            wakes = read_wakeups(os.path.join(store, "cpu-samples-wakeups.csv"))
+            if wakes:
+                out.extend(wakeup_table(rows, wakes, start, until, completed))
         out.extend(voters_memory(read_memory(os.path.join(store, "cpu-samples-memory.csv"))))
 
         out.extend(leader_profile(os.path.join(store, "leader-profile.txt")))

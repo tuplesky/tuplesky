@@ -331,7 +331,15 @@ the send and receive system calls, parking and waking, quinn's transmit,
 its receive and the rest of quinn, the allocator, TupleSky's own code by
 crate, and tokio's scheduler, each the first kind any frame of a sample's
 stack matches, in that order. The parking and waking samples are also
-given by the innermost Rust frame above the system call. The summary gives the thread, the window, its samples by object
+given by the innermost Rust frame above the system call. The busiest
+follower's tokio threads are profiled and counted the same way over the
+same window (`transport-profile-follower*.txt`,
+`follower-profile-syscalls.txt`), and the summary and the pair table set
+the leader's and the follower's tokio threads side by side in five parts,
+in µs per command: send, receive, QUIC (packet protection and quinn's
+transmit, receive, timers and streams), TupleSky's own code, and parking
+and wake-ups, with the allocator, tokio's scheduler and the rest as a
+sixth row. The summary gives the thread, the window, its samples by object
 (`coordd`, libc, the kernel) and the symbols that held most of them; the full report is `leader-profile.txt` in the store.
 
 The `voter-workers` input sets each TupleSky voter's tokio worker count
@@ -678,7 +686,15 @@ of lines. `scripts/ci/jepsen_summary.py` reads the test's store
   the voters' tokio threads' CPU and run queue per operation. The samples
   are in the store as `cpu-samples-threads.csv`. The voters' memory follows:
   each `coordd`'s resident set at its last sample, the largest sampled, and
-  its high-water mark (`VmRSS` and `VmHWM`, from `cpu-samples-memory.csv`);
+  its high-water mark (`VmRSS` and `VmHWM`, from `cpu-samples-memory.csv`).
+  Then task-d91's R4: each `coordd`'s threads by kind (the domain loop,
+  the tokio threads, the appender, the materializer, a publication's
+  checkpoint threads, the rest), with their wakeups per operation (a
+  wakeup is a timeslice, `schedstat`'s third field), the run delay per
+  wakeup (the wait for a core), the CPU per wakeup and the run delay per
+  operation, leader first, over the samples around the workload
+  (`cpu-samples-wakeups.csv`; a thread that exits keeps its last reading
+  in its kind's sums);
 * for the TupleSky job, one row per voter from its `coordd.log`: boots,
   the position it last recovered at, the highest position it executed by
   the end (read from its store by `coord-jepsen-executed --last`, so a

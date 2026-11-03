@@ -240,6 +240,23 @@ class PairTests(unittest.TestCase):
         self.assertIn("| tokio threads: CPU (µs) | 300.0 | 250.0 | -50.0 |", text)
         self.assertIn("| `futex`, tokio threads | 2.00 | 0.83 | -1.17 |", text)
         self.assertIn("| tokio: send (`sendmsg` and the kernel's UDP send) (µs) | 150.0 | 125.0 | -25.0 |", text)
+        # The same in the five parts; no follower profile, no follower rows.
+        self.assertIn("| tokio in five parts, leader: parking and wake-ups (futex, epoll, the I/O driver's waker) (µs) "
+                      "| 150.0 | 125.0 | -25.0 |", text)
+        self.assertNotIn("tokio in five parts, follower", text)
+        # A follower's tokio threads, profiled on the head's run only: n2's
+        # loop at 400 µs a command and 400 ms in the window, 1000 commands.
+        with open(os.path.join(self.runs[1].store, "follower-profile-syscalls.txt"), "w") as f:
+            f.write("follower process 200, each thread's CPU and system calls, counted from 2026-10-08 10:00:00 "
+                    "to 2026-10-08 10:00:20 UTC (20 s); perf stat -x, --per-thread\n"
+                    "coordd-200,400.00,msec,task-clock,1,100.00,0.02,CPUs utilized\n"
+                    "tokio-rt-worker-201,200.00,msec,task-clock,1,100.00,0.01,CPUs utilized\n")
+        with open(os.path.join(self.runs[1].store, "transport-profile-follower-chains.txt"), "w") as f:
+            f.write("header\n    100.00%  [kernel.kallsyms]  [k] udp_recvmsg\n"
+                    "100.00% start_thread;quinn::endpoint::State::drive_recv;__x64_sys_recvmsg;udp_recvmsg\n")
+        text = jp.render([jp.read_run(r.label, r.store) for r in self.runs[:2]], "Paired")
+        self.assertIn("| tokio in five parts, follower: receive (`recvmsg` and the kernel's UDP receive) (µs) "
+                      "| - | 200.0 | - |", text)
 
     def test_acknowledgements_and_the_two_planes(self):
         for run, acks in zip(self.runs[:2], (1500, 500)):
