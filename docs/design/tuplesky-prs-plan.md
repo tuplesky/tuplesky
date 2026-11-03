@@ -2960,12 +2960,21 @@ This entry is the budget and the record, not a lever:
   | L6 | Wake and hop latency | task-d91 | R4 is read from the batch's base side |
 
   - **Projected for the register row:** about 3.22 ms an operation, against the #173 carry's 3.58, from C1, C2 and C10. Every lever left out, each at the top of its size, would bring it to about 3.03. So no lever on record reaches 2.8 ms in this batch.
-  - **The CPU target is revised for this batch under the entry's clause.** The batch's target is the projection: the register row at or under 3.25 ms an operation, about 10% under the carry, with `ok`/s not lower. 2.8 ms stays the entry's target. The rest of the gap is named with its owners, from the runner's split (tokio workers 1.45 ms, domain loops 1.28, the rest about 0.85):
+  - **The CPU target for this batch stays 2.8 ms (#185 review).** The projection, 3.22 ms, comes from the levers built so far. Three local readings that could move it aren't in yet, so the clause doesn't apply until they are. Each is local and goes in its own PR:
+    - **R5, where the materializer's cost a record goes** (task-d86's first step). R1 puts the materializer at about 115 µs a command at each voter, besides 60 µs a commit: on the order of half a millisecond an operation at the runner's five voters. The profile is a record's path through the materializer: the rows a command writes, by table, and redb's insert, page and freed-page costs. task-d92's profile of the export found half its thread in avoidable re-encoding, so this is the same reading for the other half of the engine.
+    - **R3 on the head, the api plane's datagrams by kind** (task-d88). C5 showed that the tokio workers' cost doesn't follow stream tasks, and C1 and C2, the levers that did move it, both cut datagrams. After them the api plane is the larger plane. It's read on the head, since #167 and #180 change what crosses it: submissions, fast and slow acknowledgements, releases and the client's own traffic, with ACK-only datagrams split out.
+    - **R6, a fresh profile of a leader's and a follower's domain loop on the head,** at the register row's shape. The last ranking of what the loops spend is task-d75's, and this record shows it's stale: B-tree searches went from about 8% of the leader's samples to 1 to 2%. The loops are 1.28 ms an operation on the runner.
+
+    Then:
+    - **If all three come up small,** the target is revised under the clause, with them as the reason. The gap that remains is then spread across the engine, the transport and the loop, with each part read.
+    - **If any is large,** it's built, the batch is re-projected, and the batch job runs once.
+
+    Where the gap is now, from the runner's split (tokio workers 1.45 ms, domain loops 1.28, the rest about 0.85):
     - **The voters' tokio workers:** their cost is per datagram, not per stream task (C5). Owners: task-d91 (R4, where they wait) and task-d88 (R3, the api plane's datagrams).
-    - **The materializer:** its cost is per record (R1). task-d86 now starts from a profile of a record's cost, not from the commit cadence.
-    - **The domain loops:** task-d60's third step (C6, C8) and task-d87 (C7), each small on its own.
-    - **A publication's export,** now led by redb's scan (task-d92's head profile). That is the engine's cost, with no owner yet; task-d27's trim stays the long-run bound.
-  - **The `service` p99 target is not projected to be met by this batch,** and is revised to a reading. L3 removes one of the leader's syncs in series, about 2.3 ms on the runner. L1 is already in the next carry. L4, the long pole, comes after its review. So the batch reads p50 and p99 at `replay` and `strict` on both sides as L3's step. Whether it is within etcd's spread rests on L4 and L6, in the batch after.
+    - **The materializer:** its cost is per record (R1). task-d86 now starts from R5, a profile of a record's cost, not from the commit cadence.
+    - **The domain loops:** task-d60's third step (C6, C8) and task-d87 (C7), each small on its own, and whatever R6 finds.
+    - **A publication's export,** now led by redb's scan (task-d92's head profile). That's the engine's cost; R5 reads the same engine from the materializer's side, and task-d27's trim stays the long-run bound.
+  - **The `service` p99 target is not projected to be met by this batch,** and is revised to a reading. L3 removes one of the leader's syncs in series, about 2.3 ms on the runner. L1 is already in the next carry. L4 is the long pole, and its design step is up for review (#181). If its code lands while the readings above are under way, the batch carries it, so the `service` row reads L1, L3 and L4 together rather than L3 alone. Whether p99 is then within etcd's spread rests on L4 and L6.
 - **How the runner is used from here (#174 review):**
   - **No more single-lever performance pairs on the runner.** Each lever gets its local pair and its simulator sweep in its own PR. Where a lever's acceptance names a runner pair, the batch job is that pair.
   - **One batch job, once the batch is projected to close the gap:** this record puts the head at or under 2.8 ms from the local pairs, with task-d89 and task-d90 built, or the target has been revised. The job then confirms the gap closed rather than reporting a step toward it.
@@ -2976,8 +2985,12 @@ This entry is the budget and the record, not a lever:
       - `claude/task-d73-group-ends` (#182), which only adds R1's counters, so the summary can read flushes by cause.
 
       #181 and #183 are docs only. #184 and #182 sit directly on the stack and touch no code the others do. The only conflicts in the merge are the notes' sections, which each branch appends at the end of the notes; both are kept.
+    - **Before the batch's pairs, the head also holds the gate change** (#167 review, its own task stacked on #167): the frontend's gate holds a read whose session this node hasn't projected yet, instead of answering it `Pending`. Without it, the head's histories carry more indeterminate reads at followers than the base's, which moves `ok`/s for a reason that isn't CPU.
   - **Runs:** three register pairs, and `service` at `replay` and at `strict` on both sides, with the call graph on one pair, a follower's tokio threads included.
-  - **Before the batch,** only the next carry's leader-kill run. It is not a lever pair: it checks task-d82's liveness target and carries #178's safety fix, and nothing in the batch changes it.
+  - **Before the batch, correctness runs, not lever pairs (#185 review):** #167 and #180 change what the leader sends and journals, so they need fault runs before they merge, whatever the batch shows.
+    - **The leader-kill run** is made on the head instead of on the base. The head holds everything the base does, #175's liveness target and #178's fix included, so one run covers both.
+    - **One run of the standard schedule** (kill, pause and partition, 300 s, two workers) on the same head.
+    - **If either stops,** the same schedule runs on the base to say whose it is, and the stop is traced from the voters' stores before it's read as any one PR's.
 - **The record:** the table below, one row a lever, each row a pair on the runner.
 
 | Row | Build | Shape | `ok`/s | Server CPU an operation | Idle cores | Expected to move |
