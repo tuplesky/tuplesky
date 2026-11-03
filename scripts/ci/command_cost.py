@@ -167,12 +167,20 @@ def traffic_of(cost: dict, executed: int) -> dict:
     command (task-d62): frames, bytes and streams each way, and frames
     lost before they were written. Beside them, frames per stream each
     way, the batching factor (task-d61), and frames lost per stream lost.
-    Empty for a binary older than the reading."""
+    The api plane's QUIC counts (task-d70) are a block of their own in the
+    reading, and per command as `api_<count>`. Empty for a binary older
+    than the reading."""
     traffic = cost.get("traffic")
     if not isinstance(traffic, dict) or "Observed" not in traffic:
         return {}
     traffic = traffic["Observed"]
-    out = {"traffic_per_command": {k: v / executed for k, v in traffic.items()}}
+    flat = {}
+    for key, value in traffic.items():
+        if isinstance(value, dict):
+            flat.update({f"{key}_{k}": v for k, v in value.items()})
+        else:
+            flat[key] = value
+    out = {"traffic_per_command": {k: v / executed for k, v in flat.items()}}
     for side in ("sent", "received"):
         if traffic.get(f"{side}_streams"):
             out[f"frames_per_stream_{side}"] = (
