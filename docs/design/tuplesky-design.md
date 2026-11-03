@@ -344,6 +344,32 @@ The release point is the group's `JournalDurable` as the store reports it. With 
 
 What it can buy: in task-d62's run (five voters on one host, replay profile), a command waited 7.80 ms on the leader from its group closing to its release. The journal's job was about 1.2 ms of that (0.10 queued, 0.78 served, 0.30 to completion), and the rest was the projection's commit and its queue.
 
+**Releasing before the execution group is durable (task-d90, proposed; reviewed before any code).** The rule above would drop its second condition. A result is released once:
+- the leader has learned the command and every predecessor (task-29's gate, unchanged);
+- the leader has executed it in memory, which is after every command it executes after, since execution is in the decided order;
+- the frontend's output gate authorizes it.
+
+Its group's `JournalDurable` is no longer awaited. Everything else in the rule above stands: watch events, signatures and external calls wait for the projection's commit, and a retry or resolve at the releasing node waits for the projection through the command's position.
+
+What the release rests on, today and with the change:
+- **Today** the releasing voter's durable execution group is a witness of the order it released: a crash of that voter replays the group, so the released result is in its own journal before anyone sees it.
+- **With the change** the released result rests wholly on recovery reproducing every decision and its dependencies. The argument has three parts, and the step has to show each one for every path to a decision.
+  1. **Every decision is durable at a quorum before it is learned.** A follower's fast and slow acknowledgements are sent once their rows are durable (Section 4.8's outbox). The leader's own slow vote counts once its acceptance row is durable (task-d19, and task-d89's merged batch). The leader's fast vote is its proposal, and the leader commits nothing it proposed until the proposal batch is durable (task-d89's gate, `Learner::commit_learned_where`). A follower can acknowledge a submission before the leader's proposal reaches it, since every voter is sent the submission, so that gate, not the proposal's send, is what makes the leader's vote durable before it counts. So a slow decision is a majority's durable ACCEPT at the ballot, and a fast one a fast quorum's durable PRE-ACCEPT with one path and one dependency set.
+  2. **Recovery selects every decision with its dependencies,** whichever voters crash (Section 4.9). A slow decision is selected by the highest-ballot ACCEPT rule. A fast one is selected by the possible-fast rule, through which every recovering majority intersects the fast quorum. This is what the domain already relies on for every voter but the releasing one; the change extends it to that one.
+  3. **Execution is a function of the decided commands.** The order is task-d06's chain over decisions and dependencies. Planning is pure over the predecessor state (Section 17.4): the application holds no engine handle and reads no clock (`coord-state`). The inputs to a command's result that are not the command itself are each a function of that order:
+     - its authorization is read from the session and policy rows the predecessors left;
+     - leases and expiry change only through decided commands, which the expiry scheduler proposes (`coord-state::expiry`);
+     - its admission facts are in its payload, which is part of the decision.
+
+     What a voter keeps besides the order does not reach a result: the execution ordinal (task-d77's counter) and the executed-history window decide only what the voter remembers and forgets. The forgetting floor is a checkpoint a majority holds durably, and a released command whose group no voter has made durable is above every voter's durable frontier, so it is never below the floor.
+- **The state it adds** is every voter crashing after a release and before any of them made the command's execution group durable. Today the releasing voter's group is durable in that state. After it, the domain re-learns the command from the durable decisions and executes it again, and the step shows the result is the released one.
+- **The collector's late-release comparison (task-d12)** compares a release with each voter's execution record. Across that crash it compares the release with the re-executed record, so a recovery that got a decision wrong is caught there, and the node stops (task-d06). **The execution chain (task-d35)** is recomputed from the durable frontier, and a released command not yet in it is chained in the same place.
+- **Events and watches still wait for Materialized.** They are irrevocable effects of the local state, not results, and nothing here moves them.
+
+**What the acceptance has to show,** before the rule is changed:
+- Crash tests at every cut between the decision, the release and the execution group's durability, in which every voter crashes at each cut, not only the releasing one: the result each voter executes after recovery is the one released.
+- A protocol-simulator oracle that compares each released result with what the voters execute after healing, over the sweep.
+
 <a id="s4-6"></a>
 ### 4.6 Performance hypotheses
 
