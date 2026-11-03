@@ -10745,8 +10745,12 @@ window.
 - **The domain loop does not grow with history.** It holds at 0.48 to
   0.53 ms a command at the leader and 0.39 to 0.44 at a follower, from the
   first window to the last.
-- **The process grows by 10 to 14%,** and the windows that carry less are
-  the ones around a local checkpoint publication.
+- **The process steps up, and does not slope (#174 review).** The
+  leader's process goes from 1.345 ms a command in the first window to
+  1.45 to 1.48 in every later full window but 241 to 271 s (1.892), and a
+  follower's from 1.151 to 1.27 to 1.31. The first publication falls near
+  the end of the first window, so the 10 to 14% is the publications
+  starting, not history slowing the path.
 - **A publication grows with the position it represents:**
 
   | Records represented | Export (s) | Write (s) |
@@ -10758,7 +10762,17 @@ window.
 
   task-d51 moved the export off the domain thread, which is why the loop
   stays flat.
-- **For task-d27.** If what the publication exports grows by the rows the
-  trim reclaims (payload, executed, dependency and proposal rows) rather
-  than by the application's keys, the trim bounds it. Its first reading
-  is that split: the rows exported, by kind, at two positions.
+- **Its size.** The four publications' export and write sum to about 37
+  to 44 s against 304,000 commands, 0.12 to 0.14 ms a command a voter,
+  which is the step. That is about 16 to 26 µs a record represented: 12
+  to 18 to export, and a write that rises from about 3 to 10 µs a record
+  as the image grows. On the runner's 120 s register row, one publication
+  near 65,536 records would cost a voter about 1.1 to 1.7 s, 0.15 to 0.2
+  ms an operation over five voters.
+- **Who owns it.** task-d27's trim cannot be in the batch: trimming stays
+  off by default until task-d32, which needs task-d41's chain. So the
+  batch's lever is the publication's own cost (task-d92), starting from a
+  profile of one publication's `checkpoint` thread and a per-thread split
+  of the process's CPU per window. The trim stays the long-run bound, and
+  its first reading, the rows exported by kind at two positions, waits
+  for it.
