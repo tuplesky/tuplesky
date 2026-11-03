@@ -371,6 +371,7 @@ What the release rests on, today and with the change:
 **What the acceptance has to show,** before the rule is changed:
 - Crash tests at every cut between the decision, the release and the execution group's durability, in which every voter crashes at each cut, not only the releasing one: the result each voter executes after recovery is the one released.
 - A protocol-simulator oracle that compares each released result with what the voters execute after healing, over the sweep.
+- A simulator schedule that crashes the leader in part 1's window: after it has counted a fast quorum over its own proposal, and before that proposal batch is durable. The release rests on task-d89's gate there, and today only a model test pins it (`an_early_fast_quorum_commits_nothing_before_the_proposal_is_durable`). The sweep doesn't fail with the gate removed, since nothing in it crashes the leader in that window (#180 review).
 
 <a id="s4-6"></a>
 ### 4.6 Performance hypotheses
