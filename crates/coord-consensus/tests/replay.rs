@@ -210,7 +210,7 @@ fn acknowledged(f: &mut Follower, seq: u64) -> (CommandId, ProtocolMessage) {
         released.extend(f.step(d));
     }
     let sent = sends(&released);
-    assert_eq!(sent.len(), 3, "two peers and the frontend");
+    assert_eq!(sent.len(), 2, "the leader and the frontend (task-d74)");
     let (_, ack) = sent
         .into_iter()
         .find(|(to, _)| *to == FRONTEND.replica)
@@ -267,10 +267,10 @@ fn a_leader_publishes_its_reply_again_to_the_frontend_only() {
         released.extend(l.step(d));
     }
     let first = sends(&released);
-    // Two proposals and the reply, and the leader's adoption to both
-    // voters and the frontend: its acceptance rides in the proposal batch
+    // Two proposals and the reply, and the leader's adoption to the
+    // frontend (task-d74): its acceptance rides in the proposal batch
     // (task-d89).
-    assert_eq!(first.len(), 6, "{first:?}");
+    assert_eq!(first.len(), 4, "{first:?}");
     let to_frontend: Vec<ProtocolMessage> = first
         .iter()
         .filter(|(to, _)| *to == FRONTEND.replica)
