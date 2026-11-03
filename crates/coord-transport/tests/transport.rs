@@ -3266,3 +3266,172 @@ async fn a_voter_restarted_under_its_incarnation_is_linked_again_within_the_peer
         "r1 restarted was not linked to r0 within {bound:?} of its kill"
     );
 }
+
+/// A raw api caller of `role` that offers several deliveries a stream,
+/// or not, negotiated with the voter `acceptor`; with the connection the
+/// voter knows it by and whether the voter granted it (task-d88).
+async fn raw_api_caller(
+    f: &Fixture,
+    acceptor: &mut Transport,
+    role: PeerRole,
+    offers: bool,
+) -> (
+    quinn::Endpoint,
+    quinn::Connection,
+    quinn::SendStream,
+    coord_transport::ConnectionId,
+    bool,
+) {
+    let client = raw_client(f, &f.ids[1], ALPN_API);
+    let conn = client
+        .connect(acceptor.local_addr().unwrap(), &f.ids[0].name)
+        .unwrap()
+        .await
+        .unwrap();
+    let (mut control, _recv) = conn.open_bi().await.unwrap();
+    let mut caps = vec![Lane::Unary.capability()];
+    if offers {
+        caps.push(coord_transport::CAPABILITY_DELIVERIES_PER_STREAM);
+    }
+    control
+        .write_all(&hello_with(role, CLUSTER, None, caps))
+        .await
+        .unwrap();
+    match event(acceptor).await {
+        TransportEvent::Connected {
+            connection,
+            identity,
+            ..
+        } => {
+            let granted = identity
+                .capabilities
+                .contains(&coord_transport::CAPABILITY_DELIVERIES_PER_STREAM);
+            (client, conn, control, connection, granted)
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// The streams the voter opened toward a raw caller, until `frames`
+/// frames' bytes arrived, each as the bytes it carried.
+async fn delivery_streams(conn: &quinn::Connection, frames: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    let want: usize = frames.iter().map(Vec::len).sum();
+    let mut streams = Vec::new();
+    let mut got = 0;
+    while got < want {
+        // A voter's delivery rides a bidirectional stream it opens, as
+        // the api lane's streams all are; nothing comes back on it.
+        let (_send, mut recv) = timeout(Duration::from_secs(5), conn.accept_bi())
+            .await
+            .expect("a delivery stream within the deadline")
+            .unwrap();
+        let bytes = recv.read_to_end(1 << 20).await.unwrap();
+        got += bytes.len();
+        streams.push(bytes);
+    }
+    streams
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_voter_sends_a_collector_several_deliveries_a_stream_only_where_that_was_granted() {
+    let frames = numbered(5);
+    let whole: Vec<u8> = frames.concat();
+
+    // A collector that offers it is granted it, and what the voter
+    // queued for it in one turn goes on one stream, in order.
+    let f = fixture(&[PeerRole::Voter, PeerRole::Frontend]);
+    let mut voter = bind(&f, 0);
+    let (_client, conn, _control, connection, granted) =
+        raw_api_caller(&f, &mut voter, PeerRole::Frontend, true).await;
+    assert!(granted);
+    let sent = voter.send_many(Destination::Connection(connection), DOMAIN, frames.clone());
+    assert!(sent.iter().all(Result::is_ok));
+    assert_eq!(delivery_streams(&conn, &frames).await, vec![whole.clone()]);
+
+    // A collector that does not offer it, as a build before task-d88,
+    // is sent one frame a stream, as before.
+    let f = fixture(&[PeerRole::Voter, PeerRole::Frontend]);
+    let mut voter = bind(&f, 0);
+    let (_client, conn, _control, connection, granted) =
+        raw_api_caller(&f, &mut voter, PeerRole::Frontend, false).await;
+    assert!(!granted);
+    let sent = voter.send_many(Destination::Connection(connection), DOMAIN, frames.clone());
+    assert!(sent.iter().all(Result::is_ok));
+    let streams = delivery_streams(&conn, &frames).await;
+    assert_eq!(streams.len(), frames.len());
+    assert_eq!(sorted(streams), sorted(frames.clone()));
+
+    // A client is never granted it: what it is sent is answers on its
+    // own requests' streams, and nothing a client offers changes how
+    // the voter frames for it.
+    let f = fixture(&[PeerRole::Voter, PeerRole::Client]);
+    let mut voter = bind(&f, 0);
+    let (_client, _conn, _control, _connection, granted) =
+        raw_api_caller(&f, &mut voter, PeerRole::Client, true).await;
+    assert!(!granted);
+
+    // And a voter set to one frame a stream grants it to no one.
+    let f = fixture(&[PeerRole::Voter, PeerRole::Frontend]);
+    let single = Limits {
+        stream_frames: 1,
+        ..limits()
+    };
+    let mut voter = bind_with(&f, 0, single);
+    let (_client, _conn, _control, _connection, granted) =
+        raw_api_caller(&f, &mut voter, PeerRole::Frontend, true).await;
+    assert!(!granted);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_collector_reads_every_delivery_a_batched_stream_carries() {
+    // Both ends real: the collector dials, both grant it, and every
+    // frame of a turn's deliveries reaches the collector, in order,
+    // with the connection still up.
+    let f = fixture(&[PeerRole::Voter, PeerRole::Frontend]);
+    let mut voter = bind(&f, 0);
+    let mut collector = bind(&f, 1);
+    collector
+        .connect(
+            voter.local_addr().unwrap(),
+            &f.ids[0].name,
+            PeerRole::Frontend,
+            None,
+            Lane::Unary,
+            f.ids[0].expected(),
+        )
+        .await
+        .unwrap();
+    let connection = match event(&mut voter).await {
+        TransportEvent::Connected {
+            connection,
+            identity,
+            ..
+        } => {
+            assert!(
+                identity
+                    .capabilities
+                    .contains(&coord_transport::CAPABILITY_DELIVERIES_PER_STREAM)
+            );
+            connection
+        }
+        other => panic!("{other:?}"),
+    };
+    let frames = numbered(7);
+    let sent = voter.send_many(Destination::Connection(connection), DOMAIN, frames.clone());
+    assert!(sent.iter().all(Result::is_ok));
+    let mut got = Vec::new();
+    while got.len() < frames.len() {
+        match event(&mut collector).await {
+            TransportEvent::ApiDelivery { frame, .. } => got.push(frame.payload),
+            TransportEvent::Connected { .. } => {}
+            other => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(got, said(7));
+    assert!(
+        timeout(Duration::from_millis(300), collector.next_event())
+            .await
+            .is_err(),
+        "nothing more, and no close"
+    );
+}

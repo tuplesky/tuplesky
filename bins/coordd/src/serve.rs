@@ -3423,10 +3423,15 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     fn carry(&mut self, api: &Transport, out: coord_daemon::Outbound, provenance: PeerProvenance) {
         // A read's answer goes to the collector that sent the read, and
         // to no other (task-d50).
+        // What this step returns to collectors elsewhere goes to the
+        // transport together, a connection at a time (task-d88), so a
+        // link that carries several deliveries a stream takes the
+        // step's frames for it together.
+        let mut returned: BTreeMap<u64, Vec<Vec<u8>>> = BTreeMap::new();
         for (origin, bytes) in out.reads {
             match origin {
                 coord_daemon::voter::Origin::Connection(id) => {
-                    self.return_to_collector(api, id, &bytes);
+                    returned.entry(id).or_default().push(bytes);
                 }
                 coord_daemon::voter::Origin::Local => match one_frame(&bytes) {
                     Ok(frame) => self.on_frame_from_voter(provenance, &frame),
@@ -3435,7 +3440,10 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             }
         }
         for frame in out.frontend {
-            self.hand_to_collector(api, provenance, &frame);
+            self.hand_to_collector(provenance, frame, &mut returned);
+        }
+        for (id, frames) in returned {
+            self.return_to_collector(api, id, frames);
         }
         let mut turn = Vec::with_capacity(out.peer.len());
         for (to, frame) in out.peer {
@@ -3646,20 +3654,28 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     /// it to the collector in this process instead loses it, because
     /// that collector has never heard of the command. So it waits for
     /// the submission to say where it goes.
-    fn hand_to_collector(&mut self, api: &Transport, provenance: PeerProvenance, bytes: &[u8]) {
-        let Ok(frame) = one_frame(bytes) else {
+    ///
+    /// A frame for a collector elsewhere is added to `returned`, under
+    /// its connection, for the caller to send with the rest of its step.
+    fn hand_to_collector(
+        &mut self,
+        provenance: PeerProvenance,
+        bytes: Vec<u8>,
+        returned: &mut BTreeMap<u64, Vec<Vec<u8>>>,
+    ) {
+        let Ok(frame) = one_frame(&bytes) else {
             self.frontend.counts.unserved += 1;
             return;
         };
         match self.owed_to(&frame) {
             Some(coord_daemon::voter::Origin::Connection(id)) => {
-                self.return_to_collector(api, id, bytes);
+                returned.entry(id).or_default().push(bytes);
             }
             Some(coord_daemon::voter::Origin::Local) => {
                 self.on_frame_from_voter(provenance, &frame);
             }
             None => match command_of_frame(&frame) {
-                Some(command) => self.park(command, provenance, bytes),
+                Some(command) => self.park(command, provenance, &bytes),
                 // Not about a command at all: nothing can arrive later to
                 // say where it belongs, so this process is where it ends.
                 None => self.on_frame_from_voter(provenance, &frame),
@@ -3667,19 +3683,22 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         }
     }
 
-    /// Send a frame back to the collector on the other end of `id`.
-    fn return_to_collector(&mut self, api: &Transport, id: u64, bytes: &[u8]) {
-        let sent = api.send(
+    /// Send frames back to the collector on the other end of `id`, in
+    /// order, together (task-d88).
+    fn return_to_collector(&mut self, api: &Transport, id: u64, frames: Vec<Vec<u8>>) {
+        for frame in &frames {
+            count_returned(&mut self.frontend.counts.api_frames, frame);
+        }
+        let sent = api.send_many(
             coord_transport::Destination::Connection(coord_transport::ConnectionId(id)),
             self.frontend.membership.domain(),
-            bytes.to_vec(),
+            frames,
         );
-        match sent {
-            Ok(()) => {
-                self.frontend.counts.returned += 1;
-                count_returned(&mut self.frontend.counts.api_frames, bytes);
+        for result in sent {
+            match result {
+                Ok(()) => self.frontend.counts.returned += 1,
+                Err(_) => self.frontend.counts.unreturnable += 1,
             }
-            Err(_) => self.frontend.counts.unreturnable += 1,
         }
     }
 
@@ -3831,10 +3850,11 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             }
             self.frontend.counts.unclaimed += routed.unclaimed as u64;
         }
+        let mut returned: BTreeMap<u64, Vec<Vec<u8>>> = BTreeMap::new();
         for (origin, provenance, bytes) in routed.ready {
             match origin {
                 coord_daemon::voter::Origin::Connection(id) => {
-                    self.return_to_collector(api, id, &bytes);
+                    returned.entry(id).or_default().push(bytes);
                 }
                 coord_daemon::voter::Origin::Local => {
                     if let Ok(frame) = one_frame(&bytes) {
@@ -3842,6 +3862,9 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                     }
                 }
             }
+        }
+        for (id, frames) in returned {
+            self.return_to_collector(api, id, frames);
         }
     }
 

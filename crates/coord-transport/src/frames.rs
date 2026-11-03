@@ -23,6 +23,17 @@ pub const PEER_EVIDENCE_VERSION: u16 = 1;
 /// frame a stream, as before it existed.
 pub const CAPABILITY_FRAMES_PER_STREAM: u16 = 0x0020;
 
+/// The capability a collector's api-plane `Hello` offers to a voter, and
+/// the voter's `HelloAck` grants, when a stream the voter opens toward
+/// the collector may carry several frames one after another rather than
+/// exactly one (task-d88; registered in `spec/wire-v1.md`). Those streams
+/// carry what the voter returns to the collector that submitted: its
+/// evidence, its releases and its read answers. Each frame is unchanged,
+/// at most [`MAX_FRAMES_PER_STREAM`] share a stream, and a stream the
+/// collector opens -- a submission or a read, which may be answered on
+/// it -- still carries exactly one.
+pub const CAPABILITY_DELIVERIES_PER_STREAM: u16 = 0x0021;
+
 /// The most frames one peer stream may carry where
 /// [`CAPABILITY_FRAMES_PER_STREAM`] is granted. A stream with more is a
 /// protocol violation: the bound is the protocol's, not either end's

@@ -54,8 +54,8 @@ pub use endpoint::{
     TrafficReader, Transport, TransportError, TransportEvent,
 };
 pub use frames::{
-    CAPABILITY_FRAMES_PER_STREAM, FrameError, FrameStream, KIND_PEER_EVIDENCE,
-    MAX_FRAMES_PER_STREAM, evidence_frame,
+    CAPABILITY_DELIVERIES_PER_STREAM, CAPABILITY_FRAMES_PER_STREAM, FrameError, FrameStream,
+    KIND_PEER_EVIDENCE, MAX_FRAMES_PER_STREAM, evidence_frame,
 };
 pub use identity::{BindError, BoundIdentity, IdentityBinder, role_class};
 pub use lane::{Lane, LaneError, LaneLimits, lane_of_hello, role_lanes};

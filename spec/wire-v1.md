@@ -100,7 +100,8 @@ The first frame on the first bidirectional stream (the control stream) is
 that answer before it sends anything else. `Hello` must name the
 acceptor's cluster and domain and a role of the connection's class. The
 control stream then carries only `Close`. Every other stream carries
-exactly one frame and ends: peer evidence on unidirectional streams, unary
+exactly one frame and ends, except where a capability below says otherwise:
+peer evidence on unidirectional streams, unary
 requests and their responses on bidirectional streams. TLS 1.3 with the
 explicit AWS-LC provider, no application early data, no server-side
 migration.
@@ -157,9 +158,25 @@ violation. Where it is not granted, a peer stream carries exactly one
 frame, and a byte after it is a violation. The capability is never
 offered or granted on the API plane.
 
+Several deliveries a stream (task-d88): on the API plane, a collector's
+`Hello` (a role that may submit for clients: Frontend or KineCollector)
+may offer capability `0x0021`, and the voter that accepted grants it in
+`HelloAck` when it offers it too. Where it is granted, a stream the voter
+opens toward the collector, which carries what it returns to the
+collector that submitted (its evidence, releases and read answers),
+carries one or more frames back to back, at most 256, and ends after the
+last, under the same rules as `0x0020`'s: each frame is unchanged and
+takes its own class limit, frames on one stream are delivered in order,
+and a stream with no frame, one that ends inside a frame, or one with
+more than 256 frames closes the connection. A stream the collector opens
+(a submission or a read, which may be answered on it) still carries
+exactly one request. A client's `Hello` is never granted it, and where it
+is not granted a voter's stream carries exactly one frame, as before.
+
 | Capability | Meaning | Plane |
 |---|---|---|
 | `0x0020` | several peer-evidence frames on one stream, at most 256 | peer |
+| `0x0021` | several frames on one stream a voter opens toward a collector, at most 256 | API |
 
 ## Collector frames (task-33)
 

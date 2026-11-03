@@ -24,8 +24,9 @@ use tokio::time::{timeout, timeout_at};
 use crate::budget::{Budget, BudgetError, Opens};
 use crate::config::{ALPN_API, ALPN_PEER, Class, Limits, LocalIdentity, TlsProfile};
 use crate::frames::{
-    CAPABILITY_FRAMES_PER_STREAM, ControlStream, FrameError, FrameStream, KIND_PEER_EVIDENCE,
-    MAX_FRAMES_PER_STREAM, PEER_EVIDENCE_VERSION, read_frame_within,
+    CAPABILITY_DELIVERIES_PER_STREAM, CAPABILITY_FRAMES_PER_STREAM, ControlStream, FrameError,
+    FrameStream, KIND_PEER_EVIDENCE, MAX_FRAMES_PER_STREAM, PEER_EVIDENCE_VERSION,
+    read_frame_within,
 };
 use crate::identity::{BoundIdentity, IdentityBinder, role_class};
 use crate::lane::{self, Lane, LaneLimits, lane_of_hello, role_lanes};
@@ -451,6 +452,13 @@ struct Peer {
     /// from the same negotiated set, so the sender batches exactly where
     /// the receiver reads a batch.
     batched: bool,
+    /// Whether a stream the accepting end of this api connection opens
+    /// may carry several frames: a collector's link to a voter whose two
+    /// ends granted [`CAPABILITY_DELIVERIES_PER_STREAM`] (task-d88). The
+    /// voter, which accepted, sends its deliveries that way, and the
+    /// collector, which dialed, reads them; a stream the collector opens
+    /// still carries one.
+    deliveries_batched: bool,
 }
 
 impl Peer {
@@ -479,6 +487,10 @@ impl Peer {
                 && identity
                     .capabilities
                     .contains(&CAPABILITY_FRAMES_PER_STREAM),
+            deliveries_batched: class == Class::Api
+                && identity
+                    .capabilities
+                    .contains(&CAPABILITY_DELIVERIES_PER_STREAM),
             identity,
         })
     }
@@ -1037,6 +1049,14 @@ impl Dialer {
         // end is set to send one (task-d61).
         if role_class(local_role) == Class::Peer && shared.limits.stream_frames > 1 {
             capabilities.push(CAPABILITY_FRAMES_PER_STREAM);
+        }
+        // And on a collector's link to a voter, for what the voter
+        // returns to it (task-d88).
+        if role_class(local_role) == Class::Api
+            && local_role.may_submit_for_clients()
+            && shared.limits.stream_frames > 1
+        {
+            capabilities.push(CAPABILITY_DELIVERIES_PER_STREAM);
         }
         capabilities.sort_unstable();
         capabilities.dedup();
@@ -1835,7 +1855,11 @@ async fn sender_loop(shared: Arc<Shared>, link: Arc<Link>, peer: Arc<Peer>) {
     // configured frames and bytes, where the link grants it; one frame
     // elsewhere. The bytes never exceed what either budget can hold, so
     // a batch is never refused as too large when its frames were not.
-    let (most_frames, most_bytes) = if peer.batched {
+    // On an api link only the accepting end batches, and only where the
+    // collector granted it (task-d88): a stream the dialer opens is a
+    // request, which may be answered on it, and carries one frame.
+    let batches = peer.batched || (peer.deliveries_batched && peer.accepted);
+    let (most_frames, most_bytes) = if batches {
         (
             shared.limits.stream_frames.clamp(1, MAX_FRAMES_PER_STREAM),
             shared
@@ -2181,6 +2205,10 @@ async fn negotiate_incoming(
                 || (*c == CAPABILITY_FRAMES_PER_STREAM
                     && class == Class::Peer
                     && shared.limits.stream_frames > 1)
+                || (*c == CAPABILITY_DELIVERIES_PER_STREAM
+                    && class == Class::Api
+                    && hello.role.may_submit_for_clients()
+                    && shared.limits.stream_frames > 1)
         })
         .collect();
     granted.push(lane.capability());
@@ -2499,38 +2527,67 @@ async fn read_delivery(
     permit: tokio::sync::OwnedSemaphorePermit,
 ) {
     let _held = permit;
-    match read_frame_within(
-        &mut recv,
-        shared.limits.frame_timeout,
-        true,
-        Some((&shared.receive_budget, peer.lane)),
-    )
-    .await
-    {
-        Ok(frame) => {
-            shared
-                .emit(TransportEvent::ApiDelivery {
-                    connection: peer.id,
-                    lane: peer.lane,
-                    // The same binding the connection was admitted
-                    // under, not anything the frame says.
-                    provenance: peer.identity.replica.and_then(|replica| {
-                        peer.identity.incarnation.map(|incarnation| {
-                            PeerProvenance::from_transport(replica, incarnation, peer.id.0)
-                        })
-                    }),
-                    identity: peer.identity.clone(),
-                    frame,
-                })
-                .await;
+    let budget = Some((&shared.receive_budget, peer.lane));
+    // A link whose voter was granted several deliveries a stream sends
+    // them back to back (task-d88); any other sends exactly one, and a
+    // byte after it is a violation, as it always was.
+    if !peer.deliveries_batched {
+        match read_frame_within(&mut recv, shared.limits.frame_timeout, true, budget).await {
+            Ok(frame) => emit_delivery(&shared, &peer, frame).await,
+            Err(FrameError::Stream(_)) => {}
+            Err(e) => close_on(&peer, frame_reason(e)),
         }
-        Err(FrameError::Stream(_)) => {}
-        Err(e) => {
-            let reason = frame_reason(e);
-            *peer.close_reason.lock().unwrap() = Some(reason.clone());
-            peer.conn.close(VarInt::from_u32(reason.code() as u32), b"");
+        return;
+    }
+    let mut stream = FrameStream::new(recv);
+    let mut read = 0usize;
+    loop {
+        match stream.next_frame(shared.limits.frame_timeout, budget).await {
+            Ok(Some(frame)) => {
+                read += 1;
+                if read > MAX_FRAMES_PER_STREAM {
+                    close_on(
+                        &peer,
+                        CloseReason::Malformed(format!(
+                            "more than {MAX_FRAMES_PER_STREAM} frames on a delivery stream"
+                        )),
+                    );
+                    return;
+                }
+                emit_delivery(&shared, &peer, frame).await;
+            }
+            // An empty stream carried no frame at all: as truncated as
+            // one that ended inside its frame.
+            Ok(None) if read == 0 => {
+                close_on(&peer, frame_reason(FrameError::Truncated));
+                return;
+            }
+            Ok(None) | Err(FrameError::Stream(_)) => return,
+            Err(e) => {
+                close_on(&peer, frame_reason(e));
+                return;
+            }
         }
     }
+}
+
+/// Hand one frame a voter delivered on an api connection inward.
+async fn emit_delivery(shared: &Shared, peer: &Peer, frame: coord_types::wire_v1::Frame) {
+    shared
+        .emit(TransportEvent::ApiDelivery {
+            connection: peer.id,
+            lane: peer.lane,
+            // The same binding the connection was admitted under, not
+            // anything the frame says.
+            provenance: peer.identity.replica.and_then(|replica| {
+                peer.identity.incarnation.map(|incarnation| {
+                    PeerProvenance::from_transport(replica, incarnation, peer.id.0)
+                })
+            }),
+            identity: peer.identity.clone(),
+            frame,
+        })
+        .await;
 }
 
 async fn read_request(
