@@ -2935,10 +2935,47 @@ This entry is the budget and the record, not a lever:
   - **Projected:** a barrier read's 6.9 ms wait for its index is the in-flight writes' latency, so L3 and L4 shorten reads too. After L1 to L4 a write is one sync, at the leader and the followers in parallel, plus about two hops: roughly 3 to 4 ms on the runner before queueing, etcd's shape. p99 within etcd's spread then rests on L6, and perhaps a revised target, decided from the batch's local readings.
   - **The readings that size the levers no task owned,** all local but R4: R1 for task-d73 and task-d86, R2 for task-d92 (and task-d27's split, for the long run), R3 for task-d88, and R4 for task-d91, read from the runner's summary on the batch's base side with no extra run (the summary column is the testing session's).
   - **If the projection falls short** of 2.8 ms or of etcd's p99 once the local readings are in, which is now likely for the CPU target, the target is revised under this entry's clause, with the reason beside it, rather than run again to find out.
+- **The batch, as built (task-d72's batch record).** Each lever's local reading is in its own PR. The tables above stay as they were sized; this is what the readings made of them.
+
+  | # | Lever | Owner | Outcome | Size (ms an operation) | Running total before overlap (ms) |
+  | --- | --- | --- | --- | --- | --- |
+  | C1 | Threshold 8 as the acknowledgement cadence's default | task-d70's second step (#155) | Built, merged | −0.15, measured | 3.43 |
+  | C2 | Acknowledgements to the leader and the frontend only | task-d74 (#167) | Built, now on the stack, with L3 stacked on it | about −0.16 (−4.5% locally) | 3.27 |
+  | C3 | A turn takes every ready event before it lowers | task-d73 (#182) | R1: no group ends while events are ready, over 98% of flushes find nothing ready. The bounded wait is not taken | 0 | 3.27 |
+  | C4 | Fewer projection commits per command | task-d86 | Re-sized by R1 (#182): the materializer's cost is about 60 µs a commit and 115 µs a record, so per record more than per commit. Not built; it waits for the runner's group sizes (#98) | −0.03 to −0.09, not in the batch | 3.27 |
+  | C5 | The inbound path without a task per stream | task-d70's third step (#183) | Measured, not kept: the tokio workers' share and CPU a command don't move, and their wake-ups fall 3 to 8% | 0 | 3.27 |
+  | C6 | The leader's lookups as hash maps, broadcasts from one buffer | task-d60's third step | Not built: B-tree searches are 1 to 2% of a leader's samples locally after task-d75 | −0.02 to −0.04, not in the batch | 3.27 |
+  | C7 | Held reads share one confirmation round | task-d87 | Not built: R1 reads 1.15 reads a round at 10 callers and 2.3 at 30, so rounds are already shared | −0.02 to −0.04, not in the batch | 3.27 |
+  | C8 | `load_authorization` once a session | task-d60's third step | Not built: 0.8% of a leader's samples locally | about −0.02, not in the batch | 3.27 |
+  | C9 | The api plane's datagrams | task-d88 | R3 not read | unknown | |
+  | C10 | A local checkpoint publication's cost a record | task-d92 (#184) | Built: about 30% less a record, and 2 to 3.6% less process CPU a command at every voter, at R2's setup | about −0.05 | 3.22 |
+
+  | # | Lever | Owner | Outcome |
+  | --- | --- | --- | --- |
+  | L1 | Read-only transactions at the barrier | task-d83 (#176) | Built; on the stack, so in the next carry |
+  | L2 | The `replay` profile | a run setting | Read on both sides |
+  | L3 | A fresh proposal's acceptance in its proposal batch | task-d89 (#180) | Built: the leader's syncs a command fall from 2.91 to 2.00 at one caller, and 14 to 18% at ten |
+  | L4 | Release before the execution group is durable | task-d90 | The design step is up for review (#181); no code before it is accepted |
+  | L5 | Held reads share one confirmation round | task-d87 | Not built (C7) |
+  | L6 | Wake and hop latency | task-d91 | R4 is read from the batch's base side |
+
+  - **Projected for the register row:** about 3.22 ms an operation, against the #173 carry's 3.58, from C1, C2 and C10. Every lever left out, each at the top of its size, would bring it to about 3.03. So no lever on record reaches 2.8 ms in this batch.
+  - **The CPU target is revised for this batch under the entry's clause.** The batch's target is the projection: the register row at or under 3.25 ms an operation, about 10% under the carry, with `ok`/s not lower. 2.8 ms stays the entry's target. The rest of the gap is named with its owners, from the runner's split (tokio workers 1.45 ms, domain loops 1.28, the rest about 0.85):
+    - **The voters' tokio workers:** their cost is per datagram, not per stream task (C5). Owners: task-d91 (R4, where they wait) and task-d88 (R3, the api plane's datagrams).
+    - **The materializer:** its cost is per record (R1). task-d86 now starts from a profile of a record's cost, not from the commit cadence.
+    - **The domain loops:** task-d60's third step (C6, C8) and task-d87 (C7), each small on its own.
+    - **A publication's export,** now led by redb's scan (task-d92's head profile). That is the engine's cost, with no owner yet; task-d27's trim stays the long-run bound.
+  - **The `service` p99 target is not projected to be met by this batch,** and is revised to a reading. L3 removes one of the leader's syncs in series, about 2.3 ms on the runner. L1 is already in the next carry. L4, the long pole, comes after its review. So the batch reads p50 and p99 at `replay` and `strict` on both sides as L3's step. Whether it is within etcd's spread rests on L4 and L6, in the batch after.
 - **How the runner is used from here (#174 review):**
   - **No more single-lever performance pairs on the runner.** Each lever gets its local pair and its simulator sweep in its own PR. Where a lever's acceptance names a runner pair, the batch job is that pair.
   - **One batch job, once the batch is projected to close the gap:** this record puts the head at or under 2.8 ms from the local pairs, with task-d89 and task-d90 built, or the target has been revised. The job then confirms the gap closed rather than reporting a step toward it.
   - **Sides:** the base is the next carry, with #155's default in it, since C1 is measured. The head is that and every other built lever: C2, C4 to C8, C10, L3 and L4; C9 if R3 finds one, and task-d73's wait only if its sizing takes it.
+    - **As built (the batch record):** the base is the next carry, `claude/task-d84-journal-syncs` (#179) with #178. The head is the base with three branches merged in:
+      - `claude/task-d89-accept-in-proposal` (#180, L3). It now stacks on `claude/task-d74-acks-to-leader` (#167, C2), which holds the stack. The two levers both change what the leader sends and journals, so they are reconciled and swept as one.
+      - `claude/task-d92-publication-cost` (#184, C10).
+      - `claude/task-d73-group-ends` (#182), which only adds R1's counters, so the summary can read flushes by cause.
+
+      #181 and #183 are docs only. #184 and #182 sit directly on the stack and touch no code the others do. The only conflicts in the merge are the notes' sections, which each branch appends at the end of the notes; both are kept.
   - **Runs:** three register pairs, and `service` at `replay` and at `strict` on both sides, with the call graph on one pair, a follower's tokio threads included.
   - **Before the batch,** only the next carry's leader-kill run. It is not a lever pair: it checks task-d82's liveness target and carries #178's safety fix, and nothing in the batch changes it.
 - **The record:** the table below, one row a lever, each row a pair on the runner.
