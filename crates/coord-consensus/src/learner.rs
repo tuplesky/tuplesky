@@ -135,6 +135,21 @@ impl Learner {
         table: &mut CommandTable,
         votes: &BTreeMap<CommandId, VoteSet>,
     ) -> Vec<CommandId> {
+        self.commit_learned_where(table, votes, |_| true)
+    }
+
+    /// [`Learner::commit_learned`], over the accepted commands `eligible`
+    /// admits only. A leader commits its fresh proposal only once its
+    /// proposal batch is durable, since its own fast vote is that
+    /// proposal (task-d89): a follower's acknowledgement can arrive
+    /// before it, and a fast quorum counted over a volatile proposal is
+    /// one a restarted leader's report would deny.
+    pub fn commit_learned_where(
+        &mut self,
+        table: &mut CommandTable,
+        votes: &BTreeMap<CommandId, VoteSet>,
+        eligible: impl Fn(&CommandId) -> bool,
+    ) -> Vec<CommandId> {
         let mut committed = Vec::new();
         loop {
             // The commands at ACCEPT, not every vote set held: executed
@@ -145,6 +160,7 @@ impl Learner {
             let candidates: Vec<(CommandId, Learned)> = table
                 .in_accept()
                 .into_iter()
+                .filter(|c| eligible(c))
                 .filter_map(|c| {
                     let v = votes.get(&c)?;
                     let learned = match self.mode {
