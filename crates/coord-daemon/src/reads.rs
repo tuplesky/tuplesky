@@ -399,9 +399,10 @@ pub enum Evaluated {
 /// path would not execute as new work -- a retry, a request outside its
 /// session's window, a session that is unknown or retired -- is left to
 /// it, and so is a request past half its session's window, which the
-/// ordered path must retire behind, and so is any plan that is not a range result: a refusal is an
-/// outcome the ordered path records, and recording it is not this
-/// path's to skip.
+/// ordered path must retire behind, and so is any plan that is not a
+/// read's result, a range's or a read-only transaction's (task-d83): a
+/// refusal is an outcome the ordered path records, and recording it is
+/// not this path's to skip.
 pub fn evaluate<V: OrderedRead>(gated: &GatedView<V>, held: &Held) -> Evaluated {
     let Some(required) = held.required else {
         return Evaluated::NotYet;
@@ -454,12 +455,25 @@ pub fn evaluate<V: OrderedRead>(gated: &GatedView<V>, held: &Held) -> Evaluated 
     let Ok(planned) = plan(logical, &view, &PlanLimits::default()) else {
         return Evaluated::NotServable;
     };
-    if !matches!(planned.response.outcome, coord_state::Outcome::Range { .. }) {
+    if !read_only(&planned.response.outcome) {
         return Evaluated::NotServable;
     }
     match postcard::to_allocvec(&planned.response) {
         Ok(bytes) => Evaluated::Served(bytes),
         Err(_) => Evaluated::NotServable,
+    }
+}
+
+/// Whether `outcome` is a read's: a range result, or a transaction's whose
+/// every result is one (task-d83). Anything else is an outcome the ordered
+/// path records.
+fn read_only(outcome: &coord_state::Outcome) -> bool {
+    match outcome {
+        coord_state::Outcome::Range { .. } => true,
+        coord_state::Outcome::Txn { results, .. } => results
+            .iter()
+            .all(|r| matches!(r, coord_state::Outcome::Range { .. })),
+        _ => false,
     }
 }
 
@@ -550,7 +564,84 @@ mod tests {
             lease: None,
             prev_kv: false,
         });
-        assert!(!servable(&LogicalRequest::new(NamespaceId([5; 16]), put)));
+        assert!(!servable(&LogicalRequest::new(
+            NamespaceId([5; 16]),
+            put.clone()
+        )));
+    }
+
+    /// task-d83: a transaction with no compares and no failure branch,
+    /// whose every branch is a current range, is a read of many keys at
+    /// one point, which the barrier argument covers as it covers one
+    /// range. Anything else in a transaction stays ordered.
+    #[test]
+    fn a_read_only_transaction_of_current_ranges_is_served() {
+        use coord_types::logical_v1::{
+            BranchOp, Compare, CompareOperand, CompareResult, CompareTarget, TxnOp,
+        };
+        let CanonicalOperation::Range(current) = range() else {
+            unreachable!()
+        };
+        let mut other = current.clone();
+        other.range.key = b"j".to_vec();
+        let txn = |compares: Vec<Compare>, success: Vec<BranchOp>, failure: Vec<BranchOp>| {
+            LogicalRequest::new(
+                NamespaceId([5; 16]),
+                CanonicalOperation::Txn(TxnOp {
+                    compares,
+                    success,
+                    failure,
+                }),
+            )
+        };
+        let reads = vec![
+            BranchOp::Range(current.clone()),
+            BranchOp::Range(other.clone()),
+        ];
+        assert!(servable(&txn(Vec::new(), reads.clone(), Vec::new())));
+
+        let mut historical = other;
+        historical.revision = Some(coord_types::ids::KvRevision::new(3).unwrap());
+        let put = PutOp {
+            key: b"k".to_vec(),
+            value: b"v".to_vec(),
+            lease: None,
+            prev_kv: false,
+        };
+        let compare = Compare {
+            key: b"k".to_vec(),
+            target: CompareTarget::Version,
+            result: CompareResult::Equal,
+            operand: CompareOperand::Counter(0),
+        };
+        for (why, request) in [
+            (
+                "a compare decides on state",
+                txn(vec![compare], reads.clone(), Vec::new()),
+            ),
+            (
+                "a failure branch",
+                txn(Vec::new(), reads.clone(), reads.clone()),
+            ),
+            (
+                "a write",
+                txn(
+                    Vec::new(),
+                    vec![BranchOp::Range(current.clone()), BranchOp::Put(put)],
+                    Vec::new(),
+                ),
+            ),
+            (
+                "a historical range",
+                txn(
+                    Vec::new(),
+                    vec![BranchOp::Range(current), BranchOp::Range(historical)],
+                    Vec::new(),
+                ),
+            ),
+        ] {
+            assert!(!servable(&request), "{why}");
+        }
     }
 
     #[test]

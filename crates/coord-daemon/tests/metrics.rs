@@ -434,7 +434,7 @@ fn a_rendered_snapshot_carries_no_secret_or_key_shaped_text() {
                 commands: 1150,
                 predecessors: Duration::from_millis(900),
                 group: Duration::from_millis(300),
-                projection: Duration::from_millis(2100),
+                journal: Duration::from_millis(2100),
             },
             traffic: Measure::Observed(Traffic {
                 sent_frames: 9000,
