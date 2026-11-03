@@ -921,6 +921,9 @@ pub struct Domain<P: Persistence> {
     /// The other voters, where this process votes. `None` for a process
     /// that does not, and for a domain with nobody else in it.
     plane: Option<PeerPlane>,
+    /// What the api plane's transport carried, read beside the peer
+    /// plane's (task-d70). Taken when the loop starts serving on it.
+    api_traffic: Option<coord_transport::TrafficReader>,
     /// The other voters, as somewhere to submit to. Empty for a domain
     /// with nobody else in it, and for a process whose frontend holds no
     /// collector credential to submit with.
@@ -1580,6 +1583,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             housekeeping: None,
             durable_projection: None,
             plane: None,
+            api_traffic: None,
             links: CollectorLinks::new(Vec::new()),
             expiry: None,
             asked: None,
@@ -1710,6 +1714,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 Measure::Observed,
             ),
             projection_commits: storage.lowering.commits,
+            journal_groups: journal_groups(&storage.lowering.groups),
             busy,
             uptime: now.saturating_duration_since(self.started),
             recent,
@@ -1724,6 +1729,11 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 Measure::Unavailable(Unavailable::NotInstrumented),
                 |plane| {
                     let t = plane.traffic();
+                    let api = self
+                        .api_traffic
+                        .as_ref()
+                        .map(|reader| reader.read().api)
+                        .unwrap_or_default();
                     Measure::Observed(Traffic {
                         sent_frames: t.sent_frames,
                         sent_bytes: t.sent_bytes,
@@ -1738,6 +1748,13 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                         received_frames: t.received_frames,
                         received_bytes: t.received_bytes,
                         received_streams: t.received_streams,
+                        api: coord_daemon::metrics::Datagrams {
+                            datagrams_sent: api.datagrams_sent,
+                            datagrams_received: api.datagrams_received,
+                            send_calls: api.send_calls,
+                            acks_sent: api.acks_sent,
+                            acks_received: api.acks_received,
+                        },
                     })
                 },
             ),
@@ -1986,6 +2003,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         // deaf to the domain it had come back to -- and a submission
         // arriving first was always correct anyway, since an unreachable
         // voter contributes nothing and the quorum rule decides.
+        self.api_traffic = Some(transport.traffic_reader());
         let now = std::time::Instant::now();
         if let Some(plane) = &mut self.plane {
             plane.redial.start(now);
@@ -4911,7 +4929,20 @@ fn release(split: &coord_daemon::learned::ReleaseSplit) -> coord_daemon::metrics
         commands: split.commands,
         predecessors: split.predecessors,
         group: split.group,
-        projection: split.projection,
+        journal: split.journal,
+    }
+}
+
+/// The snapshot's reading of what the journal groups held (task-d84).
+fn journal_groups(mix: &coord_storage::GroupMix) -> coord_daemon::metrics::JournalGroups {
+    coord_daemon::metrics::JournalGroups {
+        protocol: mix.protocol,
+        application: mix.application,
+        both: mix.both,
+        other: mix.other,
+        protocol_records: mix.protocol_records,
+        payload_records: mix.payload_records,
+        application_records: mix.application_records,
     }
 }
 
@@ -5136,8 +5167,7 @@ fn endpoint(
     // The transport's limits are its own (streams, windows, deadlines);
     // the semantic limits the configuration states are the frontend's,
     // and are enforced where the meaning is, not at the framing.
-    #[allow(unused_mut)]
-    let mut limits = coord_transport::Limits::default();
+    let mut limits = coord_transport::Limits::node();
     // A test build can shorten the connection age cap, so the test that
     // shows a capped connection is dialled again (task-d03) does not wait
     // the twelve hours a real one lasts. Compiled out of a release build:
@@ -5160,8 +5190,44 @@ fn endpoint(
     {
         limits.stream_frames = frames.max(1);
     }
+    // The acknowledgement cadence asked of every peer and caller
+    // (task-d70), overridden from the environment for the same reason, on
+    // both planes: `<threshold>`, `<threshold>,<max delay in
+    // microseconds>`, or `off` for QUIC's own cadence, the control.
+    // Unset, the transport's default.
+    if let Ok(value) = std::env::var("COORDD_ACK_FREQUENCY") {
+        match ack_frequency(&value) {
+            Some(ack) => limits.ack_frequency = ack,
+            None => eprintln!(
+                "COORDD_ACK_FREQUENCY={value:?} is not <threshold>, \
+                 <threshold>,<max delay in microseconds> or off: \
+                 the default acknowledgement cadence is kept"
+            ),
+        }
+    }
     Transport::with_socket(socket, identity, std::sync::Arc::new(binder), limits)
         .map_err(|e| TransportError::Endpoint(format!("{e:?}")))
+}
+
+/// An acknowledgement cadence written `<threshold>`, which keeps the
+/// peer's own delay, `<threshold>,<max delay in microseconds>`, or `off`,
+/// which asks nothing (task-d70). `None` is a malformed value.
+fn ack_frequency(value: &str) -> Option<Option<coord_transport::AckFrequency>> {
+    let value = value.trim();
+    if value == "off" {
+        return Some(None);
+    }
+    let (threshold, delay) = match value.split_once(',') {
+        Some((threshold, delay)) => (
+            threshold,
+            Some(std::time::Duration::from_micros(delay.trim().parse().ok()?)),
+        ),
+        None => (value, None),
+    };
+    Some(Some(coord_transport::AckFrequency {
+        threshold: threshold.trim().parse().ok()?,
+        max_delay: delay,
+    }))
 }
 
 /// Why the endpoint could not be built.
@@ -6014,6 +6080,41 @@ mod tests {
         // `owes_flush` already leaves out what waits on the append.
         assert!(flush_due(0, true, true, FLUSH_EVENTS));
         assert!(!flush_due(0, false, true, FLUSH_EVENTS - 1));
+    }
+
+    #[test]
+    fn an_acknowledgement_cadence_is_a_threshold_and_a_delay_or_off() {
+        use coord_transport::AckFrequency;
+        assert_eq!(
+            super::ack_frequency("4, 2000"),
+            Some(Some(AckFrequency {
+                threshold: 4,
+                max_delay: Some(std::time::Duration::from_millis(2)),
+            }))
+        );
+        // A threshold alone keeps the peer's own delay.
+        assert_eq!(
+            super::ack_frequency("8"),
+            Some(Some(AckFrequency {
+                threshold: 8,
+                max_delay: None,
+            }))
+        );
+        assert_eq!(super::ack_frequency("8"), Some(Some(AckFrequency::DEFAULT)));
+        // `off` asks nothing: QUIC's own cadence, the control.
+        assert_eq!(super::ack_frequency(" off "), Some(None));
+        for malformed in [
+            "",
+            "4,",
+            ",2000",
+            "four,2000",
+            "4,2ms",
+            "-1,2000",
+            "of",
+            "none",
+        ] {
+            assert_eq!(super::ack_frequency(malformed), None, "{malformed:?}");
+        }
     }
 
     #[test]

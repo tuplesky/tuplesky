@@ -30,7 +30,7 @@ use coord_types::{CommandId, RetryKey};
 
 use coord_core::event::AdmittedRequest;
 use coord_types::ids::{Ballot, ReplicaId};
-use coord_types::logical_v1::{CanonicalOperation, LogicalRequest};
+use coord_types::logical_v1::{BranchOp, CanonicalOperation, LogicalRequest, RangeOp};
 use coord_types::wire_v1::{OutcomeV1, RequestV1, ResponseV1};
 
 use crate::admission::{Admission, AdmissionRefusal, Caller};
@@ -59,10 +59,23 @@ pub struct Delivery {
 pub const READ_FALLBACK_MILLIS: u64 = 1_500;
 
 /// Whether the leader read barrier serves `request` (task-d50; design
-/// Section 6.3): a range with no explicit revision. A historical read is
-/// not current, and every other operation changes state.
+/// Section 6.3): a range with no explicit revision, or a transaction with
+/// no compares and no failure branch whose every branch is one (task-d83).
+/// A historical read is not current, and every other operation changes
+/// state or decides on one.
 pub fn servable(request: &LogicalRequest) -> bool {
-    matches!(&request.operation, CanonicalOperation::Range(r) if r.revision.is_none())
+    let current = |r: &RangeOp| r.revision.is_none();
+    match &request.operation {
+        CanonicalOperation::Range(r) => current(r),
+        CanonicalOperation::Txn(t) => {
+            t.compares.is_empty()
+                && t.failure.is_empty()
+                && t.success
+                    .iter()
+                    .all(|op| matches!(op, BranchOp::Range(r) if current(r)))
+        }
+        _ => false,
+    }
 }
 
 /// A read for the leader the collector follows (task-d50).

@@ -147,7 +147,7 @@ class ReduceTests(unittest.TestCase):
         observed["unordered"] = {"pending": 1, "reordered": 1, "oldest": duration(30)}
         observed["release"] = {
             "commands": 20, "predecessors": duration(0.04), "group": duration(0.02),
-            "projection": duration(0.1),
+            "journal": duration(0.1),
         }
         reading = cost.per_command("n1", snap)
         paths = reading["fast_path"]
@@ -156,7 +156,11 @@ class ReduceTests(unittest.TestCase):
         self.assertEqual((paths["acks"], paths["acks_reordered"]), (26, 19))
         self.assertEqual(reading["unordered"]["oldest_seconds"], 30)
         self.assertAlmostEqual(reading["release"]["predecessors_ms"], 2.0)
-        self.assertAlmostEqual(reading["release"]["projection_ms"], 5.0)
+        self.assertAlmostEqual(reading["release"]["journal_ms"], 5.0)
+        # A binary of before task-d83 names the journal wait `projection`.
+        observed["release"]["projection"] = observed["release"].pop("journal")
+        self.assertAlmostEqual(
+            cost.per_command("n1", snap)["release"]["journal_ms"], 5.0)
         observed["fast_path"]["missed_path"] = 14
         self.assertFalse(cost.per_command("n1", snap)["fast_path"]["reasons_sum"])
         self.assertNotIn("release", cost.per_command("n1", snapshot()))
@@ -169,6 +173,8 @@ class ReduceTests(unittest.TestCase):
             "sent_lost_streams": 1, "datagrams_sent": 500, "datagrams_received": 450,
             "send_calls": 480, "acks_sent": 200, "acks_received": 210,
             "received_frames": 880, "received_bytes": 190000, "received_streams": 880,
+            "api": {"datagrams_sent": 400, "datagrams_received": 390, "send_calls": 395,
+                    "acks_sent": 150, "acks_received": 160},
         }}
         jobs = lambda n, q, s, c: {"count": n, "queued": duration(q), "served": duration(s),
                                    "completed": duration(c)}
@@ -183,6 +189,8 @@ class ReduceTests(unittest.TestCase):
         self.assertAlmostEqual(traffic["sent_frames"], 9.0)
         self.assertAlmostEqual(traffic["received_bytes"], 1900.0)
         self.assertAlmostEqual(traffic["sent_lost"], 0.02)
+        self.assertAlmostEqual(traffic["api_datagrams_sent"], 4.0)
+        self.assertAlmostEqual(traffic["api_acks_sent"], 1.5)
         self.assertAlmostEqual(reading["frames_per_stream_sent"], 3.0)
         self.assertAlmostEqual(reading["frames_per_stream_received"], 1.0)
         self.assertAlmostEqual(reading["frames_per_lost_stream"], 2.0)
@@ -194,6 +202,25 @@ class ReduceTests(unittest.TestCase):
         self.assertIn("9.00/8.80 (3.00/8.80)", table)
         self.assertIn("5.00/4.50 (4.80, 2.00)", table)
         self.assertNotIn("traffic_per_command", cost.per_command("n1", snapshot()))
+
+    def test_journal_groups_are_read_per_command_when_reported(self):
+        snap = snapshot(executed=100, appends=180, syncs=190)
+        snap["cost"]["Observed"]["journal_groups"] = {
+            "protocol": 90, "application": 60, "both": 20, "other": 10,
+            "protocol_records": 330, "payload_records": 100, "application_records": 100,
+        }
+        reading = cost.per_command("n1", snap)
+        groups = reading["groups_per_command"]
+        self.assertAlmostEqual(groups["protocol"], 0.9)
+        self.assertAlmostEqual(groups["both"], 0.2)
+        self.assertAlmostEqual(groups["not_a_group"], 0.1)
+        self.assertAlmostEqual(reading["protocol_records_per_group"], 3.0)
+        self.assertAlmostEqual(reading["commands_per_execution_group"], 1.25)
+        self.assertAlmostEqual(reading["payload_records_per_command"], 1.0)
+        table = cost.groups_table({"runs": [{"callers": 1, "voters": [reading]}]})
+        self.assertIn("| 1 | n1 | 1.900 | 0.900 | 0.600 | 0.200 | 0.100 | 0.100 "
+                      "| 3.30 (1.00) | 3.00 | 1.25 |", table)
+        self.assertNotIn("groups_per_command", cost.per_command("n1", snapshot()))
 
     def test_a_run_with_no_fast_decision_is_a_finding(self):
         def voter(fast):

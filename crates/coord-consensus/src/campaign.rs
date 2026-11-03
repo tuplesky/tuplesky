@@ -189,6 +189,31 @@ impl Campaign {
             .collect()
     }
 
+    /// The voters to ask for their promise again (task-d82): every voter
+    /// of the ballot whose promise has not arrived, the candidate
+    /// excluded, once its own promise is durable (its report is taken
+    /// then, as the first `NewLeader` waited for) and until the selection
+    /// is made.
+    ///
+    /// A `NewLeader` is published once, and one sent on a connection its
+    /// peer was closing is lost: a voter restarted under its incarnation
+    /// is linked for a moment by each dial its peers then close, and a
+    /// campaign it starts in that moment reached nobody. Nothing asked
+    /// again, so the campaign held the voter until the election replaced
+    /// it at its ceiling, 16 s later.
+    pub fn unpromised(&self) -> Vec<ReplicaId> {
+        if self.decision.is_some() || self.own.is_none() {
+            return Vec::new();
+        }
+        let me = self.config.leader();
+        self.config
+            .voters()
+            .iter()
+            .filter(|r| **r != me && !self.promised.contains(r))
+            .copied()
+            .collect()
+    }
+
     /// The commands whose durable dependency rows the selection last
     /// waited on (task-d77): ones the candidate executed and forgot that a
     /// voter behind still reports below COMMIT.

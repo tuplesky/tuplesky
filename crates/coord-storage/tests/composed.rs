@@ -1215,6 +1215,13 @@ fn a_group_of_commands_lowers_once_and_matches_applying_them_one_at_a_time() {
         1,
         "one projection commit"
     );
+    // What the group held, by its records (task-d84): one group of
+    // application outcomes only, a record for each command it executed.
+    let (groups, before) = (cost.groups, cost_before.groups);
+    assert_eq!(groups.application - before.application, 1);
+    assert_eq!(groups.protocol + groups.both, before.protocol + before.both);
+    assert_eq!(groups.application_records - before.application_records, 10);
+    assert_eq!(groups.protocol_records, before.protocol_records);
 
     assert_eq!(together, one_at_a_time);
     assert_eq!(grouped.kv_revision().unwrap(), alone.kv_revision().unwrap());

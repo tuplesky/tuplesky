@@ -529,6 +529,34 @@ pub struct Cost {
     /// (task-d62), or why there is no reading.
     #[serde(default = "not_instrumented")]
     pub traffic: Measure<Traffic>,
+    /// What the journal groups this voter appended held (task-d84).
+    #[serde(default)]
+    pub journal_groups: JournalGroups,
+}
+
+/// What a voter's journal groups held, by their records (task-d84),
+/// cumulative: which of a turn's writes each synced group carried.
+///
+/// Each group is counted once, in the first of `protocol`,
+/// `application` and `both` that it fits, or as `other` when it holds
+/// neither kind (a checkpoint pointer alone, a lifecycle record).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JournalGroups {
+    /// Groups of protocol transitions and no application outcome.
+    pub protocol: u64,
+    /// Groups of application outcomes and no protocol transition.
+    pub application: u64,
+    /// Groups holding both.
+    pub both: u64,
+    /// Groups holding neither.
+    pub other: u64,
+    /// Protocol transitions journaled: promises, votes, adoptions and
+    /// Sync bindings.
+    pub protocol_records: u64,
+    /// Of those, the ones carrying a command's payload row.
+    pub payload_records: u64,
+    /// Application outcomes journaled, one an executed command.
+    pub application_records: u64,
 }
 
 /// What a voter's transport carried between voters (task-d62),
@@ -570,6 +598,25 @@ pub struct Traffic {
     pub acks_sent: u64,
     /// ACK frames QUIC received on peer connections.
     #[serde(default)]
+    pub acks_received: u64,
+    /// The same QUIC counts on this node's api connections, callers' and
+    /// collectors' (task-d70), so its datagrams split into its two planes.
+    #[serde(default)]
+    pub api: Datagrams,
+}
+
+/// What QUIC sent and received on one class of connections (task-d70).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Datagrams {
+    /// UDP datagrams sent, acknowledgements included.
+    pub datagrams_sent: u64,
+    /// UDP datagrams received.
+    pub datagrams_received: u64,
+    /// The system calls that sent them.
+    pub send_calls: u64,
+    /// ACK frames sent.
+    pub acks_sent: u64,
+    /// ACK frames received.
     pub acks_received: u64,
 }
 
@@ -656,8 +703,10 @@ pub struct Release {
     pub predecessors: Duration,
     /// From applied to its execution group closing.
     pub group: Duration,
-    /// From the group closing to the release: the projection committing.
-    pub projection: Duration,
+    /// From the group closing to the release: the group's journal sync,
+    /// which releases it since task-d63 (`projection` before task-d83,
+    /// named for the commit it timed before then).
+    pub journal: Duration,
 }
 
 /// The domain loop's blocking takes from its pipeline threads (task-d54).

@@ -3,8 +3,10 @@
 //! A command the leader has committed waits three times before its
 //! result goes out: for its predecessors to execute, which is also the
 //! execution loop reaching it; for its execution group to close; and for
-//! the projection to commit the group, which a pipelined store does on
-//! the materializer's thread (task-d52). Each command is stamped at the
+//! the group to be durable in the journal, which releases it since
+//! task-d63. The projection commits the group on the materializer's
+//! thread (task-d52), off the release path; this split timed that commit
+//! before task-d63 and was named for it (task-d83). Each command is stamped at the
 //! four instants and the three waits are summed over the commands that
 //! reached the last, so a reader divides by [`ReleaseSplit::commands`]
 //! for the means. It bounds what executing on the serving path
@@ -32,9 +34,9 @@ pub struct ReleaseSplit {
     pub predecessors: Duration,
     /// From applied to its group closing.
     pub group: Duration,
-    /// From the group closing to the result released: the projection
-    /// committing it.
-    pub projection: Duration,
+    /// From the group closing to the result released: the group's journal
+    /// sync, the release rule's wait since task-d63.
+    pub journal: Duration,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -93,7 +95,7 @@ impl ReleaseTiming {
         self.split.commands += 1;
         self.split.predecessors += applied.saturating_duration_since(stamps.learned);
         self.split.group += closed.saturating_duration_since(applied);
-        self.split.projection += now.saturating_duration_since(closed);
+        self.split.journal += now.saturating_duration_since(closed);
     }
 
     /// Drop the stamps of commands in flight: the role that would have
@@ -134,7 +136,7 @@ mod tests {
                 commands: 2,
                 predecessors: ms(3 + 4),
                 group: ms(2),
-                projection: ms(7 + 2),
+                journal: ms(7 + 2),
             }
         );
     }

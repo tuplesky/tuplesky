@@ -117,6 +117,7 @@ def per_command(node: str, snapshot: dict) -> dict:
         **cpu_of(cost, executed),
         **waits_of(cost, executed),
         **traffic_of(cost, executed),
+        **groups_of(cost, executed, syncs["Observed"]),
     }
 
 
@@ -167,18 +168,51 @@ def traffic_of(cost: dict, executed: int) -> dict:
     command (task-d62): frames, bytes and streams each way, and frames
     lost before they were written. Beside them, frames per stream each
     way, the batching factor (task-d61), and frames lost per stream lost.
-    Empty for a binary older than the reading."""
+    The api plane's QUIC counts (task-d70) are a block of their own in the
+    reading, and per command as `api_<count>`. Empty for a binary older
+    than the reading."""
     traffic = cost.get("traffic")
     if not isinstance(traffic, dict) or "Observed" not in traffic:
         return {}
     traffic = traffic["Observed"]
-    out = {"traffic_per_command": {k: v / executed for k, v in traffic.items()}}
+    flat = {}
+    for key, value in traffic.items():
+        if isinstance(value, dict):
+            flat.update({f"{key}_{k}": v for k, v in value.items()})
+        else:
+            flat[key] = value
+    out = {"traffic_per_command": {k: v / executed for k, v in flat.items()}}
     for side in ("sent", "received"):
         if traffic.get(f"{side}_streams"):
             out[f"frames_per_stream_{side}"] = (
                 traffic[f"{side}_frames"] / traffic[f"{side}_streams"])
     if traffic.get("sent_lost_streams"):
         out["frames_per_lost_stream"] = traffic["sent_lost"] / traffic["sent_lost_streams"]
+    return out
+
+
+def groups_of(cost: dict, executed: int, syncs: int) -> dict:
+    """What the journal groups held (task-d84), per command: groups of
+    protocol transitions only, of application outcomes only, of both, and
+    of neither; and the syncs that were no group, the journal's mapping
+    updates and compactions. Beside them, the records a group carried of
+    each kind, over the groups that carried that kind: protocol
+    transitions, and commands executed, the second the execution group's
+    size. Empty for a binary older than the reading."""
+    groups = cost.get("journal_groups")
+    if not isinstance(groups, dict):
+        return {}
+    kinds = ("protocol", "application", "both", "other")
+    out = {"groups_per_command": {k: groups[k] / executed for k in kinds}}
+    out["groups_per_command"]["not_a_group"] = (syncs - cost["journal_appends"]) / executed
+    out["payload_records_per_command"] = groups["payload_records"] / executed
+    out["protocol_records_per_command"] = groups["protocol_records"] / executed
+    with_protocol = groups["protocol"] + groups["both"]
+    if with_protocol:
+        out["protocol_records_per_group"] = groups["protocol_records"] / with_protocol
+    with_application = groups["application"] + groups["both"]
+    if with_application:
+        out["commands_per_execution_group"] = groups["application_records"] / with_application
     return out
 
 
@@ -252,19 +286,22 @@ def paths_of(cost: dict) -> dict:
 def release_of(cost: dict) -> dict:
     """The leader's mean milliseconds per command from learned to
     released (task-d62): waiting for predecessors to execute, for the
-    group to close, and for the projection to commit it. Empty for a
-    binary older than the reading, or a voter that timed none."""
+    group to close, and for the group's journal sync (task-d63; named
+    `projection` before task-d83, which a binary of before then still
+    reports). Empty for a binary older than the reading, or a voter that
+    timed none."""
     release = cost.get("release")
     if not isinstance(release, dict) or release["commands"] == 0:
         return {}
     commands = release["commands"]
     per = lambda field: seconds(release[field]) * 1000 / commands
+    journal = "journal" if "journal" in release else "projection"
     return {
         "release": {
             "commands": commands,
             "predecessors_ms": per("predecessors"),
             "group_ms": per("group"),
-            "projection_ms": per("projection"),
+            "journal_ms": per(journal),
         }
     }
 
@@ -491,7 +528,7 @@ def paths_table(result: dict) -> str:
     lines = [
         "| callers | node | fast share | missed path/deps/missing/slow first/other "
         "| acks (reordered) | unordered (reordered, oldest s) "
-        "| learned to released ms: predecessors/group/projection "
+        "| learned to released ms: predecessors/group/journal "
         "| read ms: confirm/after confirm/after index | reads/round | behind/read "
         "| peer frames/cmd sent/received (streams sent/received) "
         "| peer datagrams/cmd sent/received (send calls, ACKs sent) "
@@ -515,7 +552,7 @@ def paths_table(result: dict) -> str:
                 f"{held['pending']} ({held['reordered']}, {held['oldest_seconds']:.0f})")
             release = v.get("release")
             release = dash if release is None else "/".join(
-                f"{release[f]:.2f}" for f in ("predecessors_ms", "group_ms", "projection_ms"))
+                f"{release[f]:.2f}" for f in ("predecessors_ms", "group_ms", "journal_ms"))
             reads = v.get("reads")
             waits = dash if reads is None else "/".join(
                 f"{reads[f]:.2f}" for f in
@@ -539,6 +576,35 @@ def paths_table(result: dict) -> str:
                 f"| {run['callers']} | {v['node']} | {share} | {missed} | {acks} | {held} "
                 f"| {release} | {waits} | {per_round} | {behind} | {traffic} | {packets} "
                 f"| {jobs('appender')} | {jobs('materializer')} |")
+    return "\n".join(lines)
+
+
+def groups_table(result: dict) -> str:
+    """What each voter's journal syncs carried (task-d84), one row per
+    voter per run: syncs a command, split by what the group held, and how
+    many records of each kind a group carried."""
+    lines = [
+        "| callers | node | syncs/cmd | protocol only | application only | both "
+        "| neither | not a group | protocol records/cmd (with payload) "
+        "| protocol records/group | commands/execution group |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+    ]
+    dash = "--"
+    for run in result["runs"]:
+        for v in run["voters"]:
+            groups = v.get("groups_per_command")
+            if groups is None:
+                continue
+            split = " | ".join(f"{groups[k]:.3f}" for k in
+                               ("protocol", "application", "both", "other", "not_a_group"))
+            per_group = v.get("protocol_records_per_group")
+            per_group = dash if per_group is None else f"{per_group:.2f}"
+            size = v.get("commands_per_execution_group")
+            size = dash if size is None else f"{size:.2f}"
+            lines.append(
+                f"| {run['callers']} | {v['node']} | {v['journal_syncs_per_command']:.3f} "
+                f"| {split} | {v['protocol_records_per_command']:.2f} "
+                f"({v['payload_records_per_command']:.2f}) | {per_group} | {size} |")
     return "\n".join(lines)
 
 
@@ -585,6 +651,8 @@ def main(argv: list[str]) -> int:
             print(table(result))
             print()
             print(paths_table(result))
+            print()
+            print(groups_table(result))
         else:
             baseline = json.loads(args.baseline.read_text())
             result = json.loads(args.result.read_text())

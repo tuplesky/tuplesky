@@ -106,6 +106,7 @@ use coord_journal_api::stream::{
 };
 use coord_store_api::engine::{CommitFailure, EngineError, LocalEngine, SnapshotSource, WriteTxn};
 use coord_store_api::envelope::AppliedStamp;
+use coord_store_api::registry::Collection;
 use coord_store_api::seq::StoreSeq;
 use coord_types::identity::Digest32;
 use coord_types::ids::{
@@ -998,6 +999,64 @@ pub struct LoweringCost {
     pub appends: u64,
     /// Projection transactions committed.
     pub commits: u64,
+    /// What the groups appended held (task-d84).
+    pub groups: GroupMix,
+}
+
+/// What the journal groups a store appended held, by the records in
+/// them (task-d84): which of a turn's writes each synced group carried.
+///
+/// Every group is counted once, in the first of `protocol`, `application`
+/// and `both` that it fits, or as `other` when it holds neither kind:
+/// a checkpoint pointer alone, or a lifecycle record. The record counts
+/// are over every group.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GroupMix {
+    /// Groups of protocol transitions and no application outcome.
+    pub protocol: u64,
+    /// Groups of application outcomes and no protocol transition.
+    pub application: u64,
+    /// Groups holding both.
+    pub both: u64,
+    /// Groups holding neither.
+    pub other: u64,
+    /// Protocol transitions journaled: promises, votes, adoptions and
+    /// Sync bindings.
+    pub protocol_records: u64,
+    /// Of those, the ones carrying a command's payload row.
+    pub payload_records: u64,
+    /// Application outcomes journaled, one an executed command.
+    pub application_records: u64,
+}
+
+impl GroupMix {
+    /// Count one group of `sealed` entries.
+    fn count(&mut self, sealed: &[Sealed]) {
+        let payload = Collection::PayloadV1.id();
+        let (mut protocol, mut application) = (0u64, 0u64);
+        for (_, _, records) in sealed {
+            for item in records {
+                match item.record.body() {
+                    RecordBody::ProtocolTransition { updates, .. } => {
+                        protocol += 1;
+                        if updates.iter().any(|u| u.collection == payload) {
+                            self.payload_records += 1;
+                        }
+                    }
+                    RecordBody::ApplicationOutcome { .. } => application += 1,
+                    _ => {}
+                }
+            }
+        }
+        self.protocol_records += protocol;
+        self.application_records += application;
+        match (protocol > 0, application > 0) {
+            (true, false) => self.protocol += 1,
+            (false, true) => self.application += 1,
+            (true, true) => self.both += 1,
+            (false, false) => self.other += 1,
+        }
+    }
 }
 
 impl LoweringCost {
@@ -2475,6 +2534,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
         sealed: Vec<Sealed>,
         written: GroupWritten,
     ) -> Result<FlushReport, JournaledError> {
+        self.cost.groups.count(&sealed);
         let mut report = FlushReport {
             appends: 1,
             ..FlushReport::default()
