@@ -11199,3 +11199,79 @@ voter, plus the datagrams a flush sends, which C1 and C2 already cut.
 It adds up to the wait to every command, and the `service` row's p99 is
 what the batch is furthest from. At one caller, where that p99 is read,
 there is nothing to group. The counters stay for the batch's pairs.
+
+## The api plane's frames by kind (R3, for task-d88)
+
+The api plane carried more datagrams than the peer plane in #155's pairs,
+and nothing said what. Each node now counts the frames it hands its
+transport, and takes from it, on api connections, by kind
+(`traffic.api_frames`, read per command by `command_cost.py`). QUIC packs
+frames into datagrams as it sees fit, so datagrams can't be split by
+kind; the frames can.
+
+**The reading.** The batch's head as #185 assembles it (#179 with #178,
+#180, #184, #182 and #186) with these counters. Three voters on one host,
+each a frontend, 30 callers, the default mix, `replay`, stores on tmpfs,
+150,000 operations (2,107 `ok`/s). Per command executed:
+
+| frames a command | n1 (leader) | n2 | n3 | all |
+| --- | --- | --- | --- | --- |
+| submissions sent to a voter elsewhere | 0.98 | 0.49 | 0.53 | 2.00 |
+| reads sent to the leader (task-d50) | 0 | 0.34 | 0.35 | 0.70 |
+| fast acknowledgements returned to a collector | 0 | 0.76 | 0 | 0.76 |
+| slow acknowledgements returned | 0.51 | 0.76 | 0.74 | 2.00 |
+| leader replies returned | 0.51 | 0 | 0 | 0.51 |
+| releases returned | 0.51 | 0 | 0 | 0.51 |
+| read answers returned | 0.70 | 0 | 0 | 0.70 |
+| callers' frames taken | 0.60 | 0.59 | 0.62 | 1.80 |
+| collectors' frames taken | 1.21 | 0.75 | 0.74 | 2.70 |
+| api datagrams sent | 3.65 | 3.19 | 3.12 | 9.97 |
+| peer datagrams sent | 2.39 | 0.94 | 0.74 | 4.07 |
+
+**What it says:**
+- **The api plane is the larger plane, about 10 datagrams a command
+  against the peer plane's 4.** Frames sent on it come to about 9 a
+  command (the submissions, reads and returned frames above, and about
+  one answer a caller's frame, which isn't counted), so about 1.1
+  datagrams a frame. The peer plane sends
+  about 9 frames on 4.1 datagrams, 0.45 a frame.
+- **Why:** task-d61's several frames a stream is granted on the peer
+  plane only, and coordd hands each frame it returns to a collector to
+  the transport alone (`return_to_collector`, one `send` each), where a
+  turn's peer frames go together (`send_turn`). So every frame between a
+  collector and a voter is a stream of its own.
+- **The lever, recorded before it is built:** several frames a stream
+  on links between a collector and a voter, and a turn's frames for one
+  connection handed over together. At the peer plane's batching, the 7.2
+  collector-to-voter frames a command take about 4.7 datagrams fewer,
+  about a third of the voters' sends. The workers' cost follows datagrams
+  (task-d70's third step), so it is sized at −0.15 to −0.4 ms an
+  operation at the register row.
+- **The lever, built and measured, not kept.** The voter grants a
+  collector's api link a new capability (`0x0021`) and sends what it
+  returns to that collector several frames a stream, and coordd hands a
+  step's frames for one connection to the transport together. A
+  stream the collector opens (a submission or a read) still carries one
+  request. The code is on `claude/task-d88-deliveries-per-stream`
+  (`0c5e122`), with its transport tests and its `spec/wire-v1.md` entry.
+  A local pair on the same head, with the lever and without, alternating,
+  four runs a side, 30 callers, `replay`, tmpfs, 50,000 operations:
+
+  | side | `ok`/s | CPU/cmd, all voters (ms) | api datagrams sent/cmd | peer datagrams sent/cmd |
+  | --- | --- | --- | --- | --- |
+  | without | 2476, 2598, 2598, 2605 | 2.393, 2.474, 2.388, 2.262 | 10.47, 10.95, 10.71, 10.48 | 4.21, 4.39, 4.28, 4.17 |
+  | with | 2485, 2594, 2587, 2551 | 2.403, 2.367, 2.278, 2.375 | 9.31, 9.35, 9.20, 9.31 | 4.28, 4.37, 4.33, 4.36 |
+
+  The api plane's datagrams fell 13% (10.65 to 9.29 a command), a third of
+  what the sizing assumed. Only the returned direction is batched, and a
+  step seldom holds more than a frame or two for one collector. The
+  voters' CPU didn't move: the means are 2.379 and 2.356 ms, and two
+  pairs went each way. That's −0.02 ms against the −0.15 to −0.4 it was
+  sized at. A wire capability for no CPU is not worth carrying, so it
+  stays off the stack. Batching the submission direction too would mean
+  answering a collector's requests on a stream other than the one they
+  came on, and this reading gives no reason to expect more from it.
+- **Not this task's:** which frames a collector needs. A follower in
+  the fast quorum returns both its fast and its slow acknowledgement, and
+  the slow one counts only when the fast path does not hold. Changing what a
+  frontend learns from is a design step of its own.

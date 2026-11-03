@@ -170,8 +170,9 @@ def traffic_of(cost: dict, executed: int) -> dict:
     lost before they were written. Beside them, frames per stream each
     way, the batching factor (task-d61), and frames lost per stream lost.
     The api plane's QUIC counts (task-d70) are a block of their own in the
-    reading, and per command as `api_<count>`. Empty for a binary older
-    than the reading."""
+    reading, and per command as `api_<count>`; its frames by kind
+    (task-d88's R3) likewise, as `api_frames_<kind>`. Empty for a binary
+    older than the reading."""
     traffic = cost.get("traffic")
     if not isinstance(traffic, dict) or "Observed" not in traffic:
         return {}
