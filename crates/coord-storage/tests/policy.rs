@@ -426,6 +426,34 @@ impl coord_store_api::engine::OrderedRead for Failing {
     }
 }
 
+/// A view whose session row is larger than the schema's view budget,
+/// and otherwise the store's own: the one way the authorization read is
+/// refused as a replicated answer rather than failing locally.
+struct Oversized<'a, V>(&'a V);
+
+impl<V: coord_store_api::engine::OrderedRead> coord_store_api::engine::OrderedRead
+    for Oversized<'_, V>
+{
+    fn get(
+        &self,
+        collection: coord_store_api::engine::CollectionId,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>, coord_store_api::engine::EngineError> {
+        if collection == coord_store_api::registry::Collection::SessionV1.id() {
+            return Ok(Some(vec![0; ViewBudget::SCHEMA.max_bytes as usize + 1]));
+        }
+        self.0.get(collection, key)
+    }
+
+    fn scan_page(
+        &self,
+        collection: coord_store_api::engine::CollectionId,
+        request: &coord_store_api::engine::ScanRequest,
+    ) -> Result<coord_store_api::engine::RowPage, coord_store_api::engine::EngineError> {
+        self.0.scan_page(collection, request)
+    }
+}
+
 /// Whether a retained result may be handed out is a function of the
 /// replicated rows only (task-d95): a replica that can't read its own
 /// authorization rows, or can't decode the response it stored, has no
@@ -451,6 +479,13 @@ fn a_local_fault_reading_a_retained_results_authorization_is_an_error_not_a_refu
     assert_eq!(
         coord_storage::apply::retained_is_authorized(view, &S1, &request, &record),
         Ok(true)
+    );
+    // Over the view budget: a refusal, the same on every replica, which
+    // must stay `Ok(false)` and never become an error that stops them all
+    // (#188 review).
+    assert_eq!(
+        coord_storage::apply::retained_is_authorized(&Oversized(view), &S1, &request, &record),
+        Ok(false)
     );
     // The authorization rows can't be read: an error, not a refusal.
     let read = coord_storage::apply::retained_is_authorized(&Failing, &S1, &request, &record)
