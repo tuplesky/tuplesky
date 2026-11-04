@@ -3425,6 +3425,25 @@ The change, in two steps:
 - **The candidates, each with the messages it saves and what it costs:** a message that can ride the next one the same peer is sent anyway (an acknowledgement on the next submission's fan-out, a commit on the next proposal), a message only one voter needs that every voter is sent, and a message whose content a peer already has. Each names the latency it adds and the protocol rule it touches.
 - **The projection:** packets a command saved times the runner's cost a packet from the batch's call graph, so a candidate is carried into a batch only if it adds up to its share of the re-anchored target.
 
+- **The count, first read (#185):** from task-d91's pairs on the batch's head (`b59f2b0`): one 4-core host, 30 callers, `replay`, tmpfs, 50,000 operations, its one-worker side. The figures are per command executed, summed over the voters. R3's counters split the api plane by kind; the peer plane has no counter by kind yet.
+
+  | A command | 3 voters | 5 voters |
+  | --- | --- | --- |
+  | submissions to the voters elsewhere | 2.00 | 4.00 |
+  | slow acknowledgements returned to a collector | 2.00 | 4.00 |
+  | fast acknowledgements returned | 0.74 | 1.62 |
+  | leader replies and releases returned | 0.53 + 0.53 | 0.76 + 0.76 |
+  | reads to the leader, and their answers | 0.72 + 0.72 | 1.03 + 1.03 |
+  | api frames sent, counted (callers' answers not counted) | 7.24 | 13.2 |
+  | peer frames sent | 9.00 | 17.9 |
+  | api datagrams sent (of them ACK-only) | 9.91 (6.20) | 20.5 (13.2) |
+  | peer datagrams sent (of them ACK-only) | 3.96 (2.03) | 7.81 (4.32) |
+
+  - **Against its floor:** a leader-based log sends 2N messages a write: the request, an append to each follower, each acknowledgement, and the reply. That's 6 at three voters and 10 at five, plus two when the caller's frontend isn't the leader. This count is about 16 frames at three voters and 31 at five, roughly three times the floor. Two kinds grow as N−1: the submission's fan-out and the slow acknowledgements.
+  - **Most datagrams are ACK-only:** about 59% at three voters and 62% at five, with task-d70's threshold of 8 already on both planes. Data datagrams are about 5.6 and 10.8 a command.
+  - **What the count doesn't yet say: a datagram's cost.** task-d88's pair cut 1.36 api datagrams a command and moved the voters' CPU by 0.02 ms, within its runs' spread. That pair ran at tokio's default worker count, where task-d91 found the workers' parking and wake-ups to be most of the cost. So the candidates are sized in CPU only after a datagram's cost is read at one worker. The cheapest such reading is a pair on the api plane's ACK cadence, the largest kind above, which changes no message the protocol sends.
+  - **The peer plane's 9 and 18 frames** are split by kind before a candidate there is sized.
+
 **Acceptance:** The count recorded at three and five voters with its floor, each candidate sized in messages, packets and projected CPU, and the ones carried named with the design sections they amend. No code.
 
 **Review boundary:** What the voters and the frontend send a command, counted and sized. No change to the wire or the protocol in this entry.
