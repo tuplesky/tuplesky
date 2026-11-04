@@ -114,6 +114,7 @@ def per_command(node: str, snapshot: dict) -> dict:
         **paths_of(cost),
         **release_of(cost),
         **reads_of(cost),
+        **gate_of(cost),
         **cpu_of(cost, executed),
         **waits_of(cost, executed),
         **traffic_of(cost, executed),
@@ -304,6 +305,18 @@ def release_of(cost: dict) -> dict:
             "journal_ms": per(journal),
         }
     }
+
+
+def gate_of(cost: dict) -> dict:
+    """What this node's output gate did with disclosures to its own
+    callers (task-d93): how many it held for the projection to catch up
+    with their session, how many it still answered `Pending`, and how
+    many a barrier denied. Empty for a binary older than the counts, or a
+    node whose gate did none of these."""
+    gate = cost.get("gate")
+    if not isinstance(gate, dict) or not any(gate.values()):
+        return {}
+    return {"gate": {k: gate[k] for k in ("holds", "deferred", "denied")}}
 
 
 def resends_of(cost: dict, executed: int) -> dict:

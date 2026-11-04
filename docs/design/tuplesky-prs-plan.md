@@ -3354,6 +3354,7 @@ The change, in two steps:
 - **Nothing is disclosed earlier than before.** A held disclosure is gated again against a fresh barrier when it goes out, so it is authorized by the same projection it would have been had the caller asked again. The rule that a session once shown and then absent is a refusal is unchanged.
 - **A retained answer is not held.** Its caller is answered within the call, on the stream it retried on, so it is answered `Pending` as before.
 - **The two leader-restart tests** no longer read again on `Pending` (task-d74's `read_projected`, reverted).
+- **The gate's counts are on the metrics line** (#186 review): `cost.gate` carries the disclosures held, those still answered `Pending`, and those a barrier denied, and `command_cost.py` reads them. So a run's summary says directly how many reads waited at a follower's gate and how many still came back `Pending`.
 
 **Acceptance:** Frontend tests: a held disclosure goes out disclosed once the projection shows the session; one still behind at its deadline is answered `Pending`, at the client's deadline when it is the earlier and at the gate's bound otherwise; and a held disclosure goes with its connection. coordd's cli suite passes without the stopgap, also under CPU contention.
 

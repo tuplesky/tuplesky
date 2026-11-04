@@ -7,10 +7,10 @@
 use std::time::Duration;
 
 use coord_daemon::metrics::{
-    Cost, Cpu, Datagrams, Durability, FastPath, Frontiers, Headroom, Interval, Jobs, JournalGroups,
-    Lane, LaneReading, Latency, MAX_REPORTED_SHARDS, Measure, MetricsSnapshot, PipelineWaits,
-    Reads, Recorder, Release, Resends, Scheduling, ShardIndex, ShardReading, Stage, StageReading,
-    Traffic, Unavailable, UnorderedPreAcceptances, Wait,
+    Cost, Cpu, Datagrams, Durability, FastPath, Frontiers, Gate, Headroom, Interval, Jobs,
+    JournalGroups, Lane, LaneReading, Latency, MAX_REPORTED_SHARDS, Measure, MetricsSnapshot,
+    PipelineWaits, Reads, Recorder, Release, Resends, Scheduling, ShardIndex, ShardReading, Stage,
+    StageReading, Traffic, Unavailable, UnorderedPreAcceptances, Wait,
 };
 use coord_daemon::role::RoleSet;
 
@@ -384,6 +384,11 @@ fn a_rendered_snapshot_carries_no_secret_or_key_shaped_text() {
                 snapshots: 280,
                 behind: 12,
             },
+            gate: Gate {
+                holds: 30,
+                deferred: 2,
+                denied: 0,
+            },
             cpu: Measure::Observed(Cpu {
                 domain: Duration::from_secs(25),
                 process: Duration::from_secs(70),
@@ -499,6 +504,21 @@ fn a_rendered_snapshot_carries_no_secret_or_key_shaped_text() {
     let parsed: MetricsSnapshot = serde_json::from_str(&rendered).expect("round trip");
     assert_eq!(parsed, snapshot);
     assert!(parsed.stage(Stage::Admission).is_some());
+
+    // A reading from a build before the gate's counts (task-d93) parses,
+    // with them zero.
+    let mut older: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+    let cost = older["cost"]
+        .as_object_mut()
+        .and_then(|m| m.values_mut().next())
+        .and_then(|v| v.as_object_mut())
+        .expect("an observed cost");
+    assert!(cost.remove("gate").is_some(), "the gate is on the line");
+    let older: MetricsSnapshot = serde_json::from_value(older).expect("an older reading parses");
+    let coord_daemon::metrics::Measure::Observed(cost) = older.cost else {
+        panic!("the cost is still observed");
+    };
+    assert_eq!(cost.gate, Gate::default());
 }
 
 /// Readers and writers run concurrently and the recorder stays

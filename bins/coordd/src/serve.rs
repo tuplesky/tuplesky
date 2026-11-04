@@ -1722,6 +1722,11 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             established_fast: voter.node().established.fast,
             established_slow: voter.node().established.slow,
             reads: reads(&voter.read_counts()),
+            gate: coord_daemon::metrics::Gate {
+                holds: self.frontend.frontend.holds,
+                deferred: self.frontend.frontend.deferred,
+                denied: self.frontend.frontend.denied,
+            },
             fast_path: fast_path(&voter.node().fast_path_counts()),
             unordered: self.unordered,
             release: release(&voter.node().release_split()),
