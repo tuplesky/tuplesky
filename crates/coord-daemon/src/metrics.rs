@@ -707,6 +707,27 @@ pub struct Release {
     /// which releases it since task-d63 (`projection` before task-d83,
     /// named for the commit it timed before then).
     pub journal: Duration,
+    /// How each wait was distributed over the commands (task-d97).
+    #[serde(default)]
+    pub distributions: ReleaseDistributions,
+}
+
+/// The distributions of a command's waits from learned to released on
+/// the leader (task-d97), over the same commands as [`Release`]'s sums.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseDistributions {
+    /// From committed to applied.
+    #[serde(default)]
+    pub predecessors: Distribution,
+    /// From applied to its group closing.
+    #[serde(default)]
+    pub group: Distribution,
+    /// From the group closing to the release.
+    #[serde(default)]
+    pub journal: Distribution,
+    /// From learned to released.
+    #[serde(default)]
+    pub whole: Distribution,
 }
 
 /// The domain loop's blocking takes from its pipeline threads (task-d54).
@@ -762,7 +783,18 @@ pub struct Scheduling {
     pub voluntary: u64,
     /// Times the scheduler took the CPU from it.
     pub involuntary: u64,
+    /// The domain loop's run-queue time a pass, distributed over a
+    /// sample of its passes (task-d97): one pass in
+    /// [`RUN_QUEUE_SAMPLE_EVERY`], from its start to the next pass's
+    /// start. That is the pass's own preemptions and the wait to run
+    /// once something woke it again.
+    #[serde(default)]
+    pub run_queue_per_pass: Distribution,
 }
+
+/// One domain-loop pass in this many has its run-queue time sampled
+/// (task-d97): two reads of the thread's `schedstat` a sample.
+pub const RUN_QUEUE_SAMPLE_EVERY: u64 = 16;
 
 fn not_instrumented<T>() -> Measure<T> {
     Measure::Unavailable(Unavailable::NotInstrumented)
@@ -790,6 +822,10 @@ pub struct Reads {
     pub waited_index_ms: u64,
     /// Milliseconds from arrival to the answer, summed.
     pub waited_ms: u64,
+    /// The same wait, distributed over the reads served (task-d97), at
+    /// the barrier's millisecond resolution.
+    #[serde(default)]
+    pub waited: Distribution,
     /// Snapshots pinned to answer reads: one per pump with a read due
     /// (task-d58).
     #[serde(default)]
@@ -1057,5 +1093,196 @@ impl Recorder {
                 },
             })
             .collect()
+    }
+}
+
+/// Sub-buckets a power of two of microseconds is split into: a recorded
+/// value is placed within about 19% of where it fell (task-d97).
+const SUB_BUCKETS: usize = 4;
+
+/// Buckets of a [`Distribution`]: the values below [`SUB_BUCKETS`]
+/// microseconds one each, then [`SUB_BUCKETS`] for each power of two up
+/// to 2^26 µs (about 67 s). A longer value falls in the last.
+pub const DISTRIBUTION_BUCKETS: usize = SUB_BUCKETS + (26 - 2 + 1) * SUB_BUCKETS;
+
+/// How a wait was distributed, cumulative (task-d97): counts in
+/// log-linear buckets of microseconds and the longest seen.
+///
+/// A sum says what the mean was; it can't say what the slowest
+/// operations waited for, which is what a p99 is made of. A reader takes
+/// two snapshots' buckets apart for an interval and reads its quantiles
+/// from them. Printed sparse: only the buckets that counted something.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "SparseDistribution", into = "SparseDistribution")]
+pub struct Distribution {
+    /// Values counted in each bucket.
+    pub buckets: [u64; DISTRIBUTION_BUCKETS],
+    /// The longest value counted.
+    pub max: Duration,
+}
+
+impl Default for Distribution {
+    fn default() -> Self {
+        Distribution {
+            buckets: [0; DISTRIBUTION_BUCKETS],
+            max: Duration::ZERO,
+        }
+    }
+}
+
+impl Distribution {
+    /// The bucket `micros` falls in.
+    pub fn bucket(micros: u64) -> usize {
+        let sub = SUB_BUCKETS as u64;
+        if micros < sub {
+            return micros as usize;
+        }
+        let octave = 63 - micros.leading_zeros() as u64;
+        let within = (micros >> (octave - 2)) & (sub - 1);
+        ((sub + (octave - 2) * sub + within) as usize).min(DISTRIBUTION_BUCKETS - 1)
+    }
+
+    /// The least value, in microseconds, bucket `index` holds.
+    pub fn lower(index: usize) -> u64 {
+        if index < SUB_BUCKETS {
+            return index as u64;
+        }
+        let octave = ((index - SUB_BUCKETS) / SUB_BUCKETS) as u64 + 2;
+        let within = ((index - SUB_BUCKETS) % SUB_BUCKETS) as u64;
+        (SUB_BUCKETS as u64 + within) << (octave - 2)
+    }
+
+    /// Count `wait`.
+    pub fn record(&mut self, wait: Duration) {
+        let micros = u64::try_from(wait.as_micros()).unwrap_or(u64::MAX);
+        self.buckets[Self::bucket(micros)] += 1;
+        self.max = self.max.max(wait);
+    }
+
+    /// Values counted.
+    pub fn count(&self) -> u64 {
+        self.buckets.iter().sum()
+    }
+
+    /// The value at quantile `q` (0 to 1): the upper edge of the bucket
+    /// it falls in, never past the longest seen. `None` with nothing
+    /// counted.
+    pub fn quantile(&self, q: f64) -> Option<Duration> {
+        let count = self.count();
+        if count == 0 {
+            return None;
+        }
+        let rank = ((q.clamp(0.0, 1.0) * count as f64).ceil() as u64).max(1);
+        let mut seen = 0;
+        for (index, n) in self.buckets.iter().enumerate() {
+            seen += n;
+            if seen >= rank {
+                let upper = if index + 1 < DISTRIBUTION_BUCKETS {
+                    Duration::from_micros(Self::lower(index + 1))
+                } else {
+                    self.max
+                };
+                return Some(upper.min(self.max));
+            }
+        }
+        Some(self.max)
+    }
+}
+
+/// A [`Distribution`] as it is printed: `[bucket, count]` pairs for the
+/// buckets that counted something.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct SparseDistribution {
+    #[serde(default)]
+    buckets: Vec<(usize, u64)>,
+    #[serde(default)]
+    max: Duration,
+}
+
+impl From<Distribution> for SparseDistribution {
+    fn from(d: Distribution) -> Self {
+        SparseDistribution {
+            buckets: d
+                .buckets
+                .iter()
+                .enumerate()
+                .filter(|(_, n)| **n > 0)
+                .map(|(i, n)| (i, *n))
+                .collect(),
+            max: d.max,
+        }
+    }
+}
+
+impl From<SparseDistribution> for Distribution {
+    fn from(s: SparseDistribution) -> Self {
+        let mut d = Distribution {
+            max: s.max,
+            ..Distribution::default()
+        };
+        for (i, n) in s.buckets {
+            if let Some(slot) = d.buckets.get_mut(i) {
+                *slot += n;
+            }
+        }
+        d
+    }
+}
+
+#[cfg(test)]
+mod distribution_tests {
+    use super::*;
+
+    /// Each bucket's lower edge falls in it, the one below it in the
+    /// bucket before, and the edges grow within about a fifth of each
+    /// other past the first few microseconds (task-d97).
+    #[test]
+    fn the_buckets_are_contiguous_and_within_a_fifth() {
+        for index in 0..DISTRIBUTION_BUCKETS {
+            let lower = Distribution::lower(index);
+            assert_eq!(Distribution::bucket(lower), index, "lower edge of {index}");
+            if index > 0 {
+                assert_eq!(Distribution::bucket(lower - 1), index - 1, "below {index}");
+            }
+            if index >= SUB_BUCKETS && index + 1 < DISTRIBUTION_BUCKETS {
+                let next = Distribution::lower(index + 1);
+                assert!((next - lower) * 4 <= lower, "bucket {index} is too wide");
+            }
+        }
+        assert_eq!(Distribution::bucket(u64::MAX), DISTRIBUTION_BUCKETS - 1);
+    }
+
+    #[test]
+    fn quantiles_read_the_bucket_their_rank_falls_in() {
+        let mut d = Distribution::default();
+        assert_eq!(d.quantile(0.5), None);
+        // 98 of a millisecond, one of 12 ms, one of 40 ms.
+        for _ in 0..98 {
+            d.record(Duration::from_millis(1));
+        }
+        d.record(Duration::from_millis(12));
+        d.record(Duration::from_millis(40));
+        assert_eq!(d.count(), 100);
+        assert_eq!(d.max, Duration::from_millis(40));
+        let p50 = d.quantile(0.5).expect("p50");
+        assert!(p50 >= Duration::from_millis(1) && p50 <= Duration::from_micros(1_200));
+        let p99 = d.quantile(0.99).expect("p99");
+        assert!(p99 >= Duration::from_millis(12) && p99 <= Duration::from_micros(14_400));
+        assert_eq!(d.quantile(1.0), Some(Duration::from_millis(40)));
+    }
+
+    /// Printed sparse and read back whole; an older line without the
+    /// field reads as an empty distribution.
+    #[test]
+    fn a_distribution_prints_sparse_and_reads_back() {
+        let mut d = Distribution::default();
+        d.record(Duration::from_micros(3));
+        d.record(Duration::from_millis(7));
+        let text = serde_json::to_string(&d).expect("prints");
+        assert!(text.len() < 80, "{text}");
+        let back: Distribution = serde_json::from_str(&text).expect("reads");
+        assert_eq!(back, d);
+        let empty: Distribution = serde_json::from_str("{}").expect("reads");
+        assert_eq!(empty, Distribution::default());
     }
 }

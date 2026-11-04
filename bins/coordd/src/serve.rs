@@ -1202,6 +1202,13 @@ struct Pacing {
         u64,
         Option<std::time::Duration>,
     )>,
+    /// Passes the loop has started (task-d97).
+    passes: u64,
+    /// The run-queue time read at the start of a sampled pass, until the
+    /// next pass starts.
+    sampled_from: Option<std::time::Duration>,
+    /// The run-queue time of each sampled pass, to the next pass's start.
+    run_queue_per_pass: coord_daemon::metrics::Distribution,
 }
 
 impl Pacing {
@@ -1210,10 +1217,30 @@ impl Pacing {
         self.waiting_since = Some(std::time::Instant::now());
     }
 
-    /// The loop is working again; a wait that was running ends here.
+    /// The loop is working again, at the start of a pass; a wait that
+    /// was running ends here.
+    ///
+    /// One pass in [`RUN_QUEUE_SAMPLE_EVERY`] has its run-queue time read
+    /// from here to the next pass's start (task-d97): what the scheduler
+    /// kept the loop from running, a pass at a time, which the snapshot's
+    /// run-queue total only gives as a sum.
+    ///
+    /// [`RUN_QUEUE_SAMPLE_EVERY`]: coord_daemon::metrics::RUN_QUEUE_SAMPLE_EVERY
     fn woke(&mut self) {
         if let Some(since) = self.waiting_since.take() {
             self.idle += since.elapsed();
+        }
+        if let Some(from) = self.sampled_from.take()
+            && let Some(now) = crate::cpu::this_thread_run_queue()
+        {
+            self.run_queue_per_pass.record(now.saturating_sub(from));
+        }
+        self.passes += 1;
+        if self
+            .passes
+            .is_multiple_of(coord_daemon::metrics::RUN_QUEUE_SAMPLE_EVERY)
+        {
+            self.sampled_from = crate::cpu::this_thread_run_queue();
         }
     }
 
@@ -1699,6 +1726,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                             run_queue: s.run_queue,
                             voluntary: s.voluntary,
                             involuntary: s.involuntary,
+                            run_queue_per_pass: self.pacing.run_queue_per_pass,
                         })
                     },
                 ),
@@ -4930,6 +4958,7 @@ fn release(split: &coord_daemon::learned::ReleaseSplit) -> coord_daemon::metrics
         predecessors: split.predecessors,
         group: split.group,
         journal: split.journal,
+        distributions: split.distributions,
     }
 }
 
@@ -4956,6 +4985,7 @@ fn reads(counts: &coord_daemon::reads::ReadCounts) -> coord_daemon::metrics::Rea
         waited_confirm_ms: counts.waited_confirm_ms,
         waited_index_ms: counts.waited_index_ms,
         waited_ms: counts.waited_ms,
+        waited: counts.waited,
         snapshots: counts.snapshots,
         behind: counts.behind,
     }

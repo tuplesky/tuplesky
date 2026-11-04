@@ -10897,3 +10897,33 @@ window.
   of the process's CPU per window. The trim stays the long-run bound, and
   its first reading, the rows exported by kind at two positions, waits
   for it.
+
+## The waits' tails on the metrics line (task-d97)
+
+The `service` row's p99 is several times its p50 (task-d72's batch),
+and the metrics line could not say which wait made it: every wait on it
+is a sum, so a reader gets a mean a command and nothing about the tail.
+Three waits now also go out as distributions:
+
+- **The leader's learned to released,** in all and by part
+  (`cost.release.distributions`: `predecessors`, `group`, `journal`,
+  `whole`), over the same commands as the sums.
+- **The read barrier's wait,** arrival to answer (`cost.reads.waited`),
+  at the barrier's millisecond resolution.
+- **The domain loop's run-queue time a pass**
+  (`cost.cpu.domain_scheduling.run_queue_per_pass`): one pass in 16
+  reads the thread's `schedstat` at its start and again at the next
+  pass's start, so a sample is the pass's own preemptions and the wait
+  to run once something woke it. Two reads of a `/proc` file in 16
+  passes; the total run-queue time beside it is unchanged.
+
+A distribution is cumulative like the rest of the cost: log-linear
+buckets in microseconds, four an octave from 4 µs to 2^26 µs (104
+buckets, each within a fifth of its values), with the longest value
+seen. It prints sparse, as `[bucket, count]` pairs and the longest, so
+an idle voter's line hardly grows. A quantile is read as the upper edge
+of the bucket its rank falls in, never past the longest.
+`scripts/ci/command_cost.py table` prints p50, p99 and the longest of
+each, from a voter's last snapshot, in a fourth table. A line written
+before task-d97 reads with empty distributions, which have no quantile
+rather than a zero one.

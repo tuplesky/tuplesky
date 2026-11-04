@@ -77,6 +77,14 @@ pub fn this_thread_scheduling() -> Option<Scheduling> {
     })
 }
 
+/// The calling thread's time waiting on a run queue since it started,
+/// from `schedstat` alone: what the domain loop reads on a sampled pass
+/// (task-d97), one read rather than [`this_thread_scheduling`]'s two.
+pub fn this_thread_run_queue() -> Option<Duration> {
+    let schedstat = std::fs::read_to_string("/proc/thread-self/schedstat").ok()?;
+    schedstat_times(&schedstat).map(|(_, run_queue)| run_queue)
+}
+
 /// Time on a CPU and time waiting on a run queue, the first two fields of
 /// a `schedstat` line, in nanoseconds.
 fn schedstat_times(schedstat: &str) -> Option<(Duration, Duration)> {

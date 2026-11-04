@@ -20,6 +20,8 @@ use std::time::{Duration, Instant};
 
 use coord_types::CommandId;
 
+use crate::metrics::ReleaseDistributions;
+
 /// Commands stamped and not yet released past which no new one is
 /// stamped: more than a leader holds in flight, so reaching it means
 /// releases are not being counted, and the stamps are not let grow.
@@ -37,6 +39,10 @@ pub struct ReleaseSplit {
     /// From the group closing to the result released: the group's journal
     /// sync, the release rule's wait since task-d63.
     pub journal: Duration,
+    /// How each of the three waits, and the whole from learned to
+    /// released, was distributed over the commands (task-d97): the sums
+    /// give the means, these the tail.
+    pub distributions: ReleaseDistributions,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -92,10 +98,19 @@ impl ReleaseTiming {
             return;
         };
         let closed = stamps.closed.unwrap_or(applied);
+        let predecessors = applied.saturating_duration_since(stamps.learned);
+        let group = closed.saturating_duration_since(applied);
+        let journal = now.saturating_duration_since(closed);
         self.split.commands += 1;
-        self.split.predecessors += applied.saturating_duration_since(stamps.learned);
-        self.split.group += closed.saturating_duration_since(applied);
-        self.split.journal += now.saturating_duration_since(closed);
+        self.split.predecessors += predecessors;
+        self.split.group += group;
+        self.split.journal += journal;
+        let d = &mut self.split.distributions;
+        d.predecessors.record(predecessors);
+        d.group.record(group);
+        d.journal.record(journal);
+        d.whole
+            .record(now.saturating_duration_since(stamps.learned));
     }
 
     /// Drop the stamps of commands in flight: the role that would have
@@ -130,15 +145,25 @@ mod tests {
         // Applied outside a group: it closed when it was applied.
         timing.applied(&command(2), t0 + ms(4));
         timing.released(&command(2), t0 + ms(6));
+        let split = timing.split();
         assert_eq!(
-            timing.split(),
-            ReleaseSplit {
-                commands: 2,
-                predecessors: ms(3 + 4),
-                group: ms(2),
-                journal: ms(7 + 2),
-            }
+            (
+                split.commands,
+                split.predecessors,
+                split.group,
+                split.journal
+            ),
+            (2, ms(3 + 4), ms(2), ms(7 + 2))
         );
+        // Each command is counted once in each distribution, at its own
+        // wait: the longest whole is the first command's 12 ms.
+        let d = split.distributions;
+        for one in [d.predecessors, d.group, d.journal, d.whole] {
+            assert_eq!(one.count(), 2);
+        }
+        assert_eq!(d.predecessors.max, ms(4));
+        assert_eq!(d.journal.max, ms(7));
+        assert_eq!(d.whole.max, ms(12));
     }
 
     #[test]
