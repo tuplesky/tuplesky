@@ -502,6 +502,11 @@ pub struct Cost {
     /// (task-d50). Zero for a voter that never led.
     #[serde(default)]
     pub reads: Reads,
+    /// What this node's output gate did with disclosures to its own
+    /// callers (task-d93). Zero for a node with no frontend, and in a
+    /// reading from a build before it.
+    #[serde(default)]
+    pub gate: Gate,
     /// CPU time used since the process started (task-d54), or why there
     /// is no reading. Beside [`Cost::busy`], which counts the syncs the
     /// loop waits for, it says what the work itself cost.
@@ -798,6 +803,24 @@ pub struct Reads {
     /// reached their position yet (task-d58).
     #[serde(default)]
     pub behind: u64,
+}
+
+/// What a frontend's output gate did with its disclosures (task-d93),
+/// cumulative.
+///
+/// A disclosure whose session this node has not projected yet is held
+/// until it has, up to the caller's deadline or the gate's own bound.
+/// [`Gate::holds`] counts the holds however each ended; [`Gate::deferred`]
+/// the disclosures still answered `Pending`, at the end of a hold or at
+/// once where nothing holds; [`Gate::denied`] those a barrier refused.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Gate {
+    /// Disclosures held for the projection to catch up.
+    pub holds: u64,
+    /// Disclosures answered `Pending`.
+    pub deferred: u64,
+    /// Disclosures a barrier denied.
+    pub denied: u64,
 }
 
 /// What a leader's re-sends of proposals did (task-d49), cumulative.
