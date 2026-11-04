@@ -1225,10 +1225,13 @@ fn main() -> ExitCode {
     // on the address it reported.
     let api_socket = listeners.take_api();
     let peer_socket = listeners.take_peer();
-    let runtime = match tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-    {
+    // The runtime's worker count is the configuration's if it sets one,
+    // and tokio's (a worker a core) otherwise (task-d91).
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    if let Some(workers) = config.runtime.worker_threads {
+        builder.worker_threads(workers.get());
+    }
+    let runtime = match builder.enable_all().build() {
         Ok(r) => r,
         Err(e) => {
             eprintln!("cannot start the runtime: {e}");
