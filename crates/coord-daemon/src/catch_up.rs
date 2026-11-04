@@ -9,13 +9,21 @@
 //! A page reads nothing but the rows of the commands it carries.
 //!
 //! The requester half, [`Pacer`], decides when a voter asks and whom. A
-//! voter that holds work it is not executing, and whose frontier has not
-//! moved for [`STILL_FOR`], asks the leader; one that is not answered
-//! asks the other voters in turn. A voter asks once after it starts,
-//! whatever it holds, since a restart can leave it behind holding
-//! nothing. The machine asks again at once when a
-//! full page is executed, so the pacer is the floor for an ask nobody
-//! answered, not the rate a voter catches up at.
+//! voter that has held work it is not executing for [`STILL_FOR`], and
+//! whose frontier has moved by less than a page in that time, asks the
+//! leader; one that is not answered asks the other voters in turn. A
+//! voter asks once after it starts, whatever it holds, since a restart
+//! can leave it behind holding nothing. The machine asks again at once
+//! when a full page is executed, so the pacer is the floor for an ask
+//! nobody answered, not the rate a voter catches up at.
+//!
+//! "Less than a page", not "not at all" (task-d94): a voter restarted
+//! behind, holding pre-acceptances the others decided long ago, executes
+//! one each time the leader's re-send lets it decide one, every 250 ms.
+//! Its frontier never stays put for a second, so a pacer that waited for
+//! a still frontier never asked, and the voter crept through hundreds of
+//! commands at the re-send's pace where a page would have taken 64 at a
+//! time.
 
 use std::time::{Duration, Instant};
 
@@ -26,7 +34,8 @@ use coord_types::CommandId;
 use coord_types::ids::{ConfigurationEpoch, ExecutionPosition, ReplicaId};
 
 /// How long a voter holding work it does not execute waits, with its
-/// frontier still, before it asks a peer for what it is missing.
+/// frontier moving by less than a page ([`MAX_CATCH_UP_COMMANDS`]),
+/// before it asks a peer for what it is missing.
 pub const STILL_FOR: Duration = Duration::from_secs(1);
 
 /// How long an ask goes unanswered before the next one, to the next
@@ -278,11 +287,13 @@ pub struct Standing {
 /// When a voter asks a peer for what it is missing, and whom (task-d08).
 #[derive(Clone, Debug, Default)]
 pub struct Pacer {
-    /// The frontier last seen, and since when it has not moved.
+    /// Where the frontier stood when this voter last began to hold work
+    /// with no page in hand, and when: the window a page's worth of
+    /// progress has to fill to count as catching up.
     still: Option<(ExecutionPosition, Instant)>,
     /// When the last ask went, if one is outstanding.
     asked: Option<Instant>,
-    /// Asks gone unanswered since the frontier last moved.
+    /// Asks gone unanswered since the window last began.
     unanswered: u32,
     /// Whether the last turn found a voter that may have to ask: one
     /// that holds work (or has not asked since it started), does not
@@ -314,14 +325,17 @@ impl Pacer {
     ) -> Option<ReplicaId> {
         let holds = standing.holds || !self.probed;
         self.wanting = holds && !standing.leads && !standing.busy;
-        let moved = self.still.is_none_or(|(at, _)| at != standing.executed);
-        if moved || standing.busy {
+        // The window starts over when the voter is catching up anyway --
+        // a page's worth executed since it began, or a page in hand --
+        // and when there is nothing to catch up for: it held nothing on
+        // this turn, or it leads. A healthy follower empties between
+        // commands; a voter behind holds work on every turn.
+        let caught_up = self.still.is_none_or(|(at, _)| {
+            standing.executed < at
+                || standing.executed.get() - at.get() >= MAX_CATCH_UP_COMMANDS as u64
+        });
+        if caught_up || standing.busy || standing.leads || !holds {
             self.still = Some((standing.executed, now));
-            self.asked = None;
-            self.unanswered = 0;
-            return None;
-        }
-        if standing.leads || !holds {
             self.asked = None;
             self.unanswered = 0;
             return None;
@@ -454,14 +468,87 @@ mod tests {
             pacer.due(t, standing(5, true), r(3), r(1), &voters),
             Some(r(2))
         );
-        // Progress starts over with the leader.
+        // A page's worth of progress starts over with the leader.
+        let page = 5 + MAX_CATCH_UP_COMMANDS as u64;
         let t = t + UNANSWERED;
-        assert_eq!(pacer.due(t, standing(9, true), r(3), r(1), &voters), None);
+        assert_eq!(
+            pacer.due(t, standing(page, true), r(3), r(1), &voters),
+            None
+        );
         let t = t + STILL_FOR;
         assert_eq!(
-            pacer.due(t, standing(9, true), r(3), r(1), &voters),
+            pacer.due(t, standing(page, true), r(3), r(1), &voters),
             Some(r(1))
         );
+    }
+
+    /// A voter that creeps -- one command each time the leader's re-send
+    /// lets it decide one -- is behind, and asks; one that moves a page a
+    /// window is catching up, and doesn't (task-d94). Before this a
+    /// frontier that moved at all was never still, and a voter restarted
+    /// behind crept through its backlog for minutes without asking.
+    #[test]
+    fn a_voter_whose_frontier_creeps_asks_for_a_page() {
+        let voters = [r(1), r(2), r(3)];
+        let t0 = Instant::now();
+        let tick = Duration::from_millis(250);
+
+        // One command every 250 ms for 60 s, holding work throughout.
+        let mut creeping = Pacer::default();
+        let mut asked = 0;
+        for i in 0..240u64 {
+            let at = t0 + tick * i as u32;
+            if creeping
+                .due(at, standing(5 + i, true), r(3), r(1), &voters)
+                .is_some()
+            {
+                asked += 1;
+            }
+        }
+        assert!(asked >= 50, "a creeping voter asked {asked} times in 60 s");
+
+        // The probe after start is made even while the frontier creeps.
+        let mut started = Pacer::default();
+        let first = (0..8u64).find_map(|i| {
+            started.due(
+                t0 + tick * i as u32,
+                standing(5 + i, false),
+                r(3),
+                r(1),
+                &voters,
+            )
+        });
+        assert_eq!(first, Some(r(1)), "the probe after start was never made");
+
+        // A page a window is catching up: no ask.
+        // Probed already, so only held work makes it ask.
+        let mut fast = Pacer {
+            probed: true,
+            ..Pacer::default()
+        };
+        for i in 0..240u64 {
+            let at = t0 + tick * i as u32;
+            let executed = 5 + i * MAX_CATCH_UP_COMMANDS as u64 / 3;
+            assert_eq!(
+                fast.due(at, standing(executed, true), r(3), r(1), &voters),
+                None
+            );
+        }
+
+        // A healthy follower at low load empties between commands, and
+        // doesn't ask either.
+        let mut healthy = Pacer {
+            probed: true,
+            ..Pacer::default()
+        };
+        for i in 0..240u64 {
+            let at = t0 + tick * i as u32;
+            let holds = i % 2 == 0;
+            assert_eq!(
+                healthy.due(at, standing(5 + i / 2, holds), r(3), r(1), &voters),
+                None
+            );
+        }
     }
 
     /// The pacer registers when it next has to look, so an idle loop
