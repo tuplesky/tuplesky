@@ -411,12 +411,16 @@ fn a_rendered_snapshot_carries_no_secret_or_key_shaped_text() {
                     queued: Duration::from_millis(30),
                     served: Duration::from_millis(1800),
                     completed: Duration::from_millis(260),
+                    served_each: distribution(&[1, 2, 2, 9]),
+                    ..Jobs::default()
                 },
                 materializer_jobs: Jobs {
                     count: 120,
                     queued: Duration::from_millis(40),
                     served: Duration::from_millis(700),
                     completed: Duration::from_millis(90),
+                    served_each: distribution(&[1, 2, 2, 9]),
+                    ..Jobs::default()
                 },
             }),
             fast_path: FastPath {

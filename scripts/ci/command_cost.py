@@ -34,7 +34,10 @@ the voter started:
   released, in all and by part;
 - the read barrier's wait;
 - the domain loop's run-queue time a pass, sampled one pass in sixteen,
-  over every sampled pass and over those that executed a command.
+  over every sampled pass and over those that executed a command;
+- the journal appender's and the projection's jobs, each job's time
+  served (for the appender, an append and its sync: the disk's own
+  tail) and queued before its thread took it, at every voter.
 
 A quantile is the upper edge of the bucket it falls in, within a fifth
 of the value. The read barrier's wait is kept in whole milliseconds, the
@@ -214,6 +217,14 @@ def tails_of(cost: dict) -> dict:
                 q = quantiles_of(scheduling["Observed"].get(name))
                 if q is not None:
                     tails[name] = q
+    waits = cost.get("waits")
+    if isinstance(waits, dict) and "Observed" in waits:
+        for side, short in (("appender", "journal"), ("materializer", "projection")):
+            jobs = waits["Observed"].get(f"{side}_jobs") or {}
+            for time in ("served", "queued"):
+                q = quantiles_of(jobs.get(f"{time}_each"))
+                if q is not None:
+                    tails[f"{short}_{time}"] = q
     return {"tails": tails} if tails else {}
 
 
@@ -677,7 +688,8 @@ def paths_table(result: dict) -> str:
 
 TAILS = ("answered_writes", "answered_reads", "release_round", "release_whole",
          "release_predecessors", "release_group", "release_journal", "read_waited",
-         "run_queue_per_pass", "run_queue_per_working_pass")
+         "run_queue_per_pass", "run_queue_per_working_pass", "journal_served",
+         "journal_queued", "projection_served", "projection_queued")
 
 
 def tails_table(result: dict) -> str:
@@ -686,8 +698,10 @@ def tails_table(result: dict) -> str:
     lines = [
         "| callers | node | arrival to answer ms p50/p99/max (n): writes | reads "
         "| submitted to learned | learned to released | predecessors | group | journal "
-        "| read wait (whole ms) | run queue a pass (sampled) | a pass that executed |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        "| read wait (whole ms) | run queue a pass (sampled) | a pass that executed "
+        "| journal job served | queued | projection job served | queued |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- "
+        "| --- | --- | --- |",
     ]
     for run in result["runs"]:
         for v in run["voters"]:

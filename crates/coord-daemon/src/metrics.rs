@@ -636,6 +636,13 @@ pub struct Jobs {
     pub served: Duration,
     /// From each one's end to the domain thread taking it back.
     pub completed: Duration,
+    /// `queued`, distributed over the jobs (task-d97, #191 review).
+    #[serde(default)]
+    pub queued_each: Distribution,
+    /// `served`, distributed over the jobs: for the journal's appender,
+    /// each append and its sync, the disk's own tail.
+    #[serde(default)]
+    pub served_each: Distribution,
 }
 
 /// Why commands missed the fast path, and the fast acknowledgements a
@@ -723,9 +730,10 @@ pub struct Release {
 /// network's; beside the parts, it says how much of the server's tail
 /// they hold.
 ///
-/// Every request answered is counted: an answer from consensus, from a
-/// retained result, or at the door, a refusal among them. One whose
-/// caller went away, or that was never answered, is not.
+/// An operation's answer is counted: one from consensus, from the read
+/// barrier, or from a retained result. An answer at the door, a refusal
+/// or a binding, is not an operation's and is not counted, and neither
+/// is a request whose caller went away or that was never answered.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Answered {
     /// Requests other than a read.
@@ -1130,14 +1138,12 @@ impl Recorder {
     }
 }
 
-/// Sub-buckets a power of two of microseconds is split into: a recorded
-/// value is placed within about 19% of where it fell (task-d97).
-const SUB_BUCKETS: usize = 4;
-
-/// Buckets of a [`Distribution`]: the values below [`SUB_BUCKETS`]
-/// microseconds one each, then [`SUB_BUCKETS`] for each power of two up
-/// to 2^26 µs (about 67 s). A longer value falls in the last.
-pub const DISTRIBUTION_BUCKETS: usize = SUB_BUCKETS + (26 - 2 + 1) * SUB_BUCKETS;
+/// Buckets of a [`Distribution`]: the values below four microseconds
+/// one each, then four for each power of two up to 2^26 µs (about 67 s),
+/// so a value is placed within about a fifth of where it fell. A longer
+/// value falls in the last. The bucketing is `coord_storage::latency`'s,
+/// which the pipeline threads count their jobs in too.
+pub const DISTRIBUTION_BUCKETS: usize = coord_storage::latency::BUCKETS;
 
 /// How a wait was distributed, cumulative (task-d97): counts in
 /// log-linear buckets of microseconds and the longest seen.
@@ -1155,6 +1161,15 @@ pub struct Distribution {
     pub max: Duration,
 }
 
+impl From<coord_storage::latency::Counts> for Distribution {
+    fn from(counts: coord_storage::latency::Counts) -> Self {
+        Distribution {
+            buckets: counts.buckets,
+            max: counts.max,
+        }
+    }
+}
+
 impl Default for Distribution {
     fn default() -> Self {
         Distribution {
@@ -1167,29 +1182,17 @@ impl Default for Distribution {
 impl Distribution {
     /// The bucket `micros` falls in.
     pub fn bucket(micros: u64) -> usize {
-        let sub = SUB_BUCKETS as u64;
-        if micros < sub {
-            return micros as usize;
-        }
-        let octave = 63 - micros.leading_zeros() as u64;
-        let within = (micros >> (octave - 2)) & (sub - 1);
-        ((sub + (octave - 2) * sub + within) as usize).min(DISTRIBUTION_BUCKETS - 1)
+        coord_storage::latency::bucket(micros)
     }
 
     /// The least value, in microseconds, bucket `index` holds.
     pub fn lower(index: usize) -> u64 {
-        if index < SUB_BUCKETS {
-            return index as u64;
-        }
-        let octave = ((index - SUB_BUCKETS) / SUB_BUCKETS) as u64 + 2;
-        let within = ((index - SUB_BUCKETS) % SUB_BUCKETS) as u64;
-        (SUB_BUCKETS as u64 + within) << (octave - 2)
+        coord_storage::latency::lower(index)
     }
 
     /// Count `wait`.
     pub fn record(&mut self, wait: Duration) {
-        let micros = u64::try_from(wait.as_micros()).unwrap_or(u64::MAX);
-        self.buckets[Self::bucket(micros)] += 1;
+        self.buckets[coord_storage::latency::bucket_of(wait)] += 1;
         self.max = self.max.max(wait);
     }
 
@@ -1278,7 +1281,7 @@ mod distribution_tests {
             if index > 0 {
                 assert_eq!(Distribution::bucket(lower - 1), index - 1, "below {index}");
             }
-            if index >= SUB_BUCKETS && index + 1 < DISTRIBUTION_BUCKETS {
+            if index >= coord_storage::latency::SUB_BUCKETS && index + 1 < DISTRIBUTION_BUCKETS {
                 let next = Distribution::lower(index + 1);
                 assert!((next - lower) * 4 <= lower, "bucket {index} is too wide");
             }

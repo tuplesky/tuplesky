@@ -1853,6 +1853,8 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                             queued: times.queued,
                             served: times.served,
                             completed: times.completed,
+                            queued_each: times.queued_each.into(),
+                            served_each: times.served_each.into(),
                         }
                     };
                     Measure::Observed(PipelineWaits {

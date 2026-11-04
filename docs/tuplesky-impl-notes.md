@@ -10939,6 +10939,13 @@ the three parts above reads as somewhere, not as "not in these":
   leading voter's loop, the first one for a command submitted twice, to
   the leader learning it. A command learned without a submission
   stamped, one recovered, is not in it.
+- **The journal's and the projection's jobs, at every voter**
+  (`cost.waits.appender_jobs.served_each` and `queued_each`, the same for
+  `materializer_jobs`). Each job's served time is, for the appender, an
+  append and its sync: the disk's own tail, which tells a round's p99
+  that is the disk from one that is queueing or hops (#191 review). The
+  pipeline threads count them in `coord_storage::latency`'s buckets,
+  which the daemon's distributions use too.
 
 A distribution is cumulative like the rest of the cost: log-linear
 buckets in microseconds, four an octave from 4 µs to 2^26 µs (104

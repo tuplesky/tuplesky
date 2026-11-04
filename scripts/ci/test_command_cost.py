@@ -323,6 +323,24 @@ class ReduceTests(unittest.TestCase):
             self.assertAlmostEqual(tails[name]["p99_ms"], 1.0, msg=name)
         self.assertNotIn("run_queue_per_pass", tails)
 
+    def test_the_jobs_tails_are_read_when_reported(self):
+        snap = snapshot()
+        syncs = {"buckets": [[41, 9], [49, 1]], "max": duration(0.012)}
+        snap["cost"]["Observed"]["waits"] = {"Observed": {
+            "appender": {"count": 0, "time": duration(0)},
+            "materializer": {"count": 0, "time": duration(0)},
+            "appender_jobs": {"count": 10, "queued": duration(0), "served": duration(0.03),
+                              "completed": duration(0), "served_each": syncs},
+            "materializer_jobs": {"count": 0, "queued": duration(0), "served": duration(0),
+                                  "completed": duration(0)},
+        }}
+        tails = cost.per_command("n1", snap)["tails"]
+        self.assertEqual(tails["journal_served"]["count"], 10)
+        self.assertAlmostEqual(tails["journal_served"]["p50_ms"], 3.072)
+        self.assertAlmostEqual(tails["journal_served"]["max_ms"], 12.0)
+        for absent in ("journal_queued", "projection_served", "projection_queued"):
+            self.assertNotIn(absent, tails)
+
     def test_the_bucket_edges_match_the_daemons(self):
         # Four a power of two: 4..7 us one each, then 8, 10, 12, 14.
         self.assertEqual([cost.bucket_lower(i) for i in range(12)],
