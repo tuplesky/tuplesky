@@ -155,7 +155,7 @@ impl<E: LocalEngine> Domain<E> {
             let auth =
                 load_authorization(gated.view(), NS, &session, ViewBudget::default()).unwrap();
             let stored: coord_state::Response = postcard::from_bytes(&record.response).unwrap();
-            authorize_retained(&auth, &NS, request, &stored.outcome).is_ok()
+            Ok(authorize_retained(&auth, &NS, request, &stored.outcome).is_ok())
         })
         .unwrap();
         if admission != Admission::New {
@@ -183,7 +183,7 @@ impl<E: LocalEngine> Domain<E> {
         let gated = self.worker.reader().snapshot().unwrap();
         let view = gated.view();
         retry::resolve(view, &binding(session, seq, request), |_| {
-            retry::session_executable(view, &session).unwrap()
+            Ok(retry::session_executable(view, &session).unwrap())
         })
         .unwrap()
     }
@@ -397,4 +397,75 @@ fn a_retained_result_is_resolved_under_the_authorization_a_live_one_gets() {
         d.resolve_as_a_frontend(S1, 1, &request),
         Resolution::NoSession
     );
+}
+
+/// A view whose every read fails, as a store with an I/O fault does.
+struct Failing;
+
+impl coord_store_api::engine::OrderedRead for Failing {
+    fn get(
+        &self,
+        _: coord_store_api::engine::CollectionId,
+        _: &[u8],
+    ) -> Result<Option<Vec<u8>>, coord_store_api::engine::EngineError> {
+        Err(coord_store_api::engine::EngineError::new(
+            coord_store_api::engine::ErrorClass::Io,
+            "injected",
+        ))
+    }
+
+    fn scan_page(
+        &self,
+        _: coord_store_api::engine::CollectionId,
+        _: &coord_store_api::engine::ScanRequest,
+    ) -> Result<coord_store_api::engine::RowPage, coord_store_api::engine::EngineError> {
+        Err(coord_store_api::engine::EngineError::new(
+            coord_store_api::engine::ErrorClass::Io,
+            "injected",
+        ))
+    }
+}
+
+/// Whether a retained result may be handed out is a function of the
+/// replicated rows only (task-d95): a replica that can't read its own
+/// authorization rows, or can't decode the response it stored, has no
+/// answer, and says so with an error rather than `false`. At execution
+/// `false` landed `RetryUnauthorized` as the command's replicated result,
+/// which a replica without the fault would not produce; the error stops
+/// the voter instead, as every other local fault at execution does.
+#[test]
+fn a_local_fault_reading_a_retained_results_authorization_is_an_error_not_a_refusal() {
+    let (backend, _) = FaultBackend::new(Vec::new(), FaultPlan::default());
+    let mut d = Domain::new(RedbEngine::create_on_backend(backend, 4 << 20).unwrap());
+    d.run_internal(&trust(true));
+    d.run_internal(&admit(1, S1));
+    d.run_internal(&allow_write(1, b"a", b"c"));
+    let request = put(b"a", b"1");
+    assert_eq!(d.run(S1, 1, &request).0, Admission::New);
+    let Resolution::Result(record) = d.resolve(S1, 1, &request) else {
+        panic!("the result was not retained");
+    };
+
+    let gated = d.worker.reader().snapshot().unwrap();
+    let view = gated.view();
+    assert_eq!(
+        coord_storage::apply::retained_is_authorized(view, &S1, &request, &record),
+        Ok(true)
+    );
+    // The authorization rows can't be read: an error, not a refusal.
+    let read = coord_storage::apply::retained_is_authorized(&Failing, &S1, &request, &record)
+        .expect_err("a failed read is not an answer");
+    assert_eq!(read.class, coord_store_api::engine::ErrorClass::Io);
+    // The stored response doesn't decode: corruption, not a refusal.
+    let mut garbled = record.clone();
+    garbled.response = vec![0xff; 4];
+    let decoded = coord_storage::apply::retained_is_authorized(view, &S1, &request, &garbled)
+        .expect_err("an undecodable result is not an answer");
+    assert_eq!(decoded.class, coord_store_api::engine::ErrorClass::Corrupt);
+    // And admission, the path execution takes, carries the error out
+    // rather than `Admission::Unauthorized`.
+    let admitted = retry::admit(view, &binding(S1, 1, &request), |record| {
+        coord_storage::apply::retained_is_authorized(&Failing, &S1, &request, record)
+    });
+    assert!(admitted.is_err(), "{admitted:?}");
 }
