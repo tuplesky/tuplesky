@@ -173,8 +173,10 @@ pub struct MetricsConfig {
 ///
 /// coordd's network, timers and serve loop run on tokio's multi-thread
 /// runtime; the domain loop and the store workers are threads of their
-/// own and are not counted here. Unset, tokio chooses, which is a worker
-/// a core. On one host with every voter sharing its cores that runs
+/// own and are not counted here. Set, it is the count, whatever
+/// `TOKIO_WORKER_THREADS` says. Unset, tokio chooses: that variable's
+/// count where it is set, as the Jepsen job sets it, and otherwise a
+/// worker a core. On one host with every voter sharing its cores that runs
 /// several workers a core: in task-d91's local pair one worker a voter
 /// cut the voters' CPU a command by 12 to 27%, with latency lower too,
 /// almost all of it the workers' parking, wake-ups and stealing. The

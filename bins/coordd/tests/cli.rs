@@ -6837,7 +6837,22 @@ async fn the_runtime_runs_the_configured_number_of_workers() {
     for config in &cluster.configs {
         assert_eq!(run(config, &["init"]).code, Some(0));
     }
-    let running: Vec<Running> = cluster.configs.iter().map(|c| start(c)).collect();
+    // The configured node and the second run with tokio's environment
+    // variable set, as the Jepsen job sets it for every voter: the
+    // configuration wins on the first, the variable holds on the second
+    // (#190 review).
+    let running: Vec<Running> = cluster
+        .configs
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            if i < 2 {
+                start_with(c, &[("TOKIO_WORKER_THREADS", "2")])
+            } else {
+                start(c)
+            }
+        })
+        .collect();
     for node in &running {
         assert!(
             node.waits_to_say("voters submittable=2 of 2"),
@@ -6856,11 +6871,12 @@ async fn the_runtime_runs_the_configured_number_of_workers() {
             .filter(|name| name.trim() == "tokio-rt-worker")
             .count()
     };
-    assert_eq!(workers(&running[0]), 1);
+    assert_eq!(workers(&running[0]), 1, "the setting beats the variable");
+    assert_eq!(workers(&running[1]), 2, "the variable, with no setting");
     // tokio's own default, which its environment variable overrides.
     let default = std::env::var("TOKIO_WORKER_THREADS")
         .ok()
         .and_then(|n| n.parse().ok())
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
-    assert_eq!(workers(&running[1]), default);
+    assert_eq!(workers(&running[2]), default);
 }
