@@ -3012,6 +3012,7 @@ This entry is the budget and the record, not a lever:
   - **The target, as a ratio to etcd.** 2.8 ms was set against etcd's 1.39 ms on the #173 carry's EPYC 7763; this batch ran on a Platinum 8573C without etcd on the register row. So the target is about 2.0 times etcd's register row read on the same runner in the same job, asked of the testing session on #98. If etcd moved across runners as the base did (3.58 to 2.85 ms, ×0.80), the target on this runner is about 2.2 ms, and the head, at 2.60, is about 0.4 ms (15%) short. That's an assumption until etcd's row is read.
   - **What the split and R4 name, sized locally before anything is built:**
     - **Parking and wake-ups, about a fifth of the tokio threads** (task-d91). The leader's tokio threads wake 7.2 times an operation and run 34 µs a wake. coordd's runtime is tokio's multi-thread one at its default worker count, one a core. A local pair at one worker a voter, behind an environment setting, says whether work stealing and wake-ups across workers are a lever before anything else is built.
+      - **Read:** it is. One worker a voter cut the voters' CPU a command 27% at three voters and 12% at five, on one 4-core host, with latency lower too (task-d91's entry). Its lever, a worker-count setting, goes into the next batch.
     - **QUIC, send and receive, about three fifths of the tokio threads** (task-d96). They scale with packets. The ACK frequency is already 8 (task-d70), and R3 measured per-step coalescing (#187), so what's left is fewer messages a command. That's design work, so task-d96 is a design entry that sizes it from R3's frame counts at each voter count before anyone builds it.
     - **The domain loops,** about 1.08 ms an operation on the head. C6 to C8 stay small, as recorded: task-d60's third step and task-d87.
     - **`service` p99,** 12 to 22 ms against etcd's 3: task-d90 (L4, #181) is the long pole. R4 on that row, asked of the testing session on #98, says how much of it is waiting for a core rather than syncs in series.
@@ -3376,6 +3377,21 @@ The change, in two steps:
 - **Then the lever it names:** fewer wake-ups a hop (task-d70's third step, or task-d73's wait if it is taken), or where the threads run.
   - **Read (task-d72's batch, #98):** the leader's threads wait about 2.1 ms for a core an operation in all; its tokio threads wake 7.2 times an operation and run 34 µs a wake, and parking and wake-ups are about a fifth of the tokio threads.
   - **Where the threads run, read first:** a local pair, each voter's runtime at tokio's default worker count against one worker, behind an environment setting that is read only for the pair. It says whether work stealing and wake-ups across workers are a lever, and how much of the fifth they are.
+  - **Read locally (#185):** the batch's head (`b59f2b0`), each voter's runtime given its worker count through tokio's own `TOKIO_WORKER_THREADS`, set for coordd alone. Same shape as the earlier pairs: 30 callers, `replay`, stores on tmpfs, 50,000 operations, sides alternating, on one 4-core host.
+
+    | Voters | Workers a voter | Runs | Voters' CPU a command | Off the domain loops | `ok`/s | put p50 / p99 |
+    | --- | --- | --- | --- | --- | --- | --- |
+    | 3 | default (4) | 3 | 2.87 ms | 1.72 ms | 2,522 | 21.8 / 48.0 ms |
+    | 3 | 2 | 3 | 2.49 ms (−13%) | 1.44 ms | 2,571 | 20.9 / 43.9 ms |
+    | 3 | 1 | 3 | 2.09 ms (−27%) | 1.10 ms | 2,680 | 19.7 / 42.0 ms |
+    | 5 | default (4) | 2 | 4.71 ms | 2.81 ms | 1,773 | 32.1 / 63.3 ms |
+    | 5 | 1 | 2 | 4.15 ms (−12%) | 2.28 ms | 1,961 | 29.1 / 57.9 ms |
+
+    - **It's a lever, and most of it is off the domain loops:** the tokio threads' parking, wake-ups and stealing between workers.
+    - **Latency doesn't pay for it.** Fewer workers also cut p50 and p99, and `ok`/s rises.
+    - **The caveat: every voter here shares four cores.** tokio's default is a worker a core, so three voters run 12 workers and five run 20. The Jepsen runner co-locates its nodes the same way, and R4 read 2.1 ms an operation waiting for a core there. A node with a host of its own may gain less. That's why the default isn't changed on this reading.
+  - **The lever it names:** a `[runtime] worker_threads` setting in coordd's configuration, unset meaning tokio's default. The next batch's head sets it to 1 on every node, and the batch's base doesn't. The batch's pair is then the runner's reading of it. The default is decided from that reading together with one where each node has cores of its own.
+  - **Projected on the register row:** if it moves as the five-voter pair did, −12% of the head's 2.60 ms is about 2.29 ms. That's within about 0.1 ms of the re-anchored ~2.2 ms, if etcd's row confirms it, and before task-d96 or task-d90.
 
 **Acceptance:** The reading recorded from the batch's base side, with the lever chosen from it and its local pair.
 
