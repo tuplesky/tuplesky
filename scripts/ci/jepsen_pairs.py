@@ -4,13 +4,17 @@ on one runner, so the runner's own speed cancels out of their difference.
 
     scripts/ci/jepsen_pairs.py [--title TITLE] LABEL=STORE [LABEL=STORE ...]
 
-Each argument is one run's store directory, labelled `base` or `head`, in
-the order the job ran them. A pair is a base and a head next to each other,
-in either order (the job alternates the order from pair to pair, so a drift
-over the job does not favour one side). For every run it reads, with
-`jepsen_summary.py`'s own parsers:
+Each argument is one run's store directory, labelled `base`, `head` or
+`etcd`, in the order the job ran them. A pair is a base and a head next to
+each other, in either order (the job alternates the order from pair to
+pair, so a drift over the job does not favour one side). An `etcd` run is
+the etcd test on the same runner and cluster (the workflow's
+`etcd-beside`), after the TupleSky runs it is compared with: those since
+the etcd run before it. For every run it reads, with `jepsen_summary.py`'s
+own parsers:
 
-* `ok` a second and the read p99, from `jepsen.log`;
+* `ok` a second, the read p99, and the p50 and p99 of every `ok`
+  operation, from `jepsen.log`;
 * the voters' process CPU per completed operation, summed over each
   voter's boots (each boot's last `metrics` line), and the leader's loop
   CPU per command and the followers' mean, and the leader's excess over
@@ -26,6 +30,8 @@ over the job does not favour one side). For every run it reads, with
 
 It writes one row per run and one per pair with the head's difference from
 the base, then the mean, smallest and largest difference over the pairs,
+and, with `etcd` runs, each TupleSky run's ratio to its etcd run and each
+build's mean ratio,
 as Markdown, to `$GITHUB_STEP_SUMMARY` when it is set and to standard
 output either way.
 """
@@ -45,6 +51,9 @@ class Run:
     store: str
     ok_per_s: float | None = None
     read_p99: float | None = None
+    # Every `ok` operation's latency, whatever its function (ms).
+    ok_p50: float | None = None
+    ok_p99: float | None = None
     voters_cpu_per_op: float | None = None
     leader_loop: float | None = None
     followers_loop: float | None = None
@@ -248,6 +257,9 @@ def read_run(label: str, store: str) -> Run:
     reads = latencies.get(":read")
     if reads:
         run.read_p99 = js.percentile(reads, 0.99)
+    every = sorted(ms for f in latencies.values() for ms in f)
+    if every:
+        run.ok_p50, run.ok_p99 = js.percentile(every, 0.5), js.percentile(every, 0.99)
     done = [o for o in client if o.type != "invoke"]
     if client:
         start = client[0].at
@@ -630,8 +642,10 @@ def profile_table(runs: list[Run], top: int = 20) -> list[str]:
 
 
 def pairs(runs: list[Run]) -> list[tuple[Run, Run]]:
-    """Each base with the head beside it, taking the runs two at a time."""
+    """Each base with the head beside it, taking TupleSky's runs two at a
+    time (the etcd runs between them aside)."""
     out = []
+    runs = [r for r in runs if r.label != "etcd"]
     for a, b in zip(runs[0::2], runs[1::2]):
         if {a.label, b.label} == {"base", "head"}:
             out.append((a, b) if a.label == "base" else (b, a))
@@ -681,6 +695,82 @@ def group_tables(runs: list[Run], paired: list, measures, heading: str) -> list[
     return out
 
 
+# Against etcd on one runner (etcd-beside): what the two tests share.
+ETCD = (
+    ("ok_per_s", "`ok`/s", "{:.1f}"),
+    ("ok_p50", "p50 (ms)", "{:.0f}"),
+    ("ok_p99", "p99 (ms)", "{:.0f}"),
+    ("servers_cpu_per_op", "Servers' CPU per op, sampled (ms)", "{:.2f}"),
+)
+
+
+def beside_etcd(runs: list[Run]) -> list[tuple[Run, list[Run]]]:
+    """Each etcd run with the TupleSky runs it is compared with: those
+    since the etcd run before it."""
+    out, since = [], []
+    for run in runs:
+        if run.label == "etcd":
+            out.append((run, since))
+            since = []
+        else:
+            since.append(run)
+    return out
+
+
+def ratio(value, etcd) -> float | None:
+    return value / etcd if value is not None and etcd else None
+
+
+def etcd_table(runs: list[Run]) -> list[str]:
+    """Each TupleSky run's measures and their ratio to its etcd run's, then
+    each build's mean ratio, smallest to largest, over the etcd runs."""
+    groups = [(e, rs) for e, rs in beside_etcd(runs) if rs]
+    if not groups:
+        return []
+    out = [
+        "**Against etcd on this runner** (`etcd-beside`: the etcd test on this job's runner and cluster after each "
+        "pair, or after the one run, with the same workload, faults, rate and clients; each TupleSky run's value, "
+        "then its ratio to the etcd run after it; the servers' CPU is the runner's samples of `coordd` or `etcd`, "
+        "over the operations completed)",
+        "",
+        "| Pair | Run | " + " | ".join(h for _, h, _ in ETCD) + " |",
+        "| --- " * (len(ETCD) + 2) + "|",
+    ]
+    for i, (etcd, others) in enumerate(groups, 1):
+        out.append(f"| {i} | etcd | " + " | ".join(cell(getattr(etcd, a), f) for a, _, f in ETCD) + " |")
+        for run in others:
+            cells = []
+            for a, _, f in ETCD:
+                r = ratio(getattr(run, a), getattr(etcd, a))
+                cells.append(cell(getattr(run, a), f) + (f" ({r:.2f}×)" if r is not None else ""))
+            out.append(f"| {i} | {run.label} | " + " | ".join(cells) + " |")
+    out.append("")
+    labels = [label for label in ("base", "head") if any(r.label == label for _, rs in groups for r in rs)]
+    if labels:
+        out.append("| Build, ratio to etcd | " + " | ".join(h for _, h, _ in ETCD) + " |")
+        out.append("| --- " * (len(ETCD) + 1) + "|")
+        for label in labels:
+            cells = []
+            for a, _, _ in ETCD:
+                rs = [
+                    x
+                    for etcd, others in groups
+                    for run in others
+                    if run.label == label
+                    for x in [ratio(getattr(run, a), getattr(etcd, a))]
+                    if x is not None
+                ]
+                if rs:
+                    mean = sum(rs) / len(rs)
+                    cells.append(f"{mean:.2f}× ({min(rs):.2f}× to {max(rs):.2f}×)" if len(rs) > 1 else f"{mean:.2f}×")
+                else:
+                    cells.append("-")
+            n = sum(1 for _, others in groups for run in others if run.label == label)
+            out.append(f"| {label}, mean of {n} | " + " | ".join(cells) + " |")
+        out.append("")
+    return out
+
+
 def render(runs: list[Run], title: str) -> str:
     out = [f"## {title}", ""]
     paired = pairs(runs)
@@ -694,6 +784,7 @@ def render(runs: list[Run], title: str) -> str:
             "loop's CPU per command less the followers' mean)",
         )
     )
+    out.extend(etcd_table(runs))
     if any(getattr(r, a) is not None for r in runs for a, _, _ in TRAFFIC):
         out.extend(
             group_tables(
@@ -752,13 +843,13 @@ def render(runs: list[Run], title: str) -> str:
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     p.add_argument("--title", default="Paired runs")
-    p.add_argument("runs", nargs="+", help="LABEL=STORE, with LABEL base or head, in the order they ran")
+    p.add_argument("runs", nargs="+", help="LABEL=STORE, with LABEL base, head or etcd, in the order they ran")
     a = p.parse_args()
     runs = []
     for spec in a.runs:
         label, _, store = spec.partition("=")
-        if label not in ("base", "head") or not store:
-            print(f"not LABEL=STORE with LABEL base or head: {spec}", file=sys.stderr)
+        if label not in ("base", "head", "etcd") or not store:
+            print(f"not LABEL=STORE with LABEL base, head or etcd: {spec}", file=sys.stderr)
             return 2
         runs.append(read_run(label, store))
     text = render(runs, a.title)

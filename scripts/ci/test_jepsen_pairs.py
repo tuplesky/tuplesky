@@ -322,6 +322,50 @@ class PairTests(unittest.TestCase):
         # With what it calls: all of the base's samples, a tenth of the head's.
         self.assertIn("| `coord_core::outbox::Outbox::release` and what it calls | 100.00% | 10.00% | -90.00 |", text)
 
+    def etcd_store(self, name, read_ms, servers_s=None):
+        """An etcd run of the same four reads, with no voters, and the
+        runner's samples when servers_s is given (its CPU over the run)."""
+        path = os.path.join(self.tmp.name, name)
+        os.makedirs(path)
+        with open(os.path.join(path, "jepsen.log"), "w") as f:
+            for i, second in enumerate((0, 3, 6, 10)):
+                f.write(op(f"10:00:{second:02d},000", i, "invoke"))
+                f.write(op(f"10:00:{second:02d},{read_ms:03d}", i, "ok"))
+        if servers_s is not None:
+            with open(os.path.join(path, "cpu-samples.csv"), "w") as f:
+                f.write("time,host_busy_s,host_total_s,cpus,servers_s,steal_s\n"
+                        "2026-09-27 09:59:59.000000,0,0,4,10,0\n"
+                        f"2026-09-27 10:00:11.000000,0,0,4,{10 + servers_s},0\n")
+        return jp.read_run("etcd", path)
+
+    def test_each_run_against_the_etcd_run_after_its_pair(self):
+        with open(os.path.join(self.runs[0].store, "cpu-samples.csv"), "w") as f:
+            f.write("time,host_busy_s,host_total_s,cpus,servers_s,steal_s\n"
+                    "2026-09-27 09:59:59.000000,0,0,4,10,0\n"
+                    "2026-09-27 10:00:11.000000,0,0,4,14,0\n")
+        first = jp.read_run("base", self.runs[0].store)
+        runs = [first, self.runs[1], self.etcd_store("e1", 10, 2), self.runs[2], self.runs[3], self.etcd_store("e2", 20)]
+        # The etcd runs between them leave the pairs as they were.
+        self.assertEqual([(b.store[-1], h.store[-1]) for b, h in jp.pairs(runs)], [("1", "2"), ("4", "3")])
+        self.assertEqual((first.ok_p50, first.ok_p99), (50, 50))
+        text = jp.render(runs, "Paired")
+        self.assertIn("**Against etcd on this runner**", text)
+        # 2 s of etcd's CPU over its four operations; 4 s of the base's.
+        self.assertIn("| 1 | etcd | 0.4 | 10 | 10 | 500.00 |", text)
+        self.assertIn("| 1 | base | 0.4 (1.00×) | 50 (5.00×) | 50 (5.00×) | 1000.00 (2.00×) |", text)
+        self.assertIn("| 1 | head | 0.4 (1.00×) | 40 (4.00×) | 40 (4.00×) | - |", text)
+        self.assertIn("| 2 | etcd | 0.4 | 20 | 20 | - |", text)
+        self.assertIn("| 2 | base | 0.4 (1.00×) | 60 (3.00×) | 60 (3.00×) | - |", text)
+        # The base's p99 at 5 and 3 times etcd's, the head's at 4 and 1.5.
+        self.assertIn("| base, mean of 2 | 1.00× (1.00× to 1.00×) | 4.00× (3.00× to 5.00×) | 4.00× (3.00× to 5.00×) | 2.00× |", text)
+        self.assertIn("| head, mean of 2 | 1.00× (1.00× to 1.00×) | 2.75× (1.50× to 4.00×) | 2.75× (1.50× to 4.00×) | - |", text)
+
+    def test_one_run_against_etcd_without_a_pair(self):
+        text = jp.render([self.runs[1], self.etcd_store("e", 10)], "Beside etcd")
+        self.assertIn("| 1 | head | 0.4 (1.00×) | 40 (4.00×) | 40 (4.00×) | - |", text)
+        self.assertIn("| head, mean of 1 | 1.00× | 4.00× | 4.00× | - |", text)
+        self.assertIn("no pair to compare", text)
+
     def test_runs_that_are_not_side_by_side_are_not_paired(self):
         text = jp.render([self.runs[0], self.runs[3]], "Paired")
         self.assertIn("no pair to compare", text)

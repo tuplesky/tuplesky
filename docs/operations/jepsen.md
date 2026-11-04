@@ -562,6 +562,28 @@ and its behaviour under faults have something to be compared with:
 
 Its store is the `jepsen-store-etcd-<scenario>-<workload>` artifact.
 
+Runners differ from job to job (AMD EPYC 7763, Intel Xeon Platinum 8573C
+and 8370C in November 2026), so the two jobs' absolute numbers compare only
+as far as their runners do. With `etcd-beside: true` the TupleSky job runs
+the etcd test itself instead, on its own runner and cluster, and the
+`etcd-baseline` job is skipped:
+
+* **When:** after each pair's two runs, so each pair has its own etcd run
+  on the same runner; in a job of one run, after it. Both tests run through
+  `scripts/ci/jepsen_etcd.sh`, which holds the version choice and the edits
+  above, so the etcd run is the baseline job's.
+* **What it gives:** each etcd run's own summary, and in the pair table
+  (`jepsen_pairs.py`, with each etcd run labelled `etcd`) a table of each
+  TupleSky run's `ok`/s, p50, p99 and servers' CPU per operation beside its
+  ratio to the etcd run after it, then each build's mean ratio over the
+  pairs. A target set against etcd is then a ratio read within one job.
+* **What it costs:** one etcd run per pair: a register pair job of three
+  pairs runs nine tests.
+* **The store:** etcd's runs are packed as `jepsen-store-etcd.tgz` beside
+  `jepsen-store.tgz` in the TupleSky job's artifact.
+* **A profiled job:** its nodes run Ubuntu (above), so the etcd test sets
+  up on that image there, where the baseline job's runs on Debian.
+
 A third job, `swiftpaxos-baseline`, runs
 [SwiftPaxos](https://github.com/imdea-software/swiftpaxos), the reference
 implementation of the protocol TupleSky's consensus follows, with the

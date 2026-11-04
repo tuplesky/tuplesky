@@ -9,6 +9,9 @@
 # test (jepsen-io/etcd) against etcd on the same cluster, with the same
 # workload, faults, time limit, concurrency, rate and fault interval, so a
 # run's throughput and fault behaviour have a baseline to compare with.
+# With `etcd-beside`, the TupleSky job runs that test itself instead, on its
+# own runner and cluster after each pair, so the two compare as a ratio on
+# one runner model.
 # `swiftpaxos-baseline` does the same for SwiftPaxos (imdea-software/swiftpaxos),
 # the reference implementation of the protocol TupleSky's consensus follows,
 # with the `jepsen.swiftpaxos` test from the same repository: linearizable
@@ -62,6 +65,11 @@ on:
       etcd-version:
         description: "etcd for the baseline: a version such as 3.7.2, latest (the newest stable release), or none to skip it"
         default: latest
+      etcd-beside:
+        description: "Run the etcd baseline in the TupleSky job, on its runner and cluster, after each pair (or after the one run), with each TupleSky run's ratio to it, instead of in a job of its own on another runner"
+        type: choice
+        options: ["false", "true"]
+        default: "false"
       store:
         description: "Where TupleSky's voters and etcd keep their stores: disk, or tmpfs to measure without the runner's disk"
         type: choice
@@ -118,6 +126,7 @@ on:
       - crates/coord-jepsen/**
       - scripts/ci/cpu_sampler.py
       - scripts/ci/jepsen_bounded.sh
+      - scripts/ci/jepsen_etcd.sh
       - scripts/ci/jepsen_pairs.py
       - scripts/ci/leader_profile.py
       - scripts/ci/jepsen_scenario.sh
@@ -165,6 +174,7 @@ env:
   IN_LEADER_PROFILE: ${{ inputs.leader-profile || 'false' }}
   NODES: ${{ inputs.nodes || '5' }}
   ETCD_VERSION: ${{ inputs.etcd-version || 'latest' }}
+  ETCD_BESIDE: ${{ inputs.etcd-beside || 'false' }}
   # jepsen-io/etcd, pinned; its head when the baseline was added.
   ETCD_TEST_REPO: jepsen-io/etcd
   ETCD_TEST_REF: b47cc401f27bfb7c28afd9ac088b5f0dca4501b8
@@ -198,6 +208,13 @@ jobs:
           ref: ${{ env.JEPSEN_REF }}
           path: jepsen
           persist-credentials: false
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        if: env.ETCD_BESIDE == 'true'
+        with:
+          repository: ${{ env.ETCD_TEST_REPO }}
+          ref: ${{ env.ETCD_TEST_REF }}
+          path: etcd-test
+          persist-credentials: false
       - name: Choose the scenario's settings
         run: |
           tuplesky/scripts/ci/jepsen_scenario.sh
@@ -225,6 +242,15 @@ jobs:
             }
             lsmod | grep -E '^(sch_prio|sch_netem|cls_u32) '
           fi
+      - name: Prepare the etcd test beside TupleSky
+        # etcd-beside: the etcd-baseline job's test, run on this runner and
+        # cluster in the Jepsen step below.
+        if: env.ETCD_BESIDE == 'true'
+        run: |
+          if [ "$ETCD_VERSION" = none ]; then
+            echo "::error::etcd-beside needs an etcd-version other than none"; exit 1
+          fi
+          tuplesky/scripts/ci/jepsen_etcd.sh prepare
       - name: Install the exact Rust toolchain from rust-toolchain.toml
         working-directory: tuplesky
         run: rustup show active-toolchain || rustup toolchain install
@@ -281,7 +307,8 @@ jobs:
           path: |
             ~/.m2/repository
             ~/.lein/self-installs
-          key: jepsen-m2-${{ hashFiles('jepsen/jepsen/project.clj', 'jepsen/tuplesky/project.clj') }}
+          # With etcd beside TupleSky, its test's dependencies too.
+          key: jepsen-m2-${{ hashFiles('jepsen/jepsen/project.clj', 'jepsen/tuplesky/project.clj', 'etcd-test/project.clj') }}
           restore-keys: jepsen-m2-
       - name: Install Leiningen and this repository's Jepsen
         run: |
@@ -427,16 +454,44 @@ jobs:
             "$ci/jepsen_bounded.sh" $((TIME_LIMIT + 1200)) "$RUNNER_TEMP/cluster/nodes" -- \
               "${common[@]}" --bin-dir "$bin" "$@"
           }
+          # With etcd-beside, the etcd test once on this runner and cluster,
+          # its samples in $1, summarized as the etcd-baseline job's is and
+          # named $2; its store in etcd_store.
+          etcd_previous="" etcd_store=""
+          etcd_one() {
+            local dir=$1 label=$2 store
+            mkdir -p "$dir"
+            (cd "$GITHUB_WORKSPACE" && "$ci/jepsen_etcd.sh" run "$dir/cpu-samples.csv") \
+              || echo "::warning::$label: the etcd test ended with status $?"
+            store=$(readlink -f "$GITHUB_WORKSPACE/etcd-test/store/latest" || true)
+            if [ -z "$store" ] || [ "$store" = "$etcd_previous" ]; then
+              echo "::warning::$label: the etcd test left no store"
+              return 1
+            fi
+            etcd_previous=$store etcd_store=$store
+            cp "$dir"/cpu-samples* "$store"/ 2>/dev/null || true
+            python3 "$ci/jepsen_summary.py" "$store" --nodes-file "$RUNNER_TEMP/cluster/nodes" \
+              --title "etcd $ETCD_VERSION: $WORKLOAD, $NEMESIS$TITLE_SUFFIX$STORE_SUFFIX: $label" || true
+          }
+          head_sha=$(git -C "$GITHUB_WORKSPACE/tuplesky" rev-parse --short HEAD)
+          beside=""; if [ "$ETCD_BESIDE" = true ]; then beside=", beside etcd $ETCD_VERSION"; fi
           if [ -z "$IN_PAIR_BASE" ]; then
             graph=flat; if [ "$IN_LEADER_PROFILE" = call-graph ]; then graph=graph; fi
-            run_one "$GITHUB_WORKSPACE/tuplesky/target/release" "$RUNNER_TEMP" "$graph"
-            exit $?
+            rc=0
+            run_one "$GITHUB_WORKSPACE/tuplesky/target/release" "$RUNNER_TEMP" "$graph" || rc=$?
+            store=$(readlink -f store/latest || true)
+            if [ "$ETCD_BESIDE" = true ] && [ -n "$store" ] && etcd_one "$RUNNER_TEMP/etcd" "beside TupleSky"; then
+              cp "$RUNNER_TEMP"/cpu-samples* "$store"/ 2>/dev/null || true
+              python3 "$ci/jepsen_pairs.py" \
+                --title "TupleSky $head_sha$beside on one runner: $WORKLOAD, $NEMESIS$TITLE_SUFFIX$STORE_SUFFIX$PROFILE_SUFFIX$CHECKPOINT_SUFFIX$WORKERS_SUFFIX$TUPLESKY_SUFFIX" \
+                "head=$store" "etcd=$etcd_store" || true
+            fi
+            exit $rc
           fi
           # Paired: base and head in turn on this runner, the order
           # alternating from pair to pair, each run summarized as it ends,
           # then the head's difference from the base pair by pair.
           head_bin="$RUNNER_TEMP/head-bin" base_bin="$RUNNER_TEMP/base-bin" base_args=()
-          head_sha=$(git -C "$GITHUB_WORKSPACE/tuplesky" rev-parse --short HEAD)
           case $IN_PAIR_BASE in
             env:*)
               if ! grep -q -- '--voter-env' src/jepsen/tuplesky.clj; then
@@ -482,9 +537,14 @@ jobs:
                 --title "TupleSky: $WORKLOAD, $NEMESIS$TITLE_SUFFIX$STORE_SUFFIX$PROFILE_SUFFIX$CHECKPOINT_SUFFIX$WORKERS_SUFFIX$TUPLESKY_SUFFIX: pair $i, $side ($name)" || true
               runs+=("$side=$store")
             done
+            # etcd after the pair, so each pair has its own on this runner.
+            if [ "$ETCD_BESIDE" = true ]; then
+              n=$((n + 1))
+              if etcd_one "$RUNNER_TEMP/run-$n" "pair $i"; then runs+=("etcd=$etcd_store"); fi
+            fi
           done
           python3 "$ci/jepsen_pairs.py" \
-            --title "TupleSky pairs: $head_sha (head) against $base_name (base), $WORKLOAD, $NEMESIS$TITLE_SUFFIX$STORE_SUFFIX$PROFILE_SUFFIX$CHECKPOINT_SUFFIX$WORKERS_SUFFIX$TUPLESKY_SUFFIX" \
+            --title "TupleSky pairs: $head_sha (head) against $base_name (base)$beside, $WORKLOAD, $NEMESIS$TITLE_SUFFIX$STORE_SUFFIX$PROFILE_SUFFIX$CHECKPOINT_SUFFIX$WORKERS_SUFFIX$TUPLESKY_SUFFIX" \
             ${runs[@]+"${runs[@]}"} || true
           exit $rc
       - name: Read how far each voter executed
@@ -602,12 +662,19 @@ jobs:
             tar czf "$RUNNER_TEMP/jepsen-store.tgz" --exclude=tuplesky-runs \
               -C jepsen/tuplesky store
           fi
+          # etcd's runs beside TupleSky (etcd-beside), as the etcd-baseline
+          # job packs its own.
+          if [ -d etcd-test/store ]; then
+            tar czf "$RUNNER_TEMP/jepsen-store-etcd.tgz" -C etcd-test store
+          fi
       - name: Upload the Jepsen store
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: jepsen-store-${{ env.SCENARIO }}-${{ env.WORKLOAD }}
-          path: ${{ runner.temp }}/jepsen-store.tgz
+          path: |
+            ${{ runner.temp }}/jepsen-store.tgz
+            ${{ runner.temp }}/jepsen-store-etcd.tgz
           retention-days: 14
           if-no-files-found: warn
       - name: Take the cluster down
@@ -616,7 +683,8 @@ jobs:
 
   etcd-baseline:
     name: etcd baseline (docker cluster)
-    if: ${{ (inputs.etcd-version || 'latest') != 'none' }}
+    # Not when the TupleSky job runs etcd on its own runner (etcd-beside).
+    if: ${{ (inputs.etcd-version || 'latest') != 'none' && inputs.etcd-beside != 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
@@ -684,133 +752,11 @@ jobs:
           echo "$LEIN_SHA256  $HOME/bin/lein" | sha256sum -c -
           chmod +x "$HOME/bin/lein"
           echo "$HOME/bin" >> "$GITHUB_PATH"
-      - name: Choose the etcd version
-        run: |
-          # `latest` is the highest stable (x.y.z) release tag of etcd-io/etcd,
-          # read when the job runs; anything else must be a version.
-          if [ "$ETCD_VERSION" = latest ]; then
-            ETCD_VERSION=$(git ls-remote --tags --refs https://github.com/etcd-io/etcd.git 'v*' \
-              | sed -n 's#.*refs/tags/v\([0-9]*\.[0-9]*\.[0-9]*\)$#\1#p' | sort -V | tail -n 1)
-          fi
-          if ! [[ "$ETCD_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::not an etcd version: '$ETCD_VERSION'"; exit 1
-          fi
-          echo "ETCD_VERSION=$ETCD_VERSION" >> "$GITHUB_ENV"
-          echo "etcd baseline: etcd $ETCD_VERSION, $ETCD_TEST_REPO@$ETCD_TEST_REF" >> "$GITHUB_STEP_SUMMARY"
-      - name: Let the etcd test start etcd 3.6 and later
-        working-directory: etcd-test
-        # The test passes --enable-v2, which etcd 3.6 removed ("flag provided
-        # but not defined"). The workloads here use only the v3 API.
-        run: sed -i '/^[[:space:]]*:--enable-v2$/d' src/jepsen/etcd/db.clj
-      - name: Let the etcd test pause etcd by process name
-        working-directory: etcd-test
-        # cu/grepkill! runs `pgrep -f etcd | xargs kill -stop` in a
-        # `bash -c` naming etcd. pgrep can list the pipeline's own xargs
-        # while it is still a fork of that bash, and xargs then stops
-        # itself: the pause never returns and holds the nemesis, so no
-        # start, resume or heal follows (runs 36323935964, 36365926073,
-        # 36368134612). cu/signal! is pkill by process name, which matches
-        # only etcd itself, as jepsen.tuplesky.db pauses coordd.
-        run: |
-          python3 - src/jepsen/etcd/db.clj <<'PY'
-          import sys
-          path = sys.argv[1]
-          src = open(path).read()
-          edits = [
-              ('(cu/grepkill! :stop "etcd")', '(cu/signal! "etcd" "STOP")'),
-              ('(cu/grepkill! :cont "etcd")', '(cu/signal! "etcd" "CONT")'),
-          ]
-          for old, new in edits:
-              if src.count(old) != 1:
-                  sys.exit(f"etcd db.clj no longer has: {old!r}")
-              src = src.replace(old, new)
-          open(path, "w").write(src)
-          PY
-          grep -n 'cu/signal!' src/jepsen/etcd/db.clj
-      - name: Give the etcd test the TupleSky test's kill schedule, network and keys
-        # The combined nemesis draws kill/start and pause/resume from one
-        # mix, so a start can wait minutes after a kill. jepsen.tuplesky
-        # staggers the two on their own (jepsen.tuplesky.nemesis); the
-        # baseline loads the same namespace so both tests keep one schedule.
-        # With jepsen.tuplesky.wan, it also takes the same --wan profile
-        # and packet fault: a --wan option, :packet among its faults, and
-        # the WAN nemesis in place of Jepsen's packet package. Its append
-        # and wr workloads take the run's key count and distribution, and
-        # its wr workload the read ratio, as jepsen.tuplesky's do; the etcd
-        # test has no options for them, so they are written in.
-        run: |
-          mkdir -p etcd-test/src/jepsen/tuplesky
-          cp jepsen/tuplesky/src/jepsen/tuplesky/nemesis.clj etcd-test/src/jepsen/tuplesky/
-          wan=false
-          if [ -f jepsen/tuplesky/src/jepsen/tuplesky/wan.clj ]; then
-            cp jepsen/tuplesky/src/jepsen/tuplesky/wan.clj etcd-test/src/jepsen/tuplesky/
-            wan=true
-          fi
-          python3 - etcd-test/src/jepsen "$wan" <<'PY'
-          import os, sys
-          root, wan = sys.argv[1], sys.argv[2] == "true"
-          def edit(path, edits):
-              src = open(path).read()
-              for old, new in edits:
-                  if src.count(old) != 1:
-                      sys.exit(f"{path} no longer has: {old!r}")
-                  src = src.replace(old, new)
-              open(path, "w").write(src)
-          packages = "(tn/separate-db-faults opts (nc/nemesis-packages opts))"
-          if wan:
-              packages = f"(tn/with-wan opts {packages})"
-          edit(f"{root}/etcd/nemesis.clj", [
-              ("            [jepsen.nemesis [combined :as nc]",
-               "            [jepsen.tuplesky.nemesis :as tn]\n"
-               "            [jepsen.nemesis [combined :as nc]"),
-              ("    (-> (nc/nemesis-packages opts)", f"    (-> {packages}"),
-          ])
-          keys = "{:key-count         " + (os.environ.get("KEY_COUNT") or "3")
-          if os.environ.get("KEY_DIST"):
-              keys += "\n                   :key-dist          :" + os.environ["KEY_DIST"]
-          edit(f"{root}/etcd/append.clj", [("{:key-count         3", keys)])
-          wr = [("{:key-count         3", keys)]
-          ratio = os.environ.get("READ_RATIO")
-          if ratio:
-              # jepsen.tuplesky/with-read-ratio, written in: clojure.core's
-              # rand, since this namespace may load before jepsen.random.
-              wr += [
-                  ("(defn workload\n",
-                   "(defn- with-read-ratio\n"
-                   "  \"Makes about `ratio` of the workload's transactions read-only\n"
-                   "  (jepsen.tuplesky/with-read-ratio, from the TupleSky workflow).\"\n"
-                   "  [ratio workload]\n"
-                   "  (update workload :generator\n"
-                   "          (fn [g]\n"
-                   "            (jepsen.generator/map\n"
-                   "              (fn [op]\n"
-                   "                (if (< (rand) ratio)\n"
-                   "                  (update op :value\n"
-                   "                          (fn [txn] (mapv (fn [[f k _ :as mop]]\n"
-                   "                                            (if (= :w f) [:r k nil] mop))\n"
-                   "                                          txn)))\n"
-                   "                  op))\n"
-                   "              g))))\n\n"
-                   "(defn workload\n"),
-                  ("  (assoc (wr/test {", f"  (with-read-ratio {ratio}\n  (assoc (wr/test {{"),
-                  (":client (TxnClient. nil)))", ":client (TxnClient. nil))))"),
-              ]
-          edit(f"{root}/etcd/wr.clj", wr)
-          if wan:
-              edit(f"{root}/etcd.clj", [
-                  ("    :clock :member})", "    :clock :member :packet})"),
-                  ("                         :interval  (:nemesis-interval opts)})",
-                   "                         :wan       (:wan opts)\n"
-                   "                         :interval  (:nemesis-interval opts)})"),
-                  ('   [nil "--nemesis-interval SECONDS"',
-                   '   [nil "--wan PROFILE" "none, regions, or one-way milliseconds (jepsen.tuplesky.wan)"\n'
-                   '    :parse-fn #(jepsen.tuplesky.wan/parse-spec %)]\n\n'
-                   '   [nil "--nemesis-interval SECONDS"'),
-              ])
-          PY
-          grep -n 'tn/' etcd-test/src/jepsen/etcd/nemesis.clj
-          grep -n -A1 ':key-count\|read-ratio' etcd-test/src/jepsen/etcd/{append,wr}.clj
-          grep -n 'wan' etcd-test/src/jepsen/etcd.clj || true
+      - name: Prepare the etcd test
+        # The version, and the etcd test's edits: etcd 3.6's flags, a pause
+        # by process name, and the TupleSky test's kill schedule, network,
+        # keys and read ratio (scripts/ci/jepsen_etcd.sh says why each).
+        run: tuplesky/scripts/ci/jepsen_etcd.sh prepare
       - name: Stand the cluster up
         # With store tmpfs, /opt, which holds etcd's binary and data
         # directory (/opt/etcd), is a tmpfs.
@@ -820,30 +766,9 @@ jobs:
           jepsen/tuplesky/docker/up.sh --nodes "$NODES" --dir "$RUNNER_TEMP/cluster" \
             ${tmpfs[@]+"${tmpfs[@]}"}
       - name: Run the etcd test
-        working-directory: etcd-test
-        # The tuplesky test's rate, fault interval (30 s) and operations per
-        # register (100) rather than the etcd test's defaults (200/s, 5 s,
-        # 200); unthrottled is a rate of 100000/s here, since the etcd test
-        # takes no 0. Bounded as the tuplesky test is, with the same dump
-        # before the bound: two etcd runs stopped on a :pause :all that
-        # never returned, one of them for 84 minutes after its time limit.
-        run: |
-          wan=(); if [ "$WAN" != none ]; then wan=(--wan "$WAN"); fi
-          export JEPSEN_CPU_SAMPLES="$RUNNER_TEMP/cpu-samples.csv"
-          "$GITHUB_WORKSPACE/tuplesky/scripts/ci/jepsen_bounded.sh" \
-            $((TIME_LIMIT + 1200)) "$RUNNER_TEMP/cluster/nodes" -- lein run test \
-            --nodes-file "$RUNNER_TEMP/cluster/nodes" \
-            --ssh-private-key "$RUNNER_TEMP/cluster/id_ed25519" \
-            --username root \
-            --version "$ETCD_VERSION" \
-            --workload "$WORKLOAD" \
-            --nemesis "$NEMESIS" \
-            --nemesis-interval 30 \
-            --ops-per-key 100 \
-            --rate "$ETCD_RATE" \
-            --time-limit "$TIME_LIMIT" \
-            --concurrency "$CONCURRENCY" \
-            ${wan[@]+"${wan[@]}"}
+        # The TupleSky test's rate, fault interval and operations per
+        # register, bounded as it is (scripts/ci/jepsen_etcd.sh).
+        run: tuplesky/scripts/ci/jepsen_etcd.sh run "$RUNNER_TEMP/cpu-samples.csv"
       - name: Summarize the run
         if: always()
         run: |
