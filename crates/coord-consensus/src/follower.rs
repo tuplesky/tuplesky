@@ -2685,6 +2685,30 @@ impl Follower {
                 .any(|(_, r)| r.payload.is_some() && r.phase < Phase::Executed)
     }
 
+    /// How much work this replica holds and has not executed, counted
+    /// as [`Self::holds_unexecuted`] reads it: the records below EXECUTED
+    /// with their payload, the proposals it holds and the Sync entries it
+    /// has not installed (task-d94). A voter refused a promise as behind
+    /// counts as holding without bound, since how far behind it is isn't
+    /// known here. The catch-up pacer reads it to tell a voter that is
+    /// behind from one with a few commands in flight, on a turn that may
+    /// ask: it scans the table, so not on every pass.
+    pub fn unexecuted_held(&self) -> usize {
+        if self
+            .behind_voters
+            .is_some_and(|needed| self.learner.executed_through() < needed)
+        {
+            return usize::MAX;
+        }
+        self.held.len()
+            + self.sync_pending.len()
+            + self
+                .table
+                .records()
+                .filter(|(_, r)| r.payload.is_some() && r.phase < Phase::Executed)
+                .count()
+    }
+
     /// Ask `donor` for the commands it executed after this replica's own
     /// frontier (task-d08).
     ///
