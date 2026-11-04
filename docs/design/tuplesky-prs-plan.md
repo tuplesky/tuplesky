@@ -3016,6 +3016,7 @@ This entry is the budget and the record, not a lever:
     - **Parking and wake-ups, about a fifth of the tokio threads** (task-d91). The leader's tokio threads wake 7.2 times an operation and run 34 µs a wake. coordd's runtime is tokio's multi-thread one at its default worker count, one a core. A local pair at one worker a voter, behind an environment setting, says whether work stealing and wake-ups across workers are a lever before anything else is built.
       - **Read:** it is. One worker a voter cut the voters' CPU a command 27% at three voters and 12% at five against tokio's default, and 10% at five against the runner's two, on one 4-core host, with latency lower too (task-d91's entry). Its lever, a worker-count setting, goes into the next batch.
     - **QUIC, send and receive, about three fifths of the tokio threads** (task-d96). They scale with packets. The ACK frequency is already 8 (task-d70), and R3 measured per-step coalescing (#187), so what's left is fewer messages a command. That's design work, so task-d96 is a design entry that sizes it from R3's frame counts at each voter count before anyone builds it.
+      - **Read:** at one worker a datagram costs next to nothing (an ACK-cadence pair: 2.9 more datagrams a command, no CPU change), so fewer messages a command sizes small and none is carried (task-d96's entry).
     - **The domain loops,** about 1.08 ms an operation on the head. C6 to C8 stay small, as recorded: task-d60's third step and task-d87.
     - **`service` p99,** 12 to 22 ms against etcd's 3: task-d90 (L4, #181) is the long pole. task-d97 reads what the p99 operations wait for first, since R4's means put L4 at a p50-scale gain (#185 review). R4 on that row, asked of the testing session on #98, says how much of it is waiting for a core rather than syncs in series.
   - **Then the next batch** runs once those add up to the re-anchored target, with task-d90's code step in it if it has landed.
@@ -3450,6 +3451,17 @@ The change, in two steps:
   - **Most datagrams are ACK-only:** about 59% at three voters and 62% at five, with task-d70's threshold of 8 already on both planes. Data datagrams are about 5.6 and 10.8 a command.
   - **What the count doesn't yet say: a datagram's cost.** task-d88's pair cut 1.36 api datagrams a command and moved the voters' CPU by 0.02 ms, within its runs' spread. That pair ran at tokio's default worker count, where task-d91 found the workers' parking and wake-ups to be most of the cost. So the candidates are sized in CPU only after a datagram's cost is read at one worker. The cheapest such reading is a pair on the api plane's ACK cadence, the largest kind above, which changes no message the protocol sends.
   - **The peer plane's 9 and 18 frames** are split by kind before a candidate there is sized.
+- **A datagram's cost at one worker, read (#185):** the ACK cadence both planes ask, through a reading-only override of task-d70's threshold, on the batch's head at one worker a voter. Three voters, the same shape as task-d91's pairs, three runs a side, alternating.
+
+  | ACK threshold | datagrams a command (of them ACK-only) | voters' CPU a command | `ok`/s |
+  | --- | --- | --- | --- |
+  | 1 | 16.36 (8.61) | 1.935 ms | 2,812 |
+  | 8 (today's) | 13.48 (8.00) | 1.966 ms | 2,785 |
+  | 64 | 13.40 (7.95) | 1.934 ms | 2,815 |
+
+  - **A datagram costs next to nothing at one worker.** 2.9 more datagrams a command moved the voters' CPU by nothing outside the runs' spread (about ±0.09 ms). That bounds a datagram at about 0.03 ms or less, and the point estimate is near zero. task-d88's pair, at the default worker count, said the same.
+  - **The threshold isn't what leaves the ACK-only datagrams.** Above 8 they don't fall, so they come from QUIC's delay, on connections where no reply follows within it, not from the count.
+  - **So fewer messages a command sizes small.** Removing every ACK-only datagram, the largest kind, projects at most about 0.25 ms a command at the bound and near nothing at the estimate. Cutting the fan-out or the slow acknowledgements by N−1 frames projects less, for a protocol change. None is carried into the next batch. The count stays recorded as the floor comparison, and the QUIC share in the batch's call graph is read again on the next batch's head at one worker before this entry is reopened.
 
 **Acceptance:** The count recorded at three and five voters with its floor, each candidate sized in messages, packets and projected CPU, and the ones carried named with the design sections they amend. No code.
 
