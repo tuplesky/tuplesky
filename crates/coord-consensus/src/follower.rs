@@ -2691,7 +2691,8 @@ impl Follower {
     /// has not installed (task-d94). A voter refused a promise as behind
     /// counts as holding without bound, since how far behind it is isn't
     /// known here. The catch-up pacer reads it to tell a voter that is
-    /// behind from one with a few commands in flight.
+    /// behind from one with a few commands in flight, on a turn that may
+    /// ask: it scans the table, so not on every pass.
     pub fn unexecuted_held(&self) -> usize {
         if self
             .behind_voters
