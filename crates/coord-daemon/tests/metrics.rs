@@ -7,10 +7,11 @@
 use std::time::Duration;
 
 use coord_daemon::metrics::{
-    Cost, Cpu, Datagrams, Distribution, Durability, FastPath, Frontiers, Headroom, Interval, Jobs,
-    JournalGroups, Lane, LaneReading, Latency, MAX_REPORTED_SHARDS, Measure, MetricsSnapshot,
-    PipelineWaits, Reads, Recorder, Release, ReleaseDistributions, Resends, Scheduling, ShardIndex,
-    ShardReading, Stage, StageReading, Traffic, Unavailable, UnorderedPreAcceptances, Wait,
+    Answered, Cost, Cpu, Datagrams, Distribution, Durability, FastPath, Frontiers, Headroom,
+    Interval, Jobs, JournalGroups, Lane, LaneReading, Latency, MAX_REPORTED_SHARDS, Measure,
+    MetricsSnapshot, PipelineWaits, Reads, Recorder, Release, ReleaseDistributions, Resends,
+    Scheduling, ShardIndex, ShardReading, Stage, StageReading, Traffic, Unavailable,
+    UnorderedPreAcceptances, Wait,
 };
 use coord_daemon::role::RoleSet;
 
@@ -393,6 +394,7 @@ fn a_rendered_snapshot_carries_no_secret_or_key_shaped_text() {
                     voluntary: 5200,
                     involuntary: 410,
                     run_queue_per_pass: distribution(&[0, 0, 1, 9]),
+                    run_queue_per_working_pass: distribution(&[1, 9]),
                 }),
             }),
             waits: Measure::Observed(PipelineWaits {
@@ -442,7 +444,12 @@ fn a_rendered_snapshot_carries_no_secret_or_key_shaped_text() {
                     group: distribution(&[0, 1]),
                     journal: distribution(&[2, 2, 3]),
                     whole: distribution(&[3, 4, 9]),
+                    round: distribution(&[1, 2, 6]),
                 },
+            },
+            answered: Answered {
+                writes: distribution(&[2, 3, 3, 14]),
+                reads: distribution(&[1, 2, 5]),
             },
             traffic: Measure::Observed(Traffic {
                 sent_frames: 9000,
@@ -664,6 +671,7 @@ fn a_reading_without_distributions_reads_as_empty() {
         serde_json::from_str(r#"{"run_queue":{"secs":3,"nanos":0},"voluntary":5,"involuntary":4}"#)
             .expect("an older scheduling reading parses");
     assert_eq!(scheduling.run_queue_per_pass.count(), 0);
+    assert_eq!(scheduling.run_queue_per_working_pass.count(), 0);
 }
 
 /// A recorded distribution goes out on the metrics line and reads back

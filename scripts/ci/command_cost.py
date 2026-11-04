@@ -25,12 +25,23 @@ frames and streams per command, and the journal's and the projection's
 jobs per command, queued, served and completed. A run
 in which no voter decided anything fast is printed as a finding.
 
-`table` prints a third table (task-d97): the tails of the waits the
+`table` prints a fourth table (task-d97): the tails of the waits the
 metrics line carries as distributions, p50, p99 and the longest, since
-the voter started. The leader's whole wait from learned to released and
-its journal part, the read barrier's wait, and the domain loop's
-run-queue time a pass, sampled one pass in sixteen. A quantile is the
-upper edge of the bucket it falls in, within a fifth of the value.
+the voter started:
+- end to end at the node that took the request, from its arrival to the
+  answer handed back, writes and reads apart (#191 review);
+- the leader's round from a submission to learned, then from learned to
+  released, in all and by part;
+- the read barrier's wait;
+- the domain loop's run-queue time a pass, sampled one pass in sixteen,
+  over every sampled pass and over those that executed a command.
+
+A quantile is the upper edge of the bucket it falls in, within a fifth
+of the value. The read barrier's wait is kept in whole milliseconds, the
+barrier's clock, so its quantiles are millisecond steps printed at bucket
+edges: 2.05 is 2 ms, 5.12 is 5 ms, and a read that waited under a
+millisecond counts as 0. The arrival-to-answer reads are timed on the
+monotonic clock, to the microsecond.
 
 `gate` fails when, at any caller count the baseline records, the
 busiest voter's busy time per command, over the run or over its last
@@ -178,6 +189,12 @@ def tails_of(cost: dict) -> dict:
     in all and by part; the read barrier's; and the domain loop's
     run-queue time a sampled pass. Empty for a binary older than them."""
     tails = {}
+    answered = cost.get("answered")
+    if isinstance(answered, dict):
+        for kind in ("writes", "reads"):
+            q = quantiles_of(answered.get(kind))
+            if q is not None:
+                tails[f"answered_{kind}"] = q
     release = cost.get("release")
     if isinstance(release, dict):
         for part, d in (release.get("distributions") or {}).items():
@@ -193,9 +210,10 @@ def tails_of(cost: dict) -> dict:
     if isinstance(cpu, dict) and "Observed" in cpu:
         scheduling = cpu["Observed"].get("domain_scheduling")
         if isinstance(scheduling, dict) and "Observed" in scheduling:
-            q = quantiles_of(scheduling["Observed"].get("run_queue_per_pass"))
-            if q is not None:
-                tails["run_queue_per_pass"] = q
+            for name in ("run_queue_per_pass", "run_queue_per_working_pass"):
+                q = quantiles_of(scheduling["Observed"].get(name))
+                if q is not None:
+                    tails[name] = q
     return {"tails": tails} if tails else {}
 
 
@@ -657,17 +675,19 @@ def paths_table(result: dict) -> str:
     return "\n".join(lines)
 
 
-TAILS = ("release_whole", "release_predecessors", "release_group", "release_journal",
-         "read_waited", "run_queue_per_pass")
+TAILS = ("answered_writes", "answered_reads", "release_round", "release_whole",
+         "release_predecessors", "release_group", "release_journal", "read_waited",
+         "run_queue_per_pass", "run_queue_per_working_pass")
 
 
 def tails_table(result: dict) -> str:
     """The waits' tails (task-d97), one row per voter per run: p50, p99
     and the longest, in milliseconds, each with its count."""
     lines = [
-        "| callers | node | learned to released ms p50/p99/max (n) "
-        "| predecessors | group | journal | read wait | run queue a pass (sampled) |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- |",
+        "| callers | node | arrival to answer ms p50/p99/max (n): writes | reads "
+        "| submitted to learned | learned to released | predecessors | group | journal "
+        "| read wait (whole ms) | run queue a pass (sampled) | a pass that executed |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for run in result["runs"]:
         for v in run["voters"]:

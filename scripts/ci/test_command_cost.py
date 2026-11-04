@@ -298,8 +298,30 @@ class ReduceTests(unittest.TestCase):
         self.assertAlmostEqual(per_pass["max_ms"], 0.3)
         table = cost.tails_table({"runs": [{"callers": 1, "voters": [
             {"node": "n1", "tails": tails}]}]})
-        self.assertIn("| 1 | n1 | 1.02/12.29/40.00 (100) | -- |", table)
+        self.assertIn("| 1 | n1 | -- | -- | -- | 1.02/12.29/40.00 (100) | -- |", table)
         self.assertNotIn("tails", cost.per_command("n1", snapshot()))
+
+    def test_the_end_to_end_tails_are_read_when_reported(self):
+        snap = snapshot()
+        one_ms = {"buckets": [[35, 4]], "max": duration(0.001)}
+        snap["cost"]["Observed"]["answered"] = {"writes": one_ms, "reads": one_ms}
+        snap["cost"]["Observed"]["release"] = {
+            "commands": 4, "predecessors": duration(0), "group": duration(0),
+            "journal": duration(0), "distributions": {"round": one_ms},
+        }
+        snap["cost"]["Observed"]["cpu"] = {"Observed": {
+            "domain": duration(0.3), "process": duration(0.9),
+            "domain_scheduling": {"Observed": {
+                "run_queue": duration(1.0), "voluntary": 1, "involuntary": 1,
+                "run_queue_per_working_pass": one_ms,
+            }},
+        }}
+        tails = cost.per_command("n1", snap)["tails"]
+        for name in ("answered_writes", "answered_reads", "release_round",
+                     "run_queue_per_working_pass"):
+            self.assertEqual(tails[name]["count"], 4, name)
+            self.assertAlmostEqual(tails[name]["p99_ms"], 1.0, msg=name)
+        self.assertNotIn("run_queue_per_pass", tails)
 
     def test_the_bucket_edges_match_the_daemons(self):
         # Four a power of two: 4..7 us one each, then 8, 10, 12, 14.

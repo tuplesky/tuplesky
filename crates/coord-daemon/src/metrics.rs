@@ -525,6 +525,10 @@ pub struct Cost {
     /// (task-d62).
     #[serde(default)]
     pub release: Release,
+    /// What this node's frontend took from a request's arrival to its
+    /// answer, writes and reads apart (task-d97, #191 review).
+    #[serde(default)]
+    pub answered: Answered,
     /// What this voter's transport carried to and from the other voters
     /// (task-d62), or why there is no reading.
     #[serde(default = "not_instrumented")]
@@ -712,6 +716,26 @@ pub struct Release {
     pub distributions: ReleaseDistributions,
 }
 
+/// What a node's frontend took from a caller's request read off its
+/// stream to the answer handed back to the transport (task-d97, #191
+/// review), at this node, writes and reads apart. Beside the client's
+/// own latency, it splits the client's tail into the server's and the
+/// network's; beside the parts, it says how much of the server's tail
+/// they hold.
+///
+/// Every request answered is counted: an answer from consensus, from a
+/// retained result, or at the door, a refusal among them. One whose
+/// caller went away, or that was never answered, is not.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Answered {
+    /// Requests other than a read.
+    #[serde(default)]
+    pub writes: Distribution,
+    /// Current reads.
+    #[serde(default)]
+    pub reads: Distribution,
+}
+
 /// The distributions of a command's waits from learned to released on
 /// the leader (task-d97), over the same commands as [`Release`]'s sums.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -728,6 +752,11 @@ pub struct ReleaseDistributions {
     /// From learned to released.
     #[serde(default)]
     pub whole: Distribution,
+    /// From a submission's arrival at the leader's loop to learned: the
+    /// consensus round's own tail (#191 review), over the commands
+    /// submitted while it led.
+    #[serde(default)]
+    pub round: Distribution,
 }
 
 /// The domain loop's blocking takes from its pipeline threads (task-d54).
@@ -790,6 +819,11 @@ pub struct Scheduling {
     /// once something woke it again.
     #[serde(default)]
     pub run_queue_per_pass: Distribution,
+    /// The same, over the sampled passes in which the loop executed at
+    /// least one command (#191 review): the idle passes' near-zero waits
+    /// left out, so it compares with the commands' own tails.
+    #[serde(default)]
+    pub run_queue_per_working_pass: Distribution,
 }
 
 /// One domain-loop pass in this many has its run-queue time sampled

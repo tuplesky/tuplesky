@@ -1074,6 +1074,15 @@ impl<P: Persistence> Node<P> {
         }
     }
 
+    /// `command` was submitted to this replica at `now`: stamped while it
+    /// leads, the start of the round [`crate::learned`] times to learned
+    /// (task-d97). A follower stamps nothing: it learns nothing to end it.
+    pub fn stamp_submitted(&mut self, command: CommandId, now: std::time::Instant) {
+        if matches!(self.machine(), Machine::Leader(_)) {
+            self.release.submitted(command, now);
+        }
+    }
+
     /// Stamp what the leader committed since the last stamp (task-d62).
     fn stamp_learned(&mut self) {
         let learned = self.machine_mut().take_learned();

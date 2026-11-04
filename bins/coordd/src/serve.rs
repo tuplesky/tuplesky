@@ -78,6 +78,30 @@ impl core::fmt::Display for ServeError {
 
 impl core::error::Error for ServeError {}
 
+/// A caller's stream held for its answer, and whether it asked a current
+/// read: which of the frontend's two distributions its wait goes in
+/// (task-d97).
+struct Held {
+    responder: Responder,
+    read: bool,
+}
+
+impl Frontend {
+    /// `responder`'s request is answered now: from its arrival to here
+    /// goes into the writes' or the reads' distribution (task-d97, #191
+    /// review). An answer from consensus, the read barrier or a retained
+    /// result; an answer at the door, a refusal or a binding, is not an
+    /// operation's and is not counted.
+    fn answered(&mut self, responder: &Responder, read: bool) {
+        let waited = responder.received().elapsed();
+        if read {
+            self.answered.reads.record(waited);
+        } else {
+            self.answered.writes.record(waited);
+        }
+    }
+}
+
 /// The frontend of one domain: what a caller's frame means, and where a
 /// submission goes.
 ///
@@ -90,7 +114,10 @@ impl core::error::Error for ServeError {}
 pub struct Frontend {
     frontend: BoundFrontend,
     membership: Membership,
-    pending: Pending<Responder>,
+    pending: Pending<Held>,
+    /// From a request's arrival to its answer, writes and reads apart
+    /// (task-d97, #191 review).
+    answered: coord_daemon::metrics::Answered,
     /// The ingress of a voter running in this process, where there is
     /// one. A frontend-only process has `None` here and reaches every
     /// voter over the wire.
@@ -298,6 +325,7 @@ impl Frontend {
             frontend,
             membership,
             pending: Pending::new(),
+            answered: coord_daemon::metrics::Answered::default(),
             local,
             watches: BTreeMap::new(),
             counts: Counts::default(),
@@ -1204,11 +1232,14 @@ struct Pacing {
     )>,
     /// Passes the loop has started (task-d97).
     passes: u64,
-    /// The run-queue time read at the start of a sampled pass, until the
-    /// next pass starts.
-    sampled_from: Option<std::time::Duration>,
+    /// The run-queue time and the commands executed, read at the start
+    /// of a sampled pass, until the next pass starts.
+    sampled_from: Option<(std::time::Duration, u64)>,
     /// The run-queue time of each sampled pass, to the next pass's start.
     run_queue_per_pass: coord_daemon::metrics::Distribution,
+    /// The same, over the sampled passes that executed a command (#191
+    /// review).
+    run_queue_per_working_pass: coord_daemon::metrics::Distribution,
 }
 
 impl Pacing {
@@ -1235,18 +1266,31 @@ impl Pacing {
     ///
     /// [`woke`]: Pacing::woke
     /// [`RUN_QUEUE_SAMPLE_EVERY`]: coord_daemon::metrics::RUN_QUEUE_SAMPLE_EVERY
-    fn pass_started(&mut self) {
-        if let Some(from) = self.sampled_from.take()
-            && let Some(now) = crate::cpu::this_thread_run_queue()
+    ///
+    /// `executed` is the commands the loop has executed so far: a sample
+    /// whose pass executed one also goes into the working passes'
+    /// distribution.
+    fn pass_started(&mut self, executed: u64) {
+        self.pass_started_with(executed, crate::cpu::this_thread_run_queue);
+    }
+
+    /// [`Pacing::pass_started`], reading the run-queue time from `read`.
+    fn pass_started_with(&mut self, executed: u64, read: impl Fn() -> Option<std::time::Duration>) {
+        if let Some((from, executed_from)) = self.sampled_from.take()
+            && let Some(now) = read()
         {
-            self.run_queue_per_pass.record(now.saturating_sub(from));
+            let waited = now.saturating_sub(from);
+            self.run_queue_per_pass.record(waited);
+            if executed > executed_from {
+                self.run_queue_per_working_pass.record(waited);
+            }
         }
         self.passes += 1;
         if self
             .passes
             .is_multiple_of(coord_daemon::metrics::RUN_QUEUE_SAMPLE_EVERY)
         {
-            self.sampled_from = crate::cpu::this_thread_run_queue();
+            self.sampled_from = read().map(|run_queue| (run_queue, executed));
         }
     }
 
@@ -1733,6 +1777,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                             voluntary: s.voluntary,
                             involuntary: s.involuntary,
                             run_queue_per_pass: self.pacing.run_queue_per_pass,
+                            run_queue_per_working_pass: self.pacing.run_queue_per_working_pass,
                         })
                     },
                 ),
@@ -1759,6 +1804,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             fast_path: fast_path(&voter.node().fast_path_counts()),
             unordered: self.unordered,
             release: release(&voter.node().release_split()),
+            answered: self.frontend.answered,
             traffic: self.plane.as_ref().map_or(
                 Measure::Unavailable(Unavailable::NotInstrumented),
                 |plane| {
@@ -2057,7 +2103,11 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             // due goes out before the work, so a pass that never ends
             // does not take the interval's counters with it.
             self.pacing.woke();
-            self.pacing.pass_started();
+            let executed = match &self.backing {
+                Backing::Voting(voter) => voter.node().executed,
+                _ => 0,
+            };
+            self.pacing.pass_started(executed);
             self.report_if_due();
             // The leaf this node presents first, every pass: a node whose
             // leaf has expired serves nothing more on it, however much
@@ -4109,8 +4159,8 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 // session, so an operator who cannot see why has nothing
                 // to go on.
                 eprintln!("a session was not established: {reason:?}");
-                if let Ok(responder) = self.frontend.pending.take(connection, &retry_key) {
-                    drop(responder);
+                if let Ok(held) = self.frontend.pending.take(connection, &retry_key) {
+                    drop(held);
                 }
                 self.frontend.counts.unreturnable += 1;
                 return;
@@ -4121,8 +4171,9 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             .pending
             .take(delivery.connection, &delivery.retry_key)
         {
-            Ok(responder) => {
+            Ok(Held { responder, read }) => {
                 self.frontend.counts.released += 1;
+                self.frontend.answered(&responder, read);
                 // The caller is answered on the stream it asked on, and
                 // the send is not awaited here: a slow reader must not
                 // hold up the voter's next turn.
@@ -4186,6 +4237,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 // produced.
                 if let Some(answer) = self.retained(&health, connection.0, &frame) {
                     self.frontend.counts.released += 1;
+                    self.frontend.answered(&responder, false);
                     let _ = responder.respond(answer).await;
                     return;
                 }
@@ -4234,8 +4286,8 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 self.frontend
                     .frontend
                     .on_connection_closed(connection.0, self.backing.applier().hub());
-                for responder in self.frontend.pending.close(connection.0) {
-                    drop(responder);
+                for held in self.frontend.pending.close(connection.0) {
+                    drop(held);
                 }
                 self.frontend.watches.retain(|(c, _), _| *c != connection.0);
             }
@@ -4389,7 +4441,13 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 let _ = responder.respond(frame).await;
             }
             Step::Hold(key) => {
-                if let Some(displaced) = self.frontend.pending.hold(connection.0, key, responder) {
+                // A retry held behind its invocation in flight, counted
+                // with the writes.
+                let held = Held {
+                    responder,
+                    read: false,
+                };
+                if let Some(displaced) = self.frontend.pending.hold(connection.0, key, held) {
                     drop(displaced);
                 }
             }
@@ -4398,10 +4456,14 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 // after: evidence can come back faster than this task
                 // returns, and a delivery that arrived first would find
                 // nothing waiting and be dropped.
+                let held = Held {
+                    responder,
+                    read: false,
+                };
                 if let Some(displaced) =
                     self.frontend
                         .pending
-                        .hold(connection.0, plan.retry_key, responder)
+                        .hold(connection.0, plan.retry_key, held)
                 {
                     drop(displaced);
                 }
@@ -4420,10 +4482,14 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             Step::Read(plan) => {
                 // Held before the read goes out, as a submission is: the
                 // leader beside this collector answers within this call.
+                let held = Held {
+                    responder,
+                    read: true,
+                };
                 if let Some(displaced) =
                     self.frontend
                         .pending
-                        .hold(connection.0, plan.retry_key, responder)
+                        .hold(connection.0, plan.retry_key, held)
                 {
                     drop(displaced);
                 }
@@ -5560,15 +5626,19 @@ mod tests {
     #[test]
     fn the_run_queue_is_sampled_once_in_sixteen_passes() {
         let mut pacing = super::Pacing::default();
-        for _ in 0..(2 * coord_daemon::metrics::RUN_QUEUE_SAMPLE_EVERY + 1) {
+        for pass in 0..(2 * coord_daemon::metrics::RUN_QUEUE_SAMPLE_EVERY + 1) {
             pacing.woke();
-            pacing.pass_started();
+            // A command executed in every pass but the 16th.
+            let executed = pass.min(15) + pass.saturating_sub(16);
+            pacing.pass_started_with(executed, || Some(std::time::Duration::ZERO));
             pacing.woke();
             pacing.woke();
         }
         // Passes 16 and 32 start a sample; passes 17 and 33 end them.
         assert_eq!(pacing.run_queue_per_pass.count(), 2);
         assert!(pacing.sampled_from.is_none());
+        // The 16th executed nothing, so only the 32nd's sample worked.
+        assert_eq!(pacing.run_queue_per_working_pass.count(), 1);
     }
 
     /// A session this node has not projected yet is "not yet", not a

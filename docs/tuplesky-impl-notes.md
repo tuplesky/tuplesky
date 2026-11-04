@@ -10915,7 +10915,30 @@ Three waits now also go out as distributions:
   reads the thread's `schedstat` at its start and again at the next
   pass's start, so a sample is the pass's own preemptions and the wait
   to run once something woke it. Two reads of a `/proc` file in 16
-  passes; the total run-queue time beside it is unchanged.
+  passes; the total run-queue time beside it is unchanged. Idle passes
+  outnumber working ones many times over, so the samples whose pass
+  executed a command also go into `run_queue_per_working_pass`, which
+  compares with the commands' own tails.
+
+Two more close the end-to-end account (#191 review), so a tail outside
+the three parts above reads as somewhere, not as "not in these":
+
+- **Arrival to answer at the node that took the request**
+  (`cost.answered.writes`, `cost.answered.reads`). The transport stamps
+  a request when its frame has been read off the stream, the stamp rides
+  with the caller's stream while it is held, and the wait is recorded
+  when the answer is handed back to the transport. It counts answers
+  from consensus, from the read barrier and from a retained result; an
+  answer at the door, a refusal or a binding, is not an operation's and
+  is not counted. Beside the client's latency it splits the client's
+  tail into the server's and the network's, and beside the parts it
+  says how much of the server's they hold, including what runs on the
+  transport's threads rather than the domain loop's.
+- **The leader's round, submission to learned**
+  (`cost.release.distributions.round`): a submission's arrival at the
+  leading voter's loop, the first one for a command submitted twice, to
+  the leader learning it. A command learned without a submission
+  stamped, one recovered, is not in it.
 
 A distribution is cumulative like the rest of the cost: log-linear
 buckets in microseconds, four an octave from 4 µs to 2^26 µs (104
