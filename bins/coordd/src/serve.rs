@@ -1217,19 +1217,25 @@ impl Pacing {
         self.waiting_since = Some(std::time::Instant::now());
     }
 
-    /// The loop is working again, at the start of a pass; a wait that
-    /// was running ends here.
-    ///
-    /// One pass in [`RUN_QUEUE_SAMPLE_EVERY`] has its run-queue time read
-    /// from here to the next pass's start (task-d97): what the scheduler
-    /// kept the loop from running, a pass at a time, which the snapshot's
-    /// run-queue total only gives as a sum.
-    ///
-    /// [`RUN_QUEUE_SAMPLE_EVERY`]: coord_daemon::metrics::RUN_QUEUE_SAMPLE_EVERY
+    /// The loop is working again; a wait that was running ends here.
     fn woke(&mut self) {
         if let Some(since) = self.waiting_since.take() {
             self.idle += since.elapsed();
         }
+    }
+
+    /// A pass of the domain loop starts: called once a pass, at the top
+    /// of the loop, and nowhere else. [`woke`] is also called after the
+    /// event select, so a pass can call it more than once.
+    ///
+    /// One pass in [`RUN_QUEUE_SAMPLE_EVERY`] has its run-queue time read
+    /// from here to the next pass's start (task-d97): its own
+    /// preemptions, and the wait to run once something woke it, which
+    /// the snapshot's run-queue total only gives as a sum.
+    ///
+    /// [`woke`]: Pacing::woke
+    /// [`RUN_QUEUE_SAMPLE_EVERY`]: coord_daemon::metrics::RUN_QUEUE_SAMPLE_EVERY
+    fn pass_started(&mut self) {
         if let Some(from) = self.sampled_from.take()
             && let Some(now) = crate::cpu::this_thread_run_queue()
         {
@@ -2051,6 +2057,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             // due goes out before the work, so a pass that never ends
             // does not take the interval's counters with it.
             self.pacing.woke();
+            self.pacing.pass_started();
             self.report_if_due();
             // The leaf this node presents first, every pass: a node whose
             // leaf has expired serves nothing more on it, however much
@@ -5546,6 +5553,23 @@ mod tests {
         SAID_IN_FULL, addressed, ask_for_payloads_now, flush_due, payload_batch_size,
         poll_api_first,
     };
+
+    /// One pass in sixteen is sampled, counted by the loop's passes
+    /// alone: the event paths' extra `woke` calls neither start nor end a
+    /// sample (task-d97, #191 review).
+    #[test]
+    fn the_run_queue_is_sampled_once_in_sixteen_passes() {
+        let mut pacing = super::Pacing::default();
+        for _ in 0..(2 * coord_daemon::metrics::RUN_QUEUE_SAMPLE_EVERY + 1) {
+            pacing.woke();
+            pacing.pass_started();
+            pacing.woke();
+            pacing.woke();
+        }
+        // Passes 16 and 32 start a sample; passes 17 and 33 end them.
+        assert_eq!(pacing.run_queue_per_pass.count(), 2);
+        assert!(pacing.sampled_from.is_none());
+    }
 
     /// A session this node has not projected yet is "not yet", not a
     /// session that may no longer execute; one that is present and
