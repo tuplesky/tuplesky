@@ -10,7 +10,8 @@
 //!
 //! The requester half, [`Pacer`], decides when a voter asks and whom. A
 //! voter that has held work it is not executing for [`STILL_FOR`], and
-//! whose frontier has moved by less than a page in that time, asks the
+//! whose frontier has not moved in that time (by less than a page, if it
+//! holds a page or more), asks the
 //! leader; one that is not answered asks the other voters in turn. A
 //! voter asks once after it starts, whatever it holds, since a restart
 //! can leave it behind holding nothing. The machine asks again at once
@@ -24,6 +25,12 @@
 //! a still frontier never asked, and the voter crept through hundreds of
 //! commands at the re-send's pace where a page would have taken 64 at a
 //! time.
+//!
+//! Only for a voter holding a page or more (#189 review): one with a few
+//! commands always in flight, on a slow link or under overlapping load,
+//! holds work on every turn and executes fewer than a page a window, and
+//! is not behind. It keeps the rule it had, any movement starting the
+//! window over, and asks only when its frontier stands still.
 
 use std::time::{Duration, Instant};
 
@@ -278,6 +285,9 @@ pub struct Standing {
     pub executed: ExecutionPosition,
     /// Whether it holds work it has not executed.
     pub holds: bool,
+    /// How much of that work it holds (`Machine::unexecuted_held`): a
+    /// voter behind holds hundreds, a healthy one a handful in flight.
+    pub backlog: usize,
     /// Whether a page is in hand.
     pub busy: bool,
     /// Whether it leads: a leader has nobody to catch up from.
@@ -325,14 +335,23 @@ impl Pacer {
     ) -> Option<ReplicaId> {
         let holds = standing.holds || !self.probed;
         self.wanting = holds && !standing.leads && !standing.busy;
-        // The window starts over when the voter is catching up anyway --
-        // a page's worth executed since it began, or a page in hand --
+        // The window starts over when the voter is catching up anyway,
         // and when there is nothing to catch up for: it held nothing on
-        // this turn, or it leads. A healthy follower empties between
-        // commands; a voter behind holds work on every turn.
+        // this turn, or it leads. Catching up is any movement for a voter
+        // with less than a page held, as task-d08 had it: a follower with
+        // a few commands always in flight moves and doesn't ask. A voter
+        // holding a page or more, or one that hasn't probed since it
+        // started, is catching up only when it executes a page's worth in
+        // the window: one that creeps through its backlog a command per
+        // re-send asks.
+        let by_page = standing.backlog >= MAX_CATCH_UP_COMMANDS || !self.probed;
         let caught_up = self.still.is_none_or(|(at, _)| {
             standing.executed < at
-                || standing.executed.get() - at.get() >= MAX_CATCH_UP_COMMANDS as u64
+                || if by_page {
+                    standing.executed.get() - at.get() >= MAX_CATCH_UP_COMMANDS as u64
+                } else {
+                    standing.executed != at
+                }
         });
         if caught_up || standing.busy || standing.leads || !holds {
             self.still = Some((standing.executed, now));
@@ -431,10 +450,18 @@ mod tests {
         assert_eq!(order.between(p(6), p(7)).count(), 1);
     }
 
+    /// A voter's standing, holding a backlog of a page or more when it
+    /// holds work at all: the voter behind that the pacer is for.
     fn standing(executed: u64, holds: bool) -> Standing {
+        held(executed, if holds { MAX_CATCH_UP_COMMANDS } else { 0 })
+    }
+
+    /// A voter's standing, holding `backlog` unexecuted.
+    fn held(executed: u64, backlog: usize) -> Standing {
         Standing {
             executed: p(executed),
-            holds,
+            holds: backlog > 0,
+            backlog,
             busy: false,
             leads: false,
         }
@@ -549,6 +576,59 @@ mod tests {
                 None
             );
         }
+    }
+
+    /// A follower with a few commands always in flight holds work on
+    /// every turn and executes fewer than a page a window. It is not
+    /// behind, and doesn't ask; a voter holding the same few and stuck
+    /// still asks once its frontier has stood still (#189 review).
+    #[test]
+    fn a_follower_with_a_few_commands_in_flight_does_not_ask() {
+        let voters = [r(1), r(2), r(3)];
+        let t0 = Instant::now();
+        let tick = Duration::from_millis(20);
+        // 50 commands a second for 60 s, three held on every turn.
+        let mut steady = Pacer {
+            probed: true,
+            ..Pacer::default()
+        };
+        for i in 0..3000u64 {
+            let at = t0 + tick * i as u32;
+            assert_eq!(
+                steady.due(at, held(5 + i, 3), r(3), r(1), &voters),
+                None,
+                "a steady follower asked at {i}"
+            );
+        }
+        // The same three held and the frontier still: it asks, as before.
+        let mut stuck = Pacer {
+            probed: true,
+            ..Pacer::default()
+        };
+        assert_eq!(stuck.due(t0, held(5, 3), r(3), r(1), &voters), None);
+        assert_eq!(
+            stuck.due(t0 + STILL_FOR, held(5, 3), r(3), r(1), &voters),
+            Some(r(1))
+        );
+        // A page held and the same 50 a second: behind, so it asks.
+        let mut behind = Pacer {
+            probed: true,
+            ..Pacer::default()
+        };
+        let asked = (0..3000u64)
+            .filter(|i| {
+                behind
+                    .due(
+                        t0 + tick * *i as u32,
+                        held(5 + i, MAX_CATCH_UP_COMMANDS),
+                        r(3),
+                        r(1),
+                        &voters,
+                    )
+                    .is_some()
+            })
+            .count();
+        assert!(asked >= 20, "a voter behind asked {asked} times in 60 s");
     }
 
     /// The pacer registers when it next has to look, so an idle loop
