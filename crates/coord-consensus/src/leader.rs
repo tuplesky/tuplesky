@@ -687,10 +687,14 @@ impl Leader {
             ledger: self.ledger,
             payloads: self.payloads,
             bindings: self.bindings,
+            // A durable proposal whose batch wrote the payload row: a
+            // re-proposal of an entry this leader held without its
+            // payload wrote none, and its follower would report a payload
+            // it cannot serve (task-d90, point 4; protocol_sim row 20).
             served_payloads: self
                 .proposals
                 .values()
-                .filter(|p| p.durable)
+                .filter(|p| p.durable && writes_payload(&p.updates))
                 .map(|p| p.command)
                 .chain(self.served_payloads)
                 .collect(),

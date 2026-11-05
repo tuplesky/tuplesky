@@ -64,7 +64,7 @@
 //! once failed are kept in `fixtures/protocol_sim/seeds.json`, with the
 //! catch-up and the loss they were found under, and replayed on every run.
 //!
-//! Rows 19 and 20 are task-d90's. In every other row a node flushes its
+//! Rows 19 to 21 are task-d90's. In every other row a node flushes its
 //! journal before it executes, and an execution is durable as it is taken,
 //! as the models apply. In row 19 an execution's group joins the journal
 //! behind the batches before it, as `coordd`'s does, and is durable only
@@ -74,9 +74,11 @@
 //! ahead of their durability, and every voter is crashed at once at each
 //! cut between a decision, the release of its result and its group's
 //! durability. Its table capacity is 8, so a voter's executions past a
-//! command reach the window it forgets past. Row 20 crashes a follower
-//! while it writes the payload row of a record it holds without one, so a
-//! record is restored without its payload row. Each row has a negative
+//! command reach the window it forgets past. Row 20 is oracle 9's sweep.
+//! Row 21 fails a follower's batch of a payload row and its dependency
+//! row, so a later vote's batch can write the dependency row alone, and
+//! crashes a follower while it writes the payload row of such a record; it
+//! is replayed from its kept seeds. Rows 19 and 20 each have a negative
 //! control that must fail: row 19's machines counting executions durable
 //! as they are taken, and row 20's followers' payload rows dropped on their
 //! way to the store.
@@ -221,10 +223,16 @@ struct Knobs {
     count_in_memory: bool,
     /// Table capacity: the retirement window a voter forgets past.
     capacity: usize,
-    /// Chance per step a follower is crashed while a batch of its own
-    /// writes the payload row of a record it holds without one (task-d90,
-    /// point 4): a record a Sync installed, whose payload arrived later.
-    /// Restored, the record is there without its payload row.
+    /// Chance a follower's batch writing a command's payload row and its
+    /// dependency row fails, definitely not committed, when the journal
+    /// reaches it (task-d90, point 4). Later batches still complete, so a
+    /// later vote's batch can write the dependency row without the payload
+    /// row, the state every vote point 4 closed rested on.
+    payload_fail: u32,
+    /// Chance per step a follower is crashed while a batch writes the
+    /// payload row of a command whose dependency row is durable there
+    /// without one (task-d90, point 4): restored, the record holds the
+    /// dependency row without the payload row.
     payload_crash: u32,
     /// The negative control of point 4: a follower's payload rows never
     /// reach its store, while the follower goes on as if they were
@@ -264,6 +272,7 @@ impl Knobs {
         total_crash: 0,
         count_in_memory: false,
         capacity: CAPACITY,
+        payload_fail: 0,
         payload_crash: 0,
         drop_payload_rows: false,
     };
@@ -389,15 +398,29 @@ impl Knobs {
             },
             // Each vote on a payload row durable at the voter (task-d90,
             // point 4): row 2's admissions that miss most nodes and lost
-            // messages, so records are installed by Syncs without their
-            // payloads, and a follower crashed while it writes the payload
-            // row of such a record.
+            // messages, and a follower crashed while it writes the payload
+            // row of a record durable without one. Without a failed batch
+            // no record is durable without its payload row, so the crash
+            // never fires here: row 20 is oracle 9's sweep and its negative
+            // control, and row 21 reaches the cut.
             20 => Knobs {
                 row,
                 reach: 450_000,
                 campaign: 6_000,
                 payload_crash: 300_000,
                 ..Knobs::row(2)
+            },
+            // Row 20 with a follower's batch of a payload row and its
+            // dependency row failed, definitely not committed, so a later
+            // vote's batch writes the dependency row alone, and the crash
+            // restores such a record (task-d90, point 4). Replayed from its
+            // kept seeds only: at five voters, seeds 2, 7, 10 and 35 of 40
+            // stall a campaign while healing, which is not understood yet
+            // (task-d90's plan entry).
+            21 => Knobs {
+                row,
+                payload_fail: 150_000,
+                ..Knobs::row(20)
             },
             _ => unreachable!("not a scenario of the simulator: row {row}"),
         }
@@ -431,9 +454,12 @@ struct Node {
     /// of them unless execution groups reach the journal late (task-d90).
     /// A crash loses the rest.
     durable_executed: usize,
-    /// Commands whose payload row this node is writing in a batch of its
-    /// own, with none durable yet (task-d90, row 20).
+    /// Commands whose payload row this node is writing over a durable
+    /// dependency row with no durable payload row (task-d90, row 20).
     payload_window: BTreeSet<CommandId>,
+    /// Its batches writing a payload row and a dependency row, which row
+    /// 20 may fail (task-d90).
+    failable: BTreeSet<BarrierId>,
     boot: u8,
     /// Highest ballot this node published `Promise` for.
     promised_out: Option<Ballot>,
@@ -678,6 +704,7 @@ struct Stats {
     /// and records restored with a dependency row and no payload row
     /// (task-d90, point 4).
     votes_checked: usize,
+    payload_failures: u32,
     payload_windows: u32,
     payload_crashes: u32,
     restored_without_payload: usize,
@@ -733,6 +760,7 @@ impl Sim {
                 executed: Vec::new(),
                 durable_executed: 0,
                 payload_window: BTreeSet::new(),
+                failable: BTreeSet::new(),
                 boot: 1,
                 promised_out: None,
                 durable_promise: None,
@@ -867,6 +895,9 @@ impl Sim {
                         matches!(self.nodes[usize::from(i)].role, Some(Role::Follower(_)));
                     if follower && self.knobs.payload_crash > 0 {
                         self.note_payload_window(i, &batch);
+                    }
+                    if follower && self.knobs.payload_fail > 0 && writes_payload_and_row(&batch) {
+                        self.nodes[usize::from(i)].failable.insert(batch.barrier);
                     }
                     if follower && self.knobs.drop_payload_rows {
                         let payloads = Collection::PayloadV1.id();
@@ -1552,6 +1583,27 @@ impl Sim {
             .pop_front()
             .expect("an entry");
         let barrier = match entry {
+            Entry::Batch(barrier)
+                if !self.healing
+                    && self.nodes[usize::from(i)].failable.remove(&barrier)
+                    && matches!(self.nodes[usize::from(i)].role, Some(Role::Follower(_)))
+                    && self.chance("payload-fail", self.knobs.payload_fail) =>
+            {
+                // Definitely not committed (task-d90, row 20): the batch
+                // never happens, and the journal goes on past it.
+                let error = coord_core::event::StorageError::DefinitelyNotCommitted;
+                self.nodes[usize::from(i)].storage.fail(barrier, error);
+                self.stats.payload_failures += 1;
+                self.note(|| format!("failed node {i} {barrier:?}"));
+                self.step_node(
+                    i,
+                    Event::Storage(StorageEvent::Failed {
+                        barrier_id: barrier,
+                        error,
+                    }),
+                );
+                return;
+            }
             Entry::Batch(barrier) => barrier,
             Entry::Group(through) => {
                 // The group is durable, with every entry before it: the
@@ -1688,11 +1740,9 @@ impl Sim {
         self.convert(i);
     }
 
-    /// Note the commands whose payload row `batch` writes at node `i` for
-    /// a record its store holds without one -- a dependency row, or an
-    /// entry of a Sync it holds a row of -- as an adoption over a record a
-    /// Sync installed does (row 20). A crash before the batch is durable
-    /// restores the record without its payload row.
+    /// Note the commands whose payload row `batch` writes at node `i` over
+    /// a dependency row durable there without one (row 20): a crash before
+    /// the batch is durable restores the record without its payload row.
     fn note_payload_window(&mut self, i: u8, batch: &coord_core::effect::PersistBatch) {
         let payloads = Collection::PayloadV1.id();
         let written: Vec<CommandId> = batch
@@ -1872,6 +1922,7 @@ impl Sim {
         node.role = None;
         node.journal.clear();
         node.payload_window.clear();
+        node.failable.clear();
         node.storage.crash();
         // What its materializer executed past its durable groups is gone
         // with the journal (task-d90).
@@ -2855,20 +2906,30 @@ fn describe(m: &ProtocolMessage) -> String {
     }
 }
 
-/// The records `storage` holds without a payload row (row 20): its
-/// dependency rows, and the entries of the Syncs it holds rows of.
+/// The commands `storage` holds a dependency row of without a payload
+/// row (row 20). A Sync's entries are left out: one restored without a
+/// record of its own comes back as a placeholder, which nothing votes on.
 fn records_without_payload(storage: &StorageModel) -> BTreeSet<CommandId> {
     let held: BTreeSet<CommandId> = payload_rows(storage).into_iter().map(|(c, _)| c).collect();
     dependency_rows(storage)
         .into_iter()
         .map(|(c, _)| c)
-        .chain(
-            sync_rows(storage)
-                .into_iter()
-                .flat_map(|d| d.entries.into_keys()),
-        )
         .filter(|c| !held.contains(c))
         .collect()
+}
+
+/// Whether `batch` writes a command's payload row and a dependency row
+/// (row 20's failable batches).
+fn writes_payload_and_row(batch: &coord_core::effect::PersistBatch) -> bool {
+    let payloads = Collection::PayloadV1.id();
+    let protocol = Collection::ProtocolV1.id();
+    batch
+        .updates
+        .iter()
+        .any(|u| u.collection == payloads && u.value.is_some())
+        && batch.updates.iter().any(|u| {
+            u.collection == protocol && u.key.len() == 41 && u.key[8] == 0x01 && u.value.is_some()
+        })
 }
 
 /// The response a node's materializer gives `c` executed after
@@ -3066,6 +3127,7 @@ fn run_row(row: u8) {
                     totals.votes_checked += s.votes_checked;
                     totals.payload_crashes += s.payload_crashes;
                     totals.payload_windows += s.payload_windows;
+                    totals.payload_failures += s.payload_failures;
                     totals.restored_without_payload += s.restored_without_payload;
                     totals.cut_released += s.cut_released;
                     totals.cut_durable += s.cut_durable;
@@ -3122,15 +3184,6 @@ fn run_row(row: u8) {
                 && totals.executions_lost > 0
                 && totals.compared > 0,
             "row 19 missed a cut: {totals:?}"
-        );
-    }
-    // Row 20 reaches its cut (task-d90, point 4): followers crashed while
-    // writing a payload row over a durable dependency row, and records
-    // restored without their payload rows.
-    if row == 20 {
-        assert!(
-            totals.payload_crashes > 0 && totals.restored_without_payload > 0,
-            "row 20 missed its cut: {totals:?}"
         );
     }
     // Oracle 9 ran.

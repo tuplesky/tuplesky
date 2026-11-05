@@ -1517,3 +1517,36 @@ fn a_failed_payload_batch_is_written_again_by_the_next_adoption() {
         "{released:?}"
     );
 }
+
+/// A submission's own batch, which writes its payload row and its
+/// dependency row, fails (task-d90, point 4, the fault of protocol_sim's
+/// row 21): the record stays initialized in memory with its payload, and
+/// no row holds it. The adoption of the leader's proposal for it writes
+/// the payload row again, which the vote waits on.
+#[test]
+fn a_vote_after_its_submissions_batch_failed_writes_the_payload_row_again() {
+    let mut f = booted(1);
+    let (e1, c1) = admitted(1, 1, 1);
+    let effects = f.step(e1);
+    f.step(Event::Storage(StorageEvent::Failed {
+        barrier_id: effects_barrier(&effects),
+        error: StorageError::DefinitelyNotCommitted,
+    }));
+    let record = f
+        .table()
+        .record(&c1)
+        .expect("initialized in memory")
+        .clone();
+    let effects = f.step(peer(
+        0,
+        proposal(c1, vec![], 0, record.paths.clone(), record.path),
+    ));
+    let batches = persisted(&effects);
+    assert!(
+        batches.iter().any(|b| b
+            .updates
+            .iter()
+            .any(|u| u.collection == Collection::PayloadV1.id() && u.value.is_some())),
+        "the vote's batch writes the payload row again: {batches:?}"
+    );
+}
