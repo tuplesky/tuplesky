@@ -119,6 +119,13 @@ pub enum FollowerRejection {
     BatchFailed(CommandId),
     /// A proposal for another ballot or from a non-leader.
     ForeignProposal,
+    /// Another voter's fast acknowledgement, not counted (task-d98). Only
+    /// a build from before task-d74 sends one to a follower. Counted with
+    /// a proposal that left before the leader's batch was durable, it
+    /// could make a fast quorum over a vote the leader may yet lose, so a
+    /// follower learns a fast decision only from the leader's commit
+    /// frontier, whatever the other voters run.
+    PeerFastAck,
     /// A Sync named a ballot at or below the synchronized one, or from
     /// another epoch: the record never regresses.
     SyncRegression(crate::ballot::SyncRejection),
@@ -4994,6 +5001,17 @@ impl Follower {
     }
 
     fn collect(&mut self, from: ReplicaId, vote: Vote) -> Vec<Effect> {
+        // A follower counts its own fast acknowledgement (deferred until
+        // durable) and the leader's proposal, never another voter's fast
+        // acknowledgement (task-d98, design Section 4.3). Since task-d74
+        // only an older build sends one here, and with an early proposal
+        // it could complete a fast quorum the leader's restarted report
+        // would deny. An adoption is a durable ACCEPT copy whatever it
+        // is counted with (task-d19), so slow acknowledgements still are.
+        if matches!(vote, Vote::Fast(_)) {
+            self.rejections.push(FollowerRejection::PeerFastAck);
+            return Vec::new();
+        }
         if vote.replica() != from {
             self.rejections
                 .push(FollowerRejection::Vote(VoteError::NotAVoter));
