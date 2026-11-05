@@ -122,8 +122,10 @@ pub enum FollowerRejection {
     /// Another voter's fast acknowledgement, not counted (task-d98). Only
     /// a build from before task-d74 sends one to a follower. Counted with
     /// a proposal that left before the leader's batch was durable, it
-    /// could make a fast quorum over a vote the leader may yet lose, so a
-    /// follower learns a fast decision only from the leader's commit
+    /// could make a fast quorum over a vote the leader may yet lose.
+    /// Apart from the three-voter fast-set follower, whose proposal waits
+    /// for the leader's batch and which counts its own acknowledgement
+    /// with it, a follower takes fast decisions from the leader's commit
     /// frontier, whatever the other voters run.
     PeerFastAck,
     /// A Sync named a ballot at or below the synchronized one, or from
