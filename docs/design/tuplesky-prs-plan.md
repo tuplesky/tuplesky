@@ -3631,7 +3631,8 @@ So every feature-gated change, task-d98's `EarlyProposal` first, would ship unre
     - **a generation replacement keeps the feature rows:** the handoff copies the voter's own support row, markers and activation into the staged generation, and selection refuses a generation that lacks one the active one holds, since `checkpoint_v1` is node-private and no image carries it;
     - **the held set is per follower boot,** and a follower's entry clears on a new peer link from it, since a restart keeps the incarnation;
     - **the node's own switch turns on at runtime,** once its own activation row is durable;
-    - **a leader change in the middle:** a follower's `FeatureHeld` tells a new leader the feature is active, and a leader whose own support row names it writes the activation and resumes the re-sends. `activate` is idempotent, and `feature status` shows a partial state.
+    - **a leader change in the middle:** a follower's `FeatureHeld` carries the activation record it holds, and a new leader whose own support row names the feature installs that record unchanged and resumes the re-sends, since `activate_feature`'s reports are in the old leader's store. `activate` is idempotent, and `feature status` shows a partial state;
+    - **a voter that joins after an activation** holds no feature rows, so promotion to voter requires a current advertisement of every active feature, and the leader prepares and activates for that voter alone before the promotion completes (Section 22's learner rule).
   - **No ordered switch:** a feature that changes what every voter executes needs its own.
   - **Membership:** everything names its epoch. An activation stays, and a prepare in flight at a change is run again.
   - **Operator output:** a refusal names the voters missing, and `coordctl feature status` reads the leader's view.
@@ -3643,7 +3644,8 @@ So every feature-gated change, task-d98's `EarlyProposal` first, would ship unre
   - the leader's held set, keyed by follower boot, and task-d98's `sends_early_to` reading it;
   - the node's switch turned on when its own activation row is durable;
   - the handoff's copy of the feature rows into a staged generation, and selection's refusal of one that lacks them;
-  - a new leader's resumption from a follower's `FeatureHeld`;
+  - a new leader's resumption from a follower's `FeatureHeld`, installing the record it carries;
+  - the promotion check and the single-voter prepare and activate for a joining voter;
   - `coordctl feature activate` and `feature status`, over the admin API;
   - the harnesses' activation.
 
@@ -3654,7 +3656,8 @@ So every feature-gated change, task-d98's `EarlyProposal` first, would ship unre
 - after prepare and activate, a voter replaced through install and handoff refuses a build without the feature at its next start;
 - a follower restarted after it said `FeatureHeld` gets no early proposal until it says it again;
 - a node's early send turns on once its own activation row is durable, with no restart;
-- a leader change between activation and the last follower's install still finishes the activation;
+- a leader change between activation and the last follower's install still finishes the activation, with the old leader's record and reporters;
+- a voter added after an activation is refused promotion on a build without the feature, and on a build with it ends up holding the activation;
 - the window rule holds in a mixed-build test that includes a voter from before task-d99, not only a voter without the feature;
 - a voter that rolled back after reporting is handled as the design step decides;
 - `coordctl`'s command works against a running domain;
