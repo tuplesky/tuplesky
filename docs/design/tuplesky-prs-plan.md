@@ -3632,7 +3632,7 @@ So every feature-gated change, task-d98's `EarlyProposal` first, would ship unre
     - **the held set is per follower boot,** and a follower's entry clears on a new peer link from it, since a restart keeps the incarnation;
     - **the node's own switch turns on at runtime,** once its own activation row is durable;
     - **a leader change in the middle:** a follower's `FeatureHeld` carries the activation record it holds, and a new leader whose own support row names the feature installs that record unchanged and resumes the re-sends, since `activate_feature`'s reports are in the old leader's store. `activate` is idempotent, and `feature status` shows a partial state;
-    - **a voter that joins after an activation** holds no feature rows, so promotion to voter requires a current advertisement of every active feature, and the leader prepares and activates for that voter alone before the promotion completes (Section 22's learner rule).
+    - **a voter that joins after an activation** holds no feature rows, so promotion to voter requires a current advertisement of every active feature, and the leader prepares and activates for that voter alone before the promotion completes (Section 22's learner rule). The joiner installs the record unchanged, with the original reporters, and `feature status` places a voter in the active set from its `FeatureHeld`, not from the reporters.
   - **No ordered switch:** a feature that changes what every voter executes needs its own.
   - **Membership:** everything names its epoch. An activation stays, and a prepare in flight at a change is run again.
   - **Operator output:** a refusal names the voters missing, and `coordctl feature status` reads the leader's view.
