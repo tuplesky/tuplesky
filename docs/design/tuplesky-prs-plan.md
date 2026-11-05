@@ -3537,7 +3537,7 @@ The change, in two steps:
 ### task-d98: Send the leader's proposal before its batch is durable
 
 **Prerequisites:** task-d30, task-d74, task-d89, task-d99 (its local disk pair needn't wait, below).  
-**Design:** Sections 4.3 and 4.8 (amended by this task's design step, if it is accepted).
+**Design:** Sections 4.3 and 4.8 (amended by this task).
 
 **Implement:** L7 (#185 review). A slow-path write pays two syncs in series before it is learned:
 - the leader publishes each `Proposal` with `requires: [barrier]`, so it leaves once the leader's proposal batch is durable;
@@ -3552,7 +3552,7 @@ About 95% of the register row's writes take the slow path on the runner (a fast 
   - **Section 4.8's persist-before-send, restated:** it binds a voter's acknowledgement of another voter's proposal; the leader's proposal is where the value comes from, so the `Proposal` to followers may leave early. The `LeaderReply` to the frontend may not, since the frontend learns a fast decision from it with the followers' fast acknowledgements.
   - **The leader crashing after sending and before its batch is durable:** followers then hold PRE-ACCEPT or ACCEPT rows at ballot b for a proposal the leader's store lacks. A slow quorum can form from followers alone and the frontend learns it from their acknowledgements, so recovery has to keep it. Boot fencing has to keep a rebooted leader from proposing that command at b again with other dependencies or another seqnum.
   - **The protocol simulator,** every row at 1,000 seeds with catch-up and without, with crash cuts between the send and the leader's durability.
-- **What the design step found** (Sections 4.3 and 4.8, proposed):
+- **What the design step found** (Sections 4.3 and 4.8, accepted on #192):
   - **A fast decision at a follower.** A fast-set follower at three voters learns a fast decision from its own vote set: the leader's proposal and its own fast acknowledgement. With the proposal sent early, that would count over a volatile vote.
     - So the proposal leaves early only to a follower whose own acknowledgement and the proposal fall short of `fast_size`. At three voters under C2 that's the follower outside the fast set, and with the leader it makes a slow quorum. At five voters it's every follower.
     - The fast-set follower at three voters gets it once the batch is durable, as do re-sends and retries.
@@ -3579,6 +3579,48 @@ About 95% of the register row's writes take the slow path on the runner (a fast 
     - The pair: three and five voters, one worker a voter, sides alternating.
     - It reads #191's `round` and the journal's `served_each` and `queued_each` at every voter.
     - `round`'s p50 and p99 should fall by about one served sync plus one queue wait. If they don't, the batch doesn't carry the change.
+- **Built (the code step, on `claude/compassionate-brahmagupta-jfeevb`, 4231192):**
+  - **The rule, in `Leader::proposal_sends`:** a copy leaves with no barrier when the node's setting is on, a proposal batch of this leadership is durable (`early_ready`), and `1 + fast_eligible(follower) < fast_size`. `propose` releases an early copy in the same step, and `retry_proposal` uses the same rule. The leader reply keeps its barrier.
+  - **Two departures from the step's text:**
+    - **The re-send timer is unchanged.** It re-sends only proposals whose batch is durable, so none of its copies has a barrier left to drop.
+    - **The genesis condition is one rule for every leader:** no early copy until a proposal batch of this leadership is durable. A won ballot's bound Sync was submitted before that batch, and batches are durable in submission order, so the rule covers both cases Section 4.8 names. A batch in flight when the first completes keeps its barrier.
+  - **The switch:** `Feature::EarlyProposal = 0x0004`. `coordd` takes the active set from `admit` at start and gives it to the node, which gives it to every leader it becomes (`Node::set_early_proposal`, `change_role`). Until task-d99 nothing activates it in a running domain. The cargo feature `early-proposal-without-activation` reads it as active, says so on stderr at start, and is built only for the local pair.
+  - **A count:** `resends.early` in the metrics, the copies sent early.
+  - **Tests:**
+    - `coord-consensus/tests/early_proposal.rs`, six model tests:
+      - with the feature off, nothing leaves early (the mixed-build test);
+      - at three voters only the follower outside the fast set gets it early, and at five every follower does;
+      - the first batch holds every copy, and a batch in flight when it completes keeps its barrier;
+      - adoptions an early copy brings back commit nothing before the batch is durable;
+      - a retried batch goes early by the same rule.
+    - `coord-daemon/tests/voter.rs::a_leader_a_node_becomes_sends_early_as_the_node_does`.
+    - `coordd/tests/cli.rs::a_leader_that_sent_early_and_restarted_comes_back_following`: `EarlyProposal` written into every store, and the leader's `resends.early` above zero. Killed and started again, the leader campaigns, wins ballot 1, never leads ballot 0, and every voter reads the write.
+    - The first-batch case is a model test rather than a `coordd` one, since the model test controls when a batch completes. The `coordd` test covers the restart.
+  - **The simulator:** knobs `early`, `leader_journal_lag`, `window_crash` and `window_depose`, each drawn only when nonzero. So rows without them are unchanged seed for seed, with decision hashes equal to the base's. Rows 1 and 2 run each seed again with them, row 18 is the early send's own row, and the sweep workflow runs row 18.
+    - **At 1,000 seeds, with catch-up and without:** rows 1, 2 and 18 are clean. Row 18 crashed a leader in the window 6,641 and 7,162 times and deposed one 2,224 and 2,427 times, and rows 1 and 2's early runs reached it 1,540 to 4,861 times.
+    - **Without catch-up, one of row 1's early runs at each size learned nothing** (seed 399 at three voters, seed 24 at five), where the base row has none. With the same knobs and the early copies off, both seeds give the same counts, so it's the lagging journal and the row's churn, not the early send.
+    - **The negative control** (`row_18_fails_when_the_fast_set_follower_gets_the_proposal_early_too`) fails at three voters on seed 66. The leader crashes before its batch is durable, the fast-set follower has committed the command over the lost vote, and the restarted leader's recovery finds it accepted under two dependency sets (`IncompatibleAccepted`).
+  - **The local pair:**
+    - **Setup:** one 4-core host, stores on ext4 on a virtio disk, `replay`, one tokio worker a voter (`TOKIO_WORKER_THREADS=1`, coordd alone). The mix is put 50, contended 30 and get 20, sides alternate, and the head side is built with `early-proposal-without-activation`.
+    - **What it reads:** #191's `round`, `served_each` and `queued_each` aren't on this branch, so it reads the bench's service latency and the voters' appender jobs.
+
+    | Voters | Callers | Side | Runs | Operations/s | Put p50 / p99 (ms) | Contended p50 / p99 | Get p50 / p99 | Leader's slow share | Append served / queued (ms, mean over voters) |
+    | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+    | 3 | 1 | off | 3 | 630 | 1.60 / 4.29 | 1.65 / 4.51 | 0.46 / 3.13 | 3% | 0.37 / 0.04 |
+    | 3 | 1 | on | 3 | 652 | 1.53 / 4.35 | 1.58 / 4.76 | 0.46 / 3.43 | 32% | 0.38 / 0.04 |
+    | 3 | 10 | off | 6 | 1,476 | 5.96 / 14.87 | 5.99 / 15.02 | 5.69 / 15.06 | 84% | 0.74 / 0.08 |
+    | 3 | 10 | on | 6 | 1,562 | 5.65 / 14.07 | 5.70 / 13.97 | 5.56 / 15.32 | 92% | 0.79 / 0.09 |
+    | 5 | 1 | off | 3 | 432 | 2.39 / 5.40 | 2.43 / 5.60 | 0.61 / 2.95 | 10% | 0.48 / 0.06 |
+    | 5 | 1 | on | 3 | 456 | 2.22 / 5.39 | 2.30 / 5.46 | 0.59 / 3.00 | 62% | 0.52 / 0.06 |
+    | 5 | 10 | off | 3 | 880 | 10.67 / 21.89 | 10.75 / 22.05 | 10.07 / 23.47 | 90% | 1.00 / 0.11 |
+    | 5 | 10 | on | 3 | 958 | 9.83 / 20.23 | 9.90 / 20.24 | 9.45 / 22.34 | 93% | 1.09 / 0.12 |
+
+    - **At ten callers, put p50 fell 0.31 ms at three voters and 0.84 ms at five,** and p99 0.80 and 1.66 ms. Every head run's put p50 was below every base run's, and operations/s rose 6% and 9%.
+    - **That's about two fifths of the expected size at three voters, and three quarters at five.** The expected size was one served sync plus one queue wait, 0.82 and 1.11 ms here. At three voters the early copy goes only to the follower outside the fast set, so the slow quorum is the leader and that one follower. At five it's the leader and the faster two of four followers.
+    - **At one caller, writes mostly take the fast path** (3% and 10% slow), which already pays one sync. The change there is under 0.2 ms.
+    - **The leader's fast share isn't comparable across the sides.** With the early copy, a slow quorum often forms before the fast one. At one caller and three voters, the leader's slow decisions went from 103 to 1,060 (`missed_missing` 638 and `missed_slow_first` 422). So a head with L7 on reads its fast share as a race between the two quorums, not as conflicts.
+    - **Get p99 at three voters and ten callers was higher in the first three head runs and lower in the next three.** Over six runs a side it's level, 15.06 against 15.32 ms.
+    - **The runner's sync is 2.28 ms,** three times this disk's served 0.74, so the batch's pair reads the size there.
 
 **Acceptance:** The design step accepted, or declined with the reason. If accepted: the code, the simulator's rows clean (rows 1, 2 and 18 with the new knobs, every row at 1,000 seeds with catch-up and without) and the negative control failing, the mixed-build and `coordd` tests, the local pair on a disk showing `round` fall, the leader-kill run and the standard schedule `:valid? true` on its head, and the next batch's `service` row read with it. If declined, the batch revises the `service` target, with the slow path's two syncs in series as the reason.
 
@@ -3657,7 +3699,7 @@ G3 requires task-43/transitive prerequisites, G4 task-48, G5 checkpoint/replacem
 - **The Jepsen runs of task-d67's code** (#98): after four of five leader changes the new leader ran 81 to 87% fast; the fifth's fixed fast set held the voter just killed, which task-d76 takes. Under load the share stayed at Section 2.2's 1 to 2%, which task-d65 records as confirming that section's decision. The publications over 10 ms spent under 2.5 ms on a CPU or waiting for one, so task-d66's job is built.
 - **Against etcd on one host**, the one matched comparison is 2.5 times behind, at 3.5 to 4.7 ms of server CPU an operation against etcd's 1.39, and none of the gap is the order. task-d72 sets the budget and keeps the record; task-d73 through task-d75 are its levers, after task-d63's build and task-d66's job.
 - **Gating.** task-d45 through task-d49 and task-d51 through task-d53 are prerequisites of task-64 and task-q01, so that the qualification and the combined report measure the protocol rather than these costs. task-d56 is a prerequisite of task-64, as liveness under faults. task-62's remaining rows, and any reference result it publishes again, wait on them and on task-d54 for the same reason. This is stated in task-62 rather than as a prerequisite, since task-62's first runs produced task-c01 and task-c02, which the throughput tasks build on. task-d50, reads and the fast path off the slow path, changes protocol behaviour and waits on its own design amendment.
-- **Design changes.** task-d45 through task-d47, task-d49, task-d51 through task-d56 and task-d58 through task-d62, task-d66, task-d69, task-d70, task-d72, task-d73, task-d75, task-d88, task-d91, task-d92, task-d96 and task-d97 do not change the design; task-d98 amends Sections 4.3 and 4.8 if its design step is accepted, and task-d99 Sections 13 and 17.7 with the activation path and the admission window; task-d74 amends Sections 4.1 and 4.3 if a decision reads another follower's votes, and task-d76 amends Section 4.2; task-d71 amends Sections 4.9 and 13.1, and task-d77 through task-d80 and task-d85 Section 4.9, and task-d81 Section 6.7.3 if it changes which ballot a donor serves at; task-d82 amends Section 11.4 and the O14 row, task-d83 Section 6.3 and task-d84 Section 17.3.3; task-d89 amends Section 4.7, and task-d90 Sections 4.5, 17.3.3 and 17.4; task-d86 amends Section 17.3.4 only if a commit cadence reaches `strict`, and task-d87 Section 6.3 only if a round serves a read that arrived after it began; task-d67 amends Sections 4.1, 4.7 and 4.9 with its rule, and task-d68 Sections 4.1 and 4.7 with its, and task-d63's release-rule step amends Sections 4.5, 17.3.3 and 17.4; task-d64 amends Sections 4 and 6.4, and task-d65 Section 2.2 if it changes the model. task-d48 amends Section 17.3.4's projection hardening; task-d50 amends Sections 4.5, 6.3 and 17.4; task-d57 amends Sections 2.2, 4.5 and 6.3.
+- **Design changes.** task-d45 through task-d47, task-d49, task-d51 through task-d56 and task-d58 through task-d62, task-d66, task-d69, task-d70, task-d72, task-d73, task-d75, task-d88, task-d91, task-d92, task-d96 and task-d97 do not change the design; task-d98 amends Sections 4.3 and 4.8, and task-d99 Sections 13 and 17.7 with the activation path and the admission window; task-d74 amends Sections 4.1 and 4.3 if a decision reads another follower's votes, and task-d76 amends Section 4.2; task-d71 amends Sections 4.9 and 13.1, and task-d77 through task-d80 and task-d85 Section 4.9, and task-d81 Section 6.7.3 if it changes which ballot a donor serves at; task-d82 amends Section 11.4 and the O14 row, task-d83 Section 6.3 and task-d84 Section 17.3.3; task-d89 amends Section 4.7, and task-d90 Sections 4.5, 17.3.3 and 17.4; task-d86 amends Section 17.3.4 only if a commit cadence reaches `strict`, and task-d87 Section 6.3 only if a round serves a read that arrived after it began; task-d67 amends Sections 4.1, 4.7 and 4.9 with its rule, and task-d68 Sections 4.1 and 4.7 with its, and task-d63's release-rule step amends Sections 4.5, 17.3.3 and 17.4; task-d64 amends Sections 4 and 6.4, and task-d65 Section 2.2 if it changes the model. task-d48 amends Section 17.3.4's projection hardening; task-d50 amends Sections 4.5, 6.3 and 17.4; task-d57 amends Sections 2.2, 4.5 and 6.3.
 
 task-j06 is optional and cannot silently relax durable materialization. ReadFence is its own capability gate. Observers do not improve quorum fault tolerance or acquire voting rights by catching up. Interface drift in Kine is resolved at one explicit pin, not mixed across examples. Strict per-output authorization remains authoritative even for regional observers.
 
