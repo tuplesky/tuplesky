@@ -1149,6 +1149,7 @@ dependencies = [
  "coord-transport-testkit",
  "coord-types",
  "coord-wan-bench",
+ "coordctl",
  "jsonwebtoken",
  "mimalloc",
  "postcard",

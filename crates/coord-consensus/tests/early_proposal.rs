@@ -379,3 +379,28 @@ fn a_retried_batch_goes_early_by_the_same_rule() {
     assert_eq!((late[0].0, late[0].1), (1, false));
     assert_eq!(replies(&released), 1);
 }
+
+/// The window (task-d99): an early proposal goes only to a follower known
+/// to hold the activation. At five voters every follower could take one;
+/// with r3 alone in the held set, only r3 does, and the rest wait for the
+/// batch, as every copy did before. Out of the set again -- a new link, a
+/// new ballot -- it waits too.
+#[test]
+fn an_early_proposal_goes_only_to_a_follower_known_to_hold_the_activation() {
+    let (mut leader, mut seq) = ready(5, true);
+    leader.set_early_holders(Some([r(3)].into_iter().collect()));
+    let (event, _) = admitted(seq);
+    let effects = leader.step(event);
+    let early: Vec<u8> = proposals(&effects).iter().map(|(to, _, _)| *to).collect();
+    assert_eq!(early, vec![3], "{effects:?}");
+    let released = leader.step(durable(batch(&effects), seq));
+    let mut late: Vec<u8> = proposals(&released).iter().map(|(to, _, _)| *to).collect();
+    late.sort_unstable();
+    assert_eq!(late, vec![1, 2, 4]);
+    seq += 1;
+
+    leader.set_early_holders(Some(BTreeSet::new()));
+    let (event, _) = admitted(seq);
+    let effects = leader.step(event);
+    assert!(proposals(&effects).is_empty(), "{effects:?}");
+}

@@ -1232,6 +1232,26 @@ fn a_staging_without_the_active_generations_feature_rows_is_not_selected() {
         .unwrap();
     }
     tx.commit_durable().unwrap();
+    // And activated it.
+    let view = active.reader().snapshot().unwrap();
+    let activation = coord_checkpoint::feature::activate_feature(
+        &view,
+        &voters,
+        CLUSTER,
+        DOMAIN,
+        Feature::EarlyProposal,
+        &coord_checkpoint::trim::TrimLimits::default(),
+    )
+    .unwrap();
+    drop(view);
+    let mut tx = active.begin_write().unwrap();
+    tx.put(
+        activation.collection,
+        &activation.key,
+        activation.value.as_ref().unwrap(),
+    )
+    .unwrap();
+    tx.commit_durable().unwrap();
     let view = active.reader().snapshot().unwrap();
     let rows = FeatureRows::read(&view, &LEARNER).unwrap();
     drop(view);
@@ -1265,10 +1285,22 @@ fn a_staging_without_the_active_generations_feature_rows_is_not_selected() {
     let view = generation.engine().reader().snapshot().unwrap();
     assert!(rows.held_by(&view).unwrap());
     assert!(coord_checkpoint::feature::prepared(&view, &LEARNER, Feature::EarlyProposal).unwrap());
-    assert!(
-        admit(&view).unwrap().is_empty(),
-        "a marker activates nothing"
+    // At its next start the replaced voter admits the activation, and a
+    // build without the feature is refused: `admit`'s rule over the
+    // carried record, with that build's support.
+    assert_eq!(
+        admit(&view).unwrap(),
+        [Feature::EarlyProposal].into_iter().collect()
     );
+    let record = coord_checkpoint::feature::published_activation(&view)
+        .unwrap()
+        .unwrap();
+    let without: std::collections::BTreeSet<Feature> = Feature::ALL
+        .iter()
+        .copied()
+        .filter(|f| *f != Feature::EarlyProposal && *f != Feature::EarlyProposalPrepared)
+        .collect();
+    assert!(record.active().unwrap().admits(&without).is_err());
 }
 
 #[test]

@@ -3693,6 +3693,15 @@ So every feature-gated change, task-d98's `EarlyProposal` first, would ship unre
   - the promotion check and the single-voter prepare and activate for a joining voter;
   - `coordctl feature activate` and `feature status`, over the admin API;
   - the harnesses' activation.
+- **Built (the code step):**
+  - **Rows and markers** (`coord_types::formats`, `coord_checkpoint::feature`): `EarlyProposalPrepared = 0x0005`; `prepare_feature` writes the support row and the marker in one batch; `install_activation` installs another voter's record unchanged over this voter's durable support row, keeping its own markers; `admit` reads a marker as a requirement on `Supported` and returns only what turns a behaviour on. Each rule also takes explicit state (`prepare_rows`, `activation_over`, `installed_record`, `check_support`), since a batch is durable in the journal before its rows are in the view.
+  - **Messages:** the five, appended to `ProtocolMessage`. `FeatureActivated { feature, record }` and `FeatureHeld { record }` carry the record as `FeatureRecord { epoch, features, reporters }`, the row without the cluster and domain, which the link names.
+  - **The driver** (`coord_daemon::feature`, wired through `Node` and `Voter` as the floor is): advertisements at start and on each new peer link; the leader's prepare, its record of each durable answer, its activation once every report is durable in its store, and the send. A follower installs and says `FeatureHeld` once durable.
+  - **The window:** the leader keeps who said `FeatureHeld`, cleared on any new peer link from that voter (a restart has only new links, so this is at least as strict as per boot) and on a new ballot. `Leader::set_early_holders` narrows `sends_early_to` to it. The node's switch follows its own durable record.
+  - **The re-send,** once a second while leading: it asks a voter whose advertisement it has not heard since its last link (a follower answers the leader's `FeatureSupport` with its own), and sends the prepare and the record to every voter not holding an active feature. That one path finishes an activation after a leader change, with the record a follower's `FeatureHeld` gave the new leader, and prepares and activates a voter that joined after one.
+  - **The operator:** `coordd` takes requests on `<state_directory>/admin.sock`, the owner's alone; `coordctl feature --socket <path> activate <name> | status`. A follower refuses and names the leader.
+  - **Handoff and promotion:** `FeatureRows`, `carry_feature_rows` and `select_installed`'s refusal of a staging without the active generation's rows, and `promotion_missing`. No running daemon installs a generation or promotes a learner yet; task-d40 and task-d41 call these where they do.
+  - **Harnesses:** `scripts/bench/activate.sh DIR FEATURE...`, and `ACTIVATE=early-proposal` on `command-cost.sh`. The Jepsen job is the testing session's: it runs `coordctl feature --socket <state>/admin.sock activate early-proposal` against each node after start until one accepts.
 
 **Acceptance:** The design step accepted. Then the code, with tests:
 - activation is refused without every configured voter's support;

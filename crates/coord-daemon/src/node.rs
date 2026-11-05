@@ -1192,9 +1192,12 @@ impl<P: Persistence> Node<P> {
         if self.early_without_activation {
             return;
         }
-        let Some(features) = self.features.as_ref() else {
+        let Some(features) = self.features.as_mut() else {
             return;
         };
+        if !features.take_changed() {
+            return;
+        }
         let on = features
             .active()
             .contains(&coord_types::formats::Feature::EarlyProposal);

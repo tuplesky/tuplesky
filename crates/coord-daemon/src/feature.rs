@@ -272,6 +272,9 @@ pub struct Features {
     /// A batch failed: what is kept here is no longer what the store
     /// holds, so nothing is written until it is read again.
     stale: bool,
+    /// The switch or the window may have moved since the node last read
+    /// them ([`Features::take_changed`]).
+    changed: bool,
     barriers: BarrierAllocator,
     /// Since boot.
     pub counts: FeatureCounts,
@@ -304,6 +307,7 @@ impl Features {
             standing: None,
             unsettled: VecDeque::new(),
             stale: false,
+            changed: true,
             barriers: BarrierAllocator::new(incarnation, boot).for_features(),
             counts: FeatureCounts::default(),
         };
@@ -331,6 +335,7 @@ impl Features {
         }
         self.record = record.clone();
         self.durable_record = record;
+        self.changed = true;
         self.stale = false;
         Ok(())
     }
@@ -339,6 +344,13 @@ impl Features {
     /// again ([`Features::reload`]).
     pub fn wants_reload(&self) -> bool {
         self.stale && self.unsettled.is_empty()
+    }
+
+    /// Whether [`Features::active`] or [`Features::holders`] may have
+    /// changed since this was last asked: the node re-reads them only
+    /// then, since it asks on every pass of its loop.
+    pub fn take_changed(&mut self) -> bool {
+        core::mem::take(&mut self.changed)
     }
 
     /// The configured voters.
@@ -414,7 +426,9 @@ impl Features {
             return step;
         }
         self.advertised.remove(&peer);
-        self.holders.remove(&peer);
+        if self.holders.remove(&peer).is_some() {
+            self.changed = true;
+        }
         step.sends.push((peer, self.advertisement()));
         if let Some(standing) = self.standing
             && !standing.leading
@@ -435,6 +449,9 @@ impl Features {
         let promoted = self
             .standing
             .is_some_and(|s| s.ballot == standing.ballot && !s.leading && standing.leading);
+        if self.standing != Some(standing) {
+            self.changed = true;
+        }
         self.standing = Some(standing);
         if moved {
             self.holders.clear();
@@ -475,7 +492,19 @@ impl Features {
                 }
                 self.counts.advertised += 1;
                 self.advertised.insert(from, (*epoch, set));
-                FeatureStep::default()
+                // The leader's advertisement is also its ask: a voter
+                // answers it with its own, which the leader may have
+                // forgotten at a new link after it arrived. Only the
+                // leader's is answered, so two voters never echo each
+                // other.
+                let mut step = FeatureStep::default();
+                if let Some(standing) = self.standing
+                    && !standing.leading
+                    && standing.ballot.leader == from
+                {
+                    step.sends.push((from, self.advertisement()));
+                }
+                step
             }
             ProtocolMessage::FeaturePrepare { feature, epoch } => {
                 self.on_prepare(from, *feature, *epoch)
@@ -719,6 +748,9 @@ impl Features {
             .filter(|f| !f.is_marker())
             .collect();
         self.counts.held += 1;
+        if self.holders.get(&from) != Some(&held) {
+            self.changed = true;
+        }
         self.holders.insert(from, held);
         // A leader that never heard the activation finishes it with the
         // record its followers hold, not one of its own: the reports it
@@ -883,6 +915,7 @@ impl Features {
             }
             if let Some(record) = batch.record {
                 self.durable_record = Some(record);
+                self.changed = true;
             }
             if let Some(feature) = batch.announce {
                 self.activating = None;
@@ -945,7 +978,9 @@ impl Features {
         step
     }
 
-    /// The leader's re-send, paced by the runtime: for each feature its own
+    /// The leader's re-send, paced by the runtime. A voter whose
+    /// advertisement it has not heard since its last link is asked for it.
+    /// For each feature its own
     /// durable record turns on, every voter that has not said it holds it
     /// is asked to prepare and sent the record -- after a lost message, a
     /// leader change, or a voter that joined after the activation -- and,
@@ -958,6 +993,13 @@ impl Features {
         }
         let epoch = self.voters.epoch();
         let peers: Vec<ReplicaId> = self.peers().collect();
+        // A voter whose advertisement this leader has not heard since its
+        // last link is asked for it.
+        for peer in &peers {
+            if self.advertised.get(peer).is_none_or(|(e, _)| *e != epoch) {
+                step.sends.push((*peer, self.advertisement()));
+            }
+        }
         if let Some(feature) = self.activating {
             for peer in &peers {
                 if !self.recorded(peer, feature) {

@@ -88,3 +88,5 @@ axum.workspace = true
 coord-authn.workspace = true
 # A dial against real listeners of both planes (task-d16).
 coord-transport-testkit.workspace = true
+# `coordctl feature`'s request to a running node's admin socket (task-d99).
+coordctl.workspace = true
