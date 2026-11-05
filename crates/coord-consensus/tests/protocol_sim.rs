@@ -49,6 +49,16 @@
 //! that loss in every row (task-d78), as the weekly sweep does. Seeds that
 //! once failed are kept in `fixtures/protocol_sim/seeds.json`, with the
 //! catch-up and the loss they were found under, and replayed on every run.
+//!
+//! task-d98's leader sends its proposal before its batch is durable, to
+//! the followers that cannot make a fast quorum from it. Rows 1 and 2 run
+//! every seed again with it on and with the three faults that reach it: a
+//! leader journal that lags its followers', and the leader crashed, or
+//! deposed (cut off while a follower campaigns, then joined again), while
+//! a proposal it sent early is not durable. Row 18 is those faults more
+//! often, with more loss. Its negative control sends the early copy to the
+//! fast-set followers too, and must fail: at three voters one of them then
+//! commits over a vote the leader may lose.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -166,6 +176,25 @@ struct Knobs {
     /// from the leader's frontier alone, as every follower does with
     /// acknowledgements to the leader only (task-d74).
     peer_ack_loss: u32,
+    /// The leader sends a fresh proposal before its batch is durable, to
+    /// the followers that cannot make a fast quorum from it (task-d98).
+    early: bool,
+    /// Chance a journal completion that falls to the leading node is put
+    /// off: its batches complete later than its followers' (task-d98).
+    leader_journal_lag: u32,
+    /// Chance per step the leader is crashed while it holds a proposal it
+    /// sent early whose batch is not durable (task-d98).
+    window_crash: u32,
+    /// Chance per step the leader is deposed in that window: cut off from
+    /// its peers while a follower campaigns, and joined again later
+    /// (task-d98).
+    window_depose: u32,
+    /// The negative control of task-d98's rows: an early proposal reaches
+    /// the fast-set followers too, as a copy of the frame, as if the
+    /// leader sent it to them early. At three voters one of them then
+    /// commits a fast decision over a vote the leader may lose, and the
+    /// oracle has to say so.
+    early_to_fast_set: bool,
 }
 
 impl Knobs {
@@ -193,10 +222,29 @@ impl Knobs {
         crash_candidate: false,
         heal_page_loss: false,
         peer_ack_loss: 0,
+        early: false,
+        leader_journal_lag: 0,
+        window_crash: 0,
+        window_depose: 0,
+        early_to_fast_set: false,
     };
 
-    /// The checklist's matrix rows 1 to 5, 9, 10, 12 and 14, and rows 16
-    /// and 17.
+    /// These knobs with task-d98's early proposals and the three faults
+    /// that reach them: a leader journal that lags its followers', and
+    /// the leader crashed or deposed while a proposal it sent early is
+    /// not durable.
+    fn with_early(self) -> Knobs {
+        Knobs {
+            early: true,
+            leader_journal_lag: 500_000,
+            window_crash: 30_000,
+            window_depose: 15_000,
+            ..self
+        }
+    }
+
+    /// The checklist's matrix rows 1 to 5, 9, 10, 12 and 14, rows 16
+    /// and 17, and row 18.
     fn row(row: u8) -> Knobs {
         let base = Knobs { row, ..Knobs::BASE };
         match row {
@@ -299,6 +347,19 @@ impl Knobs {
                 row,
                 peer_ack_loss: if row == 16 { 1_000_000 } else { 500_000 },
                 ..Knobs::row(9)
+            },
+            // The leader's proposal before its batch is durable (task-d98):
+            // a leader journal that lags its followers', and the leader
+            // crashed or deposed while a proposal it sent early is not
+            // durable, more often than rows 1 and 2's early runs do it,
+            // with messages lost so a follower may miss the early copy.
+            18 => Knobs {
+                crash_leader: true,
+                crash: 2_000,
+                loss: 60_000,
+                window_crash: 60_000,
+                window_depose: 30_000,
+                ..base.with_early()
             },
             _ => unreachable!("not a scenario of the simulator: row {row}"),
         }
@@ -490,6 +551,13 @@ struct Sim {
     probed: Vec<bool>,
     asked_at: Vec<Option<usize>>,
     unanswered: Vec<usize>,
+    /// Whether each node, leading, holds a proposal it sent early whose
+    /// batch is not durable yet (task-d98): set when the copy leaves,
+    /// cleared when its journal has nothing left in flight.
+    window: Vec<bool>,
+    /// A node cut off from its peers, and the step it is joined again
+    /// (task-d98's deposition).
+    partition: Option<(u8, u32)>,
 }
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -522,6 +590,13 @@ struct Stats {
     /// structure under the machines -- leaves it as it was, seed for
     /// seed.
     decisions: u64,
+    /// Proposal copies that left before their batch was durable
+    /// (task-d98).
+    early_sends: u64,
+    /// Leaders crashed, and leaders deposed, while a proposal they sent
+    /// early was not durable (task-d98).
+    window_crashes: u32,
+    window_deposes: u32,
 }
 
 /// FNV-1a over `bytes`, continuing from `hash`.
@@ -552,6 +627,7 @@ impl Sim {
                     ExecutionPosition::ZERO,
                 );
                 leader.set_learning(LearningMode::Full);
+                leader.set_early_proposal(knobs.early);
                 Role::Leader(leader)
             } else {
                 let mut follower = Follower::new(FollowerConfig {
@@ -615,6 +691,8 @@ impl Sim {
             probed: vec![false; usize::from(n)],
             asked_at: vec![None; usize::from(n)],
             unanswered: vec![0; usize::from(n)],
+            window: vec![false; usize::from(n)],
+            partition: None,
         };
         for i in 0..n {
             let effects = sim.nodes[usize::from(i)].step(boot_event(1));
@@ -689,7 +767,12 @@ impl Sim {
                     node.journal.push_back(batch.barrier);
                     node.storage.submit(batch);
                 }
-                Effect::SendWhenDurable { to, frame, .. } => {
+                Effect::SendWhenDurable {
+                    requires,
+                    to,
+                    frame,
+                    ..
+                } => {
                     // Oracle 5: a protocol frame, and a Sync's entries. The
                     // frame bound, like the journal record's, is vacuous
                     // at this scale.
@@ -697,6 +780,34 @@ impl Sim {
                         self.fail(&format!("node {i} sent a frame of {} bytes", frame.len()));
                     }
                     let message = ProtocolMessage::decode(&frame);
+                    // A proposal that waits on nothing left before its
+                    // batch was durable: every other copy names the batch
+                    // (task-d98).
+                    if let Ok(ProtocolMessage::Proposal(p)) = &message
+                        && requires.is_empty()
+                    {
+                        self.stats.early_sends += 1;
+                        if !self.nodes[usize::from(i)].journal.is_empty() {
+                            self.window[usize::from(i)] = true;
+                        }
+                        self.note(|| format!("early node {i} -> {}", to.replica.0[0]));
+                        // The negative control: the copy reaches the
+                        // fast-set followers as well.
+                        if self.knobs.early_to_fast_set {
+                            let q = quorum(p.ballot, self.n);
+                            if !q.fast_eligible(&to.replica) {
+                                for f in q.fast_set().iter().map(|f| f.0[0]) {
+                                    if f != i {
+                                        self.net.push(Msg {
+                                            from: i,
+                                            to: f,
+                                            frame: frame.clone(),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
                     if let Ok(ProtocolMessage::Sync(d)) = &message
                         && d.entries.len() > 5 * coord_consensus::max_report_entries(CAPACITY)
                     {
@@ -736,6 +847,10 @@ impl Sim {
                         }
                     }
                     let to = to.replica.0[0];
+                    // Cut off from its peers (task-d98's deposition).
+                    if self.partition.is_some_and(|(p, _)| p == i || p == to) {
+                        continue;
+                    }
                     let msg = Msg { from: i, to, frame };
                     // Faults stop while healing: nothing is held back.
                     if !self.healing && self.chance("hold", self.knobs.hold) {
@@ -883,6 +998,7 @@ impl Sim {
                     None => Vec::new(),
                 };
                 node.role = Some(Role::Follower(f));
+                self.window[usize::from(i)] = false;
                 if let Some(t) = self.trace.as_mut() {
                     t.push_back(format!("{:>5} node {i} deposed", self.step));
                 }
@@ -927,6 +1043,9 @@ impl Sim {
                 let q = f.quorum().clone();
                 let (mut l, effects) = Leader::from_recovered(f.into_recovered(), q, &decision);
                 l.set_learning(LearningMode::Full);
+                // The node's setting, given to every leader it becomes,
+                // as `coordd`'s node does (task-d98).
+                l.set_early_proposal(self.knobs.early);
                 node.role = Some(Role::Leader(l));
                 if let Some(t) = self.trace.as_mut() {
                     t.push_back(format!(
@@ -1258,6 +1377,13 @@ impl Sim {
         if !self.nodes[usize::from(msg.to)].alive() {
             return;
         }
+        // Cut off from its peers (task-d98's deposition).
+        if self
+            .partition
+            .is_some_and(|(p, _)| p == msg.to || p == msg.from)
+        {
+            return;
+        }
         if self.trace.is_some() {
             let d = ProtocolMessage::decode(&msg.frame)
                 .map_or_else(|e| format!("{e:?}"), |m| describe(&m));
@@ -1359,6 +1485,9 @@ impl Sim {
             .storage
             .complete(barrier)
             .expect("volatile");
+        if self.nodes[usize::from(i)].journal.is_empty() {
+            self.window[usize::from(i)] = false;
+        }
         self.note(|| format!("durable node {i} {barrier:?}"));
         self.step_node(
             i,
@@ -1552,6 +1681,7 @@ impl Sim {
         }
         self.net.retain(|m| m.from != i && m.to != i);
         self.held.retain(|m| m.from != i && m.to != i);
+        self.window[usize::from(i)] = false;
         let node = &mut self.nodes[usize::from(i)];
         node.role = None;
         node.journal.clear();
@@ -1729,7 +1859,45 @@ impl Sim {
             let dead: Vec<u8> = (0..self.n)
                 .filter(|i| !self.nodes[usize::from(*i)].alive())
                 .collect();
-            if alive.len() > majority && self.chance("crash", self.knobs.crash) {
+            if self.partition.is_some_and(|(_, until)| step >= until) {
+                let (p, _) = self.partition.take().expect("checked");
+                self.note(|| format!("node {p} joined again"));
+            }
+            // task-d98's faults, each while the leader holds a proposal
+            // it sent early whose batch is not durable. Drawn only in the
+            // rows that set them, so every other row's draws are as they
+            // were.
+            let in_window = self.leader_index().filter(|l| self.window[usize::from(*l)]);
+            if self.knobs.window_crash > 0
+                && let Some(l) = in_window
+                && alive.len() > majority
+                && self.chance("window-crash", self.knobs.window_crash)
+            {
+                self.stats.window_crashes += 1;
+                self.crash(l);
+            } else if self.knobs.window_depose > 0
+                && let Some(l) = in_window
+                && self.partition.is_none()
+                && self.chance("window-depose", self.knobs.window_depose)
+            {
+                // Cut off: what was in flight to or from it is lost, and
+                // a follower that can no longer hear it campaigns.
+                self.stats.window_deposes += 1;
+                let until = step + 40 + self.below("partition-length", 200) as u32;
+                self.note(|| format!("node {l} cut off until {until}"));
+                self.partition = Some((l, until));
+                self.net.retain(|m| m.from != l && m.to != l);
+                let followers: Vec<u8> = alive
+                    .iter()
+                    .copied()
+                    .filter(|i| *i != l)
+                    .filter(|i| matches!(self.nodes[usize::from(*i)].role, Some(Role::Follower(_))))
+                    .collect();
+                if !followers.is_empty() {
+                    let who = followers[self.below("depose-candidate", followers.len())];
+                    self.campaign(who);
+                }
+            } else if alive.len() > majority && self.chance("crash", self.knobs.crash) {
                 let candidates: Vec<u8> = alive
                     .iter()
                     .copied()
@@ -1805,6 +1973,14 @@ impl Sim {
                 0 => self.deliver(),
                 1 => {
                     let i = journals[self.below("journal", journals.len())];
+                    // A leader's journal that lags its followers'
+                    // (task-d98): its turn is put off.
+                    if self.knobs.leader_journal_lag > 0
+                        && self.leader_index() == Some(i)
+                        && self.chance("leader-journal-lag", self.knobs.leader_journal_lag)
+                    {
+                        return;
+                    }
                     self.complete(i);
                 }
                 _ => {
@@ -2049,6 +2225,7 @@ impl Sim {
     /// budget of steps to settle everything it admitted.
     fn heal(&mut self) {
         self.healing = true;
+        self.partition = None;
         self.note(|| "faults stop".to_owned());
         self.net.append(&mut self.held);
         self.retries.clear();
@@ -2451,30 +2628,40 @@ fn payload_rows(storage: &StorageModel) -> Vec<(CommandId, coord_consensus::Payl
 
 /// Run one scenario for one seed; `Err` carries the oracle's (or the
 /// machine's) panic message.
-fn run_one(n: u8, row: u8, seed: u64) -> Result<Stats, String> {
-    run_one_with(n, row, seed, None)
-}
-
-/// [`run_one`], with catch-up set as `catch_up` says rather than as the
-/// environment does: a kept seed found without it is replayed without it.
-fn run_one_with(n: u8, row: u8, seed: u64, catch_up: Option<bool>) -> Result<Stats, String> {
-    run_kept(n, row, seed, catch_up, None)
-}
-
-/// [`run_one_with`], with the loss of acknowledgements to followers set
-/// as `peer_ack_loss` says rather than as the row and the environment do:
-/// a kept seed found under that loss is replayed under it (task-d78).
+///
+/// `catch_up` sets catch-up as it says rather than as the environment
+/// does: a kept seed found without it is replayed without it. And
+/// `peer_ack_loss` sets the loss of acknowledgements to followers as it
+/// says rather than as the row and the environment do: a kept seed found
+/// under that loss is replayed under it (task-d78). `early` runs the row
+/// with task-d98's early proposals and their faults (`Knobs::with_early`),
+/// as rows 1 and 2 also run.
 fn run_kept(
     n: u8,
     row: u8,
     seed: u64,
     catch_up: Option<bool>,
     peer_ack_loss: Option<u32>,
+    early: bool,
 ) -> Result<Stats, String> {
     let mut knobs = row_knobs(row);
+    if early {
+        knobs = knobs.with_early();
+    }
     if let Some(loss) = peer_ack_loss {
         knobs.peer_ack_loss = loss;
     }
+    run_knobs(n, knobs, seed, catch_up)
+}
+
+/// One run with `knobs`, its panic caught and said with its seed.
+fn run_knobs(n: u8, knobs: Knobs, seed: u64, catch_up: Option<bool>) -> Result<Stats, String> {
+    let row = knobs.row;
+    let early = if knobs.early {
+        " with early proposals"
+    } else {
+        ""
+    };
     let outcome = catch_unwind(AssertUnwindSafe(|| {
         let mut sim = Sim::new(n, knobs, seed);
         if let Some(on) = catch_up {
@@ -2488,7 +2675,7 @@ fn run_kept(
             .cloned()
             .or_else(|| e.downcast_ref::<&str>().map(|s| (*s).to_owned()))
             .unwrap_or_default();
-        format!("row {row} at {n} voters, seed {seed}: {text}")
+        format!("row {row}{early} at {n} voters, seed {seed}: {text}")
     })
 }
 
@@ -2506,6 +2693,9 @@ fn row_knobs(row: u8) -> Knobs {
     }
     knobs
 }
+
+/// Seeds row 18's negative control may take to fail (task-d98).
+const NEGATIVE_CONTROL_SEEDS: u64 = 200;
 
 /// Seeds per scenario and size. `PROTOCOL_SIM_SEEDS` raises it for a
 /// longer local search.
@@ -2525,9 +2715,17 @@ fn run_row(row: u8) {
     let mut totals = Stats::default();
     // Runs that learned nothing, and runs that did, at three and five.
     let (mut idle, mut busy) = ([0u32; 2], [0u32; 2]);
+    // Rows 1 and 2 run each seed again with task-d98's early proposals
+    // and the faults that reach them, so the rows keep what they read
+    // with today's barrier and read the early send too.
+    let variants: &[bool] = if row == 1 || row == 2 {
+        &[false, true]
+    } else {
+        &[false]
+    };
     for n in [3u8, 5] {
-        for seed in 0..seeds() {
-            match run_one(n, row, seed) {
+        for (seed, early) in (0..seeds()).flat_map(|s| variants.iter().map(move |e| (s, *e))) {
+            match run_kept(n, row, seed, None, None, early) {
                 Ok(s) => {
                     if s.learned == 0 {
                         idle[usize::from(n == 5)] += 1;
@@ -2551,6 +2749,9 @@ fn run_row(row: u8) {
                     totals.peak_examinations_pct =
                         totals.peak_examinations_pct.max(s.peak_examinations_pct);
                     totals.decisions = fold(totals.decisions, &s.decisions.to_be_bytes());
+                    totals.early_sends += s.early_sends;
+                    totals.window_crashes += s.window_crashes;
+                    totals.window_deposes += s.window_deposes;
                 }
                 Err(e) => failures.push(e),
             }
@@ -2591,6 +2792,15 @@ fn run_row(row: u8) {
         assert!(
             totals.leader_crashes > 0,
             "row 1 crashed no leader: {totals:?}"
+        );
+    }
+    // Rows that send early read the window they were made for: proposals
+    // left early, and leaders were crashed and deposed while one was not
+    // durable (task-d98).
+    if variants.contains(&true) || row == 18 {
+        assert!(
+            totals.early_sends > 0 && totals.window_crashes > 0 && totals.window_deposes > 0,
+            "row {row} never reached the early window: {totals:?}"
         );
     }
 }
@@ -2650,6 +2860,34 @@ fn row_17_repeated_elections_with_half_the_acknowledgements_to_a_follower_lost()
     run_row(17);
 }
 
+#[test]
+fn row_18_the_leaders_proposal_before_its_batch_is_durable() {
+    run_row(18);
+}
+
+/// Row 18's negative control (task-d98): with the early proposal reaching
+/// the fast-set follower too, a seed at three voters fails the oracle.
+/// That follower then counts the proposal with its own fast
+/// acknowledgement, which at three voters is a fast quorum, and commits
+/// over a vote the leader may lose. If no seed failed, the row would not
+/// reach the case the per-follower rule exists for.
+#[test]
+fn row_18_fails_when_the_fast_set_follower_gets_the_proposal_early_too() {
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let knobs = Knobs {
+        early_to_fast_set: true,
+        ..Knobs::row(18)
+    };
+    let budget = NEGATIVE_CONTROL_SEEDS.max(seeds());
+    let failed = (0..budget).find_map(|seed| run_knobs(3, knobs, seed, None).err());
+    std::panic::set_hook(hook);
+    let Some(failure) = failed else {
+        panic!("row 18 passed {budget} seeds with the fast-set follower sent early too");
+    };
+    println!("the negative control failed as it should: {failure}");
+}
+
 /// A seed kept because it once failed.
 #[derive(Deserialize)]
 struct Kept {
@@ -2665,6 +2903,9 @@ struct Kept {
     /// environment say.
     #[serde(default)]
     peer_ack_loss: Option<u32>,
+    /// Whether it found it with task-d98's early proposals; absent, not.
+    #[serde(default)]
+    early: bool,
     /// What it found, for the reader.
     #[allow(dead_code)]
     found: String,
@@ -2679,7 +2920,17 @@ fn every_kept_seed_passes() {
     let kept: Vec<Kept> = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
     let failures: Vec<String> = kept
         .iter()
-        .filter_map(|k| run_kept(k.voters, k.row, k.seed, k.catch_up, k.peer_ack_loss).err())
+        .filter_map(|k| {
+            run_kept(
+                k.voters,
+                k.row,
+                k.seed,
+                k.catch_up,
+                k.peer_ack_loss,
+                k.early,
+            )
+            .err()
+        })
         .collect();
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
@@ -2692,6 +2943,14 @@ fn one_seed_from_the_environment() {
         return;
     };
     let v: Vec<u64> = spec.split(',').map(|x| x.trim().parse().unwrap()).collect();
-    let stats = Sim::new(v[1] as u8, row_knobs(v[0] as u8), v[2]).run();
+    let mut knobs = row_knobs(v[0] as u8);
+    // `PROTOCOL_SIM_EARLY=1` runs it with task-d98's early proposals, as
+    // rows 1 and 2 also run; `=fast-set` as row 18's negative control.
+    match std::env::var("PROTOCOL_SIM_EARLY").as_deref() {
+        Ok("fast-set") => knobs.early_to_fast_set = true,
+        Ok(_) => knobs = knobs.with_early(),
+        Err(_) => {}
+    }
+    let stats = Sim::new(v[1] as u8, knobs, v[2]).run();
     println!("{stats:?}");
 }

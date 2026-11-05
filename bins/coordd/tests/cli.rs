@@ -4490,14 +4490,19 @@ fn a_node_refuses_a_store_that_activated_something_this_build_cannot_do() {
 }
 
 /// Write the cluster's activation record straight into the selected
-/// generation, as the replicated path will once task-m02 drives it.
+/// generation, as the replicated path will once task-d99 drives it.
 fn write_activation(dir: &Path, features: &[u16]) {
+    write_activation_of(dir, 1, features, &[1]);
+}
+
+/// [`write_activation`] into voter `node`'s store, naming `reporters`.
+fn write_activation_of(dir: &Path, node: u8, features: &[u16], reporters: &[u8]) {
     use coord_store_api::engine::{LocalEngine, WriteTxn};
     let root = dir.join("state");
     let identity = coord_storage_redb::StoreIdentity {
         cluster_id: coord_types::ids::ClusterId(CLUSTER),
         domain_id: coord_types::ids::DomainId(DOMAIN),
-        replica_id: coord_types::ids::ReplicaId([1; 16]),
+        replica_id: coord_types::ids::ReplicaId([node; 16]),
         incarnation: coord_types::ids::ReplicaIncarnation::new(1).unwrap(),
     };
     let options = coord_storage_redb::OpenOptions {
@@ -4510,7 +4515,10 @@ fn write_activation(dir: &Path, features: &[u16]) {
         domain: coord_types::ids::DomainId(DOMAIN),
         configuration: coord_types::ids::ConfigurationEpoch::new(1).unwrap(),
         features: features.to_vec(),
-        reporters: vec![coord_types::ids::ReplicaId([1; 16])],
+        reporters: reporters
+            .iter()
+            .map(|r| coord_types::ids::ReplicaId([*r; 16]))
+            .collect(),
     };
     let mut tx = generation.engine().begin_write().expect("write");
     tx.put(
@@ -6457,6 +6465,119 @@ async fn a_leader_restarted_before_it_is_missed_campaigns_rather_than_resuming_i
         assert_eq!(
             read_value(&read).as_deref(),
             Some(&b"after"[..]),
+            "voter {}",
+            n + 1
+        );
+    }
+}
+
+/// The proposals an early-sending leader sent, from the last interval
+/// snapshot in `said` (task-d98).
+fn early_sends(said: &str) -> u64 {
+    said.lines()
+        .rev()
+        .filter_map(|line| line.strip_prefix("metrics "))
+        .filter_map(|rendered| serde_json::from_str::<serde_json::Value>(rendered).ok())
+        .filter_map(|snapshot| {
+            snapshot
+                .pointer("/cost/Observed/resends/early")
+                .and_then(serde_json::Value::as_u64)
+        })
+        .next()
+        .unwrap_or(0)
+}
+
+/// A genesis leader that sent its proposals before their batches were
+/// durable, killed and started again at once, comes back following
+/// (task-d98, design Section 4.8's fourth condition).
+///
+/// With `EarlyProposal` active on every voter's store, the leader sends a
+/// proposal to the follower outside the fast set as soon as it is
+/// batched, once its first batch is durable. That first batch is what
+/// keeps a restart from reading its store as fresh: had it come back
+/// leading the genesis ballot, it would have numbered its proposals from
+/// zero again over orders that follower already held. It campaigns
+/// instead, and what was written before is what every voter reads after.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_leader_that_sent_early_and_restarted_comes_back_following() {
+    let dir = workspace("early-restart");
+    let cluster = three_voters(&dir);
+    for (i, config) in cluster.configs.iter().enumerate() {
+        let mut text = std::fs::read_to_string(config).expect("read config");
+        text.push_str("\n[metrics]\ninterval_seconds = 1\n");
+        std::fs::write(config, text).expect("write config");
+        assert_eq!(run(config, &["init"]).code, Some(0));
+        let node = u8::try_from(i + 1).unwrap();
+        write_activation_of(
+            &dir.join(format!("n{node}")),
+            node,
+            &[coord_types::formats::Feature::EarlyProposal.id()],
+            &[1, 2, 3],
+        );
+    }
+    let mut running: Vec<Running> = cluster.configs.iter().map(|c| start(c)).collect();
+    for node in &running {
+        assert!(
+            node.waits_to_say("voters submittable=2 of 2"),
+            "{}",
+            node.said()
+        );
+    }
+    assert!(
+        running[0].waits_to_say("this voter leads ballot 0"),
+        "{}",
+        running[0].said()
+    );
+    let before = Caller::bind(&running[1], &cluster.ca, &cluster.ring, [0x65; 16]).await;
+    for sequence in 1..=5u64 {
+        let put = ask(&before.connection, &before.put(sequence, b"k", b"before"))
+            .await
+            .expect("the domain established a write while its leader was up");
+        assert!(matches!(
+            response_of(&put).outcome,
+            coord_types::wire_v1::OutcomeV1::Ok { .. }
+        ));
+    }
+    assert!(
+        running[0].waits_until(30, |said| early_sends(said) > 0),
+        "the leader sent nothing early with the feature active:\n{}",
+        running[0].said()
+    );
+
+    drop(running.remove(0));
+    let back = start(&cluster.configs[0]);
+    running.insert(0, back);
+    assert!(
+        running[0].waits_until(120, |said| said.contains("this voter leads ballot 1")),
+        "the restarted leader did not win the next ballot:\n-- 1 --\n{}\n-- 2 --\n{}\n-- 3 --\n{}",
+        running[0].said(),
+        running[1].said(),
+        running[2].said()
+    );
+    assert!(
+        !running[0].said().contains("this voter leads ballot 0"),
+        "the restarted leader resumed the genesis ballot:\n{}",
+        running[0].said()
+    );
+    for node in &running[1..] {
+        assert!(
+            node.waits_until(90, |said| healed(said, "voters submittable=", 2)),
+            "a survivor's collector did not get its link to the restarted leader back:\n{}",
+            node.said()
+        );
+    }
+    let callers = [
+        Caller::bind(&running[0], &cluster.ca, &cluster.ring, [0x66; 16]).await,
+        Caller::bind(&running[1], &cluster.ca, &cluster.ring, [0x67; 16]).await,
+        Caller::bind(&running[2], &cluster.ca, &cluster.ring, [0x68; 16]).await,
+    ];
+    for (n, caller) in callers.iter().enumerate() {
+        let read = read_projected(caller, 1, b"k")
+            .await
+            .unwrap_or_else(|| panic!("voter {} did not answer a read", n + 1));
+        assert_eq!(
+            read_value(&read).as_deref(),
+            Some(&b"before"[..]),
             "voter {}",
             n + 1
         );
