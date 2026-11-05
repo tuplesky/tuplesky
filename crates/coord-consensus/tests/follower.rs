@@ -1324,3 +1324,132 @@ fn a_proposal_that_is_not_adopted_leaves_the_path_log_alone() {
         "the leader's path for c1 runs through cz, which this replica never held"
     );
 }
+
+// ---------------------------------------------------------------------
+// task-d90 (point 4): a vote rests on the payload row, not its digest.
+// ---------------------------------------------------------------------
+
+/// Durable dependency rows and durable payload rows, as recovery reads them.
+type DurableRows = (
+    Vec<(CommandId, CommandRecord)>,
+    Vec<(CommandId, PayloadRecordV1)>,
+);
+
+/// A follower outside the fast set that admitted `c1` and made its batch
+/// durable, then crashed: its durable rows, with the dependency row and
+/// the payload row in hand separately.
+fn durable_admission() -> (CommandId, DurableRows) {
+    let mut f = booted(2);
+    let mut storage = StorageModel::default();
+    let (e1, c1) = admitted(1, 1, 1);
+    let effects = f.step(e1);
+    let Effect::Persist(batch) = effects[0].clone() else {
+        panic!()
+    };
+    storage.submit(batch);
+    storage.complete(effects_barrier(&effects)).unwrap();
+    f.step(durable_of(&effects, 1).remove(0));
+    storage.crash();
+    (c1, (restore_rows(&storage), restore_payloads(&storage)))
+}
+
+/// A record whose dependency row is durable and whose payload row is not
+/// -- restored from the one without the other, as after a Sync installed
+/// it or a payload batch was lost -- is initialized, with its admission
+/// digest, and holds no payload. It is reported without one, a proposal
+/// for it is adopted only once the payload is back, and the adoption's
+/// acknowledgement waits for the batch that writes it (task-d90, design
+/// Section 4.5, point 4). Adopted over the digest, its slow vote counted
+/// toward a decision no recovery could re-execute from this voter.
+#[test]
+fn an_adoption_waits_for_the_payload_row_not_only_its_digest() {
+    let (c1, (rows, mut payloads)) = durable_admission();
+    let payload = payloads.remove(0).1;
+    let mut g = Follower::recover(config(2), None, rows, Vec::new(), ExecutionPosition::ZERO);
+    g.step(boot_event());
+    assert!(g.table().is_initialized(&c1));
+    assert!(g.payload(&c1).is_none());
+    let reported = |g: &Follower| {
+        g.report(ballot(1, 1))
+            .entries
+            .into_iter()
+            .find(|e| e.command == c1)
+            .expect("reported")
+            .payload_present
+    };
+    assert!(!reported(&g), "no payload row: none reported present");
+    // The leader's proposal is held for the payload, which is asked for.
+    let record = g.table().record(&c1).unwrap().clone();
+    let held = g.step(peer(
+        0,
+        proposal(c1, vec![], 0, record.paths.clone(), record.path),
+    ));
+    assert!(
+        persisted(&held).is_empty(),
+        "adopted over the digest alone: {held:?}"
+    );
+    assert_eq!(g.held().len(), 1);
+    assert!(g.missing_payloads().contains(&c1));
+    // The payload arrives: its batch and the adoption's, and the
+    // acknowledgement waits for both.
+    let effects = g.step(peer(
+        0,
+        ProtocolMessage::PayloadResponse {
+            command: c1,
+            payload,
+        },
+    ));
+    let batches = persisted(&effects);
+    assert_eq!(batches.len(), 2, "the payload batch and the adoption");
+    let (payload_batch, adoption) = (batches[0].barrier, batches[1].barrier);
+    let released = g.step(Event::Storage(StorageEvent::JournalDurable {
+        barrier_id: adoption,
+        journal_seq: LocalJournalSeq::new(1).unwrap(),
+    }));
+    assert!(
+        sends(&released).is_empty(),
+        "the payload row is still volatile: {released:?}"
+    );
+    assert!(!reported(&g));
+    let released = g.step(Event::Storage(StorageEvent::JournalDurable {
+        barrier_id: payload_batch,
+        journal_seq: LocalJournalSeq::new(2).unwrap(),
+    }));
+    assert_eq!(sends(&released).len(), 2, "the leader and the frontend");
+    assert!(reported(&g), "durable now, and reported present");
+}
+
+/// A decided record is answered from its durable record when the leader
+/// proposes it again (task-d07), and only with its payload row durable
+/// here too (task-d90, point 4): without one the answer was a vote no
+/// recovery could re-execute from.
+#[test]
+fn a_decided_record_is_acknowledged_again_only_with_its_payload_row() {
+    let (c1, (mut rows, payloads)) = durable_admission();
+    rows[0].1.phase = Phase::Commit;
+    let record = rows[0].1.clone();
+    let again = || {
+        peer(
+            0,
+            proposal(c1, vec![], 0, record.paths.clone(), record.path),
+        )
+    };
+    let mut without = Follower::recover(
+        config(2),
+        None,
+        rows.clone(),
+        Vec::new(),
+        ExecutionPosition::ZERO,
+    );
+    without.step(boot_event());
+    let out = without.step(again());
+    assert!(sends(&out).is_empty(), "acknowledged without a payload row");
+    assert_eq!(without.pending_sends(), 0);
+    let mut with = Follower::recover(config(2), None, rows, payloads, ExecutionPosition::ZERO);
+    with.step(boot_event());
+    let out = with.step(again());
+    assert!(
+        matches!(&sends(&out)[..], [(to, ProtocolMessage::SlowAck(_))] if *to == r(0)),
+        "{out:?}"
+    );
+}

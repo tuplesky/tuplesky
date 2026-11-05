@@ -341,6 +341,22 @@ pub(crate) fn overlay_selected<'a>(
 /// a command means it was committed, under the dependencies its record
 /// holds, so that is what the report says, and the selection installs it
 /// as committed wherever it goes.
+/// A report names a payload present only where its row is durable here
+/// (task-d90, design Section 4.5, point 4): `served` is what this replica
+/// holds durable payload rows of. The ledger reports from dependency rows,
+/// and a dependency row can be durable without its payload's: adopted over
+/// a record a Sync installed, or restored without a payload row. Claimed
+/// present, the replica counted as a supplier of a payload it cannot
+/// serve, and as a holder of a fast pre-acceptance no recovery could
+/// re-execute from.
+pub(crate) fn report_durable_payloads(report: &mut RecoveryReport, served: &BTreeSet<CommandId>) {
+    for e in &mut report.entries {
+        if !served.contains(&e.command) {
+            e.payload_present = false;
+        }
+    }
+}
+
 pub(crate) fn report_executed_as_committed(report: &mut RecoveryReport, table: &CommandTable) {
     for entry in &mut report.entries {
         if entry.phase < Phase::Commit && table.phase_of(&entry.command) == Some(Phase::Executed) {
@@ -2218,6 +2234,7 @@ impl Follower {
         let mut report =
             self.ledger
                 .report(self.config.identity.replica, ballot, self.ballots.synced());
+        report_durable_payloads(&mut report, &self.served_payloads);
         // A Sync this replica accepted durably but has not finished
         // installing is part of what it knows, and the report is taken at
         // the synchronized ballot that Sync established. Reporting that
@@ -3518,6 +3535,14 @@ impl Follower {
         if !requires.contains(&barrier) {
             requires.push(barrier);
         }
+        // The batch writing the command's payload row, which need not be
+        // a vote's (task-d90): a payload sent for a record already
+        // initialized is written in a batch of its own.
+        for b in self.payload_row(&command).unwrap_or_default() {
+            if !requires.contains(&b) {
+                requires.push(b);
+            }
+        }
         let frame = message.encode();
         let leader = self.config.quorum.leader();
         let outbox = self.outbox.as_mut().expect("booted");
@@ -4075,9 +4100,10 @@ impl Follower {
     /// when the proposal carries those dependencies and the admission the
     /// record holds, so it claims nothing this replica did not adopt;
     /// without a durable record (none yet, or swept as history) nothing is
-    /// sent. The record is durable, so the acknowledgement waits for
-    /// nothing; and it goes to the leader only, since no submitter is
-    /// waiting on it.
+    /// sent. The record is durable, so the acknowledgement waits only for
+    /// the payload row, while its batch is in flight, and is not sent
+    /// without one (task-d90); and it goes to the leader only, since no
+    /// submitter is waiting on it.
     fn acknowledge_decided(&mut self, proposal: &FastAck, leader: ReplicaId) -> Vec<Effect> {
         let Some(boot) = self.boot else {
             return Vec::new();
@@ -4090,6 +4116,18 @@ impl Follower {
         {
             return Vec::new();
         }
+        // Its payload row too (task-d90): a decided record whose payload
+        // is not written here is no vote a recovery can re-execute from.
+        if self
+            .payloads
+            .get(&proposal.command)
+            .is_none_or(|p| p.admission_digest() != proposal.admission)
+        {
+            return Vec::new();
+        }
+        let Some(requires) = self.payload_row(&proposal.command) else {
+            return Vec::new();
+        };
         let ballot = self.config.quorum.ballot();
         let ack = SlowAck {
             replica: self.config.identity.replica,
@@ -4103,7 +4141,7 @@ impl Follower {
         };
         outbox.publish(PendingSend {
             context,
-            requires: Vec::new(),
+            requires,
             to: PeerId {
                 replica: leader,
                 incarnation: ReplicaIncarnation::ZERO,
@@ -4111,6 +4149,41 @@ impl Follower {
             frame: ProtocolMessage::SlowAck(ack).encode(),
         });
         self.release()
+    }
+
+    /// What a vote for `command` waits on for its payload row here
+    /// (task-d90, design Section 4.5, point 4): nothing once the row is
+    /// durable, the batches writing it while they are in flight, and
+    /// `None` when no row is durable or being written, such as a record
+    /// a Sync installed, or a dependency row restored without its payload
+    /// row.
+    ///
+    /// Recovery re-executes a decided command, so every vote that counts
+    /// toward a decision has to rest on the command's payload at the
+    /// voter, not only on its admission digest: else a crash of every
+    /// voter can leave a released command's payload durable nowhere.
+    fn payload_row(&self, command: &CommandId) -> Option<Vec<BarrierId>> {
+        if self.served_payloads.contains(command) {
+            return Some(Vec::new());
+        }
+        if !self.payloads.contains_key(command) {
+            return None;
+        }
+        let failed = |b: &BarrierId| self.outbox.as_ref().is_some_and(|o| o.is_failed(b));
+        let writing: Vec<BarrierId> = self
+            .durable_payloads
+            .iter()
+            .filter(|(b, c)| *c == command && !failed(b))
+            .map(|(b, _)| *b)
+            .chain(
+                self.catch_up
+                    .running
+                    .iter()
+                    .filter(|r| r.command == *command && !r.durable && !failed(&r.barrier))
+                    .map(|r| r.barrier),
+            )
+            .collect();
+        (!writing.is_empty()).then_some(writing)
     }
 
     /// Whether this boot kept what this replica acknowledged for `command`
@@ -4167,8 +4240,17 @@ impl Follower {
     /// held until the payload arrives -- from the submission, or from the
     /// leader that proposed it. Nor under other facts than the
     /// proposal's: that one waits for the leader's payload to be bound.
+    ///
+    /// Nor with the admission digest alone (task-d90): a record a Sync
+    /// installed, or restored from a dependency row whose payload row was
+    /// never written, is initialized with no payload here, and adopted it
+    /// was a slow vote no recovery could re-execute from. It waits for
+    /// the payload, which `held_missing` asks for.
     fn held_blocker(&self, command: &CommandId, held: &HeldProposal) -> Option<CommandId> {
-        if !self.table.is_initialized(command) || self.awaits_rebind(command) {
+        if !self.table.is_initialized(command)
+            || self.awaits_rebind(command)
+            || !self.payloads.contains_key(command)
+        {
             return Some(*command);
         }
         match crate::phase::guard_accept(&held.proposal.deps, |d| self.table.phase_of(d)) {
@@ -4304,12 +4386,22 @@ impl Follower {
                 let record = self.table.record(&command).expect("adopted").clone();
                 let admission = record.payload.unwrap_or_else(|| admission_digest(None, 0));
                 let barrier = self.alloc.as_mut().expect("booted").allocate();
+                let mut updates =
+                    alloc::vec![dependency_update(epoch, &command, &record).expect("bounded")];
+                // The payload row with it, where none is durable or being
+                // written here (task-d90): its batch failed, or it was
+                // never written. The acknowledgement waits on the batch
+                // that writes it either way.
+                if self.payload_row(&command).is_none()
+                    && let Some(payload) = self.payloads.get(&command)
+                {
+                    updates.push(payload_update(&command, payload).expect("bounded"));
+                    self.durable_payloads.insert(barrier, command);
+                }
                 effects.push(Effect::Persist(PersistBatch {
                     barrier,
                     base: None,
-                    updates: alloc::vec![
-                        dependency_update(epoch, &command, &record).expect("bounded")
-                    ],
+                    updates,
                 }));
                 self.pending.insert(barrier, Pending::Adoption(command));
                 self.ledger.stage(barrier, command, record);
@@ -4466,6 +4558,18 @@ impl Follower {
             return out;
         }
         let mut reinstall = false;
+        // A payload row's batch, a vote's or one of its own: a payload
+        // sent for a record already initialized is written in a batch no
+        // vote stages (task-d90). Left to the votes' batches, it was never
+        // served and never counted durable.
+        if let Some(barrier) = event.barrier()
+            && let Some(c) = self.durable_payloads.remove(&barrier)
+            && matches!(event, StorageEvent::JournalDurable { .. })
+            && self.payloads.contains_key(&c)
+            && !self.durable_payloads.values().any(|other| *other == c)
+        {
+            self.served_payloads.insert(c);
+        }
         if let Some(barrier) = event.barrier()
             && let Some(pending) = self.pending.get(&barrier).cloned()
         {
@@ -4473,9 +4577,6 @@ impl Follower {
                 StorageEvent::JournalDurable { journal_seq, .. } => {
                     self.pending.remove(&barrier);
                     self.ledger.durable(barrier, *journal_seq);
-                    if let Some(c) = self.durable_payloads.remove(&barrier) {
-                        self.served_payloads.insert(c);
-                    }
                     if let Pending::Adoption(c) = pending
                         && let Some(entry) = self.adopted.get_mut(&c)
                     {
@@ -4522,7 +4623,6 @@ impl Follower {
                     // The batch never happened: its vote is not evidence.
                     self.deferred.remove(&barrier);
                     self.ledger.failed(barrier);
-                    self.durable_payloads.remove(&barrier);
                     let command = match pending {
                         Pending::Vote(c) | Pending::Adoption(c) => c,
                     };
@@ -4961,11 +5061,18 @@ impl Follower {
         self.note_lacking(command);
         let barrier = self.alloc.as_mut().expect("booted").allocate();
         self.durable_payloads.insert(barrier, command);
-        alloc::vec![Effect::Persist(PersistBatch {
+        let mut effects = alloc::vec![Effect::Persist(PersistBatch {
             barrier,
             base: None,
             updates: alloc::vec![payload_update(&command, &payload).expect("bounded")],
-        })]
+        })];
+        // A proposal held for this payload is adopted now, its
+        // acknowledgement waiting on this batch (task-d90).
+        if self.held.contains_key(&command) {
+            self.held_check.insert(command);
+            effects.extend(self.advance_pending());
+        }
+        effects
     }
 
     /// Bind the leader's payload in place of the one this replica took
