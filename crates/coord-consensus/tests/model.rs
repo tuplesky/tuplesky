@@ -2452,8 +2452,10 @@ fn a_candidate_after_a_command_its_member_retired_past_the_window_is_kept() {
 /// pre-acceptance without a payload. No other reporter holds the command
 /// and no entry waits on it: it was never decided, and is left out.
 /// Re-proposed, the candidate waited for a payload no voter it asks has.
-/// It is re-proposed as before when a reporter holds its payload row,
-/// when the candidate holds the command, or when an entry waits on it.
+/// It is re-proposed as before when a reporter holds its payload row or
+/// an entry waits on it. A candidate holding its record is no supplier:
+/// re-proposed, the leader's own vote rested on no payload row (row 21,
+/// three voters, seed 4); its own report says whether its row is durable.
 #[test]
 fn a_pre_acceptance_no_reporter_holds_a_payload_row_for_is_left_out() {
     let cfg = config(3, 2, &[2, 0], 2);
@@ -2477,9 +2479,9 @@ fn a_pre_acceptance_no_reporter_holds_a_payload_row_for_is_left_out() {
         report_for(2, ballot(2, 2), 0, vec![pre_accept_with(f, &[], 9)]),
     ];
     assert!(select(&cfg, &with).unwrap().reproposed.contains(&f));
-    // The candidate holds the command.
+    // The candidate holds its record.
     let held = coord_consensus::select_from(&cfg, &reports, |c, _| *c == f, |_| None).unwrap();
-    assert!(held.reproposed.contains(&f));
+    assert!(!held.reproposed.contains(&f));
     // An accepted entry waits on it.
     let waited = vec![
         report_for(

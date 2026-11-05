@@ -1668,6 +1668,7 @@ impl Sim {
                 journal_seq: seq,
             }),
         );
+        self.check_leader_vote(i, barrier);
         self.check_promise(i);
     }
 
@@ -1835,6 +1836,35 @@ impl Sim {
             ));
         }
         self.stats.votes_checked += commands.len();
+    }
+
+    /// Oracle 9 for a leader's own vote: its proposal, which counts once
+    /// the proposal's batch is durable (task-d89), rests on a payload row
+    /// durable at the leader then.
+    fn check_leader_vote(&mut self, i: u8, barrier: BarrierId) {
+        let Some(Role::Leader(m)) = &self.nodes[usize::from(i)].role else {
+            return;
+        };
+        let proposed: Vec<CommandId> = self
+            .offers
+            .keys()
+            .filter(|c| m.proposal(c).is_some_and(|p| p.barrier == barrier))
+            .copied()
+            .collect();
+        if proposed.is_empty() {
+            return;
+        }
+        let held: BTreeSet<CommandId> = payload_rows(&self.nodes[usize::from(i)].storage)
+            .into_iter()
+            .map(|(c, _)| c)
+            .collect();
+        if let Some(c) = proposed.iter().find(|c| !held.contains(c)) {
+            self.fail(&format!(
+                "leader {i}'s proposal of {} is durable with no durable payload row",
+                short(c)
+            ));
+        }
+        self.stats.votes_checked += proposed.len();
     }
 
     /// Oracle 7 for node `i`'s execution of `c` with `response`.

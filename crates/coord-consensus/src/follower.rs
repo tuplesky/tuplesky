@@ -1437,7 +1437,7 @@ impl Follower {
             // result is bound: the new leader re-proposes from payloads,
             // never from identities alone. The reporting voters hold them
             // durably (they reported the command).
-            if !Self::selection_missing(&self.table, &decision).is_empty() {
+            if !Self::selection_missing(&self.table, &self.payloads, &decision).is_empty() {
                 // Ask again when a voter promised that has not been asked
                 // yet -- the ones asked first may be gone while a live
                 // quorum holds the payload -- or when the last ask was
@@ -2366,13 +2366,37 @@ impl Follower {
 
     /// The commands a selection names that this replica holds nothing
     /// for: what it needs before the selection can be bound.
-    fn selection_missing(table: &CommandTable, decision: &SyncDecision) -> Vec<CommandId> {
+    fn selection_missing(
+        table: &CommandTable,
+        payloads: &BTreeMap<CommandId, PayloadRecordV1>,
+        decision: &SyncDecision,
+    ) -> Vec<CommandId> {
         decision
             .entries
             .keys()
             .chain(decision.reproposed.iter())
             .filter(|c| table.phase_of(c).is_none())
             .copied()
+            // Held by a record alone, not executed: its payload batch
+            // failed, or the replica crashed while writing it, and came
+            // back with the dependency row only. The new leader
+            // re-proposes every selected command it has not executed,
+            // committed ones included, and re-proposed so, its own vote
+            // rested on no payload row (task-d90, point 4; protocol_sim
+            // row 21, three voters, seeds 3 and 4, and five voters, seed
+            // 35): the payload is fetched first, from a reporter that
+            // holds it, and the proposal batch writes it.
+            .chain(
+                decision
+                    .entries
+                    .keys()
+                    .chain(decision.reproposed.iter())
+                    .copied()
+                    .filter(|c| {
+                        table.record(c).is_some_and(|r| r.phase < Phase::Executed)
+                            && !payloads.contains_key(c)
+                    }),
+            )
             // Held below COMMIT under other facts than the selection
             // names: the payload under the named ones is fetched and the
             // record rebound before binding, so the re-proposal carries
@@ -2439,7 +2463,7 @@ impl Follower {
         match self.campaign.as_ref() {
             Some(c) if c.binding().is_none() && !c.is_durable() => c
                 .decision()
-                .map(|d| Self::selection_missing(&self.table, d))
+                .map(|d| Self::selection_missing(&self.table, &self.payloads, d))
                 .unwrap_or_default(),
             _ => Vec::new(),
         }
