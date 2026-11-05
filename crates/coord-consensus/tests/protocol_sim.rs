@@ -64,7 +64,7 @@
 //! once failed are kept in `fixtures/protocol_sim/seeds.json`, with the
 //! catch-up and the loss they were found under, and replayed on every run.
 //!
-//! Rows 19 to 21 are task-d90's. In every other row a node flushes its
+//! Rows 19 to 22 are task-d90's. In every other row a node flushes its
 //! journal before it executes, and an execution is durable as it is taken,
 //! as the models apply. In row 19 an execution's group joins the journal
 //! behind the batches before it, as `coordd`'s does, and is durable only
@@ -78,7 +78,13 @@
 //! Row 21 fails a follower's batch of a payload row and its dependency
 //! row, so a later vote's batch can write the dependency row alone, and
 //! crashes a follower while it writes the payload row of such a record.
-//! Rows 19 and 20 each have a negative
+//! Row 22 is row 19's late execution with the leader crashed inside
+//! task-d89's window: after it counted a fast quorum over its own
+//! proposal, before that proposal's batch is durable. With the gate
+//! removed from `Leader::learn` it fails (five voters, seeds 3 and 5, in
+//! CI's twelve), and its kept seeds replay those failures; row 19, which
+//! never crashes the leader there, passes without the gate. Rows 19 and
+//! 20 each have a negative
 //! control that must fail: row 19's machines counting executions durable
 //! as they are taken, and row 20's followers' payload rows dropped on their
 //! way to the store.
@@ -240,6 +246,11 @@ struct Knobs {
     /// batch, from a voter that then crashed before the batch was
     /// durable.
     drop_payload_rows: bool,
+    /// Chance per step the leader is crashed while it has counted a fast
+    /// quorum over a proposal of its own whose batch is not durable:
+    /// task-d89's window, where its gate commits nothing until the batch
+    /// is (task-d90's acceptance).
+    gate_crash: u32,
 }
 
 impl Knobs {
@@ -275,10 +286,11 @@ impl Knobs {
         payload_fail: 0,
         payload_crash: 0,
         drop_payload_rows: false,
+        gate_crash: 0,
     };
 
     /// The checklist's matrix rows 1 to 5, 9, 10, 12 and 14, rows 16 and
-    /// 17, and rows 19 and 20.
+    /// 17, and rows 19 to 22.
     fn row(row: u8) -> Knobs {
         let base = Knobs { row, ..Knobs::BASE };
         match row {
@@ -421,6 +433,18 @@ impl Knobs {
                 row,
                 payload_fail: 150_000,
                 ..Knobs::row(20)
+            },
+            // Row 19's late execution with the leader crashed inside
+            // task-d89's window: after it counted a fast quorum over its
+            // own proposal, and before that proposal's batch is durable.
+            // Its gate commits nothing there, so nothing is executed or
+            // released over a vote a restarted leader's report would deny.
+            // Without the crash of every voter: the leader alone.
+            22 => Knobs {
+                row,
+                total_crash: 0,
+                gate_crash: 250_000,
+                ..Knobs::row(19)
             },
             _ => unreachable!("not a scenario of the simulator: row {row}"),
         }
@@ -650,6 +674,8 @@ struct Sim {
     released: BTreeMap<CommandId, Vec<u8>>,
     /// The voter whose journal is slow (task-d90's execution lag).
     lagging: Option<u8>,
+    /// Commands seen in task-d89's window at a leader.
+    gate_seen: BTreeSet<CommandId>,
     /// Report pages oracle 9 read, by node, boot, ballot number and page:
     /// a page asked for again is served as first sent (task-d28), and is
     /// read at the cut it was taken at.
@@ -711,6 +737,11 @@ struct Stats {
     cut_decided: u32,
     cut_released: u32,
     cut_durable: u32,
+    /// Commands the leader counted a fast quorum over before its proposal
+    /// batch was durable, and leader crashes while one was (task-d89's
+    /// window).
+    gate_windows: usize,
+    gate_crashes: u32,
 }
 
 /// FNV-1a over `bytes`, continuing from `hash`.
@@ -809,6 +840,7 @@ impl Sim {
             unanswered: vec![0; usize::from(n)],
             released: BTreeMap::new(),
             lagging: None,
+            gate_seen: BTreeSet::new(),
             pages_read: BTreeSet::new(),
         };
         for i in 0..n {
@@ -2148,6 +2180,15 @@ impl Sim {
                 self.stats.payload_crashes += 1;
                 self.note(|| format!("node {f} crashes writing a payload row"));
                 self.crash(f);
+            } else if self.knobs.gate_crash > 0
+                && alive.len() > majority
+                && let Some(l) = self.gate_open()
+                && self.chance("gate-crash", self.knobs.gate_crash)
+            {
+                // task-d89's window (task-d90's acceptance).
+                self.stats.gate_crashes += 1;
+                self.note(|| format!("leader {l} crashes in the gate's window"));
+                self.crash(l);
             } else if alive.len() > majority && self.chance("crash", self.knobs.crash) {
                 let candidates: Vec<u8> = alive
                     .iter()
@@ -2191,6 +2232,7 @@ impl Sim {
         self.heal();
         self.check_released();
         self.stats.ballots = self.highest_ballot;
+        self.stats.gate_windows = self.gate_seen.len();
         let mut decisions = 0xcbf2_9ce4_8422_2325;
         for (i, node) in self.nodes.iter().enumerate() {
             decisions = fold(decisions, &(i as u64).to_be_bytes());
@@ -2206,6 +2248,29 @@ impl Sim {
         }
         self.stats.decisions = decisions;
         self.stats
+    }
+
+    /// The leader, while it has counted a fast quorum over a proposal of
+    /// its own whose batch is not durable (task-d89's window).
+    fn gate_open(&mut self) -> Option<u8> {
+        let l = self.leader_index()?;
+        let Some(Role::Leader(m)) = &self.nodes[usize::from(l)].role else {
+            return None;
+        };
+        let open: Vec<CommandId> = self
+            .offers
+            .keys()
+            .filter(|c| {
+                m.proposal(c).is_some_and(|p| !p.durable)
+                    && m.votes(c).is_some_and(|v| v.learned().is_some())
+            })
+            .copied()
+            .collect();
+        if open.is_empty() {
+            return None;
+        }
+        self.gate_seen.extend(open);
+        Some(l)
     }
 
     /// The cuts the domain is at, of task-d90's three (crash tests at
@@ -3131,6 +3196,8 @@ fn run_row(row: u8) {
                     totals.restored_without_payload += s.restored_without_payload;
                     totals.cut_released += s.cut_released;
                     totals.cut_durable += s.cut_durable;
+                    totals.gate_windows += s.gate_windows;
+                    totals.gate_crashes += s.gate_crashes;
                 }
                 Err(e) => failures.push(e),
             }
@@ -3195,6 +3262,13 @@ fn run_row(row: u8) {
                 && totals.restored_without_payload > 0
                 && totals.payload_crashes > 0,
             "row 21 missed its cut: {totals:?}"
+        );
+    }
+    // Row 22 is defined by its leader crashes in task-d89's window.
+    if row == 22 {
+        assert!(
+            totals.gate_windows > 0 && totals.gate_crashes > 0,
+            "row 22 never crashed a leader in the gate's window: {totals:?}"
         );
     }
     // Oracle 9 ran.
@@ -3272,6 +3346,11 @@ fn row_20_each_vote_on_a_durable_payload_row() {
 #[test]
 fn row_21_a_payload_batch_failed_under_a_later_vote() {
     run_row(21);
+}
+
+#[test]
+fn row_22_the_leader_crashed_in_the_gates_window() {
+    run_row(22);
 }
 
 /// Row 20's negative control (task-d90, point 4): with a follower's
