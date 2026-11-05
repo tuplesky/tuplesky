@@ -3602,13 +3602,23 @@ So every feature-gated change, task-d98's `EarlyProposal` first, would ship unre
 - **The harnesses:** the Jepsen job and the bench scripts activate a feature after start, on the side that should have it, so a batch reads the production path.
 - **A design step first,** answering:
   - **The admission window.** `admit` reads only the voter's own store. A follower that hasn't executed the activation yet still admits an older build, and a feature whose safety rests on every voter's build needs a rule for that window. One option: a gated behavior acts toward a voter only once that voter is known to have executed the activation. For task-d98, the leader would send early only to such a follower.
+  - **How a leader knows it** (#192 review). No message tells a leader a follower's executed position today: only a candidate's `NewLeader`, a `PromiseRefused`, and `CatchUpRequest` and `CatchUpPage` carry one, and a catch-up request goes out only when a voter lags, to any donor.
+    - So the window rule needs a message. One option: a follower tells its leader once its store holds the activation, and says so again at start and on a new ballot.
+    - The leader's set of such followers is volatile. It is empty after a restart or a new ballot until the followers say so again. An older follower never says it, so it never qualifies.
+    - "Holds" means durable in its store, not executed: `admit` reads the store, and a command executes before its execution group is durable (and, under task-d90, its result is released before then too).
+  - **Builds that predate the new commands** (#192 review). A support report and an activation are new command variants. A build from before this task can't decode them, and no voter can skip a committed command without its state diverging from the others'. So the first report submitted in a rolling upgrade reaches voters that can't apply it. Two options:
+    - a voter submits its report only once every configured voter's link advertises a capability for the new commands. The transport already negotiates per link (`CAPABILITY_FRAMES_PER_STREAM`, task-d61), and Section 11.7 forbids negotiation only as the authority for activation;
+    - or reports go in only by operator command, after the rollout.
+  - **A voter that rolls back after reporting** (#192 review). `record_support` refuses a report that shrinks, by design. But task-60's entry says rollback before activation is running the old binary, so a voter that reported and then rolled back leaves its larger report standing, and unanimity counts a build it no longer runs. Either `admit` also refuses a build that lacks what the voter's own durable report promised, so a report binds once it is durable, or the design says why a stale report is harmless.
   - **Membership:** what a configuration change does to an active feature and to the reports, which name voters of an epoch.
   - **What a refused activation says,** and where an operator reads which voters lack support.
 
 **Acceptance:** The design step accepted. Then the code, with tests:
 - activation is refused without every configured voter's support;
 - an activated feature survives a restart, and a build without it is refused at start;
-- the window rule holds in a mixed-build test;
+- the window rule holds in a mixed-build test, with a voter built before this task among the builds;
+- a gated behavior reaches a follower only after that follower has said its store holds the activation, and not again after a restart until it says so again;
+- a voter that reported a feature and was rolled back is handled as the design step decides, with a test;
 - `coordctl`'s command works against a running domain;
 - the harnesses' activation runs.
 
