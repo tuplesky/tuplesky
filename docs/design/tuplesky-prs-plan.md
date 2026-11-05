@@ -3601,14 +3601,30 @@ So every feature-gated change, task-d98's `EarlyProposal` first, would ship unre
 - **One switch point.** Consensus code reads an active feature from its executed state, so a leader switches at one point in the order.
 - **The harnesses:** the Jepsen job and the bench scripts activate a feature after start, on the side that should have it, so a batch reads the production path.
 - **A design step first,** answering:
-  - **The admission window.** `admit` reads only the voter's own store. A follower that hasn't executed the activation yet still admits an older build, and a feature whose safety rests on every voter's build needs a rule for that window. One option: a gated behavior acts toward a voter only once that voter is known to have executed the activation. For task-d98, the leader would send early only to such a follower.
+  - **Commands older builds can't decode** (#192 review).
+    - The report and activation commands would be new command variants, and the `Command` format's window is 1..1, so a build from before task-d99 can't decode them.
+    - No voter can skip a committed command it can't apply without diverging. So the first report a task-d99 voter submits at start would land in front of every older voter in a rolling upgrade.
+    - **Options:**
+      - A voter submits its report only once every configured voter's link advertises a capability for the new commands. The transport already negotiates per link (`CAPABILITY_FRAMES_PER_STREAM`, task-d61), and Section 11.7 forbids negotiation only as the authority for activation, not for when to submit.
+      - Or reports go in only by operator command, after the rollout.
+  - **The admission window, and how a leader knows a follower holds the activation** (#192 review).
+    - `admit` reads only the voter's own store, so a follower that doesn't hold the activation yet still admits an older build. A feature whose safety rests on every voter's build needs a rule for that window.
+    - The rule named: a gated behavior acts toward a voter only once that voter is known to hold the activation. For task-d98, the leader sends early only to such a follower.
+    - **"Holds" means durable in its store, not executed,** since `admit` reads the store. A command executes before its execution group is durable, and under task-d90 its result is released before then too.
+    - **No message carries that today.** A follower's executed position reaches another voter only in `NewLeader`, `PromiseRefused`, `CatchUpRequest` and `CatchUpPage`.
+    - So the follower tells the leader once its store holds the activation, and repeats it at start and on a new ballot. The leader's set is volatile: empty after a restart or a new ballot until the message is repeated. Absence means not eligible, so an older follower that never sends it is safe.
+  - **A voter that rolls back after reporting** (#192 review).
+    - `record_support` refuses a report that shrinks, by design. But task-60's entry says rollback before activation is running the old binary.
+    - A voter that reported and then rolled back leaves its larger report standing, and unanimity would count a build it no longer runs.
+    - So either `admit` also refuses a build that lacks what the voter's own durable report promised, which binds a report from the moment it's durable, or the design says why a stale report is harmless.
   - **Membership:** what a configuration change does to an active feature and to the reports, which name voters of an epoch.
   - **What a refused activation says,** and where an operator reads which voters lack support.
 
 **Acceptance:** The design step accepted. Then the code, with tests:
 - activation is refused without every configured voter's support;
 - an activated feature survives a restart, and a build without it is refused at start;
-- the window rule holds in a mixed-build test;
+- the window rule holds in a mixed-build test that includes a voter from before task-d99, not only a voter without the feature;
+- a voter that rolled back after reporting is handled as the design step decides;
 - `coordctl`'s command works against a running domain;
 - the harnesses' activation runs.
 
