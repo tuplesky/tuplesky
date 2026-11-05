@@ -19,6 +19,11 @@ path = "src/main.rs"
 # See coord-daemon's feature of the same name: the register check's
 # negative control, never built for anything else.
 skip-read-confirmation = ["coord-daemon/skip-read-confirmation"]
+# task-d98's local reading: a leader sends its proposal before its batch
+# is durable without the domain having activated `EarlyProposal`. Never
+# built for anything else; the fault runs and the batch use the
+# activation (task-d99).
+early-proposal-without-activation = []
 
 [dependencies]
 coord-daemon.workspace = true

@@ -284,14 +284,21 @@ pub enum Feature {
     /// (task-j04). A voter that cannot load a published baseline cannot
     /// recover from a reclaimed prefix at all.
     LocalCheckpoint = 0x0003,
+    /// The leader's proposal sent before its batch is durable, to a
+    /// follower that cannot make a fast quorum from it (task-d98, design
+    /// Sections 4.3 and 4.8). A follower built before task-d74 hears the
+    /// other followers' fast acknowledgements, and with the proposal they
+    /// make a fast quorum it would count over a vote the leader may lose.
+    EarlyProposal = 0x0004,
 }
 
 impl Feature {
     /// Every feature, in identifier order.
-    pub const ALL: [Feature; 3] = [
+    pub const ALL: [Feature; 4] = [
         Feature::CheckpointFloor,
         Feature::SealedHandoff,
         Feature::LocalCheckpoint,
+        Feature::EarlyProposal,
     ];
 
     /// The frozen identifier.
@@ -305,6 +312,7 @@ impl Feature {
             Feature::CheckpointFloor => "checkpoint-floor",
             Feature::SealedHandoff => "sealed-handoff",
             Feature::LocalCheckpoint => "local-checkpoint",
+            Feature::EarlyProposal => "early-proposal",
         }
     }
 
@@ -326,7 +334,7 @@ pub struct Supported;
 
 impl Supported {
     /// The features this build supports, in identifier order.
-    pub const fn features() -> [Feature; 3] {
+    pub const fn features() -> [Feature; 4] {
         Feature::ALL
     }
 

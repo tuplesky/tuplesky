@@ -4906,6 +4906,7 @@ fn resends(
         late: counts.late,
         handed_off: counts.handed_off,
         duplicate_votes: counts.duplicate_votes,
+        early: counts.early,
     }
 }
 

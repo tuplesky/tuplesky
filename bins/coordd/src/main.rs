@@ -1069,6 +1069,7 @@ fn main() -> ExitCode {
     // find. This is the order that makes `live` mean it.
     let boot = storage.boot;
     let checkpoints = storage.checkpoints;
+    let early_proposal = early_proposal(&storage.active);
     let applier = match coord_storage::Applier::new(
         storage.domain,
         coord_core::outbox::BarrierAllocator::new(placed.incarnation, boot),
@@ -1091,9 +1092,15 @@ fn main() -> ExitCode {
     // Where the loop's waits on those two threads are counted.
     let mut waits = None;
     let backing = if roles.votes() {
-        match voter(&placed, applier, boot, config.limits.command_table_capacity)
-            .and_then(|v| keep_floor(&placed, &config, v))
-            .and_then(|v| pipeline(v, &materialized, &mut waits))
+        match voter(
+            &placed,
+            applier,
+            boot,
+            config.limits.command_table_capacity,
+            early_proposal,
+        )
+        .and_then(|v| keep_floor(&placed, &config, v))
+        .and_then(|v| pipeline(v, &materialized, &mut waits))
         {
             Ok(v) => serve::Backing::Voting(Box::new(v)),
             Err(e) => {
@@ -1425,6 +1432,28 @@ crowded_out={}",
     })
 }
 
+/// Whether this node's leaders send the proposal before its batch is
+/// durable (task-d98): only where the domain activated `EarlyProposal`,
+/// which every configured voter's build supports, or in a build made for
+/// task-d98's local reading alone (`early-proposal-without-activation`),
+/// never built for anything else. Section 23 rules out an operator flag
+/// around a correctness gate, so there is no setting for it.
+///
+/// Nothing in a running domain can activate a feature yet: that is
+/// task-d99, which also narrows the early send to the followers known to
+/// hold the activation.
+fn early_proposal(active: &std::collections::BTreeSet<coord_types::formats::Feature>) -> bool {
+    if cfg!(feature = "early-proposal-without-activation") {
+        eprintln!(
+            "coordd: built with early-proposal-without-activation, task-d98's local reading: \
+             a leader sends its proposal before its batch is durable without the domain having \
+             activated it, so a voter built before task-d74 may count it toward a fast decision"
+        );
+        return true;
+    }
+    active.contains(&coord_types::formats::Feature::EarlyProposal)
+}
+
 /// This node's voter, booted, over the store it will write.
 ///
 /// The role it takes is not a setting. The committed configuration says
@@ -1438,6 +1467,7 @@ fn voter(
     applier: coord_storage::Applier<store::Persistence>,
     boot: coord_core::effect::BootId,
     capacity: usize,
+    early_proposal: bool,
 ) -> Result<coord_daemon::Voter<store::Persistence>, String> {
     use coord_consensus::{
         ConfigurationIdentity, Follower, FollowerConfig, Leader, LeaderConfig, LearningMode,
@@ -1603,6 +1633,9 @@ fn voter(
         (m.cluster(), m.domain()),
         promised,
     );
+    // Given to the node before its boot, so the leader it holds now and
+    // every one it becomes later sends as the domain allows (task-d98).
+    voter.node_mut().set_early_proposal(early_proposal);
     voter
         .boot(boot, placed.incarnation)
         .map_err(|e| format!("this voter cannot record its own boot: {e}"))?;
