@@ -4125,8 +4125,27 @@ impl Follower {
         {
             return Vec::new();
         }
-        let Some(requires) = self.payload_row(&proposal.command) else {
-            return Vec::new();
+        // Held with no row durable or in flight (its batch failed): the row
+        // is written again, and the answer waits on it (#195 review).
+        let mut effects = Vec::new();
+        let requires = match self.payload_row(&proposal.command) {
+            Some(requires) => requires,
+            None => {
+                let Some(alloc) = self.alloc.as_mut() else {
+                    return Vec::new();
+                };
+                let barrier = alloc.allocate();
+                let payload = &self.payloads[&proposal.command];
+                effects.push(Effect::Persist(PersistBatch {
+                    barrier,
+                    base: None,
+                    updates: alloc::vec![
+                        payload_update(&proposal.command, payload).expect("bounded")
+                    ],
+                }));
+                self.durable_payloads.insert(barrier, proposal.command);
+                alloc::vec![barrier]
+            }
         };
         let ballot = self.config.quorum.ballot();
         let ack = SlowAck {
@@ -4148,7 +4167,8 @@ impl Follower {
             },
             frame: ProtocolMessage::SlowAck(ack).encode(),
         });
-        self.release()
+        effects.extend(self.release());
+        effects
     }
 
     /// What a vote for `command` waits on for its payload row here
@@ -4564,11 +4584,26 @@ impl Follower {
         // served and never counted durable.
         if let Some(barrier) = event.barrier()
             && let Some(c) = self.durable_payloads.remove(&barrier)
-            && matches!(event, StorageEvent::JournalDurable { .. })
-            && self.payloads.contains_key(&c)
-            && !self.durable_payloads.values().any(|other| *other == c)
         {
-            self.served_payloads.insert(c);
+            match event {
+                StorageEvent::JournalDurable { .. }
+                    if self.payloads.contains_key(&c)
+                        && !self.durable_payloads.values().any(|other| *other == c) =>
+                {
+                    self.served_payloads.insert(c);
+                }
+                // A payload batch of its own: an acknowledgement that
+                // waited on it was dropped, and published again it would
+                // be dropped again. Forgotten, the leader's next proposal
+                // is answered afresh: adopted again, which writes the
+                // payload row again, or answered from the decided record,
+                // which does (#195 review). A vote's own batch failing is
+                // that vote never made, and keeps its refusal.
+                StorageEvent::Failed { .. } if !self.pending.contains_key(&barrier) => {
+                    self.replay.drop_requiring(&c, &barrier);
+                }
+                _ => {}
+            }
         }
         if let Some(barrier) = event.barrier()
             && let Some(pending) = self.pending.get(&barrier).cloned()

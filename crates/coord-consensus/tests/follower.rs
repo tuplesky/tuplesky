@@ -1453,3 +1453,67 @@ fn a_decided_record_is_acknowledged_again_only_with_its_payload_row() {
         "{out:?}"
     );
 }
+
+/// The payload batch an adoption waited on fails (#195 review): the
+/// acknowledgement it held was dropped, and kept evidence that names the
+/// failed batch would be dropped again each time it was published. It is
+/// forgotten, and the leader's next proposal is adopted again, in a batch
+/// that writes the payload row again, which the new acknowledgement waits
+/// on.
+#[test]
+fn a_failed_payload_batch_is_written_again_by_the_next_adoption() {
+    let (c1, (rows, mut payloads)) = durable_admission();
+    let payload = payloads.remove(0).1;
+    let mut g = Follower::recover(config(2), None, rows, Vec::new(), ExecutionPosition::ZERO);
+    g.step(boot_event());
+    let record = g.table().record(&c1).unwrap().clone();
+    let again = || {
+        peer(
+            0,
+            proposal(c1, vec![], 0, record.paths.clone(), record.path),
+        )
+    };
+    g.step(again());
+    let effects = g.step(peer(
+        0,
+        ProtocolMessage::PayloadResponse {
+            command: c1,
+            payload,
+        },
+    ));
+    let batches = persisted(&effects);
+    let (payload_batch, adoption) = (batches[0].barrier, batches[1].barrier);
+    g.step(Event::Storage(StorageEvent::Failed {
+        barrier_id: payload_batch,
+        error: StorageError::NoSpace,
+    }));
+    let released = g.step(Event::Storage(StorageEvent::JournalDurable {
+        barrier_id: adoption,
+        journal_seq: LocalJournalSeq::new(1).unwrap(),
+    }));
+    assert!(
+        sends(&released).is_empty(),
+        "the payload row was never written"
+    );
+    // The leader proposes again, lacking this voter's vote.
+    let effects = g.step(again());
+    let batches = persisted(&effects);
+    assert_eq!(batches.len(), 1, "adopted again: {effects:?}");
+    assert!(
+        batches[0]
+            .updates
+            .iter()
+            .any(|u| u.collection == Collection::PayloadV1.id()),
+        "the adoption writes the payload row again"
+    );
+    let released = g.step(Event::Storage(StorageEvent::JournalDurable {
+        barrier_id: batches[0].barrier,
+        journal_seq: LocalJournalSeq::new(2).unwrap(),
+    }));
+    assert!(
+        sends(&released)
+            .iter()
+            .any(|(to, m)| *to == r(0) && matches!(m, ProtocolMessage::SlowAck(_))),
+        "{released:?}"
+    );
+}
