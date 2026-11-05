@@ -1346,12 +1346,6 @@ impl<P: Persistence> Node<P> {
         let outbox = &self.outbox;
         let mut step = features.observe(standing);
         step.absorb(features.settle(|b| outbox.is_durable(b), |b| outbox.is_failed(b)));
-        if features.wants_reload()
-            && let Ok(gated) = self.applier.store().reader().snapshot()
-            && let Err(e) = features.reload(gated.view())
-        {
-            eprintln!("this voter cannot read its feature rows back: {e}");
-        }
         let effects = self.feature_effects(step, out);
         self.follow_features();
         effects

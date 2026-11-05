@@ -5159,12 +5159,30 @@ pub fn listen_admin(
     {
         std::fs::remove_file(path)?;
     }
-    let listener = tokio::net::UnixListener::bind(path)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    // Bound inside a directory only the owner may enter, made private
+    // before the socket exists, and then moved into place: the socket is
+    // never reachable under the process's umask (the state directory's
+    // own mode is not this node's to set).
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let private = parent.join(format!(".admin-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&private);
+    std::fs::create_dir(&private)?;
+    std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700))?;
+    let staged = private.join("admin.sock");
+    let bound = tokio::net::UnixListener::bind(&staged).and_then(|listener| {
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::rename(&staged, path)?;
+        Ok(listener)
+    });
+    let _ = std::fs::remove_dir_all(&private);
+    let listener = bound?;
     let (requests, admin) = tokio::sync::mpsc::channel(8);
     tokio::spawn(async move {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
+                // A persistent error (out of descriptors) is not retried
+                // in a spin.
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 continue;
             };
             let requests = requests.clone();

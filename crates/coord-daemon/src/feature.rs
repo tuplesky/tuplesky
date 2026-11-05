@@ -141,8 +141,6 @@ pub enum ActivateRefusal {
     },
     /// Another activation is in progress.
     Busy(Feature),
-    /// The last feature batch failed; the store is read again first.
-    Recovering,
 }
 
 impl core::fmt::Display for ActivateRefusal {
@@ -170,9 +168,6 @@ impl core::fmt::Display for ActivateRefusal {
             }
             ActivateRefusal::Busy(feature) => {
                 write!(f, "{} is being activated", feature.name())
-            }
-            ActivateRefusal::Recovering => {
-                f.write_str("a feature batch failed and the store is being read again")
             }
         }
     }
@@ -250,6 +245,10 @@ pub struct Features {
     /// Every support row this store holds or has journaled, this voter's
     /// own among them.
     rows: BTreeMap<ReplicaId, Row>,
+    /// Each voter's support row as this store's durable batches hold it:
+    /// what `rows` falls back to when a batch fails, since the view can
+    /// lag a batch already durable in the journal.
+    durable_rows: BTreeMap<ReplicaId, FeatureSupportV1>,
     /// This voter's activation record as its latest batch writes it.
     record: Option<ActiveFeaturesV1>,
     /// As its durable rows hold it: the switch, and what `FeatureHeld`
@@ -269,9 +268,6 @@ pub struct Features {
     activating: Option<Feature>,
     standing: Option<Standing>,
     unsettled: VecDeque<Batch>,
-    /// A batch failed: what is kept here is no longer what the store
-    /// holds, so nothing is written until it is read again.
-    stale: bool,
     /// The switch or the window may have moved since the node last read
     /// them ([`Features::take_changed`]).
     changed: bool,
@@ -297,6 +293,7 @@ impl Features {
             me,
             voters,
             rows: BTreeMap::new(),
+            durable_rows: BTreeMap::new(),
             record: None,
             durable_record: None,
             advertised: BTreeMap::new(),
@@ -306,7 +303,6 @@ impl Features {
             activating: None,
             standing: None,
             unsettled: VecDeque::new(),
-            stale: false,
             changed: true,
             barriers: BarrierAllocator::new(incarnation, boot).for_features(),
             counts: FeatureCounts::default(),
@@ -315,14 +311,14 @@ impl Features {
         Ok(features)
     }
 
-    /// Read the rows back from the store, after a failed batch or at open.
-    /// Only once no batch is in flight: until then the view is behind.
-    pub fn reload<V: OrderedRead>(&mut self, view: &V) -> Result<(), String> {
-        if !self.unsettled.is_empty() {
-            return Ok(());
-        }
+    /// Read the rows from the store, at open. Never again: a batch is
+    /// durable in the journal before its rows are in the view, so after
+    /// open this driver's own record of its durable batches is the truth
+    /// and the view may be behind it.
+    fn reload<V: OrderedRead>(&mut self, view: &V) -> Result<(), String> {
         let rows = read_support(view, &TrimLimits::default())
             .map_err(|e| format!("the support rows: {e:?}"))?;
+        self.durable_rows = rows.iter().map(|row| (row.voter, row.clone())).collect();
         self.rows = rows
             .into_iter()
             .map(|row| (row.voter, Row { row, durable: true }))
@@ -336,14 +332,41 @@ impl Features {
         self.record = record.clone();
         self.durable_record = record;
         self.changed = true;
-        self.stale = false;
         Ok(())
     }
 
-    /// Whether a failed batch left this driver waiting to read the store
-    /// again ([`Features::reload`]).
-    pub fn wants_reload(&self) -> bool {
-        self.stale && self.unsettled.is_empty()
+    /// After a failed batch: what the store will hold is what its durable
+    /// batches hold, with the batches still in flight on top, in order.
+    /// Kept here, not read back, since the view can lag a durable batch.
+    fn roll_back(&mut self) {
+        self.rows = self
+            .durable_rows
+            .iter()
+            .map(|(voter, row)| {
+                (
+                    *voter,
+                    Row {
+                        row: row.clone(),
+                        durable: true,
+                    },
+                )
+            })
+            .collect();
+        self.record = self.durable_record.clone();
+        for batch in &self.unsettled {
+            if let Some(row) = &batch.row {
+                self.rows.insert(
+                    row.voter,
+                    Row {
+                        row: row.clone(),
+                        durable: false,
+                    },
+                );
+            }
+            if let Some(record) = &batch.record {
+                self.record = Some(record.clone());
+            }
+        }
     }
 
     /// Whether [`Features::active`] or [`Features::holders`] may have
@@ -595,7 +618,6 @@ impl Features {
         if epoch != self.voters.epoch()
             || feature.prepare_marker().is_none()
             || !Supported::reported().any(|f| f == feature)
-            || self.stale
         {
             self.counts.refused += 1;
             return step;
@@ -646,7 +668,7 @@ impl Features {
             self.counts.refused += 1;
             return step;
         };
-        if !leading || epoch != self.voters.epoch() || !features.contains(&id) || self.stale {
+        if !leading || epoch != self.voters.epoch() || !features.contains(&id) {
             self.counts.refused += 1;
             return step;
         }
@@ -677,9 +699,6 @@ impl Features {
     /// durable support row names every feature in it.
     fn install(&mut self, record: &FeatureRecord) -> Result<FeatureStep, ()> {
         let mut step = FeatureStep::default();
-        if self.stale {
-            return Err(());
-        }
         let offered = ActiveFeaturesV1 {
             cluster: self.cluster,
             domain: self.domain,
@@ -710,17 +729,27 @@ impl Features {
     /// The leader's activation record: installed, and the leader told once
     /// it is durable.
     fn on_activated(&mut self, from: ReplicaId, record: &FeatureRecord) -> FeatureStep {
+        // A voter whose durable record already turns these on says so,
+        // whatever the store's history: its record may predate its support
+        // row, and the answer is what repairs the leader's held set.
+        let covered = |held: &Option<ActiveFeaturesV1>| {
+            held.as_ref().is_some_and(|held| {
+                record.features.iter().all(|f| {
+                    held.features.contains(f)
+                        || Feature::from_id(*f).is_some_and(Feature::is_marker)
+                })
+            })
+        };
+        if covered(&self.durable_record) {
+            let mut step = FeatureStep::default();
+            if let Some(held) = self.held_message() {
+                step.sends.push((from, held));
+            }
+            return step;
+        }
         match self.install(record) {
-            Ok(mut step) => {
-                let covered = self
-                    .durable_record
-                    .as_ref()
-                    .is_some_and(|held| record.features.iter().all(|f| held.features.contains(f)));
-                if covered {
-                    if let Some(held) = self.held_message() {
-                        step.sends.push((from, held));
-                    }
-                } else {
+            Ok(step) => {
+                if !covered(&self.durable_record) {
                     self.owed_held = true;
                 }
                 step
@@ -791,9 +820,6 @@ impl Features {
         if !Supported::reported().any(|f| f == feature) {
             return Err(ActivateRefusal::Unsupported(feature));
         }
-        if self.stale {
-            return Err(ActivateRefusal::Recovering);
-        }
         if self.active().contains(&feature) {
             return Ok((Activation::AlreadyActive, self.resend()));
         }
@@ -849,7 +875,7 @@ impl Features {
         let Some(feature) = self.activating else {
             return step;
         };
-        if self.stale || !self.standing.is_some_and(|s| s.leading) {
+        if !self.standing.is_some_and(|s| s.leading) {
             return step;
         }
         if self.unsettled.iter().any(|b| b.announce == Some(feature)) {
@@ -895,23 +921,26 @@ impl Features {
         let mut step = FeatureStep::default();
         while let Some(batch) = self.unsettled.front() {
             if is_failed(&batch.barrier) {
+                // What it would have written never lands. The rest stands:
+                // a prepare or an install it carried is asked for again by
+                // the leader's re-send, and an activation it carried is
+                // written again by `try_activate` below.
                 self.unsettled.pop_front();
                 self.counts.failed += 1;
-                self.stale = true;
-                self.activating = None;
-                self.owed_prepared.clear();
-                self.owed_held = false;
+                self.roll_back();
                 continue;
             }
             if !is_durable(&batch.barrier) {
                 break;
             }
             let batch = self.unsettled.pop_front().expect("checked above");
-            if let Some(row) = &batch.row
-                && let Some(held) = self.rows.get_mut(&row.voter)
-                && held.row == *row
-            {
-                held.durable = true;
+            if let Some(row) = &batch.row {
+                self.durable_rows.insert(row.voter, row.clone());
+                if let Some(held) = self.rows.get_mut(&row.voter)
+                    && held.row == *row
+                {
+                    held.durable = true;
+                }
             }
             if let Some(record) = batch.record {
                 self.durable_record = Some(record);
@@ -921,9 +950,6 @@ impl Features {
                 self.activating = None;
                 step.absorb(self.announce(feature));
             }
-        }
-        if self.stale {
-            return step;
         }
         // Answers owed once this voter's prepare is durable.
         let owed: Vec<(ReplicaId, Feature)> = self.owed_prepared.iter().copied().collect();
@@ -988,7 +1014,7 @@ impl Features {
     /// reports are not durable here are asked again.
     pub fn resend(&mut self) -> FeatureStep {
         let mut step = FeatureStep::default();
-        if self.stale || !self.standing.is_some_and(|s| s.leading) {
+        if !self.standing.is_some_and(|s| s.leading) {
             return step;
         }
         let epoch = self.voters.epoch();

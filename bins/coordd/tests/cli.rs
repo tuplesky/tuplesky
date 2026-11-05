@@ -6528,8 +6528,18 @@ async fn a_leader_that_sent_early_and_restarted_comes_back_following() {
         "{}",
         running[0].said()
     );
+    // Writes, paced, until the leader has sent one early: it sends early
+    // only to a follower that has said it holds the activation (task-d99),
+    // which may land after the first few writes.
     let before = Caller::bind(&running[1], &cluster.ca, &cluster.ring, [0x65; 16]).await;
-    for sequence in 1..=5u64 {
+    let mut sequence = 0u64;
+    while early_sends(&running[0].said()) == 0 {
+        sequence += 1;
+        assert!(
+            sequence <= 60,
+            "the leader sent nothing early with the feature active:\n{}",
+            running[0].said()
+        );
         let put = ask(&before.connection, &before.put(sequence, b"k", b"before"))
             .await
             .expect("the domain established a write while its leader was up");
@@ -6537,12 +6547,8 @@ async fn a_leader_that_sent_early_and_restarted_comes_back_following() {
             response_of(&put).outcome,
             coord_types::wire_v1::OutcomeV1::Ok { .. }
         ));
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
-    assert!(
-        running[0].waits_until(30, |said| early_sends(said) > 0),
-        "the leader sent nothing early with the feature active:\n{}",
-        running[0].said()
-    );
 
     drop(running.remove(0));
     let back = start(&cluster.configs[0]);

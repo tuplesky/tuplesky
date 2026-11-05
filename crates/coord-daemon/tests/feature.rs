@@ -44,6 +44,7 @@ struct Voter {
     engine: ModelEngine,
     pending: VecDeque<(BarrierId, Vec<StoreUpdate>)>,
     durable: BTreeSet<BarrierId>,
+    failed: BTreeSet<BarrierId>,
     standing: Standing,
     boot: u8,
     /// A build from before task-d99.
@@ -61,6 +62,9 @@ struct Domain {
     mute_activated: BTreeSet<(ReplicaId, ReplicaId)>,
     /// Voters whose batches are not made durable.
     hold: BTreeSet<ReplicaId>,
+    /// Voters whose next batch fails, as a store fenced at a higher
+    /// promise refuses one.
+    fail_next: BTreeSet<ReplicaId>,
 }
 
 fn open(
@@ -101,6 +105,7 @@ impl Domain {
                     engine,
                     pending: VecDeque::new(),
                     durable: BTreeSet::new(),
+                    failed: BTreeSet::new(),
                     standing: Standing {
                         ballot: ballot(1, 1),
                         leading: n == 1,
@@ -118,6 +123,7 @@ impl Domain {
             cut: BTreeSet::new(),
             mute_activated: BTreeSet::new(),
             hold: BTreeSet::new(),
+            fail_next: BTreeSet::new(),
         };
         for n in 1..=count {
             domain.start(replica(n));
@@ -158,6 +164,10 @@ impl Domain {
         }
         let voter = self.voters.get_mut(&n).unwrap();
         while let Some((barrier, updates)) = voter.pending.pop_front() {
+            if self.fail_next.remove(&n) {
+                voter.failed.insert(barrier);
+                continue;
+            }
             let mut tx = voter.engine.begin_write().unwrap();
             for update in &updates {
                 match &update.value {
@@ -169,10 +179,11 @@ impl Domain {
             voter.durable.insert(barrier);
         }
         let durable = voter.durable.clone();
+        let failed = voter.failed.clone();
         let standing = voter.standing;
         if let Some(features) = voter.features.as_mut() {
             let mut step = features.observe(standing);
-            step.absorb(features.settle(|b| durable.contains(b), |_| false));
+            step.absorb(features.settle(|b| durable.contains(b), |b| failed.contains(b)));
             self.take(n, step);
         }
     }
@@ -500,6 +511,7 @@ fn a_voter_added_after_an_activation_is_prepared_and_activated_alone() {
             engine: ModelEngine::new(),
             pending: VecDeque::new(),
             durable: BTreeSet::new(),
+            failed: BTreeSet::new(),
             standing: Standing {
                 ballot: ballot(1, 1),
                 leading: false,
@@ -539,4 +551,52 @@ fn a_voter_added_after_an_activation_is_prepared_and_activated_alone() {
         .unwrap();
     assert_eq!(own.configuration, epoch(4));
     let _: FeatureSupportV1 = own;
+}
+
+/// A failed feature batch -- a store fenced at a higher promise refuses
+/// one around an election -- rolls the driver back to its durable rows, not
+/// to a view that may lag them: the follower's prepare stands, and the
+/// leader's next re-send gets it holding the activation, with no restart.
+#[test]
+fn a_failed_install_is_installed_again_from_the_durable_rows() {
+    let mut d = Domain::new(3, &[]);
+    d.mute_activated.insert((replica(1), replica(2)));
+    d.activate(1, EP).unwrap();
+    d.mute_activated.clear();
+    // Voter 2's install fails.
+    d.fail_next.insert(replica(2));
+    d.resend(1);
+    assert!(d.fail_next.is_empty(), "no batch failed");
+    assert!(d.features(2).active().is_empty());
+    assert!(!d.features(1).holders(EP).contains(&replica(2)));
+    // The next re-send installs it.
+    d.resend(1);
+    assert_eq!(d.features(2).active(), set(&[EP]));
+    assert_eq!(d.record(2), d.record(1));
+    assert!(d.features(1).holders(EP).contains(&replica(2)));
+}
+
+/// A voter whose store holds the activation answers the leader's re-send
+/// with `FeatureHeld` even with no support row of its own, as a store
+/// activated before this driver existed is.
+#[test]
+fn a_voter_holding_the_record_answers_even_without_its_support_row() {
+    let mut d = Domain::new(3, &[]);
+    d.activate(1, EP).unwrap();
+    let record = d.record(1).unwrap();
+    // Voter 3's store: the record alone.
+    let mut engine = ModelEngine::new();
+    let mut tx = engine.begin_write().unwrap();
+    let update = record.update().unwrap();
+    tx.put(
+        update.collection,
+        &update.key,
+        update.value.as_ref().unwrap(),
+    )
+    .unwrap();
+    tx.commit_durable().unwrap();
+    d.voter(3).engine = engine;
+    d.restart(3);
+    d.resend(1);
+    assert!(d.features(1).holders(EP).contains(&replica(3)));
 }
