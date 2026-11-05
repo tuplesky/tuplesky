@@ -3070,6 +3070,11 @@ impl Leader {
             | ProtocolMessage::FloorReadiness { .. }
             | ProtocolMessage::ReadConfirm { .. }
             | ProtocolMessage::ReadConfirmed { .. }
+            | ProtocolMessage::FeatureSupport { .. }
+            | ProtocolMessage::FeaturePrepare { .. }
+            | ProtocolMessage::FeaturePrepared { .. }
+            | ProtocolMessage::FeatureActivated { .. }
+            | ProtocolMessage::FeatureHeld { .. }
             | ProtocolMessage::ReportPage(_)
             | ProtocolMessage::PromiseRefused { .. }
             | ProtocolMessage::CatchUpRequest { .. }

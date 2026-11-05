@@ -14,6 +14,7 @@ use coord_checkpoint::install::{
     ChunkSet, InstallError, InstallLimits, InstallRequirements, SelectError, install_shared,
     installed_baseline, select_installed,
 };
+use coord_checkpoint::feature::FeatureRows;
 use coord_checkpoint::manifest::{SharedCheckpointV1, SharedManifestV1};
 use coord_checkpoint::verify::VerifyError;
 use coord_redb_faultkit::{FaultBackend, FaultPlan, Tail};
@@ -1154,7 +1155,7 @@ fn only_a_generation_holding_its_own_install_receipt_is_selected() {
     tx.put(Collection::KvCurrentV1.id(), b"partial", b"row")
         .unwrap();
     tx.commit_durable().unwrap();
-    let Err(err) = select_installed(staged, other_installed.clone()) else {
+    let Err(err) = select_installed(staged, other_installed.clone(), &FeatureRows::default()) else {
         panic!("selected a generation without its own receipt");
     };
     assert!(matches!(err, SelectError::NotInstalled), "{err}");
@@ -1176,7 +1177,7 @@ fn only_a_generation_holding_its_own_install_receipt_is_selected() {
     )
     .unwrap();
     installed.receipt.rows += 1;
-    let Err(err) = select_installed(staged, installed) else {
+    let Err(err) = select_installed(staged, installed, &FeatureRows::default()) else {
         panic!("selected a generation without its own receipt");
     };
     assert!(matches!(err, SelectError::ReceiptMismatch), "{err}");
@@ -1193,10 +1194,74 @@ fn only_a_generation_holding_its_own_install_receipt_is_selected() {
     )
     .unwrap();
     let number = staged.generation();
-    let mut generation = select_installed(staged, installed.clone()).unwrap();
+    let mut generation = select_installed(staged, installed.clone(), &FeatureRows::default()).unwrap();
     assert_eq!(current_pointer(&root), format!("gen-{number:06}"));
     let view = generation.engine().reader().snapshot().unwrap();
     assert_eq!(installed_baseline(&view).unwrap(), Some(installed.receipt));
+}
+
+/// A generation replacement carries the voter's own feature rows: a
+/// staging without them is refused, since its `admit` would let in a build
+/// the active generation refuses, and one they were carried into is
+/// selected holding them (task-d99).
+#[test]
+fn a_staging_without_the_active_generations_feature_rows_is_not_selected() {
+    use coord_checkpoint::feature::{FeatureSupportV1, admit, prepare_feature};
+    use coord_consensus::quorum::EpochVoters;
+    use coord_types::formats::Feature;
+
+    let donor = donor_checkpoint();
+    let dir = tempfile::tempdir().unwrap();
+    let root = learner_root(dir.path());
+    // The active generation's rows: this voter prepared `EarlyProposal`.
+    let mut active = ModelEngine::new();
+    let voters = EpochVoters::new(epoch(EPOCH), [LEARNER].into_iter().collect()).unwrap();
+    let offered = FeatureSupportV1::of_this_build(LEARNER, CLUSTER, DOMAIN, epoch(EPOCH));
+    let view = active.reader().snapshot().unwrap();
+    let updates = prepare_feature(&view, &voters, &offered, Feature::EarlyProposal).unwrap();
+    drop(view);
+    let mut tx = active.begin_write().unwrap();
+    for update in &updates {
+        tx.put(update.collection, &update.key, update.value.as_ref().unwrap())
+            .unwrap();
+    }
+    tx.commit_durable().unwrap();
+    let view = active.reader().snapshot().unwrap();
+    let rows = FeatureRows::read(&view, &LEARNER).unwrap();
+    drop(view);
+
+    let mut staged = InactiveGeneration::stage(&root, identity(LEARNER, 3), options()).unwrap();
+    let installed = install_shared(
+        staged.engine(),
+        &donor.manifest,
+        chunk_set(&donor),
+        &requirements(),
+        &install_limits(),
+    )
+    .unwrap();
+    let Err(err) = select_installed(staged, installed, &rows) else {
+        panic!("selected a generation without the voter's feature rows");
+    };
+    assert!(matches!(err, SelectError::FeatureRowsMissing), "{err}");
+    assert_eq!(current_pointer(&root), "gen-000001");
+
+    let mut staged = InactiveGeneration::stage(&root, identity(LEARNER, 3), options()).unwrap();
+    let installed = install_shared(
+        staged.engine(),
+        &donor.manifest,
+        chunk_set(&donor),
+        &requirements(),
+        &install_limits(),
+    )
+    .unwrap();
+    coord_checkpoint::install::carry_feature_rows(staged.engine(), &rows).unwrap();
+    let mut generation = select_installed(staged, installed, &rows).unwrap();
+    let view = generation.engine().reader().snapshot().unwrap();
+    assert!(rows.held_by(&view).unwrap());
+    assert!(
+        coord_checkpoint::feature::prepared(&view, &LEARNER, Feature::EarlyProposal).unwrap()
+    );
+    assert!(admit(&view).unwrap().is_empty(), "a marker activates nothing");
 }
 
 #[test]

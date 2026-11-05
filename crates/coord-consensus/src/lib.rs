@@ -171,7 +171,7 @@ pub use leader::{
 };
 pub use learner::{AppliedOutcome, LearnError, Learner, LearningMode};
 pub use messages::{
-    CatchUpEntry, MAX_CATCH_UP_BYTES, MAX_CATCH_UP_COMMANDS, MAX_PAYLOAD_TRANSFER,
+    CatchUpEntry, FeatureRecord, MAX_CATCH_UP_BYTES, MAX_CATCH_UP_COMMANDS, MAX_PAYLOAD_TRANSFER,
     MAX_PROPOSAL_ASK, PathAnchors, ProtocolMessage, SubmissionRefusal, is_payload_transfer,
 };
 pub use phase::{GuardViolation, Phase, guard_accept, guard_commit, guard_execute};

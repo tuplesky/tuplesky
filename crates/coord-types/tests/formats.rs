@@ -125,3 +125,30 @@ fn every_feature_in_the_registry_is_one_this_build_supports() {
     assert_eq!(Feature::from_id(0), None);
     assert_eq!(Supported::features().len(), Feature::ALL.len());
 }
+
+/// A prepare marker and its feature name each other, the marker is never
+/// reported, and the frozen id is the one the design names (task-d99).
+#[test]
+fn a_prepare_marker_names_its_feature_and_is_never_reported() {
+    assert_eq!(Feature::EarlyProposalPrepared.id(), 0x0005);
+    assert_eq!(
+        Feature::EarlyProposal.prepare_marker(),
+        Some(Feature::EarlyProposalPrepared)
+    );
+    assert_eq!(
+        Feature::EarlyProposalPrepared.marks(),
+        Some(Feature::EarlyProposal)
+    );
+    for feature in Feature::ALL {
+        if let Some(marker) = feature.prepare_marker() {
+            assert_eq!(marker.marks(), Some(feature));
+            assert!(marker.is_marker() && !feature.is_marker());
+        }
+        assert_eq!(Feature::from_name(feature.name()), Some(feature));
+    }
+    assert!(Supported::reported().all(|f| !f.is_marker()));
+    assert_eq!(
+        Supported::reported().count(),
+        Feature::ALL.iter().filter(|f| !f.is_marker()).count()
+    );
+}

@@ -78,7 +78,7 @@ impl FeatureSupportV1 {
             cluster,
             domain,
             configuration,
-            features: Supported::features().iter().map(|f| f.id()).collect(),
+            features: Supported::reported().map(|f| f.id()).collect(),
         }
     }
 
@@ -321,6 +321,12 @@ pub enum ActivateError {
         /// The feature.
         feature: Feature,
     },
+    /// A prepare marker, which is written by a prepare and never
+    /// activated (task-d99).
+    NotActivatable {
+        /// The marker.
+        feature: Feature,
+    },
     /// The store failed.
     Engine(EngineError),
 }
@@ -336,6 +342,9 @@ impl core::fmt::Display for ActivateError {
             ),
             ActivateError::AlreadyActive { feature } => {
                 write!(f, "{} is already active", feature.name())
+            }
+            ActivateError::NotActivatable { feature } => {
+                write!(f, "{} is a prepare marker, not a feature", feature.name())
             }
             ActivateError::Engine(e) => write!(f, "{e}"),
         }
@@ -362,6 +371,9 @@ pub fn activate_feature<V: OrderedRead>(
     feature: Feature,
     limits: &TrimLimits,
 ) -> Result<StoreUpdate, ActivateError> {
+    if feature.is_marker() {
+        return Err(ActivateError::NotActivatable { feature });
+    }
     let rows = read_support(view, limits).map_err(|e| match e {
         TrimError::Engine(e) => ActivateError::Engine(e),
         other => ActivateError::Engine(corrupt(match other {
@@ -454,7 +466,9 @@ pub fn admit<V: OrderedRead>(view: &V) -> Result<BTreeSet<Feature>, AdmitError> 
     ActiveFeatures::recovered(active.clone())
         .admits(&supported)
         .map_err(|missing| AdmitError::TooOld(TooOld { missing }))?;
-    Ok(active)
+    // A prepare marker is a requirement on this build, read above, and
+    // turns nothing on: only a feature's own id does (task-d99).
+    Ok(active.into_iter().filter(|f| !f.is_marker()).collect())
 }
 
 /// Why a store was not admitted.
@@ -481,4 +495,358 @@ impl From<EngineError> for AdmitError {
     fn from(e: EngineError) -> Self {
         AdmitError::Engine(e)
     }
+}
+
+/// Why a prepare could not be written (task-d99).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PrepareError {
+    /// The feature has no prepare marker, so nothing would bind this
+    /// voter's report once durable, and it is not activated through the
+    /// running path.
+    NotActivatable {
+        /// The feature.
+        feature: Feature,
+    },
+    /// This build does not report the feature.
+    Unsupported {
+        /// The feature.
+        feature: Feature,
+    },
+    /// The support row was refused (another configuration, not a voter,
+    /// or a withdrawal), or the store failed.
+    Refused(String),
+}
+
+impl core::fmt::Display for PrepareError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            PrepareError::NotActivatable { feature } => write!(
+                f,
+                "{} has no prepare marker and cannot be activated in a running domain",
+                feature.name()
+            ),
+            PrepareError::Unsupported { feature } => {
+                write!(f, "this build does not support {}", feature.name())
+            }
+            PrepareError::Refused(why) => f.write_str(why),
+        }
+    }
+}
+
+impl core::error::Error for PrepareError {}
+
+/// What a voter's prepare of `feature` writes, in one batch (task-d99,
+/// design Section 13): its durable support row, from `record_support`,
+/// and `feature`'s prepare marker in its own activation record.
+///
+/// The marker is the rollback guard. Every build since `admit` reads the
+/// activation record at start and refuses one naming an id it does not
+/// know, so once this batch is durable a build from before the marker
+/// cannot start on this store, and the report it holds cannot outlive the
+/// binary that made it. A record with no activation yet is created with
+/// the marker alone and no reporters: it activates nothing.
+pub fn prepare_feature<V: OrderedRead>(
+    view: &V,
+    voters: &EpochVoters,
+    offered: &FeatureSupportV1,
+    feature: Feature,
+) -> Result<Vec<StoreUpdate>, PrepareError> {
+    let Some(marker) = feature.prepare_marker() else {
+        return Err(PrepareError::NotActivatable { feature });
+    };
+    if !offered.features.contains(&feature.id()) {
+        return Err(PrepareError::Unsupported { feature });
+    }
+    let support = record_support(view, voters, offered)
+        .map_err(|e| PrepareError::Refused(format!("{e:?}")))?;
+    let held = published_activation(view).map_err(|e| PrepareError::Refused(format!("{e:?}")))?;
+    let mut record = held.unwrap_or(ActiveFeaturesV1 {
+        cluster: offered.cluster,
+        domain: offered.domain,
+        configuration: voters.epoch(),
+        features: Vec::new(),
+        reporters: Vec::new(),
+    });
+    if record.cluster != offered.cluster || record.domain != offered.domain {
+        return Err(PrepareError::Refused(
+            "the activation record is another cluster's or domain's".into(),
+        ));
+    }
+    let mut updates = vec![support];
+    if !record.features.contains(&marker.id()) {
+        record.features.push(marker.id());
+        record.features.sort_unstable();
+        updates.push(StoreUpdate {
+            collection: Collection::CheckpointV1.id(),
+            key: ACTIVE_KEY.to_vec(),
+            value: Some(
+                record
+                    .encode()
+                    .map_err(|e| PrepareError::Refused(format!("{e:?}")))?,
+            ),
+        });
+    }
+    Ok(updates)
+}
+
+/// Whether this voter's store holds a durable prepare of `feature`: its
+/// own support row names it, and its activation record names the marker.
+pub fn prepared<V: OrderedRead>(
+    view: &V,
+    me: &ReplicaId,
+    feature: Feature,
+) -> Result<bool, EngineError> {
+    let Some(marker) = feature.prepare_marker() else {
+        return Ok(false);
+    };
+    let supported = own_support(view, me)?.is_some_and(|row| row.features.contains(&feature.id()));
+    let marked = published_activation(view)?.is_some_and(|r| r.features.contains(&marker.id()));
+    Ok(supported && marked)
+}
+
+/// Why an activation record was not installed (task-d99).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InstallActivationError {
+    /// The record names another cluster or domain.
+    OtherDomain,
+    /// This voter's own durable support row does not name these features:
+    /// an activation never lands in a store whose build did not promise it.
+    NotPrepared {
+        /// The features its row does not name.
+        missing: Vec<Feature>,
+    },
+    /// This build does not support a feature the record names.
+    TooOld(TooOld),
+    /// The record would drop a feature this store already holds active:
+    /// two records with different reporters, which no install merges.
+    Diverged,
+    /// The record is unreadable, or the store failed.
+    Engine(EngineError),
+}
+
+impl core::fmt::Display for InstallActivationError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            InstallActivationError::OtherDomain => {
+                f.write_str("the activation is another cluster's or domain's")
+            }
+            InstallActivationError::NotPrepared { missing } => {
+                f.write_str("this voter has not prepared ")?;
+                for (i, feature) in missing.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    f.write_str(feature.name())?;
+                }
+                Ok(())
+            }
+            InstallActivationError::TooOld(e) => write!(f, "{e}"),
+            InstallActivationError::Diverged => {
+                f.write_str("the activation would drop a feature this store holds active")
+            }
+            InstallActivationError::Engine(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl core::error::Error for InstallActivationError {}
+
+impl From<EngineError> for InstallActivationError {
+    fn from(e: EngineError) -> Self {
+        InstallActivationError::Engine(e)
+    }
+}
+
+/// The update that installs `offered`, an activation another voter holds,
+/// into this voter's store, or `None` where the store already holds it
+/// (task-d99, design Section 13).
+///
+/// It is checked against this voter's own durable support row and nothing
+/// else: the prepared reports `activate_feature` counted are in the store
+/// of the leader that wrote it. The record is installed unchanged -- its
+/// configuration and reporters are the domain's one record, whichever
+/// voter holds it -- except that this store's own prepare markers are
+/// kept, since dropping one would undo its rollback guard.
+pub fn install_activation<V: OrderedRead>(
+    view: &V,
+    me: &ReplicaId,
+    offered: &ActiveFeaturesV1,
+) -> Result<Option<StoreUpdate>, InstallActivationError> {
+    let held = published_activation(view)?;
+    if let Some(held) = &held
+        && (held.cluster != offered.cluster || held.domain != offered.domain)
+    {
+        return Err(InstallActivationError::OtherDomain);
+    }
+    let features = offered.features()?;
+    let unsupported: Vec<Feature> = features
+        .iter()
+        .copied()
+        .filter(|f| !Supported::supports(*f))
+        .collect();
+    if !unsupported.is_empty() {
+        return Err(InstallActivationError::TooOld(TooOld {
+            missing: unsupported,
+        }));
+    }
+    let offered_active: BTreeSet<Feature> =
+        features.iter().copied().filter(|f| !f.is_marker()).collect();
+    let own = own_support(view, me)?;
+    if let Some(own) = &own
+        && (own.cluster != offered.cluster || own.domain != offered.domain)
+    {
+        return Err(InstallActivationError::OtherDomain);
+    }
+    let promised: BTreeSet<u16> = own
+        .map(|row| row.features.into_iter().collect())
+        .unwrap_or_default();
+    let missing: Vec<Feature> = offered_active
+        .iter()
+        .copied()
+        .filter(|f| !promised.contains(&f.id()))
+        .collect();
+    if !missing.is_empty() {
+        return Err(InstallActivationError::NotPrepared { missing });
+    }
+    let held_ids: BTreeSet<u16> = held
+        .as_ref()
+        .map(|r| r.features.iter().copied().collect())
+        .unwrap_or_default();
+    let held_active: BTreeSet<Feature> = match &held {
+        Some(record) => record
+            .features()?
+            .into_iter()
+            .filter(|f| !f.is_marker())
+            .collect(),
+        None => BTreeSet::new(),
+    };
+    if !held_active.is_subset(&offered_active) {
+        return Err(InstallActivationError::Diverged);
+    }
+    if held_active == offered_active {
+        return Ok(None);
+    }
+    let mut ids: BTreeSet<u16> = offered.features.iter().copied().collect();
+    ids.extend(held_ids);
+    let record = ActiveFeaturesV1 {
+        features: ids.into_iter().collect(),
+        ..offered.clone()
+    };
+    Ok(Some(StoreUpdate {
+        collection: Collection::CheckpointV1.id(),
+        key: ACTIVE_KEY.to_vec(),
+        value: Some(record.encode()?),
+    }))
+}
+
+/// The features a store's activation record turns on: its ids without the
+/// prepare markers. Empty where nothing is activated.
+pub fn active_features<V: OrderedRead>(view: &V) -> Result<BTreeSet<Feature>, EngineError> {
+    Ok(match published_activation(view)? {
+        Some(record) => record
+            .features()?
+            .into_iter()
+            .filter(|f| !f.is_marker())
+            .collect(),
+        None => BTreeSet::new(),
+    })
+}
+
+/// A voter's own feature rows, which a generation replacement carries
+/// (task-d99, design Section 13): its support row, and its activation
+/// record with its prepare markers.
+///
+/// They live in `checkpoint_v1`, node-private and outside the common
+/// hash, so no checkpoint image carries them and an install writes none.
+/// A voter whose new generation lacked them would start with no
+/// activation and no marker, and its next `admit` would admit any build.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FeatureRows {
+    /// This voter's support row.
+    pub support: Option<FeatureSupportV1>,
+    /// Its activation record, markers included.
+    pub activation: Option<ActiveFeaturesV1>,
+}
+
+impl FeatureRows {
+    /// `me`'s rows in the store behind `view`.
+    pub fn read<V: OrderedRead>(view: &V, me: &ReplicaId) -> Result<Self, EngineError> {
+        Ok(FeatureRows {
+            support: own_support(view, me)?,
+            activation: published_activation(view)?,
+        })
+    }
+
+    /// Whether there is nothing to carry.
+    pub const fn is_empty(&self) -> bool {
+        self.support.is_none() && self.activation.is_none()
+    }
+
+    /// The updates that write these rows into another generation.
+    pub fn updates(&self) -> Result<Vec<StoreUpdate>, EngineError> {
+        let mut out = Vec::new();
+        if let Some(support) = &self.support {
+            out.push(StoreUpdate {
+                collection: Collection::CheckpointV1.id(),
+                key: support_key(&support.voter),
+                value: Some(support.encode()?),
+            });
+        }
+        if let Some(activation) = &self.activation {
+            out.push(StoreUpdate {
+                collection: Collection::CheckpointV1.id(),
+                key: ACTIVE_KEY.to_vec(),
+                value: Some(activation.encode()?),
+            });
+        }
+        Ok(out)
+    }
+
+    /// Whether the store behind `view` holds at least these rows: the same
+    /// voter's support row naming every feature this one does, and an
+    /// activation record naming every id this one does. Less is a store a
+    /// build could be admitted to that this voter's rows refuse.
+    pub fn held_by<V: OrderedRead>(&self, view: &V) -> Result<bool, EngineError> {
+        if let Some(support) = &self.support {
+            let Some(theirs) = own_support(view, &support.voter)? else {
+                return Ok(false);
+            };
+            if !support.features.iter().all(|f| theirs.features.contains(f)) {
+                return Ok(false);
+            }
+        }
+        if let Some(activation) = &self.activation {
+            let Some(theirs) = published_activation(view)? else {
+                return Ok(false);
+            };
+            if !activation
+                .features
+                .iter()
+                .all(|f| theirs.features.contains(f))
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+}
+
+/// Whether a learner may be promoted to voter, given the features the
+/// domain holds active and what the learner currently advertises (task-d99,
+/// design Section 13): every active feature, or the ones it lacks.
+///
+/// Images carry no `checkpoint_v1`, so a joining voter holds no feature
+/// rows and its `admit` accepts any build. The activation's claim that
+/// every configured voter supports the feature would stop holding at the
+/// join, so promotion waits for a current advertisement of each, and the
+/// leader prepares and activates for the joiner alone before it completes.
+pub fn promotion_missing(
+    active: &BTreeSet<Feature>,
+    advertised: &BTreeSet<Feature>,
+) -> Vec<Feature> {
+    active
+        .iter()
+        .copied()
+        .filter(|f| !f.is_marker() && !advertised.contains(f))
+        .collect()
 }
