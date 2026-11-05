@@ -2144,6 +2144,10 @@ With the comparison disabled, the same perturbation is found only through a half
 - **Promotion:** a successor that was a learner (task-d39) enrolls a voter-role leaf for its committed key while it is staged, against task-d42's record, as part of readiness (task-d38). Renewal refuses a role change, and without the early enrollment an issuer outage at activation would leave f at 0 until the new voter re-enrolls. Promotion is then a reconnect under that leaf: the renewal driver's membership and `votes` flag are updated, and `coordd` switches from learner mode to voter mode.
 - **Recovery:** a successor that crashes between the published activation and its own install learns the new epoch from a peer. Frontends and the Rust collector, which has no epoch refresh today, follow the new epoch.
 
+- **Replicated features at promotion (task-d99, #196 review).** A joiner holds no feature rows, since images carry no `checkpoint_v1`:
+  - promotion calls `coord_checkpoint::feature::promotion_missing` and completes only after the joiner's `FeatureHeld`. task-d99's driver re-sends only to configured voters, so that ordering is this task's;
+  - `coord_daemon::feature::Features` takes its `EpochVoters` once, in `open`. At an epoch change it needs the new voters: abandon a prepare in flight, and clear the advertisements and the held set. Until then it drops every message from a joiner as not from a voter.
+
 **Acceptance:** After an activation that replaces C by D, every continuing voter refuses C's old incarnation and admits D without a restart, D votes as a voter, the collector routes to D, and the new epoch elects its first leader. Every successor's position P+1 is the epoch-boundary record, with identical bytes, and a client command pre-accepted at a successor before the switch executes after it, never before. A non-boundary application offered at P+1, after the closure is installed and after the install record, is refused by name. A boundary record whose base, chain value or updates differ from the certificate's is refused, and after the boundary every new stamp and fence carries the new epoch. `config_v1` is byte-identical on every successor, including one whose approvals came from a different majority, were collected again by a replacement coordinator, or were learned from a peer, and the first scrub after activation stops nobody. A restart comes up in the activated configuration and verifies its chain. A successor that crashes before its install learns the epoch from a peer, and one that crashes between its install and the boundary record applies the boundary at start. A successor behind P at the seal reaches P and then the new epoch. D's leaf renews as a voter's after promotion, and under an issuer outage promotion is still only a reconnect. The old epoch's state is dropped, kept or carried as the design amendment decides, each with a test.
 
 **Review boundary:** Installing an activated configuration into running nodes, the epoch-boundary record, the store's admission of it and its refusal of anything else past P, and promoting a learner. No change to the handoff rules or to credential classification.
@@ -2162,6 +2166,8 @@ With the comparison disabled, the same perturbation is found only through a half
 5. each successor installs the new configuration and applies the epoch-boundary record at P+1, which completes the prepared record (task-d40).
 
 Before step 2 the operator can cancel; after it the transition completes with the healthy majority readiness counted, and a successor that fails later is replaced by the next transition. Write the runbook in `docs/operations`, including the cases where more than f voters are stopped or lost, or voters are in task-d36's undecided state: sealing needs an old majority that agrees, so those cases are disaster recovery (a restore as a new cluster, task-59), not replacement. A node stopped by task-d13, task-d36 or task-d37 is replaced this way, task-d32 reuses the path for a voter behind the forgetting floor, and task-m03 builds on it.
+
+- **Replicated features at the handoff (task-d99, #196 review).** The staged generation gets the voter's own feature rows through `carry_feature_rows`, and selection passes them to `select_installed`, which refuses a staging that lacks them. Read those rows from the active generation only once the feature driver's last batch is durable and materialized: a record installed after they were read would be missed.
 
 **Acceptance:** A stress run and a Jepsen scenario each wipe a voter's store under load and replace it, at three and at five voters, with no anomaly, final reads on every node, and the pause and the write stall across activation measured and reported. The replaced incarnation, restarted on its old store, is refused by every voter. A coordinator killed after each durable step resumes to the same successor, and one killed between the point of no return and the first seal resumes to sealing, never to stable. A successor that never reaches readiness leaves the old configuration serving, and cancelling the prepared transition returns it to stable; a cancellation after the point of no return is refused, and a stale coordinator's seal request for a cancelled transition is refused by every voter. With more than f voters stopped, or voters undecided, the command refuses to seal and names the runbook's disaster-recovery section.
 
@@ -3665,9 +3671,53 @@ So every feature-gated change, task-d98's `EarlyProposal` first, would ship unre
   - **Membership:** what a configuration change does to an active feature and to the reports, which name voters of an epoch.
   - **What a refused activation says,** and where an operator reads which voters lack support.
 
+- **The design step's proposal** ([Section 13](tuplesky-design.md#s13-feature-activation), proposed):
+  - **Support is advertised as a peer message** (`FeatureSupport`), not committed. An older build drops a peer message it can't decode (`MalformedPeerMessage`), so a rolling upgrade needs no capability gate, and nothing reaches the order that some voter can't apply.
+  - **Activation is two phases at the leader, on an operator's request** (`coordctl feature activate`):
+    - **prepare:** every voter writes its durable `FeatureSupportV1` and answers, and the leader records each answer;
+    - **activate:** the leader writes `ActiveFeaturesV1` over those rows and sends it. A voter installs it only if its own durable report names the feature.
+  - **A report binds once durable, through a guard every build already runs (#194 review).** Prepare also writes a marker feature id (`EarlyProposalPrepared`) into the voter's own `ActiveFeaturesV1` record. Every build since `admit` refuses a store whose record names an id it doesn't know or support, so a voter rolled back to a build from before task-d99 refuses to start. A check in the new `admit` alone would not bind an older build. The marker gates no behavior. Preparing is the operator's step, so starting a new binary binds nothing.
+  - **The window:** a follower says `FeatureHeld` once its activation row is durable, again at start and on a new ballot. The leader keeps that set in memory, per follower incarnation, and a gated behavior acts toward a follower only while it is in the set. For task-d98, the early send also needs it.
+  - **#194 review, four more rules:**
+    - **a generation replacement keeps the feature rows:** the handoff copies the voter's own support row, markers and activation into the staged generation, and selection refuses a generation that lacks one the active one holds, since `checkpoint_v1` is node-private and no image carries it;
+    - **the held set is per follower boot,** and a follower's entry clears on a new peer link from it, since a restart keeps the incarnation;
+    - **the node's own switch turns on at runtime,** once its own activation row is durable;
+    - **a leader change in the middle:** a follower's `FeatureHeld` carries the activation record it holds, and a new leader whose own support row names the feature installs that record unchanged and resumes the re-sends, since `activate_feature`'s reports are in the old leader's store. `activate` is idempotent, and `feature status` shows a partial state;
+    - **a voter that joins after an activation** holds no feature rows, so promotion to voter requires a current advertisement of every active feature, and the leader prepares and activates for that voter alone before the promotion completes (Section 22's learner rule). The joiner installs the record unchanged, with the original reporters, and `feature status` places a voter in the active set from its `FeatureHeld`, not from the reporters.
+  - **No ordered switch:** a feature that changes what every voter executes needs its own.
+  - **Membership:** everything names its epoch. An activation stays, and a prepare in flight at a change is run again.
+  - **Operator output:** a refusal names the voters missing, and `coordctl feature status` reads the leader's view.
+- **The code step, once the design is accepted:**
+  - the five peer messages, appended to `ProtocolMessage`: `FeatureSupport`, `FeaturePrepare`, `FeaturePrepared`, `FeatureActivated` and `FeatureHeld`;
+  - the leader's prepare and activate driver and its re-send;
+  - the follower's handlers;
+  - the prepare marker ids in `Feature`, written with the support row, and `admit` reading a marker as a requirement on `Supported` only;
+  - the leader's held set, keyed by follower boot, and task-d98's `sends_early_to` reading it;
+  - the node's switch turned on when its own activation row is durable;
+  - the handoff's copy of the feature rows into a staged generation, and selection's refusal of one that lacks them;
+  - a new leader's resumption from a follower's `FeatureHeld`, installing the record it carries;
+  - the promotion check and the single-voter prepare and activate for a joining voter;
+  - `coordctl feature activate` and `feature status`, over the admin API;
+  - the harnesses' activation.
+- **Built (the code step):**
+  - **Rows and markers** (`coord_types::formats`, `coord_checkpoint::feature`): `EarlyProposalPrepared = 0x0005`; `prepare_feature` writes the support row and the marker in one batch; `install_activation` installs another voter's record unchanged over this voter's durable support row, keeping its own markers; `admit` reads a marker as a requirement on `Supported` and returns only what turns a behaviour on. Each rule also takes explicit state (`prepare_rows`, `activation_over`, `installed_record`, `check_support`), since a batch is durable in the journal before its rows are in the view.
+  - **Messages:** the five, appended to `ProtocolMessage`. `FeatureActivated { feature, record }` and `FeatureHeld { record }` carry the record as `FeatureRecord { epoch, features, reporters }`, the row without the cluster and domain, which the link names.
+  - **The driver** (`coord_daemon::feature`, wired through `Node` and `Voter` as the floor is): advertisements at start and on each new peer link; the leader's prepare, its record of each durable answer, its activation once every report is durable in its store, and the send. A follower installs and says `FeatureHeld` once durable.
+  - **The window:** the leader keeps who said `FeatureHeld`, cleared on any new peer link from that voter (a restart has only new links, so this is at least as strict as per boot) and on a new ballot. `Leader::set_early_holders` narrows `sends_early_to` to it. The node's switch follows its own durable record.
+  - **The re-send,** once a second while leading: it asks a voter whose advertisement it has not heard since its last link (a follower answers the leader's `FeatureSupport` with its own), and sends the prepare and the record to every voter not holding an active feature. That one path finishes an activation after a leader change, with the record a follower's `FeatureHeld` gave the new leader, and prepares and activates a voter that joined after one.
+  - **The operator:** `coordd` takes requests on `<state_directory>/admin.sock`, the owner's alone; `coordctl feature --socket <path> activate <name> | status`. A follower refuses and names the leader.
+  - **Handoff and promotion:** `FeatureRows`, `carry_feature_rows` and `select_installed`'s refusal of a staging without the active generation's rows, and `promotion_missing`. No running daemon installs a generation or promotes a learner yet; task-d40 and task-d41 call these where they do.
+  - **Harnesses:** `scripts/bench/activate.sh DIR FEATURE...`, and `ACTIVATE=early-proposal` on `command-cost.sh`. The Jepsen job is the testing session's: it runs `coordctl feature --socket <state>/admin.sock activate early-proposal` against each node after start until one accepts.
+
 **Acceptance:** The design step accepted. Then the code, with tests:
 - activation is refused without every configured voter's support;
 - an activated feature survives a restart, and a build without it is refused at start;
+- a prepared store is refused at start by a build from before task-d99, through that build's own `admit`;
+- after prepare and activate, a voter replaced through install and handoff refuses a build without the feature at its next start;
+- a follower restarted after it said `FeatureHeld` gets no early proposal until it says it again;
+- a node's early send turns on once its own activation row is durable, with no restart;
+- a leader change between activation and the last follower's install still finishes the activation, with the old leader's record and reporters;
+- a voter added after an activation is refused promotion on a build without the feature, and on a build with it ends up holding the activation;
 - the window rule holds in a mixed-build test that includes a voter from before task-d99, not only a voter without the feature;
 - a voter that rolled back after reporting is handled as the design step decides;
 - `coordctl`'s command works against a running domain;

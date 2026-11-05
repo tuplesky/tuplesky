@@ -536,6 +536,23 @@ impl<P: Persistence> Voter<P> {
                     .hear_floor(provenance.from(), readiness, &self.ballot)?,
             );
         }
+        // A peer's feature advertisement, prepare or activation is the
+        // runtime's, like a floor promise (task-d99): the machines ignore
+        // it, and it is taken only from the voter whose link it came on.
+        if let Some(
+            message @ (coord_consensus::ProtocolMessage::FeatureSupport { .. }
+            | coord_consensus::ProtocolMessage::FeaturePrepare { .. }
+            | coord_consensus::ProtocolMessage::FeaturePrepared { .. }
+            | coord_consensus::ProtocolMessage::FeatureActivated { .. }
+            | coord_consensus::ProtocolMessage::FeatureHeld { .. }),
+        ) = &message
+        {
+            out.absorb(
+                self.node
+                    .hear_feature(provenance.from(), message, &self.ballot)?,
+            );
+            return Ok(out);
+        }
         out.absorb(self.node.on_event(
             Event::Peer(AuthenticatedPeerMessage::new(provenance, frame)),
             &self.ballot,
@@ -551,6 +568,40 @@ impl<P: Persistence> Voter<P> {
         }
         out.absorb(self.follow_machine()?);
         Ok(out)
+    }
+
+    /// What this voter says about features at start (task-d99): its
+    /// advertisement to every peer, and what it holds to its leader.
+    pub fn feature_start(&mut self) -> Result<Outbound, DriveError> {
+        self.node.feature_start(&self.ballot)
+    }
+
+    /// A new peer-plane link with `peer` came up (task-d99): what it said
+    /// about features before is forgotten, and it is told this voter's.
+    pub fn peer_linked(&mut self, peer: ReplicaId) -> Result<Outbound, DriveError> {
+        self.node.feature_linked(peer, &self.ballot)
+    }
+
+    /// The leader's paced re-send of feature prepares and activations
+    /// (task-d99).
+    pub fn resend_features(&mut self) -> Result<Outbound, DriveError> {
+        self.node.feature_resend(&self.ballot)
+    }
+
+    /// An operator's request to activate `feature` (task-d99).
+    pub fn activate_feature(
+        &mut self,
+        feature: coord_types::formats::Feature,
+    ) -> Result<
+        Result<(crate::feature::Activation, Outbound), crate::feature::ActivateRefusal>,
+        DriveError,
+    > {
+        self.node.activate_feature(feature, &self.ballot)
+    }
+
+    /// The features as this voter sees them, if it takes part (task-d99).
+    pub fn feature_status(&self) -> Option<crate::feature::FeatureStatus> {
+        self.node.features().map(crate::feature::Features::status)
     }
 
     /// A submission a collector made, from `origin`.

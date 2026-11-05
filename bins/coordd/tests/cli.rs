@@ -6528,8 +6528,18 @@ async fn a_leader_that_sent_early_and_restarted_comes_back_following() {
         "{}",
         running[0].said()
     );
+    // Writes, paced, until the leader has sent one early: it sends early
+    // only to a follower that has said it holds the activation (task-d99),
+    // which may land after the first few writes.
     let before = Caller::bind(&running[1], &cluster.ca, &cluster.ring, [0x65; 16]).await;
-    for sequence in 1..=5u64 {
+    let mut sequence = 0u64;
+    while early_sends(&running[0].said()) == 0 {
+        sequence += 1;
+        assert!(
+            sequence <= 60,
+            "the leader sent nothing early with the feature active:\n{}",
+            running[0].said()
+        );
         let put = ask(&before.connection, &before.put(sequence, b"k", b"before"))
             .await
             .expect("the domain established a write while its leader was up");
@@ -6537,12 +6547,8 @@ async fn a_leader_that_sent_early_and_restarted_comes_back_following() {
             response_of(&put).outcome,
             coord_types::wire_v1::OutcomeV1::Ok { .. }
         ));
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
-    assert!(
-        running[0].waits_until(30, |said| early_sends(said) > 0),
-        "the leader sent nothing early with the feature active:\n{}",
-        running[0].said()
-    );
 
     drop(running.remove(0));
     let back = start(&cluster.configs[0]);
@@ -6581,6 +6587,138 @@ async fn a_leader_that_sent_early_and_restarted_comes_back_following() {
             "voter {}",
             n + 1
         );
+    }
+}
+
+/// `coordctl feature`'s request to voter `n`'s admin socket (task-d99).
+async fn admin(dir: &Path, n: u8, line: &str) -> coordctl::admin::Answer {
+    let socket = dir.join(format!("n{n}")).join("admin.sock");
+    let line = line.to_owned();
+    tokio::task::spawn_blocking(move || {
+        coordctl::admin::request(&socket, &line, std::time::Duration::from_secs(20))
+    })
+    .await
+    .expect("the request ran")
+    .expect("the node answered")
+}
+
+/// An operator activates `EarlyProposal` in a running domain with
+/// `coordctl feature` (task-d99): a follower refuses and names the
+/// leader; the leader prepares every voter, activates, and every voter
+/// ends up holding it, with no restart; its leader then sends early; and
+/// a voter restarted after it still holds it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_operator_activates_a_feature_in_a_running_domain() {
+    let dir = workspace("feature");
+    let cluster = three_voters(&dir);
+    for config in &cluster.configs {
+        let mut text = std::fs::read_to_string(config).expect("read config");
+        text.push_str("\n[metrics]\ninterval_seconds = 1\n");
+        std::fs::write(config, text).expect("write config");
+        assert_eq!(run(config, &["init"]).code, Some(0));
+    }
+    let mut running: Vec<Running> = cluster.configs.iter().map(|c| start(c)).collect();
+    for node in &running {
+        assert!(
+            node.waits_to_say("voters submittable=2 of 2"),
+            "{}",
+            node.said()
+        );
+    }
+    assert!(
+        running[0].waits_to_say("this voter leads ballot 0"),
+        "{}",
+        running[0].said()
+    );
+    let refused = admin(&dir, 2, "feature activate early-proposal").await;
+    assert!(!refused.ok, "a follower activated: {}", refused.text);
+    assert!(refused.text.contains("does not lead"), "{}", refused.text);
+    let refused = admin(&dir, 1, "feature activate no-such-feature").await;
+    assert!(!refused.ok);
+    // Every voter's advertisement reaches the leader as its links come
+    // up; until then the request is refused, naming the voters.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let answer = admin(&dir, 1, "feature activate early-proposal").await;
+        if answer.ok {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the leader never had every voter's advertisement: {}\n-- 1 --\n{}\n-- 2 --\n{}",
+            answer.text,
+            running[0].said(),
+            running[1].said()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    let held = |text: &str| {
+        text.contains("active early-proposal")
+            && text
+                .lines()
+                .filter(|l| l.starts_with("voter "))
+                .all(|l| l.contains(" held early-proposal"))
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut status = admin(&dir, 1, "feature status").await;
+    while !held(&status.text) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "not every voter holds the activation:\n{}",
+            status.text
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        status = admin(&dir, 1, "feature status").await;
+    }
+    assert!(status.ok);
+    let caller = Caller::bind(&running[1], &cluster.ca, &cluster.ring, [0x71; 16]).await;
+    for sequence in 1..=5u64 {
+        let put = ask(&caller.connection, &caller.put(sequence, b"k", b"v"))
+            .await
+            .expect("the domain established a write");
+        assert!(matches!(
+            response_of(&put).outcome,
+            coord_types::wire_v1::OutcomeV1::Ok { .. }
+        ));
+    }
+    assert!(
+        running[0].waits_until(30, |said| early_sends(said) > 0),
+        "the leader sent nothing early once the feature was active:\n{}",
+        running[0].said()
+    );
+    // A voter restarted after the activation holds it, and says so again.
+    drop(running.remove(2));
+    running.push(start(&cluster.configs[2]));
+    assert!(
+        running[2].waits_to_say("voters submittable=2 of 2"),
+        "{}",
+        running[2].said()
+    );
+    let mine = admin(&dir, 3, "feature status").await;
+    assert!(
+        mine.text.contains("active early-proposal"),
+        "the restarted voter's own switch is off:\n{}",
+        mine.text
+    );
+    // The restart may have moved leadership: the leader's view is the
+    // domain's, wherever it is now.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    'held: loop {
+        let mut seen = Vec::new();
+        for n in 1..=3u8 {
+            let status = admin(&dir, n, "feature status").await;
+            if status.text.contains("(this node)") && held(&status.text) {
+                break 'held;
+            }
+            seen.push(status.text);
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no leader sees every voter holding the activation:\n{}\n{}",
+            seen.join("\n"),
+            running[2].said()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
 }
 

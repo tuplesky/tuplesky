@@ -549,6 +549,11 @@ pub struct Leader {
     /// condition). Batches are durable in the order they were submitted,
     /// so once one is, every restart finds it.
     early_ready: bool,
+    /// The followers known to hold `EarlyProposal`'s activation durably
+    /// (task-d99): an early send goes only to one of them. `None` reads
+    /// every follower as holding it, which only a build made for task-d98's
+    /// local reading sets, and the tests of the send itself.
+    early_holders: Option<BTreeSet<ReplicaId>>,
 }
 
 /// This leader's adoption of its own order, published and waiting on the
@@ -641,6 +646,7 @@ impl Leader {
             learned: None,
             early: false,
             early_ready: false,
+            early_holders: None,
             config,
             boot: None,
             alloc: None,
@@ -785,6 +791,7 @@ impl Leader {
             learned: None,
             early: false,
             early_ready: false,
+            early_holders: None,
         };
         // Dependency order among the entries: a command follows every
         // dependency that is itself an entry. A cycle is an invariant
@@ -1994,6 +2001,16 @@ impl Leader {
         self.early
     }
 
+    /// The followers an early proposal may go to: those known to hold the
+    /// activation durably, by their `FeatureHeld` since their last link
+    /// and in this ballot (task-d99, design Section 13's window rule). A
+    /// follower whose store does not hold it may still restart on a build
+    /// that counts an early proposal toward a fast quorum. `None` reads
+    /// every follower as holding it.
+    pub fn set_early_holders(&mut self, holders: Option<BTreeSet<ReplicaId>>) {
+        self.early_holders = holders;
+    }
+
     /// Whether this leader's proposal may go to `voter` before its batch
     /// is durable (design Sections 4.3 and 4.8).
     ///
@@ -2011,6 +2028,13 @@ impl Leader {
     /// `early_ready`).
     fn sends_early_to(&self, voter: &ReplicaId) -> bool {
         if !self.early || !self.early_ready || *voter == self.config.identity.replica {
+            return false;
+        }
+        if self
+            .early_holders
+            .as_ref()
+            .is_some_and(|holders| !holders.contains(voter))
+        {
             return false;
         }
         let quorum = &self.config.quorum;
@@ -3070,6 +3094,11 @@ impl Leader {
             | ProtocolMessage::FloorReadiness { .. }
             | ProtocolMessage::ReadConfirm { .. }
             | ProtocolMessage::ReadConfirmed { .. }
+            | ProtocolMessage::FeatureSupport { .. }
+            | ProtocolMessage::FeaturePrepare { .. }
+            | ProtocolMessage::FeaturePrepared { .. }
+            | ProtocolMessage::FeatureActivated { .. }
+            | ProtocolMessage::FeatureHeld { .. }
             | ProtocolMessage::ReportPage(_)
             | ProtocolMessage::PromiseRefused { .. }
             | ProtocolMessage::CatchUpRequest { .. }

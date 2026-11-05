@@ -609,6 +609,15 @@ pub struct Node<P: Persistence> {
     /// is durable, where it may (task-d98). The node's, not the role's:
     /// every leader this node becomes is given it.
     early_proposal: bool,
+    /// The followers each leader of this node may send early to: those
+    /// known to hold `EarlyProposal`'s activation (task-d99). `None` reads
+    /// every follower as holding it.
+    early_holders: Option<std::collections::BTreeSet<coord_types::ids::ReplicaId>>,
+    /// Whether this node is the build made for task-d98's local reading
+    /// alone, which sends early without an activation.
+    early_without_activation: bool,
+    /// This voter's part in activating features (task-d99).
+    features: Option<crate::feature::Features>,
     /// Commands this replica established, by the path that decided them
     /// (task-d50).
     pub established: Established,
@@ -697,6 +706,9 @@ impl<P: Persistence> Node<P> {
             results: VecDeque::new(),
             resends: coord_consensus::ResendCounts::default(),
             early_proposal: false,
+            early_holders: None,
+            early_without_activation: false,
+            features: None,
             established: Established::default(),
             fast_path: coord_consensus::FastPathCounts::default(),
             release: crate::learned::ReleaseTiming::default(),
@@ -1014,6 +1026,7 @@ impl<P: Persistence> Node<P> {
                 let (mut leader, effects) =
                     Leader::from_recovered(f.into_recovered(), quorum, &decision);
                 leader.set_early_proposal(self.early_proposal);
+                leader.set_early_holders(self.early_holders.clone());
                 self.won = Some(decision);
                 (Machine::Leader(Box::new(leader)), effects)
             }
@@ -1135,6 +1148,207 @@ impl<P: Persistence> Node<P> {
     /// [`Node::set_early_proposal`]).
     pub const fn early_proposal(&self) -> bool {
         self.early_proposal
+    }
+
+    /// Mark this node as the build made for task-d98's local reading
+    /// alone: its leaders send early without an activation, to every
+    /// follower that cannot make a fast quorum from the proposal.
+    pub fn send_early_without_activation(&mut self) {
+        self.early_without_activation = true;
+        self.set_early_holders(None);
+        self.set_early_proposal(true);
+    }
+
+    fn set_early_holders(
+        &mut self,
+        holders: Option<std::collections::BTreeSet<coord_types::ids::ReplicaId>>,
+    ) {
+        if self.early_holders == holders {
+            return;
+        }
+        self.early_holders = holders.clone();
+        if let Machine::Leader(l) = self.machine_mut() {
+            l.set_early_holders(holders);
+        }
+    }
+
+    /// Take part in activating features (task-d99). From here on, this
+    /// node's own durable activation record is its switch, and its leaders
+    /// send early only to the followers known to hold it.
+    pub fn keep_features(&mut self, features: crate::feature::Features) {
+        self.features = Some(features);
+        self.follow_features();
+    }
+
+    /// This voter's feature driver, when it takes part.
+    pub const fn features(&self) -> Option<&crate::feature::Features> {
+        self.features.as_ref()
+    }
+
+    /// The switch and the window, from what the feature driver holds now:
+    /// early sends on once this node's own activation row is durable, and
+    /// only toward the followers that said they hold it.
+    fn follow_features(&mut self) {
+        if self.early_without_activation {
+            return;
+        }
+        let Some(features) = self.features.as_mut() else {
+            return;
+        };
+        if !features.take_changed() {
+            return;
+        }
+        let on = features
+            .active()
+            .contains(&coord_types::formats::Feature::EarlyProposal);
+        let holders = features.holders(coord_types::formats::Feature::EarlyProposal);
+        self.set_early_holders(Some(holders));
+        if on != self.early_proposal {
+            self.set_early_proposal(on);
+        }
+    }
+
+    fn standing(&self, ballot: &Ballot) -> crate::feature::Standing {
+        crate::feature::Standing {
+            ballot: *ballot,
+            leading: self.machine().leads(),
+        }
+    }
+
+    /// The batches a feature step journals, each under its own barrier,
+    /// and its messages, which go now.
+    fn feature_effects(
+        &mut self,
+        step: crate::feature::FeatureStep,
+        out: &mut Outbound,
+    ) -> Vec<Effect> {
+        for (to, message) in step.sends {
+            out.peer.push((
+                PeerId {
+                    replica: to,
+                    incarnation: coord_types::ids::ReplicaIncarnation::ZERO,
+                },
+                message.encode(),
+            ));
+        }
+        step.batches
+            .into_iter()
+            .map(|(barrier, updates)| {
+                Effect::Persist(PersistBatch {
+                    barrier,
+                    base: None,
+                    updates,
+                })
+            })
+            .collect()
+    }
+
+    /// Carry out a feature step.
+    fn carry_feature(
+        &mut self,
+        step: crate::feature::FeatureStep,
+        ballot: &Ballot,
+    ) -> Result<Outbound, DriveError> {
+        let mut out = Outbound::default();
+        let effects = self.feature_effects(step, &mut out);
+        out.absorb(self.carry_out(effects, ballot)?);
+        self.follow_features();
+        Ok(out)
+    }
+
+    /// A peer's feature message, over its own link (task-d99).
+    pub fn hear_feature(
+        &mut self,
+        from: coord_types::ids::ReplicaId,
+        message: &coord_consensus::ProtocolMessage,
+        ballot: &Ballot,
+    ) -> Result<Outbound, DriveError> {
+        let standing = self.standing(ballot);
+        let Some(features) = self.features.as_mut() else {
+            return Ok(Outbound::default());
+        };
+        let mut step = features.observe(standing);
+        step.absorb(features.hear(from, message));
+        self.carry_feature(step, ballot)
+    }
+
+    /// What this voter says at start (task-d99): its advertisement to
+    /// every peer, and what it holds to its leader.
+    pub fn feature_start(&mut self, ballot: &Ballot) -> Result<Outbound, DriveError> {
+        let standing = self.standing(ballot);
+        let Some(features) = self.features.as_mut() else {
+            return Ok(Outbound::default());
+        };
+        let step = features.start(standing);
+        self.carry_feature(step, ballot)
+    }
+
+    /// A new link with `peer` came up (task-d99).
+    pub fn feature_linked(
+        &mut self,
+        peer: coord_types::ids::ReplicaId,
+        ballot: &Ballot,
+    ) -> Result<Outbound, DriveError> {
+        let standing = self.standing(ballot);
+        let Some(features) = self.features.as_mut() else {
+            return Ok(Outbound::default());
+        };
+        let mut step = features.observe(standing);
+        step.absorb(features.linked(peer));
+        self.carry_feature(step, ballot)
+    }
+
+    /// The leader's paced re-send of prepares and activations (task-d99).
+    pub fn feature_resend(&mut self, ballot: &Ballot) -> Result<Outbound, DriveError> {
+        let standing = self.standing(ballot);
+        let Some(features) = self.features.as_mut() else {
+            return Ok(Outbound::default());
+        };
+        let mut step = features.observe(standing);
+        step.absorb(features.resend());
+        self.carry_feature(step, ballot)
+    }
+
+    /// An operator's request to activate `feature` (task-d99).
+    pub fn activate_feature(
+        &mut self,
+        feature: coord_types::formats::Feature,
+        ballot: &Ballot,
+    ) -> Result<
+        Result<(crate::feature::Activation, Outbound), crate::feature::ActivateRefusal>,
+        DriveError,
+    > {
+        let standing = self.standing(ballot);
+        let Some(features) = self.features.as_mut() else {
+            return Ok(Err(crate::feature::ActivateRefusal::NotActivatable(
+                feature,
+            )));
+        };
+        let observed = features.observe(standing);
+        let result = features.activate(feature);
+        let mut out = self.carry_feature(observed, ballot)?;
+        match result {
+            Ok((activation, step)) => {
+                out.absorb(self.carry_feature(step, ballot)?);
+                Ok(Ok((activation, out)))
+            }
+            Err(refusal) => Ok(Err(refusal)),
+        }
+    }
+
+    /// Hand the feature driver what became of its batches, and what the
+    /// ones now durable lead to.
+    fn settle_features(&mut self, ballot: &Ballot, out: &mut Outbound) -> Vec<Effect> {
+        let standing = self.standing(ballot);
+        let Some(features) = self.features.as_mut() else {
+            return Vec::new();
+        };
+        let outbox = &self.outbox;
+        let mut step = features.observe(standing);
+        step.absorb(features.settle(|b| outbox.is_durable(b), |b| outbox.is_failed(b)));
+        let effects = self.feature_effects(step, out);
+        self.follow_features();
+        effects
     }
 
     /// What this replica's re-sends did since boot (task-d49).
@@ -1346,6 +1560,9 @@ impl<P: Persistence> Node<P> {
         for _ in 0..MAX_ROUNDS {
             if queue.is_empty() && !release {
                 queue = self.settle_floor(ballot);
+                if queue.is_empty() {
+                    queue = self.settle_features(ballot, &mut out);
+                }
                 if queue.is_empty() {
                     queue = self.read_executed_rows();
                 }

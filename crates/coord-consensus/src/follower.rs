@@ -4792,7 +4792,12 @@ impl Follower {
             // The runtime answers a read confirmation from the promise it
             // can see (task-d50): it is not a machine transition.
             | ProtocolMessage::ReadConfirm { .. }
-            | ProtocolMessage::ReadConfirmed { .. } => Vec::new(),
+            | ProtocolMessage::ReadConfirmed { .. }
+            | ProtocolMessage::FeatureSupport { .. }
+            | ProtocolMessage::FeaturePrepare { .. }
+            | ProtocolMessage::FeaturePrepared { .. }
+            | ProtocolMessage::FeatureActivated { .. }
+            | ProtocolMessage::FeatureHeld { .. } => Vec::new(),
         }
     }
 
