@@ -928,6 +928,8 @@ pub struct Domain<P: Persistence> {
     /// with nobody else in it, and for a process whose frontend holds no
     /// collector credential to submit with.
     links: CollectorLinks,
+    /// Operators' requests over this node's admin socket (task-d99).
+    admin: Option<tokio::sync::mpsc::Receiver<AdminRequest>>,
     /// Lease and private-TTL expiry, where this process votes. A node
     /// that runs no voter schedules nothing: an expiry is a command,
     /// and proposing one is a leader's.
@@ -947,6 +949,13 @@ pub struct Domain<P: Persistence> {
     /// When this leader last sent its voters the proposals they had not
     /// voted on (task-d07).
     resent: Option<std::time::Instant>,
+    /// When this leader last re-sent its feature prepares and
+    /// activations (task-d99); `None` before this voter said what it
+    /// supports and holds at start.
+    features_resent: Option<std::time::Instant>,
+    /// Whether this voter has said, at start, what it supports and holds
+    /// (task-d99).
+    features_started: bool,
     /// How long those calls took, in all and the longest (task-d59).
     resend_time: (std::time::Duration, std::time::Duration),
     /// When this voter's campaign last asked for the report pages it
@@ -1237,6 +1246,12 @@ const PAYLOAD_RETRY: std::time::Duration = std::time::Duration::from_millis(50);
 /// serves, so a vote on its way is not answered with a second copy, and
 /// short enough that a voter that missed a proposal is not held long.
 const RESEND_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// How often a leader re-sends the feature prepares and activations its
+/// voters have not answered (task-d99). An operator's request, not the
+/// domain's traffic: a second is soon enough, and a voter that cannot
+/// answer -- an older build -- costs no more than that.
+const FEATURE_RESEND_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Something in a domain that has work due at a time rather than on an
 /// event.
@@ -1585,9 +1600,12 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             plane: None,
             api_traffic: None,
             links: CollectorLinks::new(Vec::new()),
+            admin: None,
             expiry: None,
             asked: None,
             resent: None,
+            features_resent: None,
+            features_started: false,
             resend_time: Default::default(),
             pages_asked: None,
             parked: coord_daemon::parked::Parked::new(PARKED_HOLD, PARKED_EVIDENCE),
@@ -1955,6 +1973,58 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         self.housekeeping.as_ref().map_or((0, 0), |h| h.done)
     }
 
+    /// Take operators' requests from `admin` (task-d99).
+    pub fn with_admin(mut self, admin: tokio::sync::mpsc::Receiver<AdminRequest>) -> Self {
+        self.admin = Some(admin);
+        self
+    }
+
+    /// One operator's request (task-d99): `feature activate <name>` or
+    /// `feature status`. The answer's first line is `ok` or `refused:`
+    /// with the reason.
+    fn on_admin(&mut self, api: &Transport, request: AdminRequest) {
+        let words: Vec<&str> = request.line.split_whitespace().collect();
+        let answer = match (&mut self.backing, words.as_slice()) {
+            (Backing::Serving(_), _) => "refused: this node does not vote\n".to_owned(),
+            (Backing::Voting(voter), ["feature", "status"]) => match voter.feature_status() {
+                Some(status) => format!("ok\n{}", feature_status_text(&status)),
+                None => "refused: this voter does not take part in features\n".to_owned(),
+            },
+            (Backing::Voting(voter), ["feature", "activate", name]) => {
+                match coord_types::formats::Feature::from_name(name) {
+                    None => format!("refused: no feature is named {name}\n"),
+                    Some(feature) => match voter.activate_feature(feature) {
+                        Ok(Ok((activation, out))) => {
+                            let provenance = voter.provenance();
+                            self.carry(api, out, provenance);
+                            match activation {
+                                coord_daemon::feature::Activation::Started => format!(
+                                    "ok\n{} is being prepared at every voter; \
+                                     `coordctl feature status` shows where it stands\n",
+                                    feature.name()
+                                ),
+                                coord_daemon::feature::Activation::AlreadyActive => format!(
+                                    "ok\n{} is active at this leader; the voters that do \
+                                     not hold it yet are sent it again\n",
+                                    feature.name()
+                                ),
+                            }
+                        }
+                        Ok(Err(refusal)) => format!("refused: {refusal}\n"),
+                        Err(DriveError::Fenced(what)) => {
+                            let said = format!("refused: this voter is fenced: {what}\n");
+                            self.fenced_stop = Some(what);
+                            said
+                        }
+                        Err(e) => format!("refused: {e}\n"),
+                    },
+                }
+            }
+            _ => "refused: expected `feature activate <name>` or `feature status`\n".to_owned(),
+        };
+        let _ = request.reply.send(answer);
+    }
+
     /// Submit to the other voters over `links`.
     pub fn with_links(mut self, links: CollectorLinks) -> Self {
         self.links = links;
@@ -2207,6 +2277,10 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                         self.requested();
                         continue;
                     }
+                    Some(request) = next_admin(self.admin.as_mut()) => {
+                        self.on_admin(transport, request);
+                        continue;
+                    }
                     () = sleep, if wake.is_some() => continue,
                 }
             } else {
@@ -2244,6 +2318,10 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                     }
                     Some(()) = next_signal(operator.as_mut()) => {
                         self.requested();
+                        continue;
+                    }
+                    Some(request) = next_admin(self.admin.as_mut()) => {
+                        self.on_admin(transport, request);
                         continue;
                     }
                     () = sleep, if wake.is_some() => continue,
@@ -2942,6 +3020,27 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             }
         } else {
             self.resent = None;
+        }
+        // What this voter supports, said to every peer, and what it holds,
+        // said to its leader, once at start; a link that comes up later
+        // is told again (task-d99). Then a leader re-sends the prepares
+        // and the activations its voters have not answered, paced: a
+        // voter that never answers costs one message a second.
+        if !self.features_started {
+            self.features_started = true;
+            out.absorb(voter.feature_start()?);
+        }
+        if voter.leads() {
+            let now = std::time::Instant::now();
+            if self
+                .features_resent
+                .is_none_or(|at| now.duration_since(at) >= FEATURE_RESEND_INTERVAL)
+            {
+                self.features_resent = Some(now);
+                out.absorb(voter.resend_features()?);
+            }
+        } else {
+            self.features_resent = None;
         }
         // A report page is published once, on a lane that drops when
         // full: a campaign asks the voters that promised it for the pages
@@ -4286,7 +4385,26 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             // is what an operator reads to see a mesh form, and it is
             // said again whenever a connection's coming or going
             // changed it.
-            TransportEvent::Closed { .. } | TransportEvent::Connected { .. } => {
+            // A new link from or to a voter: what it said about features
+            // before is forgotten -- a restart draws only new links -- and
+            // it is told this voter's (task-d99).
+            TransportEvent::Connected { identity, .. } => {
+                if let Some(plane) = &mut self.plane {
+                    plane.report();
+                }
+                if let (Some(peer), Backing::Voting(voter)) = (identity.replica, &mut self.backing)
+                {
+                    match voter.peer_linked(peer) {
+                        Ok(out) => {
+                            let provenance = voter.provenance();
+                            self.carry(api, out, provenance);
+                        }
+                        Err(DriveError::Fenced(what)) => self.fenced_stop = Some(what),
+                        Err(e) => eprintln!("this voter cannot answer a new link: {e}"),
+                    }
+                }
+            }
+            TransportEvent::Closed { .. } => {
                 if let Some(plane) = &mut self.plane {
                     plane.report();
                 }
@@ -5013,6 +5131,126 @@ fn operator_signal() -> Option<OperatorSignal> {
 
 /// The next operator request, or never where there is no signal to wait
 /// on: a `select!` arm needs a future either way.
+/// An operator's request over a node's admin socket (task-d99): one
+/// line, answered with text whose first line is `ok` or `refused: ...`.
+#[derive(Debug)]
+pub struct AdminRequest {
+    /// The request line.
+    pub line: String,
+    /// Where the answer goes.
+    pub reply: tokio::sync::oneshot::Sender<String>,
+}
+
+/// The longest request line an admin connection may send.
+const ADMIN_LINE_BYTES: u64 = 4096;
+
+/// Listen for operators on a Unix socket at `path` (task-d99): local
+/// only, and only to whoever the socket's permissions let in, which are
+/// set to the owner's alone. A stale socket a crash left is replaced.
+#[cfg(unix)]
+pub fn listen_admin(
+    path: &std::path::Path,
+) -> std::io::Result<tokio::sync::mpsc::Receiver<AdminRequest>> {
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+
+    if let Ok(meta) = std::fs::symlink_metadata(path)
+        && meta.file_type().is_socket()
+    {
+        std::fs::remove_file(path)?;
+    }
+    let listener = tokio::net::UnixListener::bind(path)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    let (requests, admin) = tokio::sync::mpsc::channel(8);
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                continue;
+            };
+            let requests = requests.clone();
+            tokio::spawn(async move {
+                let (read, mut write) = stream.into_split();
+                let mut line = String::new();
+                let mut reader = tokio::io::BufReader::new(read.take(ADMIN_LINE_BYTES));
+                if reader.read_line(&mut line).await.is_err() {
+                    return;
+                }
+                let (reply, answer) = tokio::sync::oneshot::channel();
+                if requests
+                    .send(AdminRequest {
+                        line: line.trim().to_owned(),
+                        reply,
+                    })
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                if let Ok(answer) = answer.await {
+                    let _ = write.write_all(answer.as_bytes()).await;
+                }
+                let _ = write.shutdown().await;
+            });
+        }
+    });
+    Ok(admin)
+}
+
+/// `coordctl feature status`'s text.
+pub fn feature_status_text(status: &coord_daemon::feature::FeatureStatus) -> String {
+    use coord_daemon::feature::hex;
+    use std::fmt::Write as _;
+
+    fn names(set: &std::collections::BTreeSet<coord_types::formats::Feature>) -> String {
+        if set.is_empty() {
+            return "-".to_owned();
+        }
+        set.iter().map(|f| f.name()).collect::<Vec<_>>().join(",")
+    }
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "epoch {} leader {}{}",
+        status.epoch.get(),
+        status.leader.as_ref().map_or_else(|| "-".to_owned(), hex),
+        if status.leading {
+            " (this node)"
+        } else {
+            " (not this node: its view is not the domain's)"
+        }
+    );
+    let _ = writeln!(out, "active {}", names(&status.active));
+    let _ = writeln!(
+        out,
+        "activating {}",
+        status.activating.map_or("-", |f| f.name())
+    );
+    for voter in &status.voters {
+        let _ = writeln!(
+            out,
+            "voter {} advertised {} prepared {} held {}",
+            hex(&voter.voter),
+            voter
+                .advertised
+                .as_ref()
+                .map_or_else(|| "?".to_owned(), names),
+            names(&voter.prepared),
+            voter.held.as_ref().map_or_else(|| "?".to_owned(), names),
+        );
+    }
+    out
+}
+
+/// The next operator request, or never where there is no admin socket.
+async fn next_admin(
+    admin: Option<&mut tokio::sync::mpsc::Receiver<AdminRequest>>,
+) -> Option<AdminRequest> {
+    match admin {
+        Some(admin) => admin.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
 async fn next_signal(signal: Option<&mut OperatorSignal>) -> Option<()> {
     match signal {
         #[cfg(unix)]

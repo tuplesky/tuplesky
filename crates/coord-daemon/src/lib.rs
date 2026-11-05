@@ -70,6 +70,7 @@ pub mod catch_up;
 pub mod config;
 pub mod diagnostics;
 pub mod fanout;
+pub mod feature;
 pub mod floor;
 pub mod identity;
 pub mod learned;

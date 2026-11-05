@@ -296,7 +296,6 @@ fn a_build_that_cannot_read_the_active_state_refuses_it() {
     assert!(future.features().is_err());
 }
 
-
 fn apply_all<E: LocalEngine>(engine: &mut E, updates: Vec<coord_core::effect::StoreUpdate>) {
     let mut tx = engine.begin_write().unwrap();
     for update in &updates {
@@ -345,7 +344,9 @@ fn a_prepare_writes_the_report_and_the_marker_and_activates_nothing() {
     );
     // A build that does not report the feature does not prepare it.
     let mut without = report(1);
-    without.features.retain(|f| *f != Feature::EarlyProposal.id());
+    without
+        .features
+        .retain(|f| *f != Feature::EarlyProposal.id());
     assert!(matches!(
         prepare_feature(&view, &voters, &without, Feature::EarlyProposal),
         Err(PrepareError::Refused(_) | PrepareError::Unsupported { .. })
@@ -499,7 +500,9 @@ fn a_voter_that_rolls_back_after_preparing_is_refused_not_counted() {
     // A build without `EarlyProposal` reports less, and the shrink is
     // refused, as every withdrawal is.
     let mut without = report(1);
-    without.features.retain(|f| *f != Feature::EarlyProposal.id());
+    without
+        .features
+        .retain(|f| *f != Feature::EarlyProposal.id());
     assert!(record_support(&view, &voters, &without).is_err());
     // And the marker it holds is a requirement such a build fails:
     // `admit`'s rule over the record, with that build's support.

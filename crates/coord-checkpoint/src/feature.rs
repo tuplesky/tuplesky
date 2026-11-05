@@ -115,6 +115,15 @@ impl FeatureSupportV1 {
     pub fn decode(bytes: &[u8]) -> Result<Self, EngineError> {
         decode_record(SUPPORT_RECORD_KIND, bytes, "feature support record")
     }
+
+    /// The update that writes this row.
+    pub fn update(&self) -> Result<StoreUpdate, EngineError> {
+        Ok(StoreUpdate {
+            collection: Collection::CheckpointV1.id(),
+            key: support_key(&self.voter),
+            value: Some(self.encode()?),
+        })
+    }
 }
 
 /// The key of `voter`'s support row.
@@ -172,6 +181,24 @@ impl ActiveFeaturesV1 {
     pub fn decode(bytes: &[u8]) -> Result<Self, EngineError> {
         decode_record(ACTIVE_RECORD_KIND, bytes, "active features record")
     }
+
+    /// The update that writes this record.
+    pub fn update(&self) -> Result<StoreUpdate, EngineError> {
+        Ok(StoreUpdate {
+            collection: Collection::CheckpointV1.id(),
+            key: ACTIVE_KEY.to_vec(),
+            value: Some(self.encode()?),
+        })
+    }
+
+    /// The features it turns on: its ids without the prepare markers.
+    pub fn turned_on(&self) -> Result<BTreeSet<Feature>, EngineError> {
+        Ok(self
+            .features()?
+            .into_iter()
+            .filter(|f| !f.is_marker())
+            .collect())
+    }
 }
 
 /// This node's own support row, if it has written one.
@@ -202,8 +229,26 @@ pub fn record_support<V: OrderedRead>(
     voters: &EpochVoters,
     offered: &FeatureSupportV1,
 ) -> Result<StoreUpdate, TrimError> {
+    let held = own_support(view, &offered.voter)?;
+    check_support(held.as_ref(), voters, offered)?;
+    Ok(offered.update()?)
+}
+
+/// [`record_support`]'s rule over the row this store holds for the same
+/// voter, `held`, as the caller knows it: a runtime whose last batch is
+/// still in the journal knows a row its view does not show yet.
+pub fn check_support(
+    held: Option<&FeatureSupportV1>,
+    voters: &EpochVoters,
+    offered: &FeatureSupportV1,
+) -> Result<(), TrimError> {
     let mut ledger = SupportLedger::new(voters.clone());
-    if let Some(held) = own_support(view, &offered.voter)? {
+    if let Some(held) = held {
+        if held.voter != offered.voter {
+            return Err(TrimError::Engine(corrupt(
+                "a support row checked against another voter's",
+            )));
+        }
         // A row from an earlier configuration is what a voter retained
         // across a membership change left behind, and the report it is
         // making now replaces it: refusing the row as another
@@ -230,11 +275,7 @@ pub fn record_support<V: OrderedRead>(
     ledger
         .record(&offered.report()?)
         .map_err(|e| TrimError::Engine(corrupt(support_refusal(e))))?;
-    Ok(StoreUpdate {
-        collection: Collection::CheckpointV1.id(),
-        key: support_key(&offered.voter),
-        value: Some(offered.encode()?),
-    })
+    Ok(())
 }
 
 const fn support_refusal(e: coord_consensus::feature::SupportError) -> &'static str {
@@ -371,9 +412,6 @@ pub fn activate_feature<V: OrderedRead>(
     feature: Feature,
     limits: &TrimLimits,
 ) -> Result<StoreUpdate, ActivateError> {
-    if feature.is_marker() {
-        return Err(ActivateError::NotActivatable { feature });
-    }
     let rows = read_support(view, limits).map_err(|e| match e {
         TrimError::Engine(e) => ActivateError::Engine(e),
         other => ActivateError::Engine(corrupt(match other {
@@ -381,8 +419,27 @@ pub fn activate_feature<V: OrderedRead>(
             _ => "support rows could not be read",
         })),
     })?;
+    let held = published_activation(view)?;
+    let record = activation_over(&rows, held.as_ref(), voters, cluster, domain, feature)?;
+    Ok(record.update()?)
+}
+
+/// [`activate_feature`]'s rule over the support rows and the activation
+/// record the caller knows this store holds: the record that activates
+/// `feature`, keeping every id `held` names.
+pub fn activation_over(
+    rows: &[FeatureSupportV1],
+    held: Option<&ActiveFeaturesV1>,
+    voters: &EpochVoters,
+    cluster: ClusterId,
+    domain: DomainId,
+    feature: Feature,
+) -> Result<ActiveFeaturesV1, ActivateError> {
+    if feature.is_marker() {
+        return Err(ActivateError::NotActivatable { feature });
+    }
     let mut reports = Vec::with_capacity(rows.len());
-    for row in &rows {
+    for row in rows {
         // A row is evidence only for the cluster and domain it names.
         // The consensus-level report carries neither, so this is the
         // one place a row copied or replayed from another store can be
@@ -396,7 +453,7 @@ pub fn activate_feature<V: OrderedRead>(
         reports.push(row.report()?);
     }
     let ledger = SupportLedger::recovered(voters.clone(), &reports);
-    let mut active = match published_activation(view)? {
+    let mut active = match held {
         Some(record) => record.active()?,
         None => ActiveFeatures::new(),
     };
@@ -413,17 +470,12 @@ pub fn activate_feature<V: OrderedRead>(
                 ActivateError::Engine(corrupt("a support ledger of another configuration"))
             }
         })?;
-    let record = ActiveFeaturesV1 {
+    Ok(ActiveFeaturesV1 {
         cluster,
         domain,
         configuration: voters.epoch(),
         features: active.active().iter().map(|f| f.id()).collect(),
         reporters: voters.voters().iter().copied().collect(),
-    };
-    Ok(StoreUpdate {
-        collection: Collection::CheckpointV1.id(),
-        key: ACTIVE_KEY.to_vec(),
-        value: Some(record.encode()?),
     })
 }
 
@@ -551,16 +603,35 @@ pub fn prepare_feature<V: OrderedRead>(
     offered: &FeatureSupportV1,
     feature: Feature,
 ) -> Result<Vec<StoreUpdate>, PrepareError> {
+    let refused = |e: EngineError| PrepareError::Refused(format!("{e:?}"));
+    let support = own_support(view, &offered.voter).map_err(refused)?;
+    let held = published_activation(view).map_err(refused)?;
+    let record = prepare_rows(support.as_ref(), held.as_ref(), voters, offered, feature)?;
+    let mut updates = vec![offered.update().map_err(refused)?];
+    if let Some(record) = record {
+        updates.push(record.update().map_err(refused)?);
+    }
+    Ok(updates)
+}
+
+/// [`prepare_feature`]'s rule over the support row and the activation
+/// record the caller knows this voter's store holds: `offered` is the row
+/// to write, and the record is returned where the marker is not in it yet.
+pub fn prepare_rows(
+    support: Option<&FeatureSupportV1>,
+    held: Option<&ActiveFeaturesV1>,
+    voters: &EpochVoters,
+    offered: &FeatureSupportV1,
+    feature: Feature,
+) -> Result<Option<ActiveFeaturesV1>, PrepareError> {
     let Some(marker) = feature.prepare_marker() else {
         return Err(PrepareError::NotActivatable { feature });
     };
     if !offered.features.contains(&feature.id()) {
         return Err(PrepareError::Unsupported { feature });
     }
-    let support = record_support(view, voters, offered)
-        .map_err(|e| PrepareError::Refused(format!("{e:?}")))?;
-    let held = published_activation(view).map_err(|e| PrepareError::Refused(format!("{e:?}")))?;
-    let mut record = held.unwrap_or(ActiveFeaturesV1 {
+    check_support(support, voters, offered).map_err(|e| PrepareError::Refused(format!("{e:?}")))?;
+    let mut record = held.cloned().unwrap_or(ActiveFeaturesV1 {
         cluster: offered.cluster,
         domain: offered.domain,
         configuration: voters.epoch(),
@@ -572,21 +643,12 @@ pub fn prepare_feature<V: OrderedRead>(
             "the activation record is another cluster's or domain's".into(),
         ));
     }
-    let mut updates = vec![support];
-    if !record.features.contains(&marker.id()) {
-        record.features.push(marker.id());
-        record.features.sort_unstable();
-        updates.push(StoreUpdate {
-            collection: Collection::CheckpointV1.id(),
-            key: ACTIVE_KEY.to_vec(),
-            value: Some(
-                record
-                    .encode()
-                    .map_err(|e| PrepareError::Refused(format!("{e:?}")))?,
-            ),
-        });
+    if record.features.contains(&marker.id()) {
+        return Ok(None);
     }
-    Ok(updates)
+    record.features.push(marker.id());
+    record.features.sort_unstable();
+    Ok(Some(record))
 }
 
 /// Whether this voter's store holds a durable prepare of `feature`: its
@@ -673,7 +735,21 @@ pub fn install_activation<V: OrderedRead>(
     offered: &ActiveFeaturesV1,
 ) -> Result<Option<StoreUpdate>, InstallActivationError> {
     let held = published_activation(view)?;
-    if let Some(held) = &held
+    let own = own_support(view, me)?;
+    match installed_record(held.as_ref(), own.as_ref(), offered)? {
+        Some(record) => Ok(Some(record.update()?)),
+        None => Ok(None),
+    }
+}
+
+/// [`install_activation`]'s rule over the record and the support row the
+/// caller knows this voter's store holds: the record to write, or `None`.
+pub fn installed_record(
+    held: Option<&ActiveFeaturesV1>,
+    own: Option<&FeatureSupportV1>,
+    offered: &ActiveFeaturesV1,
+) -> Result<Option<ActiveFeaturesV1>, InstallActivationError> {
+    if let Some(held) = held
         && (held.cluster != offered.cluster || held.domain != offered.domain)
     {
         return Err(InstallActivationError::OtherDomain);
@@ -689,16 +765,18 @@ pub fn install_activation<V: OrderedRead>(
             missing: unsupported,
         }));
     }
-    let offered_active: BTreeSet<Feature> =
-        features.iter().copied().filter(|f| !f.is_marker()).collect();
-    let own = own_support(view, me)?;
-    if let Some(own) = &own
+    let offered_active: BTreeSet<Feature> = features
+        .iter()
+        .copied()
+        .filter(|f| !f.is_marker())
+        .collect();
+    if let Some(own) = own
         && (own.cluster != offered.cluster || own.domain != offered.domain)
     {
         return Err(InstallActivationError::OtherDomain);
     }
     let promised: BTreeSet<u16> = own
-        .map(|row| row.features.into_iter().collect())
+        .map(|row| row.features.iter().copied().collect())
         .unwrap_or_default();
     let missing: Vec<Feature> = offered_active
         .iter()
@@ -708,16 +786,8 @@ pub fn install_activation<V: OrderedRead>(
     if !missing.is_empty() {
         return Err(InstallActivationError::NotPrepared { missing });
     }
-    let held_ids: BTreeSet<u16> = held
-        .as_ref()
-        .map(|r| r.features.iter().copied().collect())
-        .unwrap_or_default();
-    let held_active: BTreeSet<Feature> = match &held {
-        Some(record) => record
-            .features()?
-            .into_iter()
-            .filter(|f| !f.is_marker())
-            .collect(),
+    let held_active = match held {
+        Some(record) => record.turned_on()?,
         None => BTreeSet::new(),
     };
     if !held_active.is_subset(&offered_active) {
@@ -727,15 +797,12 @@ pub fn install_activation<V: OrderedRead>(
         return Ok(None);
     }
     let mut ids: BTreeSet<u16> = offered.features.iter().copied().collect();
-    ids.extend(held_ids);
-    let record = ActiveFeaturesV1 {
+    if let Some(held) = held {
+        ids.extend(held.features.iter().copied());
+    }
+    Ok(Some(ActiveFeaturesV1 {
         features: ids.into_iter().collect(),
         ..offered.clone()
-    };
-    Ok(Some(StoreUpdate {
-        collection: Collection::CheckpointV1.id(),
-        key: ACTIVE_KEY.to_vec(),
-        value: Some(record.encode()?),
     }))
 }
 
@@ -743,11 +810,7 @@ pub fn install_activation<V: OrderedRead>(
 /// prepare markers. Empty where nothing is activated.
 pub fn active_features<V: OrderedRead>(view: &V) -> Result<BTreeSet<Feature>, EngineError> {
     Ok(match published_activation(view)? {
-        Some(record) => record
-            .features()?
-            .into_iter()
-            .filter(|f| !f.is_marker())
-            .collect(),
+        Some(record) => record.turned_on()?,
         None => BTreeSet::new(),
     })
 }

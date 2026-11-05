@@ -394,9 +394,9 @@ impl fmt::Display for SelectError {
                 f.write_str("staged generation's receipt differs from the completed install")
             }
             SelectError::Receipt(e) => write!(f, "install receipt: {e}"),
-            SelectError::FeatureRowsMissing => f.write_str(
-                "staged generation lacks a feature row the active generation holds",
-            ),
+            SelectError::FeatureRowsMissing => {
+                f.write_str("staged generation lacks a feature row the active generation holds")
+            }
             SelectError::Activate(e) => write!(f, "activate: {e}"),
         }
     }

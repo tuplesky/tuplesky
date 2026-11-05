@@ -10,11 +10,11 @@
 //! donor's identity, never an obligation the learner did not make itself.
 
 use coord_checkpoint::export::{CheckpointOrigin, ExportLimits, export_shared};
+use coord_checkpoint::feature::FeatureRows;
 use coord_checkpoint::install::{
     ChunkSet, InstallError, InstallLimits, InstallRequirements, SelectError, install_shared,
     installed_baseline, select_installed,
 };
-use coord_checkpoint::feature::FeatureRows;
 use coord_checkpoint::manifest::{SharedCheckpointV1, SharedManifestV1};
 use coord_checkpoint::verify::VerifyError;
 use coord_redb_faultkit::{FaultBackend, FaultPlan, Tail};
@@ -1155,7 +1155,8 @@ fn only_a_generation_holding_its_own_install_receipt_is_selected() {
     tx.put(Collection::KvCurrentV1.id(), b"partial", b"row")
         .unwrap();
     tx.commit_durable().unwrap();
-    let Err(err) = select_installed(staged, other_installed.clone(), &FeatureRows::default()) else {
+    let Err(err) = select_installed(staged, other_installed.clone(), &FeatureRows::default())
+    else {
         panic!("selected a generation without its own receipt");
     };
     assert!(matches!(err, SelectError::NotInstalled), "{err}");
@@ -1194,7 +1195,8 @@ fn only_a_generation_holding_its_own_install_receipt_is_selected() {
     )
     .unwrap();
     let number = staged.generation();
-    let mut generation = select_installed(staged, installed.clone(), &FeatureRows::default()).unwrap();
+    let mut generation =
+        select_installed(staged, installed.clone(), &FeatureRows::default()).unwrap();
     assert_eq!(current_pointer(&root), format!("gen-{number:06}"));
     let view = generation.engine().reader().snapshot().unwrap();
     assert_eq!(installed_baseline(&view).unwrap(), Some(installed.receipt));
@@ -1222,8 +1224,12 @@ fn a_staging_without_the_active_generations_feature_rows_is_not_selected() {
     drop(view);
     let mut tx = active.begin_write().unwrap();
     for update in &updates {
-        tx.put(update.collection, &update.key, update.value.as_ref().unwrap())
-            .unwrap();
+        tx.put(
+            update.collection,
+            &update.key,
+            update.value.as_ref().unwrap(),
+        )
+        .unwrap();
     }
     tx.commit_durable().unwrap();
     let view = active.reader().snapshot().unwrap();
@@ -1258,10 +1264,11 @@ fn a_staging_without_the_active_generations_feature_rows_is_not_selected() {
     let mut generation = select_installed(staged, installed, &rows).unwrap();
     let view = generation.engine().reader().snapshot().unwrap();
     assert!(rows.held_by(&view).unwrap());
+    assert!(coord_checkpoint::feature::prepared(&view, &LEARNER, Feature::EarlyProposal).unwrap());
     assert!(
-        coord_checkpoint::feature::prepared(&view, &LEARNER, Feature::EarlyProposal).unwrap()
+        admit(&view).unwrap().is_empty(),
+        "a marker activates nothing"
     );
-    assert!(admit(&view).unwrap().is_empty(), "a marker activates nothing");
 }
 
 #[test]
