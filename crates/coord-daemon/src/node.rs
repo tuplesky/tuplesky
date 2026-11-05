@@ -181,6 +181,24 @@ impl Machine {
         }
     }
 
+    /// Count executions durable only as the node reports them
+    /// (task-d90). The command table carries it across a role change.
+    fn track_execution_durability(&mut self) {
+        match self {
+            Machine::Leader(m) => m.track_execution_durability(),
+            Machine::Follower(m) => m.track_execution_durability(),
+        }
+    }
+
+    /// The journal holds this replica's executions through `position`
+    /// (task-d90).
+    fn executions_durable_through(&mut self, position: ExecutionPosition) {
+        match self {
+            Machine::Leader(m) => m.executions_durable_through(position),
+            Machine::Follower(m) => m.executions_durable_through(position),
+        }
+    }
+
     /// What a leader committed since the last call (task-d62).
     pub fn take_learned(&mut self) -> Vec<CommandId> {
         match self {
@@ -698,6 +716,9 @@ impl<P: Persistence> Node<P> {
             unordered_since: std::collections::BTreeMap::new(),
         };
         node.machine_mut().observe_learning();
+        // A group's outcomes are taken before it is journaled, so what
+        // the machine may forget waits for the journal (task-d90).
+        node.machine_mut().track_execution_durability();
         node
     }
 
@@ -1450,6 +1471,12 @@ impl<P: Persistence> Node<P> {
                 // release rule had admitted it.
                 Effect::Established(result) => {
                     let command = result.command();
+                    // Held with the group's results until the group is in
+                    // the journal (task-d63), so the execution is durable
+                    // here, and the machine may forget it in its turn
+                    // (task-d90).
+                    self.machine_mut()
+                        .executions_durable_through(result.position());
                     if result.fast_path() {
                         self.established.fast += 1;
                     } else {

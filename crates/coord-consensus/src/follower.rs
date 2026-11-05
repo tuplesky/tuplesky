@@ -2559,6 +2559,25 @@ impl Follower {
         self.learner.executed_through()
     }
 
+    /// Count this replica's executions durable only as its runtime says
+    /// they are ([`Self::executions_durable_through`]), not when they are
+    /// applied (task-d90). For a runtime whose execution groups reach
+    /// the journal after their outcomes are taken.
+    pub fn track_execution_durability(&mut self) {
+        self.table.track_execution_durability();
+    }
+
+    /// This replica's journal holds its executions through `position`
+    /// (task-d90): those may now be forgotten, in their turn.
+    pub fn executions_durable_through(&mut self, position: ExecutionPosition) {
+        let undurable = self
+            .learner
+            .executed_through()
+            .get()
+            .saturating_sub(position.get());
+        self.table.executions_durable_except(undurable);
+    }
+
     /// The materializer applied `command`: seal and publish the established
     /// result, then learn whatever the new phase enables.
     pub fn applied(
