@@ -1426,6 +1426,43 @@ Audit accepted/rejected policy, session, enrollment, membership, compaction and 
 
 At-rest encrypted volumes and scoped access protect files/checkpoints/backups. Voters, collectors and observers see role-required data; no operator-blind encryption claim. A domain's scalar revision can disclose aggregate activity across namespaces; independent domains avoid a fleet-wide counter side channel. Protocol/data feature activation is replicated after compatible binaries; unsupported versions fail explicitly. Upgrades retain recovery and rollback rules.
 
+<a id="s13-feature-activation"></a>
+**Activating a feature in a running domain (task-d99, proposed; reviewed before any code).** task-60 built the rule (`coord_consensus::feature`: unanimity of the configured voters, no deactivation) and its rows (`coord_checkpoint::feature`: `FeatureSupportV1` and `ActiveFeaturesV1`). `coordd` uses only `admit` at start. This is the path from a binary that supports a feature to a domain that uses it. A rolling upgrade is the case it must get right: until the last voter is upgraded, some voters run a build that knows nothing of it.
+- **Support is advertised, not committed.**
+  - Each voter sends `FeatureSupport { epoch, features }` to every configured voter: at start, on every new peer link, and when asked. A receiver keeps the latest one per peer incarnation, in memory. It binds nothing.
+  - Why a peer message and not a committed command: no voter may skip a committed command it can't decode, so the first report in a rolling upgrade would reach builds that can't apply it.
+  - A build that can't decode a peer message records `MalformedPeerMessage` and changes nothing (`Follower` and `Leader` alike). So an advertisement reaches only the builds that understand it, and no capability gate is needed for it. Floor readiness travels the same way (Section 5.3).
+- **Activation is an operator's two-phase request, run by the leader.** `coordctl feature activate <name>` reaches the domain's leader. A follower refuses it and names the leader.
+  1. **Prepare.**
+     - The leader needs a current advertisement of the feature from every configured voter, its own included. Otherwise it refuses, naming the voters without one.
+     - It sends `FeaturePrepare { feature, epoch }` to every voter.
+     - A voter whose build supports the feature writes its durable `FeatureSupportV1` row (`record_support`) and, once the row is durable, answers `FeaturePrepared` with its report. The leader records each answer in its own store with `record_support`.
+  2. **Activate.**
+     - Once every configured voter's prepared report is durable in its store, the leader writes `ActiveFeaturesV1` (`activate_feature`, which checks unanimity over those rows).
+     - It then sends `FeatureActivated { feature, epoch, reporters }` to every voter.
+     - A voter writes the activation row only if its own durable support row names the feature. An activation never lands in a store whose build didn't promise it.
+     - The leader sends `FeatureActivated` again on its re-send timer to any follower that hasn't said it holds it (below), and a new leader does the same.
+- **A report binds once it is durable.**
+  - From a voter's prepared row on, `admit` refuses a build that lacks what the row promised, as it refuses one lacking an active feature.
+  - Rollback before preparing is still running the old binary. After preparing, rollback is a restore (task-59), which task-60 already says of activation.
+  - So a voter can't report a feature, roll back, and leave unanimity counting a build it no longer runs.
+  - Preparing is the operator's step, not a start's, so starting a new binary once doesn't bind anything.
+  - A prepare that never completes leaves its rows binding, and a later activation reuses them. `record_support` already refuses a report that shrinks.
+- **The window: a gated behavior acts toward a voter only once that voter holds the activation.**
+  - `admit` reads only the voter's own store, so until a follower's activation row is durable, nothing stops it from restarting on an older build.
+  - A follower sends `FeatureHeld { features }` to its leader once its activation row is durable. It sends it again at start (after `admit`) and when it installs a new ballot's Sync.
+  - The leader keeps the set per follower incarnation, in memory. It's empty at its own start and at each new ballot, and absence means not eligible. A follower that never says it, an older build among them, never qualifies.
+  - "Holds" means durable in the store, not executed. A command executes before its execution group is durable, and under task-d90 its result is released before then too.
+  - For task-d98, a proposal goes early only to a follower that holds `EarlyProposal`, besides Section 4.3's fast-quorum rule.
+  - task-d98's follower counts no other voter's fast acknowledgement, so what the other voters run doesn't matter to it. The window rule is enough.
+- **No ordered switch.** Activation is per store, at different times at different voters, and it is safe for a feature whose use is toward one peer at a time under the window rule, as task-d98's is. A feature that changes what every voter executes needs one switch point in the order. task-d99 doesn't provide that; such a feature's own task must.
+- **Membership.** Advertisements, prepared reports and activations name their configuration epoch.
+  - An activation stays across a configuration change, since activation is one-way. A voter joins only on a build `admit` accepts against the state it installs.
+  - A prepare or activation in flight at an epoch change is abandoned, and the operator runs it again under the new epoch. `record_support` already reads a voter's rows from an earlier configuration as binding.
+- **What the operator sees.**
+  - A refused request names the feature and each voter that lacks a current advertisement or a prepared row.
+  - `coordctl feature status` reports, from the leader: each configured voter's advertised, prepared and held features, and the domain's active set.
+
 <a id="s13-1"></a>
 ### 13.1 Resource contract
 
@@ -1748,7 +1785,7 @@ Import inactive generation after checking origin/configuration/format, row order
 <a id="s17-7"></a>
 ### 17.7 Schema upgrades
 
-Same-engine schema upgrades require old/new fixtures and interrupted-generation tests. V1 uses explicit offline/generation replacement, not destructive in-place startup changes or engine savepoint rollback of live promises. Unsupported format fails before admission. Journal, snapshot, application and adapter formats have separate reviewed transitions.
+Same-engine schema upgrades require old/new fixtures and interrupted-generation tests. V1 uses explicit offline/generation replacement, not destructive in-place startup changes or engine savepoint rollback of live promises. Unsupported format fails before admission. Journal, snapshot, application and adapter formats have separate reviewed transitions. A replicated feature is activated in a running domain by advertisement, a prepared report and an activation per store, not by a schema transition (Section 13, task-d99).
 
 <a id="s17-8"></a>
 ### 17.8 Semantic port and physical boundaries

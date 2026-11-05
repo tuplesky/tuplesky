@@ -3620,6 +3620,25 @@ So every feature-gated change, task-d98's `EarlyProposal` first, would ship unre
   - **Membership:** what a configuration change does to an active feature and to the reports, which name voters of an epoch.
   - **What a refused activation says,** and where an operator reads which voters lack support.
 
+- **The design step's proposal** ([Section 13](tuplesky-design.md#s13-feature-activation), proposed):
+  - **Support is advertised as a peer message** (`FeatureSupport`), not committed. An older build drops a peer message it can't decode (`MalformedPeerMessage`), so a rolling upgrade needs no capability gate, and nothing reaches the order that some voter can't apply.
+  - **Activation is two phases at the leader, on an operator's request** (`coordctl feature activate`):
+    - **prepare:** every voter writes its durable `FeatureSupportV1` and answers, and the leader records each answer;
+    - **activate:** the leader writes `ActiveFeaturesV1` over those rows and sends it. A voter installs it only if its own durable report names the feature.
+  - **A report binds once durable.** `admit` refuses a build that lacks what its own prepared row promised. Preparing is the operator's step, so starting a new binary binds nothing.
+  - **The window:** a follower says `FeatureHeld` once its activation row is durable, again at start and on a new ballot. The leader keeps that set in memory, per follower incarnation, and a gated behavior acts toward a follower only while it is in the set. For task-d98, the early send also needs it.
+  - **No ordered switch:** a feature that changes what every voter executes needs its own.
+  - **Membership:** everything names its epoch. An activation stays, and a prepare in flight at a change is run again.
+  - **Operator output:** a refusal names the voters missing, and `coordctl feature status` reads the leader's view.
+- **The code step, once the design is accepted:**
+  - the four peer messages, appended to `ProtocolMessage`;
+  - the leader's prepare and activate driver and its re-send;
+  - the follower's handlers;
+  - `admit`'s check against the voter's own prepared row;
+  - the leader's held set, and task-d98's `sends_early_to` reading it;
+  - `coordctl feature activate` and `feature status`, over the admin API;
+  - the harnesses' activation.
+
 **Acceptance:** The design step accepted. Then the code, with tests:
 - activation is refused without every configured voter's support;
 - an activated feature survives a restart, and a build without it is refused at start;
