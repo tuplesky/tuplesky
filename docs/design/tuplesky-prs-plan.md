@@ -3579,13 +3579,14 @@ About 95% of the register row's writes take the slow path on the runner (a fast 
     - The pair: three and five voters, one worker a voter, sides alternating.
     - It reads #191's `round` and the journal's `served_each` and `queued_each` at every voter.
     - `round`'s p50 and p99 should fall by about one served sync plus one queue wait. If they don't, the batch doesn't carry the change.
-- **Built (the code step, on `claude/compassionate-brahmagupta-jfeevb`, 4231192):**
+- **Built (the code step, `claude/task-d98-early-proposal`, its own PR on #192):**
   - **The rule, in `Leader::proposal_sends`:** a copy leaves with no barrier when the node's setting is on, a proposal batch of this leadership is durable (`early_ready`), and `1 + fast_eligible(follower) < fast_size`. `propose` releases an early copy in the same step, and `retry_proposal` uses the same rule. The leader reply keeps its barrier.
   - **Two departures from the step's text:**
     - **The re-send timer is unchanged.** It re-sends only proposals whose batch is durable, so none of its copies has a barrier left to drop.
     - **The genesis condition is one rule for every leader:** no early copy until a proposal batch of this leadership is durable. A won ballot's bound Sync was submitted before that batch, and batches are durable in submission order, so the rule covers both cases Section 4.8 names. A batch in flight when the first completes keeps its barrier.
   - **The switch:** `Feature::EarlyProposal = 0x0004`. `coordd` takes the active set from `admit` at start and gives it to the node, which gives it to every leader it becomes (`Node::set_early_proposal`, `change_role`). Until task-d99 nothing activates it in a running domain. The cargo feature `early-proposal-without-activation` reads it as active, says so on stderr at start, and is built only for the local pair.
   - **A count:** `resends.early` in the metrics, the copies sent early.
+  - **A follower counts no other voter's fast acknowledgement** (`FollowerRejection::PeerFastAck`). Only a build from before task-d74 sends one to a follower. With an early proposal it would complete a fast quorum at the receiving follower, so condition 2 now rests on that follower's build alone. A follower takes fast decisions from the commit frontier, as task-d74 has it take its slow ones.
   - **Tests:**
     - `coord-consensus/tests/early_proposal.rs`, six model tests:
       - with the feature off, nothing leaves early (the mixed-build test);
@@ -3593,6 +3594,7 @@ About 95% of the register row's writes take the slow path on the runner (a fast 
       - the first batch holds every copy, and a batch in flight when it completes keeps its barrier;
       - adoptions an early copy brings back commit nothing before the batch is durable;
       - a retried batch goes early by the same rule.
+    - `coord-consensus/tests/follower.rs::a_follower_never_counts_another_voters_fast_ack_toward_a_fast_decision`: at three voters, the follower outside the fast set gets r1's fast acknowledgement, equal to the leader's proposal in path and dependencies, and then the proposal. It neither learns nor commits. `equal_direct_dependencies_are_not_learning_and_guards_are_explicit` now reads `PeerFastAck` for the peer's acknowledgement.
     - `coord-daemon/tests/voter.rs::a_leader_a_node_becomes_sends_early_as_the_node_does`.
     - `coordd/tests/cli.rs::a_leader_that_sent_early_and_restarted_comes_back_following`: `EarlyProposal` written into every store, and the leader's `resends.early` above zero. Killed and started again, the leader campaigns, wins ballot 1, never leads ballot 0, and every voter reads the write.
     - The first-batch case is a model test rather than a `coordd` one, since the model test controls when a batch completes. The `coordd` test covers the restart.

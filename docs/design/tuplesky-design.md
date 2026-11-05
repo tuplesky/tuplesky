@@ -298,14 +298,16 @@ Kine occupies G rather than sending to a second remote collector. The diagram is
     - At three voters under C2 it's the follower outside the fast set. The leader and that follower are a slow quorum, so a slow-path round is still one sync while that follower is up.
     - The fast-set follower gets the proposal once the batch is durable, as now, and so does every re-send and retry of it while the batch is volatile.
   - What it costs: at three voters, a slow-path command whose non-fast-set follower is slow or down falls back to today's two syncs in series.
+  - **And a follower counts no other voter's fast acknowledgement** (`FollowerRejection::PeerFastAck`). Since task-d74 only an older build sends one to a follower. Counted with an early proposal, it would complete a fast quorum at the follower that got the proposal early, whatever that follower's own build. A follower takes fast decisions from the leader's commit frontier, as task-d74 already has it learn its slow ones. So condition 2 rests on the receiving follower's build alone, and not on what the other voters run.
   - The other way to hold this is to have every follower learn with the slow predicate only (`LearningMode::SlowOnly`) and take fast decisions from the frontier. It wasn't taken, for three reasons:
     - it changes how every follower learns;
     - it adds a leader turn and a hop to a three-voter fast-set follower's fast decisions, which a read served there would see;
     - the mode must follow the role. `coordd` sets it at boot, while `Leader::from_recovered` and `Follower::from_recovered` carry the learner across an election and a step-down. So a deposed leader would keep `Full` over its successor's early proposals, and a follower that won would lead without fast learning.
-- **A replicated feature.** Section 4.8's conditions 1 and 2 rest on every voter's build, not the leader's alone.
-  - A follower built before task-d74 still hears the other followers' fast acknowledgements. With the proposal, those make a fast quorum at any follower.
+- **A replicated feature.** Section 4.8's condition 2 rests on the build of every follower that gets the proposal early.
+  - A follower built before this change counts the fast acknowledgements other voters send it, and a build from before task-d74 sends them to every voter. With the proposal, those make a fast quorum at the follower that counts them.
     - At three voters, the fast-set follower's acknowledgement does it at the follower outside the fast set.
     - At five voters, two fast-set followers' acknowledgements do it.
+  - A follower of this build drops them (above). So the early send is safe toward a follower whose store holds the activation, since `admit` then refuses any build without it, whatever the other voters run. That is task-d99's window rule.
   - So a leader sends early only while a task-60 feature (`coord_consensus::feature`), `EarlyProposal`, is active. Activating it needs every configured voter to support it (Sections 11.7 and 13). Until then, the leader keeps the barrier on every proposal.
   - `coordd` reads the active set from its store at start (`admit`) and sets the leader's flag from it, through every election. Nothing in a running domain records support or activates a feature yet: that is task-d99, and until it lands the early send is off everywhere.
   - task-d74's "mixed versions are safe" doesn't carry over. That change took evidence away; this one weakens what a message means.
