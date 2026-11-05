@@ -3625,7 +3625,7 @@ So every feature-gated change, task-d98's `EarlyProposal` first, would ship unre
   - **Activation is two phases at the leader, on an operator's request** (`coordctl feature activate`):
     - **prepare:** every voter writes its durable `FeatureSupportV1` and answers, and the leader records each answer;
     - **activate:** the leader writes `ActiveFeaturesV1` over those rows and sends it. A voter installs it only if its own durable report names the feature.
-  - **A report binds once durable.** `admit` refuses a build that lacks what its own prepared row promised. Preparing is the operator's step, so starting a new binary binds nothing.
+  - **A report binds once durable, through a guard every build already runs (#194 review).** Prepare also writes a marker feature id (`EarlyProposalPrepared`) into the voter's own `ActiveFeaturesV1` record. Every build since `admit` refuses a store whose record names an id it doesn't know or support, so a voter rolled back to a build from before task-d99 refuses to start. A check in the new `admit` alone would not bind an older build. The marker gates no behavior. Preparing is the operator's step, so starting a new binary binds nothing.
   - **The window:** a follower says `FeatureHeld` once its activation row is durable, again at start and on a new ballot. The leader keeps that set in memory, per follower incarnation, and a gated behavior acts toward a follower only while it is in the set. For task-d98, the early send also needs it.
   - **No ordered switch:** a feature that changes what every voter executes needs its own.
   - **Membership:** everything names its epoch. An activation stays, and a prepare in flight at a change is run again.
@@ -3634,7 +3634,7 @@ So every feature-gated change, task-d98's `EarlyProposal` first, would ship unre
   - the four peer messages, appended to `ProtocolMessage`;
   - the leader's prepare and activate driver and its re-send;
   - the follower's handlers;
-  - `admit`'s check against the voter's own prepared row;
+  - the prepare marker ids in `Feature`, written with the support row, and `admit` reading a marker as a requirement on `Supported` only;
   - the leader's held set, and task-d98's `sends_early_to` reading it;
   - `coordctl feature activate` and `feature status`, over the admin API;
   - the harnesses' activation.
@@ -3642,6 +3642,7 @@ So every feature-gated change, task-d98's `EarlyProposal` first, would ship unre
 **Acceptance:** The design step accepted. Then the code, with tests:
 - activation is refused without every configured voter's support;
 - an activated feature survives a restart, and a build without it is refused at start;
+- a prepared store is refused at start by a build from before task-d99, through that build's own `admit`;
 - the window rule holds in a mixed-build test that includes a voter from before task-d99, not only a voter without the feature;
 - a voter that rolled back after reporting is handled as the design step decides;
 - `coordctl`'s command works against a running domain;

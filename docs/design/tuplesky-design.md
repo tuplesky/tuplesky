@@ -1436,14 +1436,17 @@ At-rest encrypted volumes and scoped access protect files/checkpoints/backups. V
   1. **Prepare.**
      - The leader needs a current advertisement of the feature from every configured voter, its own included. Otherwise it refuses, naming the voters without one.
      - It sends `FeaturePrepare { feature, epoch }` to every voter.
-     - A voter whose build supports the feature writes its durable `FeatureSupportV1` row (`record_support`) and, once the row is durable, answers `FeaturePrepared` with its report. The leader records each answer in its own store with `record_support`.
+     - A voter whose build supports the feature writes its durable `FeatureSupportV1` row (`record_support`) and, in the same batch, adds the feature's prepare marker to its own `ActiveFeaturesV1` record (below). Once the batch is durable it answers `FeaturePrepared` with its report. The leader records each answer in its own store with `record_support`.
   2. **Activate.**
      - Once every configured voter's prepared report is durable in its store, the leader writes `ActiveFeaturesV1` (`activate_feature`, which checks unanimity over those rows).
      - It then sends `FeatureActivated { feature, epoch, reporters }` to every voter.
      - A voter writes the activation row only if its own durable support row names the feature. An activation never lands in a store whose build didn't promise it.
      - The leader sends `FeatureActivated` again on its re-send timer to any follower that hasn't said it holds it (below), and a new leader does the same.
-- **A report binds once it is durable.**
-  - From a voter's prepared row on, `admit` refuses a build that lacks what the row promised, as it refuses one lacking an active feature.
+- **A report binds once it is durable, and the guard is one every build already enforces (#194 review).**
+  - A guard in the new `admit` alone would bind nothing: a voter rolled back to a build from before it runs that build's `admit`, which reads only the activation record and ignores a support row.
+  - So the prepare marker is a feature id of its own in the voter's `ActiveFeaturesV1` record, one per gated feature (`EarlyProposalPrepared` for task-d98). Every build since `admit` reads that record at start and refuses a store naming a feature id it doesn't know (`Feature::from_id` fails, so the record is corrupt to it) or doesn't support (`TooOld`). A build from before task-d99 knows no marker id, so it refuses to start on a prepared store. That is the rollback guard, and it needs no prerequisite release.
+  - The marker is not the feature. A build that knows it reads it as a requirement on its own `Supported` set, and no behavior is gated on it. Only the feature's own id, written at activation, turns the behavior on.
+  - Builds from before `admit` itself are below the floor task-60 already sets for any activation.
   - Rollback before preparing is still running the old binary. After preparing, rollback is a restore (task-59), which task-60 already says of activation.
   - So a voter can't report a feature, roll back, and leave unanimity counting a build it no longer runs.
   - Preparing is the operator's step, not a start's, so starting a new binary once doesn't bind anything.
