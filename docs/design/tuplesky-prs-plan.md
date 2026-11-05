@@ -3627,15 +3627,23 @@ So every feature-gated change, task-d98's `EarlyProposal` first, would ship unre
     - **activate:** the leader writes `ActiveFeaturesV1` over those rows and sends it. A voter installs it only if its own durable report names the feature.
   - **A report binds once durable, through a guard every build already runs (#194 review).** Prepare also writes a marker feature id (`EarlyProposalPrepared`) into the voter's own `ActiveFeaturesV1` record. Every build since `admit` refuses a store whose record names an id it doesn't know or support, so a voter rolled back to a build from before task-d99 refuses to start. A check in the new `admit` alone would not bind an older build. The marker gates no behavior. Preparing is the operator's step, so starting a new binary binds nothing.
   - **The window:** a follower says `FeatureHeld` once its activation row is durable, again at start and on a new ballot. The leader keeps that set in memory, per follower incarnation, and a gated behavior acts toward a follower only while it is in the set. For task-d98, the early send also needs it.
+  - **#194 review, four more rules:**
+    - **a generation replacement keeps the feature rows:** the handoff copies the voter's own support row, markers and activation into the staged generation, and selection refuses a generation that lacks one the active one holds, since `checkpoint_v1` is node-private and no image carries it;
+    - **the held set is per follower boot,** and a follower's entry clears on a new peer link from it, since a restart keeps the incarnation;
+    - **the node's own switch turns on at runtime,** once its own activation row is durable;
+    - **a leader change in the middle:** a follower's `FeatureHeld` tells a new leader the feature is active, and a leader whose own support row names it writes the activation and resumes the re-sends. `activate` is idempotent, and `feature status` shows a partial state.
   - **No ordered switch:** a feature that changes what every voter executes needs its own.
   - **Membership:** everything names its epoch. An activation stays, and a prepare in flight at a change is run again.
   - **Operator output:** a refusal names the voters missing, and `coordctl feature status` reads the leader's view.
 - **The code step, once the design is accepted:**
-  - the four peer messages, appended to `ProtocolMessage`;
+  - the five peer messages, appended to `ProtocolMessage`: `FeatureSupport`, `FeaturePrepare`, `FeaturePrepared`, `FeatureActivated` and `FeatureHeld`;
   - the leader's prepare and activate driver and its re-send;
   - the follower's handlers;
   - the prepare marker ids in `Feature`, written with the support row, and `admit` reading a marker as a requirement on `Supported` only;
-  - the leader's held set, and task-d98's `sends_early_to` reading it;
+  - the leader's held set, keyed by follower boot, and task-d98's `sends_early_to` reading it;
+  - the node's switch turned on when its own activation row is durable;
+  - the handoff's copy of the feature rows into a staged generation, and selection's refusal of one that lacks them;
+  - a new leader's resumption from a follower's `FeatureHeld`;
   - `coordctl feature activate` and `feature status`, over the admin API;
   - the harnesses' activation.
 
@@ -3643,6 +3651,10 @@ So every feature-gated change, task-d98's `EarlyProposal` first, would ship unre
 - activation is refused without every configured voter's support;
 - an activated feature survives a restart, and a build without it is refused at start;
 - a prepared store is refused at start by a build from before task-d99, through that build's own `admit`;
+- after prepare and activate, a voter replaced through install and handoff refuses a build without the feature at its next start;
+- a follower restarted after it said `FeatureHeld` gets no early proposal until it says it again;
+- a node's early send turns on once its own activation row is durable, with no restart;
+- a leader change between activation and the last follower's install still finishes the activation;
 - the window rule holds in a mixed-build test that includes a voter from before task-d99, not only a voter without the feature;
 - a voter that rolled back after reporting is handled as the design step decides;
 - `coordctl`'s command works against a running domain;
