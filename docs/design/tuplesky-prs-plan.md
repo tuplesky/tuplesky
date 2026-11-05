@@ -3,7 +3,7 @@
 **Status:** Review proposal, consolidated v1.5.  
 **Date:** 2026-09-24.  
 **Companion:** [TupleSky implementation design](tuplesky-design.md).  
-**Scope:** 190 implementation tasks with stable `task-*` identifiers. The `task-01` through `task-66`, `task-s01` through `task-s04`, `task-j01` through `task-j10`, `task-o01` through `task-o06`, `task-m01` through `task-m05`, `task-c01`, `task-c02`, `task-c03`, `task-d01` through `task-d92`, `task-d96` through `task-d98` and `task-q01` suffixes and prerequisites are preserved. v1.5 adds `task-d01` through `task-d04` from review of the open implementation PRs and of multi-host readiness, `task-d05` through `task-d17` from the Jepsen client's runs, `task-d18` through `task-d33` from a review against an external SwiftPaxos correctness checklist ([review record](tuplesky-checklist-review.md)), `task-d34` from what the protocol simulator of task-d30 found, `task-d35` through `task-d44` from a review of recovery time and storage integrity (an execution chain, a scrub, and voter replacement through a prepared transition, a staged learner, terminal recovery after the seal, serving across a transition and a running membership install), `task-d45` through `task-d50` from measuring the throughput of the Jepsen client's first unthrottled runs, `task-d51` from task-d46's long runs, `task-d52` and `task-d53` from a profile of the domain thread after task-d46, `task-d54` from the Jepsen runs of task-d50, `task-d55` through `task-d57` from the Jepsen runs of task-j06, `task-d58` through `task-d61` from a profile of five voters' CPU per operation, `task-d62` through `task-d65` from a consolidated review against the reference SwiftPaxos, `task-d66` from the Jepsen runs of task-d51, `task-d67` from a Jepsen run on #98 that made no fast decision, `task-d68` from task-d62's counts after a leader change, `task-d69` from a profile of a follower's loop, `task-d70` from the Jepsen runner's profile of the transport's workers, `task-d71` from the protocol simulator's first 1,000-seed sweep, `task-d72` through `task-d75` from comparing a command's cost with etcd's on one host, `task-d76` from a Jepsen run that killed the leader, `task-d77` through `task-d81` from the protocol simulator with acknowledgements between followers lost, `task-d82` through `task-d84` from the Jepsen runs of the #173 carry, `task-d85` from the protocol simulator on task-d74's routing, `task-d86` through `task-d92` from planning the whole gap to etcd on #174, and moves committed key replacement from `task-58` to `task-m03`; the changes are listed under [Gate checklist and deferred work](#gate-checklist-and-deferred-work). Task IDs are not GitHub pull-request or issue numbers. One implementation PR corresponds to one task; its GitHub-assigned number is recorded separately. No baseline, supplement or separate amendment is needed.
+**Scope:** 191 implementation tasks with stable `task-*` identifiers. The `task-01` through `task-66`, `task-s01` through `task-s04`, `task-j01` through `task-j10`, `task-o01` through `task-o06`, `task-m01` through `task-m05`, `task-c01`, `task-c02`, `task-c03`, `task-d01` through `task-d92`, `task-d96` through `task-d99` and `task-q01` suffixes and prerequisites are preserved. v1.5 adds `task-d01` through `task-d04` from review of the open implementation PRs and of multi-host readiness, `task-d05` through `task-d17` from the Jepsen client's runs, `task-d18` through `task-d33` from a review against an external SwiftPaxos correctness checklist ([review record](tuplesky-checklist-review.md)), `task-d34` from what the protocol simulator of task-d30 found, `task-d35` through `task-d44` from a review of recovery time and storage integrity (an execution chain, a scrub, and voter replacement through a prepared transition, a staged learner, terminal recovery after the seal, serving across a transition and a running membership install), `task-d45` through `task-d50` from measuring the throughput of the Jepsen client's first unthrottled runs, `task-d51` from task-d46's long runs, `task-d52` and `task-d53` from a profile of the domain thread after task-d46, `task-d54` from the Jepsen runs of task-d50, `task-d55` through `task-d57` from the Jepsen runs of task-j06, `task-d58` through `task-d61` from a profile of five voters' CPU per operation, `task-d62` through `task-d65` from a consolidated review against the reference SwiftPaxos, `task-d66` from the Jepsen runs of task-d51, `task-d67` from a Jepsen run on #98 that made no fast decision, `task-d68` from task-d62's counts after a leader change, `task-d69` from a profile of a follower's loop, `task-d70` from the Jepsen runner's profile of the transport's workers, `task-d71` from the protocol simulator's first 1,000-seed sweep, `task-d72` through `task-d75` from comparing a command's cost with etcd's on one host, `task-d76` from a Jepsen run that killed the leader, `task-d77` through `task-d81` from the protocol simulator with acknowledgements between followers lost, `task-d82` through `task-d84` from the Jepsen runs of the #173 carry, `task-d85` from the protocol simulator on task-d74's routing, `task-d86` through `task-d92` from planning the whole gap to etcd on #174, and moves committed key replacement from `task-58` to `task-m03`; the changes are listed under [Gate checklist and deferred work](#gate-checklist-and-deferred-work). Task IDs are not GitHub pull-request or issue numbers. One implementation PR corresponds to one task; its GitHub-assigned number is recorded separately. No baseline, supplement or separate amendment is needed.
 
 ## How to use this plan
 
@@ -56,6 +56,7 @@ Reference single-store and fixed-membership compositions are early increments, n
 | task-d96 | From the task-d72 batch's call graph of the tokio threads (#185 review): QUIC's packet protection, send and receive are about three fifths of the threads and scale with packets, and the ACK frequency and per-step coalescing are already read, so what is left is fewer messages a command | A design entry before the next batch; no code until it is sized |
 | task-d97 | From the `service` row's R4 (#98, #185 review): its means put L4 at a p50-scale gain, 0.76 to 1.36 ms off a write's release, so nothing on record says what a p99 operation waits for | Before task-d90's code step is sized against the p99 |
 | task-d98 | From the next step on the gap (#185 review): a slow-path write pays two syncs in series before it is learned, the leader's and then a follower's, since the leader sends its proposal only once its batch is durable; about 95% of the register row's writes take the slow path, and two runner syncs are about 4.6 ms against etcd's `service` p99 of 3 | Before the next batch, or the batch revises the `service` target with this as the reason |
+| task-d99 | From task-d98's design step (#192 review): task-60's activation rule and rows exist, but nothing in a running `coordd` records a voter's support or activates a feature, so a feature-gated change ships unreachable, and Section 23 rules out an operator flag around a correctness gate | Before the batch that carries task-d98 |
 | task-q01 | Combined durable WAN/Kine qualification | Required before task-66 |
 
 ```mermaid
@@ -273,7 +274,8 @@ This is a workstream overview; the individual prerequisites are authoritative. O
 | [task-d92](#task-d92) | Cut a local checkpoint publication's cost a record | task-d51, task-d55, task-d72 |
 | [task-d96](#task-d96) | Size the messages a command sends, before cutting them | task-d70, task-d72, task-d88 |
 | [task-d97](#task-d97) | Read what a `service` p99 operation waits for | task-d55, task-d72, task-d91 |
-| [task-d98](#task-d98) | Send the leader's proposal before its batch is durable | task-d30, task-d74, task-d89 |
+| [task-d98](#task-d98) | Send the leader's proposal before its batch is durable | task-d30, task-d74, task-d89, task-d99 |
+| [task-d99](#task-d99) | Activate a replicated feature in a running domain | task-60 |
 | [task-q01](#task-q01) | Produce the combined durable WAN/Kine qualification report | task-j07, task-j08, task-o06, task-m05, task-63, task-64, task-d45, task-d46, task-d47, task-d48, task-d49, task-d51, task-d52, task-d53 |
 
 ## Task specifications
@@ -3035,6 +3037,7 @@ This entry is the budget and the record, not a lever:
     - **Base:** the last batch's head, `b59f2b0`, at two workers.
     - **`etcd-beside`** after each pair, with its setup check on the profiled image first: it is the target.
     - **Correctness first:** L4 and L7 both let something leave before it is durable, so the leader-kill run and the standard schedule run on the head before the pairs.
+    - **L7 needs task-d99 first** (#192 review): its early send is behind a replicated feature, and only task-d99 makes one activatable in a running domain. The head activates `EarlyProposal` after start through task-d99's command, never through a build flag.
     - **The readings:** three register pairs, and `service` at `replay` on both sides with #191's per-voter tails and the fast share, and at `strict` as its own line.
   - **What the batch decides, set now:**
     - **CPU:** the head at or under 2.0× etcd's row closes it. Above, the record names each remaining part from the split it has: the workers, the loops and the materializer.
@@ -3533,7 +3536,7 @@ The change, in two steps:
 <a id="task-d98"></a>
 ### task-d98: Send the leader's proposal before its batch is durable
 
-**Prerequisites:** task-d30, task-d74, task-d89.  
+**Prerequisites:** task-d30, task-d74, task-d89, task-d99 (its local disk pair needn't wait, below).  
 **Design:** Sections 4.3 and 4.8 (amended by this task's design step, if it is accepted).
 
 **Implement:** L7 (#185 review). A slow-path write pays two syncs in series before it is learned:
@@ -3571,6 +3574,8 @@ About 95% of the register row's writes take the slow path on the runner (a fast 
     - **A mixed-build test:** with the feature inactive, no follower gets a proposal before its batch is durable.
     - **A `coordd` test:** a genesis leader holds its first proposal until that batch is durable, with a second batch in flight when the first completes, which keeps its own barrier. A restart after an early send comes back as a follower.
   - **A local pair before the batch, with the stores on a disk** (#192 review). On tmpfs the sync L7 removes isn't there; CI's command-cost job keeps its stores on `/dev/shm`.
+    - The pair needn't wait for task-d99. Its head side is built with a cargo feature that reads `EarlyProposal` as active, as `skip-read-confirmation` serves the register check's negative control, and is never built for anything else. It sizes L7 before the wiring lands.
+    - The fault runs and the batch use task-d99's activation, the production path (Section 23).
     - The pair: three and five voters, one worker a voter, sides alternating.
     - It reads #191's `round` and the journal's `served_each` and `queued_each` at every voter.
     - `round`'s p50 and p99 should fall by about one served sync plus one queue wait. If they don't, the batch doesn't carry the change.
@@ -3578,6 +3583,36 @@ About 95% of the register row's writes take the slow path on the runner (a fast 
 **Acceptance:** The design step accepted, or declined with the reason. If accepted: the code, the simulator's rows clean (rows 1, 2 and 18 with the new knobs, every row at 1,000 seeds with catch-up and without) and the negative control failing, the mixed-build and `coordd` tests, the local pair on a disk showing `round` fall, the leader-kill run and the standard schedule `:valid? true` on its head, and the next batch's `service` row read with it. If declined, the batch revises the `service` target, with the slow path's two syncs in series as the reason.
 
 **Review boundary:** When the leader's proposal leaves and to which followers, the feature that allows it, and when a genesis leader may send early. Followers' learning and acknowledgements, the leader reply, recovery and the release rule are unchanged.
+
+<a id="task-d99"></a>
+### task-d99: Activate a replicated feature in a running domain
+
+**Prerequisites:** task-60.  
+**Design:** Sections 13 and 17.7 (amended by this task's design step, if it is accepted).
+
+**Implement:** task-60 built the rule and its rows: `coord_consensus::feature`'s unanimity of the configured voters, and `coord_checkpoint::feature`'s `FeatureSupportV1` and `ActiveFeaturesV1`. `coordd` uses one piece of it, `admit` at start, which refuses a build that lacks an active feature. Nothing records support or activates (#192 review):
+- `record_support` and `activate_feature` have no caller outside their tests;
+- the only other writer of `ActiveFeaturesV1` is `bins/coordd/tests/cli.rs`'s `write_activation`, which writes the row into a store directly;
+- `coordctl` has no feature command.
+
+So every feature-gated change, task-d98's `EarlyProposal` first, would ship unreachable. Section 23 rules out an operator flag around a correctness gate. This task wires the path every later feature needs too:
+- **Support reports through the order.** Each voter's `FeatureSupportV1` is a committed command, so every voter's unanimity check reads the same reports. A voter submits its own when its build's support differs from what the domain recorded for it.
+- **Activation as an operator command** (`coordctl`). Executing it runs `activate_feature`, which refuses unless every configured voter has reported the feature.
+- **One switch point.** Consensus code reads an active feature from its executed state, so a leader switches at one point in the order.
+- **The harnesses:** the Jepsen job and the bench scripts activate a feature after start, on the side that should have it, so a batch reads the production path.
+- **A design step first,** answering:
+  - **The admission window.** `admit` reads only the voter's own store. A follower that hasn't executed the activation yet still admits an older build, and a feature whose safety rests on every voter's build needs a rule for that window. One option: a gated behavior acts toward a voter only once that voter is known to have executed the activation. For task-d98, the leader would send early only to such a follower.
+  - **Membership:** what a configuration change does to an active feature and to the reports, which name voters of an epoch.
+  - **What a refused activation says,** and where an operator reads which voters lack support.
+
+**Acceptance:** The design step accepted. Then the code, with tests:
+- activation is refused without every configured voter's support;
+- an activated feature survives a restart, and a build without it is refused at start;
+- the window rule holds in a mixed-build test;
+- `coordctl`'s command works against a running domain;
+- the harnesses' activation runs.
+
+**Review boundary:** How a feature becomes active in a running domain. No feature's behavior changes here.
 
 ## Gate checklist and deferred work
 
@@ -3612,7 +3647,7 @@ G3 requires task-43/transitive prerequisites, G4 task-48, G5 checkpoint/replacem
 - **The Jepsen runs of task-d67's code** (#98): after four of five leader changes the new leader ran 81 to 87% fast; the fifth's fixed fast set held the voter just killed, which task-d76 takes. Under load the share stayed at Section 2.2's 1 to 2%, which task-d65 records as confirming that section's decision. The publications over 10 ms spent under 2.5 ms on a CPU or waiting for one, so task-d66's job is built.
 - **Against etcd on one host**, the one matched comparison is 2.5 times behind, at 3.5 to 4.7 ms of server CPU an operation against etcd's 1.39, and none of the gap is the order. task-d72 sets the budget and keeps the record; task-d73 through task-d75 are its levers, after task-d63's build and task-d66's job.
 - **Gating.** task-d45 through task-d49 and task-d51 through task-d53 are prerequisites of task-64 and task-q01, so that the qualification and the combined report measure the protocol rather than these costs. task-d56 is a prerequisite of task-64, as liveness under faults. task-62's remaining rows, and any reference result it publishes again, wait on them and on task-d54 for the same reason. This is stated in task-62 rather than as a prerequisite, since task-62's first runs produced task-c01 and task-c02, which the throughput tasks build on. task-d50, reads and the fast path off the slow path, changes protocol behaviour and waits on its own design amendment.
-- **Design changes.** task-d45 through task-d47, task-d49, task-d51 through task-d56 and task-d58 through task-d62, task-d66, task-d69, task-d70, task-d72, task-d73, task-d75, task-d88, task-d91, task-d92, task-d96 and task-d97 do not change the design; task-d98 amends Sections 4.3 and 4.8 if its design step is accepted; task-d74 amends Sections 4.1 and 4.3 if a decision reads another follower's votes, and task-d76 amends Section 4.2; task-d71 amends Sections 4.9 and 13.1, and task-d77 through task-d80 and task-d85 Section 4.9, and task-d81 Section 6.7.3 if it changes which ballot a donor serves at; task-d82 amends Section 11.4 and the O14 row, task-d83 Section 6.3 and task-d84 Section 17.3.3; task-d89 amends Section 4.7, and task-d90 Sections 4.5, 17.3.3 and 17.4; task-d86 amends Section 17.3.4 only if a commit cadence reaches `strict`, and task-d87 Section 6.3 only if a round serves a read that arrived after it began; task-d67 amends Sections 4.1, 4.7 and 4.9 with its rule, and task-d68 Sections 4.1 and 4.7 with its, and task-d63's release-rule step amends Sections 4.5, 17.3.3 and 17.4; task-d64 amends Sections 4 and 6.4, and task-d65 Section 2.2 if it changes the model. task-d48 amends Section 17.3.4's projection hardening; task-d50 amends Sections 4.5, 6.3 and 17.4; task-d57 amends Sections 2.2, 4.5 and 6.3.
+- **Design changes.** task-d45 through task-d47, task-d49, task-d51 through task-d56 and task-d58 through task-d62, task-d66, task-d69, task-d70, task-d72, task-d73, task-d75, task-d88, task-d91, task-d92, task-d96 and task-d97 do not change the design; task-d98 amends Sections 4.3 and 4.8 if its design step is accepted, and task-d99 Sections 13 and 17.7 with the activation path and the admission window; task-d74 amends Sections 4.1 and 4.3 if a decision reads another follower's votes, and task-d76 amends Section 4.2; task-d71 amends Sections 4.9 and 13.1, and task-d77 through task-d80 and task-d85 Section 4.9, and task-d81 Section 6.7.3 if it changes which ballot a donor serves at; task-d82 amends Section 11.4 and the O14 row, task-d83 Section 6.3 and task-d84 Section 17.3.3; task-d89 amends Section 4.7, and task-d90 Sections 4.5, 17.3.3 and 17.4; task-d86 amends Section 17.3.4 only if a commit cadence reaches `strict`, and task-d87 Section 6.3 only if a round serves a read that arrived after it began; task-d67 amends Sections 4.1, 4.7 and 4.9 with its rule, and task-d68 Sections 4.1 and 4.7 with its, and task-d63's release-rule step amends Sections 4.5, 17.3.3 and 17.4; task-d64 amends Sections 4 and 6.4, and task-d65 Section 2.2 if it changes the model. task-d48 amends Section 17.3.4's projection hardening; task-d50 amends Sections 4.5, 6.3 and 17.4; task-d57 amends Sections 2.2, 4.5 and 6.3.
 
 task-j06 is optional and cannot silently relax durable materialization. ReadFence is its own capability gate. Observers do not improve quorum fault tolerance or acquire voting rights by catching up. Interface drift in Kine is resolved at one explicit pin, not mixed across examples. Strict per-output authorization remains authoritative even for regional observers.
 
