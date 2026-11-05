@@ -3550,22 +3550,34 @@ About 95% of the register row's writes take the slow path on the runner (a fast 
   - **The leader crashing after sending and before its batch is durable:** followers then hold PRE-ACCEPT or ACCEPT rows at ballot b for a proposal the leader's store lacks. A slow quorum can form from followers alone and the frontend learns it from their acknowledgements, so recovery has to keep it. Boot fencing has to keep a rebooted leader from proposing that command at b again with other dependencies or another seqnum.
   - **The protocol simulator,** every row at 1,000 seeds with catch-up and without, with crash cuts between the send and the leader's durability.
 - **What the design step found** (Sections 4.3 and 4.8, proposed):
-  - **A third thing waits for the batch.** A fast-set follower at three voters learns a fast decision from its own vote set: the leader's proposal and its own fast acknowledgement. With the proposal sent early, that would count over a volatile vote. So a follower learns with the slow predicate only, and takes fast decisions from the leader's commit frontier. The cost is one leader turn and one hop for a fast-set follower's fast decisions at three voters. The leader reply and the leader's own learning stay behind the batch, as the entry had them.
+  - **A fast decision at a follower.** A fast-set follower at three voters learns a fast decision from its own vote set: the leader's proposal and its own fast acknowledgement. With the proposal sent early, that would count over a volatile vote.
+    - So the proposal leaves early only to a follower whose own acknowledgement and the proposal fall short of `fast_size`. At three voters under C2 that's the follower outside the fast set, and with the leader it makes a slow quorum. At five voters it's every follower.
+    - The fast-set follower at three voters gets it once the batch is durable, as do re-sends and retries.
+    - The cost: at three voters, a slow-path round whose non-fast-set follower is slow or down falls back to two syncs.
+    - Followers' learning isn't changed (#192 review). `SlowOnly` at followers was the first answer. It would have had to follow the role across elections and step-downs, and it would delay a three-voter follower's fast decisions.
+  - **A replicated feature gates it** (#192 review). A follower built before task-d74 hears the other followers' fast acknowledgements, and with the proposal those make a fast quorum at any follower. So the leader sends early only while a task-60 feature is active, and every configured voter must support it to activate it. Until then, today's barrier stays on every proposal.
   - **Boot fencing has one gap.** `coordd` brings the genesis leader back leading when its store is empty. With early sends, a crash before the first batch is durable leaves exactly that store. So a leader sends early only once its store holds the bound Sync of the ballot it won, or, at the genesis ballot, once its first proposal batch is durable.
   - **Recovery needs no change.** Every copy at a ballot is the leader's one order. A slow decision is durable adoptions, which never rested on the leader's row (task-d19). No fast decision is counted over a volatile proposal. So the source rule and the possible-fast rule keep what they kept.
 - **The code step:**
-  - `Leader::propose` publishes the `Proposal` with no barrier once the leader may send early, and the leader reply keeps its barrier. The proposal's re-send is timed from the send.
-  - A follower's learner runs `LearningMode::SlowOnly`.
+  - `Leader::propose`, `retry_proposal` and the re-send timer publish the `Proposal` with no barrier to each follower that qualifies, while the feature is active and the leader may send early (the genesis condition). Every other copy keeps the barrier, and the leader reply keeps its own.
+  - The feature: a new `coord_types::formats::Feature` variant (`EarlyProposal = 0x0004`) under task-60's unanimity rule.
   - New simulator knobs:
     - one that makes the leader's journal complete its batches later than the followers';
-    - one that crashes the leader while it holds a proposal it sent whose batch isn't durable.
-  - Both are on in rows 1 and 2 and in a new row 18 at three and five voters.
-  - **A negative control:** row 18 with followers still learning fast must fail the oracle on some seed, to show the row reaches the case.
-  - A `coordd` test that a genesis leader holds its first proposal until its batch is durable, and that a restart after an early send comes back as a follower.
+    - one that crashes the leader while it holds a proposal it sent whose batch isn't durable;
+    - one that deposes a live leader in that window: a partition, then the heal.
+  - All three are on in rows 1 and 2, and in a new row 18 at three and five voters.
+  - **A negative control:** row 18 with the fast-set follower at three voters also sent early must fail the oracle on some seed. That shows the row reaches the case.
+  - **Tests:**
+    - **A mixed-build test:** with the feature inactive, no follower gets a proposal before its batch is durable.
+    - **A `coordd` test:** a genesis leader holds its first proposal until that batch is durable, with a second batch in flight when the first completes, which keeps its own barrier. A restart after an early send comes back as a follower.
+  - **A local pair before the batch, with the stores on a disk** (#192 review). On tmpfs the sync L7 removes isn't there; CI's command-cost job keeps its stores on `/dev/shm`.
+    - The pair: three and five voters, one worker a voter, sides alternating.
+    - It reads #191's `round` and the journal's `served_each` and `queued_each` at every voter.
+    - `round`'s p50 and p99 should fall by about one served sync plus one queue wait. If they don't, the batch doesn't carry the change.
 
-**Acceptance:** The design step accepted, or declined with the reason. If accepted: the code, the simulator's rows clean (rows 1, 2 and 18 with the new knobs, every row at 1,000 seeds with catch-up and without) and the negative control failing, the leader-kill run and the standard schedule `:valid? true` on its head, and the next batch's `service` row read with it. If declined, the batch revises the `service` target, with the slow path's two syncs in series as the reason.
+**Acceptance:** The design step accepted, or declined with the reason. If accepted: the code, the simulator's rows clean (rows 1, 2 and 18 with the new knobs, every row at 1,000 seeds with catch-up and without) and the negative control failing, the mixed-build and `coordd` tests, the local pair on a disk showing `round` fall, the leader-kill run and the standard schedule `:valid? true` on its head, and the next batch's `service` row read with it. If declined, the batch revises the `service` target, with the slow path's two syncs in series as the reason.
 
-**Review boundary:** When the leader's proposal leaves, which predicate a follower learns with, and when a genesis leader may send early. Followers' acknowledgements, the leader reply, recovery and the release rule are unchanged.
+**Review boundary:** When the leader's proposal leaves and to which followers, the feature that allows it, and when a genesis leader may send early. Followers' learning and acknowledgements, the leader reply, recovery and the release rule are unchanged.
 
 ## Gate checklist and deferred work
 
