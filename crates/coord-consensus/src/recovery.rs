@@ -709,6 +709,31 @@ pub fn select_decided(
     for c in entries.keys() {
         reproposed.remove(c);
     }
+    // Nor a command no reporter holds a payload row for, the candidate
+    // holds nothing of, and no selected entry waits on (task-d90, point
+    // 4). Every vote rests on a payload row durable at the voter, so a
+    // slow decision of it would be an acceptance in some report and a
+    // fast one a pre-acceptance with its payload at a reporting member of
+    // the fast quorum: it was never decided, and is left out as a command
+    // no reporter held is. Re-proposed, the candidate waited for a
+    // payload no voter it asks has, and never bound: a voter's
+    // pre-acceptance whose payload batch failed, its record durable from
+    // a later batch without the payload row (protocol_sim row 21, five
+    // voters, seed 2). One an entry was decided after is still
+    // re-proposed, for the entry to execute after it (task-d33).
+    let waited_on: BTreeSet<CommandId> = entries
+        .values()
+        .flat_map(|e| e.deps.iter().copied())
+        .collect();
+    reproposed.retain(|c| {
+        waited_on.contains(c)
+            || supplied(c, None)
+            || reports.iter().any(|r| {
+                r.entries
+                    .iter()
+                    .any(|e| e.command == *c && e.payload_present)
+            })
+    });
     let reproposed = within_bound(&entries, reproposed, MAX_REPORT_ENTRIES);
     Ok(SyncDecision {
         ballot: config.ballot(),

@@ -77,8 +77,8 @@
 //! command reach the window it forgets past. Row 20 is oracle 9's sweep.
 //! Row 21 fails a follower's batch of a payload row and its dependency
 //! row, so a later vote's batch can write the dependency row alone, and
-//! crashes a follower while it writes the payload row of such a record; it
-//! is replayed from its kept seeds. Rows 19 and 20 each have a negative
+//! crashes a follower while it writes the payload row of such a record.
+//! Rows 19 and 20 each have a negative
 //! control that must fail: row 19's machines counting executions durable
 //! as they are taken, and row 20's followers' payload rows dropped on their
 //! way to the store.
@@ -413,10 +413,10 @@ impl Knobs {
             // Row 20 with a follower's batch of a payload row and its
             // dependency row failed, definitely not committed, so a later
             // vote's batch writes the dependency row alone, and the crash
-            // restores such a record (task-d90, point 4). Replayed from its
-            // kept seeds only: at five voters, seeds 2, 7, 10 and 35 of 40
-            // stall a campaign while healing, which is not understood yet
-            // (task-d90's plan entry).
+            // restores such a record (task-d90, point 4). Its seeds found
+            // a deposed leader's report of a payload row it never wrote,
+            // and a selection that re-proposed a pre-acceptance whose
+            // payload no voter held, so its campaign never bound.
             21 => Knobs {
                 row,
                 payload_fail: 150_000,
@@ -3186,6 +3186,17 @@ fn run_row(row: u8) {
             "row 19 missed a cut: {totals:?}"
         );
     }
+    // Row 21 is defined by its failed payload batches (task-d90, point
+    // 4): records restored with a dependency row and no payload row, and
+    // a follower crashed while it wrote one's payload row again.
+    if row == 21 {
+        assert!(
+            totals.payload_failures > 0
+                && totals.restored_without_payload > 0
+                && totals.payload_crashes > 0,
+            "row 21 missed its cut: {totals:?}"
+        );
+    }
     // Oracle 9 ran.
     assert!(
         totals.votes_checked > 0,
@@ -3256,6 +3267,11 @@ fn row_19_results_released_before_their_execution_group_is_durable() {
 #[test]
 fn row_20_each_vote_on_a_durable_payload_row() {
     run_row(20);
+}
+
+#[test]
+fn row_21_a_payload_batch_failed_under_a_later_vote() {
+    run_row(21);
 }
 
 /// Row 20's negative control (task-d90, point 4): with a follower's
