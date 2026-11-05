@@ -605,6 +605,10 @@ pub struct Node<P: Persistence> {
     /// What this replica's re-sends did, over every ballot it led since
     /// boot (task-d49).
     resends: coord_consensus::ResendCounts,
+    /// Whether a leader of this node sends its proposal before its batch
+    /// is durable, where it may (task-d98). The node's, not the role's:
+    /// every leader this node becomes is given it.
+    early_proposal: bool,
     /// Commands this replica established, by the path that decided them
     /// (task-d50).
     pub established: Established,
@@ -692,6 +696,7 @@ impl<P: Persistence> Node<P> {
             releases: VecDeque::new(),
             results: VecDeque::new(),
             resends: coord_consensus::ResendCounts::default(),
+            early_proposal: false,
             established: Established::default(),
             fast_path: coord_consensus::FastPathCounts::default(),
             release: crate::learned::ReleaseTiming::default(),
@@ -1006,8 +1011,9 @@ impl<P: Persistence> Node<P> {
             Machine::Follower(f) => {
                 let decision = f.won().cloned().expect("checked above");
                 let quorum = f.quorum().clone();
-                let (leader, effects) =
+                let (mut leader, effects) =
                     Leader::from_recovered(f.into_recovered(), quorum, &decision);
+                leader.set_early_proposal(self.early_proposal);
                 self.won = Some(decision);
                 (Machine::Leader(Box::new(leader)), effects)
             }
@@ -1112,6 +1118,23 @@ impl<P: Persistence> Node<P> {
     /// for a leader of the genesis ballot, which nobody campaigned for.
     pub const fn won(&self) -> Option<&SyncDecision> {
         self.won.as_ref()
+    }
+
+    /// Have every leader of this node send its proposal before its batch
+    /// is durable, to the followers that cannot make a fast quorum from it
+    /// (task-d98): the one it holds now and every one it becomes. Only for
+    /// a domain that activated `EarlyProposal`.
+    pub fn set_early_proposal(&mut self, on: bool) {
+        self.early_proposal = on;
+        if let Machine::Leader(l) = self.machine_mut() {
+            l.set_early_proposal(on);
+        }
+    }
+
+    /// Whether this node's leaders send early (see
+    /// [`Node::set_early_proposal`]).
+    pub const fn early_proposal(&self) -> bool {
+        self.early_proposal
     }
 
     /// What this replica's re-sends did since boot (task-d49).
