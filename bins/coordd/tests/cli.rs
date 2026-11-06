@@ -7274,3 +7274,63 @@ async fn a_voter_restarted_late_under_load_catches_up_in_pages() {
             .join("\n")
     );
 }
+
+/// A node whose configuration sets the runtime's worker count runs that
+/// many tokio workers and serves with its peers; one that doesn't runs
+/// tokio's default (task-d91).
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn the_runtime_runs_the_configured_number_of_workers() {
+    let dir = workspace("worker-threads");
+    let cluster = three_voters(&dir);
+    {
+        let mut text = std::fs::read_to_string(&cluster.configs[0]).expect("read config");
+        text.push_str("\n[runtime]\nworker_threads = 1\n");
+        std::fs::write(&cluster.configs[0], text).expect("write config");
+    }
+    for config in &cluster.configs {
+        assert_eq!(run(config, &["init"]).code, Some(0));
+    }
+    // The configured node and the second run with tokio's environment
+    // variable set, as the Jepsen job sets it for every voter: the
+    // configuration wins on the first, the variable holds on the second
+    // (#190 review).
+    let running: Vec<Running> = cluster
+        .configs
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            if i < 2 {
+                start_with(c, &[("TOKIO_WORKER_THREADS", "2")])
+            } else {
+                start(c)
+            }
+        })
+        .collect();
+    for node in &running {
+        assert!(
+            node.waits_to_say("voters submittable=2 of 2"),
+            "{}",
+            node.said()
+        );
+    }
+    // tokio names its workers' threads; the blocking pool's are named
+    // apart, and the domain loop and store workers are threads of their
+    // own.
+    let workers = |node: &Running| -> usize {
+        let pid = node.child.id();
+        std::fs::read_dir(format!("/proc/{pid}/task"))
+            .expect("the daemon's threads")
+            .filter_map(|t| std::fs::read_to_string(t.ok()?.path().join("comm")).ok())
+            .filter(|name| name.trim() == "tokio-rt-worker")
+            .count()
+    };
+    assert_eq!(workers(&running[0]), 1, "the setting beats the variable");
+    assert_eq!(workers(&running[1]), 2, "the variable, with no setting");
+    // tokio's own default, which its environment variable overrides.
+    let default = std::env::var("TOKIO_WORKER_THREADS")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
+    assert_eq!(workers(&running[2]), default);
+}
