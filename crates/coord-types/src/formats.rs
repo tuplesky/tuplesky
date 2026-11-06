@@ -298,16 +298,29 @@ pub enum Feature {
     /// record and refuses to start, so a voter cannot report the feature,
     /// roll back, and leave unanimity counting a build it no longer runs.
     EarlyProposalPrepared = 0x0005,
+    /// A leader's results released as its commands execute in memory,
+    /// before their execution group is journaled (task-d90, design
+    /// Section 4.5). The argument needs every voter to vote on durable
+    /// payload rows and forget only what its journal holds (#195,
+    /// task-d95): a build from before those can acknowledge a command
+    /// whose payload it has not made durable, and a domain-wide crash in
+    /// that window could lose a result already released.
+    ReleaseAtExecution = 0x0006,
+    /// `ReleaseAtExecution`'s prepare marker, as `EarlyProposalPrepared`
+    /// is `EarlyProposal`'s.
+    ReleaseAtExecutionPrepared = 0x0007,
 }
 
 impl Feature {
     /// Every feature, in identifier order.
-    pub const ALL: [Feature; 5] = [
+    pub const ALL: [Feature; 7] = [
         Feature::CheckpointFloor,
         Feature::SealedHandoff,
         Feature::LocalCheckpoint,
         Feature::EarlyProposal,
         Feature::EarlyProposalPrepared,
+        Feature::ReleaseAtExecution,
+        Feature::ReleaseAtExecutionPrepared,
     ];
 
     /// The frozen identifier.
@@ -323,6 +336,8 @@ impl Feature {
             Feature::LocalCheckpoint => "local-checkpoint",
             Feature::EarlyProposal => "early-proposal",
             Feature::EarlyProposalPrepared => "early-proposal-prepared",
+            Feature::ReleaseAtExecution => "release-at-execution",
+            Feature::ReleaseAtExecutionPrepared => "release-at-execution-prepared",
         }
     }
 
@@ -333,6 +348,7 @@ impl Feature {
     pub const fn prepare_marker(self) -> Option<Feature> {
         match self {
             Feature::EarlyProposal => Some(Feature::EarlyProposalPrepared),
+            Feature::ReleaseAtExecution => Some(Feature::ReleaseAtExecutionPrepared),
             _ => None,
         }
     }
@@ -342,6 +358,7 @@ impl Feature {
     pub const fn marks(self) -> Option<Feature> {
         match self {
             Feature::EarlyProposalPrepared => Some(Feature::EarlyProposal),
+            Feature::ReleaseAtExecutionPrepared => Some(Feature::ReleaseAtExecution),
             _ => None,
         }
     }
@@ -377,7 +394,7 @@ impl Supported {
     /// The features this build supports, in identifier order, prepare
     /// markers included: a marker is supported exactly when the feature
     /// it marks is, and `admit` reads one as a requirement on this set.
-    pub const fn features() -> [Feature; 5] {
+    pub const fn features() -> [Feature; 7] {
         Feature::ALL
     }
 

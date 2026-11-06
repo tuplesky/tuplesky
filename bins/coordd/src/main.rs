@@ -1692,6 +1692,9 @@ fn voter(
         )
         .map_err(|e| format!("the feature rows cannot be read: {e}"))?
     };
+    // The release rule (task-d90) has no start value of its own: the
+    // driver reports its active set as changed when opened, so this sets
+    // it from the same activation the store holds.
     voter.node_mut().keep_features(features);
     if cfg!(feature = "early-proposal-without-activation") {
         voter.node_mut().send_early_without_activation();

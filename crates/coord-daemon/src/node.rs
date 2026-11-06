@@ -58,6 +58,20 @@ pub enum Machine {
 }
 
 impl Machine {
+    /// The commands this machine holds below EXECUTE: every one it may
+    /// still execute, learned or not.
+    fn unexecuted(&self) -> std::collections::BTreeSet<CommandId> {
+        let table = match self {
+            Machine::Leader(m) => m.table(),
+            Machine::Follower(m) => m.table(),
+        };
+        table
+            .records()
+            .filter(|(_, record)| record.phase < coord_consensus::Phase::Executed)
+            .map(|(command, _)| *command)
+            .collect()
+    }
+
     /// Feed one event and take the effects it produced.
     pub fn step(&mut self, event: Event) -> Vec<Effect> {
         match self {
@@ -634,10 +648,11 @@ pub struct Node<P: Persistence> {
     /// projection has committed through its position (task-d52), oldest
     /// first. A group's results are not here but in `results`.
     releases: VecDeque<(ExecutionPosition, Vec<Effect>)>,
-    /// The establishments of groups handed to a pipelined store, each held
-    /// until the group is in the journal (task-d63), oldest first: the
-    /// voter counts its executions durable then (task-d90, point 2). The
-    /// groups' results went out as each command executed (task-d90).
+    /// The results and establishments of groups handed to a pipelined
+    /// store, each held until the group is in the journal (task-d63),
+    /// oldest first: the voter counts its executions durable then
+    /// (task-d90, point 2). Where the domain activated the release rule,
+    /// the results went out as each command executed instead (task-d90).
     results: VecDeque<(ExecutionPosition, Vec<Effect>)>,
     /// What this replica's re-sends did, over every ballot it led since
     /// boot (task-d49).
@@ -665,6 +680,17 @@ pub struct Node<P: Persistence> {
     fast_path: coord_consensus::FastPathCounts,
     /// From learned to released, per command this replica led (task-d62).
     release: crate::learned::ReleaseTiming,
+    /// Whether a leader's result goes out as its command executes rather
+    /// than at its execution group's `JournalDurable` (task-d90). Off
+    /// until the domain activates it as a replicated feature (task-d99):
+    /// the rule rests on every voter's build casting its votes on durable
+    /// payload rows and forgetting only what its journal holds, and an
+    /// older build in the domain does neither.
+    release_at_execution: bool,
+    /// The commands this node held unexecuted when the rule was switched
+    /// on. They keep the group's release: one may have been learned over
+    /// a vote an older build cast before its voter upgraded.
+    release_held: std::collections::BTreeSet<CommandId>,
     /// When each pre-acceptance the leader ordered a later command past
     /// was first seen (task-d62).
     unordered_since: std::collections::BTreeMap<CommandId, std::time::Instant>,
@@ -749,6 +775,8 @@ impl<P: Persistence> Node<P> {
             established: Established::default(),
             fast_path: coord_consensus::FastPathCounts::default(),
             release: crate::learned::ReleaseTiming::default(),
+            release_at_execution: false,
+            release_held: std::collections::BTreeSet::new(),
             unordered_since: std::collections::BTreeMap::new(),
         };
         node.machine_mut().observe_learning();
@@ -1103,6 +1131,29 @@ impl<P: Persistence> Node<P> {
         counts
     }
 
+    /// Release a leader's results as their commands execute, rather than
+    /// at their execution group's `JournalDurable` (task-d90, design
+    /// Section 4.5): for a domain that activated it, which every voter's
+    /// build supports (task-d99). The commands this node holds unexecuted
+    /// when it is switched on keep the group's release.
+    pub fn set_release_at_execution(&mut self, on: bool) {
+        if on == self.release_at_execution {
+            return;
+        }
+        self.release_at_execution = on;
+        self.release_held = if on {
+            self.machine().unexecuted()
+        } else {
+            std::collections::BTreeSet::new()
+        };
+    }
+
+    /// Whether this node releases at execution (see
+    /// [`Node::set_release_at_execution`]).
+    pub const fn release_at_execution(&self) -> bool {
+        self.release_at_execution
+    }
+
     /// From learned to released, over the commands this replica led
     /// (task-d62).
     pub const fn release_split(&self) -> crate::learned::ReleaseSplit {
@@ -1213,8 +1264,9 @@ impl<P: Persistence> Node<P> {
     }
 
     /// Take part in activating features (task-d99). From here on, this
-    /// node's own durable activation record is its switch, and its leaders
-    /// send early only to the followers known to hold it.
+    /// node's own durable activation record is its switch, for early sends
+    /// and for the release rule (task-d90), and its leaders send early only
+    /// to the followers known to hold it.
     pub fn keep_features(&mut self, features: crate::feature::Features) {
         self.features = Some(features);
         self.follow_features();
@@ -1225,9 +1277,10 @@ impl<P: Persistence> Node<P> {
         self.features.as_ref()
     }
 
-    /// The switch and the window, from what the feature driver holds now:
+    /// The switches and the window, from what the feature driver holds now:
     /// early sends on once this node's own activation row is durable, and
-    /// only toward the followers that said they hold it.
+    /// only toward the followers that said they hold it; release at
+    /// execution on once its row for `ReleaseAtExecution` is.
     fn follow_features(&mut self) {
         if self.early_without_activation {
             return;
@@ -1242,10 +1295,14 @@ impl<P: Persistence> Node<P> {
             .active()
             .contains(&coord_types::formats::Feature::EarlyProposal);
         let holders = features.holders(coord_types::formats::Feature::EarlyProposal);
+        let release = features
+            .active()
+            .contains(&coord_types::formats::Feature::ReleaseAtExecution);
         self.set_early_holders(Some(holders));
         if on != self.early_proposal {
             self.set_early_proposal(on);
         }
+        self.set_release_at_execution(release);
     }
 
     fn standing(&self, ballot: &Ballot) -> crate::feature::Standing {
@@ -2052,12 +2109,14 @@ impl<P: Persistence> Node<P> {
             // what lets it name the next command, and what it answers is
             // held for the group (task-d47): its establishment until the
             // group is in the journal (task-d63), a send and everything
-            // else until it has materialized. A released result is not
-            // held: it goes out now (task-d90, below).
+            // else until it has materialized. Where the domain activated
+            // the release rule, a released result is not held: it goes
+            // out now (task-d90, below).
             let mut effects = self.machine_mut().applied(command, &outcome)?;
-            if grouping {
-                Self::release_executed(&mut effects, &mut out, self.frontend)?;
+            if grouping && self.release_at_execution {
+                Self::release_executed(&mut effects, &mut out, self.frontend, &self.release_held)?;
             }
+            self.release_held.remove(&command);
             self.release.applied(&command, std::time::Instant::now());
             self.stamp_learned();
             // At a floor boundary the view is exactly the command's: the
@@ -2100,17 +2159,26 @@ impl<P: Persistence> Node<P> {
     /// (point 3). Watch events, signatures and external calls still wait
     /// for the projection's commit, and a retry or a resolve at this node
     /// waits for the projection through the command's position.
+    ///
+    /// Only where the domain activated the rule
+    /// ([`Node::set_release_at_execution`]), and never for a command in
+    /// `held`, which this node held unexecuted when the rule was switched
+    /// on: its result waits for its group, as it would have.
     fn release_executed(
         effects: &mut Vec<Effect>,
         out: &mut Outbound,
         frontend: PeerId,
+        held: &std::collections::BTreeSet<CommandId>,
     ) -> Result<(), DriveError> {
         let mut rest = Vec::with_capacity(effects.len());
         for effect in effects.drain(..) {
             match (&effect, frontend_frame(&effect, frontend)) {
-                (Effect::Released(_), Some(frame)) => out
-                    .frontend
-                    .push(frame.map_err(|e| DriveError::Encode(format!("{e:?}")))?),
+                (Effect::Released(released), Some(frame))
+                    if !held.contains(&released.established().command()) =>
+                {
+                    out.frontend
+                        .push(frame.map_err(|e| DriveError::Encode(format!("{e:?}")))?);
+                }
                 _ => rest.push(effect),
             }
         }
@@ -2122,13 +2190,13 @@ impl<P: Persistence> Node<P> {
     /// to once it has materialized (task-d47).
     ///
     /// On a pipelined store (task-d52) the group is journaled and its
-    /// projection commit handed to the materializer. Its establishments
-    /// are held until it is in the journal, and are carried out then
-    /// (task-d63): a voter forgets only executions its journal holds
-    /// (task-d90, point 2). Its results have gone out already, as each
-    /// command executed ([`Node::release_executed`]). Everything else it
-    /// led to is held until the projection has committed through it
-    /// ([`Node::settle`]). Execution
+    /// projection commit handed to the materializer. Its results and
+    /// establishments are held until it is in the journal, and go out
+    /// then (task-d63): a voter forgets only executions its journal holds
+    /// (task-d90, point 2). Where the domain activated the release rule,
+    /// its results have gone out already, as each command executed
+    /// ([`Node::release_executed`]). Everything else it led to is held
+    /// until the projection has committed through it ([`Node::settle`]). Execution
     /// goes on meanwhile, planning over the groups in flight. Past
     /// `PIPELINE_RECORDS` owed it waits for them.
     fn close_group(
