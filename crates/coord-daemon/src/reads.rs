@@ -425,7 +425,7 @@ pub fn evaluate<V: OrderedRead>(gated: &GatedView<V>, held: &Held) -> Evaluated 
         retires,
     };
     if !matches!(
-        retry::admit(gated.view(), &binding, |_| false),
+        retry::admit(gated.view(), &binding, |_| Ok(false)),
         Ok(Admission::New)
     ) {
         return Evaluated::NotServable;
