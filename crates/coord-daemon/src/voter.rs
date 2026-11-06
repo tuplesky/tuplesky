@@ -638,6 +638,8 @@ impl<P: Persistence> Voter<P> {
         debug_assert_eq!(command, expected, "the machine's command is the frame's");
         if let Some(command) = command {
             self.origins.remember(command, origin);
+            self.node
+                .stamp_submitted(command, std::time::Instant::now());
         }
         out.map(Ok)
     }

@@ -110,6 +110,9 @@ pub struct ReadCounts {
     /// Over the reads served: milliseconds from arrival until served,
     /// summed.
     pub waited_ms: u64,
+    /// The same wait, distributed over the reads served (task-d97): the
+    /// sum gives the mean, this the tail.
+    pub waited: crate::metrics::Distribution,
     /// Snapshots pinned to answer reads (task-d58).
     pub snapshots: u64,
     /// Due reads held again because their snapshot was behind them.
@@ -350,7 +353,11 @@ impl ReadBarrier {
         self.counts.served += 1;
         self.counts.waited_confirm_ms += since(held.confirmed_at);
         self.counts.waited_index_ms += since(held.due_at);
-        self.counts.waited_ms += since(Some(now));
+        let waited = since(Some(now));
+        self.counts.waited_ms += waited;
+        self.counts
+            .waited
+            .record(std::time::Duration::from_millis(waited));
     }
 
     /// Count a read refused after it was due.

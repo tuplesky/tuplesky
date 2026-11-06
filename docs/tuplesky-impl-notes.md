@@ -10960,3 +10960,63 @@ time for puts.
 **Checks.** coord-consensus's suites. The protocol simulator at 1,000
 seeds a row and size, 13 of 13 with catch-up (1,009 s) and without
 (1,107 s).
+
+## The waits' tails on the metrics line (task-d97)
+
+The `service` row's p99 is several times its p50 (task-d72's batch),
+and the metrics line could not say which wait made it: every wait on it
+is a sum, so a reader gets a mean a command and nothing about the tail.
+Three waits now also go out as distributions:
+
+- **The leader's learned to released,** in all and by part
+  (`cost.release.distributions`: `predecessors`, `group`, `journal`,
+  `whole`), over the same commands as the sums.
+- **The read barrier's wait,** arrival to answer (`cost.reads.waited`),
+  at the barrier's millisecond resolution.
+- **The domain loop's run-queue time a pass**
+  (`cost.cpu.domain_scheduling.run_queue_per_pass`): one pass in 16
+  reads the thread's `schedstat` at its start and again at the next
+  pass's start, so a sample is the pass's own preemptions and the wait
+  to run once something woke it. Two reads of a `/proc` file in 16
+  passes; the total run-queue time beside it is unchanged. Idle passes
+  outnumber working ones many times over, so the samples whose pass
+  executed a command also go into `run_queue_per_working_pass`, which
+  compares with the commands' own tails.
+
+Two more close the end-to-end account (#191 review), so a tail outside
+the three parts above reads as somewhere, not as "not in these":
+
+- **Arrival to answer at the node that took the request**
+  (`cost.answered.writes`, `cost.answered.reads`). The transport stamps
+  a request when its frame has been read off the stream, the stamp rides
+  with the caller's stream while it is held, and the wait is recorded
+  when the answer is handed back to the transport. It counts answers
+  from consensus, from the read barrier and from a retained result; an
+  answer at the door, a refusal or a binding, is not an operation's and
+  is not counted. Beside the client's latency it splits the client's
+  tail into the server's and the network's, and beside the parts it
+  says how much of the server's they hold, including what runs on the
+  transport's threads rather than the domain loop's.
+- **The leader's round, submission to learned**
+  (`cost.release.distributions.round`): a submission's arrival at the
+  leading voter's loop, the first one for a command submitted twice, to
+  the leader learning it. A command learned without a submission
+  stamped, one recovered, is not in it.
+- **The journal's and the projection's jobs, at every voter**
+  (`cost.waits.appender_jobs.served_each` and `queued_each`, the same for
+  `materializer_jobs`). Each job's served time is, for the appender, an
+  append and its sync: the disk's own tail, which tells a round's p99
+  that is the disk from one that is queueing or hops (#191 review). The
+  pipeline threads count them in `coord_storage::latency`'s buckets,
+  which the daemon's distributions use too.
+
+A distribution is cumulative like the rest of the cost: log-linear
+buckets in microseconds, four an octave from 4 µs to 2^26 µs (104
+buckets, each within a fifth of its values), with the longest value
+seen. It prints sparse, as `[bucket, count]` pairs and the longest, so
+an idle voter's line hardly grows. A quantile is read as the upper edge
+of the bucket its rank falls in, never past the longest.
+`scripts/ci/command_cost.py table` prints p50, p99 and the longest of
+each, from a voter's last snapshot, in a fourth table. A line written
+before task-d97 reads with empty distributions, which have no quantile
+rather than a zero one.
