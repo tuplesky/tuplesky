@@ -58,7 +58,8 @@
 //!    on the command's payload row durable at that voter. And the converse,
 //!    which the selection rests on: a pre-acceptance a selection leaves out
 //!    for want of a payload at every reporter was never decided, unless a
-//!    voter executed it durably.
+//!    voter executed it durably. Those exempt ones are counted apart
+//!    (`left_out_executed`), since they rest on catch-up instead.
 //!
 //! Scenarios are the checklist's failure-test matrix rows 1 to 5, 9, 10,
 //! 12 and 14, and rows 16 and 17, which are row 9's with acknowledgements
@@ -758,6 +759,10 @@ struct Stats {
     /// Pre-acceptances a selection left out for want of a payload row at
     /// any reporter, each checked never to have been decided.
     left_out: usize,
+    /// Of those, the ones that were decided and pass only because a voter
+    /// had executed them durably: they rest on catch-up and task-d77, not
+    /// on the payload argument (#197 review).
+    left_out_executed: usize,
 }
 
 /// FNV-1a over `bytes`, continuing from `hash`.
@@ -1945,9 +1950,13 @@ impl Sim {
                 .iter()
                 .any(|n| n.executed[..n.durable_executed].contains(c))
         };
-        if let Some(c) = left_out.iter().find(|c| {
-            (self.counted.contains(*c) || self.decided.contains_key(*c)) && !executed_durably(c)
-        }) {
+        let decided: Vec<&CommandId> = left_out
+            .iter()
+            .filter(|c| self.counted.contains(*c) || self.decided.contains_key(*c))
+            .collect();
+        let exempt = decided.iter().filter(|c| executed_durably(c)).count();
+        self.stats.left_out_executed += exempt;
+        if let Some(c) = decided.into_iter().find(|c| !executed_durably(c)) {
             let how = self
                 .decided
                 .get(c)
@@ -3351,6 +3360,7 @@ fn run_row(row: u8) {
                     totals.gate_windows += s.gate_windows;
                     totals.gate_crashes += s.gate_crashes;
                     totals.left_out += s.left_out;
+                    totals.left_out_executed += s.left_out_executed;
                 }
                 Err(e) => failures.push(e),
             }
