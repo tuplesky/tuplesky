@@ -169,6 +169,26 @@ pub struct MetricsConfig {
     pub interval_seconds: u64,
 }
 
+/// The process's async runtime (task-d91).
+///
+/// coordd's network, timers and serve loop run on tokio's multi-thread
+/// runtime; the domain loop and the store workers are threads of their
+/// own and are not counted here. Set, it is the count, whatever
+/// `TOKIO_WORKER_THREADS` says. Unset, tokio chooses: that variable's
+/// count where it is set, as the Jepsen job sets it, and otherwise a
+/// worker a core. On one host with every voter sharing its cores that runs
+/// several workers a core: in task-d91's local pair one worker a voter
+/// cut the voters' CPU a command by 12 to 27%, with latency lower too,
+/// almost all of it the workers' parking, wake-ups and stealing. The
+/// default stays tokio's until a node with cores of its own is read.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeConfig {
+    /// Worker threads of the runtime. Zero is refused.
+    #[serde(default)]
+    pub worker_threads: Option<std::num::NonZeroUsize>,
+}
+
 /// How this node's frontend serves a current read (task-d50; design
 /// Section 6.3).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
@@ -731,6 +751,10 @@ pub struct Config {
     /// How current reads are served (task-d50).
     #[serde(default)]
     pub reads: ReadsConfig,
+    /// The async runtime's worker count (task-d91). Absent, tokio's
+    /// default.
+    #[serde(default)]
+    pub runtime: RuntimeConfig,
     /// Local capability.
     pub capability: Capability,
     /// Whether application 0-RTT is disabled (must be true).
@@ -1252,6 +1276,19 @@ allow_insecure_loopback = {allow}
         assert!(on.enabled);
         assert_ne!(on.images, state_checkpoints());
         assert!(toml::from_str::<FloorConfig>("interval = 8").is_err());
+    }
+
+    /// The runtime's worker count is tokio's unless a configuration sets
+    /// one, and a configuration can't set none (task-d91).
+    #[test]
+    fn the_runtime_keeps_tokios_worker_count_unless_configured() {
+        use super::RuntimeConfig;
+        assert_eq!(with_renewal(true).runtime, RuntimeConfig::default());
+        assert_eq!(RuntimeConfig::default().worker_threads, None);
+        let one: RuntimeConfig = toml::from_str("worker_threads = 1").expect("parses");
+        assert_eq!(one.worker_threads.map(|n| n.get()), Some(1));
+        assert!(toml::from_str::<RuntimeConfig>("worker_threads = 0").is_err());
+        assert!(toml::from_str::<RuntimeConfig>("workers = 1").is_err());
     }
 
     /// Turned on, the floor refuses a directory the local checkpoints

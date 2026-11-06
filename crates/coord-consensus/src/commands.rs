@@ -33,6 +33,7 @@ use coord_types::identity::Digest32;
 use coord_types::ids::Ballot;
 use serde::{Deserialize, Serialize};
 
+use crate::digest::{self, DigestSet};
 use crate::graph::{ClosureCursor, ClosureProgress, PathLog, Position, combined_path};
 use crate::phase::{GuardViolation, Phase, guard_accept, guard_commit, guard_execute};
 
@@ -164,7 +165,7 @@ pub struct CommandTable {
     keys: BTreeMap<Vec<u8>, KeyState>,
     /// Commands retired after executing: what this replica still
     /// remembers having executed, for the dependency guards.
-    executed: BTreeSet<CommandId>,
+    executed: DigestSet<CommandId>,
     /// The same commands in the order they were retired, so the oldest
     /// is the one dropped when the memory reaches its bound.
     retired: VecDeque<CommandId>,
@@ -180,7 +181,7 @@ pub struct CommandTable {
     /// treated it as work still to do -- a placeholder, a payload to
     /// fetch, a table filling with history. So that answer is kept for
     /// every command, at the cost of one identity each.
-    history: BTreeSet<CommandId>,
+    history: DigestSet<CommandId>,
     /// The last `capacity` commands retired, in the order they were: the
     /// window a recovery report still names (task-d05).
     ///
@@ -189,7 +190,7 @@ pub struct CommandTable {
     /// grow with the keys; a report bounded by them grew with them.
     recent: VecDeque<CommandId>,
     /// The same commands, for lookup.
-    recent_set: BTreeSet<CommandId>,
+    recent_set: DigestSet<CommandId>,
     capacity: Option<usize>,
     /// The command this replica executed last. With every command on one
     /// key, it is the tail of the order everything executed so far
@@ -228,19 +229,34 @@ pub struct CommandTable {
     /// (task-d71). Execution is one order at every voter, so a candidate
     /// reads it for every voter's.
     execution_order: BTreeMap<CommandId, u64>,
+    /// How many of `execution_order`'s ordinals this replica's journal
+    /// holds the execution of, once its owner tracks it
+    /// ([`CommandTable::track_execution_durability`], task-d90). `None`:
+    /// an execution is durable when it is noted, as on a store that
+    /// applies synchronously.
+    ///
+    /// A command is forgotten only once its execution is durable here,
+    /// since a forgotten command is refused and left out of this
+    /// replica's reports on the ground that its effects are in this
+    /// replica's durable state. Counted in memory instead, a voter could
+    /// forget a command it executed and released before its execution
+    /// group was durable, and a crash of every voter would leave it in no
+    /// report (design Section 4.5, "Releasing before the execution group
+    /// is durable", point 2).
+    durable_executions: Option<u64>,
 }
 
 impl CommandTable {
     /// Unbounded table.
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         CommandTable {
             records: BTreeMap::new(),
             keys: BTreeMap::new(),
-            executed: BTreeSet::new(),
+            executed: digest::set(),
             retired: VecDeque::new(),
-            history: BTreeSet::new(),
+            history: digest::set(),
             recent: VecDeque::new(),
-            recent_set: BTreeSet::new(),
+            recent_set: digest::set(),
             capacity: None,
             last_executed: None,
             unretired: VecDeque::new(),
@@ -249,19 +265,20 @@ impl CommandTable {
             accepted: BTreeSet::new(),
             committed: BTreeSet::new(),
             execution_order: BTreeMap::new(),
+            durable_executions: None,
         }
     }
 
     /// A table admitting at most `capacity` records (placeholders included).
-    pub const fn with_capacity(capacity: usize) -> Self {
+    pub fn with_capacity(capacity: usize) -> Self {
         CommandTable {
             records: BTreeMap::new(),
             keys: BTreeMap::new(),
-            executed: BTreeSet::new(),
+            executed: digest::set(),
             retired: VecDeque::new(),
-            history: BTreeSet::new(),
+            history: digest::set(),
             recent: VecDeque::new(),
-            recent_set: BTreeSet::new(),
+            recent_set: digest::set(),
             capacity: Some(capacity),
             last_executed: None,
             unretired: VecDeque::new(),
@@ -270,6 +287,7 @@ impl CommandTable {
             accepted: BTreeSet::new(),
             committed: BTreeSet::new(),
             execution_order: BTreeMap::new(),
+            durable_executions: None,
         }
     }
 
@@ -285,11 +303,11 @@ impl CommandTable {
         let mut table = CommandTable {
             records: BTreeMap::new(),
             keys: BTreeMap::new(),
-            executed: BTreeSet::new(),
+            executed: digest::set(),
             retired: VecDeque::new(),
-            history: BTreeSet::new(),
+            history: digest::set(),
             recent: VecDeque::new(),
-            recent_set: BTreeSet::new(),
+            recent_set: digest::set(),
             capacity,
             last_executed: None,
             unretired: VecDeque::new(),
@@ -298,6 +316,7 @@ impl CommandTable {
             accepted: BTreeSet::new(),
             committed: BTreeSet::new(),
             execution_order: BTreeMap::new(),
+            durable_executions: None,
         };
         for (c, r) in records {
             if r.phase == Phase::Accept {
@@ -1049,6 +1068,32 @@ impl CommandTable {
         self.execution_order.entry(command).or_insert(next);
     }
 
+    /// Count an execution as durable only once its owner says it is
+    /// ([`CommandTable::executions_durable_except`], task-d90). Every
+    /// execution noted so far counts as durable: a table restored from
+    /// rows holds only executions its journal already has.
+    pub fn track_execution_durability(&mut self) {
+        if self.durable_executions.is_none() {
+            self.durable_executions = Some(self.execution_order.len() as u64);
+        }
+    }
+
+    /// Every execution noted is durable but the last `undurable`
+    /// (task-d90). A durable execution stays durable: a smaller count
+    /// than one already noted moves nothing. Nothing without tracking.
+    pub fn executions_durable_except(&mut self, undurable: u64) {
+        let noted = self.execution_order.len() as u64;
+        if let Some(durable) = self.durable_executions.as_mut() {
+            *durable = (*durable).max(noted.saturating_sub(undurable));
+        }
+    }
+
+    /// How many executions are durable: all of them without tracking.
+    fn durable_executions(&self) -> u64 {
+        self.durable_executions
+            .unwrap_or(self.execution_order.len() as u64)
+    }
+
     /// Whether this replica executed `first` before `then` (task-d71).
     pub fn executed_before(&self, first: &CommandId, then: &CommandId) -> bool {
         match (
@@ -1225,7 +1270,7 @@ impl CommandTable {
 
     /// Commands this replica executed and retired, and still remembers
     /// having executed.
-    pub fn tombstones(&self) -> &BTreeSet<CommandId> {
+    pub fn tombstones(&self) -> &DigestSet<CommandId> {
         &self.executed
     }
 
@@ -1262,13 +1307,23 @@ impl CommandTable {
     /// what a selection asks of its own candidate (task-d77). A command
     /// with no ordinal executed before this boot's first, and the count
     /// is the window alone, as before.
+    ///
+    /// Both the command's own execution and those counted past it are
+    /// durable ones (task-d90): what this replica forgets is a function
+    /// of its journal, not of what it executed in memory, which a crash
+    /// takes back.
     pub fn forgotten(&self, command: &CommandId) -> bool {
+        let durable = self.durable_executions();
         self.history.contains(command)
+            && self
+                .execution_order
+                .get(command)
+                .is_none_or(|at| *at < durable)
             && match self.capacity {
                 Some(bound) => {
                     !self.recent_set.contains(command)
                         && self.execution_order.get(command).is_none_or(|at| {
-                            let past = (self.execution_order.len() as u64).saturating_sub(at + 1);
+                            let past = durable.saturating_sub(at + 1);
                             past >= bound as u64
                         })
                 }

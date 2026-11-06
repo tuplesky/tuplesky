@@ -1049,6 +1049,46 @@ fn a_command_retired_early_is_forgotten_only_a_table_of_executions_later() {
     assert_eq!(remembered, vec![4, 5, 6, 7, 8]);
 }
 
+/// A command is forgotten only once its execution is durable here, and
+/// the executions counted past it are durable ones (task-d90, design
+/// Section 4.5, "Releasing before the execution group is durable",
+/// point 2).
+///
+/// A forgotten command is refused and left out of this replica's reports
+/// on the ground that its effects are in its durable state. Counted over
+/// executions in memory, a voter forgot a command whose execution group
+/// was not journaled yet; released before that group was durable, and
+/// every voter crashing, it would be in no report.
+#[test]
+fn a_command_is_forgotten_only_once_its_execution_is_durable() {
+    let capacity = 4usize;
+    let mut t = CommandTable::with_capacity(capacity);
+    t.track_execution_durability();
+    for i in 1..=12u8 {
+        let deps = t
+            .initialize_beyond_capacity(cmd(i), payload(i), vec![alloc_key(i)])
+            .unwrap()
+            .deps;
+        t.accept(cmd(i), deps).unwrap();
+        t.commit(cmd(i)).unwrap();
+        t.execute(cmd(i)).unwrap();
+    }
+    assert_eq!(t.reclaim(), 12);
+    let remembered =
+        |t: &CommandTable| -> Vec<u8> { (1..=12u8).filter(|i| !t.forgotten(&cmd(*i))).collect() };
+    // Executed and retired, and none of it in the journal: nothing goes.
+    assert_eq!(remembered(&t), (1..=12u8).collect::<Vec<_>>());
+    // Durable through the sixth: what has four durable executions past it.
+    t.executions_durable_except(6);
+    assert_eq!(remembered(&t), (3..=12u8).collect::<Vec<_>>());
+    // A smaller count of durable executions moves nothing back.
+    t.executions_durable_except(9);
+    assert_eq!(remembered(&t), (3..=12u8).collect::<Vec<_>>());
+    // All durable: the window alone, as a table that does not track.
+    t.executions_durable_except(0);
+    assert_eq!(remembered(&t), vec![9, 10, 11, 12]);
+}
+
 /// A command whose turn has come takes the recovery reserve and stops one
 /// past the capacity (task-d71, protocol_sim row 3, five voters, seed 158).
 /// New admission stops an eighth short of it; recovery work alone passes

@@ -924,6 +924,43 @@ fn a_live_leader_that_refuses_a_behind_candidate_leads_again_above_it() {
     assert!(!voters[1].node().machine().campaigning());
 }
 
+/// Every leader a node becomes sends early as the node does (task-d98).
+///
+/// The setting is the node's: the domain activated the feature, not the
+/// ballot. A leader that steps down and leads again above a refused
+/// candidate is a new machine, made from the follower it was; given
+/// nothing, it would lead without the early send until a restart.
+#[test]
+fn a_leader_a_node_becomes_sends_early_as_the_node_does() {
+    let ahead = coord_types::ids::ExecutionPosition::new(100).unwrap();
+    let mut voters = vec![
+        stamped_at(0, Some(ahead)),
+        stamped(1),
+        stamped_at(2, Some(ahead)),
+    ];
+    for voter in &mut voters {
+        voter.node_mut().set_early_proposal(true);
+    }
+    let Machine::Leader(first) = voters[0].node().machine() else {
+        panic!("voter 0 leads the genesis ballot")
+    };
+    assert!(first.early_proposal(), "the leader it holds now");
+    let (refused, out) = voters[1].campaign().expect("stepped").expect("campaigns");
+    route(&mut voters, 1, out);
+
+    assert!(voters[0].leads(), "the leader leads again");
+    assert_eq!(
+        voters[0].ballot().compare_same_epoch(&refused),
+        Some(core::cmp::Ordering::Greater),
+        "at a ballot of its own, as a new machine"
+    );
+    let Machine::Leader(again) = voters[0].node().machine() else {
+        panic!("voter 0 leads")
+    };
+    assert!(again.early_proposal(), "and the leader it became");
+    assert!(voters[1].node().early_proposal());
+}
+
 /// A transition the store refuses as fenced fails its barrier and the
 /// voter goes on serving (task-d01).
 ///

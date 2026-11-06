@@ -102,6 +102,7 @@ pub mod codecs;
 pub mod compaction;
 pub mod cut;
 pub mod journaled;
+pub mod latency;
 pub mod lowering;
 pub mod materialize;
 pub mod persistence;

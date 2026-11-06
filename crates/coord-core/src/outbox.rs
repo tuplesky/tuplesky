@@ -445,6 +445,11 @@ pub const APPLICATION_BARRIERS: u64 = 1 << 63;
 /// [`APPLICATION_BARRIERS`], so the applier hands their facts on.
 pub const RUNTIME_BARRIERS: u64 = 1 << 62;
 
+/// The first sequence of the runtime's feature batches (task-d99): the
+/// upper half of the runtime's sequences, so they never meet a floor's,
+/// which a runtime allocates from [`RUNTIME_BARRIERS`] in the same boot.
+pub const FEATURE_BARRIERS: u64 = RUNTIME_BARRIERS + (1 << 61);
+
 /// Whether `barrier` was allocated by an applier ([`BarrierAllocator::for_application`]).
 pub const fn is_application(barrier: &BarrierId) -> bool {
     barrier.sequence >= APPLICATION_BARRIERS
@@ -475,11 +480,22 @@ impl BarrierAllocator {
     }
 
     /// The same allocator moved to the runtime's own sequences, between
-    /// the protocol's and the application's.
+    /// the protocol's and the application's, below the feature batches'.
     #[must_use]
     pub const fn for_runtime(mut self) -> Self {
         if self.next < RUNTIME_BARRIERS {
             self.next = RUNTIME_BARRIERS;
+        }
+        self.end = FEATURE_BARRIERS;
+        self
+    }
+
+    /// The same allocator moved to the runtime's feature batches
+    /// (task-d99), the top of the runtime's sequences.
+    #[must_use]
+    pub const fn for_features(mut self) -> Self {
+        if self.next < FEATURE_BARRIERS {
+            self.next = FEATURE_BARRIERS;
         }
         self.end = APPLICATION_BARRIERS;
         self

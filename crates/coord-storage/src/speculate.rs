@@ -231,7 +231,7 @@ pub fn speculate<E: LocalEngine>(
     // applier, which is where the retained result is reauthorized; the
     // predicate is therefore `true` so the refusal names the retry rather
     // than an authorization this path never performs.
-    match retry::admit(gated.view(), &binding, |_| true)? {
+    match retry::admit(gated.view(), &binding, |_| Ok(true))? {
         Admission::New => {}
         other => return Err(SpeculationRefused::NotAdmitted(other)),
     }

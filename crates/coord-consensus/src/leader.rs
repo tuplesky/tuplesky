@@ -35,6 +35,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::ballot::{BallotState, ConfigurationIdentity, PromiseRejection, ReplicaRole};
 use crate::commands::{CommandTable, InitError};
+use crate::digest::{self, DigestMap};
 use crate::learner::{AppliedOutcome, LearnError, Learner, LearningMode};
 use crate::messages::{MAX_PAYLOAD_TRANSFER, PathAnchors, ProtocolMessage, SubmissionRefusal};
 use crate::phase::Phase;
@@ -123,6 +124,10 @@ pub enum Rejection {
     /// A service command presented again while still unlearned: its
     /// proposal was published to the other voters again, unchanged.
     ProposalRepublished(CommandId),
+    /// This leader's acceptance of a command was not counted: its payload
+    /// row is neither durable here nor in the batch the acceptance rests
+    /// on (task-d90).
+    NoPayloadRow(CommandId),
     /// The leader stopped leading; a new election recovers the role.
     Fenced(FenceReason),
     /// A peer message was rejected.
@@ -350,6 +355,11 @@ pub struct ResendCounts {
     /// yet, not every proposal kept until the history sweep.
     #[serde(default)]
     pub scanned: u64,
+    /// Copies of proposals, first sends and retries, that left before
+    /// their batch was durable (task-d98): one per follower each went to
+    /// early.
+    #[serde(default)]
+    pub early: u64,
 }
 
 impl ResendCounts {
@@ -377,6 +387,7 @@ impl ResendCounts {
         self.duplicate_votes += other.duplicate_votes;
         self.calls += other.calls;
         self.scanned += other.scanned;
+        self.early += other.early;
     }
 }
 
@@ -418,7 +429,7 @@ pub struct Leader {
     ballots: BallotState,
     table: CommandTable,
     bindings: BTreeMap<RetryKey, CommandId>,
-    proposals: BTreeMap<CommandId, Proposal>,
+    proposals: DigestMap<CommandId, Proposal>,
     /// The proposals not yet both durable and executed, by sequence
     /// number (task-d46): what the per-vote and per-event passes read,
     /// instead of every proposal, which `proposals` keeps until the
@@ -440,7 +451,7 @@ pub struct Leader {
     /// above it only once the proposal it names was swept or its votes
     /// replaced, which [`Leader::adopted_through`] finds and corrects.
     adopted_through: BTreeMap<ReplicaId, (u64, CommandId)>,
-    votes: BTreeMap<CommandId, VoteSet>,
+    votes: DigestMap<CommandId, VoteSet>,
     /// Acknowledgements that reached this leader before it had proposed
     /// the command they are about, held until it does.
     early_votes: BTreeMap<CommandId, Vec<Vote>>,
@@ -472,6 +483,10 @@ pub struct Leader {
     /// A follower learns only from it, so it goes out in the step that
     /// moves it.
     announced: Option<u64>,
+    /// The command the last admitted request became, once derived
+    /// (task-d60, step 3): the voter files where its evidence is owed
+    /// under it instead of decoding the request a second time.
+    admitted: Option<CommandId>,
     fenced: Option<FenceReason>,
     /// Entries of the selection this leader was handed that no order
     /// keeps: a dependency cycle, which is an invariant violation
@@ -508,7 +523,7 @@ pub struct Leader {
     /// Per proposal and voter it was re-sent to: when it may be re-sent
     /// again, and how often it was. Kept only while the proposal is held
     /// and the voter has not adopted it.
-    resent: BTreeMap<(CommandId, ReplicaId), Resent>,
+    resent: DigestMap<(CommandId, ReplicaId), Resent>,
     /// Per voter, how many calls of `resend_unvoted` its latest adoptions
     /// took to arrive after the proposal's first send, newest last and at
     /// most `RESEND_LATENCY_SAMPLES`: what its re-send interval is taken
@@ -521,7 +536,7 @@ pub struct Leader {
     /// second copy shows the first was the answer to the first send, and
     /// late (task-d49).
     /// Kept one call after the adoption, with the call count it came at.
-    answered: BTreeMap<(CommandId, ReplicaId), (u64, u64)>,
+    answered: DigestMap<(CommandId, ReplicaId), (u64, u64)>,
     /// What the re-sends did, until the driver takes it (task-d49).
     counts: ResendCounts,
     /// Why each command established on the slow path missed the fast
@@ -530,6 +545,24 @@ pub struct Leader {
     /// The commands committed since the driver last took them, while it
     /// asked for them (task-d62).
     learned: Option<Vec<CommandId>>,
+    /// Whether this leader sends a fresh proposal before its batch is
+    /// durable, to each follower that cannot make a fast quorum from it
+    /// (task-d98, design Sections 4.3 and 4.8). The driver sets it from
+    /// the replicated feature, `EarlyProposal`; it is off until then.
+    early: bool,
+    /// Whether a proposal batch of this leadership has been durable. No
+    /// proposal leaves early before one has: a genesis leader that
+    /// restarts on a store holding none comes back leading its ballot
+    /// (`coordd`'s `fresh`) and numbers its proposals from zero again,
+    /// over orders its followers may already hold (Section 4.8's fourth
+    /// condition). Batches are durable in the order they were submitted,
+    /// so once one is, every restart finds it.
+    early_ready: bool,
+    /// The followers known to hold `EarlyProposal`'s activation durably
+    /// (task-d99): an early send goes only to one of them. `None` reads
+    /// every follower as holding it, which only a build made for task-d98's
+    /// local reading sets, and the tests of the send itself.
+    early_holders: Option<BTreeSet<ReplicaId>>,
 }
 
 /// This leader's adoption of its own order, published and waiting on the
@@ -614,12 +647,15 @@ impl Leader {
             // Every voter of the genesis ballot is in it from the start.
             joined: config.identity.voters.iter().copied().collect(),
             resend_calls: 0,
-            resent: BTreeMap::new(),
+            resent: digest::map(),
             latency: BTreeMap::new(),
-            answered: BTreeMap::new(),
+            answered: digest::map(),
             counts: ResendCounts::default(),
             missed: MissedLog::default(),
             learned: None,
+            early: false,
+            early_ready: false,
+            early_holders: None,
             config,
             boot: None,
             alloc: None,
@@ -627,12 +663,12 @@ impl Leader {
             ballots,
             table,
             bindings: BTreeMap::new(),
-            proposals: BTreeMap::new(),
+            proposals: digest::map(),
             unsettled: BTreeSet::new(),
             by_barrier: BTreeMap::new(),
             durable: BTreeSet::new(),
             adopted_through: BTreeMap::new(),
-            votes: BTreeMap::new(),
+            votes: digest::map(),
             early_votes: BTreeMap::new(),
             early_order: VecDeque::new(),
             payloads: BTreeMap::new(),
@@ -647,6 +683,7 @@ impl Leader {
             speculation: Speculation::new(),
             rejections: Vec::new(),
             announced: None,
+            admitted: None,
             fenced: None,
             recovery_cycle: None,
             own_adoptions: BTreeMap::new(),
@@ -683,10 +720,14 @@ impl Leader {
             ledger: self.ledger,
             payloads: self.payloads,
             bindings: self.bindings,
+            // A durable proposal whose batch wrote the payload row: a
+            // re-proposal of an entry this leader held without its
+            // payload wrote none, and its follower would report a payload
+            // it cannot serve (task-d90, point 4; protocol_sim row 20).
             served_payloads: self
                 .proposals
                 .values()
-                .filter(|p| p.durable)
+                .filter(|p| p.durable && writes_payload(&p.updates))
                 .map(|p| p.command)
                 .chain(self.served_payloads)
                 .collect(),
@@ -725,12 +766,12 @@ impl Leader {
             ballots: state.ballots,
             table: state.table,
             bindings: state.bindings,
-            proposals: BTreeMap::new(),
+            proposals: digest::map(),
             unsettled: BTreeSet::new(),
             by_barrier: BTreeMap::new(),
             durable: BTreeSet::new(),
             adopted_through: BTreeMap::new(),
-            votes: BTreeMap::new(),
+            votes: digest::map(),
             early_votes: BTreeMap::new(),
             early_order: VecDeque::new(),
             own_adoptions: BTreeMap::new(),
@@ -746,6 +787,7 @@ impl Leader {
             speculation: Speculation::new(),
             rejections: Vec::new(),
             announced: None,
+            admitted: None,
             fenced: None,
             recovery_cycle: None,
             replay: crate::replay::EvidenceStore::new(state.capacity),
@@ -756,12 +798,15 @@ impl Leader {
             // frame were lost (task-d33). A vote at this ballot joins it.
             joined: BTreeSet::from([identity.replica]),
             resend_calls: 0,
-            resent: BTreeMap::new(),
+            resent: digest::map(),
             latency: BTreeMap::new(),
-            answered: BTreeMap::new(),
+            answered: digest::map(),
             counts: ResendCounts::default(),
             missed: MissedLog::default(),
             learned: None,
+            early: false,
+            early_ready: false,
+            early_holders: None,
         };
         // Dependency order among the entries: a command follows every
         // dependency that is itself an entry. A cycle is an invariant
@@ -1051,7 +1096,7 @@ impl Leader {
         self.seqnum += 1;
         let record = self.table.record(&command).expect("known").clone();
         let barrier = self.alloc.as_mut().expect("booted").allocate();
-        let updates = alloc::vec![
+        let mut updates = alloc::vec![
             dependency_update(epoch, &command, &record).expect("bounded"),
             proposal_update(
                 epoch,
@@ -1065,6 +1110,20 @@ impl Leader {
             )
             .expect("bounded"),
         ];
+        // The payload row too, where it is not durable here yet (task-d90):
+        // the batch is this leader's acceptance, and the acceptance has to
+        // rest on a payload a recovery can re-execute from. A payload
+        // fetched for the selection was written in a batch no vote
+        // required, and one still in flight when this replica took the
+        // lead is no batch this leader follows.
+        if !self.served_payloads.contains(&command)
+            && let Some(payload) = self
+                .payloads
+                .get(&command)
+                .filter(|p| Some(p.admission_digest()) == record.payload)
+        {
+            updates.push(payload_update(&command, payload).expect("bounded"));
+        }
         self.ledger.stage(barrier, command, record.clone());
         let proposal = FastAck {
             replica: self.config.identity.replica,
@@ -1680,6 +1739,7 @@ impl Leader {
         let mut report =
             self.ledger
                 .report(self.config.identity.replica, ballot, self.ballots.synced());
+        crate::follower::report_durable_payloads(&mut report, &self.served_payloads);
         // The report is labelled with the ballot this leader synchronized
         // to, and its selection is that ballot's state, whether or not its
         // re-proposal batches are durable yet, or were made at all for an
@@ -1717,6 +1777,25 @@ impl Leader {
         self.learner.executed_through()
     }
 
+    /// Count this replica's executions durable only as its runtime says
+    /// they are ([`Self::executions_durable_through`]), not when they are
+    /// applied (task-d90). For a runtime whose execution groups reach
+    /// the journal after their outcomes are taken.
+    pub fn track_execution_durability(&mut self) {
+        self.table.track_execution_durability();
+    }
+
+    /// This replica's journal holds its executions through `position`
+    /// (task-d90): those may now be forgotten, in their turn.
+    pub fn executions_durable_through(&mut self, position: ExecutionPosition) {
+        let undurable = self
+            .learner
+            .executed_through()
+            .get()
+            .saturating_sub(position.get());
+        self.table.executions_durable_except(undurable);
+    }
+
     /// The materializer applied `command`: seal and publish the established
     /// result, then learn whatever the new phase enables.
     pub fn applied(
@@ -1750,11 +1829,13 @@ impl Leader {
         // on a disclosure nothing was going to assemble.
         //
         // It rests on more evidence than the speculative release, not
-        // less: the command is committed, its whole prefix has executed
-        // before it, and its result is durable. That is why it carries
-        // `speculative: false`. Durable is the record: in a group on a
-        // pipelined store the release goes out at the group's
-        // `JournalDurable`, before its projection commit (task-d63).
+        // less: the command is committed and its whole prefix has
+        // executed before it. That is why it carries `speculative:
+        // false`. It goes out as the command executes, not at its
+        // group's `JournalDurable` (task-d90, design Section 4.5): it
+        // rests on recovery reproducing the decision and its inputs, and
+        // the establishment above waits for the group instead, since a
+        // voter forgets only executions its journal holds.
         let released = self.speculation.released(&command);
         self.speculation
             .reconcile(command, outcome.position, outcome.result_digest)
@@ -1783,15 +1864,16 @@ impl Leader {
         // quorum counted over a volatile proposal is one a restarted
         // leader's report would deny. So nothing this leader proposed is
         // committed until its batch is durable, as it was when the
-        // acceptance waited for that batch. A re-proposal's votes come
-        // after its batch is durable anyway, since every voter hears of
-        // it from the leader's send, which waits on the batch.
+        // acceptance waited for that batch. The same holds for the
+        // adoptions an early proposal brings back before the batch is
+        // durable (task-d98): they are counted, and nothing is committed
+        // over them until the batch is.
         let proposals = &self.proposals;
-        let committed = self
-            .learner
-            .commit_learned_where(&mut self.table, &self.votes, |c| {
-                proposals.get(c).is_none_or(|p| p.durable)
-            });
+        let committed = self.learner.commit_learned_where(
+            &mut self.table,
+            |c| self.votes.get(c),
+            |c| proposals.get(c).is_none_or(|p| p.durable),
+        );
         if let Some(learned) = self.learned.as_mut() {
             learned.extend(committed);
         }
@@ -1953,6 +2035,89 @@ impl Leader {
         self.learner.mode()
     }
 
+    /// Send each fresh proposal before its batch is durable, to the
+    /// followers that cannot make a fast quorum from it (task-d98). Only
+    /// for a domain that has activated `EarlyProposal`, which every
+    /// configured voter's build has to support: a follower built before
+    /// task-d74 hears the other followers' fast acknowledgements, and with
+    /// an early proposal they make a fast quorum over a vote this leader
+    /// may lose (design Section 4.3). It belongs to the node, not the
+    /// role: a driver sets it again on every leader it makes.
+    pub const fn set_early_proposal(&mut self, on: bool) {
+        self.early = on;
+    }
+
+    /// Whether early proposals are on (see [`Leader::set_early_proposal`]).
+    pub const fn early_proposal(&self) -> bool {
+        self.early
+    }
+
+    /// The followers an early proposal may go to: those known to hold the
+    /// activation durably, by their `FeatureHeld` since their last link
+    /// and in this ballot (task-d99, design Section 13's window rule). A
+    /// follower whose store does not hold it may still restart on a build
+    /// that counts an early proposal toward a fast quorum. `None` reads
+    /// every follower as holding it.
+    pub fn set_early_holders(&mut self, holders: Option<BTreeSet<ReplicaId>>) {
+        self.early_holders = holders;
+    }
+
+    /// Whether this leader's proposal may go to `voter` before its batch
+    /// is durable (design Sections 4.3 and 4.8).
+    ///
+    /// Only to a follower that cannot make a fast quorum from it: the
+    /// proposal is the leader's fast vote, and a follower counts it with
+    /// its own fast acknowledgement, if it is in the fast set, and nothing
+    /// else, since acknowledgements reach only the leader and the frontend
+    /// (task-d74). Where those two make a fast quorum -- the fast-set
+    /// follower at three voters under C2 -- an early proposal would let
+    /// that follower commit over a vote this leader may yet lose, so it
+    /// waits for the batch, as every copy did before. That is every
+    /// follower at five voters under C2, and every one under C1.
+    ///
+    /// And only once a proposal batch of this leadership is durable (see
+    /// `early_ready`).
+    fn sends_early_to(&self, voter: &ReplicaId) -> bool {
+        if !self.early || !self.early_ready || *voter == self.config.identity.replica {
+            return false;
+        }
+        if self
+            .early_holders
+            .as_ref()
+            .is_some_and(|holders| !holders.contains(voter))
+        {
+            return false;
+        }
+        let quorum = &self.config.quorum;
+        1 + usize::from(quorum.fast_eligible(voter)) < quorum.fast_size()
+    }
+
+    /// Each other voter a proposal on `barrier` goes to, with what its
+    /// send waits on: nothing when it may leave early, the batch
+    /// otherwise.
+    fn proposal_sends(&mut self, barrier: BarrierId) -> Vec<(ReplicaId, Vec<BarrierId>)> {
+        let me = self.config.identity.replica;
+        let voters: Vec<ReplicaId> = self
+            .config
+            .identity
+            .voters
+            .iter()
+            .copied()
+            .filter(|v| *v != me)
+            .collect();
+        voters
+            .into_iter()
+            .map(|voter| {
+                if self.sends_early_to(&voter) {
+                    self.counts.early += 1;
+                    (voter, Vec::new())
+                } else {
+                    (voter, alloc::vec![barrier])
+                }
+            })
+            .collect()
+    }
+
     /// Whether this replica leads the promised ballot: it votes in this
     /// epoch (a non-voting role never proposes), its identity agrees with
     /// the ballot configuration, the promised ballot is the configured
@@ -2050,7 +2215,19 @@ impl Leader {
     }
 
     fn on_admitted(&mut self, frame: &[u8], admission: AdmissionFacts) -> Vec<Effect> {
+        self.admitted = None;
         self.propose(frame, Some(admission))
+    }
+
+    /// Whether an admitted request reaches the derivation of its command
+    /// here: the checks [`Leader::propose`] makes before it decodes.
+    pub fn takes_admission(&self) -> bool {
+        self.boot.is_some() && self.ballots.seal_held().is_none() && self.is_leading()
+    }
+
+    /// The command the last admitted request became, if it was derived.
+    pub const fn admitted(&self) -> Option<CommandId> {
+        self.admitted
     }
 
     /// Propose one of the service's own commands.
@@ -2200,6 +2377,7 @@ impl Leader {
             self.rejections.push(Rejection::MalformedRequest);
             return Vec::new();
         };
+        self.admitted = Some(command);
         let payload = PayloadRecordV1 {
             retry_key: request.retry_key,
             logical: request.logical.as_slice().to_vec(),
@@ -2349,18 +2527,21 @@ impl Leader {
             seqnum: Some(seqnum),
         };
         let context = self.ballots.context(boot, ballot, LocalJournalSeq::ZERO);
+        // To a follower that cannot make a fast quorum from it, the
+        // proposal leaves now, and its sync runs beside this leader's
+        // (task-d98); every other copy waits for the batch. The leader
+        // reply below always does: it is this leader's fast vote.
+        let sends = self.proposal_sends(barrier);
+        let early = sends.iter().any(|(_, requires)| requires.is_empty());
         let outbox = self.outbox.as_mut().expect("booted");
         // Encoded once for every voter it goes to (task-d61).
         let frame = ProtocolMessage::Proposal(proposal.clone()).encode();
-        for voter in &self.config.identity.voters {
-            if *voter == self.config.identity.replica {
-                continue;
-            }
+        for (voter, requires) in sends {
             outbox.publish(PendingSend {
                 context,
-                requires: alloc::vec![barrier],
+                requires,
                 to: PeerId {
-                    replica: *voter,
+                    replica: voter,
                     incarnation: ReplicaIncarnation::ZERO,
                 },
                 frame: frame.clone(),
@@ -2419,7 +2600,14 @@ impl Leader {
         if accepts {
             self.adopt_own(command, barrier);
         }
-        alloc::vec![persist]
+        let mut effects = alloc::vec![persist];
+        // An early copy waits on nothing, so it goes out with the batch's
+        // submission rather than at the next event, which would most
+        // often be the batch's own durability.
+        if early {
+            effects.extend(self.release());
+        }
+        effects
     }
 
     fn on_storage(&mut self, event: &StorageEvent) -> Vec<Effect> {
@@ -2473,6 +2661,14 @@ impl Leader {
                     let calls = self.resend_calls;
                     if let Some(p) = self.proposals.get_mut(&command) {
                         p.durable = true;
+                        // Its payload row is durable here now, if the
+                        // batch wrote it (task-d90).
+                        if writes_payload(&p.updates) {
+                            self.served_payloads.insert(command);
+                        }
+                        // A restart finds this batch from now on, so it
+                        // comes back following (task-d98).
+                        self.early_ready = true;
                         // Its first send was released with the batch.
                         if p.published && p.sent.is_none() {
                             p.sent = Some(calls);
@@ -2571,18 +2767,18 @@ impl Leader {
         let path = proposal.path;
         let ballot = self.config.quorum.ballot();
         let context = self.ballots.context(boot, ballot, LocalJournalSeq::ZERO);
+        // The same proposal, unchanged, under the same rule as its first
+        // send (Section 4.8's third condition).
+        let sends = self.proposal_sends(barrier);
         let outbox = self.outbox.as_mut().expect("booted");
         // Encoded once for every voter it goes to (task-d61).
         let frame = ProtocolMessage::Proposal(ack.clone()).encode();
-        for voter in &self.config.identity.voters {
-            if *voter == self.config.identity.replica {
-                continue;
-            }
+        for (voter, requires) in sends {
             outbox.publish(PendingSend {
                 context,
-                requires: alloc::vec![barrier],
+                requires,
                 to: PeerId {
-                    replica: *voter,
+                    replica: voter,
                     incarnation: ReplicaIncarnation::ZERO,
                 },
                 frame: frame.clone(),
@@ -2636,7 +2832,20 @@ impl Leader {
     /// crash that loses the acceptance batch leaves a restarted leader
     /// reporting PRE-ACCEPT. Counting the leader for its proposal made a
     /// slow majority that a recovering majority could miss entirely.
+    ///
+    /// Nor before the payload row (task-d90): the leader's acceptance is a
+    /// vote recovery may re-execute from, so it counts only where the
+    /// payload row is durable here or in a proposal batch it waits on.
     fn adopt_own(&mut self, command: CommandId, barrier: BarrierId) {
+        if !self.served_payloads.contains(&command)
+            && !self
+                .proposals
+                .get(&command)
+                .is_some_and(|p| writes_payload(&p.updates))
+        {
+            self.rejections.push(Rejection::NoPayloadRow(command));
+            return;
+        }
         let (Some(boot), Some(admission)) = (
             self.boot,
             self.proposals
@@ -2967,6 +3176,11 @@ impl Leader {
             | ProtocolMessage::FloorReadiness { .. }
             | ProtocolMessage::ReadConfirm { .. }
             | ProtocolMessage::ReadConfirmed { .. }
+            | ProtocolMessage::FeatureSupport { .. }
+            | ProtocolMessage::FeaturePrepare { .. }
+            | ProtocolMessage::FeaturePrepared { .. }
+            | ProtocolMessage::FeatureActivated { .. }
+            | ProtocolMessage::FeatureHeld { .. }
             | ProtocolMessage::ReportPage(_)
             | ProtocolMessage::PromiseRefused { .. }
             | ProtocolMessage::CatchUpRequest { .. }
@@ -2990,7 +3204,8 @@ impl Leader {
         let responses: Vec<ProtocolMessage> = commands
             .iter()
             .filter(|c| {
-                self.proposals.get(c).is_some_and(|p| p.durable) || self.served_payloads.contains(c)
+                self.proposals.get(*c).is_some_and(|p| p.durable)
+                    || self.served_payloads.contains(c)
             })
             .filter_map(|c| {
                 self.payloads
@@ -3383,6 +3598,14 @@ impl Leader {
     pub fn outstanding_barriers(&self) -> Vec<BarrierId> {
         self.outstanding()
     }
+}
+
+/// Whether a proposal batch writes the command's payload row (task-d90).
+fn writes_payload(updates: &[StoreUpdate]) -> bool {
+    let payloads = coord_store_api::registry::Collection::PayloadV1.id();
+    updates
+        .iter()
+        .any(|u| u.collection == payloads && u.value.is_some())
 }
 
 #[cfg(test)]

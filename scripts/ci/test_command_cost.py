@@ -275,6 +275,92 @@ class ReduceTests(unittest.TestCase):
         self.assertAlmostEqual(reading["materializer_wait_ms_per_command"], 0.1)
         self.assertNotIn("appender_wait_ms_per_command", cost.per_command("n1", snapshot()))
 
+    def test_the_tails_are_read_from_the_distributions_when_reported(self):
+        snap = snapshot()
+        # 98 waits of 1 ms (bucket 35: 896 to 1023 us), one of 12 ms
+        # (bucket 49: 10240 to 12287 us) and one of 40 ms (bucket 56).
+        waits = {"buckets": [[35, 98], [49, 1], [56, 1]], "max": duration(0.040)}
+        snap["cost"]["Observed"]["release"] = {
+            "commands": 100, "predecessors": duration(0.1), "group": duration(0.0),
+            "journal": duration(0.2),
+            "distributions": {"whole": waits, "journal": {"buckets": [], "max": duration(0)}},
+        }
+        snap["cost"]["Observed"]["reads"] = {
+            "served": 1, "refused": 0, "rounds": 1, "confirmed": 1,
+            "waited_confirm_ms": 1, "waited_index_ms": 2, "waited_ms": 3,
+            "waited": {"buckets": [[41, 1]], "max": duration(0.003)},
+        }
+        snap["cost"]["Observed"]["cpu"] = {"Observed": {
+            "domain": duration(0.3), "process": duration(0.9),
+            "domain_scheduling": {"Observed": {
+                "run_queue": duration(1.0), "voluntary": 1, "involuntary": 1,
+                "run_queue_per_pass": {"buckets": [[0, 30], [28, 2]],
+                                       "max": duration(0.000300)},
+            }},
+        }}
+        tails = cost.per_command("n1", snap)["tails"]
+        whole = tails["release_whole"]
+        self.assertEqual(whole["count"], 100)
+        self.assertAlmostEqual(whole["p50_ms"], 1.024)
+        self.assertAlmostEqual(whole["p99_ms"], 12.288)
+        self.assertAlmostEqual(whole["max_ms"], 40.0)
+        # A distribution that counted nothing has no quantile, not zero.
+        self.assertNotIn("release_journal", tails)
+        self.assertAlmostEqual(tails["read_waited"]["p99_ms"], 3.0)
+        per_pass = tails["run_queue_per_pass"]
+        self.assertAlmostEqual(per_pass["p50_ms"], 0.001)
+        self.assertAlmostEqual(per_pass["max_ms"], 0.3)
+        table = cost.tails_table({"runs": [{"callers": 1, "voters": [
+            {"node": "n1", "tails": tails}]}]})
+        self.assertIn("| 1 | n1 | -- | -- | -- | 1.02/12.29/40.00 (100) | -- |", table)
+        self.assertNotIn("tails", cost.per_command("n1", snapshot()))
+
+    def test_the_end_to_end_tails_are_read_when_reported(self):
+        snap = snapshot()
+        one_ms = {"buckets": [[35, 4]], "max": duration(0.001)}
+        snap["cost"]["Observed"]["answered"] = {"writes": one_ms, "reads": one_ms}
+        snap["cost"]["Observed"]["release"] = {
+            "commands": 4, "predecessors": duration(0), "group": duration(0),
+            "journal": duration(0), "distributions": {"round": one_ms},
+        }
+        snap["cost"]["Observed"]["cpu"] = {"Observed": {
+            "domain": duration(0.3), "process": duration(0.9),
+            "domain_scheduling": {"Observed": {
+                "run_queue": duration(1.0), "voluntary": 1, "involuntary": 1,
+                "run_queue_per_working_pass": one_ms,
+            }},
+        }}
+        tails = cost.per_command("n1", snap)["tails"]
+        for name in ("answered_writes", "answered_reads", "release_round",
+                     "run_queue_per_working_pass"):
+            self.assertEqual(tails[name]["count"], 4, name)
+            self.assertAlmostEqual(tails[name]["p99_ms"], 1.0, msg=name)
+        self.assertNotIn("run_queue_per_pass", tails)
+
+    def test_the_jobs_tails_are_read_when_reported(self):
+        snap = snapshot()
+        syncs = {"buckets": [[41, 9], [49, 1]], "max": duration(0.012)}
+        snap["cost"]["Observed"]["waits"] = {"Observed": {
+            "appender": {"count": 0, "time": duration(0)},
+            "materializer": {"count": 0, "time": duration(0)},
+            "appender_jobs": {"count": 10, "queued": duration(0), "served": duration(0.03),
+                              "completed": duration(0), "served_each": syncs},
+            "materializer_jobs": {"count": 0, "queued": duration(0), "served": duration(0),
+                                  "completed": duration(0)},
+        }}
+        tails = cost.per_command("n1", snap)["tails"]
+        self.assertEqual(tails["journal_served"]["count"], 10)
+        self.assertAlmostEqual(tails["journal_served"]["p50_ms"], 3.072)
+        self.assertAlmostEqual(tails["journal_served"]["max_ms"], 12.0)
+        for absent in ("journal_queued", "projection_served", "projection_queued"):
+            self.assertNotIn(absent, tails)
+
+    def test_the_bucket_edges_match_the_daemons(self):
+        # Four a power of two: 4..7 us one each, then 8, 10, 12, 14.
+        self.assertEqual([cost.bucket_lower(i) for i in range(12)],
+                         [0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14])
+        self.assertEqual(cost.bucket_lower(cost.DISTRIBUTION_BUCKETS - 1), 7 << 24)
+
     def test_an_absent_reading_is_absent_not_zero(self):
         with self.assertRaises(cost.Absent):
             cost.per_command("n1", snapshot(syncs_observed=False))

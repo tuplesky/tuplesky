@@ -536,6 +536,23 @@ impl<P: Persistence> Voter<P> {
                     .hear_floor(provenance.from(), readiness, &self.ballot)?,
             );
         }
+        // A peer's feature advertisement, prepare or activation is the
+        // runtime's, like a floor promise (task-d99): the machines ignore
+        // it, and it is taken only from the voter whose link it came on.
+        if let Some(
+            message @ (coord_consensus::ProtocolMessage::FeatureSupport { .. }
+            | coord_consensus::ProtocolMessage::FeaturePrepare { .. }
+            | coord_consensus::ProtocolMessage::FeaturePrepared { .. }
+            | coord_consensus::ProtocolMessage::FeatureActivated { .. }
+            | coord_consensus::ProtocolMessage::FeatureHeld { .. }),
+        ) = &message
+        {
+            out.absorb(
+                self.node
+                    .hear_feature(provenance.from(), message, &self.ballot)?,
+            );
+            return Ok(out);
+        }
         out.absorb(self.node.on_event(
             Event::Peer(AuthenticatedPeerMessage::new(provenance, frame)),
             &self.ballot,
@@ -551,6 +568,40 @@ impl<P: Persistence> Voter<P> {
         }
         out.absorb(self.follow_machine()?);
         Ok(out)
+    }
+
+    /// What this voter says about features at start (task-d99): its
+    /// advertisement to every peer, and what it holds to its leader.
+    pub fn feature_start(&mut self) -> Result<Outbound, DriveError> {
+        self.node.feature_start(&self.ballot)
+    }
+
+    /// A new peer-plane link with `peer` came up (task-d99): what it said
+    /// about features before is forgotten, and it is told this voter's.
+    pub fn peer_linked(&mut self, peer: ReplicaId) -> Result<Outbound, DriveError> {
+        self.node.feature_linked(peer, &self.ballot)
+    }
+
+    /// The leader's paced re-send of feature prepares and activations
+    /// (task-d99).
+    pub fn resend_features(&mut self) -> Result<Outbound, DriveError> {
+        self.node.feature_resend(&self.ballot)
+    }
+
+    /// An operator's request to activate `feature` (task-d99).
+    pub fn activate_feature(
+        &mut self,
+        feature: coord_types::formats::Feature,
+    ) -> Result<
+        Result<(crate::feature::Activation, Outbound), crate::feature::ActivateRefusal>,
+        DriveError,
+    > {
+        self.node.activate_feature(feature, &self.ballot)
+    }
+
+    /// The features as this voter sees them, if it takes part (task-d99).
+    pub fn feature_status(&self) -> Option<crate::feature::FeatureStatus> {
+        self.node.features().map(crate::feature::Features::status)
     }
 
     /// A submission a collector made, from `origin`.
@@ -569,16 +620,28 @@ impl<P: Persistence> Voter<P> {
             Ok(a) => a,
             Err(e) => return Ok(Err(Refused::NotAdmissible(e))),
         };
-        // The identity the machine will derive, derived the same way. A
-        // retry rebinds it: the same command submitted again through
-        // another collector is owed to that one, and a collector that
-        // went away is not owed anything.
-        if let Some(command) = command_of(&admitted.frame) {
+        // The identity the machine derives, taken from it (task-d60, step
+        // 3), or derived the same way here where the machine refuses the
+        // request before deriving it. A retry rebinds it: the same command
+        // submitted again through another collector is owed to that one,
+        // and a collector that went away is not owed anything.
+        #[cfg(debug_assertions)]
+        let expected = command_of(&admitted.frame);
+        let early = if self.node.machine().takes_admission() {
+            None
+        } else {
+            command_of(&admitted.frame)
+        };
+        let out = self.node.on_event(Event::Admitted(admitted), &self.ballot);
+        let command = early.or_else(|| self.node.machine().admitted());
+        #[cfg(debug_assertions)]
+        debug_assert_eq!(command, expected, "the machine's command is the frame's");
+        if let Some(command) = command {
             self.origins.remember(command, origin);
+            self.node
+                .stamp_submitted(command, std::time::Instant::now());
         }
-        self.node
-            .on_event(Event::Admitted(admitted), &self.ballot)
-            .map(Ok)
+        out.map(Ok)
     }
 
     /// What this voter leads, for the read barrier: `None` unless its
@@ -857,6 +920,7 @@ impl<P: Persistence> Voter<P> {
         let standing = crate::catch_up::Standing {
             executed: machine.executed_through(),
             holds: machine.holds_unexecuted(),
+            backlog: || machine.unexecuted_held(),
             busy: machine.catching_up(),
             leads: machine.leads(),
         };

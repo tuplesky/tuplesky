@@ -57,6 +57,8 @@ pub struct Waits {
     queued: AtomicU64,
     served: AtomicU64,
     completed: AtomicU64,
+    queued_each: crate::latency::SharedBuckets,
+    served_each: crate::latency::SharedBuckets,
 }
 
 /// A pipeline thread's jobs and their three times, summed (task-d62).
@@ -70,6 +72,11 @@ pub struct JobTimes {
     pub served: Duration,
     /// From its end to the domain thread taking it back.
     pub completed: Duration,
+    /// `queued`, job by job (task-d97).
+    pub queued_each: crate::latency::Counts,
+    /// `served`, job by job: for the appender, each append and its
+    /// sync.
+    pub served_each: crate::latency::Counts,
 }
 
 fn add_nanos(counter: &AtomicU64, d: Duration) {
@@ -94,6 +101,8 @@ impl Waits {
             queued: nanos(&self.queued),
             served: nanos(&self.served),
             completed: nanos(&self.completed),
+            queued_each: self.queued_each.read(),
+            served_each: self.served_each.read(),
         }
     }
 
@@ -106,6 +115,8 @@ impl Waits {
     fn ran(&self, queued: Duration, served: Duration) {
         add_nanos(&self.queued, queued);
         add_nanos(&self.served, served);
+        self.queued_each.record(queued);
+        self.served_each.record(served);
     }
 
     /// A job that finished at `finished` was taken back now.

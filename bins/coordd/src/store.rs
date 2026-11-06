@@ -259,6 +259,10 @@ pub struct Storage {
     /// the boot fence refuses a batch of any other, so a component that
     /// invented its own would have every write refused.
     pub boot: BootId,
+    /// The features this store's domain has activated, as `admit` read
+    /// them at start (task-60): each one this build supports, or the
+    /// store was refused.
+    pub active: std::collections::BTreeSet<coord_types::formats::Feature>,
 }
 
 /// The journal and the projection, open and not yet attached.
@@ -532,6 +536,7 @@ impl Opened {
             options,
         } = self;
         let mut generation = generation;
+        let active;
         // The rollback guard (task-60). A build started against a cluster
         // that has activated something it cannot do refuses here, before
         // anything is adopted or the domain is attached, and long before
@@ -552,7 +557,7 @@ impl Opened {
                         root: show(&directory),
                         reason: format!("the activation record could not be read: {e}"),
                     })?;
-            coord_checkpoint::feature::admit(&view).map_err(|e| StoreError::Refused {
+            active = coord_checkpoint::feature::admit(&view).map_err(|e| StoreError::Refused {
                 root: show(&directory),
                 reason: format!("{e}"),
             })?;
@@ -642,6 +647,7 @@ impl Opened {
             baseline,
             generation: directory,
             boot,
+            active,
         })
     }
 }

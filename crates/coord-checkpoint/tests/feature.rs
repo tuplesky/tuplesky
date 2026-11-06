@@ -6,8 +6,10 @@
 use std::collections::BTreeSet;
 
 use coord_checkpoint::feature::{
-    ACTIVE_KEY, ActiveFeaturesV1, AdmitError, FeatureSupportV1, activate_feature, admit,
-    own_support, published_activation, read_support, record_support, support_key,
+    ACTIVE_KEY, ActivateError, ActiveFeaturesV1, AdmitError, FeatureRows, FeatureSupportV1,
+    InstallActivationError, PrepareError, activate_feature, active_features, admit,
+    install_activation, own_support, prepare_feature, prepared, promotion_missing,
+    published_activation, read_support, record_support, support_key,
 };
 use coord_checkpoint::trim::TrimLimits;
 use coord_consensus::quorum::EpochVoters;
@@ -58,7 +60,11 @@ fn a_support_row_is_this_builds_own_report() {
     let offered = report(1);
     assert_eq!(
         offered.features().unwrap(),
-        Feature::ALL.iter().copied().collect::<BTreeSet<_>>(),
+        Feature::ALL
+            .iter()
+            .copied()
+            .filter(|f| !f.is_marker())
+            .collect::<BTreeSet<_>>(),
         "a report is not this build's registry"
     );
 
@@ -288,4 +294,260 @@ fn a_build_that_cannot_read_the_active_state_refuses_it() {
         "an unknown active feature decoded to a smaller set"
     );
     assert!(future.features().is_err());
+}
+
+fn apply_all<E: LocalEngine>(engine: &mut E, updates: Vec<coord_core::effect::StoreUpdate>) {
+    let mut tx = engine.begin_write().unwrap();
+    for update in &updates {
+        match &update.value {
+            Some(bytes) => tx.put(update.collection, &update.key, bytes).unwrap(),
+            None => tx.delete(update.collection, &update.key).unwrap(),
+        }
+    }
+    tx.commit_durable().unwrap();
+}
+
+/// A prepare writes the support row and the marker in one batch; the
+/// marker activates nothing, and `admit` reads it as a requirement on this
+/// build's own support (task-d99).
+#[test]
+fn a_prepare_writes_the_report_and_the_marker_and_activates_nothing() {
+    let mut engine = ModelEngine::new();
+    let voters = voters(3);
+    let view = engine.reader().snapshot().unwrap();
+    let updates = prepare_feature(&view, &voters, &report(1), Feature::EarlyProposal).unwrap();
+    assert_eq!(updates.len(), 2, "the support row and the marker, together");
+    drop(view);
+    apply_all(&mut engine, updates);
+
+    let view = engine.reader().snapshot().unwrap();
+    assert!(prepared(&view, &replica(1), Feature::EarlyProposal).unwrap());
+    let record = published_activation(&view).unwrap().unwrap();
+    assert_eq!(record.features, vec![Feature::EarlyProposalPrepared.id()]);
+    assert!(record.reporters.is_empty());
+    assert!(
+        admit(&view).unwrap().is_empty(),
+        "a marker turned a behaviour on"
+    );
+    assert!(active_features(&view).unwrap().is_empty());
+
+    // Again: the report is the same and the marker is already there.
+    let again = prepare_feature(&view, &voters, &report(1), Feature::EarlyProposal).unwrap();
+    assert_eq!(again.len(), 1);
+
+    // A feature with no marker has no guard, and is not prepared.
+    assert_eq!(
+        prepare_feature(&view, &voters, &report(1), Feature::CheckpointFloor),
+        Err(PrepareError::NotActivatable {
+            feature: Feature::CheckpointFloor
+        })
+    );
+    // A build that does not report the feature does not prepare it.
+    let mut without = report(1);
+    without
+        .features
+        .retain(|f| *f != Feature::EarlyProposal.id());
+    assert!(matches!(
+        prepare_feature(&view, &voters, &without, Feature::EarlyProposal),
+        Err(PrepareError::Refused(_) | PrepareError::Unsupported { .. })
+    ));
+    // A marker is never activated.
+    assert_eq!(
+        activate_feature(
+            &view,
+            &voters,
+            CLUSTER,
+            DOMAIN,
+            Feature::EarlyProposalPrepared,
+            &limits()
+        ),
+        Err(ActivateError::NotActivatable {
+            feature: Feature::EarlyProposalPrepared
+        })
+    );
+}
+
+/// A prepared store is refused at start by a build from before task-d99,
+/// through that build's own `admit`: it decodes the record with a registry
+/// that has no marker id, and an unknown id is corruption to it.
+#[test]
+fn a_prepared_store_is_refused_by_a_build_that_does_not_know_the_marker() {
+    let mut engine = ModelEngine::new();
+    let view = engine.reader().snapshot().unwrap();
+    let updates = prepare_feature(&view, &voters(3), &report(1), Feature::EarlyProposal).unwrap();
+    drop(view);
+    apply_all(&mut engine, updates);
+    let view = engine.reader().snapshot().unwrap();
+    let record = published_activation(&view).unwrap().unwrap();
+
+    // The registry of the build before task-d99: ids 1 to 4. Its `admit`
+    // is `features()` over that registry, which refuses an unknown id.
+    let old_registry = [0x0001u16, 0x0002, 0x0003, 0x0004];
+    let unknown: Vec<u16> = record
+        .features
+        .iter()
+        .copied()
+        .filter(|id| !old_registry.contains(id))
+        .collect();
+    assert_eq!(unknown, vec![Feature::EarlyProposalPrepared.id()]);
+    // The same refusal, through this build's own decoding of an id it
+    // does not know (`a_build_that_cannot_read_the_active_state_refuses_it`).
+    let as_old_build_reads_it = ActiveFeaturesV1 {
+        features: vec![0x7fff],
+        ..record
+    };
+    assert!(as_old_build_reads_it.features().is_err());
+}
+
+fn prepared_engine(voter: u8, voters: &EpochVoters) -> ModelEngine {
+    let mut engine = ModelEngine::new();
+    let view = engine.reader().snapshot().unwrap();
+    let updates = prepare_feature(&view, voters, &report(voter), Feature::EarlyProposal).unwrap();
+    drop(view);
+    apply_all(&mut engine, updates);
+    engine
+}
+
+/// The leader activates over the prepared reports in its own store, and a
+/// follower installs that record unchanged only over its own durable
+/// report; a store that never prepared refuses it.
+#[test]
+fn an_activation_installs_only_where_the_voter_prepared() {
+    let voters = voters(3);
+    // The leader: its own prepare, then each follower's prepared report.
+    let mut leader = prepared_engine(1, &voters);
+    for voter in [2u8, 3] {
+        let view = leader.reader().snapshot().unwrap();
+        let update = record_support(&view, &voters, &report(voter)).unwrap();
+        drop(view);
+        apply(&mut leader, update);
+    }
+    let view = leader.reader().snapshot().unwrap();
+    let update = activate_feature(
+        &view,
+        &voters,
+        CLUSTER,
+        DOMAIN,
+        Feature::EarlyProposal,
+        &limits(),
+    )
+    .unwrap();
+    drop(view);
+    apply(&mut leader, update);
+    let view = leader.reader().snapshot().unwrap();
+    let record = published_activation(&view).unwrap().unwrap();
+    assert_eq!(
+        record.features,
+        vec![
+            Feature::EarlyProposal.id(),
+            Feature::EarlyProposalPrepared.id()
+        ],
+        "the activation kept the leader's marker"
+    );
+    assert_eq!(
+        admit(&view).unwrap(),
+        [Feature::EarlyProposal].into_iter().collect()
+    );
+    drop(view);
+
+    // A prepared follower installs it, once.
+    let mut follower = prepared_engine(2, &voters);
+    let view = follower.reader().snapshot().unwrap();
+    let update = install_activation(&view, &replica(2), &record)
+        .unwrap()
+        .expect("a prepared follower installs the record");
+    drop(view);
+    apply(&mut follower, update);
+    let view = follower.reader().snapshot().unwrap();
+    let held = published_activation(&view).unwrap().unwrap();
+    assert_eq!(held, record, "the record is installed unchanged");
+    assert_eq!(install_activation(&view, &replica(2), &record), Ok(None));
+    assert_eq!(
+        active_features(&view).unwrap(),
+        [Feature::EarlyProposal].into_iter().collect()
+    );
+
+    // A store that never prepared refuses it.
+    let bare = ModelEngine::new();
+    let view = bare.reader().snapshot().unwrap();
+    assert_eq!(
+        install_activation(&view, &replica(3), &record),
+        Err(InstallActivationError::NotPrepared {
+            missing: vec![Feature::EarlyProposal]
+        })
+    );
+    // Nor does another domain's record land.
+    let follower3 = prepared_engine(3, &voters);
+    let view = follower3.reader().snapshot().unwrap();
+    let elsewhere = ActiveFeaturesV1 {
+        domain: DomainId([9; 16]),
+        ..record.clone()
+    };
+    assert_eq!(
+        install_activation(&view, &replica(3), &elsewhere),
+        Err(InstallActivationError::OtherDomain)
+    );
+}
+
+/// A voter that reported and then rolled back: once its prepare is
+/// durable, no build without the feature is admitted, and a report it
+/// later makes cannot withdraw it.
+#[test]
+fn a_voter_that_rolls_back_after_preparing_is_refused_not_counted() {
+    let voters = voters(3);
+    let engine = prepared_engine(1, &voters);
+    let view = engine.reader().snapshot().unwrap();
+    // A build without `EarlyProposal` reports less, and the shrink is
+    // refused, as every withdrawal is.
+    let mut without = report(1);
+    without
+        .features
+        .retain(|f| *f != Feature::EarlyProposal.id());
+    assert!(record_support(&view, &voters, &without).is_err());
+    // And the marker it holds is a requirement such a build fails:
+    // `admit`'s rule over the record, with that build's support.
+    let record = published_activation(&view).unwrap().unwrap();
+    let held = record.active().unwrap();
+    let supported: BTreeSet<Feature> = Feature::ALL
+        .iter()
+        .copied()
+        .filter(|f| *f != Feature::EarlyProposal && *f != Feature::EarlyProposalPrepared)
+        .collect();
+    assert_eq!(
+        held.admits(&supported),
+        Err(vec![Feature::EarlyProposalPrepared])
+    );
+}
+
+/// The rows a generation replacement carries, and the check selection
+/// makes: a store holding fewer is refused.
+#[test]
+fn feature_rows_are_carried_and_a_store_without_them_does_not_hold_them() {
+    let voters = voters(3);
+    let engine = prepared_engine(1, &voters);
+    let view = engine.reader().snapshot().unwrap();
+    let rows = FeatureRows::read(&view, &replica(1)).unwrap();
+    assert!(rows.support.is_some() && rows.activation.is_some());
+    assert!(rows.held_by(&view).unwrap());
+
+    let mut staged = ModelEngine::new();
+    let empty = staged.reader().snapshot().unwrap();
+    assert!(!rows.held_by(&empty).unwrap());
+    drop(empty);
+    apply_all(&mut staged, rows.updates().unwrap());
+    let carried = staged.reader().snapshot().unwrap();
+    assert!(rows.held_by(&carried).unwrap());
+    assert!(prepared(&carried, &replica(1), Feature::EarlyProposal).unwrap());
+    assert!(FeatureRows::default().held_by(&carried).unwrap());
+}
+
+/// Promotion waits for an advertisement of every active feature.
+#[test]
+fn a_learner_without_an_active_feature_is_not_promoted() {
+    let active: BTreeSet<Feature> = [Feature::EarlyProposal].into_iter().collect();
+    assert_eq!(
+        promotion_missing(&active, &BTreeSet::new()),
+        vec![Feature::EarlyProposal]
+    );
+    assert!(promotion_missing(&active, &active).is_empty());
 }

@@ -8,7 +8,7 @@ use alloc::vec::Vec;
 use coord_types::CommandId;
 use coord_types::error::DecodeError;
 use coord_types::identity::Digest32;
-use coord_types::ids::{Ballot, ExecutionPosition, KvRevision, ReplicaId};
+use coord_types::ids::{Ballot, ConfigurationEpoch, ExecutionPosition, KvRevision, ReplicaId};
 use serde::{Deserialize, Serialize};
 
 use crate::commands::CommandRecord;
@@ -347,6 +347,70 @@ pub enum ProtocolMessage {
         /// The voter answering.
         replica: ReplicaId,
     },
+    /// What the sending voter's build supports (task-d99, design Section
+    /// 13): an advertisement, not a report. Sent at start, on every new
+    /// peer link and when asked; a receiver keeps the latest one per peer
+    /// in memory, and it binds nothing. The machines never read it, and a
+    /// build that cannot decode it drops it, so it needs no capability
+    /// gate in a rolling upgrade.
+    FeatureSupport {
+        /// The configuration it is advertised under.
+        epoch: ConfigurationEpoch,
+        /// Frozen feature identifiers, prepare markers excluded.
+        features: Vec<u16>,
+    },
+    /// The leader asks a voter to prepare `feature`: write its durable
+    /// support row and the feature's prepare marker in one batch, and say
+    /// [`ProtocolMessage::FeaturePrepared`] once it is durable.
+    FeaturePrepare {
+        /// The frozen feature identifier.
+        feature: u16,
+        /// The configuration it is prepared under.
+        epoch: ConfigurationEpoch,
+    },
+    /// A voter's prepare of `feature` is durable: `features` is the report
+    /// its support row holds, which the leader records in its own store.
+    FeaturePrepared {
+        /// The frozen feature identifier.
+        feature: u16,
+        /// The configuration of the report.
+        epoch: ConfigurationEpoch,
+        /// The report: frozen feature identifiers.
+        features: Vec<u16>,
+    },
+    /// The leader activated `feature`: `record` is the activation it holds,
+    /// which a voter installs unchanged, and only over its own durable
+    /// support row naming every feature in it.
+    FeatureActivated {
+        /// The feature this activation turned on.
+        feature: u16,
+        /// The activation record.
+        record: FeatureRecord,
+    },
+    /// The sending voter's activation row is durable, and this is the
+    /// record it holds (task-d99). Sent to the leader once it is, again at
+    /// start and on a new ballot, and in answer to a
+    /// [`ProtocolMessage::FeatureActivated`] it already holds. A leader
+    /// treats a follower as holding the activation only while this is the
+    /// latest it heard from that follower's current link; a new leader
+    /// that has not installed the record installs it from here.
+    FeatureHeld {
+        /// The activation record.
+        record: FeatureRecord,
+    },
+}
+
+/// An activation record as it travels between voters (task-d99): the
+/// `ActiveFeaturesV1` row without the cluster and domain, which the link
+/// already names.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct FeatureRecord {
+    /// The configuration it was activated under.
+    pub epoch: ConfigurationEpoch,
+    /// Frozen feature identifiers, prepare markers included.
+    pub features: Vec<u16>,
+    /// The voters whose reports made it unanimous.
+    pub reporters: Vec<ReplicaId>,
 }
 
 /// Why a voter refused a submission (task-d22).
@@ -404,6 +468,11 @@ impl ProtocolMessage {
             | ProtocolMessage::FloorReadiness { .. }
             | ProtocolMessage::ReadConfirm { .. }
             | ProtocolMessage::ReadConfirmed { .. }
+            | ProtocolMessage::FeatureSupport { .. }
+            | ProtocolMessage::FeaturePrepare { .. }
+            | ProtocolMessage::FeaturePrepared { .. }
+            | ProtocolMessage::FeatureActivated { .. }
+            | ProtocolMessage::FeatureHeld { .. }
             | ProtocolMessage::Sync(_) => None,
         }
     }
@@ -416,5 +485,72 @@ impl ProtocolMessage {
             return Err(DecodeError::TrailingBytes);
         }
         Ok(m)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn epoch() -> ConfigurationEpoch {
+        ConfigurationEpoch::new(3).unwrap()
+    }
+
+    /// task-d99's messages are appended after every older variant, so an
+    /// older build's encodings are unchanged, and the variant index it
+    /// meets for one of them is past its last: it cannot decode the
+    /// message, records it as malformed and changes nothing.
+    #[test]
+    fn feature_messages_are_appended_and_an_older_registry_cannot_decode_them() {
+        let read = ProtocolMessage::ReadConfirm {
+            ballot: Ballot {
+                epoch: epoch(),
+                number: 1,
+                leader: ReplicaId([1; 16]),
+            },
+            round: 0,
+        }
+        .encode();
+        let messages = [
+            ProtocolMessage::FeatureSupport {
+                epoch: epoch(),
+                features: alloc::vec![4],
+            },
+            ProtocolMessage::FeaturePrepare {
+                feature: 4,
+                epoch: epoch(),
+            },
+            ProtocolMessage::FeaturePrepared {
+                feature: 4,
+                epoch: epoch(),
+                features: alloc::vec![4],
+            },
+            ProtocolMessage::FeatureActivated {
+                feature: 4,
+                record: FeatureRecord {
+                    epoch: epoch(),
+                    features: alloc::vec![4, 5],
+                    reporters: alloc::vec![ReplicaId([1; 16])],
+                },
+            },
+            ProtocolMessage::FeatureHeld {
+                record: FeatureRecord {
+                    epoch: epoch(),
+                    features: alloc::vec![4, 5],
+                    reporters: alloc::vec![ReplicaId([1; 16])],
+                },
+            },
+        ];
+        // `ReadConfirmed` is the last variant before task-d99, right after
+        // `ReadConfirm`.
+        let last_before = read[0] + 1;
+        for (offset, message) in messages.iter().enumerate() {
+            let bytes = message.encode();
+            assert_eq!(ProtocolMessage::decode(&bytes).as_ref(), Ok(message));
+            assert_eq!(bytes[0], last_before + 1 + offset as u8);
+            assert_eq!(message.command(), None);
+        }
+        // An index past the last variant is not a message.
+        assert!(ProtocolMessage::decode(&[last_before + 1 + messages.len() as u8]).is_err());
     }
 }
