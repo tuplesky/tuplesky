@@ -1869,11 +1869,11 @@ impl Leader {
         // durable (task-d98): they are counted, and nothing is committed
         // over them until the batch is.
         let proposals = &self.proposals;
-        let committed = self
-            .learner
-            .commit_learned_where(&mut self.table, |c| self.votes.get(c), |c| {
-                proposals.get(c).is_none_or(|p| p.durable)
-            });
+        let committed = self.learner.commit_learned_where(
+            &mut self.table,
+            |c| self.votes.get(c),
+            |c| proposals.get(c).is_none_or(|p| p.durable),
+        );
         if let Some(learned) = self.learned.as_mut() {
             learned.extend(committed);
         }
