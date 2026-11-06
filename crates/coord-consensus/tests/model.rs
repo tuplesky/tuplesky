@@ -2459,6 +2459,19 @@ fn a_candidate_after_a_command_its_member_retired_past_the_window_is_kept() {
 #[test]
 fn a_pre_acceptance_no_reporter_holds_a_payload_row_for_is_left_out() {
     let cfg = config(3, 2, &[2, 0], 2);
+    let rules = coord_consensus::SelectionRules {
+        leave_out_unheld: true,
+    };
+    let select = |cfg: &coord_consensus::BallotConfiguration, reports: &[RecoveryReport]| {
+        coord_consensus::select_ruled(
+            cfg,
+            reports,
+            |_, _| false,
+            |_| None,
+            &|_: &CommandId| false,
+            rules,
+        )
+    };
     let (f, a) = (cmd(1), cmd(2));
     let without = ReportEntry {
         payload_present: false,
@@ -2480,7 +2493,15 @@ fn a_pre_acceptance_no_reporter_holds_a_payload_row_for_is_left_out() {
     ];
     assert!(select(&cfg, &with).unwrap().reproposed.contains(&f));
     // The candidate holds its record.
-    let held = coord_consensus::select_from(&cfg, &reports, |c, _| *c == f, |_| None).unwrap();
+    let held = coord_consensus::select_ruled(
+        &cfg,
+        &reports,
+        |c, _| *c == f,
+        |_| None,
+        &|_: &CommandId| false,
+        rules,
+    )
+    .unwrap();
     assert!(!held.reproposed.contains(&f));
     // An accepted entry waits on it.
     let waited = vec![
@@ -2494,4 +2515,40 @@ fn a_pre_acceptance_no_reporter_holds_a_payload_row_for_is_left_out() {
     ];
     let decision = select(&cfg, &waited).unwrap();
     assert!(decision.entries.contains_key(&a) && decision.reproposed.contains(&f));
+}
+
+/// Without the rule, a domain's selection before task-d90 (#197 review):
+/// a pre-acceptance no reporter holds a payload row for is re-proposed, so
+/// the campaign waits for a supplier rather than drop a command an older
+/// voter may have acknowledged without its payload row.
+#[test]
+fn without_the_rule_a_pre_acceptance_no_reporter_holds_a_payload_for_is_reproposed() {
+    let cfg = config(3, 2, &[2, 0], 2);
+    let f = cmd(1);
+    let without = ReportEntry {
+        payload_present: false,
+        ..pre_accept_with(f, &[], 9)
+    };
+    let reports = vec![
+        report_for(1, ballot(2, 2), 1, vec![without]),
+        report_for(2, ballot(2, 2), 1, vec![]),
+    ];
+    assert_eq!(
+        coord_consensus::SelectionRules::default(),
+        coord_consensus::SelectionRules {
+            leave_out_unheld: false
+        }
+    );
+    let decision = select(&cfg, &reports).unwrap();
+    assert!(decision.reproposed.contains(&f), "{decision:?}");
+    let decision = coord_consensus::select_ruled(
+        &cfg,
+        &reports,
+        |_, _| false,
+        |_| None,
+        &|_: &CommandId| false,
+        coord_consensus::SelectionRules::default(),
+    )
+    .unwrap();
+    assert!(decision.reproposed.contains(&f), "{decision:?}");
 }

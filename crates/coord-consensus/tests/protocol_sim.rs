@@ -574,6 +574,13 @@ struct Node {
     durable_promise: Option<Ballot>,
 }
 
+/// The rules every candidate here selects under: one build everywhere,
+/// every voter on point 4, as a domain that activated `ReleaseAtExecution`
+/// is (task-d90).
+const RULES: coord_consensus::SelectionRules = coord_consensus::SelectionRules {
+    leave_out_unheld: true,
+};
+
 impl Node {
     fn alive(&self) -> bool {
         self.role.is_some()
@@ -892,6 +899,7 @@ impl Sim {
                     capacity: knobs.capacity,
                 });
                 follower.set_learning(LearningMode::Full);
+                follower.set_selection_rules(RULES);
                 Role::Follower(follower)
             };
             nodes.push(Node {
@@ -1287,6 +1295,7 @@ impl Sim {
                 let q = l.config_quorum();
                 let pending = l.pending_sync().cloned();
                 let mut f = Follower::from_recovered(l.into_recovered(), q);
+                f.set_selection_rules(RULES);
                 // A new machine: its examinations count from here, against
                 // what it is given from here, its own carried selection
                 // included (task-d34), bounded by the table.
@@ -2327,6 +2336,7 @@ impl Sim {
         .restore_execution(executed, node.executed.iter().copied())
         .restore_payloads(payload_rows(&node.storage));
         f.set_learning(LearningMode::Full);
+        f.set_selection_rules(RULES);
         // Restored from rows, its executions are the journal's (task-d90).
         if self.knobs.late_execution && !self.knobs.count_in_memory {
             f.track_execution_durability();
