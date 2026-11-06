@@ -264,12 +264,12 @@ sequenceDiagram
     and Propagate to other voters
         G->>R: Canonical command
     end
+    L->>R: Leader proposal, before its batch is durable while EarlyProposal is active
     L->>L: Durably record proposal and compute tentative result
     F->>F: Durably record required proposal state
     L-->>G: Internal tentative result and evidence
     F-->>G: Durable fast acknowledgements
-    L->>F: Leader proposal
-    L->>R: Leader proposal
+    L->>F: Leader proposal, once durable at three voters and early at five
     alt Complete fast-learning predicate holds
         G->>G: Establish execution and authorization
     else Leader-guided resolution
@@ -285,6 +285,34 @@ sequenceDiagram
 Kine occupies G rather than sending to a second remote collector. The diagram is not replacement pseudocode: dependency processing and guards remain required. Opening a stream on a warm connection is not another request/accept handshake.
 
 **Who receives an acknowledgement (task-d74).** A voter's fast and slow acknowledgements go to the ballot's leader and to the voter's own frontend, not to every other voter as the reference's do. The leader's own adoption goes to its frontend only. The design check behind this: one follower decision read another voter's acknowledgements, its own learning (`Follower::learn`, `Learner::commit_learned` over the vote sets that peers' acknowledgements filled), and one metric (`missed_fast`, which classifies a follower's slow decisions). The frontend learns from the copies it still receives, the leader from the acknowledgements addressed to it, and recovery reads reports, never votes, so none of them moves. A follower now learns a command only from the leader's commit frontier (task-d09's `Committed`): it commits what it adopted from the current ballot's leader up to the frontier. The leader announces the frontier in the step that moves it, on a peer or storage event, as well as on its re-send timer, which repairs a lost one. What it costs is one message delay: a follower commits a command one leader turn and one hop after the leader does, where it used to learn about when the leader did, and its executed frontier lags the leader's by that. That lag is what a result released at a follower's frontend, task-d10's catch-up, the reports' window and a read served at a follower see. A follower's own fast-path counts read only the proposal and its own vote, so it counts its slow decisions as `missed_missing`; the leader's counts, which the fast-path share is read from, are unchanged. Mixed versions are safe: an acknowledgement still counted by a voter that receives it is the same evidence, and one a voter no longer receives was never one it decided on.
+
+**When the leader's proposal leaves (task-d98).** Without the early send the leader publishes each fresh `Proposal` with `requires: [barrier]`, so it leaves once the proposal batch is durable. A follower adopts it, and its slow acknowledgement leaves once that adoption and every outstanding batch of its own are durable. So a slow-path command pays two syncs in series before it is learned: the leader's, and then a follower's. With it, the proposal leaves as soon as it is batched (`Leader::propose` releases it in the same step), and the leader's sync runs beside the followers'. The argument for the early send (Section 4.8) needs four things: two that still wait for the leader's batch, a rule for which followers get the proposal early, and a replicated feature:
+- **The leader reply.** A frontend learns a fast decision from it together with the fast-set followers' fast acknowledgements (`VoteSet::learned`). It is the leader's fast vote, so it stays behind the batch, as Section 5.1's row says.
+- **The leader's own learning.** task-d89's gate (`Learner::commit_learned_where`) already holds it until the batch is durable. So the commit frontier the leader announces never covers a command whose proposal is volatile.
+- **A fast decision at a follower.**
+  - The paragraph above says a follower learns only from the leader's commit frontier, but that isn't quite so. A follower's vote set holds the leader's proposal and its own fast acknowledgement, counted once that acknowledgement is durable.
+  - At three voters under C2 the fast set is exactly those two, so a fast-set follower commits a fast decision from its own vote set (`Follower::learn`). Over a proposal that left early, that would be a fast decision counted over a volatile vote.
+  - The follower could execute it and answer from its own record (task-d12), while the restarted leader's report denies it. A recovery from the leader and the third voter would then re-propose the command under other dependencies.
+  - So the proposal leaves early only to a follower that can't make a fast quorum from it: one for which the proposal and its own acknowledgement fall short of `fast_size`.
+    - That's every follower at five voters under C2, and every follower under C1.
+    - At three voters under C2 it's the follower outside the fast set. The leader and that follower are a slow quorum, so a slow-path round is still one sync while that follower is up.
+    - The fast-set follower gets the proposal once the batch is durable, as now, and so does every re-send and retry of it while the batch is volatile.
+  - What it costs: at three voters, a slow-path command whose non-fast-set follower is slow or down falls back to today's two syncs in series.
+  - **And a follower counts no other voter's fast acknowledgement** (`FollowerRejection::PeerFastAck`). Since task-d74 only an older build sends one to a follower. Counted with an early proposal, it would complete a fast quorum at the follower that got the proposal early, whatever that follower's own build. Apart from the three-voter fast-set follower, whose proposal waits for the leader's batch (above) and which counts it with its own acknowledgement, a follower takes fast decisions from the leader's commit frontier, as task-d74 already has it learn its slow ones. So condition 2 rests on the receiving follower's build alone, and not on what the other voters run.
+  - The other way to hold this is to have every follower learn with the slow predicate only (`LearningMode::SlowOnly`) and take fast decisions from the frontier. It wasn't taken, for three reasons:
+    - it changes how every follower learns;
+    - it adds a leader turn and a hop to a three-voter fast-set follower's fast decisions, which a read served there would see;
+    - the mode must follow the role. `coordd` sets it at boot, while `Leader::from_recovered` and `Follower::from_recovered` carry the learner across an election and a step-down. So a deposed leader would keep `Full` over its successor's early proposals, and a follower that won would lead without fast learning.
+- **A replicated feature.** Section 4.8's condition 2 rests on the build of every follower that gets the proposal early.
+  - A follower built before this change counts the fast acknowledgements other voters send it, and a build from before task-d74 sends them to every voter. With the proposal, those make a fast quorum at the follower that counts them.
+    - At three voters, the fast-set follower's acknowledgement does it at the follower outside the fast set.
+    - At five voters, two fast-set followers' acknowledgements do it.
+  - A follower of this build drops them (above). So the early send is safe toward a follower whose store holds the activation, since `admit` then refuses any build without it, whatever the other voters run. That is task-d99's window rule.
+  - So a leader sends early only while a task-60 feature (`coord_consensus::feature`), `EarlyProposal`, is active. Activating it needs every configured voter to support it (Sections 11.7 and 13). Until then, the leader keeps the barrier on every proposal.
+  - `coordd` reads the active set from its store at start (`admit`) and sets the leader's flag from it, through every election. Nothing in a running domain records support or activates a feature yet: that is task-d99, and until it lands the early send is off everywhere.
+  - task-d74's "mixed versions are safe" doesn't carry over. That change took evidence away; this one weakens what a message means.
+
+What a follower does with the proposal is unchanged: it adopts it, and its slow acknowledgement still leaves once durable. What moves is when the followers' syncs start. A slow-path command then waits for the slower of the leader's sync and the first slow quorum's, plus the hops: one sync where it was two in series. At the runner's 2.28 ms an append (task-d84), that is about 2.3 ms off every slow-path round, at p50 and at p99. The fast path already waits for one sync and doesn't change. This is etcd's order too: its leader sends before it saves (`server/etcdserver/raft.go`, after the Raft thesis's §10.2.1), and its followers save before they answer. The diagram above shows the early copy.
 
 Evidence binds cluster, domain, configuration epoch, ballot, command and relevant order information. Never count an identity twice, including when frontend and voter are colocated. Messages on different streams/connections can arrive independently; stream IDs or arrival order do not establish semantic order. Keep bounded dependency queues and fetch missing prerequisites without blocking socket processing.
 
@@ -425,6 +453,29 @@ Recovery reads the sequence-40 projection and omits the voting obligation.
 This is an illustrative integration counterexample, not a reproduced upstream trace. Before authorizing a higher-ballot reply, stop admitting new old-ballot voting transitions, resolve submitted journal work relative to the cut, durably establish the new promise, and include all source-required recovery state. Timeout or missing completion does not prove absence. Reconcile indeterminate writes or stop serving; do not guess or blindly union historical dependency sets.
 
 Define actor-owned logical publication of immutable eligible evidence separately from physical transmission. Each vote-producing effect binds domain, replica incarnation, boot, membership epoch, ballot and prerequisite durable state. A late callback may update valid durability bookkeeping without authorizing a newly obsolete vote. Boot fencing alone is insufficient for same-process elections.
+
+**Persist-before-send binds votes, not the leader's proposal (task-d98).** The rule here and in Section 5.1 is about evidence. A message that some learner counts as a voter's vote leaves only once what it claims is durable. Sent early only to a follower that can't make a fast quorum from it (Section 4.3), the leader's proposal is counted by nobody as a vote. It carries the order, and each follower's adoption of it is that follower's own vote, which is durable before it leaves. Section 5.1's table never listed the proposal, so the barrier the code puts on it is stricter than the design. It may leave before the leader's batch is durable under four conditions, each of which the argument below uses:
+1. **The leader's fast vote counts only once it is durable.** The leader reply waits for the batch, and so do the leader's own learning (task-d89) and the commit frontier it announces.
+2. **No follower counts the proposal toward a fast decision.** It goes early only to a follower whose own acknowledgement and the proposal fall short of a fast quorum, and only while the replicated feature is active, so no voter is running a build that counts more (Section 4.3).
+3. **A proposal is sent again only unchanged.** A batch that definitely failed is presented again as it was, under a new barrier (`retry_proposal`). The leader fences itself once the attempts are spent. It never proposes a command twice in one ballot with different orders.
+4. **A leader that restarts never leads its old ballot again.**
+   - `coordd` brings a stopped leader back as a follower that campaigns, with one exception: the genesis leader on a store that has never taken part in anything (`fresh` in `coordd`'s boot).
+   - Suppose a genesis leader sent proposals before any of its batches was durable, then crashed. It comes back with exactly such a store. It would lead the genesis ballot again from sequence zero, against followers that adopted its earlier proposals.
+   - So a leader sends early only once its store holds a row that a restart reads as having taken part. For a ballot it won, that's the bound Sync (task-26). At the genesis ballot it's its first proposal batch, which waits for durability as every proposal did before.
+   - The code holds one rule for both: a leader sends early only once a proposal batch of its own leadership is durable (`Leader::early_ready`). Batches become durable in submission order, so a won ballot's bound Sync is durable by then too. A batch in flight when that first one completes keeps its own barrier.
+
+**The leader crashing between the send and its batch.** Followers can then hold the proposal adopted at ballot b, at ACCEPT, while the restarted leader's store lacks it.
+- **Every copy at b is the same order** (conditions 3 and 4): only b's leader proposes at b, and it proposes each command once. So the selection's agreement check (Section 4.9) never finds incompatible accepted copies.
+- **A slow decision never rested on the leader's row.** It is `slow_size` durable adoptions at b (task-d19), and the leader's own adoption counts only once its acceptance row is durable.
+  - So a slow quorum of followers alone is a decision: three of them at five voters, or both at three.
+  - Every majority of reports holds a copy of it, and the source rule keeps ACCEPT at the source ballot whatever the restarted leader's report says.
+  - Its frontend can't learn it without the leader reply (condition 1). So with the leader down, it is learned through recovery, as a slow decision is when the leader crashes after the quorum formed.
+- **No fast decision was counted over the lost proposal** (conditions 1 and 2). So the possible-fast rule's premise holds as before: the source leader's report without the command proves no fast decision was possible.
+- **Fewer adoptions than a slow quorum decided nothing.** Recovery re-proposes the command, or a Sync releases it, as with any undecided command. The followers' path logs are volatile, and a head the leader never ordered is slow, never wrong (Section 4.1).
+
+A deposed leader is the same case without the crash. Its report waits for the batch's outcome (above), and a batch that failed leaves the followers holding copies the leader lacks, as the crash does.
+
+task-d89's third point (Section 4.7) compares durable states at the moment its batch is durable, before any send went out. The merged batch doesn't change. The states the early send adds are the ones above, and the simulator rows of task-d98's acceptance cut crashes into exactly that window.
 
 Previously authorized old evidence can arrive late; never relabel it or combine configurations. Dropping a queue cannot recall transmitted packets. Historical completion can remain valid after configuration refresh; retain stable retries. Recovery need not wait for every old packet to reach every peer. Per-domain cuts and effect ordering are compatible with cross-domain group commit, subject to model/refinement review. [X2]
 
@@ -1379,6 +1430,51 @@ Audit accepted/rejected policy, session, enrollment, membership, compaction and 
 
 At-rest encrypted volumes and scoped access protect files/checkpoints/backups. Voters, collectors and observers see role-required data; no operator-blind encryption claim. A domain's scalar revision can disclose aggregate activity across namespaces; independent domains avoid a fleet-wide counter side channel. Protocol/data feature activation is replicated after compatible binaries; unsupported versions fail explicitly. Upgrades retain recovery and rollback rules.
 
+<a id="s13-feature-activation"></a>
+**Activating a feature in a running domain (task-d99).** task-60 built the rule (`coord_consensus::feature`: unanimity of the configured voters, no deactivation) and its rows (`coord_checkpoint::feature`: `FeatureSupportV1` and `ActiveFeaturesV1`). `coordd` uses only `admit` at start. This is the path from a binary that supports a feature to a domain that uses it. A rolling upgrade is the case it must get right: until the last voter is upgraded, some voters run a build that knows nothing of it.
+- **Support is advertised, not committed.**
+  - Each voter sends `FeatureSupport { epoch, features }` to every configured voter: at start, on every new peer link, and when asked. A receiver keeps the latest one per peer, in memory, until that peer's next link. It binds nothing. The leader's own advertisement is the ask: a follower answers it with its own, and the leader sends it, once a second, to each voter whose advertisement it does not hold.
+  - Why a peer message and not a committed command: no voter may skip a committed command it can't decode, so the first report in a rolling upgrade would reach builds that can't apply it.
+  - A build that can't decode a peer message records `MalformedPeerMessage` and changes nothing (`Follower` and `Leader` alike). So an advertisement reaches only the builds that understand it, and no capability gate is needed for it. Floor readiness travels the same way (Section 5.3).
+- **Activation is an operator's two-phase request, run by the leader.** `coordctl feature activate <name>` reaches the domain's leader. A follower refuses it and names the leader.
+  1. **Prepare.**
+     - The leader needs a current advertisement of the feature from every configured voter, its own included. Otherwise it refuses, naming the voters without one.
+     - It sends `FeaturePrepare { feature, epoch }` to every voter.
+     - A voter whose build supports the feature writes its durable `FeatureSupportV1` row (`record_support`) and, in the same batch, adds the feature's prepare marker to its own `ActiveFeaturesV1` record (below). Once the batch is durable it answers `FeaturePrepared` with its report. The leader records each answer in its own store with `record_support`.
+  2. **Activate.**
+     - Once every configured voter's prepared report is durable in its store, the leader writes `ActiveFeaturesV1` (`activate_feature`, which checks unanimity over those rows).
+     - It then sends `FeatureActivated { feature, record }` to every voter, where the record is the activation row's epoch, features and reporters.
+     - A voter writes the activation row only if its own durable support row names the feature. An activation never lands in a store whose build didn't promise it.
+     - The leader sends `FeatureActivated` again on its re-send timer to any follower that hasn't said it holds it (below), and a new leader does the same.
+     - **A leader change in the middle (#194 review).** A new leader that never received `FeatureActivated` would re-send nothing, and the domain would stay partly activated. So a follower's `FeatureHeld` carries the activation record it holds (features, epoch and reporters), not the feature names alone. A leader that hears it installs that record unchanged, as a follower installs `FeatureActivated`: checked only against its own durable support row, since the prepared reports `activate_feature` counted are in the old leader's store, not its own. It then resumes the re-sends of the same record. The domain holds one record with one set of reporters, whichever leader finishes it. A leader whose support row doesn't name the feature can't install it, and `coordctl feature status` shows the partial state. `activate` is idempotent, so the operator can also run it again.
+- **A report binds once it is durable, and the guard is one every build already enforces (#194 review).**
+  - A guard in the new `admit` alone would bind nothing: a voter rolled back to a build from before it runs that build's `admit`, which reads only the activation record and ignores a support row.
+  - So the prepare marker is a feature id of its own in the voter's `ActiveFeaturesV1` record, one per gated feature (`EarlyProposalPrepared` for task-d98). Every build since `admit` reads that record at start and refuses a store naming a feature id it doesn't know (`Feature::from_id` fails, so the record is corrupt to it) or doesn't support (`TooOld`). A build from before task-d99 knows no marker id, so it refuses to start on a prepared store. That is the rollback guard, and it needs no prerequisite release. Such a build reports the record as unreadable, not as too old, and the runbook says that after a rollback this means the store was prepared for a newer build.
+  - The marker is not the feature. A build that knows it reads it as a requirement on its own `Supported` set, and no behavior is gated on it. Only the feature's own id, written at activation, turns the behavior on.
+  - Builds from before `admit` itself are below the floor task-60 already sets for any activation.
+  - Rollback before preparing is still running the old binary. After preparing, rollback is a restore (task-59), which task-60 already says of activation.
+  - So a voter can't report a feature, roll back, and leave unanimity counting a build it no longer runs.
+  - Preparing is the operator's step, not a start's, so starting a new binary once doesn't bind anything.
+  - A prepare that never completes leaves its rows binding, and a later activation reuses them. `record_support` already refuses a report that shrinks.
+  - **A generation replacement keeps them (#194 review).** The feature rows live in `checkpoint_v1`, which is node-private and outside the common hash (`Collection::in_common_hash`). A checkpoint image doesn't carry them, and an install writes only common collections. A voter replaced through an install and handoff would start on a generation with no activation, no support row and no marker, and its next `admit` would admit any build. So the handoff copies the voter's own feature rows (its support row, its markers and its activation) into the staged generation before selecting it, and selection refuses a generation that lacks a row the active one holds. This is latent in task-60 too; task-d99 is the first thing that relies on it.
+- **The window: a gated behavior acts toward a voter only once that voter holds the activation.**
+  - `admit` reads only the voter's own store, so until a follower's activation row is durable, nothing stops it from restarting on an older build.
+  - A follower sends `FeatureHeld { activation }`, the activation record it holds, to its leader once its activation row is durable. It sends it again at start (after `admit`) and when it installs a new ballot's Sync.
+  - The leader keeps the set per follower boot, in memory, and clears a follower's entry on any new peer link from it. A restart has only new links, so the link is the key the runtime uses: an entry also goes when a connection is replaced without a restart, and the leader's re-send gets it back. A restart keeps the placement's `ReplicaIncarnation` and draws a new `BootId`, so keyed by incarnation an entry would outlive the restart (#194 review). A restarted follower qualifies again only after its post-start `FeatureHeld`, which it sends anyway. The set is empty at the leader's own start and at each new ballot, and absence means not eligible. A follower that never says it, an older build among them, never qualifies.
+  - "Holds" means durable in the store, not executed. A command executes before its execution group is durable, and under task-d90 its result is released before then too.
+  - For task-d98, a proposal goes early only to a follower that holds `EarlyProposal`, besides Section 4.3's fast-quorum rule.
+  - **The node's own switch turns on at runtime (#194 review).** A node turns the gated behavior on once its own activation row is durable, not only from `admit` at its next start. So a leader sends early only while its own store holds the activation, and the leader is bound by `admit` as its followers are. Without it, an activation would take effect at each voter only after a restart.
+  - task-d98's follower counts no other voter's fast acknowledgement, so what the other voters run doesn't matter to it. The window rule is enough.
+- **No ordered switch.** Activation is per store, at different times at different voters, and it is safe for a feature whose use is toward one peer at a time under the window rule, as task-d98's is. A feature that changes what every voter executes needs one switch point in the order. task-d99 doesn't provide that; such a feature's own task must.
+- **Membership.** Advertisements, prepared reports and activations name their configuration epoch.
+  - An activation stays across a configuration change, since activation is one-way.
+  - **A voter that joins after an activation (#194 review).** Images don't carry `checkpoint_v1`, and a handoff copies only a voter's own feature rows, so a joining voter, or one whose old generation is gone, starts with none, and its `admit` accepts any build. The activation's claim that every configured voter supports the feature would then stop holding at the join. So promoting a learner to voter requires a current advertisement of every active feature from it, and the leader runs prepare and activate for that voter alone before the promotion completes. Until then `feature status` shows it outside the active set. This is Section 22's rule that a learner can't vote before durable activation, applied to features. task-d98 is safe meanwhile, since such a voter never says `FeatureHeld` and its own switch stays off. The joiner installs the domain's record unchanged, with the original reporters: its own prepared report stays in its own store and the leader's, not in the record, so every store keeps one record with one set of reporters (#194 review). `feature status` therefore takes a voter's place in the active set from its `FeatureHeld`, not from the record's reporters.
+  - A prepare or activation in flight at an epoch change is abandoned, and the operator runs it again under the new epoch. `record_support` already reads a voter's rows from an earlier configuration as binding.
+- **What the operator sees.**
+  - A refused request names the feature and each voter that lacks a current advertisement or a prepared row.
+  - `coordctl feature status` reports, from the leader: each configured voter's advertised, prepared and held features, and the domain's active set.
+  - Both reach a voter through its admin socket, `<state_directory>/admin.sock`, which only the node's owner may open.
+
 <a id="s13-1"></a>
 ### 13.1 Resource contract
 
@@ -1701,7 +1797,7 @@ Import inactive generation after checking origin/configuration/format, row order
 <a id="s17-7"></a>
 ### 17.7 Schema upgrades
 
-Same-engine schema upgrades require old/new fixtures and interrupted-generation tests. V1 uses explicit offline/generation replacement, not destructive in-place startup changes or engine savepoint rollback of live promises. Unsupported format fails before admission. Journal, snapshot, application and adapter formats have separate reviewed transitions.
+Same-engine schema upgrades require old/new fixtures and interrupted-generation tests. V1 uses explicit offline/generation replacement, not destructive in-place startup changes or engine savepoint rollback of live promises. Unsupported format fails before admission. Journal, snapshot, application and adapter formats have separate reviewed transitions. A replicated feature is activated in a running domain by advertisement, a prepared report and an activation per store, not by a schema transition (Section 13, task-d99).
 
 <a id="s17-8"></a>
 ### 17.8 Semantic port and physical boundaries

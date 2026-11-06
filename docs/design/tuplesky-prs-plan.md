@@ -3,7 +3,7 @@
 **Status:** Review proposal, consolidated v1.5.  
 **Date:** 2026-09-24.  
 **Companion:** [TupleSky implementation design](tuplesky-design.md).  
-**Scope:** 187 implementation tasks with stable `task-*` identifiers. The `task-01` through `task-66`, `task-s01` through `task-s04`, `task-j01` through `task-j10`, `task-o01` through `task-o06`, `task-m01` through `task-m05`, `task-c01`, `task-c02`, `task-c03`, `task-d01` through `task-d92` and `task-q01` suffixes and prerequisites are preserved. v1.5 adds `task-d01` through `task-d04` from review of the open implementation PRs and of multi-host readiness, `task-d05` through `task-d17` from the Jepsen client's runs, `task-d18` through `task-d33` from a review against an external SwiftPaxos correctness checklist ([review record](tuplesky-checklist-review.md)), `task-d34` from what the protocol simulator of task-d30 found, `task-d35` through `task-d44` from a review of recovery time and storage integrity (an execution chain, a scrub, and voter replacement through a prepared transition, a staged learner, terminal recovery after the seal, serving across a transition and a running membership install), `task-d45` through `task-d50` from measuring the throughput of the Jepsen client's first unthrottled runs, `task-d51` from task-d46's long runs, `task-d52` and `task-d53` from a profile of the domain thread after task-d46, `task-d54` from the Jepsen runs of task-d50, `task-d55` through `task-d57` from the Jepsen runs of task-j06, `task-d58` through `task-d61` from a profile of five voters' CPU per operation, `task-d62` through `task-d65` from a consolidated review against the reference SwiftPaxos, `task-d66` from the Jepsen runs of task-d51, `task-d67` from a Jepsen run on #98 that made no fast decision, `task-d68` from task-d62's counts after a leader change, `task-d69` from a profile of a follower's loop, `task-d70` from the Jepsen runner's profile of the transport's workers, `task-d71` from the protocol simulator's first 1,000-seed sweep, `task-d72` through `task-d75` from comparing a command's cost with etcd's on one host, `task-d76` from a Jepsen run that killed the leader, `task-d77` through `task-d81` from the protocol simulator with acknowledgements between followers lost, `task-d82` through `task-d84` from the Jepsen runs of the #173 carry, `task-d85` from the protocol simulator on task-d74's routing, `task-d86` through `task-d92` from planning the whole gap to etcd on #174, and moves committed key replacement from `task-58` to `task-m03`; the changes are listed under [Gate checklist and deferred work](#gate-checklist-and-deferred-work). Task IDs are not GitHub pull-request or issue numbers. One implementation PR corresponds to one task; its GitHub-assigned number is recorded separately. No baseline, supplement or separate amendment is needed.
+**Scope:** 191 implementation tasks with stable `task-*` identifiers. The `task-01` through `task-66`, `task-s01` through `task-s04`, `task-j01` through `task-j10`, `task-o01` through `task-o06`, `task-m01` through `task-m05`, `task-c01`, `task-c02`, `task-c03`, `task-d01` through `task-d92`, `task-d96` through `task-d99` and `task-q01` suffixes and prerequisites are preserved. v1.5 adds `task-d01` through `task-d04` from review of the open implementation PRs and of multi-host readiness, `task-d05` through `task-d17` from the Jepsen client's runs, `task-d18` through `task-d33` from a review against an external SwiftPaxos correctness checklist ([review record](tuplesky-checklist-review.md)), `task-d34` from what the protocol simulator of task-d30 found, `task-d35` through `task-d44` from a review of recovery time and storage integrity (an execution chain, a scrub, and voter replacement through a prepared transition, a staged learner, terminal recovery after the seal, serving across a transition and a running membership install), `task-d45` through `task-d50` from measuring the throughput of the Jepsen client's first unthrottled runs, `task-d51` from task-d46's long runs, `task-d52` and `task-d53` from a profile of the domain thread after task-d46, `task-d54` from the Jepsen runs of task-d50, `task-d55` through `task-d57` from the Jepsen runs of task-j06, `task-d58` through `task-d61` from a profile of five voters' CPU per operation, `task-d62` through `task-d65` from a consolidated review against the reference SwiftPaxos, `task-d66` from the Jepsen runs of task-d51, `task-d67` from a Jepsen run on #98 that made no fast decision, `task-d68` from task-d62's counts after a leader change, `task-d69` from a profile of a follower's loop, `task-d70` from the Jepsen runner's profile of the transport's workers, `task-d71` from the protocol simulator's first 1,000-seed sweep, `task-d72` through `task-d75` from comparing a command's cost with etcd's on one host, `task-d76` from a Jepsen run that killed the leader, `task-d77` through `task-d81` from the protocol simulator with acknowledgements between followers lost, `task-d82` through `task-d84` from the Jepsen runs of the #173 carry, `task-d85` from the protocol simulator on task-d74's routing, `task-d86` through `task-d92` from planning the whole gap to etcd on #174, and moves committed key replacement from `task-58` to `task-m03`; the changes are listed under [Gate checklist and deferred work](#gate-checklist-and-deferred-work). Task IDs are not GitHub pull-request or issue numbers. One implementation PR corresponds to one task; its GitHub-assigned number is recorded separately. No baseline, supplement or separate amendment is needed.
 
 ## How to use this plan
 
@@ -53,6 +53,10 @@ Reference single-store and fixed-membership compositions are early increments, n
 | task-d82 through task-d84 | From the #173 carry's Jepsen runs (#98): a leader killed and back within the transport's idle timeout left the domain leaderless for 23 to 54 s; the `service` row ordered about seven reads in ten, where the barrier serves only a bare Range; and durability costs about 1.7 journal syncs a command | task-d82 before the next fault series; task-d83 next; task-d84 after task-d74's pairs and the tokio profile task-d73 waits on |
 | task-d85 | From the sweep of #167's head at half the acknowledgements between followers lost, catch-up off: a Sync received twice activated its ballot before its marker was durable, and the marker then released commands the voter had just accepted, so a decided command was reported at PRE-ACCEPT under other dependencies | Safety; before task-d74's routing |
 | task-d86 through task-d92 | From planning the whole gap to etcd before the next performance run (#174): the levers the readings on record name and no task owned, each sized, so the runner measures them as one batch | Each with its reading first where it has one; task-d90's design step started now, as the long pole for p99 |
+| task-d96 | From the task-d72 batch's call graph of the tokio threads (#185 review): QUIC's packet protection, send and receive are about three fifths of the threads and scale with packets, and the ACK frequency and per-step coalescing are already read, so what is left is fewer messages a command | A design entry before the next batch; no code until it is sized |
+| task-d97 | From the `service` row's R4 (#98, #185 review): its means put L4 at a p50-scale gain, 0.76 to 1.36 ms off a write's release, so nothing on record says what a p99 operation waits for | Before task-d90's code step is sized against the p99 |
+| task-d98 | From the next step on the gap (#185 review): a slow-path write pays two syncs in series before it is learned, the leader's and then a follower's, since the leader sends its proposal only once its batch is durable; about 95% of the register row's writes take the slow path, and two runner syncs are about 4.6 ms against etcd's `service` p99 of 3 | Before the next batch, or the batch revises the `service` target with this as the reason |
+| task-d99 | From task-d98's design step (#192 review): task-60's activation rule and rows exist, but nothing in a running `coordd` records a voter's support or activates a feature, so a feature-gated change ships unreachable, and Section 23 rules out an operator flag around a correctness gate | Before the batch that carries task-d98 |
 | task-q01 | Combined durable WAN/Kine qualification | Required before task-66 |
 
 ```mermaid
@@ -268,6 +272,10 @@ This is a workstream overview; the individual prerequisites are authoritative. O
 | [task-d90](#task-d90) | Release a result before its execution group is durable | task-d06, task-d12, task-d35, task-d63, task-d84 |
 | [task-d91](#task-d91) | Read and cut wake and hop latency | task-d55, task-d72 |
 | [task-d92](#task-d92) | Cut a local checkpoint publication's cost a record | task-d51, task-d55, task-d72 |
+| [task-d96](#task-d96) | Size the messages a command sends, before cutting them | task-d70, task-d72, task-d88 |
+| [task-d97](#task-d97) | Read what a `service` p99 operation waits for | task-d55, task-d72, task-d91 |
+| [task-d98](#task-d98) | Send the leader's proposal before its batch is durable | task-d30, task-d74, task-d89, task-d99 |
+| [task-d99](#task-d99) | Activate a replicated feature in a running domain | task-60 |
 | [task-q01](#task-q01) | Produce the combined durable WAN/Kine qualification report | task-j07, task-j08, task-o06, task-m05, task-63, task-64, task-d45, task-d46, task-d47, task-d48, task-d49, task-d51, task-d52, task-d53 |
 
 ## Task specifications
@@ -2136,6 +2144,10 @@ With the comparison disabled, the same perturbation is found only through a half
 - **Promotion:** a successor that was a learner (task-d39) enrolls a voter-role leaf for its committed key while it is staged, against task-d42's record, as part of readiness (task-d38). Renewal refuses a role change, and without the early enrollment an issuer outage at activation would leave f at 0 until the new voter re-enrolls. Promotion is then a reconnect under that leaf: the renewal driver's membership and `votes` flag are updated, and `coordd` switches from learner mode to voter mode.
 - **Recovery:** a successor that crashes between the published activation and its own install learns the new epoch from a peer. Frontends and the Rust collector, which has no epoch refresh today, follow the new epoch.
 
+- **Replicated features at promotion (task-d99, #196 review).** A joiner holds no feature rows, since images carry no `checkpoint_v1`:
+  - promotion calls `coord_checkpoint::feature::promotion_missing` and completes only after the joiner's `FeatureHeld`. task-d99's driver re-sends only to configured voters, so that ordering is this task's;
+  - `coord_daemon::feature::Features` takes its `EpochVoters` once, in `open`. At an epoch change it needs the new voters: abandon a prepare in flight, and clear the advertisements and the held set. Until then it drops every message from a joiner as not from a voter.
+
 **Acceptance:** After an activation that replaces C by D, every continuing voter refuses C's old incarnation and admits D without a restart, D votes as a voter, the collector routes to D, and the new epoch elects its first leader. Every successor's position P+1 is the epoch-boundary record, with identical bytes, and a client command pre-accepted at a successor before the switch executes after it, never before. A non-boundary application offered at P+1, after the closure is installed and after the install record, is refused by name. A boundary record whose base, chain value or updates differ from the certificate's is refused, and after the boundary every new stamp and fence carries the new epoch. `config_v1` is byte-identical on every successor, including one whose approvals came from a different majority, were collected again by a replacement coordinator, or were learned from a peer, and the first scrub after activation stops nobody. A restart comes up in the activated configuration and verifies its chain. A successor that crashes before its install learns the epoch from a peer, and one that crashes between its install and the boundary record applies the boundary at start. A successor behind P at the seal reaches P and then the new epoch. D's leaf renews as a voter's after promotion, and under an issuer outage promotion is still only a reconnect. The old epoch's state is dropped, kept or carried as the design amendment decides, each with a test.
 
 **Review boundary:** Installing an activated configuration into running nodes, the epoch-boundary record, the store's admission of it and its refusal of anything else past P, and promoting a learner. No change to the handoff rules or to credential classification.
@@ -2154,6 +2166,8 @@ With the comparison disabled, the same perturbation is found only through a half
 5. each successor installs the new configuration and applies the epoch-boundary record at P+1, which completes the prepared record (task-d40).
 
 Before step 2 the operator can cancel; after it the transition completes with the healthy majority readiness counted, and a successor that fails later is replaced by the next transition. Write the runbook in `docs/operations`, including the cases where more than f voters are stopped or lost, or voters are in task-d36's undecided state: sealing needs an old majority that agrees, so those cases are disaster recovery (a restore as a new cluster, task-59), not replacement. A node stopped by task-d13, task-d36 or task-d37 is replaced this way, task-d32 reuses the path for a voter behind the forgetting floor, and task-m03 builds on it.
+
+- **Replicated features at the handoff (task-d99, #196 review).** The staged generation gets the voter's own feature rows through `carry_feature_rows`, and selection passes them to `select_installed`, which refuses a staging that lacks them. Read those rows from the active generation only once the feature driver's last batch is durable and materialized: a record installed after they were read would be missed.
 
 **Acceptance:** A stress run and a Jepsen scenario each wipe a voter's store under load and replace it, at three and at five voters, with no anomaly, final reads on every node, and the pause and the write stall across activation measured and reported. The replaced incarnation, restarted on its old store, is refused by every voter. A coordinator killed after each durable step resumes to the same successor, and one killed between the point of no return and the first seal resumes to sealing, never to stable. A successor that never reaches readiness leaves the old configuration serving, and cancelling the prepared transition returns it to stable; a cancellation after the point of no return is refused, and a stale coordinator's seal request for a cancelled transition is refused by every voter. With more than f voters stopped, or voters undecided, the command refuses to seal and names the runbook's disaster-recovery section.
 
@@ -2937,12 +2951,104 @@ This entry is the budget and the record, not a lever:
   - **Projected:** a barrier read's 6.9 ms wait for its index is the in-flight writes' latency, so L3 and L4 shorten reads too. After L1 to L4 a write is one sync, at the leader and the followers in parallel, plus about two hops: roughly 3 to 4 ms on the runner before queueing, etcd's shape. p99 within etcd's spread then rests on L6, and perhaps a revised target, decided from the batch's local readings.
   - **The readings that size the levers no task owned,** all local but R4: R1 for task-d73 and task-d86, R2 for task-d92 (and task-d27's split, for the long run), R3 for task-d88, and R4 for task-d91, read from the runner's summary on the batch's base side with no extra run (the summary column is the testing session's).
   - **If the projection falls short** of 2.8 ms or of etcd's p99 once the local readings are in, which is now likely for the CPU target, the target is revised under this entry's clause, with the reason beside it, rather than run again to find out.
+- **The batch, as built (task-d72's batch record).** Each lever's local reading is in its own PR. The tables above stay as they were sized; this is what the readings made of them.
+
+  | # | Lever | Owner | Outcome | Size (ms an operation) | Running total before overlap (ms) |
+  | --- | --- | --- | --- | --- | --- |
+  | C1 | Threshold 8 as the acknowledgement cadence's default | task-d70's second step (#155) | Built, merged | −0.15, measured | 3.43 |
+  | C2 | Acknowledgements to the leader and the frontend only | task-d74 (#167) | Built, now on the stack, with L3 stacked on it | about −0.16 (−4.5% locally) | 3.27 |
+  | C3 | A turn takes every ready event before it lowers | task-d73 (#182) | R1: almost no group ends while events are ready. 97.2 to 99.9% of flushes find nothing ready, and the rest are at most 0.013 a command. The bounded wait is not taken | 0 | 3.27 |
+  | C4 | Fewer projection commits per command | task-d86 | Re-sized by R1 (#182): the materializer's cost is about 60 µs a commit and 115 µs a record, so per record more than per commit. Not built; it waits for the runner's group sizes (#98) | −0.03 to −0.09, not in the batch | 3.27 |
+  | C5 | The inbound path without a task per stream | task-d70's third step (#183) | Measured, not kept: the tokio workers' share and CPU a command don't move, and their wake-ups fall 3 to 8% | 0 | 3.27 |
+  | C6 | The leader's lookups as hash maps, broadcasts from one buffer | task-d60's third step | Not built: B-tree searches are 1 to 2% of a leader's samples locally after task-d75 | −0.02 to −0.04, not in the batch | 3.27 |
+  | C7 | Held reads share one confirmation round | task-d87 | Not built: R1 reads 1.15 reads a round at 10 callers and 2.3 at 30, so rounds are already shared | −0.02 to −0.04, not in the batch | 3.27 |
+  | C8 | `load_authorization` once a session | task-d60's third step | Not built: 0.8% of a leader's samples locally | about −0.02, not in the batch | 3.27 |
+  | C9 | The api plane's datagrams | task-d88 (#187) | R3 read; its lever (several returned frames a stream on a collector's link) measured, not kept: 13% fewer api datagrams, no CPU change | about −0.02, not in the batch | 3.27 |
+  | C10 | A local checkpoint publication's cost a record | task-d92 (#184) | Built: about 30% less a record, and 2 to 3.6% less process CPU a command at every voter, at R2's setup | about −0.05 | 3.22 |
+
+  | # | Lever | Owner | Outcome |
+  | --- | --- | --- | --- |
+  | L1 | Read-only transactions at the barrier | task-d83 (#176) | Built; on the stack, so in the next carry |
+  | L2 | The `replay` profile | a run setting | Read on both sides |
+  | L3 | A fresh proposal's acceptance in its proposal batch | task-d89 (#180) | Built: the leader's syncs a command fall from 2.91 to 2.00 at one caller, and 14 to 18% at ten |
+  | L4 | Release before the execution group is durable | task-d90 | The design step is up for review (#181); no code before it is accepted |
+  | L5 | Held reads share one confirmation round | task-d87 | Not built (C7) |
+  | L6 | Wake and hop latency | task-d91 | R4 is read from the batch's base side |
+
+  - **Projected for the register row:** about 3.22 ms an operation, against the #173 carry's 3.58, from C1, C2 and C10. Every lever left out, each at the top of its size, would bring it to about 3.03. So no lever on record reaches 2.8 ms in this batch.
+  - **The CPU target for this batch stays 2.8 ms (#185 review).** The projection, 3.22 ms, comes from the levers built so far. Three local readings that could move it aren't in yet, so the clause doesn't apply until they are. Each is local and goes in its own PR:
+    - **R5, where the materializer's cost a record goes** (task-d86's first step). R1 puts the materializer at about 115 µs a command at each voter, besides 60 µs a commit: on the order of half a millisecond an operation at the runner's five voters. The profile is a record's path through the materializer: the rows a command writes, by table, and redb's insert, page and freed-page costs. task-d92's profile of the export found half its thread in avoidable re-encoding, so this is the same reading for the other half of the engine.
+      - **Read (local, the head, three voters, 30 callers, `replay`, tmpfs, 150,000 operations):** no avoidable copy like the export's. The materializer's samples are memmove 17.5%, clearing fresh pages 13% (page faults on pages mimalloc has just been handed), redb's `get_page` 11%, its page cache's LRU 7%, and checksums and frees after that. redb's cache is 256 MiB, so it isn't under pressure; the copy-on-write page work is the engine's own. The one lever is the allocator's: never returning freed pages to the OS (`MIMALLOC_PURGE_DELAY=-1`) takes the page clearing off. Over nine alternating pairs it was lower in seven, by a median pair of 4.3% and a mean of 2.9% of the voters' CPU, about −0.1 ms an operation, for 5 to 10% more resident memory (189 to 199 MiB against 182 to 186). That's small, and it's a setting, so it's carried as task-d86's step, not as a code lever.
+      - **Read again with a bounded delay (#185 review), and not reproduced.** Six alternating runs a side, the same setup at 50,000 operations, with each voter's resident memory sampled every second. Mean CPU a command over the voters: 2.604 ms at the default 10 ms, 2.627 at 1,000 ms, 2.678 never purging. Inside each side the runs spread 0.4 to 0.7 ms, so none of the three differs from the others. Peak resident memory was 185 MiB at the default and at 1,000 ms, and 200 never purging. So no allocator setting is carried: R5's lever is within the spread, and the materializer's cost stays the engine's own.
+    - **R3 on the head, the api plane's datagrams by kind** (task-d88). C5 showed that the tokio workers' cost doesn't follow stream tasks, and C1 and C2, the levers that did move it, both cut datagrams. After them the api plane is the larger plane. It's read on the head, since #167 and #180 change what crosses it: submissions, fast and slow acknowledgements, releases and the client's own traffic, with ACK-only datagrams split out.
+      - **Read (#187):** the api plane sent about 10.0 datagrams a command against the peer plane's 4.1, because every frame between a collector and a voter was a stream of its own. The lever that names, several returned frames a stream on a collector's link, was built and paired on the head: the api plane's datagrams fell 13% and the voters' CPU didn't move (2.379 against 2.356 ms a command, two pairs each way). So it isn't kept, and R3 is small.
+    - **R6, a fresh profile of a leader's and a follower's domain loop on the head,** at the register row's shape. The last ranking of what the loops spend is task-d75's, and this record shows it's stale: B-tree searches went from about 8% of the leader's samples to 1 to 2%. The loops are 1.28 ms an operation on the runner.
+      - **Read (local, the same run as R5's):** no single lever. The leader's loop, inclusive: `Leader::step` 25%, the stops after a settle 20%, `pump_reads` 13%, `RedbView::get` 8%, `scan_page` 8%. By self time it's the allocator at about 19%, memcmp 9% and page faults 8%. A follower spends 10% in `settle_from_records`, half of it in `conflicts_for`. These spread over task-d60's third step (C6, C8: hash maps and one-buffer broadcasts, which go at the allocator and memcmp) and task-d87 (C7, `pump_reads`), each small.
+
+    Then:
+    - **If all three come up small,** the target is revised under the clause, with them as the reason. The gap that remains is then spread across the engine, the transport and the loop, with each part read.
+    - **If any is large,** it's built, the batch is re-projected, and the batch job runs once.
+
+    **All three came up small, so the target is revised under the clause.** R5's one lever, an allocator setting, read about −0.1 ms first and nothing on a second, larger set, so none is carried. R3's lever moved datagrams and not CPU. R6 found no single lever, only the allocator and comparisons that task-d60's third step and task-d87 already own. The projection stays about 3.22 ms an operation. The batch's CPU target is that, at or under 3.25 ms with `ok`/s not lower, and 2.8 ms stays the entry's target, owned by the parts named below.
+
+    Where the gap is now, from the runner's split (tokio workers 1.45 ms, domain loops 1.28, the rest about 0.85):
+    - **The voters' tokio workers:** their cost follows neither stream tasks (C5) nor datagrams (R3, #187): 13% fewer api datagrams is about 9% fewer across both planes, 0.02 to 0.05 ms of the workers' 1.45 even at the runner's price of a send. So this bucket has no lever on record. Its owner is the batch's call graph of the tokio threads, split into send, receive, QUIC, the stack's own work, and parking and wake-ups (#185 review), with task-d91's R4 for where they wait.
+    - **The materializer:** its cost is per record (R1). task-d86 now starts from R5, a profile of a record's cost, not from the commit cadence.
+    - **The domain loops:** task-d60's third step (C6, C8) and task-d87 (C7), each small on its own, and whatever R6 finds.
+    - **A publication's export,** now led by redb's scan (task-d92's head profile). That's the engine's cost; R5 reads the same engine from the materializer's side, and task-d27's trim stays the long-run bound.
+  - **The `service` p99 target is not projected to be met by this batch,** and is revised to a reading. L3 removes one of the leader's syncs in series, about 2.3 ms on the runner. L1 is already in the next carry. L4 is the long pole, and its design step is up for review (#181). If its code lands while the readings above are under way, the batch carries it, so the `service` row reads L1, L3 and L4 together rather than L3 alone. Whether p99 is then within etcd's spread rests on L4 and L6.
 - **How the runner is used from here (#174 review):**
   - **No more single-lever performance pairs on the runner.** Each lever gets its local pair and its simulator sweep in its own PR. Where a lever's acceptance names a runner pair, the batch job is that pair.
   - **One batch job, once the batch is projected to close the gap:** this record puts the head at or under 2.8 ms from the local pairs, with task-d89 and task-d90 built, or the target has been revised. The job then confirms the gap closed rather than reporting a step toward it.
   - **Sides:** the base is the next carry, with #155's default in it, since C1 is measured. The head is that and every other built lever: C2, C4 to C8, C10, L3 and L4; C9 if R3 finds one, and task-d73's wait only if its sizing takes it.
+    - **As built (the batch record):** the base is the next carry, `claude/task-d84-journal-syncs` (#179) with #178. The head is the base with three branches merged in:
+      - `claude/task-d89-accept-in-proposal` (#180, L3). It now stacks on `claude/task-d74-acks-to-leader` (#167, C2), which holds the stack. The two levers both change what the leader sends and journals, so they are reconciled and swept as one.
+      - `claude/task-d92-publication-cost` (#184, C10).
+      - `claude/task-d73-group-ends` (#182), which only adds R1's counters, so the summary can read flushes by cause.
+
+      #181 and #183 are docs only. #184 and #182 sit directly on the stack and touch no code the others do. The only conflicts in the merge are the notes' sections, which each branch appends at the end of the notes; both are kept.
+    - **Before the batch's pairs, the head also holds the gate change** (#167 review, its own task stacked on #167): the frontend's gate holds a read whose session this node hasn't projected yet, instead of answering it `Pending`. Without it, the head's histories carry more indeterminate reads at followers than the base's, which moves `ok`/s for a reason that isn't CPU.
   - **Runs:** three register pairs, and `service` at `replay` and at `strict` on both sides, with the call graph on one pair, a follower's tokio threads included.
-  - **Before the batch,** only the next carry's leader-kill run. It is not a lever pair: it checks task-d82's liveness target and carries #178's safety fix, and nothing in the batch changes it.
+  - **Before the batch, correctness runs, not lever pairs (#185 review):** #167 and #180 change what the leader sends and journals, so they need fault runs before they merge, whatever the batch shows.
+    - **The leader-kill run** is made on the head instead of on the base. The head holds everything the base does, #175's liveness target and #178's fix included, so one run covers both.
+    - **One run of the standard schedule** (kill, pause and partition, 300 s, two workers) on the same head.
+    - **If either stops,** the same schedule runs on the base to say whose it is, and the stop is traced from the voters' stores before it's read as any one PR's.
+- **The batch, read (#98, [6619874597](https://github.com/tuplesky/tuplesky/pull/98#issuecomment-6619874597)).** Base `dcaf249` (the shim with #179 and #178), head `b59f2b0` (that with #180, #167, #186, #184, #182 and #187), on one Intel Xeon Platinum 8573C runner a pair. The #173 carry ran on AMD EPYC 7763, so absolute numbers don't compare across carries; the pair is the reading.
+  - **Correctness first, all valid.** The leader-kill run on the head, the same run on base and head on one runner, and the standard schedule on the head: `:valid? true`, no stop and no panic, every voter ending equal and every node serving its final reads. #175's gap after a kill is about 6 s on both sides (median 6.1 s).
+  - **The register row meets the batch's target:** server CPU an operation fell 0.23 ms (−8.2%, 2.82–2.87 to 2.59–2.62 ms) against the −6% projected, `ok`/s rose 4.8%, and p99 fell about 5 ms. The domain loops fell 0.10 ms an operation and the tokio threads 0.11. Peer datagrams fell by a third; the leader's own streams and datagrams rose about 20%, with the acknowledgements now coming to it (#167). The voters' high-water mark fell 51 MiB (−20%).
+  - **L3:** the leader's syncs fell 17% at 30 clients, and in `service` from about 2.6 to 1.9 a command (−26 to −28%).
+  - **C10:** export and write per 1,000 records represented fell about 39% combined, against the 30% projected.
+  - **`service`:** CPU an operation −6 to −7%, p99 −1 to −2 ms (22 ms at `strict`, 12 at `replay`), not yet within etcd's 3 ms, as projected. No indeterminate reads on either side, so #186 adds no `Pending`.
+  - **The tokio threads in five parts** (µs a command, base / head): QUIC's packet protection and connection state is the largest part on both, 171 / 164 at the leader and 131 / 119 at a follower, about a third of the threads. Parking and wake-ups are about a fifth (84–89 µs). Send is the part #167 moved: up at the leader (89 to 105), down at a follower (77 to 60). This is the input for the next step on the workers' bucket.
+  - **R4 (task-d91), base side:** the leader's threads wait about 2.1 ms for a core an operation in all; its tokio threads wake 7.2 times an operation and run 34 µs a wake, and its materializer waits longest, 368 µs a wake.
+  - **n5's slow catch-up is the catch-up pacer's, and its fix is its own task** (#189; #98, [6621159759](https://github.com/tuplesky/tuplesky/pull/98#issuecomment-6621159759)). In the first leader-kill run on the head, n5, restarted 17 s before the final heal, executed only about 4 commands a second once the load stopped, and ended at 3,387 against 4,127, holding 283 unordered pre-acceptances. A voter asked for a page only once its frontier had been still for 1 s, and any movement reset that. A voter restarted behind decides one command each time the leader's re-send reaches it, every 250 ms, so it never asked, not even the probe after start. The pacer is task-d08's, the same on both sides, so it's neither #167's nor #180's, though #167's routing, which leaves a follower to hear decisions from the leader alone, is where it shows: a local restart test crawled in 3 runs of 6 on #167's head and in none of six on the base. The fix counts a page instead of any movement, and passed the same test 8 runs of 8.
+- **The next step on the gap (#185 review).** By #174's rule, the next performance run needs a step projected to close the gap, and the gap is stated again first.
+  - **The target, as a ratio to etcd.** 2.8 ms was set against etcd's 1.39 ms on the #173 carry's EPYC 7763; this batch ran on a Platinum 8573C without etcd on the register row. So the target is about 2.0 times etcd's register row read on the same runner in the same job, asked of the testing session on #98. If etcd moved across runners as the base did (3.58 to 2.85 ms, ×0.80), the target on this runner is about 2.2 ms, and the head, at 2.60, is about 0.4 ms (15%) short. That's an assumption until etcd's row is read.
+  - **What the split and R4 name, sized locally before anything is built:**
+    - **Parking and wake-ups, about a fifth of the tokio threads** (task-d91). The leader's tokio threads wake 7.2 times an operation and run 34 µs a wake. coordd's runtime is tokio's multi-thread one at its default worker count, one a core. A local pair at one worker a voter, behind an environment setting, says whether work stealing and wake-ups across workers are a lever before anything else is built.
+      - **Read:** it is. One worker a voter cut the voters' CPU a command 27% at three voters and 12% at five against tokio's default, and 10% at five against the runner's two, on one 4-core host, with latency lower too (task-d91's entry). Its lever, a worker-count setting, goes into the next batch.
+    - **QUIC, send and receive, about three fifths of the tokio threads** (task-d96). They scale with packets. The ACK frequency is already 8 (task-d70), and R3 measured per-step coalescing (#187), so what's left is fewer messages a command. That's design work, so task-d96 is a design entry that sizes it from R3's frame counts at each voter count before anyone builds it.
+      - **Read:** at one worker a datagram costs next to nothing (an ACK-cadence pair: 2.9 more datagrams a command, no CPU change), so fewer messages a command sizes small and none is carried (task-d96's entry).
+    - **The domain loops,** about 1.08 ms an operation on the head. C6 to C8 stay small, as recorded: task-d60's third step and task-d87.
+    - **`service` p99,** 12 to 22 ms against etcd's 3: task-d90 (L4, #181) is the long pole. task-d97 reads what the p99 operations wait for first, since R4's means put L4 at a p50-scale gain (#185 review). R4 on that row, asked of the testing session on #98, says how much of it is waiting for a core rather than syncs in series.
+  - **Then the next batch** runs once those add up to the re-anchored target, with task-d90's code step in it if it has landed.
+- **The next step, revised (#185 review, after #188 to #191): the next runner job closes the gap or names what's left with an owner, not another step toward it.**
+  - **Where it stands:** the register row is 2.60 ms an operation on the head, about 2.34 projected at one worker a voter, against about 2.2 (2.0× etcd, if etcd moved as the base did): within about 0.15 ms, and uncertain until `etcd-beside` reads it. `service` at `replay` is 2 / 9 / 12 ms (p50 / p95 / p99) against etcd's 1 / 2 / 3: 4× off at p99, for a structural reason.
+  - **L7, a new lever (task-d98):** the slow path pays the leader's sync and then a follower's before a command is learned, and L4 doesn't touch it. Its design step comes first.
+  - **task-d90's code step (L4) starts now,** not after the batch's tails. Its design is approved (#181), point 3 is #188, and parts 2 and 4 depend on no reading. Built now, one batch reads L1, L3, L4, L7 and the tails together, rather than one job for the tails and another for L4.
+  - **CPU margin, built while L4 and L7 are:** task-d60's third step (C6 and C8, −0.04 to −0.06 ms) and task-d86 (C4, −0.03 to −0.09 ms, now sizeable from the batch's group sizes: 1.92 commands a group, 2.13 a commit, at the head's leader), each with its local pair at one worker a voter. Together −0.07 to −0.15 ms, about the projected shortfall.
+  - **One more distribution before the batch** (#191): the journal appender's and the projection's served and queued time a job, at every voter, so the batch can tell a round's p99 that is the disk from one that is queueing or hops.
+  - **The batch, once L4 and L7 are in, or L7's design step says no:**
+    - **Head:** today's head with #189, #188, #191, L4, L7 and whichever C levers measure, at one worker a voter (#190's `[runtime] worker_threads`, which beats `TOKIO_WORKER_THREADS` under test, or a per-side `voter-workers`).
+    - **Base:** the last batch's head, `b59f2b0`, at two workers.
+    - **`etcd-beside`** after each pair, with its setup check on the profiled image first: it is the target.
+    - **Correctness first:** L4 and L7 both let something leave before it is durable, so the leader-kill run and the standard schedule run on the head before the pairs.
+    - **L7 needs task-d99 first** (#192 review): its early send is behind a replicated feature, and only task-d99 makes one activatable in a running domain. The head activates `EarlyProposal` after start through task-d99's command, never through a build flag.
+    - **The readings:** three register pairs, and `service` at `replay` on both sides with #191's per-voter tails and the fast share, and at `strict` as its own line.
+  - **What the batch decides, set now:**
+    - **CPU:** the head at or under 2.0× etcd's row closes it. Above, the record names each remaining part from the split it has: the workers, the loops and the materializer.
+    - **`service` p99:** within etcd's spread closes it. Otherwise the tails name the part, and that part gets a task: the round (the journal's served tail says whether it is the disk), the release after L4 (the predecessors or the group), or what's past both (the frontend, the gate and the transport, L6). The target is revised under the clause only if no lever on record can reach it.
+    - **If L7's design step says no,** the batch still runs with L4, and the record revises the `service` target with the slow path's two syncs in series as the reason.
 - **The record:** the table below, one row a lever, each row a pair on the runner.
 
 | Row | Build | Shape | `ok`/s | Server CPU an operation | Idle cores | Expected to move |
@@ -3355,6 +3461,28 @@ The change, in two steps:
 **Implement:** In the #173 carry's `service` row the voters' tokio threads waited 15 ms an operation for a core while 1.87 cores sat idle, and the leader's loop waited 1.35 ms a command against 0.65 of CPU. Part of every hop's latency is scheduling, and nothing owns it.
 - **First, the reading (R4):** each thread's run-queue delay per wake-up (schedstat's `run_delay` over its timeslices) and wake-ups a command. It needs the runner's VMs, so it is a column of the runner's summary (the testing session's) and is read from the batch's base side, with no extra run. task-d55's `Scheduling` already reads the domain loop's.
 - **Then the lever it names:** fewer wake-ups a hop (task-d70's third step, or task-d73's wait if it is taken), or where the threads run.
+  - **Read (task-d72's batch, #98):** the leader's threads wait about 2.1 ms for a core an operation in all; its tokio threads wake 7.2 times an operation and run 34 µs a wake, and parking and wake-ups are about a fifth of the tokio threads.
+  - **Where the threads run, read first:** a local pair, each voter's runtime at tokio's default worker count against one worker, behind an environment setting that is read only for the pair. It says whether work stealing and wake-ups across workers are a lever, and how much of the fifth they are.
+  - **Read locally (#185):** the batch's head (`b59f2b0`), each voter's runtime given its worker count through tokio's own `TOKIO_WORKER_THREADS`, set for coordd alone. Same shape as the earlier pairs: 30 callers, `replay`, stores on tmpfs, 50,000 operations, sides alternating, on one 4-core host.
+
+    | Voters | Workers a voter | Runs | Voters' CPU a command | Off the domain loops | `ok`/s | put p50 / p99 |
+    | --- | --- | --- | --- | --- | --- | --- |
+    | 3 | default (4) | 3 | 2.87 ms | 1.72 ms | 2,522 | 21.8 / 48.0 ms |
+    | 3 | 2 | 3 | 2.49 ms (−13%) | 1.44 ms | 2,571 | 20.9 / 43.9 ms |
+    | 3 | 1 | 3 | 2.09 ms (−27%) | 1.10 ms | 2,680 | 19.7 / 42.0 ms |
+    | 5 | default (4) | 2 | 4.71 ms | 2.81 ms | 1,773 | 32.1 / 63.3 ms |
+    | 5 | 1 | 2 | 4.15 ms (−12%) | 2.28 ms | 1,961 | 29.1 / 57.9 ms |
+    | 5 | 2 | 3 | 4.34 ms | 2.56 ms | 1,889 | 30.2 / 59.4 ms |
+    | 5 | 1 | 3 | 3.90 ms (−10%) | 2.13 ms | 2,045 | 27.8 / 54.7 ms |
+
+    The last two rows are their own pair, at the runner's step: the Jepsen job already runs every voter at two workers (`voter-workers`, five voters on a 4-CPU runner), so its batch takes 2 → 1, not tokio's 4 → 1 (#185 review). Absolute figures move between pairs on this host; each pair's ratio is the reading.
+
+    - **It's a lever, and most of it is off the domain loops:** the tokio threads' parking, wake-ups and stealing between workers.
+    - **Latency doesn't pay for it.** Fewer workers also cut p50 and p99, and `ok`/s rises.
+    - **The caveat: every voter here shares four cores.** tokio's default is a worker a core, so three voters run 12 workers and five run 20. The Jepsen runner co-locates its nodes the same way, and R4 read 2.1 ms an operation waiting for a core there. A node with a host of its own may gain less. That's why the default isn't changed on this reading.
+  - **The lever it names:** a `[runtime] worker_threads` setting in coordd's configuration, unset meaning tokio's default. The next batch's head sets it to 1 on every node, and the batch's base doesn't. The batch's pair is then the runner's reading of it. The default is decided from that reading together with one where each node has cores of its own.
+  - **Projected on the register row from the runner's step, 2 → 1 at five voters:** −10% of the head's 2.60 ms is about 2.34 ms. That's about 0.14 ms short of the re-anchored ~2.2 ms, if etcd's row confirms that target, before task-d96 or task-d90.
+  - **The pair job needs the head at one worker and the base at two.** The job sets every voter's count through `TOKIO_WORKER_THREADS` (`voter-workers`), and task-d91's setting (#190) overrides it only where a node's configuration sets it. So the head's side needs a per-side `voter-workers`, or the harness writing `[runtime] worker_threads = 1` for that side (#98, the testing session's).
 
 **Acceptance:** The reading recorded from the batch's base side, with the lever chosen from it and its local pair.
 
@@ -3376,6 +3504,256 @@ The change, in two steps:
 **Acceptance:** The profile and the per-thread split recorded first. A local pair at R2's setup: the publication's CPU a record and the step in the process's cost a command fall, and an image is byte-identical to one written before the change at the same represented position. task-j04's crash points recover as task-d51's acceptance states. Its runner pair is read in the batch job (task-d72).
 
 **Review boundary:** How a local checkpoint publication spends its CPU. No change to the image's format, to what it carries, to when one is taken or to task-j04's recovery rule.
+
+<a id="task-d96"></a>
+### task-d96: Size the messages a command sends, before cutting them
+
+**Prerequisites:** task-d70, task-d72, task-d88.  
+**Design:** This entry is the sizing; a candidate it carries amends the sections it names in its own task.
+
+**Implement:** In the task-d72 batch's call graph of the voters' tokio threads, QUIC's packet protection and connection state is about a third, and with send and receive about three fifths. They scale with packets. The ACK frequency is already 8 (task-d70), R3 measured coalescing within a step (#187, 13% fewer api datagrams and no CPU change), and C5 showed the cost doesn't follow stream tasks. So the lever left is fewer messages a command, which changes what the protocol sends, and is sized before it is built.
+- **The count:** each message a write sends, by kind (the submission, its fan-out to the voters, the fast and slow acknowledgements, the commit, the release, and the client's own), and the datagrams each costs, at three and five voters, from R3's counters on the head. Beside it, what a leader-based log sends for the same write (the append to each follower, each acknowledgement, and the reply), so the count has a floor to be read against.
+- **The candidates, each with the messages it saves and what it costs:** a message that can ride the next one the same peer is sent anyway (an acknowledgement on the next submission's fan-out, a commit on the next proposal), a message only one voter needs that every voter is sent, and a message whose content a peer already has. Each names the latency it adds and the protocol rule it touches.
+- **The projection:** packets a command saved times the runner's cost a packet from the batch's call graph, so a candidate is carried into a batch only if it adds up to its share of the re-anchored target.
+
+- **The count, first read (#185):** from task-d91's pairs on the batch's head (`b59f2b0`): one 4-core host, 30 callers, `replay`, tmpfs, 50,000 operations, its one-worker side. The figures are per command executed, summed over the voters. R3's counters split the api plane by kind; the peer plane has no counter by kind yet.
+
+  | A command | 3 voters | 5 voters |
+  | --- | --- | --- |
+  | submissions to the voters elsewhere | 2.00 | 4.00 |
+  | slow acknowledgements returned to a collector | 2.00 | 4.00 |
+  | fast acknowledgements returned | 0.74 | 1.62 |
+  | leader replies and releases returned | 0.53 + 0.53 | 0.76 + 0.76 |
+  | reads to the leader, and their answers | 0.72 + 0.72 | 1.03 + 1.03 |
+  | api frames sent, counted (callers' answers not counted) | 7.24 | 13.2 |
+  | peer frames sent | 9.00 | 17.9 |
+  | api datagrams sent (of them ACK-only) | 9.91 (6.20) | 20.5 (13.2) |
+  | peer datagrams sent (of them ACK-only) | 3.96 (2.03) | 7.81 (4.32) |
+
+  - **Against its floor:** a leader-based log sends 2N messages a write: the request, an append to each follower, each acknowledgement, and the reply. That's 6 at three voters and 10 at five, plus two when the caller's frontend isn't the leader. This count is about 16 frames at three voters and 31 at five, roughly three times the floor. Two kinds grow as N−1: the submission's fan-out and the slow acknowledgements.
+  - **Most datagrams are ACK-only:** about 59% at three voters and 62% at five, with task-d70's threshold of 8 already on both planes. Data datagrams are about 5.6 and 10.8 a command.
+  - **What the count doesn't yet say: a datagram's cost.** task-d88's pair cut 1.36 api datagrams a command and moved the voters' CPU by 0.02 ms, within its runs' spread. That pair ran at tokio's default worker count, where task-d91 found the workers' parking and wake-ups to be most of the cost. So the candidates are sized in CPU only after a datagram's cost is read at one worker. The cheapest such reading is a pair on the api plane's ACK cadence, the largest kind above, which changes no message the protocol sends.
+  - **The peer plane's 9 and 18 frames** are split by kind before a candidate there is sized.
+- **A datagram's cost at one worker, read (#185):** the ACK cadence both planes ask, through a reading-only override of task-d70's threshold, on the batch's head at one worker a voter. Three voters, the same shape as task-d91's pairs, three runs a side, alternating.
+
+  | ACK threshold | datagrams a command (of them ACK-only) | voters' CPU a command | `ok`/s |
+  | --- | --- | --- | --- |
+  | 1 | 16.36 (8.61) | 1.935 ms | 2,812 |
+  | 8 (today's) | 13.48 (8.00) | 1.966 ms | 2,785 |
+  | 64 | 13.40 (7.95) | 1.934 ms | 2,815 |
+
+  - **A datagram costs next to nothing at one worker.** 2.9 more datagrams a command moved the voters' CPU by nothing outside the runs' spread (about ±0.09 ms). That bounds a datagram at about 0.03 ms or less, and the point estimate is near zero. task-d88's pair, at the default worker count, said the same.
+  - **The threshold isn't what leaves the ACK-only datagrams.** Above 8 they don't fall, so they come from QUIC's delay, on connections where no reply follows within it, not from the count.
+  - **So fewer messages a command sizes small.** Removing every ACK-only datagram, the largest kind, projects at most about 0.25 ms a command at the bound and near nothing at the estimate. Cutting the fan-out or the slow acknowledgements by N−1 frames projects less, for a protocol change. None is carried into the next batch. The count stays recorded as the floor comparison, and the QUIC share in the batch's call graph is read again on the next batch's head at one worker before this entry is reopened.
+
+**Acceptance:** The count recorded at three and five voters with its floor, each candidate sized in messages, packets and projected CPU, and the ones carried named with the design sections they amend. No code.
+
+**Review boundary:** What the voters and the frontend send a command, counted and sized. No change to the wire or the protocol in this entry.
+
+<a id="task-d97"></a>
+### task-d97: Read what a `service` p99 operation waits for
+
+**Prerequisites:** task-d55, task-d72, task-d91.  
+**Design:** None.
+
+**Implement:** The `service` row's p99 is 12 to 22 ms against etcd's 3 (task-d72's batch). task-d90 (L4) was to be sized against that row's R4, but R4 reports means. On the testing session's R4 for that row (#98), L4 is a p50-scale gain: 0.76 to 1.36 ms off a write's release. A sum or a mean can't say what the slowest operations waited for, so no lever on record owns the p99 yet (#185 review).
+- **Distributions, not sums, on the `metrics` line:** p50, p99 and the maximum of each interval, or a log-bucketed histogram the summary folds. Three of them:
+  - the leader's learned-to-released parts (predecessors, group, journal), above all the group's journal wait;
+  - the domain loop's run-queue wait a turn (task-d55's `Scheduling`, today a sum);
+  - the read barrier's wait.
+- **And, so the account is end to end (#191 review):** each request's arrival to its answer at the node that took it, writes and reads apart; the leader's round from a submission to learned; the run queue of the sampled passes that executed a command; and the journal's and the projection's served and queued time a job, at every voter, which says whether a round's tail is the disk.
+- **Read from the next batch's `service` job,** with no run of its own: the testing session's summary gains the columns, and the record says which part the p99 operations waited in.
+- **Strict's publications** as a side in that job (`checkpoint-after-records: 65536`), not a run of its own. Replay's 12 ms p99, with at most one publication, already says publications aren't the whole tail.
+
+**Acceptance:** The three distributions on the `metrics` line, with a unit test of the bucketing and the summary's fold, and the record naming what the `service` row's p99 operations waited for. task-d90's code step is then sized against that, not against the means.
+
+**Review boundary:** What the `metrics` line reports about waits. No change to when anything is released, journaled or served.
+
+<a id="task-d98"></a>
+### task-d98: Send the leader's proposal before its batch is durable
+
+**Prerequisites:** task-d30, task-d74, task-d89, task-d99 (its local disk pair needn't wait, below).  
+**Design:** Sections 4.3 and 4.8 (amended by this task).
+
+**Implement:** L7 (#185 review). A slow-path write pays two syncs in series before it is learned:
+- the leader publishes each `Proposal` with `requires: [barrier]`, so it leaves once the leader's proposal batch is durable;
+- a follower's slow acknowledgement answers that proposal, and leaves once the follower's own row and every outstanding batch are durable;
+- so a slow-path write is the leader's sync, a hop, a follower's sync and a hop before the leader learns it. The fast path has one sync, since the followers take the command from the frontend's fan-out and their syncs run beside the leader's.
+
+About 95% of the register row's writes take the slow path on the runner (a fast share of 4.7 to 4.9%), and the CI harness's leader 72 to 76% at ten callers. At the runner's 2.28 ms an append (task-d84), two syncs in series are about 4.6 ms before any queueing, above etcd's `service` p99 of 3 ms, and task-d90 (L4) doesn't touch them. etcd's leader sends before it saves (`server/etcdserver/raft.go` calls the transport's `Send` ahead of `storage.Save`, after the Raft thesis's §10.2.1), and its followers send only after saving.
+
+- **The lever:** the leader sends its proposal once it is batched, not once it is durable, and counts its own vote only once that batch is durable. task-d89's learning gate (`Learner::commit_learned_where`) already does the second. A slow-path write then waits for the slower of the leader's sync and a follower's, plus the hops: one sync, etcd's shape.
+- **Size:** about one runner sync, 2.3 ms, off every slow-path write's round at p50 and at p99. Barrier reads wait for the writes in flight, so they shorten too. No CPU change.
+- **A design step first,** in its own PR, answering:
+  - **Section 4.8's persist-before-send, restated:** it binds a voter's acknowledgement of another voter's proposal; the leader's proposal is where the value comes from, so the `Proposal` to followers may leave early. The `LeaderReply` to the frontend may not, since the frontend learns a fast decision from it with the followers' fast acknowledgements.
+  - **The leader crashing after sending and before its batch is durable:** followers then hold PRE-ACCEPT or ACCEPT rows at ballot b for a proposal the leader's store lacks. A slow quorum can form from followers alone and the frontend learns it from their acknowledgements, so recovery has to keep it. Boot fencing has to keep a rebooted leader from proposing that command at b again with other dependencies or another seqnum.
+  - **The protocol simulator,** every row at 1,000 seeds with catch-up and without, with crash cuts between the send and the leader's durability.
+- **What the design step found** (Sections 4.3 and 4.8, accepted on #192):
+  - **A fast decision at a follower.** A fast-set follower at three voters learns a fast decision from its own vote set: the leader's proposal and its own fast acknowledgement. With the proposal sent early, that would count over a volatile vote.
+    - So the proposal leaves early only to a follower whose own acknowledgement and the proposal fall short of `fast_size`. At three voters under C2 that's the follower outside the fast set, and with the leader it makes a slow quorum. At five voters it's every follower.
+    - The fast-set follower at three voters gets it once the batch is durable, as do re-sends and retries.
+    - The cost: at three voters, a slow-path round whose non-fast-set follower is slow or down falls back to two syncs.
+    - Followers' learning isn't changed (#192 review). `SlowOnly` at followers was the first answer. It would have had to follow the role across elections and step-downs, and it would delay a three-voter follower's fast decisions.
+  - **A replicated feature gates it** (#192 review). A follower built before task-d74 hears the other followers' fast acknowledgements, and with the proposal those make a fast quorum at any follower. So the leader sends early only while a task-60 feature is active, and every configured voter must support it to activate it. Until then, today's barrier stays on every proposal.
+  - **Boot fencing has one gap.** `coordd` brings the genesis leader back leading when its store is empty. With early sends, a crash before the first batch is durable leaves exactly that store. So a leader sends early only once its store holds the bound Sync of the ballot it won, or, at the genesis ballot, once its first proposal batch is durable.
+  - **Recovery needs no change.** Every copy at a ballot is the leader's one order. A slow decision is durable adoptions, which never rested on the leader's row (task-d19). No fast decision is counted over a volatile proposal. So the source rule and the possible-fast rule keep what they kept.
+- **The code step:**
+  - `Leader::propose`, `retry_proposal` and the re-send timer publish the `Proposal` with no barrier to each follower that qualifies, while the feature is active and the leader may send early (the genesis condition). Every other copy keeps the barrier, and the leader reply keeps its own.
+  - The feature: a new `coord_types::formats::Feature` variant (`EarlyProposal = 0x0004`) under task-60's unanimity rule.
+  - New simulator knobs:
+    - one that makes the leader's journal complete its batches later than the followers';
+    - one that crashes the leader while it holds a proposal it sent whose batch isn't durable;
+    - one that deposes a live leader in that window: a partition, then the heal.
+  - All three are on in rows 1 and 2, and in a new row 18 at three and five voters.
+  - **A negative control:** row 18 with the fast-set follower at three voters also sent early must fail the oracle on some seed. That shows the row reaches the case.
+  - **Tests:**
+    - **A mixed-build test:** with the feature inactive, no follower gets a proposal before its batch is durable.
+    - **A `coordd` test:** a genesis leader holds its first proposal until that batch is durable, with a second batch in flight when the first completes, which keeps its own barrier. A restart after an early send comes back as a follower.
+  - **A local pair before the batch, with the stores on a disk** (#192 review). On tmpfs the sync L7 removes isn't there; CI's command-cost job keeps its stores on `/dev/shm`.
+    - The pair needn't wait for task-d99. Its head side is built with a cargo feature that reads `EarlyProposal` as active, as `skip-read-confirmation` serves the register check's negative control, and is never built for anything else. It sizes L7 before the wiring lands.
+    - The fault runs and the batch use task-d99's activation, the production path (Section 23).
+    - The pair: three and five voters, one worker a voter, sides alternating.
+    - It reads #191's `round` and the journal's `served_each` and `queued_each` at every voter.
+    - `round`'s p50 and p99 should fall by about one served sync plus one queue wait. If they don't, the batch doesn't carry the change.
+- **Built (the code step, `claude/task-d98-early-proposal`, its own PR on #192):**
+  - **The rule, in `Leader::proposal_sends`:** a copy leaves with no barrier when the node's setting is on, a proposal batch of this leadership is durable (`early_ready`), and `1 + fast_eligible(follower) < fast_size`. `propose` releases an early copy in the same step, and `retry_proposal` uses the same rule. The leader reply keeps its barrier.
+  - **Two departures from the step's text:**
+    - **The re-send timer is unchanged.** It re-sends only proposals whose batch is durable, so none of its copies has a barrier left to drop.
+    - **The genesis condition is one rule for every leader:** no early copy until a proposal batch of this leadership is durable. A won ballot's bound Sync was submitted before that batch, and batches are durable in submission order, so the rule covers both cases Section 4.8 names. A batch in flight when the first completes keeps its barrier.
+  - **The switch:** `Feature::EarlyProposal = 0x0004`. `coordd` takes the active set from `admit` at start and gives it to the node, which gives it to every leader it becomes (`Node::set_early_proposal`, `change_role`). Until task-d99 nothing activates it in a running domain. The cargo feature `early-proposal-without-activation` reads it as active, says so on stderr at start, and is built only for the local pair.
+  - **A count:** `resends.early` in the metrics, the copies sent early.
+  - **A follower counts no other voter's fast acknowledgement** (`FollowerRejection::PeerFastAck`). Only a build from before task-d74 sends one to a follower. With an early proposal it would complete a fast quorum at the receiving follower, so condition 2 now rests on that follower's build alone. Apart from the three-voter fast-set follower, whose proposal waits for the leader's batch, a follower takes fast decisions from the commit frontier, as task-d74 has it take its slow ones.
+  - **Tests:**
+    - `coord-consensus/tests/early_proposal.rs`, six model tests:
+      - with the feature off, nothing leaves early (the mixed-build test);
+      - at three voters only the follower outside the fast set gets it early, and at five every follower does;
+      - the first batch holds every copy, and a batch in flight when it completes keeps its barrier;
+      - adoptions an early copy brings back commit nothing before the batch is durable;
+      - a retried batch goes early by the same rule.
+    - `coord-consensus/tests/follower.rs::a_follower_never_counts_another_voters_fast_ack_toward_a_fast_decision`: at three voters, the follower outside the fast set gets r1's fast acknowledgement, equal to the leader's proposal in path and dependencies, and then the proposal. It neither learns nor commits. `equal_direct_dependencies_are_not_learning_and_guards_are_explicit` now reads `PeerFastAck` for the peer's acknowledgement.
+    - `coord-daemon/tests/voter.rs::a_leader_a_node_becomes_sends_early_as_the_node_does`.
+    - `coordd/tests/cli.rs::a_leader_that_sent_early_and_restarted_comes_back_following`: `EarlyProposal` written into every store, and the leader's `resends.early` above zero. Killed and started again, the leader campaigns, wins ballot 1, never leads ballot 0, and every voter reads the write.
+    - The first-batch case is a model test rather than a `coordd` one, since the model test controls when a batch completes. The `coordd` test covers the restart.
+  - **The simulator:** knobs `early`, `leader_journal_lag`, `window_crash` and `window_depose`, each drawn only when nonzero. So rows without them are unchanged seed for seed, with decision hashes equal to the base's. Rows 1 and 2 run each seed again with them, row 18 is the early send's own row, and the sweep workflow runs row 18.
+    - **At 1,000 seeds, with catch-up and without:** rows 1, 2 and 18 are clean. Row 18 crashed a leader in the window 6,641 and 7,162 times and deposed one 2,224 and 2,427 times, and rows 1 and 2's early runs reached it 1,540 to 4,861 times.
+    - **The same at half, three in four and every acknowledgement to a follower lost** (the sweep workflow's other settings): no failure. Without catch-up, a few runs learned nothing, at most two in a thousand at a size.
+    - **Without catch-up, one of row 1's early runs at each size learned nothing** (seed 399 at three voters, seed 24 at five), where the base row has none. With the same knobs and the early copies off, both seeds give the same counts, so it's the lagging journal and the row's churn, not the early send.
+    - **The negative control** (`row_18_fails_when_the_fast_set_follower_gets_the_proposal_early_too`) fails at three voters on seed 66. The leader crashes before its batch is durable, the fast-set follower has committed the command over the lost vote, and the restarted leader's recovery finds it accepted under two dependency sets (`IncompatibleAccepted`).
+  - **The local pair:**
+    - **Setup:** one 4-core host, stores on ext4 on a virtio disk, `replay`, one tokio worker a voter (`TOKIO_WORKER_THREADS=1`, coordd alone). The mix is put 50, contended 30 and get 20, sides alternate, and the head side is built with `early-proposal-without-activation`.
+    - **What it reads:** #191's `round`, `served_each` and `queued_each` aren't on this branch, so it reads the bench's service latency and the voters' appender jobs.
+
+    | Voters | Callers | Side | Runs | Operations/s | Put p50 / p99 (ms) | Contended p50 / p99 | Get p50 / p99 | Leader's slow share | Append served / queued (ms, mean over voters) |
+    | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+    | 3 | 1 | off | 3 | 630 | 1.60 / 4.29 | 1.65 / 4.51 | 0.46 / 3.13 | 3% | 0.37 / 0.04 |
+    | 3 | 1 | on | 3 | 652 | 1.53 / 4.35 | 1.58 / 4.76 | 0.46 / 3.43 | 32% | 0.38 / 0.04 |
+    | 3 | 10 | off | 6 | 1,476 | 5.96 / 14.87 | 5.99 / 15.02 | 5.69 / 15.06 | 84% | 0.74 / 0.08 |
+    | 3 | 10 | on | 6 | 1,562 | 5.65 / 14.07 | 5.70 / 13.97 | 5.56 / 15.32 | 92% | 0.79 / 0.09 |
+    | 5 | 1 | off | 3 | 432 | 2.39 / 5.40 | 2.43 / 5.60 | 0.61 / 2.95 | 10% | 0.48 / 0.06 |
+    | 5 | 1 | on | 3 | 456 | 2.22 / 5.39 | 2.30 / 5.46 | 0.59 / 3.00 | 62% | 0.52 / 0.06 |
+    | 5 | 10 | off | 3 | 880 | 10.67 / 21.89 | 10.75 / 22.05 | 10.07 / 23.47 | 90% | 1.00 / 0.11 |
+    | 5 | 10 | on | 3 | 958 | 9.83 / 20.23 | 9.90 / 20.24 | 9.45 / 22.34 | 93% | 1.09 / 0.12 |
+
+    - **At ten callers, put p50 fell 0.31 ms at three voters and 0.84 ms at five,** and p99 0.80 and 1.66 ms. Every head run's put p50 was below every base run's, and operations/s rose 6% and 9%.
+    - **That's about two fifths of the expected size at three voters, and three quarters at five.** The expected size was one served sync plus one queue wait, 0.82 and 1.11 ms here. At three voters the early copy goes only to the follower outside the fast set, so the slow quorum is the leader and that one follower. At five it's the leader and the faster two of four followers.
+    - **At one caller, writes mostly take the fast path** (3% and 10% slow), which already pays one sync. The change there is under 0.2 ms.
+    - **The leader's fast share isn't comparable across the sides.** With the early copy, a slow quorum often forms before the fast one. At one caller and three voters, the leader's slow decisions went from 103 to 1,060 (`missed_missing` 638 and `missed_slow_first` 422). So a head with L7 on reads its fast share as a race between the two quorums, not as conflicts.
+    - **Get p99 at three voters and ten callers was higher in the first three head runs and lower in the next three.** Over six runs a side it's level, 15.06 against 15.32 ms.
+    - **The runner's sync is 2.28 ms,** three times this disk's served 0.74, so the batch's pair reads the size there.
+
+**Acceptance:** The design step accepted, or declined with the reason. If accepted: the code, the simulator's rows clean (rows 1, 2 and 18 with the new knobs, every row at 1,000 seeds with catch-up and without) and the negative control failing, the mixed-build and `coordd` tests, the local pair on a disk showing `round` fall, the leader-kill run and the standard schedule `:valid? true` on its head, and the next batch's `service` row read with it. If declined, the batch revises the `service` target, with the slow path's two syncs in series as the reason.
+
+**Review boundary:** When the leader's proposal leaves and to which followers, the feature that allows it, and when a genesis leader may send early. Followers' learning and acknowledgements, the leader reply, recovery and the release rule are unchanged.
+
+<a id="task-d99"></a>
+### task-d99: Activate a replicated feature in a running domain
+
+**Prerequisites:** task-60.  
+**Design:** Sections 13 and 17.7 (amended by this task's design step, if it is accepted).
+
+**Implement:** task-60 built the rule and its rows: `coord_consensus::feature`'s unanimity of the configured voters, and `coord_checkpoint::feature`'s `FeatureSupportV1` and `ActiveFeaturesV1`. `coordd` uses one piece of it, `admit` at start, which refuses a build that lacks an active feature. Nothing records support or activates (#192 review):
+- `record_support` and `activate_feature` have no caller outside their tests;
+- the only other writer of `ActiveFeaturesV1` is `bins/coordd/tests/cli.rs`'s `write_activation`, which writes the row into a store directly;
+- `coordctl` has no feature command.
+
+So every feature-gated change, task-d98's `EarlyProposal` first, would ship unreachable. Section 23 rules out an operator flag around a correctness gate. This task wires the path every later feature needs too:
+- **Support reports through the order.** Each voter's `FeatureSupportV1` is a committed command, so every voter's unanimity check reads the same reports. A voter submits its own when its build's support differs from what the domain recorded for it.
+- **Activation as an operator command** (`coordctl`). Executing it runs `activate_feature`, which refuses unless every configured voter has reported the feature.
+- **One switch point.** Consensus code reads an active feature from its executed state, so a leader switches at one point in the order.
+- **The harnesses:** the Jepsen job and the bench scripts activate a feature after start, on the side that should have it, so a batch reads the production path.
+- **A design step first,** answering:
+  - **Commands older builds can't decode** (#192 review).
+    - The report and activation commands would be new command variants, and the `Command` format's window is 1..1, so a build from before task-d99 can't decode them.
+    - No voter can skip a committed command it can't apply without diverging. So the first report a task-d99 voter submits at start would land in front of every older voter in a rolling upgrade.
+    - **Options:**
+      - A voter submits its report only once every configured voter's link advertises a capability for the new commands. The transport already negotiates per link (`CAPABILITY_FRAMES_PER_STREAM`, task-d61), and Section 11.7 forbids negotiation only as the authority for activation, not for when to submit.
+      - Or reports go in only by operator command, after the rollout.
+  - **The admission window, and how a leader knows a follower holds the activation** (#192 review).
+    - `admit` reads only the voter's own store, so a follower that doesn't hold the activation yet still admits an older build. A feature whose safety rests on every voter's build needs a rule for that window.
+    - The rule named: a gated behavior acts toward a voter only once that voter is known to hold the activation. For task-d98, the leader sends early only to such a follower.
+    - **"Holds" means durable in its store, not executed,** since `admit` reads the store. A command executes before its execution group is durable, and under task-d90 its result is released before then too.
+    - **No message carries that today.** A follower's executed position reaches another voter only in `NewLeader`, `PromiseRefused`, `CatchUpRequest` and `CatchUpPage`.
+    - So the follower tells the leader once its store holds the activation, and repeats it at start and on a new ballot. The leader's set is volatile: empty after a restart or a new ballot until the message is repeated. Absence means not eligible, so an older follower that never sends it is safe.
+  - **A voter that rolls back after reporting** (#192 review).
+    - `record_support` refuses a report that shrinks, by design. But task-60's entry says rollback before activation is running the old binary.
+    - A voter that reported and then rolled back leaves its larger report standing, and unanimity would count a build it no longer runs.
+    - So either `admit` also refuses a build that lacks what the voter's own durable report promised, which binds a report from the moment it's durable, or the design says why a stale report is harmless.
+  - **Membership:** what a configuration change does to an active feature and to the reports, which name voters of an epoch.
+  - **What a refused activation says,** and where an operator reads which voters lack support.
+
+- **The design step's proposal** ([Section 13](tuplesky-design.md#s13-feature-activation), proposed):
+  - **Support is advertised as a peer message** (`FeatureSupport`), not committed. An older build drops a peer message it can't decode (`MalformedPeerMessage`), so a rolling upgrade needs no capability gate, and nothing reaches the order that some voter can't apply.
+  - **Activation is two phases at the leader, on an operator's request** (`coordctl feature activate`):
+    - **prepare:** every voter writes its durable `FeatureSupportV1` and answers, and the leader records each answer;
+    - **activate:** the leader writes `ActiveFeaturesV1` over those rows and sends it. A voter installs it only if its own durable report names the feature.
+  - **A report binds once durable, through a guard every build already runs (#194 review).** Prepare also writes a marker feature id (`EarlyProposalPrepared`) into the voter's own `ActiveFeaturesV1` record. Every build since `admit` refuses a store whose record names an id it doesn't know or support, so a voter rolled back to a build from before task-d99 refuses to start. A check in the new `admit` alone would not bind an older build. The marker gates no behavior. Preparing is the operator's step, so starting a new binary binds nothing.
+  - **The window:** a follower says `FeatureHeld` once its activation row is durable, again at start and on a new ballot. The leader keeps that set in memory, per follower incarnation, and a gated behavior acts toward a follower only while it is in the set. For task-d98, the early send also needs it.
+  - **#194 review, four more rules:**
+    - **a generation replacement keeps the feature rows:** the handoff copies the voter's own support row, markers and activation into the staged generation, and selection refuses a generation that lacks one the active one holds, since `checkpoint_v1` is node-private and no image carries it;
+    - **the held set is per follower boot,** and a follower's entry clears on a new peer link from it, since a restart keeps the incarnation;
+    - **the node's own switch turns on at runtime,** once its own activation row is durable;
+    - **a leader change in the middle:** a follower's `FeatureHeld` carries the activation record it holds, and a new leader whose own support row names the feature installs that record unchanged and resumes the re-sends, since `activate_feature`'s reports are in the old leader's store. `activate` is idempotent, and `feature status` shows a partial state;
+    - **a voter that joins after an activation** holds no feature rows, so promotion to voter requires a current advertisement of every active feature, and the leader prepares and activates for that voter alone before the promotion completes (Section 22's learner rule). The joiner installs the record unchanged, with the original reporters, and `feature status` places a voter in the active set from its `FeatureHeld`, not from the reporters.
+  - **No ordered switch:** a feature that changes what every voter executes needs its own.
+  - **Membership:** everything names its epoch. An activation stays, and a prepare in flight at a change is run again.
+  - **Operator output:** a refusal names the voters missing, and `coordctl feature status` reads the leader's view.
+- **The code step, once the design is accepted:**
+  - the five peer messages, appended to `ProtocolMessage`: `FeatureSupport`, `FeaturePrepare`, `FeaturePrepared`, `FeatureActivated` and `FeatureHeld`;
+  - the leader's prepare and activate driver and its re-send;
+  - the follower's handlers;
+  - the prepare marker ids in `Feature`, written with the support row, and `admit` reading a marker as a requirement on `Supported` only;
+  - the leader's held set, keyed by follower boot, and task-d98's `sends_early_to` reading it;
+  - the node's switch turned on when its own activation row is durable;
+  - the handoff's copy of the feature rows into a staged generation, and selection's refusal of one that lacks them;
+  - a new leader's resumption from a follower's `FeatureHeld`, installing the record it carries;
+  - the promotion check and the single-voter prepare and activate for a joining voter;
+  - `coordctl feature activate` and `feature status`, over the admin API;
+  - the harnesses' activation.
+- **Built (the code step):**
+  - **Rows and markers** (`coord_types::formats`, `coord_checkpoint::feature`): `EarlyProposalPrepared = 0x0005`; `prepare_feature` writes the support row and the marker in one batch; `install_activation` installs another voter's record unchanged over this voter's durable support row, keeping its own markers; `admit` reads a marker as a requirement on `Supported` and returns only what turns a behaviour on. Each rule also takes explicit state (`prepare_rows`, `activation_over`, `installed_record`, `check_support`), since a batch is durable in the journal before its rows are in the view.
+  - **Messages:** the five, appended to `ProtocolMessage`. `FeatureActivated { feature, record }` and `FeatureHeld { record }` carry the record as `FeatureRecord { epoch, features, reporters }`, the row without the cluster and domain, which the link names.
+  - **The driver** (`coord_daemon::feature`, wired through `Node` and `Voter` as the floor is): advertisements at start and on each new peer link; the leader's prepare, its record of each durable answer, its activation once every report is durable in its store, and the send. A follower installs and says `FeatureHeld` once durable.
+  - **The window:** the leader keeps who said `FeatureHeld`, cleared on any new peer link from that voter (a restart has only new links, so this is at least as strict as per boot) and on a new ballot. `Leader::set_early_holders` narrows `sends_early_to` to it. The node's switch follows its own durable record.
+  - **The re-send,** once a second while leading: it asks a voter whose advertisement it has not heard since its last link (a follower answers the leader's `FeatureSupport` with its own), and sends the prepare and the record to every voter not holding an active feature. That one path finishes an activation after a leader change, with the record a follower's `FeatureHeld` gave the new leader, and prepares and activates a voter that joined after one.
+  - **The operator:** `coordd` takes requests on `<state_directory>/admin.sock`, the owner's alone; `coordctl feature --socket <path> activate <name> | status`. A follower refuses and names the leader.
+  - **Handoff and promotion:** `FeatureRows`, `carry_feature_rows` and `select_installed`'s refusal of a staging without the active generation's rows, and `promotion_missing`. No running daemon installs a generation or promotes a learner yet; task-d40 and task-d41 call these where they do.
+  - **Harnesses:** `scripts/bench/activate.sh DIR FEATURE...`, and `ACTIVATE=early-proposal` on `command-cost.sh`. The Jepsen job is the testing session's: it runs `coordctl feature --socket <state>/admin.sock activate early-proposal` against each node after start until one accepts.
+
+**Acceptance:** The design step accepted. Then the code, with tests:
+- activation is refused without every configured voter's support;
+- an activated feature survives a restart, and a build without it is refused at start;
+- a prepared store is refused at start by a build from before task-d99, through that build's own `admit`;
+- after prepare and activate, a voter replaced through install and handoff refuses a build without the feature at its next start;
+- a follower restarted after it said `FeatureHeld` gets no early proposal until it says it again;
+- a node's early send turns on once its own activation row is durable, with no restart;
+- a leader change between activation and the last follower's install still finishes the activation, with the old leader's record and reporters;
+- a voter added after an activation is refused promotion on a build without the feature, and on a build with it ends up holding the activation;
+- the window rule holds in a mixed-build test that includes a voter from before task-d99, not only a voter without the feature;
+- a voter that rolled back after reporting is handled as the design step decides;
+- `coordctl`'s command works against a running domain;
+- the harnesses' activation runs.
+
+**Review boundary:** How a feature becomes active in a running domain. No feature's behavior changes here.
 
 ## Gate checklist and deferred work
 
@@ -3410,7 +3788,7 @@ G3 requires task-43/transitive prerequisites, G4 task-48, G5 checkpoint/replacem
 - **The Jepsen runs of task-d67's code** (#98): after four of five leader changes the new leader ran 81 to 87% fast; the fifth's fixed fast set held the voter just killed, which task-d76 takes. Under load the share stayed at Section 2.2's 1 to 2%, which task-d65 records as confirming that section's decision. The publications over 10 ms spent under 2.5 ms on a CPU or waiting for one, so task-d66's job is built.
 - **Against etcd on one host**, the one matched comparison is 2.5 times behind, at 3.5 to 4.7 ms of server CPU an operation against etcd's 1.39, and none of the gap is the order. task-d72 sets the budget and keeps the record; task-d73 through task-d75 are its levers, after task-d63's build and task-d66's job.
 - **Gating.** task-d45 through task-d49 and task-d51 through task-d53 are prerequisites of task-64 and task-q01, so that the qualification and the combined report measure the protocol rather than these costs. task-d56 is a prerequisite of task-64, as liveness under faults. task-62's remaining rows, and any reference result it publishes again, wait on them and on task-d54 for the same reason. This is stated in task-62 rather than as a prerequisite, since task-62's first runs produced task-c01 and task-c02, which the throughput tasks build on. task-d50, reads and the fast path off the slow path, changes protocol behaviour and waits on its own design amendment.
-- **Design changes.** task-d45 through task-d47, task-d49, task-d51 through task-d56 and task-d58 through task-d62, task-d66, task-d69, task-d70, task-d72, task-d73, task-d75, task-d88, task-d91 and task-d92 do not change the design; task-d74 amends Sections 4.1 and 4.3 if a decision reads another follower's votes, and task-d76 amends Section 4.2; task-d71 amends Sections 4.9 and 13.1, and task-d77 through task-d80 and task-d85 Section 4.9, and task-d81 Section 6.7.3 if it changes which ballot a donor serves at; task-d82 amends Section 11.4 and the O14 row, task-d83 Section 6.3 and task-d84 Section 17.3.3; task-d89 amends Section 4.7, and task-d90 Sections 4.5, 17.3.3 and 17.4; task-d86 amends Section 17.3.4 only if a commit cadence reaches `strict`, and task-d87 Section 6.3 only if a round serves a read that arrived after it began; task-d67 amends Sections 4.1, 4.7 and 4.9 with its rule, and task-d68 Sections 4.1 and 4.7 with its, and task-d63's release-rule step amends Sections 4.5, 17.3.3 and 17.4; task-d64 amends Sections 4 and 6.4, and task-d65 Section 2.2 if it changes the model. task-d48 amends Section 17.3.4's projection hardening; task-d50 amends Sections 4.5, 6.3 and 17.4; task-d57 amends Sections 2.2, 4.5 and 6.3.
+- **Design changes.** task-d45 through task-d47, task-d49, task-d51 through task-d56 and task-d58 through task-d62, task-d66, task-d69, task-d70, task-d72, task-d73, task-d75, task-d88, task-d91, task-d92, task-d96 and task-d97 do not change the design; task-d98 amends Sections 4.3 and 4.8, and task-d99 Sections 13 and 17.7 with the activation path and the admission window; task-d74 amends Sections 4.1 and 4.3 if a decision reads another follower's votes, and task-d76 amends Section 4.2; task-d71 amends Sections 4.9 and 13.1, and task-d77 through task-d80 and task-d85 Section 4.9, and task-d81 Section 6.7.3 if it changes which ballot a donor serves at; task-d82 amends Section 11.4 and the O14 row, task-d83 Section 6.3 and task-d84 Section 17.3.3; task-d89 amends Section 4.7, and task-d90 Sections 4.5, 17.3.3 and 17.4; task-d86 amends Section 17.3.4 only if a commit cadence reaches `strict`, and task-d87 Section 6.3 only if a round serves a read that arrived after it began; task-d67 amends Sections 4.1, 4.7 and 4.9 with its rule, and task-d68 Sections 4.1 and 4.7 with its, and task-d63's release-rule step amends Sections 4.5, 17.3.3 and 17.4; task-d64 amends Sections 4 and 6.4, and task-d65 Section 2.2 if it changes the model. task-d48 amends Section 17.3.4's projection hardening; task-d50 amends Sections 4.5, 6.3 and 17.4; task-d57 amends Sections 2.2, 4.5 and 6.3.
 
 task-j06 is optional and cannot silently relax durable materialization. ReadFence is its own capability gate. Observers do not improve quorum fault tolerance or acquire voting rights by catching up. Interface drift in Kine is resolved at one explicit pin, not mixed across examples. Strict per-output authorization remains authoritative even for regional observers.
 

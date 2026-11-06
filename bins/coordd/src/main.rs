@@ -1069,6 +1069,7 @@ fn main() -> ExitCode {
     // find. This is the order that makes `live` mean it.
     let boot = storage.boot;
     let checkpoints = storage.checkpoints;
+    let early_proposal = early_proposal(&storage.active);
     let applier = match coord_storage::Applier::new(
         storage.domain,
         coord_core::outbox::BarrierAllocator::new(placed.incarnation, boot),
@@ -1091,9 +1092,15 @@ fn main() -> ExitCode {
     // Where the loop's waits on those two threads are counted.
     let mut waits = None;
     let backing = if roles.votes() {
-        match voter(&placed, applier, boot, config.limits.command_table_capacity)
-            .and_then(|v| keep_floor(&placed, &config, v))
-            .and_then(|v| pipeline(v, &materialized, &mut waits))
+        match voter(
+            &placed,
+            applier,
+            boot,
+            config.limits.command_table_capacity,
+            early_proposal,
+        )
+        .and_then(|v| keep_floor(&placed, &config, v))
+        .and_then(|v| pipeline(v, &materialized, &mut waits))
         {
             Ok(v) => serve::Backing::Voting(Box::new(v)),
             Err(e) => {
@@ -1278,6 +1285,20 @@ fn main() -> ExitCode {
             domain = domain.with_peers(plane);
         }
         domain = domain.with_links(serve::CollectorLinks::new(links));
+        // An operator reaches a voter's feature activation through a
+        // socket beside its state, local and the owner's alone (task-d99):
+        // `coordctl feature --socket <state>/admin.sock activate <name>`.
+        if voting {
+            let path = std::path::Path::new(&config.state_directory).join(ADMIN_SOCKET);
+            match serve::listen_admin(&path) {
+                Ok(admin) => domain = domain.with_admin(admin),
+                Err(e) => eprintln!(
+                    "the admin socket at {} could not be opened, and this node takes no \
+                     operator requests: {e}",
+                    path.display()
+                ),
+            }
+        }
         // Expiry is scheduled where this process votes. A frontend-only
         // node schedules nothing: it proposes no commands, and an
         // expiry is a command like any other.
@@ -1425,6 +1446,31 @@ crowded_out={}",
     })
 }
 
+/// The admin socket's name in the state directory (task-d99).
+const ADMIN_SOCKET: &str = "admin.sock";
+
+/// Whether this node's leaders send the proposal before its batch is
+/// durable (task-d98): only where the domain activated `EarlyProposal`,
+/// which every configured voter's build supports, or in a build made for
+/// task-d98's local reading alone (`early-proposal-without-activation`),
+/// never built for anything else. Section 23 rules out an operator flag
+/// around a correctness gate, so there is no setting for it.
+///
+/// In a running domain the feature driver activates it (task-d99), and
+/// narrows the early send to the followers known to hold the activation;
+/// this is the value at start, from the activation the store holds.
+fn early_proposal(active: &std::collections::BTreeSet<coord_types::formats::Feature>) -> bool {
+    if cfg!(feature = "early-proposal-without-activation") {
+        eprintln!(
+            "coordd: built with early-proposal-without-activation, task-d98's local reading: \
+             a leader sends its proposal before its batch is durable without the domain having \
+             activated it, so a voter built before task-d74 may count it toward a fast decision"
+        );
+        return true;
+    }
+    active.contains(&coord_types::formats::Feature::EarlyProposal)
+}
+
 /// This node's voter, booted, over the store it will write.
 ///
 /// The role it takes is not a setting. The committed configuration says
@@ -1438,6 +1484,7 @@ fn voter(
     applier: coord_storage::Applier<store::Persistence>,
     boot: coord_core::effect::BootId,
     capacity: usize,
+    early_proposal: bool,
 ) -> Result<coord_daemon::Voter<store::Persistence>, String> {
     use coord_consensus::{
         ConfigurationIdentity, Follower, FollowerConfig, Leader, LeaderConfig, LearningMode,
@@ -1603,6 +1650,41 @@ fn voter(
         (m.cluster(), m.domain()),
         promised,
     );
+    // Given to the node before its boot, so the leader it holds now and
+    // every one it becomes later sends as the domain allows (task-d98):
+    // from the activation this store holds, and from here on from the
+    // feature driver, which turns it on once its own activation row is
+    // durable and keeps the followers known to hold it (task-d99).
+    voter.node_mut().set_early_proposal(early_proposal);
+    let features = {
+        use coord_storage::Persistence;
+        let voters = coord_consensus::quorum::EpochVoters::new(
+            m.epoch(),
+            m.voters().map(|v| v.node).collect(),
+        )
+        .ok_or("a configuration without voters")?;
+        let gated = voter
+            .node()
+            .applier()
+            .store()
+            .reader()
+            .snapshot()
+            .map_err(|e| format!("the feature rows cannot be read: {e:?}"))?;
+        coord_daemon::feature::Features::open(
+            m.cluster(),
+            m.domain(),
+            placed.replica,
+            voters,
+            gated.view(),
+            placed.incarnation,
+            boot,
+        )
+        .map_err(|e| format!("the feature rows cannot be read: {e}"))?
+    };
+    voter.node_mut().keep_features(features);
+    if cfg!(feature = "early-proposal-without-activation") {
+        voter.node_mut().send_early_without_activation();
+    }
     voter
         .boot(boot, placed.incarnation)
         .map_err(|e| format!("this voter cannot record its own boot: {e}"))?;

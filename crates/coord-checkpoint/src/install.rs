@@ -377,6 +377,11 @@ pub enum SelectError {
     ReceiptMismatch,
     /// The receipt could not be read or decoded. The staging was abandoned.
     Receipt(InstallError),
+    /// The staged generation lacks a feature row the active one holds --
+    /// this voter's support row, a prepare marker or the activation --
+    /// so a build the active generation refuses would be admitted to it
+    /// (task-d99). The staging was abandoned.
+    FeatureRowsMissing,
     /// The lifecycle refused or failed the activation itself.
     Activate(OpenError),
 }
@@ -389,6 +394,9 @@ impl fmt::Display for SelectError {
                 f.write_str("staged generation's receipt differs from the completed install")
             }
             SelectError::Receipt(e) => write!(f, "install receipt: {e}"),
+            SelectError::FeatureRowsMissing => {
+                f.write_str("staged generation lacks a feature row the active generation holds")
+            }
             SelectError::Activate(e) => write!(f, "activate: {e}"),
         }
     }
@@ -406,20 +414,34 @@ impl std::error::Error for SelectError {}
 /// since nothing may ever select it; if removing its directory fails, it
 /// stays unreferenced, which is the state a crash before activation leaves
 /// and which the next staging steps over.
+///
+/// `carried` is this voter's feature rows as the active generation holds
+/// them ([`crate::feature::FeatureRows::read`]), which
+/// [`carry_feature_rows`] wrote into the staging: a staging that lacks one
+/// is refused, since its `admit` would let in a build the active
+/// generation refuses (task-d99).
 pub fn select_installed(
     mut staged: InactiveGeneration,
     installed: Installed,
+    carried: &crate::feature::FeatureRows,
 ) -> Result<Generation, SelectError> {
     let durable = staged
         .engine()
         .reader()
         .snapshot()
         .map_err(InstallError::from)
-        .and_then(|view| installed_baseline(&view));
+        .and_then(|view| {
+            let receipt = installed_baseline(&view)?;
+            let rows = carried.held_by(&view).map_err(InstallError::from)?;
+            Ok((receipt, rows))
+        });
     let refusal = match durable {
-        Ok(Some(receipt)) if receipt == installed.receipt => None,
-        Ok(Some(_)) => Some(SelectError::ReceiptMismatch),
-        Ok(None) => Some(SelectError::NotInstalled),
+        Ok((Some(receipt), true)) if receipt == installed.receipt => None,
+        Ok((Some(receipt), false)) if receipt == installed.receipt => {
+            Some(SelectError::FeatureRowsMissing)
+        }
+        Ok((Some(_), _)) => Some(SelectError::ReceiptMismatch),
+        Ok((None, _)) => Some(SelectError::NotInstalled),
         Err(e) => Some(SelectError::Receipt(e)),
     };
     if let Some(refusal) = refusal {
@@ -427,6 +449,29 @@ pub fn select_installed(
         return Err(refusal);
     }
     staged.activate().map_err(SelectError::Activate)
+}
+
+/// Write this voter's own feature rows into a staged generation, durably,
+/// before it is selected (task-d99, design Section 13).
+///
+/// They are node-private, so an install writes none of them; without them
+/// the voter's next start would admit a build its activation refuses.
+pub fn carry_feature_rows<E: LocalEngine>(
+    engine: &mut E,
+    rows: &crate::feature::FeatureRows,
+) -> Result<(), InstallError> {
+    let updates = rows.updates()?;
+    if updates.is_empty() {
+        return Ok(());
+    }
+    let mut txn = engine.begin_write()?;
+    for update in &updates {
+        if let Some(value) = &update.value {
+            txn.put(update.collection, &update.key, value)?;
+        }
+    }
+    txn.commit_durable().map_err(InstallError::Commit)?;
+    Ok(())
 }
 
 /// Install a verified artifact into the engine of an inactive generation.

@@ -15,11 +15,15 @@
 //!   A refresh refused as reuse means the family was revoked: the CLI
 //!   reports that a fresh login is required and never invents recovery.
 //!
+//! * [`admin`]: a running node's admin socket, for `coordctl feature`
+//!   (task-d99).
+//!
 //! Tokens are never accepted as arguments or written to logs. Headless
 //! automation uses workload identity federation, not desktop refresh.
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod admin;
 pub mod client;
 pub mod credentials;
 pub mod store;

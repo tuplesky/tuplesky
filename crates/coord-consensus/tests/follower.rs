@@ -616,6 +616,60 @@ fn restore_rows(storage: &StorageModel) -> Vec<(CommandId, CommandRecord)> {
         .collect()
 }
 
+/// task-d98: a follower outside the fast set that gets the leader's
+/// proposal before the leader's batch is durable must not complete a fast
+/// quorum with a fast-set member's acknowledgement. Only a build from
+/// before task-d74 sends one to a follower, and counted with an early
+/// proposal it would decide over a vote the leader may lose. The follower
+/// takes the decision from the leader's commit frontier instead.
+#[test]
+fn a_follower_never_counts_another_voters_fast_ack_toward_a_fast_decision() {
+    // r2 is outside the fast set {r0, r1} at three voters.
+    let mut f = booted(2);
+    let (e1, c1) = admitted(1, 1, 1);
+    let effects = f.step(e1);
+    f.step(durable_of(&effects, 1).remove(0));
+    let record = f.table().record(&c1).unwrap().clone();
+    // r1's fast ack, equal to the leader's proposal in path and deps, as a
+    // pre-task-d74 build would send it to every voter.
+    let r1_ack = FastAck {
+        replica: r(1),
+        ballot: ballot(0, 0),
+        command: c1,
+        deps: record.deps.clone(),
+        paths: record.paths.clone(),
+        path: record.path,
+        admission: record.payload.expect("initialized"),
+        seqnum: None,
+    };
+    assert!(f.step(peer(1, ProtocolMessage::FastAck(r1_ack))).is_empty());
+    let adoption = f.step(peer(
+        0,
+        proposal(
+            c1,
+            record.deps.clone(),
+            0,
+            record.paths.clone(),
+            record.path,
+        ),
+    ));
+    f.step(durable_of(&adoption, 2).remove(0));
+    assert!(
+        f.votes(&c1).unwrap().learned().is_none(),
+        "the leader's proposal and nothing else: no fast quorum"
+    );
+    assert_ne!(
+        f.table().phase_of(&c1),
+        Some(Phase::Commit),
+        "not committed until the leader's frontier says so"
+    );
+    assert!(
+        f.take_rejections()
+            .contains(&FollowerRejection::PeerFastAck),
+        "r1's fast ack was refused, not counted"
+    );
+}
+
 #[test]
 fn equal_direct_dependencies_are_not_learning_and_guards_are_explicit() {
     let mut f = booted(1);
@@ -641,10 +695,8 @@ fn equal_direct_dependencies_are_not_learning_and_guards_are_explicit() {
     );
     assert_eq!(
         f.take_rejections(),
-        vec![FollowerRejection::Vote(
-            coord_consensus::VoteError::NotInFastSet
-        )],
-        "r2 is outside the fast set: its fast ack never counts"
+        vec![FollowerRejection::PeerFastAck],
+        "a follower never counts another voter's fast ack (task-d98)"
     );
     let p1 = proposal(c1, vec![], 0, record.paths.clone(), record.path);
     let adoption = f.step(peer(0, p1));

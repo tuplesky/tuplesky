@@ -844,6 +844,11 @@ pub struct Resends {
     /// The longest of those calls (task-d59).
     #[serde(default)]
     pub longest: Duration,
+    /// Copies of proposals, first sends and retries, that left before
+    /// their batch was durable, one per follower (task-d98). Zero unless
+    /// the domain activated `EarlyProposal`.
+    #[serde(default)]
+    pub early: u64,
 }
 
 impl Resends {
