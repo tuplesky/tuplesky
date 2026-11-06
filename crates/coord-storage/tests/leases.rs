@@ -139,7 +139,7 @@ impl<E: LocalEngine> Domain<E> {
             let gated = self.worker.reader().snapshot().unwrap();
             let bound = seq.map(|s| binding(s, request));
             let admission = match &bound {
-                Some(b) => retry::admit(gated.view(), b, |_| true).unwrap(),
+                Some(b) => retry::admit(gated.view(), b, |_| Ok(true)).unwrap(),
                 None => Admission::New,
             };
             if let Admission::Retry(record) = &admission {

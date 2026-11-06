@@ -374,12 +374,12 @@ The release point is the group's `JournalDurable` as the store reports it. With 
 
 What it can buy: in task-d62's run (five voters on one host, replay profile), a command waited 7.80 ms on the leader from its group closing to its release. The journal's job was about 1.2 ms of that (0.10 queued, 0.78 served, 0.30 to completion), and the rest was the projection's commit and its queue.
 
-**Releasing before the execution group is durable (task-d90, proposed; reviewed before any code).** The rule above would drop its second condition. A result is released once:
+**Releasing before the execution group is durable (task-d90).** The rule above drops its second condition. A result is released once:
 - the leader has learned the command and every predecessor (task-29's gate, unchanged);
 - the leader has executed it in memory, which is after every command it executes after, since execution is in the decided order;
 - the frontend's output gate authorizes it.
 
-Its group's `JournalDurable` is no longer awaited. Everything else in the rule above stands: watch events, signatures and external calls wait for the projection's commit, and a retry or resolve at the releasing node waits for the projection through the command's position.
+Its group's `JournalDurable` is no longer awaited by the result. It is still awaited by the voter's count of its executions as durable, which is what lets it forget them (point 2 below). A group definitely not journaled still stops the node; what it released stands, since a released result rests on recovery and not on that group. Everything else in the rule above stands: watch events, signatures and external calls wait for the projection's commit, and a retry or resolve at the releasing node waits for the projection through the command's position.
 
 What the release rests on, today and with the change:
 - **Today** the releasing voter's durable execution group is a witness of the order it released: a crash of that voter replays the group, so the released result is in its own journal before anyone sees it.
@@ -405,7 +405,7 @@ What the release rests on, today and with the change:
 
    Today a released command's payload is also in the releasing voter's durable group. Without it, an all-crash could leave a decided, released command with its payload durable nowhere. Recovery doesn't then compute a wrong result. It stops at `HalfInitialized`, so the domain stalls, or the command is set aside with an unbacked report. So the step makes each of the four wait for, or read, the payload row's durability, and a report says a payload is present only where its row is. A selection then leaves out a pre-acceptance no reporter holds a payload row for, unless a selected entry was decided after it. Such a command was never decided, and re-proposed it would wait for a payload no voter has (protocol_sim row 21). And a candidate fetches the payload of each selected command it holds by its record alone before it binds, so a new leader's own vote on a re-proposal rests on a payload row too.
 
-None of these four changes what is released today. Points 2 to 4 are each a precondition the current release rule supplies implicitly through the releasing voter's durable group, and the code step puts each in place, with its own test, before the rule changes.
+None of these four changes what is released under the rule above. Points 2 to 4 are each a precondition that rule supplies implicitly through the releasing voter's durable group, and the code step put each in place, with its own test, before the rule changed.
 - **The state it adds** is every voter crashing after a release and before any of them made the command's execution group durable. Today the releasing voter's group is durable in that state. After it, the domain re-learns the command from the durable decisions and executes it again, and the step shows the result is the released one.
 - **The collector's late-release comparison (task-d12)** compares a release with each voter's execution record. Across that crash it compares the release with the re-executed record, so a recovery that got a decision wrong is caught there, and the node stops (task-d06). **The execution chain (task-d35)** is recomputed from the durable frontier, and a released command not yet in it is chained in the same place.
 - **Events and watches still wait for Materialized.** They are irrevocable effects of the local state, not results, and nothing here moves them.

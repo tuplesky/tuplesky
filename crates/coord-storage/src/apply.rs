@@ -53,22 +53,36 @@ use crate::watch::{PublishError, WatchHub};
 /// execution, when an already-executed command is presented again, and at
 /// a frontend that answers a retry from the durable record before
 /// submitting anything. Losing a permission protects what it produced,
-/// exactly as it would a fresh execution's, and a result that cannot be
-/// decoded or authorized is not handed out.
+/// exactly as it would a fresh execution's.
+///
+/// At execution this decides a replicated result, so it is a function of
+/// the replicated rows and nothing else (task-d95). A session whose
+/// authorization is larger than the schema's view budget is refused, as
+/// it is everywhere, since that is the same on every replica. A failure
+/// to read this replica's own store, or a stored response that doesn't
+/// decode, is not an answer: it is returned as an error, which stops a
+/// voter at execution and leaves a frontend answering from consensus
+/// instead. Turning it into `false` landed a `RetryUnauthorized` that a
+/// replica without the fault would not produce.
 pub fn retained_is_authorized<V: coord_store_api::engine::OrderedRead>(
     view: &V,
     session: &coord_types::ids::SessionId,
     request: &LogicalRequest,
     record: &crate::codecs::RetryRecordV1,
-) -> bool {
+) -> Result<bool, EngineError> {
     let namespace = request.namespace;
-    let Ok(auth) = load_authorization(view, namespace, session, ViewBudget::default()) else {
-        return false;
+    let auth = match load_authorization(view, namespace, session, ViewBudget::default()) {
+        Ok(auth) => auth,
+        Err(ViewBuildError::BudgetExceeded) => return Ok(false),
+        Err(ViewBuildError::Engine(e)) => return Err(e),
     };
-    let Ok(stored) = postcard::from_bytes::<coord_state::Response>(&record.response) else {
-        return false;
-    };
-    authorize_retained(&auth, &namespace, request, &stored.outcome).is_ok()
+    let stored = postcard::from_bytes::<coord_state::Response>(&record.response).map_err(|_| {
+        EngineError::new(
+            coord_store_api::engine::ErrorClass::Corrupt,
+            "a retained response does not decode",
+        )
+    })?;
+    Ok(authorize_retained(&auth, &namespace, request, &stored.outcome).is_ok())
 }
 
 /// Why a command could not be applied.

@@ -246,7 +246,7 @@ pub fn lookup<V: OrderedRead>(
 pub fn admit<V: OrderedRead>(
     view: &V,
     binding: &RetryBinding,
-    authorize: impl FnOnce(&RetryRecordV1) -> bool,
+    authorize: impl FnOnce(&RetryRecordV1) -> Result<bool, EngineError>,
 ) -> Result<Admission, EngineError> {
     let key = &binding.retry_key;
     let session = match session_state(view, &key.session_id)? {
@@ -284,7 +284,7 @@ pub fn admit<V: OrderedRead>(
     }
     match lookup(view, key)? {
         Some(record) if record.command_id == binding.command_id => {
-            if authorize(&record) {
+            if authorize(&record)? {
                 Ok(Admission::Retry(record))
             } else {
                 Ok(Admission::Unauthorized)
@@ -302,7 +302,7 @@ pub fn admit<V: OrderedRead>(
 pub fn resolve<V: OrderedRead>(
     view: &V,
     binding: &RetryBinding,
-    authorize: impl FnOnce(&RetryRecordV1) -> bool,
+    authorize: impl FnOnce(&RetryRecordV1) -> Result<bool, EngineError>,
 ) -> Result<Resolution, EngineError> {
     let key = &binding.retry_key;
     let session = match session_state(view, &key.session_id)? {
@@ -323,7 +323,7 @@ pub fn resolve<V: OrderedRead>(
             bound: record.command_id,
         }),
         Some(record) => {
-            if authorize(&record) {
+            if authorize(&record)? {
                 Ok(Resolution::Result(record))
             } else {
                 Ok(Resolution::Unauthorized)
