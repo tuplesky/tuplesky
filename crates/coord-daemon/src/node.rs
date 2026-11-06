@@ -1065,6 +1065,7 @@ impl<P: Persistence> Node<P> {
                 let quorum = l.config_quorum();
                 let pending = l.pending_sync().cloned();
                 let mut follower = Follower::from_recovered(l.into_recovered(), quorum);
+                follower.set_selection_rules(self.selection_rules());
                 self.won = None;
                 let effects = match pending {
                     Some((from, decision)) => follower.on_sync(from, decision),
@@ -1109,6 +1110,20 @@ impl<P: Persistence> Node<P> {
         } else {
             std::collections::BTreeSet::new()
         };
+        let rules = self.selection_rules();
+        if let Machine::Follower(f) = self.machine_mut() {
+            f.set_selection_rules(rules);
+        }
+    }
+
+    /// The rules this node's campaigns select under: under the release
+    /// rule's activation, a re-proposal no reporter holds a payload row for
+    /// is left out (`SelectionRules::leave_out_unheld`, #197 review), since
+    /// it rests on what the release does, point 4 at every voter.
+    pub const fn selection_rules(&self) -> coord_consensus::SelectionRules {
+        coord_consensus::SelectionRules {
+            leave_out_unheld: self.release_at_execution,
+        }
     }
 
     /// Whether this node releases at execution (see
@@ -1175,7 +1190,8 @@ impl<P: Persistence> Node<P> {
             unreachable!("checked above")
         };
         let quorum = l.config_quorum();
-        let follower = Follower::from_recovered(l.into_recovered(), quorum);
+        let mut follower = Follower::from_recovered(l.into_recovered(), quorum);
+        follower.set_selection_rules(self.selection_rules());
         self.won = None;
         self.machine = Some(Machine::Follower(Box::new(follower)));
         self.carry_out(Vec::new(), at)

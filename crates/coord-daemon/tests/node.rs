@@ -1861,3 +1861,32 @@ fn lending_the_journal_results_are_those_of_a_node_that_appends_on_its_own_threa
     assert_eq!(lent_rows, rows);
     assert_eq!(lent_frames, frames);
 }
+
+/// The release rule's switch carries the selection rule it shares a premise
+/// with (#197 review): a follower's campaigns leave out a re-proposal no
+/// reporter holds a payload row for only while the switch is on, and a
+/// leader that steps down to a follower keeps it.
+#[test]
+fn the_release_rule_switch_carries_the_selection_rule_across_a_role_change() {
+    let rules = |node: &Node<StoreWorker<ModelEngine>>| match node.machine() {
+        Machine::Follower(f) => f.selection_rules().leave_out_unheld,
+        Machine::Leader(_) => panic!("a follower"),
+    };
+    let mut node = follower(BootId([9; 16]));
+    assert!(!rules(&node), "off by default");
+    node.set_release_at_execution(true);
+    assert!(rules(&node));
+    node.set_release_at_execution(false);
+    assert!(!rules(&node));
+
+    let mut node = leader(BootId([10; 16]));
+    node.set_release_at_execution(true);
+    node.step_down(&ballot()).expect("stepped down");
+    assert!(
+        rules(&node),
+        "the follower it became selects under the rule"
+    );
+    let mut node = leader(BootId([11; 16]));
+    node.step_down(&ballot()).expect("stepped down");
+    assert!(!rules(&node), "and without the switch, as before");
+}
