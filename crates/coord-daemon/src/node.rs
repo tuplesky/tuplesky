@@ -338,6 +338,15 @@ impl Machine {
         }
     }
 
+    /// How much unexecuted work this replica holds (task-d94): none for
+    /// a leader.
+    pub fn unexecuted_held(&self) -> usize {
+        match self {
+            Machine::Leader(_) => 0,
+            Machine::Follower(m) => m.unexecuted_held(),
+        }
+    }
+
     /// Whether a catch-up page is in hand (task-d08).
     pub fn catching_up(&self) -> bool {
         match self {

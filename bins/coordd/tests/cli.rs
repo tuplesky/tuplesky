@@ -7158,3 +7158,119 @@ async fn a_request_above_the_configured_bound_is_refused_and_one_below_is_served
         "{completion:?}"
     );
 }
+
+/// A voter killed under load and started again late catches up in pages,
+/// not one command per re-send (task-d94).
+///
+/// It can come back holding pre-acceptances the others decided while it
+/// was gone, and decide one each time the leader's re-send reaches it,
+/// every 250 ms. Its frontier then creeps rather than stands, and a pacer
+/// that asked only once the frontier had been still for a second never
+/// asked: in a leader-kill run on the Jepsen runner such a voter executed
+/// about 4 commands a second for minutes, holding hundreds of them.
+///
+/// Whether it creeps depends on what it holds when it starts, so this
+/// fails on the old pacer in some runs, not all (3 of 6 when it
+/// was written); the pacer's own test,
+/// `a_voter_whose_frontier_creeps_asks_for_a_page`, fails on it every
+/// time.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_voter_restarted_late_under_load_catches_up_in_pages() {
+    let dir = workspace("late-restart");
+    let cluster = three_voters(&dir);
+    for config in &cluster.configs {
+        let mut text = std::fs::read_to_string(config).expect("read config");
+        text.push_str("\n[metrics]\ninterval_seconds = 1\n");
+        std::fs::write(config, text).expect("write config");
+        assert_eq!(run(config, &["init"]).code, Some(0));
+    }
+    let mut running: Vec<Running> = cluster.configs.iter().map(|c| start(c)).collect();
+    for node in &running {
+        assert!(
+            node.waits_to_say("voters submittable=2 of 2"),
+            "{}",
+            node.said()
+        );
+    }
+    // The restarted voter's last reading: commands it executed since it
+    // started, and the pre-acceptances it holds that the leader hasn't
+    // ordered. Behind, it holds hundreds; caught up, none.
+    let standing = |said: &str| -> (u64, u64) {
+        said.lines()
+            .filter_map(|line| {
+                let v: serde_json::Value =
+                    serde_json::from_str(line.strip_prefix("metrics ")?).ok()?;
+                let cost = &v["cost"]["Observed"];
+                Some((
+                    cost["executed"].as_u64()?,
+                    cost["unordered"]["pending"].as_u64().unwrap_or(0),
+                ))
+            })
+            .next_back()
+            .unwrap_or((0, u64::MAX))
+    };
+    // Callers on voters 2 and 3, which stay up.
+    let mut callers = Vec::new();
+    for (n, node) in running.iter().enumerate().skip(1) {
+        for k in 0..2 {
+            let session = [0x70 + (n * 2 + k) as u8; 16];
+            callers.push(Caller::bind(node, &cluster.ca, &cluster.ring, session).await);
+        }
+    }
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut loads = Vec::new();
+    for (i, caller) in callers.into_iter().enumerate() {
+        let stop = stop.clone();
+        loads.push(tokio::spawn(async move {
+            let mut n = 0u64;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                n += 1;
+                let key = format!("l{i}-{}", n % 64).into_bytes();
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(3),
+                    ask(&caller.connection, &caller.put(n, &key, b"v")),
+                )
+                .await;
+            }
+        }));
+    }
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    // Voter 1, the leader, goes; the others elect one and carry the load.
+    drop(running.remove(0));
+    tokio::time::sleep(Duration::from_secs(25)).await;
+    // Back while the load still runs, so it takes submissions the others
+    // order without it before it has caught up.
+    running.insert(0, start(&cluster.configs[0]));
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    for load in loads {
+        let _ = load.await;
+    }
+    // Caught up is holding nothing unordered, with the executed count
+    // settled: at a page of 64 commands an ask that takes seconds. At one
+    // command per re-send the voter holds hundreds for minutes, and its
+    // count moves every second.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let mut seen: Vec<(u64, u64)> = Vec::new();
+    while std::time::Instant::now() < deadline {
+        seen.push(standing(&running[0].said()));
+        let settled = seen.len() >= 5
+            && seen[seen.len() - 5..]
+                .iter()
+                .all(|&(executed, pending)| pending == 0 && executed == seen[seen.len() - 1].0);
+        if settled && seen[seen.len() - 1].0 > 0 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let last = seen.last().copied();
+    panic!(
+        "the restarted voter did not catch up within 30 s: (executed, unordered) {last:?}\n-- voter 1 --\n{}",
+        running[0]
+            .said()
+            .lines()
+            .filter(|l| !l.starts_with("metrics "))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
