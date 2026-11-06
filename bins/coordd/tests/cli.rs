@@ -6550,7 +6550,7 @@ async fn a_leader_that_sent_early_and_restarted_comes_back_following() {
         Caller::bind(&running[2], &cluster.ca, &cluster.ring, [0x68; 16]).await,
     ];
     for (n, caller) in callers.iter().enumerate() {
-        let read = read_projected(caller, 1, b"k")
+        let read = ask(&caller.connection, &caller.range(1, b"k"))
             .await
             .unwrap_or_else(|| panic!("voter {} did not answer a read", n + 1));
         assert_eq!(
