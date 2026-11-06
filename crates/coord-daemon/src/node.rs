@@ -616,9 +616,10 @@ pub struct Node<P: Persistence> {
     /// projection has committed through its position (task-d52), oldest
     /// first. A group's results are not here but in `results`.
     releases: VecDeque<(ExecutionPosition, Vec<Effect>)>,
-    /// The results of groups handed to a pipelined store, each held until
-    /// the group is in the journal (task-d63): released then, before its
-    /// projection commit (design Section 4.5), oldest first.
+    /// The establishments of groups handed to a pipelined store, each held
+    /// until the group is in the journal (task-d63), oldest first: the
+    /// voter counts its executions durable then (task-d90, point 2). The
+    /// groups' results went out as each command executed (task-d90).
     results: VecDeque<(ExecutionPosition, Vec<Effect>)>,
     /// What this replica's re-sends did, over every ballot it led since
     /// boot (task-d49).
@@ -1791,10 +1792,14 @@ impl<P: Persistence> Node<P> {
             //
             // Within a group the machine hears the outcome now, which is
             // what lets it name the next command, and what it answers is
-            // held for the group (task-d47): a result until the group is
-            // in the journal (task-d63), a send and everything else until
-            // it has materialized.
-            let effects = self.machine_mut().applied(command, &outcome)?;
+            // held for the group (task-d47): its establishment until the
+            // group is in the journal (task-d63), a send and everything
+            // else until it has materialized. A released result is not
+            // held: it goes out now (task-d90, below).
+            let mut effects = self.machine_mut().applied(command, &outcome)?;
+            if grouping {
+                Self::release_executed(&mut effects, &mut out, self.frontend)?;
+            }
             self.release.applied(&command, std::time::Instant::now());
             self.stamp_learned();
             // At a floor boundary the view is exactly the command's: the
@@ -1823,14 +1828,49 @@ impl<P: Persistence> Node<P> {
         Ok(out)
     }
 
+    /// Send the results `effects` releases to the collector now, and leave
+    /// the rest (task-d90, design Section 4.5).
+    ///
+    /// A result is released once the leader has learned the command and
+    /// every predecessor, and has executed it in memory, which is where
+    /// this is called: its execution group's `JournalDurable` is no longer
+    /// awaited. What the release rests on instead is recovery reproducing
+    /// every decision and its inputs. Every vote that counts rests on a
+    /// payload row durable at its voter (point 4), a voter forgets only
+    /// what its journal holds (point 2, which is why the establishment
+    /// still waits for the group), and no local fault becomes an outcome
+    /// (point 3). Watch events, signatures and external calls still wait
+    /// for the projection's commit, and a retry or a resolve at this node
+    /// waits for the projection through the command's position.
+    fn release_executed(
+        effects: &mut Vec<Effect>,
+        out: &mut Outbound,
+        frontend: PeerId,
+    ) -> Result<(), DriveError> {
+        let mut rest = Vec::with_capacity(effects.len());
+        for effect in effects.drain(..) {
+            match (&effect, frontend_frame(&effect, frontend)) {
+                (Effect::Released(_), Some(frame)) => out
+                    .frontend
+                    .push(frame.map_err(|e| DriveError::Encode(format!("{e:?}")))?),
+                _ => rest.push(effect),
+            }
+        }
+        *effects = rest;
+        Ok(())
+    }
+
     /// Close the open execution group and carry out what its commands led
     /// to once it has materialized (task-d47).
     ///
     /// On a pipelined store (task-d52) the group is journaled and its
-    /// projection commit handed to the materializer. Its results are held
-    /// until it is in the journal, and go out then (task-d63, design
-    /// Section 4.5); everything else it led to is held until the
-    /// projection has committed through it ([`Node::settle`]). Execution
+    /// projection commit handed to the materializer. Its establishments
+    /// are held until it is in the journal, and are carried out then
+    /// (task-d63): a voter forgets only executions its journal holds
+    /// (task-d90, point 2). Its results have gone out already, as each
+    /// command executed ([`Node::release_executed`]). Everything else it
+    /// led to is held until the projection has committed through it
+    /// ([`Node::settle`]). Execution
     /// goes on meanwhile, planning over the groups in flight. Past
     /// `PIPELINE_RECORDS` owed it waits for them.
     fn close_group(
