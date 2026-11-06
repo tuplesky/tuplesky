@@ -298,13 +298,20 @@ pub enum Feature {
     /// record and refuses to start, so a voter cannot report the feature,
     /// roll back, and leave unanimity counting a build it no longer runs.
     EarlyProposalPrepared = 0x0005,
-    /// A leader's results released as its commands execute in memory,
-    /// before their execution group is journaled (task-d90, design
-    /// Section 4.5). The argument needs every voter to vote on durable
-    /// payload rows and forget only what its journal holds (#195,
-    /// task-d95): a build from before those can acknowledge a command
-    /// whose payload it has not made durable, and a domain-wide crash in
-    /// that window could lose a result already released.
+    /// Every voter votes on durable payload rows and forgets only what its
+    /// journal holds (task-d90's points 2 and 4, #195; point 3, task-d95).
+    /// A build from before those can acknowledge a command whose payload
+    /// row it never made durable, and come back holding the record alone.
+    /// Two rules rest on this, and each is on only while it is active
+    /// (design Section 4.5):
+    /// - a leader's results are released as its commands execute in
+    ///   memory, before their execution group is journaled; without the
+    ///   premise a domain-wide crash could lose a result already
+    ///   released;
+    /// - a selection leaves out a re-proposal no reporter holds a payload
+    ///   row for (`SelectionRules::leave_out_unheld`); without the premise
+    ///   that could drop a command an older voter acknowledged, where
+    ///   re-proposing it stalls until a supplier is back.
     ReleaseAtExecution = 0x0006,
     /// `ReleaseAtExecution`'s prepare marker, as `EarlyProposalPrepared`
     /// is `EarlyProposal`'s.
