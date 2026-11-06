@@ -1246,8 +1246,9 @@ impl<P: Persistence> Node<P> {
     }
 
     /// Take part in activating features (task-d99). From here on, this
-    /// node's own durable activation record is its switch, and its leaders
-    /// send early only to the followers known to hold it.
+    /// node's own durable activation record is its switch, for early sends
+    /// and for the release rule (task-d90), and its leaders send early only
+    /// to the followers known to hold it.
     pub fn keep_features(&mut self, features: crate::feature::Features) {
         self.features = Some(features);
         self.follow_features();
@@ -1258,9 +1259,10 @@ impl<P: Persistence> Node<P> {
         self.features.as_ref()
     }
 
-    /// The switch and the window, from what the feature driver holds now:
+    /// The switches and the window, from what the feature driver holds now:
     /// early sends on once this node's own activation row is durable, and
-    /// only toward the followers that said they hold it.
+    /// only toward the followers that said they hold it; release at
+    /// execution on once its row for `ReleaseAtExecution` is.
     fn follow_features(&mut self) {
         if self.early_without_activation {
             return;
@@ -1275,10 +1277,14 @@ impl<P: Persistence> Node<P> {
             .active()
             .contains(&coord_types::formats::Feature::EarlyProposal);
         let holders = features.holders(coord_types::formats::Feature::EarlyProposal);
+        let release = features
+            .active()
+            .contains(&coord_types::formats::Feature::ReleaseAtExecution);
         self.set_early_holders(Some(holders));
         if on != self.early_proposal {
             self.set_early_proposal(on);
         }
+        self.set_release_at_execution(release);
     }
 
     fn standing(&self, ballot: &Ballot) -> crate::feature::Standing {
