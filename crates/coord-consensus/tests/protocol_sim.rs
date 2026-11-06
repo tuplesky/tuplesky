@@ -516,6 +516,18 @@ impl Knobs {
                 gate_crash: 250_000,
                 ..Knobs::row(19)
             },
+            // Row 18's early proposals, leader journal lag and window
+            // crashes with row 19's late execution and its cuts: both let
+            // something leave before it is durable (#197 review, for the
+            // batch head).
+            23 => Knobs {
+                row,
+                late_execution: true,
+                execution_lag: 980_000,
+                total_crash: 6_000,
+                capacity: 8,
+                ..Knobs::row(18)
+            },
             _ => unreachable!("not a scenario of the simulator: row {row}"),
         }
     }
@@ -3498,7 +3510,9 @@ fn run_row(row: u8) {
     // Rows 1 and 2 run each seed again with task-d98's early proposals
     // and the faults that reach them, so the rows keep what they read
     // with today's barrier and read the early send too.
-    let variants: &[bool] = if row == 1 || row == 2 {
+    // Row 22 too: early proposals put followers' pre-acceptances out
+    // ahead of the leader's batch, in the window it crashes the leader in.
+    let variants: &[bool] = if row == 1 || row == 2 || row == 22 {
         &[false, true]
     } else {
         &[false]
@@ -3593,7 +3607,7 @@ fn run_row(row: u8) {
     // Row 19 is defined by its cuts (task-d90): every voter crashed at
     // each of them, executions lost to it, and results released and then
     // executed again.
-    if row == 19 {
+    if row == 19 || row == 23 {
         assert!(
             totals.cut_decided > 0
                 && totals.cut_released > 0
@@ -3629,7 +3643,7 @@ fn run_row(row: u8) {
     // Rows that send early read the window they were made for: proposals
     // left early, and leaders were crashed and deposed while one was not
     // durable (task-d98).
-    if variants.contains(&true) || row == 18 {
+    if variants.contains(&true) || row == 18 || row == 23 {
         assert!(
             totals.early_sends > 0 && totals.window_crashes > 0 && totals.window_deposes > 0,
             "row {row} never reached the early window: {totals:?}"
@@ -3718,6 +3732,11 @@ fn row_18_fails_when_the_fast_set_follower_gets_the_proposal_early_too() {
         panic!("row 18 passed {budget} seeds with the fast-set follower sent early too");
     };
     println!("the negative control failed as it should: {failure}");
+}
+
+#[test]
+fn row_23_early_proposals_with_late_execution() {
+    run_row(23);
 }
 
 #[test]
