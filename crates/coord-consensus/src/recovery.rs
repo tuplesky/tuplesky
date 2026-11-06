@@ -449,6 +449,44 @@ pub fn select_decided(
     source_configuration: impl Fn(&Ballot) -> Option<BallotConfiguration>,
     decided: &impl CandidateDecisions,
 ) -> Result<SyncDecision, RecoveryError> {
+    select_ruled(
+        config,
+        reports,
+        supplied,
+        source_configuration,
+        decided,
+        SelectionRules::default(),
+    )
+}
+
+/// The rules a selection applies beyond task-29's, each resting on
+/// something every voter's build must do (task-d90). The default applies
+/// none of them, which is the selection a domain made before it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SelectionRules {
+    /// Leave out a re-proposal no reporter holds a payload row for and no
+    /// selected entry waits on ([`select_ruled`]). It rests on every vote
+    /// resting on a payload row durable at the voter (point 4, #195): a
+    /// build from before that can acknowledge a command whose payload row
+    /// it never made durable, and come back holding the record alone, so a
+    /// command decided over such a vote can reach a candidate with no
+    /// reporter holding its payload. Left out, that decision would be
+    /// lost; re-proposed, the campaign waits until a supplier is back.
+    /// So it holds only in a domain whose voters all run point 4: one that
+    /// activated `ReleaseAtExecution` (task-d99), whose activation every
+    /// voter prepared durably on such a build and cannot roll back from.
+    pub leave_out_unheld: bool,
+}
+
+/// [`select_decided`] under `rules`.
+pub fn select_ruled(
+    config: &BallotConfiguration,
+    reports: &[RecoveryReport],
+    supplied: impl Fn(&CommandId, Option<Digest32>) -> bool,
+    source_configuration: impl Fn(&Ballot) -> Option<BallotConfiguration>,
+    decided: &impl CandidateDecisions,
+    rules: SelectionRules,
+) -> Result<SyncDecision, RecoveryError> {
     let mut seen = BTreeSet::new();
     for r in reports {
         if !config.is_voter(&r.replica) {
@@ -709,9 +747,9 @@ pub fn select_decided(
     for c in entries.keys() {
         reproposed.remove(c);
     }
-    // Nor a command no reporter holds a payload row for, the candidate's
-    // own report among them, and no selected entry waits on (task-d90,
-    // point 4). Every vote rests on a payload row durable at the voter, so a
+    // Nor, under `rules.leave_out_unheld`, a command no reporter holds a
+    // payload row for, the candidate's own report among them, and no
+    // selected entry waits on (task-d90, point 4). Every vote rests on a payload row durable at the voter, so a
     // slow decision of it would be an acceptance in some report and a
     // fast one a pre-acceptance with its payload at a reporting member of
     // the fast quorum: it was never decided, and is left out as a command
@@ -728,14 +766,16 @@ pub fn select_decided(
         .values()
         .flat_map(|e| e.deps.iter().copied())
         .collect();
-    reproposed.retain(|c| {
-        waited_on.contains(c)
-            || reports.iter().any(|r| {
-                r.entries
-                    .iter()
-                    .any(|e| e.command == *c && e.payload_present)
-            })
-    });
+    if rules.leave_out_unheld {
+        reproposed.retain(|c| {
+            waited_on.contains(c)
+                || reports.iter().any(|r| {
+                    r.entries
+                        .iter()
+                        .any(|e| e.command == *c && e.payload_present)
+                })
+        });
+    }
     let reproposed = within_bound(&entries, reproposed, MAX_REPORT_ENTRIES);
     Ok(SyncDecision {
         ballot: config.ballot(),
