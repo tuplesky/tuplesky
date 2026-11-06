@@ -53,8 +53,12 @@
 //! 8. **Forgetting by the journal** (task-d90, point 2). A voter forgets a
 //!    command only once its execution is durable there.
 //! 9. **Each vote on its payload row** (task-d90, point 4). A fast or slow
-//!    acknowledgement a voter sends, and a report entry it names a payload
-//!    present in, rests on the command's payload row durable at that voter.
+//!    acknowledgement a voter sends, a leader's own proposal once its batch
+//!    is durable, and a report entry it names a payload present in, rest
+//!    on the command's payload row durable at that voter. And the converse,
+//!    which the selection rests on: a pre-acceptance a selection leaves out
+//!    for want of a payload at every reporter was never decided, unless a
+//!    voter executed it durably.
 //!
 //! Scenarios are the checklist's failure-test matrix rows 1 to 5, 9, 10,
 //! 12 and 14, and rows 16 and 17, which are row 9's with acknowledgements
@@ -251,6 +255,10 @@ struct Knobs {
     /// task-d89's window, where its gate commits nothing until the batch
     /// is (task-d90's acceptance).
     gate_crash: u32,
+    /// The negative control of the converse of oracle 9: a voter's report
+    /// names none of its pre-acceptances' payloads present, rows durable
+    /// or not, as a report whose bookkeeping of served payloads drifted.
+    hide_preaccepted_payloads: bool,
 }
 
 impl Knobs {
@@ -287,6 +295,7 @@ impl Knobs {
         payload_crash: 0,
         drop_payload_rows: false,
         gate_crash: 0,
+        hide_preaccepted_payloads: false,
     };
 
     /// The checklist's matrix rows 1 to 5, 9, 10, 12 and 14, rows 16 and
@@ -612,6 +621,10 @@ struct Sim {
     submitted: BTreeMap<CommandId, Digest32>,
     /// The one dependency set of each decided command, and who said so.
     decided: BTreeMap<CommandId, (BTreeSet<CommandId>, String)>,
+    /// Commands some voter counted a quorum over: a leader's commits from
+    /// its votes, and a follower's commit as an acknowledgement reaches it
+    /// (the converse of oracle 9, task-d90).
+    counted: BTreeSet<CommandId>,
     /// The one execution order.
     order: Vec<CommandId>,
     step: u32,
@@ -742,6 +755,9 @@ struct Stats {
     /// window).
     gate_windows: usize,
     gate_crashes: u32,
+    /// Pre-acceptances a selection left out for want of a payload row at
+    /// any reporter, each checked never to have been decided.
+    left_out: usize,
 }
 
 /// FNV-1a over `bytes`, continuing from `hash`.
@@ -772,6 +788,7 @@ impl Sim {
                     ExecutionPosition::ZERO,
                 );
                 leader.set_learning(LearningMode::Full);
+                leader.observe_learning();
                 Role::Leader(leader)
             } else {
                 let mut follower = Follower::new(FollowerConfig {
@@ -813,6 +830,7 @@ impl Sim {
             submitted: BTreeMap::new(),
             catch_up: std::env::var_os("PROTOCOL_SIM_NO_CATCH_UP").is_none(),
             decided: BTreeMap::new(),
+            counted: BTreeSet::new(),
             order: Vec::new(),
             step: 0,
             stats: Stats::default(),
@@ -952,6 +970,18 @@ impl Sim {
                     if let Ok(m) = &message {
                         self.check_vote_payload(i, m);
                     }
+                    let (frame, message) = match message {
+                        Ok(ProtocolMessage::ReportPage(p))
+                            if self.knobs.hide_preaccepted_payloads =>
+                        {
+                            let p = hide_preaccepted(p);
+                            (
+                                ProtocolMessage::ReportPage(p.clone()).encode(),
+                                Ok(ProtocolMessage::ReportPage(p)),
+                            )
+                        }
+                        other => (frame, other),
+                    };
                     if let Ok(ProtocolMessage::Sync(d)) = &message
                         && d.entries.len()
                             > 5 * coord_consensus::max_report_entries(self.knobs.capacity)
@@ -1183,6 +1213,7 @@ impl Sim {
                 let q = f.quorum().clone();
                 let (mut l, effects) = Leader::from_recovered(f.into_recovered(), q, &decision);
                 l.set_learning(LearningMode::Full);
+                l.observe_learning();
                 node.role = Some(Role::Leader(l));
                 if let Some(t) = self.trace.as_mut() {
                     t.push_back(format!(
@@ -1229,7 +1260,26 @@ impl Sim {
                     };
                     Some((c, self.phase(i, &c), deps.unwrap_or_default()))
                 });
+        let acked = match &event {
+            Event::Peer(m) => match ProtocolMessage::decode(m.frame()) {
+                Ok(ProtocolMessage::FastAck(a)) => Some(a.command),
+                Ok(ProtocolMessage::SlowAck(a)) => Some(a.command),
+                _ => None,
+            },
+            _ => None,
+        };
         let effects = self.nodes[usize::from(i)].step(event);
+        match &mut self.nodes[usize::from(i)].role {
+            Some(Role::Leader(l)) => self.counted.extend(l.take_learned()),
+            Some(Role::Follower(f)) => {
+                if let Some(c) = acked
+                    && f.table().phase_of(&c) >= Some(coord_consensus::Phase::Commit)
+                {
+                    self.counted.insert(c);
+                }
+            }
+            None => {}
+        }
         let mut watch_notes: Vec<String> = Vec::new();
         if let Some((c, before, deps_before)) = phase_watch {
             let deps = match &self.nodes[usize::from(i)].role {
@@ -1331,6 +1381,9 @@ impl Sim {
         }
         for text in watch_notes {
             self.note(|| text);
+        }
+        if !decided_before {
+            self.check_left_out(i);
         }
         self.handle(i, effects);
         self.convert(i);
@@ -1836,6 +1889,75 @@ impl Sim {
             ));
         }
         self.stats.votes_checked += commands.len();
+    }
+
+    /// The converse of oracle 9 (task-d90, #197 review): a selection
+    /// leaves out a pre-acceptance no reporter holds a payload row for,
+    /// which rests on every counted vote's voter reporting its payload
+    /// present. So nothing the rule leaves out was ever counted in a
+    /// quorum, nor learned or executed anywhere, unless a voter executed
+    /// it durably.
+    fn check_left_out(&mut self, i: u8) {
+        let Some(Role::Follower(f)) = &self.nodes[usize::from(i)].role else {
+            return;
+        };
+        let Some(c) = f.campaign_state() else {
+            return;
+        };
+        let Some(d) = c.decision() else {
+            return;
+        };
+        let waited_on: BTreeSet<CommandId> = d
+            .entries
+            .values()
+            .flat_map(|e| e.deps.iter().copied())
+            .collect();
+        let mut seen: BTreeSet<CommandId> = BTreeSet::new();
+        let mut present: BTreeSet<CommandId> = BTreeSet::new();
+        let mut accepted: BTreeSet<CommandId> = BTreeSet::new();
+        for r in c.reports() {
+            for e in &r.entries {
+                seen.insert(e.command);
+                if e.payload_present {
+                    present.insert(e.command);
+                }
+                if e.phase >= coord_consensus::Phase::Accept {
+                    accepted.insert(e.command);
+                }
+            }
+        }
+        let left_out: Vec<CommandId> = seen
+            .into_iter()
+            .filter(|c| {
+                !accepted.contains(c)
+                    && !present.contains(c)
+                    && !waited_on.contains(c)
+                    && !d.entries.contains_key(c)
+                    && !d.reproposed.contains(c)
+            })
+            .collect();
+        self.stats.left_out += left_out.len();
+        // One a voter executed durably is left out rightly: its executors
+        // forgot it and leave it out of their reports, and re-proposed it
+        // would be executed twice (task-d77). Catch-up serves it.
+        let executed_durably = |c: &CommandId| {
+            self.nodes
+                .iter()
+                .any(|n| n.executed[..n.durable_executed].contains(c))
+        };
+        if let Some(c) = left_out.iter().find(|c| {
+            (self.counted.contains(*c) || self.decided.contains_key(*c)) && !executed_durably(c)
+        }) {
+            let how = self
+                .decided
+                .get(c)
+                .map_or("counted in a quorum".to_owned(), |(_, how)| how.clone());
+            self.fail(&format!(
+                "node {i}'s selection for {} left out {}, which was decided: {how}",
+                bn(&d.ballot),
+                short(c)
+            ));
+        }
     }
 
     /// Oracle 9 for a leader's own vote: its proposal, which counts once
@@ -3228,6 +3350,7 @@ fn run_row(row: u8) {
                     totals.cut_durable += s.cut_durable;
                     totals.gate_windows += s.gate_windows;
                     totals.gate_crashes += s.gate_crashes;
+                    totals.left_out += s.left_out;
                 }
                 Err(e) => failures.push(e),
             }
@@ -3400,11 +3523,60 @@ fn row_20_fails_when_a_vote_does_not_rest_on_its_payload_row() {
     );
 }
 
+/// A single-page report with no pre-acceptance's payload named present,
+/// paginated again so its digests hold (`hide_preaccepted_payloads`).
+fn hide_preaccepted(page: coord_consensus::ReportPage) -> coord_consensus::ReportPage {
+    if page.total != 1 {
+        return page;
+    }
+    let mut report = coord_consensus::RecoveryReport {
+        replica: page.replica,
+        ballot: page.ballot,
+        committed_ballot: page.committed_ballot,
+        entries: page.entries.clone(),
+    };
+    // Rebuilt unchanged, it is the page sent, or it is left alone.
+    if coord_consensus::paginate(&report, coord_consensus::MAX_PAGE_ENTRIES).first() != Some(&page)
+    {
+        return page;
+    }
+    for e in &mut report.entries {
+        if e.phase < coord_consensus::Phase::Accept {
+            e.payload_present = false;
+        }
+    }
+    coord_consensus::paginate(&report, coord_consensus::MAX_PAGE_ENTRIES).remove(0)
+}
+
+/// The converse of oracle 9's negative control (task-d90, #197 review):
+/// with voters' reports naming no pre-acceptance's payload present, a
+/// selection leaves out a command a quorum decided, and the check says so.
+#[test]
+fn row_1_fails_when_reports_hide_counted_payloads() {
+    let knobs = Knobs {
+        hide_preaccepted_payloads: true,
+        ..Knobs::row(1)
+    };
+    let found = first_failure_with(3, knobs, "left out")
+        .or_else(|| first_failure_with(5, knobs, "left out"));
+    println!("row 1 with pre-acceptances' payloads hidden: {found:?}");
+    assert!(
+        found.as_deref().is_some_and(|f| f.contains("left out")),
+        "no seed of row 1 failed the converse of oracle 9 with payloads hidden: {found:?}"
+    );
+}
+
 /// Seeds a negative control may take to fail (task-d90).
 const NEGATIVE_CONTROL_SEEDS: u64 = 200;
 
 /// The first seed at which `knobs` fail, at `n` voters, with the failure.
 fn first_failure(n: u8, knobs: Knobs) -> Option<String> {
+    first_failure_with(n, knobs, "")
+}
+
+/// The first seed at which `knobs` fail, at `n` voters, with a failure
+/// that says `what`.
+fn first_failure_with(n: u8, knobs: Knobs, what: &str) -> Option<String> {
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
     let found = (0..NEGATIVE_CONTROL_SEEDS).find_map(|seed| {
@@ -3418,6 +3590,7 @@ fn first_failure(n: u8, knobs: Knobs) -> Option<String> {
                     .unwrap_or_default();
                 format!("seed {seed}: {text}")
             })
+            .filter(|f| f.contains(what))
     });
     std::panic::set_hook(hook);
     found
