@@ -506,6 +506,9 @@ pub struct Follower {
     ledger: DurableLedger,
     learner: Learner,
     campaign: Option<Campaign>,
+    /// The rules its campaigns select under (task-d90): the default until
+    /// the runtime says the domain's voters all support more.
+    selection_rules: crate::recovery::SelectionRules,
     /// Durable dependency rows of commands this replica executed and
     /// forgot, as the runtime read them for the campaign's selection
     /// (task-d77); `None` for one with no row. Read again by each campaign.
@@ -801,6 +804,7 @@ impl Follower {
             ledger,
             learner: Learner::new(executed_through),
             campaign: None,
+            selection_rules: crate::recovery::SelectionRules::default(),
             executed_rows: BTreeMap::new(),
             behind: None,
             unbacked: None,
@@ -988,6 +992,7 @@ impl Follower {
             learner: state.learner,
             deferred: BTreeMap::new(),
             campaign: None,
+            selection_rules: crate::recovery::SelectionRules::default(),
             executed_rows: BTreeMap::new(),
             behind: None,
             unbacked: None,
@@ -1192,7 +1197,8 @@ impl Follower {
         self.campaign = Some(
             Campaign::new(config)
                 .bounded(crate::recovery::MAX_REPORT_ENTRIES)
-                .knowing(self.config.quorum.clone()),
+                .knowing(self.config.quorum.clone())
+                .ruled(self.selection_rules),
         );
         let mut out = alloc::vec![effects.persist];
         out.extend(self.release());
@@ -1268,7 +1274,7 @@ impl Follower {
             self.rejections.push(FollowerRejection::CannotLead);
             return Vec::new();
         };
-        self.campaign = Some(Campaign::resumed(config, decision));
+        self.campaign = Some(Campaign::resumed(config, decision).ruled(self.selection_rules));
         self.advance_campaign()
     }
 
@@ -2613,6 +2619,22 @@ impl Follower {
     /// The execution frontier.
     pub const fn executed_through(&self) -> ExecutionPosition {
         self.learner.executed_through()
+    }
+
+    /// Select under `rules` in this replica's campaigns, the one running
+    /// now included (task-d90). `coordd` sets it from the node's own
+    /// durable activation record: [`crate::recovery::SelectionRules`]
+    /// says what each rule rests on.
+    pub fn set_selection_rules(&mut self, rules: crate::recovery::SelectionRules) {
+        self.selection_rules = rules;
+        if let Some(c) = self.campaign.as_mut() {
+            c.set_rules(rules);
+        }
+    }
+
+    /// The rules this replica's campaigns select under.
+    pub const fn selection_rules(&self) -> crate::recovery::SelectionRules {
+        self.selection_rules
     }
 
     /// Count this replica's executions durable only as its runtime says
