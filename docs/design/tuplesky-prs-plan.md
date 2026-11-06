@@ -3342,6 +3342,18 @@ The change, in two steps:
 
     The first three fail inside CI's twelve seeds, so reverting any of them fails CI without a switch.
 - **The release rule, on `claude/task-d90-release-rule`.** A leader's result goes to the collector as its command executes (`Node::release_executed`), before its execution group is journaled. The establishment still waits for the group's `JournalDurable`: that is when the voter counts the execution durable and may forget it in its turn (point 2), and when the learned-to-established split is stamped, so its last part, the group's sync, is now off the release path. Point 3 (#188) is merged in, since the rule rests on it. The node tests that pinned task-d63's rule are restated for this one: a staged group's results go out at the stage, before the flush journals it; a group closed at its bound releases every result as it executes, the open group's too, and its hand-off carries out the closed group's establishments; with the journal lent, every result goes out with the group's append still out, and the establishments once it is taken back. The simulator already released at in-memory execution (oracle 7), so rows 19 to 23 read the rule as built; the crash tests at every cut are row 19's.
+  - **The local pair (task-d84's reading again).** Three voters on one 4-core host, state on disk (a journal append served in about 0.77 ms p50), `command-cost.sh` at 1 and 10 callers, 3,000 operations a run, four runs a side alternating, both sides with #191's distributions merged in; the base is this branch with the rule reverted. Medians of the four runs, from the bench's client-side service times:
+
+    | callers | path | base p50 / p99 ms | rule p50 / p99 ms |
+    | --- | --- | --- | --- |
+    | 1 | put | 2.00 / 3.62 | 1.61 / 3.24 |
+    | 1 | transaction | 2.27 / 3.74 | 1.77 / 3.00 |
+    | 1 | get | 0.59 / 1.49 | 0.64 / 2.31 |
+    | 10 | put | 5.84 / 11.34 | 4.97 / 8.78 |
+    | 10 | transaction | 6.06 / 11.50 | 5.09 / 9.33 |
+    | 10 | get | 5.89 / 12.43 | 6.09 / 11.17 |
+
+    A write gives up one sync after learning: −0.39 ms at p50 at one caller, about half the append's served time, and −0.87 ms (−15%) at ten, with p99 −2.56 ms there. Completed operations a second rose 7% at ten callers (1,618 to 1,737), and the leader's CPU a command didn't rise (1.37 to 1.29 ms at ten callers). A read moves the other way at one caller: the closed-loop caller's next read now arrives before the write it follows has materialized, and the barrier read waits for the projection through it (its wait after the index, 0.07 to 0.27 ms on average), so a get's p99 rose 0.8 ms there. That wait is the projection's commit, which the rule leaves where it was; at ten callers it is inside the spread.
 - **Stacking with #193 (L7's code):** the two conflict only in `Leader::on_storage`'s `JournalDurable` arm, where #193 sets `early_ready` and this marks the payload served. Both are kept. Under L7 a follower's adoption of an early proposal writes its own payload row by point 4, as any adoption does.
 - **The design step is recorded** in Section 4.5 ("Releasing before the execution group is durable"), as a proposal not yet in force. It rests the release on three parts: every decision is durable at a quorum before it is learned, which needs task-d89's gate on the leader's own fast vote; recovery selects every decision with its dependencies; and execution is a function of the decided commands, with each input to a result that is not the command shown to follow from the order. The rule changes only after its review, with the crash tests and the oracle below.
 
