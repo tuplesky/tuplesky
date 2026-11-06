@@ -1,8 +1,9 @@
 //! Maps and sets keyed by a command identity (task-d60, step 3).
 //!
 //! A command identity is a BLAKE3 digest, uniform already, so it needs no
-//! hashing of its own: [`DigestHasher`] takes the first eight bytes of
-//! what it is given. A lookup is then one probe and one comparison, where
+//! hashing of its own: [`DigestHasher`] takes the first sixteen bytes of
+//! what it is given and mixes them with the map's key in one multiply. A
+//! lookup is then one probe and one comparison, where
 //! an ordered map compares 32-byte keys at every level of its tree.
 //!
 //! Only a collection that is looked up and never iterated to produce an
