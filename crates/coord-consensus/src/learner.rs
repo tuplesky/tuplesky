@@ -15,7 +15,7 @@
 //! `Effect::Established`. A leader reply, or any single response, can
 //! never establish anything here.
 
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
 
 use coord_core::capability::{EstablishError, EstablishedResult, EstablishmentEvidence};
@@ -130,10 +130,10 @@ impl Learner {
     /// whose dependencies are committed; repeat while progress is made.
     /// Returns the commands committed. Fast and slow learning yield the
     /// same dependencies (the leader's); only the evidence differs.
-    pub fn commit_learned(
+    pub fn commit_learned<'a>(
         &mut self,
         table: &mut CommandTable,
-        votes: &BTreeMap<CommandId, VoteSet>,
+        votes: impl Fn(&CommandId) -> Option<&'a VoteSet>,
     ) -> Vec<CommandId> {
         self.commit_learned_where(table, votes, |_| true)
     }
@@ -144,10 +144,10 @@ impl Learner {
     /// proposal (task-d89): a follower's acknowledgement can arrive
     /// before it, and a fast quorum counted over a volatile proposal is
     /// one a restarted leader's report would deny.
-    pub fn commit_learned_where(
+    pub fn commit_learned_where<'a>(
         &mut self,
         table: &mut CommandTable,
-        votes: &BTreeMap<CommandId, VoteSet>,
+        votes: impl Fn(&CommandId) -> Option<&'a VoteSet>,
         eligible: impl Fn(&CommandId) -> bool,
     ) -> Vec<CommandId> {
         let mut committed = Vec::new();
@@ -162,7 +162,7 @@ impl Learner {
                 .into_iter()
                 .filter(|c| eligible(c))
                 .filter_map(|c| {
-                    let v = votes.get(&c)?;
+                    let v = votes(&c)?;
                     let learned = match self.mode {
                         LearningMode::Full => v.learned(),
                         LearningMode::SlowOnly => v.learned_slow(),

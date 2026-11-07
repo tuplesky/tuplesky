@@ -33,6 +33,7 @@ use coord_types::identity::Digest32;
 use coord_types::ids::Ballot;
 use serde::{Deserialize, Serialize};
 
+use crate::digest::{self, DigestSet};
 use crate::graph::{ClosureCursor, ClosureProgress, PathLog, Position, combined_path};
 use crate::phase::{GuardViolation, Phase, guard_accept, guard_commit, guard_execute};
 
@@ -164,7 +165,7 @@ pub struct CommandTable {
     keys: BTreeMap<Vec<u8>, KeyState>,
     /// Commands retired after executing: what this replica still
     /// remembers having executed, for the dependency guards.
-    executed: BTreeSet<CommandId>,
+    executed: DigestSet<CommandId>,
     /// The same commands in the order they were retired, so the oldest
     /// is the one dropped when the memory reaches its bound.
     retired: VecDeque<CommandId>,
@@ -180,7 +181,7 @@ pub struct CommandTable {
     /// treated it as work still to do -- a placeholder, a payload to
     /// fetch, a table filling with history. So that answer is kept for
     /// every command, at the cost of one identity each.
-    history: BTreeSet<CommandId>,
+    history: DigestSet<CommandId>,
     /// The last `capacity` commands retired, in the order they were: the
     /// window a recovery report still names (task-d05).
     ///
@@ -189,7 +190,7 @@ pub struct CommandTable {
     /// grow with the keys; a report bounded by them grew with them.
     recent: VecDeque<CommandId>,
     /// The same commands, for lookup.
-    recent_set: BTreeSet<CommandId>,
+    recent_set: DigestSet<CommandId>,
     capacity: Option<usize>,
     /// The command this replica executed last. With every command on one
     /// key, it is the tail of the order everything executed so far
@@ -247,15 +248,15 @@ pub struct CommandTable {
 
 impl CommandTable {
     /// Unbounded table.
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         CommandTable {
             records: BTreeMap::new(),
             keys: BTreeMap::new(),
-            executed: BTreeSet::new(),
+            executed: digest::set(),
             retired: VecDeque::new(),
-            history: BTreeSet::new(),
+            history: digest::set(),
             recent: VecDeque::new(),
-            recent_set: BTreeSet::new(),
+            recent_set: digest::set(),
             capacity: None,
             last_executed: None,
             unretired: VecDeque::new(),
@@ -269,15 +270,15 @@ impl CommandTable {
     }
 
     /// A table admitting at most `capacity` records (placeholders included).
-    pub const fn with_capacity(capacity: usize) -> Self {
+    pub fn with_capacity(capacity: usize) -> Self {
         CommandTable {
             records: BTreeMap::new(),
             keys: BTreeMap::new(),
-            executed: BTreeSet::new(),
+            executed: digest::set(),
             retired: VecDeque::new(),
-            history: BTreeSet::new(),
+            history: digest::set(),
             recent: VecDeque::new(),
-            recent_set: BTreeSet::new(),
+            recent_set: digest::set(),
             capacity: Some(capacity),
             last_executed: None,
             unretired: VecDeque::new(),
@@ -302,11 +303,11 @@ impl CommandTable {
         let mut table = CommandTable {
             records: BTreeMap::new(),
             keys: BTreeMap::new(),
-            executed: BTreeSet::new(),
+            executed: digest::set(),
             retired: VecDeque::new(),
-            history: BTreeSet::new(),
+            history: digest::set(),
             recent: VecDeque::new(),
-            recent_set: BTreeSet::new(),
+            recent_set: digest::set(),
             capacity,
             last_executed: None,
             unretired: VecDeque::new(),
@@ -1269,7 +1270,7 @@ impl CommandTable {
 
     /// Commands this replica executed and retired, and still remembers
     /// having executed.
-    pub fn tombstones(&self) -> &BTreeSet<CommandId> {
+    pub fn tombstones(&self) -> &DigestSet<CommandId> {
         &self.executed
     }
 

@@ -574,7 +574,18 @@ fn report_metrics(
     }
 }
 
+/// Key the consensus machines' digest maps (task-d60, step 3) from the
+/// operating system's randomness, through the standard library's own
+/// randomly keyed hasher, before any machine is built: a caller who
+/// cannot learn the key cannot pick identities that share a bucket.
+fn seed_digest_maps() {
+    use std::hash::{BuildHasher, RandomState};
+    let state = RandomState::new();
+    coord_consensus::digest::seed(state.hash_one(0u64), state.hash_one(1u64));
+}
+
 fn main() -> ExitCode {
+    seed_digest_maps();
     let cli = Cli::parse();
     let text = match std::fs::read_to_string(&cli.config) {
         Ok(t) => t,
