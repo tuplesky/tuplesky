@@ -3710,11 +3710,15 @@ fn run_row(row: u8) {
     // Row 21 is defined by its failed payload batches (task-d90, point
     // 4): records restored with a dependency row and no payload row, and
     // a follower crashed while it wrote one's payload row again.
+    // With its queue failed (`fail_queue`, off under
+    // `PROTOCOL_SIM_FAIL_QUEUE=0`), batches behind a failed one, and a
+    // command's batches failed in order.
     if row == 21 {
+        let queued =
+            !row_knobs(row).fail_queue || totals.queue_failures > 0 && totals.queue_orders > 0;
         assert!(
             totals.payload_failures > 0
-                && totals.queue_failures > 0
-                && totals.queue_orders > 0
+                && queued
                 && totals.restored_without_payload > 0
                 && totals.payload_crashes > 0,
             "row 21 missed its cut: {totals:?}"
