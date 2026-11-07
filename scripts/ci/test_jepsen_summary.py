@@ -573,6 +573,84 @@ class CheckpointTests(unittest.TestCase):
 
 
 
+class CarryReadingTests(unittest.TestCase):
+    """The readings the L4/L7 carry asks for: task-d97's tails, the read
+    wait's parts, the leader's groups per `metrics` line, the replicated
+    features' status, and the early copies."""
+
+    @staticmethod
+    def line(executed, appends, commits, uptime, served=0, extra=None):
+        d = lambda s: {"secs": int(s), "nanos": int(round((s - int(s)) * 1e9))}
+        cost = {"executed": executed, "busy": d(1), "uptime": d(uptime),
+                "recent": {"Unavailable": "NotInstrumented"},
+                "reads": {"served": served, "refused": 0, "rounds": served, "confirmed": served,
+                          "waited_ms": 3 * served, "waited_confirm_ms": served, "waited_index_ms": 2 * served},
+                "journal_appends": appends, "projection_commits": commits}
+        cost.update(extra or {})
+        return "metrics " + json.dumps({"stages": [], "cost": {"Observed": cost}}) + "\n"
+
+    def summarize(self, logs, files=None):
+        with tempfile.TemporaryDirectory() as store:
+            for node, text in logs.items():
+                os.mkdir(os.path.join(store, node))
+                with open(os.path.join(store, node, "coordd.log"), "w") as f:
+                    f.write(text)
+            for (node, name), text in (files or {}).items():
+                os.makedirs(os.path.join(store, node), exist_ok=True)
+                with open(os.path.join(store, node, name), "w") as f:
+                    f.write(text)
+            return js.summarize(store, sorted(logs), "TupleSky")
+
+    def test_the_tails_and_the_read_waits_parts_by_voter(self):
+        # 98 waits of 1 ms, one of 12 ms and one of 40 ms (command_cost's).
+        waits = {"buckets": [[35, 98], [49, 1], [56, 1]], "max": {"secs": 0, "nanos": 40_000_000}}
+        extra = {"release": {"commands": 100, "distributions": {"whole": waits}},
+                 "resends": {"calls": 4, "scanned": 8, "time": {"secs": 0, "nanos": 4_000_000},
+                             "longest": {"secs": 0, "nanos": 2_000_000}, "early": 37}}
+        text = self.summarize({"n1": self.line(100, 50, 40, 10, served=10, extra=extra),
+                               "n2": self.line(100, 50, 40, 10)})
+        self.assertIn("**Tails of the waits**", text)
+        self.assertIn("| Wait | n1 | n2 |", text)
+        self.assertIn("| Leader: learned to released | 1.02 / 12.29 / 40.0 | - |", text)
+        self.assertNotIn("Leader: of it, the group's journal sync", text)
+        # 10 reads: 1 ms to confirm, 1 more to the index, 1 more to answer.
+        self.assertIn("| Read wait, mean: confirmation / the index after it / the answer after the index "
+                      "| 1.00/1.00/1.00 | - |", text)
+        self.assertIn("| Early copies (task-d98) |", text)
+        self.assertIn("| n1 | 4 | 1.000 | 2.00 | 2.0 | 0 / 0 / 0 | 37 |", text)
+
+    def test_a_build_without_distributions_prints_no_tails(self):
+        text = self.summarize({"n1": self.line(100, 50, 40, 10, served=10)})
+        self.assertNotIn("**Tails of the waits**", text)
+
+    def test_the_leaders_groups_per_metrics_line(self):
+        leader = ("coordd domain=tuplesky-harness roles=[Voter] phase=starting votes=true\n"
+                  + self.line(100, 80, 50, 10, served=5) + self.line(300, 180, 100, 20, served=9)
+                  + self.line(600, 330, 160, 30, served=12))
+        text = self.summarize({"n1": leader, "n2": self.line(600, 330, 160, 30)})
+        self.assertIn("The leader's (n1) commands, journal groups and projection commits per", text)
+        self.assertIn("| 20 | 200 | 100 | 2.00 | 50 | 4.00 |", text)
+        self.assertIn("| 30 | 300 | 150 | 2.00 | 60 | 5.00 |", text)
+
+    def test_the_features_at_start_and_end(self):
+        held = ("epoch 3 leader ab12 (this node)\nactive early-proposal,release-at-execution\nactivating -\n"
+                "voter ab12 advertised early-proposal,release-at-execution prepared - held early-proposal,release-at-execution\n"
+                "voter cd34 advertised early-proposal,release-at-execution prepared - held early-proposal\n")
+        follower = ("epoch 3 leader ab12 (not this node: its view is not the domain's)\n"
+                    "active early-proposal,release-at-execution\nactivating -\n")
+        text = self.summarize(
+            {"n1": self.line(1, 1, 1, 1), "n2": self.line(1, 1, 1, 1)},
+            {("n1", "features-start.txt"): held, ("n1", "features-end.txt"): held,
+             ("n2", "features-start.txt"): follower, ("n2", "features-end.txt"): "no admin socket\n"})
+        self.assertIn("**Replicated features**", text)
+        self.assertIn("| n1 | early-proposal,release-at-execution (leads) | 1 of 2 "
+                      "| early-proposal,release-at-execution (leads) | 1 of 2 |", text)
+        self.assertIn("| n2 | early-proposal,release-at-execution |  | no admin socket |  |", text)
+
+    def test_a_run_that_activated_nothing_prints_no_features(self):
+        self.assertNotIn("**Replicated features**", self.summarize({"n1": self.line(1, 1, 1, 1)}))
+
+
 class RunnerCpuTests(unittest.TestCase):
     """Where the runner's CPU went over the workload, from the sampler's
     rows around it: the first invocation (10:00:01) to the final heal

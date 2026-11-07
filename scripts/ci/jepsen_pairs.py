@@ -42,6 +42,7 @@ import os
 import sys
 from dataclasses import dataclass, field
 
+import command_cost as cc
 import jepsen_summary as js
 
 
@@ -130,6 +131,15 @@ class Run:
     api_send_calls_all: float | None = None
     api_acks_sent_all: float | None = None
     api_acks_received_all: float | None = None
+    # task-d97's tails on the leader, p99 in ms (None for a build without
+    # them), and task-d98's early copies per command.
+    leader_answered_writes_p99: float | None = None
+    leader_answered_reads_p99: float | None = None
+    leader_release_whole_p99: float | None = None
+    leader_release_journal_p99: float | None = None
+    leader_read_waited_p99: float | None = None
+    leader_run_queue_p99: float | None = None
+    early_per_cmd: float | None = None
 
     @property
     def profile_loop(self) -> float | None:
@@ -211,6 +221,18 @@ ACKS = (
     ("api_send_calls_all", "Api send calls per command, all voters", "{:.2f}"),
     ("api_acks_sent_all", "Api ACKs sent per command, all voters", "{:.2f}"),
     ("api_acks_received_all", "Api ACKs received per command, all voters", "{:.2f}"),
+)
+
+
+# task-d97's tails on the leader and task-d98's early copies.
+TAILS = (
+    ("leader_answered_writes_p99", "Writes, arrival to answer, p99 (ms)", "{:.2f}"),
+    ("leader_answered_reads_p99", "Reads, arrival to answer, p99 (ms)", "{:.2f}"),
+    ("leader_release_whole_p99", "Learned to released, p99 (ms)", "{:.2f}"),
+    ("leader_release_journal_p99", "Of it, the group's journal sync, p99 (ms)", "{:.2f}"),
+    ("leader_read_waited_p99", "Read barrier's wait, p99 (whole ms)", "{:.2f}"),
+    ("leader_run_queue_p99", "Loop run queue a pass that executed, p99 (ms)", "{:.3f}"),
+    ("early_per_cmd", "Early copies per command", "{:.2f}"),
 )
 
 
@@ -303,7 +325,18 @@ def read_run(label: str, store: str) -> Run:
             run.datagrams_per_cmd = t.get("datagrams_sent", 0) / leader.executed
             if t.get("sent_streams"):
                 run.frames_per_stream = t["sent_frames"] / t["sent_streams"]
+        tails = cc.tails_of(leader.raw).get("tails", {}) if leader.raw else {}
+        for name, attr in (("answered_writes", "leader_answered_writes_p99"),
+                           ("answered_reads", "leader_answered_reads_p99"),
+                           ("release_whole", "leader_release_whole_p99"),
+                           ("release_journal", "leader_release_journal_p99"),
+                           ("read_waited", "leader_read_waited_p99"),
+                           ("run_queue_per_working_pass", "leader_run_queue_p99")):
+            if name in tails:
+                setattr(run, attr, tails[name]["p99_ms"])
         r = leader.resends
+        if "early" in r:
+            run.early_per_cmd = r["early"] / leader.executed
         if r.get("calls") and "time" in r:
             run.resend_ms_per_call = js.seconds(r["time"]) * 1e3 / r["calls"]
             run.resend_longest_ms = js.seconds(r.get("longest")) * 1e3
@@ -797,6 +830,13 @@ def render(runs: list[Run], title: str) -> str:
             )
         )
     for measures, heading in (
+        (
+            TAILS,
+            "**The leader's tails** (task-d97's distributions on the leader's last `metrics` line, since it "
+            "started: p99 at the upper edge of its bucket, arrival to answer at the leader for the requests it took; "
+            "and task-d98's copies of proposals sent before their batch was durable, per command, zero unless "
+            "`early-proposal` is active)",
+        ),
         (
             ACKS,
             "**Acknowledgements and the two planes** (task-d70's QUIC counts from each voter's last `metrics` line: "

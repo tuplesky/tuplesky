@@ -366,6 +366,29 @@ class PairTests(unittest.TestCase):
         self.assertIn("| head, mean of 1 | 1.00× | 4.00× | 4.00× | - |", text)
         self.assertIn("no pair to compare", text)
 
+    def test_the_leaders_tails_and_early_copies_by_pair(self):
+        def with_tails(path, slow_ms, early):
+            log = os.path.join(path, "n1", "coordd.log")
+            with open(log) as f:
+                snap = json.loads(f.read()[len("metrics "):])
+            cost = snap["cost"]["Observed"]
+            # 98 waits of 1 ms and two in the bucket from 10.24 ms (49) or
+            # from 20.48 ms (53): p99 at 12.29 or 24.58 ms.
+            cost["release"] = {"commands": 100, "distributions": {
+                "whole": {"buckets": [[35, 98], [slow_ms, 2]], "max": {"secs": 0, "nanos": 30_000_000}}}}
+            cost["resends"] = {"early": early}
+            with open(log, "w") as f:
+                f.write("metrics " + json.dumps(snap) + "\n")
+            return jp.read_run("base" if os.path.basename(path) == "1" else "head", path)
+        runs = [with_tails(self.runs[0].store, 53, 0), with_tails(self.runs[1].store, 49, 1500)]
+        self.assertAlmostEqual(runs[0].leader_release_whole_p99, 24.576)
+        self.assertAlmostEqual(runs[1].early_per_cmd, 1.5)
+        text = jp.render(runs, "Paired")
+        self.assertIn("**The leader's tails**", text)
+        self.assertIn("| 1 | base | - | - | 24.58 | - | - | - | 0.00 |", text)
+        self.assertIn("| 2 | head | - | - | 12.29 | - | - | - | 1.50 |", text)
+        self.assertIn("| 1 | - | - | -12.29 (-50.0%) | - | - | - | +1.50 |", text)
+
     def test_runs_that_are_not_side_by_side_are_not_paired(self):
         text = jp.render([self.runs[0], self.runs[3]], "Paired")
         self.assertIn("no pair to compare", text)

@@ -257,6 +257,10 @@ class Cost:
     appends: int | None = None
     commits: int | None = None
     groups: dict = field(default_factory=dict)
+    # The observed `cost` object as the line printed it, for the readings
+    # `command_cost.py` takes from it (task-d97's distributions, the read
+    # wait's parts).
+    raw: dict = field(default_factory=dict, compare=False, repr=False)
 
 
 def seconds(d) -> float:
@@ -306,6 +310,7 @@ def parse_cost(snapshot: dict) -> Cost | None:
         appends=cost.get("journal_appends"),
         commits=cost.get("projection_commits"),
         groups=cost.get("journal_groups") if isinstance(cost.get("journal_groups"), dict) else {},
+        raw=cost,
     )
 
 
@@ -1672,6 +1677,163 @@ def journal_table(voters: dict) -> list[str]:
     return out
 
 
+# task-d97's distributions, in command_cost.py's order, with what each is.
+TAIL_ROWS = (
+    ("answered_writes", "Writes, arrival to answer, at the node that took them"),
+    ("answered_reads", "Reads, arrival to answer, at the node that took them"),
+    ("release_round", "Leader: submitted to learned"),
+    ("release_whole", "Leader: learned to released"),
+    ("release_predecessors", "Leader: of it, predecessors"),
+    ("release_group", "Leader: of it, the group's close"),
+    ("release_journal", "Leader: of it, the group's journal sync"),
+    ("read_waited", "Read barrier's wait (whole ms)"),
+    ("run_queue_per_pass", "Domain loop's run queue a pass (one in 16)"),
+    ("run_queue_per_working_pass", "Domain loop's run queue a pass that executed"),
+    ("journal_served", "Journal job served (an append and its sync)"),
+    ("journal_queued", "Journal job queued"),
+    ("projection_served", "Projection job served"),
+    ("projection_queued", "Projection job queued"),
+)
+
+
+def tails_table(voters: dict) -> list[str]:
+    """The waits' tails each voter's last `metrics` line carries as
+    distributions (task-d97), p50 / p99 / the longest, a row per wait and a
+    column per voter, then the read barrier's mean wait taken apart; [] for
+    a build without them."""
+    import command_cost as cc
+
+    costs = [(node, v.cost) for node, v in voters.items() if v.cost and v.cost.raw]
+    tails = {node: cc.tails_of(c.raw).get("tails", {}) for node, c in costs}
+    if not any(tails.values()):
+        return []
+    nodes = [node for node, _ in costs]
+    out = [
+        "**Tails of the waits** (task-d97, each voter's last boot, from its last `metrics` line: p50 / p99 / the "
+        "longest, in ms, since the voter started; a quantile is the upper edge of its log-linear bucket, within a "
+        "fifth of the value; the read barrier's wait is in whole ms, so 0 is under one)",
+        "",
+        "| Wait | " + " | ".join(nodes) + " |",
+        "| --- " * (len(nodes) + 1) + "|",
+    ]
+    for name, label in TAIL_ROWS:
+        if not any(name in t for t in tails.values()):
+            continue
+        cells = []
+        for node in nodes:
+            q = tails[node].get(name)
+            cells.append(f"{q['p50_ms']:.2f} / {q['p99_ms']:.2f} / {q['max_ms']:.1f}" if q else "-")
+        out.append(f"| {label} | " + " | ".join(cells) + " |")
+    reads = {node: cc.reads_of(c.raw).get("reads") for node, c in costs}
+    if any(reads.values()):
+        cells = []
+        for node in nodes:
+            r = reads[node]
+            cells.append(
+                "/".join(f"{r[k]:.2f}" for k in ("mean_confirm_ms", "mean_after_confirm_ms", "mean_after_index_ms"))
+                if r else "-")
+        out.append("| Read wait, mean: confirmation / the index after it / the answer after the index | "
+                   + " | ".join(cells) + " |")
+    out.append("")
+    return out
+
+
+def leader_groups_series(voters: dict) -> list[str]:
+    """The leader's commands, journal groups and projection commits between
+    one `metrics` line and the next, over its last boot (task-d86's C4 at
+    the runner's group sizes), folded; [] without the counts."""
+    led = [(node, v) for node, v in voters.items() if v.cost and v.cost.served and v.boot_rows]
+    if not led:
+        return []
+    node, voter = max(led, key=lambda nv: nv[1].cost.served)
+    readings = [c for c in voter.boot_rows[-1].readings if c.appends is not None and c.commits is not None]
+    if len(readings) < 2:
+        return []
+    out = [
+        f"<details><summary>The leader's ({node}) commands, journal groups and projection commits per "
+        "<code>metrics</code> line (task-d86's C4)</summary>",
+        "",
+        "| Up (s) | Commands | Journal groups | Commands per group | Projection commits | Commands per commit |",
+        "| --- | --- | --- | --- | --- | --- |",
+    ]
+    for before, after in zip(readings, readings[1:]):
+        cmds = after.executed - before.executed
+        groups = after.appends - before.appends
+        commits = after.commits - before.commits
+        per = lambda n: f"{cmds / n:.2f}" if n else "-"
+        out.append(f"| {after.uptime:.0f} | {cmds} | {groups} | {per(groups)} | {commits} | {per(commits)} |")
+    out += ["", "</details>", ""]
+    return out
+
+
+def read_features(path: str) -> dict | None:
+    """One `coordctl feature status` the harness saved (task-d99): the
+    active set, whether this voter leads, and each voter's held set as
+    this voter sees it; {"none": text} for a node that had no admin
+    socket, None without the file."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return None
+    out = {"active": None, "leads": None, "held": []}
+    for line in text.splitlines():
+        words = line.split()
+        if line.startswith("epoch ") and "leader" in words:
+            out["leads"] = "(this node)" in line
+        elif words[:1] == ["active"] and len(words) == 2:
+            out["active"] = [] if words[1] == "-" else words[1].split(",")
+        elif words[:1] == ["voter"] and "held" in words:
+            held = words[words.index("held") + 1]
+            out["held"].append(None if held == "?" else [] if held == "-" else held.split(","))
+    if out["active"] is None:
+        return {"none": " ".join(text.split())[:120] or "empty"}
+    return out
+
+
+def features_table(store: str, nodes: list[str]) -> list[str]:
+    """The replicated features each voter reported after the harness
+    activated them at setup and again before its logs were taken
+    (jepsen.tuplesky's --activate, task-d99); [] when the run activated
+    nothing."""
+    rows = []
+    for i, _ in enumerate(nodes, 1):
+        node = f"n{i}"
+        start = read_features(os.path.join(store, node, "features-start.txt"))
+        end = read_features(os.path.join(store, node, "features-end.txt"))
+        if start or end:
+            rows.append((node, start, end))
+    if not rows:
+        return []
+
+    def active(f):
+        if f is None:
+            return "-"
+        if "none" in f:
+            return f["none"]
+        return (",".join(f["active"]) or "none") + (" (leads)" if f["leads"] else "")
+
+    def holding(f):
+        if not f or "none" in f or not f["leads"]:
+            return ""
+        want = set(f["active"])
+        n = sum(1 for h in f["held"] if h is not None and want <= set(h))
+        return f"{n} of {len(f['held'])}"
+
+    out = [
+        "**Replicated features** (task-d99: `coordctl feature status` on each voter's admin socket, after the "
+        "harness activated them at setup and before the voter's logs were taken at the end; the leader's view is "
+        "the domain's, and holding counts the voters it sees holding every active feature)",
+        "",
+        "| Node | At start: active | Holding, at start | At end: active | Holding, at end |",
+        "| --- | --- | --- | --- | --- |",
+    ]
+    for node, start, end in rows:
+        out.append(f"| {node} | {active(start)} | {holding(start)} | {active(end)} | {holding(end)} |")
+    out.append("")
+    return out
+
+
 def resend_table(voters: dict) -> list[str]:
     """task-d59's re-send timer on each voter that ran it (the leader): its
     calls, the loop's time in a call on average and at most, and the
@@ -1685,14 +1847,16 @@ def resend_table(voters: dict) -> list[str]:
         "`Node::resend_proposals` on the domain loop, once per re-send interval, sends included; looked at is "
         "the proposals it examined)",
         "",
-        "| Node | Calls | Mean per call (ms) | Longest (ms) | Looked at per call | Re-sent (decided / acknowledged / unanswered) |",
-        "| --- | --- | --- | --- | --- | --- |",
+        "| Node | Calls | Mean per call (ms) | Longest (ms) | Looked at per call | Re-sent (decided / acknowledged / unanswered) "
+        "| Early copies (task-d98) |",
+        "| --- | --- | --- | --- | --- | --- | --- |",
     ]
     for node, r in rows:
         calls = r["calls"]
         out.append(
             f"| {node} | {calls} | {seconds(r['time']) * 1e3 / calls:.3f} | {seconds(r.get('longest')) * 1e3:.2f} "
-            f"| {r.get('scanned', 0) / calls:.1f} | {r.get('decided', 0)} / {r.get('acknowledged', 0)} / {r.get('unanswered', 0)} |"
+            f"| {r.get('scanned', 0) / calls:.1f} | {r.get('decided', 0)} / {r.get('acknowledged', 0)} / {r.get('unanswered', 0)} "
+            f"| {r['early'] if 'early' in r else '-'} |"
         )
     out.append("")
     return out
@@ -2354,7 +2518,10 @@ def summarize(store: str, nodes: list[str], title: str, profile: str | None = No
                     f"| {cpu} | {runq} | {last} | {image_cost} |"
                 )
             out.append("")
+        out.extend(features_table(store, nodes))
         out.extend(journal_table(voters))
+        out.extend(leader_groups_series(voters))
+        out.extend(tails_table(voters))
         timed = [(node, name, r) for node, v in voters.items() for name, r in v.stages.items() if r[1] or r[2]]
         if timed:
             out.append(
