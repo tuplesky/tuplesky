@@ -240,6 +240,12 @@ struct Knobs {
     /// later vote's batch can write the dependency row without the payload
     /// row, the state every vote point 4 closed rested on.
     payload_fail: u32,
+    /// Whether a failed batch fails every batch queued behind it too, in
+    /// order, as `coordd`'s journal does on a definite failure: it drops
+    /// the group and its queue, then takes the next batches (#197
+    /// review). Without it, only the drawn batch fails and the journal
+    /// goes on past it.
+    fail_queue: bool,
     /// Chance per step a follower is crashed while a batch writes the
     /// payload row of a command whose dependency row is durable there
     /// without one (task-d90, point 4): restored, the record holds the
@@ -293,6 +299,7 @@ impl Knobs {
         count_in_memory: false,
         capacity: CAPACITY,
         payload_fail: 0,
+        fail_queue: false,
         payload_crash: 0,
         drop_payload_rows: false,
         gate_crash: 0,
@@ -442,6 +449,7 @@ impl Knobs {
             21 => Knobs {
                 row,
                 payload_fail: 150_000,
+                fail_queue: true,
                 ..Knobs::row(20)
             },
             // Row 19's late execution with the leader crashed inside
@@ -752,6 +760,12 @@ struct Stats {
     /// (task-d90, point 4).
     votes_checked: usize,
     payload_failures: u32,
+    /// Batches failed behind a failed one (`Knobs::fail_queue`).
+    queue_failures: u32,
+    /// Commands two of whose batches failed in order in one queue
+    /// failure, as a vote batch and then the adoption batch behind it
+    /// (#197 review).
+    queue_orders: u32,
     payload_windows: u32,
     payload_crashes: u32,
     restored_without_payload: usize,
@@ -1349,7 +1363,7 @@ impl Sim {
                         "  from {} synced {} {:?}",
                         r.replica.0[0],
                         bn(&r.committed_ballot),
-                        e.map(|e| (e.phase, shorts(&e.deps), e.seqnum))
+                        e.map(|e| (e.phase, shorts(&e.deps), e.seqnum, e.payload_present))
                     )
                 })
                 .collect();
@@ -1691,6 +1705,14 @@ impl Sim {
                 // Definitely not committed (task-d90, row 20): the batch
                 // never happens, and the journal goes on past it.
                 let error = coord_core::event::StorageError::DefinitelyNotCommitted;
+                let staged = |node: &Node, b: &BarrierId| match &node.role {
+                    Some(Role::Follower(f)) => f.ledger().staged_commands(b),
+                    _ => Vec::new(),
+                };
+                let mut failed_with: BTreeMap<CommandId, u32> = BTreeMap::new();
+                for c in staged(&self.nodes[usize::from(i)], &barrier) {
+                    *failed_with.entry(c).or_default() += 1;
+                }
                 self.nodes[usize::from(i)].storage.fail(barrier, error);
                 self.stats.payload_failures += 1;
                 self.note(|| format!("failed node {i} {barrier:?}"));
@@ -1701,6 +1723,41 @@ impl Sim {
                         error,
                     }),
                 );
+                // And every batch queued behind it, in order, as
+                // `coordd`'s journal fails a group and its queue (#197
+                // review): a command's vote batch and then its adoption
+                // batch can fail together. What the machine submits while
+                // they fail joins the journal after them.
+                if self.knobs.fail_queue {
+                    let queued = core::mem::take(&mut self.nodes[usize::from(i)].journal);
+                    let mut groups = Vec::new();
+                    for entry in queued {
+                        let Entry::Batch(behind) = entry else {
+                            groups.push(entry);
+                            continue;
+                        };
+                        for c in staged(&self.nodes[usize::from(i)], &behind) {
+                            *failed_with.entry(c).or_default() += 1;
+                        }
+                        let node = &mut self.nodes[usize::from(i)];
+                        node.failable.remove(&behind);
+                        node.storage.fail(behind, error);
+                        self.stats.queue_failures += 1;
+                        self.note(|| format!("failed node {i} {behind:?} behind it"));
+                        self.step_node(
+                            i,
+                            Event::Storage(StorageEvent::Failed {
+                                barrier_id: behind,
+                                error,
+                            }),
+                        );
+                    }
+                    for entry in groups.into_iter().rev() {
+                        self.nodes[usize::from(i)].journal.push_front(entry);
+                    }
+                    let orders = failed_with.values().filter(|n| **n > 1).count();
+                    self.stats.queue_orders += u32::try_from(orders).unwrap_or(u32::MAX);
+                }
                 return;
             }
             Entry::Batch(barrier) => barrier,
@@ -3261,7 +3318,7 @@ fn run_one(n: u8, row: u8, seed: u64) -> Result<Stats, String> {
 /// [`run_one`], with catch-up set as `catch_up` says rather than as the
 /// environment does: a kept seed found without it is replayed without it.
 fn run_one_with(n: u8, row: u8, seed: u64, catch_up: Option<bool>) -> Result<Stats, String> {
-    run_kept(n, row, seed, catch_up, None)
+    run_kept(n, row, seed, catch_up, None, None)
 }
 
 /// [`run_one_with`], with the loss of acknowledgements to followers set
@@ -3273,10 +3330,14 @@ fn run_kept(
     seed: u64,
     catch_up: Option<bool>,
     peer_ack_loss: Option<u32>,
+    fail_queue: Option<bool>,
 ) -> Result<Stats, String> {
     let mut knobs = row_knobs(row);
     if let Some(loss) = peer_ack_loss {
         knobs.peer_ack_loss = loss;
+    }
+    if let Some(on) = fail_queue {
+        knobs.fail_queue = on;
     }
     let outcome = catch_unwind(AssertUnwindSafe(|| {
         let mut sim = Sim::new(n, knobs, seed);
@@ -3306,6 +3367,13 @@ fn row_knobs(row: u8) -> Knobs {
         .and_then(|s| s.parse().ok())
     {
         knobs.peer_ack_loss = loss;
+    }
+    // `PROTOCOL_SIM_FAIL_QUEUE=0` fails one batch at a time where the row
+    // fails the queue behind it, `=1` the queue where it doesn't.
+    match std::env::var("PROTOCOL_SIM_FAIL_QUEUE").as_deref() {
+        Ok("0") => knobs.fail_queue = false,
+        Ok("1") => knobs.fail_queue = true,
+        _ => {}
     }
     knobs
 }
@@ -3364,6 +3432,8 @@ fn run_row(row: u8) {
                     totals.payload_crashes += s.payload_crashes;
                     totals.payload_windows += s.payload_windows;
                     totals.payload_failures += s.payload_failures;
+                    totals.queue_failures += s.queue_failures;
+                    totals.queue_orders += s.queue_orders;
                     totals.restored_without_payload += s.restored_without_payload;
                     totals.cut_released += s.cut_released;
                     totals.cut_durable += s.cut_durable;
@@ -3432,6 +3502,8 @@ fn run_row(row: u8) {
     if row == 21 {
         assert!(
             totals.payload_failures > 0
+                && totals.queue_failures > 0
+                && totals.queue_orders > 0
                 && totals.restored_without_payload > 0
                 && totals.payload_crashes > 0,
             "row 21 missed its cut: {totals:?}"
@@ -3648,6 +3720,10 @@ struct Kept {
     /// environment say.
     #[serde(default)]
     peer_ack_loss: Option<u32>,
+    /// Whether a failed batch failed the queue behind it (#197 review);
+    /// absent, as the row says.
+    #[serde(default)]
+    fail_queue: Option<bool>,
     /// What it found, for the reader.
     #[allow(dead_code)]
     found: String,
@@ -3662,7 +3738,17 @@ fn every_kept_seed_passes() {
     let kept: Vec<Kept> = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
     let failures: Vec<String> = kept
         .iter()
-        .filter_map(|k| run_kept(k.voters, k.row, k.seed, k.catch_up, k.peer_ack_loss).err())
+        .filter_map(|k| {
+            run_kept(
+                k.voters,
+                k.row,
+                k.seed,
+                k.catch_up,
+                k.peer_ack_loss,
+                k.fail_queue,
+            )
+            .err()
+        })
         .collect();
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
@@ -3677,4 +3763,14 @@ fn one_seed_from_the_environment() {
     let v: Vec<u64> = spec.split(',').map(|x| x.trim().parse().unwrap()).collect();
     let stats = Sim::new(v[1] as u8, row_knobs(v[0] as u8), v[2]).run();
     println!("{stats:?}");
+}
+
+/// Row 21's queue failure reaches the order `coordd`'s journal fails a
+/// queue in (#197 review): a command's vote batch fails and then its
+/// adoption batch behind it. Kept in `seeds.json`; the rewrite at the
+/// failure, keyed on the vote batch, failed it.
+#[test]
+fn row_21_fails_a_commands_vote_and_adoption_batches_in_order() {
+    let stats = run_kept(3, 21, 231, Some(true), None, Some(true)).unwrap();
+    assert!(stats.queue_orders > 0, "{stats:?}");
 }
