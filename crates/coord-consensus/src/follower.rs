@@ -645,6 +645,10 @@ pub struct Follower {
     /// for payloads (task-d09).
     proposal_cursor: usize,
     rejections: Vec<FollowerRejection>,
+    /// The command the last admitted request became, once derived
+    /// (task-d60, step 3): the voter files where its evidence is owed
+    /// under it instead of decoding the request a second time.
+    admitted: Option<CommandId>,
     /// The catch-up page in hand, if any (task-d08).
     catch_up: CatchUp,
     /// A pulled command whose execution here disagreed with the donor's
@@ -846,6 +850,7 @@ impl Follower {
             won: None,
             awaiting_sync: Vec::new(),
             rejections: Vec::new(),
+            admitted: None,
             synced_selection: resumed.clone(),
             resumed,
             early_sync: None,
@@ -1045,6 +1050,7 @@ impl Follower {
             won: None,
             awaiting_sync: Vec::new(),
             rejections: Vec::new(),
+            admitted: None,
             resumed: selection.clone(),
             early_sync: None,
             sync_behind_promise: None,
@@ -3458,7 +3464,9 @@ impl Follower {
 
     fn learn(&mut self) {
         loop {
-            let learned = self.learner.commit_learned(&mut self.table, &self.votes);
+            let learned = self
+                .learner
+                .commit_learned(&mut self.table, |c| self.votes.get(c));
             if !self.commit_through_leader() && learned.is_empty() {
                 return;
             }
@@ -3914,6 +3922,7 @@ impl Follower {
     }
 
     fn on_admitted(&mut self, frame: &[u8], admission: AdmissionFacts) -> Vec<Effect> {
+        self.admitted = None;
         if self.boot.is_none() {
             return Vec::new();
         }
@@ -3943,6 +3952,17 @@ impl Follower {
         )
     }
 
+    /// Whether an admitted request reaches the derivation of its command
+    /// here: the checks [`Follower::on_admitted`] makes before it decodes.
+    pub fn takes_admission(&self) -> bool {
+        self.boot.is_some() && self.ballots.seal_held().is_none() && self.may_vote()
+    }
+
+    /// The command the last admitted request became, if it was derived.
+    pub const fn admitted(&self) -> Option<CommandId> {
+        self.admitted
+    }
+
     /// A canonical request reached this replica (from the frontend, or as
     /// a transferred payload): initialize, persist, vote.
     fn on_request(
@@ -3966,6 +3986,7 @@ impl Follower {
             self.rejections.push(FollowerRejection::MalformedRequest);
             return Vec::new();
         };
+        self.admitted = Some(command);
         let payload = PayloadRecordV1 {
             retry_key,
             logical,
