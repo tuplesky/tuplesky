@@ -1,10 +1,13 @@
-//! From learned to released, per command on the leader (task-d62).
+//! From learned to established, per command on the leader (task-d62).
 //!
 //! A command the leader has committed waits three times before its
-//! result goes out: for its predecessors to execute, which is also the
-//! execution loop reaching it; for its execution group to close; and for
-//! the group to be durable in the journal, which releases it since
-//! task-d63. The projection commits the group on the materializer's
+//! establishment is carried out: for its predecessors to execute, which
+//! is also the execution loop reaching it; for its execution group to
+//! close; and for the group to be durable in the journal. The last
+//! released its result from task-d63 to task-d90; since task-d90 the
+//! result goes out when the command executes, so a result's own wait is
+//! the first part alone, and the other two are what a voter waits before
+//! it counts the execution durable. The projection commits the group on the materializer's
 //! thread (task-d52), off the release path; this split timed that commit
 //! before task-d63 and was named for it (task-d83). Each command is stamped at the
 //! four instants and the three waits are summed over the commands that
@@ -34,8 +37,9 @@ pub struct ReleaseSplit {
     pub predecessors: Duration,
     /// From applied to its group closing.
     pub group: Duration,
-    /// From the group closing to the result released: the group's journal
-    /// sync, the release rule's wait since task-d63.
+    /// From the group closing to its establishment: the group's journal
+    /// sync, the release rule's wait from task-d63 to task-d90, and off
+    /// the release path since.
     pub journal: Duration,
 }
 
