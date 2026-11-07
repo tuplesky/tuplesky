@@ -492,6 +492,12 @@ pub struct Follower {
     /// A failed installation was put back: installation resumes at the
     /// next event that is not a failure.
     sync_reinstall: bool,
+    /// A catch-up window whose batch failed was put back at the head of
+    /// its page: it is installed again at the next event that is not a
+    /// failure, not at the failure itself, so a store that refuses every
+    /// batch fails one window a delivery rather than looping (#197
+    /// review).
+    catch_up_reinstall: bool,
     served_payloads: alloc::collections::BTreeSet<CommandId>,
     /// Where the next bounded payload ask starts in the missing set, so
     /// that a bound on how many are asked for at once does not mean the
@@ -824,6 +830,7 @@ impl Follower {
             payload_unwritten: BTreeSet::new(),
             installs: BTreeMap::new(),
             sync_reinstall: false,
+            catch_up_reinstall: false,
             ledger,
             learner: Learner::new(executed_through),
             campaign: None,
@@ -1008,6 +1015,7 @@ impl Follower {
             payload_unwritten: BTreeSet::new(),
             installs: BTreeMap::new(),
             sync_reinstall: false,
+            catch_up_reinstall: false,
             served_payloads: state.served_payloads,
             payload_cursor: 0,
             payloads_answered: 0,
@@ -4997,7 +5005,10 @@ impl Follower {
                     // the head of its page and installed again, rather
                     // than left waiting on a batch that will never be
                     // durable: nothing executes past it meanwhile, and no
-                    // further page is asked for (task-d08, task-d25).
+                    // further page is asked for (task-d08, task-d25). It
+                    // is installed at the next event that is not a
+                    // failure (`catch_up_reinstall`), as nothing else is
+                    // written at a failure (#197 review).
                     if self
                         .catch_up
                         .running
@@ -5037,7 +5048,7 @@ impl Follower {
         out.extend(self.deliver_due_report());
         self.learn();
         if reinstall {
-            out.extend(self.install_catch_up());
+            self.catch_up_reinstall = true;
         }
         out.extend(self.release());
         out
@@ -5604,6 +5615,9 @@ impl DeterministicMachine for Follower {
         if !failure {
             if core::mem::take(&mut self.sync_reinstall) {
                 effects.extend(self.advance_sync());
+            }
+            if core::mem::take(&mut self.catch_up_reinstall) {
+                effects.extend(self.install_catch_up());
             }
             effects.extend(self.carry_stale());
         }
