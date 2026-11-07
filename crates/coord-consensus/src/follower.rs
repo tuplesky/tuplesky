@@ -2241,6 +2241,41 @@ impl Follower {
             self.ledger
                 .report(self.config.identity.replica, ballot, self.ballots.synced());
         report_durable_payloads(&mut report, &self.served_payloads);
+        // A command executed and retired here while the batch writing its
+        // newest row is still in flight: execution runs ahead of the
+        // journal (task-d90), so the table can let the record go before
+        // that row is durable. The durable row is then an older one -- a
+        // pre-acceptance from before the Sync that committed the command,
+        // say -- and reported as committed below, it named dependencies
+        // the decision never had, which a selection found beside the
+        // decision's own (protocol_sim row 22 with early proposals, five
+        // voters, seed 120, without catch-up). The row in flight is the
+        // record as this replica executed it, and the one a restart
+        // restores beside the execution, which the journal makes durable
+        // after it.
+        for (command, record) in self.ledger.in_flight_records() {
+            if record.payload.is_none()
+                || self.table.record(&command).is_some()
+                || self.table.phase_of(&command) != Some(Phase::Executed)
+            {
+                continue;
+            }
+            let entry = ReportEntry {
+                command,
+                phase: record.phase,
+                deps: record.deps.clone(),
+                path: record.path,
+                paths: record.paths.clone(),
+                seqnum: record.synced_seq.unwrap_or(0),
+                keys: record.keys.clone(),
+                payload_present: self.served_payloads.contains(&command),
+                admission: record.payload,
+            };
+            match report.entries.iter_mut().find(|e| e.command == command) {
+                Some(e) => *e = entry,
+                None => report.entries.push(entry),
+            }
+        }
         // A Sync this replica accepted durably but has not finished
         // installing is part of what it knows, and the report is taken at
         // the synchronized ballot that Sync established. Reporting that

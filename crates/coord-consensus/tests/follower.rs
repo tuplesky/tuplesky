@@ -1631,3 +1631,44 @@ fn a_vote_after_its_submissions_batch_failed_writes_the_payload_row_again() {
         "{released:?}"
     );
 }
+
+/// The record the newest batch in flight writes for a command (task-d90):
+/// what a report gives for a command executed and retired while that row
+/// is not yet durable, in place of the older durable row (protocol_sim row
+/// 22 with early proposals, five voters, seed 120, without catch-up).
+#[test]
+fn the_ledger_names_the_newest_record_in_flight() {
+    use coord_consensus::DurableLedger;
+    use coord_core::effect::BarrierId;
+    let barrier = |sequence| BarrierId {
+        node_generation: ReplicaIncarnation::new(1).unwrap(),
+        boot_id: BootId([1; 16]),
+        sequence,
+    };
+    let (_, c) = admitted(1, 1, 1);
+    let (_, d) = admitted(2, 2, 2);
+    let record = |phase, deps: Vec<CommandId>| CommandRecord {
+        phase,
+        deps,
+        keys: vec![CONSERVATIVE_KEY.to_vec()],
+        payload: Some(Digest32([7; 32])),
+        paths: Vec::new(),
+        synced_seq: None,
+        path: Digest32([0; 32]),
+    };
+    let mut ledger = DurableLedger::new();
+    ledger.stage(barrier(1), c, record(Phase::PreAccept, Vec::new()));
+    ledger.durable(barrier(1), LocalJournalSeq::new(1).unwrap());
+    assert!(ledger.in_flight_records().is_empty());
+    ledger.stage(barrier(2), c, record(Phase::Accept, vec![d]));
+    ledger.stage(barrier(3), c, record(Phase::Commit, vec![d]));
+    let in_flight = ledger.in_flight_records();
+    assert_eq!(in_flight.len(), 1);
+    assert_eq!(in_flight[&c].phase, Phase::Commit, "the newest batch's");
+    assert_eq!(in_flight[&c].deps, vec![d]);
+    assert_eq!(ledger.record(&c).map(|r| r.phase), Some(Phase::PreAccept));
+    ledger.durable(barrier(2), LocalJournalSeq::new(2).unwrap());
+    ledger.durable(barrier(3), LocalJournalSeq::new(3).unwrap());
+    assert!(ledger.in_flight_records().is_empty());
+    assert_eq!(ledger.record(&c).map(|r| r.phase), Some(Phase::Commit));
+}
