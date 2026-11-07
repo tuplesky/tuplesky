@@ -1731,7 +1731,8 @@ def tails_table(voters: dict) -> list[str]:
             r = reads[node]
             cells.append(
                 "/".join(f"{r[k]:.2f}" for k in ("mean_confirm_ms", "mean_after_confirm_ms", "mean_after_index_ms"))
-                if r else "-")
+                # A voter that refused reads and served none has no mean.
+                if r and r["served"] else "-")
         out.append("| Read wait, mean: confirmation / the index after it / the answer after the index | "
                    + " | ".join(cells) + " |")
     out.append("")

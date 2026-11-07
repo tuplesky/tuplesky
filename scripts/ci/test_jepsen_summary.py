@@ -619,6 +619,14 @@ class CarryReadingTests(unittest.TestCase):
         self.assertIn("| Early copies (task-d98) |", text)
         self.assertIn("| n1 | 4 | 1.000 | 2.00 | 2.0 | 0 / 0 / 0 | 37 |", text)
 
+    def test_a_voter_that_only_refused_reads_has_no_mean_wait(self):
+        waits = {"buckets": [[35, 1]], "max": {"secs": 0, "nanos": 1_000_000}}
+        refusing = self.line(100, 50, 40, 10, extra={"release": {"distributions": {"whole": waits}}})
+        refusing = refusing.replace('"refused": 0', '"refused": 3')
+        text = self.summarize({"n1": self.line(100, 50, 40, 10, served=10), "n2": refusing})
+        self.assertIn("| Read wait, mean: confirmation / the index after it / the answer after the index "
+                      "| 1.00/1.00/1.00 | - |", text)
+
     def test_a_build_without_distributions_prints_no_tails(self):
         text = self.summarize({"n1": self.line(100, 50, 40, 10, served=10)})
         self.assertNotIn("**Tails of the waits**", text)
