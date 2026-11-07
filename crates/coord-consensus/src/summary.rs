@@ -176,6 +176,20 @@ impl DurableLedger {
         self.records.get(command)
     }
 
+    /// The record the newest batch in flight writes for each command it
+    /// stages: what the ledger holds of it once those batches are durable
+    /// (task-d90). Barriers are allocated in order within a boot, and a
+    /// restart starts the ledger again from the durable rows.
+    pub fn in_flight_records(&self) -> BTreeMap<CommandId, &CommandRecord> {
+        let mut out = BTreeMap::new();
+        for batch in self.staged.values() {
+            for (command, record) in batch {
+                out.insert(*command, record);
+            }
+        }
+        out
+    }
+
     /// Whether `command` has a durable record or one in a batch still in
     /// flight: a deletion has to follow either (task-d33).
     pub fn written(&self, command: &CommandId) -> bool {
