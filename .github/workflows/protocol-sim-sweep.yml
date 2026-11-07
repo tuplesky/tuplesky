@@ -6,9 +6,13 @@
 # runs with half, three in four and every acknowledgement to a follower
 # lost (`PROTOCOL_SIM_PEER_ACK_LOSS`, task-d78): half found row 4's seed
 # 720, all found row 10's seed 540, and only three in four found row 9's
-# seed 296 (task-d80); rows 16 and 17 run under their own loss. Rows 1
-# and 2 run each seed again with task-d98's early proposals, and row 18
-# is the early send's own row. CI's default
+# seed 296 (task-d80); rows 16 and 17 run under their own loss. Rows 1,
+# 2 and 22 run each seed again with task-d98's early proposals, and row 18
+# is the early send's own row. Rows 19 to 23 are L4's and L7's (task-d90,
+# task-d98): a result released before its execution group is durable,
+# each vote on a durable payload row, a payload batch failed under a
+# later vote, the leader crashed in task-d89's gate window, and early
+# proposals with late execution. CI's default
 # of 12 seeds per row and size stays in `cargo xtask test`. A failing
 # seed is printed with its row and size; replay it with
 # `PROTOCOL_SIM_ONE=row,voters,seed` and `PROTOCOL_SIM_TRACE=1`, and keep
@@ -54,6 +58,11 @@ jobs:
           - row_16_repeated_elections_with_every_acknowledgement_to_a_follower_lost
           - row_17_repeated_elections_with_half_the_acknowledgements_to_a_follower_lost
           - row_18_the_leaders_proposal_before_its_batch_is_durable
+          - row_19_results_released_before_their_execution_group_is_durable
+          - row_20_each_vote_on_a_durable_payload_row
+          - row_21_a_payload_batch_failed_under_a_later_vote
+          - row_22_the_leader_crashed_in_the_gates_window
+          - row_23_early_proposals_with_late_execution
         catch-up: [catch-up, no-catch-up]
         # Parts per million; empty is the row's own.
         peer-ack-loss: ["", "500000", "750000", "1000000"]
