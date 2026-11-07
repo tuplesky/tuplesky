@@ -73,16 +73,48 @@ fn scan<T: ReadableTable<&'static [u8], &'static [u8]>>(
     table: &T,
     request: &ScanRequest,
 ) -> Result<RowPage, EngineError> {
-    let lower: Bound<&[u8]> = match &request.lower {
+    let mut lower: Bound<&[u8]> = match &request.lower {
         Bound::Unbounded => Bound::Unbounded,
         Bound::Included(b) => Bound::Included(b.as_slice()),
         Bound::Excluded(b) => Bound::Excluded(b.as_slice()),
     };
-    let upper: Bound<&[u8]> = match &request.upper {
+    let mut upper: Bound<&[u8]> = match &request.upper {
         Bound::Unbounded => Bound::Unbounded,
         Bound::Included(b) => Bound::Included(b.as_slice()),
         Bound::Excluded(b) => Bound::Excluded(b.as_slice()),
     };
+    // The cursor narrows the range itself: starting every page at the
+    // interval's edge and skipping to the cursor walks the rows before it
+    // again, which makes a whole scan quadratic in its rows.
+    if let Some(cursor) = request.resume_after.as_deref() {
+        let (near, far) = match request.direction {
+            Direction::Forward => (&mut lower, upper),
+            Direction::Reverse => (&mut upper, lower),
+        };
+        let inside = match *near {
+            Bound::Unbounded => true,
+            Bound::Included(b) | Bound::Excluded(b) => match request.direction {
+                Direction::Forward => cursor >= b,
+                Direction::Reverse => cursor <= b,
+            },
+        };
+        if inside {
+            *near = Bound::Excluded(cursor);
+        }
+        let past_far = match far {
+            Bound::Unbounded => false,
+            Bound::Included(b) | Bound::Excluded(b) => match request.direction {
+                Direction::Forward => cursor >= b,
+                Direction::Reverse => cursor <= b,
+            },
+        };
+        if past_far {
+            return Ok(RowPage {
+                rows: Vec::new(),
+                exhausted: true,
+            });
+        }
+    }
     let iter = table
         .range::<&[u8]>((lower, upper))
         .map_err(storage_error)?;
@@ -162,6 +194,9 @@ pub struct RedbEngine {
     /// nothing is served or accepted until a later reopen succeeds. The
     /// placeholder database installed during reopen is never exposed.
     quarantined: bool,
+    /// Commit in one phase, the torn commit detected by redb's checksums
+    /// (task-d48): set once a journal is underneath. Two-phase otherwise.
+    one_phase: bool,
 }
 
 impl RedbEngine {
@@ -176,12 +211,19 @@ impl RedbEngine {
             source: Source::File { path, cache_bytes },
             writer_open: false,
             quarantined: false,
+            one_phase: false,
         }
     }
 
     /// Whether a failed reopen left the engine unavailable.
     pub fn is_quarantined(&self) -> bool {
         self.quarantined
+    }
+
+    /// Whether commits are one-phase (task-d48): the journal is
+    /// underneath, see [`LocalEngine::commit_under_journal`].
+    pub fn commits_in_one_phase(&self) -> bool {
+        self.one_phase
     }
 
     fn quarantine_error() -> EngineError {
@@ -218,6 +260,7 @@ impl RedbEngine {
             source: Source::Backend,
             writer_open: false,
             quarantined: false,
+            one_phase: false,
         })
     }
 
@@ -258,6 +301,7 @@ impl RedbEngine {
             source: Source::Backend,
             writer_open: false,
             quarantined: false,
+            one_phase: false,
         })
     }
 
@@ -345,29 +389,61 @@ pub struct RedbReader {
     quarantined: bool,
 }
 
+/// A table of a read transaction, opened.
+type ReadTable = redb::ReadOnlyTable<&'static [u8], &'static [u8]>;
+
 /// A pinned cross-table snapshot.
+///
+/// Each table is opened on its first read and kept for the snapshot's
+/// life (task-d58). Opening one walks the transaction's table tree, and a
+/// snapshot that serves several reads -- a pump's held reads, a view
+/// built from sessions, policy and grants -- used to walk it again for
+/// every point read: 11% of the leader's domain thread in the five-voter
+/// profile. A table opened in a read transaction is that transaction's
+/// state of it, so keeping it changes nothing a read can see.
 pub struct RedbView {
     txn: redb::ReadTransaction,
+    tables: [std::cell::OnceCell<ReadTable>; Collection::ALL.len()],
+}
+
+impl RedbView {
+    fn new(txn: redb::ReadTransaction) -> Self {
+        RedbView {
+            txn,
+            tables: std::array::from_fn(|_| std::cell::OnceCell::new()),
+        }
+    }
+
+    /// `c`'s table, opened once. A failed open is not kept: the next
+    /// read tries again and fails the same way.
+    fn table(&self, c: CollectionId) -> Result<&ReadTable, EngineError> {
+        let collection = collection(c)?;
+        let slot = Collection::ALL
+            .iter()
+            .position(|known| *known == collection)
+            .expect("a registered collection is in the registry");
+        if let Some(table) = self.tables[slot].get() {
+            return Ok(table);
+        }
+        let table = self
+            .txn
+            .open_table(table_definition(collection))
+            .map_err(table_error)?;
+        Ok(self.tables[slot].get_or_init(|| table))
+    }
 }
 
 impl OrderedRead for RedbView {
     fn get(&self, c: CollectionId, key: &[u8]) -> Result<Option<Vec<u8>>, EngineError> {
-        let table = self
-            .txn
-            .open_table(table_definition(collection(c)?))
-            .map_err(table_error)?;
-        Ok(table
+        Ok(self
+            .table(c)?
             .get(key)
             .map_err(storage_error)?
             .map(|g| g.value().to_vec()))
     }
 
     fn scan_page(&self, c: CollectionId, request: &ScanRequest) -> Result<RowPage, EngineError> {
-        let table = self
-            .txn
-            .open_table(table_definition(collection(c)?))
-            .map_err(table_error)?;
-        scan(&table, request)
+        scan(self.table(c)?, request)
     }
 }
 
@@ -382,7 +458,7 @@ impl SnapshotSource for RedbReader {
             redb::TransactionError::Storage(s) => storage_error(s),
             other => EngineError::new(ErrorClass::Busy, redact(&other)),
         })?;
-        Ok(RedbView { txn })
+        Ok(RedbView::new(txn))
     }
 }
 
@@ -445,25 +521,41 @@ impl WriteTxn for RedbWrite<'_> {
 
     fn commit_durable(mut self) -> Result<(), CommitFailure> {
         let txn = self.txn.take().expect("transaction open");
-        match txn.commit() {
-            Ok(()) => Ok(()),
-            // A poisoned transaction never reached the commit path.
-            Err(redb::CommitError::TransactionPoisoned) => {
-                Err(CommitFailure::DefinitelyNotCommitted(EngineError::new(
-                    ErrorClass::Io,
-                    "transaction poisoned before commit",
-                )))
-            }
-            // Anything during commit/sync is indeterminate: redb may have
-            // written the commit record before reporting the failure.
-            Err(redb::CommitError::Storage(s)) => {
-                Err(CommitFailure::Indeterminate(storage_error(s)))
-            }
-            Err(other) => Err(CommitFailure::Indeterminate(EngineError::new(
-                ErrorClass::Io,
-                redact(&other),
-            ))),
+        commit(txn)
+    }
+
+    /// One `Durability::None` commit (task-j06): visible at once, made
+    /// durable by the next Immediate commit, rolled back by a crash
+    /// before one. redb never leaves part of a commit: the header names
+    /// the last durable commit until a durable one replaces it.
+    fn commit_working(mut self) -> Result<(), CommitFailure> {
+        let mut txn = self.txn.take().expect("transaction open");
+        if let Err(e) = txn.set_durability(redb::Durability::None) {
+            // Nothing was written: the transaction is dropped unapplied.
+            return Err(CommitFailure::DefinitelyNotCommitted(EngineError::new(
+                ErrorClass::Unsupported,
+                redact(&e),
+            )));
         }
+        commit(txn)
+    }
+}
+
+/// Commit `txn`, sorting a failure into what is known of its outcome.
+fn commit(txn: redb::WriteTransaction) -> Result<(), CommitFailure> {
+    match txn.commit() {
+        Ok(()) => Ok(()),
+        // A poisoned transaction never reached the commit path.
+        Err(redb::CommitError::TransactionPoisoned) => Err(CommitFailure::DefinitelyNotCommitted(
+            EngineError::new(ErrorClass::Io, "transaction poisoned before commit"),
+        )),
+        // Anything during commit/sync is indeterminate: redb may have
+        // written the commit record before reporting the failure.
+        Err(redb::CommitError::Storage(s)) => Err(CommitFailure::Indeterminate(storage_error(s))),
+        Err(other) => Err(CommitFailure::Indeterminate(EngineError::new(
+            ErrorClass::Io,
+            redact(&other),
+        ))),
     }
 }
 
@@ -497,16 +589,35 @@ impl LocalEngine for RedbEngine {
             redb::TransactionError::Storage(s) => storage_error(s),
             other => EngineError::new(ErrorClass::Busy, redact(&other)),
         })?;
-        // Strict profile: Immediate durability plus two-phase commit; quick
-        // repair stays off (Section 17.3.4).
+        // Strict profile: Immediate durability, every commit synced; quick
+        // repair stays off (Section 17.3.4). Two-phase commit, unless a
+        // journal is underneath (task-d48): then one phase, one sync, and
+        // a commit a crash tore fails redb's checksums at the next open
+        // and rolls back to the one before it, which the journal replay
+        // carries forward again.
         txn.set_durability(redb::Durability::Immediate)
             .map_err(|e| EngineError::new(ErrorClass::Unsupported, redact(&e)))?;
-        txn.set_two_phase_commit(true);
+        txn.set_two_phase_commit(!self.one_phase);
         txn.set_quick_repair(false);
         self.writer_open = true;
         Ok(RedbWrite {
             engine: self,
             txn: Some(txn),
         })
+    }
+
+    fn commit_under_journal(&mut self) {
+        self.one_phase = true;
+    }
+
+    const WORKING_STATE: bool = true;
+
+    /// An empty Immediate commit: redb persists every `Durability::None`
+    /// commit before it with it (task-j06).
+    fn sync_working(&mut self) -> Result<(), CommitFailure> {
+        let txn = self
+            .begin_write()
+            .map_err(CommitFailure::DefinitelyNotCommitted)?;
+        txn.commit_durable()
     }
 }

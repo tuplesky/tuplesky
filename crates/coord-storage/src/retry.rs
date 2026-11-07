@@ -204,6 +204,26 @@ pub fn floor<V: OrderedRead>(
     }
 }
 
+/// The floor of `key`'s client instance, with its window width taken
+/// from the session record when no floor row exists yet; `None` when the
+/// session is unknown. What [`admit`] measures a request's window from,
+/// before the request's own acknowledgement moves it.
+pub fn session_floor<V: OrderedRead>(
+    view: &V,
+    key: &RetryKey,
+) -> Result<Option<RetryFloorV1>, EngineError> {
+    let Some(session) = session_state(view, &key.session_id)? else {
+        return Ok(None);
+    };
+    floor(
+        view,
+        &key.session_id,
+        &key.client_instance_id,
+        session.window,
+    )
+    .map(Some)
+}
+
 /// Retained record for a retry key.
 pub fn lookup<V: OrderedRead>(
     view: &V,
@@ -226,7 +246,7 @@ pub fn lookup<V: OrderedRead>(
 pub fn admit<V: OrderedRead>(
     view: &V,
     binding: &RetryBinding,
-    authorize: impl FnOnce(&RetryRecordV1) -> bool,
+    authorize: impl FnOnce(&RetryRecordV1) -> Result<bool, EngineError>,
 ) -> Result<Admission, EngineError> {
     let key = &binding.retry_key;
     let session = match session_state(view, &key.session_id)? {
@@ -264,7 +284,7 @@ pub fn admit<V: OrderedRead>(
     }
     match lookup(view, key)? {
         Some(record) if record.command_id == binding.command_id => {
-            if authorize(&record) {
+            if authorize(&record)? {
                 Ok(Admission::Retry(record))
             } else {
                 Ok(Admission::Unauthorized)
@@ -282,7 +302,7 @@ pub fn admit<V: OrderedRead>(
 pub fn resolve<V: OrderedRead>(
     view: &V,
     binding: &RetryBinding,
-    authorize: impl FnOnce(&RetryRecordV1) -> bool,
+    authorize: impl FnOnce(&RetryRecordV1) -> Result<bool, EngineError>,
 ) -> Result<Resolution, EngineError> {
     let key = &binding.retry_key;
     let session = match session_state(view, &key.session_id)? {
@@ -303,7 +323,7 @@ pub fn resolve<V: OrderedRead>(
             bound: record.command_id,
         }),
         Some(record) => {
-            if authorize(&record) {
+            if authorize(&record)? {
                 Ok(Resolution::Result(record))
             } else {
                 Ok(Resolution::Unauthorized)
@@ -316,6 +336,30 @@ pub fn resolve<V: OrderedRead>(
 /// Digest of an encoded response.
 pub fn result_digest(response: &[u8]) -> Digest32 {
     HashDomain::CommandResult.digest(&[response])
+}
+
+/// The row saying `command` executed, at `position`, with the result
+/// digested as `result_digest`.
+///
+/// Every executed command has one, whether or not its outcome is bound
+/// under a retry key: a restart replays these rows as the commands this
+/// voter executed, and a command without one comes back unexecuted and is
+/// executed again at another position.
+pub fn executed_update(
+    command: &CommandId,
+    position: coord_types::ids::ExecutionPosition,
+    revision: Option<coord_types::ids::KvRevision>,
+    result_digest: Digest32,
+) -> Result<StoreUpdate, EngineError> {
+    Ok(StoreUpdate {
+        collection: Collection::ExecutedV1.id(),
+        key: codecs::executed_key(command),
+        value: Some(codecs::encode_executed(&ExecutedRecordV1 {
+            position,
+            revision,
+            result_digest,
+        })?),
+    })
 }
 
 /// Rows binding a plan to its invocation: the retry record and the
@@ -334,22 +378,13 @@ pub fn binding_updates(
         response,
         result_digest: digest,
     };
-    let executed = ExecutedRecordV1 {
-        position,
-        revision,
-        result_digest: digest,
-    };
     let mut updates = vec![
         StoreUpdate {
             collection: Collection::RetryV1.id(),
             key: codecs::retry_key(&binding.retry_key),
             value: Some(codecs::encode_retry(&record)?),
         },
-        StoreUpdate {
-            collection: Collection::ExecutedV1.id(),
-            key: codecs::executed_key(&binding.command_id),
-            value: Some(codecs::encode_executed(&executed)?),
-        },
+        executed_update(&binding.command_id, position, revision, digest)?,
     ];
     if let Some(retires) = binding.retires {
         updates.extend(retirement_updates(&binding.retry_key, retires)?);

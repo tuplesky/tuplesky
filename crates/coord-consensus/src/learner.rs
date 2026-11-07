@@ -15,7 +15,7 @@
 //! `Effect::Established`. A leader reply, or any single response, can
 //! never establish anything here.
 
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
 
 use coord_core::capability::{EstablishError, EstablishedResult, EstablishmentEvidence};
@@ -130,22 +130,44 @@ impl Learner {
     /// whose dependencies are committed; repeat while progress is made.
     /// Returns the commands committed. Fast and slow learning yield the
     /// same dependencies (the leader's); only the evidence differs.
-    pub fn commit_learned(
+    pub fn commit_learned<'a>(
         &mut self,
         table: &mut CommandTable,
-        votes: &BTreeMap<CommandId, VoteSet>,
+        votes: impl Fn(&CommandId) -> Option<&'a VoteSet>,
+    ) -> Vec<CommandId> {
+        self.commit_learned_where(table, votes, |_| true)
+    }
+
+    /// [`Learner::commit_learned`], over the accepted commands `eligible`
+    /// admits only. A leader commits its fresh proposal only once its
+    /// proposal batch is durable, since its own fast vote is that
+    /// proposal (task-d89): a follower's acknowledgement can arrive
+    /// before it, and a fast quorum counted over a volatile proposal is
+    /// one a restarted leader's report would deny.
+    pub fn commit_learned_where<'a>(
+        &mut self,
+        table: &mut CommandTable,
+        votes: impl Fn(&CommandId) -> Option<&'a VoteSet>,
+        eligible: impl Fn(&CommandId) -> bool,
     ) -> Vec<CommandId> {
         let mut committed = Vec::new();
         loop {
-            let candidates: Vec<(CommandId, Learned)> = votes
-                .iter()
-                .filter(|(c, _)| table.phase_of(c) == Some(Phase::Accept))
-                .filter_map(|(c, v)| {
+            // The commands at ACCEPT, not every vote set held: executed
+            // ones keep theirs until the history sweep, and a pass over
+            // them costs the history rather than the change (task-d46).
+            // The same commands as filtering the vote sets by phase, in
+            // the same order.
+            let candidates: Vec<(CommandId, Learned)> = table
+                .in_accept()
+                .into_iter()
+                .filter(|c| eligible(c))
+                .filter_map(|c| {
+                    let v = votes(&c)?;
                     let learned = match self.mode {
                         LearningMode::Full => v.learned(),
                         LearningMode::SlowOnly => v.learned_slow(),
                     }?;
-                    Some((*c, learned))
+                    Some((c, learned))
                 })
                 .collect();
             let mut progressed = false;
@@ -176,9 +198,10 @@ impl Learner {
         table: &CommandTable,
         seqnum_of: impl Fn(&CommandId) -> Option<u64>,
     ) -> Option<CommandId> {
+        // The records at COMMIT only: the table keeps executed ones
+        // until it retires them (task-d46).
         table
-            .records()
-            .filter(|(_, r)| r.phase == Phase::Commit)
+            .in_commit()
             .filter(|(_, r)| guard_execute(&r.deps, |d| table.phase_of(d)).is_ok())
             .map(|(c, _)| (seqnum_of(c).unwrap_or(u64::MAX), *c))
             .min()
@@ -213,8 +236,10 @@ impl Learner {
             });
         }
         let cursor = table.closure_start(command).map_err(LearnError::Guard)?;
+        // Stop at what already executed: its predecessors were
+        // established then (task-d53).
         let closed = match table
-            .closure_step(cursor, usize::MAX)
+            .unexecuted_closure_step(cursor, usize::MAX)
             .map_err(LearnError::Guard)?
         {
             ClosureProgress::Complete(c) => c.members.into_iter().collect(),

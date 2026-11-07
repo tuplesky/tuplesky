@@ -7,8 +7,11 @@
 use std::time::Duration;
 
 use coord_daemon::metrics::{
-    Durability, Frontiers, Headroom, Lane, LaneReading, Latency, MAX_REPORTED_SHARDS, Measure,
-    MetricsSnapshot, Recorder, ShardIndex, ShardReading, Stage, StageReading, Unavailable,
+    Answered, Cost, Cpu, Datagrams, Distribution, Durability, FastPath, Flushes, Frontiers,
+    Headroom, Interval, Jobs, JournalGroups, Lane, LaneReading, Latency, MAX_REPORTED_SHARDS,
+    Measure, MetricsSnapshot, PipelineWaits, Reads, Recorder, Release, ReleaseDistributions,
+    Resends, Scheduling, ShardIndex, ShardReading, Stage, StageReading, Traffic, Unavailable,
+    UnorderedPreAcceptances, Wait,
 };
 use coord_daemon::role::RoleSet;
 
@@ -129,6 +132,21 @@ fn an_unavailable_metric_is_never_reported_as_zero() {
             consensus.name()
         );
     }
+    // An observer holds storage and replays its journal at every start,
+    // so recovery is its stage, as the journal is, while the consensus
+    // stages are still not (task-d55).
+    let observer = recorder.snapshot_stages(&roles("observer"));
+    let why = |stage: Stage| {
+        observer
+            .iter()
+            .find(|r| r.stage == stage)
+            .expect("every stage is reported")
+            .metrics
+            .why()
+    };
+    assert_ne!(why(Stage::Recovery), Some(Unavailable::NotThisRole));
+    assert_ne!(why(Stage::Journal), Some(Unavailable::NotThisRole));
+    assert_eq!(why(Stage::FanOut), Some(Unavailable::NotThisRole));
     // And the stages it does have are present, with honest zeroes for
     // the counts: "nothing has happened here" is a different statement
     // from "this does not exist here", and both are said.
@@ -233,6 +251,7 @@ fn the_journal_and_the_projection_are_reported_separately() {
         journal: 1000,
         materialized: 940,
         checkpoint: 500,
+        projection_durable: None,
     };
     assert_eq!(frontiers.unmaterialized(), 60, "the node is behind its log");
     assert_eq!(frontiers.unreclaimed(), 440, "what a reclaim would replay");
@@ -244,6 +263,7 @@ fn the_journal_and_the_projection_are_reported_separately() {
         journal: 10,
         materialized: 10,
         checkpoint: 10,
+        projection_durable: None,
     };
     assert_eq!(level.unmaterialized(), 0);
     assert_eq!(level.unreclaimed(), 0);
@@ -251,6 +271,7 @@ fn the_journal_and_the_projection_are_reported_separately() {
         journal: 5,
         materialized: 9,
         checkpoint: 20,
+        projection_durable: None,
     };
     assert_eq!(impossible.unmaterialized(), 0);
     assert_eq!(impossible.unreclaimed(), 0);
@@ -326,9 +347,160 @@ fn a_rendered_snapshot_carries_no_secret_or_key_shaped_text() {
             journal: 90,
             materialized: 88,
             checkpoint: 40,
+            projection_durable: Some(70),
         }),
         view_age: Measure::Observed(Duration::from_millis(12)),
         engine_pressure: Measure::Observed(Headroom { used: 3, bound: 10 }),
+        cost: Measure::Observed(Cost {
+            executed: 1200,
+            lowerings: 6100,
+            journal_appends: 6000,
+            journal_syncs: Measure::Observed(6020),
+            projection_commits: 6100,
+            busy: Duration::from_secs(41),
+            uptime: Duration::from_secs(60),
+            recent: Measure::Observed(Interval {
+                span: Duration::from_secs(10),
+                busy: Duration::from_secs(7),
+                executed: 210,
+                domain_cpu: Measure::Observed(Duration::from_secs(4)),
+            }),
+            resends: Resends {
+                unanswered: 3,
+                lost: 2,
+                late: 1,
+                duplicate_votes: 1,
+                ..Resends::default()
+            },
+            established_fast: 40,
+            established_slow: 1160,
+            reads: Reads {
+                served: 900,
+                refused: 4,
+                rounds: 310,
+                confirmed: 305,
+                waited_confirm_ms: 450,
+                waited_index_ms: 2700,
+                waited_ms: 2800,
+                waited: distribution(&[2, 3, 3, 40]),
+                snapshots: 280,
+                behind: 12,
+            },
+            cpu: Measure::Observed(Cpu {
+                domain: Duration::from_secs(25),
+                process: Duration::from_secs(70),
+                domain_scheduling: Measure::Observed(Scheduling {
+                    run_queue: Duration::from_secs(3),
+                    voluntary: 5200,
+                    involuntary: 410,
+                    run_queue_per_pass: distribution(&[0, 0, 1, 9]),
+                    run_queue_per_working_pass: distribution(&[1, 9]),
+                }),
+            }),
+            waits: Measure::Observed(PipelineWaits {
+                appender: Wait {
+                    count: 9,
+                    time: Duration::from_millis(40),
+                },
+                materializer: Wait {
+                    count: 3,
+                    time: Duration::from_millis(12),
+                },
+                appender_jobs: Jobs {
+                    count: 900,
+                    queued: Duration::from_millis(30),
+                    served: Duration::from_millis(1800),
+                    completed: Duration::from_millis(260),
+                    served_each: distribution(&[1, 2, 2, 9]),
+                    ..Jobs::default()
+                },
+                materializer_jobs: Jobs {
+                    count: 120,
+                    queued: Duration::from_millis(40),
+                    served: Duration::from_millis(700),
+                    completed: Duration::from_millis(90),
+                    served_each: distribution(&[1, 2, 2, 9]),
+                    ..Jobs::default()
+                },
+            }),
+            fast_path: FastPath {
+                missed_path: 900,
+                missed_deps: 10,
+                missed_missing: 200,
+                missed_slow_first: 45,
+                missed_unclassified: 5,
+                acks: 0,
+                acks_reordered: 0,
+            },
+            unordered: UnorderedPreAcceptances {
+                pending: 3,
+                reordered: 1,
+                oldest: Duration::from_secs(30),
+                leader_log: 0,
+            },
+            release: Release {
+                commands: 1150,
+                predecessors: Duration::from_millis(900),
+                group: Duration::from_millis(300),
+                journal: Duration::from_millis(2100),
+                distributions: ReleaseDistributions {
+                    predecessors: distribution(&[1, 1, 4]),
+                    group: distribution(&[0, 1]),
+                    journal: distribution(&[2, 2, 3]),
+                    whole: distribution(&[3, 4, 9]),
+                    round: distribution(&[1, 2, 6]),
+                },
+            },
+            answered: Answered {
+                writes: distribution(&[2, 3, 3, 14]),
+                reads: distribution(&[1, 2, 5]),
+            },
+            traffic: Measure::Observed(Traffic {
+                sent_frames: 9000,
+                sent_bytes: 2_700_000,
+                sent_streams: 9000,
+                sent_lost: 0,
+                sent_lost_streams: 0,
+                datagrams_sent: 6100,
+                datagrams_received: 5900,
+                send_calls: 6000,
+                acks_sent: 3000,
+                acks_received: 3100,
+                received_frames: 8800,
+                received_bytes: 1_900_000,
+                received_streams: 8800,
+                api: Datagrams {
+                    datagrams_sent: 4100,
+                    datagrams_received: 4000,
+                    send_calls: 4050,
+                    acks_sent: 1900,
+                    acks_received: 2000,
+                },
+                api_frames: coord_daemon::metrics::ApiFrames {
+                    submissions: 2300,
+                    fast_acks: 2250,
+                    slow_acks: 40,
+                    releases: 1150,
+                    requests: 1200,
+                    ..Default::default()
+                },
+            }),
+            journal_groups: JournalGroups {
+                protocol: 3100,
+                application: 2400,
+                both: 500,
+                other: 20,
+                protocol_records: 4300,
+                payload_records: 1200,
+                application_records: 1200,
+            },
+            flushes: Flushes {
+                idle: 5000,
+                events: 40,
+                queued: 2,
+                appending: 900,
+            },
+        }),
     };
     let rendered = serde_json::to_string(&snapshot).expect("a snapshot renders");
 
@@ -476,4 +648,72 @@ fn every_stage_is_accounted_for_under_every_role() {
             );
         }
     }
+}
+
+/// A `cpu` reading written before the thread's scheduling was reported
+/// (task-d55) still reads, and says it has no scheduling rather than
+/// zero run-queue time.
+/// A traffic reading from before task-d88's R3 has no frames by kind,
+/// and parses with them zero.
+#[test]
+fn a_traffic_reading_without_api_frames_reads_them_as_zero() {
+    let older = r#"{"sent_frames":1,"sent_bytes":2,"sent_streams":1,"sent_lost":0,
+        "received_frames":1,"received_bytes":2,"received_streams":1}"#;
+    let traffic: Traffic = serde_json::from_str(older).expect("an older reading parses");
+    assert_eq!(
+        traffic.api_frames,
+        coord_daemon::metrics::ApiFrames::default()
+    );
+}
+
+#[test]
+fn a_cpu_reading_without_scheduling_reads_as_not_instrumented() {
+    let older = r#"{"domain":{"secs":25,"nanos":0},"process":{"secs":70,"nanos":0}}"#;
+    let cpu: Cpu = serde_json::from_str(older).expect("an older reading parses");
+    assert_eq!(cpu.domain, Duration::from_secs(25));
+    assert_eq!(
+        cpu.domain_scheduling,
+        Measure::Unavailable(Unavailable::NotInstrumented)
+    );
+}
+
+/// A distribution of the given milliseconds (task-d97).
+fn distribution(millis: &[u64]) -> Distribution {
+    let mut d = Distribution::default();
+    for &ms in millis {
+        d.record(Duration::from_millis(ms));
+    }
+    d
+}
+
+/// A metrics line written before task-d97 still reads: the release
+/// split, the read barrier and the loop's scheduling read with empty
+/// distributions, which say no quantile rather than zero.
+#[test]
+fn a_reading_without_distributions_reads_as_empty() {
+    let release: Release = serde_json::from_str(
+        r#"{"commands":3,"predecessors":{"secs":0,"nanos":3000000},"group":{"secs":0,"nanos":0},"journal":{"secs":0,"nanos":6000000}}"#,
+    )
+    .expect("an older release split parses");
+    assert_eq!(release.commands, 3);
+    assert_eq!(release.distributions, ReleaseDistributions::default());
+    assert_eq!(release.distributions.whole.quantile(0.99), None);
+    let scheduling: Scheduling =
+        serde_json::from_str(r#"{"run_queue":{"secs":3,"nanos":0},"voluntary":5,"involuntary":4}"#)
+            .expect("an older scheduling reading parses");
+    assert_eq!(scheduling.run_queue_per_pass.count(), 0);
+    assert_eq!(scheduling.run_queue_per_working_pass.count(), 0);
+}
+
+/// A recorded distribution goes out on the metrics line and reads back
+/// whole, so a reader can take the difference of two lines' buckets
+/// (task-d97).
+#[test]
+fn a_distribution_survives_the_metrics_line() {
+    let d = distribution(&[1, 2, 2, 3, 250]);
+    let line = serde_json::to_string(&d).expect("serializes");
+    let back: Distribution = serde_json::from_str(&line).expect("parses");
+    assert_eq!(back, d);
+    assert_eq!(back.count(), 5);
+    assert_eq!(back.quantile(1.0), Some(Duration::from_millis(250)));
 }

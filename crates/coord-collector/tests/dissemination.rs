@@ -110,7 +110,7 @@ fn admitted(seq: u64, op: CanonicalOperation) -> (CommandId, AdmittedRequest) {
 }
 
 fn collector(max_pending: usize, max_undelivered_bytes: usize) -> Collector {
-    Collector::new(CollectorConfig {
+    Collector::traced(CollectorConfig {
         quorum: quorum(3),
         max_pending,
         max_resolved: 16,
@@ -693,8 +693,9 @@ fn a_voter_that_leaves_the_configuration_is_no_longer_a_destination() {
 fn settle(c: &mut Collector, command: CommandId, voters: &[ReplicaId]) {
     use coord_core::capability::{EstablishedResult, EstablishmentEvidence, ReleasedResult};
     for v in voters {
-        // The leader publishes its order as a `LeaderReply`; a follower
-        // outside the fast set adopts it and answers `SlowAck`. Each
+        // The leader publishes its order as a `LeaderReply` and adopts it
+        // with a `SlowAck`; a follower outside the fast set adopts it and
+        // answers `SlowAck`. Each
         // identity votes once, which is the whole of what the learning
         // predicate counts.
         let message = if *v == ballot().leader {
@@ -717,6 +718,19 @@ fn settle(c: &mut Collector, command: CommandId, voters: &[ReplicaId]) {
             PeerProvenance::from_transport(*v, ReplicaIncarnation::new(1).unwrap(), 1),
             message,
         );
+        // The leader adopts its own order too, once its acceptance row is
+        // durable: its reply alone is not an adoption (task-d19).
+        if *v == ballot().leader {
+            let _ = c.on_evidence(
+                PeerProvenance::from_transport(*v, ReplicaIncarnation::new(1).unwrap(), 1),
+                ProtocolMessage::SlowAck(SlowAck {
+                    replica: *v,
+                    ballot: ballot(),
+                    command,
+                    admission: c.admission(&command).expect("pending"),
+                }),
+            );
+        }
     }
     let released = ReleasedResult::from_gate(
         EstablishedResult::establish(EstablishmentEvidence {

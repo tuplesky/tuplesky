@@ -57,6 +57,14 @@ the voter published to its frontend peer identity: `LeaderReply`,
 `FastAck` or `SlowAck`. Anything else in an `Evidence` frame is
 `NotEvidence` and is not counted.
 
+A frontend with a voter beside it sends a Range without an explicit
+revision to the leader of the ballot it follows as `Read` (`0x0107`),
+and answers it from that leader's `ReadAnswer` (`0x0702`) only when the
+answer is `Served` and comes from that leader; a refusal, an answer from
+anyone else or no answer within 1.5 s orders the read as a `Submit`
+instead (task-d50). The answer goes through the same output gate as an
+ordered result.
+
 ## Admission
 
 A request enters through the admission interface with the connection's
@@ -228,6 +236,14 @@ as `SettledFromRecord` followed by the `Released` it produced, whose
   outcome; `Pending` while bound and collecting; `Err
   RequestIdentityConflict` when the key is bound to another command;
   `Unknown` for an identity never seen here or beyond the retained window.
+  `coordd` asks its durable record first (task-d23): the executed result,
+  gated against the request its payload row names; `Err OutputWithheld`
+  (`0x0007`) when the caller may not read it; `Err ResultRetired`
+  (`0x0008`) at or below the retirement floor, including for a session
+  retired or whose trust rule is disabled, whose floor row outlives its
+  retry rows. What the record does not
+  settle, and a result whose payload row is gone, is the collector's to
+  answer as above.
 
 ## Ballot changes
 
@@ -249,9 +265,13 @@ Every transition is recorded as a `CollectorEvent` (`Submitted`,
 `Reoffered`, `Undisseminated`) with identities in lowercase hex. The three
 added in revisions 2 and 3 appear only when a delivery was lost or did not go
 straight through, so the frozen revision-1 scenario produces the same trace it
-always did. The Rust reference trace of the frozen scenario is
+always did. Its voters are part of the scenario, though: since task-d74 a
+follower sends its acknowledgements to the leader and the frontend only, so
+evidence arrives in another order, and the fast release counts the two votes
+that arrived before it rather than all three. No collector rule changed; the
+trace was regenerated then. The Rust reference trace of the frozen scenario is
 `crates/coord-collector/fixtures/collector_trace_v1.json` (regenerate
-deliberately with `COORD_COLLECTOR_WRITE_FIXTURES=1`). The Go collector
+deliberately with `COORD_COLLECTOR_WRITE_FIXTURES=1`). It was regenerated when the leader's acceptance moved into its proposal batch (task-d89): the leader's adoption now rests on the same batch as its reply and reaches the collector just before it, so one hold reads `awaiting-votes` where it read `awaiting-release`. The events are the same, of the same kinds, and no collector rule changed. It was regenerated once more when task-d89 was stacked on task-d74's routing, with both orders in it; again no rule changed. The Go collector
 must produce the same trace for the same scenario; differential tests of
 loss, duplication, reordering, recovery and configuration change are
 task-m02.

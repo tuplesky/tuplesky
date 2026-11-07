@@ -1,4 +1,5 @@
-//! `coordctl`: login, refresh, logout and status.
+//! `coordctl`: login, refresh, logout and status, and a running node's
+//! feature activation (task-d99).
 
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -11,9 +12,9 @@ use coordctl::{
 #[derive(Parser)]
 #[command(name = "coordctl", about = "TupleSky operator CLI")]
 struct Cli {
-    /// Broker base URL.
+    /// Broker base URL (every command but `feature`).
     #[arg(long)]
-    broker: String,
+    broker: Option<String>,
     /// Registered client identifier.
     #[arg(long, default_value = "coordctl")]
     client_id: String,
@@ -51,6 +52,54 @@ enum Command {
     Logout,
     /// Show the stored credentials' metadata (never secrets).
     Status,
+    /// A running domain's replicated features (task-d99), through a
+    /// voter's admin socket. Activation goes to the leader: a follower
+    /// refuses it and names the leader.
+    Feature {
+        /// The voter's admin socket: `<state_directory>/admin.sock`.
+        #[arg(long)]
+        socket: PathBuf,
+        #[command(subcommand)]
+        action: FeatureAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum FeatureAction {
+    /// Prepare `name` at every voter and activate it once each has
+    /// durably reported it. Refused, naming the voters, while any voter
+    /// has not advertised it.
+    Activate {
+        /// The feature, e.g. `early-proposal`.
+        name: String,
+    },
+    /// Each voter's advertised, prepared and held features, and the
+    /// active set, as this voter sees them: the leader's is the domain's.
+    Status,
+}
+
+/// `coordctl feature`: one request to the node's admin socket.
+fn feature(socket: &std::path::Path, action: &FeatureAction) -> ! {
+    let line = match action {
+        FeatureAction::Activate { name } => format!("feature activate {name}"),
+        FeatureAction::Status => "feature status".to_owned(),
+    };
+    match coordctl::admin::request(socket, &line, Duration::from_secs(20)) {
+        Ok(answer) if answer.ok => {
+            if !answer.text.is_empty() {
+                println!("{}", answer.text);
+            }
+            std::process::exit(0);
+        }
+        Ok(answer) => {
+            eprintln!("refused: {}", answer.text);
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("cannot reach the node at {}: {e}", socket.display());
+            std::process::exit(2);
+        }
+    }
 }
 
 fn now() -> u64 {
@@ -63,6 +112,13 @@ fn now() -> u64 {
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
+    if let Command::Feature { socket, action } = &cli.command {
+        feature(socket, action);
+    }
+    let Some(broker) = cli.broker.clone() else {
+        eprintln!("--broker is required for this command");
+        std::process::exit(2);
+    };
     let kind = match cli.store {
         // Defaulting to memory meant a successful login was discarded
         // when the process exited and every later command found nothing.
@@ -80,7 +136,7 @@ async fn main() {
     if matches!(cli.store, Store::Memory) {
         eprintln!("note: --store memory keeps credentials for this process only");
     }
-    let store = match open_store(kind, "coordctl", &cli.broker) {
+    let store = match open_store(kind, "coordctl", &broker) {
         Ok(s) => s,
         Err(e) => {
             eprintln!(
@@ -90,7 +146,7 @@ async fn main() {
         }
     };
     let lock = UpdateLock::new(&cli.lock);
-    let client = match BrokerClient::new(&cli.broker, &cli.client_id, Duration::from_secs(20)) {
+    let client = match BrokerClient::new(&broker, &cli.client_id, Duration::from_secs(20)) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("{e:?}");
@@ -108,8 +164,7 @@ async fn main() {
                     .await
             };
             response.and_then(|r| {
-                let credentials =
-                    Credentials::from_response(&cli.broker, &cli.client_id, now(), &r);
+                let credentials = Credentials::from_response(&broker, &cli.client_id, now(), &r);
                 update(store.as_ref(), &lock, |_| Ok(Some(credentials)))
                     .map(|_| ())
                     .map_err(CliError::Store)
@@ -129,7 +184,7 @@ async fn main() {
                             Some(t) => match client.refresh(t).await {
                                 Ok(r) => {
                                     let next = Credentials::from_response(
-                                        &cli.broker,
+                                        &broker,
                                         &cli.client_id,
                                         now(),
                                         &r,
@@ -164,6 +219,7 @@ async fn main() {
                 .map_err(CliError::Store)
                 .and(result)
         }
+        Command::Feature { .. } => unreachable!("answered above"),
         Command::Status => match store.load() {
             Ok(Some(c)) => {
                 println!("{} store={}", c.summary(), store.name());

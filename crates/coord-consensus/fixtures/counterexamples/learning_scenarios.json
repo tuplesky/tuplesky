@@ -134,7 +134,7 @@
   },
   {
     "name": "forged-proposal-and-redelivered-adoption",
-    "permutations": 720,
+    "permutations": 5040,
     "learned": {
       "Slow": {
         "deps": [
@@ -226,7 +226,7 @@
   },
   {
     "name": "slow-path-path-disagreement",
-    "permutations": 6,
+    "permutations": 24,
     "learned": {
       "Slow": {
         "deps": [

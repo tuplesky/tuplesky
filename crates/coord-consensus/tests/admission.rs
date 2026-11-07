@@ -21,7 +21,7 @@ use std::collections::BTreeSet;
 
 use coord_consensus::{
     BallotConfiguration, ConfigurationIdentity, FastAck, Follower, FollowerConfig,
-    FollowerRejection, ProtocolMessage, ReplicaRole, SlowAck, Vote, VoteError, VoteSet,
+    FollowerRejection, Phase, ProtocolMessage, ReplicaRole, SlowAck, Vote, VoteError, VoteSet,
 };
 use coord_core::capability::{
     AdmissionFacts, AdmissionReceipt, AttestedAdmission, AttestedEstablishment, CredentialDeadline,
@@ -175,9 +175,15 @@ fn a_fresh_receipt_on_a_retry_does_not_replace_what_was_accepted() {
     );
 
     // A second presentation of the same command with another receipt.
+    // Nothing new is proposed for a command already accepted: the only
+    // effect is the reason, to the frontend (task-d22).
+    let effects = f.step(admitted(4, 99));
     assert!(
-        f.step(admitted(4, 99)).is_empty(),
-        "nothing new is proposed for a command already accepted"
+        effects.len() == 1
+            && effects.iter().all(|e| matches!(e, Effect::SendWhenDurable { frame, .. }
+                if matches!(ProtocolMessage::decode(frame),
+                    Ok(ProtocolMessage::Refused { refusal: coord_consensus::SubmissionRefusal::OtherFacts { .. }, .. })))),
+        "{effects:?}"
     );
     // The same identity under other facts is a conflict, not a
     // duplicate: nothing is replayed for it, because what this replica
@@ -199,11 +205,13 @@ fn a_fresh_receipt_on_a_retry_does_not_replace_what_was_accepted() {
 }
 
 /// A leader proposal that names other facts for a command this replica
-/// holds is refused, not held.
+/// holds is not adopted.
 ///
-/// Adopting it would execute facts this replica never admitted. Which
-/// of the two is the real command is not something the proposal can
-/// settle, so nothing is adopted and the disagreement is reported.
+/// Adopting it would execute facts this replica never admitted, so the
+/// disagreement is reported and nothing is adopted or counted. Nothing
+/// was accepted over the record here either, so the proposal is held
+/// while the leader's payload is fetched to rebind it (task-d09;
+/// `frontier.rs` follows it through).
 #[test]
 fn a_proposal_that_disagrees_with_the_payload_is_refused() {
     let mut f = booted(1);
@@ -254,6 +262,9 @@ fn a_proposal_that_disagrees_with_the_payload_is_refused() {
             accepted,
         }]
     );
+    assert_eq!(f.table().phase_of(&command()), Some(Phase::PreAccept));
+    assert!(f.held().contains_key(&command()));
+    assert_eq!(f.missing_payloads(), vec![command()]);
 }
 
 /// A quorum cannot form across senders that accepted one identity as

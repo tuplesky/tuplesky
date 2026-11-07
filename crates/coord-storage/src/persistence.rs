@@ -24,6 +24,7 @@
 use coord_core::effect::{ApplyBase, BootId, PersistBatch};
 use coord_core::event::StorageEvent;
 use coord_store_api::engine::EngineError;
+use coord_types::ids::LocalJournalSeq;
 
 use crate::journaled::TransitionKind;
 use crate::view::GatedReader;
@@ -116,6 +117,18 @@ pub trait Persistence {
     /// because a durable journal record is never a failed batch.
     fn unmaterialized(&self) -> usize;
 
+    /// Whether an application batch may be submitted while the one before
+    /// it is still waiting to materialize (task-d47): whether
+    /// [`Persistence::application_base`] already counts what is queued.
+    ///
+    /// The journal-first coordinator's base is its queued frontier, so an
+    /// applier can plan a group of commands and lower them together. The
+    /// reference worker's is its projection's own frontier, so there a
+    /// command is applied, and lowered, before the next is planned.
+    fn chains_applications(&self) -> bool {
+        false
+    }
+
     /// Whether the queue has room for `batch` now.
     ///
     /// Only the queue's own bounds, which is the refusal a caller can do
@@ -140,6 +153,125 @@ pub trait Persistence {
 
     /// Lower as much accepted work as one group allows.
     fn lower(&mut self) -> Result<Lowered, EngineError>;
+
+    /// Make as much accepted work as one group allows durable, without
+    /// necessarily applying it to the projection yet (task-d47). Where
+    /// the projection is the record this is [`Persistence::lower`]. On
+    /// the journal-first path it is the journal append alone: what it
+    /// made durable is materialized by a later lowering, and a recovery
+    /// cut includes it meanwhile.
+    fn journal(&mut self) -> Result<Lowered, EngineError> {
+        self.lower()
+    }
+
+    /// What lowering has cost since this coordinator opened (task-d45),
+    /// or `None` when it does not count it.
+    fn cost(&self) -> Option<StorageCost> {
+        None
+    }
+
+    /// Whether projection commits leave the caller's thread (task-d52):
+    /// whether [`Persistence::hand_off`] returns before what it hands
+    /// over has materialized.
+    fn pipelined(&self) -> bool {
+        false
+    }
+
+    /// Whether a journal append is out on another thread now, its outcome
+    /// not yet taken (task-d54). A [`Persistence::journal`] takes it back
+    /// once it has finished and moves nothing before: what is queued
+    /// meanwhile waits for the next group.
+    fn appending(&self) -> bool {
+        false
+    }
+
+    /// Take back a journal append that has finished on another thread,
+    /// without waiting and without starting the next (task-d54); what it
+    /// made durable is reported. Nothing is out where nothing is
+    /// pipelined.
+    fn take_back(&mut self) -> Result<Lowered, EngineError> {
+        Ok(Lowered::default())
+    }
+
+    /// Whether journal appends go to another thread (task-d54): whether
+    /// [`Persistence::journal`] lends the next group rather than waiting
+    /// for its sync.
+    fn journal_pipelined(&self) -> bool {
+        false
+    }
+
+    /// Wait for a journal append out on another thread, if one is, and
+    /// take it back without starting the next (task-d54); what it made
+    /// durable is reported. Nothing is out where nothing is pipelined.
+    fn finish_append(&mut self) -> Result<Lowered, EngineError> {
+        Ok(Lowered::default())
+    }
+
+    /// Take back the projection commits that have finished, without
+    /// waiting, and hand what is journaled and not materialized to the
+    /// next one (task-d52). The facts of the commits taken back are
+    /// reported; the rest come with a later call.
+    ///
+    /// Where nothing is pipelined this is [`Persistence::lower`].
+    fn hand_off(&mut self) -> Result<Lowered, EngineError> {
+        self.lower()
+    }
+
+    /// Wait for every projection commit out and take it back (task-d52).
+    /// Nothing is out where nothing is pipelined.
+    fn drain(&mut self) -> Result<Lowered, EngineError> {
+        Ok(Lowered::default())
+    }
+
+    /// Make the next projection commit a durable one, whatever the
+    /// replay-backed profile's cadence says (task-j06). For a caller that
+    /// bounds the time a working commit stays volatile; it waits for
+    /// nothing. Every commit is durable under the strict profile, so
+    /// there is nothing to ask for there.
+    fn request_durable_projection(&mut self) {}
+
+    /// Make durable now the working projection commits a request has
+    /// been waiting on with no commit to take it (task-j06): the half of
+    /// the time bound an idle domain needs, since it has no next commit.
+    /// Nothing under the strict profile.
+    fn sync_idle_projections(&mut self) -> Result<(), EngineError> {
+        Ok(())
+    }
+
+    /// Whether the projection holds working commits a crash would lose
+    /// (task-j06). Never under the strict profile.
+    fn projection_volatile(&self) -> bool {
+        false
+    }
+
+    /// Make every working projection commit durable now (task-j06), for
+    /// a clean stop: a commit or an append out on another thread is
+    /// waited for and taken back first, and what it completed reported.
+    /// Under the strict profile this is [`Persistence::drain`].
+    fn sync_projections(&mut self) -> Result<Lowered, EngineError> {
+        self.drain()
+    }
+
+    /// The journal sequence of the projection's last durable commit, if
+    /// this persistence has one apart from what it has materialized
+    /// (task-j06): what a crash would leave of the projection.
+    fn projection_durable(&self) -> Option<LocalJournalSeq> {
+        None
+    }
+
+    /// The execution position the projection has committed, as far as
+    /// this coordinator has taken the outcome back: what a result may be
+    /// released at (task-d52).
+    fn materialized_through(&self) -> Result<coord_types::ids::ExecutionPosition, EngineError> {
+        let gated = self.reader().snapshot().map_err(|e| match e {
+            crate::view::ViewError::Engine(e) => e,
+            other => EngineError::new(
+                coord_store_api::engine::ErrorClass::Busy,
+                format!("no durable view: {other:?}"),
+            ),
+        })?;
+        Ok(gated.meta().frontier.execution_position)
+    }
 
     /// Resolve an indeterminate outcome against what is actually durable.
     fn reconcile(&mut self) -> Result<Lowered, EngineError>;
@@ -390,6 +522,10 @@ impl<J: coord_journal_api::JournalEngine, E: coord_store_api::engine::LocalEngin
         self.store.has_room(self.domain, batch)
     }
 
+    fn chains_applications(&self) -> bool {
+        true
+    }
+
     fn follow_ballot(&mut self, ballot: coord_types::ids::Ballot) {
         self.ballot = coord_types::ids::Ballot {
             epoch: self.application_base().configuration,
@@ -438,6 +574,93 @@ impl<J: coord_journal_api::JournalEngine, E: coord_store_api::engine::LocalEngin
         self.store.flush().map(lowered_from_journal).map_err(engine)
     }
 
+    fn journal(&mut self) -> Result<Lowered, EngineError> {
+        self.store
+            .append()
+            .map(lowered_from_journal)
+            .map_err(engine)
+    }
+
+    fn cost(&self) -> Option<StorageCost> {
+        Some(StorageCost {
+            lowering: self.store.cost(),
+            journal_syncs: self.store.journal_syncs(),
+        })
+    }
+
+    fn pipelined(&self) -> bool {
+        self.store.pipelined()
+    }
+
+    fn appending(&self) -> bool {
+        self.store.appending()
+    }
+
+    fn take_back(&mut self) -> Result<Lowered, EngineError> {
+        self.store
+            .take_back_append()
+            .map(lowered_from_journal)
+            .map_err(engine)
+    }
+
+    fn journal_pipelined(&self) -> bool {
+        self.store.journal_pipelined()
+    }
+
+    fn finish_append(&mut self) -> Result<Lowered, EngineError> {
+        self.store
+            .finish_append()
+            .map(lowered_from_journal)
+            .map_err(engine)
+    }
+
+    fn hand_off(&mut self) -> Result<Lowered, EngineError> {
+        self.store
+            .hand_off()
+            .map(lowered_from_journal)
+            .map_err(engine)
+    }
+
+    fn drain(&mut self) -> Result<Lowered, EngineError> {
+        self.store.drain().map(lowered_from_journal).map_err(engine)
+    }
+
+    fn request_durable_projection(&mut self) {
+        self.store.request_durable_projection();
+    }
+
+    fn sync_projections(&mut self) -> Result<Lowered, EngineError> {
+        self.store
+            .sync_projections()
+            .map(lowered_from_journal)
+            .map_err(engine)
+    }
+
+    fn sync_idle_projections(&mut self) -> Result<(), EngineError> {
+        self.store.sync_idle_projections().map_err(engine)
+    }
+
+    fn projection_volatile(&self) -> bool {
+        self.store.projection_volatile(self.domain)
+    }
+
+    fn projection_durable(&self) -> Option<LocalJournalSeq> {
+        match self.store.projection_profile() {
+            crate::journaled::ProjectionProfile::Strict => None,
+            crate::journaled::ProjectionProfile::Replay(_) => {
+                self.store.projection_durable(self.domain)
+            }
+        }
+    }
+
+    fn materialized_through(&self) -> Result<coord_types::ids::ExecutionPosition, EngineError> {
+        Ok(self
+            .store
+            .materialized_frontier(self.domain)
+            .expect("the domain is attached: checked at construction")
+            .execution_position)
+    }
+
     fn reconcile(&mut self) -> Result<Lowered, EngineError> {
         self.store
             .reconcile(self.domain)
@@ -461,6 +684,18 @@ impl<J: coord_journal_api::JournalEngine, E: coord_store_api::engine::LocalEngin
         })?;
         crate::protocol::read_protocol(&cut, epoch, budget)
     }
+}
+
+/// What a coordinator's lowering has cost since it opened (task-d45).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StorageCost {
+    /// Lowerings, journal appends and projection commits, as the store
+    /// counted them.
+    pub lowering: crate::journaled::LoweringCost,
+    /// Synced writes as the journal counted them, or `None` when the
+    /// journal does not count its own. More than the appends: mapping
+    /// updates and compactions sync too.
+    pub journal_syncs: Option<u64>,
 }
 
 fn lowered_from_journal(report: crate::journaled::FlushReport) -> Lowered {

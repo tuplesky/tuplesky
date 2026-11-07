@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use coord_core::effect::{BootId, CollectionId, PersistBatch, StoreUpdate};
 use coord_core::outbox::BarrierAllocator;
-use coord_redb_faultkit::{FaultBackend, FaultPlan, Op, Shared, Tail};
+use coord_redb_faultkit::{FaultBackend, FaultPlan, Op, SECTOR_BYTES, Shared, Tail};
 use coord_storage::{GroupLimits, StoreWorker, WorkerState};
 use coord_storage_redb::{Generation, OpenError, OpenOptions, RedbEngine, StoreIdentity};
 use coord_store_api::engine::{LocalEngine, OrderedRead, SnapshotSource, WriteTxn};
@@ -104,11 +104,34 @@ fn recovered_state(engine: &RedbEngine, max: u64) -> (u64, u64) {
     (meta.stamp.store_seq().journal_seq().get(), present)
 }
 
+/// A fresh engine committing as it does under the journal when
+/// `one_phase` (task-d48), two-phase otherwise.
+fn fresh_in(plan: FaultPlan, one_phase: bool) -> (RedbEngine, Arc<Shared>) {
+    let (mut engine, shared) = fresh(plan);
+    if one_phase {
+        engine.commit_under_journal();
+    }
+    (engine, shared)
+}
+
 #[test]
 fn crash_at_every_write_and_sync_boundary_reopens_only_permitted_states() {
+    crash_matrix(false);
+}
+
+/// The same matrix with the projection committed in one phase, as it is
+/// under the journal (task-d48): a crash anywhere, a torn and reordered
+/// unsynced tail included, reopens at an acknowledged state or the one
+/// commit after it, never a partial one.
+#[test]
+fn crash_at_every_write_and_sync_boundary_reopens_only_permitted_states_in_one_phase() {
+    crash_matrix(true);
+}
+
+fn crash_matrix(one_phase: bool) {
     const TXNS: u64 = 5;
     // Baseline: count the operations of setup and of the whole workload.
-    let (engine, shared) = fresh(FaultPlan::default());
+    let (engine, shared) = fresh_in(FaultPlan::default(), one_phase);
     let mut worker = StoreWorker::open(engine, boot(1), inc(), GroupLimits::default()).unwrap();
     let setup_ops = shared.ops();
     assert_eq!(workload(&mut worker, TXNS), TXNS);
@@ -122,7 +145,7 @@ fn crash_at_every_write_and_sync_boundary_reopens_only_permitted_states() {
     let mut checked = 0;
     for k in 1..=workload_ops {
         for tail in [Tail::None, Tail::All, Tail::Seeded(k)] {
-            let (engine, shared) = fresh(FaultPlan::default());
+            let (engine, shared) = fresh_in(FaultPlan::default(), one_phase);
             let mut worker =
                 StoreWorker::open(engine, boot(2), inc(), GroupLimits::default()).unwrap();
             assert_eq!(shared.ops(), setup_ops, "setup is deterministic");
@@ -388,7 +411,10 @@ fn child_entry_point() {
         return;
     };
     let generation = Generation::create(Path::new(&root), identity(), options()).unwrap();
-    let (engine, _lock, _manifest) = generation.into_parts();
+    let (mut engine, _lock, _manifest) = generation.into_parts();
+    if std::env::var_os("COORD_FAULT_CHILD_ONE_PHASE").is_some() {
+        engine.commit_under_journal();
+    }
     let mut worker = StoreWorker::open(engine, boot(1), inc(), GroupLimits::default()).unwrap();
     assert_eq!(workload(&mut worker, 5), 5);
     eprintln!("child: five transactions acknowledged");
@@ -397,14 +423,28 @@ fn child_entry_point() {
 
 #[test]
 fn subprocess_death_keeps_every_acknowledged_transaction_on_real_files() {
+    subprocess_death(false);
+}
+
+/// The same with the child committing in one phase, as under the journal
+/// (task-d48).
+#[test]
+fn subprocess_death_keeps_every_acknowledged_transaction_on_real_files_in_one_phase() {
+    subprocess_death(true);
+}
+
+fn subprocess_death(one_phase: bool) {
     let dir = tempfile::tempdir().unwrap();
     let exe = std::env::current_exe().unwrap();
-    let status = std::process::Command::new(exe)
+    let mut child = std::process::Command::new(exe);
+    child
         .args(["child_entry_point", "--exact", "--nocapture"])
         .env("COORD_FAULT_CHILD_ROOT", dir.path())
-        .env_remove("RUST_BACKTRACE")
-        .output()
-        .unwrap();
+        .env_remove("RUST_BACKTRACE");
+    if one_phase {
+        child.env("COORD_FAULT_CHILD_ONE_PHASE", "1");
+    }
+    let status = child.output().unwrap();
     let stderr = String::from_utf8_lossy(&status.stderr);
     assert!(
         stderr.contains("five transactions acknowledged"),
@@ -553,4 +593,91 @@ fn write_failure_is_reported_and_leaves_state_consistent() {
     let tx = engine.begin_write().unwrap();
     let _ = tx.get(KV, &key(1)).unwrap();
     tx.abort().unwrap();
+}
+
+/// The syncs one application commit costs: two in two phases, one in one
+/// phase (task-d48).
+#[test]
+fn a_commit_under_the_journal_syncs_once_and_otherwise_twice() {
+    for (one_phase, syncs) in [(false, 2), (true, 1)] {
+        let (engine, shared) = fresh_in(FaultPlan::default(), one_phase);
+        let mut worker = StoreWorker::open(engine, boot(1), inc(), GroupLimits::default()).unwrap();
+        assert_eq!(workload(&mut worker, 1), 1);
+        let before = shared.log().len();
+        assert_eq!(workload(&mut worker, 3), 3);
+        let counted = shared.log()[before..]
+            .iter()
+            .filter(|op| matches!(op, Op::Sync))
+            .count();
+        assert_eq!(
+            counted,
+            3 * syncs,
+            "one_phase={one_phase}: {syncs} syncs a commit"
+        );
+    }
+}
+
+/// The residual of one-phase commit (task-d48, Section 17.3.4): a crash
+/// that persisted the header naming the new commit but not the pages it
+/// names leaves a primary slot whose checksums fail. redb detects that at
+/// the next open and rolls back to the commit before, which was the last
+/// one acknowledged. Two-phase commit never writes such a header before
+/// its pages are synced.
+#[test]
+fn a_one_phase_commit_torn_under_its_header_rolls_back_to_the_commit_before() {
+    let (engine, shared) = fresh_in(FaultPlan::default(), true);
+    let mut worker = StoreWorker::open(engine, boot(1), inc(), GroupLimits::default()).unwrap();
+    assert_eq!(workload(&mut worker, 2), 2);
+    // Crash at the third commit's one sync: everything it wrote is
+    // unsynced.
+    let probe = shared.ops();
+    let (engine, counting) = fresh_in(FaultPlan::default(), true);
+    let mut counter = StoreWorker::open(engine, boot(1), inc(), GroupLimits::default()).unwrap();
+    assert_eq!(workload(&mut counter, 2), 2);
+    assert_eq!(counting.ops(), probe, "the runs are deterministic");
+    let start = counting.log().len();
+    assert_eq!(workload(&mut counter, 1), 1);
+    let third: Vec<Op> = counting.log()[start..].to_vec();
+    let to_sync = third
+        .iter()
+        .filter(|op| !matches!(op, Op::Read { .. }))
+        .position(|op| matches!(op, Op::Sync))
+        .expect("the commit syncs") as u64;
+    shared.set_plan(FaultPlan {
+        crash_after: Some(probe + to_sync),
+        tail: Tail::None,
+        ..FaultPlan::default()
+    });
+    assert_eq!(workload(&mut worker, 1), 0, "the crash took the sync");
+    assert!(shared.is_frozen());
+    let header_writes = third
+        .iter()
+        .filter(|op| matches!(op, Op::Write { offset: 0, .. }))
+        .count();
+    assert!(header_writes > 0, "the commit rewrites the header");
+
+    // What survives: the synced state plus the header as the commit left
+    // it, and none of the pages that header names.
+    let mut image = shared.durable();
+    let volatile = shared.volatile();
+    let header = SECTOR_BYTES.min(volatile.len());
+    image[..header].copy_from_slice(&volatile[..header]);
+    assert_ne!(image, shared.durable(), "the header names the new commit");
+    drop(worker);
+
+    // Control: with the pages it names, the same header opens at the
+    // third commit, so it is that commit's header and the rollback below
+    // is redb finding its pages missing.
+    let (whole, _) = reopen(volatile.clone(), FaultPlan::default()).unwrap();
+    // (`workload` writes `key(1)..` on every call, so the stamp, not the
+    // rows, names the commit.)
+    assert_eq!(recovered_state(&whole, 3).0, 3);
+
+    let (engine, _) = reopen(image, FaultPlan::default())
+        .unwrap_or_else(|e| panic!("a torn one-phase commit must roll back: {e}"));
+    let (seq, _) = recovered_state(&engine, 3);
+    assert_eq!(seq, 2, "back at the last acknowledged commit");
+    let mut next = StoreWorker::open(engine, boot(3), inc(), GroupLimits::default()).unwrap();
+    assert_eq!(next.application_base().execution_position.get(), 2);
+    assert_eq!(workload(&mut next, 1), 1);
 }

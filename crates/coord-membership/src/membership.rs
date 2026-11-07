@@ -29,6 +29,20 @@ pub enum MembershipError {
         /// The node named twice.
         node: ReplicaId,
     },
+    /// A voter count the design does not allow (task-d31): an epoch has
+    /// three or five voters, or one in the single-voter test profile.
+    UnsupportedVoterCount {
+        /// Voters the manifest names.
+        count: usize,
+    },
+}
+
+/// Whether an epoch of `count` voters is one the design allows (task-d31):
+/// three or five, and one for the single-voter test profile. Two and four
+/// have no fast quorum the source protocol defines, and a four-voter epoch
+/// has none in the design at all.
+pub const fn supported_voter_count(count: usize) -> bool {
+    matches!(count, 1 | 3 | 5)
 }
 
 /// What a presented node credential is, against committed membership
@@ -131,6 +145,11 @@ impl Membership {
                 return Err(MembershipError::DuplicateVoter { node });
             }
         }
+        if !supported_voter_count(voters.len()) {
+            return Err(MembershipError::UnsupportedVoterCount {
+                count: voters.len(),
+            });
+        }
         Ok(Membership {
             cluster,
             domain,
@@ -150,6 +169,11 @@ impl Membership {
     /// Epoch.
     pub const fn epoch(&self) -> ConfigurationEpoch {
         self.epoch
+    }
+
+    /// How many voters the epoch commits (task-d31).
+    pub fn voter_count(&self) -> usize {
+        self.voters.len()
     }
 
     /// The committed voters, node order.

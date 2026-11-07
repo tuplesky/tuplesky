@@ -282,6 +282,9 @@ struct Chunker {
     current_bytes: usize,
     chunks: Vec<ChunkV1>,
     descriptors: Vec<ChunkDescriptorV1>,
+    /// The buffer each chunk is encoded into to be measured and hashed,
+    /// kept from one chunk to the next (task-d92).
+    scratch: Vec<u8>,
 }
 
 impl Chunker {
@@ -306,9 +309,11 @@ impl Chunker {
         self.current_bytes = 0;
         let ordinal = self.chunks.len() as u32;
         let chunk = ChunkV1 { ordinal, rows };
-        let encoded = chunk.encode().map_err(|_| LocalError::RowTooLarge {
-            collection: chunk.rows[0].collection,
-        })?;
+        let encoded = chunk
+            .encode_into(std::mem::take(&mut self.scratch))
+            .map_err(|_| LocalError::RowTooLarge {
+                collection: chunk.rows[0].collection,
+            })?;
         let first = &chunk.rows[0];
         let last = &chunk.rows[chunk.rows.len() - 1];
         self.descriptors.push(ChunkDescriptorV1 {
@@ -320,6 +325,7 @@ impl Chunker {
             digest: ChunkV1::digest_of(&encoded),
         });
         self.chunks.push(chunk);
+        self.scratch = encoded;
         Ok(())
     }
 }
@@ -357,6 +363,7 @@ pub fn export_local<V: OrderedRead>(
         current_bytes: 0,
         chunks: Vec::new(),
         descriptors: Vec::new(),
+        scratch: Vec::new(),
     };
     let mut summaries = Vec::new();
     for collection in Collection::ALL {
@@ -403,7 +410,10 @@ fn traverse<V: OrderedRead>(
     let mut bytes = 0u64;
     loop {
         let page = view.scan_page(id, &request)?;
-        for engine_row in &page.rows {
+        let resume = page.rows.last().map(|last| last.key.clone());
+        // The page is ours, so its rows move into the image rather than
+        // being copied (task-d92).
+        for engine_row in page.rows {
             if engine_row.key.len() > MAX_ROW_KEY_BYTES
                 || engine_row.value.len() > MAX_ROW_VALUE_BYTES
             {
@@ -411,8 +421,8 @@ fn traverse<V: OrderedRead>(
             }
             let row = RowV1 {
                 collection: id.0,
-                key: engine_row.key.clone(),
-                value: engine_row.value.clone(),
+                key: engine_row.key,
+                value: engine_row.value,
             };
             rows += 1;
             bytes += row.bytes() as u64;
@@ -421,8 +431,8 @@ fn traverse<V: OrderedRead>(
         if page.exhausted {
             return Ok((rows, bytes));
         }
-        match page.rows.last() {
-            Some(last) => request.resume_after = Some(last.key.clone()),
+        match resume {
+            Some(last) => request.resume_after = Some(last),
             None => {
                 return Err(EngineError::new(
                     coord_store_api::engine::ErrorClass::Corrupt,
@@ -444,68 +454,84 @@ fn traverse<V: OrderedRead>(
 /// belongs to this incarnation is the pointer's question, not the
 /// artifact's.
 pub fn verify_local(checkpoint: &LocalCheckpointV1) -> Result<(), LocalError> {
+    verify_local_each(checkpoint, |_, _| Ok(()))
+}
+
+/// [`verify_local`], handing each chunk's encoding to `each` once that
+/// chunk has verified, so a caller that writes the image encodes every
+/// chunk once (task-d92). `each` is called in ordinal order; the checks
+/// that span chunks (row order across them and the collections' counts)
+/// finish after the last call, so nothing `each` did is evidence of a
+/// valid image until this returns `Ok`.
+pub(crate) fn verify_local_each<E: From<LocalError>>(
+    checkpoint: &LocalCheckpointV1,
+    mut each: impl FnMut(&ChunkV1, &[u8]) -> Result<(), E>,
+) -> Result<(), E> {
     let manifest = &checkpoint.manifest;
     if manifest.format != LOCAL_CHECKPOINT_FORMAT_V1 {
         return Err(LocalError::UnsupportedFormat {
             format: manifest.format,
-        });
+        }
+        .into());
     }
     if manifest.root != manifest.compute_root() {
-        return Err(LocalError::RootMismatch);
+        return Err(LocalError::RootMismatch.into());
     }
     // Complete, or it is not a local checkpoint: every collection of the
     // registry appears exactly once, in identifier order.
     let expected: Vec<u16> = Collection::ALL.iter().map(|c| c.id().0).collect();
     let present: Vec<u16> = manifest.collections.iter().map(|c| c.collection).collect();
     if present != expected {
-        return Err(LocalError::Incomplete);
+        return Err(LocalError::Incomplete.into());
     }
     if manifest.chunks.len() != checkpoint.chunks.len() {
-        return Err(LocalError::Chunks);
+        return Err(LocalError::Chunks.into());
     }
     let mut counted: Vec<(u64, u64)> = vec![(0, 0); expected.len()];
-    let mut previous: Option<(u16, Vec<u8>)> = None;
+    let mut previous: Option<(u16, &[u8])> = None;
+    let mut scratch = Vec::new();
     for (index, chunk) in checkpoint.chunks.iter().enumerate() {
         let ordinal = index as u32;
         let descriptor = &manifest.chunks[index];
         if chunk.ordinal != ordinal || descriptor.ordinal != ordinal {
-            return Err(LocalError::Chunks);
+            return Err(LocalError::Chunks.into());
         }
-        if chunk.rows.is_empty() {
-            return Err(LocalError::Descriptor { ordinal });
-        }
+        let (Some(first), Some(last)) = (chunk.rows.first(), chunk.rows.last()) else {
+            return Err(LocalError::Descriptor { ordinal }.into());
+        };
         let encoded = chunk
-            .encode()
+            .encode_into(std::mem::take(&mut scratch))
             .map_err(|_| LocalError::Descriptor { ordinal })?;
         if ChunkV1::digest_of(&encoded) != descriptor.digest {
-            return Err(LocalError::ChunkDigest { ordinal });
+            return Err(LocalError::ChunkDigest { ordinal }.into());
         }
         if encoded.len() as u32 != descriptor.bytes
             || chunk.rows.len() as u32 != descriptor.rows
-            || (chunk.rows[0].collection, chunk.rows[0].key.clone()) != descriptor.first
-            || (
-                chunk.rows[chunk.rows.len() - 1].collection,
-                chunk.rows[chunk.rows.len() - 1].key.clone(),
-            ) != descriptor.last
+            || (first.collection, first.key.as_slice())
+                != (descriptor.first.0, descriptor.first.1.as_slice())
+            || (last.collection, last.key.as_slice())
+                != (descriptor.last.0, descriptor.last.1.as_slice())
         {
-            return Err(LocalError::Descriptor { ordinal });
+            return Err(LocalError::Descriptor { ordinal }.into());
         }
         for row in &chunk.rows {
-            let here = (row.collection, row.key.clone());
-            if previous.as_ref().is_some_and(|p| *p >= here) {
-                return Err(LocalError::Rows);
+            let here = (row.collection, row.key.as_slice());
+            if previous.is_some_and(|p| p >= here) {
+                return Err(LocalError::Rows.into());
             }
             let Some(slot) = expected.iter().position(|c| *c == row.collection) else {
-                return Err(LocalError::Rows);
+                return Err(LocalError::Rows.into());
             };
             counted[slot].0 += 1;
             counted[slot].1 += row.bytes() as u64;
             previous = Some(here);
         }
+        each(chunk, &encoded)?;
+        scratch = encoded;
     }
     for (summary, (rows, bytes)) in manifest.collections.iter().zip(counted) {
         if summary.rows != rows || summary.bytes != bytes {
-            return Err(LocalError::Rows);
+            return Err(LocalError::Rows.into());
         }
     }
     Ok(())
@@ -579,6 +605,37 @@ impl Default for InstallLocalLimits {
     }
 }
 
+/// Whether a target's metadata row `key = staged` may stand before an
+/// install of an image whose row under `key` is `image`: an identity row
+/// the image holds as it is, or an incarnation the image's is at or
+/// below.
+fn identity_row_admitted(key: &[u8], staged: &[u8], image: Option<&[u8]>) -> bool {
+    use coord_store_api::registry::meta_fields;
+    use coord_types::ReplicaIncarnation;
+    const IDENTITY: [&[u8]; 6] = [
+        meta_fields::CLUSTER_ID,
+        meta_fields::DOMAIN_ID,
+        meta_fields::REPLICA_ID,
+        meta_fields::INCARNATION,
+        meta_fields::ENGINE,
+        meta_fields::PROFILE,
+    ];
+    let Some(image) = image else { return false };
+    if !IDENTITY.contains(&key) {
+        return false;
+    }
+    if key != meta_fields::INCARNATION {
+        return image == staged;
+    }
+    match (
+        ReplicaIncarnation::from_be_slice(image),
+        ReplicaIncarnation::from_be_slice(staged),
+    ) {
+        (Ok(image), Ok(staged)) => image <= staged,
+        _ => false,
+    }
+}
+
 /// Write a verified local image into an empty generation, restoring this
 /// incarnation's storage as it was at the represented sequence.
 ///
@@ -608,6 +665,9 @@ pub fn install_local<E: coord_store_api::engine::LocalEngine>(
     {
         let view = engine.reader().snapshot()?;
         for collection in Collection::ALL {
+            if collection == Collection::MetaV1 {
+                continue;
+            }
             // One row, and room for it: a byte budget too small to
             // return the first row would report every collection empty
             // and make this check say nothing at all.
@@ -616,6 +676,48 @@ pub fn install_local<E: coord_store_api::engine::LocalEngine>(
                 return Err(InstallLocalError::NotEmpty {
                     collection: collection.id().0,
                 });
+            }
+        }
+        // A staged generation carries its own identity record (task-j06
+        // reinstalls into one). Those six rows, and only those, are
+        // admitted where the image holds the same: any other metadata --
+        // a stamp above all -- is a target that is not empty. The
+        // incarnation is the one row that may differ, by the rule a
+        // selected generation is opened under: an adoption (task-58)
+        // advances the manifest alone, so this node's projection, and
+        // every image published from it since, records the incarnation
+        // it was created under, at or below the one a reinstall stages
+        // with. The install writes the image's row back, which that
+        // same rule admits.
+        let meta = Collection::MetaV1.id();
+        let image: std::collections::BTreeMap<&[u8], &[u8]> = checkpoint
+            .chunks
+            .iter()
+            .flat_map(|chunk| chunk.rows.iter())
+            .filter(|row| row.collection == meta.0)
+            .map(|row| (row.key.as_slice(), row.value.as_slice()))
+            .collect();
+        let mut resume_after = None;
+        loop {
+            let page = view.scan_page(
+                meta,
+                &ScanRequest {
+                    resume_after: resume_after.clone(),
+                    ..ScanRequest::all(64, 1 << 20)
+                },
+            )?;
+            for row in &page.rows {
+                if !identity_row_admitted(
+                    row.key.as_slice(),
+                    &row.value,
+                    image.get(row.key.as_slice()).copied(),
+                ) {
+                    return Err(InstallLocalError::NotEmpty { collection: meta.0 });
+                }
+            }
+            match page.rows.last() {
+                Some(last) if !page.exhausted => resume_after = Some(last.key.clone()),
+                _ => break,
             }
         }
     }

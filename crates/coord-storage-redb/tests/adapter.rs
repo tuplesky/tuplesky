@@ -154,6 +154,60 @@ fn cross_collection_atomicity_with_read_your_writes_scans() {
     }
 }
 
+/// A snapshot keeps each table it has read open for its life (task-d58).
+/// The table it keeps is its own transaction's: a commit after the first
+/// read is invisible to the second, for point reads and scans alike, and a
+/// new snapshot sees it.
+#[test]
+fn a_snapshot_keeps_its_tables_and_sees_only_its_own_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = RedbHarness::create(dir.path());
+    let write = |h: &mut RedbHarness, key: &[u8], value: &[u8]| {
+        let mut tx = h.engine().begin_write().unwrap();
+        tx.put(Collection::KvCurrentV1.id(), key, value).unwrap();
+        tx.commit_durable().unwrap();
+    };
+    write(&mut h, b"a", b"1");
+    let reader = h.engine().reader();
+    let pinned = reader.snapshot().unwrap();
+    // The first read opens the table.
+    assert_eq!(
+        pinned.get(Collection::KvCurrentV1.id(), b"a").unwrap(),
+        Some(b"1".to_vec())
+    );
+    write(&mut h, b"a", b"2");
+    write(&mut h, b"b", b"1");
+    for _ in 0..2 {
+        assert_eq!(
+            pinned.get(Collection::KvCurrentV1.id(), b"a").unwrap(),
+            Some(b"1".to_vec()),
+            "the kept table is the snapshot's"
+        );
+        assert_eq!(
+            pinned.get(Collection::KvCurrentV1.id(), b"b").unwrap(),
+            None
+        );
+        let page = pinned
+            .scan_page(Collection::KvCurrentV1.id(), &ScanRequest::all(10, 1 << 20))
+            .unwrap();
+        assert_eq!(page.rows.len(), 1);
+    }
+    // Another table of the same snapshot opens on its own first read.
+    assert_eq!(
+        pinned.get(Collection::EventsV1.id(), b"none").unwrap(),
+        None
+    );
+    let fresh = reader.snapshot().unwrap();
+    assert_eq!(
+        fresh.get(Collection::KvCurrentV1.id(), b"a").unwrap(),
+        Some(b"2".to_vec())
+    );
+    assert_eq!(
+        fresh.get(Collection::KvCurrentV1.id(), b"b").unwrap(),
+        Some(b"1".to_vec())
+    );
+}
+
 #[test]
 fn open_never_creates_and_create_never_reinitializes() {
     let dir = tempfile::tempdir().unwrap();

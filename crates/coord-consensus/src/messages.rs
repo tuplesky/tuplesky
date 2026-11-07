@@ -8,9 +8,10 @@ use alloc::vec::Vec;
 use coord_types::CommandId;
 use coord_types::error::DecodeError;
 use coord_types::identity::Digest32;
-use coord_types::ids::{Ballot, ReplicaId};
+use coord_types::ids::{Ballot, ConfigurationEpoch, ExecutionPosition, KvRevision, ReplicaId};
 use serde::{Deserialize, Serialize};
 
+use crate::commands::CommandRecord;
 use crate::recovery::SyncDecision;
 use crate::rows::PayloadRecordV1;
 use crate::summary::ReportPage;
@@ -33,6 +34,31 @@ pub type PathAnchors = Vec<(Vec<u8>, Digest32)>;
 /// flood: a request for more than this is answered with this many.
 pub const MAX_PAYLOAD_TRANSFER: usize = 8;
 
+/// How many commands one [`ProtocolMessage::ProposalRequest`] names,
+/// and how many proposals the leader answers one with (task-d09).
+///
+/// Bounded for the reason [`MAX_PAYLOAD_TRANSFER`] is: the ask repeats
+/// with every commit frontier, and the answers share the lane with the
+/// proposals and acknowledgements the domain is waiting for.
+pub const MAX_PROPOSAL_ASK: usize = 16;
+
+/// How many commands one [`ProtocolMessage::CatchUpPage`] carries at
+/// most (task-d08).
+///
+/// A page is executed before the next is asked for, so this bounds what a
+/// voter catching up holds beside its table, and what one ask can make a
+/// donor read and send on its bulk lane.
+pub const MAX_CATCH_UP_COMMANDS: usize = 64;
+
+/// How many payload bytes one [`ProtocolMessage::CatchUpPage`] carries
+/// at most, beyond its first command (task-d08).
+///
+/// A page always carries at least one command when the donor has one to
+/// give, whatever its size: a command larger than this would otherwise
+/// never be served. One command is bounded by the request frame, well
+/// inside a protocol frame.
+pub const MAX_CATCH_UP_BYTES: usize = 1024 * 1024;
+
 /// Whether an encoded protocol message is payload transfer.
 ///
 /// Payload transfer is bulk. A replica catching up moves whole command
@@ -50,10 +76,19 @@ pub const MAX_PAYLOAD_TRANSFER: usize = 8;
 /// `payload_transfer_is_recognized_from_the_encoded_discriminant` pins
 /// these two bytes against the encoder, so a variant added above them
 /// fails a test rather than quietly mis-routing.
+///
+/// Catch-up is bulk for the same reason (task-d08): a page is up to
+/// [`MAX_CATCH_UP_COMMANDS`] payloads, and a voter far behind asks for
+/// one after another.
 pub fn is_payload_transfer(frame: &[u8]) -> bool {
     matches!(
         frame.first(),
-        Some(&PAYLOAD_REQUEST_TAG | &PAYLOAD_RESPONSE_TAG)
+        Some(
+            &PAYLOAD_REQUEST_TAG
+                | &PAYLOAD_RESPONSE_TAG
+                | &CATCH_UP_REQUEST_TAG
+                | &CATCH_UP_PAGE_TAG
+        )
     )
 }
 
@@ -63,6 +98,44 @@ const PAYLOAD_REQUEST_TAG: u8 = 7;
 /// The encoded discriminant of [`ProtocolMessage::PayloadResponse`].
 const PAYLOAD_RESPONSE_TAG: u8 = 8;
 
+/// The encoded discriminant of [`ProtocolMessage::CatchUpRequest`].
+const CATCH_UP_REQUEST_TAG: u8 = 15;
+
+/// The encoded discriminant of [`ProtocolMessage::CatchUpPage`].
+const CATCH_UP_PAGE_TAG: u8 = 16;
+
+/// One command of a catch-up page (task-d08): a command the donor
+/// executed, with what it was decided and executed as.
+///
+/// Everything here is read from the donor's durable rows: the payload
+/// from `payload_v1`, the decided record from its dependency row in
+/// `protocol_v1`, the position, revision and result digest from its
+/// `executed_v1` row. The admission digest is the payload's own.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct CatchUpEntry {
+    /// Command.
+    pub command: CommandId,
+    /// Its payload, which the receiver rehashes against the identity.
+    pub payload: PayloadRecordV1,
+    /// The donor's dependency row of the command: the dependencies it was
+    /// decided with. `None` when the donor keeps no row for it.
+    pub decided: Option<CommandRecord>,
+    /// The position the donor executed it at.
+    pub position: ExecutionPosition,
+    /// The KV revision its execution produced there, if any.
+    pub revision: Option<KvRevision>,
+    /// The digest of its result there.
+    pub result_digest: Digest32,
+}
+
+impl CatchUpEntry {
+    /// The length of its encoding: what it costs a page against
+    /// [`MAX_CATCH_UP_BYTES`].
+    pub fn encoded_len(&self) -> usize {
+        postcard::experimental::serialized_size(self).unwrap_or(usize::MAX)
+    }
+}
+
 /// A peer message of the ballot/promise increment.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ProtocolMessage {
@@ -70,6 +143,9 @@ pub enum ProtocolMessage {
     NewLeader {
         /// Ballot; its leader is the sender.
         ballot: Ballot,
+        /// What the candidate executed through (task-d10): a voter more
+        /// than a table ahead of it refuses to promise.
+        executed: ExecutionPosition,
     },
     /// A voter's promise (`MNewLeaderAckN` header): it will vote in no
     /// ballot below `ballot`, and its state is that of `synced`. The
@@ -141,6 +217,219 @@ pub enum ProtocolMessage {
         /// Sealing replica.
         replica: ReplicaId,
     },
+    /// The leader's commit frontier (task-d09): every proposal of
+    /// `ballot` with a sequence number up to `through` is committed at
+    /// the leader, and its batch is durable there.
+    ///
+    /// A follower otherwise learns a command only from acknowledgements
+    /// it receives itself, each published once on a lane that drops
+    /// frames. One missed quorum left it at ACCEPT on that command, and
+    /// with the chain total on everything after it, for good. With this
+    /// it commits what it adopted from the leader of `ballot` up to the
+    /// frontier. The leader publishes it again on its re-send timer, so a
+    /// lost frame is repaired by the next one.
+    Committed {
+        /// The ballot the sequence numbers are in; its leader is the
+        /// sender.
+        ballot: Ballot,
+        /// Highest sequence number of the committed prefix.
+        through: u64,
+    },
+    /// A follower asks the leader of `ballot` for its proposals of
+    /// commands the follower adopted without knowing their sequence
+    /// number in that ballot (task-d09).
+    ///
+    /// An adoption restored from the rows after a restart carries no
+    /// sequence number (a ballot numbers from zero, and the row names no
+    /// ballot), so the commit frontier cannot commit it. The leader
+    /// counted its acknowledgement before the restart and never re-sends
+    /// it. Answered with the leader's durable proposals of the ballot,
+    /// which the follower adopts again with their sequence numbers; a
+    /// command the leader did not propose in the ballot is not answered.
+    ProposalRequest {
+        /// The ballot whose proposals are asked for.
+        ballot: Ballot,
+        /// Commands; at most [`MAX_PROPOSAL_ASK`] are answered.
+        commands: Vec<CommandId>,
+    },
+    /// A voter's refusal to promise `ballot` to a candidate more than a
+    /// table behind it (task-d10). The candidate abandons the campaign
+    /// and does not campaign again until it has executed past
+    /// `executed`; the refuser never promised, so for it the ballot is
+    /// leaderless.
+    PromiseRefused {
+        /// The refused ballot.
+        ballot: Ballot,
+        /// The refusing replica.
+        replica: ReplicaId,
+        /// What the refusing replica executed through.
+        executed: ExecutionPosition,
+    },
+    /// A voter behind its peers asks one of them for the commands it
+    /// executed after `after`, in execution order (task-d08).
+    ///
+    /// Answered only by a voter synchronized at `ballot`, from its durable
+    /// rows, with at most one [`ProtocolMessage::CatchUpPage`].
+    CatchUpRequest {
+        /// The ballot the asking voter is synchronized at.
+        ballot: Ballot,
+        /// What the asking voter executed through.
+        after: ExecutionPosition,
+    },
+    /// The answer to a [`ProtocolMessage::CatchUpRequest`] (task-d08):
+    /// the commands the donor executed at `after + 1` onward, contiguous
+    /// and in position order, at most [`MAX_CATCH_UP_COMMANDS`] of them.
+    CatchUpPage {
+        /// The ballot the donor is synchronized at; a page of any other
+        /// ballot is dropped.
+        ballot: Ballot,
+        /// The position the page follows.
+        after: ExecutionPosition,
+        /// What the donor executed through when it answered.
+        through: ExecutionPosition,
+        /// The commands.
+        entries: Vec<CatchUpEntry>,
+    },
+    /// A candidate asks a voter that promised `ballot` for pages of its
+    /// report that never arrived (task-d28). The voter answers from the
+    /// report it sent, never a regenerated one: an empty list asks for
+    /// the first [`crate::summary::MAX_PAGE_ASK`] pages, and at most that
+    /// many are answered.
+    ReportPageRequest {
+        /// The ballot promised.
+        ballot: Ballot,
+        /// The pages wanted, by number.
+        pages: Vec<u32>,
+    },
+    /// A voter's answer to a submission it refused and can say nothing
+    /// else about (task-d22). Sent to the frontend that submitted, so the
+    /// collector's entry for `command` ends rather than waits for
+    /// evidence that is never coming from this voter.
+    Refused {
+        /// The ballot the voter was at.
+        ballot: Ballot,
+        /// The command the submission derives to.
+        command: CommandId,
+        /// Why.
+        refusal: SubmissionRefusal,
+    },
+    /// A voter's durable promise about the shared checkpoint it holds at a
+    /// forgetting-floor boundary (task-d27), sent for its peers to record
+    /// so a majority's promises can activate the floor.
+    ///
+    /// The bytes are an encoded `CheckpointReadinessV1`, which the
+    /// machines never read: the runtime that exports checkpoints and
+    /// holds the readiness rows does. A voter sends it only once its own
+    /// row is durable, since a promise that is not durable is not one.
+    FloorReadiness {
+        /// The encoded readiness.
+        readiness: Vec<u8>,
+    },
+    /// A leader asks whether its ballot is still every voter's promise
+    /// (task-d50; design Section 6.3). One round answers every read that
+    /// reached the leader before the round was started, so a leader
+    /// starts one after a read arrives and never answers a read from a
+    /// round started earlier.
+    ReadConfirm {
+        /// The ballot the leader leads.
+        ballot: Ballot,
+        /// The leader's round number, echoed in the answer.
+        round: u64,
+    },
+    /// A voter's answer to [`ProtocolMessage::ReadConfirm`]: its promise
+    /// is `ballot`, with no higher one in flight. A voter that has
+    /// promised anything else does not answer.
+    ReadConfirmed {
+        /// The ballot confirmed.
+        ballot: Ballot,
+        /// The round answered.
+        round: u64,
+        /// The voter answering.
+        replica: ReplicaId,
+    },
+    /// What the sending voter's build supports (task-d99, design Section
+    /// 13): an advertisement, not a report. Sent at start, on every new
+    /// peer link and when asked; a receiver keeps the latest one per peer
+    /// in memory, and it binds nothing. The machines never read it, and a
+    /// build that cannot decode it drops it, so it needs no capability
+    /// gate in a rolling upgrade.
+    FeatureSupport {
+        /// The configuration it is advertised under.
+        epoch: ConfigurationEpoch,
+        /// Frozen feature identifiers, prepare markers excluded.
+        features: Vec<u16>,
+    },
+    /// The leader asks a voter to prepare `feature`: write its durable
+    /// support row and the feature's prepare marker in one batch, and say
+    /// [`ProtocolMessage::FeaturePrepared`] once it is durable.
+    FeaturePrepare {
+        /// The frozen feature identifier.
+        feature: u16,
+        /// The configuration it is prepared under.
+        epoch: ConfigurationEpoch,
+    },
+    /// A voter's prepare of `feature` is durable: `features` is the report
+    /// its support row holds, which the leader records in its own store.
+    FeaturePrepared {
+        /// The frozen feature identifier.
+        feature: u16,
+        /// The configuration of the report.
+        epoch: ConfigurationEpoch,
+        /// The report: frozen feature identifiers.
+        features: Vec<u16>,
+    },
+    /// The leader activated `feature`: `record` is the activation it holds,
+    /// which a voter installs unchanged, and only over its own durable
+    /// support row naming every feature in it.
+    FeatureActivated {
+        /// The feature this activation turned on.
+        feature: u16,
+        /// The activation record.
+        record: FeatureRecord,
+    },
+    /// The sending voter's activation row is durable, and this is the
+    /// record it holds (task-d99). Sent to the leader once it is, again at
+    /// start and on a new ballot, and in answer to a
+    /// [`ProtocolMessage::FeatureActivated`] it already holds. A leader
+    /// treats a follower as holding the activation only while this is the
+    /// latest it heard from that follower's current link; a new leader
+    /// that has not installed the record installs it from here.
+    FeatureHeld {
+        /// The activation record.
+        record: FeatureRecord,
+    },
+}
+
+/// An activation record as it travels between voters (task-d99): the
+/// `ActiveFeaturesV1` row without the cluster and domain, which the link
+/// already names.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct FeatureRecord {
+    /// The configuration it was activated under.
+    pub epoch: ConfigurationEpoch,
+    /// Frozen feature identifiers, prepare markers included.
+    pub features: Vec<u16>,
+    /// The voters whose reports made it unanimous.
+    pub reporters: Vec<ReplicaId>,
+}
+
+/// Why a voter refused a submission (task-d22).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SubmissionRefusal {
+    /// The command is bound here under other admission facts, and this
+    /// voter never acknowledges it under these.
+    OtherFacts {
+        /// The admission digest it is bound under.
+        accepted: Digest32,
+    },
+    /// The retry key is bound here to another command.
+    OtherCommand {
+        /// That command.
+        bound: CommandId,
+    },
+    /// A duplicate this voter keeps no payload of any more: it went to
+    /// history, and what it did is in the durable record.
+    Forgotten,
 }
 
 impl ProtocolMessage {
@@ -162,13 +451,28 @@ impl ProtocolMessage {
             ProtocolMessage::Proposal(a) | ProtocolMessage::FastAck(a) => Some(a.command),
             ProtocolMessage::SlowAck(a) => Some(a.command),
             ProtocolMessage::LeaderReply { command, .. }
-            | ProtocolMessage::PayloadResponse { command, .. } => Some(*command),
+            | ProtocolMessage::PayloadResponse { command, .. }
+            | ProtocolMessage::Refused { command, .. } => Some(*command),
             ProtocolMessage::NewLeader { .. }
             | ProtocolMessage::Promise { .. }
             | ProtocolMessage::ReportPage(_)
+            | ProtocolMessage::ReportPageRequest { .. }
             | ProtocolMessage::PayloadRequest { .. }
             | ProtocolMessage::SealRequest { .. }
             | ProtocolMessage::Sealed { .. }
+            | ProtocolMessage::Committed { .. }
+            | ProtocolMessage::ProposalRequest { .. }
+            | ProtocolMessage::PromiseRefused { .. }
+            | ProtocolMessage::CatchUpRequest { .. }
+            | ProtocolMessage::CatchUpPage { .. }
+            | ProtocolMessage::FloorReadiness { .. }
+            | ProtocolMessage::ReadConfirm { .. }
+            | ProtocolMessage::ReadConfirmed { .. }
+            | ProtocolMessage::FeatureSupport { .. }
+            | ProtocolMessage::FeaturePrepare { .. }
+            | ProtocolMessage::FeaturePrepared { .. }
+            | ProtocolMessage::FeatureActivated { .. }
+            | ProtocolMessage::FeatureHeld { .. }
             | ProtocolMessage::Sync(_) => None,
         }
     }
@@ -181,5 +485,72 @@ impl ProtocolMessage {
             return Err(DecodeError::TrailingBytes);
         }
         Ok(m)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn epoch() -> ConfigurationEpoch {
+        ConfigurationEpoch::new(3).unwrap()
+    }
+
+    /// task-d99's messages are appended after every older variant, so an
+    /// older build's encodings are unchanged, and the variant index it
+    /// meets for one of them is past its last: it cannot decode the
+    /// message, records it as malformed and changes nothing.
+    #[test]
+    fn feature_messages_are_appended_and_an_older_registry_cannot_decode_them() {
+        let read = ProtocolMessage::ReadConfirm {
+            ballot: Ballot {
+                epoch: epoch(),
+                number: 1,
+                leader: ReplicaId([1; 16]),
+            },
+            round: 0,
+        }
+        .encode();
+        let messages = [
+            ProtocolMessage::FeatureSupport {
+                epoch: epoch(),
+                features: alloc::vec![4],
+            },
+            ProtocolMessage::FeaturePrepare {
+                feature: 4,
+                epoch: epoch(),
+            },
+            ProtocolMessage::FeaturePrepared {
+                feature: 4,
+                epoch: epoch(),
+                features: alloc::vec![4],
+            },
+            ProtocolMessage::FeatureActivated {
+                feature: 4,
+                record: FeatureRecord {
+                    epoch: epoch(),
+                    features: alloc::vec![4, 5],
+                    reporters: alloc::vec![ReplicaId([1; 16])],
+                },
+            },
+            ProtocolMessage::FeatureHeld {
+                record: FeatureRecord {
+                    epoch: epoch(),
+                    features: alloc::vec![4, 5],
+                    reporters: alloc::vec![ReplicaId([1; 16])],
+                },
+            },
+        ];
+        // `ReadConfirmed` is the last variant before task-d99, right after
+        // `ReadConfirm`.
+        let last_before = read[0] + 1;
+        for (offset, message) in messages.iter().enumerate() {
+            let bytes = message.encode();
+            assert_eq!(ProtocolMessage::decode(&bytes).as_ref(), Ok(message));
+            assert_eq!(bytes[0], last_before + 1 + offset as u8);
+            assert_eq!(message.command(), None);
+        }
+        // An index past the last variant is not a message.
+        assert!(ProtocolMessage::decode(&[last_before + 1 + messages.len() as u8]).is_err());
     }
 }

@@ -110,9 +110,9 @@ impl EstablishedResult {
         if evidence.position == ExecutionPosition::ZERO {
             return Err(EstablishError::ZeroPosition);
         }
-        let preds = &evidence.closed_predecessors;
-        for (i, p) in preds.iter().enumerate() {
-            if *p == evidence.command || preds[..i].contains(p) {
+        let mut seen = alloc::collections::BTreeSet::new();
+        for p in &evidence.closed_predecessors {
+            if *p == evidence.command || !seen.insert(p) {
                 return Err(EstablishError::InconsistentClosure);
             }
         }

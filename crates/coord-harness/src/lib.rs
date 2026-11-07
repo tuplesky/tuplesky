@@ -32,7 +32,7 @@ pub mod issuer;
 pub mod pki;
 pub mod run;
 
-pub use domain::{Edge, Issuer, Node, Plan, Provisioned, provision};
+pub use domain::{Edge, Issuer, JournalPlan, JournalProfile, Node, Plan, Provisioned, provision};
 pub use run::{Daemon, RunError, initialize, start_all};
 
 /// Crate role marker used by the dependency-policy check.

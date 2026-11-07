@@ -284,14 +284,50 @@ pub enum Feature {
     /// (task-j04). A voter that cannot load a published baseline cannot
     /// recover from a reclaimed prefix at all.
     LocalCheckpoint = 0x0003,
+    /// The leader's proposal sent before its batch is durable, to a
+    /// follower that cannot make a fast quorum from it (task-d98, design
+    /// Sections 4.3 and 4.8). A follower built before task-d74 hears the
+    /// other followers' fast acknowledgements, and with the proposal they
+    /// make a fast quorum it would count over a vote the leader may lose.
+    EarlyProposal = 0x0004,
+    /// `EarlyProposal`'s prepare marker (task-d99, design Section 13): a
+    /// voter that wrote its durable support for `EarlyProposal` names this
+    /// in its own activation record, in the same batch. It gates no
+    /// behaviour. It is the rollback guard every build since `admit`
+    /// already runs: a build that does not know this id cannot read the
+    /// record and refuses to start, so a voter cannot report the feature,
+    /// roll back, and leave unanimity counting a build it no longer runs.
+    EarlyProposalPrepared = 0x0005,
+    /// Every voter votes on durable payload rows and forgets only what its
+    /// journal holds (task-d90's points 2 and 4, #195; point 3, task-d95).
+    /// A build from before those can acknowledge a command whose payload
+    /// row it never made durable, and come back holding the record alone.
+    /// Two rules rest on this, and each is on only while it is active
+    /// (design Section 4.5):
+    /// - a leader's results are released as its commands execute in
+    ///   memory, before their execution group is journaled; without the
+    ///   premise a domain-wide crash could lose a result already
+    ///   released;
+    /// - a selection leaves out a re-proposal no reporter holds a payload
+    ///   row for (`SelectionRules::leave_out_unheld`); without the premise
+    ///   that could drop a command an older voter acknowledged, where
+    ///   re-proposing it stalls until a supplier is back.
+    ReleaseAtExecution = 0x0006,
+    /// `ReleaseAtExecution`'s prepare marker, as `EarlyProposalPrepared`
+    /// is `EarlyProposal`'s.
+    ReleaseAtExecutionPrepared = 0x0007,
 }
 
 impl Feature {
     /// Every feature, in identifier order.
-    pub const ALL: [Feature; 3] = [
+    pub const ALL: [Feature; 7] = [
         Feature::CheckpointFloor,
         Feature::SealedHandoff,
         Feature::LocalCheckpoint,
+        Feature::EarlyProposal,
+        Feature::EarlyProposalPrepared,
+        Feature::ReleaseAtExecution,
+        Feature::ReleaseAtExecutionPrepared,
     ];
 
     /// The frozen identifier.
@@ -305,7 +341,44 @@ impl Feature {
             Feature::CheckpointFloor => "checkpoint-floor",
             Feature::SealedHandoff => "sealed-handoff",
             Feature::LocalCheckpoint => "local-checkpoint",
+            Feature::EarlyProposal => "early-proposal",
+            Feature::EarlyProposalPrepared => "early-proposal-prepared",
+            Feature::ReleaseAtExecution => "release-at-execution",
+            Feature::ReleaseAtExecutionPrepared => "release-at-execution-prepared",
         }
+    }
+
+    /// The prepare marker of a feature a running domain can activate
+    /// (task-d99), or `None` for one it cannot: a feature without a marker
+    /// has no guard binding a voter's report from the moment it is
+    /// durable, so it is not activated through the running path.
+    pub const fn prepare_marker(self) -> Option<Feature> {
+        match self {
+            Feature::EarlyProposal => Some(Feature::EarlyProposalPrepared),
+            Feature::ReleaseAtExecution => Some(Feature::ReleaseAtExecutionPrepared),
+            _ => None,
+        }
+    }
+
+    /// The feature this is the prepare marker of, or `None` for a feature
+    /// that is not a marker.
+    pub const fn marks(self) -> Option<Feature> {
+        match self {
+            Feature::EarlyProposalPrepared => Some(Feature::EarlyProposal),
+            Feature::ReleaseAtExecutionPrepared => Some(Feature::ReleaseAtExecution),
+            _ => None,
+        }
+    }
+
+    /// Whether this is a prepare marker rather than a feature: it is never
+    /// reported, never activated and gates nothing.
+    pub const fn is_marker(self) -> bool {
+        self.marks().is_some()
+    }
+
+    /// Look up by stable name (operator input).
+    pub fn from_name(name: &str) -> Option<Feature> {
+        Feature::ALL.iter().copied().find(|f| f.name() == name)
     }
 
     /// Look up by frozen identifier.
@@ -325,9 +398,17 @@ impl Feature {
 pub struct Supported;
 
 impl Supported {
-    /// The features this build supports, in identifier order.
-    pub const fn features() -> [Feature; 3] {
+    /// The features this build supports, in identifier order, prepare
+    /// markers included: a marker is supported exactly when the feature
+    /// it marks is, and `admit` reads one as a requirement on this set.
+    pub const fn features() -> [Feature; 7] {
         Feature::ALL
+    }
+
+    /// What this build reports it can take part in: its features without
+    /// the prepare markers, which are never reported.
+    pub fn reported() -> impl Iterator<Item = Feature> {
+        Feature::ALL.into_iter().filter(|f| !f.is_marker())
     }
 
     /// Whether this build supports `feature`.

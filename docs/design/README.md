@@ -8,6 +8,7 @@ The review has two authoritative documents:
 |---|---|
 | [tuplesky-design.md](tuplesky-design.md) | Architecture, source-mapped protocol and recovery safeguards, APIs, identity, leases, observers, client-aware membership, transport, shared journal/materialization, tests and release gates |
 | [tuplesky-prs-plan.md](tuplesky-prs-plan.md) | All 89 task specifications, one index, direct prerequisites, acceptance criteria and optional tracks |
+| [tuplesky-checklist-review.md](tuplesky-checklist-review.md) | Review record against an external SwiftPaxos correctness checklist: item-by-item coverage, two confirmed safety bugs and the tasks that close each gap (task-d18 through task-d33); not a specification |
 
 Start with the design's navigation table, then review the corresponding tasks. The original contracts, observer/membership/journal revision and upstream issues #1/#2 safeguards are integrated in place. Earlier files at commit `2acf4eb724a36dcdb74baeb0c3b13368bc1317eb` remain historical provenance, not additional specifications reviewers must combine. No earlier chat or File Library access is required.
 

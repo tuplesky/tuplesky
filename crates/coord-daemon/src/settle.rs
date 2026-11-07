@@ -19,7 +19,9 @@
 //! ([`coord_collector::Collector::settle_from_record`]), and it is the
 //! collector that decides whether its own evidence corroborates it.
 
-use coord_storage::codecs::RetryRecordV1;
+use coord_collector::Mismatch;
+use coord_storage::codecs::{ExecutedRecordV1, RetryRecordV1};
+use coord_storage::views::ViewBudget;
 use coord_storage::{Applier, Persistence};
 use coord_types::{CommandId, RetryKey};
 
@@ -71,4 +73,201 @@ pub fn records_for<P: Persistence>(
             (record.command_id == command).then_some((command, record))
         })
         .collect()
+}
+
+/// The half-established commands whose retry key this node's store holds
+/// bound to another command, with that command (task-d22): the domain
+/// executed the other one under the key, and these are rejected wherever
+/// they execute. Read from one snapshot, as [`records_for`].
+pub fn conflicts_for<P: Persistence>(
+    applier: &Applier<P>,
+    half: impl IntoIterator<Item = (CommandId, RetryKey)>,
+) -> Vec<(CommandId, CommandId)> {
+    let Ok(gated) = applier.store().reader().snapshot() else {
+        return Vec::new();
+    };
+    half.into_iter()
+        .filter_map(|(command, key)| {
+            let record = coord_storage::retry::lookup(gated.view(), &key).ok()??;
+            (record.command_id != command).then_some((command, record.command_id))
+        })
+        .collect()
+}
+
+/// What a node's store holds for the half-held commands of one turn,
+/// read from one snapshot: each command's own record, and the commands
+/// whose retry key it holds bound to another command, with that command.
+#[derive(Debug, Default)]
+pub struct Records {
+    /// As [`records_for`] gives them.
+    pub records: Vec<(CommandId, RetryRecordV1)>,
+    /// As [`conflicts_for`] gives them.
+    pub conflicts: Vec<(CommandId, CommandId)>,
+}
+
+/// The read of the half-held commands a domain does every turn
+/// (task-d75): one snapshot and one lookup a key, for the records and the
+/// conflicts both, and no snapshot at all when nothing it would read can
+/// have changed.
+///
+/// A record only appears with a projection commit, and a commit moves
+/// the completed frontier, so a command found with no record stays
+/// without one until the frontier moves: until then it is not looked up
+/// again, and a turn whose commands are all such takes no snapshot. With
+/// a domain serving its callers, nearly every command is half held for
+/// a while before its record appears, and every turn pinned a snapshot,
+/// read the durable metadata and opened the retry table twice to find
+/// none (a twentieth of a follower's domain loop). A command that has a
+/// record, or one bound to another command, is read every turn, as
+/// before: what the collector makes of it is the collector's.
+///
+/// What it remembers is bounded by what is still half held, which the
+/// caller says with [`RecordReads::retain`] every turn: on a node whose
+/// store takes no commands -- a frontend-only one -- the frontier never
+/// moves, and every command that was ever half held there for a turn
+/// would otherwise stay remembered for the life of the process (Codex
+/// review of #168).
+#[derive(Debug, Default)]
+pub struct RecordReads {
+    /// The completed frontier `absent` was read at.
+    at: Option<u64>,
+    /// The commands found with no record at `at`.
+    absent: std::collections::BTreeSet<CommandId>,
+}
+
+impl RecordReads {
+    /// Forget every command not in `pending`, the commands still half
+    /// held.
+    pub fn retain(&mut self, pending: impl IntoIterator<Item = CommandId>) {
+        if self.absent.is_empty() {
+            return;
+        }
+        let pending: std::collections::BTreeSet<CommandId> = pending.into_iter().collect();
+        self.absent.retain(|command| pending.contains(command));
+    }
+
+    /// How many commands it remembers as having no record.
+    pub fn remembered(&self) -> usize {
+        self.absent.len()
+    }
+
+    /// What the store holds for `half`.
+    pub fn read<P: Persistence>(
+        &mut self,
+        applier: &Applier<P>,
+        half: impl IntoIterator<Item = (CommandId, RetryKey)>,
+    ) -> Records {
+        let reader = applier.store().reader();
+        let completed = reader.completed();
+        if self.at != Some(completed) {
+            self.at = Some(completed);
+            self.absent.clear();
+        }
+        let half: Vec<(CommandId, RetryKey)> = half
+            .into_iter()
+            .filter(|(command, _)| !self.absent.contains(command))
+            .collect();
+        let mut out = Records::default();
+        if half.is_empty() {
+            return out;
+        }
+        // Pinned after the frontier was read, so it shows at least what
+        // the frontier says: a record it lacks was not there at `at`
+        // either.
+        let Ok(gated) = reader.snapshot() else {
+            return out;
+        };
+        for (command, key) in half {
+            match coord_storage::retry::lookup(gated.view(), &key) {
+                Ok(Some(record)) if record.command_id == command => {
+                    out.records.push((command, record));
+                }
+                Ok(Some(record)) => out.conflicts.push((command, record.command_id)),
+                Ok(None) => {
+                    self.absent.insert(command);
+                }
+                Err(_) => {}
+            }
+        }
+        out
+    }
+}
+
+/// What one turn of settling from records sends, or the command that
+/// stopped it.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Settled<D> {
+    /// Every record was offered.
+    Offered {
+        /// The commands the collector accepted a record for.
+        settled: u64,
+        /// What goes out.
+        deliveries: Vec<D>,
+    },
+    /// The collector holds a release this node's own record of the
+    /// command contradicts (task-d06). This node executed the domain's
+    /// commands in another order than the leader, so nothing it read
+    /// from that record this turn goes out, and nothing after the
+    /// mismatch is offered. What was compared comes with it (task-d17).
+    Diverged(Box<Mismatch>),
+}
+
+/// Offer each of `records` to `settle` in turn, and say what goes out.
+///
+/// `settle` is the collector's own decision
+/// ([`coord_collector::Dispatcher::settle_from_record`] in `coordd`).
+/// A refusal for want of corroboration, or of a command no longer
+/// pending, is ordinary and passed over. A mismatch is not: it ends the
+/// turn at once, and the deliveries already settled in it are dropped
+/// with it, since they come from the same execution record.
+pub fn offer<D>(
+    records: impl IntoIterator<Item = (CommandId, RetryRecordV1)>,
+    mut settle: impl FnMut(CommandId, &RetryRecordV1) -> Result<Option<D>, coord_collector::SettleError>,
+) -> Settled<D> {
+    let mut settled = 0;
+    let mut deliveries = Vec::new();
+    for (command, record) in records {
+        match settle(command, &record) {
+            Ok(delivery) => {
+                settled += 1;
+                deliveries.extend(delivery);
+            }
+            Err(coord_collector::SettleError::Mismatch(mismatch)) => {
+                return Settled::Diverged(mismatch);
+            }
+            Err(_) => {}
+        }
+    }
+    Settled::Offered {
+        settled,
+        deliveries,
+    }
+}
+
+/// How far either side of a stopped command's two positions the stop
+/// shows this node's executed rows (task-d17).
+pub const NEAR_POSITIONS: u64 = 8;
+
+/// This node's `executed_v1` rows within [`NEAR_POSITIONS`] of where it
+/// executed `mismatch`'s command and of where the leader's release put
+/// it, in position order (task-d17).
+///
+/// Read once, when the node stops on the mismatch, so that the stop
+/// shows the order this node executed in around the command. A store
+/// that cannot be read shows nothing, and the stop still says what it
+/// compared.
+pub fn executed_near<P: Persistence>(
+    applier: &Applier<P>,
+    mismatch: &Mismatch,
+) -> Vec<(CommandId, ExecutedRecordV1)> {
+    let Ok(gated) = applier.store().reader().snapshot() else {
+        return Vec::new();
+    };
+    coord_storage::protocol::executed_near(
+        gated.view(),
+        &[mismatch.own.position, mismatch.release.position],
+        NEAR_POSITIONS,
+        ViewBudget::default(),
+    )
+    .unwrap_or_default()
 }

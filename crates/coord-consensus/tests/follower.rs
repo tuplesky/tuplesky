@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 use coord_consensus::{
     BallotConfiguration, CONSERVATIVE_KEY, CommandRecord, ConfigurationIdentity, FastAck, Follower,
     FollowerConfig, FollowerRejection, PayloadRecordV1, Phase, ProtocolMessage, ReplayRefusal,
-    ReplicaRole, decode_dependency, decode_payload, dependency_key,
+    ReplicaRole, SlowAck, decode_dependency, decode_payload, dependency_key,
 };
 use coord_core::capability::{AdmissionReceipt, AttestedAdmission, VerifierToken};
 use coord_core::effect::{BootId, Effect, PeerId};
@@ -126,6 +126,24 @@ fn peer(from: u8, message: ProtocolMessage) -> Event {
     ))
 }
 
+/// The leader's own adoption of `command`, sent once its acceptance row is
+/// durable (task-d19): the leader's copy of the slow majority.
+fn leader_adoption(f: &Follower, command: CommandId) -> Event {
+    peer(
+        0,
+        ProtocolMessage::SlowAck(SlowAck {
+            replica: r(0),
+            ballot: ballot(0, 0),
+            command,
+            admission: f
+                .table()
+                .record(&command)
+                .and_then(|r| r.payload)
+                .expect("admitted"),
+        }),
+    )
+}
+
 /// The leader's proposal for `command` with `deps`, computed by a leader
 /// table that saw the given order.
 fn proposal(
@@ -214,12 +232,16 @@ fn fast_votes_wait_for_durable_payload_dependencies_and_path() {
     assert_eq!(batch.updates[1].key, dependency_key(epoch(), &c1));
     let row = decode_dependency(batch.updates[1].value.as_ref().unwrap()).unwrap();
     assert_eq!(row.phase, Phase::PreAccept);
-    assert_eq!(fast.pending_sends(), 3, "two voters and the frontend");
+    assert_eq!(
+        fast.pending_sends(),
+        2,
+        "the leader and the frontend, not the other voter (task-d74)"
+    );
     let released = fast.step(durable_of(&effects, 1).remove(0));
     let sent = sends(&released);
-    assert_eq!(sent.len(), 3);
+    assert_eq!(sent.len(), 2);
     for (to, m) in &sent {
-        assert!(*to == r(0) || *to == r(2) || *to == FRONTEND.replica);
+        assert!(*to == r(0) || *to == FRONTEND.replica);
         let ProtocolMessage::FastAck(ack) = m else {
             panic!("{m:?}")
         };
@@ -252,7 +274,14 @@ fn fast_votes_wait_for_durable_payload_dependencies_and_path() {
         "the same acknowledgement, not a new one: {:?}",
         again[0].1
     );
-    assert!(fast.step(admitted(1, 1, 7).0).is_empty());
+    // Answered, to the frontend only, with why (task-d22).
+    let refused = sends(&fast.step(admitted(1, 1, 7).0));
+    assert!(
+        matches!(refused.as_slice(), [(to, ProtocolMessage::Refused {
+            refusal: coord_consensus::SubmissionRefusal::OtherCommand { bound }, ..
+        })] if *to == FRONTEND.replica && *bound == c1),
+        "{refused:?}"
+    );
     let rejections = fast.take_rejections();
     assert_eq!(rejections[0], FollowerRejection::Duplicate(c1));
     assert!(matches!(
@@ -332,10 +361,20 @@ fn a_proposal_before_the_payload_is_held_against_an_invisible_placeholder() {
         assert_eq!(row.phase, Phase::Accept, "adoption {i} persisted");
     }
     // The adoption rows become durable: only now does this replica's own
-    // slow vote count, and the commands are learned.
+    // slow vote count, and with the leader's adoption the commands are
+    // learned. The leader's proposal alone is not its adoption (task-d19).
     let mut released = Vec::new();
     for event in durable_of(&adoptions, 3) {
         released.extend(f.step(event));
+    }
+    assert_eq!(
+        f.table().phase_of(&c1),
+        Some(Phase::Accept),
+        "the leader's acceptance is not known durable yet"
+    );
+    for c in [c1, c2] {
+        let adoption = leader_adoption(&f, c);
+        released.extend(f.step(adoption));
     }
     assert_eq!(f.table().phase_of(&c1), Some(Phase::Commit));
     assert_eq!(f.table().phase_of(&c2), Some(Phase::Commit));
@@ -345,8 +384,8 @@ fn a_proposal_before_the_payload_is_held_against_an_invisible_placeholder() {
         .collect();
     assert_eq!(
         slow.len(),
-        6,
-        "two slow acks to two voters and the frontend"
+        4,
+        "two slow acks to the leader and the frontend (task-d74)"
     );
     assert!(f.take_rejections().is_empty());
 }
@@ -394,7 +433,11 @@ fn conflict_arrival_permutations_converge_on_the_leader_order() {
         for d in durable_of(&effects, 5) {
             acks += sends(&f.step(d)).len();
         }
-        assert_eq!(acks, 6);
+        assert_eq!(acks, 4, "to the leader and the frontend (task-d74)");
+        for c in [c1, c2] {
+            let adoption = leader_adoption(f, c);
+            f.step(adoption);
+        }
         assert_eq!(f.table().record(&c1).unwrap().deps, vec![]);
         assert_eq!(f.table().record(&c2).unwrap().deps, vec![c1]);
         assert_eq!(f.table().phase_of(&c1), Some(Phase::Commit));
@@ -441,7 +484,7 @@ fn a_crash_between_state_and_vote_preserves_the_learning_obligation() {
         panic!()
     };
     storage.submit(batch.clone());
-    assert_eq!(f.pending_sends(), 3, "the vote waits");
+    assert_eq!(f.pending_sends(), 2, "the vote waits");
     assert_eq!(storage.crash(), 1);
     let rows = restore_rows(&storage);
     assert!(rows.is_empty());
@@ -479,7 +522,7 @@ fn a_crash_between_state_and_vote_preserves_the_learning_obligation() {
     storage.submit(batch);
     storage.complete(effects_barrier(&effects)).unwrap();
     let released = f.step(durable_of(&effects, 1).remove(0));
-    assert_eq!(sends(&released).len(), 3);
+    assert_eq!(sends(&released).len(), 2, "the leader and the frontend");
     storage.crash();
     let rows = restore_rows(&storage);
     assert_eq!(rows.len(), 1);
@@ -573,6 +616,60 @@ fn restore_rows(storage: &StorageModel) -> Vec<(CommandId, CommandRecord)> {
         .collect()
 }
 
+/// task-d98: a follower outside the fast set that gets the leader's
+/// proposal before the leader's batch is durable must not complete a fast
+/// quorum with a fast-set member's acknowledgement. Only a build from
+/// before task-d74 sends one to a follower, and counted with an early
+/// proposal it would decide over a vote the leader may lose. The follower
+/// takes the decision from the leader's commit frontier instead.
+#[test]
+fn a_follower_never_counts_another_voters_fast_ack_toward_a_fast_decision() {
+    // r2 is outside the fast set {r0, r1} at three voters.
+    let mut f = booted(2);
+    let (e1, c1) = admitted(1, 1, 1);
+    let effects = f.step(e1);
+    f.step(durable_of(&effects, 1).remove(0));
+    let record = f.table().record(&c1).unwrap().clone();
+    // r1's fast ack, equal to the leader's proposal in path and deps, as a
+    // pre-task-d74 build would send it to every voter.
+    let r1_ack = FastAck {
+        replica: r(1),
+        ballot: ballot(0, 0),
+        command: c1,
+        deps: record.deps.clone(),
+        paths: record.paths.clone(),
+        path: record.path,
+        admission: record.payload.expect("initialized"),
+        seqnum: None,
+    };
+    assert!(f.step(peer(1, ProtocolMessage::FastAck(r1_ack))).is_empty());
+    let adoption = f.step(peer(
+        0,
+        proposal(
+            c1,
+            record.deps.clone(),
+            0,
+            record.paths.clone(),
+            record.path,
+        ),
+    ));
+    f.step(durable_of(&adoption, 2).remove(0));
+    assert!(
+        f.votes(&c1).unwrap().learned().is_none(),
+        "the leader's proposal and nothing else: no fast quorum"
+    );
+    assert_ne!(
+        f.table().phase_of(&c1),
+        Some(Phase::Commit),
+        "not committed until the leader's frontier says so"
+    );
+    assert!(
+        f.take_rejections()
+            .contains(&FollowerRejection::PeerFastAck),
+        "r1's fast ack was refused, not counted"
+    );
+}
+
 #[test]
 fn equal_direct_dependencies_are_not_learning_and_guards_are_explicit() {
     let mut f = booted(1);
@@ -598,15 +695,19 @@ fn equal_direct_dependencies_are_not_learning_and_guards_are_explicit() {
     );
     assert_eq!(
         f.take_rejections(),
-        vec![FollowerRejection::Vote(
-            coord_consensus::VoteError::NotInFastSet
-        )],
-        "r2 is outside the fast set: its fast ack never counts"
+        vec![FollowerRejection::PeerFastAck],
+        "a follower never counts another voter's fast ack (task-d98)"
     );
     let p1 = proposal(c1, vec![], 0, record.paths.clone(), record.path);
     let adoption = f.step(peer(0, p1));
     assert_eq!(adoption.len(), 1);
     f.step(durable_of(&adoption, 2).remove(0));
+    assert!(
+        f.votes(&c1).unwrap().learned_slow().is_none(),
+        "the leader's proposal is not its adoption"
+    );
+    let leader = leader_adoption(&f, c1);
+    f.step(leader);
     let votes = f.votes(&c1).unwrap();
     assert!(votes.learned_slow().is_some(), "the slow predicate holds");
     assert_eq!(
@@ -657,7 +758,7 @@ fn an_adoption_acknowledgement_waits_for_the_payload_batch_too() {
         .collect();
     assert_eq!(batches.len(), 2, "payload batch and adoption batch");
     let (payload, adoption) = (batches[0].clone(), batches[1].clone());
-    assert_eq!(f.pending_sends(), 3, "the adoption acknowledgement waits");
+    assert_eq!(f.pending_sends(), 2, "the adoption acknowledgement waits");
     // The adoption batch alone is not enough: the payload row is still
     // volatile, so a crash now would leave an accepted dependency row
     // without the payload it accepted.
@@ -669,14 +770,14 @@ fn an_adoption_acknowledgement_waits_for_the_payload_batch_too() {
         sends(&released).is_empty(),
         "nothing leaves while the payload batch is volatile: {released:?}"
     );
-    assert_eq!(f.pending_sends(), 3);
+    assert_eq!(f.pending_sends(), 2);
     let released = f.step(Event::Storage(StorageEvent::JournalDurable {
         barrier_id: payload.barrier,
         journal_seq: LocalJournalSeq::new(2).unwrap(),
     }));
     assert_eq!(
         sends(&released).len(),
-        3,
+        2,
         "both batches durable: the acknowledgement goes out"
     );
     assert_eq!(f.pending_sends(), 0);
@@ -692,6 +793,7 @@ fn a_higher_promise_in_flight_fences_the_configured_ballot() {
         2,
         ProtocolMessage::NewLeader {
             ballot: ballot(1, 2),
+            executed: coord_types::ids::ExecutionPosition::ZERO,
         },
     ));
     assert!(matches!(effects.as_slice(), [Effect::Persist(_), ..]));
@@ -755,7 +857,15 @@ fn recovery_rebuilds_retry_key_bindings_from_durable_payloads() {
     // The same retry key with other bytes derives another command; without
     // the rebuilt binding it would be admitted as a second command.
     let other = admitted_with_key(1, 9, 9);
-    assert!(recovered.step(other.0).is_empty());
+    // Refused with the reason, since the binding is durable (task-d22).
+    let refused = recovered.step(other.0);
+    assert!(
+        refused.iter().all(|e| matches!(e, Effect::SendWhenDurable { to, frame, .. }
+            if *to == FRONTEND && matches!(ProtocolMessage::decode(frame),
+                Ok(ProtocolMessage::Refused { refusal: coord_consensus::SubmissionRefusal::OtherCommand { bound }, .. }) if bound == c1)))
+            && refused.len() == 1,
+        "{refused:?}"
+    );
     assert_eq!(
         recovered.take_rejections(),
         vec![FollowerRejection::RequestIdentityConflict {
@@ -987,7 +1097,10 @@ fn a_seal_stops_the_follower_voting_live_and_after_a_restart() {
 /// asked for refused as unauthorized for the rest of the run.
 #[test]
 fn a_full_table_still_adopts_and_still_keeps_the_order_it_was_sent() {
+    // Full for new admission: the capacity less the share kept for
+    // recovery and catch-up (task-d24).
     let capacity = config(1).capacity;
+    let capacity = capacity - capacity / coord_consensus::RECOVERY_RESERVE_PARTS;
     let mut f = booted(1);
 
     // The leader's view, so the proposals carry real path evidence.
@@ -1088,5 +1201,404 @@ fn a_full_table_still_adopts_and_still_keeps_the_order_it_was_sent() {
         f.held().len(),
         1,
         "only the proposal whose command has no record is still held"
+    );
+}
+
+/// A proposal held when this replica promises a higher ballot is not
+/// adopted, and a payload that arrives after the promise is not voted on
+/// (task-d12).
+///
+/// The report the candidate selects from is taken at the promise, so it
+/// cannot name what this replica accepts after it. Adopting the held
+/// proposal then let this replica's own acceptance and the old leader's
+/// proposal make a quorum here: it committed and executed a command the
+/// new ballot's selection never saw, and the new leader chained its first
+/// command after the same predecessor (stress runs d12c-1, -7, -9, -11).
+#[test]
+fn a_proposal_held_across_a_higher_promise_is_not_accepted_after_it() {
+    let mut f = booted(1);
+    let (e1, c1) = admitted(1, 1, 1);
+    let (_, c2) = admitted(2, 2, 2);
+    let mut leader_view = coord_consensus::CommandTable::new();
+    let l1 = leader_view
+        .initialize(c1, c1.0, vec![CONSERVATIVE_KEY.to_vec()])
+        .unwrap();
+    let l2 = leader_view
+        .initialize(c2, c2.0, vec![CONSERVATIVE_KEY.to_vec()])
+        .unwrap();
+    // c1 is accepted (and, with the fast votes, committed) in ballot 0.
+    let effects = f.step(e1);
+    for event in durable_of(&effects, 1) {
+        f.step(event);
+    }
+    let adopted = f.step(peer(0, proposal(c1, vec![], 0, l1.paths.clone(), l1.path)));
+    for event in durable_of(&adopted, 2) {
+        f.step(event);
+    }
+    assert!(f.table().phase_of(&c1) >= Some(Phase::Accept));
+    // c2's proposal arrives before its payload: held.
+    assert!(
+        f.step(peer(
+            0,
+            proposal(c2, vec![c1], 1, l2.paths.clone(), l2.path)
+        ))
+        .is_empty()
+    );
+    assert!(f.held().contains_key(&c2));
+    // r2 campaigns; the promise becomes durable, and the report it answers
+    // with names c1 and not c2.
+    let promised = f.step(peer(
+        2,
+        ProtocolMessage::NewLeader {
+            ballot: ballot(1, 2),
+            executed: coord_types::ids::ExecutionPosition::ZERO,
+        },
+    ));
+    for event in durable_of(&promised, 3) {
+        f.step(event);
+    }
+    assert_eq!(f.ballots().promised(), ballot(1, 2));
+    let report = f.report(ballot(1, 2));
+    assert!(report.entries.iter().all(|e| e.command != c2));
+    // c2's payload arrives now, as a fetched payload does.
+    let request = LogicalRequest::new(
+        NamespaceId([5; 16]),
+        CanonicalOperation::Put(PutOp {
+            key: vec![2],
+            value: vec![2],
+            lease: None,
+            prev_kv: false,
+        }),
+    );
+    let payload = PayloadRecordV1 {
+        retry_key: retry_key(2),
+        logical: postcard::to_allocvec(&request).unwrap(),
+        admission: Some(coord_core::capability::AdmissionFacts {
+            attested: AttestedAdmission {
+                cluster: ClusterId([1; 16]),
+                domain: DomainId([2; 16]),
+                session: SessionId([3; 16]),
+                rule_generation: 1,
+                scope_ceiling: u32::MAX,
+                receipt_id: Digest32([9; 32]),
+                admitted_at_ticks: 0,
+            },
+            establishing: None,
+        }),
+        ack_through: 0,
+    };
+    assert_eq!(payload.admission_digest(), admitted_under());
+    let mut effects = f.step(peer(
+        0,
+        ProtocolMessage::PayloadResponse {
+            command: c2,
+            payload,
+        },
+    ));
+    let mut sent = Vec::new();
+    let mut seq = 4;
+    while !effects.is_empty() {
+        sent.extend(sends(&effects));
+        let mut next = Vec::new();
+        for event in durable_of(&effects, seq) {
+            next.extend(f.step(event));
+        }
+        seq += 1;
+        effects = next;
+    }
+    assert!(
+        f.table().phase_of(&c2) < Some(Phase::Accept),
+        "c2 accepted after the promise: {:?}",
+        f.table().phase_of(&c2)
+    );
+    assert!(
+        sent.iter().all(|(_, m)| !matches!(
+            m,
+            ProtocolMessage::FastAck(a) if a.command == c2
+        ) && !matches!(
+            m,
+            ProtocolMessage::SlowAck(a) if a.command == c2
+        )),
+        "acknowledged c2 in the ballot it promised away: {sent:?}"
+    );
+}
+
+/// A proposal's arrival does not align this replica's path logs; only
+/// adopting it does (task-d34, F7; vicaya on #118).
+///
+/// The leader ordered cz, c0, c1. r1 never received cz. It pre-accepted
+/// c0 with its own dependencies (none it can see), then took c0's
+/// proposal, which it cannot adopt while cz is unknown. Aligned on
+/// arrival, its log took the leader's anchor for c0, and c1 pre-accepted
+/// next carried the leader's path over r1's own history: an equal path
+/// without cz behind it. With the leader absent, a recovery could not
+/// rebuild the fast decision's ancestors from r1's records, and refused
+/// the decided command. r1's path for c1 is now the one a replica that
+/// never received the proposal computes.
+#[test]
+fn a_proposal_that_is_not_adopted_leaves_the_path_log_alone() {
+    let (_, cz) = admitted(1, 1, 1);
+    let (e0, c0) = admitted(2, 2, 2);
+    let (e1, c1) = admitted(3, 3, 3);
+    let mut leader_view = coord_consensus::CommandTable::new();
+    for c in [cz, c0, c1] {
+        leader_view
+            .initialize(c, c.0, vec![CONSERVATIVE_KEY.to_vec()])
+            .unwrap();
+    }
+    let l0 = leader_view.record(&c0).unwrap().clone();
+    let l1 = leader_view.record(&c1).unwrap().clone();
+    assert_eq!(l0.deps, vec![cz]);
+    let mut aligned = booted(1);
+    let mut plain = booted(1);
+    for f in [&mut aligned, &mut plain] {
+        let effects = f.step(e0.clone());
+        f.step(durable_of(&effects, 1).remove(0));
+    }
+    // c0's proposal reaches `aligned`: held, since cz is unknown here.
+    let p0 = proposal(c0, vec![cz], 1, l0.paths.clone(), l0.path);
+    aligned.step(peer(0, p0));
+    assert!(aligned.held().contains_key(&c0));
+    assert_eq!(aligned.table().phase_of(&c0), Some(Phase::PreAccept));
+    for f in [&mut aligned, &mut plain] {
+        let effects = f.step(e1.clone());
+        f.step(durable_of(&effects, 2).remove(0));
+    }
+    let a = aligned.table().record(&c1).unwrap();
+    let p = plain.table().record(&c1).unwrap();
+    assert_eq!(a.deps, vec![c0]);
+    assert_eq!(
+        a.path, p.path,
+        "the path is this replica's own history, not the leader's"
+    );
+    assert_ne!(
+        a.path, l1.path,
+        "the leader's path for c1 runs through cz, which this replica never held"
+    );
+}
+
+// ---------------------------------------------------------------------
+// task-d90 (point 4): a vote rests on the payload row, not its digest.
+// ---------------------------------------------------------------------
+
+/// Durable dependency rows and durable payload rows, as recovery reads them.
+type DurableRows = (
+    Vec<(CommandId, CommandRecord)>,
+    Vec<(CommandId, PayloadRecordV1)>,
+);
+
+/// A follower outside the fast set that admitted `c1` and made its batch
+/// durable, then crashed: its durable rows, with the dependency row and
+/// the payload row in hand separately.
+fn durable_admission() -> (CommandId, DurableRows) {
+    let mut f = booted(2);
+    let mut storage = StorageModel::default();
+    let (e1, c1) = admitted(1, 1, 1);
+    let effects = f.step(e1);
+    let Effect::Persist(batch) = effects[0].clone() else {
+        panic!()
+    };
+    storage.submit(batch);
+    storage.complete(effects_barrier(&effects)).unwrap();
+    f.step(durable_of(&effects, 1).remove(0));
+    storage.crash();
+    (c1, (restore_rows(&storage), restore_payloads(&storage)))
+}
+
+/// A record whose dependency row is durable and whose payload row is not
+/// -- restored from the one without the other, as after a Sync installed
+/// it or a payload batch was lost -- is initialized, with its admission
+/// digest, and holds no payload. It is reported without one, a proposal
+/// for it is adopted only once the payload is back, and the adoption's
+/// acknowledgement waits for the batch that writes it (task-d90, design
+/// Section 4.5, point 4). Adopted over the digest, its slow vote counted
+/// toward a decision no recovery could re-execute from this voter.
+#[test]
+fn an_adoption_waits_for_the_payload_row_not_only_its_digest() {
+    let (c1, (rows, mut payloads)) = durable_admission();
+    let payload = payloads.remove(0).1;
+    let mut g = Follower::recover(config(2), None, rows, Vec::new(), ExecutionPosition::ZERO);
+    g.step(boot_event());
+    assert!(g.table().is_initialized(&c1));
+    assert!(g.payload(&c1).is_none());
+    let reported = |g: &Follower| {
+        g.report(ballot(1, 1))
+            .entries
+            .into_iter()
+            .find(|e| e.command == c1)
+            .expect("reported")
+            .payload_present
+    };
+    assert!(!reported(&g), "no payload row: none reported present");
+    // The leader's proposal is held for the payload, which is asked for.
+    let record = g.table().record(&c1).unwrap().clone();
+    let held = g.step(peer(
+        0,
+        proposal(c1, vec![], 0, record.paths.clone(), record.path),
+    ));
+    assert!(
+        persisted(&held).is_empty(),
+        "adopted over the digest alone: {held:?}"
+    );
+    assert_eq!(g.held().len(), 1);
+    assert!(g.missing_payloads().contains(&c1));
+    // The payload arrives: its batch and the adoption's, and the
+    // acknowledgement waits for both.
+    let effects = g.step(peer(
+        0,
+        ProtocolMessage::PayloadResponse {
+            command: c1,
+            payload,
+        },
+    ));
+    let batches = persisted(&effects);
+    assert_eq!(batches.len(), 2, "the payload batch and the adoption");
+    let (payload_batch, adoption) = (batches[0].barrier, batches[1].barrier);
+    let released = g.step(Event::Storage(StorageEvent::JournalDurable {
+        barrier_id: adoption,
+        journal_seq: LocalJournalSeq::new(1).unwrap(),
+    }));
+    assert!(
+        sends(&released).is_empty(),
+        "the payload row is still volatile: {released:?}"
+    );
+    assert!(!reported(&g));
+    let released = g.step(Event::Storage(StorageEvent::JournalDurable {
+        barrier_id: payload_batch,
+        journal_seq: LocalJournalSeq::new(2).unwrap(),
+    }));
+    assert_eq!(sends(&released).len(), 2, "the leader and the frontend");
+    assert!(reported(&g), "durable now, and reported present");
+}
+
+/// A decided record is answered from its durable record when the leader
+/// proposes it again (task-d07), and only with its payload row durable
+/// here too (task-d90, point 4): without one the answer was a vote no
+/// recovery could re-execute from.
+#[test]
+fn a_decided_record_is_acknowledged_again_only_with_its_payload_row() {
+    let (c1, (mut rows, payloads)) = durable_admission();
+    rows[0].1.phase = Phase::Commit;
+    let record = rows[0].1.clone();
+    let again = || {
+        peer(
+            0,
+            proposal(c1, vec![], 0, record.paths.clone(), record.path),
+        )
+    };
+    let mut without = Follower::recover(
+        config(2),
+        None,
+        rows.clone(),
+        Vec::new(),
+        ExecutionPosition::ZERO,
+    );
+    without.step(boot_event());
+    let out = without.step(again());
+    assert!(sends(&out).is_empty(), "acknowledged without a payload row");
+    assert_eq!(without.pending_sends(), 0);
+    let mut with = Follower::recover(config(2), None, rows, payloads, ExecutionPosition::ZERO);
+    with.step(boot_event());
+    let out = with.step(again());
+    assert!(
+        matches!(&sends(&out)[..], [(to, ProtocolMessage::SlowAck(_))] if *to == r(0)),
+        "{out:?}"
+    );
+}
+
+/// The payload batch an adoption waited on fails (#195 review): the
+/// acknowledgement it held was dropped, and kept evidence that names the
+/// failed batch would be dropped again each time it was published. It is
+/// forgotten, and the leader's next proposal is adopted again, in a batch
+/// that writes the payload row again, which the new acknowledgement waits
+/// on.
+#[test]
+fn a_failed_payload_batch_is_written_again_by_the_next_adoption() {
+    let (c1, (rows, mut payloads)) = durable_admission();
+    let payload = payloads.remove(0).1;
+    let mut g = Follower::recover(config(2), None, rows, Vec::new(), ExecutionPosition::ZERO);
+    g.step(boot_event());
+    let record = g.table().record(&c1).unwrap().clone();
+    let again = || {
+        peer(
+            0,
+            proposal(c1, vec![], 0, record.paths.clone(), record.path),
+        )
+    };
+    g.step(again());
+    let effects = g.step(peer(
+        0,
+        ProtocolMessage::PayloadResponse {
+            command: c1,
+            payload,
+        },
+    ));
+    let batches = persisted(&effects);
+    let (payload_batch, adoption) = (batches[0].barrier, batches[1].barrier);
+    g.step(Event::Storage(StorageEvent::Failed {
+        barrier_id: payload_batch,
+        error: StorageError::NoSpace,
+    }));
+    let released = g.step(Event::Storage(StorageEvent::JournalDurable {
+        barrier_id: adoption,
+        journal_seq: LocalJournalSeq::new(1).unwrap(),
+    }));
+    assert!(
+        sends(&released).is_empty(),
+        "the payload row was never written"
+    );
+    // The leader proposes again, lacking this voter's vote.
+    let effects = g.step(again());
+    let batches = persisted(&effects);
+    assert_eq!(batches.len(), 1, "adopted again: {effects:?}");
+    assert!(
+        batches[0]
+            .updates
+            .iter()
+            .any(|u| u.collection == Collection::PayloadV1.id()),
+        "the adoption writes the payload row again"
+    );
+    let released = g.step(Event::Storage(StorageEvent::JournalDurable {
+        barrier_id: batches[0].barrier,
+        journal_seq: LocalJournalSeq::new(2).unwrap(),
+    }));
+    assert!(
+        sends(&released)
+            .iter()
+            .any(|(to, m)| *to == r(0) && matches!(m, ProtocolMessage::SlowAck(_))),
+        "{released:?}"
+    );
+}
+
+/// A submission's own batch, which writes its payload row and its
+/// dependency row, fails (task-d90, point 4, the fault of protocol_sim's
+/// row 21): the record stays initialized in memory with its payload, and
+/// no row holds it. The adoption of the leader's proposal for it writes
+/// the payload row again, which the vote waits on.
+#[test]
+fn a_vote_after_its_submissions_batch_failed_writes_the_payload_row_again() {
+    let mut f = booted(1);
+    let (e1, c1) = admitted(1, 1, 1);
+    let effects = f.step(e1);
+    f.step(Event::Storage(StorageEvent::Failed {
+        barrier_id: effects_barrier(&effects),
+        error: StorageError::DefinitelyNotCommitted,
+    }));
+    let record = f
+        .table()
+        .record(&c1)
+        .expect("initialized in memory")
+        .clone();
+    let effects = f.step(peer(
+        0,
+        proposal(c1, vec![], 0, record.paths.clone(), record.path),
+    ));
+    let batches = persisted(&effects);
+    assert!(
+        batches.iter().any(|b| b
+            .updates
+            .iter()
+            .any(|u| u.collection == Collection::PayloadV1.id() && u.value.is_some())),
+        "the vote's batch writes the payload row again: {batches:?}"
     );
 }

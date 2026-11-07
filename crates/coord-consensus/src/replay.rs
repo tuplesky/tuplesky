@@ -159,6 +159,19 @@ impl EvidenceStore {
         }
     }
 
+    /// Drop what was kept for `command` that required `failed`, a batch
+    /// that will never be durable (task-d90): its send was dropped, and
+    /// published again it would be dropped again, so the next proposal
+    /// is answered afresh instead.
+    pub fn drop_requiring(&mut self, command: &CommandId, failed: &BarrierId) {
+        if let Some(kept) = self.own.get_mut(command) {
+            kept.retain(|e| !e.requires.contains(failed));
+            if kept.is_empty() {
+                self.own.remove(command);
+            }
+        }
+    }
+
     /// Forget every command the table no longer remembers either.
     fn sweep(&mut self, table: &CommandTable) {
         self.own
@@ -225,6 +238,11 @@ impl EvidenceStore {
         }
         *self.repairs.entry(command).or_insert(0) += 1;
         Ok(sends)
+    }
+
+    /// What this replica published for `command`, as it was published.
+    pub fn kept(&self, command: &CommandId) -> &[RetainedEvidence] {
+        self.own.get(command).map_or(&[], Vec::as_slice)
     }
 
     /// How often `command`'s evidence has been published again this boot.

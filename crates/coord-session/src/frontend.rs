@@ -66,6 +66,60 @@ struct RequestInfo {
     /// reauthorized over what was asked for and not merely over what came
     /// back.
     intervals: Vec<KeyInterval>,
+    /// The client's own deadline, where it named one: a disclosure held
+    /// at the gate is answered `Pending` by then at the latest.
+    deadline: Option<MonotonicMillis>,
+}
+
+/// The longest the output gate holds a disclosure whose session this
+/// node has not projected yet, in milliseconds, when the client named no
+/// earlier deadline (task-d93).
+///
+/// A node projects a session one leader turn and a hop after the leader
+/// does (task-d74), so the hold is normally released within a few
+/// milliseconds. The bound is for a node that is behind by more than
+/// that: it answers `Pending` then, as it did before the hold, and the
+/// caller resolves by identity.
+pub const GATE_HOLD_MILLIS: u64 = 2_000;
+
+/// A disclosure the output gate holds until this node has projected the
+/// caller's session (task-d93).
+#[derive(Clone, Debug)]
+struct Held {
+    delivery: Delivery,
+    session: coord_types::ids::SessionId,
+    scope: u32,
+    /// When the hold ends with `Pending` if the projection has not
+    /// caught up: the client's deadline, or `GATE_HOLD_MILLIS` after the
+    /// hold began, whichever is earlier.
+    until: MonotonicMillis,
+    /// When the hold began, so a retry that presents another deadline
+    /// moves `until` without moving the hold's own bound.
+    began: MonotonicMillis,
+}
+
+/// When a hold that began at `began` ends: the client's deadline, or
+/// `GATE_HOLD_MILLIS` after it began, whichever is earlier.
+fn hold_until(began: MonotonicMillis, deadline: Option<MonotonicMillis>) -> MonotonicMillis {
+    let bound = began.plus(GATE_HOLD_MILLIS);
+    deadline.map_or(bound, |d| d.min(bound))
+}
+
+/// What the gate decided about one delivery.
+enum Decision {
+    /// Write this.
+    Out(Delivery),
+    /// This node has not projected the caller's session yet.
+    NotYet(Delivery, coord_types::CommandId),
+}
+
+/// What the gate did with one delivery.
+enum Gated {
+    /// Write this.
+    Out(Delivery),
+    /// Held until the projection shows the session; `release_held`
+    /// hands it out.
+    Held(coord_types::CommandId),
 }
 
 /// A binding waiting for the session it named to be established.
@@ -95,6 +149,11 @@ pub enum Delivered {
         /// Why, for this node's own record.
         reason: BindError,
     },
+    /// The output gate holds this delivery until this node has projected
+    /// the caller's session (task-d93). Keep the caller's stream:
+    /// `release_held` hands the delivery out, gated, once the
+    /// projection shows the session or the hold's deadline passes.
+    Held,
 }
 
 /// The frontend of one domain with session binding and output gating.
@@ -116,10 +175,16 @@ pub struct BoundFrontend {
     pub sessions_checked: u64,
     /// Disclosures denied by a barrier.
     pub denied: u64,
-    /// Disclosures held because this node's replicated state had not
-    /// caught up with the session yet. Counted apart from `denied`,
-    /// because they are not refusals: the caller is told to ask again.
+    /// Disclosures answered `Pending` because this node's replicated
+    /// state had not caught up with the session by the end of the hold.
+    /// Counted apart from `denied`, because they are not refusals: the
+    /// caller is told to ask again.
     pub deferred: u64,
+    /// Disclosures the gate held for the projection to catch up with the
+    /// session (task-d93), however each hold ended.
+    pub holds: u64,
+    /// The disclosures held now, oldest first.
+    held: Vec<Held>,
     /// Connections whose session a barrier on this node has shown at
     /// least once.
     ///
@@ -157,6 +222,8 @@ impl BoundFrontend {
             barriers_read: 0,
             sessions_checked: 0,
             deferred: 0,
+            holds: 0,
+            held: Vec::new(),
             seen: BTreeSet::new(),
             denied: 0,
         }
@@ -221,7 +288,10 @@ impl BoundFrontend {
         let scope = binding.scope_ceiling;
         let decoded = decode(frame).ok();
         let presented = match &decoded {
-            Some(MessageV1::Request(r)) => r.logical().ok().map(|l| (r.retry_key, l)),
+            Some(MessageV1::Request(r)) => r.logical().ok().map(|l| {
+                let deadline = (r.deadline_ms > 0).then(|| now.plus(u64::from(r.deadline_ms)));
+                (r.retry_key, l, deadline)
+            }),
             _ => None,
         };
         let action = self
@@ -233,11 +303,16 @@ impl BoundFrontend {
         // key replace the namespace and keys that authorize the original
         // command's result, and the rejection would not put them back.
         match (&action, &presented) {
-            (Action::FanOut(f), Some((key, logical))) => {
-                self.remember(*key, f.command, logical);
+            (Action::FanOut(f), Some((key, logical, deadline))) => {
+                self.remember(*key, f.command, logical, *deadline);
             }
-            (Action::Pending { command }, Some((key, logical))) => {
-                self.remember(*key, *command, logical);
+            (Action::Pending { command }, Some((key, logical, deadline))) => {
+                self.remember(*key, *command, logical, *deadline);
+            }
+            // A read sent to the leader barrier is disclosed through the
+            // same gate, with the same metadata (task-d50).
+            (Action::Read(r), Some((key, logical, deadline))) => {
+                self.remember(*key, r.command, logical, *deadline);
             }
             _ => {}
         }
@@ -257,7 +332,12 @@ impl BoundFrontend {
                 }
             }
             Action::Respond(delivery) => {
-                Action::Respond(self.gate(delivery, session, scope, policy))
+                match self.gate(Some(now), delivery, session, scope, policy) {
+                    Gated::Out(delivery) => Action::Respond(delivery),
+                    // The stream is kept under the invocation, as for any
+                    // outcome still to come, and `release_held` answers it.
+                    Gated::Held(command) => Action::Pending { command },
+                }
             }
             other => other,
         };
@@ -324,7 +404,7 @@ impl BoundFrontend {
                 Ingress::Bound(ack)
             }
             Some(_) => Ingress::Rejected(BindError::SessionDisagrees),
-            None => self.establish(clock, now, connection, binding, ack),
+            None => self.establish(clock, now, connection, binding, ack, policy),
         }
     }
 
@@ -337,6 +417,7 @@ impl BoundFrontend {
         connection: u64,
         binding: Binding,
         ack: Vec<u8>,
+        policy: &dyn PolicySource,
     ) -> Ingress {
         let retry_key = binding.establishment_key(&self.config);
         // The operation carries nothing. Everything about the session
@@ -373,6 +454,27 @@ impl BoundFrontend {
                     },
                 );
                 Ingress::Establishing(Box::new(plan))
+            }
+            // This very establishment already executed and its outcome
+            // is kept: it is settled from that outcome, as the stream
+            // that submitted it was. A released outcome can precede the
+            // snapshot the barrier above reads (a response is released
+            // at journal durability, task-d63), so a second binding
+            // right after the first finds no row yet and would
+            // otherwise be refused a session that exists.
+            Ok(Action::Respond(delivery)) => {
+                let waiting = Establishing {
+                    connection,
+                    binding,
+                    ack,
+                };
+                match self.settle(waiting, delivery, policy) {
+                    Delivered::Answer(answer) => Ingress::Bound(answer.frame),
+                    Delivered::Unbound { reason, .. } => Ingress::Rejected(reason),
+                    // An establishment's outcome is not gated, so it is
+                    // never held.
+                    Delivered::Held => Ingress::Rejected(BindError::Unavailable),
+                }
             }
             // Another connection is already establishing this very
             // command. Its outcome is this one's too, but only one
@@ -462,9 +564,19 @@ impl BoundFrontend {
         key: RetryKey,
         command: coord_types::CommandId,
         logical: &LogicalRequest,
+        deadline: Option<MonotonicMillis>,
     ) {
-        if let Some(existing) = self.requests.get(&key) {
+        if let Some(existing) = self.requests.get_mut(&key) {
             debug_assert_eq!(existing.command, command, "identity decides the metadata");
+            // A retry the dispatcher accepted waits under the deadline it
+            // presented, and so does its disclosure at the gate. What
+            // authorizes the result stays the first request's.
+            existing.deadline = deadline;
+            for held in self.held.iter_mut() {
+                if held.delivery.retry_key == key {
+                    held.until = hold_until(held.began, deadline);
+                }
+            }
             return;
         }
         let info = RequestInfo {
@@ -472,6 +584,7 @@ impl BoundFrontend {
             namespace: logical.namespace,
             keys: request_keys(logical),
             intervals: request_intervals(logical),
+            deadline,
         };
         self.requests.insert(key, info);
         self.order.push_back(key);
@@ -483,8 +596,33 @@ impl BoundFrontend {
     }
 
     /// Gate a delivery for `connection`'s session (a release, a retained
-    /// result or a resolution) against a fresh barrier.
+    /// result or a resolution) against a fresh barrier, answering now: a
+    /// disclosure whose session this node has not projected yet is
+    /// answered `Pending`. `deliver_at` holds it instead.
     pub fn deliver(&mut self, delivery: Delivery, policy: &dyn PolicySource) -> Delivered {
+        self.deliver_with(None, delivery, policy)
+    }
+
+    /// Gate a delivery as `deliver` does, at `now` (the monotonic reading
+    /// a request's deadline is measured on), holding a disclosure whose
+    /// session this node has not projected yet until it has (task-d93).
+    /// A held delivery is `Delivered::Held`, and `release_held` hands it
+    /// out.
+    pub fn deliver_at(
+        &mut self,
+        now: MonotonicMillis,
+        delivery: Delivery,
+        policy: &dyn PolicySource,
+    ) -> Delivered {
+        self.deliver_with(Some(now), delivery, policy)
+    }
+
+    fn deliver_with(
+        &mut self,
+        now: Option<MonotonicMillis>,
+        delivery: Delivery,
+        policy: &dyn PolicySource,
+    ) -> Delivered {
         // An establishment's outcome is not output to gate: the caller
         // it answers has no session yet, and what it gets back is the
         // acknowledgement of the one this command created.
@@ -498,7 +636,10 @@ impl BoundFrontend {
         else {
             return Delivered::Answer(delivery);
         };
-        Delivered::Answer(self.gate(delivery, session, scope, policy))
+        match self.gate(now, delivery, session, scope, policy) {
+            Gated::Out(delivery) => Delivered::Answer(delivery),
+            Gated::Held(_) => Delivered::Held,
+        }
     }
 
     /// Gate a result the durable record retained for `delivery`'s retry
@@ -515,6 +656,10 @@ impl BoundFrontend {
     /// record's command. The record decides which command the key is
     /// bound to, so an entry this key holds for another command is
     /// replaced rather than used to authorize output it did not produce.
+    ///
+    /// A retained result is answered at once: one this node cannot
+    /// disclose yet is answered `Pending` rather than held, since its
+    /// caller is answered on the stream it retried on, within the call.
     pub fn deliver_retained(
         &mut self,
         delivery: Delivery,
@@ -531,26 +676,104 @@ impl BoundFrontend {
             self.requests.remove(&key);
             self.order.retain(|k| *k != key);
         }
-        self.remember(key, command, logical);
+        self.remember(key, command, logical, None);
         self.deliver(delivery, policy)
     }
 
+    /// The held disclosures that can go out at `now`: each is gated
+    /// again, and goes out as that gate decides once this node has
+    /// projected its caller's session, or as `Pending` once its hold's
+    /// deadline has passed (task-d93). The rest stay held.
+    ///
+    /// Called whenever this node's projection may have moved, and at
+    /// `next_hold_deadline`.
+    pub fn release_held(
+        &mut self,
+        now: MonotonicMillis,
+        policy: &dyn PolicySource,
+    ) -> Vec<Delivery> {
+        let mut out = Vec::new();
+        for held in std::mem::take(&mut self.held) {
+            match self.decide(held.delivery, held.session, held.scope, policy) {
+                Decision::Out(delivery) => out.push(delivery),
+                Decision::NotYet(delivery, command) if held.until <= now => {
+                    out.push(self.defer(delivery, command));
+                }
+                Decision::NotYet(delivery, _) => self.held.push(Held { delivery, ..held }),
+            }
+        }
+        out
+    }
+
+    /// Whether the gate holds any disclosure now.
+    pub fn holds_any(&self) -> bool {
+        !self.held.is_empty()
+    }
+
+    /// The earliest deadline of a held disclosure: nothing arrives to say
+    /// it has passed.
+    pub fn next_hold_deadline(&self) -> Option<MonotonicMillis> {
+        self.held.iter().map(|h| h.until).min()
+    }
+
+    /// Gate a delivery, holding it if this node has not projected the
+    /// caller's session yet and `now` says when the hold began
+    /// (task-d93). Without `now` such a delivery is answered `Pending`.
     fn gate(
+        &mut self,
+        now: Option<MonotonicMillis>,
+        delivery: Delivery,
+        session: coord_types::ids::SessionId,
+        scope: u32,
+        policy: &dyn PolicySource,
+    ) -> Gated {
+        match self.decide(delivery, session, scope, policy) {
+            Decision::Out(delivery) => Gated::Out(delivery),
+            Decision::NotYet(delivery, command) => {
+                let Some(now) = now else {
+                    return Gated::Out(self.defer(delivery, command));
+                };
+                let deadline = self
+                    .requests
+                    .get(&delivery.retry_key)
+                    .and_then(|i| i.deadline);
+                let until = hold_until(now, deadline);
+                // A deadline already passed, or no room: answered as
+                // before the hold, `Pending`. The hold is bounded as the
+                // request metadata it rests on is.
+                if until <= now || self.held.len() >= self.max_requests {
+                    return Gated::Out(self.defer(delivery, command));
+                }
+                self.holds += 1;
+                self.held.push(Held {
+                    delivery,
+                    session,
+                    scope,
+                    until,
+                    began: now,
+                });
+                Gated::Held(command)
+            }
+        }
+    }
+
+    /// The gate's decision about one delivery against a fresh barrier.
+    fn decide(
         &mut self,
         delivery: Delivery,
         session: coord_types::ids::SessionId,
         scope: u32,
         policy: &dyn PolicySource,
-    ) -> Delivery {
+    ) -> Decision {
         let response = match decode_stream(&delivery.frame).as_deref() {
             Ok([MessageV1::Response(r)]) => r.clone(),
-            _ => return delivery,
+            _ => return Decision::Out(delivery),
         };
         let OutcomeV1::Ok { result, .. } = &response.outcome else {
-            return delivery;
+            return Decision::Out(delivery);
         };
         let Ok(decoded) = postcard::from_bytes::<Response>(result.as_slice()) else {
-            return self.deny(delivery, response.command_id);
+            return Decision::Out(self.deny(delivery, response.command_id));
         };
         let mut keys = protected_keys(&decoded);
         let info = self.requests.get(&delivery.retry_key);
@@ -559,7 +782,7 @@ impl BoundFrontend {
                 Some(i) => keys.extend(i.keys.iter().cloned()),
                 // The request is unknown here: its keys cannot be named,
                 // so the previous values are not disclosed.
-                None => return self.deny(delivery, response.command_id),
+                None => return Decision::Out(self.deny(delivery, response.command_id)),
             }
         }
         // An empty key list is not evidence that nothing is disclosed: a
@@ -569,10 +792,10 @@ impl BoundFrontend {
         // mutation acknowledgement passes without a barrier.
         let reads = is_read_output(&decoded);
         if keys.is_empty() && !reads {
-            return delivery;
+            return Decision::Out(delivery);
         }
         let Some(info) = info else {
-            return self.deny(delivery, response.command_id);
+            return Decision::Out(self.deny(delivery, response.command_id));
         };
         let namespace = info.namespace;
         let intervals = info.intervals.clone();
@@ -582,11 +805,11 @@ impl BoundFrontend {
         // unary admission entirely, so without this a token without the
         // read bit would still receive read output.
         if reads && scope & PolicyAction::Read.bit() == 0 {
-            return self.deny(delivery, response.command_id);
+            return Decision::Out(self.deny(delivery, response.command_id));
         }
         self.barriers_read += 1;
         let Ok(barrier) = policy.barrier(namespace, &session) else {
-            return self.deny(delivery, response.command_id);
+            return Decision::Out(self.deny(delivery, response.command_id));
         };
         // "Not yet" is not "no". This node's binding was established
         // from a committed session-creation command, but the barrier
@@ -599,27 +822,29 @@ impl BoundFrontend {
         // less of. Under load that is a caller whose reads never
         // succeed again, on a domain that is working.
         //
-        // So a session this node has never seen means wait, and the
-        // caller resolves as it does for any pending outcome. Once a
-        // barrier has shown the row, its absence is a real answer:
-        // policy moved, and the projection only moves forward.
+        // So a session this node has never seen means wait: the gate
+        // holds the disclosure until this node's projection shows the
+        // session (task-d93), and past the hold's deadline the caller
+        // resolves as it does for any pending outcome. Once a barrier
+        // has shown the row, its absence is a real answer: policy
+        // moved, and the projection only moves forward.
         if barrier.session_record().is_none() && !self.seen.contains(&delivery.connection) {
-            return self.defer(delivery, response.command_id);
+            return Decision::NotYet(delivery, response.command_id);
         }
         self.seen.insert(delivery.connection);
         if !barrier.permits_keys(keys.iter().map(Vec::as_slice)) {
-            return self.deny(delivery, response.command_id);
+            return Decision::Out(self.deny(delivery, response.command_id));
         }
         // What the request asked to read, not only what came back: the
         // count, the truncation flag and the keys that are absent all
         // describe the interval that was asked for.
         if !intervals.iter().all(|i| barrier.permits_interval(i)) {
-            return self.deny(delivery, response.command_id);
+            return Decision::Out(self.deny(delivery, response.command_id));
         }
-        delivery
+        Decision::Out(delivery)
     }
 
-    /// Hold a disclosure this node cannot yet decide: nothing is shown,
+    /// Answer a disclosure this node cannot yet decide: nothing is shown,
     /// and the caller is told the outcome is still pending rather than
     /// that its credential was refused.
     fn defer(&mut self, delivery: Delivery, command: coord_types::CommandId) -> Delivery {
@@ -633,6 +858,10 @@ impl BoundFrontend {
         }
     }
 
+    /// Withhold an executed command's result: `OUTPUT_WITHHELD`, never
+    /// `NOT_ADMITTED` (task-d23). The command was admitted and executed;
+    /// telling the caller it was not would have it take a write that
+    /// happened for one that did not.
     fn deny(&mut self, delivery: Delivery, command: coord_types::CommandId) -> Delivery {
         self.denied += 1;
         Delivery {
@@ -640,7 +869,7 @@ impl BoundFrontend {
             retry_key: delivery.retry_key,
             frame: MessageV1::Response(codes::error_response(
                 command,
-                codes::NOT_ADMITTED,
+                codes::OUTPUT_WITHHELD,
                 "output not authorized by current policy",
             ))
             .encode()
@@ -723,6 +952,7 @@ impl BoundFrontend {
     pub fn on_connection_closed(&mut self, connection: u64, hub: &WatchHub) {
         self.bindings.remove(&connection);
         self.seen.remove(&connection);
+        self.held.retain(|h| h.delivery.connection != connection);
         self.watches.retain(|(c, _), _| *c != connection);
         self.dispatcher.on_connection_closed(connection, hub);
     }
