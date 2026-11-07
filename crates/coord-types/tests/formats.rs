@@ -131,6 +131,12 @@ fn every_feature_in_the_registry_is_one_this_build_supports() {
 #[test]
 fn a_prepare_marker_names_its_feature_and_is_never_reported() {
     assert_eq!(Feature::EarlyProposalPrepared.id(), 0x0005);
+    assert_eq!(Feature::ReleaseAtExecution.id(), 0x0006);
+    assert_eq!(Feature::ReleaseAtExecutionPrepared.id(), 0x0007);
+    assert_eq!(
+        Feature::ReleaseAtExecution.prepare_marker(),
+        Some(Feature::ReleaseAtExecutionPrepared)
+    );
     assert_eq!(
         Feature::EarlyProposal.prepare_marker(),
         Some(Feature::EarlyProposalPrepared)

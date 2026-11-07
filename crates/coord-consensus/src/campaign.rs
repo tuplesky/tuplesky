@@ -19,7 +19,7 @@ use coord_types::ids::{Ballot, ReplicaId};
 use crate::phase::Phase;
 use crate::quorum::BallotConfiguration;
 use crate::recovery::{
-    CandidateDecisions, RecoveryError, RecoveryReport, SyncDecision, select_decided,
+    CandidateDecisions, RecoveryError, RecoveryReport, SyncDecision, select_ruled,
 };
 use crate::summary::{PageError, ReportAssembler, ReportPage};
 
@@ -55,6 +55,8 @@ pub struct Campaign {
     /// Commands the candidate executed and forgot whose durable
     /// dependency rows the selection last waited on (task-d77).
     rows_wanted: Vec<CommandId>,
+    /// The rules its selection applies beyond task-29's (task-d90).
+    rules: crate::recovery::SelectionRules,
 }
 
 impl Campaign {
@@ -77,7 +79,20 @@ impl Campaign {
             supply_moves: 0,
             sources: Vec::new(),
             rows_wanted: Vec::new(),
+            rules: crate::recovery::SelectionRules::default(),
         }
+    }
+
+    /// Select under `rules` ([`crate::recovery::select_ruled`]).
+    #[must_use]
+    pub const fn ruled(mut self, rules: crate::recovery::SelectionRules) -> Self {
+        self.rules = rules;
+        self
+    }
+
+    /// Select under `rules` from here on.
+    pub const fn set_rules(&mut self, rules: crate::recovery::SelectionRules) {
+        self.rules = rules;
     }
 
     /// Voters whose promise for this ballot arrived (the candidate
@@ -389,7 +404,14 @@ impl Campaign {
         }
         let decision = loop {
             let source = |b: &Ballot| self.sources.iter().find(|c| c.ballot() == *b).cloned();
-            match select_decided(&self.config, &reports, &supplied, source, &decided) {
+            match select_ruled(
+                &self.config,
+                &reports,
+                &supplied,
+                source,
+                &decided,
+                self.rules,
+            ) {
                 Ok(decision) => break decision,
                 // Rows the runtime reads for the candidate: waited for, as
                 // a payload is (task-d77).

@@ -123,6 +123,10 @@ pub enum Rejection {
     /// A service command presented again while still unlearned: its
     /// proposal was published to the other voters again, unchanged.
     ProposalRepublished(CommandId),
+    /// This leader's acceptance of a command was not counted: its payload
+    /// row is neither durable here nor in the batch the acceptance rests
+    /// on (task-d90).
+    NoPayloadRow(CommandId),
     /// The leader stopped leading; a new election recovers the role.
     Fenced(FenceReason),
     /// A peer message was rejected.
@@ -710,10 +714,14 @@ impl Leader {
             ledger: self.ledger,
             payloads: self.payloads,
             bindings: self.bindings,
+            // A durable proposal whose batch wrote the payload row: a
+            // re-proposal of an entry this leader held without its
+            // payload wrote none, and its follower would report a payload
+            // it cannot serve (task-d90, point 4; protocol_sim row 20).
             served_payloads: self
                 .proposals
                 .values()
-                .filter(|p| p.durable)
+                .filter(|p| p.durable && writes_payload(&p.updates))
                 .map(|p| p.command)
                 .chain(self.served_payloads)
                 .collect(),
@@ -1081,7 +1089,7 @@ impl Leader {
         self.seqnum += 1;
         let record = self.table.record(&command).expect("known").clone();
         let barrier = self.alloc.as_mut().expect("booted").allocate();
-        let updates = alloc::vec![
+        let mut updates = alloc::vec![
             dependency_update(epoch, &command, &record).expect("bounded"),
             proposal_update(
                 epoch,
@@ -1095,6 +1103,20 @@ impl Leader {
             )
             .expect("bounded"),
         ];
+        // The payload row too, where it is not durable here yet (task-d90):
+        // the batch is this leader's acceptance, and the acceptance has to
+        // rest on a payload a recovery can re-execute from. A payload
+        // fetched for the selection was written in a batch no vote
+        // required, and one still in flight when this replica took the
+        // lead is no batch this leader follows.
+        if !self.served_payloads.contains(&command)
+            && let Some(payload) = self
+                .payloads
+                .get(&command)
+                .filter(|p| Some(p.admission_digest()) == record.payload)
+        {
+            updates.push(payload_update(&command, payload).expect("bounded"));
+        }
         self.ledger.stage(barrier, command, record.clone());
         let proposal = FastAck {
             replica: self.config.identity.replica,
@@ -1710,6 +1732,7 @@ impl Leader {
         let mut report =
             self.ledger
                 .report(self.config.identity.replica, ballot, self.ballots.synced());
+        crate::follower::report_durable_payloads(&mut report, &self.served_payloads);
         // The report is labelled with the ballot this leader synchronized
         // to, and its selection is that ballot's state, whether or not its
         // re-proposal batches are durable yet, or were made at all for an
@@ -1747,6 +1770,25 @@ impl Leader {
         self.learner.executed_through()
     }
 
+    /// Count this replica's executions durable only as its runtime says
+    /// they are ([`Self::executions_durable_through`]), not when they are
+    /// applied (task-d90). For a runtime whose execution groups reach
+    /// the journal after their outcomes are taken.
+    pub fn track_execution_durability(&mut self) {
+        self.table.track_execution_durability();
+    }
+
+    /// This replica's journal holds its executions through `position`
+    /// (task-d90): those may now be forgotten, in their turn.
+    pub fn executions_durable_through(&mut self, position: ExecutionPosition) {
+        let undurable = self
+            .learner
+            .executed_through()
+            .get()
+            .saturating_sub(position.get());
+        self.table.executions_durable_except(undurable);
+    }
+
     /// The materializer applied `command`: seal and publish the established
     /// result, then learn whatever the new phase enables.
     pub fn applied(
@@ -1780,11 +1822,13 @@ impl Leader {
         // on a disclosure nothing was going to assemble.
         //
         // It rests on more evidence than the speculative release, not
-        // less: the command is committed, its whole prefix has executed
-        // before it, and its result is durable. That is why it carries
-        // `speculative: false`. Durable is the record: in a group on a
-        // pipelined store the release goes out at the group's
-        // `JournalDurable`, before its projection commit (task-d63).
+        // less: the command is committed and its whole prefix has
+        // executed before it. That is why it carries `speculative:
+        // false`. It goes out as the command executes, not at its
+        // group's `JournalDurable` (task-d90, design Section 4.5): it
+        // rests on recovery reproducing the decision and its inputs, and
+        // the establishment above waits for the group instead, since a
+        // voter forgets only executions its journal holds.
         let released = self.speculation.released(&command);
         self.speculation
             .reconcile(command, outcome.position, outcome.result_digest)
@@ -2597,6 +2641,11 @@ impl Leader {
                     let calls = self.resend_calls;
                     if let Some(p) = self.proposals.get_mut(&command) {
                         p.durable = true;
+                        // Its payload row is durable here now, if the
+                        // batch wrote it (task-d90).
+                        if writes_payload(&p.updates) {
+                            self.served_payloads.insert(command);
+                        }
                         // A restart finds this batch from now on, so it
                         // comes back following (task-d98).
                         self.early_ready = true;
@@ -2763,7 +2812,20 @@ impl Leader {
     /// crash that loses the acceptance batch leaves a restarted leader
     /// reporting PRE-ACCEPT. Counting the leader for its proposal made a
     /// slow majority that a recovering majority could miss entirely.
+    ///
+    /// Nor before the payload row (task-d90): the leader's acceptance is a
+    /// vote recovery may re-execute from, so it counts only where the
+    /// payload row is durable here or in a proposal batch it waits on.
     fn adopt_own(&mut self, command: CommandId, barrier: BarrierId) {
+        if !self.served_payloads.contains(&command)
+            && !self
+                .proposals
+                .get(&command)
+                .is_some_and(|p| writes_payload(&p.updates))
+        {
+            self.rejections.push(Rejection::NoPayloadRow(command));
+            return;
+        }
         let (Some(boot), Some(admission)) = (
             self.boot,
             self.proposals
@@ -3515,6 +3577,14 @@ impl Leader {
     pub fn outstanding_barriers(&self) -> Vec<BarrierId> {
         self.outstanding()
     }
+}
+
+/// Whether a proposal batch writes the command's payload row (task-d90).
+fn writes_payload(updates: &[StoreUpdate]) -> bool {
+    let payloads = coord_store_api::registry::Collection::PayloadV1.id();
+    updates
+        .iter()
+        .any(|u| u.collection == payloads && u.value.is_some())
 }
 
 #[cfg(test)]
