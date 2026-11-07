@@ -1226,3 +1226,117 @@ fn a_step_that_asks_for_more_than_the_queue_holds_is_carried_out() {
     assert_eq!(coord_storage::Persistence::queued(store), 0);
     assert_eq!(voter.node().held(), 0, "every send was released");
 }
+
+/// A follower below its own fence takes a request and serves on (#197
+/// review): the store refuses its vote batch as fenced, and nothing is
+/// written again at that failure. A write there was refused the same way
+/// and written again until `carry_out` gave up and the node stopped; an
+/// election race puts a follower in this state, as Jepsen's repeated
+/// leader kills found (task-d01).
+#[test]
+fn a_fenced_follower_takes_a_request_and_serves_on() {
+    let mut follower = stamped(1);
+    promise_that_fails(
+        &mut follower,
+        2,
+        Ballot {
+            epoch: epoch(),
+            number: 1,
+            leader: r(2),
+        },
+    );
+    let _ = follower
+        .on_submission(
+            PeerRole::Frontend,
+            &frame(&submission(1)),
+            Origin::Connection(8),
+        )
+        .expect("a follower below its fence serves on");
+}
+
+/// A command's vote batch fails and then its adoption batch, in the order
+/// a definite journal failure fails a group and the queue behind it (#197
+/// review). A later command on the same key names it: the batch that
+/// names it carries its rows, so no durable record here names a command
+/// with no row here.
+#[test]
+fn both_of_a_commands_batches_fail_then_a_later_vote_names_it() {
+    let mut leader = stamped(0);
+    let mut follower = stamped(1);
+    follower.node_mut().applier_mut().store_mut().hold = true;
+    let out = leader
+        .on_submission(
+            PeerRole::Frontend,
+            &frame(&submission(1)),
+            Origin::Connection(7),
+        )
+        .expect("serves")
+        .expect("admitted");
+    for (_, f) in out.peer.into_iter().filter(|(to, _)| to.replica == r(1)) {
+        follower
+            .on_peer(PeerProvenance::from_local_voter(r(0), inc()), f)
+            .expect("stepped");
+    }
+    follower
+        .on_submission(
+            PeerRole::Frontend,
+            &frame(&submission(1)),
+            Origin::Connection(8),
+        )
+        .expect("stepped")
+        .expect("admitted");
+    // Command A's vote batch and adoption batch, failed in submission
+    // order, as a definite journal failure fails a group and its queue.
+    let held = core::mem::take(&mut follower.node_mut().applier_mut().store_mut().held);
+    assert!(held.len() >= 2, "both of A's batches were held: {held:?}");
+    follower.node_mut().applier_mut().store_mut().hold = false;
+    let at = follower.ballot();
+    for barrier in held {
+        follower
+            .node_mut()
+            .on_storage(
+                coord_core::event::StorageEvent::Failed {
+                    barrier_id: barrier,
+                    error: coord_core::event::StorageError::DefinitelyNotCommitted,
+                },
+                &at,
+            )
+            .expect("a storage fact");
+    }
+    // Command B, same key: the follower acknowledges it to the leader.
+    let out = leader
+        .on_submission(
+            PeerRole::Frontend,
+            &frame(&submission(2)),
+            Origin::Connection(7),
+        )
+        .expect("serves")
+        .expect("admitted");
+    for (_, f) in out.peer.into_iter().filter(|(to, _)| to.replica == r(1)) {
+        follower
+            .on_peer(PeerProvenance::from_local_voter(r(0), inc()), f)
+            .expect("stepped");
+    }
+    follower
+        .on_submission(
+            PeerRole::Frontend,
+            &frame(&submission(2)),
+            Origin::Connection(8),
+        )
+        .expect("stepped")
+        .expect("admitted");
+    let Machine::Follower(f) = follower.node().machine() else {
+        panic!("a follower")
+    };
+    let report = f.report(ballot());
+    let durable: BTreeSet<_> = report.entries.iter().map(|e| e.command).collect();
+    assert!(report.entries.len() >= 2, "{report:?}");
+    for e in &report.entries {
+        assert!(
+            e.deps.iter().all(|d| durable.contains(d)),
+            "{:?} names {:?}",
+            e.command,
+            e.deps
+        );
+    }
+}
