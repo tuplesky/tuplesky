@@ -146,7 +146,7 @@ impl<E: LocalEngine> Domain<E> {
     fn run(&mut self, request: &LogicalRequest, seq: u64) -> (Admission, coord_state::Response) {
         let b = binding(seq, request);
         let gated = self.worker.reader().snapshot().unwrap();
-        let admission = retry::admit(gated.view(), &b, |_| true).unwrap();
+        let admission = retry::admit(gated.view(), &b, |_| Ok(true)).unwrap();
         if let Admission::Retry(record) = &admission {
             let stored: coord_state::Response = postcard::from_bytes(&record.response).unwrap();
             return (admission.clone(), stored);

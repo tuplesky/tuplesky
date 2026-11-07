@@ -1792,11 +1792,13 @@ impl Leader {
         // on a disclosure nothing was going to assemble.
         //
         // It rests on more evidence than the speculative release, not
-        // less: the command is committed, its whole prefix has executed
-        // before it, and its result is durable. That is why it carries
-        // `speculative: false`. Durable is the record: in a group on a
-        // pipelined store the release goes out at the group's
-        // `JournalDurable`, before its projection commit (task-d63).
+        // less: the command is committed and its whole prefix has
+        // executed before it. That is why it carries `speculative:
+        // false`. It goes out as the command executes, not at its
+        // group's `JournalDurable` (task-d90, design Section 4.5): it
+        // rests on recovery reproducing the decision and its inputs, and
+        // the establishment above waits for the group instead, since a
+        // voter forgets only executions its journal holds.
         let released = self.speculation.released(&command);
         self.speculation
             .reconcile(command, outcome.position, outcome.result_digest)
