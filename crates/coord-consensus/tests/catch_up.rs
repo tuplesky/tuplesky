@@ -873,7 +873,8 @@ fn a_command_the_donor_keeps_no_row_of_goes_to_history() {
 /// A pulled command whose installation batch fails is installed again,
 /// rather than left waiting on a batch that will never be durable: the
 /// voter does not wedge, and catches up once its store takes the batch
-/// (task-d08).
+/// (task-d08). It is installed again at its next event, not at the
+/// failure (#197 review).
 #[test]
 fn a_failed_installation_is_installed_again() {
     let (mut cluster, _) = left_behind(13);
@@ -882,8 +883,12 @@ fn a_failed_installation_is_installed_again() {
     let page = cluster.page(0, ballot0(), after);
     cluster.failing = Some((4, 2));
     cluster.deliver_page(4, 0, &page);
-    assert_eq!(cluster.failed, 2, "both failures reached r4");
+    // The window failed is installed again at the next event that is not
+    // a failure, not at the failure itself (#197 review).
+    assert_eq!(cluster.failed, 1, "one failure a delivery");
+    cluster.tick();
     cluster.settle();
+    assert_eq!(cluster.failed, 2, "both failures reached r4");
     assert!(
         cluster.nodes[4].executed.len() > before,
         "r4 wedged on a failed installation"
@@ -892,6 +897,22 @@ fn a_failed_installation_is_installed_again() {
     cluster.settle_ticking(8);
     assert_eq!(cluster.nodes[4].executed, cluster.nodes[0].executed);
     assert!(!cluster.follower(4).holds_unexecuted());
+}
+
+/// A window refused by a store that refuses every batch, as a fenced one
+/// does: one delivered page fails one batch, not a loop (#197 review).
+/// Installed again at the failure itself, the page failed 200.
+#[test]
+fn a_store_that_refuses_every_batch_fails_one_window_a_page() {
+    let (mut cluster, _) = left_behind(13);
+    let after = cluster.follower(4).executed_through();
+    let page = cluster.page(0, ballot0(), after);
+    cluster.failing = Some((4, 200));
+    cluster.deliver_page(4, 0, &page);
+    assert_eq!(
+        cluster.failed, 1,
+        "the window was written again at its failure"
+    );
 }
 
 /// A page cut short of what the donor executed -- by the byte bound as

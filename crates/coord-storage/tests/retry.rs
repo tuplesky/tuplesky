@@ -105,7 +105,7 @@ impl<E: LocalEngine> Domain<E> {
     ) -> (Admission, Option<coord_state::Response>) {
         let b = binding(seq, request);
         let gated = self.worker.reader().snapshot().unwrap();
-        let admission = retry::admit(gated.view(), &b, |_| true).unwrap();
+        let admission = retry::admit(gated.view(), &b, |_| Ok(true)).unwrap();
         if admission != Admission::New {
             return (admission, None);
         }
@@ -135,7 +135,7 @@ impl<E: LocalEngine> Domain<E> {
 
     fn resolve(&self, seq: u64, request: &LogicalRequest, authorized: bool) -> Resolution {
         let gated = self.worker.reader().snapshot().unwrap();
-        retry::resolve(gated.view(), &binding(seq, request), |_| authorized).unwrap()
+        retry::resolve(gated.view(), &binding(seq, request), |_| Ok(authorized)).unwrap()
     }
 
     fn retire_through(&mut self, seq: u64) {
@@ -165,7 +165,7 @@ impl<E: LocalEngine> Domain<E> {
         let mut b = binding(seq, request);
         let gated = self.worker.reader().snapshot().unwrap();
         b.retires = retry::retirement(gated.view(), &b.retry_key, ack_through).unwrap();
-        let admission = retry::admit(gated.view(), &b, |_| true).unwrap();
+        let admission = retry::admit(gated.view(), &b, |_| Ok(true)).unwrap();
         if admission != Admission::New {
             return (admission, None);
         }
@@ -475,7 +475,7 @@ fn admission_is_revalidated_atomically_with_the_application_batch() {
     // Admit and plan from one snapshot.
     let gated = d.worker.reader().snapshot().unwrap();
     assert_eq!(
-        retry::admit(gated.view(), &b, |_| true).unwrap(),
+        retry::admit(gated.view(), &b, |_| Ok(true)).unwrap(),
         Admission::New
     );
     let view = build_read_view(

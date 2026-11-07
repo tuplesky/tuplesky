@@ -722,6 +722,17 @@ impl BallotState {
         })
     }
 
+    /// The marker of `ballot` failed (#197 review): nothing of it is
+    /// durable, so the synchronized ballot goes back to `previous`, unless
+    /// another marker has taken its place since. Left at `ballot`, a
+    /// report labelled the older rows with it, and a promise row written
+    /// after made that durable.
+    pub fn unmark_synced(&mut self, ballot: Ballot, previous: Ballot) {
+        if self.synced == ballot {
+            self.synced = previous;
+        }
+    }
+
     /// The highest promise already queued for disk: the durable promise or
     /// the highest promise in flight, whichever is higher.
     ///

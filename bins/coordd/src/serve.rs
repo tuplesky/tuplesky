@@ -5702,7 +5702,7 @@ fn resolve_retained_unread<V: coord_store_api::OrderedRead>(
             command_id: command,
             retires: None,
         },
-        |_| false,
+        |_| Ok(false),
     )
     .map(Some)
 }
@@ -5837,7 +5837,7 @@ mod tests {
                     command_id: command,
                     retires: None,
                 },
-                |_| true,
+                |_| Ok(true),
             )
             .unwrap();
             (retained, resolved)

@@ -980,6 +980,68 @@ fn a_new_leaders_first_command_follows_the_recovered_tail() {
     }
 }
 
+/// A follower whose executions the runtime reports durable keeps every
+/// command it executed in its recovery report until the journal holds
+/// that execution (task-d90, point 2).
+///
+/// A command forgotten is left out of a report. Executed in memory, and
+/// released before its execution group was durable, a command forgotten
+/// then was in no voter's report once every voter crashed.
+#[test]
+fn a_follower_reports_a_command_until_its_execution_is_durable() {
+    let capacity = 32usize;
+    let history = 200u64;
+    let mut cluster = Cluster::new(29);
+    cluster.nodes[1].follower_mut().track_execution_durability();
+    let mut submitted = Vec::new();
+    for n in 0..history {
+        submitted.push(cluster.admit(n + 1, (n % 250) as u8));
+        cluster.settle();
+    }
+    for i in 0..3 {
+        assert_eq!(cluster.nodes[i].executed, submitted, "node {i}");
+    }
+    let reported = |f: &Follower| -> BTreeSet<CommandId> {
+        f.report(ballot(1, 2))
+            .entries
+            .iter()
+            .map(|e| e.command)
+            .collect()
+    };
+    // The untracked follower forgets the oldest history; the tracking
+    // one, whose journal holds none of its executions yet, reports it all.
+    let first = submitted[0];
+    assert!(!reported(cluster.nodes[2].follower()).contains(&first));
+    let ours = reported(cluster.nodes[1].follower());
+    assert!(
+        submitted.iter().all(|c| ours.contains(c)),
+        "{} of {history} reported",
+        submitted.iter().filter(|c| ours.contains(c)).count()
+    );
+    // Durable through all but the last capacity: still everything past
+    // the first durable execution's window.
+    let through = cluster.nodes[1].follower().executed_through();
+    let all_but = ExecutionPosition::new(through.get() - capacity as u64).unwrap();
+    cluster.nodes[1]
+        .follower_mut()
+        .executions_durable_through(all_but);
+    let ours = reported(cluster.nodes[1].follower());
+    assert!(!ours.contains(&first));
+    assert!(
+        submitted[submitted.len() - 2 * capacity..]
+            .iter()
+            .all(|c| ours.contains(c))
+    );
+    // All durable: what the untracked follower reports.
+    cluster.nodes[1]
+        .follower_mut()
+        .executions_durable_through(through);
+    assert_eq!(
+        reported(cluster.nodes[1].follower()),
+        reported(cluster.nodes[2].follower())
+    );
+}
+
 /// An election after more history than the table holds completes in one
 /// campaign, asks for no payload of a command the candidate executed,
 /// carries a selection bounded by the table rather than the history, and

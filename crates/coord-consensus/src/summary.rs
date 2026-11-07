@@ -166,6 +166,27 @@ impl DurableLedger {
             .and_then(|s| s.first().map(|(c, _)| *c))
     }
 
+    /// The commands the batch under `barrier` writes, while it is in
+    /// flight.
+    pub fn staged_commands(&self, barrier: &BarrierId) -> Vec<CommandId> {
+        self.staged
+            .get(barrier)
+            .map(|s| s.iter().map(|(c, _)| *c).collect())
+            .unwrap_or_default()
+    }
+
+    /// The newest record written of `command`: the one the newest batch
+    /// in flight stages, else the durable one. Barriers are allocated in
+    /// order within a boot.
+    pub fn newest(&self, command: &CommandId) -> Option<&CommandRecord> {
+        self.staged
+            .values()
+            .rev()
+            .find_map(|batch| batch.iter().rev().find(|(c, _)| c == command))
+            .map(|(_, r)| r)
+            .or_else(|| self.records.get(command))
+    }
+
     /// The barriers of the batches still in flight.
     pub fn in_flight(&self) -> impl Iterator<Item = BarrierId> + '_ {
         self.staged.keys().copied()
@@ -174,6 +195,20 @@ impl DurableLedger {
     /// Durable record of a command.
     pub fn record(&self, command: &CommandId) -> Option<&CommandRecord> {
         self.records.get(command)
+    }
+
+    /// The record the newest batch in flight writes for each command it
+    /// stages: what the ledger holds of it once those batches are durable
+    /// (task-d90). Barriers are allocated in order within a boot, and a
+    /// restart starts the ledger again from the durable rows.
+    pub fn in_flight_records(&self) -> BTreeMap<CommandId, &CommandRecord> {
+        let mut out = BTreeMap::new();
+        for batch in self.staged.values() {
+            for (command, record) in batch {
+                out.insert(*command, record);
+            }
+        }
+        out
     }
 
     /// Whether `command` has a durable record or one in a batch still in

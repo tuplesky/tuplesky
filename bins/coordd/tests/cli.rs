@@ -6686,6 +6686,52 @@ async fn an_operator_activates_a_feature_in_a_running_domain() {
         "the leader sent nothing early once the feature was active:\n{}",
         running[0].said()
     );
+    // The release rule (task-d90) is activated the same way, beside the
+    // first, and the domain goes on answering under it.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let answer = admin(&dir, 1, "feature activate release-at-execution").await;
+        if answer.ok {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the release rule was never activated: {}",
+            answer.text
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    let both = |text: &str| {
+        text.lines()
+            .any(|l| l.starts_with("active ") && l.contains("release-at-execution"))
+            && text
+                .lines()
+                .filter(|l| l.starts_with("voter "))
+                .filter_map(|l| l.split(" held ").nth(1))
+                .all(|held| {
+                    held.contains("early-proposal") && held.contains("release-at-execution")
+                })
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut status = admin(&dir, 1, "feature status").await;
+    while !both(&status.text) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "not every voter holds both activations:\n{}",
+            status.text
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        status = admin(&dir, 1, "feature status").await;
+    }
+    for sequence in 6..=10u64 {
+        let put = ask(&caller.connection, &caller.put(sequence, b"k", b"v"))
+            .await
+            .expect("the domain established a write under the release rule");
+        assert!(matches!(
+            response_of(&put).outcome,
+            coord_types::wire_v1::OutcomeV1::Ok { .. }
+        ));
+    }
     // A voter restarted after the activation holds it, and says so again.
     drop(running.remove(2));
     running.push(start(&cluster.configs[2]));
@@ -6698,6 +6744,13 @@ async fn an_operator_activates_a_feature_in_a_running_domain() {
     assert!(
         mine.text.contains("active early-proposal"),
         "the restarted voter's own switch is off:\n{}",
+        mine.text
+    );
+    assert!(
+        mine.text
+            .lines()
+            .any(|l| l.starts_with("active ") && l.contains("release-at-execution")),
+        "the restarted voter's release switch is off:\n{}",
         mine.text
     );
     // The restart may have moved leadership: the leader's view is the
