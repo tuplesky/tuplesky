@@ -572,9 +572,26 @@ pub fn select_ruled(
         }
     }
     if let Some(command) = accepted_somewhere.difference(&with_payload).next() {
+        // The reporter that holds the acceptance without its payload,
+        // not merely the first that names the command: a campaign sets
+        // that report aside and selects again. Named by a reporter that
+        // held the command's payload at a pre-acceptance, the campaign set
+        // aside the reports that could supply it, one by one, and never
+        // selected; a leader that crashed between its Sync row and its
+        // payload rows held the acceptance (protocol_sim row 21, five
+        // voters, seed 518).
         let replica = reports
             .iter()
-            .find(|r| r.entries.iter().any(|e| e.command == *command))
+            .find(|r| {
+                r.entries.iter().any(|e| {
+                    e.command == *command && e.phase >= Phase::Accept && !e.payload_present
+                })
+            })
+            .or_else(|| {
+                reports
+                    .iter()
+                    .find(|r| r.entries.iter().any(|e| e.command == *command))
+            })
             .map_or(reports[0].replica, |r| r.replica);
         return Err(RecoveryError::HalfInitialized {
             replica,
