@@ -558,83 +558,25 @@ fn a_crash_between_state_and_vote_preserves_the_learning_obligation() {
         recovered.table().record(&c2).unwrap().path,
         "identical path evidence with and without the crash"
     );
-    // A failed batch is reported and leaves the command where it was; its
-    // rows are written again, without the vote (task-d90).
+    // A failed batch is reported and leaves the command where it was.
     let mut g = booted(1);
     let (e3, c3) = admitted(3, 3, 3);
     let effects = g.step(e3);
     let Effect::Persist(b) = &effects[0] else {
         panic!()
     };
-    let again = persisted(&g.step(Event::Storage(StorageEvent::Failed {
-        barrier_id: b.barrier,
-        error: StorageError::NoSpace,
-    })));
-    assert_eq!(again.len(), 1, "the record's rows, once more");
+    assert!(
+        g.step(Event::Storage(StorageEvent::Failed {
+            barrier_id: b.barrier,
+            error: StorageError::NoSpace
+        }))
+        .is_empty()
+    );
     assert_eq!(
         g.take_rejections(),
         vec![FollowerRejection::BatchFailed(c3)]
     );
     assert_eq!(g.pending_sends(), 0, "the vote is dropped with its batch");
-}
-
-/// A vote's batch fails (task-d90): the record stays in the table, so the
-/// next vote on its keys names it as a dependency. Its rows are written
-/// again at once, without the vote, and the next vote's acknowledgement
-/// waits on that batch: it goes out only once the dependency it names is
-/// durable here. Before, nothing wrote the record again, the later vote's
-/// row named a command a restart lost, and a recovery read the gap as
-/// another order than the leader's and re-proposed a command a fast
-/// quorum had decided (protocol_sim row 21, five voters, seed 608).
-#[test]
-fn a_failed_vote_batch_writes_its_record_again_before_a_vote_that_names_it() {
-    let mut g = booted(1);
-    let (e1, c1) = admitted(1, 1, 1);
-    let first = effects_barrier(&g.step(e1));
-    let again = persisted(&g.step(Event::Storage(StorageEvent::Failed {
-        barrier_id: first,
-        error: StorageError::NoSpace,
-    })));
-    assert_eq!(again.len(), 1, "the record is written again");
-    let collections: Vec<Collection> = again[0]
-        .updates
-        .iter()
-        .map(|u| Collection::from_id(u.collection).unwrap())
-        .collect();
-    assert_eq!(
-        collections,
-        vec![Collection::PayloadV1, Collection::ProtocolV1]
-    );
-    let row = decode_dependency(again[0].updates[1].value.as_ref().unwrap()).unwrap();
-    assert_eq!(row.phase, Phase::PreAccept);
-    assert_eq!(&row.deps, &g.table().record(&c1).unwrap().deps);
-    assert_eq!(g.pending_sends(), 0, "no vote for the failed batch");
-    let (e2, c2) = admitted(2, 2, 2);
-    let second = effects_barrier(&g.step(e2));
-    assert_eq!(g.table().record(&c2).unwrap().deps, vec![c1]);
-    // The later vote's own batch completes first: its acknowledgement
-    // names `c1`, whose rows are not durable yet.
-    let released = g.step(Event::Storage(StorageEvent::JournalDurable {
-        barrier_id: second,
-        journal_seq: LocalJournalSeq::new(3).unwrap(),
-    }));
-    assert!(sends(&released).is_empty(), "{released:?}");
-    let released = g.step(Event::Storage(StorageEvent::JournalDurable {
-        barrier_id: again[0].barrier,
-        journal_seq: LocalJournalSeq::new(2).unwrap(),
-    }));
-    let sent = sends(&released);
-    assert_eq!(sent.len(), 2, "the leader and the frontend: {sent:?}");
-    for (_, m) in &sent {
-        assert!(
-            matches!(m, ProtocolMessage::FastAck(a) if a.command == c2 && a.deps == vec![c1]),
-            "{m:?}"
-        );
-    }
-    assert_eq!(
-        g.ledger().record(&c1).map(|r| r.phase),
-        Some(Phase::PreAccept)
-    );
 }
 
 fn effects_barrier(effects: &[Effect]) -> coord_core::effect::BarrierId {
@@ -1567,9 +1509,10 @@ fn a_decided_record_is_acknowledged_again_only_with_its_payload_row() {
 /// The payload batch an adoption waited on fails (#195 review): the
 /// acknowledgement it held was dropped, and kept evidence that names the
 /// failed batch would be dropped again each time it was published. It is
-/// forgotten, and the leader's next proposal is adopted again, in a batch
-/// that writes the payload row again, which the new acknowledgement waits
-/// on.
+/// forgotten. The acceptance is durable without its payload row, so the
+/// next event that is not a failure writes the payload row again (#197
+/// review), and the leader's next proposal is adopted again, its
+/// acknowledgement waiting on that row.
 #[test]
 fn a_failed_payload_batch_is_written_again_by_the_next_adoption() {
     let (c1, (rows, mut payloads)) = durable_admission();
@@ -1605,52 +1548,52 @@ fn a_failed_payload_batch_is_written_again_by_the_next_adoption() {
         sends(&released).is_empty(),
         "the payload row was never written"
     );
+    let repair = persisted(&released);
+    assert_eq!(
+        repair.len(),
+        1,
+        "the payload row written again: {released:?}"
+    );
+    assert!(
+        repair[0]
+            .updates
+            .iter()
+            .all(|u| u.collection == Collection::PayloadV1.id())
+    );
     // The leader proposes again, lacking this voter's vote.
     let effects = g.step(again());
     let batches = persisted(&effects);
     assert_eq!(batches.len(), 1, "adopted again: {effects:?}");
+    let mut sent = Vec::new();
+    for (seq, barrier) in [(2, repair[0].barrier), (3, batches[0].barrier)] {
+        sent.extend(sends(&g.step(Event::Storage(
+            StorageEvent::JournalDurable {
+                barrier_id: barrier,
+                journal_seq: LocalJournalSeq::new(seq).unwrap(),
+            },
+        ))));
+    }
     assert!(
-        batches[0]
-            .updates
-            .iter()
-            .any(|u| u.collection == Collection::PayloadV1.id()),
-        "the adoption writes the payload row again"
-    );
-    let released = g.step(Event::Storage(StorageEvent::JournalDurable {
-        barrier_id: batches[0].barrier,
-        journal_seq: LocalJournalSeq::new(2).unwrap(),
-    }));
-    assert!(
-        sends(&released)
-            .iter()
+        sent.iter()
             .any(|(to, m)| *to == r(0) && matches!(m, ProtocolMessage::SlowAck(_))),
-        "{released:?}"
+        "{sent:?}"
     );
 }
 
 /// A submission's own batch, which writes its payload row and its
 /// dependency row, fails (task-d90, point 4, the fault of protocol_sim's
 /// row 21): the record stays initialized in memory with its payload, and
-/// no row holds it. The failure writes its rows again, and the adoption
-/// of the leader's proposal for it waits on that batch's payload row.
+/// no row holds it. The adoption of the leader's proposal for it writes
+/// the payload row again, which the vote waits on.
 #[test]
 fn a_vote_after_its_submissions_batch_failed_writes_the_payload_row_again() {
     let mut f = booted(1);
     let (e1, c1) = admitted(1, 1, 1);
     let effects = f.step(e1);
-    // The failure itself writes the rows again (task-d90, row 21, five
-    // voters, seed 608), so the adoption's vote waits on that batch.
-    let again = persisted(&f.step(Event::Storage(StorageEvent::Failed {
+    f.step(Event::Storage(StorageEvent::Failed {
         barrier_id: effects_barrier(&effects),
         error: StorageError::DefinitelyNotCommitted,
-    })));
-    assert!(
-        again.iter().any(|b| b
-            .updates
-            .iter()
-            .any(|u| u.collection == Collection::PayloadV1.id() && u.value.is_some())),
-        "the payload row is written again: {again:?}"
-    );
+    }));
     let record = f
         .table()
         .record(&c1)
@@ -1660,28 +1603,91 @@ fn a_vote_after_its_submissions_batch_failed_writes_the_payload_row_again() {
         0,
         proposal(c1, vec![], 0, record.paths.clone(), record.path),
     ));
-    let adoption = persisted(&effects);
-    assert_eq!(adoption.len(), 1, "{effects:?}");
-    let released = f.step(Event::Storage(StorageEvent::JournalDurable {
-        barrier_id: adoption[0].barrier,
-        journal_seq: LocalJournalSeq::new(3).unwrap(),
-    }));
+    let batches = persisted(&effects);
     assert!(
-        !sends(&released)
+        batches.iter().any(|b| b
+            .updates
             .iter()
-            .any(|(_, m)| matches!(m, ProtocolMessage::SlowAck(_))),
-        "the vote waits on the payload row: {released:?}"
+            .any(|u| u.collection == Collection::PayloadV1.id() && u.value.is_some())),
+        "the vote's batch writes the payload row again: {batches:?}"
     );
-    let released = f.step(Event::Storage(StorageEvent::JournalDurable {
-        barrier_id: again[0].barrier,
-        journal_seq: LocalJournalSeq::new(2).unwrap(),
-    }));
+}
+
+/// A vote's batch fails (task-d90): the record stays in the table, so the
+/// next vote on its keys names it as a dependency. Nothing is written at
+/// the failure; the next batch that names it carries its payload and
+/// dependency rows, so they are durable with that vote or fail with it.
+/// Before, nothing wrote the record again, the later vote's row named a
+/// command a restart lost, and a recovery read the gap as another order
+/// than the leader's and re-proposed a command a fast quorum had decided
+/// (protocol_sim row 21, five voters, seed 608). A write at the failure
+/// looped on a fenced queue, which refuses every batch (#197 review).
+#[test]
+fn a_vote_carries_the_rows_of_a_dependency_whose_batch_failed() {
+    let mut g = booted(1);
+    let (e1, c1) = admitted(1, 1, 1);
+    let first = effects_barrier(&g.step(e1));
     assert!(
-        sends(&released)
-            .iter()
-            .any(|(to, m)| *to == r(0) && matches!(m, ProtocolMessage::SlowAck(_))),
-        "{released:?}"
+        g.step(Event::Storage(StorageEvent::Failed {
+            barrier_id: first,
+            error: StorageError::NoSpace,
+        }))
+        .is_empty(),
+        "nothing is written at the failure"
     );
+    let (e2, c2) = admitted(2, 2, 2);
+    let second = persisted(&g.step(e2));
+    assert_eq!(second.len(), 1);
+    assert_eq!(g.table().record(&c2).unwrap().deps, vec![c1]);
+    let rows: Vec<(Collection, Vec<u8>)> = second[0]
+        .updates
+        .iter()
+        .map(|u| (Collection::from_id(u.collection).unwrap(), u.key.clone()))
+        .collect();
+    assert!(
+        rows.contains(&(Collection::ProtocolV1, dependency_key(epoch(), &c1))),
+        "the vote carries the dependency's row: {rows:?}"
+    );
+    assert_eq!(
+        rows.iter()
+            .filter(|(c, _)| *c == Collection::PayloadV1)
+            .count(),
+        2,
+        "and its payload row, beside the vote's own"
+    );
+    let released = g.step(Event::Storage(StorageEvent::JournalDurable {
+        barrier_id: second[0].barrier,
+        journal_seq: LocalJournalSeq::new(1).unwrap(),
+    }));
+    let sent = sends(&released);
+    assert_eq!(sent.len(), 2, "the leader and the frontend: {sent:?}");
+    assert!(
+        sent.iter().all(|(_, m)| matches!(m, ProtocolMessage::FastAck(a) if a.command == c2 && a.deps == vec![c1])),
+        "{sent:?}"
+    );
+    assert_eq!(
+        g.ledger().record(&c1).map(|r| r.phase),
+        Some(Phase::PreAccept)
+    );
+    // A third vote names `c2`, now written: nothing more is carried.
+    let (e3, _) = admitted(3, 3, 3);
+    let third = persisted(&g.step(e3));
+    assert_eq!(third[0].updates.len(), 2, "its own rows only");
+    // Once fenced, the queue refuses every batch, and a vote is refused
+    // once: nothing writes again at a failure.
+    let mut h = booted(1);
+    for seq in 1..=4 {
+        let (e, _) = admitted(seq, seq as u8, seq as u8);
+        let batches = persisted(&h.step(e));
+        assert_eq!(batches.len(), 1);
+        assert!(
+            h.step(Event::Storage(StorageEvent::Failed {
+                barrier_id: batches[0].barrier,
+                error: StorageError::NoSpace,
+            }))
+            .is_empty()
+        );
+    }
 }
 
 /// The record the newest batch in flight writes for a command (task-d90):
@@ -1723,4 +1729,92 @@ fn the_ledger_names_the_newest_record_in_flight() {
     ledger.durable(barrier(3), LocalJournalSeq::new(3).unwrap());
     assert!(ledger.in_flight_records().is_empty());
     assert_eq!(ledger.record(&c).map(|r| r.phase), Some(Phase::Commit));
+}
+
+/// A commit over an adoption whose batch failed (#197 review): the record
+/// is committed in memory under the leader's order while the row here is
+/// still the pre-acceptance, under other dependencies. Executed over that
+/// row, a report, and a restart, gave the command committed under
+/// dependencies it was never decided with (protocol_sim row 21 with its
+/// queue failed, three voters, seed 39). It executes only once its rows
+/// are written again, in a batch of the next event that is not a failure,
+/// and a failure of that batch holds it back again without a write.
+#[test]
+fn a_commit_whose_adoption_failed_executes_only_over_its_rows_written_again() {
+    let (e1, c1) = admitted(1, 1, 1);
+    let (e2, c2) = admitted(2, 2, 2);
+    let mut leader_view = coord_consensus::CommandTable::new();
+    let l1 = leader_view
+        .initialize(c1, c1.0, vec![CONSERVATIVE_KEY.to_vec()])
+        .unwrap();
+    let mut f = booted(1);
+    for e in [e2, e1] {
+        let effects = f.step(e);
+        f.step(durable_of(&effects, 1).remove(0));
+    }
+    assert_eq!(f.ledger().record(&c1).unwrap().deps, vec![c2]);
+    let adoption = persisted(&f.step(peer(0, proposal(c1, vec![], 0, l1.paths.clone(), l1.path))));
+    assert_eq!(adoption.len(), 1);
+    assert!(
+        persisted(&f.step(Event::Storage(StorageEvent::Failed {
+            barrier_id: adoption[0].barrier,
+            error: StorageError::DefinitelyNotCommitted,
+        })))
+        .is_empty(),
+        "nothing is written at the failure"
+    );
+    let ack = |from: u8, f: &Follower| {
+        peer(
+            from,
+            ProtocolMessage::SlowAck(SlowAck {
+                replica: r(from),
+                ballot: ballot(0, 0),
+                command: c1,
+                admission: f.table().record(&c1).and_then(|r| r.payload).unwrap(),
+            }),
+        )
+    };
+    let e = ack(0, &f);
+    f.step(e);
+    let e = ack(2, &f);
+    let carried = persisted(&f.step(e));
+    assert_eq!(f.table().phase_of(&c1), Some(Phase::Commit));
+    assert_eq!(f.table().record(&c1).unwrap().deps, vec![]);
+    let rows: Vec<CommandRecord> = carried
+        .iter()
+        .flat_map(|b| b.updates.iter())
+        .filter(|u| u.collection == Collection::ProtocolV1.id())
+        .filter(|u| u.key == dependency_key(epoch(), &c1))
+        .map(|u| decode_dependency(u.value.as_deref().unwrap()).unwrap())
+        .collect();
+    assert_eq!(
+        rows.len(),
+        1,
+        "the commit's rows go out with the event that committed it"
+    );
+    assert_eq!(rows[0].deps, vec![]);
+    assert_eq!(f.next_executable(), Some(c1), "over its row in flight");
+    // That batch fails too: held back, and nothing is written at the
+    // failure.
+    let failed = f.step(Event::Storage(StorageEvent::Failed {
+        barrier_id: carried[0].barrier,
+        error: StorageError::DefinitelyNotCommitted,
+    }));
+    assert!(persisted(&failed).is_empty());
+    assert_eq!(
+        f.next_executable(),
+        None,
+        "not over the pre-acceptance's row"
+    );
+    // The next event that is not a failure writes it again.
+    let e = ack(0, &f);
+    let again = persisted(&f.step(e));
+    assert_eq!(again.len(), 1);
+    assert_eq!(f.next_executable(), Some(c1));
+    f.step(Event::Storage(StorageEvent::JournalDurable {
+        barrier_id: again[0].barrier,
+        journal_seq: LocalJournalSeq::new(2).unwrap(),
+    }));
+    assert_eq!(f.ledger().record(&c1).unwrap().deps, vec![]);
+    assert_eq!(f.next_executable(), Some(c1));
 }
