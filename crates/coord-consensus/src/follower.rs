@@ -4624,6 +4624,7 @@ impl Follower {
             return out;
         }
         let mut reinstall = false;
+        let mut rewritten: Vec<Effect> = Vec::new();
         // A payload row's batch, a vote's or one of its own: a payload
         // sent for a record already initialized is written in a batch no
         // vote stages (task-d90). Left to the votes' batches, it was never
@@ -4709,11 +4710,49 @@ impl Follower {
                     };
                     self.rejections
                         .push(FollowerRejection::BatchFailed(command));
+                    // The record stays in the table, and every later vote
+                    // on its keys names it as a dependency. With none of
+                    // its rows durable or in flight, a restart lost it
+                    // while those votes' rows kept naming it: a member's
+                    // records then stopped short of what the leader had
+                    // ordered before such a vote, a recovery read that as
+                    // another order than the leader's, and it re-proposed
+                    // under other dependencies a command a fast quorum had
+                    // decided (task-d90, protocol_sim row 21, five voters,
+                    // seed 608). Its rows are written again at once,
+                    // without the vote: a later vote's acknowledgement
+                    // waits on every batch in flight, this one among them,
+                    // so none goes out over a dependency this replica could
+                    // lose. Releasing the record instead let the command
+                    // come back as a fresh pre-acceptance after the
+                    // commands since, under dependencies its decision
+                    // never had, and a later vote that named it lost its
+                    // order after them (row 21, three voters, seed 864).
+                    if matches!(pending, Pending::Vote(_))
+                        && !self.ledger.written(&command)
+                        && let Some(record) = self.table.record(&command).cloned()
+                        && let Some(payload) = self.payloads.get(&command)
+                        && let Some(alloc) = self.alloc.as_mut()
+                    {
+                        let barrier = alloc.allocate();
+                        rewritten.push(Effect::Persist(PersistBatch {
+                            barrier,
+                            base: None,
+                            updates: alloc::vec![
+                                payload_update(&command, payload).expect("bounded"),
+                                dependency_update(self.config.identity.epoch, &command, &record)
+                                    .expect("bounded"),
+                            ],
+                        }));
+                        self.pending.insert(barrier, Pending::Vote(command));
+                        self.ledger.stage(barrier, command, record);
+                        self.durable_payloads.insert(barrier, command);
+                    }
                 }
                 _ => {}
             }
         }
-        let mut out = Vec::new();
+        let mut out = rewritten;
         if let (Some(barrier), StorageEvent::JournalDurable { .. }) = (event.barrier(), event)
             && let Some(c) = self.campaign.as_mut()
             && c.binding() == Some(barrier)
