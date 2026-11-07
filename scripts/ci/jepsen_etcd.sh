@@ -11,7 +11,8 @@
 # `run` runs it once against the cluster in $RUNNER_TEMP/cluster, with the
 # runner's CPU sampled into SAMPLES (a path ending .csv); its store is
 # etcd-test/store/latest after. Both the `etcd-baseline` job, on a runner
-# of its own, and the `jepsen` job's etcd beside TupleSky (`etcd-beside`),
+# of its own, and the `jepsen` job's etcd beside TupleSky (`etcd-version:
+# beside`),
 # on TupleSky's runner and cluster, run the test through it.
 set -euo pipefail
 
@@ -20,6 +21,12 @@ test_dir=${ETCD_TEST_DIR:-etcd-test}
 jepsen_dir=${JEPSEN_DIR:-jepsen}
 
 prepare() {
+  # `beside` or `beside:VERSION` (etcd in the TupleSky job) names the
+  # version after it, `latest` without one.
+  case $ETCD_VERSION in
+    beside) ETCD_VERSION=latest ;;
+    beside:*) ETCD_VERSION=${ETCD_VERSION#beside:} ;;
+  esac
   # `latest` is the highest stable (x.y.z) release tag of etcd-io/etcd,
   # read when the job runs; anything else must be a version.
   if [ "$ETCD_VERSION" = latest ]; then

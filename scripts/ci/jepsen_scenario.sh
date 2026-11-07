@@ -31,8 +31,14 @@
 #                  comes later, under replay: task-d51). It
 #                  reaches the voters as COORD_HARNESS_CHECKPOINT_AFTER_RECORDS
 #                  and is named in the TupleSky title when set
+#   IN_FEATURES    replicated features TupleSky's voters activate once all
+#                  are submittable (jepsen.tuplesky's --activate,
+#                  task-d99), comma-separated; a build without an admin
+#                  socket is left as it is; empty for none
 #   IN_VOTER_WORKERS
 #                  tokio worker threads per TupleSky voter: a number, or
+#                  BASE/HEAD for a pair's two sides (a single run takes
+#                  HEAD), each a number or
 #                  default (or empty) for tokio's one per runner core
 #   IN_VOTER_ENV   NAME=VALUE every TupleSky voter starts with; empty for
 #                  none
@@ -203,12 +209,32 @@ case $checkpoint in
   *) checkpoint_suffix=", checkpoint every $checkpoint" ;;
 esac
 
-workers=${IN_VOTER_WORKERS:-default}
-case $workers in
-  default) workers="" workers_suffix="" ;;
-  "" | 0 | *[!0-9]*) echo "voter-workers must be a positive number or default, not $workers" >&2; exit 2 ;;
-  *) workers_suffix=", $workers tokio workers per voter" ;;
+# N, or BASE/HEAD for a pair's two sides (a single run takes HEAD).
+workers_in=${IN_VOTER_WORKERS:-default}
+case $workers_in in
+  */*) base_workers=${workers_in%%/*} workers=${workers_in#*/} ;;
+  *) base_workers=$workers_in workers=$workers_in ;;
 esac
+for w in "$base_workers" "$workers"; do
+  case $w in
+    default) ;;
+    "" | 0 | *[!0-9]*) echo "voter-workers must be a positive number or default, or BASE/HEAD of them, not $workers_in" >&2; exit 2 ;;
+  esac
+done
+if [ "$base_workers" = default ]; then base_workers=""; fi
+if [ "$workers" = default ]; then workers=""; fi
+if [ "$base_workers" = "$workers" ]; then
+  workers_suffix=${workers:+", $workers tokio workers per voter"}
+else
+  workers_suffix=", ${base_workers:-default} (base) / ${workers:-default} (head) tokio workers per voter"
+fi
+
+features=${IN_FEATURES:-}
+if [ -n "$features" ]; then
+  case $features in
+    *[!a-z,-]* | ,* | *, | *,,*) echo "features must be names separated by commas, not $features" >&2; exit 2 ;;
+  esac
+fi
 
 tuplesky_suffix=""
 voter_env=${IN_VOTER_ENV:-}
@@ -222,6 +248,9 @@ if [ -n "$voter_env" ]; then
     *[!A-Za-z0-9_]*) echo "voter-env must be NAME=VALUE, not $voter_env" >&2; exit 2 ;;
   esac
   tuplesky_suffix+=", with $voter_env"
+fi
+if [ -n "$features" ]; then
+  tuplesky_suffix+=", $features active"
 fi
 
 key_count=${IN_KEY_COUNT:-${key_count:-}}
@@ -319,6 +348,8 @@ out=${GITHUB_ENV:-/dev/stdout}
   echo "COORD_HARNESS_CHECKPOINT_AFTER_RECORDS=$checkpoint"
   echo "CHECKPOINT_SUFFIX=$checkpoint_suffix"
   echo "VOTER_WORKERS=$workers"
+  echo "BASE_VOTER_WORKERS=$base_workers"
+  echo "FEATURES=$features"
   echo "WORKERS_SUFFIX=$workers_suffix"
   echo "VOTER_ENV=$voter_env"
   echo "KEY_COUNT=$key_count"

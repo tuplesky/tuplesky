@@ -352,6 +352,30 @@ keeps tokio's one per runner core. It needs a `jepsen-ref` with the option
 (tuplesky/jepsen's `claude/voter-tokio-workers` and branches on it); with
 one without, the run warns and keeps tokio's default, and the title, which
 otherwise ends in ", N tokio workers per voter", drops the count.
+`BASE/HEAD`, such as `2/1`, sets a pair's two sides apart (the base at
+two, the head at one), and a single run takes `HEAD`; the title then says
+", 2 (base) / 1 (head) tokio workers per voter".
+
+The `features` input activates replicated features (task-d99) on
+TupleSky's voters through jepsen.tuplesky's `--activate`, comma-separated
+in order, such as `early-proposal,release-at-execution`. The job builds
+`coordctl` beside `coordd`, and the harness uploads it to every node. Once
+every voter says `voters submittable`, and before the nemesis and the
+workload, each node asks its own admin socket (`admin.sock` in the bundle)
+to activate the first feature not yet active, once a second: a follower is
+refused, naming the leader, and the leader is refused until every voter's
+advertisement has reached it. Each node waits until its own `coordctl
+feature status` holds them all, the leader's with every voter holding them.
+A node with no admin socket, a pair's base built before task-d99, is left
+as it is. If the features aren't held within a minute, the test fails
+rather than measure an inactive build. Each voter's status after the
+activation and before its logs are taken comes with its log
+(`features-start.txt`, `features-end.txt`), and the summary's
+**Replicated features** table shows both, so a reading can't silently be
+of an inactive build, and the end shows restarts kept them. The title
+says ", F active". In an `env:` pair, both sides are the same build, so
+both activate.
+
 `voter-env` gives every voter of every run one more variable through
 `--voter-env` (such as `COORDD_ACK_FREQUENCY=8,25000`), and the title says
 ", with NAME=VALUE". `key-count` sets the keys in play at once in the
@@ -564,7 +588,8 @@ Its store is the `jepsen-store-etcd-<scenario>-<workload>` artifact.
 
 Runners differ from job to job (AMD EPYC 7763, Intel Xeon Platinum 8573C
 and 8370C in November 2026), so the two jobs' absolute numbers compare only
-as far as their runners do. With `etcd-beside: true` the TupleSky job runs
+as far as their runners do. With `etcd-version: beside` (or
+`beside:VERSION`; `latest` without one) the TupleSky job runs
 the etcd test itself instead, on its own runner and cluster, and the
 `etcd-baseline` job is skipped:
 

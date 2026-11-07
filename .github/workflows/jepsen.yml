@@ -9,9 +9,9 @@
 # test (jepsen-io/etcd) against etcd on the same cluster, with the same
 # workload, faults, time limit, concurrency, rate and fault interval, so a
 # run's throughput and fault behaviour have a baseline to compare with.
-# With `etcd-beside`, the TupleSky job runs that test itself instead, on its
-# own runner and cluster after each pair, so the two compare as a ratio on
-# one runner model.
+# With `etcd-version: beside`, the TupleSky job runs that test itself
+# instead, on its own runner and cluster after each pair, so the two compare
+# as a ratio on one runner model.
 # `swiftpaxos-baseline` does the same for SwiftPaxos (imdea-software/swiftpaxos),
 # the reference implementation of the protocol TupleSky's consensus follows,
 # with the `jepsen.swiftpaxos` test from the same repository: linearizable
@@ -63,13 +63,11 @@ on:
         description: Voters (containers), 3 or 5
         default: "5"
       etcd-version:
-        description: "etcd for the baseline: a version such as 3.7.2, latest (the newest stable release), or none to skip it"
+        description: "etcd for the baseline: a version such as 3.7.2, latest (the newest stable release), or none to skip it; beside, or beside:VERSION, runs it in the TupleSky job, on its runner and cluster, after each pair (or after the one run), with each TupleSky run's ratio to it, instead of in a job of its own on another runner"
         default: latest
-      etcd-beside:
-        description: "Run the etcd baseline in the TupleSky job, on its runner and cluster, after each pair (or after the one run), with each TupleSky run's ratio to it, instead of in a job of its own on another runner"
-        type: choice
-        options: ["false", "true"]
-        default: "false"
+      features:
+        description: "Replicated features TupleSky's voters activate once every voter is submittable, before the nemesis and the workload (jepsen.tuplesky's --activate, task-d99), comma-separated in order, such as early-proposal,release-at-execution; a build without an admin socket (a pair's base before task-d99) is left as it is; empty for none"
+        default: ""
       store:
         description: "Where TupleSky's voters and etcd keep their stores: disk, or tmpfs to measure without the runner's disk"
         type: choice
@@ -84,7 +82,7 @@ on:
         description: "Journal records each TupleSky voter holds past its last local checkpoint before publishing the next (task-d55); 0 never publishes; empty for the profile's default (4096 under strict; 65536 and 30 s under replay, task-d51)"
         default: ""
       voter-workers:
-        description: "Tokio worker threads per TupleSky voter (TOKIO_WORKER_THREADS, through jepsen.tuplesky's --voter-workers): 2, the job's standard (five voters on a 4-CPU runner), or default for tokio's one per runner core, which each co-located voter takes"
+        description: "Tokio worker threads per TupleSky voter (TOKIO_WORKER_THREADS, through jepsen.tuplesky's --voter-workers): 2, the job's standard (five voters on a 4-CPU runner), or default for tokio's one per runner core, which each co-located voter takes; BASE/HEAD, such as 2/1, for a pair's two sides (a single run takes HEAD)"
         default: "2"
       voter-env:
         description: "An environment variable every TupleSky voter starts with in every run, as NAME=VALUE (through jepsen.tuplesky's --voter-env), such as COORDD_ACK_FREQUENCY=8,25000; empty for none"
@@ -162,6 +160,7 @@ env:
   # Scheduled and pull-request runs have no inputs: two workers, the
   # job's standard, as a dispatch's default.
   IN_VOTER_WORKERS: ${{ inputs.voter-workers || '2' }}
+  IN_FEATURES: ${{ inputs.features }}
   IN_VOTER_ENV: ${{ inputs.voter-env }}
   IN_KEY_COUNT: ${{ inputs.key-count }}
   IN_KEY_DIST: ${{ inputs.key-dist }}
@@ -174,7 +173,8 @@ env:
   IN_LEADER_PROFILE: ${{ inputs.leader-profile || 'false' }}
   NODES: ${{ inputs.nodes || '5' }}
   ETCD_VERSION: ${{ inputs.etcd-version || 'latest' }}
-  ETCD_BESIDE: ${{ inputs.etcd-beside || 'false' }}
+  # etcd-version beside or beside:VERSION: etcd in the TupleSky job.
+  ETCD_BESIDE: ${{ startsWith(inputs.etcd-version, 'beside') }}
   # jepsen-io/etcd, pinned; its head when the baseline was added.
   ETCD_TEST_REPO: jepsen-io/etcd
   ETCD_TEST_REF: b47cc401f27bfb7c28afd9ac088b5f0dca4501b8
@@ -243,14 +243,10 @@ jobs:
             lsmod | grep -E '^(sch_prio|sch_netem|cls_u32) '
           fi
       - name: Prepare the etcd test beside TupleSky
-        # etcd-beside: the etcd-baseline job's test, run on this runner and
+        # etcd-version beside: the etcd-baseline job's test, run on this runner and
         # cluster in the Jepsen step below.
         if: env.ETCD_BESIDE == 'true'
-        run: |
-          if [ "$ETCD_VERSION" = none ]; then
-            echo "::error::etcd-beside needs an etcd-version other than none"; exit 1
-          fi
-          tuplesky/scripts/ci/jepsen_etcd.sh prepare
+        run: tuplesky/scripts/ci/jepsen_etcd.sh prepare
       - name: Install the exact Rust toolchain from rust-toolchain.toml
         working-directory: tuplesky
         run: rustup show active-toolchain || rustup toolchain install
@@ -260,12 +256,13 @@ jobs:
           key: jepsen
       - name: Build the daemon, the harness and the Jepsen client
         working-directory: tuplesky
-        run: cargo build --locked --release -p coordd -p coord-harness -p coord-jepsen
+        # coordctl too, which activates the replicated features (task-d99).
+        run: cargo build --locked --release -p coordd -p coord-harness -p coord-jepsen -p coordctl
       - name: Keep the head's binaries
         if: env.IN_PAIR_BASE != ''
         run: |
           mkdir -p "$RUNNER_TEMP/head-bin"
-          for b in coordd coord-harness coord-jepsen coord-jepsen-executed; do
+          for b in coordd coord-harness coord-jepsen coord-jepsen-executed coordctl; do
             cp "tuplesky/target/release/$b" "$RUNNER_TEMP/head-bin/" 2>/dev/null || true
           done
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
@@ -285,10 +282,13 @@ jobs:
           # A product branch has no coord-jepsen (it is this PR's); the
           # base then runs the head's shim, which only the client uses.
           shim=(); if [ -d crates/coord-jepsen ]; then shim=(-p coord-jepsen); fi
+          # Its coordctl where it has one, which needs no admin socket of
+          # the base: the activation leaves a node without one as it is.
+          if [ -d crates/coordctl ]; then shim+=(-p coordctl); fi
           cargo build --locked --release -p coordd -p coord-harness ${shim[@]+"${shim[@]}"} \
             --target-dir "$GITHUB_WORKSPACE/tuplesky/target"
           mkdir -p "$RUNNER_TEMP/base-bin"
-          for b in coordd coord-harness coord-jepsen coord-jepsen-executed; do
+          for b in coordd coord-harness coord-jepsen coord-jepsen-executed coordctl; do
             cp "$GITHUB_WORKSPACE/tuplesky/target/release/$b" "$RUNNER_TEMP/base-bin/" 2>/dev/null || true
             cp "$RUNNER_TEMP/head-bin/$b" "$GITHUB_WORKSPACE/tuplesky/target/release/" 2>/dev/null || true
           done
@@ -373,10 +373,13 @@ jobs:
         # harness from before it.
         run: |
           wan=(); if [ "$WAN" != none ]; then wan=(--wan "$WAN"); fi
-          voter=()
-          if [ -n "$VOTER_WORKERS" ]; then
+          # Each side's workers: the head's (or the one run's), and in a
+          # pair the base's, which BASE/HEAD sets apart.
+          voter=() head_workers=() base_workers=()
+          if [ -n "$VOTER_WORKERS$BASE_VOTER_WORKERS" ]; then
             if grep -q -- '--voter-workers' src/jepsen/tuplesky.clj; then
-              voter=(--voter-workers "$VOTER_WORKERS")
+              if [ -n "$VOTER_WORKERS" ]; then head_workers=(--voter-workers "$VOTER_WORKERS"); fi
+              if [ -n "$BASE_VOTER_WORKERS" ]; then base_workers=(--voter-workers "$BASE_VOTER_WORKERS"); fi
             else
               # The standard two workers need a harness that sets them; a
               # harness without the option runs tokio's default, and the
@@ -385,6 +388,13 @@ jobs:
               WORKERS_SUFFIX=""
               echo "WORKERS_SUFFIX=" >> "$GITHUB_ENV"
             fi
+          fi
+          if [ -n "$FEATURES" ]; then
+            if ! grep -q -- '--activate' src/jepsen/tuplesky.clj; then
+              echo "::error::tuplesky/jepsen@$JEPSEN_REF has no --activate; dispatch with a jepsen-ref that has it, or no features"
+              exit 1
+            fi
+            voter+=(--activate "$FEATURES")
           fi
           if [ -n "$VOTER_ENV" ]; then
             if ! grep -q -- '--voter-env' src/jepsen/tuplesky.clj; then
@@ -454,7 +464,7 @@ jobs:
             "$ci/jepsen_bounded.sh" $((TIME_LIMIT + 1200)) "$RUNNER_TEMP/cluster/nodes" -- \
               "${common[@]}" --bin-dir "$bin" "$@"
           }
-          # With etcd-beside, the etcd test once on this runner and cluster,
+          # With etcd beside TupleSky, the etcd test once on this runner and cluster,
           # its samples in $1, summarized as the etcd-baseline job's is and
           # named $2; its store in etcd_store.
           etcd_previous="" etcd_store=""
@@ -478,7 +488,8 @@ jobs:
           if [ -z "$IN_PAIR_BASE" ]; then
             graph=flat; if [ "$IN_LEADER_PROFILE" = call-graph ]; then graph=graph; fi
             rc=0
-            run_one "$GITHUB_WORKSPACE/tuplesky/target/release" "$RUNNER_TEMP" "$graph" || rc=$?
+            run_one "$GITHUB_WORKSPACE/tuplesky/target/release" "$RUNNER_TEMP" "$graph" \
+              ${head_workers[@]+"${head_workers[@]}"} || rc=$?
             store=$(readlink -f store/latest || true)
             if [ "$ETCD_BESIDE" = true ] && [ -n "$store" ] && etcd_one "$RUNNER_TEMP/etcd" "beside TupleSky"; then
               cp "$RUNNER_TEMP"/cpu-samples* "$store"/ 2>/dev/null || true
@@ -513,10 +524,11 @@ jobs:
               # pairs keep the flat profile, which costs the loop less.
               graph=flat; if [ "$IN_LEADER_PROFILE" = call-graph ] && [ "$i" = 1 ]; then graph=graph; fi
               if [ "$side" = base ]; then
-                run_one "$base_bin" "$dir" "$graph" ${base_args[@]+"${base_args[@]}"} || rc=$?
+                run_one "$base_bin" "$dir" "$graph" ${base_workers[@]+"${base_workers[@]}"} \
+                  ${base_args[@]+"${base_args[@]}"} || rc=$?
                 name=$base_name
               else
-                run_one "$head_bin" "$dir" "$graph" || rc=$?
+                run_one "$head_bin" "$dir" "$graph" ${head_workers[@]+"${head_workers[@]}"} || rc=$?
                 name=$head_sha
               fi
               store=$(readlink -f store/latest || true)
@@ -662,7 +674,7 @@ jobs:
             tar czf "$RUNNER_TEMP/jepsen-store.tgz" --exclude=tuplesky-runs \
               -C jepsen/tuplesky store
           fi
-          # etcd's runs beside TupleSky (etcd-beside), as the etcd-baseline
+          # etcd's runs beside TupleSky (etcd-version beside), as the etcd-baseline
           # job packs its own.
           if [ -d etcd-test/store ]; then
             tar czf "$RUNNER_TEMP/jepsen-store-etcd.tgz" -C etcd-test store
@@ -683,8 +695,8 @@ jobs:
 
   etcd-baseline:
     name: etcd baseline (docker cluster)
-    # Not when the TupleSky job runs etcd on its own runner (etcd-beside).
-    if: ${{ (inputs.etcd-version || 'latest') != 'none' && inputs.etcd-beside != 'true' }}
+    # Not when the TupleSky job runs etcd on its own runner (beside).
+    if: ${{ (inputs.etcd-version || 'latest') != 'none' && !startsWith(inputs.etcd-version, 'beside') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
