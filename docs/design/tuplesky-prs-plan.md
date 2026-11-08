@@ -3065,6 +3065,20 @@ This entry is the budget and the record, not a lever:
     1. **The transport: messages and packets a command.** The tokio threads and the kernel's share, 1.55 ms an operation, cost more than etcd's whole server side. task-d96's reading put a datagram near zero, but it counted the voters' CPU only; the kernel's share outside every process is not in it, so task-d96 is read again with the host's share.
     2. **Journal groups a command** (task-d84's sync budget). About 13.4 syncs a command over the cluster at `service`'s load, against etcd's roughly 5, on one shared disk. Its three parts are in task-d84.
     3. **The followers' loops,** 0.46 ms a command each, nearly the leader's 0.54. At 30 callers the local profile shows no scan of in-flight batches as a cost; a profile at the sweep's peak step says whether one grows with load before anything is indexed.
+       - **Read at 30 and 120 callers (#185 review).** On the head with both features, `perf` on a fast-set follower (n2) and one outside the fast set (n4), split by handler, in µs a command (n2 / n4):
+
+         | Handler | 30 callers | 120 callers |
+         | --- | --- | --- |
+         | The whole loop | 341 / 332 | 317 / 300 |
+         | The vote: `Follower::on_request` | 39 / 31 | 44 / 36 |
+         | The adoption: `Follower::on_proposal` | 5 / 5 | 5 / 6 |
+         | Learning: `Follower::learn`, inside the storage and commit events | 23 / 20 | 42 / 38 |
+         | Executions: `Node::run_executions` | 59 / 60 | 59 / 59 |
+         | Peer messages, their handlers included (`Domain::on_peer_plane`) | 44 / 43 | 39 / 41 |
+
+       - **Learning grows with load:** it doubles from 30 to 120 callers. Every pass of `Learner::commit_learned_where` and `Follower::commit_through_leader` collects every command at ACCEPT (`CommandTable::in_accept`, which also retains its set against the records) and looks each one up, and a pass runs on every vote and storage event. That's a walk of what's in flight on every event, so its cost a command grows with the callers. The leader learns through the same function. An incremental learner, which looks again only at a command whose votes, phase or dependencies changed, is the follower loop's lever, ahead of the remaining lookups (`memcmp`, about 7%).
+       - **The vote outside the fast set** (task-d84's second part) costs n4 31 to 36 µs a command, and only part of it goes, since the payload row is still written. At two of five voters that's at most about 0.04 ms an operation.
+       - **Slow-only rounds while the fast share is low** (a design question) would take the vote at all four followers, about 140 to 160 µs a command, and the fast acknowledgements' frames: together about 0.1 ms an operation of loops and as much again in datagrams at the runner's bound.
     4. **C4 (task-d86),** sized from the materializer's part of the voters' other threads at the sweep's peak step, where a commit already spreads over the most commands.
     5. **task-d73's bounded wait,** sized at the sweep's knee.
     - **The read path** (a barrier read answered from the executed state, in task-d90's entry) shortens an operation, so at a fixed caller count it is a throughput lever too. On register the batch's mean read wait was 17 to 20 ms, 6.5 to 7.4 of it after the index. It is ranked by the sweep: if the head saturates its cores, it moves `ok`/s little; if it doesn't, it leads.
@@ -3518,6 +3532,20 @@ The change, in two steps:
   - **The threshold isn't what leaves the ACK-only datagrams.** Above 8 they don't fall, so they come from QUIC's delay, on connections where no reply follows within it, not from the count.
   - **So fewer messages a command sizes small.** Removing every ACK-only datagram, the largest kind, projects at most about 0.25 ms a command at the bound and near nothing at the estimate. Cutting the fan-out or the slow acknowledgements by N−1 frames projects less, for a protocol change. None is carried into the next batch. The count stays recorded as the floor comparison, and the QUIC share in the batch's call graph is read again on the next batch's head at one worker before this entry is reopened.
 - **Reopened (#185 review, after the batch on `6791ba6`).** On the runner the transport is the largest part of the host's CPU a completed operation: the tokio threads 1.02 ms and the kernel's packet work outside any process 0.53, against etcd's kernel share of 0.21 (task-d72). The pair above read the voters' CPU only, so the kernel's share a datagram is outside it. The next reading costs a datagram on the whole host (the voters, softirq and the rest of the kernel), at one worker and at two, before a candidate is sized again.
+  - **Read on the whole host (#185 review).** Five voters on one 4-core host, two workers, 30 callers, tmpfs, 40,000 operations, three runs a side alternating, each lever against its own base. The host's busy time is `/proc/stat`'s, softirq included, beside every voter thread's `schedstat`, the bench's own CPU and every other process's.
+
+    | Lever | Host CPU an operation, base → lever (ms) | Voters' threads (ms) | Outside every process (ms) |
+    | --- | --- | --- | --- |
+    | C9, a voter's returned frames on one stream (`0c5e1229` against `3cab7d25`) | 2.406 → 2.389 (−0.7%) | 2.074 → 2.058 | 0.210 → 0.210 |
+    | C5, the inbound path without a task a stream (`6bc0ee15` against `df72e281`) | 2.393 → 2.354 (−1.6%) | 2.061 → 2.022 | 0.213 → 0.213 |
+
+    - **Neither moves the host's time outside its threads,** and C9's 13% fewer api datagrams move the host by less than the runs' spread. On this host's loopback a packet's kernel work runs in the sending thread (the kernel has no IRQ time accounting), so the threads already carried it in the first pairs; both stay out.
+    - **The runner's share is bounded from its own counts.** Its 0.53 ms an operation outside every process, over about 16 datagrams an operation, is at most about 32 µs a datagram, and task-d70's runner pair put the threads' part at about 30 µs. So a datagram an operation is worth at most about 0.06 ms on the runner, and C9's cut at most about 0.05 ms with both parts.
+  - **The api plane's acknowledgements ride its data (#185 review).** On the head with both features, the api plane sends 19.2 datagrams a command over the five voters, holding 14.8 stream frames, 12.3 ACK frames and 1.5 `MAX_STREAMS`. Threshold 32 with a 100 ms delay (`COORDD_ACK_FREQUENCY=32,100000`) moves none of them, nor the host's CPU: an ACK goes with the next datagram already leaving. So the ACK cadence is no lever on that plane; its datagrams follow its messages, and the candidates are the messages (task-d96's count).
+  - **What the messages left are worth, at the bound above:**
+    - the leader's reply and its release as one frame when both leave in one turn: at most 0.76 datagrams a command, about 0.03 ms an operation, and a wire change;
+    - the collector's slow acknowledgements, 4.0 a command: at most about 0.14 ms an operation, and a protocol question;
+    - the fast acknowledgements, 1.6 a command on the api plane and as many on the peer plane: about 0.1 ms an operation, which slow-only rounds would take (below).
 
 **Acceptance:** The count recorded at three and five voters with its floor, each candidate sized in messages, packets and projected CPU, and the ones carried named with the design sections they amend. No code.
 
