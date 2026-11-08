@@ -1249,3 +1249,43 @@ class LeaderProfileTests(unittest.TestCase):
         self.assertIn("| `coordd::serve::Domain<P>::carry` | 10.00% | 10.00% |", text)
         self.assertIn("| `(the stack did not unwind to the loop)` | 5.00% | 0.00% |", text)
         self.assertIn("| `coord_daemon::reads::Reads::due` | 20.00% |", text)
+
+
+class KindsTests(unittest.TestCase):
+    def test_each_kind_share_and_clients(self):
+        lines = [
+            file_line("10:00:01", "jepsen worker 0", "0\t:invoke\t:read\tnil"),
+            file_line("10:00:02", "jepsen worker 0", "0\t:ok\t:read\t1"),
+            file_line("10:00:01", "jepsen worker 1", "1\t:invoke\t:write\t1"),
+            file_line("10:00:02", "jepsen worker 1", "1\t:ok\t:write\t1"),
+            file_line("10:00:03", "jepsen worker 2", "2\t:invoke\t:cas\t[1 2]"),
+            file_line("10:00:04", "jepsen worker 2", "2\t:fail\t:cas\t[1 2]"),
+            file_line("10:00:05", "jepsen worker 1", "1\t:invoke\t:cas\t[1 2]"),
+            file_line("10:00:06", "jepsen worker 1", "1\t:ok\t:cas\t[1 2]"),
+        ]
+        client = [o for o in js.parse_ops(lines) if not o.process.startswith(":")]
+        self.assertEqual(
+            js.kinds_line(client, None),
+            "**Operations by kind** (share of those completed, and the clients that invoked it): "
+            "`:cas` 50% (2 clients), `:read` 25% (1 clients), `:write` 25% (1 clients)",
+        )
+
+    def test_one_kind_is_no_line(self):
+        lines = [
+            file_line("10:00:01", "jepsen worker 0", "0\t:invoke\t:txn\tnil"),
+            file_line("10:00:02", "jepsen worker 0", "0\t:ok\t:txn\tnil"),
+        ]
+        client = [o for o in js.parse_ops(lines) if not o.process.startswith(":")]
+        self.assertEqual(js.kinds_line(client, None), "")
+
+    def test_occupancy_counts_a_client_still_waiting(self):
+        lines = [
+            file_line("10:00:01", "jepsen worker 0", "0\t:invoke\t:read\tnil"),
+            file_line("10:00:03", "jepsen worker 0", "0\t:ok\t:read\t1"),
+            file_line("10:00:02", "jepsen worker 1", "1\t:invoke\t:write\t1"),
+            file_line("10:00:05", "jepsen worker 0", "0\t:invoke\t:read\tnil"),
+            file_line("10:00:06", "jepsen worker 0", "0\t:ok\t:read\t1"),
+        ]
+        client = [o for o in js.parse_ops(lines) if not o.process.startswith(":")]
+        # 2 s and 1 s done, worker 1 waiting from :02 to the end at :06.
+        self.assertEqual(js.occupancy(client, None), (2, 7.0))

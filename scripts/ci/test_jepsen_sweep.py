@@ -168,7 +168,7 @@ class SweepTests(unittest.TestCase):
         text = sw.render(steps, "Sweep")
         self.assertIn("## Sweep", text)
         self.assertIn("**Runner:** Some CPU (4 CPUs)", text)
-        self.assertIn("| 30 | head | 0.4 | 0.5 | 0.4 | 60% / 20% / 20% | 100.0 / 300.0 | 1000.0 / 1000.0 | - |", text)
+        self.assertIn("| 30 | head | 0.4 | 0.5 | 0.4 | 60% (1) / 20% (1) / 20% (2) | 100.0 / 300.0 | 1000.0 / 1000.0 | - |", text)
         self.assertIn("| 30 | etcd | 0.4 | 0.5 | 0.4 |", text)
         # Per command: 2400 / 2 commands an operation; per write: 2400 / 0.4.
         self.assertIn("| 30 | head | 2.000 | 1200.000 | 200.000 | 400.000 | 6000.000 | 2.50 | 2.00 | 2.000 | - |", text)

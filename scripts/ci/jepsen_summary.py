@@ -582,6 +582,30 @@ def occupancy(client: list[Op], end: datetime.datetime | None) -> tuple[int, flo
     return completed, busy
 
 
+def kinds_line(client: list[Op], end: datetime.datetime | None) -> str:
+    """Each kind of operation's share of those completed by `end` and the
+    clients (Jepsen's worker threads) that invoked it, as one line; empty
+    with a single kind. Two workloads' mixes compare by it: the register
+    tests split their threads between reading and writing."""
+    done: collections.Counter = collections.Counter()
+    threads: dict = {}
+    for o in client:
+        if end is not None and o.at > end:
+            break
+        if o.type == "invoke":
+            threads.setdefault(o.f, set()).add(o.thread)
+        else:
+            done[o.f] += 1
+    total = sum(done.values())
+    if len(done) < 2 or not total:
+        return ""
+    cells = [
+        f"`{f}` {n * 100 / total:.0f}% ({len(threads.get(f, ()))} clients)"
+        for f, n in sorted(done.items())
+    ]
+    return "**Operations by kind** (share of those completed, and the clients that invoked it): " + ", ".join(cells)
+
+
 # What `cpu_sampler.py` groups the runner's processes into, in its columns'
 # order, and what this summary calls each.
 CPU_GROUPS = (
@@ -2321,6 +2345,10 @@ def summarize(store: str, nodes: list[str], title: str, profile: str | None = No
                 f"{busy / secs:.1f} clients busy on average"
             )
             out.append("")
+            kinds_text = kinds_line(client, heal)
+            if kinds_text:
+                out.append(kinds_text)
+                out.append("")
         if latencies:
             out.append("| Latency of `ok` (ms) | Count | p50 | p95 | p99 | Max |")
             out.append("| --- | --- | --- | --- | --- | --- |")

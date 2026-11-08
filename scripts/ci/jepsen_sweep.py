@@ -59,8 +59,10 @@ class Step:
     completed_per_s: float | None = None
     completed: int = 0
     busy_clients: float | None = None
-    # Kind of operation (`read`, `write`, `cas`) -> share of the completed.
+    # Kind of operation (`read`, `write`, `cas`) -> share of the completed,
+    # and the clients that invoked it.
     mix: dict = field(default_factory=dict)
+    clients: dict = field(default_factory=dict)
     # Kind -> (p50, p99) of its `ok`s, in ms.
     latency: dict = field(default_factory=dict)
     # CPU ms per completed operation, by part (see PARTS).
@@ -124,6 +126,7 @@ def clients_and_mix(step: Step, client: list, start, end) -> None:
             break
         if o.type == "invoke":
             invoked[o.thread] = o
+            step.clients.setdefault(o.f, set()).add(o.thread)
             continue
         inv = invoked.pop(o.thread, None)
         done[o.f] = done.get(o.f, 0) + 1
@@ -277,14 +280,14 @@ def render(steps: list[Step], title: str) -> str:
         "**Throughput and latency** (each run in the order the job ran them; over the workload, the first "
         "invocation to the last completion; completed is `ok`, `fail` and `info`; busy clients is the clients' "
         "time between an invocation and its completion over the window, so the clients' mean concurrency; the "
-        "mix is each kind's share of the operations completed; latency is of `ok`s, p50 / p99 in ms)",
+        "mix is each kind's share of the operations completed, with the clients that invoked it; latency is of `ok`s, p50 / p99 in ms)",
         "",
         "| Step | Side | `ok`/s | Completed/s | Busy clients | Reads / writes / cas | Read p50 / p99 | "
         "Write p50 / p99 | Cas p50 / p99 |",
         "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for s in steps:
-        mix = " / ".join(f"{s.mix.get(k, 0) * 100:.0f}%" for k in KINDS) if s.mix else "-"
+        mix = " / ".join(f"{s.mix.get(k, 0) * 100:.0f}% ({len(s.clients.get(k, ()))})" for k in KINDS) if s.mix else "-"
         lat = [
             f"{s.latency[k][0]:.1f} / {s.latency[k][1]:.1f}" if k in s.latency else "-" for k in KINDS
         ]
