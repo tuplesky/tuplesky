@@ -3512,7 +3512,7 @@ impl Follower {
         ready.sort_unstable();
         let mut progressed = false;
         for (_, command) in ready {
-            progressed |= self.table.commit(command).is_ok();
+            progressed |= self.table.commit_accepted(command);
         }
         progressed
     }

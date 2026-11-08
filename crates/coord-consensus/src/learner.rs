@@ -172,7 +172,7 @@ impl Learner {
                 .collect();
             let mut progressed = false;
             for (c, learned) in candidates {
-                if table.commit(c).is_ok() {
+                if table.commit_accepted(c) {
                     if learned == LearnedBy::Fast {
                         self.fast.insert(c);
                     }

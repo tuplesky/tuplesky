@@ -1050,6 +1050,22 @@ impl CommandTable {
         Ok(())
     }
 
+    /// [`CommandTable::commit`] for a learning pass, whose candidates come
+    /// from [`CommandTable::in_accept`]: commits `command` only if its
+    /// record is at ACCEPT now, and says whether it did. The set is kept
+    /// exact and checked against the records in debug builds; this keeps
+    /// a release build from committing a record below ACCEPT should it
+    /// ever go stale, for one lookup a candidate the votes have already
+    /// learned rather than one a member (task-d60, step 4; #185 review).
+    pub fn commit_accepted(&mut self, command: CommandId) -> bool {
+        let at_accept = self
+            .records
+            .get(&command)
+            .is_some_and(|r| r.phase == Phase::Accept);
+        debug_assert!(at_accept, "a learning candidate is not at ACCEPT");
+        at_accept && self.commit(command).is_ok()
+    }
+
     /// Mark an executed command, under the source guard. Idempotent for a
     /// command already executed.
     pub fn execute(&mut self, command: CommandId) -> Result<(), GuardViolation> {
