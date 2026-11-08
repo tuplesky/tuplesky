@@ -459,6 +459,7 @@ impl CommandTable {
             _ => return false,
         }
         let record = self.records.remove(command).expect("checked");
+        self.accepted.remove(command);
         for key in &record.keys {
             let Some(state) = self.keys.get_mut(key) else {
                 continue;
@@ -768,6 +769,7 @@ impl CommandTable {
                     && matches!(record.phase, Phase::PreAccept | Phase::Accept) =>
             {
                 record.demote();
+                self.accepted.remove(command);
                 true
             }
             _ => false,
@@ -961,17 +963,19 @@ impl CommandTable {
     /// The commands at ACCEPT, in identity order (task-d46): those the
     /// learner can commit. Costs what is in flight, not the history.
     pub fn in_accept(&mut self) -> Vec<CommandId> {
-        let records = &self.records;
-        self.accepted
-            .retain(|c| records.get(c).is_some_and(|r| r.phase == Phase::Accept));
-        // Every record at ACCEPT is entered where it got there; a path
-        // that missed would leave a command the learner never commits.
+        // Kept exact where a record leaves ACCEPT (commit, execute,
+        // restore_executed, demote, release), so a pass takes the set
+        // as it stands rather than checking every member against the
+        // records: that check was most of a learning pass under load,
+        // since the learner asks on every vote and storage event
+        // (task-d60, step 4).
         debug_assert!(
             self.records
                 .iter()
                 .filter(|(_, r)| r.phase == Phase::Accept)
-                .all(|(c, _)| self.accepted.contains(c)),
-            "a record at ACCEPT is missing from the learner's set"
+                .map(|(c, _)| c)
+                .eq(self.accepted.iter()),
+            "the learner's set is not exactly the records at ACCEPT"
         );
         self.accepted.iter().copied().collect()
     }
@@ -1040,6 +1044,7 @@ impl CommandTable {
         let deps = record.deps.clone();
         guard_commit(&deps, |c| self.phase_of(c))?;
         self.initialized_mut(&command)?.phase = Phase::Commit;
+        self.accepted.remove(&command);
         self.committed.insert(command);
         self.raise(command);
         Ok(())
@@ -1055,6 +1060,7 @@ impl CommandTable {
         let deps = record.deps.clone();
         guard_execute(&deps, |c| self.phase_of(c))?;
         self.initialized_mut(&command)?.phase = Phase::Executed;
+        self.accepted.remove(&command);
         self.committed.remove(&command);
         self.last_executed = Some(command);
         self.note_execution(command);
@@ -1154,6 +1160,7 @@ impl CommandTable {
             Some(r) if r.payload.is_some() => {
                 if r.phase != Phase::Executed {
                     r.phase = Phase::Executed;
+                    self.accepted.remove(command);
                     self.unretired.push_back(*command);
                 }
             }
