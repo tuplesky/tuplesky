@@ -42,7 +42,7 @@ on:
         options: [faults, throughput, wan, wan-throughput, service]
         default: faults
       workload:
-        description: "append, wr or register; empty for the scenario's"
+        description: "append, wr, register, or register-etcd-mix (register with TupleSky's client threads split as etcd's register test splits its own: n readers in all, the rest mixing write and cas); empty for the scenario's"
         default: ""
       nemesis:
         description: "Comma-separated faults (kill, pause, partition, packet), or none; empty for the scenario's. Not clock: the containers share this runner's clock."
@@ -54,7 +54,7 @@ on:
         description: "Seconds of workload before healing; empty for the scenario's (300, or 120 for throughput)"
         default: ""
       concurrency:
-        description: "Clients, as a number or a multiple of the nodes such as 5n; empty for the scenario's (2n, 10n for throughput, 4 for service)"
+        description: "Clients, as a number or a multiple of the nodes such as 5n; empty for the scenario's (2n, 10n for throughput, 4 for service); comma-separated, a sweep: every side in turn at each count, etcd-beside after each step, one table of the steps at the end"
         default: ""
       rate:
         description: "Operations a second over all clients, for every system (0 for unthrottled); empty for the scenario's (20, 0 for throughput, 300 for service)"
@@ -103,11 +103,11 @@ on:
         description: "Seconds every TupleSky voter's inbound peer-plane traffic is dropped from the workload's start, the collectors still reaching every voter (through --hold-peer-links; task-d67's start-up row); empty or 0 for none"
         default: ""
       pair-base:
-        description: "Run TupleSky in pairs on one runner against this base: a tuplesky ref (a branch, a tag or a full commit SHA, which actions/checkout needs whole) built beside the head, or env:NAME=VALUE for the head's own build with that variable on every voter; empty for one run"
+        description: "Run TupleSky in pairs on one runner against this base: a tuplesky ref (a branch, a tag or a full commit SHA, which actions/checkout needs whole) built beside the head, env:NAME=VALUE for the head's own build with that variable on every voter, or same for the head's own build (voter-workers BASE/HEAD then sets the sides apart); empty for one run"
         default: ""
       pairs:
-        description: "How many base and head pairs, when pair-base is set (the order alternates from pair to pair)"
-        default: "3"
+        description: "How many base and head pairs, when pair-base is set (the order alternates from pair to pair; empty for 3); in a sweep, the steps the base runs at, comma-separated (empty for every step)"
+        default: ""
       leader-profile:
         description: "Profile the TupleSky leader's domain thread with perf for 20 s in each run's workload, into its summary: true (flat), call-graph (call graphs by frame pointer, on the first pair's runs in a paired job, with every build in the job made with frame pointers; also the busiest follower, the leader's and that follower's tokio threads and their threads' system calls), or false"
         type: choice
@@ -126,6 +126,7 @@ on:
       - scripts/ci/jepsen_bounded.sh
       - scripts/ci/jepsen_etcd.sh
       - scripts/ci/jepsen_pairs.py
+      - scripts/ci/jepsen_sweep.py
       - scripts/ci/leader_profile.py
       - scripts/ci/jepsen_scenario.sh
       - scripts/ci/jepsen_summary.py
@@ -170,6 +171,8 @@ env:
   IN_HOLD_PEER_LINKS: ${{ inputs.hold-peer-links }}
   IN_PAIR_BASE: ${{ inputs.pair-base }}
   IN_PAIRS: ${{ inputs.pairs || '3' }}
+  # In a sweep, the steps the base runs at (jepsen_scenario.sh).
+  IN_PAIRS_GIVEN: ${{ inputs.pairs }}
   IN_LEADER_PROFILE: ${{ inputs.leader-profile || 'false' }}
   NODES: ${{ inputs.nodes || '5' }}
   ETCD_VERSION: ${{ inputs.etcd-version || 'latest' }}
@@ -266,7 +269,7 @@ jobs:
             cp "tuplesky/target/release/$b" "$RUNNER_TEMP/head-bin/" 2>/dev/null || true
           done
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
-        if: env.IN_PAIR_BASE != '' && !startsWith(env.IN_PAIR_BASE, 'env:')
+        if: env.IN_PAIR_BASE != '' && env.IN_PAIR_BASE != 'same' && !startsWith(env.IN_PAIR_BASE, 'env:')
         with:
           ref: ${{ inputs.pair-base }}
           path: tuplesky-base
@@ -274,7 +277,7 @@ jobs:
       - name: Build the pair's base
         # Into the head's target directory, so the dependencies the two
         # share are not built twice; the head's binaries are put back after.
-        if: env.IN_PAIR_BASE != '' && !startsWith(env.IN_PAIR_BASE, 'env:')
+        if: env.IN_PAIR_BASE != '' && env.IN_PAIR_BASE != 'same' && !startsWith(env.IN_PAIR_BASE, 'env:')
         working-directory: tuplesky-base
         run: |
           rustup show active-toolchain || rustup toolchain install
@@ -431,6 +434,13 @@ jobs:
             fi
             voter+=(--read-ratio "$READ_RATIO")
           fi
+          if [ -n "$REGISTER_MIX" ]; then
+            if ! grep -q -- '--register-mix' src/jepsen/tuplesky.clj; then
+              echo "::error::tuplesky/jepsen@$JEPSEN_REF has no --register-mix; dispatch with a jepsen-ref that has it, or the register workload"
+              exit 1
+            fi
+            voter+=(--register-mix "$REGISTER_MIX")
+          fi
           if [ -n "$HOLD_PEER_LINKS" ]; then
             if ! grep -q -- '--hold-peer-links' src/jepsen/tuplesky.clj; then
               echo "::error::tuplesky/jepsen@$JEPSEN_REF has no --hold-peer-links; dispatch with a jepsen-ref that has it, or no hold-peer-links"
@@ -447,12 +457,12 @@ jobs:
             --time-limit "$TIME_LIMIT"
             --rate "$RATE"
             --recovery-time "$RECOVERY_TIME"
-            --concurrency "$CONCURRENCY"
             ${wan[@]+"${wan[@]}"}
             ${voter[@]+"${voter[@]}"})
           ci="$GITHUB_WORKSPACE/tuplesky/scripts/ci"
           # One test with the binaries in $1, its samples and profile in $2,
-          # a call graph when $3 is "graph".
+          # a call graph when $3 is "graph", at $CONCURRENCY clients (a
+          # sweep's step sets it, and the etcd test reads it too).
           run_one() {
             local bin=$1 dir=$2 graph=$3
             shift 3
@@ -462,7 +472,7 @@ jobs:
             if [ "$IN_LEADER_PROFILE" != false ]; then export JEPSEN_LEADER_PROFILE="$dir/leader-profile.txt"; fi
             if [ "$IN_LEADER_PROFILE" != false ] && [ "$graph" = graph ]; then export JEPSEN_LEADER_CALLGRAPH=1; fi
             "$ci/jepsen_bounded.sh" $((TIME_LIMIT + 1200)) "$RUNNER_TEMP/cluster/nodes" -- \
-              "${common[@]}" --bin-dir "$bin" "$@"
+              "${common[@]}" --concurrency "$CONCURRENCY" --bin-dir "$bin" "$@"
           }
           # With etcd beside TupleSky, the etcd test once on this runner and cluster,
           # its samples in $1, summarized as the etcd-baseline job's is and
@@ -485,7 +495,7 @@ jobs:
           }
           head_sha=$(git -C "$GITHUB_WORKSPACE/tuplesky" rev-parse --short HEAD)
           beside=""; if [ "$ETCD_BESIDE" = true ]; then beside=", beside etcd $ETCD_VERSION"; fi
-          if [ -z "$IN_PAIR_BASE" ]; then
+          if [ -z "$IN_PAIR_BASE" ] && [ -z "$SWEEP" ]; then
             graph=flat; if [ "$IN_LEADER_PROFILE" = call-graph ]; then graph=graph; fi
             rc=0
             run_one "$GITHUB_WORKSPACE/tuplesky/target/release" "$RUNNER_TEMP" "$graph" \
@@ -499,11 +509,17 @@ jobs:
             fi
             exit $rc
           fi
-          # Paired: base and head in turn on this runner, the order
-          # alternating from pair to pair, each run summarized as it ends,
-          # then the head's difference from the base pair by pair.
-          head_bin="$RUNNER_TEMP/head-bin" base_bin="$RUNNER_TEMP/base-bin" base_args=()
+          # Paired, or a sweep: TupleSky's sides in turn on this runner,
+          # each run summarized as it ends.
+          head_bin="$RUNNER_TEMP/head-bin" base_bin="$RUNNER_TEMP/base-bin" base_args=() base_name=""
+          # A sweep's head is the build in the target directory, which the
+          # base's build puts back; a single-sided sweep keeps no copy.
+          if [ -n "$SWEEP" ]; then head_bin="$GITHUB_WORKSPACE/tuplesky/target/release"; fi
           case $IN_PAIR_BASE in
+            "") ;;
+            same)
+              base_bin=$head_bin
+              base_name="$head_sha at ${BASE_VOTER_WORKERS:-default} workers" ;;
             env:*)
               if ! grep -q -- '--voter-env' src/jepsen/tuplesky.clj; then
                 echo "::error::tuplesky/jepsen@$JEPSEN_REF has no --voter-env; dispatch with a jepsen-ref that has it"
@@ -515,39 +531,73 @@ jobs:
               base_name="$IN_PAIR_BASE at $(git -C "$GITHUB_WORKSPACE/tuplesky-base" rev-parse --short HEAD)" ;;
           esac
           rc=0 n=0 runs=() previous=""
+          # One TupleSky run of side $1 (base or head), with the call graph
+          # when $2 is "graph", named $3 in its summary's title and $4 in
+          # the final table.
+          one_side() {
+            local side=$1 graph=$2 where=$3 label=$4 dir name store
+            n=$((n + 1))
+            dir="$RUNNER_TEMP/run-$n"
+            if [ "$side" = base ]; then
+              run_one "$base_bin" "$dir" "$graph" ${base_workers[@]+"${base_workers[@]}"} \
+                ${base_args[@]+"${base_args[@]}"} || rc=$?
+              name=$base_name
+            else
+              run_one "$head_bin" "$dir" "$graph" ${head_workers[@]+"${head_workers[@]}"} || rc=$?
+              name=$head_sha
+            fi
+            store=$(readlink -f store/latest || true)
+            if [ -z "$store" ] || [ "$store" = "$previous" ]; then
+              echo "::warning::$where, $side: the test left no store"
+              return 0
+            fi
+            previous=$store
+            cp "$dir"/cpu-samples* "$dir"/leader-profile*.txt "$dir"/follower-profile*.txt "$dir"/transport-profile*.txt "$store"/ 2>/dev/null || true
+            for db in "$store"/n*/domain.redb; do
+              [ -e "$db" ] || continue
+              cp "$db" "$RUNNER_TEMP/scratch.redb"
+              "$head_bin/coord-jepsen-executed" "$RUNNER_TEMP/scratch.redb" --last \
+                > "$(dirname "$db")/executed-at-end" || true
+            done
+            python3 "$ci/jepsen_summary.py" "$store" \
+              --nodes-file "$RUNNER_TEMP/cluster/nodes" --profile "$PROFILE" \
+              --title "TupleSky: $WORKLOAD, $NEMESIS$TITLE_SUFFIX$STORE_SUFFIX$PROFILE_SUFFIX$CHECKPOINT_SUFFIX$WORKERS_SUFFIX$TUPLESKY_SUFFIX: $where, $side ($name)" || true
+            runs+=("$label=$store")
+          }
+          if [ -n "$SWEEP" ]; then
+            # Each step in turn: the head, the base where it runs at this
+            # step (the order alternating from step to step), then etcd.
+            i=0
+            for step in $SWEEP; do
+              i=$((i + 1))
+              CONCURRENCY=$step
+              sides=head
+              if [ -n "$IN_PAIR_BASE" ] && [[ " $SWEEP_BASE_STEPS " == *" $step "* ]]; then
+                if [ $((i % 2)) = 1 ]; then sides="head base"; else sides="base head"; fi
+              fi
+              graph=flat; if [ "$IN_LEADER_PROFILE" = call-graph ] && [ "$i" = 1 ]; then graph=graph; fi
+              for side in $sides; do
+                one_side "$side" "$graph" "step $step" "$side@$step"
+              done
+              if [ "$ETCD_BESIDE" = true ]; then
+                n=$((n + 1))
+                if etcd_one "$RUNNER_TEMP/run-$n" "step $step"; then runs+=("etcd@$step=$etcd_store"); fi
+              fi
+            done
+            python3 "$ci/jepsen_sweep.py" \
+              --title "TupleSky sweep: $head_sha (head)${base_name:+ and $base_name (base)}$beside, $WORKLOAD, $NEMESIS$TITLE_SUFFIX$STORE_SUFFIX$PROFILE_SUFFIX$CHECKPOINT_SUFFIX$WORKERS_SUFFIX$TUPLESKY_SUFFIX" \
+              ${runs[@]+"${runs[@]}"} || true
+            exit $rc
+          fi
+          # Paired: base and head in turn, the order alternating from pair
+          # to pair, then the head's difference from the base pair by pair.
           for i in $(seq 1 "$IN_PAIRS"); do
             if [ $((i % 2)) = 1 ]; then order="base head"; else order="head base"; fi
             for side in $order; do
-              n=$((n + 1))
-              dir="$RUNNER_TEMP/run-$n"
               # The call graph on the first pair's two runs: the rest of the
               # pairs keep the flat profile, which costs the loop less.
               graph=flat; if [ "$IN_LEADER_PROFILE" = call-graph ] && [ "$i" = 1 ]; then graph=graph; fi
-              if [ "$side" = base ]; then
-                run_one "$base_bin" "$dir" "$graph" ${base_workers[@]+"${base_workers[@]}"} \
-                  ${base_args[@]+"${base_args[@]}"} || rc=$?
-                name=$base_name
-              else
-                run_one "$head_bin" "$dir" "$graph" ${head_workers[@]+"${head_workers[@]}"} || rc=$?
-                name=$head_sha
-              fi
-              store=$(readlink -f store/latest || true)
-              if [ -z "$store" ] || [ "$store" = "$previous" ]; then
-                echo "::warning::pair $i, $side: the test left no store"
-                continue
-              fi
-              previous=$store
-              cp "$dir"/cpu-samples* "$dir"/leader-profile*.txt "$dir"/follower-profile*.txt "$dir"/transport-profile*.txt "$store"/ 2>/dev/null || true
-              for db in "$store"/n*/domain.redb; do
-                [ -e "$db" ] || continue
-                cp "$db" "$RUNNER_TEMP/scratch.redb"
-                "$head_bin/coord-jepsen-executed" "$RUNNER_TEMP/scratch.redb" --last \
-                  > "$(dirname "$db")/executed-at-end" || true
-              done
-              python3 "$ci/jepsen_summary.py" "$store" \
-                --nodes-file "$RUNNER_TEMP/cluster/nodes" --profile "$PROFILE" \
-                --title "TupleSky: $WORKLOAD, $NEMESIS$TITLE_SUFFIX$STORE_SUFFIX$PROFILE_SUFFIX$CHECKPOINT_SUFFIX$WORKERS_SUFFIX$TUPLESKY_SUFFIX: pair $i, $side ($name)" || true
-              runs+=("$side=$store")
+              one_side "$side" "$graph" "pair $i" "$side"
             done
             # etcd after the pair, so each pair has its own on this runner.
             if [ "$ETCD_BESIDE" = true ]; then
@@ -560,7 +610,7 @@ jobs:
             ${runs[@]+"${runs[@]}"} || true
           exit $rc
       - name: Read how far each voter executed
-        if: always() && env.IN_PAIR_BASE == ''
+        if: always() && env.IN_PAIR_BASE == '' && env.SWEEP == ''
         # Each voter's highest executed position at the end, from its store
         # (a crash image, jepsen.tuplesky.db's log-files kills coordd first),
         # for the summary's "Executed at end" column: a voter left behind
@@ -577,7 +627,7 @@ jobs:
             echo "$node: $(head -c 200 "$dir/executed-at-end")"
           done
       - name: Summarize the run
-        if: always() && env.IN_PAIR_BASE == ''
+        if: always() && env.IN_PAIR_BASE == '' && env.SWEEP == ''
         # The verdict, counts, final reads per node, faults and one row per
         # voter, in the job summary; each voter's last 400 lines follow here.
         run: |
@@ -593,7 +643,7 @@ jobs:
         # Not for a paired job: the API returns only a log's last 5000
         # lines, which the runs' summaries and the pair table need; every
         # run's voter logs are in the uploaded store.
-        if: always() && env.IN_PAIR_BASE == ''
+        if: always() && env.IN_PAIR_BASE == '' && env.SWEEP == ''
         # Jepsen copies each voter's coordd.log into the test's store before
         # tearing the cluster down. Printed here, without the periodic
         # metrics lines, so a run can be read from its job log alone.

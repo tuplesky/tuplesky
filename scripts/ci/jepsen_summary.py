@@ -554,6 +554,34 @@ def throughput(client: list[Op], end: datetime.datetime | None):
     return oks, (end - start).total_seconds(), {f: sorted(ms) for f, ms in latencies.items()}
 
 
+def occupancy(client: list[Op], end: datetime.datetime | None) -> tuple[int, float]:
+    """The operations completed (`ok`, `fail` or `info`) from the first
+    invocation to `end` (the last completion without one), and the clients'
+    seconds between an invocation and its completion over the same span, a
+    client still waiting at `end` counted to it: over the span's length, the
+    clients busy on average, which falls short of their count when they wait
+    on something besides the servers."""
+    if not client:
+        return 0, 0.0
+    if end is None:
+        end = client[-1].at
+    invoked = {}
+    completed = 0
+    busy = 0.0
+    for o in client:
+        if o.at > end:
+            break
+        if o.type == "invoke":
+            invoked[o.thread] = o
+            continue
+        completed += 1
+        inv = invoked.pop(o.thread, None)
+        if inv is not None:
+            busy += (o.at - inv.at).total_seconds()
+    busy += sum((end - inv.at).total_seconds() for inv in invoked.values())
+    return completed, busy
+
+
 # What `cpu_sampler.py` groups the runner's processes into, in its columns'
 # order, and what this summary calls each.
 CPU_GROUPS = (
@@ -2285,9 +2313,12 @@ def summarize(store: str, nodes: list[str], title: str, profile: str | None = No
         if secs > 0:
             until = "the final heal" if heal is not None else "the last operation"
             peak = max(buckets.values(), default=0) / BUCKET_S
+            n_done, busy = occupancy(client, heal)
             out.append(
                 f"**Throughput:** {n_ok} `ok` in {secs:.0f} s until {until}, "
-                f"{n_ok / secs:.1f} `ok`/s (best {BUCKET_S} s: {peak:.1f}/s)"
+                f"{n_ok / secs:.1f} `ok`/s (best {BUCKET_S} s: {peak:.1f}/s); "
+                f"{n_done / secs:.1f} completed/s (`ok`, `fail` or `info`), "
+                f"{busy / secs:.1f} clients busy on average"
             )
             out.append("")
         if latencies:

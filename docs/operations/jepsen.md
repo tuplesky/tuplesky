@@ -604,10 +604,58 @@ the etcd test itself instead, on its own runner and cluster, and the
   pairs. A target set against etcd is then a ratio read within one job.
 * **What it costs:** one etcd run per pair: a register pair job of three
   pairs runs nine tests.
+* **In a sweep** (below), after each step's TupleSky runs, at the step's
+  clients.
 * **The store:** etcd's runs are packed as `jepsen-store-etcd.tgz` beside
   `jepsen-store.tgz` in the TupleSky job's artifact.
 * **A profiled job:** its nodes run Ubuntu (above), so the etcd test sets
   up on that image there, where the baseline job's runs on Debian.
+
+**A sweep.** A `concurrency` of several counts, comma-separated
+(`30,60,120`), runs the TupleSky job at each in turn on one runner: the
+head at each step; the base too, where `pair-base` is set, at the steps
+`pairs` lists (comma-separated; empty for every step), the order of the two
+alternating from step to step; and with `etcd-version: beside`, etcd after
+each step at the same clients. A register sweep's steps are raised to
+multiples of 2n as one count is. `pair-base: same` makes the base the
+head's own build, so `voter-workers: 2/1` sweeps the head at one worker
+against itself at two, with the same `features` on both. SwiftPaxos is
+skipped. Each run gets its own summary, and `scripts/ci/jepsen_sweep.py`
+then gives a table of the steps, each run labelled `SIDE@STEP`:
+
+* `ok`/s and operations completed a second, the clients busy on average
+  (each client's time between an invocation and its completion, over the
+  workload), each kind of operation's share of those completed and the p50
+  and p99 of its `ok`s;
+* the runner's CPU per completed operation, split into the leader's loop,
+  the followers' loops (the sampled main threads, split as the voters'
+  `metrics` lines split their loops' CPU), the voters' tokio threads, the
+  appender and the materializer and the voters' other threads (from
+  `cpu_sampler.py --wakeups`), the servers in all, the Jepsen JVM, the
+  clients' shims, the containers' plumbing and everything else (the
+  kernel's packet work most of it), with the host's idle and steal cores
+  and the runner's CPU model;
+* per command (the leader's executed commands over the operations
+  completed): the servers', the loops' and the tokio threads' CPU, the
+  leader's commands per journal group and per projection commit, and its
+  loop's run queue per command and a pass's p99 (task-d97); and the
+  servers' CPU per write or compare-and-set completed, which both systems
+  replicate;
+* each TupleSky run's ratio to etcd's at its step.
+
+Each run's own summary also gives operations completed a second and the
+clients busy on average beside its `ok`/s.
+
+**etcd's register mix.** The register workload's two tests split their
+client threads differently. Jepsen's register test, which jepsen.tuplesky
+runs, reads on n threads in each key's group of 2n and mixes write, cas,
+cas on the rest; etcd's runs read on n threads in all (5 of 30) and mix
+write and cas. So at the same clients TupleSky's history holds about 45%
+reads and etcd's about 17%, and a ratio between the two compares different
+work. `workload: register-etcd-mix` runs the register workload with
+jepsen.tuplesky's `--register-mix etcd`, which splits TupleSky's threads as
+etcd's runs do; etcd's test runs as before. The titles say ", etcd's
+register mix".
 
 A third job, `swiftpaxos-baseline`, runs
 [SwiftPaxos](https://github.com/imdea-software/swiftpaxos), the reference

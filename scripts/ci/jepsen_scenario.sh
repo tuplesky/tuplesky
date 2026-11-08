@@ -5,12 +5,20 @@
 #
 #   SCENARIO       faults (default), throughput, wan, wan-throughput or
 #                  service
-#   IN_WORKLOAD    TupleSky's and etcd's workload; empty for the scenario's
+#   IN_WORKLOAD    TupleSky's and etcd's workload; empty for the scenario's.
+#                  register-etcd-mix is the register workload with
+#                  TupleSky's client threads split as etcd's register test
+#                  splits its own (jepsen.tuplesky's --register-mix etcd:
+#                  n readers in all, the rest mixing write and cas)
 #   IN_NEMESIS     their faults; empty for the scenario's
 #   IN_SWIFTPAXOS  SwiftPaxos's faults; empty for the scenario's
 #   IN_TIME_LIMIT  seconds of workload; empty for the scenario's
 #   IN_CONCURRENCY clients, a number or a multiple of the nodes (5n);
-#                  empty for the scenario's
+#                  empty for the scenario's. Comma-separated, a sweep: the
+#                  job runs every side at each count in turn (SWEEP), and
+#                  CONCURRENCY is the first
+#   IN_PAIRS_GIVEN in a sweep with a pair base, the steps the base runs
+#                  at, comma-separated; empty for every step
 #   IN_RATE        operations a second over all clients, 0 for
 #                  unthrottled; empty for the scenario's
 #   NODES          the cluster's nodes (5), for the register minimum
@@ -110,15 +118,29 @@ case $scenario in
 esac
 
 workload=${IN_WORKLOAD:-$workload}
+register_mix=""
+if [ "$workload" = register-etcd-mix ]; then
+  workload=register register_mix=etcd
+fi
 nemesis=${IN_NEMESIS:-$nemesis}
 swiftpaxos=${IN_SWIFTPAXOS:-$swiftpaxos}
 time_limit=${IN_TIME_LIMIT:-$time_limit}
 concurrency=${IN_CONCURRENCY:-$concurrency}
-case $concurrency in
-  *[!0-9n]* | "" | n* | *n?*)
-    echo "::error::concurrency '$concurrency' is not a number or a multiple of the nodes (5n)" >&2
-    exit 1 ;;
-esac
+# A comma-separated list is a sweep: each count is a step.
+steps_in=${concurrency//,/ }
+for step in $steps_in; do
+  case $step in
+    *[!0-9n]* | "" | n* | *n?*)
+      echo "::error::concurrency '$step' is not a number or a multiple of the nodes (5n)" >&2
+      exit 1 ;;
+  esac
+done
+if [ -z "$steps_in" ]; then
+  echo "::error::concurrency '$concurrency' is not a number or a multiple of the nodes (5n)" >&2
+  exit 1
+fi
+set -- $steps_in
+concurrency=$1
 wan=${IN_WAN:-$wan}
 # A scenario's keys and read ratio are for the workloads they apply to; a
 # workload input of another drops them.
@@ -142,19 +164,24 @@ if [ "$rate" = 0 ]; then etcd_rate=100000; fi
 # not split evenly into such groups. A register run's count goes up to the
 # next multiple of 2n, and its summaries' titles say so.
 nodes=${NODES:-5}
-case $concurrency in
-  *n) clients=$(( ${concurrency%n} * nodes )) ;;
-  *)  clients=$concurrency ;;
-esac
 group=$(( 2 * nodes ))
 # A register run's clients, raised to the next multiple of 2n where they
 # are not one already.
-register_clients=$concurrency
-if [ $(( clients % group )) -ne 0 -o "$clients" -eq 0 ]; then
-  groups=$(( (clients + group - 1) / group ))
-  if [ "$groups" -lt 1 ]; then groups=1; fi
-  register_clients=$(( 2 * groups ))n
-fi
+raise_register() {
+  local c=$1 clients groups
+  case $c in
+    *n) clients=$(( ${c%n} * nodes )) ;;
+    *)  clients=$c ;;
+  esac
+  if [ $(( clients % group )) -ne 0 -o "$clients" -eq 0 ]; then
+    groups=$(( (clients + group - 1) / group ))
+    if [ "$groups" -lt 1 ]; then groups=1; fi
+    echo "$(( 2 * groups ))n"
+  else
+    echo "$c"
+  fi
+}
+register_clients=$(raise_register "$concurrency")
 raised_note=" (raised from $concurrency to a multiple of the register workload's 2n)"
 # SwiftPaxos runs the register workload whatever TupleSky's and etcd's is.
 swiftpaxos_concurrency=$register_clients
@@ -164,6 +191,36 @@ raised=""
 if [ "$workload" = register ]; then
   raised=$swiftpaxos_raised
   concurrency=$register_clients
+fi
+# A sweep's steps, each raised as the first is; one step is no sweep.
+sweep=""
+if [ $# -gt 1 ]; then
+  for step in "$@"; do
+    if [ "$workload" = register ]; then step=$(raise_register "$step"); fi
+    case " $sweep " in
+      *" $step "*) echo "::error::concurrency '$IN_CONCURRENCY' names the step $step twice" >&2; exit 1 ;;
+    esac
+    sweep+="${sweep:+ }$step"
+  done
+  raised=""
+  if [ "$workload" = register ] && [ "${steps_in// /,}" != "${sweep// /,}" ]; then
+    raised=" (raised from ${steps_in// /, } to multiples of the register workload's 2n)"
+  fi
+  concurrency=${sweep%% *}
+  swiftpaxos="skip"
+fi
+# In a sweep with a pair base, the steps the base runs at.
+base_steps=""
+if [ -n "$sweep" ] && [ -n "${IN_PAIRS_GIVEN:-}" ]; then
+  for step in ${IN_PAIRS_GIVEN//,/ }; do
+    if [ "$workload" = register ]; then step=$(raise_register "$step"); fi
+    case " $sweep " in
+      *" $step "*) base_steps+="${base_steps:+ }$step" ;;
+      *) echo "::error::pairs '$IN_PAIRS_GIVEN' in a sweep names the step $step, which concurrency '$IN_CONCURRENCY' does not" >&2; exit 1 ;;
+    esac
+  done
+elif [ -n "$sweep" ]; then
+  base_steps=$sweep
 fi
 # The TupleSky test waits after the final heal for killed peers to rejoin;
 # with no faults there is nothing to wait for.
@@ -185,7 +242,9 @@ load_suffix() {
   fi
   if [ "$wan" != none ]; then printf ', wan %s' "$wan"; fi
 }
-suffix=$(load_suffix "$concurrency" "$raised")
+steps_title=${sweep// /, }
+suffix=$(load_suffix "${steps_title:-$concurrency}" "$raised")
+if [ -n "$register_mix" ]; then suffix+=", etcd's register mix"; fi
 swiftpaxos_suffix=$(load_suffix "$swiftpaxos_concurrency" "$swiftpaxos_raised")
 
 store=${IN_STORE:-disk}
@@ -335,6 +394,9 @@ out=${GITHUB_ENV:-/dev/stdout}
   echo "RATE=$rate"
   echo "ETCD_RATE=$etcd_rate"
   echo "CONCURRENCY=$concurrency"
+  echo "SWEEP=$sweep"
+  echo "SWEEP_BASE_STEPS=$base_steps"
+  echo "REGISTER_MIX=$register_mix"
   echo "SWIFTPAXOS_CONCURRENCY=$swiftpaxos_concurrency"
   echo "WAN=$wan"
   echo "RECOVERY_TIME=$recovery_time"
