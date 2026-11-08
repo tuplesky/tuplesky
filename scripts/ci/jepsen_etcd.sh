@@ -39,6 +39,16 @@ prepare() {
   echo "ETCD_VERSION=$ETCD_VERSION" >> "${GITHUB_ENV:-/dev/null}"
   echo "etcd baseline: etcd $ETCD_VERSION, $ETCD_TEST_REPO@$ETCD_TEST_REF" >> "${GITHUB_STEP_SUMMARY:-/dev/stdout}"
 
+  # The test's JVM may take a 72 GiB heap (its project.clj's -Xmx72g), on
+  # a runner with 16 GiB beside five voters. A register history whose
+  # Knossos search grows ("More than 1024 reachable models") then takes
+  # the VM's memory, and the runner goes down with it: "The runner has
+  # received a shutdown signal" in the etcd run's check, twice (runs
+  # 42410314677 and 42474921362). jepsen.tuplesky's 8 GiB holds it to
+  # what the runner has; a search that needs more fails in the JVM.
+  sed -i 's/"-Xmx72g"/"-Xmx8g"/' "$test_dir/project.clj"
+  grep -q '"-Xmx8g"' "$test_dir/project.clj" || { echo "::error::etcd project.clj has no -Xmx72g to cap"; exit 1; }
+
   # The test passes --enable-v2, which etcd 3.6 removed ("flag provided
   # but not defined"). The workloads here use only the v3 API.
   sed -i '/^[[:space:]]*:--enable-v2$/d' "$test_dir/src/jepsen/etcd/db.clj"
