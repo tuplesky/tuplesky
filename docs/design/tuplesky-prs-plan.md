@@ -3,7 +3,7 @@
 **Status:** Review proposal, consolidated v1.5.  
 **Date:** 2026-09-24.  
 **Companion:** [TupleSky implementation design](tuplesky-design.md).  
-**Scope:** 198 implementation tasks with stable `task-*` identifiers. The `task-01` through `task-66`, `task-s01` through `task-s04`, `task-j01` through `task-j10`, `task-o01` through `task-o06`, `task-m01` through `task-m05`, `task-c01`, `task-c02`, `task-c03`, `task-d01` through `task-d92`, `task-d94` through `task-d104` and `task-q01` suffixes and prerequisites are preserved. v1.5 adds `task-d01` through `task-d04` from review of the open implementation PRs and of multi-host readiness, `task-d05` through `task-d17` from the Jepsen client's runs, `task-d18` through `task-d33` from a review against an external SwiftPaxos correctness checklist ([review record](tuplesky-checklist-review.md)), `task-d34` from what the protocol simulator of task-d30 found, `task-d35` through `task-d44` from a review of recovery time and storage integrity (an execution chain, a scrub, and voter replacement through a prepared transition, a staged learner, terminal recovery after the seal, serving across a transition and a running membership install), `task-d45` through `task-d50` from measuring the throughput of the Jepsen client's first unthrottled runs, `task-d51` from task-d46's long runs, `task-d52` and `task-d53` from a profile of the domain thread after task-d46, `task-d54` from the Jepsen runs of task-d50, `task-d55` through `task-d57` from the Jepsen runs of task-j06, `task-d58` through `task-d61` from a profile of five voters' CPU per operation, `task-d62` through `task-d65` from a consolidated review against the reference SwiftPaxos, `task-d66` from the Jepsen runs of task-d51, `task-d67` from a Jepsen run on #98 that made no fast decision, `task-d68` from task-d62's counts after a leader change, `task-d69` from a profile of a follower's loop, `task-d70` from the Jepsen runner's profile of the transport's workers, `task-d71` from the protocol simulator's first 1,000-seed sweep, `task-d72` through `task-d75` from comparing a command's cost with etcd's on one host, `task-d76` from a Jepsen run that killed the leader, `task-d77` through `task-d81` from the protocol simulator with acknowledgements between followers lost, `task-d82` through `task-d84` from the Jepsen runs of the #173 carry, `task-d85` from the protocol simulator on task-d74's routing, `task-d86` through `task-d92` from planning the whole gap to etcd on #174, and moves committed key replacement from `task-58` to `task-m03`; the changes are listed under [Gate checklist and deferred work](#gate-checklist-and-deferred-work). Task IDs are not GitHub pull-request or issue numbers. One implementation PR corresponds to one task; its GitHub-assigned number is recorded separately. No baseline, supplement or separate amendment is needed.
+**Scope:** 199 implementation tasks with stable `task-*` identifiers. The `task-01` through `task-66`, `task-s01` through `task-s04`, `task-j01` through `task-j10`, `task-o01` through `task-o06`, `task-m01` through `task-m05`, `task-c01`, `task-c02`, `task-c03`, `task-d01` through `task-d92`, `task-d94` through `task-d105` and `task-q01` suffixes and prerequisites are preserved. v1.5 adds `task-d01` through `task-d04` from review of the open implementation PRs and of multi-host readiness, `task-d05` through `task-d17` from the Jepsen client's runs, `task-d18` through `task-d33` from a review against an external SwiftPaxos correctness checklist ([review record](tuplesky-checklist-review.md)), `task-d34` from what the protocol simulator of task-d30 found, `task-d35` through `task-d44` from a review of recovery time and storage integrity (an execution chain, a scrub, and voter replacement through a prepared transition, a staged learner, terminal recovery after the seal, serving across a transition and a running membership install), `task-d45` through `task-d50` from measuring the throughput of the Jepsen client's first unthrottled runs, `task-d51` from task-d46's long runs, `task-d52` and `task-d53` from a profile of the domain thread after task-d46, `task-d54` from the Jepsen runs of task-d50, `task-d55` through `task-d57` from the Jepsen runs of task-j06, `task-d58` through `task-d61` from a profile of five voters' CPU per operation, `task-d62` through `task-d65` from a consolidated review against the reference SwiftPaxos, `task-d66` from the Jepsen runs of task-d51, `task-d67` from a Jepsen run on #98 that made no fast decision, `task-d68` from task-d62's counts after a leader change, `task-d69` from a profile of a follower's loop, `task-d70` from the Jepsen runner's profile of the transport's workers, `task-d71` from the protocol simulator's first 1,000-seed sweep, `task-d72` through `task-d75` from comparing a command's cost with etcd's on one host, `task-d76` from a Jepsen run that killed the leader, `task-d77` through `task-d81` from the protocol simulator with acknowledgements between followers lost, `task-d82` through `task-d84` from the Jepsen runs of the #173 carry, `task-d85` from the protocol simulator on task-d74's routing, `task-d86` through `task-d92` from planning the whole gap to etcd on #174, and moves committed key replacement from `task-58` to `task-m03`; the changes are listed under [Gate checklist and deferred work](#gate-checklist-and-deferred-work). Task IDs are not GitHub pull-request or issue numbers. One implementation PR corresponds to one task; its GitHub-assigned number is recorded separately. No baseline, supplement or separate amendment is needed.
 
 ## How to use this plan
 
@@ -64,6 +64,7 @@ Reference single-store and fixed-membership compositions are early increments, n
 | task-d102 | From #185's next steps (#185 review): at 120 callers a command costs about 16.8 datagrams and a journal group holds about 4.9 commands, since every message and group of a slow round is per command | A design step now, after task-d100's step A; it builds step B, and reads task-d84's parts 2 and 3, task-d86 and task-d101's option 1 together |
 | task-d103 | The first of task-d101's option 2 cuts, its own design step (#185 review): the protocol rows can't move to the journal, whose readers look them up by command past its retention, but the leader's proposal row is written in every proposal batch and read by nothing | A design step now; a row at the leader |
 | task-d104 | The second of task-d101's option 2 cuts (#185 review): a client acknowledges on every request, so each command retires one sequence and rewrites its client's floor | A design step now; about a row a command at every voter |
+| task-d105 | The third of task-d101's option 2 cuts (#185 review): a put writes a history row and an event row holding the same version, keyed two ways | A design step now; about a row a mutated key at every voter, and a checkpoint format version |
 | task-q01 | Combined durable WAN/Kine qualification | Required before task-66 |
 
 ```mermaid
@@ -290,6 +291,7 @@ This is a workstream overview; the individual prerequisites are authoritative. O
 | [task-d102](#task-d102) | A contended round is a batch: one frame, one group and one acknowledgement a turn | task-d61, task-d84, task-d86, task-d99, task-d100, task-d101 |
 | [task-d103](#task-d103) | Stop writing the leader's proposal row, which nothing reads | task-d89, task-d101 |
 | [task-d104](#task-d104) | Retire the retry window in batches | task-c02, task-d26, task-d101 |
+| [task-d105](#task-d105) | One version row a revision, with the key index in memory | task-d26, task-d37, task-d101 |
 | [task-q01](#task-q01) | Produce the combined durable WAN/Kine qualification report | task-j07, task-j08, task-o06, task-m05, task-63, task-64, task-d45, task-d46, task-d47, task-d48, task-d49, task-d51, task-d52, task-d53 |
 
 ## Task specifications
@@ -4008,6 +4010,29 @@ So every feature-gated change, task-d98's `EarlyProposal` first, would ship unre
 - **A local pair** at `K = 16` against today: rows a command at every voter, and the materializer's CPU a command and a commit.
 
 **Review boundary:** When a client's acknowledged results are retired. No change to admission, to what a retry is answered, or to the wire.
+
+<a id="task-d105"></a>
+### task-d105: One version row a revision, with the key index in memory
+
+**Prerequisites:** task-d26, task-d37, task-d101.  
+**Design:** Section 17.4 (amended by this task's design step: one version row a revision), and Section 17.5, whose compaction rule it changes.
+
+**Implement:** The third of task-d101's option 2 cuts (#185 review), etcd's layout.
+- **The rows.** `KvHistoryV1` is no longer written. The event row, keyed by revision and ordinal, is the one version row a mutated key a revision.
+- **The index.** It is held in memory, from (namespace, key) to retained (revision, ordinal)s. It is built at boot and at a local image's install from the retained events, and kept up to date by the materializer.
+- **Reads.** Reads at a past revision and range reads at a revision walk the index and read event rows.
+- **Compaction** keeps each key's newest version at or below the floor unless the current row is it, and deletes the rest below the floor.
+- **Formats.** `KvHistoryV1` leaves the common hash and the shared checkpoint, and that format's version is raised. The scrub (task-d37) reads the new layout. task-d26's contract gains the index's memory budget.
+
+**Acceptance:**
+- **The design step** recorded and reviewed.
+- **A differential test** over randomized histories, multi-key transactions and deletes among them, with compactions between: every read at a past revision, range read and watch replay answers as the current layout does, and a read at the floor still finds each key.
+- **Boot and install:** the index rebuilt equals the one kept live, after a restart and after a local image's install. The rebuild's time and the index's memory are measured at 10⁵ and 10⁶ retained versions.
+- **The checkpoint:** export, install, restore and scrub tests on the new format version, and an old format refused with the reason.
+- **The storage crash tests** at every cut of a materializer commit and of a compaction.
+- **A local pair:** rows a command at every voter, the materializer's CPU a command, and compaction's deletes a revision.
+
+**Review boundary:** How versions are stored and found, and the checkpoint format that carries them. No change to what a read at a revision or a watch returns.
 
 ## Gate checklist and deferred work
 

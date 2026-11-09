@@ -2011,6 +2011,23 @@ A client acknowledges on every request (`ack_through`), so `retirement()` (`retr
 
 **What it moves.** The floor row is written once every `K` commands a client instead of every command: about −(1 − 1/K) rows a command at every voter, about −0.03 to −0.04 ms an operation at `K = 16`. The `K` deletes land together on consecutive keys of one client, which redb writes as one region of its tree. Whether that is cheaper than `K` scattered deletes is read in the pair, not assumed. `ExecutedV1` stays: it is the index by command that catch-up, campaigns and boot read, and `RetryV1` is keyed by the retry key.
 
+**One version row a revision (task-d105).** A put writes three rows for its key: the current entry (`KvCurrentV1`), a history row (`KvHistoryV1`, keyed by namespace, key and revision, holding the entry) and an event row (`EventsV1`, keyed by revision and ordinal, holding kind, namespace, key, entry and the previous entry). The event row holds everything the history row holds. They differ in their keys and their retention:
+- reads at a past revision (`scan_history`) need the newest version of a key at or below a revision, in key order;
+- a watch's replay needs versions in revision order;
+- compaction keeps each key's newest version at or below the floor, and deletes whole revisions of events below it.
+
+**The layout: etcd's.** One row a mutated key a revision, keyed by revision: the event row, which keeps its key and its contents. The key order comes from an index held in memory, from each (namespace, key) to its retained (revision, ordinal)s, as etcd's `treeIndex` does (`server/storage/mvcc/index.go`).
+- **Reads.** A read at revision r finds a key's newest revision at or below r in the index, and reads that event row. A range read at r walks the index's key range.
+- **Building the index.** The index is built at boot from the retained event rows and kept up to date by the materializer as each revision lands.
+- **Compaction** keeps each key's newest version at or below the floor as a row, unless the current row already is that version, so a read at the floor still finds it. It deletes every other event below the floor. A watch from below the floor is refused as compacted, as today.
+
+**What it costs.**
+- **Memory.** The index holds about a key's bytes and 16 bytes a retained version, which task-d26's resource contract adds as a budget per domain, bounded by the compaction floor.
+- **Boot.** The rebuild reads every retained event once, before the projection serves reads. It is bounded and measured beside task-d55's replay.
+- **The checkpoint.** `KvHistoryV1` leaves the common hash and `SharedCheckpointV1`, and the events' retention changes. So this is a checkpoint format version and a scrub change (task-d37), accepted because nothing is deployed in production yet. A local image's index is rebuilt at install as at boot.
+
+**What it moves.** One row a mutated key a revision at every voter: about −0.03 to −0.04 ms an operation at the register row, and more for a transaction over several keys. History rows were also the larger part of compaction's deletes, which now fall to one deletion a revision below the floor.
+
 <a id="s17-5"></a>
 ### 17.5 MVCC and physical maintenance
 
