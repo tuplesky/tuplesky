@@ -3996,13 +3996,13 @@ So every feature-gated change, task-d98's `EarlyProposal` first, would ship unre
 **Prerequisites:** task-c02, task-d26, task-d101.  
 **Design:** Section 17.4 (amended by this task's design step: the retry window retired in batches).
 
-**Implement:** The second of task-d101's option 2 cuts (#185 review). `retirement()` retires a client's acknowledged sequences once at least `RETIRE_BATCH` (`K`) are acknowledged above the floor, up to `MAX_RETIRE_PER_COMMAND`. It also retires whenever deferring would leave the command's own sequence, or the next `K`, outside the window measured from the unretired floor. The rule stays a function of the durable view and the accepted payload. task-d26's bound on a session's retained results becomes `width + K`. `K` is a constant of the format, not a setting, since every voter must compute the same retirement.
+**Implement:** The second of task-d101's option 2 cuts (#185 review). `retirement()` retires a client's acknowledged sequences once at least `RETIRE_BATCH` (`K`) are acknowledged above the floor. It also retires whenever deferring would leave the command's own sequence, or the next `K`, outside the window measured from the unretired floor. A retiring command retires up to `MAX_RETIRE_PER_COMMAND + K − 1` above the floor, so the batched floor is never more than `K − 1` below today's and a retirement reaches at least today's. The rule stays a function of the durable view and the accepted payload. task-d26's bound on a session's retained results becomes `width + K`. `K` is a constant of the format, not a setting, since every voter must compute the same retirement.
 
 **Acceptance:**
 - **The design step** recorded and reviewed.
 - **Model tests:**
   - every voter retires the same sequences at the same position, and the common hash agrees across voters through a long run with clients at and near the window's edge;
-  - no request is refused `OutOfWindow` that today's rule admits, over randomized acknowledgement patterns;
+  - no request is refused `OutOfWindow` that today's rule admits, over randomized acknowledgement patterns, including an acknowledgement jump past `MAX_RETIRE_PER_COMMAND` after a deferred prefix (the case on #207);
   - a retry of an acknowledged sequence still retained answers with its result, and one retired answers `Retired` as today;
   - resolve and `records_for` answer as today;
   - a session's retained results never exceed `width + K`.
