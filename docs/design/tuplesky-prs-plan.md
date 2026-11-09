@@ -3845,7 +3845,7 @@ So every feature-gated change, task-d98's `EarlyProposal` first, would ship unre
 - **Step A: the collector answers on the release alone, for every command.**
   - **The wire.** A mark on a submission, carried on the leader's proposal: the command is answered on the release. For a marked command the leader sends no `LeaderReply`, and every voter sends its fast and slow acknowledgements to the leader only. The release envelope carries the admission digest of the payload the leader decided, outside the result's bytes.
   - **The collector.** It marks commands while its node reads `Feature::AnswerOnRelease` active, and answers a marked command on the leader's non-speculative release alone, with `check_release` unchanged, once the release's admission equals the one it submitted under. A release under other facts is held, as a release without learning is today. The `(None, true) => "votes"` corroboration of `settle_from_record` goes.
-  - **The leader's evidence repair** (`repair_evidence`, task-c02) publishes the release again for an exact duplicate of a marked command it has executed, instead of its reply. A follower repairs nothing for a marked command.
+  - **The leader's evidence repair** (`repair_evidence`, task-c02) publishes the release again for an exact duplicate of a marked command it has executed, instead of its reply. The daemon rebuilds the release from the leader's retry record and its table record's admission, since the `EvidenceStore` keeps no release. A duplicate ahead of the projection waits for it through the command's position, and one ahead of the release waits for the release; neither is refused. A follower repairs nothing for a marked command.
   - **The frontend's hold** (`parked.rs`) holds nothing for a marked command, and goes once no supported build leaves a command unmarked.
   - **The switch:** `Feature::AnswerOnRelease`, read on the collector's side, which reads no feature today.
 - **Step B: the leader relay while rounds are slow-only.**
@@ -3870,7 +3870,7 @@ So every feature-gated change, task-d98's `EarlyProposal` first, would ship unre
 - **Model tests, step A:**
   - a marked command is answered on a final release alone, and a speculative release is held;
   - a release whose admission differs from the submitted one is held, and the entry settles from the record or a voter's `OtherFacts` refusal, with the answer today's collector gives;
-  - a connection lost after execution with the leader still leading: the re-sent submission gets the release again from the leader's evidence repair; and past what the leader's table remembers, its `Forgotten` refusal settles the entry from the record;
+  - a connection lost after execution with the leader still leading: the re-sent submission gets the release again from the leader's evidence repair, rebuilt from its records; a duplicate that arrives before the release waits for it; and past what the leader's table remembers, its `Forgotten` refusal settles the entry from the record;
   - marked and unmarked commands mix while the feature activates, and neither waits for evidence nobody sends.
 - **Model tests, step B:**
   - a relayed command is learned on the slow path and released to its collector;

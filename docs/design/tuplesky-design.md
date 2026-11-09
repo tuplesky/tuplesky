@@ -334,11 +334,21 @@ The section below is the design step; the code step is task-d100's entry in the 
     - A release under other facts is held, as a release without learning is held today, and the entry ends the way it ends today: settled from this node's record against the held release (`settle_from_record`), which answers by identity as a retry before submission is answered, or by a voter's `OtherFacts` refusal (task-d22). So step A keeps today's comparison and changes no answer a caller gets.
   - **The record's corroboration (#202 review).** When the release is lost, `settle_from_record` takes the collector's own learning as corroboration of this node's record (the `(None, true) => "votes"` branch, task-c02), and `half_established` lists those entries. Under step A no entry learns, so that branch goes. A lost release then ends by one of three paths, by where the leader is:
     - **Still leading, with the command in its table:** the collector's re-sent submission (`due_solicits`) reaches it as an exact duplicate, and its evidence repair (`repair_evidence`, task-c02) publishes the release again instead of its reply. A follower has nothing to repair any more.
+      - **What the repair re-publishes (#202 review).** Today the repair re-sends frames the leader's `EvidenceStore` kept (`replay.rs`), at most two acknowledgements a command. The release is not one of them: it leaves the machine as `Effect::Released`, so nothing in the machine can send it again. So the daemon rebuilds it: the response, position, revision and result digest from the leader's retry record (`RetryRecordV1`), and the admission digest from its table record. That keeps the store's memory independent of response sizes.
+      - **A duplicate that reaches the leader before its projection holds the record** waits for the projection through the command's position, as a retry there does (Section 4.5).
+      - **A duplicate that arrives before the release exists** finds nothing to re-publish, though the release is still coming. It waits for the release, as the original submission does; it is never answered with a refusal the collector acts on.
     - **Still leading, past what its table remembers:** it refuses the duplicate as `Forgotten`, which marks the entry for the record (`from_record`, task-d22).
     - **Replaced:** `Collector::reconfigure` marks every entry it voids for the record (task-d22).
 
     `half_established` then lists the entries marked for the record and those holding a release they can't answer on (speculative, or under other facts).
-  - **A leader that is wrong.** That is outside the fault model, and the collector's count is no defense against it anyway: the leader also chooses the order the votes are counted over. What does check a leader's result is the late-release comparison against each voter's execution record (task-d12), which stops a node on a difference, and the simulator's oracle, which compares every released `ResponseV1` byte for byte with what the voters execute after healing. Both stay, and task-d100's acceptance runs that oracle over both steps.
+  - **A leader that is wrong.** That is outside the fault model, and the collector's count is no defense against it anyway: the leader also chooses the order the votes are counted over. What compares a leader's result with a voter's execution today is narrower than every command at every voter (#202 and #203 reviews):
+    - `LateReleaseAgainstAnswer` (task-d12): a late release, against an answer this collector already gave from its own record;
+    - `HeldReleaseAgainstRecord` (task-d06): a held release, against this node's record, for a half-held entry; it stops the node;
+    - catch-up's comparison with the donor, for the commands it pulls (task-d08);
+    - the forgetting floor's root every 4,096 positions (task-d27), where a voter whose root differs isn't counted with the majority, and nothing stops on it;
+    - and in the simulator, the oracle, which compares every released `ResponseV1` byte for byte with what the voters execute after healing.
+
+    All stay, and task-d100's acceptance runs the oracle over both steps. Neither step changes what they cover.
   - **The fast-path label.** `EstablishedResult.fast_path` is the leader's, as it is today, and the collector's trace takes it from there.
 
 **A2. What changes on the wire.**
