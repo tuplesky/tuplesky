@@ -646,12 +646,21 @@ impl<P: Persistence> Voter<P> {
         // step A) marks its command before it is stepped, so the
         // proposal or acknowledgement it leads to already knows not to
         // send the frontend anything.
-        if frame.version == coord_collector::VERSION_ANSWER_ON_RELEASE
-            && let Some(command) = early.or_else(|| command_of(&admitted.frame))
-        {
+        let marked = if frame.version == coord_collector::VERSION_ANSWER_ON_RELEASE {
+            early.or_else(|| command_of(&admitted.frame))
+        } else {
+            None
+        };
+        if let Some(command) = marked {
             self.node.mark_answer_on_release(command);
         }
         let out = self.node.on_event(Event::Admitted(admitted), &self.ballot);
+        // A submission refused before its command was initialized leaves
+        // nothing the mark is for (#204 review): it goes, and the table's
+        // own sweep drops the rest with their records.
+        if let Some(command) = marked {
+            self.node.keep_mark_if_held(&command);
+        }
         let command = early.or_else(|| self.node.machine().admitted());
         #[cfg(debug_assertions)]
         debug_assert_eq!(command, expected, "the machine's command is the frame's");

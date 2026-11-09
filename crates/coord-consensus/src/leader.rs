@@ -1041,7 +1041,7 @@ impl Leader {
         self.payloads.retain(|c, _| !table.forgotten(c));
         self.served_payloads.retain(|c| !table.forgotten(c));
         self.proposals.retain(|c, _| !table.forgotten(c));
-        self.answer_on_release.retain(|c| !table.forgotten(c));
+        self.answer_on_release.retain(|c| table.record(c).is_some());
         let proposals = &self.proposals;
         self.unsettled.retain(|(_, c)| proposals.contains_key(c));
         self.durable.retain(|(_, c)| proposals.contains_key(c));
@@ -2060,6 +2060,17 @@ impl Leader {
     /// proposal that submission leads to.
     pub fn mark_answer_on_release(&mut self, command: CommandId) {
         self.answer_on_release.insert(command);
+    }
+
+    /// Drop `command`'s mark unless this leader's table holds it: the
+    /// submission that marked it was refused before the command was
+    /// initialized (backpressure, a ballot this leader doesn't lead, a
+    /// retired key), and nothing here will ever release it (#204
+    /// review). A later submission marks it again.
+    pub fn keep_mark_if_held(&mut self, command: &CommandId) {
+        if self.table.record(command).is_none() {
+            self.answer_on_release.remove(command);
+        }
     }
 
     /// Whether `command`'s collector answers it on the release alone.

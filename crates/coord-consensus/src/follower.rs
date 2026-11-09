@@ -3436,7 +3436,7 @@ impl Follower {
         self.payloads.retain(|c, _| !table.forgotten(c));
         self.served_payloads.retain(|c| !table.forgotten(c));
         self.votes.retain(|c, _| !table.forgotten(c));
-        self.answer_on_release.retain(|c| !table.forgotten(c));
+        self.answer_on_release.retain(|c| table.record(c).is_some());
         // The adoption order of a forgotten command decides nothing more,
         // and kept without its payload it would read as a payload still
         // missing.
@@ -3811,6 +3811,20 @@ impl Follower {
     /// release alone (task-d100, step A).
     pub fn mark_answer_on_release(&mut self, command: CommandId) {
         self.answer_on_release.insert(command);
+    }
+
+    /// Whether `command`'s collector answers it on the release alone.
+    pub fn answers_on_release(&self, command: &CommandId) -> bool {
+        self.answer_on_release.contains(command)
+    }
+
+    /// Drop `command`'s mark unless this replica's table holds it: the
+    /// submission that marked it was refused before the command was
+    /// initialized (#204 review). A later submission marks it again.
+    pub fn keep_mark_if_held(&mut self, command: &CommandId) {
+        if self.table.record(command).is_none() {
+            self.answer_on_release.remove(command);
+        }
     }
 
     /// Whether this replica may send fast acknowledgements in this ballot.

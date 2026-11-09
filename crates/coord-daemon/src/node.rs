@@ -152,6 +152,23 @@ impl Machine {
         }
     }
 
+    /// Whether `command` is marked as answered on the release alone.
+    pub fn answers_on_release(&self, command: &CommandId) -> bool {
+        match self {
+            Machine::Leader(l) => l.answers_on_release(command),
+            Machine::Follower(f) => f.answers_on_release(command),
+        }
+    }
+
+    /// Drop `command`'s mark unless the machine's table holds it, once
+    /// the submission that marked it has been stepped (#204 review).
+    pub fn keep_mark_if_held(&mut self, command: &CommandId) {
+        match self {
+            Machine::Leader(l) => l.keep_mark_if_held(command),
+            Machine::Follower(f) => f.keep_mark_if_held(command),
+        }
+    }
+
     /// Whether this replica is holding a command it knows by identity
     /// and not by content.
     pub fn wants_payloads(&self) -> bool {
@@ -1074,6 +1091,12 @@ impl<P: Persistence> Node<P> {
     /// (task-d100, step A).
     pub fn mark_answer_on_release(&mut self, command: CommandId) {
         self.machine_mut().mark_answer_on_release(command);
+    }
+
+    /// Drop `command`'s mark unless the machine holds it (see
+    /// [`Machine::keep_mark_if_held`]).
+    pub fn keep_mark_if_held(&mut self, command: &CommandId) {
+        self.machine_mut().keep_mark_if_held(command);
     }
 
     /// The marked commands whose release the voter publishes again

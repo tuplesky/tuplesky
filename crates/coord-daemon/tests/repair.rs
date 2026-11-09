@@ -1752,3 +1752,46 @@ fn a_duplicate_ahead_of_the_release_waits_for_it() {
     assert_eq!(w.counted, vec![(0, KIND_RELEASE)]);
     assert!(w.rejected.is_empty(), "{:?}", w.rejected);
 }
+
+/// A marked submission the machine refuses before initializing its
+/// command -- here a follower's table past its unreserved part -- leaves
+/// no mark behind (#204 review): only the commands its table holds stay
+/// marked, so marks cannot outgrow the table under sustained overload.
+#[test]
+fn a_marked_submission_refused_before_initialization_leaves_no_mark() {
+    let mut w = Cluster::new(256);
+    let mut held = 0;
+    let mut refused = 0;
+    for sequence in 1..=96u64 {
+        let admitted = admitted(sequence);
+        let request = RequestV1::new(retry_key(sequence), &logical(sequence), 0, 0).unwrap();
+        let submit = coord_collector::submit_frame_answer_on_release(&coord_collector::SubmitV1 {
+            receipt: admitted.receipt.facts(),
+            request,
+        })
+        .unwrap();
+        // Only the follower hears of it: it pre-accepts until its table
+        // keeps the rest for recovery, and refuses the others.
+        w.voters[1]
+            .on_submission(PeerRole::Frontend, &frame(&submit), COLLECTOR)
+            .expect("driven")
+            .expect("admitted at the door");
+        let command = w.command(sequence);
+        let machine = w.voters[1].node().machine();
+        let in_table = match machine {
+            Machine::Follower(f) => f.table().record(&command).is_some(),
+            Machine::Leader(_) => unreachable!("replica 1 follows"),
+        };
+        assert_eq!(
+            machine.answers_on_release(&command),
+            in_table,
+            "command {sequence}: marked exactly while the table holds it"
+        );
+        if in_table {
+            held += 1;
+        } else {
+            refused += 1;
+        }
+    }
+    assert!(held > 0 && refused > 0, "held {held}, refused {refused}");
+}
