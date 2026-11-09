@@ -909,6 +909,7 @@ dependencies = [
  "coord-consensus",
  "coord-core",
  "coord-journal-api",
+ "coord-journal-faultkit",
  "coord-journal-raft-engine",
  "coord-oracle",
  "coord-redb-faultkit",

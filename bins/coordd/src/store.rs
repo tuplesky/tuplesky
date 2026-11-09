@@ -100,63 +100,70 @@ impl core::fmt::Display for StoreError {
 
 impl core::error::Error for StoreError {}
 
-/// Open the projection `config` names, for `intent`.
-pub fn open(
-    config: &Config,
-    intent: Intent,
-    cluster: ClusterId,
-    domain: DomainId,
-    replica: ReplicaId,
-    incarnation: ReplicaIncarnation,
-) -> Result<(Generation, Option<ReplicaIncarnation>), StoreError> {
-    let root = config.state.root_path(&config.state_directory);
-    let identity = StoreIdentity {
-        cluster_id: cluster,
-        domain_id: domain,
-        replica_id: replica,
-        incarnation,
-    };
-    let options = OpenOptions {
-        cache_bytes: config.state.cache_bytes,
-    };
-    match intent {
-        Intent::Initialize => initialize(&root, identity, options, |_| Ok(())).map(|g| (g, None)),
-        Intent::Serve => {
-            // An authorized replacement keeps this node's durable state
-            // (task-58). `place` has already established that this
-            // certificate's generation is the *committed* voter's, so a
-            // root stamped with an earlier one belongs to this same
-            // replica before its key was replaced -- its journal,
-            // checkpoints and epoch metadata are exactly what the new
-            // generation comes back on. A root stamped *later* is the
-            // fencing case and is refused, so a clone restored from
-            // before a replacement still cannot serve.
-            //
-            // Nothing is adopted here. The generation is opened as it is
-            // stamped, and the adoption is only reported as pending: the
-            // genesis pin is checked on this generation before anything
-            // durable moves (`Opened::attach` carries the stream and then
-            // advances the manifest), so a manifest the node was not
-            // initialized under is refused while the store is still
-            // exactly as it was.
-            let not_there = |e| match e {
-                OpenError::NotInitialized | OpenError::MissingGeneration(_) => {
-                    StoreError::NotInitialized { root: show(&root) }
-                }
-                other => StoreError::Refused {
-                    root: show(&root),
-                    reason: format!("{other:?}"),
-                },
-            };
-            let pending = Generation::adoption_pending(&root, identity).map_err(not_there)?;
-            let stamped = StoreIdentity {
-                incarnation: pending.unwrap_or(incarnation),
-                ..identity
-            };
-            let generation =
-                Generation::open_existing(&root, stamped, options).map_err(not_there)?;
-            Ok((generation, pending))
+/// What a serving start found at the projection root.
+enum Found {
+    /// The selected generation, and the incarnation an adoption is
+    /// pending from, if one is.
+    Opened(Generation, Option<ReplicaIncarnation>),
+    /// A selected generation whose database cannot be opened
+    /// ([`OpenError::is_unreadable_database`]): under the replay-backed
+    /// profile it is reinstalled from the local baseline
+    /// ([`reinstall_unreadable`]), and otherwise refused with `error`.
+    Unreadable {
+        /// The identity the root is stamped with.
+        stamped: StoreIdentity,
+        /// As for [`Found::Opened`].
+        pending: Option<ReplicaIncarnation>,
+        /// Why the database did not open.
+        error: OpenError,
+    },
+}
+
+/// Open the generation `root` selects to serve as `identity`.
+fn find_serving(
+    root: &Path,
+    identity: StoreIdentity,
+    options: OpenOptions,
+) -> Result<Found, StoreError> {
+    // An authorized replacement keeps this node's durable state
+    // (task-58). `place` has already established that this
+    // certificate's generation is the *committed* voter's, so a
+    // root stamped with an earlier one belongs to this same
+    // replica before its key was replaced -- its journal,
+    // checkpoints and epoch metadata are exactly what the new
+    // generation comes back on. A root stamped *later* is the
+    // fencing case and is refused, so a clone restored from
+    // before a replacement still cannot serve.
+    //
+    // Nothing is adopted here. The generation is opened as it is
+    // stamped, and the adoption is only reported as pending: the
+    // genesis pin is checked on this generation before anything
+    // durable moves (`Opened::attach` carries the stream and then
+    // advances the manifest), so a manifest the node was not
+    // initialized under is refused while the store is still
+    // exactly as it was.
+    let not_there = |e| match e {
+        OpenError::NotInitialized | OpenError::MissingGeneration(_) => {
+            StoreError::NotInitialized { root: show(root) }
         }
+        other => StoreError::Refused {
+            root: show(root),
+            reason: format!("{other:?}"),
+        },
+    };
+    let pending = Generation::adoption_pending(root, identity).map_err(not_there)?;
+    let stamped = StoreIdentity {
+        incarnation: pending.unwrap_or(identity.incarnation),
+        ..identity
+    };
+    match Generation::open_existing(root, stamped, options) {
+        Ok(generation) => Ok(Found::Opened(generation, pending)),
+        Err(error) if error.is_unreadable_database() => Ok(Found::Unreadable {
+            stamped,
+            pending,
+            error,
+        }),
+        Err(e) => Err(not_there(e)),
     }
 }
 
@@ -373,7 +380,8 @@ pub fn open_storage_with(
         },
     };
 
-    let (generation, pending, journal) = match intent {
+    let mut before_attach = Some(before_attach);
+    let (found, journal) = match intent {
         Intent::Initialize => {
             // Refused before anything is written if the journal is already
             // there, so a restore is not carried out in full only to be
@@ -410,7 +418,7 @@ pub fn open_storage_with(
                 &config.state.root_path(&config.state_directory),
                 identity_of_store,
                 options_of_store,
-                before_attach,
+                before_attach.take().expect("not yet run"),
             )?;
             // The journal is created only once the generation is selected.
             // A journal is what makes a root servable and what a second
@@ -430,15 +438,24 @@ pub fn open_storage_with(
                         .map_err(journal_error)?
                 }
             };
-            (generation, None, journal)
+            (Found::Opened(generation, None), journal)
         }
         Intent::Serve => {
             let journal = RaftEngineJournal::open_existing(&journal_root, identity, &options)
                 .map_err(journal_error)?;
-            let (mut generation, pending) =
-                open(config, intent, cluster, domain_id, replica, incarnation)?;
-            before_attach(generation.engine())?;
-            (generation, pending, journal)
+            let found = find_serving(
+                &config.state.root_path(&config.state_directory),
+                StoreIdentity {
+                    cluster_id: cluster,
+                    domain_id,
+                    replica_id: replica,
+                    incarnation,
+                },
+                OpenOptions {
+                    cache_bytes: config.state.cache_bytes,
+                },
+            )?;
+            (found, journal)
         }
     };
 
@@ -477,6 +494,30 @@ pub fn open_storage_with(
     }
 
     let checkpoint_root = root_path(&config.state_directory, &config.state.checkpoints);
+    let (mut generation, pending) = match found {
+        Found::Opened(generation, pending) => (generation, pending),
+        Found::Unreadable {
+            stamped,
+            pending,
+            error,
+        } => (
+            reinstall_unreadable(
+                &store,
+                &config.state.root_path(&config.state_directory),
+                &checkpoint_root,
+                domain_id,
+                stamped,
+                error,
+                OpenOptions {
+                    cache_bytes: config.state.cache_bytes,
+                },
+            )?,
+            pending,
+        ),
+    };
+    if let Some(before_attach) = before_attach.take() {
+        before_attach(generation.engine())?;
+    }
     let adoption = pending.map(|previous| Adoption {
         previous,
         root: config.state.root_path(&config.state_directory),
@@ -708,9 +749,81 @@ fn reinstall_if_invalid(
         replica_id: manifest.replica_id,
         incarnation: manifest.incarnation,
     };
-    let mut staged = generation
+    let staged = generation
         .stage_reinstall(identity, options)
         .map_err(|e| refused(format!("a generation to reinstall into: {e}")))?;
+    install_baseline(staged, pointer, image, refused)
+}
+
+/// Under the replay-backed profile (task-j05 step 3), a projection whose
+/// database cannot be opened at all -- absent, empty, refused by redb or
+/// failing its integrity check -- is the projection's loss, not the
+/// node's: the journal and the image of the local baseline rebuild it, as
+/// they rebuild one that does not continue the journal
+/// ([`reinstall_if_invalid`]). The selected generation is replaced by one
+/// holding the baseline's image, and the attach replays `(C, J]` onto it.
+///
+/// Under the strict profile the projection is the authority for what it
+/// committed, so the file is refused as it always was; and without a
+/// baseline there is nothing to install, so the node refuses to serve
+/// rather than guess. A database whose identity record names another
+/// node never reaches here: it is not unreadable, it is someone else's.
+fn reinstall_unreadable(
+    store: &JournaledStore<RaftEngineJournal, RedbEngine>,
+    root: &Path,
+    checkpoint_root: &Path,
+    domain_id: DomainId,
+    stamped: StoreIdentity,
+    error: OpenError,
+    options: OpenOptions,
+) -> Result<Generation, StoreError> {
+    let refused = |reason: String| StoreError::Refused {
+        root: show(root),
+        reason,
+    };
+    if store.projection_profile() == ProjectionProfile::Strict {
+        return Err(refused(format!("{error:?}")));
+    }
+    let baseline = store.recovery_baseline(domain_id).map_err(|e| {
+        refused(format!(
+            "the local recovery baseline could not be read: {e}"
+        ))
+    })?;
+    let Some(pointer) = baseline else {
+        return Err(refused(format!(
+            "the projection could not be opened ({error}) and no local checkpoint was \
+             published to reinstall it from"
+        )));
+    };
+    let checkpoints =
+        coord_checkpoint::LocalCheckpointStore::open(checkpoint_root).map_err(|e| {
+            StoreError::Refused {
+                root: show(checkpoint_root),
+                reason: format!("the local checkpoint directory could not be opened: {e}"),
+            }
+        })?;
+    let image = checkpoints
+        .load(&pointer)
+        .map_err(|e| StoreError::Refused {
+            root: show(checkpoint_root),
+            reason: format!("{e}"),
+        })?;
+    eprintln!(
+        "the projection could not be opened ({error}); reinstalling the local checkpoint at {}",
+        pointer.represented.get()
+    );
+    let staged = Generation::stage_reinstall_unreadable(root, stamped, options)
+        .map_err(|e| refused(format!("a generation to reinstall into: {e}")))?;
+    install_baseline(staged, &pointer, &image, refused)
+}
+
+/// Fill `staged` with the baseline's image and select it.
+fn install_baseline(
+    mut staged: InactiveGeneration,
+    pointer: &coord_journal_api::CheckpointPointerV1,
+    image: &coord_checkpoint::LocalCheckpointV1,
+    refused: impl Fn(String) -> StoreError,
+) -> Result<Generation, StoreError> {
     coord_checkpoint::install_local(
         staged.engine(),
         image,
@@ -722,10 +835,9 @@ fn reinstall_if_invalid(
             "the local checkpoint could not be installed: {e:?}"
         ))
     })?;
-    let generation = staged
+    staged
         .activate()
-        .map_err(|e| refused(format!("the reinstalled generation: {e}")))?;
-    Ok(generation)
+        .map_err(|e| refused(format!("the reinstalled generation: {e}")))
 }
 
 /// Carry out an authorized replacement's adoption: the journal's stream
@@ -869,7 +981,8 @@ pub(crate) fn root_path(state_directory: &str, root: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use coord_store_api::engine::{LocalEngine, WriteTxn};
+    use coord_checkpoint::LocalBaseline;
+    use coord_store_api::engine::{LocalEngine, SnapshotSource, WriteTxn};
     use coord_store_api::registry::Collection;
 
     /// A configuration whose store lives under `dir`, with a genesis
@@ -1129,7 +1242,6 @@ namespace = "5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e"
     /// the baseline a later boot published. Returns the journal's durable
     /// head and the baseline's represented sequence.
     fn a_projection_behind_its_baseline(config: &Config, dir: &Path, at: u64) -> (u64, u64) {
-        use coord_checkpoint::LocalBaseline;
         let opened = open_storage(
             config,
             Intent::Initialize,
@@ -1298,6 +1410,233 @@ namespace = "5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e"
         assert_eq!(frontiers.materialized(), frontiers.durable());
         assert_eq!(frontiers.checkpoint().get(), represented);
         assert!(frontiers.durable().get() > durable);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// How a lost projection is lost (task-j05 step 3, `replay`'s case).
+    #[derive(Clone, Copy, Debug)]
+    enum Loss {
+        /// A fresh database: the projection holds nothing.
+        Empty,
+        /// The projection of an earlier boot, behind the baseline.
+        Stale,
+        /// A stamp naming a record the journal does not hold.
+        Foreign,
+        /// A file redb cannot open: garbage, empty, or gone.
+        Garbage,
+        ZeroLength,
+        Missing,
+    }
+
+    /// The selected generation's database file.
+    fn selected_database(config: &Config) -> PathBuf {
+        let root = config.state.root_path(&config.state_directory);
+        let current = std::fs::read_to_string(root.join("CURRENT")).expect("CURRENT");
+        root.join(current.trim()).join("domain.redb")
+    }
+
+    /// Lose the selected projection of a node that published a baseline,
+    /// in the way `loss` names.
+    fn lose(config: &Config, dir: &Path, loss: Loss) {
+        let database = selected_database(config);
+        match loss {
+            Loss::Empty => {
+                let scratch = dir.join("scratch");
+                let fresh = Generation::create(
+                    &scratch,
+                    StoreIdentity {
+                        cluster_id: CLUSTER,
+                        domain_id: DOMAIN,
+                        replica_id: REPLICA,
+                        incarnation: incarnation(1),
+                    },
+                    OpenOptions::default(),
+                )
+                .expect("a fresh generation");
+                let path = fresh.directory().join("domain.redb");
+                drop(fresh);
+                std::fs::copy(path, &database).expect("replace");
+                std::fs::remove_dir_all(scratch).expect("scratch");
+            }
+            Loss::Stale => {
+                std::fs::remove_dir_all(dir.join("state")).expect("remove");
+                copy_tree(&dir.join("state-before"), &dir.join("state"));
+            }
+            Loss::Foreign => {
+                let identity = StoreIdentity {
+                    cluster_id: CLUSTER,
+                    domain_id: DOMAIN,
+                    replica_id: REPLICA,
+                    incarnation: incarnation(1),
+                };
+                let root = config.state.root_path(&config.state_directory);
+                let mut generation =
+                    Generation::open_existing(&root, identity, OpenOptions::default())
+                        .expect("open");
+                let engine = generation.engine();
+                let meta = coord_storage::lowering::DurableMeta::read(
+                    &engine.reader().snapshot().expect("snapshot"),
+                )
+                .expect("meta");
+                let foreign = coord_storage::lowering::DurableMeta {
+                    stamp: coord_store_api::envelope::AppliedStamp::new(
+                        meta.stamp.store_seq(),
+                        coord_types::identity::Digest32([0xee; 32]),
+                    ),
+                    ..meta
+                };
+                let mut txn = engine.begin_write().expect("write");
+                foreign.write(&mut txn).expect("stamp");
+                txn.commit_durable().expect("commit");
+            }
+            Loss::Garbage => std::fs::write(&database, vec![0x5a; 64 << 10]).expect("garbage"),
+            Loss::ZeroLength => std::fs::write(&database, []).expect("truncate"),
+            Loss::Missing => std::fs::remove_file(&database).expect("remove"),
+        }
+    }
+
+    /// A node initialized, given its genesis policy and booted once more
+    /// to publish a baseline, with the state of the first boot kept in
+    /// `state-before`. Returns the baseline's represented sequence.
+    fn a_node_with_a_baseline(config: &Config, dir: &Path) -> u64 {
+        let opened = open_storage(
+            config,
+            Intent::Initialize,
+            CLUSTER,
+            DOMAIN,
+            REPLICA,
+            incarnation(1),
+        )
+        .expect("init");
+        let mut storage = opened.attach().expect("attach");
+        crate::write_genesis_policy(config, &mut storage, incarnation(1)).expect("policy");
+        drop(storage);
+        copy_tree(&dir.join("state"), &dir.join("state-before"));
+        let mut storage = serve(config, 1).expect("serve").attach().expect("attach");
+        let published = storage
+            .domain
+            .publish_local(
+                &storage.checkpoints,
+                &coord_checkpoint::LocalLimits::default(),
+            )
+            .expect("publish")
+            .expect("something to represent");
+        published.represented.get()
+    }
+
+    /// task-j05 step 3: a projection lost in any of the ways `replay`'s
+    /// case names -- empty, behind the baseline, stamped with a record the
+    /// journal does not hold, or a file redb cannot open -- stops a strict
+    /// node, and a replay-backed node discards it, installs its baseline
+    /// and replays the journal onto it, serving at the journal's head.
+    #[test]
+    fn a_lost_projection_is_reinstalled_under_replay_and_refused_under_strict() {
+        for loss in [
+            Loss::Empty,
+            Loss::Stale,
+            Loss::Foreign,
+            Loss::Garbage,
+            Loss::ZeroLength,
+            Loss::Missing,
+        ] {
+            let dir = workspace(&format!("lost-{loss:?}"));
+            let mut config = config(&dir);
+            let represented = a_node_with_a_baseline(&config, &dir);
+            assert!(represented > 0);
+            lose(&config, &dir, loss);
+
+            let refused = serve(&config, 1).and_then(Opened::attach);
+            assert!(
+                matches!(refused, Err(StoreError::Refused { .. })),
+                "{loss:?}: the strict profile served a lost projection: {:?}",
+                refused.map(|_| ()).map_err(|e| e.to_string())
+            );
+
+            config.journal.profile = coord_daemon::config::JOURNAL_REPLAY_PROFILE.to_owned();
+            let storage = serve(&config, 1)
+                .and_then(Opened::attach)
+                .unwrap_or_else(|e| panic!("{loss:?}: not reinstalled: {e}"));
+            let frontiers = storage.domain.store().frontiers(DOMAIN).expect("frontiers");
+            assert_eq!(frontiers.materialized(), frontiers.durable(), "{loss:?}");
+            assert_eq!(frontiers.checkpoint().get(), represented, "{loss:?}");
+            drop(storage);
+            serve(&config, 1)
+                .and_then(Opened::attach)
+                .unwrap_or_else(|e| panic!("{loss:?}: the reinstalled generation: {e}"));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// Without a published baseline there is nothing to install: a
+    /// replay-backed node whose projection file cannot be opened refuses
+    /// to serve and says why, and the file is left where it was.
+    #[test]
+    fn an_unreadable_projection_without_a_baseline_is_refused() {
+        let dir = workspace("unreadable-no-baseline");
+        let mut config = config(&dir);
+        config.journal.profile = coord_daemon::config::JOURNAL_REPLAY_PROFILE.to_owned();
+        let opened = open_storage(
+            &config,
+            Intent::Initialize,
+            CLUSTER,
+            DOMAIN,
+            REPLICA,
+            incarnation(1),
+        )
+        .expect("init");
+        let mut storage = opened.attach().expect("attach");
+        crate::write_genesis_policy(&config, &mut storage, incarnation(1)).expect("policy");
+        drop(storage);
+        let database = selected_database(&config);
+        std::fs::write(&database, vec![0x5a; 64 << 10]).expect("garbage");
+
+        match serve(&config, 1) {
+            Err(StoreError::Refused { reason, .. }) => assert!(
+                reason.contains("no local checkpoint was published"),
+                "{reason}"
+            ),
+            Err(other) => panic!("refused for another reason: {other}"),
+            Ok(_) => panic!("an unreadable projection served with no baseline"),
+        }
+        assert_eq!(selected_database(&config), database, "nothing was staged");
+        assert_eq!(
+            std::fs::read(&database).expect("kept"),
+            vec![0x5a; 64 << 10]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A database whose identity record names another node is not
+    /// unreadable: it is someone else's, and even a replay-backed node
+    /// with a baseline refuses it rather than reinstalling over it.
+    #[test]
+    fn a_foreign_database_is_refused_even_with_a_baseline() {
+        let dir = workspace("foreign-database");
+        let mut config = config(&dir);
+        config.journal.profile = coord_daemon::config::JOURNAL_REPLAY_PROFILE.to_owned();
+        a_node_with_a_baseline(&config, &dir);
+        let scratch = dir.join("scratch");
+        let other = Generation::create(
+            &scratch,
+            StoreIdentity {
+                cluster_id: CLUSTER,
+                domain_id: DOMAIN,
+                replica_id: ReplicaId([2; 16]),
+                incarnation: incarnation(1),
+            },
+            OpenOptions::default(),
+        )
+        .expect("another node's generation");
+        let path = other.directory().join("domain.redb");
+        drop(other);
+        std::fs::copy(path, selected_database(&config)).expect("swap");
+        match serve(&config, 1) {
+            Err(StoreError::Refused { reason, .. }) => {
+                assert!(reason.contains("IdentityRecordMismatch"), "{reason}");
+            }
+            Err(other) => panic!("refused for another reason: {other}"),
+            Ok(_) => panic!("another node's database was served or reinstalled over"),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

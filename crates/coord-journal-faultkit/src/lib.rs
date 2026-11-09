@@ -193,7 +193,9 @@ type Files = BTreeMap<PathBuf, Arc<Mutex<Images>>>;
 pub struct Shared {
     plan: Mutex<FaultPlan>,
     ops: AtomicU64,
-    frozen: AtomicBool,
+    /// The power line: shared with another kit's (see
+    /// [`FaultFs::with_power`]), a crash in either halts both.
+    frozen: Arc<AtomicBool>,
     log: Mutex<Vec<Op>>,
     files: Mutex<Files>,
 }
@@ -358,8 +360,16 @@ pub struct FaultFs {
 impl FaultFs {
     /// A file system under `plan`, and the test's view of it.
     pub fn new(plan: FaultPlan) -> (Arc<FaultFs>, Arc<Shared>) {
+        Self::with_power(plan, Arc::default())
+    }
+
+    /// [`FaultFs::new`] on a power line shared with other devices
+    /// (task-j05's composed matrix): a crash any of them schedules halts
+    /// every one at the same instant, as one machine's power loss would.
+    pub fn with_power(plan: FaultPlan, power: Arc<AtomicBool>) -> (Arc<FaultFs>, Arc<Shared>) {
         let shared = Arc::new(Shared {
             plan: Mutex::new(plan),
+            frozen: power,
             ..Shared::default()
         });
         (

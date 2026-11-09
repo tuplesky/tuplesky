@@ -139,6 +139,25 @@ impl std::fmt::Display for OpenError {
 
 impl std::error::Error for OpenError {}
 
+impl OpenError {
+    /// Whether this is how a selected generation's database fails when
+    /// the file itself cannot be used: absent, empty, refused by redb, a
+    /// table missing or damaged pages (task-j05). An identity record that
+    /// disagrees with the manifest is not one: that is a database that
+    /// belongs to someone else, and stays refused.
+    ///
+    /// The variants are shared with the root's own checks (`CURRENT`, the
+    /// manifest), so this is a hint for which recovery to try; the
+    /// staging that acts on it, [`Generation::stage_reinstall_unreadable`],
+    /// verifies the root and the manifest again first.
+    pub const fn is_unreadable_database(&self) -> bool {
+        matches!(
+            self,
+            OpenError::MissingDatabase | OpenError::EmptyDatabase | OpenError::Corrupt(_)
+        )
+    }
+}
+
 impl From<std::io::Error> for OpenError {
     fn from(e: std::io::Error) -> Self {
         OpenError::Io(e)
@@ -512,6 +531,35 @@ impl Generation {
         let (engine, lock, _) = self.into_parts();
         drop(engine);
         InactiveGeneration::stage_migration_with_lock(&root, lock, identity, options)
+    }
+
+    /// Stage the next generation of `root` to reinstall this node's own
+    /// local recovery image into, when the selected generation's database
+    /// cannot be opened at all (task-j05 step 3; Section 17.16.4). Under
+    /// the replay-backed profile the projection is derived state: the
+    /// journal and the image of a published baseline rebuild it, so a
+    /// file redb cannot open is discarded and reinstalled like a
+    /// projection that does not continue the journal.
+    ///
+    /// Everything about the root is verified as any staging verifies it:
+    /// `CURRENT`, the selected manifest, its engine, profile and registry,
+    /// and that `identity` is the same replica of the same domain, no
+    /// earlier than the manifest. Only the database is not opened, and it
+    /// must fail as [`OpenError::is_unreadable_database`] says: a database
+    /// that opens is not discarded, and one whose identity record names
+    /// another node is refused. The selected generation stays selected
+    /// until the staging is activated, so a crash before that finds the
+    /// same unreadable file and reinstalls again.
+    pub fn stage_reinstall_unreadable(
+        root: &Path,
+        identity: StoreIdentity,
+        options: OpenOptions,
+    ) -> Result<InactiveGeneration, OpenError> {
+        let lock = RootLock::acquire(root, false)?;
+        if !root.join(CURRENT).is_file() {
+            return Err(OpenError::NotInitialized);
+        }
+        stage_with_lock_for(root, lock, identity, options, Obligations::Unreadable)
     }
 
     /// Remove every generation directory of this root except the selected
@@ -966,6 +1014,10 @@ pub(crate) enum Obligations {
     Refused,
     /// Obligations are carried forward by the caller.
     Carried,
+    /// The selected database cannot be opened, so its obligations cannot
+    /// be read; the caller carries them forward from this node's own
+    /// recovery image (task-j05). A database that opens is refused.
+    Unreadable,
 }
 
 fn stage_with_lock_for(
@@ -1058,7 +1110,17 @@ fn read_selected_for(
     // generation that open would refuse (a swapped or foreign database, a
     // missing table, damaged pages) fails closed here too, rather than being
     // silently replaced and later pruned.
-    let db = open_verified_database(&directory.join(DATABASE), &manifest, options)?;
+    let opened = open_verified_database(&directory.join(DATABASE), &manifest, options);
+    if obligations == Obligations::Unreadable {
+        return match opened {
+            Ok(_) => Err(OpenError::Corrupt(
+                "the selected database opens; only an unreadable one is discarded".into(),
+            )),
+            Err(e) if e.is_unreadable_database() => Ok(Some(manifest)),
+            Err(e) => Err(e),
+        };
+    }
+    let db = opened?;
     // The selected generation must hold no protocol obligations: promises and
     // votes are never replaced or reset by an install. An offline migration
     // says `Carried` and copies them forward itself (task-60).
