@@ -136,6 +136,22 @@ impl Machine {
         }
     }
 
+    /// Mark `command` as answered by its collector on the leader's
+    /// release alone (task-d100, step A), before the submission that
+    /// asks for it is stepped.
+    ///
+    /// The mark lives in this role's machine and goes with it: a
+    /// campaign replaces the machine, and the collector voids every
+    /// entry the ballot change reaches for its node's record
+    /// (`Collector::reconfigure`, task-d22), so no entry waits on a mark
+    /// the new machine lacks.
+    pub fn mark_answer_on_release(&mut self, command: CommandId) {
+        match self {
+            Machine::Leader(l) => l.mark_answer_on_release(command),
+            Machine::Follower(f) => f.mark_answer_on_release(command),
+        }
+    }
+
     /// Whether this replica is holding a command it knows by identity
     /// and not by content.
     pub fn wants_payloads(&self) -> bool {
@@ -228,6 +244,21 @@ impl Machine {
         match self {
             Machine::Leader(m) => m.executions_durable_through(position),
             Machine::Follower(m) => m.executions_durable_through(position),
+        }
+    }
+
+    /// The marked commands a leader was sent again after executing them,
+    /// whose release the voter publishes again (task-d100, step A).
+    pub fn take_release_again(
+        &mut self,
+    ) -> Vec<(
+        CommandId,
+        coord_types::RetryKey,
+        coord_types::identity::Digest32,
+    )> {
+        match self {
+            Machine::Leader(m) => m.take_release_again(),
+            Machine::Follower(_) => Vec::new(),
         }
     }
 
@@ -679,6 +710,10 @@ pub struct Node<P: Persistence> {
     early_without_activation: bool,
     /// This voter's part in activating features (task-d99).
     features: Option<crate::feature::Features>,
+    /// Whether this node reads `Feature::AnswerOnRelease` active
+    /// (task-d100, step A): the collector beside it marks its
+    /// submissions as answered on the leader's release alone.
+    answer_on_release: bool,
     /// Commands this replica established, by the path that decided them
     /// (task-d50).
     pub established: Established,
@@ -781,6 +816,7 @@ impl<P: Persistence> Node<P> {
             early_holders: None,
             early_without_activation: false,
             features: None,
+            answer_on_release: false,
             established: Established::default(),
             fast_path: coord_consensus::FastPathCounts::default(),
             release: crate::learned::ReleaseTiming::default(),
@@ -1032,6 +1068,24 @@ impl<P: Persistence> Node<P> {
         self.machine
             .as_ref()
             .expect("a node always holds a machine")
+    }
+
+    /// Mark `command` as answered on the leader's release alone
+    /// (task-d100, step A).
+    pub fn mark_answer_on_release(&mut self, command: CommandId) {
+        self.machine_mut().mark_answer_on_release(command);
+    }
+
+    /// The marked commands whose release the voter publishes again
+    /// (task-d100, step A; see [`Machine::take_release_again`]).
+    pub fn take_release_again(
+        &mut self,
+    ) -> Vec<(
+        CommandId,
+        coord_types::RetryKey,
+        coord_types::identity::Digest32,
+    )> {
+        self.machine_mut().take_release_again()
     }
 
     fn machine_mut(&mut self) -> &mut Machine {
@@ -1335,11 +1389,21 @@ impl<P: Persistence> Node<P> {
         let release = features
             .active()
             .contains(&coord_types::formats::Feature::ReleaseAtExecution);
+        let answer_on_release = features
+            .active()
+            .contains(&coord_types::formats::Feature::AnswerOnRelease);
         self.set_early_holders(Some(holders));
         if on != self.early_proposal {
             self.set_early_proposal(on);
         }
         self.set_release_at_execution(release);
+        self.answer_on_release = answer_on_release;
+    }
+
+    /// Whether this node reads `Feature::AnswerOnRelease` active
+    /// (task-d100, step A).
+    pub const fn answer_on_release(&self) -> bool {
+        self.answer_on_release
     }
 
     fn standing(&self, ballot: &Ballot) -> crate::feature::Standing {

@@ -230,7 +230,14 @@ impl Frontend {
     /// counted under the old one. Only this process's own collector: a
     /// frontend with no voter beside it has nothing to follow (the
     /// task-d01 plan entry records the gap).
-    fn follow(&mut self, active: coord_types::ids::Ballot) {
+    ///
+    /// The voter's node also says whether `Feature::AnswerOnRelease` is
+    /// active (task-d100, step A); while it is, this collector marks the
+    /// commands it submits as answered on the leader's release alone.
+    fn follow(&mut self, active: coord_types::ids::Ballot, answer_on_release: bool) {
+        self.frontend
+            .dispatcher_mut()
+            .set_answer_on_release(answer_on_release);
         if self.frontend.dispatcher_mut().ballot() != active
             && let Ok(quorum) = coord_consensus::BallotConfiguration::c2_default(
                 active.epoch,
@@ -2964,7 +2971,10 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 // waited for (task-d50).
                 out.absorb(voter.pump_reads(now));
                 let provenance = voter.provenance();
-                self.frontend.follow(voter.node().machine().active());
+                self.frontend.follow(
+                    voter.node().machine().active(),
+                    voter.node().answer_on_release(),
+                );
                 self.carry(api, out, provenance);
                 false
             }
@@ -3174,7 +3184,10 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             }
         }
         let provenance = voter.provenance();
-        self.frontend.follow(voter.node().machine().active());
+        self.frontend.follow(
+            voter.node().machine().active(),
+            voter.node().answer_on_release(),
+        );
         // Work queued under a ballot this voter has left can no longer be
         // made durable, and the store refuses it rather than holding it.
         // So is work stamped under a ballot below its promise, after a
@@ -4453,7 +4466,10 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                         // beside this voter: evidence the step that
                         // activated a ballot produced is counted under
                         // that ballot, not refused as the old one's.
-                        self.frontend.follow(voter.node().machine().active());
+                        self.frontend.follow(
+                            voter.node().machine().active(),
+                            voter.node().answer_on_release(),
+                        );
                         self.carry(api, out, provenance);
                     }
                     Err(DriveError::Fenced(what)) => self.fenced_stop = Some(what),

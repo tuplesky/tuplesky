@@ -563,6 +563,19 @@ pub struct Leader {
     /// every follower as holding it, which only a build made for task-d98's
     /// local reading sets, and the tests of the send itself.
     early_holders: Option<BTreeSet<ReplicaId>>,
+    /// The commands whose collector answers on the release alone
+    /// (task-d100, step A), marked by the voter before each submission
+    /// of one is stepped: no reply and no copy of this leader's own
+    /// acknowledgement goes to the frontend for them, and their release
+    /// carries the decided payload's admission digest.
+    answer_on_release: BTreeSet<CommandId>,
+    /// Marked commands this leader executed and was sent again as exact
+    /// duplicates, with the admission digest of the payload it decided
+    /// (task-d100, step A): their collector lost the release, and the
+    /// daemon publishes it again, rebuilt from this node's retry record,
+    /// since the release left the machine as an effect and nothing here
+    /// kept it.
+    release_again: Vec<(CommandId, RetryKey, Digest32)>,
 }
 
 /// This leader's adoption of its own order, published and waiting on the
@@ -656,6 +669,8 @@ impl Leader {
             early: false,
             early_ready: false,
             early_holders: None,
+            answer_on_release: BTreeSet::new(),
+            release_again: Vec::new(),
             config,
             boot: None,
             alloc: None,
@@ -807,6 +822,8 @@ impl Leader {
             early: false,
             early_ready: false,
             early_holders: None,
+            answer_on_release: BTreeSet::new(),
+            release_again: Vec::new(),
         };
         // Dependency order among the entries: a command follows every
         // dependency that is itself an entry. A cycle is an invariant
@@ -1024,6 +1041,7 @@ impl Leader {
         self.payloads.retain(|c, _| !table.forgotten(c));
         self.served_payloads.retain(|c| !table.forgotten(c));
         self.proposals.retain(|c, _| !table.forgotten(c));
+        self.answer_on_release.retain(|c| !table.forgotten(c));
         let proposals = &self.proposals;
         self.unsettled.retain(|(_, c)| proposals.contains_key(c));
         self.durable.retain(|(_, c)| proposals.contains_key(c));
@@ -1845,12 +1863,14 @@ impl Leader {
         }
         self.settle(command);
         let mut effects = alloc::vec![Effect::Established(result.clone())];
-        if self.is_leading() && !released {
-            effects.push(Effect::Released(ReleasedResult::from_gate(
-                result,
-                outcome.response.clone(),
-                false,
-            )));
+        // A marked command's collector answers only on a final release
+        // and holds a speculative one (task-d100, step A), so the final
+        // release follows a speculative one for it: the collector
+        // answers once, on the final release.
+        let marked = self.answer_on_release.contains(&command);
+        if self.is_leading() && (!released || marked) {
+            let release = ReleasedResult::from_gate(result, outcome.response.clone(), false);
+            effects.push(Effect::Released(self.with_admission(release)));
         }
         effects.extend(self.release_ready());
         Ok(effects)
@@ -1886,6 +1906,13 @@ impl Leader {
     /// hold every command.
     pub fn observe_learning(&mut self) {
         self.learned.get_or_insert_with(Vec::new);
+    }
+
+    /// The marked commands whose release the daemon publishes again,
+    /// each with its retry key and the decided payload's admission
+    /// digest, since this was last called (task-d100, step A).
+    pub fn take_release_again(&mut self) -> Vec<(CommandId, RetryKey, Digest32)> {
+        core::mem::take(&mut self.release_again)
     }
 
     /// The commands committed from votes since this was last called,
@@ -2019,8 +2046,40 @@ impl Leader {
             fast: &fast,
         };
         match gate.release(&mut self.speculation, &proposals) {
-            Ok(released) => released.into_iter().map(Effect::Released).collect(),
+            Ok(released) => released
+                .into_iter()
+                .map(|r| Effect::Released(self.with_admission(r)))
+                .collect(),
             Err(_) => Vec::new(),
+        }
+    }
+
+    /// Mark `command` as answered by its collector on the release alone
+    /// (task-d100, step A). The voter calls this before stepping each
+    /// submission of a marked command, so the mark is in place for the
+    /// proposal that submission leads to.
+    pub fn mark_answer_on_release(&mut self, command: CommandId) {
+        self.answer_on_release.insert(command);
+    }
+
+    /// Whether `command`'s collector answers it on the release alone.
+    pub fn answers_on_release(&self, command: &CommandId) -> bool {
+        self.answer_on_release.contains(command)
+    }
+
+    /// `released` with the decided payload's admission digest, for a
+    /// command answered on the release alone; unchanged otherwise, and
+    /// unchanged where this leader no longer holds the command's
+    /// record, since a release that names no admission is one its
+    /// collector holds rather than answers (task-d100, step A).
+    fn with_admission(&self, released: ReleasedResult) -> ReleasedResult {
+        let command = released.established().command();
+        if !self.answer_on_release.contains(&command) {
+            return released;
+        }
+        match self.table.record(&command).and_then(|r| r.payload) {
+            Some(admission) => released.with_admission(admission),
+            None => released,
         }
     }
 
@@ -2411,7 +2470,7 @@ impl Leader {
                 return match accepted {
                     Some(accepted) if accepted == payload.admission_digest() => {
                         self.rejections.push(Rejection::Duplicate(command));
-                        self.repair_evidence(command)
+                        self.repair_evidence(command, request.retry_key)
                     }
                     Some(accepted) => {
                         self.rejections
@@ -2454,7 +2513,7 @@ impl Leader {
             Err(InitError::AlreadyInitialized) => {
                 self.bindings.insert(request.retry_key, command);
                 self.rejections.push(Rejection::Duplicate(command));
-                return self.repair_evidence(command);
+                return self.repair_evidence(command, request.retry_key);
             }
             Err(InitError::PayloadConflict) => {
                 self.rejections.push(Rejection::PayloadConflict(command));
@@ -2547,33 +2606,37 @@ impl Leader {
                 frame: frame.clone(),
             });
         }
-        let reply = ProtocolMessage::LeaderReply {
-            ballot,
-            command,
-            seqnum,
-            deps: init.deps.clone(),
-            path: init.path,
-        }
-        .encode();
-        outbox.publish(PendingSend {
-            context,
-            requires: alloc::vec![barrier],
-            to: self.config.frontend,
-            frame: reply.clone(),
-        });
-        // The frontend's copy is the one a submission can ask for again
-        // (task-c02).
-        self.replay.retain(
-            command,
-            crate::replay::RetainedEvidence {
-                barrier,
+        // A command its collector answers on the release alone gets no
+        // reply: nothing at the collector counts it (task-d100, step A).
+        if !self.answer_on_release.contains(&command) {
+            let reply = ProtocolMessage::LeaderReply {
                 ballot,
+                command,
+                seqnum,
+                deps: init.deps.clone(),
+                path: init.path,
+            }
+            .encode();
+            outbox.publish(PendingSend {
                 context,
                 requires: alloc::vec![barrier],
-                frame: reply,
-            },
-            &self.table,
-        );
+                to: self.config.frontend,
+                frame: reply.clone(),
+            });
+            // The frontend's copy is the one a submission can ask for
+            // again (task-c02).
+            self.replay.retain(
+                command,
+                crate::replay::RetainedEvidence {
+                    barrier,
+                    ballot,
+                    context,
+                    requires: alloc::vec![barrier],
+                    frame: reply,
+                },
+                &self.table,
+            );
+        }
         // The leader's own acknowledgement counts toward learning later.
         let mut set = VoteSet::new(self.config.quorum.clone(), command);
         set.add(Vote::Fast(proposal)).expect("leader proposal");
@@ -2784,31 +2847,33 @@ impl Leader {
                 frame: frame.clone(),
             });
         }
-        let reply = ProtocolMessage::LeaderReply {
-            ballot,
-            command,
-            seqnum,
-            deps,
-            path,
-        }
-        .encode();
-        outbox.publish(PendingSend {
-            context,
-            requires: alloc::vec![barrier],
-            to: self.config.frontend,
-            frame: reply.clone(),
-        });
-        self.replay.retain(
-            command,
-            crate::replay::RetainedEvidence {
-                barrier,
+        if !self.answer_on_release.contains(&command) {
+            let reply = ProtocolMessage::LeaderReply {
                 ballot,
+                command,
+                seqnum,
+                deps,
+                path,
+            }
+            .encode();
+            outbox.publish(PendingSend {
                 context,
                 requires: alloc::vec![barrier],
-                frame: reply,
-            },
-            &self.table,
-        );
+                to: self.config.frontend,
+                frame: reply.clone(),
+            });
+            self.replay.retain(
+                command,
+                crate::replay::RetainedEvidence {
+                    barrier,
+                    ballot,
+                    context,
+                    requires: alloc::vec![barrier],
+                    frame: reply,
+                },
+                &self.table,
+            );
+        }
         // A re-proposal's batch is also its acceptance: the adoption rests
         // on the new batch now, and the one on the rejected batch was
         // dropped with it.
@@ -2879,28 +2944,33 @@ impl Leader {
             .into_iter()
             .collect();
         let frame = ProtocolMessage::SlowAck(ack.clone()).encode();
+        let marked = self.answer_on_release.contains(&command);
         let Some(outbox) = self.outbox.as_mut() else {
             return;
         };
         // To the frontend, which counts it, and to no other voter
-        // (task-d74): a follower learns from the commit frontier.
-        outbox.publish(PendingSend {
-            context,
-            requires: requires.clone(),
-            to: self.config.frontend,
-            frame: frame.clone(),
-        });
-        self.replay.retain(
-            command,
-            crate::replay::RetainedEvidence {
-                barrier,
-                ballot,
+        // (task-d74): a follower learns from the commit frontier. Not
+        // for a command answered on the release alone (task-d100, step
+        // A): its collector counts nothing.
+        if !marked {
+            outbox.publish(PendingSend {
                 context,
                 requires: requires.clone(),
-                frame,
-            },
-            &self.table,
-        );
+                to: self.config.frontend,
+                frame: frame.clone(),
+            });
+            self.replay.retain(
+                command,
+                crate::replay::RetainedEvidence {
+                    barrier,
+                    ballot,
+                    context,
+                    requires: requires.clone(),
+                    frame,
+                },
+                &self.table,
+            );
+        }
         self.own_adoptions.insert(
             barrier,
             OwnAdoption {
@@ -3013,7 +3083,24 @@ impl Leader {
     /// only, through the same outbox and under the same gates, and
     /// released here (task-c02). Not a proposal attempt: nothing is
     /// persisted, and the fence on repeated persistence is not touched.
-    fn repair_evidence(&mut self, command: CommandId) -> Vec<Effect> {
+    fn repair_evidence(&mut self, command: CommandId, retry_key: RetryKey) -> Vec<Effect> {
+        // A command answered on the release alone (task-d100, step A):
+        // what its collector may be missing is the release, which the
+        // evidence store never kept. Once this leader has executed it,
+        // the daemon publishes it again from its records; before then
+        // the release is still coming to the origin the duplicate just
+        // named, and nothing is owed.
+        if self.answer_on_release.contains(&command) {
+            if self.boot.is_some()
+                && self.is_leading()
+                && let Some(record) = self.table.record(&command)
+                && record.phase >= Phase::Executed
+                && let Some(admission) = record.payload
+            {
+                self.release_again.push((command, retry_key, admission));
+            }
+            return Vec::new();
+        }
         let why = if self.boot.is_none() || !self.is_leading() {
             crate::replay::ReplayRefusal::Fenced
         } else {

@@ -665,6 +665,11 @@ pub struct Follower {
     /// it to the submitter again (task-c02). Never recovered: the outbox
     /// it went through is this boot's.
     replay: crate::replay::EvidenceStore,
+    /// The commands whose collector answers on the leader's release
+    /// alone (task-d100, step A), marked by the voter before each
+    /// submission of one is stepped: this replica's acknowledgements of
+    /// them go to the leader only, and it keeps nothing to repair.
+    answer_on_release: BTreeSet<CommandId>,
 }
 
 /// The retry-key bindings a restart restores from the payload rows
@@ -795,6 +800,7 @@ impl Follower {
         let adopted_lacking = lacking(adopted.keys(), &payloads);
         Follower {
             replay: crate::replay::EvidenceStore::new(config.capacity),
+            answer_on_release: BTreeSet::new(),
             catch_up: CatchUp::default(),
             diverged: None,
             config,
@@ -1066,6 +1072,7 @@ impl Follower {
             leader_committed: None,
             proposal_cursor: 0,
             replay: crate::replay::EvidenceStore::new(state.capacity),
+            answer_on_release: BTreeSet::new(),
             catch_up: CatchUp::default(),
             diverged: None,
         }
@@ -3429,6 +3436,7 @@ impl Follower {
         self.payloads.retain(|c, _| !table.forgotten(c));
         self.served_payloads.retain(|c| !table.forgotten(c));
         self.votes.retain(|c, _| !table.forgotten(c));
+        self.answer_on_release.retain(|c| !table.forgotten(c));
         // The adoption order of a forgotten command decides nothing more,
         // and kept without its payload it would read as a payload still
         // missing.
@@ -3799,6 +3807,12 @@ impl Follower {
             && self.ballots.in_flight().is_none()
     }
 
+    /// Mark `command` as answered by its collector on the leader's
+    /// release alone (task-d100, step A).
+    pub fn mark_answer_on_release(&mut self, command: CommandId) {
+        self.answer_on_release.insert(command);
+    }
+
     /// Whether this replica may send fast acknowledgements in this ballot.
     fn in_fast_set(&self) -> bool {
         self.config
@@ -3852,6 +3866,12 @@ impl Follower {
                 },
                 frame: frame.clone(),
             });
+        }
+        // A command answered on the leader's release alone (task-d100,
+        // step A): its collector counts nothing, so nothing goes to the
+        // frontend, and nothing is kept to offer it again.
+        if self.answer_on_release.contains(&command) {
+            return;
         }
         outbox.publish(PendingSend {
             context,

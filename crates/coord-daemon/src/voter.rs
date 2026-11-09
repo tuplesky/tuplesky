@@ -141,6 +141,15 @@ pub struct Voter<P: Persistence> {
     /// (task-d58). While the frontier still reads exactly this, a new
     /// snapshot would show what that one did.
     reads_behind_at: Option<u64>,
+    /// Marked commands whose release this voter, as their leader,
+    /// publishes again once its projection holds their retry record
+    /// (task-d100, step A), with each one's retry key and the decided
+    /// payload's admission digest. Bounded by [`ORIGINS`], oldest
+    /// first: a collector that is still waiting asks again.
+    release_again: std::collections::BTreeMap<
+        CommandId,
+        (coord_types::RetryKey, coord_types::identity::Digest32),
+    >,
 }
 
 impl<P: Persistence> Voter<P> {
@@ -176,6 +185,7 @@ impl<P: Persistence> Voter<P> {
             fenced_at: None,
             reads: ReadBarrier::new(),
             reads_behind_at: None,
+            release_again: std::collections::BTreeMap::new(),
         }
     }
 
@@ -632,6 +642,15 @@ impl<P: Persistence> Voter<P> {
         } else {
             command_of(&admitted.frame)
         };
+        // A submission sent as answered on the release alone (task-d100,
+        // step A) marks its command before it is stepped, so the
+        // proposal or acknowledgement it leads to already knows not to
+        // send the frontend anything.
+        if frame.version == coord_collector::VERSION_ANSWER_ON_RELEASE
+            && let Some(command) = early.or_else(|| command_of(&admitted.frame))
+        {
+            self.node.mark_answer_on_release(command);
+        }
         let out = self.node.on_event(Event::Admitted(admitted), &self.ballot);
         let command = early.or_else(|| self.node.machine().admitted());
         #[cfg(debug_assertions)]
@@ -641,7 +660,72 @@ impl<P: Persistence> Voter<P> {
             self.node
                 .stamp_submitted(command, std::time::Instant::now());
         }
-        out.map(Ok)
+        let mut out = out?;
+        for (command, key, admission) in self.node.take_release_again() {
+            if self.release_again.len() >= ORIGINS {
+                self.release_again.pop_first();
+            }
+            self.release_again.insert(command, (key, admission));
+        }
+        out.absorb(self.publish_releases_again());
+        Ok(Ok(out))
+    }
+
+    /// Publish again the releases of marked commands a collector sent
+    /// again (task-d100, step A), rebuilt from this node's retry record
+    /// of each: the response, position, revision and result digest from
+    /// the record, the epoch and ballot this voter leads at, and the
+    /// admission digest the leader's table held. One whose record the
+    /// projection does not hold yet waits for it, as a retry there does;
+    /// none goes out once this voter no longer leads, and the collector
+    /// then settles from its own node's record (task-d22).
+    ///
+    /// Called after every step that can move the projection. The
+    /// fast-path label of a rebuilt release is `false`: nothing kept
+    /// says which path decided it, and the collector compares only the
+    /// position, revision, digest and bytes.
+    pub fn publish_releases_again(&mut self) -> Outbound {
+        let mut out = Outbound::default();
+        if self.release_again.is_empty() {
+            return out;
+        }
+        let Some(leading) = self.leading() else {
+            self.release_again.clear();
+            return out;
+        };
+        let wanted: Vec<(CommandId, coord_types::RetryKey)> = self
+            .release_again
+            .iter()
+            .map(|(c, (k, _))| (*c, *k))
+            .collect();
+        for (command, record) in crate::settle::records_for(self.node.applier(), wanted) {
+            let Some((_, admission)) = self.release_again.remove(&command) else {
+                continue;
+            };
+            let Ok(established) = coord_core::capability::EstablishedResult::restore(
+                coord_core::capability::EstablishedRecord {
+                    command,
+                    epoch: leading.ballot.epoch,
+                    ballot: leading.ballot,
+                    position: record.position,
+                    result_digest: record.result_digest,
+                    revision: record.revision,
+                    fast_path: false,
+                },
+            ) else {
+                continue;
+            };
+            let released = coord_core::capability::ReleasedResult::from_gate(
+                established,
+                record.response,
+                false,
+            )
+            .with_admission(admission);
+            if let Ok(frame) = coord_collector::release_frame(&released) {
+                out.frontend.push(frame);
+            }
+        }
+        out
     }
 
     /// What this voter leads, for the read barrier: `None` unless its
@@ -695,7 +779,9 @@ impl<P: Persistence> Voter<P> {
     /// Called after anything that can move one of those: a read, a
     /// confirmation, an execution, a materialization, a turn.
     pub fn pump_reads(&mut self, now: MonotonicMillis) -> Outbound {
-        let mut out = Outbound::default();
+        // A materialization may also be what a release published again
+        // waited for (task-d100, step A).
+        let mut out = self.publish_releases_again();
         if self.reads.held() == 0 {
             self.reads_behind_at = None;
             return out;

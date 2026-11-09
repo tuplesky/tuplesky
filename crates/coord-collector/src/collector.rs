@@ -59,7 +59,7 @@ use crate::clock::MonotonicMillis;
 use crate::codes;
 
 use crate::trace::{CollectorEvent, command_hex, replica_hex};
-use crate::wire::{SubmitV1, submit_frame};
+use crate::wire::{SubmitV1, submit_frame, submit_frame_answer_on_release};
 
 /// The largest result a client can actually be handed: an API-class
 /// frame, less room for the response's own fields and the frame header.
@@ -380,6 +380,12 @@ pub enum HoldReason {
     /// admission facts, or executed it long ago and forgot its payload
     /// (task-d22). The entry is settled from this node's record.
     AwaitingRecord,
+    /// A command answered on the release alone holds a release it may
+    /// not be answered on (task-d100, step A): a speculative one, or one
+    /// naming another admission than the one it was submitted under. It
+    /// is settled from this node's record against that release, or by a
+    /// voter's refusal, as one holding a release without learning is.
+    ReleaseNotAnswerable,
 }
 
 /// A released result for a caller.
@@ -626,6 +632,11 @@ struct Pending {
     /// refused it in a way only the record answers, it was asked for
     /// more than once, or a ballot change voided what it held (task-d22).
     from_record: bool,
+    /// Whether it was submitted as answered on the leader's release
+    /// alone (task-d100, step A): the voters send this frontend no
+    /// evidence for it, so it is answered on a final release whose
+    /// admission is the one it was submitted under.
+    marked: bool,
 }
 
 /// The collector of one domain.
@@ -656,6 +667,10 @@ pub struct Collector {
     /// destination's congestion cannot spend the whole budget on the
     /// same command every turn.
     offer_cursor: usize,
+    /// Whether new submissions are marked as answered on the leader's
+    /// release alone (task-d100, step A): while this collector's node
+    /// reads `Feature::AnswerOnRelease` active.
+    answer_on_release: bool,
 }
 
 impl Collector {
@@ -670,6 +685,7 @@ impl Collector {
             trace: None,
             undelivered_bytes: 0,
             offer_cursor: 0,
+            answer_on_release: false,
         }
     }
 
@@ -687,6 +703,20 @@ impl Collector {
     /// outstanding: what evidence for it has to agree with.
     pub fn admission(&self, command: &CommandId) -> Option<coord_types::identity::Digest32> {
         self.pending.get(command).map(|p| p.admission)
+    }
+
+    /// Mark the commands submitted from now on as answered on the
+    /// leader's release alone, or stop (task-d100, step A). Entries
+    /// already pending keep what they were submitted as, so marked and
+    /// unmarked commands mix while the feature activates and neither
+    /// waits for evidence nobody sends.
+    pub fn set_answer_on_release(&mut self, on: bool) {
+        self.answer_on_release = on;
+    }
+
+    /// Whether new submissions are marked as answered on the release.
+    pub const fn answers_on_release(&self) -> bool {
+        self.answer_on_release
     }
 
     /// Whether `command` is outstanding here.
@@ -784,10 +814,16 @@ impl Collector {
                 pending: self.pending.len(),
             });
         }
-        let frame = submit_frame(&SubmitV1 {
+        let marked = self.answer_on_release;
+        let submit = SubmitV1 {
             receipt: admitted.receipt.facts(),
             request: request.clone(),
-        })
+        };
+        let frame = if marked {
+            submit_frame_answer_on_release(&submit)
+        } else {
+            submit_frame(&submit)
+        }
         .map_err(|_| SubmitRefusal::Malformed)?;
         // The second half of the reservation, and the last point at
         // which refusing is honest. Accepting a command means owing its
@@ -826,6 +862,7 @@ impl Collector {
                 solicit_at: now.plus(SOLICIT_AFTER_MILLIS),
                 solicited: 0,
                 from_record: false,
+                marked,
                 dissemination: Dissemination {
                     envelope: Some(Arc::clone(&frame)),
                     reserved: bytes,
@@ -1341,11 +1378,41 @@ impl Collector {
     }
 
     /// The release rule: both the collector's learning predicate and the
-    /// leader's release must hold.
+    /// leader's release must hold. For a marked entry (task-d100, step
+    /// A), the leader's release alone, once it is final and names the
+    /// admission the entry was submitted under: the leader released it
+    /// only after learning it over the same acknowledgements, and a
+    /// release under other facts, or a speculative one, is held as one
+    /// without learning is held.
     fn try_release(&mut self, command: CommandId) -> Progress {
         let Some(entry) = self.pending.get(&command) else {
             return Progress::Settled;
         };
+        if entry.marked && entry.votes.learned().is_none() {
+            let Some((sender, released)) = entry.released.clone() else {
+                record(&mut self.trace, || CollectorEvent::Held {
+                    command: command_hex(&command),
+                    reason: "awaiting-release".into(),
+                });
+                return Progress::Held(HoldReason::AwaitingRelease);
+            };
+            if released.speculative() || released.admission() != Some(entry.admission) {
+                record(&mut self.trace, || CollectorEvent::Held {
+                    command: command_hex(&command),
+                    reason: "release-not-answerable".into(),
+                });
+                return Progress::Held(HoldReason::ReleaseNotAnswerable);
+            }
+            let entry = self.pending.remove(&command).expect("present");
+            self.undelivered_bytes = self
+                .undelivered_bytes
+                .saturating_sub(entry.dissemination.reserved);
+            let established = released.established();
+            let fast = established.fast_path();
+            let response = self.answer_of(command, established.revision(), released.response());
+            let executed = Said::released(sender, &released);
+            return self.finish(command, entry, (response, executed), false, fast);
+        }
         let Some(learned) = entry.votes.learned() else {
             record(&mut self.trace, || CollectorEvent::Held {
                 command: command_hex(&command),

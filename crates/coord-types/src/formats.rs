@@ -316,11 +316,22 @@ pub enum Feature {
     /// `ReleaseAtExecution`'s prepare marker, as `EarlyProposalPrepared`
     /// is `EarlyProposal`'s.
     ReleaseAtExecutionPrepared = 0x0007,
+    /// A collector answers a command on its leader's final release alone,
+    /// and the voters send its frontend no evidence for it (task-d100,
+    /// step A; design Section 4.3). A collector marks its submissions so
+    /// only while this is active, which implies that every configured
+    /// voter runs a build that reads the mark and puts the decided
+    /// payload's admission digest in its releases. Unmarked commands keep
+    /// today's evidence, so the two mix while it activates.
+    AnswerOnRelease = 0x0008,
+    /// `AnswerOnRelease`'s prepare marker, as `EarlyProposalPrepared` is
+    /// `EarlyProposal`'s.
+    AnswerOnReleasePrepared = 0x0009,
 }
 
 impl Feature {
     /// Every feature, in identifier order.
-    pub const ALL: [Feature; 7] = [
+    pub const ALL: [Feature; 9] = [
         Feature::CheckpointFloor,
         Feature::SealedHandoff,
         Feature::LocalCheckpoint,
@@ -328,6 +339,8 @@ impl Feature {
         Feature::EarlyProposalPrepared,
         Feature::ReleaseAtExecution,
         Feature::ReleaseAtExecutionPrepared,
+        Feature::AnswerOnRelease,
+        Feature::AnswerOnReleasePrepared,
     ];
 
     /// The frozen identifier.
@@ -345,6 +358,8 @@ impl Feature {
             Feature::EarlyProposalPrepared => "early-proposal-prepared",
             Feature::ReleaseAtExecution => "release-at-execution",
             Feature::ReleaseAtExecutionPrepared => "release-at-execution-prepared",
+            Feature::AnswerOnRelease => "answer-on-release",
+            Feature::AnswerOnReleasePrepared => "answer-on-release-prepared",
         }
     }
 
@@ -356,6 +371,7 @@ impl Feature {
         match self {
             Feature::EarlyProposal => Some(Feature::EarlyProposalPrepared),
             Feature::ReleaseAtExecution => Some(Feature::ReleaseAtExecutionPrepared),
+            Feature::AnswerOnRelease => Some(Feature::AnswerOnReleasePrepared),
             _ => None,
         }
     }
@@ -366,6 +382,7 @@ impl Feature {
         match self {
             Feature::EarlyProposalPrepared => Some(Feature::EarlyProposal),
             Feature::ReleaseAtExecutionPrepared => Some(Feature::ReleaseAtExecution),
+            Feature::AnswerOnReleasePrepared => Some(Feature::AnswerOnRelease),
             _ => None,
         }
     }
@@ -401,7 +418,7 @@ impl Supported {
     /// The features this build supports, in identifier order, prepare
     /// markers included: a marker is supported exactly when the feature
     /// it marks is, and `admit` reads one as a requirement on this set.
-    pub const fn features() -> [Feature; 7] {
+    pub const fn features() -> [Feature; 9] {
         Feature::ALL
     }
 

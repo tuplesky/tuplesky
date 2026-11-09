@@ -1494,3 +1494,261 @@ fn another_request_under_a_bound_key_ends_with_a_conflict() {
     ));
     assert_eq!(w.collector.pending(), 0);
 }
+
+// ---------------------------------------------------------------------
+// task-d100, step A: a command answered on the leader's release alone.
+// ---------------------------------------------------------------------
+
+/// The release the leader published for `command`, decoded from what was
+/// lost on the way to the collector.
+fn lost_release(w: &Cluster, command: CommandId) -> coord_core::capability::ReleasedResult {
+    w.lost
+        .iter()
+        .map(|(_, f)| decode_release(f).expect("release"))
+        .find(|r| r.established().command() == command)
+        .expect("the leader released it")
+}
+
+/// A marked command is answered on the leader's final release alone: the
+/// leader sends no reply, every voter sends its acknowledgements to the
+/// leader only, nothing is parked, and the release carries the admission
+/// the collector submitted under.
+#[test]
+fn a_marked_command_is_answered_on_the_release_alone() {
+    let mut w = Cluster::new(256);
+    w.collector.set_answer_on_release(true);
+    let submit = w.submit(1);
+    assert_eq!(
+        frame(&submit).version,
+        coord_collector::VERSION_ANSWER_ON_RELEASE,
+        "the submission is the mark"
+    );
+    let command = w.command(1);
+    let admission = w.collector.admission(&command).expect("pending");
+    for i in 0..3 {
+        w.deliver_submission(i, &submit);
+    }
+    w.settle();
+
+    assert_eq!(w.executed(), [1, 1, 1]);
+    assert_eq!(
+        w.counted,
+        vec![(0, KIND_RELEASE)],
+        "the release is the only frame back"
+    );
+    assert_eq!(w.published, [0, 0, 0], "nothing was parked");
+    assert_eq!(w.releases.len(), 1);
+    let release = &w.releases[0];
+    assert_eq!(release.command, command);
+    assert!(!release.speculative);
+    assert!(w.rejected.is_empty(), "{:?}", w.rejected);
+    assert!(!w.collector.is_pending(&command));
+    // The release named the admission the collector submitted under.
+    let mut again = Cluster::new(256);
+    again.collector.set_answer_on_release(true);
+    again.lose = Lose::Releases;
+    let submit = again.submit(1);
+    for i in 0..3 {
+        again.deliver_submission(i, &submit);
+    }
+    again.settle();
+    assert_eq!(lost_release(&again, command).admission(), Some(admission));
+}
+
+/// Marked and unmarked commands mix while the feature activates: one
+/// submitted before the switch keeps the collector's own count and its
+/// evidence, the one after it the release alone, and neither waits for
+/// evidence nobody sends.
+#[test]
+fn marked_and_unmarked_commands_mix() {
+    let mut w = Cluster::new(256);
+    let first = w.submit(1);
+    w.collector.set_answer_on_release(true);
+    let second = w.submit(2);
+    assert_eq!(frame(&first).version, coord_collector::wire::VERSION);
+    assert_eq!(
+        frame(&second).version,
+        coord_collector::VERSION_ANSWER_ON_RELEASE
+    );
+    for i in 0..3 {
+        w.deliver_submission(i, &first);
+        w.deliver_submission(i, &second);
+    }
+    w.settle();
+
+    assert_eq!(w.executed(), [2, 2, 2]);
+    let released: BTreeSet<CommandId> = w.releases.iter().map(|r| r.command).collect();
+    assert_eq!(released, BTreeSet::from([w.command(1), w.command(2)]));
+    assert!(w.rejected.is_empty(), "{:?}", w.rejected);
+    let evidence = w
+        .counted
+        .iter()
+        .filter(|(_, k)| *k == KIND_EVIDENCE)
+        .count();
+    assert!(
+        evidence >= 3,
+        "the unmarked command was counted from its evidence: {:?}",
+        w.counted
+    );
+}
+
+/// A speculative release of a marked command is held, and the final one
+/// answers it; a release naming another admission is held, and the
+/// command settles from this node's record against it.
+#[test]
+fn a_marked_command_holds_a_speculative_release_or_one_under_other_facts() {
+    let mut w = Cluster::new(256);
+    w.collector.set_answer_on_release(true);
+    w.lose = Lose::Releases;
+    let submit = w.submit(1);
+    let command = w.command(1);
+    let admission = w.collector.admission(&command).expect("pending");
+    for i in 0..3 {
+        w.deliver_submission(i, &submit);
+    }
+    w.settle();
+    assert!(w.releases.is_empty());
+    assert_eq!(w.counted, Vec::<(u8, u16)>::new(), "nothing came back");
+    let final_release = lost_release(&w, command);
+    let leader = w.voters[0].provenance();
+
+    // Speculative: held.
+    let speculative = coord_core::capability::ReleasedResult::from_gate(
+        final_release.established().clone(),
+        final_release.response().to_vec(),
+        true,
+    )
+    .with_admission(admission);
+    assert_eq!(
+        w.collector.on_release(leader, speculative),
+        Ok(Progress::Held(HoldReason::ReleaseNotAnswerable))
+    );
+    // Under other facts: held as well, and listed for the record.
+    let other = coord_core::capability::ReleasedResult::from_gate(
+        final_release.established().clone(),
+        final_release.response().to_vec(),
+        false,
+    )
+    .with_admission(Digest32([0x99; 32]));
+    assert_eq!(
+        w.collector.on_release(leader, other),
+        Ok(Progress::Held(HoldReason::ReleaseNotAnswerable))
+    );
+    assert!(w.collector.is_pending(&command));
+    let half = w.collector.half_established();
+    assert_eq!(half, vec![(command, retry_key(1))]);
+    let records = records_for(w.voters[0].node().applier(), half);
+    let (_, record) = &records[0];
+    let progress = w
+        .collector
+        .settle_from_record(
+            command,
+            record.result_digest,
+            record.position,
+            record.revision,
+            &record.response,
+        )
+        .expect("settled from the record against the held release");
+    let Progress::Released(release) = progress else {
+        panic!("not released: {progress:?}");
+    };
+    assert_eq!(release.command, command);
+    assert!(w.collector.trace().iter().any(|e| matches!(
+        e,
+        CollectorEvent::SettledFromRecord { corroborated, .. } if corroborated == "release"
+    )));
+
+    // The final release under the submitted admission answers at once.
+    let mut w = Cluster::new(256);
+    w.collector.set_answer_on_release(true);
+    w.lose = Lose::Releases;
+    let submit = w.submit(1);
+    for i in 0..3 {
+        w.deliver_submission(i, &submit);
+    }
+    w.settle();
+    let final_release = lost_release(&w, command);
+    let leader = w.voters[0].provenance();
+    let speculative = coord_core::capability::ReleasedResult::from_gate(
+        final_release.established().clone(),
+        final_release.response().to_vec(),
+        true,
+    )
+    .with_admission(admission);
+    assert_eq!(
+        w.collector.on_release(leader, speculative),
+        Ok(Progress::Held(HoldReason::ReleaseNotAnswerable))
+    );
+    let progress = w
+        .collector
+        .on_release(leader, final_release)
+        .expect("accepted");
+    assert!(
+        matches!(&progress, Progress::Released(r) if r.command == command && !r.speculative),
+        "{progress:?}"
+    );
+}
+
+/// A lost release, with the leader still leading: the collector's
+/// submission sent again reaches the leader as an exact duplicate, and
+/// the leader's voter publishes the release again, rebuilt from its
+/// retry record and its table's admission. What it rebuilds is what was
+/// lost, and the collector answers on it.
+#[test]
+fn a_lost_release_of_a_marked_command_is_published_again() {
+    let mut w = Cluster::new(256);
+    w.collector.set_answer_on_release(true);
+    w.lose = Lose::Releases;
+    let submit = w.submit(1);
+    let command = w.command(1);
+    for i in 0..3 {
+        w.deliver_submission(i, &submit);
+    }
+    w.settle();
+    assert!(w.collector.is_pending(&command));
+    let lost = lost_release(&w, command);
+
+    w.lose = Lose::Nothing;
+    let shape = w.deliver_submission(0, &submit);
+    assert_eq!(shape.peer, 0, "nothing goes to the peers");
+    assert_eq!(shape.frontend, 1, "the release, published again");
+    w.settle();
+    assert_eq!(w.executed(), [1, 1, 1], "and nothing executes again");
+    assert_eq!(w.releases.len(), 1);
+    assert!(!w.collector.is_pending(&command));
+    assert_eq!(w.lost.len(), 1, "only the first release was lost");
+    // Rebuilt from the record: the same execution, bytes and admission.
+    let answered = &w.releases[0];
+    assert_eq!(answered.command, command);
+    let coord_types::wire_v1::OutcomeV1::Ok { result, .. } = &answered.response.outcome else {
+        panic!("not an established result: {:?}", answered.response);
+    };
+    assert_eq!(result.as_slice(), lost.response());
+    assert!(w.rejected.is_empty(), "{:?}", w.rejected);
+
+    // A follower sent the same duplicate repairs nothing for it.
+    let shape = w.deliver_submission(1, &submit);
+    assert_eq!(shape.frontend, 0);
+}
+
+/// A duplicate that reaches the leader before the release exists waits
+/// for it: nothing is published for it, nothing is refused, and the
+/// release, once there, answers the collector once.
+#[test]
+fn a_duplicate_ahead_of_the_release_waits_for_it() {
+    let mut w = Cluster::new(256);
+    w.collector.set_answer_on_release(true);
+    let submit = w.submit(1);
+    let command = w.command(1);
+    w.deliver_submission(0, &submit);
+    let shape = w.deliver_submission(0, &submit);
+    assert_eq!(shape.frontend, 0, "nothing to publish yet");
+    for i in 1..3 {
+        w.deliver_submission(i, &submit);
+    }
+    w.settle();
+    assert_eq!(w.releases.len(), 1);
+    assert_eq!(w.releases[0].command, command);
+    assert_eq!(w.counted, vec![(0, KIND_RELEASE)]);
+    assert!(w.rejected.is_empty(), "{:?}", w.rejected);
+}
