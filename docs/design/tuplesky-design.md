@@ -2019,7 +2019,7 @@ A client acknowledges on every request (`ack_through`), so `retirement()` (`retr
 **The layout: etcd's.** One row a mutated key a revision, keyed by revision: the event row, which keeps its key and its contents. The key order comes from an index held in memory, from each (namespace, key) to its retained (revision, ordinal)s, as etcd's `treeIndex` does (`server/storage/mvcc/index.go`).
 - **Reads.** A read at revision r finds a key's newest revision at or below r in the index, and reads that event row. A range read at r walks the index's key range.
 - **Building the index.** The index is built at boot from the retained event rows and kept up to date by the materializer as each revision lands.
-- **Compaction** keeps each key's newest version at or below the floor as a row, unless the current row already is that version, so a read at the floor still finds it. It deletes every other event below the floor. A watch from below the floor is refused as compacted, as today.
+- **Compaction** keeps each key's newest version at or below the floor as its event row, even when the current row holds the same version: the index is built from event rows alone, and a later write replaces the current row while a read at the floor must still find the version (Codex review on #208). It deletes every other event below the floor. A watch from below the floor is refused as compacted, as today.
 
 **What it costs.**
 - **Memory.** The index holds about a key's bytes and 16 bytes a retained version, which task-d26's resource contract adds as a budget per domain, bounded by the compaction floor.

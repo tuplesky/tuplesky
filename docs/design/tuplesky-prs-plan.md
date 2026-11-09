@@ -4021,7 +4021,7 @@ So every feature-gated change, task-d98's `EarlyProposal` first, would ship unre
 - **The rows.** `KvHistoryV1` is no longer written. The event row, keyed by revision and ordinal, is the one version row a mutated key a revision.
 - **The index.** It is held in memory, from (namespace, key) to retained (revision, ordinal)s. It is built at boot and at a local image's install from the retained events, and kept up to date by the materializer.
 - **Reads.** Reads at a past revision and range reads at a revision walk the index and read event rows.
-- **Compaction** keeps each key's newest version at or below the floor unless the current row is it, and deletes the rest below the floor.
+- **Compaction** keeps each key's newest version at or below the floor as its event row, even when the current row holds the same version, and deletes the rest below the floor.
 - **Formats.** `KvHistoryV1` leaves the common hash and the shared checkpoint, and that format's version is raised. The scrub (task-d37) reads the new layout. task-d26's contract gains the index's memory budget.
 
 **Acceptance:**
