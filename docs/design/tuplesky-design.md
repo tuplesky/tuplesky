@@ -360,6 +360,7 @@ The section below is the design step; the code step is task-d100's entry in the 
 
 **A4. What it moves** (#202 review). Of the about 9.7 api frames a command the two steps remove, step A removes about 6.4: the slow acknowledgements 4.0, the fast ones 1.6 and the leader reply 0.77 (the counts on #185). That is about two thirds of the 13 datagrams.
 - **In the servers:** about −0.26 ms a command, at about 30 µs a datagram in the voters' threads.
+  - **At the runner's own datagram rate, about twice that** (#185 review). The runner's tmpfs and disk jobs put the tokio threads at 53 to 64 µs of CPU a datagram sent, against the 30 µs used here: about −0.46 to −0.55 ms a command, −0.34 to −0.51 an operation, and B's datagram part doubles with it. Load is confounded with the datagram count on those runs, so step A's local pair, which removes about nine datagrams a command at a fixed load, reads which holds.
 - **In the kernel:** up to about −0.28 ms a command, at up to about 32 µs a datagram.
 - **Per operation:** times the runner's commands an operation at the register row's mix, 0.74 at 30 callers and 0.93 at 120 (the local mix's 0.5 has half reads): about −0.19 to −0.24 ms an operation in the servers.
 - **Latency:** none. The collector already waited for the release.
