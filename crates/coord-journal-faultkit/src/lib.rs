@@ -400,6 +400,7 @@ impl FaultHandle {
         };
         if self.shared.full(n) {
             self.shared.record(Op::Failed);
+            self.shared.end(n);
             return Err(io::Error::new(
                 io::ErrorKind::StorageFull,
                 "simulated ENOSPC",
@@ -476,6 +477,7 @@ impl Write for FaultWriter {
         };
         if shared.full(n) {
             shared.record(Op::Failed);
+            shared.end(n);
             return Err(io::Error::new(
                 io::ErrorKind::StorageFull,
                 "simulated ENOSPC",
@@ -555,6 +557,7 @@ impl WriteExt for FaultWriter {
         };
         if shared.full(n) {
             shared.record(Op::Failed);
+            shared.end(n);
             return Err(io::Error::new(
                 io::ErrorKind::StorageFull,
                 "simulated ENOSPC",
