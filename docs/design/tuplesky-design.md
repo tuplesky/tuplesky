@@ -1995,6 +1995,22 @@ So task-d103 stops writing the proposal row and has the trim plan stop expecting
 
 **What this leaves of option 2.** The journal-only cut was most of option 2's −0.15 to −0.2. What holds is the proposal row here, the follower's vote row under task-d102's relay, and task-d104's and task-d105's cuts: about −0.07 to −0.09 an operation, before task-d102's share.
 
+**The retry window retired in batches (task-d104).** In steady state a command writes four retry rows at every voter:
+- its retained result (`RetryV1`) and its executed row (`ExecutedV1`), both put;
+- the sequence its client just acknowledged, deleted from `RetryV1`;
+- the client's floor (`RetryFloorV1`), put.
+
+A client acknowledges on every request (`ack_through`), so `retirement()` (`retry.rs`) retires one sequence a command, inline in the command's batch.
+
+**The rule.** A command retires only once its client has acknowledged at least `RETIRE_BATCH` sequences above the floor, `K`, and then all of them, up to `MAX_RETIRE_PER_COMMAND`. It also retires whenever deferring would leave its own sequence, or the next `K`, outside the window measured from the unretired floor. Admission measures the window from the floor this command's own retirement leaves (`admit`), so the second clause keeps any request from becoming `OutOfWindow` because a retirement was deferred.
+
+**What it keeps:**
+- **It is a function of the durable view and the accepted payload,** as `retirement()` is today, so every replica retires the same sequences at the same position. `RetryV1` and `RetryFloorV1` are in the common hash, and their state stays equal across voters at every agreed position.
+- **An acknowledged sequence still retained answers with its result,** not `Retired`. Both are correct answers to a retry of a request whose result the client already holds. A client's retry of its own acknowledged sequence is outside its contract, and nothing compares the two answers.
+- **The window's bound grows by `K` retained results a client,** at most. Under task-d26's resource contract, the session's retained bytes are bounded by `width + K` results, not `width`.
+
+**What it moves.** The floor row is written once every `K` commands a client instead of every command: about −(1 − 1/K) rows a command at every voter, about −0.03 to −0.04 ms an operation at `K = 16`. The `K` deletes land together on consecutive keys of one client, which redb writes as one region of its tree. Whether that is cheaper than `K` scattered deletes is read in the pair, not assumed. `ExecutedV1` stays: it is the index by command that catch-up, campaigns and boot read, and `RetryV1` is keyed by the retry key.
+
 <a id="s17-5"></a>
 ### 17.5 MVCC and physical maintenance
 
