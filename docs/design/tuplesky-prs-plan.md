@@ -3123,6 +3123,25 @@ This entry is the budget and the record, not a lever:
     3. On the carry with #201: the same `replay` and `strict` pair with `checkpoint-after-records: 65536` on both sides, at 30 and 120 callers with etcd beside, which splits the projection's sync from the cadence and reads #201 on disk at 120; and a leader-kill run on `strict` at 65,536 for task-d51's condition. Whether `replay` becomes the default is decided on what that pair leaves of its gain.
     4. task-d86 (C4) re-sized from the profiles and the runner's per-commit cost.
     5. The relay's design step (#202) settles in two steps, and step A's code comes first; its step B is sized on the runner after A. Beside it, the design step for followers doing less (#203), whose first option is task-d86's follower half.
+  - **The holistic review (#185, [6751017712](https://github.com/tuplesky/tuplesky/pull/185#issuecomment-6751017712), [6751846087](https://github.com/tuplesky/tuplesky/pull/185#issuecomment-6751846087)).** Every lever on record, #202 and #203 included, lands the servers at about 2.8 to 3.5× etcd's CPU an operation, short of bar 1. The cause is the pipeline's shape: its costs are per command and per message, where etcd's are per batch, so from 30 to 120 callers the servers' CPU a command falls only 17%, and frames a command over the cluster stay at 32 to 34.
+    - **The tokio threads' CPU tracks datagrams sent:** 53 to 64 µs a datagram on the runner's tmpfs and disk jobs, at both load steps. That corrects task-d96's reading that a datagram costs next to nothing, and about doubles #202's datagram sizes. Load is confounded with the count on those runs; #202's step A, which removes about nine datagrams a command at a fixed load, reads which holds.
+    - **A budget for each block, set from the bar down** (a first cut at 120 callers, ms an operation over five voters). A lever names its block and how much of that block's overrun it takes; a block with no route to its budget gets a design step before more levers.
+
+      | Block | Today | At 2.0× | At parity |
+      | --- | --- | --- | --- |
+      | Domain loops | 1.64 | 0.65 | 0.30 |
+      | Tokio threads | 0.79 | 0.30 | 0.15 |
+      | Materializers | 0.60 | 0.30 | 0.18 |
+      | Appenders and the rest | 0.46 | 0.25 | 0.12 |
+      | **Servers** | **3.49** | **1.50** | **0.75** |
+
+      A low-concurrency column, one to four callers a domain, is added once read: there a projection commit, a journal group and a datagram each carry about one command, so CPU an operation is worse than at the bars' row.
+    - **Levers are gated on counts, locally.** Datagrams, frames, loop passes, journal groups, commits and rows a command are nearly deterministic, and a runner pair's spread (about ±0.09 ms an operation) is larger than most lever sizes. So a lever's acceptance is its count on the local five-voter tmpfs run, with CPU beside it; the runner reads safety for each batch, and a block-sized change when the local counts predict one.
+    - **The domain loops' cost model comes before more loop levers:** passes a command and CPU a pass, and the loop's CPU by role, on a follower and on the leader, locally. If it is per frame, batching takes most of it; if per command, the loops need their own design.
+    - **A round as a batch** (one proposal frame a follower a turn with its payloads, one journal group, one acknowledgement through a position, one execution group, a projection commit on a cadence, one release frame a collector a turn) would fold task-d84's parts, task-d86, #203's option 1, the frame items and #202's step B into one design step. It is held until the owner decides which row gates: under the service's multi-tenant shape (many domains at a low rate each) the batch should be the daemon's turn across domains, and one `coordd` runs one domain today.
+    - **The fleet's shape has never been run.** A fleet row, K domains at a low rate each with `service`'s total rate, reads CPU an operation, p99, and idle CPU and memory a tenant, beside one etcd with a prefix a tenant and K etcd clusters. Until the daemon hosts several domains it is K processes a node; one local reading of it prices a tenant.
+    - **For the owner:** which row gates (the hot tenant, the fleet row, or both); when several domains in one daemon get built (task-j07, behind task-j05); the goal (the bars as recorded, or parity); `replay`'s shape as the default; and the shims in-process (about 0.35 to 0.45 ms an operation of the host on bar 2).
+    - **The order after it:** #202's step A, its local pair reporting datagrams a command beside the tokio CPU; in parallel, the loops' cost model and this budget; then the batch design step once the gating row is decided; then the row cuts; then one three-way runner job with the reference's CPU.
 - **The record:** the table below, one row a lever, each row a pair on the runner.
 
 | Row | Build | Shape | `ok`/s | Server CPU an operation | Idle cores | Expected to move |
