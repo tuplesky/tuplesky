@@ -1969,6 +1969,32 @@ So these wait on a follower's commit in steady state: its frontend's gate for a 
 
 **The order:** option 1 first, as task-d86's follower half, since it needs no protocol change; then option 2's cuts, each its own design step. Option 3 is gated on the domain loops' cost model (task-d72's order, after the owner set the goal at parity with etcd, #185): "only if bar 1 is still out of reach" would always hold at parity, so what decides it is whether a follower's executions are a block the loops' budget needs cut, and then only with its argument written and reviewed. Option 4 without a bound is not taken.
 
+**Protocol rows: what stays in the projection, and the row nobody reads (task-d103).** Option 2's first cut was to keep the protocol rows (`PayloadV1`, `ProtocolV1`) in the journal only and read them back over a bounded window. It isn't taken, because their readers look rows up by command over history the journal no longer holds. The journal is read only sequentially (`read_suffix`, `retained_from`), has no index by command, and its prefix is retired at each published checkpoint (every 4,096 records under `strict`, 65,536 or 30 s under `replay`). The readers:
+
+| Reader | What it reads | Could the journal serve it? |
+| --- | --- | --- |
+| Boot (`read_protocol`, `restore_payloads`) | the promise, the seal, every dependency and Sync row of the epoch, and a payload per record | No. It needs every untrimmed row, older than the journal keeps |
+| Catch-up served (`catch_up_entry`) and a campaign's `executed_rows` | executed, payload and dependency rows by command, over any old history | No. Random access by command, beyond the retained journal |
+| Resolve (`retained_answer`'s `requested()`) | the payload, to recover the logical request | No. No index by command |
+| The shared checkpoint | `PayloadV1` of executed commands, which is in the common hash | Only by changing `SharedCheckpointV1` |
+
+`PayloadRequest` is answered from the machine's memory, which boot refills from the rows, so it needs the rows too.
+
+What a command writes there, by role:
+- **A follower:** fanned out, the payload row and the dependency row at its vote (PRE-ACCEPT), then the dependency row again at adoption (ACCEPT). The two dependency rows record two phases recovery reads, so neither can go while the command is fanned out. A relayed command has no vote, so it writes one dependency row. task-d102's relay takes that row off and counts it.
+- **The leader:** the payload row, the dependency row and a proposal row (`ProposalRecordV1`: ballot, sequence number, dependencies, path), all in its proposal batch. Its ACCEPT row is in the same batch when the guard passes there (task-d89), and is written again by `advance_pending` when it doesn't.
+
+**The proposal row is written and never read.** Boot doesn't read it (`read_protocol` reads promise, seal, dependency and Sync rows). Recovery reports dependency rows. `ProposalRequest` is answered from the leader's proposals in memory, those marked durable (`serve_proposals`). The only reader is the checkpoint's trim plan, which nothing calls. It also has no reader it could need:
+- **Its sequence number is ballot-scoped,** and a leader that restarts never leads its ballot again (Section 4.8's condition 4).
+- **Its dependencies and path** are the leader's ACCEPT row's.
+- **The leader's vote is its ACCEPT row,** not the proposal (Section 4.8: persist-before-send binds votes).
+
+`ProtocolV1` isn't in the common hash, so no scrub or checkpoint compares it.
+
+So task-d103 stops writing the proposal row and has the trim plan stop expecting one. That is one row a command at the leader, about a fifth of a row on every voter: about −0.006 to −0.008 ms an operation, on the leader's threads, which are the serial ones at high load. A store written before the change keeps its proposal rows until trim removes them. No reader depends on whether they are there.
+
+**What this leaves of option 2.** The journal-only cut was most of option 2's −0.15 to −0.2. What holds is the proposal row here, the follower's vote row under task-d102's relay, and task-d104's and task-d105's cuts: about −0.07 to −0.09 an operation, before task-d102's share.
+
 <a id="s17-5"></a>
 ### 17.5 MVCC and physical maintenance
 
