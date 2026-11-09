@@ -3842,11 +3842,11 @@ So every feature-gated change, task-d98's `EarlyProposal` first, would ship unre
 **Design:** Section 4.3 (amended by this task's design step: the leader relay), and Section 4.6's rule on a hop to the leader.
 
 **Implement:** Item b of task-d72's levers (#185 review). The design step is in Section 4.3; this entry is its code step.
-- **The wire.** A relayed `Submit`, marked as such and sent to the ballot's leader only. A `Proposal` form that carries the payload record beside the vote. A refusal naming `NotLeading` for a relayed submission at a voter that isn't leading.
+- **The wire.** A relayed `Submit`, marked as such and sent to the ballot's leader only. The advice bit on the release envelope. A `Proposal` form that carries the payload record beside the vote. A refusal naming `NotLeading` for a relayed submission at a voter that isn't leading.
 - **The leader.** For a relayed command it sends no `LeaderReply` and no frontend copy of its own slow acknowledgement, and sends its release to the origin it recorded. A duplicate relayed submission records its origin, and a command already executed is released to it at once.
 - **The followers.** A relayed proposal initializes the command from its payload and adopts it in one batch (payload, dependency and ACCEPT rows), with no pre-acceptance and no fast acknowledgement. The slow acknowledgement goes to the leader only, and nothing is parked for it. The path log applies the adoption as a synchronization of a command not in the suffix (Section 4.1).
 - **The collector.**
-  - It relays per command while the fast share of its own fanned-out releases is below a threshold, with hysteresis, and measures while relaying by short fanned-out stretches. The threshold, the hysteresis and the stretches are settings.
+  - It relays per command while its ballot's leader advises relay. The advice is a bit on each release: the leader reads the fast share of fanned-out commands over a window, advises relay below a threshold with hysteresis, and while relaying advises fan-out for short stretches that every collector takes together, counting only commands decided inside them. The threshold, the hysteresis and the stretches are settings.
   - A relayed command is answered on the leader's non-speculative release alone, with `check_release` unchanged.
   - On a ballot change it re-sends to the new leader. On no release within a bound it falls back to today's all-voter submission.
   - A collector with no voter beside it keeps fanning out.
@@ -3864,6 +3864,8 @@ So every feature-gated change, task-d98's `EarlyProposal` first, would ship unre
   - a follower adopts a relayed proposal in one batch and sends no fast acknowledgement;
   - a collector answers on a final release alone and holds a speculative one;
   - relayed and fanned-out commands mix on one key and every decision agrees, the fanned-out ones only slower;
+  - several collectors relaying and fanning out on conflicting keys: a probe stretch reads the share it would read with no relaying, and the advice returns to fan-out when the share recovers;
+  - a collector acting on stale or missing advice stays correct;
   - each leader-change case in Section 4.3: never proposed, adopted below a slow quorum, decided, sent to a voter that isn't leading;
   - the fallback to the all-voter submission.
 - **The protocol simulator:** a relay setting (the share of commands relayed, and switching during a run) over the sweep at every loss and both catch-up settings, with every oracle, the released `ResponseV1` compared byte for byte included.
