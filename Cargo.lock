@@ -724,6 +724,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "coord-journal-faultkit"
+version = "0.1.0"
+dependencies = [
+ "coord-core",
+ "coord-journal-api",
+ "coord-journal-raft-engine",
+ "coord-store-api",
+ "coord-types",
+ "raft-engine",
+ "rand_chacha 0.10.0",
+ "rand_core 0.10.0",
+ "tempfile",
+]
+
+[[package]]
 name = "coord-journal-raft-engine"
 version = "0.1.0"
 dependencies = [
