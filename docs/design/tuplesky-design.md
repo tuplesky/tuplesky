@@ -1925,7 +1925,7 @@ So these wait on a follower's commit in steady state: its frontend's gate for a 
 - **Left without a lever after this step:** about 0.6 to 1.25 ms an operation, the 0.9 to 1.4 less option 2 (−0.15 to −0.2), coalescing (up to −0.05) and option 3 if built (−0.06 to −0.075). Option 1 is mostly C4's already counted growth. The 0.9 to 1.4 is at 120 callers on disk and these options are sized at 30 on tmpfs, so the subtraction is a range, not a reading.
 - **The largest named block in it is the leader's loop, 0.32, with nothing planned.** It opens the way the two profiles opened this step: from the call graphs already on #98, read locally, before another runner job.
 
-**The order:** option 1 first, as task-d86's follower half, since it needs no protocol change; then option 2's cuts, each its own design step. Option 3 is sized and recorded but not in the order: "only if bar 1 is still out of reach" would always hold, since its −0.06 to −0.075 alone can't close what is left. It is reconsidered only if the other levers leave bar 1 within about its size, and then only with its argument written and reviewed. Option 4 without a bound is not taken.
+**The order:** option 1 first, as task-d86's follower half, since it needs no protocol change; then option 2's cuts, each its own design step. Option 3 is gated on the domain loops' cost model (task-d72's order, after the owner set the goal at parity with etcd, #185): "only if bar 1 is still out of reach" would always hold at parity, so what decides it is whether a follower's executions are a block the loops' budget needs cut, and then only with its argument written and reviewed. Option 4 without a bound is not taken.
 
 <a id="s17-5"></a>
 ### 17.5 MVCC and physical maintenance
