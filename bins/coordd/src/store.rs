@@ -784,11 +784,16 @@ fn reinstall_unreadable(
     if store.projection_profile() == ProjectionProfile::Strict {
         return Err(refused(format!("{error:?}")));
     }
-    let baseline = store.recovery_baseline(domain_id).map_err(|e| {
-        refused(format!(
-            "the local recovery baseline could not be read: {e}"
-        ))
-    })?;
+    // The stream the root is stamped with: before an authorized
+    // replacement's adoption, which `Opened::attach` carries out after
+    // this, the node's pointers are still in its predecessor's stream.
+    let baseline = store
+        .recovery_baseline_of(domain_id, stamped.incarnation)
+        .map_err(|e| {
+            refused(format!(
+                "the local recovery baseline could not be read: {e}"
+            ))
+        })?;
     let Some(pointer) = baseline else {
         return Err(refused(format!(
             "the projection could not be opened ({error}) and no local checkpoint was \
@@ -1565,6 +1570,42 @@ namespace = "5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e"
                 .unwrap_or_else(|e| panic!("{loss:?}: the reinstalled generation: {e}"));
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    /// An authorized replacement that starts with an unreadable
+    /// projection: the baseline is in the predecessor's stream, which the
+    /// adoption carries forward only after the reinstall. The reinstall
+    /// reads it from the stream the root is stamped with, and the
+    /// adoption then proceeds on the reinstalled generation (Codex review
+    /// on #212).
+    #[test]
+    fn an_unreadable_projection_is_reinstalled_before_a_pending_adoption() {
+        let dir = workspace("unreadable-adoption");
+        let mut config = config(&dir);
+        config.journal.profile = coord_daemon::config::JOURNAL_REPLAY_PROFILE.to_owned();
+        a_node_with_a_baseline(&config, &dir);
+        lose(&config, &dir, Loss::Garbage);
+
+        let opened = serve(&config, 2).expect("an unreadable projection is reinstalled");
+        assert!(opened.adoption.is_some(), "no adoption was pending");
+        let storage = opened
+            .attach()
+            .expect("the adoption on the reinstalled generation");
+        let frontiers = storage.domain.store().frontiers(DOMAIN).expect("frontiers");
+        assert_eq!(frontiers.materialized(), frontiers.durable());
+        drop(storage);
+        assert_eq!(
+            coord_storage_redb::lifecycle::selected_manifest(
+                &config.state.root_path(&config.state_directory)
+            )
+            .expect("manifest")
+            .incarnation,
+            incarnation(2)
+        );
+        serve(&config, 2)
+            .and_then(Opened::attach)
+            .expect("the adopted generation serves again");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Without a published baseline there is nothing to install: a

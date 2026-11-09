@@ -1982,10 +1982,24 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
         &self,
         domain: DomainId,
     ) -> Result<Option<CheckpointPointerV1>, JournaledError> {
+        self.recovery_baseline_of(domain, self.incarnation)
+    }
+
+    /// [`JournaledStore::recovery_baseline`] of the stream `incarnation`
+    /// allocated: before an authorized replacement's adoption
+    /// ([`JournaledStore::adopt_stream`]) the node's stream and its
+    /// pointers are still keyed by the incarnation the root is stamped
+    /// with, not by this coordinator's (task-j05 step 3: a projection
+    /// reinstalled before the adoption that follows it).
+    pub fn recovery_baseline_of(
+        &self,
+        domain: DomainId,
+        incarnation: ReplicaIncarnation,
+    ) -> Result<Option<CheckpointPointerV1>, JournaledError> {
         let key = StreamKey {
             cluster: self.cluster,
             domain,
-            incarnation: self.incarnation,
+            incarnation,
         };
         let Some(stream) = self.allocator.lookup(&key) else {
             return Ok(None);
@@ -1994,7 +2008,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
             cluster: self.cluster,
             domain,
             replica: self.replica,
-            incarnation: self.incarnation,
+            incarnation,
             stream,
         };
         let mut found: Vec<CheckpointPointerV1> = Vec::new();
