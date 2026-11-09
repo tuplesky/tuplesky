@@ -1294,7 +1294,54 @@ On the serving path: a running daemon publishes its own baseline, retires the pr
 
 **Implement:** Pinned filesystem injection with audited unhooked/background operations; combine actual raft-engine/redb faults, subprocess death, ENOSPC/sync errors and recovery modes. Keep independent protocol/application/retry oracles.
 
-**Acceptance:** Acknowledged outcomes survive declared failures; sync panic stops affected shared service. Distinguish model from physical evidence and report uncontrolled schedules/platforms. Inject WAL/projection-cut/order errors and same-boot callbacks; suite detects missing obligations and unauthorized late effects. No permissive recovery silently loses durable prefix.
+**The matrix, in steps, with `replay`'s case in it from the start** (#185 review). `replay` (task-j06) is the profile that may become the default, and task-j06 makes task-j05's whole matrix its gate, so every step runs under `strict` and under `replay`. Each step is its own PR.
+
+What exists today:
+- **redb.** Its faults are covered by `coord-redb-faultkit`: two images, torn, seeded and reordered tails, sync failures, ENOSPC, crash-freeze, and subprocess `abort()`. `journaled_real.rs` runs that matrix under both profiles over a real raft-engine journal.
+- **The journal** is never faulted there: it is closed cleanly and copied. Its only fault test fails `Handle::sync`.
+- **Recovery modes.** Neither recovery mode is tested against a damaged file.
+- **Oracles.** No crash test of the journal-first path runs an independent oracle; they compare rows with a reference replay.
+
+The steps:
+1. **A journal fault kit.** A raft-engine `FileSystem` adapter with a volatile image and a durable one, as the redb kit has. It faults:
+   - writes and short writes, ENOSPC and EIO on write, sync failures;
+   - a crash that freezes the files and keeps none, all, or a seeded subset of what wasn't synced, torn at byte level and reordered.
+
+   **The audit:** the operations that bypass the adapter, each named in the report as uncontrolled or, where the adapter can reach it, brought under it. These are:
+   - the directory sync in raft-engine's `pipe.rs`, which panics on failure;
+   - `pipe_builder`'s directory creation, listing and lock;
+   - the adapter's own `std::fs` calls;
+   - raft-engine's background threads, if any.
+2. **The recovery modes** against the kit: a torn or partial tail, and damage inside the durable prefix, under `TolerateTailCorruption` (the default) and `AbsoluteConsistency`. A mode may drop an unsynced tail. Neither may drop, or open past, a record that was synced and reported durable; damage there is refused with its position.
+3. **The composed crash matrix:**
+   - **The crash points.** Journal and projection crash together at every counted operation of either, with each tail policy on each, under `strict` and `replay`, over the domains' real `JournaledStore`.
+   - **`replay`'s case.** The live projection is lost or unusable in four ways. For each, the node must recover the journal's state, by replay or by installing the baseline, or refuse to serve when there is no baseline:
+     - empty;
+     - a stale stamp behind the baseline;
+     - a stamp naming a record the journal doesn't hold;
+     - a file redb can't open. Today this one is refused at `open` rather than discarded and reinstalled, so the step makes it discard and reinstall.
+4. **Checkpoint and pointer publication** on a fault seam: the image's files, rename and directory sync, the pointer's append, the journal's purge, and the source switch. Each crashed at every point, under both profiles. `coord-checkpoint` uses `std::fs` directly today, so the seam is added first.
+5. **A sync failure stops the service.** On the real journal under `coordd`:
+   - the appender's panic, or a fail-stopped journal, ends the domain thread and the process with the reason, and serves nothing after it;
+   - a restart reopens the journal and doesn't reuse the uncertain handle;
+   - the uncertain record is either in the reopened journal and replayed, or absent and never acknowledged.
+6. **Subprocess death under the oracles.** `coordd` killed with `SIGKILL` at seeded points across the journal's and the projection's writes, three voters on real files, under both profiles. Each run's history is checked by:
+   - `coord-oracle`'s history check;
+   - the protocol oracle (acknowledged values durable at a quorum);
+   - the retry oracle.
+
+   None of them compares rows with a reference replay.
+7. **Negative controls and late effects.**
+   - **WAL, projection-cut and ordering errors, and same-boot late callbacks,** injected on the real engines.
+   - **For each guard,** a build with that guard removed, which the suite must catch:
+     - the projection commit before the journal sync;
+     - a late callback accepted after `reconcile`;
+     - the pointer published before the projection's durable stamp;
+     - the replay validation skipped.
+
+The report from each step separates model evidence from physical evidence, and names the platform, the filesystem and every uncontrolled operation or schedule.
+
+**Acceptance:** Acknowledged outcomes survive declared failures; sync panic stops affected shared service. Distinguish model from physical evidence and report uncontrolled schedules/platforms. Inject WAL/projection-cut/order errors and same-boot callbacks; suite detects missing obligations and unauthorized late effects. No permissive recovery silently loses durable prefix. Every step passes under `strict` and under `replay`, and task-j06's gate for making `replay` a default reads this matrix's result.
 
 **Review boundary:** Clean close or process kill alone does not prove power-loss behavior.
 
