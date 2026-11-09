@@ -3,7 +3,7 @@
 **Status:** Review proposal, consolidated v1.5.  
 **Date:** 2026-09-24.  
 **Companion:** [TupleSky implementation design](tuplesky-design.md).  
-**Scope:** 195 implementation tasks with stable `task-*` identifiers. The `task-01` through `task-66`, `task-s01` through `task-s04`, `task-j01` through `task-j10`, `task-o01` through `task-o06`, `task-m01` through `task-m05`, `task-c01`, `task-c02`, `task-c03`, `task-d01` through `task-d92`, `task-d94` through `task-d101` and `task-q01` suffixes and prerequisites are preserved. v1.5 adds `task-d01` through `task-d04` from review of the open implementation PRs and of multi-host readiness, `task-d05` through `task-d17` from the Jepsen client's runs, `task-d18` through `task-d33` from a review against an external SwiftPaxos correctness checklist ([review record](tuplesky-checklist-review.md)), `task-d34` from what the protocol simulator of task-d30 found, `task-d35` through `task-d44` from a review of recovery time and storage integrity (an execution chain, a scrub, and voter replacement through a prepared transition, a staged learner, terminal recovery after the seal, serving across a transition and a running membership install), `task-d45` through `task-d50` from measuring the throughput of the Jepsen client's first unthrottled runs, `task-d51` from task-d46's long runs, `task-d52` and `task-d53` from a profile of the domain thread after task-d46, `task-d54` from the Jepsen runs of task-d50, `task-d55` through `task-d57` from the Jepsen runs of task-j06, `task-d58` through `task-d61` from a profile of five voters' CPU per operation, `task-d62` through `task-d65` from a consolidated review against the reference SwiftPaxos, `task-d66` from the Jepsen runs of task-d51, `task-d67` from a Jepsen run on #98 that made no fast decision, `task-d68` from task-d62's counts after a leader change, `task-d69` from a profile of a follower's loop, `task-d70` from the Jepsen runner's profile of the transport's workers, `task-d71` from the protocol simulator's first 1,000-seed sweep, `task-d72` through `task-d75` from comparing a command's cost with etcd's on one host, `task-d76` from a Jepsen run that killed the leader, `task-d77` through `task-d81` from the protocol simulator with acknowledgements between followers lost, `task-d82` through `task-d84` from the Jepsen runs of the #173 carry, `task-d85` from the protocol simulator on task-d74's routing, `task-d86` through `task-d92` from planning the whole gap to etcd on #174, and moves committed key replacement from `task-58` to `task-m03`; the changes are listed under [Gate checklist and deferred work](#gate-checklist-and-deferred-work). Task IDs are not GitHub pull-request or issue numbers. One implementation PR corresponds to one task; its GitHub-assigned number is recorded separately. No baseline, supplement or separate amendment is needed.
+**Scope:** 196 implementation tasks with stable `task-*` identifiers. The `task-01` through `task-66`, `task-s01` through `task-s04`, `task-j01` through `task-j10`, `task-o01` through `task-o06`, `task-m01` through `task-m05`, `task-c01`, `task-c02`, `task-c03`, `task-d01` through `task-d92`, `task-d94` through `task-d102` and `task-q01` suffixes and prerequisites are preserved. v1.5 adds `task-d01` through `task-d04` from review of the open implementation PRs and of multi-host readiness, `task-d05` through `task-d17` from the Jepsen client's runs, `task-d18` through `task-d33` from a review against an external SwiftPaxos correctness checklist ([review record](tuplesky-checklist-review.md)), `task-d34` from what the protocol simulator of task-d30 found, `task-d35` through `task-d44` from a review of recovery time and storage integrity (an execution chain, a scrub, and voter replacement through a prepared transition, a staged learner, terminal recovery after the seal, serving across a transition and a running membership install), `task-d45` through `task-d50` from measuring the throughput of the Jepsen client's first unthrottled runs, `task-d51` from task-d46's long runs, `task-d52` and `task-d53` from a profile of the domain thread after task-d46, `task-d54` from the Jepsen runs of task-d50, `task-d55` through `task-d57` from the Jepsen runs of task-j06, `task-d58` through `task-d61` from a profile of five voters' CPU per operation, `task-d62` through `task-d65` from a consolidated review against the reference SwiftPaxos, `task-d66` from the Jepsen runs of task-d51, `task-d67` from a Jepsen run on #98 that made no fast decision, `task-d68` from task-d62's counts after a leader change, `task-d69` from a profile of a follower's loop, `task-d70` from the Jepsen runner's profile of the transport's workers, `task-d71` from the protocol simulator's first 1,000-seed sweep, `task-d72` through `task-d75` from comparing a command's cost with etcd's on one host, `task-d76` from a Jepsen run that killed the leader, `task-d77` through `task-d81` from the protocol simulator with acknowledgements between followers lost, `task-d82` through `task-d84` from the Jepsen runs of the #173 carry, `task-d85` from the protocol simulator on task-d74's routing, `task-d86` through `task-d92` from planning the whole gap to etcd on #174, and moves committed key replacement from `task-58` to `task-m03`; the changes are listed under [Gate checklist and deferred work](#gate-checklist-and-deferred-work). Task IDs are not GitHub pull-request or issue numbers. One implementation PR corresponds to one task; its GitHub-assigned number is recorded separately. No baseline, supplement or separate amendment is needed.
 
 ## How to use this plan
 
@@ -61,6 +61,7 @@ Reference single-store and fixed-membership compositions are early increments, n
 | task-d99 | From task-d98's design step (#192 review): task-60's activation rule and rows exist, but nothing in a running `coordd` records a voter's support or activates a feature, so a feature-gated change ships unreachable, and Section 23 rules out an operator flag around a correctness gate | Before the batch that carries task-d98 |
 | task-d100 | From the batch's sweep and its two runner jobs (#98, #185 review): with the disk's tail off the head is core-bound from 30 callers, and a slow-path command still costs the collector's frontend about 11 api frames, about 13 datagrams, and every follower a submission's admission for an order it only adopts | After task-d98 and task-d99, which its relayed proposal and its features rest on; step A first, step B sized on the runner after it (#202 review) |
 | task-d101 | From the two local profiles and the row count on #185, read against the runner's tmpfs job (#185 review): the four followers' executions and projections cost about 0.75 ms an operation, a fifth of the servers, and none of it is on a write's path | A design step now, beside task-d100's code step; its option 1 is task-d86's follower half |
+| task-d102 | From #185's next steps (#185 review): at 120 callers a command costs about 16.8 datagrams and a journal group holds about 4.9 commands, since every message and group of a slow round is per command | A design step now, after task-d100's step A; it builds step B, and reads task-d84's parts 2 and 3, task-d86 and task-d101's option 1 together |
 | task-q01 | Combined durable WAN/Kine qualification | Required before task-66 |
 
 ```mermaid
@@ -284,6 +285,7 @@ This is a workstream overview; the individual prerequisites are authoritative. O
 | [task-d99](#task-d99) | Activate a replicated feature in a running domain | task-60 |
 | [task-d100](#task-d100) | Answer on the release, then relay a write through the leader while rounds are slow-only | task-d74, task-d90, task-d98, task-d99 |
 | [task-d101](#task-d101) | Let followers do less: what reads a follower's projection, and what each option saves | task-d12, task-d86, task-d90 |
+| [task-d102](#task-d102) | A contended round is a batch: one frame, one group and one acknowledgement a turn | task-d61, task-d84, task-d86, task-d99, task-d100, task-d101 |
 | [task-q01](#task-q01) | Produce the combined durable WAN/Kine qualification report | task-j07, task-j08, task-o06, task-m05, task-63, task-64, task-d45, task-d46, task-d47, task-d48, task-d49, task-d51, task-d52, task-d53 |
 
 ## Task specifications
@@ -3850,7 +3852,7 @@ So every feature-gated change, task-d98's `EarlyProposal` first, would ship unre
   - **The leader's evidence repair** (`repair_evidence`, task-c02) publishes the release again for an exact duplicate of a marked command it has executed, instead of its reply. The daemon rebuilds the release from the leader's retry record and its table record's admission, since the `EvidenceStore` keeps no release. A duplicate ahead of the projection waits for it through the command's position, and one ahead of the release waits for the release; neither is refused. A follower repairs nothing for a marked command.
   - **The frontend's hold** (`parked.rs`) holds nothing for a marked command, and goes once no supported build leaves a command unmarked.
   - **The switch:** `Feature::AnswerOnRelease`, read on the collector's side, which reads no feature today.
-- **Step B: the leader relay while rounds are slow-only.**
+- **Step B: the leader relay while rounds are slow-only.** Built inside task-d102's batched round, under its `BatchedRound` feature, not alone; what follows is what that task builds of it.
   - **The wire.** A relayed `Submit`, marked as such and sent to the ballot's leader only. The advice bit on the release envelope. A `Proposal` form that carries the payload record beside the vote. A refusal naming `NotLeading` for a relayed submission at a voter that isn't leading.
   - **The leader** sends its release to the origin it recorded. A duplicate relayed submission records its origin, and a command already executed is released to it at once.
   - **The followers.** A relayed proposal's payload is checked as a `PayloadResponse` is: its identity is the proposal's command, and its admission digest the proposal's vote's; one that fails either is dropped and fetched as today. A relayed proposal initializes the command from its payload and adopts it in one batch (payload, dependency and ACCEPT rows), with no pre-acceptance and no fast acknowledgement. The path log applies the adoption as a synchronization of a command not in the suffix (Section 4.1).
@@ -3918,6 +3920,50 @@ So every feature-gated change, task-d98's `EarlyProposal` first, would ship unre
 - **Option 3, if built:** its argument reviewed, the protocol simulator with every oracle over the sweep, and a negative control: a follower whose own execution is altered on its rotation's commands stops the node.
 
 **Review boundary:** When a follower commits its projection, and what it executes. No change to the protocol, to what a vote rests on, or to what is released.
+
+<a id="task-d102"></a>
+### task-d102: A contended round is a batch: one frame, one group and one acknowledgement a turn
+
+**Prerequisites:** task-d61, task-d84, task-d86, task-d99, task-d100, task-d101.  
+**Design:** Section 4.3 (amended by this task's design step: a contended round is a batch), and Sections 4.8 and 4.9, which the acknowledgement through a position rests on and doesn't change.
+
+**Implement:** From #185's next steps (#185 review): every per-command message and group of a slow round folded into one a turn, for one domain. The design step is in Section 4.3; this entry is its code steps, each its own PR after its own review, in this order.
+- **First, the reading,** on step A's head at five voters, register row, 30 and 120 callers: datagrams a command by plane and kind, commands a proposal, an acknowledgement and a release frame, commands a journal group and a projection commit at each voter, and the servers' CPU a command. The figures in the acceptance below are read against it.
+- **The batched frames (`Feature::BatchedRound`),** with task-d100's step B built here and not alone:
+  - one proposal frame a follower a turn, carrying every proposal of the turn in sequence-number order with its vote, a relayed command's payload record, and the commit frontier; split only at the transport's frame bound;
+  - step B's relay, switch, advice bit and fallbacks as Section 4.3's B1 and B2 state them, the advice bit once a release frame;
+  - one release frame a collector a turn, each entry checked as one release is today;
+  - a follower adopts a frame's proposals in one journal group, each checked and adopted as step B adopts one.
+- **The acknowledgement through a position (`Feature::AckRanges`),** after the frames:
+  - `AdoptedThrough { ballot, ranges }`, its ranges bounded, sent once a batch is durable; above the bound, and for an adoption with no sequence number, today's `SlowAck`;
+  - the leader counts a `SlowAck` with its own proposal's command and admission for each position newly covered, and drops a position it didn't number;
+  - per voter, the contiguous position counted (`adopted_through`, task-d59) and the ranges above it.
+- **The groups and the commits, under their own entries in this order:** task-d84's parts 2 and 3 (one journal sync a turn), then task-d86's leader half and task-d101's option 1 (a follower's commit cadence). This task's acceptance reads them together.
+- **Not built:** a collector's submissions batched (the next lever if the datagram count misses, sized from the miss), and the extension across domains Section 4.3 describes.
+
+**Acceptance:**
+- **The design step** recorded and reviewed before any code, the acknowledgement's argument with it.
+- **Model tests, the frames:**
+  - a turn's proposals to a follower leave in one frame, in sequence-number order, and a follower adopts them in one journal group;
+  - a payload in a frame whose identity or admission differs from its vote's is dropped and fetched, and the frame's other proposals are adopted;
+  - a turn's releases to a collector leave in one frame, and a collector answers each entry exactly as it answers one release, a held one included;
+  - a frame lost, duplicated or split at the bound changes no decision, and the re-send (task-d49, task-d59) re-sends what a voter hasn't acknowledged.
+- **Model tests, the acknowledgement:**
+  - a range is sent only once every adoption it covers, and every outstanding batch of the voter, is durable;
+  - the leader counts a covered position once, with its own proposal's command and admission, and never toward a fast quorum;
+  - a hole (a payload fetched, a lost frame) leaves the positions above it counted, and a proposal held for a rebind (`awaits_rebind`) or refused is never covered;
+  - an adoption restored after a restart is acknowledged by `SlowAck` until `ProposalRequest` gives it a position;
+  - a position past the leader's numbering, or of another ballot, is dropped.
+- **The protocol simulator,** with both features on in every row and the oracle over the sweep, at three and five voters, with and without catch-up, and the weekly sweep's knob added by the testing session. Two negative controls, each caught by the oracle: a voter that covers a position before its adoption is durable, under crash; and a leader that counts a range under the admission of another proposal.
+- **The storage crash tests** at every cut between a frame's adoption batch and its acknowledgement.
+- **The counts,** at five voters on the register row, on step A's counters, in a local pair and then the runner pair in the batch job (task-d72):
+  - at 120 callers, at most 5 datagrams a command over both planes (about 16.8 on step A's base);
+  - at least 10 commands a journal group at every voter (about 4.9);
+  - the servers' CPU a command at 120 callers at most half of its value at 30.
+
+  A miss is read before the next part is built: which hop's batch is small, and why.
+
+**Review boundary:** What a slow round's frames carry and how many there are, and what a slow acknowledgement's frame claims. No change to what a vote rests on, to the quorum rules, to recovery's selection or rows, or to the fast path.
 
 ## Gate checklist and deferred work
 
