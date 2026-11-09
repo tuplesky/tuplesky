@@ -1860,6 +1860,45 @@ State/cache/events advance only after atomic application, recoverable journal/ch
 
 A trusted collector may return a fully established speculative response without waiting for another materialization round trip only after exact durable evidence proves result/predecessors/permission. task-29 requires task-27 crash qualification and task-28 full learning. Events and credentials still await irrevocable application. No extra volatile COMMIT quorum is assumed.
 
+**What a follower's projection is for, and how a follower could do less (task-d101).** Every voter executes every decided command and materializes its records into its own projection. On the runner's tmpfs job at 30 callers the four followers' share of that is about 0.75 ms an operation, a fifth of the servers: their materializers about 0.55 and their executions about 0.19 (#185 review, from the job's per-thread CPU at 0.74 commands an operation). None of it is on a write's path since task-d90: a result is released once the leader has executed it in memory. So what a follower's execution and projection are for is what reads them, and each option below is sized against those readers. This is the design step; the code steps are task-d101's entry in the plan.
+
+**What reads a follower's projection.** A follower's commit only has to come before the first of these that needs it:
+
+| Reader | What it needs from this node's projection | Waits on a commit? |
+| --- | --- | --- |
+| Its frontend's output gate (#186) | The caller's session shown, before a disclosure | Only for a session this node hasn't shown yet |
+| Watches served at this node (Section 6.4) | Events, which wait for `Materialized` (this section) | Yes, for every event a watch at this node is owed |
+| Retry answers and resolves from the record (task-c02, task-d22) | The command's execution record and its key's retry state | No. A projection behind the journal is a consistent older prefix, which answers "not yet" and the retry is submitted, never `Unknown` or `Forgotten` for a command the journal holds |
+| The late-release comparison (task-d12) | Its own voter's execution record of a released command | No. It compares when the record is there, off any path |
+| Catch-up served to peers (task-d08) | Executed history up to its frontier | No. It serves what it holds, and the leader serves the rest |
+| The local checkpoint (Section 17.16) | A commit that has returned | It forces one before a pointer is appended, as today |
+| This follower becoming leader | Everything decided executed and visible before it serves | Once, at the election |
+| A restart (Section 17.3.4) | Nothing: the journal above the projection's stamp is replayed | No |
+
+So only two readers wait on a follower's commit in steady state: its frontend's gate for a new session, and a watch at this node. Every other reader either reads a consistent older prefix correctly or forces the commit it needs. The code step confirms that list against every reader of the projection in `coordd` before relying on it.
+
+**The options, sized on the runner at 30 callers** (a local per-command figure converts to the runner's per-operation at about 2.1 to 2.6×: 1.4× for the CPU and 1.5 to 1.9× for the mix, 0.74 and 0.93 commands an operation at 30 and 120 callers against the local 0.5):
+
+1. **Followers commit on a cadence of their own** (C4 split by role).
+   - **What it does:** a follower's materializer takes more records a commit, up to a bound of records and time. The two readers that wait ask for the next commit, as a barrier read does under task-d86's cadence; the others don't wait. Under `strict` each commit is still durable before anything this node discloses from it, so the profile's contract is unchanged, and a restart replays more of the journal, as it already does between a group's sync and its commit.
+   - **What it moves:** a commit costs a voter's materializer about 225 µs on the runner's tmpfs fit (385 as a durable commit on its disk). Merging 2.24 commands a commit to about 20 saves about 89 µs a command a follower: about −0.25 ms an operation over four followers, more on disk.
+   - **How it overlaps C4:** task-d86 counts about −0.2 at 30 callers for every voter's merging. The leader's merging is bounded by its reads and its own gate; a follower's only by the two readers above. So the follower's half of C4 can merge further than the leader's, and C4's size is restated as the two halves.
+   - **No protocol change,** and no change to what a vote rests on: the journal, not the projection, holds every row a vote needs.
+2. **Fewer rows a command.** About 12 rows a command in nine collections (#185's count), at about 6 µs a row a voter: a row taken off every command is about −0.03 to −0.04 ms an operation over five voters on the runner. The three cuts each need their own design step: protocol rows (`PayloadV1`, `ProtocolV1`) in the journal only, read back over a bounded window, since recovery and catch-up read them; the retry window retired in batches; one history-and-event row a revision. Together about −0.15 to −0.2. They help every voter, not only followers, and no lever covers them yet.
+3. **Followers apply the leader's write set instead of executing.**
+   - **What it removes:** planning (`planning_view`, `scan_all`, `plan`, 15%), `load_authorization` (14 to 16%) and the retry computation (10 to 12%) of `run_executions`. Landing the records (25%) and `Follower::applied` (15 to 19%) stay, as does the whole materializer, since the rows are the same rows. That is about half of the followers' 0.19 ms an operation: about −0.08 to −0.1.
+   - **What it adds:** each command's application rows, about 1.4 KB, from the leader to four followers after it executes. The leader's threads are the serial ones at high load, so the leader's tokio CPU a command is read beside the saving.
+   - **What it weakens:** task-d12. A follower's own execution is the check that a release matches what every voter computes. Applying the leader's write set copies a wrong execution into every follower's state, so no comparison across voters' states (the common hash, a scrub) can see it afterwards; only executing again can.
+   - **What would replace it:** each command executed independently by one follower, by rotation (follower i executes the commands whose identity hashes to i modulo the followers), against the state it holds, with the result compared with the leader's write set and the node stopped on a difference, as task-d12 stops it. A wrong transition is then caught at the first command that makes it, by one execution instead of four. The saving falls to about three quarters of the half: about −0.06 to −0.075 an operation, before the write set's carriage.
+   - **Its argument, to be written before code:** that one independent execution a command, over a pre-state the leader's earlier write sets made, detects what task-d12 detects today under the fault model; and what a follower that becomes leader executes from.
+4. **Followers execute lazily within a bound.**
+   - **At a bound it removes no work at saturation.** Every command is still executed and materialized at every follower, later and in larger batches, so it is option 1 with a larger batch. Its one further saving is coalescing: a row a batch writes twice (the meta row every command writes, a hot key's current row) lands once. That is available to any batch, so it belongs to option 1 and C4, not to laziness. At most about two of 12 rows a command at register, about −0.05 to −0.06 over four followers, read off a count of the rows a batch coalesces before it is sized.
+   - **Without a bound** followers execute only on demand. That removes the whole 0.75, but every reader above then pays: a follower elected leader executes its backlog before it serves (at about 0.1 ms a command a follower, 10 s for 100,000 commands), watches and new sessions at its node wait for it, catch-up comes only from the leader, and task-d12's comparison happens only on demand. That is a different follower, with a different failover time, not a cost cut, and it is not taken here.
+
+**What it leaves.** Of the 0.9 to 1.4 ms an operation bar 1 had no lever for, the relay (task-d100) now takes about 0.4 to 0.54. Of this step's options, 1 is mostly C4's already counted growth, 2 adds about −0.15 to −0.2, 3 about −0.06 to −0.075 with its argument, and coalescing about −0.05. The rest of the gap, the leader's loop (0.32) among it, has no lever yet.
+
+**The order:** option 1 first, as task-d86's follower half, since it needs no protocol change; then option 2's cuts, each its own design step; option 3 only if bar 1 is still out of reach after them, and only with its argument written and reviewed; option 4 without a bound not at all.
+
 <a id="s17-5"></a>
 ### 17.5 MVCC and physical maintenance
 
