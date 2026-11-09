@@ -305,29 +305,58 @@ impl Shared {
 }
 
 fn apply_tail(images: &Images, tail: Tail) -> Vec<u8> {
-    let mut ops: Vec<Unsynced> = images.unsynced.clone();
-    match tail {
-        Tail::None => return images.durable.clone(),
-        Tail::All => return images.volatile.clone(),
-        Tail::Seeded(seed) => {
-            let mut rng = ChaCha12Rng::seed_from_u64(seed);
-            ops.retain(|_| rng.next_u32() % 2 == 0);
-            for op in &mut ops {
-                if let Unsynced::Write { bytes, .. } = op
-                    && rng.next_u32() % 4 == 0
-                {
-                    let keep = (rng.next_u32() as usize) % (bytes.len() + 1);
-                    bytes.truncate(keep);
-                }
-            }
-            for i in (1..ops.len()).rev() {
-                let j = (rng.next_u32() as usize) % (i + 1);
-                ops.swap(i, j);
+    split_tail(images, tail).0
+}
+
+/// The image `tail` leaves, and the unsynced operations it did not
+/// persist, in issue order: the ones it dropped, and the unwritten rest of
+/// a write it tore. A failed sync keeps exactly those pending, so a later
+/// crash image never replays an operation the failed sync already
+/// persisted over what came after it.
+fn split_tail(images: &Images, tail: Tail) -> (Vec<u8>, Vec<Unsynced>) {
+    let seed = match tail {
+        Tail::None => return (images.durable.clone(), images.unsynced.clone()),
+        // Everything unsynced survives in issue order: exactly the volatile
+        // image, including a shrink that followed an earlier write.
+        Tail::All => return (images.volatile.clone(), Vec::new()),
+        Tail::Seeded(seed) => seed,
+    };
+    let mut rng = ChaCha12Rng::seed_from_u64(seed);
+    // Keep each operation with probability 1/2, tear surviving writes to a
+    // prefix sometimes, and shuffle the survivors. A length change is one
+    // of the operations: it survives, or not, and lands wherever the
+    // shuffle puts it.
+    let (mut kept, mut rest) = (Vec::new(), Vec::new());
+    for (i, op) in images.unsynced.iter().enumerate() {
+        if rng.next_u32() % 2 == 0 {
+            kept.push((i, op.clone()));
+        } else {
+            rest.push((i, op.clone()));
+        }
+    }
+    for (i, op) in &mut kept {
+        if let Unsynced::Write { offset, bytes } = op
+            && rng.next_u32() % 4 == 0
+        {
+            let keep = (rng.next_u32() as usize) % (bytes.len() + 1);
+            let unwritten = bytes.split_off(keep);
+            if !unwritten.is_empty() {
+                rest.push((
+                    *i,
+                    Unsynced::Write {
+                        offset: *offset + keep as u64,
+                        bytes: unwritten,
+                    },
+                ));
             }
         }
     }
+    for i in (1..kept.len()).rev() {
+        let j = (rng.next_u32() as usize) % (i + 1);
+        kept.swap(i, j);
+    }
     let mut out = images.durable.clone();
-    for op in ops {
+    for (_, op) in kept {
         match op {
             Unsynced::Write { offset, bytes } => {
                 let end = offset as usize + bytes.len();
@@ -339,7 +368,8 @@ fn apply_tail(images: &Images, tail: Tail) -> Vec<u8> {
             Unsynced::SetLen { len } => out.resize(len as usize, 0),
         }
     }
-    out
+    rest.sort_by_key(|(i, _)| *i);
+    (out, rest.into_iter().map(|(_, op)| op).collect())
 }
 
 fn name(path: &Path) -> String {
@@ -433,10 +463,12 @@ impl Handle for FaultHandle {
         let plan = *self.shared.plan.lock().unwrap();
         if plan.fail_sync_at == Some(n) {
             // A failed sync may have persisted any permitted subset; what
-            // it did not persist stays pending against the new image.
+            // it did not persist, and only that, stays pending against the
+            // new image.
             let mut images = self.images.lock().unwrap();
-            let persisted = apply_tail(&images, plan.tail);
+            let (persisted, pending) = split_tail(&images, plan.tail);
             images.durable = persisted;
+            images.unsynced = pending;
             drop(images);
             self.shared.record(Op::Failed);
             self.shared.end(n);
