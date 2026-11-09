@@ -59,7 +59,7 @@ Reference single-store and fixed-membership compositions are early increments, n
 | task-d97 | From the `service` row's R4 (#98, #185 review): its means put L4 at a p50-scale gain, 0.76 to 1.36 ms off a write's release, so nothing on record says what a p99 operation waits for | Before task-d90's code step is sized against the p99 |
 | task-d98 | From the next step on the gap (#185 review): a slow-path write pays two syncs in series before it is learned, the leader's and then a follower's, since the leader sends its proposal only once its batch is durable; about 95% of the register row's writes take the slow path, and two runner syncs are about 4.6 ms against etcd's `service` p99 of 3 | Before the next batch, or the batch revises the `service` target with this as the reason |
 | task-d99 | From task-d98's design step (#192 review): task-60's activation rule and rows exist, but nothing in a running `coordd` records a voter's support or activates a feature, so a feature-gated change ships unreachable, and Section 23 rules out an operator flag around a correctness gate | Before the batch that carries task-d98 |
-| task-d100 | From the batch's sweep and its two runner jobs (#98, #185 review): with the disk's tail off the head is core-bound from 30 callers, and a slow-path command still costs the collector's frontend about 11 api frames, about 13 datagrams, and every follower a submission's admission for an order it only adopts | After task-d98 and task-d99, which its relayed proposal and its feature rest on |
+| task-d100 | From the batch's sweep and its two runner jobs (#98, #185 review): with the disk's tail off the head is core-bound from 30 callers, and a slow-path command still costs the collector's frontend about 11 api frames, about 13 datagrams, and every follower a submission's admission for an order it only adopts | After task-d98 and task-d99, which its relayed proposal and its features rest on; step A first, step B sized on the runner after it (#202 review) |
 | task-q01 | Combined durable WAN/Kine qualification | Required before task-66 |
 
 ```mermaid
@@ -281,7 +281,7 @@ This is a workstream overview; the individual prerequisites are authoritative. O
 | [task-d97](#task-d97) | Read what a `service` p99 operation waits for | task-d55, task-d72, task-d91 |
 | [task-d98](#task-d98) | Send the leader's proposal before its batch is durable | task-d30, task-d74, task-d89, task-d99 |
 | [task-d99](#task-d99) | Activate a replicated feature in a running domain | task-60 |
-| [task-d100](#task-d100) | Relay a write through the leader while rounds are slow-only | task-d74, task-d90, task-d98, task-d99 |
+| [task-d100](#task-d100) | Answer on the release, then relay a write through the leader while rounds are slow-only | task-d74, task-d90, task-d98, task-d99 |
 | [task-q01](#task-q01) | Produce the combined durable WAN/Kine qualification report | task-j07, task-j08, task-o06, task-m05, task-63, task-64, task-d45, task-d46, task-d47, task-d48, task-d49, task-d51, task-d52, task-d53 |
 
 ## Task specifications
@@ -3836,46 +3836,58 @@ So every feature-gated change, task-d98's `EarlyProposal` first, would ship unre
 **Review boundary:** How a feature becomes active in a running domain. No feature's behavior changes here.
 
 <a id="task-d100"></a>
-### task-d100: Relay a write through the leader while rounds are slow-only
+### task-d100: Answer on the release, then relay a write through the leader while rounds are slow-only
 
 **Prerequisites:** task-d74, task-d90, task-d98, task-d99.  
-**Design:** Section 4.3 (amended by this task's design step: the leader relay), and Section 4.6's rule on a hop to the leader.
+**Design:** Section 4.3 (amended by this task's design step: answering on the release, and the leader relay), and Section 4.6's rule on a hop to the leader.
 
-**Implement:** Item b of task-d72's levers (#185 review). The design step is in Section 4.3; this entry is its code step.
-- **The wire.** A relayed `Submit`, marked as such and sent to the ballot's leader only. The advice bit on the release envelope. A `Proposal` form that carries the payload record beside the vote. A refusal naming `NotLeading` for a relayed submission at a voter that isn't leading.
-- **The leader.** For a relayed command it sends no `LeaderReply` and no frontend copy of its own slow acknowledgement, and sends its release to the origin it recorded. A duplicate relayed submission records its origin, and a command already executed is released to it at once.
-- **The followers.** A relayed proposal initializes the command from its payload and adopts it in one batch (payload, dependency and ACCEPT rows), with no pre-acceptance and no fast acknowledgement. The slow acknowledgement goes to the leader only, and nothing is parked for it. The path log applies the adoption as a synchronization of a command not in the suffix (Section 4.1).
-- **The collector.**
-  - It relays per command while its ballot's leader advises relay. The advice is a bit on each release: the leader reads the fast share of fanned-out commands over a window, advises relay below a threshold with hysteresis, and while relaying advises fan-out for short stretches that every collector takes together, counting only commands decided inside them. The threshold, the hysteresis and the stretches are settings.
-  - A relayed command is answered on the leader's non-speculative release alone, with `check_release` unchanged.
-  - On a ballot change it re-sends to the new leader. On no release within a bound it falls back to today's all-voter submission.
-  - A collector with no voter beside it keeps fanning out.
-- **The switch:** `Feature::LeaderRelay`, read on the collector's side, which reads no feature today. Until it is active, nothing relays.
-- **What it is expected to move** (Section 4.3), on the runner:
-  - about −0.39 ms a command in the voters' threads from the datagrams, and at most −0.11 from the followers' admission;
-  - up to −0.42 ms a command in the kernel;
-  - per operation, times the run's commands an operation.
+**Implement:** Item b of task-d72's levers (#185 review), in two steps built in order (#202 review). The design step is in Section 4.3; this entry is its code step.
+- **Step A: the collector answers on the release alone, for every command.**
+  - **The wire.** A mark on a submission, carried on the leader's proposal: the command is answered on the release. For a marked command the leader sends no `LeaderReply`, and every voter sends its fast and slow acknowledgements to the leader only. The release envelope carries the admission digest of the payload the leader decided, outside the result's bytes.
+  - **The collector.** It marks commands while its node reads `Feature::AnswerOnRelease` active, and answers a marked command on the leader's non-speculative release alone, with `check_release` unchanged, once the release's admission equals the one it submitted under. A release under other facts is held, as a release without learning is today. The `(None, true) => "votes"` corroboration of `settle_from_record` goes.
+  - **The leader's evidence repair** (`repair_evidence`, task-c02) publishes the release again for an exact duplicate of a marked command it has executed, instead of its reply. A follower repairs nothing for a marked command.
+  - **The frontend's hold** (`parked.rs`) holds nothing for a marked command, and goes once no supported build leaves a command unmarked.
+  - **The switch:** `Feature::AnswerOnRelease`, read on the collector's side, which reads no feature today.
+- **Step B: the leader relay while rounds are slow-only.**
+  - **The wire.** A relayed `Submit`, marked as such and sent to the ballot's leader only. The advice bit on the release envelope. A `Proposal` form that carries the payload record beside the vote. A refusal naming `NotLeading` for a relayed submission at a voter that isn't leading.
+  - **The leader** sends its release to the origin it recorded. A duplicate relayed submission records its origin, and a command already executed is released to it at once.
+  - **The followers.** A relayed proposal's payload is checked as a `PayloadResponse` is: its identity is the proposal's command, and its admission digest the proposal's vote's; one that fails either is dropped and fetched as today. A relayed proposal initializes the command from its payload and adopts it in one batch (payload, dependency and ACCEPT rows), with no pre-acceptance and no fast acknowledgement. The path log applies the adoption as a synchronization of a command not in the suffix (Section 4.1).
+  - **The collector.**
+    - It relays per command while its ballot's leader advises relay. The advice is a bit on each release: the leader reads the fast share of fanned-out commands over a window, advises relay below a threshold with hysteresis, and while relaying advises fan-out for short stretches that every collector takes together, counting only commands decided inside them. The threshold, the hysteresis and the stretches are settings.
+    - A relayed command is answered on the release alone, as every marked command is under step A, the fallback included.
+    - On a ballot change it re-sends to the new leader. On no release within a bound it falls back to today's all-voter submission.
+    - A collector with no voter beside it keeps fanning out.
+  - **The switch:** `Feature::LeaderRelay`, activated after `AnswerOnRelease`. Until both are active, nothing relays.
+  - **task-d84's sync budget, its parts 2 and 3 (on #185), serve fanned-out rounds only:** a relayed adoption is part 2 for every relayed command, and part 3 doesn't arise. Their size is read at the fan-out share the switch leaves, on the `service` row.
+- **What it is expected to move** (Section 4.3), on the runner, at its register mix of 0.74 commands an operation at 30 callers and 0.93 at 120:
+  - **step A:** about −0.26 ms a command in the voters' threads and up to −0.28 in the kernel, from about two thirds of the datagrams; about −0.19 to −0.24 ms an operation in the servers;
+  - **step B, on top:** about −0.13 ms a command from the remaining datagrams, −0.12 to −0.16 from the followers' `on_request`, and about −0.03 from one protocol row a command instead of two at each follower; about −0.21 to −0.30 ms an operation;
+  - together at most about −0.40 to −0.54 ms an operation in the servers, before what moves into the adoption.
   
-  Bar 1 takes the servers' part. The relayed proposal's added bytes, and whether they still fit the proposal's datagram, are read off in the code step.
+  Bar 1 takes the servers' part. Step B is sized again on the runner after step A, before it is built. The relayed proposal's added bytes, and whether they still fit the proposal's datagram, are read off in the code step.
 
 **Acceptance:**
-- **Model tests:**
+- **Model tests, step A:**
+  - a marked command is answered on a final release alone, and a speculative release is held;
+  - a release whose admission differs from the submitted one is held, and the entry settles from the record or a voter's `OtherFacts` refusal, with the answer today's collector gives;
+  - a connection lost after execution with the leader still leading: the re-sent submission gets the release again from the leader's evidence repair; and past what the leader's table remembers, its `Forgotten` refusal settles the entry from the record;
+  - marked and unmarked commands mix while the feature activates, and neither waits for evidence nobody sends.
+- **Model tests, step B:**
   - a relayed command is learned on the slow path and released to its collector;
-  - a follower adopts a relayed proposal in one batch and sends no fast acknowledgement;
-  - a collector answers on a final release alone and holds a speculative one;
+  - a follower adopts a relayed proposal in one batch and sends no fast acknowledgement, and drops a relayed payload whose identity or admission differs from the proposal's;
   - relayed and fanned-out commands mix on one key and every decision agrees, the fanned-out ones only slower;
-  - several collectors relaying and fanning out on conflicting keys: a probe stretch reads the share it would read with no relaying, and the advice returns to fan-out when the share recovers;
+  - several collectors relaying and fanning out on conflicting keys: a probe stretch reads, after a tail of the advice's one-completion lag at each collector, the share it would read with no relaying, and the advice returns to fan-out when the share recovers;
   - a collector acting on stale or missing advice stays correct;
   - each leader-change case in Section 4.3: never proposed, adopted below a slow quorum, decided, sent to a voter that isn't leading;
-  - the fallback to the all-voter submission.
-- **The protocol simulator:** a relay setting (the share of commands relayed, and switching during a run) over the sweep at every loss and both catch-up settings, with every oracle, the released `ResponseV1` compared byte for byte included.
+  - the fallback to the all-voter submission, completed on the release alone.
+- **The protocol simulator:** an answer-on-release setting and a relay setting (the share of commands relayed, and switching during a run) over the sweep at every loss and both catch-up settings, with every oracle, the released `ResponseV1` compared byte for byte included.
 - **Crash tests:** the leader crashing after a relayed proposal left and before its batch is durable, and every voter crashing between the release and the execution group's durability.
 - **Measurement:**
-  - a local pair, with frames and datagrams a command, the followers' `on_request`, the voters' CPU an operation and the fast share at 30 and 120 callers;
+  - a local pair for each step, with frames and datagrams a command, the followers' `on_request`, rows and journal groups a command at a follower, the voters' CPU an operation and the leader's tokio CPU a command, and the fast share, at 30 and 120 callers;
   - the switch's settings chosen from a pair against the `service` row's p99;
-  - the runner pair in the batch job (task-d72).
+  - the runner pair for each step in the batch job (task-d72), step A's before step B is built.
 
-**Review boundary:** How a write reaches the voters and how its result reaches the collector while rounds are slow. No change to the learning predicates, recovery, what a vote rests on, or what is released.
+**Review boundary:** How a write reaches the voters and how its result reaches the collector. No change to the learning predicates, recovery, what a vote rests on, or the result's bytes.
 
 ## Gate checklist and deferred work
 
