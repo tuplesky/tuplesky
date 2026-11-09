@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use crate::commands::CommandTable;
 use crate::graph::ClosureProgress;
 use crate::phase::{GuardViolation, Phase, guard_execute};
-use crate::vote::{Learned, VoteSet};
+use crate::vote::{LearnedBy, VoteSet};
 
 /// Which learning predicates a replica applies (design Section 18.3:
 /// the slow path is the reference; fast learning is the measured
@@ -157,23 +157,23 @@ impl Learner {
             // them costs the history rather than the change (task-d46).
             // The same commands as filtering the vote sets by phase, in
             // the same order.
-            let candidates: Vec<(CommandId, Learned)> = table
+            let candidates: Vec<(CommandId, LearnedBy)> = table
                 .in_accept()
                 .into_iter()
                 .filter(|c| eligible(c))
                 .filter_map(|c| {
                     let v = votes(&c)?;
                     let learned = match self.mode {
-                        LearningMode::Full => v.learned(),
-                        LearningMode::SlowOnly => v.learned_slow(),
+                        LearningMode::Full => v.learned_by(),
+                        LearningMode::SlowOnly => v.learned_slow_by(),
                     }?;
                     Some((c, learned))
                 })
                 .collect();
             let mut progressed = false;
             for (c, learned) in candidates {
-                if table.commit(c).is_ok() {
-                    if matches!(learned, Learned::Fast { .. }) {
+                if table.commit_accepted(c) {
+                    if learned == LearnedBy::Fast {
                         self.fast.insert(c);
                     }
                     committed.push(c);

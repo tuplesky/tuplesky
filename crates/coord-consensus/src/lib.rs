@@ -202,7 +202,8 @@ pub use summary::{
     ReportPage, ServedReport, paginate,
 };
 pub use vote::{
-    FastAck, FastPathCounts, Learned, MissedFast, MissedLog, SlowAck, Vote, VoteError, VoteSet,
+    FastAck, FastPathCounts, Learned, LearnedBy, MissedFast, MissedLog, SlowAck, Vote, VoteError,
+    VoteSet,
 };
 
 /// Crate role marker used by the dependency-policy check.
