@@ -279,6 +279,14 @@ pub fn run(plan: FaultPlan, tail: Option<Tail>, case: &str) -> Arc<Shared> {
     let (fs, shared) = FaultFs::new(plan);
     let acked = workload(&root, fs, &shared);
     if let Some(tail) = tail {
+        // A scripted crash halted the device before the journal's close
+        // could sync what the fault left behind.
+        if plan.crash_after.is_some() {
+            assert!(
+                shared.is_frozen(),
+                "{case}: the crash point was never reached"
+            );
+        }
         shared.materialize(tail).unwrap();
     }
     check(&root, &acked, case);

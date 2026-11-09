@@ -68,8 +68,12 @@ fn a_failed_write_never_acknowledges_and_loses_nothing_acknowledged() {
         let n = i as u64 + 1;
         for prefix in [0, 512, 4096] {
             for tail in [None, Some(Tail::None), Some(Tail::Seeded(n))] {
+                // With a crash tail, the crash lands at the fault itself,
+                // so no later sync (the close's among them) persists what
+                // the fault left unsynced.
                 let plan = FaultPlan {
                     fail_write_at: Some(n),
+                    crash_after: tail.map(|_| n),
                     fail_write_prefix: prefix,
                     ..FaultPlan::default()
                 };
@@ -98,6 +102,7 @@ fn enospc_never_acknowledges_and_loses_nothing_acknowledged() {
             for tail in [None, Some(Tail::None)] {
                 let plan = FaultPlan {
                     enospc: Some(window),
+                    crash_after: tail.map(|_| n),
                     ..FaultPlan::default()
                 };
                 run(
@@ -122,6 +127,7 @@ fn a_failed_sync_never_acknowledges_and_loses_nothing_acknowledged() {
             for after in [Tail::None, Tail::All] {
                 let plan = FaultPlan {
                     fail_sync_at: Some(n),
+                    crash_after: Some(n),
                     tail: persisted,
                     ..FaultPlan::default()
                 };
@@ -252,6 +258,27 @@ fn a_short_write_lands_whole_sectors_and_reports_eio() {
     let err = writer.write(&[7u8; 2000]).unwrap_err();
     assert_eq!(err.raw_os_error(), Some(5));
     assert_eq!(std::fs::read(&path).unwrap(), vec![7u8; 512]);
+}
+
+#[test]
+fn a_crash_scripted_at_a_rejected_operation_still_halts() {
+    use raft_engine::env::FileSystem;
+    use std::io::Write;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("f");
+    let plan = FaultPlan {
+        // Ordinal 1 is the create; 2 is the write ENOSPC rejects.
+        enospc: Some((2, 2)),
+        crash_after: Some(2),
+        ..FaultPlan::default()
+    };
+    let (fs, shared) = FaultFs::new(plan);
+    let handle = Arc::new(fs.create(&path).unwrap());
+    let mut writer = fs.new_writer(handle).unwrap();
+    let err = writer.write(b"x").unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::StorageFull);
+    assert!(shared.is_frozen());
 }
 
 // ---------------------------------------------------------------------------
