@@ -619,7 +619,10 @@ alternating from step to step; and with `etcd-version: beside`, etcd after
 each step at the same clients. A register sweep's steps are raised to
 multiples of 2n as one count is. `pair-base: same` makes the base the
 head's own build, so `voter-workers: 2/1` sweeps the head at one worker
-against itself at two, with the same `features` on both. SwiftPaxos is
+against itself at two, with the same `features` on both; `pair-base:
+profile:strict` (or `profile:replay`) makes it the head's own build on
+that journal profile, beside the head on the `profile` input's, so one
+job reads `replay` against `strict`. SwiftPaxos is
 skipped. Each run gets its own summary, and `scripts/ci/jepsen_sweep.py`
 then gives a table of the steps, each run labelled `SIDE@STEP`:
 
@@ -641,10 +644,21 @@ then gives a table of the steps, each run labelled `SIDE@STEP`:
   loop's run queue per command and a pass's p99 (task-d97); and the
   servers' CPU per write or compare-and-set completed, which both systems
   replicate;
+* each voter's journal appender and projection materializer: their jobs,
+  their busy time in seconds and as a share of the workload, and the
+  share of their jobs and of their busy time in jobs served in 16.4 ms or
+  more (from task-d97's `served_each`, the time estimated at each
+  bucket's midpoint), beside the leader's round from submitted to learned;
 * each TupleSky run's ratio to etcd's at its step.
 
 Each run's own summary also gives operations completed a second and the
 clients busy on average beside its `ok`/s.
+
+The TupleSky job also reads each node container's CPU quota and its
+throttling (cgroup v2's `cpu.max` and `cpu.stat`), after the cluster is
+up and again after the runs, into the job summary
+(`scripts/ci/jepsen_cpu_quota.sh`): a quota would hold a voter's bursts to
+its period while the runner shows idle cores.
 
 **etcd's register mix.** The register workload's two tests split their
 client threads differently. Jepsen's register test, which jepsen.tuplesky

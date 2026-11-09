@@ -103,7 +103,7 @@ on:
         description: "Seconds every TupleSky voter's inbound peer-plane traffic is dropped from the workload's start, the collectors still reaching every voter (through --hold-peer-links; task-d67's start-up row); empty or 0 for none"
         default: ""
       pair-base:
-        description: "Run TupleSky in pairs on one runner against this base: a tuplesky ref (a branch, a tag or a full commit SHA, which actions/checkout needs whole) built beside the head, env:NAME=VALUE for the head's own build with that variable on every voter, or same for the head's own build (voter-workers BASE/HEAD then sets the sides apart); empty for one run"
+        description: "Run TupleSky in pairs on one runner against this base: a tuplesky ref (a branch, a tag or a full commit SHA, which actions/checkout needs whole) built beside the head, env:NAME=VALUE for the head's own build with that variable on every voter, profile:strict or profile:replay for the head's own build on that journal profile (the profile input is the head's), or same for the head's own build (voter-workers BASE/HEAD then sets the sides apart); empty for one run"
         default: ""
       pairs:
         description: "How many base and head pairs, when pair-base is set (the order alternates from pair to pair; empty for 3); in a sweep, the steps the base runs at, comma-separated (empty for every step)"
@@ -124,6 +124,7 @@ on:
       - crates/coord-jepsen/**
       - scripts/ci/cpu_sampler.py
       - scripts/ci/jepsen_bounded.sh
+      - scripts/ci/jepsen_cpu_quota.sh
       - scripts/ci/jepsen_etcd.sh
       - scripts/ci/jepsen_pairs.py
       - scripts/ci/jepsen_sweep.py
@@ -269,7 +270,7 @@ jobs:
             cp "tuplesky/target/release/$b" "$RUNNER_TEMP/head-bin/" 2>/dev/null || true
           done
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
-        if: env.IN_PAIR_BASE != '' && env.IN_PAIR_BASE != 'same' && !startsWith(env.IN_PAIR_BASE, 'env:')
+        if: env.IN_PAIR_BASE != '' && env.IN_PAIR_BASE != 'same' && !startsWith(env.IN_PAIR_BASE, 'env:') && !startsWith(env.IN_PAIR_BASE, 'profile:')
         with:
           ref: ${{ inputs.pair-base }}
           path: tuplesky-base
@@ -277,7 +278,7 @@ jobs:
       - name: Build the pair's base
         # Into the head's target directory, so the dependencies the two
         # share are not built twice; the head's binaries are put back after.
-        if: env.IN_PAIR_BASE != '' && env.IN_PAIR_BASE != 'same' && !startsWith(env.IN_PAIR_BASE, 'env:')
+        if: env.IN_PAIR_BASE != '' && env.IN_PAIR_BASE != 'same' && !startsWith(env.IN_PAIR_BASE, 'env:') && !startsWith(env.IN_PAIR_BASE, 'profile:')
         working-directory: tuplesky-base
         run: |
           rustup show active-toolchain || rustup toolchain install
@@ -360,6 +361,12 @@ jobs:
           fi
           jepsen/tuplesky/docker/up.sh --nodes "$NODES" --dir "$RUNNER_TEMP/cluster" \
             ${up[@]+"${up[@]}"}
+      - name: Read the nodes' CPU quota
+        # Each node container's cgroup CPU limit and its throttling so far
+        # (cgroup v2's cpu.max and cpu.stat): a quota would hold a voter's
+        # bursts to its period while the runner shows idle cores. Read
+        # again after the runs, below.
+        run: tuplesky/scripts/ci/jepsen_cpu_quota.sh "$RUNNER_TEMP/cluster/nodes" start
       - name: Deploy a domain on it and put a write through every voter
         run: |
           jepsen/tuplesky/docker/smoke.sh --dir "$RUNNER_TEMP/cluster" \
@@ -512,6 +519,7 @@ jobs:
           # Paired, or a sweep: TupleSky's sides in turn on this runner,
           # each run summarized as it ends.
           head_bin="$RUNNER_TEMP/head-bin" base_bin="$RUNNER_TEMP/base-bin" base_args=() base_name=""
+          base_profile=$PROFILE
           # A sweep's head is the build in the target directory, which the
           # base's build puts back; a single-sided sweep keeps no copy.
           if [ -n "$SWEEP" ]; then head_bin="$GITHUB_WORKSPACE/tuplesky/target/release"; fi
@@ -520,6 +528,15 @@ jobs:
             same)
               base_bin=$head_bin
               base_name="$head_sha at ${BASE_VOTER_WORKERS:-default} workers" ;;
+            profile:*)
+              # The head's own build on another journal profile, which
+              # `coord-harness provision` reads from the environment.
+              base_bin=$head_bin base_profile=${IN_PAIR_BASE#profile:}
+              case $base_profile in
+                strict | replay) ;;
+                *) echo "::error::pair-base $IN_PAIR_BASE: the profile must be strict or replay"; exit 1 ;;
+              esac
+              base_name="$head_sha on $base_profile" ;;
             env:*)
               if ! grep -q -- '--voter-env' src/jepsen/tuplesky.clj; then
                 echo "::error::tuplesky/jepsen@$JEPSEN_REF has no --voter-env; dispatch with a jepsen-ref that has it"
@@ -538,8 +555,11 @@ jobs:
             local side=$1 graph=$2 where=$3 label=$4 dir name store
             n=$((n + 1))
             dir="$RUNNER_TEMP/run-$n"
+            local profile=$PROFILE
             if [ "$side" = base ]; then
-              run_one "$base_bin" "$dir" "$graph" ${base_workers[@]+"${base_workers[@]}"} \
+              profile=$base_profile
+              COORD_HARNESS_JOURNAL_PROFILE=$base_profile \
+                run_one "$base_bin" "$dir" "$graph" ${base_workers[@]+"${base_workers[@]}"} \
                 ${base_args[@]+"${base_args[@]}"} || rc=$?
               name=$base_name
             else
@@ -560,7 +580,7 @@ jobs:
                 > "$(dirname "$db")/executed-at-end" || true
             done
             python3 "$ci/jepsen_summary.py" "$store" \
-              --nodes-file "$RUNNER_TEMP/cluster/nodes" --profile "$PROFILE" \
+              --nodes-file "$RUNNER_TEMP/cluster/nodes" --profile "$profile" \
               --title "TupleSky: $WORKLOAD, $NEMESIS$TITLE_SUFFIX$STORE_SUFFIX$PROFILE_SUFFIX$CHECKPOINT_SUFFIX$WORKERS_SUFFIX$TUPLESKY_SUFFIX: $where, $side ($name)" || true
             runs+=("$label=$store")
           }
@@ -739,6 +759,9 @@ jobs:
             ${{ runner.temp }}/jepsen-store-etcd.tgz
           retention-days: 14
           if-no-files-found: warn
+      - name: Read the nodes' CPU quota again
+        if: always()
+        run: tuplesky/scripts/ci/jepsen_cpu_quota.sh "$RUNNER_TEMP/cluster/nodes" "after the runs" || true
       - name: Take the cluster down
         if: always()
         run: jepsen/tuplesky/docker/down.sh --dir "$RUNNER_TEMP/cluster"

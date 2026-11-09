@@ -99,6 +99,36 @@ class SweepTests(unittest.TestCase):
                 f.write("model=Some CPU\nmhz=2000\ncpus=4\n")
         return path
 
+    def test_the_journal_and_projection_threads(self):
+        path = self.store("h")
+        # n1's line with its pipeline threads: six appends of about 1 ms and
+        # two of 16.4 to 20 ms, 5 s busy; a materializer with no slow job.
+        with open(os.path.join(path, "n1", "coordd.log")) as f:
+            line = json.loads(f.read()[len("metrics "):])
+        line["cost"]["Observed"]["waits"] = {"Observed": {
+            "appender_jobs": {"count": 8, "served": {"secs": 5, "nanos": 0},
+                              "served_each": {"buckets": [[35, 6], [52, 2]], "max": {"secs": 0, "nanos": 20000000}}},
+            "materializer_jobs": {"count": 3, "served": {"secs": 1, "nanos": 0},
+                                  "served_each": {"buckets": [[35, 3]], "max": {"secs": 0, "nanos": 1000000}}},
+        }}
+        line["cost"]["Observed"]["release"] = {"distributions": {
+            "round": {"buckets": [[35, 10]], "max": {"secs": 0, "nanos": 1000000}}}}
+        with open(os.path.join(path, "n1", "coordd.log"), "w") as f:
+            f.write("metrics " + json.dumps(line) + "\n")
+        step = sw.read_step("head", "30", path)
+        self.assertEqual(list(step.pipelines), ["n1"])
+        appender = step.pipelines["n1"]["appender"]
+        self.assertEqual(appender.jobs, 8)
+        self.assertAlmostEqual(appender.busy_s, 5.0)
+        self.assertAlmostEqual(appender.slow_jobs, 0.25)
+        # Midpoints: 960 µs six times, (16384 + 20000) / 2 twice.
+        self.assertAlmostEqual(appender.slow_time, 2 * 18192 / (6 * 960 + 2 * 18192))
+        self.assertEqual(step.pipelines["n1"]["materializer"].slow_jobs, 0)
+        self.assertEqual(step.round_ms, (1.0, 1.0))
+        text = sw.render([step], "Sweep")
+        self.assertIn("**The voters' journal and projection threads**", text)
+        self.assertIn("| 30 | head | 1.00 / 1.00 | n1 | 8 | 5.0 | 50% | 25% | 86% | 3 | 1.0 | 10% | 0% | 0% |", text)
+
     def test_labels(self):
         self.assertEqual(sw.label("head@30=/s/1"), ("head", "30", "/s/1"))
         self.assertEqual(sw.label("etcd@6n=/s/2"), ("etcd", "6n", "/s/2"))

@@ -33,6 +33,11 @@ or the final heal):
   `metrics` line, and the p99 a pass that executed, task-d97);
 * per write (a write or a compare-and-set completed, failed ones too, the
   work both systems replicate), each server's CPU.
+* each voter's journal appender and projection materializer (task-d62's
+  jobs, task-d97's `served_each`): its jobs, its busy time in seconds and
+  as a share of the workload, and the share of its jobs and of its busy
+  time in jobs served in 16.4 ms or more (a bucket's edge), beside the
+  leader's round from submitted to learned.
 
 Then each TupleSky side's ratio to the etcd run at the same step. It writes
 Markdown to `$GITHUB_STEP_SUMMARY` when it is set and to standard output
@@ -77,6 +82,84 @@ class Step:
     per_commit: float | None = None
     run_queue_per_cmd_ms: float | None = None
     run_queue_p99_ms: float | None = None
+    # The leader's round, submitted to learned (task-d97), p50 and p99 in ms.
+    round_ms: tuple | None = None
+    # The workload's length in seconds.
+    window_s: float | None = None
+    # Each voter's journal appender and projection materializer, from its
+    # last `metrics` line: node -> {thread: Pipeline}.
+    pipelines: dict = field(default_factory=dict)
+
+
+@dataclass
+class Pipeline:
+    """A pipeline thread's jobs since the voter started (task-d62, task-d97)."""
+
+    jobs: int
+    busy_s: float
+    # Of the jobs, and of the busy time, the share in jobs served in
+    # SLOW_US or more; the time is estimated at each bucket's midpoint,
+    # the last bucket's top at the longest job.
+    slow_jobs: float
+    slow_time: float
+
+
+# A slow job: one served in 2^14 µs (16.4 ms) or more, a bucket's edge.
+SLOW_US = 1 << 14
+PIPELINE_THREADS = (("appender", "Appender"), ("materializer", "Materializer"))
+
+
+def pipeline_of(jobs: dict) -> Pipeline | None:
+    """A thread's `*_jobs` reading as a Pipeline; None without its
+    `served_each`."""
+    served_each = jobs.get("served_each")
+    if not isinstance(served_each, dict):
+        return None
+    buckets = sorted((int(i), int(n)) for i, n in served_each.get("buckets", []))
+    count = sum(n for _, n in buckets)
+    if not count:
+        return None
+    longest_us = js.seconds(served_each.get("max")) * 1e6
+    total = slow = 0.0
+    slow_count = 0
+    for index, n in buckets:
+        low = cc.bucket_lower(index)
+        high = cc.bucket_lower(index + 1) if index + 1 < cc.DISTRIBUTION_BUCKETS else longest_us
+        mid = (low + min(high, max(longest_us, low))) / 2
+        total += n * mid
+        if low >= SLOW_US:
+            slow += n * mid
+            slow_count += n
+    return Pipeline(
+        jobs=count,
+        busy_s=js.seconds(jobs.get("served")),
+        slow_jobs=slow_count / count,
+        slow_time=slow / total if total else 0.0,
+    )
+
+
+def read_pipelines(store: str) -> dict:
+    """Each voter's appender and materializer from its last `metrics`
+    line, by node."""
+    out = {}
+    for node in sorted(os.listdir(store)):
+        path = os.path.join(store, node, "coordd.log")
+        if not os.path.exists(path):
+            continue
+        with open(path, encoding="utf-8", errors="replace") as f:
+            voter = js.parse_voter(f.readlines())
+        raw = voter.cost.raw if voter.cost else None
+        waits = (raw or {}).get("waits")
+        if not isinstance(waits, dict) or "Observed" not in waits:
+            continue
+        threads = {}
+        for thread, _ in PIPELINE_THREADS:
+            reading = pipeline_of(waits["Observed"].get(f"{thread}_jobs") or {})
+            if reading:
+                threads[thread] = reading
+        if threads:
+            out[node] = threads
+    return out
 
 
 # The runner's CPU per operation, in the tables' order: the key, the label.
@@ -241,6 +324,7 @@ def read_step(side: str, step_name: str, store: str) -> Step:
     if nemesis:
         end = nemesis[-1].at
     clients_and_mix(step, client, start, end)
+    step.window_s = (end - start).total_seconds()
     completed = step.completed
     runner(step, start, end, completed)
     costs = voter_costs(store) if side != "etcd" else []
@@ -259,6 +343,10 @@ def read_step(side: str, step_name: str, store: str) -> Step:
             tails = cc.tails_of(leader.raw).get("tails", {}) if leader.raw else {}
             if "run_queue_per_working_pass" in tails:
                 step.run_queue_p99_ms = tails["run_queue_per_working_pass"]["p99_ms"]
+            if "release_round" in tails:
+                step.round_ms = (tails["release_round"]["p50_ms"], tails["release_round"]["p99_ms"])
+    if side != "etcd":
+        step.pipelines = read_pipelines(store)
     return step
 
 
@@ -341,6 +429,40 @@ def render(steps: list[Step], title: str) -> str:
             f"{cell(s.run_queue_p99_ms, '.2f')} |"
         )
     out.append("")
+
+    rows = [s for s in steps if s.pipelines]
+    if rows:
+        out += [
+            "**The voters' journal and projection threads** (each voter's appender, an append and its sync a "
+            "job, and its materializer, a projection commit a job, from its last `metrics` line since it "
+            "started: the leader's round from submitted to learned, p50 / p99 in ms; each thread's busy time "
+            "in seconds and as a share of the workload's length; the share of its jobs, and of its busy time, "
+            f"in jobs served in {SLOW_US / 1000:.1f} ms or more, the time estimated at each bucket's midpoint "
+            "from `served_each`, task-d97)",
+            "",
+            "| Step | Side | Round p50 / p99 | Node | Appender jobs | Busy (s) | Of the run | Slow jobs | "
+            "Their share of the busy time | Materializer jobs | Busy (s) | Of the run | Slow jobs | "
+            "Their share of the busy time |",
+            "| --- " * 14 + "|",
+        ]
+        for s in rows:
+            first = True
+            for node, threads in s.pipelines.items():
+                cells = []
+                for thread, _ in PIPELINE_THREADS:
+                    p = threads.get(thread)
+                    if p is None:
+                        cells += ["-"] * 5
+                        continue
+                    share = f"{p.busy_s / s.window_s * 100:.0f}%" if s.window_s else "-"
+                    cells += [str(p.jobs), f"{p.busy_s:.1f}", share, f"{p.slow_jobs * 100:.0f}%",
+                              f"{p.slow_time * 100:.0f}%"]
+                lead = f"{name(s)} | " + (
+                    f"{s.round_ms[0]:.2f} / {s.round_ms[1]:.2f}" if (first and s.round_ms) else ("-" if first else "")
+                )
+                out.append(f"| {lead} | {node} | " + " | ".join(cells) + " |")
+                first = False
+        out.append("")
 
     etcd = {s.step: s for s in steps if s.side == "etcd"}
     rows = [s for s in steps if s.side != "etcd" and s.step in etcd]
