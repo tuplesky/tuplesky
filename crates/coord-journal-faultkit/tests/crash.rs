@@ -239,6 +239,36 @@ fn a_crash_image_is_the_synced_bytes_plus_the_chosen_tail() {
     }
 }
 
+/// A failed sync that persisted everything leaves nothing pending, so no
+/// later crash image replays an older overlapping write over what it
+/// persisted (Codex review on #210).
+#[test]
+fn a_failed_sync_that_persisted_everything_leaves_nothing_pending() {
+    use raft_engine::env::{FileSystem, Handle};
+    use std::io::{Seek, SeekFrom, Write};
+
+    for seed in 0..16 {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f");
+        let plan = FaultPlan {
+            // Ordinal 1 is the create, 2 and 3 the writes, 4 the sync.
+            fail_sync_at: Some(4),
+            tail: Tail::All,
+            ..FaultPlan::default()
+        };
+        let (fs, shared) = FaultFs::new(plan);
+        let handle = Arc::new(fs.create(&path).unwrap());
+        let mut writer = fs.new_writer(handle.clone()).unwrap();
+        writer.write_all(b"aaaa").unwrap();
+        writer.seek(SeekFrom::Start(0)).unwrap();
+        writer.write_all(b"bb").unwrap();
+        assert!(handle.sync().is_err());
+        assert_eq!(shared.unsynced(), 0);
+        shared.materialize(Tail::Seeded(seed)).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"bbaa", "seed {seed}");
+    }
+}
+
 #[test]
 fn a_short_write_lands_whole_sectors_and_reports_eio() {
     use raft_engine::env::FileSystem;
