@@ -1313,6 +1313,21 @@ The steps:
    - the adapter's own `std::fs` calls;
    - raft-engine's background threads, if any.
 2. **The recovery modes** against the kit: a torn or partial tail, and damage inside the durable prefix, under `TolerateTailCorruption` (the default) and `AbsoluteConsistency`. A mode may drop an unsynced tail. Neither may drop, or open past, a record that was synced and reported durable; damage there is refused with its position.
+
+   **Found and fixed here (#211).** The pinned engine, under `TolerateTailCorruption`, truncated the last log file at its first broken batch whatever followed it (a broken file header emptied it, and the open then read as uninitialized), and truncated the last batch of any file on a broken entries block. One damaged byte dropped every acknowledged group after it. The adapter now runs the engine over a tail guard (`coord_journal_raft_engine::guard`) that checks each truncation against the file's bytes before it reaches the file:
+   - **Only the last file of its queue,** since rotation syncs a file before creating the next.
+   - **Only an unfinished write:** no whole batch (one whose item block's checksum matches) at or after the truncation point, and the broken batch either cut short (its checksum zero, or running past the end of the file) or holding an unwritten sector part.
+   - **A file header only if it is all zeros,** since any sync of a file persists its header.
+   - **A refusal** is `OpenError::Corrupt` naming the file, the position and the reason, with the file untouched.
+
+   **The physical model:** a sector is written whole or not at all, and a buffered write can stop at any byte. The kit's sector tears (`Tail::SeededSectors`) are that model, and the crash matrix opens every one of them with every acknowledged group. Its byte tears are past it, and may be refused, never opened short.
+
+   **Not covered:**
+   - damage confined to the last batch, with nothing after it, where the batch has a sector part of zeros (its own bytes, or a sector the device lost), which reads as torn;
+   - a purge's several unsynced `.rewrite` batches, torn, which are refused, although nothing in them is lost;
+   - a crash during recovery's own truncation, which is not crash-tested.
+
+   Under `strict`, coordd also refuses a projection that does not continue the journal before anything is attached (`validate_projection`), which catches a journal shorter than the projection's commit point by another route.
 3. **The composed crash matrix:**
    - **The crash points.** Journal and projection crash together at every counted operation of either, with each tail policy on each, under `strict` and `replay`, over the domains' real `JournaledStore`.
    - **`replay`'s case.** The live projection is lost or unusable in four ways. For each, the node must recover the journal's state, by replay or by installing the baseline, or refuse to serve when there is no baseline:
