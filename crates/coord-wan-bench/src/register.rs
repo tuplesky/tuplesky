@@ -19,7 +19,12 @@
 //! 5. a write invoked after a read completed is later than what the read
 //!    saw;
 //! 6. a read invoked after another read completed saw the same write or a
-//!    later one.
+//!    later one;
+//! 7. no two writes are at the same revision. The order above is only the
+//!    domain's if its revisions are distinct, so this is checked rather
+//!    than assumed: two writes at one revision would make every
+//!    comparison treat them as one place in the order, and reads that
+//!    alternate between them would pass.
 //!
 //! Given these, the linearization is the writes in revision order with
 //! each read placed after the write it saw, the reads of one write in an
@@ -162,6 +167,21 @@ fn check_key(key: u32, ops: &[&Op], out: &mut Vec<Violation>) {
                     "a read (caller {}, completed at {} ns) saw a write invoked at {} ns",
                     read.caller, read.completed_ns, write.op.invoked_ns
                 ),
+            );
+        }
+    }
+
+    // 7: one write at each revision, once every write a read placed has
+    // its revision.
+    let mut at_revision: BTreeMap<u64, u64> = BTreeMap::new();
+    for (value, w) in &writes {
+        let Some(revision) = w.revision else {
+            continue;
+        };
+        if let Some(other) = at_revision.insert(revision, *value) {
+            violation(
+                7,
+                format!("writes of {other:#x} and {value:#x} are both at revision {revision}"),
             );
         }
     }
@@ -419,6 +439,32 @@ mod tests {
             read(3, (7, 8), None),
         ];
         assert_eq!(rules(&back), vec![6]);
+    }
+
+    #[test]
+    fn two_writes_at_one_revision_are_found() {
+        // Concurrent writes the domain stamped alike, then reads that
+        // alternate between them: no order of the two writes allows that.
+        let history = [
+            write(1, (0, 3), 10, Some(5)),
+            write(2, (1, 2), 11, Some(5)),
+            read(3, (4, 5), Some((10, 5))),
+            read(3, (6, 7), Some((11, 5))),
+            read(3, (8, 9), Some((10, 5))),
+        ];
+        assert_eq!(rules(&history), vec![7]);
+    }
+
+    #[test]
+    fn a_write_a_read_placed_at_another_writes_revision_is_found() {
+        // The unknown write takes the revision the read saw it at, which
+        // an established write already holds.
+        let history = [
+            write(1, (0, 1), 10, Some(5)),
+            write(2, (2, 3), 11, None),
+            read(3, (4, 5), Some((11, 5))),
+        ];
+        assert!(rules(&history).contains(&7));
     }
 
     #[test]
