@@ -207,16 +207,18 @@ class PairTests(unittest.TestCase):
             f.write("time,host_busy_s,host_total_s,cpus,servers_s,steal_s\n"
                     "2026-09-27 09:59:59.000000,0,0,4,10,0\n"
                     "2026-09-27 10:00:11.000000,0,0,4,14,0\n")
-        # Two voters; a third that started mid-run has no first sample.
+        # Two voters, the second killed after 10:00:05 and restarted as
+        # pid 3, whose readings count from its start.
         with open(os.path.join(path, "cpu-samples-threads.csv"), "w") as f:
             f.write("time,pid,start,loop_cpu_s,loop_runq_s,workers_cpu_s,workers_runq_s,workers\n"
                     "2026-09-27 09:59:59.000000,1,1,1.0,0,2.0,0,8\n"
                     "2026-09-27 09:59:59.000000,2,1,1.0,0,2.0,0,8\n"
+                    "2026-09-27 10:00:05.000000,1,1,1.3,0,2.4,0,8\n"
+                    "2026-09-27 10:00:05.000000,2,1,1.1,0,2.2,0,8\n"
                     "2026-09-27 10:00:11.000000,1,1,1.6,0,2.8,0,8\n"
-                    "2026-09-27 10:00:11.000000,2,1,1.2,0,2.4,0,8\n"
-                    "2026-09-27 10:00:11.000000,3,5,9.0,0,9.0,0,8\n")
+                    "2026-09-27 10:00:11.000000,3,5,0.1,0,0.2,0,8\n")
         run = jp.read_run("base", path)
-        # Four completed reads: 4 s, 0.8 s and 1.2 s over them.
+        # Four completed reads: 4 s; 0.6 + 0.1 + 0.1 s; 0.8 + 0.2 + 0.2 s.
         self.assertAlmostEqual(run.servers_cpu_per_op, 1000.0)
         self.assertAlmostEqual(run.loops_cpu_per_op, 200.0)
         self.assertAlmostEqual(run.workers_cpu_per_op, 300.0)

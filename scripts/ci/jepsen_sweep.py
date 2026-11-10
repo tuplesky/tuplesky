@@ -321,24 +321,21 @@ def runner(step: Step, start, end, completed: int) -> None:
     step.idle_cores = (d("host_total_s") - busy) / secs
     step.steal_cores = steal / secs
     threads = js.read_thread_samples(os.path.join(store, "cpu-samples-threads.csv"))
-    first, last = threads.get(a["time"]), threads.get(b["time"])
     loops = None
-    if first and last:
-        voters = [k for k in last if k in first]
-        if voters:
-            loops = sum(last[k][0] - first[k][0] for k in voters)
-            step.cpu["tokio"] = per(sum(last[k][2] - first[k][2] for k in voters))
+    # Every boot in the window, a restarted voter's both.
+    boots = js.boots_over(threads, a["time"], b["time"])
+    if boots:
+        loops = js.boots_delta(boots, 0)
+        step.cpu["tokio"] = per(js.boots_delta(boots, 2))
     wakes = js.read_wakeups(os.path.join(store, "cpu-samples-wakeups.csv"))
-    first, last = wakes.get(a["time"]), wakes.get(b["time"])
-    if first and last:
-        voters = [k for k in last if k in first]
-        if voters:
-            kind = lambda name: sum(  # noqa: E731
-                (last[k].get(name, (0, 0.0))[1] - first[k].get(name, (0, 0.0))[1]) for k in voters
-            )
-            step.cpu["appender"] = per(kind("appender"))
-            step.cpu["materializer"] = per(kind("materializer"))
-            step.cpu["voters_other"] = per(kind("checkpoint") + kind("other"))
+    boots = js.boots_over(wakes, a["time"], b["time"])
+    if boots:
+        kind = lambda name: sum(  # noqa: E731
+            last.get(name, (0, 0.0))[1] - (first or {}).get(name, (0, 0.0))[1] for first, last in boots.values()
+        )
+        step.cpu["appender"] = per(kind("appender"))
+        step.cpu["materializer"] = per(kind("materializer"))
+        step.cpu["voters_other"] = per(kind("checkpoint") + kind("other"))
     costs = voter_costs(store)
     if loops is not None and costs:
         # The sampled loops over the window, split as the voters' own

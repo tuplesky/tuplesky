@@ -399,12 +399,12 @@ def read_run(label: str, store: str) -> Run:
         if before and after:
             run.servers_cpu_per_op = (after[0]["servers_s"] - before[-1]["servers_s"]) * 1000 / completed
             threads = js.read_thread_samples(os.path.join(store, "cpu-samples-threads.csv"))
-            first, last = threads.get(before[-1]["time"]), threads.get(after[0]["time"])
-            if first and last:
-                voters = [k for k in last if k in first]
-                if voters:
-                    run.loops_cpu_per_op = sum(last[k][0] - first[k][0] for k in voters) * 1000 / completed
-                    run.workers_cpu_per_op = sum(last[k][2] - first[k][2] for k in voters) * 1000 / completed
+            # Every boot in the window: a kill run's restarted voters
+            # count both boots.
+            boots = js.boots_over(threads, before[-1]["time"], after[0]["time"])
+            if boots:
+                run.loops_cpu_per_op = js.boots_delta(boots, 0) * 1000 / completed
+                run.workers_cpu_per_op = js.boots_delta(boots, 2) * 1000 / completed
     return run
 
 

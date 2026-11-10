@@ -1289,3 +1289,22 @@ class KindsTests(unittest.TestCase):
         client = [o for o in js.parse_ops(lines) if not o.process.startswith(":")]
         # 2 s and 1 s done, worker 1 waiting from :02 to the end at :06.
         self.assertEqual(js.occupancy(client, None), (2, 7.0))
+
+
+class BootsTests(unittest.TestCase):
+    def test_every_boot_in_the_window_counts(self):
+        t = [datetime.datetime(2026, 11, 10, 0, 0, s) for s in range(5)]
+        samples = {
+            t[0]: {(9, 1): (5.0,), (1, 1): (1.0,), (2, 1): (1.0,)},
+            # Voter 2 missing from the window's first sample alone.
+            t[1]: {(1, 1): (1.5,)},
+            t[2]: {(1, 1): (2.0,), (2, 1): (1.4,)},
+            # Voter 2 killed; restarted as pid 3, counted from its start.
+            t[3]: {(1, 1): (2.5,), (3, 7): (0.2,)},
+            t[4]: {(1, 1): (3.0,), (3, 7): (0.5,)},
+        }
+        # pid 9 was last seen before the window and grew nothing in it.
+        boots = js.boots_over(samples, t[1], t[4])
+        self.assertEqual(set(boots), {(1, 1), (2, 1), (3, 7)})
+        self.assertAlmostEqual(js.boots_delta(boots, 0), 1.5 + 0.4 + 0.5)
+        self.assertEqual(js.boots_over(samples, t[1], datetime.datetime(2026, 11, 10, 0, 1)), {})

@@ -715,6 +715,38 @@ def read_thread_samples(path: str) -> dict:
     return by_time
 
 
+def boots_over(samples: dict, t0, t1) -> dict:
+    """Every coordd boot sampled over [t0, t1] in `samples` (a reader's
+    map from time to {(pid, start): reading}), each to its (reading at
+    the window's start, last reading in the window). Readings are
+    cumulative from a boot's start, so a boot the sampler had not seen by
+    t0 (one restarted in the window) starts from None, which counts from
+    zero, and one gone before t1 ends at its last reading: a kill run's
+    restarted voters count both boots, not neither. {} without a sample at
+    both ends."""
+    if t0 not in samples or t1 not in samples:
+        return {}
+    out: dict = {}
+    for when in sorted(samples):
+        if when > t1:
+            break
+        for key, reading in samples[when].items():
+            if when <= t0:
+                out[key] = [reading, reading]
+            elif key in out:
+                out[key][1] = reading
+            else:
+                out[key] = [None, reading]
+    # A boot last seen before t0 grew nothing in the window; one missing
+    # from t0's sample alone keeps its earlier reading as its start.
+    return {k: (a, b) for k, (a, b) in out.items() if b is not a or k in samples[t0]}
+
+
+def boots_delta(boots: dict, index: int) -> float:
+    """The sum over `boots_over`'s boots of one cumulative cell's growth."""
+    return sum(last[index] - (first[index] if first is not None else 0.0) for first, last in boots.values())
+
+
 def read_wakeups(path: str) -> dict:
     """The rows `cpu_sampler.py --wakeups` wrote, by their time cell: each
     coordd (pid, start) to {kind: (threads, CPU s, run queue s,
@@ -897,12 +929,13 @@ def leader_loop(rows: list[dict], threads: dict, start: datetime.datetime, end: 
         )
     if not seconds:
         return []
-    first, last = threads[window[0]["time"]], threads[window[-1]["time"]]
-    voters = [k for k in last if k in first]
+    boots = boots_over(threads, window[0]["time"], window[-1]["time"])
     span = (window[-1]["time"] - window[0]["time"]).total_seconds()
-    workers_cpu = sum(last[k][2] - first[k][2] for k in voters)
-    workers_queue = sum(last[k][3] - first[k][3] for k in voters)
-    workers = max((last[k][4] for k in voters), default=0)
+    workers_cpu = boots_delta(boots, 2)
+    workers_queue = boots_delta(boots, 3)
+    workers = max((last[4] for _, last in boots.values()), default=0)
+    voters = len(threads[window[-1]["time"]])
+    restarted = len(boots) - voters
 
     def mean(i):
         return sum(s[i] for s in seconds) / len(seconds)
@@ -941,7 +974,9 @@ def leader_loop(rows: list[dict], threads: dict, start: datetime.datetime, end: 
     if voters and span > 0:
         per = (lambda v: f"{v * 1000 / completed:.2f} ms per operation") if completed else (lambda v: "-")
         out.append(
-            f"The voters' tokio threads, the transport's workers and the blocking pool ({len(voters)} voters, up to {workers} each): CPU {workers_cpu:.1f} s "
+            f"The voters' tokio threads, the transport's workers and the blocking pool ({voters} voters"
+            + (f", and {restarted} earlier boots of voters restarted in the window" if restarted > 0 else "")
+            + f", up to {workers} each): CPU {workers_cpu:.1f} s "
             f"({workers_cpu / span:.2f} cores, {per(workers_cpu)}), run queue {workers_queue:.1f} s "
             f"({workers_queue / span:.2f} cores, {per(workers_queue)})."
         )
