@@ -638,6 +638,23 @@ impl Generation {
     /// the one a reinstall just replaced, kept as evidence of what was
     /// discarded, while every earlier one goes (#212 review).
     pub fn prune_unselected_except(&self, keep: Option<u64>) -> std::io::Result<Vec<u64>> {
+        self.prune_where(|number| Some(number) != keep)
+    }
+
+    /// Remove the stagings a stopped attempt left above the selected
+    /// generation, on an ordinary start (#212 re-review). A staging takes
+    /// the next number and `CURRENT` never named one that is above the
+    /// selection, so none of them holds anything a start reads. The
+    /// generations below the selection, a reinstall's discarded one among
+    /// them, are kept: they are evidence, and the reinstall prunes them.
+    pub fn prune_abandoned_stagings(&self) -> std::io::Result<Vec<u64>> {
+        let selected = self.manifest.generation;
+        self.prune_where(|number| number > selected)
+    }
+
+    /// Remove every generation other than the selected one that `remove`
+    /// names, syncing the root once if any went.
+    fn prune_where(&self, remove: impl Fn(u64) -> bool) -> std::io::Result<Vec<u64>> {
         let (Some(root), Some(selected)) = (self.directory.parent(), self.directory.file_name())
         else {
             return Ok(Vec::new());
@@ -645,7 +662,7 @@ impl Generation {
         let mut removed = Vec::new();
         for number in generation_numbers(root)? {
             let name = format!("gen-{number:06}");
-            if name.as_str() == selected || Some(number) == keep {
+            if name.as_str() == selected || !remove(number) {
                 continue;
             }
             std::fs::remove_dir_all(root.join(&name))?;
@@ -734,10 +751,26 @@ fn initialize_database(
 
 /// Open the database of a generation whose manifest has already been
 /// verified, and apply the in-database checks every selected generation
-/// must pass before anything reads or replaces it: the file exists and is
-/// not empty, every registered table exists, the `meta_v1` identity rows
-/// agree with the manifest (so a copied manifest cannot lend identity to a
-/// foreign database), and every table's checksums verify.
+/// must pass before anything reads or replaces it, in this order:
+///
+/// 1. the file exists and is not empty;
+/// 2. redb opens it, and every table's checksums verify
+///    (`check_integrity`): damage anywhere in the file is found before any
+///    of its rows is read;
+/// 3. the `meta_v1` identity rows agree with the manifest, so a copied
+///    manifest cannot lend identity to a foreign database;
+/// 4. every registered table exists.
+///
+/// Damage is [`OpenError::DatabaseUnreadable`]: redb's `Corrupted`, a file
+/// that isn't redb's, a missing table, and a panic inside redb on
+/// malformed pages, which some single-page damage causes at open (#212
+/// review). Identity is read only from a file whose checksums verify, so
+/// a damaged identity leaf is unreadable, never another node's database,
+/// and a foreign database is refused for its identity whatever tables it
+/// lacks. A file redb repaired (`check_integrity` returning `Ok(false)`,
+/// its allocator rebuilt or its last commit rolled back) verified after
+/// the repair and is used: its stamp is checked against the journal like
+/// any other projection's.
 fn open_verified_database(
     db_path: &Path,
     manifest: &StoreManifestV1,
@@ -753,18 +786,30 @@ fn open_verified_database(
     if meta.len() == 0 {
         return Err(OpenError::EmptyDatabase);
     }
-    let mut db = redb::Database::builder()
-        .set_cache_size(options.cache_bytes)
-        .open(db_path)
-        .map_err(OpenError::from_database)?;
-    // Every registered table must exist, and the identity record must
-    // agree with the manifest.
-    {
-        let txn = db.begin_read().map_err(OpenError::from_transaction)?;
-        for c in Collection::ALL {
-            txn.open_table(table_definition(c))
-                .map_err(|e| OpenError::from_table(c.name(), e))?;
+    let mut db = unwinding("open", || {
+        redb::Database::builder()
+            .set_cache_size(options.cache_bytes)
+            .open(db_path)
+            .map_err(OpenError::from_database)
+    })?;
+    match unwinding("integrity check", || Ok(db.check_integrity()))? {
+        Ok(true) => {}
+        Ok(false) => eprintln!(
+            "{}: redb repaired the database at open; it verifies, and its stamp is checked \
+             against the journal",
+            db_path.display()
+        ),
+        Err(e) => {
+            return Err(match OpenError::from_database(e) {
+                OpenError::DatabaseUnreadable(m) => {
+                    OpenError::DatabaseUnreadable(format!("integrity: {m}"))
+                }
+                other => other,
+            });
         }
+    }
+    unwinding("identity and tables", || {
+        let txn = db.begin_read().map_err(OpenError::from_transaction)?;
         let meta_table = txn
             .open_table(table_definition(Collection::MetaV1))
             .map_err(|e| OpenError::from_table(Collection::MetaV1.name(), e))?;
@@ -812,26 +857,36 @@ fn open_verified_database(
         }
         check("engine", meta_fields::ENGINE, ENGINE_NAME.as_bytes())?;
         check("profile", meta_fields::PROFILE, PROFILE_NAME.as_bytes())?;
-    }
-    // Damage outside the meta pages does not stop `open`; verify every
-    // table before the database is used, and fail closed on damage.
-    match db.check_integrity() {
-        Ok(true) => {}
-        Ok(false) => {
-            return Err(OpenError::DatabaseUnreadable(
-                "integrity check repaired or found inconsistencies".into(),
-            ));
+        for c in Collection::ALL {
+            txn.open_table(table_definition(c))
+                .map_err(|e| OpenError::from_table(c.name(), e))?;
         }
-        Err(e) => {
-            return Err(match OpenError::from_database(e) {
-                OpenError::DatabaseUnreadable(m) => {
-                    OpenError::DatabaseUnreadable(format!("integrity: {m}"))
-                }
-                other => other,
-            });
-        }
-    }
+        Ok(())
+    })?;
     Ok(db)
+}
+
+/// `f`, with a panic inside redb taken as proof the file is malformed:
+/// redb 4.2 panics rather than errs on some damaged pages (an allocator
+/// or tree page whose bytes pass its checks badly), and does so on every
+/// open of the same file.
+fn unwinding<T>(
+    what: &'static str,
+    f: impl FnOnce() -> Result<T, OpenError>,
+) -> Result<T, OpenError> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(result) => result,
+        Err(payload) => {
+            let message = payload
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_owned())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "no message".to_owned());
+            Err(OpenError::DatabaseUnreadable(format!(
+                "redb panicked in its {what}: {message}"
+            )))
+        }
+    }
 }
 
 /// The generation directories under a root, by number.

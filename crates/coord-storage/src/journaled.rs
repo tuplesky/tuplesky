@@ -87,7 +87,7 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use coord_core::effect::{ApplyBase, BarrierId, BootId, PersistBatch};
+use coord_core::effect::{ApplyBase, BarrierId, BootId, PersistBatch, StoreUpdate};
 use coord_core::event::{StorageError, StorageEvent};
 use coord_journal_api::engine::{JournalEngine, ReadBudget};
 use coord_journal_api::failure::{JournalError, JournalFailure};
@@ -1902,6 +1902,55 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
     /// reinstall into. A stream this boot has no mapping for is not
     /// checked, nor is the stamp of a projection that has applied
     /// nothing.
+    /// Show `visit` every update of `domain`'s journaled records the
+    /// projection `engine` has not applied, `(M, J]`, in order, without
+    /// applying any: the first answer `visit` gives is returned with the
+    /// record's sequence, and nothing after it is read. A start uses it to
+    /// refuse a record before the attach's replay writes anything (an
+    /// activation of a feature this build can't do, #212 review). It reads
+    /// what [`attach`](Self::attach) would replay and verifies nothing;
+    /// the replay verifies the chain.
+    pub fn scan_unapplied<T>(
+        &self,
+        domain: DomainId,
+        engine: &E,
+        mut visit: impl FnMut(&StoreUpdate) -> Option<T>,
+    ) -> Result<Option<(LocalJournalSeq, T)>, JournaledError> {
+        let key = StreamKey {
+            cluster: self.cluster,
+            domain,
+            incarnation: self.incarnation,
+        };
+        let Some(stream) = self.allocator.lookup(&key) else {
+            return Ok(None);
+        };
+        let journal = self.journal.as_ref().ok_or(JournaledError::JournalLent)?;
+        let durable = journal.durable_head(stream)?;
+        let meta = DurableMeta::read(&engine.reader().snapshot()?)?;
+        let mut after = AppliedFrontier::from_stamp(&meta.stamp).materialized;
+        while after < durable {
+            let page = journal.read_suffix(stream, after, self.limits.read)?;
+            let Some(last) = page.records.last() else {
+                break;
+            };
+            after = last.seq();
+            for record in &page.records {
+                if record.seq() > durable {
+                    return Ok(None);
+                }
+                for update in record.body().updates() {
+                    if let Some(answer) = visit(update) {
+                        return Ok(Some((record.seq(), answer)));
+                    }
+                }
+            }
+            if page.exhausted {
+                break;
+            }
+        }
+        Ok(None)
+    }
+
     pub fn validate_projection(
         &self,
         domain: DomainId,

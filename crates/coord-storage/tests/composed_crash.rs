@@ -184,22 +184,25 @@ struct Boot {
     durable: u64,
 }
 
-/// The leading steps whose journal writes a completed sync of the log
-/// follows in the kit's operation log. A sync persists the whole file,
-/// so one after a step's last write makes all of its writes durable;
-/// once the device halts it logs no sync.
+/// The leading steps whose journal writes a completed sync of the same
+/// log file follows in the kit's operation log. A sync persists the
+/// whole file, so one of that file after a step's last write makes all
+/// of its writes durable; once the device halts it logs no sync. The
+/// file is matched by name, not by its `.raftlog` suffix, so a sync of
+/// the next file after a rotation doesn't count for the previous one
+/// (#212 re-review).
 fn durable_steps(starts: &[usize], log: &[jkit::Op]) -> u64 {
-    let raftlog = |file: &str| file.ends_with(".raftlog");
     let mut durable = 0;
     for (i, &start) in starts.iter().enumerate() {
         let end = starts.get(i + 1).copied().unwrap_or(log.len());
-        let last_write = (start..end)
-            .rev()
-            .find(|&at| matches!(&log[at], jkit::Op::Write { file, .. } if raftlog(file)));
-        let synced = last_write.is_some_and(|at| {
+        let last_write = (start..end).rev().find_map(|at| match &log[at] {
+            jkit::Op::Write { file, .. } if file.ends_with(".raftlog") => Some((at, file)),
+            _ => None,
+        });
+        let synced = last_write.is_some_and(|(at, written)| {
             log[at + 1..]
                 .iter()
-                .any(|op| matches!(op, jkit::Op::Sync { file } if raftlog(file)))
+                .any(|op| matches!(op, jkit::Op::Sync { file } if file == written))
         });
         if !synced {
             break;
