@@ -227,6 +227,13 @@ struct Knobs {
     /// leader naming the admission it was submitted under, or on the
     /// release a leader publishes again for a duplicate, rebuilt from its
     /// record, or from its own node's record as any entry.
+    ///
+    /// The model applies the collector's rule, not the `Collector`: its
+    /// released arm checks neither the release's sender nor its ballot,
+    /// so it counts as answered some releases the collector would hold.
+    /// Safety is still covered, because the oracle compares every
+    /// release, but oracle 6's count of marked commands answered is an
+    /// upper bound (#204 review).
     answer_on_release: u32,
     /// An execution's group reaches the journal after its outcome is
     /// taken, in journal order with the protocol batches, as `coordd`'s

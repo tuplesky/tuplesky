@@ -671,6 +671,10 @@ pub struct Collector {
     /// release alone (task-d100, step A): while this collector's node
     /// reads `Feature::AnswerOnRelease` active.
     answer_on_release: bool,
+    /// Evidence frames taken for commands submitted as answered on the
+    /// release alone (diagnostic, #204 review): what a voter that learned
+    /// such a command from the leader's proposal alone still sends.
+    evidence_for_marked: u64,
 }
 
 impl Collector {
@@ -686,6 +690,7 @@ impl Collector {
             undelivered_bytes: 0,
             offer_cursor: 0,
             answer_on_release: false,
+            evidence_for_marked: 0,
         }
     }
 
@@ -717,6 +722,16 @@ impl Collector {
     /// Whether new submissions are marked as answered on the release.
     pub const fn answers_on_release(&self) -> bool {
         self.answer_on_release
+    }
+
+    /// Evidence frames this collector took for commands it submitted as
+    /// answered on the release alone, while they were pending (#204
+    /// review): the acknowledgements that still reach a frontend for
+    /// them, from voters that learned them from the leader's proposal
+    /// alone. One that arrives after the answer is counted as settled
+    /// evidence, not here.
+    pub const fn evidence_for_marked(&self) -> u64 {
+        self.evidence_for_marked
     }
 
     /// Whether `command` is outstanding here.
@@ -1196,6 +1211,9 @@ impl Collector {
         let result = if claimed != sender {
             Err(EvidenceError::SenderMismatch { sender, claimed })
         } else if let Some(entry) = self.pending.get_mut(&command) {
+            if entry.marked {
+                self.evidence_for_marked += 1;
+            }
             entry.votes.add(vote).map_err(EvidenceError::Vote)
         } else if self.is_resolved(&command) {
             record(&mut self.trace, || {

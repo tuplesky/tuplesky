@@ -451,6 +451,7 @@ fn a_rendered_snapshot_carries_no_secret_or_key_shaped_text() {
                     round: distribution(&[1, 2, 6]),
                 },
             },
+            evidence_for_marked: 3,
             answered: Answered {
                 writes: distribution(&[2, 3, 3, 14]),
                 reads: distribution(&[1, 2, 5]),

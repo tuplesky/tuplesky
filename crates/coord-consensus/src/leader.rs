@@ -487,6 +487,12 @@ pub struct Leader {
     /// (task-d60, step 3): the voter files where its evidence is owed
     /// under it instead of decoding the request a second time.
     admitted: Option<CommandId>,
+    /// Whether the next admitted request's command is marked as answered
+    /// on the leader's release alone once it is derived (task-d100, step
+    /// A): the submission carried the mark, and the voter set this
+    /// before stepping it, so the command is derived once, here (#204
+    /// review).
+    mark_next_admitted: bool,
     fenced: Option<FenceReason>,
     /// Entries of the selection this leader was handed that no order
     /// keeps: a dependency cycle, which is an invariant violation
@@ -699,6 +705,7 @@ impl Leader {
             rejections: Vec::new(),
             announced: None,
             admitted: None,
+            mark_next_admitted: false,
             fenced: None,
             recovery_cycle: None,
             own_adoptions: BTreeMap::new(),
@@ -803,6 +810,7 @@ impl Leader {
             rejections: Vec::new(),
             announced: None,
             admitted: None,
+            mark_next_admitted: false,
             fenced: None,
             recovery_cycle: None,
             replay: crate::replay::EvidenceStore::new(state.capacity),
@@ -1864,9 +1872,9 @@ impl Leader {
         self.settle(command);
         let mut effects = alloc::vec![Effect::Established(result.clone())];
         // A marked command's collector answers only on a final release
-        // and holds a speculative one (task-d100, step A), so the final
-        // release follows a speculative one for it: the collector
-        // answers once, on the final release.
+        // (task-d100, step A), so it goes out even where the command was
+        // speculated: its speculative release was never sent
+        // ([`Leader::release_ready`]).
         let marked = self.answer_on_release.contains(&command);
         if self.is_leading() && (!released || marked) {
             let release = ReleasedResult::from_gate(result, outcome.response.clone(), false);
@@ -2046,8 +2054,16 @@ impl Leader {
             fast: &fast,
         };
         match gate.release(&mut self.speculation, &proposals) {
+            // A marked command's collector holds a speculative release and
+            // answers only on the final one (task-d100, step A), which
+            // goes out whether or not this one did: it is not sent
+            // (#204 review).
             Ok(released) => released
                 .into_iter()
+                .filter(|r| {
+                    !(r.speculative()
+                        && self.answer_on_release.contains(&r.established().command()))
+                })
                 .map(|r| Effect::Released(self.with_admission(r)))
                 .collect(),
             Err(_) => Vec::new(),
@@ -2060,6 +2076,17 @@ impl Leader {
     /// proposal that submission leads to.
     pub fn mark_answer_on_release(&mut self, command: CommandId) {
         self.answer_on_release.insert(command);
+    }
+
+    /// Mark the command the next admitted request becomes as answered on
+    /// the release alone, once this replica derives it (task-d100, step
+    /// A). The voter calls this before stepping a marked submission, so
+    /// the mark is in place for the proposal or acknowledgement that
+    /// step leads to, and the command is derived only here (#204
+    /// review). A request refused before its command is held marks
+    /// nothing.
+    pub fn mark_next_admitted(&mut self) {
+        self.mark_next_admitted = true;
     }
 
     /// Drop `command`'s mark unless this leader's table holds it: the
@@ -2286,7 +2313,13 @@ impl Leader {
 
     fn on_admitted(&mut self, frame: &[u8], admission: AdmissionFacts) -> Vec<Effect> {
         self.admitted = None;
-        self.propose(frame, Some(admission))
+        let effects = self.propose(frame, Some(admission));
+        if core::mem::take(&mut self.mark_next_admitted)
+            && let Some(command) = self.admitted
+        {
+            self.keep_mark_if_held(&command);
+        }
+        effects
     }
 
     /// Whether an admitted request reaches the derivation of its command
@@ -2448,6 +2481,9 @@ impl Leader {
             return Vec::new();
         };
         self.admitted = Some(command);
+        if self.mark_next_admitted {
+            self.answer_on_release.insert(command);
+        }
         let payload = PayloadRecordV1 {
             retry_key: request.retry_key,
             logical: request.logical.as_slice().to_vec(),
@@ -3108,7 +3144,12 @@ impl Leader {
                 && record.phase >= Phase::Executed
                 && let Some(admission) = record.payload
             {
-                self.release_again.push((command, retry_key, admission));
+                match self.replay.count_release_again(command, &self.table) {
+                    Ok(()) => self.release_again.push((command, retry_key, admission)),
+                    Err(why) => self
+                        .rejections
+                        .push(Rejection::ReplayRefused { command, why }),
+                }
             }
             return Vec::new();
         }

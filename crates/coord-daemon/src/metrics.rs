@@ -529,6 +529,12 @@ pub struct Cost {
     /// answer, writes and reads apart (task-d97, #191 review).
     #[serde(default)]
     pub answered: Answered,
+    /// Evidence frames this node's collector took for commands it
+    /// submitted as answered on the release alone (task-d100, step A;
+    /// #204 review): from voters that learned them from the leader's
+    /// proposal alone, and sent today's evidence.
+    #[serde(default)]
+    pub evidence_for_marked: u64,
     /// What this voter's transport carried to and from the other voters
     /// (task-d62), or why there is no reading.
     #[serde(default = "not_instrumented")]

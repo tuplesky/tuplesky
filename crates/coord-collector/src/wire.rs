@@ -62,6 +62,16 @@ pub struct ReleaseV2 {
     /// The decided payload's admission digest.
     pub admission: coord_types::identity::Digest32,
 }
+
+/// [`ReleaseV2`] over a borrowed result, so a release is framed without
+/// copying its response (#204 review). The same fields in the same
+/// order: postcard encodes the two alike.
+#[derive(Serialize)]
+struct ReleaseV2Ref<'a> {
+    released: &'a ReleasedResult,
+    admission: coord_types::identity::Digest32,
+}
+
 /// A collector's current read, sent to the leader it follows only
 /// (task-d50; design Section 6.3).
 pub use coord_types::wire_v1::KIND_COLLECTOR_READ as KIND_READ;
@@ -267,8 +277,8 @@ pub fn release_frame(released: &ReleasedResult) -> Result<Vec<u8>, CollectorWire
             frame(KIND_RELEASE, &payload)
         }
         Some(admission) => {
-            let v2 = ReleaseV2 {
-                released: released.clone(),
+            let v2 = ReleaseV2Ref {
+                released,
                 admission,
             };
             let payload = postcard::to_allocvec(&v2).map_err(|_| CollectorWireError::TooLarge)?;

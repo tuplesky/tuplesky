@@ -136,19 +136,19 @@ impl Machine {
         }
     }
 
-    /// Mark `command` as answered by its collector on the leader's
-    /// release alone (task-d100, step A), before the submission that
-    /// asks for it is stepped.
+    /// Mark the command the next admitted request becomes as answered by
+    /// its collector on the leader's release alone (task-d100, step A),
+    /// once the machine derives it; see `Leader::mark_next_admitted`.
     ///
     /// The mark lives in this role's machine and goes with it: a
     /// campaign replaces the machine, and the collector voids every
     /// entry the ballot change reaches for its node's record
     /// (`Collector::reconfigure`, task-d22), so no entry waits on a mark
     /// the new machine lacks.
-    pub fn mark_answer_on_release(&mut self, command: CommandId) {
+    pub fn mark_next_admitted(&mut self) {
         match self {
-            Machine::Leader(l) => l.mark_answer_on_release(command),
-            Machine::Follower(f) => f.mark_answer_on_release(command),
+            Machine::Leader(l) => l.mark_next_admitted(),
+            Machine::Follower(f) => f.mark_next_admitted(),
         }
     }
 
@@ -157,15 +157,6 @@ impl Machine {
         match self {
             Machine::Leader(l) => l.answers_on_release(command),
             Machine::Follower(f) => f.answers_on_release(command),
-        }
-    }
-
-    /// Drop `command`'s mark unless the machine's table holds it, once
-    /// the submission that marked it has been stepped (#204 review).
-    pub fn keep_mark_if_held(&mut self, command: &CommandId) {
-        match self {
-            Machine::Leader(l) => l.keep_mark_if_held(command),
-            Machine::Follower(f) => f.keep_mark_if_held(command),
         }
     }
 
@@ -1087,16 +1078,11 @@ impl<P: Persistence> Node<P> {
             .expect("a node always holds a machine")
     }
 
-    /// Mark `command` as answered on the leader's release alone
-    /// (task-d100, step A).
-    pub fn mark_answer_on_release(&mut self, command: CommandId) {
-        self.machine_mut().mark_answer_on_release(command);
-    }
-
-    /// Drop `command`'s mark unless the machine holds it (see
-    /// [`Machine::keep_mark_if_held`]).
-    pub fn keep_mark_if_held(&mut self, command: &CommandId) {
-        self.machine_mut().keep_mark_if_held(command);
+    /// Mark the command the next admitted request becomes as answered on
+    /// the leader's release alone (task-d100, step A; see
+    /// [`Machine::mark_next_admitted`]).
+    pub fn mark_next_admitted(&mut self) {
+        self.machine_mut().mark_next_admitted();
     }
 
     /// The marked commands whose release the voter publishes again

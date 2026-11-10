@@ -655,6 +655,12 @@ pub struct Follower {
     /// (task-d60, step 3): the voter files where its evidence is owed
     /// under it instead of decoding the request a second time.
     admitted: Option<CommandId>,
+    /// Whether the next admitted request's command is marked as answered
+    /// on the leader's release alone once it is derived (task-d100, step
+    /// A): the submission carried the mark, and the voter set this
+    /// before stepping it, so the command is derived once, here (#204
+    /// review).
+    mark_next_admitted: bool,
     /// The catch-up page in hand, if any (task-d08).
     catch_up: CatchUp,
     /// A pulled command whose execution here disagreed with the donor's
@@ -864,6 +870,7 @@ impl Follower {
             awaiting_sync: Vec::new(),
             rejections: Vec::new(),
             admitted: None,
+            mark_next_admitted: false,
             synced_selection: resumed.clone(),
             resumed,
             early_sync: None,
@@ -1065,6 +1072,7 @@ impl Follower {
             awaiting_sync: Vec::new(),
             rejections: Vec::new(),
             admitted: None,
+            mark_next_admitted: false,
             resumed: selection.clone(),
             early_sync: None,
             sync_behind_promise: None,
@@ -3813,6 +3821,17 @@ impl Follower {
         self.answer_on_release.insert(command);
     }
 
+    /// Mark the command the next admitted request becomes as answered on
+    /// the release alone, once this replica derives it (task-d100, step
+    /// A). The voter calls this before stepping a marked submission, so
+    /// the mark is in place for the proposal or acknowledgement that
+    /// step leads to, and the command is derived only here (#204
+    /// review). A request refused before its command is held marks
+    /// nothing.
+    pub fn mark_next_admitted(&mut self) {
+        self.mark_next_admitted = true;
+    }
+
     /// Whether `command`'s collector answers it on the release alone.
     pub fn answers_on_release(&self, command: &CommandId) -> bool {
         self.answer_on_release.contains(command)
@@ -3992,6 +4011,16 @@ impl Follower {
     }
 
     fn on_admitted(&mut self, frame: &[u8], admission: AdmissionFacts) -> Vec<Effect> {
+        let effects = self.admit(frame, admission);
+        if core::mem::take(&mut self.mark_next_admitted)
+            && let Some(command) = self.admitted
+        {
+            self.keep_mark_if_held(&command);
+        }
+        effects
+    }
+
+    fn admit(&mut self, frame: &[u8], admission: AdmissionFacts) -> Vec<Effect> {
         self.admitted = None;
         if self.boot.is_none() {
             return Vec::new();
@@ -4057,6 +4086,9 @@ impl Follower {
             return Vec::new();
         };
         self.admitted = Some(command);
+        if self.mark_next_admitted {
+            self.answer_on_release.insert(command);
+        }
         let payload = PayloadRecordV1 {
             retry_key,
             logical,

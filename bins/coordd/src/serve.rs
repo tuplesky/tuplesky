@@ -1830,6 +1830,12 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             unordered: self.unordered,
             release: release(&voter.node().release_split()),
             answered: self.frontend.answered,
+            evidence_for_marked: self
+                .frontend
+                .frontend
+                .dispatcher()
+                .collector()
+                .evidence_for_marked(),
             traffic: self.plane.as_ref().map_or(
                 Measure::Unavailable(Unavailable::NotInstrumented),
                 |plane| {
