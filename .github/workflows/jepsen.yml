@@ -66,7 +66,7 @@ on:
         description: "etcd for the baseline: a version such as 3.7.2, latest (the newest stable release), or none to skip it; beside, or beside:VERSION, runs it in the TupleSky job, on its runner and cluster, after each pair (or after the one run), with each TupleSky run's ratio to it, instead of in a job of its own on another runner"
         default: latest
       features:
-        description: "Replicated features TupleSky's voters activate once every voter is submittable, before the nemesis and the workload (jepsen.tuplesky's --activate, task-d99), comma-separated in order, such as early-proposal,release-at-execution; a build without an admin socket (a pair's base before task-d99) is left as it is; empty for none"
+        description: "Replicated features TupleSky's voters activate once every voter is submittable, before the nemesis and the workload (jepsen.tuplesky's --activate, task-d99), comma-separated in order, such as early-proposal,release-at-execution; a build without an admin socket (a pair's base before task-d99) is left as it is; empty for none; BASE/HEAD gives a pair's two sides their own lists (either may be empty)"
         default: ""
       store:
         description: "Where TupleSky's voters and etcd keep their stores: disk, or tmpfs to measure without the runner's disk"
@@ -399,12 +399,14 @@ jobs:
               echo "WORKERS_SUFFIX=" >> "$GITHUB_ENV"
             fi
           fi
-          if [ -n "$FEATURES" ]; then
+          if [ -n "$FEATURES$BASE_FEATURES" ]; then
             if ! grep -q -- '--activate' src/jepsen/tuplesky.clj; then
               echo "::error::tuplesky/jepsen@$JEPSEN_REF has no --activate; dispatch with a jepsen-ref that has it, or no features"
               exit 1
             fi
-            voter+=(--activate "$FEATURES")
+            # Each side its own list: features BASE/HEAD sets them apart.
+            if [ -n "$FEATURES" ]; then head_workers+=(--activate "$FEATURES"); fi
+            if [ -n "$BASE_FEATURES" ]; then base_workers+=(--activate "$BASE_FEATURES"); fi
           fi
           if [ -n "$VOTER_ENV" ]; then
             if ! grep -q -- '--voter-env' src/jepsen/tuplesky.clj; then

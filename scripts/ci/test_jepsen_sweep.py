@@ -129,6 +129,33 @@ class SweepTests(unittest.TestCase):
         self.assertIn("**The voters' journal and projection threads**", text)
         self.assertIn("| 30 | head | 1.00 / 1.00 | n1 | 8 | 5.0 | 50% | 25% | 86% | 3 | 1.0 | 10% | 0% | 0% |", text)
 
+    def test_counts_a_command_over_the_voters(self):
+        path = self.store("h")
+        # Both voters carry traffic; only n1 counts journal groups. The
+        # leader, n1, executed 10 commands.
+        for node, datagrams, acks in (("n1", 30, 10), ("n2", 20, 5)):
+            with open(os.path.join(path, node, "coordd.log")) as f:
+                line = json.loads(f.read()[len("metrics "):])
+            line["cost"]["Observed"]["traffic"] = {"Observed": {
+                "datagrams_sent": datagrams, "acks_sent": acks, "sent_frames": 40,
+                "api": {"datagrams_sent": 5, "acks_sent": 1},
+                "api_frames": {"submissions": 2, "releases": 3},
+            }}
+            with open(os.path.join(path, node, "coordd.log"), "w") as f:
+                f.write("metrics " + json.dumps(line) + "\n")
+        step = sw.read_step("head", "30", path)
+        self.assertAlmostEqual(step.counts["peer_datagrams"], 5.0)
+        self.assertAlmostEqual(step.counts["peer_acks"], 1.5)
+        self.assertAlmostEqual(step.counts["peer_frames"], 8.0)
+        self.assertAlmostEqual(step.counts["api_datagrams"], 1.0)
+        self.assertAlmostEqual(step.counts["api_releases"], 0.6)
+        self.assertAlmostEqual(step.counts["journal_groups"], 0.4)
+        self.assertNotIn("evidence_for_marked", step.counts)
+        text = sw.render([step], "Sweep")
+        self.assertIn("**Counts a command, over the five voters**", text)
+        # A count no voter carries gets no column.
+        self.assertIn("| 30 | head | 5.00 | 1.50 | 8.00 | 1.00 | 0.20 | 0.40 | 0.60 | 0.40 | 0.50 |", text)
+
     def test_labels(self):
         self.assertEqual(sw.label("head@30=/s/1"), ("head", "30", "/s/1"))
         self.assertEqual(sw.label("etcd@6n=/s/2"), ("etcd", "6n", "/s/2"))

@@ -37,7 +37,11 @@ or the final heal):
   jobs, task-d97's `served_each`): its jobs, its busy time in seconds and
   as a share of the workload, and the share of its jobs and of its busy
   time in jobs served in 16.4 ms or more (a bucket's edge), beside the
-  leader's round from submitted to learned.
+  leader's round from submitted to learned;
+* counts a command over the five voters: datagrams, ACK frames and
+  frames on each plane, the api plane's frames by kind, the evidence for
+  marked commands where counted, and the journal groups and projection
+  commits.
 
 Then each TupleSky side's ratio to the etcd run at the same step. It writes
 Markdown to `$GITHUB_STEP_SUMMARY` when it is set and to standard output
@@ -89,6 +93,64 @@ class Step:
     # Each voter's journal appender and projection materializer, from its
     # last `metrics` line: node -> {thread: Pipeline}.
     pipelines: dict = field(default_factory=dict)
+    # Counts a command over the voters (see COUNTS), from each voter's
+    # last `metrics` line over the leader's executed commands.
+    counts: dict = field(default_factory=dict)
+
+
+# Counts a command, summed over the voters: the key, the label, and the
+# path into a voter's `cost` reading.
+COUNTS = (
+    ("peer_datagrams", "Peer datagrams", ("traffic", "Observed", "datagrams_sent")),
+    ("peer_acks", "Peer ACK frames", ("traffic", "Observed", "acks_sent")),
+    ("peer_frames", "Peer frames", ("traffic", "Observed", "sent_frames")),
+    ("api_datagrams", "Api datagrams", ("traffic", "Observed", "api", "datagrams_sent")),
+    ("api_acks", "Api ACK frames", ("traffic", "Observed", "api", "acks_sent")),
+    ("api_submissions", "Api submissions", ("traffic", "Observed", "api_frames", "submissions")),
+    ("api_fast_acks", "Api fast acks", ("traffic", "Observed", "api_frames", "fast_acks")),
+    ("api_slow_acks", "Api slow acks", ("traffic", "Observed", "api_frames", "slow_acks")),
+    ("api_leader_replies", "Api leader replies", ("traffic", "Observed", "api_frames", "leader_replies")),
+    ("api_releases", "Api releases", ("traffic", "Observed", "api_frames", "releases")),
+    ("api_other_evidence", "Api other evidence", ("traffic", "Observed", "api_frames", "other_evidence")),
+    ("evidence_for_marked", "Evidence for marked", ("evidence_for_marked",)),
+    ("journal_groups", "Journal groups", ("journal_appends",)),
+    ("projection_commits", "Projection commits", ("projection_commits",)),
+)
+
+
+def count_at(cost: dict, path: tuple):
+    """A count at `path` in a voter's `cost` reading; None where the
+    build has none."""
+    value = cost
+    for key in path:
+        if not isinstance(value, dict) or key not in value:
+            return None
+        value = value[key]
+    return value if isinstance(value, (int, float)) else None
+
+
+def read_counts(store: str) -> dict:
+    """COUNTS a command over the voters: each count summed over every
+    voter's last `metrics` line, over the leader's executed commands; a
+    count no voter carries is left out."""
+    raws = []
+    for node in sorted(os.listdir(store)):
+        path = os.path.join(store, node, "coordd.log")
+        if not os.path.exists(path):
+            continue
+        with open(path, encoding="utf-8", errors="replace") as f:
+            voter = js.parse_voter(f.readlines())
+        if voter.cost and voter.cost.cpu and voter.cost.executed and voter.cost.raw:
+            raws.append(voter.cost)
+    if not raws:
+        return {}
+    executed = lead(raws).executed
+    out = {}
+    for key, _, path in COUNTS:
+        values = [count_at(c.raw, path) for c in raws]
+        if any(v is not None for v in values):
+            out[key] = sum(v or 0 for v in values) / executed
+    return out
 
 
 @dataclass
@@ -347,6 +409,7 @@ def read_step(side: str, step_name: str, store: str) -> Step:
                 step.round_ms = (tails["release_round"]["p50_ms"], tails["release_round"]["p99_ms"])
     if side != "etcd":
         step.pipelines = read_pipelines(store)
+        step.counts = read_counts(store)
     return step
 
 
@@ -462,6 +525,23 @@ def render(steps: list[Step], title: str) -> str:
                 )
                 out.append(f"| {lead} | {node} | " + " | ".join(cells) + " |")
                 first = False
+        out.append("")
+
+    rows = [s for s in steps if s.counts]
+    if rows:
+        keys = [(k, label) for k, label, _ in COUNTS if any(k in s.counts for s in rows)]
+        out += [
+            "**Counts a command, over the five voters** (each voter's last `metrics` line, summed, over the "
+            "leader's executed commands: the peer plane's datagrams, ACK frames and frames sent, the api plane's "
+            "datagrams and ACK frames sent and its frames by kind (task-d88's R3), the evidence that reached a "
+            "frontend for marked commands where the build counts it, and the journal groups and projection "
+            "commits; QUIC counts ACK frames, not ACK-only datagrams, so an ACK riding with data counts here too)",
+            "",
+            "| Step | Side | " + " | ".join(label for _, label in keys) + " |",
+            "| --- | --- " + "| --- " * len(keys) + "|",
+        ]
+        for s in rows:
+            out.append(f"| {name(s)} | " + " | ".join(cell(s.counts.get(k), ".2f") for k, _ in keys) + " |")
         out.append("")
 
     etcd = {s.step: s for s in steps if s.side == "etcd"}

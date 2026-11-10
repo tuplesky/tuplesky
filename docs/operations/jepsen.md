@@ -358,7 +358,9 @@ two, the head at one), and a single run takes `HEAD`; the title then says
 
 The `features` input activates replicated features (task-d99) on
 TupleSky's voters through jepsen.tuplesky's `--activate`, comma-separated
-in order, such as `early-proposal,release-at-execution`. The job builds
+in order, such as `early-proposal,release-at-execution`; `BASE/HEAD`
+gives a pair's two sides their own lists (either may be empty), so one
+build can run with a feature on the head only. The job builds
 `coordctl` beside `coordd`, and the harness uploads it to every node. Once
 every voter says `voters submittable`, and before the nemesis and the
 workload, each node asks its own admin socket (`admin.sock` in the bundle)
@@ -649,6 +651,10 @@ then gives a table of the steps, each run labelled `SIDE@STEP`:
   share of their jobs and of their busy time in jobs served in 16.4 ms or
   more (from task-d97's `served_each`, the time estimated at each
   bucket's midpoint), beside the leader's round from submitted to learned;
+* counts a command over the five voters, from their `metrics` lines:
+  each plane's datagrams, ACK frames and frames, the api plane's frames by
+  kind, the evidence for marked commands where the build counts it, and
+  the journal groups and projection commits;
 * each TupleSky run's ratio to etcd's at its step.
 
 Each run's own summary also gives operations completed a second and the

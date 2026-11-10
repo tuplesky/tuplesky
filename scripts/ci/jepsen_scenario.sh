@@ -42,7 +42,9 @@
 #   IN_FEATURES    replicated features TupleSky's voters activate once all
 #                  are submittable (jepsen.tuplesky's --activate,
 #                  task-d99), comma-separated; a build without an admin
-#                  socket is left as it is; empty for none
+#                  socket is left as it is; empty for none. BASE/HEAD
+#                  gives a pair's two sides their own lists (either may be
+#                  empty), and a single run takes HEAD
 #   IN_VOTER_WORKERS
 #                  tokio worker threads per TupleSky voter: a number, or
 #                  BASE/HEAD for a pair's two sides (a single run takes
@@ -288,12 +290,21 @@ else
   workers_suffix=", ${base_workers:-default} (base) / ${workers:-default} (head) tokio workers per voter"
 fi
 
-features=${IN_FEATURES:-}
-if [ -n "$features" ]; then
-  case $features in
-    *[!a-z,-]* | ,* | *, | *,,*) echo "features must be names separated by commas, not $features" >&2; exit 2 ;;
-  esac
-fi
+# A list, or BASE/HEAD for a pair's two sides (either may be empty; a
+# single run takes HEAD).
+features_in=${IN_FEATURES:-}
+case $features_in in
+  */*/*) echo "features must be a list or BASE/HEAD of lists, not $features_in" >&2; exit 2 ;;
+  */*) base_features=${features_in%%/*} features=${features_in#*/} ;;
+  *) base_features=$features_in features=$features_in ;;
+esac
+for list in "$base_features" "$features"; do
+  if [ -n "$list" ]; then
+    case $list in
+      *[!a-z,-]* | ,* | *, | *,,*) echo "features must be names separated by commas, or BASE/HEAD of such lists, not $features_in" >&2; exit 2 ;;
+    esac
+  fi
+done
 
 tuplesky_suffix=""
 voter_env=${IN_VOTER_ENV:-}
@@ -308,7 +319,9 @@ if [ -n "$voter_env" ]; then
   esac
   tuplesky_suffix+=", with $voter_env"
 fi
-if [ -n "$features" ]; then
+if [ "$base_features" != "$features" ]; then
+  tuplesky_suffix+=", ${base_features:-no features} (base) / ${features:-no features} (head) active"
+elif [ -n "$features" ]; then
   tuplesky_suffix+=", $features active"
 fi
 
@@ -412,6 +425,7 @@ out=${GITHUB_ENV:-/dev/stdout}
   echo "VOTER_WORKERS=$workers"
   echo "BASE_VOTER_WORKERS=$base_workers"
   echo "FEATURES=$features"
+  echo "BASE_FEATURES=$base_features"
   echo "WORKERS_SUFFIX=$workers_suffix"
   echo "VOTER_ENV=$voter_env"
   echo "KEY_COUNT=$key_count"
