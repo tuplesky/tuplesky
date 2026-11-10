@@ -441,7 +441,7 @@ pub struct Follower {
     bindings: BTreeMap<RetryKey, CommandId>,
     held: BTreeMap<CommandId, HeldProposal>,
     /// Adopted commands: leader sequence number and whether durable.
-    adopted: BTreeMap<CommandId, (u64, bool)>,
+    adopted: crate::digest::DigestMap<CommandId, (u64, bool)>,
     /// The adopted commands with no payload here (task-d46): the part of
     /// [`Follower::missing_payloads`] that `adopted` contributes, kept as
     /// the two maps change. `adopted` keeps executed commands until the
@@ -473,7 +473,7 @@ pub struct Follower {
     held_waiters: BTreeMap<CommandId, alloc::collections::BTreeSet<CommandId>>,
     pending: BTreeMap<BarrierId, Pending>,
     deferred: BTreeMap<BarrierId, DeferredVote>,
-    votes: BTreeMap<CommandId, VoteSet>,
+    votes: crate::digest::DigestMap<CommandId, VoteSet>,
     payloads: BTreeMap<CommandId, PayloadRecordV1>,
     durable_payloads: BTreeMap<BarrierId, Vec<CommandId>>,
     /// Commands whose record here is ahead of every row written of it,
@@ -787,7 +787,7 @@ impl Follower {
         let report_cut = (ballots.promised() != ballots.synced())
             .then(|| (ballots.promised(), table.undecided().copied().collect()));
         let bindings = restored_bindings(&table, payloads.iter());
-        let adopted: BTreeMap<CommandId, (u64, bool)> = table
+        let adopted: crate::digest::DigestMap<CommandId, (u64, bool)> = table
             .records()
             .filter(|(_, r)| r.phase >= Phase::Accept)
             .map(|(c, _)| (*c, (u64::MAX, true)))
@@ -818,7 +818,7 @@ impl Follower {
             held_waiters: BTreeMap::new(),
             pending: BTreeMap::new(),
             deferred: BTreeMap::new(),
-            votes: BTreeMap::new(),
+            votes: crate::digest::map(),
             // A payload this replica made durable stays servable after a
             // restart: a report claiming the payload is present must be one
             // this replica can honour.
@@ -1006,14 +1006,14 @@ impl Follower {
             table: state.table,
             bindings: state.bindings,
             held: BTreeMap::new(),
-            adopted: BTreeMap::new(),
+            adopted: crate::digest::map(),
             adopted_lacking: alloc::collections::BTreeSet::new(),
             held_lacking: alloc::collections::BTreeSet::new(),
             rebinds: alloc::collections::BTreeSet::new(),
             held_check: alloc::collections::BTreeSet::new(),
             held_waiters: BTreeMap::new(),
             pending: BTreeMap::new(),
-            votes: BTreeMap::new(),
+            votes: crate::digest::map(),
             payloads: state.payloads,
             durable_payloads: BTreeMap::new(),
             unwritten: BTreeSet::new(),
@@ -3536,7 +3536,7 @@ impl Follower {
         ready.sort_unstable();
         let mut progressed = false;
         for (_, command) in ready {
-            progressed |= self.table.commit(command).is_ok();
+            progressed |= self.table.commit_accepted(command);
         }
         progressed
     }
@@ -3673,13 +3673,17 @@ impl Follower {
     /// The frontier cannot commit them, and with the chain total nothing
     /// after them either.
     fn unsequenced_adoptions(&self) -> Vec<CommandId> {
-        self.adopted
+        // In identity order, as the ordered map gave them.
+        let mut unsequenced: Vec<CommandId> = self
+            .adopted
             .iter()
             .filter(|(c, (seqnum, _))| {
                 *seqnum == u64::MAX && self.table.phase_of(c) == Some(Phase::Accept)
             })
             .map(|(c, _)| *c)
-            .collect()
+            .collect();
+        unsequenced.sort_unstable();
+        unsequenced
     }
 
     /// Ask `leader` for its proposals of the adoptions this replica holds
