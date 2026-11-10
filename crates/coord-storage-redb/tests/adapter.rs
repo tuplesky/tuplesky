@@ -341,12 +341,15 @@ fn damaged_files_fail_closed() {
         Generation::open_existing(dir.path(), identity(), options()),
         Err(OpenError::EmptyDatabase)
     ));
-    // Garbage database file.
+    // Garbage database file: redb says so (I/O of kind InvalidData), and
+    // that proves the bytes wrong.
     std::fs::write(&db, b"not a redb file at all").unwrap();
-    assert!(matches!(
-        Generation::open_existing(dir.path(), identity(), options()),
-        Err(OpenError::Corrupt(_))
-    ));
+    let garbage = Generation::open_existing(dir.path(), identity(), options());
+    assert!(
+        matches!(&garbage, Err(e @ OpenError::DatabaseUnreadable(_)) if e.is_unreadable_database()),
+        "{:?}",
+        garbage.err()
+    );
     // Missing database file.
     std::fs::remove_file(&db).unwrap();
     assert!(matches!(
@@ -355,6 +358,19 @@ fn damaged_files_fail_closed() {
     ));
     std::fs::write(&db, &good_db).unwrap();
     assert!(!db.exists() || Generation::open_existing(dir.path(), identity(), options()).is_ok());
+
+    // A whole database another opener holds: an error that says nothing
+    // about its bytes, never read as unreadable (#212 review).
+    {
+        let _held = redb::Database::open(&db).unwrap();
+        let locked = Generation::open_existing(dir.path(), identity(), options());
+        assert!(
+            matches!(&locked, Err(e @ OpenError::Database(_)) if !e.is_unreadable_database()),
+            "{:?}",
+            locked.err()
+        );
+    }
+    assert!(Generation::open_existing(dir.path(), identity(), options()).is_ok());
 
     // CURRENT pointing at a missing generation.
     std::fs::write(dir.path().join("CURRENT"), b"gen-000009").unwrap();

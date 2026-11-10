@@ -1335,6 +1335,24 @@ The steps:
      - a stale stamp behind the baseline;
      - a stamp naming a record the journal doesn't hold;
      - a file redb can't open. Today this one is refused at `open` rather than discarded and reinstalled, so the step makes it discard and reinstall.
+
+   **Built here (#212).**
+   - **The workload.** One `JournaledStore` over the two kits drives four steps with the synchronous `flush()`. One crash freezes both kits at the same instant.
+   - **What it asserts.** Every step whose journal sync completed before the crash is asserted, read from the kit's log of completed syncs; whether `flush()` returned doesn't matter. Under `strict`, 144 of 204 crashes land after a step's sync and before its `flush()` returns. Under `replay`, 81 of 183 do. A journal whose sync reports success and keeps nothing is caught at 4 of its 5 syncs. The fifth is the close's, and it acknowledges nothing.
+   - **A database redb can't read** is told apart by redb's own error, before it becomes text: `OpenError::DatabaseUnreadable` for bytes proven wrong, `OpenError::Database` for everything else. A lock, an I/O error or a format upgrade is `Database`, and both profiles refuse it. Only `DatabaseUnreadable` is discarded and reinstalled, and only under `replay`.
+   - **A reinstall is staged, checked, then selected.** The baseline is installed into a new generation, and the genesis pin and the rollback guard run on it. Only then is it activated. The generation it replaced is kept for evidence until the next reinstall prunes it.
+   - **The rollback guard runs again after the replay of `(C, J]`.** A feature activation is a journaled transition, and an activation after the baseline isn't in the baseline's image. Before this, a node replayed an activation it couldn't do and served under both profiles.
+
+   **Not covered yet; this step's remaining work:**
+   - **Both devices dirty at once.** With the synchronous `flush()`, the projection has nothing unsynced at any journal crash point, and the journal's log is synced at every projection crash point. A workload that drives the store as `coordd` does, with several steps in flight before a sync completes, is still to be built. Until it is, the matrix is close to each device's own matrix with the other device clean.
+   - Under `replay`, the working commits do no I/O until a durable commit.
+   - The scale is still #210's: one small log, no rotation, no checkpoint. Recovery isn't run on a fault seam, and the directory and `CURRENT` steps use the real filesystem.
+
+   **A decision this step found (owner's call).** Under `replay`, a stamp at or below the journal's head that names a record the journal doesn't hold is discarded and reinstalled. `strict` refuses it.
+   - No declared crash produces it. The projection applies only records whose journal sync has completed (`append_pending` before `materialize`), and #211's guard keeps every synced record through recovery.
+   - So it is the signature of a journal that lost synced records and grew again, or of a file swapped in from elsewhere. Reinstalling hides that.
+   - **Proposed:** `replay` refuses it, as `strict` does. It keeps the reinstall for an empty projection, a stamp behind the baseline, and a file redb can't read.
+   - The check is task-j06's and predates this step, so the change is its own PR after this one. Until then, the test here pins today's behaviour.
 4. **Checkpoint and pointer publication** on a fault seam: the image's files, rename and directory sync, the pointer's append, the journal's purge, and the source switch. Each crashed at every point, under both profiles. `coord-checkpoint` uses `std::fs` directly today, so the seam is added first.
 5. **A sync failure stops the service.** On the real journal under `coordd`:
    - the appender's panic, or a fail-stopped journal, ends the domain thread and the process with the reason, and serves nothing after it;

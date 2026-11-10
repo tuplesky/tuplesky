@@ -33,7 +33,7 @@ use coord_store_api::registry::{Collection, meta_fields};
 use coord_types::ids::{ClusterId, DomainId, ReplicaId, ReplicaIncarnation};
 use redb::{ReadableDatabase, ReadableTableMetadata, TableDefinition};
 
-use crate::engine::{RedbEngine, check_integrity, table_definition};
+use crate::engine::{RedbEngine, table_definition};
 use crate::manifest::{ENGINE_NAME, ManifestError, PROFILE_NAME, StoreManifestV1};
 
 /// Identity a generation must carry.
@@ -88,8 +88,19 @@ pub enum OpenError {
     MissingDatabase,
     /// Database file empty (never a fresh database on open).
     EmptyDatabase,
-    /// redb refused the database or a required table is absent.
+    /// The store root's own records (`CURRENT`, a generation directory,
+    /// the manifest's registry) are malformed or disagree with the request.
     Corrupt(String),
+    /// The database file's bytes are wrong: redb reports it corrupted, it
+    /// is not a redb database, a registered table is missing, or the
+    /// integrity check fails (task-j05). Only this, an absent file and an
+    /// empty one say the file itself cannot be used.
+    DatabaseUnreadable(String),
+    /// redb could not open or read the database for a reason that says
+    /// nothing about its bytes: another opener holds it, it needs an
+    /// upgrade, a repair was aborted, an I/O error. Refused under every
+    /// profile; the file may be whole.
+    Database(String),
     /// In-database identity record disagrees with the manifest.
     IdentityRecordMismatch(&'static str),
     /// The selected generation holds protocol obligations (promises,
@@ -119,7 +130,9 @@ impl std::fmt::Display for OpenError {
             }
             OpenError::MissingDatabase => f.write_str("database file missing"),
             OpenError::EmptyDatabase => f.write_str("database file empty"),
-            OpenError::Corrupt(e) => write!(f, "database corrupt or unusable: {e}"),
+            OpenError::Corrupt(e) => write!(f, "store root inconsistent: {e}"),
+            OpenError::DatabaseUnreadable(e) => write!(f, "database unreadable: {e}"),
+            OpenError::Database(e) => write!(f, "database could not be opened: {e}"),
             OpenError::IdentityRecordMismatch(field) => {
                 write!(f, "in-database {field} differs from manifest")
             }
@@ -141,20 +154,70 @@ impl std::error::Error for OpenError {}
 
 impl OpenError {
     /// Whether this is how a selected generation's database fails when
-    /// the file itself cannot be used: absent, empty, refused by redb, a
-    /// table missing or damaged pages (task-j05). An identity record that
-    /// disagrees with the manifest is not one: that is a database that
-    /// belongs to someone else, and stays refused.
+    /// the file itself cannot be used: absent, empty, or bytes redb proves
+    /// wrong (task-j05). Not an identity record that disagrees with the
+    /// manifest (a database that belongs to someone else), not the root's
+    /// own records, and not an error that says nothing about the bytes
+    /// ([`OpenError::Database`]: a lock, a format upgrade, I/O): those stay
+    /// refused.
     ///
-    /// The variants are shared with the root's own checks (`CURRENT`, the
-    /// manifest), so this is a hint for which recovery to try; the
-    /// staging that acts on it, [`Generation::stage_reinstall_unreadable`],
+    /// The staging that acts on it, [`Generation::stage_reinstall_unreadable`],
     /// verifies the root and the manifest again first.
     pub const fn is_unreadable_database(&self) -> bool {
         matches!(
             self,
-            OpenError::MissingDatabase | OpenError::EmptyDatabase | OpenError::Corrupt(_)
+            OpenError::MissingDatabase
+                | OpenError::EmptyDatabase
+                | OpenError::DatabaseUnreadable(_)
         )
+    }
+
+    /// Classify an error from opening a database file.
+    fn from_database(e: redb::DatabaseError) -> Self {
+        match e {
+            redb::DatabaseError::Storage(e) => Self::from_storage(e),
+            other => OpenError::Database(other.to_string()),
+        }
+    }
+
+    /// Classify an error from reading a database: only redb's own
+    /// corruption, or a file that is not a redb database (which redb
+    /// reports as I/O of kind `InvalidData`), proves the bytes wrong.
+    fn from_storage(e: redb::StorageError) -> Self {
+        match e {
+            redb::StorageError::Corrupted(m) => OpenError::DatabaseUnreadable(m),
+            redb::StorageError::Io(io) if io.kind() == std::io::ErrorKind::InvalidData => {
+                OpenError::DatabaseUnreadable(io.to_string())
+            }
+            other => OpenError::Database(other.to_string()),
+        }
+    }
+
+    fn from_transaction(e: redb::TransactionError) -> Self {
+        match e {
+            redb::TransactionError::Storage(e) => Self::from_storage(e),
+            other => OpenError::Database(other.to_string()),
+        }
+    }
+
+    /// A registered table that is absent, or present under another type,
+    /// is the file's fault.
+    fn from_table(table: &str, e: redb::TableError) -> Self {
+        match e {
+            redb::TableError::Storage(e) => match Self::from_storage(e) {
+                OpenError::DatabaseUnreadable(m) => {
+                    OpenError::DatabaseUnreadable(format!("table {table}: {m}"))
+                }
+                other => other,
+            },
+            e @ (redb::TableError::TableDoesNotExist(_)
+            | redb::TableError::TableTypeMismatch { .. }
+            | redb::TableError::TableIsMultimap(_)
+            | redb::TableError::TypeDefinitionChanged { .. }) => {
+                OpenError::DatabaseUnreadable(format!("table {table}: {e}"))
+            }
+            other => OpenError::Database(format!("table {table}: {other}")),
+        }
     }
 }
 
@@ -568,6 +631,13 @@ impl Generation {
     /// the selected directory it was opened with and never touches `CURRENT`.
     /// Returns the generation numbers removed.
     pub fn prune_unselected(&self) -> std::io::Result<Vec<u64>> {
+        self.prune_unselected_except(None)
+    }
+
+    /// [`Generation::prune_unselected`], keeping generation `keep` as well:
+    /// the one a reinstall just replaced, kept as evidence of what was
+    /// discarded, while every earlier one goes (#212 review).
+    pub fn prune_unselected_except(&self, keep: Option<u64>) -> std::io::Result<Vec<u64>> {
         let (Some(root), Some(selected)) = (self.directory.parent(), self.directory.file_name())
         else {
             return Ok(Vec::new());
@@ -575,7 +645,7 @@ impl Generation {
         let mut removed = Vec::new();
         for number in generation_numbers(root)? {
             let name = format!("gen-{number:06}");
-            if name.as_str() == selected {
+            if name.as_str() == selected || Some(number) == keep {
                 continue;
             }
             std::fs::remove_dir_all(root.join(&name))?;
@@ -624,22 +694,22 @@ fn initialize_database(
     let db = redb::Database::builder()
         .set_cache_size(options.cache_bytes)
         .create(&db_path)
-        .map_err(|e| OpenError::Corrupt(e.to_string()))?;
+        .map_err(|e| OpenError::Database(e.to_string()))?;
     {
         let mut txn = db
             .begin_write()
-            .map_err(|e| OpenError::Corrupt(e.to_string()))?;
+            .map_err(|e| OpenError::Database(e.to_string()))?;
         txn.set_durability(redb::Durability::Immediate)
-            .map_err(|e| OpenError::Corrupt(e.to_string()))?;
+            .map_err(|e| OpenError::Database(e.to_string()))?;
         txn.set_two_phase_commit(true);
         for c in Collection::ALL {
             txn.open_table(table_definition(c))
-                .map_err(|e| OpenError::Corrupt(e.to_string()))?;
+                .map_err(|e| OpenError::Database(e.to_string()))?;
         }
         {
             let mut meta = txn
                 .open_table(table_definition(Collection::MetaV1))
-                .map_err(|e| OpenError::Corrupt(e.to_string()))?;
+                .map_err(|e| OpenError::Database(e.to_string()))?;
             let rows: [(&[u8], Vec<u8>); 6] = [
                 (meta_fields::CLUSTER_ID, identity.cluster_id.0.to_vec()),
                 (meta_fields::DOMAIN_ID, identity.domain_id.0.to_vec()),
@@ -653,11 +723,11 @@ fn initialize_database(
             ];
             for (k, v) in rows {
                 meta.insert(k, v.as_slice())
-                    .map_err(|e| OpenError::Corrupt(e.to_string()))?;
+                    .map_err(|e| OpenError::Database(e.to_string()))?;
             }
         }
         txn.commit()
-            .map_err(|e| OpenError::Corrupt(e.to_string()))?;
+            .map_err(|e| OpenError::Database(e.to_string()))?;
     }
     Ok((db, db_path))
 }
@@ -686,25 +756,21 @@ fn open_verified_database(
     let mut db = redb::Database::builder()
         .set_cache_size(options.cache_bytes)
         .open(db_path)
-        .map_err(|e| OpenError::Corrupt(e.to_string()))?;
+        .map_err(OpenError::from_database)?;
     // Every registered table must exist, and the identity record must
     // agree with the manifest.
     {
-        let txn = db
-            .begin_read()
-            .map_err(|e| OpenError::Corrupt(e.to_string()))?;
+        let txn = db.begin_read().map_err(OpenError::from_transaction)?;
         for c in Collection::ALL {
             txn.open_table(table_definition(c))
-                .map_err(|e| OpenError::Corrupt(format!("table {}: {e}", c.name())))?;
+                .map_err(|e| OpenError::from_table(c.name(), e))?;
         }
         let meta_table = txn
             .open_table(table_definition(Collection::MetaV1))
-            .map_err(|e| OpenError::Corrupt(e.to_string()))?;
+            .map_err(|e| OpenError::from_table(Collection::MetaV1.name(), e))?;
         let check =
             |field: &'static str, key: &[u8], expected_bytes: &[u8]| -> Result<(), OpenError> {
-                let value = meta_table
-                    .get(key)
-                    .map_err(|e| OpenError::Corrupt(e.to_string()))?;
+                let value = meta_table.get(key).map_err(OpenError::from_storage)?;
                 match value {
                     Some(v) if v.value() == expected_bytes => Ok(()),
                     _ => Err(OpenError::IdentityRecordMismatch(field)),
@@ -734,7 +800,7 @@ fn open_verified_database(
         {
             let value = meta_table
                 .get(meta_fields::INCARNATION)
-                .map_err(|e| OpenError::Corrupt(e.to_string()))?;
+                .map_err(OpenError::from_storage)?;
             let recorded = value
                 .as_ref()
                 .map(|v| ReplicaIncarnation::from_be_slice(v.value()))
@@ -749,7 +815,22 @@ fn open_verified_database(
     }
     // Damage outside the meta pages does not stop `open`; verify every
     // table before the database is used, and fail closed on damage.
-    check_integrity(&mut db).map_err(|e| OpenError::Corrupt(format!("integrity: {e}")))?;
+    match db.check_integrity() {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(OpenError::DatabaseUnreadable(
+                "integrity check repaired or found inconsistencies".into(),
+            ));
+        }
+        Err(e) => {
+            return Err(match OpenError::from_database(e) {
+                OpenError::DatabaseUnreadable(m) => {
+                    OpenError::DatabaseUnreadable(format!("integrity: {m}"))
+                }
+                other => other,
+            });
+        }
+    }
     Ok(db)
 }
 
@@ -1127,15 +1208,11 @@ fn read_selected_for(
     if obligations == Obligations::Carried {
         return Ok(Some(manifest));
     }
-    let txn = db
-        .begin_read()
-        .map_err(|e| OpenError::Corrupt(e.to_string()))?;
+    let txn = db.begin_read().map_err(OpenError::from_transaction)?;
     let protocol = txn
         .open_table(table_definition(Collection::ProtocolV1))
-        .map_err(|e| OpenError::Corrupt(e.to_string()))?;
-    let obligations = protocol
-        .len()
-        .map_err(|e| OpenError::Corrupt(e.to_string()))?;
+        .map_err(|e| OpenError::from_table(Collection::ProtocolV1.name(), e))?;
+    let obligations = protocol.len().map_err(OpenError::from_storage)?;
     if obligations > 0 {
         return Err(OpenError::ExistingObligations);
     }

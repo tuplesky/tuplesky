@@ -1991,17 +1991,27 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
     /// pointers are still keyed by the incarnation the root is stamped
     /// with, not by this coordinator's (task-j05 step 3: a projection
     /// reinstalled before the adoption that follows it).
+    ///
+    /// An adoption stopped between its two writes has re-keyed the stream
+    /// to this coordinator's incarnation and left the root stamped with
+    /// `incarnation`, so the stream is looked up under either key. Its
+    /// pointers were published under `incarnation` either way, and are
+    /// selected against that origin (#212 review).
     pub fn recovery_baseline_of(
         &self,
         domain: DomainId,
         incarnation: ReplicaIncarnation,
     ) -> Result<Option<CheckpointPointerV1>, JournaledError> {
-        let key = StreamKey {
+        let key = |incarnation| StreamKey {
             cluster: self.cluster,
             domain,
             incarnation,
         };
-        let Some(stream) = self.allocator.lookup(&key) else {
+        let Some(stream) = self
+            .allocator
+            .lookup(&key(incarnation))
+            .or_else(|| self.allocator.lookup(&key(self.incarnation)))
+        else {
             return Ok(None);
         };
         let origin = RecordOrigin {

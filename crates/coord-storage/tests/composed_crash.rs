@@ -11,15 +11,35 @@
 //! - **the journal's state:** the recovered projection's rows are exactly
 //!   those of the same crashed journal replayed into an empty projection;
 //! - **every acknowledged step, by an independent check:** a step whose
-//!   flush returned before the crash has its protocol row and its
-//!   application rows (the key, the event, the executed row) in the
-//!   recovered projection, and no step past the last one submitted has
-//!   any.
+//!   journal group the device synced before the crash (read from the
+//!   journal kit's own log, not from what `flush` returned) has its
+//!   protocol row and its application rows (the key, the event, the
+//!   executed row) in the recovered projection, and no step past the last
+//!   one submitted has any. That is the release rule's acknowledgement
+//!   (`JournalDurable`), whether or not the flush got to return.
 //!
 //! The crash points are the workload's, after the journal is created and
 //! the domain attached: a crash while the journal is created is step 1's
 //! matrix (`coord-journal-faultkit`), and one while the projection is
 //! created is the initialization path's.
+//!
+//! **What it covers, and what it does not** (#212 review):
+//! - The workload calls the synchronous `flush`: each step's journal group
+//!   is written and synced, then materialized, before the next step. So at
+//!   every journal crash point the projection has nothing unsynced, and at
+//!   every projection crash point the journal's log is synced. Each crash
+//!   leaves one device dirty and the other clean; no crash has an unsynced
+//!   journal tail and an uncommitted projection at once. `coordd` runs the
+//!   appender and the materializer as a pipeline, and a workload driven
+//!   that way, with steps in flight before a sync completes, is what would
+//!   reach that state. It is task-j05's remaining work.
+//! - Under `replay` the projection's working commits do no I/O; it writes
+//!   at its durable commits, which here fall in one step and at the close.
+//! - One small log (no rotation, no checkpoint), and four steps. The
+//!   journal's tears are sector tears (`SeededSectors`), the physical
+//!   model #211's tail guard assumes; the projection's are the redb kit's.
+//!   The directory and `CURRENT` steps run on the real file system, and
+//!   recovery itself is not run on a fault seam.
 
 use std::num::NonZeroU32;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -142,6 +162,9 @@ fn copy_tree(from: &Path, to: &Path) {
 enum Device {
     Journal,
     Projection,
+    /// The journal, which also lies about the operation the crash follows
+    /// if it is a sync: it reports success and persists nothing.
+    LyingJournal,
 }
 
 /// What one boot of the workload saw.
@@ -154,6 +177,36 @@ struct Boot {
     acked: u64,
     /// Steps submitted, acknowledged or not.
     attempted: u64,
+    /// Where each step began in the journal kit's operation log.
+    step_starts: Vec<usize>,
+    /// Steps whose journal group the device synced before the crash, by
+    /// the kit's log: the acknowledgement the independent check asserts.
+    durable: u64,
+}
+
+/// The leading steps whose journal writes a completed sync of the log
+/// follows in the kit's operation log. A sync persists the whole file,
+/// so one after a step's last write makes all of its writes durable;
+/// once the device halts it logs no sync.
+fn durable_steps(starts: &[usize], log: &[jkit::Op]) -> u64 {
+    let raftlog = |file: &str| file.ends_with(".raftlog");
+    let mut durable = 0;
+    for (i, &start) in starts.iter().enumerate() {
+        let end = starts.get(i + 1).copied().unwrap_or(log.len());
+        let last_write = (start..end)
+            .rev()
+            .find(|&at| matches!(&log[at], jkit::Op::Write { file, .. } if raftlog(file)));
+        let synced = last_write.is_some_and(|at| {
+            log[at + 1..]
+                .iter()
+                .any(|op| matches!(op, jkit::Op::Sync { file } if raftlog(file)))
+        });
+        if !synced {
+            break;
+        }
+        durable += 1;
+    }
+    durable
 }
 
 /// Journal and materialize [`STEPS`] steps, one flush each, until the
@@ -200,6 +253,11 @@ fn workload(
                 crash_after: Some(boot.setup.0 + k),
                 ..jkit::FaultPlan::default()
             }),
+            Some((Device::LyingJournal, k)) => journal_kit.set_plan(jkit::FaultPlan {
+                crash_after: Some(boot.setup.0 + k),
+                lie_on_sync_at: Some(boot.setup.0 + k),
+                ..jkit::FaultPlan::default()
+            }),
             Some((Device::Projection, k)) => projection_kit.set_plan(rkit::FaultPlan {
                 crash_after: Some(boot.setup.1 + k),
                 ..rkit::FaultPlan::default()
@@ -209,6 +267,7 @@ fn workload(
         let mut barriers = BarrierAllocator::new(inc(), FIRST_BOOT);
         for step in 1..=STEPS {
             boot.attempted = step;
+            boot.step_starts.push(journal_kit.log().len());
             if !submit_step(&mut store, &mut barriers, step) {
                 break;
             }
@@ -232,6 +291,7 @@ fn workload(
             "the boot panicked without a crash"
         );
     }
+    boot.durable = durable_steps(&boot.step_starts, &journal_kit.log());
     (boot, journal_kit, projection_kit)
 }
 
@@ -326,14 +386,15 @@ fn recover(journal_dir: &Path, image: Vec<u8>, replay: Option<DurableCadence>) -
     rows(&next, A)
 }
 
-/// The independent check: every acknowledged step's rows are there, and
-/// no step past the last one submitted left any.
+/// The independent check: every acknowledged step's rows are there --
+/// every step the journal device synced, and every one whose flush
+/// returned -- and no step past the last one submitted left any.
 fn check_steps(rows: &Rows, boot: &Boot, case: &str) {
     let has = |collection: Collection, key: &[u8]| {
         rows.iter()
             .any(|(c, k, _)| *c == collection.id().0 && k == key)
     };
-    for step in 1..=boot.acked {
+    for step in 1..=boot.acked.max(boot.durable) {
         for (collection, key) in [
             (Collection::ProtocolV1, protocol_key(step)),
             (Collection::KvCurrentV1, kv_key(step)),
@@ -368,13 +429,13 @@ fn composed_matrix(replay: Option<DurableCadence>) {
         assert!(n >= STEPS, "{device:?} spans {n} operations");
     }
 
-    let (mut cases, mut lost_unacked, mut with_executed) = (0, 0, 0);
+    let (mut cases, mut lost_unacked, mut with_executed, mut durable_unreturned) = (0, 0, 0, 0);
     for (device, n) in ops {
         for k in 1..=n {
             for tail in [
                 (jkit::Tail::None, rkit::Tail::None),
                 (jkit::Tail::All, rkit::Tail::All),
-                (jkit::Tail::Seeded(k), rkit::Tail::Seeded(k)),
+                (jkit::Tail::SeededSectors(k), rkit::Tail::Seeded(k)),
             ] {
                 let case = format!("{device:?} crash at {k} of {n}, {:?}", tail.0);
                 let dir = tempfile::tempdir().unwrap();
@@ -396,9 +457,16 @@ fn composed_matrix(replay: Option<DurableCadence>) {
                     recovered, replayed,
                     "{case}: the recovered projection is the journal's state"
                 );
+                assert!(
+                    boot.acked <= boot.durable,
+                    "{case}: a flush returned for a step the device never synced"
+                );
                 check_steps(&recovered, &boot, &case);
 
                 cases += 1;
+                if boot.durable > boot.acked {
+                    durable_unreturned += 1;
+                }
                 let kept = recovered
                     .iter()
                     .filter(|(c, ..)| *c == Collection::KvCurrentV1.id().0)
@@ -417,13 +485,18 @@ fn composed_matrix(replay: Option<DurableCadence>) {
     }
     eprintln!(
         "composed matrix ({}): {cases} crashes over {ops:?}; {lost_unacked} lost a step \
-         submitted and not acknowledged, {with_executed} recovered executed rows",
+         submitted and not acknowledged, {with_executed} recovered executed rows, \
+         {durable_unreturned} with a step synced whose flush never returned",
         if replay.is_some() { "replay" } else { "strict" },
     );
     // The matrix reaches both outcomes: crashes that lose a submitted step
     // the journal never made durable, and crashes that keep executed rows.
     assert!(lost_unacked > 0, "no crash lost an unacknowledged step");
     assert!(with_executed > 0, "no crash left executed rows to recover");
+    assert!(
+        durable_unreturned > 0,
+        "no crash synced a step before its flush returned"
+    );
 }
 
 /// The strict profile: every projection commit is durable.
@@ -474,4 +547,50 @@ fn an_acknowledgement_believed_after_the_crash_is_caught() {
     }
     eprintln!("negative control: caught {caught} of {n} journal crashes");
     assert!(caught > 0, "no believed acknowledgement was caught");
+}
+
+/// The acknowledgement the check asserts is the device's, not the
+/// flush's: a journal that lies about a sync and halts right after, so no
+/// flush returns for that step, loses a step its own log says was synced,
+/// and the check says so. An acknowledgement taken from `flush` would see
+/// nothing to assert (#212 review, point 5).
+#[test]
+fn a_sync_the_journal_lied_about_is_caught_though_no_flush_returned() {
+    let probe = tempfile::tempdir().unwrap();
+    let (boot, journal_kit, _) = workload(&probe.path().join("journal"), None, None, false);
+    let syncs: Vec<u64> = journal_kit.log()[..]
+        .iter()
+        .filter(|op| !matches!(op, jkit::Op::Rejected | jkit::Op::Failed))
+        .enumerate()
+        .filter(|(_, op)| matches!(op, jkit::Op::Sync { file } if file.ends_with(".raftlog")))
+        .map(|(i, _)| i as u64 + 1)
+        .filter(|&n| n > boot.setup.0)
+        .map(|n| n - boot.setup.0)
+        .collect();
+    assert!(!syncs.is_empty());
+    let (mut caught, mut unreturned) = (0, 0);
+    for &k in &syncs {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_dir = dir.path().join("journal");
+        let (boot, journal_kit, projection_kit) =
+            workload(&journal_dir, None, Some((Device::LyingJournal, k)), false);
+        if boot.durable > boot.acked {
+            unreturned += 1;
+        }
+        journal_kit.materialize(jkit::Tail::None).unwrap();
+        let recovered = recover(
+            &journal_dir,
+            projection_kit.crash_image(rkit::Tail::None),
+            None,
+        );
+        if catch_unwind(AssertUnwindSafe(|| check_steps(&recovered, &boot, "lie"))).is_err() {
+            caught += 1;
+        }
+    }
+    eprintln!(
+        "lying syncs: caught {caught} of {}, {unreturned} with no flush returned",
+        syncs.len()
+    );
+    assert!(unreturned > 0, "every lie was followed by a returned flush");
+    assert!(caught > 0, "no lie was caught");
 }

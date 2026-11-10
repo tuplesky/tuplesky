@@ -1172,6 +1172,7 @@ dependencies = [
  "postcard",
  "quinn",
  "rcgen",
+ "redb",
  "reqwest",
  "rustix",
  "rustls",
