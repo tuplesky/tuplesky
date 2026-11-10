@@ -198,12 +198,13 @@ impl Learner {
         table: &CommandTable,
         seqnum_of: impl Fn(&CommandId) -> Option<u64>,
     ) -> Option<CommandId> {
-        // The records at COMMIT only: the table keeps executed ones
-        // until it retires them (task-d46).
+        // The ready records only (task-d107): a record blocked on a
+        // dependency is not looked at until that dependency executes. The
+        // choice among them stays here, since the sequence numbers are
+        // the caller's.
         table
-            .in_commit()
-            .filter(|(_, r)| guard_execute(&r.deps, |d| table.phase_of(d)).is_ok())
-            .map(|(c, _)| (seqnum_of(c).unwrap_or(u64::MAX), *c))
+            .ready()
+            .map(|c| (seqnum_of(c).unwrap_or(u64::MAX), *c))
             .min()
             .map(|(_, c)| c)
     }

@@ -3908,4 +3908,17 @@ mod tests {
         assert!(persisted(&after).is_empty(), "{after:?}");
         assert!(leader.votes[&c].adopted_by(&r(0)));
     }
+
+    /// The leader chooses its next command among the ready records only
+    /// (task-d107): with 2,000 commits blocked behind a command it lacks
+    /// and one ready, a call examines one record.
+    #[test]
+    fn the_next_command_is_chosen_among_the_ready_records_only() {
+        let mut leader = booted();
+        let (rows, ready) = crate::commands::tests::blocked_behind_a_root(2_000);
+        leader.table = CommandTable::restore(None, rows);
+        leader.table.take_examined();
+        assert_eq!(leader.next_executable(), Some(ready));
+        assert_eq!(leader.table.take_examined(), 1);
+    }
 }
