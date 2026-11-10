@@ -220,6 +220,21 @@ struct Knobs {
     /// from the leader's frontier alone, as every follower does with
     /// acknowledgements to the leader only (task-d74).
     peer_ack_loss: u32,
+    /// Chance a command is submitted as answered on the leader's release
+    /// alone (task-d100, step A): every voter is told so before it steps
+    /// a presentation of it, sends its frontend no evidence for it, and
+    /// the collector answers it on a final release from its ballot's
+    /// leader naming the admission it was submitted under, or on the
+    /// release a leader publishes again for a duplicate, rebuilt from its
+    /// record, or from its own node's record as any entry.
+    ///
+    /// The model applies the collector's rule, not the `Collector`: its
+    /// released arm checks neither the release's sender nor its ballot,
+    /// so it counts as answered some releases the collector would hold.
+    /// Safety is still covered, because the oracle compares every
+    /// release, but oracle 6's count of marked commands answered is an
+    /// upper bound (#204 review).
+    answer_on_release: u32,
     /// An execution's group reaches the journal after its outcome is
     /// taken, in journal order with the protocol batches, as `coordd`'s
     /// does, and the machines count an execution durable only once its
@@ -322,6 +337,7 @@ impl Knobs {
         crash_candidate: false,
         heal_page_loss: false,
         peer_ack_loss: 0,
+        answer_on_release: 0,
         late_execution: false,
         execution_lag: 0,
         total_crash: 0,
@@ -725,6 +741,10 @@ struct Sim {
     offers: BTreeMap<CommandId, Offer>,
     /// Commands the frontend learned from evidence.
     learned: BTreeSet<CommandId>,
+    /// Commands submitted as answered on the release alone (task-d100,
+    /// step A), and those the collector answered on a release.
+    marked: BTreeSet<CommandId>,
+    answered: BTreeSet<CommandId>,
     /// Commands a voter refused for another bound under their retry key.
     refused_for: BTreeMap<CommandId, CommandId>,
     /// Commands a voter told the frontend it keeps no payload of any
@@ -795,6 +815,10 @@ struct Sim {
 struct Stats {
     executed: usize,
     learned: usize,
+    /// Commands answered on a release alone (task-d100, step A), and the
+    /// releases a leader published again for a duplicate.
+    answered_on_release: usize,
+    released_again: usize,
     campaigns: u32,
     crashes: u32,
     /// Crashes of a node that was leading its ballot.
@@ -952,6 +976,8 @@ impl Sim {
             trace: std::env::var_os("PROTOCOL_SIM_TRACE").map(|_| VecDeque::new()),
             offers: BTreeMap::new(),
             learned: BTreeSet::new(),
+            marked: BTreeSet::new(),
+            answered: BTreeSet::new(),
             refused_for: BTreeMap::new(),
             forgotten: BTreeSet::new(),
             reoffered: BTreeSet::new(),
@@ -1182,6 +1208,24 @@ impl Sim {
                         self.held.push(msg);
                     } else {
                         self.net.push(msg);
+                    }
+                }
+                // A marked command's collector answers on a final release
+                // naming the admission it submitted under (task-d100,
+                // step A). The release may be lost on the way, as evidence
+                // may.
+                Effect::Released(released) => {
+                    let c = released.established().command();
+                    if !self.marked.contains(&c) || released.speculative() {
+                        continue;
+                    }
+                    if !self.healing && self.chance("frontend-loss", self.knobs.frontend_loss) {
+                        continue;
+                    }
+                    if released.admission() == self.submitted.get(&c).copied()
+                        && self.answered.insert(c)
+                    {
+                        self.stats.answered_on_release += 1;
                     }
                 }
                 _ => {}
@@ -1572,6 +1616,11 @@ impl Sim {
             .unwrap();
         let command = CommandId::derive(&rk, &request).unwrap();
         let host = at.first().copied().unwrap_or(0);
+        if !self.offers.contains_key(&command)
+            && self.chance("answer-on-release", self.knobs.answer_on_release)
+        {
+            self.marked.insert(command);
+        }
         self.offers.entry(command).or_insert(Offer {
             seq,
             key,
@@ -1600,6 +1649,15 @@ impl Sim {
                 coord_core::capability::admission_digest(Some(&receipt.facts()), 0),
             );
             let known = self.holds(i, &command);
+            // The voter's door marks the command before the machine steps
+            // the presentation (task-d100, step A).
+            if self.marked.contains(&command) {
+                match self.nodes[usize::from(i)].role.as_mut() {
+                    Some(Role::Leader(l)) => l.mark_answer_on_release(command),
+                    Some(Role::Follower(f)) => f.mark_answer_on_release(command),
+                    None => {}
+                }
+            }
             self.step_node(
                 i,
                 Event::Admitted(AdmittedRequest {
@@ -1607,6 +1665,22 @@ impl Sim {
                     frame: frame.clone(),
                 }),
             );
+            // A duplicate of a marked command its leader executed: the
+            // daemon publishes the release again from its retry record,
+            // which answers the collector when the record is there and
+            // names the admission it submitted under.
+            let again = match self.nodes[usize::from(i)].role.as_mut() {
+                Some(Role::Leader(l)) => l.take_release_again(),
+                _ => Vec::new(),
+            };
+            for (c, _, admission) in again {
+                self.stats.released_again += 1;
+                let recorded = self.nodes[usize::from(i)].executed.contains(&c);
+                if recorded && self.submitted.get(&c) == Some(&admission) && self.answered.insert(c)
+                {
+                    self.stats.answered_on_release += 1;
+                }
+            }
             // Oracle 5: new work is admitted only into the table's
             // unreserved part (task-d24). Work that finishes a decision
             // -- a command a Sync or a campaign selected, or whose turn
@@ -2988,7 +3062,7 @@ impl Sim {
     /// (`settle_conflict_from_record`). What the simulator knows some
     /// other node executed is not an answer.
     fn settled(&self, command: &CommandId) -> bool {
-        if self.learned.contains(command) {
+        if self.learned.contains(command) || self.answered.contains(command) {
             return true;
         }
         let from_record = self.reoffered.contains(command)
@@ -3563,6 +3637,14 @@ fn row_knobs(row: u8) -> Knobs {
     {
         knobs.peer_ack_loss = loss;
     }
+    // `PROTOCOL_SIM_ANSWER_ON_RELEASE` (parts per million): the share of
+    // commands answered on the leader's release alone (task-d100, step A).
+    if let Some(share) = std::env::var("PROTOCOL_SIM_ANSWER_ON_RELEASE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        knobs.answer_on_release = share;
+    }
     // `PROTOCOL_SIM_FAIL_QUEUE=0` fails one batch at a time where the row
     // fails the queue behind it, `=1` the queue where it doesn't.
     match std::env::var("PROTOCOL_SIM_FAIL_QUEUE").as_deref() {
@@ -3652,6 +3734,8 @@ fn run_row(row: u8) {
                     totals.window_crashes += s.window_crashes;
                     totals.window_deposes += s.window_deposes;
                     totals.left_out_executed += s.left_out_executed;
+                    totals.answered_on_release += s.answered_on_release;
+                    totals.released_again += s.released_again;
                 }
                 Err(e) => failures.push(e),
             }
@@ -3731,6 +3815,15 @@ fn run_row(row: u8) {
             "row 22 never crashed a leader in the gate's window: {totals:?}"
         );
     }
+    // A row run with marked commands (`PROTOCOL_SIM_ANSWER_ON_RELEASE`)
+    // answered some on a release alone (task-d100 step A): a sweep with
+    // the knob can't pass without reaching the rule.
+    if row_knobs(row).answer_on_release > 0 {
+        assert!(
+            totals.answered_on_release > 0,
+            "row {row} answered no marked command on its release: {totals:?}"
+        );
+    }
     // Oracle 9 ran.
     assert!(
         totals.votes_checked > 0,
@@ -3745,6 +3838,40 @@ fn run_row(row: u8) {
             "row {row} never reached the early window: {totals:?}"
         );
     }
+}
+
+/// task-d100, step A: rows 1, 9 and 14 with half their commands answered
+/// on the leader's release alone, at three and five voters. Marked and
+/// unmarked commands mix on the same keys; every oracle holds, and after
+/// healing every marked command is answered on a release, on one its
+/// leader published again for a duplicate, or from its host's record, as
+/// any entry is. `PROTOCOL_SIM_ANSWER_ON_RELEASE` runs every row so, at
+/// every loss and both catch-up settings, as the weekly sweep can.
+#[test]
+fn answer_on_release_rows() {
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let mut failures = Vec::new();
+    let (mut answered, mut again) = (0usize, 0usize);
+    for row in [1u8, 9, 14] {
+        let mut knobs = row_knobs(row);
+        knobs.answer_on_release = 500_000;
+        for n in [3u8, 5] {
+            for seed in 0..seeds() {
+                match run_knobs(n, knobs, seed, None) {
+                    Ok(stats) => {
+                        answered += stats.answered_on_release;
+                        again += stats.released_again;
+                    }
+                    Err(e) => failures.push(e),
+                }
+            }
+        }
+    }
+    std::panic::set_hook(hook);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    assert!(answered > 0, "no command was answered on a release alone");
+    assert!(again > 0, "no leader published a release again");
 }
 
 #[test]

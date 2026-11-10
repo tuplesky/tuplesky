@@ -655,6 +655,12 @@ pub struct Follower {
     /// (task-d60, step 3): the voter files where its evidence is owed
     /// under it instead of decoding the request a second time.
     admitted: Option<CommandId>,
+    /// Whether the next admitted request's command is marked as answered
+    /// on the leader's release alone once it is derived (task-d100, step
+    /// A): the submission carried the mark, and the voter set this
+    /// before stepping it, so the command is derived once, here (#204
+    /// review).
+    mark_next_admitted: bool,
     /// The catch-up page in hand, if any (task-d08).
     catch_up: CatchUp,
     /// A pulled command whose execution here disagreed with the donor's
@@ -665,6 +671,11 @@ pub struct Follower {
     /// it to the submitter again (task-c02). Never recovered: the outbox
     /// it went through is this boot's.
     replay: crate::replay::EvidenceStore,
+    /// The commands whose collector answers on the leader's release
+    /// alone (task-d100, step A), marked by the voter before each
+    /// submission of one is stepped: this replica's acknowledgements of
+    /// them go to the leader only, and it keeps nothing to repair.
+    answer_on_release: BTreeSet<CommandId>,
 }
 
 /// The retry-key bindings a restart restores from the payload rows
@@ -795,6 +806,7 @@ impl Follower {
         let adopted_lacking = lacking(adopted.keys(), &payloads);
         Follower {
             replay: crate::replay::EvidenceStore::new(config.capacity),
+            answer_on_release: BTreeSet::new(),
             catch_up: CatchUp::default(),
             diverged: None,
             config,
@@ -858,6 +870,7 @@ impl Follower {
             awaiting_sync: Vec::new(),
             rejections: Vec::new(),
             admitted: None,
+            mark_next_admitted: false,
             synced_selection: resumed.clone(),
             resumed,
             early_sync: None,
@@ -1059,6 +1072,7 @@ impl Follower {
             awaiting_sync: Vec::new(),
             rejections: Vec::new(),
             admitted: None,
+            mark_next_admitted: false,
             resumed: selection.clone(),
             early_sync: None,
             sync_behind_promise: None,
@@ -1066,6 +1080,7 @@ impl Follower {
             leader_committed: None,
             proposal_cursor: 0,
             replay: crate::replay::EvidenceStore::new(state.capacity),
+            answer_on_release: BTreeSet::new(),
             catch_up: CatchUp::default(),
             diverged: None,
         }
@@ -3429,6 +3444,7 @@ impl Follower {
         self.payloads.retain(|c, _| !table.forgotten(c));
         self.served_payloads.retain(|c| !table.forgotten(c));
         self.votes.retain(|c, _| !table.forgotten(c));
+        self.answer_on_release.retain(|c| table.record(c).is_some());
         // The adoption order of a forgotten command decides nothing more,
         // and kept without its payload it would read as a payload still
         // missing.
@@ -3799,6 +3815,37 @@ impl Follower {
             && self.ballots.in_flight().is_none()
     }
 
+    /// Mark `command` as answered by its collector on the leader's
+    /// release alone (task-d100, step A).
+    pub fn mark_answer_on_release(&mut self, command: CommandId) {
+        self.answer_on_release.insert(command);
+    }
+
+    /// Mark the command the next admitted request becomes as answered on
+    /// the release alone, once this replica derives it (task-d100, step
+    /// A). The voter calls this before stepping a marked submission, so
+    /// the mark is in place for the proposal or acknowledgement that
+    /// step leads to, and the command is derived only here (#204
+    /// review). A request refused before its command is held marks
+    /// nothing.
+    pub fn mark_next_admitted(&mut self) {
+        self.mark_next_admitted = true;
+    }
+
+    /// Whether `command`'s collector answers it on the release alone.
+    pub fn answers_on_release(&self, command: &CommandId) -> bool {
+        self.answer_on_release.contains(command)
+    }
+
+    /// Drop `command`'s mark unless this replica's table holds it: the
+    /// submission that marked it was refused before the command was
+    /// initialized (#204 review). A later submission marks it again.
+    pub fn keep_mark_if_held(&mut self, command: &CommandId) {
+        if self.table.record(command).is_none() {
+            self.answer_on_release.remove(command);
+        }
+    }
+
     /// Whether this replica may send fast acknowledgements in this ballot.
     fn in_fast_set(&self) -> bool {
         self.config
@@ -3852,6 +3899,12 @@ impl Follower {
                 },
                 frame: frame.clone(),
             });
+        }
+        // A command answered on the leader's release alone (task-d100,
+        // step A): its collector counts nothing, so nothing goes to the
+        // frontend, and nothing is kept to offer it again.
+        if self.answer_on_release.contains(&command) {
+            return;
         }
         outbox.publish(PendingSend {
             context,
@@ -3958,6 +4011,16 @@ impl Follower {
     }
 
     fn on_admitted(&mut self, frame: &[u8], admission: AdmissionFacts) -> Vec<Effect> {
+        let effects = self.admit(frame, admission);
+        if core::mem::take(&mut self.mark_next_admitted)
+            && let Some(command) = self.admitted
+        {
+            self.keep_mark_if_held(&command);
+        }
+        effects
+    }
+
+    fn admit(&mut self, frame: &[u8], admission: AdmissionFacts) -> Vec<Effect> {
         self.admitted = None;
         if self.boot.is_none() {
             return Vec::new();
@@ -4023,6 +4086,9 @@ impl Follower {
             return Vec::new();
         };
         self.admitted = Some(command);
+        if self.mark_next_admitted {
+            self.answer_on_release.insert(command);
+        }
         let payload = PayloadRecordV1 {
             retry_key,
             logical,

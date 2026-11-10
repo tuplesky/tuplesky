@@ -3,7 +3,7 @@
 **Status:** Review proposal, consolidated v1.5.  
 **Date:** 2026-09-24.  
 **Companion:** [TupleSky implementation design](tuplesky-design.md).  
-**Scope:** 193 implementation tasks with stable `task-*` identifiers. The `task-01` through `task-66`, `task-s01` through `task-s04`, `task-j01` through `task-j10`, `task-o01` through `task-o06`, `task-m01` through `task-m05`, `task-c01`, `task-c02`, `task-c03`, `task-d01` through `task-d92`, `task-d94` through `task-d99` and `task-q01` suffixes and prerequisites are preserved. v1.5 adds `task-d01` through `task-d04` from review of the open implementation PRs and of multi-host readiness, `task-d05` through `task-d17` from the Jepsen client's runs, `task-d18` through `task-d33` from a review against an external SwiftPaxos correctness checklist ([review record](tuplesky-checklist-review.md)), `task-d34` from what the protocol simulator of task-d30 found, `task-d35` through `task-d44` from a review of recovery time and storage integrity (an execution chain, a scrub, and voter replacement through a prepared transition, a staged learner, terminal recovery after the seal, serving across a transition and a running membership install), `task-d45` through `task-d50` from measuring the throughput of the Jepsen client's first unthrottled runs, `task-d51` from task-d46's long runs, `task-d52` and `task-d53` from a profile of the domain thread after task-d46, `task-d54` from the Jepsen runs of task-d50, `task-d55` through `task-d57` from the Jepsen runs of task-j06, `task-d58` through `task-d61` from a profile of five voters' CPU per operation, `task-d62` through `task-d65` from a consolidated review against the reference SwiftPaxos, `task-d66` from the Jepsen runs of task-d51, `task-d67` from a Jepsen run on #98 that made no fast decision, `task-d68` from task-d62's counts after a leader change, `task-d69` from a profile of a follower's loop, `task-d70` from the Jepsen runner's profile of the transport's workers, `task-d71` from the protocol simulator's first 1,000-seed sweep, `task-d72` through `task-d75` from comparing a command's cost with etcd's on one host, `task-d76` from a Jepsen run that killed the leader, `task-d77` through `task-d81` from the protocol simulator with acknowledgements between followers lost, `task-d82` through `task-d84` from the Jepsen runs of the #173 carry, `task-d85` from the protocol simulator on task-d74's routing, `task-d86` through `task-d92` from planning the whole gap to etcd on #174, and moves committed key replacement from `task-58` to `task-m03`; the changes are listed under [Gate checklist and deferred work](#gate-checklist-and-deferred-work). Task IDs are not GitHub pull-request or issue numbers. One implementation PR corresponds to one task; its GitHub-assigned number is recorded separately. No baseline, supplement or separate amendment is needed.
+**Scope:** 194 implementation tasks with stable `task-*` identifiers. The `task-01` through `task-66`, `task-s01` through `task-s04`, `task-j01` through `task-j10`, `task-o01` through `task-o06`, `task-m01` through `task-m05`, `task-c01`, `task-c02`, `task-c03`, `task-d01` through `task-d92`, `task-d94` through `task-d100` and `task-q01` suffixes and prerequisites are preserved. v1.5 adds `task-d01` through `task-d04` from review of the open implementation PRs and of multi-host readiness, `task-d05` through `task-d17` from the Jepsen client's runs, `task-d18` through `task-d33` from a review against an external SwiftPaxos correctness checklist ([review record](tuplesky-checklist-review.md)), `task-d34` from what the protocol simulator of task-d30 found, `task-d35` through `task-d44` from a review of recovery time and storage integrity (an execution chain, a scrub, and voter replacement through a prepared transition, a staged learner, terminal recovery after the seal, serving across a transition and a running membership install), `task-d45` through `task-d50` from measuring the throughput of the Jepsen client's first unthrottled runs, `task-d51` from task-d46's long runs, `task-d52` and `task-d53` from a profile of the domain thread after task-d46, `task-d54` from the Jepsen runs of task-d50, `task-d55` through `task-d57` from the Jepsen runs of task-j06, `task-d58` through `task-d61` from a profile of five voters' CPU per operation, `task-d62` through `task-d65` from a consolidated review against the reference SwiftPaxos, `task-d66` from the Jepsen runs of task-d51, `task-d67` from a Jepsen run on #98 that made no fast decision, `task-d68` from task-d62's counts after a leader change, `task-d69` from a profile of a follower's loop, `task-d70` from the Jepsen runner's profile of the transport's workers, `task-d71` from the protocol simulator's first 1,000-seed sweep, `task-d72` through `task-d75` from comparing a command's cost with etcd's on one host, `task-d76` from a Jepsen run that killed the leader, `task-d77` through `task-d81` from the protocol simulator with acknowledgements between followers lost, `task-d82` through `task-d84` from the Jepsen runs of the #173 carry, `task-d85` from the protocol simulator on task-d74's routing, `task-d86` through `task-d92` from planning the whole gap to etcd on #174, and moves committed key replacement from `task-58` to `task-m03`; the changes are listed under [Gate checklist and deferred work](#gate-checklist-and-deferred-work). Task IDs are not GitHub pull-request or issue numbers. One implementation PR corresponds to one task; its GitHub-assigned number is recorded separately. No baseline, supplement or separate amendment is needed.
 
 ## How to use this plan
 
@@ -59,6 +59,7 @@ Reference single-store and fixed-membership compositions are early increments, n
 | task-d97 | From the `service` row's R4 (#98, #185 review): its means put L4 at a p50-scale gain, 0.76 to 1.36 ms off a write's release, so nothing on record says what a p99 operation waits for | Before task-d90's code step is sized against the p99 |
 | task-d98 | From the next step on the gap (#185 review): a slow-path write pays two syncs in series before it is learned, the leader's and then a follower's, since the leader sends its proposal only once its batch is durable; about 95% of the register row's writes take the slow path, and two runner syncs are about 4.6 ms against etcd's `service` p99 of 3 | Before the next batch, or the batch revises the `service` target with this as the reason |
 | task-d99 | From task-d98's design step (#192 review): task-60's activation rule and rows exist, but nothing in a running `coordd` records a voter's support or activates a feature, so a feature-gated change ships unreachable, and Section 23 rules out an operator flag around a correctness gate | Before the batch that carries task-d98 |
+| task-d100 | From the batch's sweep and its two runner jobs (#98, #185 review): with the disk's tail off the head is core-bound from 30 callers, and a slow-path command still costs the collector's frontend about 11 api frames, about 13 datagrams, and every follower a submission's admission for an order it only adopts | After task-d98 and task-d99, which its relayed proposal and its features rest on; step A first, step B sized on the runner after it (#202 review) |
 | task-q01 | Combined durable WAN/Kine qualification | Required before task-66 |
 
 ```mermaid
@@ -280,6 +281,7 @@ This is a workstream overview; the individual prerequisites are authoritative. O
 | [task-d97](#task-d97) | Read what a `service` p99 operation waits for | task-d55, task-d72, task-d91 |
 | [task-d98](#task-d98) | Send the leader's proposal before its batch is durable | task-d30, task-d74, task-d89, task-d99 |
 | [task-d99](#task-d99) | Activate a replicated feature in a running domain | task-60 |
+| [task-d100](#task-d100) | Answer on the release, then relay a write through the leader while rounds are slow-only | task-d74, task-d90, task-d98, task-d99 |
 | [task-q01](#task-q01) | Produce the combined durable WAN/Kine qualification report | task-j07, task-j08, task-o06, task-m05, task-63, task-64, task-d45, task-d46, task-d47, task-d48, task-d49, task-d51, task-d52, task-d53 |
 
 ## Task specifications
@@ -3832,6 +3834,62 @@ So every feature-gated change, task-d98's `EarlyProposal` first, would ship unre
 - the harnesses' activation runs.
 
 **Review boundary:** How a feature becomes active in a running domain. No feature's behavior changes here.
+
+<a id="task-d100"></a>
+### task-d100: Answer on the release, then relay a write through the leader while rounds are slow-only
+
+**Prerequisites:** task-d74, task-d90, task-d98, task-d99.  
+**Design:** Section 4.3 (amended by this task's design step: answering on the release, and the leader relay), and Section 4.6's rule on a hop to the leader.
+
+**Implement:** Item b of task-d72's levers (#185 review), in two steps built in order (#202 review). The design step is in Section 4.3; this entry is its code step.
+- **Step A: the collector answers on the release alone, for every command.**
+  - **The wire.** A mark on a submission, its version (`Submit` version 2): the command is answered on the release. A voter marks the command as its machine derives it; the proposal carries no mark under step A (#204 review). For a marked command the leader sends no `LeaderReply`, and every voter sends its fast and slow acknowledgements to the leader only. The release envelope carries the admission digest of the payload the leader decided, outside the result's bytes.
+  - **The collector.** It marks commands while its node reads `Feature::AnswerOnRelease` active, and answers a marked command on the leader's non-speculative release alone, with `check_release` unchanged, once the release's admission equals the one it submitted under. A release under other facts is held, as a release without learning is today. The `(None, true) => "votes"` corroboration of `settle_from_record` goes.
+  - **The leader's evidence repair** (`repair_evidence`, task-c02) publishes the release again for an exact duplicate of a marked command it has executed, instead of its reply. The daemon rebuilds the release from the leader's retry record and its table record's admission, since the `EvidenceStore` keeps no release. A duplicate ahead of the projection waits for it through the command's position, and one ahead of the release waits for the release; neither is refused. A follower repairs nothing for a marked command.
+  - **The frontend's hold** (`parked.rs`) holds nothing for a marked command, and goes once no supported build leaves a command unmarked.
+  - **The early solicit** (#204 review): a marked entry holding neither half of a release is submitted again to its ballot's leader alone, once, at one offer ceiling (1 s). The all-voter solicit at 5 s and the count toward the record are unchanged.
+  - **Open, owned here (#204 review): a refused command whose release is lost.** A command executed with an admission refusal records nothing under its retry key, so once its release is lost nothing answers its collector: the leader has nothing to rebuild the release from, and the collector's own node holds no record. It ends at the caller's deadline, where the caller set one. An unmarked command is no better off. Two fixes, both durable state: keep the refusal for the key, so the record answers it; or keep the release with its outcome, so the leader can publish it again. The step that owns it picks one.
+  - **The switch:** `Feature::AnswerOnRelease`, read on the collector's side, which reads no feature today.
+- **Step B: the leader relay while rounds are slow-only.**
+  - **The wire.** A relayed `Submit`, marked as such and sent to the ballot's leader only. The advice bit on the release envelope. A `Proposal` form that carries the payload record beside the vote. A refusal naming `NotLeading` for a relayed submission at a voter that isn't leading.
+  - **The leader** sends its release to the origin it recorded. A duplicate relayed submission records its origin, and a command already executed is released to it at once.
+  - **The followers.** A relayed proposal's payload is checked as a `PayloadResponse` is: its identity is the proposal's command, and its admission digest the proposal's vote's; one that fails either is dropped and fetched as today. A relayed proposal initializes the command from its payload and adopts it in one batch (payload, dependency and ACCEPT rows), with no pre-acceptance and no fast acknowledgement. The path log applies the adoption as a synchronization of a command not in the suffix (Section 4.1).
+  - **The collector.**
+    - It relays per command while its ballot's leader advises relay. The advice is a bit on each release: the leader reads the fast share of fanned-out commands over a window, advises relay below a threshold with hysteresis, and while relaying advises fan-out for short stretches that every collector takes together, counting only commands decided inside them. The threshold, the hysteresis and the stretches are settings.
+    - A relayed command is answered on the release alone, as every marked command is under step A, the fallback included.
+    - On a ballot change it re-sends to the new leader. On no release within a bound it falls back to today's all-voter submission.
+    - A collector with no voter beside it keeps fanning out.
+  - **The switch:** `Feature::LeaderRelay`, activated after `AnswerOnRelease`. Until both are active, nothing relays.
+  - **task-d84's sync budget, its parts 2 and 3 (on #185), serve fanned-out rounds only:** a relayed adoption is part 2 for every relayed command, and part 3 doesn't arise. Their size is read at the fan-out share the switch leaves, on the `service` row.
+- **What it is expected to move** (Section 4.3), on the runner, at its register mix of 0.74 commands an operation at 30 callers and 0.93 at 120:
+  - **step A:** about −0.26 ms a command in the voters' threads and up to −0.28 in the kernel, from about two thirds of the datagrams; about −0.19 to −0.24 ms an operation in the servers;
+  - **step B, on top:** about −0.13 ms a command from the remaining datagrams, −0.12 to −0.16 from the followers' `on_request`, and about −0.03 from one protocol row a command instead of two at each follower; about −0.21 to −0.30 ms an operation;
+  - together at most about −0.40 to −0.54 ms an operation in the servers, before what moves into the adoption.
+  
+  Bar 1 takes the servers' part. Step B is sized again on the runner after step A, before it is built. The relayed proposal's added bytes, and whether they still fit the proposal's datagram, are read off in the code step.
+
+**Acceptance:**
+- **Model tests, step A:**
+  - a marked command is answered on a final release alone, and a speculative release is held;
+  - a release whose admission differs from the submitted one is held, and the entry settles from the record or a voter's `OtherFacts` refusal, with the answer today's collector gives;
+  - a connection lost after execution with the leader still leading: the re-sent submission gets the release again from the leader's evidence repair, rebuilt from its records; a duplicate that arrives before the release waits for it; and past what the leader's table remembers, its `Forgotten` refusal settles the entry from the record;
+  - marked and unmarked commands mix while the feature activates, and neither waits for evidence nobody sends.
+- **Model tests, step B:**
+  - a relayed command is learned on the slow path and released to its collector;
+  - a follower adopts a relayed proposal in one batch and sends no fast acknowledgement, and drops a relayed payload whose identity or admission differs from the proposal's;
+  - relayed and fanned-out commands mix on one key and every decision agrees, the fanned-out ones only slower;
+  - several collectors relaying and fanning out on conflicting keys: a probe stretch reads, after a tail of the advice's one-completion lag at each collector, the share it would read with no relaying, and the advice returns to fan-out when the share recovers;
+  - a collector acting on stale or missing advice stays correct;
+  - each leader-change case in Section 4.3: never proposed, adopted below a slow quorum, decided, sent to a voter that isn't leading;
+  - the fallback to the all-voter submission, completed on the release alone.
+- **The protocol simulator:** an answer-on-release setting and a relay setting (the share of commands relayed, and switching during a run) over the sweep at every loss and both catch-up settings, with every oracle, the released `ResponseV1` compared byte for byte included.
+- **Crash tests:** the leader crashing after a relayed proposal left and before its batch is durable, and every voter crashing between the release and the execution group's durability.
+- **Measurement:**
+  - a local pair for each step, with frames and datagrams a command, the followers' `on_request`, rows and journal groups a command at a follower, the voters' CPU an operation and the leader's tokio CPU a command, and the fast share, at 30 and 120 callers;
+  - the switch's settings chosen from a pair against the `service` row's p99;
+  - the runner pair for each step in the batch job (task-d72), step A's before step B is built.
+
+**Review boundary:** How a write reaches the voters and how its result reaches the collector. No change to the learning predicates, recovery, what a vote rests on, or the result's bytes.
 
 ## Gate checklist and deferred work
 
