@@ -15,7 +15,7 @@ use coord_consensus::{
 use coord_core::capability::{
     AdmissionReceipt, AttestedAdmission, EstablishedResult, VerifierToken,
 };
-use coord_core::effect::{BootId, Effect, PeerId};
+use coord_core::effect::{BarrierId, BootId, Effect, PeerId, PersistBatch};
 use coord_core::event::{
     AdmittedRequest, AuthenticatedPeerMessage, Event, PeerProvenance, StorageEvent,
 };
@@ -7979,10 +7979,10 @@ fn a_commit_a_later_sync_leaves_out_survives_its_installation_and_a_restart() {
 /// carried Sync no longer fits its row. It refused each new ballot's Sync
 /// as `SyncTooLarge`, though the leader's own Sync fitted, so it never
 /// synchronized again, and catch-up, which serves only a synchronized
-/// voter, never brought it forward. Its rows here are durable at
-/// COMMIT, so it shows the refusal, not which step of the fix it needs.
+/// voter, never brought it forward. Here every record's row is already
+/// durable at COMMIT, so the Sync fits once they are left out of it
+/// (step 1).
 #[test]
-#[ignore = "task-d106: reproduces the refusal; passes once the fix lands"]
 fn a_voter_holding_more_commits_than_a_sync_row_takes_still_installs_the_next_sync() {
     let id = |tag: u8, n: u32| {
         let mut d = [tag; 32];
@@ -8073,7 +8073,8 @@ fn a_voter_holding_more_commits_than_a_sync_row_takes_still_installs_the_next_sy
 }
 
 /// task-d106, step 0: a voter that refuses a Sync it carried past its row
-/// says what it was given and how many entries of each kind it carried:
+/// (here, by pending entries alone, which step 1 does not write) says
+/// what it was given and how many entries of each kind it carried:
 /// pending COMMIT entries of the Sync it resumed, which it never
 /// installed, and records it holds at COMMIT. Which of the two outgrew the
 /// row decides the fix, and n1's log named only the bytes.
@@ -8085,7 +8086,9 @@ fn a_carried_sync_past_its_row_is_refused_with_what_was_carried() {
         CommandId(Digest32(d))
     };
     let admitted = Digest32([0x6a; 32]);
-    let (pending, held, given) = (9_000u32, 8_000u32, 3u32);
+    // The pending entries alone are past the row, so leaving out the
+    // records durable at COMMIT (step 1) does not make it fit.
+    let (pending, held, given) = (17_000u32, 8_000u32, 3u32);
     // Records held at COMMIT, each waiting on a command not held here.
     let rows: Vec<(CommandId, CommandRecord)> = (0..held)
         .map(|n| {
@@ -8195,7 +8198,307 @@ fn a_carried_sync_past_its_row_is_refused_with_what_was_carried() {
     // The log line coordd writes is the rejection's `Debug` form.
     let line = format!("{rejections:?}");
     assert!(
-        line.contains("given: 3, carried_pending: 9000, carried_held: 8000"),
+        line.contains("given: 3, carried_pending: 17000, carried_held: 8000"),
         "{line}"
+    );
+}
+
+/// A voter, its root command, and its durable rows and payloads.
+type HoldingCommits = (
+    Follower,
+    CommandId,
+    Vec<(CommandId, CommandRecord)>,
+    Vec<(CommandId, coord_consensus::PayloadRecordV1)>,
+);
+
+/// The state behind n1's refusal, as a restart leaves it (task-d106,
+/// step 1): `held` commands whose rows say ACCEPT and whose payloads are
+/// durable, committed only in memory, every one waiting on `root`, which
+/// is committed too and whose payload this voter never received, so
+/// nothing executes. Synchronized to ballot 1, booted, and the leader of
+/// ballot 2 announced.
+fn voter_holding_commits_in_memory(held: u64) -> HoldingCommits {
+    let root = CommandId(Digest32([0x71; 32]));
+    let accepted = |deps: Vec<CommandId>, payload: Option<Digest32>| CommandRecord {
+        phase: Phase::Accept,
+        deps,
+        keys: vec![b"k".to_vec()],
+        payload,
+        paths: Vec::new(),
+        synced_seq: Some(1),
+        path: coord_consensus::empty_path(),
+    };
+    let mut rows = vec![(root, accepted(Vec::new(), Some(Digest32([0x72; 32]))))];
+    let mut payloads = Vec::new();
+    for seq in 1..=held {
+        let (command, payload) = outside_command(seq);
+        rows.push((command, accepted(vec![root], Some(Digest32([0x73; 32])))));
+        payloads.push((command, payload));
+    }
+    let synced = ballot(1, 0);
+    let f = Follower::recover_with_syncs(
+        FollowerConfig {
+            identity: identity(1),
+            quorum: quorum(synced),
+            genesis: ballot(0, 0),
+            frontend: FRONTEND,
+            capacity: coord_consensus::MAX_TABLE_CAPACITY,
+        },
+        Some(coord_consensus::PromiseRecordV1 {
+            promised: synced,
+            synced,
+        }),
+        None,
+        rows.clone(),
+        payloads.clone(),
+        Vec::new(),
+        ExecutionPosition::ZERO,
+    );
+    // Learned committed, as from the leader's frontier: in the table, not
+    // in a row.
+    let mut state = f.into_recovered();
+    state.table.commit(root).unwrap();
+    for (command, _) in &payloads {
+        state.table.commit(*command).unwrap();
+    }
+    let mut f = Follower::from_recovered(state, quorum(synced));
+    f.step(boot_event(1));
+    let out = f.step(peer_event(
+        r(0),
+        ProtocolMessage::NewLeader {
+            ballot: ballot(2, 0),
+            executed: ExecutionPosition::ZERO,
+        },
+    ));
+    for e in durable_events(&out) {
+        f.step(e);
+    }
+    (f, root, rows, payloads)
+}
+
+/// Ballot 2's Sync from a leader that selected from voters which executed
+/// and forgot every one of them: empty, and within its row.
+fn empty_sync_of_ballot_2() -> SyncDecision {
+    let sync = SyncDecision {
+        ballot: ballot(2, 0),
+        source_ballot: ballot(1, 0),
+        entries: BTreeMap::new(),
+        reproposed: BTreeSet::new(),
+    };
+    assert!(coord_consensus::bounded_sync_update(epoch(), &sync).is_ok());
+    sync
+}
+
+/// Every dependency row and Sync row `effects` write, the later over the
+/// earlier.
+fn rows_written(effects: &[Effect]) -> (BTreeMap<CommandId, CommandRecord>, Vec<SyncDecision>) {
+    let mut rows = BTreeMap::new();
+    let mut syncs = Vec::new();
+    for e in effects {
+        let Effect::Persist(batch) = e else { continue };
+        for u in &batch.updates {
+            let Some(value) = u.value.as_ref() else {
+                continue;
+            };
+            if u.key.len() == 41 {
+                if let Ok(record) = decode_dependency(value) {
+                    let mut id = [0u8; 32];
+                    id.copy_from_slice(&u.key[9..]);
+                    rows.insert(CommandId(Digest32(id)), record);
+                }
+            } else if let Ok(row) = decode_sync(value) {
+                syncs.push(row.decision);
+            }
+        }
+    }
+    (rows, syncs)
+}
+
+/// task-d106, step 1: a voter holding more commands committed in memory
+/// than a Sync row takes writes their COMMIT rows ahead of the next Sync,
+/// in batches within a journal record, waits for them, and installs the
+/// Sync carrying only what it could not write. A restart from the rows
+/// written still reports every command at COMMIT.
+#[test]
+fn a_voter_holding_more_commits_in_memory_than_a_sync_row_writes_them_and_installs_the_sync() {
+    let held = 16_000u64;
+    let (mut f, root, rows, payloads) = voter_holding_commits_in_memory(held);
+    let next = ballot(2, 0);
+    let mut written = Vec::new();
+    let mut pending: VecDeque<Event> = VecDeque::from([peer_event(
+        r(0),
+        ProtocolMessage::Sync(empty_sync_of_ballot_2()),
+    )]);
+    let mut first = true;
+    let mut steps = 0;
+    while let Some(event) = pending.pop_front() {
+        steps += 1;
+        assert!(steps < 1000, "did not settle");
+        let out = f.step(event);
+        if first {
+            // Nothing of the Sync is marked before its rows are durable:
+            // the first effects are the COMMIT rows alone.
+            first = false;
+            let batches: Vec<&PersistBatch> = out
+                .iter()
+                .filter_map(|e| match e {
+                    Effect::Persist(b) => Some(b),
+                    _ => None,
+                })
+                .collect();
+            assert!(batches.len() > 1, "{} batches", batches.len());
+            for b in &batches {
+                let bytes: usize = b
+                    .updates
+                    .iter()
+                    .map(|u| u.key.len() + u.value.as_ref().map_or(0, Vec::len))
+                    .sum();
+                assert!(bytes < 2 * 1024 * 1024, "a batch of {bytes} bytes");
+            }
+            let (rows, syncs) = rows_written(&out);
+            assert!(syncs.is_empty(), "the Sync row went down with its rows");
+            assert_eq!(
+                rows.len(),
+                held as usize,
+                "the root has no payload to write"
+            );
+            assert!(rows.values().all(|r| r.phase == Phase::Commit));
+            assert_eq!(f.ballots().synced(), ballot(1, 0));
+        }
+        pending.extend(durable_events(&out));
+        written.extend(out);
+    }
+    let rejections = f.take_rejections();
+    assert!(
+        !rejections
+            .iter()
+            .any(|x| matches!(x, FollowerRejection::SyncTooLarge { .. })),
+        "{rejections:?}"
+    );
+    assert_eq!(f.ballots().synced(), next, "never synchronized");
+    let at_commit = |f: &Follower| {
+        f.report(ballot(3, 1))
+            .entries
+            .iter()
+            .filter(|e| e.phase == Phase::Commit)
+            .count()
+    };
+    assert_eq!(at_commit(&f), held as usize + 1);
+
+    // The Sync row carries the root alone: the rest are durable at COMMIT
+    // in their own rows.
+    let (dependency_rows, syncs) = rows_written(&written);
+    let row = syncs
+        .into_iter()
+        .find(|s| s.ballot == next)
+        .expect("ballot 2's Sync row");
+    assert_eq!(row.entries.keys().copied().collect::<Vec<_>>(), vec![root]);
+
+    // A restart from the rows: every command is still at COMMIT.
+    let mut durable: BTreeMap<CommandId, CommandRecord> = rows.into_iter().collect();
+    durable.extend(dependency_rows);
+    let mut restarted = Follower::recover_with_syncs(
+        FollowerConfig {
+            identity: identity(1),
+            quorum: quorum(next),
+            genesis: ballot(0, 0),
+            frontend: FRONTEND,
+            capacity: coord_consensus::MAX_TABLE_CAPACITY,
+        },
+        Some(coord_consensus::PromiseRecordV1 {
+            promised: next,
+            synced: next,
+        }),
+        None,
+        durable,
+        payloads,
+        vec![(next, row)],
+        ExecutionPosition::ZERO,
+    );
+    restarted.step(boot_event(2));
+    assert_eq!(at_commit(&restarted), held as usize + 1);
+}
+
+/// task-d106, step 1: a batch of the COMMIT rows written ahead of a Sync
+/// that fails leaves the Sync not installed, named, and nothing is
+/// written at the failure. Sent again, the Sync leaves out what the other
+/// batches made durable at COMMIT and carries the failed batch's records
+/// in its row, which they fit.
+#[test]
+fn a_failed_batch_of_commit_rows_leaves_the_sync_uninstalled_until_it_is_sent_again() {
+    let (mut f, root, _, _) = voter_holding_commits_in_memory(16_000);
+    let next = ballot(2, 0);
+    let out = f.step(peer_event(
+        r(0),
+        ProtocolMessage::Sync(empty_sync_of_ballot_2()),
+    ));
+    let failed_batch: Vec<Effect> = out
+        .iter()
+        .filter(|e| matches!(e, Effect::Persist(_)))
+        .take(1)
+        .cloned()
+        .collect();
+    let (failed_rows, _) = rows_written(&failed_batch);
+    let barriers: Vec<BarrierId> = out
+        .iter()
+        .filter_map(|e| match e {
+            Effect::Persist(b) => Some(b.barrier),
+            _ => None,
+        })
+        .collect();
+    assert!(barriers.len() > 1);
+    // The first batch fails; the others are durable.
+    let mut after = f.step(Event::Storage(StorageEvent::Failed {
+        barrier_id: barriers[0],
+        error: coord_core::event::StorageError::DefinitelyNotCommitted,
+    }));
+    for b in &barriers[1..] {
+        after.extend(f.step(Event::Storage(StorageEvent::JournalDurable {
+            barrier_id: *b,
+            journal_seq: LocalJournalSeq::new(1).unwrap(),
+        })));
+    }
+    assert!(
+        !after.iter().any(|e| matches!(e, Effect::Persist(_))),
+        "written again at a failure"
+    );
+    assert_eq!(f.ballots().synced(), ballot(1, 0));
+    let rejections = f.take_rejections();
+    assert!(
+        rejections.contains(&FollowerRejection::CommitRowsNotDurable(next)),
+        "{rejections:?}"
+    );
+    // Sent again: installed at once, carrying the failed batch's records
+    // and the root.
+    let again = f.step(peer_event(
+        r(0),
+        ProtocolMessage::Sync(empty_sync_of_ballot_2()),
+    ));
+    let (_, syncs) = rows_written(&again);
+    let row = syncs
+        .into_iter()
+        .find(|s| s.ballot == next)
+        .expect("ballot 2's Sync row");
+    let mut expected: BTreeSet<CommandId> = failed_rows.keys().copied().collect();
+    expected.insert(root);
+    assert!(failed_rows.len() > 1000, "{} rows", failed_rows.len());
+    assert_eq!(
+        row.entries.keys().copied().collect::<BTreeSet<_>>(),
+        expected
+    );
+    // Each carried entry is installed in a batch of its own.
+    let mut pending: VecDeque<Event> = durable_events(&again).into();
+    let mut steps = 0;
+    while let Some(event) = pending.pop_front() {
+        steps += 1;
+        assert!(steps < 4 * expected.len(), "did not settle");
+        let out = f.step(event);
+        pending.extend(durable_events(&out));
+    }
+    assert_eq!(f.ballots().synced(), next);
+    assert!(
+        !f.take_rejections()
+            .iter()
+            .any(|x| matches!(x, FollowerRejection::SyncTooLarge { .. }))
     );
 }

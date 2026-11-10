@@ -137,6 +137,10 @@ pub enum FollowerRejection {
     /// A higher ballot was promised before the synchronized row became
     /// durable; that cut supersedes this Sync.
     SyncSuperseded(Ballot),
+    /// A batch of the COMMIT rows written ahead of this ballot's Sync, to
+    /// keep the Sync within its row, failed (task-d106): the Sync was not
+    /// installed, and is installed when it is sent again.
+    CommitRowsNotDurable(Ballot),
     /// A Sync that does not fit the row it would be written in (task-d20):
     /// refused before anything of it was marked.
     SyncTooLarge {
@@ -414,17 +418,50 @@ enum Pending {
     /// Rows written again of records whose batch failed, before they
     /// execute (#197 review); names the first.
     Carry(CommandId),
+    /// COMMIT rows of records committed here, written ahead of a Sync
+    /// that would not fit its row with them carried (task-d106); names
+    /// the first.
+    CommitRows(CommandId),
 }
 
-/// How many entries `Follower::carry_commits` carried into a Sync, by
-/// where they came from (task-d106).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// The entries `Follower::carry_commits` carried into a Sync, by where
+/// they came from (task-d106).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct Carried {
     /// Pending COMMIT entries of the Sync it replaces.
-    pending: usize,
+    pending: Vec<CommandId>,
     /// Records held at COMMIT and not executed.
-    held: usize,
+    held: Vec<CommandId>,
 }
+
+/// A Sync waiting for the COMMIT rows written ahead of it (task-d106).
+#[derive(Clone, Debug)]
+struct SyncBehindRows {
+    /// Its leader.
+    from: ReplicaId,
+    /// The Sync as it was sent.
+    decision: SyncDecision,
+    /// The batches still in flight.
+    barriers: BTreeSet<BarrierId>,
+    /// Whether one of them failed.
+    failed: bool,
+}
+
+/// What became of a carried Sync over its row (task-d106).
+enum Fitted {
+    /// It fits once the records durable at COMMIT are left out of it.
+    Row(SyncDecision, StoreUpdate),
+    /// Their COMMIT rows are being written; it is taken again once they
+    /// are durable.
+    Writing(Vec<Effect>),
+    /// Nothing written would make it fit.
+    No,
+}
+
+/// The encoded rows one batch of COMMIT rows written ahead of a Sync may
+/// hold (task-d106): well inside a journal record (`MAX_RECORD_BYTES`,
+/// 4 MiB) beside the batch's framing.
+const COMMIT_ROWS_BATCH_BYTES: usize = 1024 * 1024;
 
 /// What became of one pulled command offered to a window (task-d25).
 enum Pulled {
@@ -654,6 +691,9 @@ pub struct Follower {
     /// installed only if every higher promise's row fails, and dropped
     /// once one of them is durable.
     sync_behind_promise: Option<(ReplicaId, SyncDecision)>,
+    /// A Sync held while the COMMIT rows written ahead of it become
+    /// durable (task-d106).
+    sync_behind_rows: Option<SyncBehindRows>,
     /// The selection of the synchronized ballot, once its Sync row is
     /// durable (or read back from that row after a restart): what this
     /// replica accepted at the ballot its reports are labelled with
@@ -880,6 +920,7 @@ impl Follower {
             resumed,
             early_sync: None,
             sync_behind_promise: None,
+            sync_behind_rows: None,
             leader_committed: None,
             proposal_cursor: 0,
         }
@@ -1080,6 +1121,7 @@ impl Follower {
             resumed: selection.clone(),
             early_sync: None,
             sync_behind_promise: None,
+            sync_behind_rows: None,
             synced_selection: selection,
             leader_committed: None,
             proposal_cursor: 0,
@@ -1702,10 +1744,24 @@ impl Follower {
             return Vec::new();
         }
         if !already_synced {
+            if let Some(held) = &self.sync_behind_rows {
+                if held.decision.ballot == decision.ballot {
+                    // Sent again while the rows ahead of it are written:
+                    // the copy held is taken once they are durable.
+                    return Vec::new();
+                }
+                // Another ballot's Sync replaces the one held; the rows
+                // written for it are facts either way.
+                let superseded = held.decision.ballot;
+                self.sync_behind_rows = None;
+                self.rejections
+                    .push(FollowerRejection::SyncSuperseded(superseded));
+            }
             // What this replica holds decided goes down with the Sync it
             // installs, whichever ballot decided it (task-d80).
             let given = sync_work(&decision);
             let given_entries = decision.entries.len();
+            let given_ballot = decision.ballot;
             let (decision, carried) = self.carry_commits(decision);
             self.sync_carried += sync_work(&decision) - given;
             if let Err(cycle) = crate::recovery::entry_order(&decision) {
@@ -1715,22 +1771,31 @@ impl Follower {
             // A Sync that does not fit its row is refused before anything
             // of it is marked (task-d20). A candidate of this build never
             // binds one; installing it ended the process at the write.
-            let sync_row =
+            let (decision, sync_row) =
                 match crate::rows::bounded_sync_update(self.config.identity.epoch, &decision) {
-                    Ok(update) => update,
+                    Ok(update) => (decision, update),
                     Err(RecoveryError::SyncTooLarge { bytes, limit, .. }) => {
-                        // What it was given and what this voter carried,
-                        // so a refusal says which of the two outgrew the
-                        // row (task-d106).
-                        self.rejections.push(FollowerRejection::SyncTooLarge {
-                            ballot: decision.ballot,
-                            bytes,
-                            limit,
-                            given: given_entries,
-                            carried_pending: carried.pending,
-                            carried_held: carried.held,
-                        });
-                        return Vec::new();
+                        // Carried past its row: what this voter holds
+                        // committed goes down in rows of its own first
+                        // (task-d106).
+                        match self.fit_carried(from, decision, &carried) {
+                            Fitted::Row(decision, update) => (decision, update),
+                            Fitted::Writing(effects) => return effects,
+                            Fitted::No => {
+                                // What it was given and what this voter
+                                // carried, so a refusal says which of the
+                                // two outgrew the row (task-d106).
+                                self.rejections.push(FollowerRejection::SyncTooLarge {
+                                    ballot: given_ballot,
+                                    bytes,
+                                    limit,
+                                    given: given_entries,
+                                    carried_pending: carried.pending.len(),
+                                    carried_held: carried.held.len(),
+                                });
+                                return Vec::new();
+                            }
+                        }
                     }
                     Err(_) => return Vec::new(),
                 };
@@ -1989,12 +2054,14 @@ impl Follower {
             .filter(|(c, e)| e.phase == Phase::Commit && !decision.entries.contains_key(c))
             .map(|(c, e)| (*c, e.clone()))
             .collect();
-        let pending = carried.len();
+        let pending: Vec<CommandId> = carried.keys().copied().collect();
+        let mut held = Vec::new();
         for (c, r) in self.table.records() {
             if r.phase == Phase::Commit
                 && !decision.entries.contains_key(c)
                 && !carried.contains_key(c)
             {
+                held.push(*c);
                 carried.insert(
                     *c,
                     SyncEntry {
@@ -2009,9 +2076,141 @@ impl Follower {
                 );
             }
         }
-        let held = carried.len() - pending;
         decision.entries.extend(carried);
         (decision, Carried { pending, held })
+    }
+
+    /// `decision`, carried past its row, made to fit by what this
+    /// replica holds committed going down in rows of its own (task-d106).
+    ///
+    /// A record held at COMMIT and carried (task-d80) is carried for one
+    /// reason: its dependency row says ACCEPT, since learning a commit
+    /// writes no row, so after a restart only the Sync row says it was
+    /// committed. One whose row is durable at COMMIT needs no carrying: a
+    /// restart reads the commit from the row, the marker releases only
+    /// undecided records and demotes only acceptances and
+    /// pre-acceptances, and the report names it at COMMIT from the
+    /// table. Its dependencies are committed (`guard_commit`), so leaving
+    /// it out names nothing less that the release could take.
+    ///
+    /// So the records durable at COMMIT are left out first. If that is
+    /// not enough, the COMMIT rows of the others are written, in batches
+    /// within a journal record, and the Sync as sent is held until every
+    /// one is durable, then taken again. Waiting matters: a batch refused
+    /// or failed while a later marker's batch is durable would leave the
+    /// commit known nowhere after a restart. A record whose payload this
+    /// replica holds neither durably nor in memory is not written, since a
+    /// dependency row naming a payload needs its payload row; it stays
+    /// carried. Only on this path: a Sync that fits with everything
+    /// carried is installed as task-d80 installs it.
+    fn fit_carried(
+        &mut self,
+        from: ReplicaId,
+        mut decision: SyncDecision,
+        carried: &Carried,
+    ) -> Fitted {
+        let epoch = self.config.identity.epoch;
+        let durable_commit = |ledger: &DurableLedger, c: &CommandId| {
+            ledger.record(c).is_some_and(|r| r.phase == Phase::Commit)
+        };
+        let mut left_out = false;
+        for c in &carried.held {
+            if durable_commit(&self.ledger, c) {
+                decision.entries.remove(c);
+                left_out = true;
+            }
+        }
+        if left_out && let Ok(update) = crate::rows::bounded_sync_update(epoch, &decision) {
+            return Fitted::Row(decision, update);
+        }
+        let writable: Vec<CommandId> = carried
+            .held
+            .iter()
+            .filter(|c| !durable_commit(&self.ledger, c) && self.commit_row_writable(c))
+            .copied()
+            .collect();
+        if writable.is_empty() || self.alloc.is_none() {
+            return Fitted::No;
+        }
+        // The Sync as it was sent: taken again, it carries afresh.
+        for c in carried.pending.iter().chain(&carried.held) {
+            decision.entries.remove(c);
+        }
+        let effects = self.write_commit_rows(&writable);
+        let barriers = effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Persist(batch) => Some(batch.barrier),
+                _ => None,
+            })
+            .collect();
+        self.sync_behind_rows = Some(SyncBehindRows {
+            from,
+            decision,
+            barriers,
+            failed: false,
+        });
+        Fitted::Writing(effects)
+    }
+
+    /// Whether `command`, held at COMMIT, can have its COMMIT row written
+    /// (task-d106): its payload row is durable or its payload is held to
+    /// write beside it, or it names no payload.
+    fn commit_row_writable(&self, command: &CommandId) -> bool {
+        self.table.record(command).is_some_and(|r| {
+            r.phase == Phase::Commit
+                && (r.payload.is_none()
+                    || self.served_payloads.contains(command)
+                    || self.payloads.contains_key(command))
+        })
+    }
+
+    /// Write the COMMIT rows of `commands`, held at COMMIT, in batches of
+    /// at most [`COMMIT_ROWS_BATCH_BYTES`] of rows (task-d106), each with
+    /// the payload row of a command whose payload row is not durable.
+    fn write_commit_rows(&mut self, commands: &[CommandId]) -> Vec<Effect> {
+        let epoch = self.config.identity.epoch;
+        let mut effects = Vec::new();
+        let mut updates: Vec<StoreUpdate> = Vec::new();
+        let mut staged: Vec<(CommandId, CommandRecord)> = Vec::new();
+        let mut payloads: Vec<CommandId> = Vec::new();
+        let mut bytes = 0usize;
+        let size = |u: &StoreUpdate| u.key.len() + u.value.as_ref().map_or(0, Vec::len);
+        for (i, command) in commands.iter().enumerate() {
+            let record = self.table.record(command).expect("held").clone();
+            if record.payload.is_some() && !self.served_payloads.contains(command) {
+                let payload = self.payloads.get(command).expect("writable");
+                let update = payload_update(command, payload).expect("bounded");
+                bytes += size(&update);
+                updates.push(update);
+                payloads.push(*command);
+            }
+            let update = dependency_update(epoch, command, &record).expect("bounded");
+            bytes += size(&update);
+            updates.push(update);
+            staged.push((*command, record));
+            if bytes >= COMMIT_ROWS_BATCH_BYTES || i + 1 == commands.len() {
+                let barrier = self.alloc.as_mut().expect("booted").allocate();
+                let first = staged.first().map(|(c, _)| *c).expect("one");
+                for (c, r) in staged.drain(..) {
+                    self.ledger.stage(barrier, c, r);
+                }
+                if !payloads.is_empty() {
+                    self.durable_payloads
+                        .entry(barrier)
+                        .or_default()
+                        .append(&mut payloads);
+                }
+                self.pending.insert(barrier, Pending::CommitRows(first));
+                effects.push(Effect::Persist(PersistBatch {
+                    barrier,
+                    base: None,
+                    updates: core::mem::take(&mut updates),
+                }));
+                bytes = 0;
+            }
+        }
+        effects
     }
 
     /// Hold `decision`'s entries for installation, in place of whatever an
@@ -4854,6 +5053,30 @@ impl Follower {
 
     fn on_storage(&mut self, event: &StorageEvent) -> Vec<Effect> {
         let mut out = self.on_storage_event(event);
+        // A Sync held behind the COMMIT rows written ahead of it is taken
+        // again once every batch of them is settled (task-d106). If one
+        // failed, it waits to be sent again, as a Sync whose marker failed
+        // does: written again at a failure, the rows would be written at
+        // every failure after it.
+        if let Some(barrier) = event.barrier()
+            && let Some(held) = self.sync_behind_rows.as_mut()
+            && held.barriers.remove(&barrier)
+        {
+            if matches!(event, StorageEvent::Failed { .. }) {
+                held.failed = true;
+            }
+            if held.barriers.is_empty() {
+                let held = self.sync_behind_rows.take().expect("held");
+                if held.failed {
+                    self.rejections
+                        .push(FollowerRejection::CommitRowsNotDurable(
+                            held.decision.ballot,
+                        ));
+                } else {
+                    out.extend(self.on_sync(held.from, held.decision));
+                }
+            }
+        }
         // A Sync that arrived ahead of this replica's promise is installed
         // once the promise is this replica's: its row is durable, so the
         // promised ballot is the Sync's.
@@ -5108,7 +5331,10 @@ impl Follower {
                     self.deferred.remove(&barrier);
                     self.ledger.failed(barrier);
                     let command = match pending {
-                        Pending::Vote(c) | Pending::Adoption(c) | Pending::Carry(c) => c,
+                        Pending::Vote(c)
+                        | Pending::Adoption(c)
+                        | Pending::Carry(c)
+                        | Pending::CommitRows(c) => c,
                     };
                     self.rejections
                         .push(FollowerRejection::BatchFailed(command));
