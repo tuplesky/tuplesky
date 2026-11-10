@@ -14,6 +14,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
 use coord_journal_faultkit::{FaultFs, FaultPlan, Op, Tail};
+use coord_journal_raft_engine::JournalOptions;
 
 use common::*;
 
@@ -60,6 +61,59 @@ fn a_crash_at_every_operation_keeps_every_acknowledged_group() {
             );
         }
     }
+}
+
+/// Every remains a sector-atomic device can leave (every subset of the
+/// unsynced sectors, [`Tail::Sectors`]) at every crash point, over files
+/// small enough that the workload rotates: the guard opens each with
+/// every acknowledged group.
+#[test]
+fn every_sector_subset_at_every_crash_point_over_rotating_files_keeps_every_group() {
+    let small = JournalOptions {
+        target_file_size_bytes: 1024,
+        ..options()
+    };
+    let total = {
+        let dir = tempfile::tempdir().unwrap();
+        let (fs, shared) = FaultFs::new(FaultPlan::default());
+        workload_with(&dir.path().join("j"), fs, &shared, &small);
+        shared
+            .log()
+            .iter()
+            .filter(|op| !matches!(op, Op::Rejected | Op::Failed))
+            .count() as u64
+    };
+    let (mut cases, mut widest) = (0u64, 0usize);
+    for k in 1..=total {
+        let plan = FaultPlan {
+            crash_after: Some(k),
+            ..FaultPlan::default()
+        };
+        let mut mask = 0u64;
+        loop {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("j");
+            let (fs, shared) = FaultFs::new(plan);
+            let acked = workload_with(&root, fs, &shared, &small);
+            assert!(shared.is_frozen(), "crash after {k}: never reached");
+            let pieces = shared.unsynced_pieces();
+            assert!(pieces <= 12, "crash after {k}: {pieces} pieces");
+            widest = widest.max(pieces);
+            shared.materialize(Tail::Sectors(mask)).unwrap();
+            check_with(
+                &root,
+                &acked,
+                &format!("crash after {k} of {total}, sectors {mask:#b} of {pieces}"),
+                &small,
+            );
+            cases += 1;
+            mask += 1;
+            if mask >= 1 << pieces {
+                break;
+            }
+        }
+    }
+    eprintln!("sector subsets: {cases} crash images over {total} crash points, widest {widest}");
 }
 
 #[test]
