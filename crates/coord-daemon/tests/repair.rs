@@ -2224,9 +2224,15 @@ fn a_lost_release_of_a_marked_command_is_asked_of_the_leader_early() {
     assert_eq!(w.collector.next_solicit(), Some(early));
     let before = MonotonicMillis::new(coord_collector::SOLICIT_LEADER_AFTER_MILLIS - 1);
     assert!(w.collector.due_solicits(before, 16).is_empty());
+    assert_eq!(w.collector.early_solicits(), 0);
     let asked = w.collector.due_solicits(early, 16);
     assert_eq!(asked.len(), 1);
     assert_eq!(asked[0].targets, vec![r(0)], "to the leader alone");
+    assert_eq!(
+        w.collector.early_solicits(),
+        1,
+        "counted for the metrics line"
+    );
     assert!(
         w.collector.half_established().is_empty(),
         "the early solicit doesn't open the record"
@@ -2287,6 +2293,11 @@ fn an_early_solicit_to_a_voter_not_leading_changes_nothing() {
         16,
     );
     assert_eq!(all.len(), 1);
+    assert_eq!(
+        w.collector.early_solicits(),
+        1,
+        "the early solicit is counted once; the all-voter one isn't early"
+    );
     assert_eq!(all[0].targets, (0..3).map(r).collect::<Vec<_>>());
     assert!(
         w.collector

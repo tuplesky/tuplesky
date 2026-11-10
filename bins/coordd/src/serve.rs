@@ -1836,6 +1836,12 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 .dispatcher()
                 .collector()
                 .evidence_for_marked(),
+            early_solicits: self
+                .frontend
+                .frontend
+                .dispatcher()
+                .collector()
+                .early_solicits(),
             traffic: self.plane.as_ref().map_or(
                 Measure::Unavailable(Unavailable::NotInstrumented),
                 |plane| {

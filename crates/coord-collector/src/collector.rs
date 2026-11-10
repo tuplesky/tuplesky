@@ -692,6 +692,10 @@ pub struct Collector {
     /// release alone (diagnostic, #204 review): what a voter that learned
     /// such a command from the leader's proposal alone still sends.
     evidence_for_marked: u64,
+    /// Early solicits sent to the leader alone for marked entries still
+    /// waiting at [`SOLICIT_LEADER_AFTER_MILLIS`] (diagnostic, #204
+    /// review): the commands whose release took over a second.
+    early_solicits: u64,
 }
 
 impl Collector {
@@ -708,6 +712,7 @@ impl Collector {
             offer_cursor: 0,
             answer_on_release: false,
             evidence_for_marked: 0,
+            early_solicits: 0,
         }
     }
 
@@ -749,6 +754,14 @@ impl Collector {
     /// evidence, not here.
     pub const fn evidence_for_marked(&self) -> u64 {
         self.evidence_for_marked
+    }
+
+    /// Early solicits this collector sent to its ballot's leader alone,
+    /// one at most for each marked entry (#204 review): how many commands
+    /// waited past [`SOLICIT_LEADER_AFTER_MILLIS`] for their release,
+    /// which is the frames the early solicit costs under overload.
+    pub const fn early_solicits(&self) -> u64 {
+        self.early_solicits
     }
 
     /// Whether `command` is outstanding here.
@@ -1087,6 +1100,7 @@ impl Collector {
                 }
                 entry.solicit_leader_at = None;
                 spent += 1;
+                self.early_solicits += 1;
                 record(&mut self.trace, || CollectorEvent::SolicitedLeader {
                     command: command_hex(command),
                     to: replica_hex(&leader),
