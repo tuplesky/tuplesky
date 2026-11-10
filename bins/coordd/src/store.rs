@@ -641,7 +641,7 @@ impl Opened {
         };
         let represented = baseline.map_or(LocalJournalSeq::ZERO, |pointer| pointer.represented);
         let generation = if store.projection_profile() == ProjectionProfile::Strict {
-            generation
+            refuse_if_invalid(&store, domain_id, generation, represented)?
         } else {
             reinstall_if_invalid(
                 &store,
@@ -690,6 +690,35 @@ impl Opened {
             boot,
             active,
         })
+    }
+}
+
+/// Under the strict profile, refuse a projection that does not continue
+/// the journal before anything is attached (#211). Nothing rolls a strict
+/// projection back, so one behind the published baseline, or whose stamp
+/// names a record the journal does not hold where it says, is damage: to
+/// the projection, or to a journal that opened shorter than the
+/// projection's commit point. It is not reinstalled.
+fn refuse_if_invalid(
+    store: &JournaledStore<RaftEngineJournal, RedbEngine>,
+    domain_id: DomainId,
+    mut generation: Generation,
+    represented: LocalJournalSeq,
+) -> Result<Generation, StoreError> {
+    let directory = generation.directory().to_path_buf();
+    let refused = |reason: String| StoreError::Refused {
+        root: show(&directory),
+        reason,
+    };
+    match store.validate_projection(domain_id, generation.engine(), represented) {
+        Ok(()) => Ok(generation),
+        Err(JournaledError::ProjectionInvalid(why)) => Err(refused(format!(
+            "the projection does not continue the journal ({why}); the strict profile \
+             does not reinstall it"
+        ))),
+        Err(e) => Err(refused(format!(
+            "the projection could not be checked against the journal: {e}"
+        ))),
     }
 }
 
@@ -1305,7 +1334,9 @@ namespace = "5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e"
 
         let refused = serve(&config, 1).expect("serve").attach();
         assert!(
-            matches!(&refused, Err(StoreError::Refused { reason, .. }) if reason.contains("ProjectionInvalid")),
+            matches!(&refused, Err(StoreError::Refused { reason, .. })
+                if reason.contains("does not continue the journal")
+                    && reason.contains("the strict profile does not reinstall it")),
             "the strict profile attached a projection behind its baseline: {:?}",
             refused.err().map(|e| e.to_string())
         );

@@ -36,12 +36,16 @@ fn the_census_counts_writes_and_syncs_of_the_log() {
 #[test]
 fn a_crash_at_every_operation_keeps_every_acknowledged_group() {
     let total = census().len() as u64;
+    // Sector tears: the remains a device that writes a sector whole or
+    // not at all can leave, which the tail guard must open with everything
+    // acknowledged. Byte tears are `recovery.rs`'s.
     let tails = [
         Tail::None,
         Tail::All,
-        Tail::Seeded(1),
-        Tail::Seeded(2),
-        Tail::Seeded(3),
+        Tail::SeededSectors(1),
+        Tail::SeededSectors(2),
+        Tail::SeededSectors(3),
+        Tail::SeededSectors(4),
     ];
     for k in 1..=total {
         for tail in tails {
@@ -67,7 +71,7 @@ fn a_failed_write_never_acknowledges_and_loses_nothing_acknowledged() {
         }
         let n = i as u64 + 1;
         for prefix in [0, 512, 4096] {
-            for tail in [None, Some(Tail::None), Some(Tail::Seeded(n))] {
+            for tail in [None, Some(Tail::None), Some(Tail::SeededSectors(n))] {
                 // With a crash tail, the crash lands at the fault itself,
                 // so no later sync (the close's among them) persists what
                 // the fault left unsynced.
@@ -123,7 +127,7 @@ fn a_failed_sync_never_acknowledges_and_loses_nothing_acknowledged() {
             continue;
         }
         let n = i as u64 + 1;
-        for persisted in [Tail::None, Tail::All, Tail::Seeded(n)] {
+        for persisted in [Tail::None, Tail::All, Tail::SeededSectors(n)] {
             for after in [Tail::None, Tail::All] {
                 let plan = FaultPlan {
                     fail_sync_at: Some(n),
@@ -237,6 +241,53 @@ fn a_crash_image_is_the_synced_bytes_plus_the_chosen_tail() {
         assert_eq!(std::fs::read(&path).unwrap(), expect);
         std::fs::remove_file(&path).unwrap();
     }
+}
+
+/// A sector tear keeps or loses whole sectors of a write, by file offset,
+/// and nothing finer: every sector a torn write covers holds all of its
+/// bytes or none of them.
+#[test]
+fn a_sector_tear_keeps_or_loses_whole_sectors() {
+    use raft_engine::env::{FileSystem, Handle};
+    use std::io::Write;
+
+    let payload: Vec<u8> = (0..3000u32).map(|i| (i % 251) as u8 | 1).collect();
+    let (mut torn, mut whole) = (0, 0);
+    for seed in 0..64 {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f");
+        let (fs, shared) = FaultFs::new(FaultPlan::default());
+        let handle = Arc::new(fs.create(&path).unwrap());
+        let mut writer = fs.new_writer(handle.clone()).unwrap();
+        writer.write_all(&payload[..100]).unwrap();
+        handle.sync().unwrap();
+        writer.write_all(&payload[100..]).unwrap();
+        shared.materialize(Tail::SeededSectors(seed)).unwrap();
+        let image = std::fs::read(&path).unwrap();
+        assert_eq!(
+            image[..100],
+            payload[..100],
+            "seed {seed}: the synced write"
+        );
+        let mut kept = Vec::new();
+        for start in (0..payload.len()).step_by(512) {
+            let (from, to) = (start.max(100), (start + 512).min(payload.len()));
+            let got = image.get(from..to.min(image.len())).unwrap_or(&[]);
+            let all = got == &payload[from..to];
+            let none = got.iter().all(|&b| b == 0);
+            assert!(
+                all || none,
+                "seed {seed}: sector at {start} is part written"
+            );
+            kept.push(all);
+        }
+        if kept.iter().all(|&k| k) {
+            whole += 1;
+        } else if kept.iter().any(|&k| k) {
+            torn += 1;
+        }
+    }
+    assert!(torn > 0 && whole > 0, "torn {torn}, whole {whole}");
 }
 
 /// A failed sync that persisted everything leaves nothing pending, so no

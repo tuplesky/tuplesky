@@ -162,9 +162,19 @@ pub struct Acked {
 /// sync (`expect("pipe::sync()")`), and a frozen file system fails every
 /// sync after the crash.
 pub fn workload(root: &Path, fs: Arc<FaultFs>, shared: &Shared) -> Acked {
+    workload_with(root, fs, shared, &options())
+}
+
+/// [`workload`] under `options`.
+pub fn workload_with(
+    root: &Path,
+    fs: Arc<FaultFs>,
+    shared: &Shared,
+    options: &JournalOptions,
+) -> Acked {
     let mut acked = Acked::default();
     let journal = catch_unwind(AssertUnwindSafe(|| {
-        RaftEngineJournal::create_with_file_system(root, identity(), &options(), fs)
+        RaftEngineJournal::create_with_file_system(root, identity(), options, fs)
     }));
     let Ok(Ok(mut journal)) = journal else {
         return acked;
