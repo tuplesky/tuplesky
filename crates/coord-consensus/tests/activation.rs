@@ -7972,3 +7972,102 @@ fn a_commit_a_later_sync_leaves_out_survives_its_installation_and_a_restart() {
     assert!(at_commit(&report, x, &[d]), "{report:?}");
     assert!(at_commit(&report, y, &[]), "{report:?}");
 }
+
+/// task-d106 (Jepsen register-kill run of 2026-11-10, n1): a voter that
+/// holds more committed, unexecuted commands than one Sync row takes
+/// carries them all into every Sync it installs (task-d80), and the
+/// carried Sync no longer fits its row. It refused each new ballot's Sync
+/// as `SyncTooLarge`, though the leader's own Sync fitted, so it never
+/// synchronized again, and catch-up, which serves only a synchronized
+/// voter, never brought it forward. Its rows here are durable at
+/// COMMIT, so it shows the refusal, not which step of the fix it needs.
+#[test]
+#[ignore = "task-d106: reproduces the refusal; passes once the fix lands"]
+fn a_voter_holding_more_commits_than_a_sync_row_takes_still_installs_the_next_sync() {
+    let id = |tag: u8, n: u32| {
+        let mut d = [tag; 32];
+        d[..4].copy_from_slice(&n.to_be_bytes());
+        CommandId(Digest32(d))
+    };
+    let held = 16_000u32;
+    let admitted = Digest32([0x6a; 32]);
+    // Each waits on a command this voter does not hold, so none executes.
+    let rows: Vec<(CommandId, CommandRecord)> = (0..held)
+        .map(|n| {
+            (
+                id(0x6b, n),
+                CommandRecord {
+                    phase: Phase::Commit,
+                    deps: vec![id(0x6c, n)],
+                    keys: vec![b"k".to_vec()],
+                    payload: Some(admitted),
+                    paths: Vec::new(),
+                    synced_seq: Some(1),
+                    path: coord_consensus::empty_path(),
+                },
+            )
+        })
+        .collect();
+    let synced = ballot(1, 0);
+    let next = ballot(2, 0);
+    let mut f = Follower::recover_with_syncs(
+        FollowerConfig {
+            identity: identity(1),
+            quorum: quorum(synced),
+            genesis: ballot(0, 0),
+            frontend: FRONTEND,
+            capacity: coord_consensus::MAX_TABLE_CAPACITY,
+        },
+        Some(coord_consensus::PromiseRecordV1 {
+            promised: synced,
+            synced,
+        }),
+        None,
+        rows,
+        Vec::new(),
+        Vec::new(),
+        ExecutionPosition::ZERO,
+    );
+    // The leader of ballot 2 selected from voters that executed and
+    // forgot every one of them: its Sync is empty, and fits.
+    let sync = SyncDecision {
+        ballot: next,
+        source_ballot: synced,
+        entries: BTreeMap::new(),
+        reproposed: BTreeSet::new(),
+    };
+    assert!(coord_consensus::bounded_sync_update(epoch(), &sync).is_ok());
+    let mut pending: VecDeque<Event> = VecDeque::from([
+        boot_event(1),
+        peer_event(
+            r(0),
+            ProtocolMessage::NewLeader {
+                ballot: next,
+                executed: ExecutionPosition::ZERO,
+            },
+        ),
+        peer_event(r(0), ProtocolMessage::Sync(sync)),
+    ]);
+    let mut steps = 0;
+    while let Some(event) = pending.pop_front() {
+        steps += 1;
+        assert!(steps < 1000, "did not settle");
+        let out = f.step(event);
+        pending.extend(durable_events(&out));
+    }
+    let rejections = f.take_rejections();
+    assert!(
+        !rejections
+            .iter()
+            .any(|x| matches!(x, FollowerRejection::SyncTooLarge { .. })),
+        "{rejections:?}"
+    );
+    assert_eq!(f.ballots().synced(), next, "never synchronized");
+    let report = f.report(ballot(3, 1));
+    let at_commit = report
+        .entries
+        .iter()
+        .filter(|e| e.phase == Phase::Commit)
+        .count();
+    assert_eq!(at_commit, held as usize);
+}
