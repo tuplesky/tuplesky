@@ -3734,6 +3734,8 @@ fn run_row(row: u8) {
                     totals.window_crashes += s.window_crashes;
                     totals.window_deposes += s.window_deposes;
                     totals.left_out_executed += s.left_out_executed;
+                    totals.answered_on_release += s.answered_on_release;
+                    totals.released_again += s.released_again;
                 }
                 Err(e) => failures.push(e),
             }
@@ -3811,6 +3813,15 @@ fn run_row(row: u8) {
         assert!(
             totals.gate_windows > 0 && totals.gate_crashes > 0,
             "row 22 never crashed a leader in the gate's window: {totals:?}"
+        );
+    }
+    // A row run with marked commands (`PROTOCOL_SIM_ANSWER_ON_RELEASE`)
+    // answered some on a release alone (task-d100 step A): a sweep with
+    // the knob can't pass without reaching the rule.
+    if row_knobs(row).answer_on_release > 0 {
+        assert!(
+            totals.answered_on_release > 0,
+            "row {row} answered no marked command on its release: {totals:?}"
         );
     }
     // Oracle 9 ran.
