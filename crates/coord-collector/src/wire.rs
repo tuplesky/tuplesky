@@ -38,6 +38,40 @@ pub const KIND_RELEASE: u16 = 0x0701;
 pub const KIND_EVIDENCE: u16 = 0x0700;
 /// Schema version of every collector frame.
 pub const VERSION: u16 = 1;
+/// The version of a submission or a release for a command its collector
+/// answers on the leader's final release alone (task-d100, step A).
+///
+/// A version-2 submission is the version-1 payload unchanged: the
+/// version is the mark. A version-2 release is a [`ReleaseV2`]: the
+/// released result and the admission digest of the payload the leader
+/// decided. A build from before step A refuses both, which is why a
+/// collector sends them only while its node reads
+/// `Feature::AnswerOnRelease` active, and a store that holds that
+/// activation admits no such build.
+pub const VERSION_ANSWER_ON_RELEASE: u16 =
+    coord_types::wire_v1::COLLECTOR_SUBMIT_ANSWER_ON_RELEASE_VERSION;
+
+/// A release for a command answered on the release alone (task-d100,
+/// step A): the released result and the admission digest of the payload
+/// the leader decided, which the collector compares with the one it
+/// submitted under.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseV2 {
+    /// The released result, as a version-1 release carries it.
+    pub released: ReleasedResult,
+    /// The decided payload's admission digest.
+    pub admission: coord_types::identity::Digest32,
+}
+
+/// [`ReleaseV2`] over a borrowed result, so a release is framed without
+/// copying its response (#204 review). The same fields in the same
+/// order: postcard encodes the two alike.
+#[derive(Serialize)]
+struct ReleaseV2Ref<'a> {
+    released: &'a ReleasedResult,
+    admission: coord_types::identity::Digest32,
+}
+
 /// A collector's current read, sent to the leader it follows only
 /// (task-d50; design Section 6.3).
 pub use coord_types::wire_v1::KIND_COLLECTOR_READ as KIND_READ;
@@ -149,10 +183,14 @@ pub enum CollectorWireError {
 }
 
 fn check(frame: &Frame, kind: u16) -> Result<(), CollectorWireError> {
+    check_versions(frame, kind, &[VERSION])
+}
+
+fn check_versions(frame: &Frame, kind: u16, versions: &[u16]) -> Result<(), CollectorWireError> {
     if frame.kind != kind {
         return Err(CollectorWireError::UnexpectedKind { kind: frame.kind });
     }
-    if frame.version != VERSION {
+    if !versions.contains(&frame.version) {
         return Err(CollectorWireError::UnsupportedVersion {
             version: frame.version,
         });
@@ -170,7 +208,11 @@ fn exact<'a, T: Deserialize<'a>>(payload: &'a [u8]) -> Result<T, CollectorWireEr
 }
 
 fn frame(kind: u16, payload: &[u8]) -> Result<Vec<u8>, CollectorWireError> {
-    encode_frame(kind, VERSION, payload).map_err(|e| match e {
+    frame_versioned(kind, VERSION, payload)
+}
+
+fn frame_versioned(kind: u16, version: u16, payload: &[u8]) -> Result<Vec<u8>, CollectorWireError> {
+    encode_frame(kind, version, payload).map_err(|e| match e {
         WireError::PayloadTooLarge | WireError::LengthAboveClassLimit { .. } => {
             CollectorWireError::TooLarge
         }
@@ -184,10 +226,27 @@ pub fn submit_frame(submit: &SubmitV1) -> Result<Vec<u8>, CollectorWireError> {
     frame(KIND_SUBMIT, &payload)
 }
 
+/// Encode a submission its collector answers on the leader's final
+/// release alone (task-d100, step A): the version-1 payload under
+/// [`VERSION_ANSWER_ON_RELEASE`].
+pub fn submit_frame_answer_on_release(submit: &SubmitV1) -> Result<Vec<u8>, CollectorWireError> {
+    let payload = postcard::to_allocvec(submit).map_err(|_| CollectorWireError::TooLarge)?;
+    frame_versioned(KIND_SUBMIT, VERSION_ANSWER_ON_RELEASE, &payload)
+}
+
 /// Decode a submission.
 pub fn decode_submit(frame: &Frame) -> Result<SubmitV1, CollectorWireError> {
-    check(frame, KIND_SUBMIT)?;
-    exact(&frame.payload)
+    decode_submit_marked(frame).map(|(submit, _)| submit)
+}
+
+/// Decode a submission, with whether its collector answers it on the
+/// leader's final release alone (task-d100, step A).
+pub fn decode_submit_marked(frame: &Frame) -> Result<(SubmitV1, bool), CollectorWireError> {
+    check_versions(frame, KIND_SUBMIT, &[VERSION, VERSION_ANSWER_ON_RELEASE])?;
+    Ok((
+        exact(&frame.payload)?,
+        frame.version == VERSION_ANSWER_ON_RELEASE,
+    ))
 }
 
 /// Encode protocol evidence for the collector.
@@ -207,15 +266,35 @@ pub fn decode_evidence(frame: &Frame) -> Result<ProtocolMessage, CollectorWireEr
     ProtocolMessage::decode(&frame.payload).map_err(|_| CollectorWireError::Malformed)
 }
 
-/// Encode a released result.
+/// Encode a released result: a version-1 release, or a [`ReleaseV2`]
+/// when the release carries the decided payload's admission (task-d100,
+/// step A).
 pub fn release_frame(released: &ReleasedResult) -> Result<Vec<u8>, CollectorWireError> {
-    let payload = postcard::to_allocvec(released).map_err(|_| CollectorWireError::TooLarge)?;
-    frame(KIND_RELEASE, &payload)
+    match released.admission() {
+        None => {
+            let payload =
+                postcard::to_allocvec(released).map_err(|_| CollectorWireError::TooLarge)?;
+            frame(KIND_RELEASE, &payload)
+        }
+        Some(admission) => {
+            let v2 = ReleaseV2Ref {
+                released,
+                admission,
+            };
+            let payload = postcard::to_allocvec(&v2).map_err(|_| CollectorWireError::TooLarge)?;
+            frame_versioned(KIND_RELEASE, VERSION_ANSWER_ON_RELEASE, &payload)
+        }
+    }
 }
 
-/// Decode a released result.
+/// Decode a released result, of either version. A version-2 release
+/// comes back carrying its admission digest.
 pub fn decode_release(frame: &Frame) -> Result<ReleasedResult, CollectorWireError> {
-    check(frame, KIND_RELEASE)?;
+    check_versions(frame, KIND_RELEASE, &[VERSION, VERSION_ANSWER_ON_RELEASE])?;
+    if frame.version == VERSION_ANSWER_ON_RELEASE {
+        let v2: ReleaseV2 = exact(&frame.payload)?;
+        return Ok(v2.released.with_admission(v2.admission));
+    }
     exact(&frame.payload)
 }
 

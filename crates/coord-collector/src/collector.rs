@@ -59,7 +59,7 @@ use crate::clock::MonotonicMillis;
 use crate::codes;
 
 use crate::trace::{CollectorEvent, command_hex, replica_hex};
-use crate::wire::{SubmitV1, submit_frame};
+use crate::wire::{SubmitV1, submit_frame, submit_frame_answer_on_release};
 
 /// The largest result a client can actually be handed: an API-class
 /// frame, less room for the response's own fields and the frame header.
@@ -291,6 +291,18 @@ pub const OFFER_CEILING_MILLIS: u64 = 1_000;
 /// this node's durable record of the command, if it has one.
 pub const SOLICIT_AFTER_MILLIS: u64 = 5 * OFFER_CEILING_MILLIS;
 
+/// How long a command answered on the release alone (task-d100, step A)
+/// may hold neither half of a release before it is submitted again to
+/// its ballot's leader only, once, in milliseconds (#204 review).
+///
+/// Such a command has no votes at this collector, so a lost release is
+/// what it waits on, and only the leader can publish that again. One
+/// frame, once a command, bounds what this costs under overload; the
+/// all-voter solicit at [`SOLICIT_AFTER_MILLIS`] stays as it is, and this
+/// one doesn't count toward settling from the record, so a collector
+/// whose view of the leader is stale ends as it would without it.
+pub const SOLICIT_LEADER_AFTER_MILLIS: u64 = OFFER_CEILING_MILLIS;
+
 /// What a submission produced.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Submitted {
@@ -380,6 +392,12 @@ pub enum HoldReason {
     /// admission facts, or executed it long ago and forgot its payload
     /// (task-d22). The entry is settled from this node's record.
     AwaitingRecord,
+    /// A command answered on the release alone holds a release it may
+    /// not be answered on (task-d100, step A): a speculative one, or one
+    /// naming another admission than the one it was submitted under. It
+    /// is settled from this node's record against that release, or by a
+    /// voter's refusal, as one holding a release without learning is.
+    ReleaseNotAnswerable,
 }
 
 /// A released result for a caller.
@@ -621,11 +639,21 @@ struct Pending {
     solicit_at: MonotonicMillis,
     /// How many times it has been.
     solicited: u32,
+    /// When a marked entry is submitted again to its ballot's leader
+    /// alone, once, if it still holds neither half of a release
+    /// ([`SOLICIT_LEADER_AFTER_MILLIS`]); `None` for an unmarked entry
+    /// and once it has been.
+    solicit_leader_at: Option<MonotonicMillis>,
     /// Whether this node's durable record of the command may settle it
     /// with nothing of the collector's own to corroborate it: a voter
     /// refused it in a way only the record answers, it was asked for
     /// more than once, or a ballot change voided what it held (task-d22).
     from_record: bool,
+    /// Whether it was submitted as answered on the leader's release
+    /// alone (task-d100, step A): the voters send this frontend no
+    /// evidence for it, so it is answered on a final release whose
+    /// admission is the one it was submitted under.
+    marked: bool,
 }
 
 /// The collector of one domain.
@@ -656,6 +684,18 @@ pub struct Collector {
     /// destination's congestion cannot spend the whole budget on the
     /// same command every turn.
     offer_cursor: usize,
+    /// Whether new submissions are marked as answered on the leader's
+    /// release alone (task-d100, step A): while this collector's node
+    /// reads `Feature::AnswerOnRelease` active.
+    answer_on_release: bool,
+    /// Evidence frames taken for commands submitted as answered on the
+    /// release alone (diagnostic, #204 review): what a voter that learned
+    /// such a command from the leader's proposal alone still sends.
+    evidence_for_marked: u64,
+    /// Early solicits sent to the leader alone for marked entries still
+    /// waiting at [`SOLICIT_LEADER_AFTER_MILLIS`] (diagnostic, #204
+    /// review): the commands whose release took over a second.
+    early_solicits: u64,
 }
 
 impl Collector {
@@ -670,6 +710,9 @@ impl Collector {
             trace: None,
             undelivered_bytes: 0,
             offer_cursor: 0,
+            answer_on_release: false,
+            evidence_for_marked: 0,
+            early_solicits: 0,
         }
     }
 
@@ -687,6 +730,38 @@ impl Collector {
     /// outstanding: what evidence for it has to agree with.
     pub fn admission(&self, command: &CommandId) -> Option<coord_types::identity::Digest32> {
         self.pending.get(command).map(|p| p.admission)
+    }
+
+    /// Mark the commands submitted from now on as answered on the
+    /// leader's release alone, or stop (task-d100, step A). Entries
+    /// already pending keep what they were submitted as, so marked and
+    /// unmarked commands mix while the feature activates and neither
+    /// waits for evidence nobody sends.
+    pub fn set_answer_on_release(&mut self, on: bool) {
+        self.answer_on_release = on;
+    }
+
+    /// Whether new submissions are marked as answered on the release.
+    pub const fn answers_on_release(&self) -> bool {
+        self.answer_on_release
+    }
+
+    /// Evidence frames this collector took for commands it submitted as
+    /// answered on the release alone, while they were pending (#204
+    /// review): the acknowledgements that still reach a frontend for
+    /// them, from voters that learned them from the leader's proposal
+    /// alone. One that arrives after the answer is counted as settled
+    /// evidence, not here.
+    pub const fn evidence_for_marked(&self) -> u64 {
+        self.evidence_for_marked
+    }
+
+    /// Early solicits this collector sent to its ballot's leader alone,
+    /// one at most for each marked entry (#204 review): how many commands
+    /// waited past [`SOLICIT_LEADER_AFTER_MILLIS`] for their release,
+    /// which is the frames the early solicit costs under overload.
+    pub const fn early_solicits(&self) -> u64 {
+        self.early_solicits
     }
 
     /// Whether `command` is outstanding here.
@@ -784,10 +859,16 @@ impl Collector {
                 pending: self.pending.len(),
             });
         }
-        let frame = submit_frame(&SubmitV1 {
+        let marked = self.answer_on_release;
+        let submit = SubmitV1 {
             receipt: admitted.receipt.facts(),
             request: request.clone(),
-        })
+        };
+        let frame = if marked {
+            submit_frame_answer_on_release(&submit)
+        } else {
+            submit_frame(&submit)
+        }
         .map_err(|_| SubmitRefusal::Malformed)?;
         // The second half of the reservation, and the last point at
         // which refusing is honest. Accepting a command means owing its
@@ -825,7 +906,9 @@ impl Collector {
                 frame: Arc::clone(&frame),
                 solicit_at: now.plus(SOLICIT_AFTER_MILLIS),
                 solicited: 0,
+                solicit_leader_at: marked.then(|| now.plus(SOLICIT_LEADER_AFTER_MILLIS)),
                 from_record: false,
+                marked,
                 dissemination: Dissemination {
                     envelope: Some(Arc::clone(&frame)),
                     reserved: bytes,
@@ -996,18 +1079,48 @@ impl Collector {
     /// all, and this is about what a voter that took it said. From the
     /// second time on the entry may be settled from this node's durable
     /// record ([`Collector::settle_from_record`]).
+    ///
+    /// A marked entry (task-d100, step A) is also submitted once, at
+    /// [`SOLICIT_LEADER_AFTER_MILLIS`], to its ballot's leader alone: one
+    /// destination of the budget. That one leaves the all-voter schedule
+    /// and the count toward the record as they are.
     pub fn due_solicits(&mut self, now: MonotonicMillis, budget: usize) -> Vec<FanOut> {
         let voters: Vec<ReplicaId> = self.config.quorum.voters().iter().copied().collect();
+        let leader = self.config.quorum.leader();
         let mut out = Vec::new();
         let mut spent = 0usize;
         for (command, entry) in &mut self.pending {
+            let waiting = entry.released.is_none() && entry.votes.learned().is_none();
+            if waiting
+                && entry.solicit_leader_at.is_some_and(|at| at <= now)
+                && entry.solicit_at > now
+            {
+                if spent + 1 > budget {
+                    break;
+                }
+                entry.solicit_leader_at = None;
+                spent += 1;
+                self.early_solicits += 1;
+                record(&mut self.trace, || CollectorEvent::SolicitedLeader {
+                    command: command_hex(command),
+                    to: replica_hex(&leader),
+                });
+                out.push(FanOut {
+                    command: *command,
+                    retry_key: entry.retry_key,
+                    targets: vec![leader],
+                    frame: Arc::clone(&entry.frame),
+                });
+                continue;
+            }
             if spent + voters.len() > budget {
                 break;
             }
-            if entry.solicit_at > now || entry.released.is_some() || entry.votes.learned().is_some()
-            {
+            if entry.solicit_at > now || !waiting {
                 continue;
             }
+            // The all-voter solicit covers the leader too.
+            entry.solicit_leader_at = None;
             entry.solicit_at = now.plus(SOLICIT_AFTER_MILLIS);
             entry.solicited = entry.solicited.saturating_add(1);
             if entry.solicited >= 2 {
@@ -1092,7 +1205,11 @@ impl Collector {
         self.pending
             .values()
             .filter(|entry| entry.released.is_none() && entry.votes.learned().is_none())
-            .map(|entry| entry.solicit_at)
+            .map(|entry| {
+                entry
+                    .solicit_leader_at
+                    .map_or(entry.solicit_at, |at| at.min(entry.solicit_at))
+            })
             .min()
     }
 
@@ -1159,6 +1276,9 @@ impl Collector {
         let result = if claimed != sender {
             Err(EvidenceError::SenderMismatch { sender, claimed })
         } else if let Some(entry) = self.pending.get_mut(&command) {
+            if entry.marked {
+                self.evidence_for_marked += 1;
+            }
             entry.votes.add(vote).map_err(EvidenceError::Vote)
         } else if self.is_resolved(&command) {
             record(&mut self.trace, || {
@@ -1341,11 +1461,41 @@ impl Collector {
     }
 
     /// The release rule: both the collector's learning predicate and the
-    /// leader's release must hold.
+    /// leader's release must hold. For a marked entry (task-d100, step
+    /// A), the leader's release alone, once it is final and names the
+    /// admission the entry was submitted under: the leader released it
+    /// only after learning it over the same acknowledgements, and a
+    /// release under other facts, or a speculative one, is held as one
+    /// without learning is held.
     fn try_release(&mut self, command: CommandId) -> Progress {
         let Some(entry) = self.pending.get(&command) else {
             return Progress::Settled;
         };
+        if entry.marked && entry.votes.learned().is_none() {
+            let Some((sender, released)) = entry.released.clone() else {
+                record(&mut self.trace, || CollectorEvent::Held {
+                    command: command_hex(&command),
+                    reason: "awaiting-release".into(),
+                });
+                return Progress::Held(HoldReason::AwaitingRelease);
+            };
+            if released.speculative() || released.admission() != Some(entry.admission) {
+                record(&mut self.trace, || CollectorEvent::Held {
+                    command: command_hex(&command),
+                    reason: "release-not-answerable".into(),
+                });
+                return Progress::Held(HoldReason::ReleaseNotAnswerable);
+            }
+            let entry = self.pending.remove(&command).expect("present");
+            self.undelivered_bytes = self
+                .undelivered_bytes
+                .saturating_sub(entry.dissemination.reserved);
+            let established = released.established();
+            let fast = established.fast_path();
+            let response = self.answer_of(command, established.revision(), released.response());
+            let executed = Said::released(sender, &released);
+            return self.finish(command, entry, (response, executed), false, fast);
+        }
         let Some(learned) = entry.votes.learned() else {
             record(&mut self.trace, || CollectorEvent::Held {
                 command: command_hex(&command),

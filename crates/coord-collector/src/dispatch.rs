@@ -199,6 +199,13 @@ impl Dispatcher {
         self.leader_reads = on;
     }
 
+    /// Mark the commands submitted from now on as answered on the
+    /// leader's release alone, or stop (task-d100, step A; see
+    /// [`crate::Collector::set_answer_on_release`]).
+    pub fn set_answer_on_release(&mut self, on: bool) {
+        self.collector.set_answer_on_release(on);
+    }
+
     /// Reads waiting on their leader's answer.
     pub fn reads_waiting(&self) -> usize {
         self.reads.len()
