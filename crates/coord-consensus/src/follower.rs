@@ -460,8 +460,15 @@ enum Fitted {
 
 /// The encoded rows one batch of COMMIT rows written ahead of a Sync may
 /// hold (task-d106): well inside a journal record (`MAX_RECORD_BYTES`,
-/// 4 MiB) beside the batch's framing.
-const COMMIT_ROWS_BATCH_BYTES: usize = 1024 * 1024;
+/// 4 MiB) beside the batch's framing. `coord-storage` checks it against
+/// the journal's bound at compile time.
+pub const COMMIT_ROWS_BATCH_BYTES: usize = 1024 * 1024;
+
+/// The updates one batch of COMMIT rows may hold (task-d106): within a
+/// journal record's (`MAX_RECORD_UPDATES`, 4,096), which a batch of small
+/// rows reaches long before its bytes do (Codex review). `coord-storage`
+/// checks it against the journal's bound at compile time.
+pub const COMMIT_ROWS_BATCH_UPDATES: usize = 1024;
 
 /// What became of one pulled command offered to a window (task-d25).
 enum Pulled {
@@ -2113,12 +2120,33 @@ impl Follower {
         let durable_commit = |ledger: &DurableLedger, c: &CommandId| {
             ledger.record(c).is_some_and(|r| r.phase == Phase::Commit)
         };
-        let mut left_out = false;
-        for c in &carried.held {
-            if durable_commit(&self.ledger, c) {
-                decision.entries.remove(c);
-                left_out = true;
-            }
+        // Left out only while every dependency stays protected: executed,
+        // durable at COMMIT itself, still in the Sync, which names it, or
+        // not held here, which the marker cannot release or demote. A
+        // later Sync judges again, and one that fits carries the record.
+        // A record durable at COMMIT over a dependency whose commit is in
+        // memory only, as a crash between these rows and the marker
+        // leaves it, stays carried: left out, nothing named the
+        // dependency, and the marker released it under a command durable
+        // at COMMIT (Codex review).
+        let leave_out: Vec<CommandId> = carried
+            .held
+            .iter()
+            .filter(|c| {
+                durable_commit(&self.ledger, c)
+                    && self.table.record(c).is_some_and(|r| {
+                        r.deps.iter().all(|d| {
+                            matches!(self.table.phase_of(d), None | Some(Phase::Executed))
+                                || durable_commit(&self.ledger, d)
+                                || decision.entries.contains_key(d)
+                        })
+                    })
+            })
+            .copied()
+            .collect();
+        let left_out = !leave_out.is_empty();
+        for c in &leave_out {
+            decision.entries.remove(c);
         }
         if left_out && let Ok(update) = crate::rows::bounded_sync_update(epoch, &decision) {
             return Fitted::Row(decision, update);
@@ -2166,8 +2194,9 @@ impl Follower {
     }
 
     /// Write the COMMIT rows of `commands`, held at COMMIT, in batches of
-    /// at most [`COMMIT_ROWS_BATCH_BYTES`] of rows (task-d106), each with
-    /// the payload row of a command whose payload row is not durable.
+    /// at most [`COMMIT_ROWS_BATCH_BYTES`] of rows and
+    /// [`COMMIT_ROWS_BATCH_UPDATES`] updates (task-d106), each with the
+    /// payload row of a command whose payload row is not durable.
     fn write_commit_rows(&mut self, commands: &[CommandId]) -> Vec<Effect> {
         let epoch = self.config.identity.epoch;
         let mut effects = Vec::new();
@@ -2178,6 +2207,9 @@ impl Follower {
         let size = |u: &StoreUpdate| u.key.len() + u.value.as_ref().map_or(0, Vec::len);
         for (i, command) in commands.iter().enumerate() {
             let record = self.table.record(command).expect("held").clone();
+            // A command adds at most two updates, its payload row and its
+            // dependency row.
+            debug_assert!(updates.len() + 2 <= COMMIT_ROWS_BATCH_UPDATES);
             if record.payload.is_some() && !self.served_payloads.contains(command) {
                 let payload = self.payloads.get(command).expect("writable");
                 let update = payload_update(command, payload).expect("bounded");
@@ -2189,7 +2221,10 @@ impl Follower {
             bytes += size(&update);
             updates.push(update);
             staged.push((*command, record));
-            if bytes >= COMMIT_ROWS_BATCH_BYTES || i + 1 == commands.len() {
+            if bytes >= COMMIT_ROWS_BATCH_BYTES
+                || updates.len() + 2 > COMMIT_ROWS_BATCH_UPDATES
+                || i + 1 == commands.len()
+            {
                 let barrier = self.alloc.as_mut().expect("booted").allocate();
                 let first = staged.first().map(|(c, _)| *c).expect("one");
                 for (c, r) in staged.drain(..) {

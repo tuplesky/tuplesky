@@ -3920,6 +3920,17 @@ fn frontier_after(frontier: ExecutionFrontier, record: &JournalRecordV1) -> Exec
 /// the command took, and a command that legitimately changed no rows --
 /// a rejection, a comparison that did not match -- still took one, and
 /// losing that record would free the position for a successor.
+// A follower writes the COMMIT rows of what it holds committed ahead of a
+// Sync that would not fit its row, in batches it bounds itself
+// (task-d106): each must be a journal record this check admits.
+const _: () = assert!(coord_consensus::COMMIT_ROWS_BATCH_UPDATES <= MAX_RECORD_UPDATES);
+const _: () = assert!(
+    coord_consensus::COMMIT_ROWS_BATCH_BYTES
+        + coord_store_api::envelope::MAX_ENVELOPE_PAYLOAD
+        + RECORD_HEADER_ALLOWANCE
+        <= MAX_RECORD_BYTES
+);
+
 fn check_update_bounds(batch: &PersistBatch, kind: &TransitionKind) -> Result<(), RecordError> {
     if batch.updates.is_empty() && matches!(kind, TransitionKind::Protocol) {
         return Err(RecordError::EmptyUpdates);

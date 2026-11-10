@@ -8354,6 +8354,13 @@ fn a_voter_holding_more_commits_in_memory_than_a_sync_row_writes_them_and_instal
                     .map(|u| u.key.len() + u.value.as_ref().map_or(0, Vec::len))
                     .sum();
                 assert!(bytes < 2 * 1024 * 1024, "a batch of {bytes} bytes");
+                // Within a journal record's updates too (Codex review):
+                // `coord-storage` holds this bound to the journal's.
+                assert!(
+                    b.updates.len() <= coord_consensus::COMMIT_ROWS_BATCH_UPDATES,
+                    "a batch of {} updates",
+                    b.updates.len()
+                );
             }
             let (rows, syncs) = rows_written(&out);
             assert!(syncs.is_empty(), "the Sync row went down with its rows");
@@ -8501,4 +8508,88 @@ fn a_failed_batch_of_commit_rows_leaves_the_sync_uninstalled_until_it_is_sent_ag
             .iter()
             .any(|x| matches!(x, FollowerRejection::SyncTooLarge { .. }))
     );
+}
+
+/// task-d106, step 1 (Codex review): a crash after the COMMIT rows are
+/// durable and before the Sync's marker leaves the commands durable at
+/// COMMIT over a root whose commit was in memory only, durable at ACCEPT.
+/// The Sync sent again must not leave them out: left out, nothing named
+/// the root, and the marker released it under commands durable at COMMIT.
+/// Kept carried, they name it; the Sync is refused as too large, and the
+/// root is still held.
+#[test]
+fn a_crash_between_the_commit_rows_and_the_marker_keeps_their_dependency() {
+    let (mut f, root, rows, payloads) = voter_holding_commits_in_memory(16_000);
+    let next = ballot(2, 0);
+    let out = f.step(peer_event(
+        r(0),
+        ProtocolMessage::Sync(empty_sync_of_ballot_2()),
+    ));
+    // The COMMIT rows are durable; the process ends before the Sync is
+    // taken again.
+    let (commit_rows, syncs) = rows_written(&out);
+    assert!(syncs.is_empty());
+    let mut durable: BTreeMap<CommandId, CommandRecord> = rows.into_iter().collect();
+    durable.extend(commit_rows);
+    assert_eq!(durable[&root].phase, Phase::Accept);
+    let mut restarted = Follower::recover_with_syncs(
+        FollowerConfig {
+            identity: identity(1),
+            quorum: quorum(ballot(1, 0)),
+            genesis: ballot(0, 0),
+            frontend: FRONTEND,
+            capacity: coord_consensus::MAX_TABLE_CAPACITY,
+        },
+        Some(coord_consensus::PromiseRecordV1 {
+            promised: next,
+            synced: ballot(1, 0),
+        }),
+        None,
+        durable,
+        payloads,
+        Vec::new(),
+        ExecutionPosition::ZERO,
+    );
+    let mut pending: VecDeque<Event> = VecDeque::from([
+        boot_event(2),
+        peer_event(r(0), ProtocolMessage::Sync(empty_sync_of_ballot_2())),
+    ]);
+    let mut steps = 0;
+    while let Some(event) = pending.pop_front() {
+        steps += 1;
+        assert!(steps < 1000, "did not settle");
+        let out = restarted.step(event);
+        let (rows, _) = rows_written(&out);
+        assert!(
+            !rows.contains_key(&root),
+            "the root's row was rewritten or deleted"
+        );
+        for e in &out {
+            if let Effect::Persist(b) = e {
+                assert!(
+                    b.updates.iter().all(|u| u.value.is_some()),
+                    "a row was deleted"
+                );
+            }
+        }
+        pending.extend(durable_events(&out));
+    }
+    assert_eq!(restarted.ballots().synced(), ballot(1, 0));
+    let report = restarted.report(ballot(3, 1));
+    assert!(
+        report.entries.iter().any(|e| e.command == root),
+        "the root was released"
+    );
+    assert_eq!(
+        report
+            .entries
+            .iter()
+            .filter(|e| e.phase == Phase::Commit)
+            .count(),
+        16_000
+    );
+    assert!(restarted.take_rejections().iter().any(|x| matches!(
+        x,
+        FollowerRejection::SyncTooLarge { ballot: b, carried_held: 16_000, .. } if *b == next
+    )));
 }
