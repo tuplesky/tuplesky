@@ -113,6 +113,13 @@ impl ExecutedOrder {
         true
     }
 
+    /// Whether a page after `after` can start in this order: it holds
+    /// something, and nothing below the position after `after` is
+    /// missing from it (as [`ExecutedOrder::between`] reads it).
+    pub fn reaches(&self, after: ExecutionPosition) -> bool {
+        !self.commands.is_empty() && after.get().saturating_add(1) >= self.first
+    }
+
     /// The commands executed after `after`, through `through`, as
     /// (position, command).
     pub fn between(
@@ -146,15 +153,21 @@ impl ExecutedOrder {
 /// Stops at the first command whose rows it cannot read, or whose
 /// executed row does not say the position the order does: the page is a
 /// prefix of what the donor can show, never a page with a hole.
+///
+/// An empty page says why ([`NoPage`]), which the donor counts (task-d106
+/// step 0).
 pub fn page<P: Persistence>(
     applier: &Applier<P>,
     order: &ExecutedOrder,
     epoch: ConfigurationEpoch,
     after: ExecutionPosition,
     through: ExecutionPosition,
-) -> Vec<CatchUpEntry> {
+) -> Result<Vec<CatchUpEntry>, NoPage> {
+    if !order.reaches(after) {
+        return Err(NoPage::OrderAbove);
+    }
     let Ok(gated) = applier.store().reader().snapshot() else {
-        return Vec::new();
+        return Err(NoPage::Snapshot);
     };
     let mut entries = Vec::new();
     let mut bytes = 0usize;
@@ -177,7 +190,23 @@ pub fn page<P: Persistence>(
         bytes = bytes.saturating_add(len);
         entries.push(entry);
     }
-    entries
+    if entries.is_empty() {
+        return Err(NoPage::FirstRow);
+    }
+    Ok(entries)
+}
+
+/// Why a donor had no page for an ask (task-d106 step 0).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoPage {
+    /// Its executed order starts above the position asked, or holds
+    /// nothing: a store that forgot a prefix.
+    OrderAbove,
+    /// No snapshot of its store could be taken.
+    Snapshot,
+    /// The first command's rows could not be read, or its executed row
+    /// does not say the position the order does.
+    FirstRow,
 }
 
 /// The dependency rows of commands this node executed and its machine
@@ -471,6 +500,18 @@ mod tests {
         let mut order = ExecutedOrder::default();
         assert!(order.note(p(7), c(7)));
         assert_eq!(order.between(p(6), p(7)).count(), 1);
+    }
+
+    /// A page can start only where the order holds the position after the
+    /// one asked, which a donor counts apart when it cannot (task-d106).
+    #[test]
+    fn an_order_reaches_an_ask_from_its_first_position_on() {
+        let mut order = ExecutedOrder::default();
+        assert!(!order.reaches(p(6)), "an empty order reaches nothing");
+        assert!(order.note(p(7), c(7)));
+        assert!(order.reaches(p(6)));
+        assert!(order.reaches(p(7)));
+        assert!(!order.reaches(p(5)), "position 6 is below the order");
     }
 
     /// A voter's standing, holding a backlog of a page or more when it

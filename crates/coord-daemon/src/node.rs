@@ -625,8 +625,14 @@ pub struct Unserved {
     pub nothing_after: u64,
     /// With no executed order readable from this node's rows.
     pub no_order: u64,
-    /// With no rows to page from after the position asked.
-    pub no_rows: u64,
+    /// With an executed order that starts above the position asked, or
+    /// holds nothing.
+    pub order_above: u64,
+    /// With no snapshot of this node's store.
+    pub no_snapshot: u64,
+    /// With the first command's rows unreadable, or its executed row at
+    /// another position than the order's.
+    pub first_row: u64,
 }
 
 /// One voter: its machine, its store and the sends it is holding.
@@ -1647,11 +1653,18 @@ impl<P: Persistence> Node<P> {
             self.unserved.no_order += 1;
             return out;
         };
-        let entries = crate::catch_up::page(&self.applier, order, epoch, after, through);
-        if entries.is_empty() {
-            self.unserved.no_rows += 1;
-            return out;
-        }
+        let entries = match crate::catch_up::page(&self.applier, order, epoch, after, through) {
+            Ok(entries) => entries,
+            Err(why) => {
+                let count = match why {
+                    crate::catch_up::NoPage::OrderAbove => &mut self.unserved.order_above,
+                    crate::catch_up::NoPage::Snapshot => &mut self.unserved.no_snapshot,
+                    crate::catch_up::NoPage::FirstRow => &mut self.unserved.first_row,
+                };
+                *count += 1;
+                return out;
+            }
+        };
         self.pages_served += 1;
         out.peer.push((
             PeerId {

@@ -3572,6 +3572,17 @@ impl Follower {
                 Pulled::Stopped => {
                     self.catch_up.queue.clear();
                     self.catch_up.continue_from = None;
+                    // The page's rest is dropped, so the next ask starts
+                    // no later than this replica's frontier. Left at the
+                    // page's end, every ask after it started past the
+                    // frontier, every page answered was stopped as stale,
+                    // and the positions between were never asked for
+                    // again (#213 review).
+                    let executed = self.learner.executed_through();
+                    let since_boot = &mut self.catch_up.since_boot;
+                    if since_boot.from.is_some_and(|from| from > executed) {
+                        since_boot.from = Some(executed);
+                    }
                     break;
                 }
             }

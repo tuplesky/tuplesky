@@ -8677,3 +8677,213 @@ fn a_crash_between_the_commit_rows_and_the_marker_keeps_their_dependency() {
         FollowerRejection::SyncTooLarge { ballot: b, carried_held: 16_000, .. } if *b == next
     )));
 }
+
+/// Drive `f` with `event` and every durable completion it leads to,
+/// returning every effect produced.
+fn settle_collecting(f: &mut Follower, event: Event) -> Vec<Effect> {
+    let mut all = Vec::new();
+    let mut pending: VecDeque<Event> = VecDeque::from([event]);
+    let mut steps = 0;
+    while let Some(event) = pending.pop_front() {
+        steps += 1;
+        assert!(steps < 1000, "did not settle");
+        let out = f.step(event);
+        pending.extend(durable_events(&out));
+        all.extend(out);
+    }
+    all
+}
+
+/// The catch-up asks among `effects`, by where each starts.
+fn catch_up_asks(effects: &[Effect]) -> Vec<ExecutionPosition> {
+    effects
+        .iter()
+        .filter_map(|e| match e {
+            Effect::SendWhenDurable { frame, .. } => match ProtocolMessage::decode(frame) {
+                Ok(ProtocolMessage::CatchUpRequest { after, .. }) => Some(after),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+/// task-d106 (#213 review): a page taken while something restored at
+/// boot still waits sets the next ask to start at the page's end. If a
+/// later window of that page is stopped because this replica left the
+/// ballot it was answered at, the rest is dropped, and the next ask has to
+/// start back at the frontier: left at the page's end, every page answered
+/// after it starts past the frontier and is stopped as stale, and the
+/// positions between are never asked for again.
+///
+/// The restored commits are records durable at COMMIT over a root whose
+/// payload this voter never received, as step 1's rows come back after a
+/// restart: nothing executes them, so they wait for the whole boot.
+#[test]
+fn a_window_stopped_for_a_left_ballot_leaves_the_next_ask_at_the_frontier() {
+    let b2 = ballot(2, 0);
+    let b3 = ballot(3, 0);
+    let root = CommandId(Digest32([0x81; 32]));
+    let mut rows = vec![(
+        root,
+        CommandRecord {
+            phase: Phase::Accept,
+            deps: Vec::new(),
+            keys: vec![b"k".to_vec()],
+            payload: Some(Digest32([0x82; 32])),
+            paths: Vec::new(),
+            synced_seq: Some(1),
+            path: coord_consensus::empty_path(),
+        },
+    )];
+    let mut payloads = Vec::new();
+    for seq in 1..=10 {
+        let (command, payload) = outside_command(seq);
+        rows.push((
+            command,
+            CommandRecord {
+                phase: Phase::Commit,
+                deps: vec![root],
+                keys: vec![b"k".to_vec()],
+                payload: Some(payload.admission_digest()),
+                paths: Vec::new(),
+                synced_seq: Some(1),
+                path: coord_consensus::empty_path(),
+            },
+        ));
+        payloads.push((command, payload));
+    }
+    let resumed = SyncDecision {
+        ballot: b2,
+        source_ballot: ballot(1, 0),
+        entries: BTreeMap::new(),
+        reproposed: BTreeSet::new(),
+    };
+    let mut f = Follower::recover_with_syncs(
+        FollowerConfig {
+            identity: identity(1),
+            quorum: quorum(b2),
+            genesis: ballot(0, 0),
+            frontend: FRONTEND,
+            capacity: coord_consensus::MAX_TABLE_CAPACITY,
+        },
+        Some(coord_consensus::PromiseRecordV1 {
+            promised: b2,
+            synced: b2,
+        }),
+        None,
+        rows,
+        payloads,
+        vec![(b2, resumed)],
+        ExecutionPosition::ZERO,
+    )
+    .restore_execution(ExecutionPosition::ZERO, Vec::new());
+    f.step(boot_event(1));
+    assert_eq!(f.ballots().synced(), b2);
+
+    // A page of two windows: the second command's donor kept no row of
+    // it, so it is a window of its own.
+    let pos = |n: u64| ExecutionPosition::new(n).unwrap();
+    let (first, first_payload) = outside_command(101);
+    let (second, second_payload) = outside_command(102);
+    let page = |b: Ballot| ProtocolMessage::CatchUpPage {
+        ballot: b,
+        after: ExecutionPosition::ZERO,
+        through: pos(2),
+        entries: vec![
+            coord_consensus::CatchUpEntry {
+                command: first,
+                payload: first_payload.clone(),
+                decided: Some(CommandRecord {
+                    phase: Phase::Commit,
+                    deps: Vec::new(),
+                    keys: vec![b"j".to_vec()],
+                    payload: Some(first_payload.admission_digest()),
+                    paths: Vec::new(),
+                    synced_seq: None,
+                    path: coord_consensus::empty_path(),
+                }),
+                position: pos(1),
+                revision: None,
+                result_digest: Digest32([0x91; 32]),
+            },
+            coord_consensus::CatchUpEntry {
+                command: second,
+                payload: second_payload.clone(),
+                decided: None,
+                position: pos(2),
+                revision: None,
+                result_digest: Digest32([0x92; 32]),
+            },
+        ],
+    };
+    settle_collecting(&mut f, peer_event(r(0), page(b2)));
+    assert_eq!(f.catch_up_counts().0, 1, "the page was not taken");
+    assert_eq!(f.next_executable(), Some(first));
+
+    // A new ballot before the first window runs.
+    settle_collecting(
+        &mut f,
+        peer_event(
+            r(0),
+            ProtocolMessage::NewLeader {
+                ballot: b3,
+                executed: ExecutionPosition::ZERO,
+            },
+        ),
+    );
+    settle_collecting(
+        &mut f,
+        peer_event(
+            r(0),
+            ProtocolMessage::Sync(SyncDecision {
+                ballot: b3,
+                source_ballot: b2,
+                entries: BTreeMap::new(),
+                reproposed: BTreeSet::new(),
+            }),
+        ),
+    );
+    assert_eq!(f.ballots().synced(), b3);
+
+    // The first window runs; the second, answered at ballot 2, is stopped.
+    let effects = f
+        .applied(
+            first,
+            &AppliedOutcome {
+                position: pos(1),
+                revision: None,
+                result_digest: Digest32([0x91; 32]),
+                response: Vec::new(),
+            },
+        )
+        .unwrap();
+    for e in durable_events(&effects) {
+        settle_collecting(&mut f, e);
+    }
+    assert_eq!(f.executed_through(), pos(1));
+    assert_eq!(
+        f.catch_up_paths().stopped_ballot,
+        1,
+        "{:?}",
+        f.catch_up_paths()
+    );
+    assert!(!f.catching_up());
+
+    // The next ask starts at the frontier, not at the page's end.
+    let asks = catch_up_asks(&f.request_catch_up(r(0)));
+    assert_eq!(asks, vec![pos(1)]);
+
+    // And the same page's rest, answered at this ballot, is taken.
+    let rest = ProtocolMessage::CatchUpPage {
+        ballot: b3,
+        after: pos(1),
+        through: pos(2),
+        entries: match page(b3) {
+            ProtocolMessage::CatchUpPage { entries, .. } => entries[1..].to_vec(),
+            _ => unreachable!(),
+        },
+    };
+    settle_collecting(&mut f, peer_event(r(0), rest));
+    assert_eq!(f.next_executable(), Some(second));
+}

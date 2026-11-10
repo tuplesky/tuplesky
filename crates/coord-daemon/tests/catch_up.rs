@@ -506,9 +506,11 @@ fn a_follower_cut_off_for_thirty_seconds_serves_within_ten_of_the_heal() {
             after.nothing_after - before.nothing_after,
             after.stopped - before.stopped,
             after.no_order - before.no_order,
-            after.no_rows - before.no_rows,
+            after.order_above - before.order_above,
+            after.no_snapshot - before.no_snapshot,
+            after.first_row - before.first_row,
         ),
-        (2, 1, 1, 0, 0, 0),
+        (2, 1, 1, 0, 0, 0, 0, 0),
         "{before:?} {after:?}"
     );
     // Serving: executed as far as the leader, table drained, and new work

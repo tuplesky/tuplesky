@@ -1015,7 +1015,7 @@ pub struct Domain<P: Persistence> {
     /// Catch-up pages taken, as last said (task-d08).
     catch_up_said: u64,
     /// The catch-up paths line as last said, and when (task-d106 step 0).
-    catch_up_paths_said: Option<(std::time::Instant, String)>,
+    catch_up_paths_said: Option<(std::time::Instant, CatchUpCounts)>,
     /// Peers this node currently cannot queue a frame for, and how many
     /// frames it has dropped for each since it last could. Kept so the
     /// condition is said once when it starts and once when it ends,
@@ -1117,64 +1117,81 @@ struct Dialled {
 /// The least time between two catch-up paths lines (task-d106 step 0).
 const CATCH_UP_PATHS_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// `node`'s catch-up paths line, beside its pacer's `asks`.
-fn catch_up_line_of<P: Persistence>(node: &coord_daemon::Node<P>, asks: u64) -> String {
-    let machine = node.machine();
-    let (pages, pulled) = machine.catch_up_counts();
-    catch_up_paths_text(
-        asks,
-        pages,
-        pulled,
-        &machine.catch_up_paths(),
-        node.pages_served,
-        &node.unserved,
-    )
-}
-
-/// The catch-up paths line (task-d106 step 0): the pacer's asks, pages
-/// taken and commands pulled, every path that ended an ask or a page
-/// without a word, and what this node, as a donor, served and answered
-/// with nothing.
-fn catch_up_paths_text(
+/// What the catch-up paths line says (task-d106 step 0), copied out of
+/// the node to be compared as values on every turn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CatchUpCounts {
     pacer_asks: u64,
     pages: u64,
     pulled: u64,
-    p: &coord_consensus::CatchUpPaths,
+    paths: coord_consensus::CatchUpPaths,
     served: u64,
-    u: &coord_daemon::node::Unserved,
-) -> String {
-    format!(
-        "catch-up paths: pacer_asks={pacer_asks} asked={} pages={pages} pulled={pulled} \
+    unserved: coord_daemon::node::Unserved,
+}
+
+impl CatchUpCounts {
+    /// `node`'s counts, beside its pacer's `asks`.
+    fn of<P: Persistence>(node: &coord_daemon::Node<P>, asks: u64) -> Self {
+        let machine = node.machine();
+        let (pages, pulled) = machine.catch_up_counts();
+        CatchUpCounts {
+            pacer_asks: asks,
+            pages,
+            pulled,
+            paths: machine.catch_up_paths(),
+            served: node.pages_served,
+            unserved: node.unserved,
+        }
+    }
+
+    /// The catch-up paths line: the pacer's asks, pages taken and
+    /// commands pulled, every path that ended an ask or a page without a
+    /// word, and what this node, as a donor, served and answered with
+    /// nothing.
+    fn text(&self) -> String {
+        let CatchUpCounts {
+            pacer_asks,
+            pages,
+            pulled,
+            paths: p,
+            served,
+            unserved: u,
+        } = self;
+        format!(
+            "catch-up paths: pacer_asks={pacer_asks} asked={} pages={pages} pulled={pulled} \
 declined_unbooted={} declined_busy={} declined_stopped={} declined_unsynced={} \
 declined_donor={} dropped_ballot={} dropped_unsynced={} dropped_sender={} \
 ignored_busy={} ignored_stopped={} ignored_campaign={} ignored_after={} empty={} \
 cut_short={} stopped_ballot={} stopped_stale={} served={served} unserved_sender={} \
 unserved_ballot={} unserved_stopped={} unserved_nothing_after={} unserved_no_order={} \
-unserved_no_rows={}",
-        p.asked,
-        p.declined_unbooted,
-        p.declined_busy,
-        p.declined_stopped,
-        p.declined_unsynced,
-        p.declined_donor,
-        p.dropped_ballot,
-        p.dropped_unsynced,
-        p.dropped_sender,
-        p.ignored_busy,
-        p.ignored_stopped,
-        p.ignored_campaign,
-        p.ignored_after,
-        p.empty,
-        p.cut_short,
-        p.stopped_ballot,
-        p.stopped_stale,
-        u.sender,
-        u.ballot,
-        u.stopped,
-        u.nothing_after,
-        u.no_order,
-        u.no_rows,
-    )
+unserved_order_above={} unserved_no_snapshot={} unserved_first_row={}",
+            p.asked,
+            p.declined_unbooted,
+            p.declined_busy,
+            p.declined_stopped,
+            p.declined_unsynced,
+            p.declined_donor,
+            p.dropped_ballot,
+            p.dropped_unsynced,
+            p.dropped_sender,
+            p.ignored_busy,
+            p.ignored_stopped,
+            p.ignored_campaign,
+            p.ignored_after,
+            p.empty,
+            p.cut_short,
+            p.stopped_ballot,
+            p.stopped_stale,
+            u.sender,
+            u.ballot,
+            u.stopped,
+            u.nothing_after,
+            u.no_order,
+            u.order_above,
+            u.no_snapshot,
+            u.first_row,
+        )
+    }
 }
 
 /// The stages this daemon has an instrumentation point for (task-61).
@@ -2207,7 +2224,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         let Backing::Voting(voter) = &self.backing else {
             return None;
         };
-        Some(catch_up_line_of(voter.node(), self.catch_up.asks))
+        Some(CatchUpCounts::of(voter.node(), self.catch_up.asks).text())
     }
 
     /// Streams held open for results that do not exist yet.
@@ -3240,18 +3257,17 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         // How its asks and pages went, by path, when that changed and at
         // most once every `CATCH_UP_PATHS_EVERY` (task-d106 step 0): the
         // paths that stop a catch-up are otherwise silent.
+        // The clock first, then the counts as values: the line is
+        // formatted only when it is said (#213 review).
         {
-            let line = catch_up_line_of(voter.node(), self.catch_up.asks);
             let now = std::time::Instant::now();
-            let due = match &self.catch_up_paths_said {
-                None => true,
-                Some((at, said)) => {
-                    *said != line && now.duration_since(*at) >= CATCH_UP_PATHS_EVERY
+            let said = self.catch_up_paths_said;
+            if said.is_none_or(|(at, _)| now.duration_since(at) >= CATCH_UP_PATHS_EVERY) {
+                let counts = CatchUpCounts::of(voter.node(), self.catch_up.asks);
+                if said.is_none_or(|(_, last)| last != counts) {
+                    eprintln!("{}", counts.text());
+                    self.catch_up_paths_said = Some((now, counts));
                 }
-            };
-            if due {
-                eprintln!("{line}");
-                self.catch_up_paths_said = Some((now, line));
             }
         }
         // Expiry is the leader's to schedule, and every candidate it
@@ -5992,16 +6008,26 @@ mod tests {
             stopped: 22,
             nothing_after: 23,
             no_order: 24,
-            no_rows: 25,
+            order_above: 25,
+            no_snapshot: 26,
+            first_row: 27,
         };
-        let line = super::catch_up_paths_text(1, 30, 31, &paths, 19, &unserved);
+        let line = super::CatchUpCounts {
+            pacer_asks: 1,
+            pages: 30,
+            pulled: 31,
+            paths,
+            served: 19,
+            unserved,
+        }
+        .text();
         let expected = "catch-up paths: pacer_asks=1 asked=2 pages=30 pulled=31 \
 declined_unbooted=3 declined_busy=4 declined_stopped=5 declined_unsynced=6 \
 declined_donor=7 dropped_ballot=8 dropped_unsynced=9 dropped_sender=10 \
 ignored_busy=11 ignored_stopped=12 ignored_campaign=13 ignored_after=14 empty=15 \
 cut_short=16 stopped_ballot=17 stopped_stale=18 served=19 unserved_sender=20 \
 unserved_ballot=21 unserved_stopped=22 unserved_nothing_after=23 unserved_no_order=24 \
-unserved_no_rows=25";
+unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
         assert_eq!(line, expected);
     }
 
