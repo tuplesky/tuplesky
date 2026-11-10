@@ -291,6 +291,18 @@ pub const OFFER_CEILING_MILLIS: u64 = 1_000;
 /// this node's durable record of the command, if it has one.
 pub const SOLICIT_AFTER_MILLIS: u64 = 5 * OFFER_CEILING_MILLIS;
 
+/// How long a command answered on the release alone (task-d100, step A)
+/// may hold neither half of a release before it is submitted again to
+/// its ballot's leader only, once, in milliseconds (#204 review).
+///
+/// Such a command has no votes at this collector, so a lost release is
+/// what it waits on, and only the leader can publish that again. One
+/// frame, once a command, bounds what this costs under overload; the
+/// all-voter solicit at [`SOLICIT_AFTER_MILLIS`] stays as it is, and this
+/// one doesn't count toward settling from the record, so a collector
+/// whose view of the leader is stale ends as it would without it.
+pub const SOLICIT_LEADER_AFTER_MILLIS: u64 = OFFER_CEILING_MILLIS;
+
 /// What a submission produced.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Submitted {
@@ -627,6 +639,11 @@ struct Pending {
     solicit_at: MonotonicMillis,
     /// How many times it has been.
     solicited: u32,
+    /// When a marked entry is submitted again to its ballot's leader
+    /// alone, once, if it still holds neither half of a release
+    /// ([`SOLICIT_LEADER_AFTER_MILLIS`]); `None` for an unmarked entry
+    /// and once it has been.
+    solicit_leader_at: Option<MonotonicMillis>,
     /// Whether this node's durable record of the command may settle it
     /// with nothing of the collector's own to corroborate it: a voter
     /// refused it in a way only the record answers, it was asked for
@@ -876,6 +893,7 @@ impl Collector {
                 frame: Arc::clone(&frame),
                 solicit_at: now.plus(SOLICIT_AFTER_MILLIS),
                 solicited: 0,
+                solicit_leader_at: marked.then(|| now.plus(SOLICIT_LEADER_AFTER_MILLIS)),
                 from_record: false,
                 marked,
                 dissemination: Dissemination {
@@ -1048,18 +1066,47 @@ impl Collector {
     /// all, and this is about what a voter that took it said. From the
     /// second time on the entry may be settled from this node's durable
     /// record ([`Collector::settle_from_record`]).
+    ///
+    /// A marked entry (task-d100, step A) is also submitted once, at
+    /// [`SOLICIT_LEADER_AFTER_MILLIS`], to its ballot's leader alone: one
+    /// destination of the budget. That one leaves the all-voter schedule
+    /// and the count toward the record as they are.
     pub fn due_solicits(&mut self, now: MonotonicMillis, budget: usize) -> Vec<FanOut> {
         let voters: Vec<ReplicaId> = self.config.quorum.voters().iter().copied().collect();
+        let leader = self.config.quorum.leader();
         let mut out = Vec::new();
         let mut spent = 0usize;
         for (command, entry) in &mut self.pending {
+            let waiting = entry.released.is_none() && entry.votes.learned().is_none();
+            if waiting
+                && entry.solicit_leader_at.is_some_and(|at| at <= now)
+                && entry.solicit_at > now
+            {
+                if spent + 1 > budget {
+                    break;
+                }
+                entry.solicit_leader_at = None;
+                spent += 1;
+                record(&mut self.trace, || CollectorEvent::SolicitedLeader {
+                    command: command_hex(command),
+                    to: replica_hex(&leader),
+                });
+                out.push(FanOut {
+                    command: *command,
+                    retry_key: entry.retry_key,
+                    targets: vec![leader],
+                    frame: Arc::clone(&entry.frame),
+                });
+                continue;
+            }
             if spent + voters.len() > budget {
                 break;
             }
-            if entry.solicit_at > now || entry.released.is_some() || entry.votes.learned().is_some()
-            {
+            if entry.solicit_at > now || !waiting {
                 continue;
             }
+            // The all-voter solicit covers the leader too.
+            entry.solicit_leader_at = None;
             entry.solicit_at = now.plus(SOLICIT_AFTER_MILLIS);
             entry.solicited = entry.solicited.saturating_add(1);
             if entry.solicited >= 2 {
@@ -1144,7 +1191,11 @@ impl Collector {
         self.pending
             .values()
             .filter(|entry| entry.released.is_none() && entry.votes.learned().is_none())
-            .map(|entry| entry.solicit_at)
+            .map(|entry| {
+                entry
+                    .solicit_leader_at
+                    .map_or(entry.solicit_at, |at| at.min(entry.solicit_at))
+            })
             .min()
     }
 

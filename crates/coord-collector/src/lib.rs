@@ -49,8 +49,8 @@ pub use clock::MonotonicMillis;
 pub use collector::{
     Collector, CollectorConfig, Differs, EvidenceError, Expired, FanOut, HoldReason, Mismatch,
     MismatchCheck, OFFER_CEILING_MILLIS, OfferOutcome, Offered, Progress, Release, ReleaseOrigin,
-    Resolution, SOLICIT_AFTER_MILLIS, SUBMIT_ENVELOPE_ALLOWANCE, Said, SettleError, SubmitRefusal,
-    Submitted, undelivered_budget,
+    Resolution, SOLICIT_AFTER_MILLIS, SOLICIT_LEADER_AFTER_MILLIS, SUBMIT_ENVELOPE_ALLOWANCE, Said,
+    SettleError, SubmitRefusal, Submitted, undelivered_budget,
 };
 pub use dispatch::{
     Action, Delivery, Dispatcher, READ_FALLBACK_MILLIS, ReadPlan, ReadResolution, servable,

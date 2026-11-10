@@ -2200,3 +2200,104 @@ fn evidence_from_a_follower_that_learned_from_the_proposal_is_counted() {
     );
     assert!(w.rejected.is_empty(), "{:?}", w.rejected);
 }
+
+/// A lost release of a marked command, with the leader unchanged, is
+/// asked for again at one offer ceiling, from the leader alone, once
+/// (#204 review, point 3). Nothing goes to a follower before the
+/// all-voter solicit at `SOLICIT_AFTER_MILLIS`, and the early one leaves
+/// that schedule and the count toward the record as they are.
+#[test]
+fn a_lost_release_of_a_marked_command_is_asked_of_the_leader_early() {
+    let mut w = Cluster::new(256);
+    w.collector.set_answer_on_release(true);
+    w.lose = Lose::Releases;
+    let submit = w.submit(1);
+    let command = w.command(1);
+    for i in 0..3 {
+        w.deliver_submission(i, &submit);
+    }
+    w.settle();
+    assert!(w.collector.is_pending(&command));
+    w.lose = Lose::Nothing;
+
+    let early = MonotonicMillis::new(coord_collector::SOLICIT_LEADER_AFTER_MILLIS);
+    assert_eq!(w.collector.next_solicit(), Some(early));
+    let before = MonotonicMillis::new(coord_collector::SOLICIT_LEADER_AFTER_MILLIS - 1);
+    assert!(w.collector.due_solicits(before, 16).is_empty());
+    let asked = w.collector.due_solicits(early, 16);
+    assert_eq!(asked.len(), 1);
+    assert_eq!(asked[0].targets, vec![r(0)], "to the leader alone");
+    assert!(
+        w.collector.half_established().is_empty(),
+        "the early solicit doesn't open the record"
+    );
+    let shape = w.deliver_submission(0, &asked[0].frame);
+    assert_eq!(shape.frontend, 1, "the release, published again");
+    assert!(!w.collector.is_pending(&command), "answered at about 1 s");
+    assert_eq!(w.releases.len(), 1);
+    assert!(w.rejected.is_empty(), "{:?}", w.rejected);
+    assert!(
+        !w.collector
+            .trace()
+            .iter()
+            .any(|e| matches!(e, CollectorEvent::Solicited { .. })),
+        "nothing went to every voter"
+    );
+}
+
+/// The early solicit reaching a voter that isn't leading -- the
+/// collector's view of the leader is stale -- changes nothing: it is
+/// sent once, the all-voter solicit still comes at `SOLICIT_AFTER_MILLIS`,
+/// and the entry ends as it would without it (#204 review, point 3).
+#[test]
+fn an_early_solicit_to_a_voter_not_leading_changes_nothing() {
+    let mut w = Cluster::new(256);
+    w.collector.set_answer_on_release(true);
+    w.lose = Lose::Releases;
+    let submit = w.submit(1);
+    let command = w.command(1);
+    for i in 0..3 {
+        w.deliver_submission(i, &submit);
+    }
+    w.settle();
+    w.lose = Lose::Nothing;
+
+    let early = MonotonicMillis::new(coord_collector::SOLICIT_LEADER_AFTER_MILLIS);
+    let asked = w.collector.due_solicits(early, 16);
+    assert_eq!(asked.len(), 1);
+    // It reaches a follower instead.
+    let shape = w.deliver_submission(1, &asked[0].frame);
+    assert_eq!(
+        (shape.peer, shape.frontend),
+        (0, 0),
+        "nothing from a follower"
+    );
+    w.settle();
+    assert!(w.collector.is_pending(&command));
+    // Once only.
+    let later = MonotonicMillis::new(coord_collector::SOLICIT_AFTER_MILLIS - 1);
+    assert!(w.collector.due_solicits(later, 16).is_empty());
+    assert_eq!(
+        w.collector.next_solicit(),
+        Some(MonotonicMillis::new(coord_collector::SOLICIT_AFTER_MILLIS))
+    );
+    // The all-voter solicit at 5 s, as without it, counted once.
+    let all = w.collector.due_solicits(
+        MonotonicMillis::new(coord_collector::SOLICIT_AFTER_MILLIS),
+        16,
+    );
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].targets, (0..3).map(r).collect::<Vec<_>>());
+    assert!(
+        w.collector
+            .trace()
+            .iter()
+            .any(|e| matches!(e, CollectorEvent::Solicited { times: 1, .. }))
+    );
+    for i in 0..3 {
+        w.deliver_submission(i, &all[0].frame);
+    }
+    w.settle();
+    assert!(!w.collector.is_pending(&command));
+    assert_eq!(w.releases.len(), 1);
+}
