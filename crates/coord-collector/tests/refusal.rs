@@ -244,16 +244,22 @@ fn a_minority_voter_bound_to_another_request_does_not_end_the_entry() {
 
 /// A command a voter holds under other admission facts, or executed so
 /// long ago it forgot the payload, is answered from this node's durable
-/// record: with nothing of the collector's own to corroborate it.
+/// record: with nothing of the collector's own to corroborate it. A
+/// command answered on the release alone (task-d100, step A) takes the
+/// same path, though it counted nothing to begin with (#204 review).
 #[test]
 fn other_facts_and_a_forgotten_duplicate_are_answered_from_the_record() {
-    for refusal in [
-        SubmissionRefusal::OtherFacts {
-            accepted: Digest32([8; 32]),
-        },
-        SubmissionRefusal::Forgotten,
-    ] {
+    for (marked, refusal) in [false, true].into_iter().flat_map(|marked| {
+        [
+            SubmissionRefusal::OtherFacts {
+                accepted: Digest32([8; 32]),
+            },
+            SubmissionRefusal::Forgotten,
+        ]
+        .map(|refusal| (marked, refusal))
+    }) {
         let mut c = collector(4);
+        c.set_answer_on_release(marked);
         let command = submit(&mut c, 1);
         // Before the refusal the record alone settles nothing.
         assert_eq!(

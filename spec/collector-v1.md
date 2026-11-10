@@ -204,8 +204,27 @@ epoch, ballot and command:
    release must carry the same position, digest and response (a final
    release may follow a speculative one).
 
-A lone leader reply, a lone release, or a loosely counted majority never
-releases tentative data. The response is `ResponseV1 { command_id, Ok {
+**Answered on the release alone** (task-d100, step A). While the
+collector's node reads `Feature::AnswerOnRelease` active, it submits each
+new command as version 2 of `Submit`, which marks it. For a marked
+command the leader sends no `LeaderReply`, every voter sends its
+acknowledgements to the leader only, and the leader's `Release` (version
+2) carries the admission digest of the payload it decided. The
+collector answers a marked command on that release alone, once it is
+not speculative and its admission digest equals the one the command was
+submitted under; the checks of the release's sender, epoch, ballot and
+agreement with an earlier release stay. A speculative release, or one
+under other admission facts, is held as a release without the predicate
+is, and the command settles from the durable record against it or by a
+voter's refusal. A marked command that also gathers the predicate is
+released by rule 1 and 2 as before. Commands submitted before the switch
+keep the rule they were submitted under, so the two mix while the
+feature activates. An exact duplicate of a marked command reaching its
+leader after execution has the release published again, rebuilt from
+the leader's retry record and its table's admission digest.
+
+A lone leader reply, an unmarked command's lone release, or a loosely
+counted majority never releases tentative data. The response is `ResponseV1 { command_id, Ok {
 revision, result } }` with the exact response bytes, or `Err` with the
 frozen `RESULT_TOO_LARGE` code when the result does not fit the response
 bound.

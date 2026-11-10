@@ -171,8 +171,8 @@ kind at the collector boundary, like peer evidence.
 
 | Kind | Value | Direction | Payload |
 |---|---|---|---|
-| Submit | `0x0103` | collector to every voter | `SubmitV1 { receipt: AdmissionFacts, request: RequestV1 }` (postcard); API class limit |
-| Release | `0x0701` | leader to collector | `ReleasedResult` (postcard); collector-evidence class limit |
+| Submit | `0x0103` | collector to every voter | `SubmitV1 { receipt: AdmissionFacts, request: RequestV1 }` (postcard); version 1, or version 2 for a command answered on the leader's release alone (the same payload: the version is the mark, task-d100 step A); API class limit |
+| Release | `0x0701` | leader to collector | Version 1: `ReleasedResult` (postcard). Version 2, for a command marked by its submission: `ReleaseV2 { released: ReleasedResult, admission: Digest32 }`, the admission digest of the payload the leader decided; collector-evidence class limit |
 | Evidence | `0x0700` | voter to collector | Opaque `coord-consensus` protocol message (`LeaderReply`, `FastAck`, `SlowAck`); collector-evidence class limit |
 | Read | `0x0107` | frontend to the leader it follows | `ReadV1 { ballot, request: RequestV1 }` (postcard): a Range without an explicit revision, for the leader read barrier (task-d50); API class limit |
 | ReadAnswer | `0x0702` | leader to frontend | `ReadAnswerV1 { retry_key, ballot, outcome: Served { response } \| Refused { reason } }` (postcard), `reason` one of `NotLeading`, `NothingProposed`, `Expired`, `NotServable`, `Busy`; collector-evidence class limit |
