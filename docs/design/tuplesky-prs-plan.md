@@ -1316,18 +1316,29 @@ The steps:
 
    **Found and fixed here (#211).** The pinned engine, under `TolerateTailCorruption`, truncated the last log file at its first broken batch whatever followed it (a broken file header emptied it, and the open then read as uninitialized), and truncated the last batch of any file on a broken entries block. One damaged byte dropped every acknowledged group after it. The adapter now runs the engine over a tail guard (`coord_journal_raft_engine::guard`) that checks each truncation against the file's bytes before it reaches the file:
    - **Only the last file of its queue,** since rotation syncs a file before creating the next.
-   - **Only an unfinished write:** no whole batch (one whose item block's checksum matches) at or after the truncation point, and the broken batch either cut short (its checksum zero, or running past the end of the file) or holding an unwritten sector part.
-   - **A file header only if it is all zeros,** since any sync of a file persists its header.
+   - **Only an unfinished write:** nothing but zeros past the end the broken batch's header claims, and the batch either cut short (its checksum zero, or running past the end of the file) or holding an unwritten sector part. Inside the claimed end nothing is searched, since a payload can hold anything a batch looks like. Where the header doesn't decode, a whole batch (one whose item block's checksum matches) anywhere after it is refused.
+   - **A file header only if it is all zeros and no whole batch follows it,** since any sync of a file persists its header.
    - **A refusal** is `OpenError::Corrupt` naming the file, the position and the reason, with the file untouched.
 
-   **The physical model:** a sector is written whole or not at all, and a buffered write can stop at any byte. The kit's sector tears (`Tail::SeededSectors`) are that model, and the crash matrix opens every one of them with every acknowledged group. Its byte tears are past it, and may be refused, never opened short.
+   **The physical model:** a sector is written whole or not at all, and a buffered write can stop at any byte. The kit's sector tears are that model. `Tail::Sectors` tries every subset of the unsynced sectors at every crash point, over files small enough to rotate, and each opens with every acknowledged group. Its byte tears are past the model, and may be refused, never opened short.
 
-   **Not covered:**
-   - damage confined to the last batch, with nothing after it, where the batch has a sector part of zeros (its own bytes, or a sector the device lost), which reads as torn;
-   - a purge's several unsynced `.rewrite` batches, torn, which are refused, although nothing in them is lost;
-   - a crash during recovery's own truncation, which is not crash-tested.
+   **What the guard lets through.** It reads one file's tail, so damage that leaves a tail shaped like a torn write is taken for one, and acknowledged groups go with no refusal:
+   - damage confined to the last batch, with nothing after it, where the batch has a sector part of zeros (its own bytes, or a sector the device lost);
+   - the last batch's checksum bytes zeroed, read as a write that stopped short;
+   - zeros from a sector boundary to the end of the file, over whole batches;
+   - the file cut at a sector or batch boundary;
+   - the last file deleted;
+   - two damages to one batch: its length flipped past a whole batch, together with its checksum or its item offset.
 
-   Under `strict`, coordd also refuses a projection that does not continue the journal before anything is attached (`validate_projection`), which catches a journal shorter than the projection's commit point by another route.
+   What would catch these is an independent record of the synced head. Under `strict` the projection is one for what it had committed: `attach_with_baseline` refuses a journal whose head is below the projection's stamp ("materialized past the journal's durable head"), in both profiles. **Under `replay` the projection trails by up to a cadence, and nothing catches a journal shortened inside that window.** That belongs to step 3's `replay` case, and #212's reinstall trusts the same head.
+
+   **What the guard refuses that a crash can leave:**
+   - a purge's several unsynced `.rewrite` batches, torn, although nothing in them is lost (the journal's `maintain()` has no production caller yet, so not today);
+   - a tenant's payload holding a whole batch's shape, in a write torn inside its header's sector, where the header doesn't decode and the bytes after it are searched. The voter is recovered from its peers; if a majority refuses, the operator reads the bytes at the named offset and decides whether to truncate there.
+
+   **Not tested:** a crash during recovery's own truncation, and recovery on the fault seam (the tests reopen on the real file system).
+
+   Under `strict`, coordd also checks the projection against the journal before anything is attached (`validate_projection`). That refuses a stamp naming a record the journal doesn't hold, with an earlier message. A projection past the journal's head passes it and is refused by the attach check above.
 3. **The composed crash matrix:**
    - **The crash points.** Journal and projection crash together at every counted operation of either, with each tail policy on each, under `strict` and `replay`, over the domains' real `JournaledStore`.
    - **`replay`'s case.** The live projection is lost or unusable in four ways. For each, the node must recover the journal's state, by replay or by installing the baseline, or refuse to serve when there is no baseline:

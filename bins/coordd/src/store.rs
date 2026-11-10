@@ -783,9 +783,10 @@ fn rollback_guard(
 /// Under the strict profile, refuse a projection that does not continue
 /// the journal before anything is attached (#211). Nothing rolls a strict
 /// projection back, so one behind the published baseline, or whose stamp
-/// names a record the journal does not hold where it says, is damage: to
-/// the projection, or to a journal that opened shorter than the
-/// projection's commit point. It is not reinstalled.
+/// names a record the journal does not hold where it says, is damage, and
+/// is not reinstalled. A projection stamped past the journal's head passes
+/// this check; the attach refuses it ("materialized past the journal's
+/// durable head"), in both profiles.
 fn refuse_if_invalid(
     store: &JournaledStore<RaftEngineJournal, RedbEngine>,
     domain_id: DomainId,

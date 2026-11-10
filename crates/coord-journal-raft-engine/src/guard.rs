@@ -20,15 +20,19 @@
 //!   one after it is torn.
 //! * **A file header only if it was never written.** Any sync of a file
 //!   persists its header, so a file header that does not decode is
-//!   truncated only if it is all zeros, and then nothing in the file was
-//!   ever synced.
+//!   truncated only if it is all zeros and no whole batch follows it
+//!   (tried signed and unsigned, since a zeroed header no longer says the
+//!   file's version). A torn first write whose first sector never landed
+//!   leaves exactly that: a zero header, and part of one batch.
 //! * **Only one batch, the last.** Recycling is off and the adapter writes
 //!   every group with `sync`, so after the last synced batch there are only
 //!   the engine's preallocated zeros, or the remains of the one batch in
 //!   flight. Refused: a non-zero byte past the end the broken batch's
-//!   header claims, or a whole batch anywhere after it (a well-formed
-//!   header whose item block's checksum matches, wherever the broken
-//!   batch's header says it ends).
+//!   header claims. Inside that end nothing is searched: those are the
+//!   batch's own bytes, a tenant's payload among them, which can hold
+//!   anything a batch looks like. Where the broken batch's header doesn't
+//!   decode, its end is unknown, and a whole batch anywhere after it (a
+//!   well-formed header whose item block's checksum matches) is refused.
 //! * **Only a batch that was not written whole.** A batch's item block is
 //!   its last part and ends in a checksum. If the block's checksum matches
 //!   at some end, the batch was written whole there, and a header that
@@ -60,17 +64,43 @@
 //! peers. So is a torn write whose only unwritten part is a sliver too
 //! short to tell from a batch's own zeros.
 //!
-//! **What it still can't tell apart:** damage to the last batch, with
-//! nothing after it, when the batch has a sector part of zeros, whether its
-//! own bytes were zeros there or the device lost a sector it had written.
-//! That batch is truncated.
+//! **What it lets through.** It reads the tail of one file, so damage that
+//! leaves a tail shaped like a torn write is taken for one. Each of these
+//! loses acknowledged groups with no refusal; what would catch them is an
+//! independent record of the synced head (the projection's stamp, under
+//! `strict` and only for records it had committed, or the peers):
+//! * damage to the last batch, with nothing after it, when the batch has a
+//!   sector part of zeros, whether its own bytes were zeros there or the
+//!   device lost a sector it had written;
+//! * the last batch's four checksum bytes zeroed, read as a write that
+//!   stopped short;
+//! * zeros from a sector boundary to the end of the file, over whole
+//!   batches: that batch and every later one go;
+//! * the file cut at a sector or batch boundary (a cut on a batch boundary
+//!   never reaches the guard: the engine reads a clean end);
+//! * the last file deleted;
+//! * two damages to one batch: its length flipped past a whole batch
+//!   together with its own checksum or its item offset. The batch inside
+//!   the extent it claims isn't searched for (above).
 //!
-//! **What it refuses that a crash can leave:** a purge writes several
-//! batches to the `.rewrite` queue before it syncs, so a crash inside one
-//! can leave a torn batch with another after it. That is refused too;
-//! nothing in it is lost, since the append files it rewrites are kept until
-//! it syncs, but the voter is recovered from its peers. A crash during
-//! recovery's own truncation is not tested yet.
+//! **What it refuses that a crash can leave:**
+//! * a purge writes several batches to the `.rewrite` queue before it
+//!   syncs, so a crash inside one can leave a torn batch with another after
+//!   it. That is refused too; nothing in it is lost, since the append files
+//!   it rewrites are kept until it syncs, but the voter is recovered from
+//!   its peers. The journal's `maintain()`, which purges, has no production
+//!   caller yet, so this can't happen today;
+//! * where a broken batch's header doesn't decode, the bytes after it are
+//!   searched, so a tenant's payload holding a whole batch's shape, in a
+//!   write torn inside its header's sector, is refused. The refusal names
+//!   the file and the offset; the voter is recovered from its peers, and if
+//!   a majority refuses, an operator reads the bytes there and decides
+//!   whether to truncate at that offset by hand, which is the call the
+//!   guard declined to make.
+//!
+//! A crash during recovery's own truncation is not tested yet, and the
+//! tests reopen on the real file system, so recovery's truncation and the
+//! guard's read never run on the fault seam.
 //!
 //! Reads go through the wrapped file system, so the check sees what the
 //! engine sees.
@@ -312,18 +342,24 @@ pub fn torn_tail(bytes: &[u8], offset: usize, seq: u64) -> Result<(), &'static s
     }
     if offset == 0 {
         // Any sync of a file persists its header, so a header that was
-        // never written means nothing in the file was ever synced.
-        return if bytes[..FILE_HEADER_LEN.min(bytes.len())]
+        // never written means nothing in the file was ever synced: unless
+        // a whole batch follows it, which only a sync could have put
+        // there. A zeroed header no longer says the file's version, so
+        // its batches are tried signed and unsigned.
+        if !bytes[..FILE_HEADER_LEN.min(bytes.len())]
             .iter()
             .all(|&b| b == 0)
         {
-            Ok(())
-        } else {
-            Err("the file header does not decode, and it is not unwritten")
-        };
+            return Err("the file header does not decode, and it is not unwritten");
+        }
+        if batches_follow(bytes, 0, Some(seq as u32)) || batches_follow(bytes, 0, None) {
+            return Err("the file header is zeros, but a whole batch follows it");
+        }
+        return Ok(());
     }
-    // Where the one write in flight would have ended.
-    let (end, unfinished) = match batch_header(tail) {
+    // Where the one write in flight would have ended, and whether its
+    // end is known.
+    let (end, unfinished, end_known) = match batch_header(tail) {
         Some((len, item_offset)) => {
             let claimed = offset.saturating_add(len);
             if let Some(whole) = whole_batch_end(bytes, offset + item_offset, signature(bytes, seq))
@@ -338,7 +374,7 @@ pub fn torn_tail(bytes: &[u8], offset: usize, seq: u64) -> Result<(), &'static s
                 || bytes[claimed - FOOTER_CHECKSUM_LEN..claimed]
                     .iter()
                     .all(|&b| b == 0);
-            (claimed.min(bytes.len()), unfinished)
+            (claimed.min(bytes.len()), unfinished, true)
         }
         None => {
             // The header's own sector parts, through the end of the sector
@@ -350,13 +386,19 @@ pub fn torn_tail(bytes: &[u8], offset: usize, seq: u64) -> Result<(), &'static s
             }
             // The batch's length is unknown; whatever was written of it
             // runs to the end of the file.
-            (bytes.len(), true)
+            (bytes.len(), true, false)
         }
     };
     if bytes[end..].iter().any(|&b| b != 0) {
         return Err("data follows the broken batch, so it was not the last write");
     }
-    if batches_follow(bytes, offset, signature(bytes, seq)) {
+    // Where the header gives the batch's end, everything past it is
+    // zeros (above), and nothing inside it is searched: inside it are the
+    // batch's own bytes, a tenant's payload among them, which may hold
+    // anything a batch looks like. Where it doesn't, the write is taken to
+    // run to the end of the file, and a whole batch in it can only mean
+    // the header was damaged with batches after it.
+    if !end_known && batches_follow(bytes, offset, signature(bytes, seq)) {
         return Err("a whole batch follows the broken one, so it was not the last write");
     }
     if unfinished || has_unwritten_part(bytes, offset, end) {
@@ -598,19 +640,61 @@ mod tests {
     }
 
     #[test]
-    fn a_whole_batch_after_the_broken_one_is_never_claimed_by_it() {
+    fn a_length_flipped_past_a_whole_batch_is_damage_unless_its_own_footer_is_too() {
         // Two whole batches, then the preallocated zeros.
-        let (mut bytes, batches) = signed_file(5, &[(600, 30), (400, 20)]);
+        let (clean, batches) = signed_file(5, &[(600, 30), (400, 20)]);
         let (a, a_len) = batches[0];
         // The first one's length now reaches past the second into the
-        // zeros, and its own footer is damaged too, so nothing says where
-        // it really ends.
+        // zeros. Its own block still verifies where it really ends.
+        let mut bytes = clean.clone();
         bytes[a..a + 16].copy_from_slice(&header(a_len as u64 + 2000, 616));
-        bytes[a + a_len - 1] ^= 0x01;
         assert_eq!(
             torn_tail(&bytes, a, 5),
-            Err("a whole batch follows the broken one, so it was not the last write")
+            Err("a whole batch is there, but its header claims another length")
         );
+        // A known gap: with its footer damaged too, nothing says where it
+        // really ends, and the batch inside the extent it claims is not
+        // searched for (a payload may hold anything a batch looks like).
+        // Two independent damages to one batch are taken for a torn write.
+        bytes[a + a_len - 1] ^= 0x01;
+        assert_eq!(torn_tail(&bytes, a, 5), Ok(()));
+    }
+
+    #[test]
+    fn batch_shaped_bytes_in_a_torn_payload_are_the_payload() {
+        // The last write carries a tenant's value holding a whole 21-byte
+        // batch (a header, one byte, its checksum signed with the file's
+        // sequence), and its last sector part never landed.
+        let seq = 6;
+        let (mut bytes, offset, len) = signed(seq, 1200, 40);
+        let at = offset + 16 + 300;
+        bytes[at..at + 16].copy_from_slice(&header(21, 16));
+        bytes[at + 16] = 0x77;
+        bytes[at + 17..at + 21].copy_from_slice(&(crc32(&[0x77]) ^ seq as u32).to_le_bytes());
+        assert!(whole_at(&bytes, at + 16, at + 21, Some(seq as u32)));
+        bytes[offset + len - 200..offset + len].fill(0);
+        assert_eq!(torn_tail(&bytes, offset, seq), Ok(()));
+    }
+
+    #[test]
+    fn a_zeroed_file_header_with_whole_batches_after_it_is_damage() {
+        // A file whose batches were synced, then its header zeroed.
+        let (mut bytes, _) = signed_file(9, &[(300, 20), (200, 20)]);
+        bytes[..FILE_HEADER_LEN].fill(0);
+        assert_eq!(
+            torn_tail(&bytes, 0, 9),
+            Err("the file header is zeros, but a whole batch follows it")
+        );
+        // A version-1 file's batches are unsigned.
+        let (mut unsigned, _) = signed_file(0, &[(300, 20)]);
+        unsigned[..FILE_HEADER_LEN].fill(0);
+        assert!(torn_tail(&unsigned, 0, 9).is_err());
+        // A first write torn with its first sector lost: a zero header,
+        // and after it the rest of one batch that never ended.
+        let (mut torn, offset, len) = signed(9, 900, 40);
+        torn[..SECTOR_BYTES].fill(0);
+        assert!(offset < SECTOR_BYTES && offset + len > SECTOR_BYTES);
+        assert_eq!(torn_tail(&torn, 0, 9), Ok(()));
     }
 
     #[test]
