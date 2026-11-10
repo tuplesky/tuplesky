@@ -1886,22 +1886,6 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
             .is_some_and(|d| d.checkpoint.is_some())
     }
 
-    /// Whether `engine`, the projection a boot found, continues `domain`'s
-    /// stream (task-j06, Section 17.16.4), checked before anything is
-    /// attached and without writing anything.
-    ///
-    /// Its applied stamp has to be at the published `baseline` or past it,
-    /// and has to name the record the journal holds there: the record
-    /// after it names the stamp's digest as its predecessor, or, where the
-    /// projection is at the journal's head, the record at the stamp has
-    /// that digest. Otherwise it is
-    /// [`JournaledError::ProjectionInvalid`], and under the replay-backed
-    /// profile the caller discards it and installs the baseline's image.
-    /// [`JournaledStore::attach_with_baseline`] refuses the same
-    /// projection; this is for a caller that still holds what it would
-    /// reinstall into. A stream this boot has no mapping for is not
-    /// checked, nor is the stamp of a projection that has applied
-    /// nothing.
     /// Show `visit` every update of `domain`'s journaled records the
     /// projection `engine` has not applied, `(M, J]`, in order, without
     /// applying any: the first answer `visit` gives is returned with the
@@ -1951,6 +1935,22 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
         Ok(None)
     }
 
+    /// Whether `engine`, the projection a boot found, continues `domain`'s
+    /// stream (task-j06, Section 17.16.4), checked before anything is
+    /// attached and without writing anything.
+    ///
+    /// Its applied stamp has to be at the published `baseline` or past it,
+    /// and has to name the record the journal holds there: the record
+    /// after it names the stamp's digest as its predecessor, or, where the
+    /// projection is at the journal's head, the record at the stamp has
+    /// that digest. Otherwise it is
+    /// [`JournaledError::ProjectionInvalid`], and under the replay-backed
+    /// profile the caller discards it and installs the baseline's image.
+    /// [`JournaledStore::attach_with_baseline`] refuses the same
+    /// projection; this is for a caller that still holds what it would
+    /// reinstall into. A stream this boot has no mapping for is not
+    /// checked, nor is the stamp of a projection that has applied
+    /// nothing.
     pub fn validate_projection(
         &self,
         domain: DomainId,

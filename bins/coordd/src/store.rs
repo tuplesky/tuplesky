@@ -1955,10 +1955,13 @@ namespace = "5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e"
         out
     }
 
+    /// A table's rows, by key.
+    type Rows = Vec<(Vec<u8>, Vec<u8>)>;
+
     /// Every row of every table of the generation's database, by table:
     /// the projection's logical content. Its bytes are no measure, since
     /// redb rewrites its header and trims the file on any open and close.
-    fn rows_of(generation: &Path) -> Vec<(String, Vec<(Vec<u8>, Vec<u8>)>)> {
+    fn rows_of(generation: &Path) -> Vec<(String, Rows)> {
         use redb::{ReadableDatabase, ReadableTable, TableHandle};
         let db = redb::Database::open(generation.join("domain.redb")).expect("open");
         let read = db.begin_read().expect("read");
