@@ -38,7 +38,7 @@ use coord_types::{CommandId, RetryKey};
 use crate::ballot::{BallotState, ConfigurationIdentity, PromiseRejection, ReplicaRole};
 use crate::campaign::Campaign;
 use crate::catch_up::{
-    CatchUp, CatchUpDivergence, DonorExecution, OwnExecution, Running, SinceBoot,
+    CatchUp, CatchUpDivergence, CatchUpPaths, DonorExecution, OwnExecution, Running, SinceBoot,
 };
 use crate::commands::{CommandRecord, CommandTable, InitError};
 use crate::learner::{AppliedOutcome, LearnError, Learner, LearningMode};
@@ -1770,7 +1770,6 @@ impl Follower {
             let given_entries = decision.entries.len();
             let given_ballot = decision.ballot;
             let (decision, carried) = self.carry_commits(decision);
-            self.sync_carried += sync_work(&decision) - given;
             if let Err(cycle) = crate::recovery::entry_order(&decision) {
                 self.halt_on_cycle(cycle);
                 return Vec::new();
@@ -1821,6 +1820,10 @@ impl Follower {
                     return Vec::new();
                 }
             };
+            // Counted for the Sync installed only: one refused, or held
+            // while rows ahead of it are written and then taken again,
+            // carried nothing (#213 review).
+            self.sync_carried += sync_work(&decision).saturating_sub(given);
             let barrier = self.alloc.as_mut().expect("booted").allocate();
             // The selection goes down with the marker, in the one batch.
             // A marker without it would let this replica restart claiming
@@ -3180,6 +3183,16 @@ impl Follower {
             self.catch_up.since_boot.note(command, own);
             return;
         };
+        // Compared with the donor here, so a commit restored at boot and
+        // executed in a pulled window waits for nothing more. Left
+        // expected, it kept every later ask starting where the last page
+        // stopped rather than at this replica's frontier, and a donor with
+        // nothing past that page answers nothing that would end it (#213
+        // review).
+        let since_boot = &mut self.catch_up.since_boot;
+        if since_boot.expected.remove(&command) && !since_boot.waiting() {
+            since_boot.done();
+        }
         if own.position != donor.position
             || own.revision != donor.revision
             || own.result_digest != donor.result_digest
@@ -3225,6 +3238,12 @@ impl Follower {
     /// replica started (task-d08).
     pub const fn catch_up_counts(&self) -> (u64, u64) {
         (self.catch_up.pages, self.catch_up.executed)
+    }
+
+    /// How this replica's catch-up asks and pages went, by path, since
+    /// it started (task-d106 step 0).
+    pub const fn catch_up_paths(&self) -> CatchUpPaths {
+        self.catch_up.paths
     }
 
     /// Whether this replica holds work it has not executed: a record
@@ -3280,17 +3299,27 @@ impl Follower {
     /// the promised ballot, as payload transfer is: it is not a voting
     /// transition.
     pub fn request_catch_up(&mut self, donor: ReplicaId) -> Vec<Effect> {
+        type Path = fn(&mut CatchUpPaths) -> &mut u64;
         let Some(boot) = self.boot else {
+            self.catch_up.paths.declined_unbooted += 1;
             return Vec::new();
         };
         let ballot = self.config.quorum.ballot();
-        if self.catch_up.busy()
-            || self.halted.is_some()
-            || self.diverged.is_some()
-            || self.ballots.synced() != ballot
-            || donor == self.config.identity.replica
+        let declined: Option<Path> = if self.catch_up.busy() {
+            Some(|p| &mut p.declined_busy)
+        } else if self.halted.is_some() || self.diverged.is_some() {
+            Some(|p| &mut p.declined_stopped)
+        } else if self.ballots.synced() != ballot {
+            Some(|p| &mut p.declined_unsynced)
+        } else if donor == self.config.identity.replica
             || !self.config.identity.voters.contains(&donor)
         {
+            Some(|p| &mut p.declined_donor)
+        } else {
+            None
+        };
+        if let Some(path) = declined {
+            *path(&mut self.catch_up.paths) += 1;
             return Vec::new();
         }
         let context = self
@@ -3314,6 +3343,7 @@ impl Follower {
                 },
                 frame,
             });
+            self.catch_up.paths.asked += 1;
         }
         self.release()
     }
@@ -3340,23 +3370,39 @@ impl Follower {
         through: ExecutionPosition,
         entries: Vec<CatchUpEntry>,
     ) -> Vec<Effect> {
+        type Path = fn(&mut CatchUpPaths) -> &mut u64;
         let at = self.config.quorum.ballot();
-        if ballot != at
-            || self.ballots.synced() != at
-            || from == self.config.identity.replica
+        let dropped: Option<Path> = if ballot != at {
+            Some(|p| &mut p.dropped_ballot)
+        } else if self.ballots.synced() != at {
+            Some(|p| &mut p.dropped_unsynced)
+        } else if from == self.config.identity.replica
             || !self.config.identity.voters.contains(&from)
         {
+            Some(|p| &mut p.dropped_sender)
+        } else {
+            None
+        };
+        if let Some(path) = dropped {
+            *path(&mut self.catch_up.paths) += 1;
             self.rejections
                 .push(FollowerRejection::CatchUpDropped { from, ballot });
             return Vec::new();
         }
         let executed = self.learner.executed_through();
-        if self.catch_up.busy()
-            || self.halted.is_some()
-            || self.diverged.is_some()
-            || self.campaign.is_some()
-            || after != self.catch_up.since_boot.from.unwrap_or(executed)
-        {
+        let ignored: Option<Path> = if self.catch_up.busy() {
+            Some(|p| &mut p.ignored_busy)
+        } else if self.halted.is_some() || self.diverged.is_some() {
+            Some(|p| &mut p.ignored_stopped)
+        } else if self.campaign.is_some() {
+            Some(|p| &mut p.ignored_campaign)
+        } else if after != self.catch_up.since_boot.from.unwrap_or(executed) {
+            Some(|p| &mut p.ignored_after)
+        } else {
+            None
+        };
+        if let Some(path) = ignored {
+            *path(&mut self.catch_up.paths) += 1;
             return Vec::new();
         }
         let offered = entries.len();
@@ -3395,7 +3441,11 @@ impl Follower {
             }
         }
         if taken == 0 {
+            self.catch_up.paths.empty += 1;
             return Vec::new();
+        }
+        if taken < offered {
+            self.catch_up.paths.cut_short += 1;
         }
         self.catch_up.pages += 1;
         // A page taken whole that stops short of what the donor executed
@@ -3533,6 +3583,7 @@ impl Follower {
             return if previous.is_some() {
                 ends(entry)
             } else {
+                self.catch_up.paths.stopped_ballot += 1;
                 Pulled::Stopped
             };
         }
@@ -3551,6 +3602,7 @@ impl Follower {
             return if previous.is_some() {
                 ends(entry)
             } else {
+                self.catch_up.paths.stopped_stale += 1;
                 Pulled::Stopped
             };
         }

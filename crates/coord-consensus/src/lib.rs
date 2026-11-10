@@ -145,7 +145,7 @@ pub use ballot::{
     PromiseRejection, ReplicaRole, SealEffects, SealRejection, SyncRejection,
 };
 pub use campaign::Campaign;
-pub use catch_up::{CatchUpDivergence, DonorExecution, OwnExecution};
+pub use catch_up::{CatchUpDivergence, CatchUpPaths, DonorExecution, OwnExecution};
 pub use commands::{
     CommandRecord, CommandTable, InitError, Initialized, RECOVERY_RESERVE_PARTS, RetireError,
 };

@@ -1014,6 +1014,8 @@ pub struct Domain<P: Persistence> {
     catch_up: coord_daemon::catch_up::Pacer,
     /// Catch-up pages taken, as last said (task-d08).
     catch_up_said: u64,
+    /// The catch-up paths line as last said, and when (task-d106 step 0).
+    catch_up_paths_said: Option<(std::time::Instant, String)>,
     /// Peers this node currently cannot queue a frame for, and how many
     /// frames it has dropped for each since it last could. Kept so the
     /// condition is said once when it starts and once when it ends,
@@ -1110,6 +1112,69 @@ struct Dialled {
     reached: bool,
     /// Why not, when it was not.
     error: Option<String>,
+}
+
+/// The least time between two catch-up paths lines (task-d106 step 0).
+const CATCH_UP_PATHS_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// `node`'s catch-up paths line, beside its pacer's `asks`.
+fn catch_up_line_of<P: Persistence>(node: &coord_daemon::Node<P>, asks: u64) -> String {
+    let machine = node.machine();
+    let (pages, pulled) = machine.catch_up_counts();
+    catch_up_paths_text(
+        asks,
+        pages,
+        pulled,
+        &machine.catch_up_paths(),
+        node.pages_served,
+        &node.unserved,
+    )
+}
+
+/// The catch-up paths line (task-d106 step 0): the pacer's asks, pages
+/// taken and commands pulled, every path that ended an ask or a page
+/// without a word, and what this node, as a donor, served and answered
+/// with nothing.
+fn catch_up_paths_text(
+    pacer_asks: u64,
+    pages: u64,
+    pulled: u64,
+    p: &coord_consensus::CatchUpPaths,
+    served: u64,
+    u: &coord_daemon::node::Unserved,
+) -> String {
+    format!(
+        "catch-up paths: pacer_asks={pacer_asks} asked={} pages={pages} pulled={pulled} \
+declined_unbooted={} declined_busy={} declined_stopped={} declined_unsynced={} \
+declined_donor={} dropped_ballot={} dropped_unsynced={} dropped_sender={} \
+ignored_busy={} ignored_stopped={} ignored_campaign={} ignored_after={} empty={} \
+cut_short={} stopped_ballot={} stopped_stale={} served={served} unserved_sender={} \
+unserved_ballot={} unserved_stopped={} unserved_nothing_after={} unserved_no_order={} \
+unserved_no_rows={}",
+        p.asked,
+        p.declined_unbooted,
+        p.declined_busy,
+        p.declined_stopped,
+        p.declined_unsynced,
+        p.declined_donor,
+        p.dropped_ballot,
+        p.dropped_unsynced,
+        p.dropped_sender,
+        p.ignored_busy,
+        p.ignored_stopped,
+        p.ignored_campaign,
+        p.ignored_after,
+        p.empty,
+        p.cut_short,
+        p.stopped_ballot,
+        p.stopped_stale,
+        u.sender,
+        u.ballot,
+        u.stopped,
+        u.nothing_after,
+        u.no_order,
+        u.no_rows,
+    )
 }
 
 /// The stages this daemon has an instrumentation point for (task-61).
@@ -1693,6 +1758,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             caught_up_otherwise: None,
             catch_up: coord_daemon::catch_up::Pacer::default(),
             catch_up_said: 0,
+            catch_up_paths_said: None,
             undeliverable: BTreeMap::new(),
             no_plane_said: false,
             recurring: Recurring::default(),
@@ -2132,6 +2198,16 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     /// What this loop has seen.
     pub const fn counts(&self) -> Counts {
         self.frontend.counts
+    }
+
+    /// How this voter's catch-up went, by path, and how it answered its
+    /// peers' asks (task-d106 step 0). `None` for a node that does not
+    /// vote.
+    pub fn catch_up_line(&self) -> Option<String> {
+        let Backing::Voting(voter) = &self.backing else {
+            return None;
+        };
+        Some(catch_up_line_of(voter.node(), self.catch_up.asks))
     }
 
     /// Streams held open for results that do not exist yet.
@@ -3160,6 +3236,23 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 );
             }
             self.catch_up_said = pages;
+        }
+        // How its asks and pages went, by path, when that changed and at
+        // most once every `CATCH_UP_PATHS_EVERY` (task-d106 step 0): the
+        // paths that stop a catch-up are otherwise silent.
+        {
+            let line = catch_up_line_of(voter.node(), self.catch_up.asks);
+            let now = std::time::Instant::now();
+            let due = match &self.catch_up_paths_said {
+                None => true,
+                Some((at, said)) => {
+                    *said != line && now.duration_since(*at) >= CATCH_UP_PATHS_EVERY
+                }
+            };
+            if due {
+                eprintln!("{line}");
+                self.catch_up_paths_said = Some((now, line));
+            }
         }
         // Expiry is the leader's to schedule, and every candidate it
         // produces is conditional: nothing here decides that a key
@@ -5870,6 +5963,48 @@ impl core::error::Error for TransportError {}
 
 #[cfg(test)]
 mod tests {
+    /// task-d106 step 0: the catch-up paths line names every count, each
+    /// with its own value.
+    #[test]
+    fn the_catch_up_paths_line_names_every_count() {
+        let paths = coord_consensus::CatchUpPaths {
+            asked: 2,
+            declined_unbooted: 3,
+            declined_busy: 4,
+            declined_stopped: 5,
+            declined_unsynced: 6,
+            declined_donor: 7,
+            dropped_ballot: 8,
+            dropped_unsynced: 9,
+            dropped_sender: 10,
+            ignored_busy: 11,
+            ignored_stopped: 12,
+            ignored_campaign: 13,
+            ignored_after: 14,
+            empty: 15,
+            cut_short: 16,
+            stopped_ballot: 17,
+            stopped_stale: 18,
+        };
+        let unserved = coord_daemon::node::Unserved {
+            sender: 20,
+            ballot: 21,
+            stopped: 22,
+            nothing_after: 23,
+            no_order: 24,
+            no_rows: 25,
+        };
+        let line = super::catch_up_paths_text(1, 30, 31, &paths, 19, &unserved);
+        let expected = "catch-up paths: pacer_asks=1 asked=2 pages=30 pulled=31 \
+declined_unbooted=3 declined_busy=4 declined_stopped=5 declined_unsynced=6 \
+declined_donor=7 dropped_ballot=8 dropped_unsynced=9 dropped_sender=10 \
+ignored_busy=11 ignored_stopped=12 ignored_campaign=13 ignored_after=14 empty=15 \
+cut_short=16 stopped_ballot=17 stopped_stale=18 served=19 unserved_sender=20 \
+unserved_ballot=21 unserved_stopped=22 unserved_nothing_after=23 unserved_no_order=24 \
+unserved_no_rows=25";
+        assert_eq!(line, expected);
+    }
+
     use coord_membership::genesis::{GenesisManifest, VoterSeed};
     use coord_types::ids::{ReplicaId, ReplicaIncarnation};
 

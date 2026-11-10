@@ -34,8 +34,9 @@ use coord_storage::{Applier, GroupLimits, StoreWorker};
 use coord_store_testkit::model::ModelEngine;
 use coord_types::identity::Digest32;
 use coord_types::ids::{
-    Ballot, ClientInstanceId, ClusterId, ConfigurationEpoch, DomainId, NamespaceId, PolicyRuleId,
-    PrincipalId, ReplicaId, ReplicaIncarnation, RequestSequence, SessionId,
+    Ballot, ClientInstanceId, ClusterId, ConfigurationEpoch, DomainId, ExecutionPosition,
+    NamespaceId, PolicyRuleId, PrincipalId, ReplicaId, ReplicaIncarnation, RequestSequence,
+    SessionId,
 };
 use coord_types::logical_v1::{CanonicalOperation, LogicalRequest, PutOp};
 use coord_types::wire_v1::{Frame, MessageV1, PeerRole, RequestV1};
@@ -475,6 +476,41 @@ fn a_follower_cut_off_for_thirty_seconds_serves_within_ten_of_the_heal() {
         "{pages} pages, {pulled} pulled"
     );
     assert!(cluster.voters[0].node().pages_served > 0);
+    // Each page answered an ask r2 published (task-d106 step 0).
+    let paths = cluster.voters[2].node().machine().catch_up_paths();
+    assert!(paths.asked >= pages, "{paths:?}");
+    // A donor counts what it answers with nothing, by why: of itself or
+    // a stranger, at another epoch's ballot, and past its own frontier.
+    let donor = cluster.voters[0].node_mut();
+    let through = donor.machine().executed_through();
+    let other = Ballot {
+        epoch: ConfigurationEpoch::new(2).unwrap(),
+        ..ballot()
+    };
+    let before = donor.unserved;
+    for (from, at) in [(r(0), ballot()), (r(9), ballot()), (r(2), other)] {
+        let out = donor.serve_catch_up(from, at, ExecutionPosition::ZERO);
+        assert!(out.peer.is_empty(), "{from:?} {at:?}");
+    }
+    assert!(
+        donor
+            .serve_catch_up(r(2), ballot(), through)
+            .peer
+            .is_empty()
+    );
+    let after = donor.unserved;
+    assert_eq!(
+        (
+            after.sender - before.sender,
+            after.ballot - before.ballot,
+            after.nothing_after - before.nothing_after,
+            after.stopped - before.stopped,
+            after.no_order - before.no_order,
+            after.no_rows - before.no_rows,
+        ),
+        (2, 1, 1, 0, 0, 0),
+        "{before:?} {after:?}"
+    );
     // Serving: executed as far as the leader, table drained, and new work
     // taken without backpressure once caught up.
     let refused_before = cluster.backpressure[2];

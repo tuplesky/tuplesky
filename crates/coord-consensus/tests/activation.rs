@@ -8400,6 +8400,10 @@ fn a_voter_holding_more_commits_in_memory_than_a_sync_row_writes_them_and_instal
         .find(|s| s.ballot == next)
         .expect("ballot 2's Sync row");
     assert_eq!(row.entries.keys().copied().collect::<Vec<_>>(), vec![root]);
+    // Counted for the Sync installed, once: the root, with no
+    // dependencies. The copy refused into rows carried nothing (#213
+    // review).
+    assert_eq!(f.sync_carried(), 1);
 
     // A restart from the rows: every command is still at COMMIT.
     let mut durable: BTreeMap<CommandId, CommandRecord> = rows.into_iter().collect();
