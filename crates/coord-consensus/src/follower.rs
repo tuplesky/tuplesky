@@ -146,6 +146,14 @@ pub enum FollowerRejection {
         bytes: usize,
         /// The smaller of the row and frame limits.
         limit: usize,
+        /// Entries the Sync was sent with.
+        given: usize,
+        /// Entries this voter carried into it from the Sync it replaces,
+        /// pending at COMMIT and not installed (task-d80, task-d106).
+        carried_pending: usize,
+        /// Entries this voter carried into it from records it holds at
+        /// COMMIT and has not executed (task-d80, task-d106).
+        carried_held: usize,
     },
     /// A selection held a dependency cycle among its entries, an
     /// invariant violation (task-d21): this replica's own, before binding
@@ -406,6 +414,16 @@ enum Pending {
     /// Rows written again of records whose batch failed, before they
     /// execute (#197 review); names the first.
     Carry(CommandId),
+}
+
+/// How many entries `Follower::carry_commits` carried into a Sync, by
+/// where they came from (task-d106).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Carried {
+    /// Pending COMMIT entries of the Sync it replaces.
+    pending: usize,
+    /// Records held at COMMIT and not executed.
+    held: usize,
 }
 
 /// What became of one pulled command offered to a window (task-d25).
@@ -1687,7 +1705,8 @@ impl Follower {
             // What this replica holds decided goes down with the Sync it
             // installs, whichever ballot decided it (task-d80).
             let given = sync_work(&decision);
-            let decision = self.carry_commits(decision);
+            let given_entries = decision.entries.len();
+            let (decision, carried) = self.carry_commits(decision);
             self.sync_carried += sync_work(&decision) - given;
             if let Err(cycle) = crate::recovery::entry_order(&decision) {
                 self.halt_on_cycle(cycle);
@@ -1700,10 +1719,16 @@ impl Follower {
                 match crate::rows::bounded_sync_update(self.config.identity.epoch, &decision) {
                     Ok(update) => update,
                     Err(RecoveryError::SyncTooLarge { bytes, limit, .. }) => {
+                        // What it was given and what this voter carried,
+                        // so a refusal says which of the two outgrew the
+                        // row (task-d106).
                         self.rejections.push(FollowerRejection::SyncTooLarge {
                             ballot: decision.ballot,
                             bytes,
                             limit,
+                            given: given_entries,
+                            carried_pending: carried.pending,
+                            carried_held: carried.held,
                         });
                         return Vec::new();
                     }
@@ -1954,13 +1979,17 @@ impl Follower {
     /// Only this replica's copy changes. The Sync each voter installs is
     /// its own row, and no other voter reads it: a candidate's sources are
     /// fast sets, and its selection is from the reports.
-    fn carry_commits(&self, mut decision: SyncDecision) -> SyncDecision {
+    ///
+    /// Returned with how many entries of each kind were carried
+    /// (task-d106).
+    fn carry_commits(&self, mut decision: SyncDecision) -> (SyncDecision, Carried) {
         let mut carried: BTreeMap<CommandId, SyncEntry> = self
             .sync_pending
             .iter()
             .filter(|(c, e)| e.phase == Phase::Commit && !decision.entries.contains_key(c))
             .map(|(c, e)| (*c, e.clone()))
             .collect();
+        let pending = carried.len();
         for (c, r) in self.table.records() {
             if r.phase == Phase::Commit
                 && !decision.entries.contains_key(c)
@@ -1980,8 +2009,9 @@ impl Follower {
                 );
             }
         }
+        let held = carried.len() - pending;
         decision.entries.extend(carried);
-        decision
+        (decision, Carried { pending, held })
     }
 
     /// Hold `decision`'s entries for installation, in place of whatever an

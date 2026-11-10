@@ -5882,7 +5882,7 @@ fn a_follower_sent_a_sync_past_its_row_refuses_it_by_name() {
     assert!(
         f.take_rejections().iter().any(|x| matches!(
             x,
-            FollowerRejection::SyncTooLarge { ballot: sb, bytes, limit } if *sb == b && bytes > limit
+            FollowerRejection::SyncTooLarge { ballot: sb, bytes, limit, given: 16_000, carried_pending: 0, carried_held: 0 } if *sb == b && bytes > limit
         )),
         "the refusal is named"
     );
@@ -8070,4 +8070,132 @@ fn a_voter_holding_more_commits_than_a_sync_row_takes_still_installs_the_next_sy
         .filter(|e| e.phase == Phase::Commit)
         .count();
     assert_eq!(at_commit, held as usize);
+}
+
+/// task-d106, step 0: a voter that refuses a Sync it carried past its row
+/// says what it was given and how many entries of each kind it carried:
+/// pending COMMIT entries of the Sync it resumed, which it never
+/// installed, and records it holds at COMMIT. Which of the two outgrew the
+/// row decides the fix, and n1's log named only the bytes.
+#[test]
+fn a_carried_sync_past_its_row_is_refused_with_what_was_carried() {
+    let id = |tag: u8, n: u32| {
+        let mut d = [tag; 32];
+        d[..4].copy_from_slice(&n.to_be_bytes());
+        CommandId(Digest32(d))
+    };
+    let admitted = Digest32([0x6a; 32]);
+    let (pending, held, given) = (9_000u32, 8_000u32, 3u32);
+    // Records held at COMMIT, each waiting on a command not held here.
+    let rows: Vec<(CommandId, CommandRecord)> = (0..held)
+        .map(|n| {
+            (
+                id(0x6b, n),
+                CommandRecord {
+                    phase: Phase::Commit,
+                    deps: vec![id(0x6c, n)],
+                    keys: vec![b"k".to_vec()],
+                    payload: Some(admitted),
+                    paths: Vec::new(),
+                    synced_seq: Some(1),
+                    path: coord_consensus::empty_path(),
+                },
+            )
+        })
+        .collect();
+    let entry = |command: CommandId, dep: CommandId| coord_consensus::SyncEntry {
+        command,
+        phase: Phase::Commit,
+        deps: vec![dep],
+        path: coord_consensus::empty_path(),
+        paths: Vec::new(),
+        seqnum: 1,
+        admission: Some(admitted),
+    };
+    // The Sync it is synchronized to names commands it never received,
+    // so their entries stay pending across the restart.
+    let synced = ballot(1, 0);
+    let resumed = SyncDecision {
+        ballot: synced,
+        source_ballot: ballot(0, 0),
+        entries: (0..pending)
+            .map(|n| (id(0x6d, n), entry(id(0x6d, n), id(0x6e, n))))
+            .collect(),
+        reproposed: BTreeSet::new(),
+    };
+    let mut f = Follower::recover_with_syncs(
+        FollowerConfig {
+            identity: identity(1),
+            quorum: quorum(synced),
+            genesis: ballot(0, 0),
+            frontend: FRONTEND,
+            capacity: coord_consensus::MAX_TABLE_CAPACITY,
+        },
+        Some(coord_consensus::PromiseRecordV1 {
+            promised: synced,
+            synced,
+        }),
+        None,
+        rows,
+        Vec::new(),
+        vec![(synced, resumed)],
+        ExecutionPosition::ZERO,
+    );
+    // The next leader's Sync names three other commands, and fits.
+    let next = ballot(2, 0);
+    let sync = SyncDecision {
+        ballot: next,
+        source_ballot: synced,
+        entries: (0..given)
+            .map(|n| (id(0x6f, n), entry(id(0x6f, n), id(0x70, n))))
+            .collect(),
+        reproposed: BTreeSet::new(),
+    };
+    assert!(coord_consensus::bounded_sync_update(epoch(), &sync).is_ok());
+    let mut pending_events: VecDeque<Event> = VecDeque::from([
+        boot_event(1),
+        peer_event(
+            r(0),
+            ProtocolMessage::NewLeader {
+                ballot: next,
+                executed: ExecutionPosition::ZERO,
+            },
+        ),
+        peer_event(r(0), ProtocolMessage::Sync(sync)),
+    ]);
+    let mut steps = 0;
+    while let Some(event) = pending_events.pop_front() {
+        steps += 1;
+        assert!(steps < 1000, "did not settle");
+        let out = f.step(event);
+        pending_events.extend(durable_events(&out));
+    }
+    let rejections = f.take_rejections();
+    let refusal = rejections
+        .iter()
+        .find_map(|x| match x {
+            FollowerRejection::SyncTooLarge {
+                ballot: b,
+                bytes,
+                limit,
+                given,
+                carried_pending,
+                carried_held,
+            } if *b == next => Some((*bytes, *limit, *given, *carried_pending, *carried_held)),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no refusal of ballot 2's Sync: {rejections:?}"));
+    let (bytes, limit, named, carried_pending, carried_held) = refusal;
+    assert!(bytes > limit, "{refusal:?}");
+    assert_eq!(
+        (named, carried_pending, carried_held),
+        (given as usize, pending as usize, held as usize)
+    );
+    assert_eq!(f.ballots().synced(), synced);
+    // The log line coordd writes is the rejection's `Debug` form.
+    let line = format!("{rejections:?}");
+    assert!(
+        line.contains("given: 3, carried_pending: 9000, carried_held: 8000"),
+        "{line}"
+    );
 }
