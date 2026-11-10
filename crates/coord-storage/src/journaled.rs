@@ -3922,7 +3922,10 @@ fn frontier_after(frontier: ExecutionFrontier, record: &JournalRecordV1) -> Exec
 /// losing that record would free the position for a successor.
 // A follower writes the COMMIT rows of what it holds committed ahead of a
 // Sync that would not fit its row, in batches it bounds itself
-// (task-d106): each must be a journal record this check admits.
+// (task-d106): each must be a journal record this check admits. A batch
+// of several commands stays within both bounds, since it is closed before
+// a command that would pass them; one past them holds a single command's
+// payload and dependency rows, which a vote already writes as one batch.
 const _: () = assert!(coord_consensus::COMMIT_ROWS_BATCH_UPDATES <= MAX_RECORD_UPDATES);
 const _: () = assert!(
     coord_consensus::COMMIT_ROWS_BATCH_BYTES

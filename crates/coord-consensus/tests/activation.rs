@@ -6428,11 +6428,18 @@ fn a_voter_restarted_before_the_sync_still_releases_what_it_leaves_out() {
 /// A command outside the cluster's own admissions: its identity and the
 /// payload a peer would serve for it.
 fn outside_command(seq: u64) -> (CommandId, coord_consensus::PayloadRecordV1) {
+    outside_command_of(seq, 0)
+}
+
+/// [`outside_command`], its value padded with `padding` bytes.
+fn outside_command_of(seq: u64, padding: usize) -> (CommandId, coord_consensus::PayloadRecordV1) {
+    let mut value = seq.to_be_bytes().to_vec();
+    value.resize(value.len() + padding, 0x5a);
     let request = LogicalRequest::new(
         NamespaceId([5; 16]),
         CanonicalOperation::Put(PutOp {
             key: vec![7],
-            value: seq.to_be_bytes().to_vec(),
+            value,
             lease: None,
             prev_kv: false,
         }),
@@ -8218,6 +8225,13 @@ type HoldingCommits = (
 /// nothing executes. Synchronized to ballot 1, booted, and the leader of
 /// ballot 2 announced.
 fn voter_holding_commits_in_memory(held: u64) -> HoldingCommits {
+    voter_holding_commits_with(held, &BTreeSet::new(), 0)
+}
+
+/// [`voter_holding_commits_in_memory`], where the commands numbered in
+/// `large` carry a value of `padding` bytes and their payloads are held in
+/// memory only, so their payload rows go down beside their COMMIT rows.
+fn voter_holding_commits_with(held: u64, large: &BTreeSet<u64>, padding: usize) -> HoldingCommits {
     let root = CommandId(Digest32([0x71; 32]));
     let accepted = |deps: Vec<CommandId>, payload: Option<Digest32>| CommandRecord {
         phase: Phase::Accept,
@@ -8230,10 +8244,15 @@ fn voter_holding_commits_in_memory(held: u64) -> HoldingCommits {
     };
     let mut rows = vec![(root, accepted(Vec::new(), Some(Digest32([0x72; 32]))))];
     let mut payloads = Vec::new();
+    let mut in_memory = Vec::new();
     for seq in 1..=held {
-        let (command, payload) = outside_command(seq);
+        let pad = if large.contains(&seq) { padding } else { 0 };
+        let (command, payload) = outside_command_of(seq, pad);
         rows.push((command, accepted(vec![root], Some(Digest32([0x73; 32])))));
         payloads.push((command, payload));
+        if pad > 0 {
+            in_memory.push(command);
+        }
     }
     let synced = ballot(1, 0);
     let f = Follower::recover_with_syncs(
@@ -8257,6 +8276,9 @@ fn voter_holding_commits_in_memory(held: u64) -> HoldingCommits {
     // Learned committed, as from the leader's frontier: in the table, not
     // in a row.
     let mut state = f.into_recovered();
+    for command in &in_memory {
+        state.served_payloads.remove(command);
+    }
     state.table.commit(root).unwrap();
     for (command, _) in &payloads {
         state.table.commit(*command).unwrap();
@@ -8353,7 +8375,12 @@ fn a_voter_holding_more_commits_in_memory_than_a_sync_row_writes_them_and_instal
                     .iter()
                     .map(|u| u.key.len() + u.value.as_ref().map_or(0, Vec::len))
                     .sum();
-                assert!(bytes < 2 * 1024 * 1024, "a batch of {bytes} bytes");
+                // Several commands' rows stay within the batch bound
+                // (Codex review on dd426452).
+                assert!(
+                    bytes <= coord_consensus::COMMIT_ROWS_BATCH_BYTES,
+                    "a batch of {bytes} bytes"
+                );
                 // Within a journal record's updates too (Codex review):
                 // `coord-storage` holds this bound to the journal's.
                 assert!(
@@ -8428,6 +8455,59 @@ fn a_voter_holding_more_commits_in_memory_than_a_sync_row_writes_them_and_instal
     );
     restarted.step(boot_event(2));
     assert_eq!(at_commit(&restarted), held as usize + 1);
+}
+
+/// task-d106, step 1 (Codex review on #213): a command whose payload row
+/// goes down beside its COMMIT row closes the batch before it when the two
+/// would take the batch past its bound. A batch of several commands stays
+/// within it, and every batch within a journal record.
+#[test]
+fn large_payload_rows_close_a_batch_of_commit_rows_before_they_overflow_it() {
+    let held = 16_000u64;
+    // A large payload every few hundred commands, so each lands on a batch
+    // already partly filled.
+    let large: BTreeSet<u64> = (1..=8).map(|k| k * 1_700).collect();
+    let padding = 700 * 1024;
+    let (mut f, _, _, _) = voter_holding_commits_with(held, &large, padding);
+    let out = f.step(peer_event(
+        r(0),
+        ProtocolMessage::Sync(empty_sync_of_ballot_2()),
+    ));
+    let mut payload_rows = 0;
+    let mut batches = 0;
+    let mut pending: VecDeque<Event> = VecDeque::new();
+    for e in &out {
+        let Effect::Persist(b) = e else { continue };
+        batches += 1;
+        let bytes: usize = b
+            .updates
+            .iter()
+            .map(|u| u.key.len() + u.value.as_ref().map_or(0, Vec::len))
+            .sum();
+        let commands = b.updates.iter().filter(|u| u.key.len() == 41).count();
+        let large_rows = b
+            .updates
+            .iter()
+            .filter(|u| u.key.len() == 32 && u.value.as_ref().is_some_and(|v| v.len() > padding))
+            .count();
+        payload_rows += large_rows;
+        assert!(
+            commands == 1 || bytes <= coord_consensus::COMMIT_ROWS_BATCH_BYTES,
+            "a batch of {commands} commands and {bytes} bytes"
+        );
+        assert!(bytes + 512 <= 4 * 1024 * 1024, "a batch of {bytes} bytes");
+        assert!(b.updates.len() <= coord_consensus::COMMIT_ROWS_BATCH_UPDATES);
+    }
+    assert_eq!(payload_rows, large.len(), "{batches} batches");
+    pending.extend(durable_events(&out));
+    let mut steps = 0;
+    while let Some(event) = pending.pop_front() {
+        steps += 1;
+        assert!(steps < 1000, "did not settle");
+        let out = f.step(event);
+        pending.extend(durable_events(&out));
+    }
+    assert_eq!(f.ballots().synced(), ballot(2, 0), "never synchronized");
 }
 
 /// task-d106, step 1: a batch of the COMMIT rows written ahead of a Sync

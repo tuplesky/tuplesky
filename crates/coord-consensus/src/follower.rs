@@ -434,6 +434,15 @@ struct Carried {
     held: Vec<CommandId>,
 }
 
+/// A batch of COMMIT rows being filled (task-d106).
+#[derive(Default)]
+struct CommitRowsBatch {
+    updates: Vec<StoreUpdate>,
+    staged: Vec<(CommandId, CommandRecord)>,
+    payloads: Vec<CommandId>,
+    bytes: usize,
+}
+
 /// A Sync waiting for the COMMIT rows written ahead of it (task-d106).
 #[derive(Clone, Debug)]
 struct SyncBehindRows {
@@ -2200,55 +2209,72 @@ impl Follower {
     /// at most [`COMMIT_ROWS_BATCH_BYTES`] of rows and
     /// [`COMMIT_ROWS_BATCH_UPDATES`] updates (task-d106), each with the
     /// payload row of a command whose payload row is not durable.
+    ///
+    /// A command's rows go down together, and a batch is closed before a
+    /// command whose rows would take it past either bound (Codex review).
+    /// So a batch of several commands stays within both, and one past them
+    /// holds a single command's payload and dependency rows, the pair a
+    /// vote already writes in one batch.
     fn write_commit_rows(&mut self, commands: &[CommandId]) -> Vec<Effect> {
         let epoch = self.config.identity.epoch;
         let mut effects = Vec::new();
-        let mut updates: Vec<StoreUpdate> = Vec::new();
-        let mut staged: Vec<(CommandId, CommandRecord)> = Vec::new();
-        let mut payloads: Vec<CommandId> = Vec::new();
-        let mut bytes = 0usize;
+        let mut batch = CommitRowsBatch::default();
         let size = |u: &StoreUpdate| u.key.len() + u.value.as_ref().map_or(0, Vec::len);
-        for (i, command) in commands.iter().enumerate() {
+        for command in commands {
             let record = self.table.record(command).expect("held").clone();
-            // A command adds at most two updates, its payload row and its
-            // dependency row.
-            debug_assert!(updates.len() + 2 <= COMMIT_ROWS_BATCH_UPDATES);
-            if record.payload.is_some() && !self.served_payloads.contains(command) {
-                let payload = self.payloads.get(command).expect("writable");
-                let update = payload_update(command, payload).expect("bounded");
-                bytes += size(&update);
-                updates.push(update);
-                payloads.push(*command);
+            let mut rows = Vec::with_capacity(2);
+            let payload = record.payload.is_some() && !self.served_payloads.contains(command);
+            if payload {
+                let held = self.payloads.get(command).expect("writable");
+                rows.push(payload_update(command, held).expect("bounded"));
             }
-            let update = dependency_update(epoch, command, &record).expect("bounded");
-            bytes += size(&update);
-            updates.push(update);
-            staged.push((*command, record));
-            if bytes >= COMMIT_ROWS_BATCH_BYTES
-                || updates.len() + 2 > COMMIT_ROWS_BATCH_UPDATES
-                || i + 1 == commands.len()
+            rows.push(dependency_update(epoch, command, &record).expect("bounded"));
+            let bytes: usize = rows.iter().map(size).sum();
+            if !batch.updates.is_empty()
+                && (batch.bytes + bytes > COMMIT_ROWS_BATCH_BYTES
+                    || batch.updates.len() + rows.len() > COMMIT_ROWS_BATCH_UPDATES)
             {
-                let barrier = self.alloc.as_mut().expect("booted").allocate();
-                let first = staged.first().map(|(c, _)| *c).expect("one");
-                for (c, r) in staged.drain(..) {
-                    self.ledger.stage(barrier, c, r);
-                }
-                if !payloads.is_empty() {
-                    self.durable_payloads
-                        .entry(barrier)
-                        .or_default()
-                        .append(&mut payloads);
-                }
-                self.pending.insert(barrier, Pending::CommitRows(first));
-                effects.push(Effect::Persist(PersistBatch {
-                    barrier,
-                    base: None,
-                    updates: core::mem::take(&mut updates),
-                }));
-                bytes = 0;
+                effects.push(self.persist_commit_rows(core::mem::take(&mut batch)));
             }
+            batch.bytes += bytes;
+            batch.updates.extend(rows);
+            if payload {
+                batch.payloads.push(*command);
+            }
+            batch.staged.push((*command, record));
+        }
+        if !batch.updates.is_empty() {
+            effects.push(self.persist_commit_rows(batch));
         }
         effects
+    }
+
+    /// Persist one batch of COMMIT rows (task-d106), staging its records
+    /// and payloads under its barrier.
+    fn persist_commit_rows(&mut self, batch: CommitRowsBatch) -> Effect {
+        let CommitRowsBatch {
+            updates,
+            staged,
+            mut payloads,
+            ..
+        } = batch;
+        let barrier = self.alloc.as_mut().expect("booted").allocate();
+        let first = staged.first().map(|(c, _)| *c).expect("one");
+        for (c, r) in staged {
+            self.ledger.stage(barrier, c, r);
+        }
+        if !payloads.is_empty() {
+            self.durable_payloads
+                .entry(barrier)
+                .or_default()
+                .append(&mut payloads);
+        }
+        self.pending.insert(barrier, Pending::CommitRows(first));
+        Effect::Persist(PersistBatch {
+            barrier,
+            base: None,
+            updates,
+        })
     }
 
     /// Hold `decision`'s entries for installation, in place of whatever an
