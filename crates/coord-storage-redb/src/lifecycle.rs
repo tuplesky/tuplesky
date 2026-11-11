@@ -754,23 +754,27 @@ fn initialize_database(
 /// must pass before anything reads or replaces it, in this order:
 ///
 /// 1. the file exists and is not empty;
-/// 2. redb opens it, and every table's checksums verify
-///    (`check_integrity`): damage anywhere in the file is found before any
-///    of its rows is read;
+/// 2. redb opens it with its integrity check on open
+///    (`set_check_integrity_on_open`, redb 4.5): every page of the
+///    committed trees is verified and the allocator state rebuilt, so
+///    damage anywhere in the file is found before any of its rows is
+///    read, and is redb's `Corrupted` rather than a panic (#212 review);
 /// 3. the `meta_v1` identity rows agree with the manifest, so a copied
 ///    manifest cannot lend identity to a foreign database;
 /// 4. every registered table exists.
 ///
 /// Damage is [`OpenError::DatabaseUnreadable`]: redb's `Corrupted`, a file
-/// that isn't redb's, a missing table, and a panic inside redb on
-/// malformed pages, which some single-page damage causes at open (#212
-/// review). Identity is read only from a file whose checksums verify, so
-/// a damaged identity leaf is unreadable, never another node's database,
+/// that isn't redb's, a missing table, and a panic inside redb, which redb
+/// 4.2 raised on some single-page damage and which is still caught as a
+/// backstop. Identity is read only from a file that verified, so a
+/// damaged identity leaf is unreadable, never another node's database,
 /// and a foreign database is refused for its identity whatever tables it
-/// lacks. A file redb repaired (`check_integrity` returning `Ok(false)`,
-/// its allocator rebuilt or its last commit rolled back) verified after
-/// the repair and is used: its stamp is checked against the journal like
-/// any other projection's.
+/// lacks. A file the check repaired (its allocator rebuilt, or a last
+/// commit rolled back) verified after the repair and is used: its stamp
+/// is checked against the journal like any other projection's. redb does
+/// not say whether the open repaired anything, so no line is written for
+/// it; a second `check_integrity()` would say, at the cost of reading the
+/// whole file again at every start.
 fn open_verified_database(
     db_path: &Path,
     manifest: &StoreManifestV1,
@@ -786,29 +790,19 @@ fn open_verified_database(
     if meta.len() == 0 {
         return Err(OpenError::EmptyDatabase);
     }
-    let mut db = unwinding("open", || {
+    let db = unwinding("open", || {
         redb::Database::builder()
             .set_cache_size(options.cache_bytes)
+            .set_check_integrity_on_open(true)
             .open(db_path)
-            .map_err(OpenError::from_database)
-    })?;
-    match unwinding("integrity check", || Ok(db.check_integrity()))? {
-        Ok(true) => {}
-        Ok(false) => eprintln!(
-            "{}: redb repaired the database at open; it verifies, and its stamp is checked \
-             against the journal",
-            db_path.display()
-        ),
-        Err(e) => {
-            return Err(match OpenError::from_database(e) {
+            .map_err(|e| match OpenError::from_database(e) {
                 OpenError::DatabaseUnreadable(m) => {
                     OpenError::DatabaseUnreadable(format!("integrity: {m}"))
                 }
                 other => other,
-            });
-        }
-    }
-    unwinding("identity and tables", || {
+            })
+    })?;
+    let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let txn = db.begin_read().map_err(OpenError::from_transaction)?;
         let meta_table = txn
             .open_table(table_definition(Collection::MetaV1))
@@ -862,31 +856,46 @@ fn open_verified_database(
                 .map_err(|e| OpenError::from_table(c.name(), e))?;
         }
         Ok(())
-    })?;
-    Ok(db)
+    }));
+    match read {
+        Ok(Ok(())) => Ok(db),
+        Ok(Err(e)) => Err(e),
+        Err(payload) => {
+            // Not closed: redb's close writes its allocator state and
+            // clears its recovery flag, and the file is left as it was
+            // found, as evidence (#212 review). The handle's file lock
+            // stays held until the process exits; nothing in it opens
+            // this file again, since `replay` reinstalls into a new
+            // generation and `strict` stops.
+            std::mem::forget(db);
+            Err(panicked("identity and tables", &*payload))
+        }
+    }
 }
 
 /// `f`, with a panic inside redb taken as proof the file is malformed:
-/// redb 4.2 panics rather than errs on some damaged pages (an allocator
-/// or tree page whose bytes pass its checks badly), and does so on every
-/// open of the same file.
+/// redb 4.2 panicked rather than erred on some damaged pages (an
+/// allocator or tree page whose bytes pass its checks badly), and did so
+/// on every open of the same file. 4.5's integrity check on open reports
+/// them as `Corrupted`; this stays as the backstop.
 fn unwinding<T>(
     what: &'static str,
     f: impl FnOnce() -> Result<T, OpenError>,
 ) -> Result<T, OpenError> {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
         Ok(result) => result,
-        Err(payload) => {
-            let message = payload
-                .downcast_ref::<&str>()
-                .map(|s| (*s).to_owned())
-                .or_else(|| payload.downcast_ref::<String>().cloned())
-                .unwrap_or_else(|| "no message".to_owned());
-            Err(OpenError::DatabaseUnreadable(format!(
-                "redb panicked in its {what}: {message}"
-            )))
-        }
+        Err(payload) => Err(panicked(what, &*payload)),
     }
+}
+
+/// A panic inside redb, as the unreadable database it shows.
+fn panicked(what: &'static str, payload: &(dyn std::any::Any + Send)) -> OpenError {
+    let message = payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "no message".to_owned());
+    OpenError::DatabaseUnreadable(format!("redb panicked in its {what}: {message}"))
 }
 
 /// The generation directories under a root, by number.

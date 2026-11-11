@@ -1898,20 +1898,48 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
         &self,
         domain: DomainId,
         engine: &E,
+        visit: impl FnMut(&StoreUpdate) -> Option<T>,
+    ) -> Result<Option<(LocalJournalSeq, T)>, JournaledError> {
+        self.scan_unapplied_of(domain, self.incarnation, engine, visit)
+    }
+
+    /// [`JournaledStore::scan_unapplied`] over the stream `incarnation`
+    /// allocated, looked up as [`JournaledStore::recovery_baseline_of`]
+    /// looks it up: before an authorized replacement's adoption the
+    /// stream is still keyed by the incarnation the root is stamped with,
+    /// and a start scans before it adopts anything (#212 review).
+    ///
+    /// A projection stamped below the stream's retained prefix has nothing
+    /// here to scan: it is behind the published baseline, which the start
+    /// reinstalls under the replay-backed profile and refuses under the
+    /// strict one, and a reinstalled image is scanned before it is
+    /// selected.
+    pub fn scan_unapplied_of<T>(
+        &self,
+        domain: DomainId,
+        incarnation: ReplicaIncarnation,
+        engine: &E,
         mut visit: impl FnMut(&StoreUpdate) -> Option<T>,
     ) -> Result<Option<(LocalJournalSeq, T)>, JournaledError> {
-        let key = StreamKey {
+        let key = |incarnation| StreamKey {
             cluster: self.cluster,
             domain,
-            incarnation: self.incarnation,
+            incarnation,
         };
-        let Some(stream) = self.allocator.lookup(&key) else {
+        let Some(stream) = self
+            .allocator
+            .lookup(&key(incarnation))
+            .or_else(|| self.allocator.lookup(&key(self.incarnation)))
+        else {
             return Ok(None);
         };
         let journal = self.journal.as_ref().ok_or(JournaledError::JournalLent)?;
         let durable = journal.durable_head(stream)?;
         let meta = DurableMeta::read(&engine.reader().snapshot()?)?;
         let mut after = AppliedFrontier::from_stamp(&meta.stamp).materialized;
+        if after < durable && after < journal.retained_from(stream)? {
+            return Ok(None);
+        }
         while after < durable {
             let page = journal.read_suffix(stream, after, self.limits.read)?;
             let Some(last) = page.records.last() else {
