@@ -7926,9 +7926,16 @@ After every step, every limit of the resource contract (design Section
   - A fresh admission never lands past the reserve.
   - Tombstones never exceed capacity plus the conservative keys.
 - **Ledger and bindings.** Durable records and retry-key bindings never
-  exceed six tables. The history sweep (task-d26) runs once they pass
-  four; the peak is those four, the live table, and the retirement
-  window the sweep goes down to.
+  exceed six tables while the live records fit the table. The history
+  sweep (task-d26) keeps the live table and the retirement window, and
+  after a sweep that kept no more than that the next runs once they
+  pass four; the peak is those four, the live table, and the retirement
+  window. A voter behind keeps more live records than that. Its next
+  sweep runs once the records added and the commands executed since the
+  last come to half of what it kept (task-d110), so it holds at most
+  half again what that sweep kept, sweeps at a cost of about three
+  records per record added or command executed, and comes back under
+  six tables as it executes its backlog.
 - **Held proposals.** Never more than `HELD_PROPOSAL_SLACK` tables.
 - **Campaigns.**
   - Report pages held never exceed what the promising voters' reports

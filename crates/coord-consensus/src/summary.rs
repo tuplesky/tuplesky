@@ -98,6 +98,9 @@ pub struct DurableLedger {
     swept_at: usize,
     /// History sweeps run since this ledger was restored (task-d110).
     sweeps: u64,
+    /// Executions since the last history sweep (task-d110): each may have
+    /// made a kept record forgettable.
+    executed_since: usize,
 }
 
 impl DurableLedger {
@@ -110,6 +113,7 @@ impl DurableLedger {
             removals: BTreeMap::new(),
             swept_at: 0,
             sweeps: 0,
+            executed_since: 0,
         }
     }
 
@@ -122,6 +126,7 @@ impl DurableLedger {
             removals: BTreeMap::new(),
             swept_at: 0,
             sweeps: 0,
+            executed_since: 0,
         }
     }
 
@@ -254,35 +259,49 @@ impl DurableLedger {
         self.sequences.retain(|c, _| keep(c));
     }
 
+    /// A command was executed: what a sweep could forget may have grown
+    /// though the ledger did not (task-d110).
+    pub fn executed(&mut self) {
+        self.executed_since = self.executed_since.saturating_add(1);
+    }
+
     /// Whether a history sweep is due, at `threshold` records
-    /// (task-d110): once the ledger holds more than the threshold, and
-    /// more than half again what the last sweep left.
+    /// (task-d110): once the ledger holds more than the threshold, and the
+    /// records added and the commands executed since the last sweep come
+    /// to more than half of what it kept.
     ///
     /// A sweep forgets only what the command table forgets, executed
     /// history. Records the table keeps, such as committed commands a
     /// voter behind has not executed, stay through every sweep. Due at
     /// the threshold alone, the sweep then ran on every execution once
     /// those passed it, each a walk over all of them that removed
-    /// nothing. A sweep that kept little is due at the threshold as
-    /// before. One that kept more is due once the ledger has grown by
-    /// half of what it kept, so a sweep's walk is paid for by the growth
-    /// since the last one, and the ledger holds at most half again its
-    /// live records, or the threshold.
+    /// nothing. Now:
+    /// - A sweep that kept at most two thirds of the threshold is due at
+    ///   the threshold, as before: the ledger is past it only by more
+    ///   than half of what was kept.
+    /// - One that kept more is due once half of what it kept has been
+    ///   added or executed since, so its walk is paid for by those, and
+    ///   the ledger holds at most half again what the last sweep kept.
+    /// - Executions count, so a backlog that drains is reclaimed as it
+    ///   becomes forgettable, without waiting for the ledger to grow.
     pub fn sweep_due(&mut self, threshold: usize) -> bool {
         self.swept_at = self.swept_at.min(self.records.len());
-        self.records.len() > threshold.max(self.swept_at.saturating_add(self.swept_at / 2))
+        let len = self.records.len();
+        len > threshold
+            && (len - self.swept_at).saturating_add(self.executed_since) > self.swept_at / 2
     }
 
     /// A history sweep has just run: the next is measured from what it
     /// left.
     pub fn swept(&mut self) {
         self.swept_at = self.records.len();
+        self.executed_since = 0;
         self.sweeps += 1;
     }
 
     /// What the last history sweep left, lowered as records left
-    /// otherwise (task-d110): the next is due once [`DurableLedger::len`]
-    /// passes the threshold and half again this.
+    /// otherwise (task-d110): what [`DurableLedger::sweep_due`] measures
+    /// the growth and the executions since against.
     pub fn swept_at(&self) -> usize {
         self.swept_at.min(self.records.len())
     }
@@ -655,11 +674,13 @@ mod tests {
             .collect()
     }
 
-    /// task-d110: a sweep is due past the threshold, and, after one that
-    /// kept more than two thirds of it, past half again what it kept.
-    /// Records leaving without a sweep lower the mark.
+    /// task-d110: a sweep is due past the threshold once the records added
+    /// and the commands executed since the last come to more than half of
+    /// what it kept: at the threshold after one that kept little, and
+    /// after half again otherwise, growth or executions alike. Records
+    /// leaving without a sweep lower the mark.
     #[test]
-    fn a_sweep_is_due_past_the_threshold_and_half_again_what_the_last_kept() {
+    fn a_sweep_is_due_once_growth_and_executions_pass_half_what_the_last_kept() {
         let mut ledger = DurableLedger::restore(rows(0, 40));
         assert!(!ledger.sweep_due(40), "40 is not past 40");
         ledger.records.extend(rows(40, 41));
@@ -673,24 +694,105 @@ mod tests {
         ledger.records.extend(rows(61, 62));
         assert!(ledger.sweep_due(40));
         // A sweep that forgot nothing of 100 (a voter behind): not due
-        // again until past 150, half again what it kept.
+        // again until half of 100 is added or executed.
         ledger.records.extend(rows(62, 121));
         assert_eq!(ledger.len(), 100);
-        assert!(ledger.sweep_due(40));
         ledger.swept();
         assert!(!ledger.sweep_due(40));
-        ledger.records.extend(rows(121, 171));
-        assert_eq!(ledger.len(), 150);
-        assert!(!ledger.sweep_due(40), "150 is not past 150");
-        ledger.records.extend(rows(171, 172));
-        assert!(ledger.sweep_due(40));
-        // Records leaving without a sweep lower the mark: 60 left of the
-        // 100 the sweep kept, so due past 90.
+        ledger.records.extend(rows(121, 151));
+        for _ in 0..20 {
+            ledger.executed();
+        }
+        assert!(!ledger.sweep_due(40), "30 added and 20 executed");
+        ledger.executed();
+        assert!(ledger.sweep_due(40), "30 added and 21 executed");
+        // A backlog that drains: nothing added, executions alone.
+        ledger.swept();
+        for _ in 0..65 {
+            ledger.executed();
+        }
+        assert!(!ledger.sweep_due(40), "65 executed of 130 kept");
+        ledger.executed();
+        assert!(ledger.sweep_due(40), "66 executed of 130 kept");
+        // Records leaving without a sweep lower the mark: 39 left of the
+        // 130 kept, under the threshold.
+        ledger.swept();
         ledger.retain(|c| c.0.0[7] >= 112);
-        assert_eq!(ledger.len(), 60);
+        assert_eq!(ledger.len(), 39);
         assert!(!ledger.sweep_due(40));
-        ledger.records.extend(rows(172, 203));
-        assert_eq!(ledger.len(), 91);
-        assert!(ledger.sweep_due(40));
+        ledger.records.extend(rows(151, 153));
+        assert!(!ledger.sweep_due(40), "2 added since 39");
+        ledger.records.extend(rows(153, 171));
+        assert!(ledger.sweep_due(40), "20 added since 39");
+    }
+
+    fn number(c: &CommandId) -> u64 {
+        u64::from_be_bytes(c.0.0[..8].try_into().unwrap())
+    }
+
+    /// task-d110 (#217 review, point 1): a ledger that forgets nothing,
+    /// grown tenfold one record at a time. It is swept a few times, each
+    /// sweep paid for by the growth since the last (at most three records
+    /// looked at per record added), and it never holds more than half
+    /// again what the last sweep kept, or the threshold, past the record
+    /// that makes a sweep due.
+    #[test]
+    fn a_ledger_that_grows_is_swept_at_a_bounded_cost_per_record() {
+        const THRESHOLD: usize = 32;
+        for start in [500u64, 2_000] {
+            let mut ledger = DurableLedger::restore(rows(0, start));
+            ledger.swept();
+            let (mut sweeps, mut looked) = (0u64, 0u64);
+            for n in start..10 * start {
+                ledger.records.extend(rows(n, n + 1));
+                let bound = THRESHOLD.max(ledger.swept_at() + ledger.swept_at() / 2) + 1;
+                assert!(
+                    ledger.len() <= bound,
+                    "{} held, bound {bound}",
+                    ledger.len()
+                );
+                if ledger.sweep_due(THRESHOLD) {
+                    sweeps += 1;
+                    looked += ledger.len() as u64;
+                    ledger.swept();
+                }
+            }
+            let added = 9 * start;
+            assert!((4..=6).contains(&sweeps), "{sweeps} sweeps from {start}");
+            assert!(looked <= 3 * added, "{looked} looked at for {added} added");
+        }
+    }
+
+    /// task-d110 (#217 review, point 2): a voter 2,000 behind at capacity
+    /// 8 executes its backlog, with nothing new arriving. Each command
+    /// becomes forgettable once eight later executions are past it, and a
+    /// sweep takes what is forgettable. The executions alone bring the
+    /// sweeps, each paid for by the executions since the last, and once
+    /// the backlog has drained the ledger is back under the threshold.
+    /// Counting growth alone, the ledger held all 2,000 for good.
+    #[test]
+    fn a_drained_backlog_is_reclaimed_by_its_executions() {
+        const CAPACITY: u64 = 8;
+        const THRESHOLD: usize = 4 * CAPACITY as usize;
+        const BEHIND: u64 = 2_000;
+        let mut ledger = DurableLedger::restore(rows(0, BEHIND));
+        let (mut sweeps, mut looked) = (0u64, 0u64);
+        for executed in 1..=BEHIND {
+            ledger.executed();
+            if ledger.sweep_due(THRESHOLD) {
+                sweeps += 1;
+                looked += ledger.len() as u64;
+                let forgotten = executed.saturating_sub(CAPACITY);
+                ledger.retain(|c| number(c) >= forgotten);
+                ledger.swept();
+            }
+        }
+        assert!(
+            ledger.len() <= THRESHOLD,
+            "{} held once drained",
+            ledger.len()
+        );
+        assert!((5..=8).contains(&sweeps), "{sweeps} sweeps");
+        assert!(looked <= 3 * BEHIND, "{looked} looked at for {BEHIND}");
     }
 }

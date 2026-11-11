@@ -1037,8 +1037,10 @@ impl Leader {
     /// for it any more.
     ///
     /// Due as a follower's is (task-d110): past a multiple of the table,
-    /// and half again what the last sweep left.
+    /// once the records added and the commands executed since the last
+    /// sweep come to more than half of what it kept.
     fn forget_history(&mut self) {
+        self.ledger.executed();
         if !self.ledger.sweep_due(
             self.config
                 .capacity

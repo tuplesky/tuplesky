@@ -555,8 +555,10 @@ pub struct Cost {
 
 /// The durable command records a voter holds, and its history sweeps
 /// (task-d110). A sweep forgets only executed history, so a voter behind
-/// holds more than it can forget. The next sweep is due once `records`
-/// passes `kept` by the table's capacity times four.
+/// holds more than it can forget. The next sweep is due once `records` is
+/// past the table's capacity times four, and the records added and the
+/// commands executed since the last sweep come to more than half of
+/// `kept`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct History {
     /// Durable command records the ledger holds now.

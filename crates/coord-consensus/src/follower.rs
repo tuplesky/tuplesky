@@ -3860,11 +3860,13 @@ impl Follower {
     /// Neither is reported or served for such a command any more, so
     /// keeping them made the memory of a long-running voter grow with its
     /// history. The sweep runs when the ledger has outgrown a multiple of
-    /// the table, and half again what the last sweep left
-    /// ([`DurableLedger::sweep_due`]), so it is amortized over the growth
+    /// the table, and the records added and the commands executed since
+    /// the last sweep come to more than half of what it kept
+    /// ([`DurableLedger::sweep_due`]). So it is amortized over the work
     /// that made it necessary, also at a voter behind, whose ledger holds
     /// more than that the table does not forget (task-d110).
     fn forget_history(&mut self) {
+        self.ledger.executed();
         if !self
             .ledger
             .sweep_due(self.config.capacity.saturating_mul(HISTORY_SWEEP))
@@ -6516,8 +6518,8 @@ mod tests {
     /// executions looked at 10,000, 20,000 and 40,000 entries at 500,
     /// 1,000 and 2,000 behind. Measured from what the last sweep left, the
     /// first execution sweeps once and the next nine sweep nothing,
-    /// however far behind, until the ledger passes half again what that
-    /// sweep kept.
+    /// however far behind. The next sweep comes once half of what that one
+    /// kept has been added or executed.
     #[test]
     fn a_voter_behind_sweeps_once_per_growth_of_half_what_it_keeps_not_per_execution() {
         let epoch = ConfigurationEpoch::new(1).unwrap();
@@ -6598,6 +6600,12 @@ mod tests {
                 "nothing was forgotten"
             );
             swept.push(follower.swept.get() - first);
+            // Executions alone bring the next sweep, half of what the
+            // first kept later: a backlog that drains is reclaimed.
+            for _ in 0..behind / 2 {
+                follower.forget_history();
+            }
+            assert_eq!(follower.swept.get(), 2 * first, "one more sweep");
         }
         // Before task-d110 each call looked at everything held, ten times
         // the ledger over ten calls. Now none of the nine after the first
