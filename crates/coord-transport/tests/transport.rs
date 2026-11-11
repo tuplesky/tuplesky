@@ -19,7 +19,7 @@ use coord_transport::{
 use coord_transport_testkit::{TestBinder, TestCa, TestIdentity};
 use coord_types::ids::{ClusterId, DomainId, ReplicaId, ReplicaIncarnation};
 use coord_types::wire_v1::{
-    BoundedVec, COLLECTOR_SUBMIT_ANSWER_ON_RELEASE_VERSION, COLLECTOR_SUBMIT_VERSION, CloseV1,
+    BoundedVec, COLLECTOR_SUBMIT_RELAYED_VERSION, COLLECTOR_SUBMIT_VERSION, CloseV1,
     HEADER_LEN, HelloV1, KIND_COLLECTOR_SUBMIT, KIND_SESSION_BIND, KIND_SESSION_BIND_ACK,
     MessageV1, PeerRole, SESSION_BIND_VERSION, encode_frame,
 };
@@ -1090,9 +1090,10 @@ async fn a_submission_stream_is_open_to_a_collector_and_to_nobody_else() {
     send.write_all(
         &encode_frame(
             KIND_COLLECTOR_SUBMIT,
-            // Past every version this build reads: 1, and 2 for a
-            // command answered on the release alone (task-d100).
-            COLLECTOR_SUBMIT_ANSWER_ON_RELEASE_VERSION + 1,
+            // Past every version this build reads: 1, 2 for a command
+            // answered on the release alone (task-d100), and 3 for one
+            // relayed to the leader alone (task-d102).
+            COLLECTOR_SUBMIT_RELAYED_VERSION + 1,
             &[0x02, 0xaa, 0xbb],
         )
         .unwrap(),

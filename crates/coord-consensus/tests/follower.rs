@@ -1818,3 +1818,162 @@ fn a_commit_whose_adoption_failed_executes_only_over_its_rows_written_again() {
     assert_eq!(f.ledger().record(&c1).unwrap().deps, vec![]);
     assert_eq!(f.next_executable(), Some(c1));
 }
+
+/// The payload record a relayed proposal of request `seq` carries
+/// (task-d102): what the collector submitted, under the admission
+/// [`admitted_under`] names.
+fn relayed_payload(seq: u64, key: u8, value: u8) -> (PayloadRecordV1, CommandId) {
+    let request = LogicalRequest::new(
+        NamespaceId([5; 16]),
+        CanonicalOperation::Put(PutOp {
+            key: vec![key],
+            value: vec![value],
+            lease: None,
+            prev_kv: false,
+        }),
+    );
+    let command = CommandId::derive(&retry_key(seq), &request).unwrap();
+    let logical = RequestV1::new(retry_key(seq), &request, 0, 0)
+        .unwrap()
+        .logical
+        .as_slice()
+        .to_vec();
+    let payload = PayloadRecordV1 {
+        retry_key: retry_key(seq),
+        logical,
+        admission: Some(coord_core::capability::AdmissionFacts {
+            attested: AttestedAdmission {
+                cluster: ClusterId([1; 16]),
+                domain: DomainId([2; 16]),
+                session: SessionId([3; 16]),
+                rule_generation: 1,
+                scope_ceiling: u32::MAX,
+                receipt_id: Digest32([9; 32]),
+                admitted_at_ticks: 0,
+            },
+            establishing: None,
+        }),
+        ack_through: 0,
+    };
+    assert_eq!(payload.admission_digest(), admitted_under());
+    (payload, command)
+}
+
+fn relayed(proposal: ProtocolMessage, payload: PayloadRecordV1) -> ProtocolMessage {
+    let ProtocolMessage::Proposal(vote) = proposal else {
+        panic!("not a proposal");
+    };
+    ProtocolMessage::RelayedProposal { vote, payload }
+}
+
+/// task-d102: a follower that never got the submission takes the payload
+/// from the leader's relayed proposal and adopts the command at once: one
+/// batch holds the payload row and the ACCEPT row, nothing is
+/// pre-accepted or fast-acknowledged, and the one acknowledgement, a slow
+/// one, goes to the leader alone once that batch is durable.
+#[test]
+fn a_relayed_proposal_is_adopted_in_one_batch_without_pre_accepting() {
+    let mut f = booted(1);
+    let (payload, c1) = relayed_payload(1, 1, 1);
+    let mut leader_view = coord_consensus::CommandTable::new();
+    let l1 = leader_view
+        .initialize(c1, c1.0, vec![CONSERVATIVE_KEY.to_vec()])
+        .unwrap();
+    let p1 = relayed(proposal(c1, vec![], 0, l1.paths, l1.path), payload);
+    let effects = f.step(peer(0, p1));
+    assert_eq!(f.relayed_taken(), 1);
+    assert!(f.answers_on_release(&c1));
+    assert!(f.held().is_empty(), "adopted at once");
+    assert_eq!(f.table().phase_of(&c1), Some(Phase::Accept));
+    let batches: Vec<_> = effects
+        .iter()
+        .filter_map(|e| match e {
+            Effect::Persist(b) => Some(b),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(batches.len(), 1, "one batch: {effects:?}");
+    let payloads = Collection::PayloadV1.id();
+    assert!(
+        batches[0]
+            .updates
+            .iter()
+            .any(|u| u.collection == payloads && u.value.is_some()),
+        "the payload row rides the adoption batch"
+    );
+    let row = decode_dependency(batches[0].updates[0].value.as_ref().unwrap()).unwrap();
+    assert_eq!(row.phase, Phase::Accept);
+    assert!(
+        sends(&effects).is_empty(),
+        "nothing leaves before the batch"
+    );
+    let mut released = Vec::new();
+    for event in durable_of(&effects, 1) {
+        released.extend(f.step(event));
+    }
+    let out = sends(&released);
+    assert_eq!(out.len(), 1, "{out:?}");
+    assert_eq!(out[0].0, r(0), "to the leader alone");
+    assert!(matches!(out[0].1, ProtocolMessage::SlowAck(_)));
+    assert!(f.take_rejections().is_empty());
+}
+
+/// task-d102: a payload that does not match its relayed proposal -- under
+/// other admission facts -- is not taken. The proposal is held as one
+/// without its payload, and nothing is written or acknowledged.
+#[test]
+fn a_relayed_payload_that_does_not_match_its_proposal_is_not_taken() {
+    let mut f = booted(1);
+    let (mut payload, c1) = relayed_payload(1, 1, 1);
+    payload.ack_through = 7;
+    let mut leader_view = coord_consensus::CommandTable::new();
+    let l1 = leader_view
+        .initialize(c1, c1.0, vec![CONSERVATIVE_KEY.to_vec()])
+        .unwrap();
+    let effects = f.step(peer(
+        0,
+        relayed(proposal(c1, vec![], 0, l1.paths, l1.path), payload),
+    ));
+    assert_eq!(f.relayed_taken(), 0);
+    assert!(
+        !effects.iter().any(|e| matches!(e, Effect::Persist(_))),
+        "nothing written"
+    );
+    assert_eq!(f.held().len(), 1, "held for its payload");
+    assert!(f.table().record(&c1).is_none_or(|r| r.payload.is_none()));
+    assert!(
+        f.take_rejections()
+            .contains(&FollowerRejection::PayloadIdentityMismatch(c1))
+    );
+}
+
+/// task-d102: a follower that already took the submission keeps what it
+/// accepted; the payload a relayed proposal carries is left aside and the
+/// proposal is adopted as any.
+#[test]
+fn a_relayed_proposal_of_a_command_held_already_adopts_as_any() {
+    let mut f = booted(1);
+    let (e1, c1) = admitted(1, 1, 1);
+    let votes = f.step(e1);
+    for event in durable_of(&votes, 1) {
+        f.step(event);
+    }
+    let (payload, same) = relayed_payload(1, 1, 1);
+    assert_eq!(same, c1);
+    let mut leader_view = coord_consensus::CommandTable::new();
+    let l1 = leader_view
+        .initialize(c1, c1.0, vec![CONSERVATIVE_KEY.to_vec()])
+        .unwrap();
+    let adoption = f.step(peer(
+        0,
+        relayed(proposal(c1, vec![], 0, l1.paths, l1.path), payload),
+    ));
+    assert_eq!(f.relayed_taken(), 0);
+    assert!(!f.answers_on_release(&c1), "not marked by the relay");
+    // Its own durable fast vote and the leader's proposal are a fast
+    // quorum here: decided, as a plain proposal would leave it.
+    assert!(f.table().phase_of(&c1) >= Some(Phase::Accept));
+    assert!(f.held().is_empty());
+    assert!(adoption.len() <= 1, "at most the adoption batch");
+    assert!(f.take_rejections().is_empty());
+}

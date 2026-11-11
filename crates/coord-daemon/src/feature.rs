@@ -141,6 +141,25 @@ pub enum ActivateRefusal {
     },
     /// Another activation is in progress.
     Busy(Feature),
+    /// A feature that is activated only after another, which isn't
+    /// active yet (`BatchedRound` after `AnswerOnRelease`, task-d102).
+    Requires {
+        /// The feature asked for.
+        feature: Feature,
+        /// The feature that has to be active first.
+        before: Feature,
+    },
+}
+
+/// The feature that has to be active before `feature` is activated, if
+/// any. A relayed command is marked and answered on the leader's release
+/// alone, so the relay (`BatchedRound`) comes after `AnswerOnRelease`
+/// (task-d100's step B, design Section 4.3's B3).
+pub const fn requires(feature: Feature) -> Option<Feature> {
+    match feature {
+        Feature::BatchedRound => Some(Feature::AnswerOnRelease),
+        _ => None,
+    }
 }
 
 impl core::fmt::Display for ActivateRefusal {
@@ -168,6 +187,14 @@ impl core::fmt::Display for ActivateRefusal {
             }
             ActivateRefusal::Busy(feature) => {
                 write!(f, "{} is being activated", feature.name())
+            }
+            ActivateRefusal::Requires { feature, before } => {
+                write!(
+                    f,
+                    "{} is activated only once {} is active",
+                    feature.name(),
+                    before.name()
+                )
             }
         }
     }
@@ -822,6 +849,11 @@ impl Features {
         }
         if self.active().contains(&feature) {
             return Ok((Activation::AlreadyActive, self.resend()));
+        }
+        if let Some(before) = requires(feature)
+            && !self.active().contains(&before)
+        {
+            return Err(ActivateRefusal::Requires { feature, before });
         }
         if let Some(busy) = self.activating
             && busy != feature

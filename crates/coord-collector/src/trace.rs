@@ -175,4 +175,14 @@ pub enum CollectorEvent {
         /// The leader it went to.
         to: String,
     },
+    /// A command relayed to its ballot's leader alone (task-d102,
+    /// task-d100's step B) was submitted to every voter as one answered
+    /// on the release alone: its leader did not answer within
+    /// [`crate::RELAY_FALLBACK_MILLIS`], or said it isn't leading.
+    RelayFellBack {
+        /// Command.
+        command: String,
+        /// The voters it was offered to.
+        targets: Vec<String>,
+    },
 }

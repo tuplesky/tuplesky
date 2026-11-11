@@ -156,6 +156,25 @@ enum Room {
     /// the next synchronization's digest covers; appended, it stayed in the
     /// suffix after it retired.
     Installed,
+    /// A relayed command (task-d102, task-d100's step B): bounded as
+    /// `room` says, and not appended to the path logs. It is never
+    /// pre-accepted here, so its place is not in this replica's suffix:
+    /// its adoption is a synchronization of a command outside the suffix
+    /// (design Section 4.1).
+    Relayed(RelayRoom),
+}
+
+/// How much of the table a relayed command may take (task-d102): the
+/// same rule a submission's initialization follows, which the follower
+/// decides ([`CommandTable::initialize_relayed`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RelayRoom {
+    /// New admission: up to the capacity less the recovery reserve.
+    Admission,
+    /// A command whose turn has come: the reserve too, and one past it.
+    Reserve,
+    /// Recovery work, which the largest Sync bounds.
+    Unbounded,
 }
 
 /// The command table of one replica in one domain.
@@ -704,6 +723,24 @@ impl CommandTable {
         self.initialize_bounded(command, payload, keys, Room::Installed)
     }
 
+    /// [`CommandTable::initialize`] for a relayed command (task-d102,
+    /// task-d100's step B): its payload arrived with the leader's
+    /// proposal, and the follower adopts the leader's order at once, so
+    /// the command is never pre-accepted here. Its key's latest moves to
+    /// it, so the next command this replica pre-accepts on the key
+    /// follows it, and its path logs don't take it: its adoption
+    /// synchronizes it from outside the suffix. The record is at
+    /// PRE-ACCEPT in memory only until that adoption, which writes it.
+    pub fn initialize_relayed(
+        &mut self,
+        command: CommandId,
+        payload: Digest32,
+        keys: Vec<Vec<u8>>,
+        room: RelayRoom,
+    ) -> Result<Initialized, InitError> {
+        self.initialize_bounded(command, payload, keys, Room::Relayed(room))
+    }
+
     fn initialize_bounded(
         &mut self,
         command: CommandId,
@@ -722,9 +759,15 @@ impl CommandTable {
             Some(_) => {}
             None => {
                 let refused = match room {
-                    Room::Admission => self.full_after_reclaim(),
-                    Room::Reserve => self.at_capacity_after_reclaim(),
-                    Room::Unbounded | Room::Installed => false,
+                    Room::Admission | Room::Relayed(RelayRoom::Admission) => {
+                        self.full_after_reclaim()
+                    }
+                    Room::Reserve | Room::Relayed(RelayRoom::Reserve) => {
+                        self.at_capacity_after_reclaim()
+                    }
+                    Room::Unbounded | Room::Installed | Room::Relayed(RelayRoom::Unbounded) => {
+                        false
+                    }
                 };
                 if refused {
                     return Err(InitError::Backpressure);
@@ -741,7 +784,7 @@ impl CommandTable {
                 }
             }
             state.last = Some(command);
-            let digest = if room == Room::Installed {
+            let digest = if matches!(room, Room::Installed | Room::Relayed(_)) {
                 state.log.install(command)
             } else {
                 state.log.append(command)

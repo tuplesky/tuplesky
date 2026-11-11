@@ -825,6 +825,8 @@ pub struct HistoryMaps {
     pub bare_bindings: usize,
     /// Commands to answer on release.
     pub answer_on_release: usize,
+    /// Commands whose proposals carry their payload (task-d102).
+    pub relayed: usize,
     /// Held proposals' waits, by the command each waits on.
     pub held_waiters: usize,
     /// The leader's proposals.
@@ -841,6 +843,7 @@ impl HistoryMaps {
             + self.bindings
             + self.bare_bindings
             + self.answer_on_release
+            + self.relayed
             + self.held_waiters
             + self.proposals
     }
@@ -855,6 +858,7 @@ impl HistoryMaps {
             self.bindings,
             self.bare_bindings,
             self.answer_on_release,
+            self.relayed,
             self.held_waiters,
             self.proposals,
         ]

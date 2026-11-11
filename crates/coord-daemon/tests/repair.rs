@@ -477,6 +477,20 @@ impl<P: Persistence> Cluster<P> {
         }
     }
 
+    /// The collector submits `sequence`; returns where it sends the
+    /// frame and the frame, for a submission that need not go to every
+    /// voter (a relayed one, task-d102).
+    fn submit_to(&mut self, sequence: u64) -> (Vec<ReplicaId>, Vec<u8>) {
+        match self
+            .collector
+            .submit(MonotonicMillis::ZERO, &admitted(sequence))
+            .expect("submitted")
+        {
+            Submitted::FanOut(fan_out) => (fan_out.targets, fan_out.frame.to_vec()),
+            other => panic!("not new work: {other:?}"),
+        }
+    }
+
     /// The submission reaches voter `to`, over the collector's
     /// connection. Returns the round it produced, after routing it.
     fn deliver_submission(&mut self, to: usize, submit: &[u8]) -> RoundShape {
@@ -2311,4 +2325,132 @@ fn an_early_solicit_to_a_voter_not_leading_changes_nothing() {
     w.settle();
     assert!(!w.collector.is_pending(&command));
     assert_eq!(w.releases.len(), 1);
+}
+
+// ---------------------------------------------------------------------
+// task-d102, task-d100's step B: a command relayed to the leader alone.
+// ---------------------------------------------------------------------
+
+/// How many relayed proposals' payloads voter `i` took.
+fn relayed_taken<P: Persistence>(w: &Cluster<P>, i: usize) -> u64 {
+    match w.voters[i].node().machine() {
+        Machine::Follower(f) => f.relayed_taken(),
+        Machine::Leader(_) => 0,
+    }
+}
+
+/// A relayed command reaches the leader alone, whose proposal carries
+/// its payload: every follower adopts it from that proposal without
+/// pre-accepting it or asking for the payload, acknowledges it to the
+/// leader only, and the collector is answered on the release alone.
+#[test]
+fn a_relayed_command_is_adopted_from_the_proposal_and_answered_on_the_release() {
+    let mut w = Cluster::new(256);
+    w.collector.set_answer_on_release(true);
+    w.collector.set_relay(true);
+    assert!(w.collector.relays());
+    let (targets, submit) = w.submit_to(1);
+    assert_eq!(targets, vec![w.collector.quorum().leader()]);
+    assert_eq!(frame(&submit).version, coord_collector::VERSION_RELAYED);
+    let command = w.command(1);
+    let leader = usize::from(targets[0].0[0]);
+    w.deliver_submission(leader, &submit);
+    w.settle();
+
+    assert_eq!(w.executed(), [1, 1, 1]);
+    assert_eq!(
+        w.counted,
+        vec![(leader as u8, KIND_RELEASE)],
+        "the release is the only frame back"
+    );
+    assert_eq!(w.published, [0, 0, 0], "nothing was parked");
+    assert_eq!(w.releases.len(), 1);
+    assert_eq!(w.releases[0].command, command);
+    assert!(!w.releases[0].speculative);
+    assert!(w.rejected.is_empty(), "{:?}", w.rejected);
+    assert!(!w.collector.is_pending(&command));
+    for i in (0..3).filter(|i| *i != leader) {
+        assert_eq!(relayed_taken(&w, i), 1, "voter {i} took the payload");
+    }
+    assert_eq!(w.collector.relay_fallbacks(), 0);
+}
+
+/// A relayed submission that reaches a voter that isn't leading is
+/// refused as `NotLeading`; the collector fans the command out at once as
+/// a step-A submission, and it is answered on the release.
+#[test]
+fn a_relayed_submission_at_a_follower_is_refused_and_falls_back() {
+    let mut w = Cluster::new(256);
+    w.collector.set_answer_on_release(true);
+    w.collector.set_relay(true);
+    let (targets, submit) = w.submit_to(1);
+    let command = w.command(1);
+    let leader = usize::from(targets[0].0[0]);
+    let follower = (leader + 1) % 3;
+    // A stale view of the leader: the relayed frame reaches a follower.
+    w.deliver_submission(follower, &submit);
+    w.settle();
+    assert_eq!(w.executed(), [0, 0, 0], "the follower took nothing");
+    assert_eq!(w.collector.not_leading(), 1);
+    assert_eq!(w.counted, vec![(follower as u8, KIND_EVIDENCE)]);
+    let fall_back = w.collector.due_solicits(MonotonicMillis::ZERO, 16);
+    assert_eq!(fall_back.len(), 1);
+    assert_eq!(fall_back[0].command, command);
+    assert_eq!(fall_back[0].targets, (0..3).map(r).collect::<Vec<_>>());
+    let step_a = fall_back[0].frame.to_vec();
+    assert_eq!(
+        frame(&step_a).version,
+        coord_collector::VERSION_ANSWER_ON_RELEASE
+    );
+    for i in 0..3 {
+        w.deliver_submission(i, &step_a);
+    }
+    w.settle();
+    assert_eq!(w.executed(), [1, 1, 1]);
+    assert_eq!(w.releases.len(), 1);
+    assert!(!w.collector.is_pending(&command));
+    assert_eq!(w.collector.relay_fallbacks(), 1);
+}
+
+/// A relayed entry its leader never answers falls back to every voter at
+/// the bound, and not before; until then it is asked of the leader alone.
+#[test]
+fn a_relayed_entry_falls_back_at_its_bound() {
+    let mut w = Cluster::new(256);
+    w.collector.set_answer_on_release(true);
+    w.collector.set_relay(true);
+    let (_, submit) = w.submit_to(1);
+    let command = w.command(1);
+    assert!(
+        w.collector
+            .due_solicits(MonotonicMillis::ZERO, 16)
+            .is_empty(),
+        "nothing is due before the bound"
+    );
+    assert_eq!(
+        w.collector.next_solicit(),
+        Some(MonotonicMillis::ZERO.plus(coord_collector::RELAY_FALLBACK_MILLIS))
+    );
+    let due = w.collector.due_solicits(
+        MonotonicMillis::ZERO.plus(coord_collector::RELAY_FALLBACK_MILLIS),
+        16,
+    );
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].targets, (0..3).map(r).collect::<Vec<_>>());
+    assert_eq!(
+        frame(&due[0].frame).version,
+        coord_collector::VERSION_ANSWER_ON_RELEASE
+    );
+    // The relayed frame reached the leader after all: the step-A one is
+    // a duplicate there, and the command is answered once.
+    let leader = usize::from(w.collector.quorum().leader().0[0]);
+    w.deliver_submission(leader, &submit);
+    let step_a = due[0].frame.to_vec();
+    for i in 0..3 {
+        w.deliver_submission(i, &step_a);
+    }
+    w.settle();
+    assert_eq!(w.executed(), [1, 1, 1]);
+    assert_eq!(w.releases.len(), 1);
+    assert!(!w.collector.is_pending(&command));
 }

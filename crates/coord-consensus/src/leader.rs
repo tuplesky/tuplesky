@@ -493,6 +493,11 @@ pub struct Leader {
     /// before stepping it, so the command is derived once, here (#204
     /// review).
     mark_next_admitted: bool,
+    /// Whether the next admitted request was relayed to this voter alone
+    /// as its ballot's leader (task-d102, task-d100's step B): set by the
+    /// voter beside `mark_next_admitted`, so a leader proposes the
+    /// command with its payload and a voter that isn't leading says so.
+    mark_next_relayed: bool,
     fenced: Option<FenceReason>,
     /// Entries of the selection this leader was handed that no order
     /// keeps: a dependency cycle, which is an invariant violation
@@ -575,6 +580,12 @@ pub struct Leader {
     /// acknowledgement goes to the frontend for them, and their release
     /// carries the decided payload's admission digest.
     answer_on_release: BTreeSet<CommandId>,
+    /// The marked commands whose submission was relayed to this leader
+    /// alone (task-d102): every proposal of one carries its payload
+    /// ([`ProtocolMessage::RelayedProposal`]), since the followers never
+    /// got the submission. A subset of `answer_on_release`, let go with
+    /// it.
+    relayed: BTreeSet<CommandId>,
     /// Marked commands this leader executed and was sent again as exact
     /// duplicates, with the admission digest of the payload it decided
     /// (task-d100, step A): their collector lost the release, and the
@@ -676,6 +687,7 @@ impl Leader {
             early_ready: false,
             early_holders: None,
             answer_on_release: BTreeSet::new(),
+            relayed: BTreeSet::new(),
             release_again: Vec::new(),
             config,
             boot: None,
@@ -706,6 +718,7 @@ impl Leader {
             announced: None,
             admitted: None,
             mark_next_admitted: false,
+            mark_next_relayed: false,
             fenced: None,
             recovery_cycle: None,
             own_adoptions: BTreeMap::new(),
@@ -811,6 +824,7 @@ impl Leader {
             announced: None,
             admitted: None,
             mark_next_admitted: false,
+            mark_next_relayed: false,
             fenced: None,
             recovery_cycle: None,
             replay: crate::replay::EvidenceStore::new(state.capacity),
@@ -831,6 +845,7 @@ impl Leader {
             early_ready: false,
             early_holders: None,
             answer_on_release: BTreeSet::new(),
+            relayed: BTreeSet::new(),
             release_again: Vec::new(),
         };
         // Dependency order among the entries: a command follows every
@@ -1085,6 +1100,8 @@ impl Leader {
         self.served_payloads.retain(|c| !table.forgotten(c));
         self.proposals.retain(|c, _| !table.forgotten(c));
         self.answer_on_release.retain(|c| table.record(c).is_some());
+        let marked = &self.answer_on_release;
+        self.relayed.retain(|c| marked.contains(c));
         let proposals = &self.proposals;
         self.unsettled.retain(|(_, c)| proposals.contains_key(c));
         self.durable.retain(|(_, c)| proposals.contains_key(c));
@@ -1116,6 +1133,7 @@ impl Leader {
             }
         }
         self.answer_on_release.remove(&command);
+        self.relayed.remove(&command);
         self.votes.remove(&command);
         if let Some(payload) = payload
             && self.bindings.get(&payload.retry_key) == Some(&command)
@@ -1247,9 +1265,9 @@ impl Leader {
         };
         if publish {
             let context = self.ballots.context(boot, ballot, LocalJournalSeq::ZERO);
-            let outbox = self.outbox.as_mut().expect("booted");
             // Encoded once for every voter it goes to (task-d61).
-            let frame = ProtocolMessage::Proposal(proposal.clone()).encode();
+            let frame = self.proposal_message(proposal.clone()).encode();
+            let outbox = self.outbox.as_mut().expect("booted");
             for voter in &self.config.identity.voters {
                 if *voter == self.config.identity.replica {
                     continue;
@@ -1572,7 +1590,7 @@ impl Leader {
 
     /// The proposal frame for `p`, as it was first published.
     fn proposal_frame(&self, p: &Proposal) -> Vec<u8> {
-        ProtocolMessage::Proposal(FastAck {
+        self.proposal_message(FastAck {
             replica: self.config.identity.replica,
             ballot: self.config.quorum.ballot(),
             command: p.command,
@@ -1845,6 +1863,7 @@ impl Leader {
             bindings: self.bindings.len(),
             bare_bindings: self.ledger.bare_bindings(),
             answer_on_release: self.answer_on_release.len(),
+            relayed: self.relayed.len(),
             proposals: self.proposals.len(),
             ..crate::summary::HistoryMaps::default()
         }
@@ -2188,6 +2207,40 @@ impl Leader {
         self.mark_next_admitted = true;
     }
 
+    /// Mark the next admitted request as relayed to this voter alone as
+    /// its ballot's leader (task-d102, task-d100's step B): marked as
+    /// answered on the release too, proposed with its payload, and
+    /// refused with [`SubmissionRefusal::NotLeading`] if this voter
+    /// isn't leading.
+    pub fn mark_next_relayed(&mut self) {
+        self.mark_next_admitted = true;
+        self.mark_next_relayed = true;
+    }
+
+    /// Whether `command`'s proposals carry its payload (task-d102).
+    pub fn relays(&self, command: &CommandId) -> bool {
+        self.relayed.contains(command)
+    }
+
+    /// The proposal message for `proposal`: with the command's payload
+    /// when its submission was relayed to this leader alone (task-d102),
+    /// so a follower that never got the submission adopts it without
+    /// asking for the payload.
+    fn proposal_message(&self, proposal: FastAck) -> ProtocolMessage {
+        let payload = self
+            .relayed
+            .contains(&proposal.command)
+            .then(|| self.payloads.get(&proposal.command))
+            .flatten();
+        match payload {
+            Some(payload) => ProtocolMessage::RelayedProposal {
+                vote: proposal,
+                payload: payload.clone(),
+            },
+            None => ProtocolMessage::Proposal(proposal),
+        }
+    }
+
     /// Drop `command`'s mark unless this leader's table holds it: the
     /// submission that marked it was refused before the command was
     /// initialized (backpressure, a ballot this leader doesn't lead, a
@@ -2196,6 +2249,7 @@ impl Leader {
     pub fn keep_mark_if_held(&mut self, command: &CommandId) {
         if self.table.record(command).is_none() {
             self.answer_on_release.remove(command);
+            self.relayed.remove(command);
         }
     }
 
@@ -2413,6 +2467,7 @@ impl Leader {
     fn on_admitted(&mut self, frame: &[u8], admission: AdmissionFacts) -> Vec<Effect> {
         self.admitted = None;
         let effects = self.propose(frame, Some(admission));
+        self.mark_next_relayed = false;
         if core::mem::take(&mut self.mark_next_admitted)
             && let Some(command) = self.admitted
         {
@@ -2528,9 +2583,9 @@ impl Leader {
         };
         let barrier = proposal.barrier;
         let context = self.ballots.context(boot, ballot, LocalJournalSeq::ZERO);
-        let outbox = self.outbox.as_mut()?;
         // Encoded once for every voter it goes to (task-d61).
-        let frame = ProtocolMessage::Proposal(ack.clone()).encode();
+        let frame = self.proposal_message(ack.clone()).encode();
+        let outbox = self.outbox.as_mut()?;
         for voter in &self.config.identity.voters {
             if *voter == self.config.identity.replica {
                 continue;
@@ -2562,6 +2617,14 @@ impl Leader {
             self.rejections.push(Rejection::NotLeading {
                 promised: self.ballots.promised(),
             });
+            // A submission relayed to this voter alone is answered: its
+            // collector re-routes at once rather than at its fallback
+            // (task-d102). The command is not held, so it is not marked.
+            if self.mark_next_relayed
+                && let Some(command) = relayed_command(frame)
+            {
+                return self.refuse(command, SubmissionRefusal::NotLeading);
+            }
             return Vec::new();
         }
         let request = match decode_stream(frame).as_deref() {
@@ -2582,6 +2645,9 @@ impl Leader {
         self.admitted = Some(command);
         if self.mark_next_admitted {
             self.answer_on_release.insert(command);
+        }
+        if self.mark_next_relayed {
+            self.relayed.insert(command);
         }
         let payload = PayloadRecordV1 {
             retry_key: request.retry_key,
@@ -2741,9 +2807,9 @@ impl Leader {
         // reply below always does: it is this leader's fast vote.
         let sends = self.proposal_sends(barrier);
         let early = sends.iter().any(|(_, requires)| requires.is_empty());
-        let outbox = self.outbox.as_mut().expect("booted");
         // Encoded once for every voter it goes to (task-d61).
-        let frame = ProtocolMessage::Proposal(proposal.clone()).encode();
+        let frame = self.proposal_message(proposal.clone()).encode();
+        let outbox = self.outbox.as_mut().expect("booted");
         for (voter, requires) in sends {
             outbox.publish(PendingSend {
                 context,
@@ -2982,9 +3048,9 @@ impl Leader {
         // The same proposal, unchanged, under the same rule as its first
         // send (Section 4.8's third condition).
         let sends = self.proposal_sends(barrier);
-        let outbox = self.outbox.as_mut().expect("booted");
         // Encoded once for every voter it goes to (task-d61).
-        let frame = ProtocolMessage::Proposal(ack.clone()).encode();
+        let frame = self.proposal_message(ack.clone()).encode();
+        let outbox = self.outbox.as_mut().expect("booted");
         for (voter, requires) in sends {
             outbox.publish(PendingSend {
                 context,
@@ -3412,6 +3478,7 @@ impl Leader {
             ProtocolMessage::Sealed { .. }
             | ProtocolMessage::Committed { .. }
             | ProtocolMessage::Proposal(_)
+            | ProtocolMessage::RelayedProposal { .. }
             | ProtocolMessage::LeaderReply { .. }
             | ProtocolMessage::Refused { .. }
             | ProtocolMessage::FloorReadiness { .. }
@@ -3839,6 +3906,18 @@ impl Leader {
     pub fn outstanding_barriers(&self) -> Vec<BarrierId> {
         self.outstanding()
     }
+}
+
+/// The command a relayed submission names, for a voter that isn't
+/// leading to refuse it by (task-d102). `None` for a frame that does not
+/// decode to one request.
+pub(crate) fn relayed_command(frame: &[u8]) -> Option<CommandId> {
+    let request = match decode_stream(frame).as_deref() {
+        Ok([MessageV1::Request(r)]) => r.clone(),
+        _ => return None,
+    };
+    let logical = request.logical().ok()?;
+    CommandId::derive(&request.retry_key, &logical).ok()
 }
 
 /// Whether a proposal batch writes the command's payload row (task-d90).

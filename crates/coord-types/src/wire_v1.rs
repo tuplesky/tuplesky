@@ -143,11 +143,19 @@ pub const COLLECTOR_SUBMIT_VERSION: u16 = 1;
 /// evidence.
 pub const COLLECTOR_SUBMIT_ANSWER_ON_RELEASE_VERSION: u16 = 2;
 
+/// Schema version of a collector submission relayed to its ballot's
+/// leader alone (task-d102, task-d100's step B): the same payload as
+/// [`COLLECTOR_SUBMIT_VERSION`], answered on the leader's release alone
+/// as version 2 is, and proposed with its payload. A voter that isn't
+/// leading refuses it rather than voting on it.
+pub const COLLECTOR_SUBMIT_RELAYED_VERSION: u16 = 3;
+
 /// Every schema version of a collector submission this build
 /// understands.
-pub const COLLECTOR_SUBMIT_VERSIONS: [u16; 2] = [
+pub const COLLECTOR_SUBMIT_VERSIONS: [u16; 3] = [
     COLLECTOR_SUBMIT_VERSION,
     COLLECTOR_SUBMIT_ANSWER_ON_RELEASE_VERSION,
+    COLLECTOR_SUBMIT_RELAYED_VERSION,
 ];
 
 /// A trusted collector's current read, sent to the leader it follows

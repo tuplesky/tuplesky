@@ -672,6 +672,12 @@ impl<P: Persistence> Voter<P> {
         if frame.version == coord_collector::VERSION_ANSWER_ON_RELEASE {
             self.node.mark_next_admitted();
         }
+        // Relayed to this voter alone as the leader (task-d102, step B):
+        // marked the same way, proposed with its payload if this voter
+        // leads, and refused as `NotLeading` if it doesn't.
+        if frame.version == coord_collector::VERSION_RELAYED {
+            self.node.mark_next_relayed();
+        }
         let out = self.node.on_event(Event::Admitted(admitted), &self.ballot);
         let command = early.or_else(|| self.node.machine().admitted());
         #[cfg(debug_assertions)]

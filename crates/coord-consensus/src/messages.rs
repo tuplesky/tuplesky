@@ -398,6 +398,22 @@ pub enum ProtocolMessage {
         /// The activation record.
         record: FeatureRecord,
     },
+    /// The leader's proposal of a relayed command, with its payload
+    /// (task-d102, task-d100's step B; design Section 4.3). The collector
+    /// sent the submission to the leader alone, so this is how the
+    /// followers get the payload: with the order, as a `PayloadResponse`
+    /// already arrives after a proposal. The payload is no vote. A
+    /// follower checks it as it checks a `PayloadResponse` (identity, and
+    /// the vote's admission digest), and with it initializes and adopts
+    /// the command in one batch, without pre-accepting it. Sent only
+    /// while `Feature::BatchedRound` is active: an older build can't
+    /// decode it.
+    RelayedProposal {
+        /// The proposal, exactly as `Proposal` carries it.
+        vote: FastAck,
+        /// The payload record of `vote.command`.
+        payload: PayloadRecordV1,
+    },
 }
 
 /// An activation record as it travels between voters (task-d99): the
@@ -430,6 +446,11 @@ pub enum SubmissionRefusal {
     /// A duplicate this voter keeps no payload of any more: it went to
     /// history, and what it did is in the durable record.
     Forgotten,
+    /// A submission relayed to this voter as the leader, which isn't
+    /// leading (task-d102, task-d100's step B, design Section 4.3's B2):
+    /// the collector re-routes at once rather than at a timeout. A
+    /// fanned-out submission is still dropped without a word.
+    NotLeading,
 }
 
 impl ProtocolMessage {
@@ -449,6 +470,7 @@ impl ProtocolMessage {
     pub const fn command(&self) -> Option<CommandId> {
         match self {
             ProtocolMessage::Proposal(a) | ProtocolMessage::FastAck(a) => Some(a.command),
+            ProtocolMessage::RelayedProposal { vote, .. } => Some(vote.command),
             ProtocolMessage::SlowAck(a) => Some(a.command),
             ProtocolMessage::LeaderReply { command, .. }
             | ProtocolMessage::PayloadResponse { command, .. }
@@ -552,5 +574,64 @@ mod tests {
         }
         // An index past the last variant is not a message.
         assert!(ProtocolMessage::decode(&[last_before + 1 + messages.len() as u8]).is_err());
+    }
+
+    /// task-d102's relayed proposal is appended after task-d99's
+    /// messages, so it changes no older encoding and an older build
+    /// cannot decode it; it names the command its vote names. The
+    /// `NotLeading` refusal is appended to the refusals the same way.
+    #[test]
+    fn the_relayed_proposal_and_not_leading_are_appended() {
+        use coord_types::ids::{ClientInstanceId, ClusterId, DomainId, RequestSequence, SessionId};
+        let held = ProtocolMessage::FeatureHeld {
+            record: FeatureRecord {
+                epoch: epoch(),
+                features: alloc::vec![4],
+                reporters: alloc::vec![ReplicaId([1; 16])],
+            },
+        }
+        .encode();
+        let vote = FastAck {
+            replica: ReplicaId([1; 16]),
+            ballot: Ballot {
+                epoch: epoch(),
+                number: 1,
+                leader: ReplicaId([1; 16]),
+            },
+            command: CommandId(Digest32([7; 32])),
+            deps: alloc::vec![CommandId(Digest32([6; 32]))],
+            paths: Vec::new(),
+            path: Digest32([0; 32]),
+            admission: Digest32([8; 32]),
+            seqnum: Some(3),
+        };
+        let relayed = ProtocolMessage::RelayedProposal {
+            vote: vote.clone(),
+            payload: PayloadRecordV1 {
+                retry_key: coord_types::RetryKey {
+                    cluster_id: ClusterId([1; 16]),
+                    domain_id: DomainId([2; 16]),
+                    session_id: SessionId([3; 16]),
+                    client_instance_id: ClientInstanceId([4; 16]),
+                    request_sequence: RequestSequence::new(1).unwrap(),
+                },
+                logical: alloc::vec![1, 2, 3],
+                admission: None,
+                ack_through: 0,
+            },
+        };
+        let bytes = relayed.encode();
+        assert_eq!(ProtocolMessage::decode(&bytes).as_ref(), Ok(&relayed));
+        assert_eq!(bytes[0], held[0] + 1);
+        assert_eq!(relayed.command(), Some(vote.command));
+        assert!(ProtocolMessage::decode(&[held[0] + 2]).is_err());
+        // The proposal's own bytes follow the index unchanged: a
+        // follower reads the vote as a `Proposal` carries it.
+        let proposal = ProtocolMessage::Proposal(vote).encode();
+        assert_eq!(&bytes[1..proposal.len()], &proposal[1..]);
+
+        let forgotten = postcard::to_allocvec(&SubmissionRefusal::Forgotten).unwrap();
+        let not_leading = postcard::to_allocvec(&SubmissionRefusal::NotLeading).unwrap();
+        assert_eq!(not_leading, alloc::vec![forgotten[0] + 1]);
     }
 }

@@ -152,6 +152,17 @@ impl Machine {
         }
     }
 
+    /// Mark the next admitted request as relayed to this voter alone as
+    /// its ballot's leader (task-d102, task-d100's step B): a leader
+    /// proposes it with its payload, and a voter that isn't leading
+    /// refuses it.
+    pub fn mark_next_relayed(&mut self) {
+        match self {
+            Machine::Leader(l) => l.mark_next_relayed(),
+            Machine::Follower(f) => f.mark_next_relayed(),
+        }
+    }
+
     /// Whether `command` is marked as answered on the release alone.
     pub fn answers_on_release(&self, command: &CommandId) -> bool {
         match self {
@@ -784,6 +795,9 @@ pub struct Node<P: Persistence> {
     /// (task-d100, step A): the collector beside it marks its
     /// submissions as answered on the leader's release alone.
     answer_on_release: bool,
+    /// Whether `Feature::BatchedRound` is active (task-d102): the
+    /// collector beside it may relay its submissions to the leader alone.
+    batched_round: bool,
     /// Commands this replica established, by the path that decided them
     /// (task-d50).
     pub established: Established,
@@ -888,6 +902,7 @@ impl<P: Persistence> Node<P> {
             early_without_activation: false,
             features: None,
             answer_on_release: false,
+            batched_round: false,
             established: Established::default(),
             fast_path: coord_consensus::FastPathCounts::default(),
             release: crate::learned::ReleaseTiming::default(),
@@ -1146,6 +1161,11 @@ impl<P: Persistence> Node<P> {
     /// [`Machine::mark_next_admitted`]).
     pub fn mark_next_admitted(&mut self) {
         self.machine_mut().mark_next_admitted();
+    }
+
+    /// See [`Machine::mark_next_relayed`] (task-d102).
+    pub fn mark_next_relayed(&mut self) {
+        self.machine_mut().mark_next_relayed();
     }
 
     /// The marked commands whose release the voter publishes again
@@ -1464,18 +1484,30 @@ impl<P: Persistence> Node<P> {
         let answer_on_release = features
             .active()
             .contains(&coord_types::formats::Feature::AnswerOnRelease);
+        let batched_round = features
+            .active()
+            .contains(&coord_types::formats::Feature::BatchedRound);
         self.set_early_holders(Some(holders));
         if on != self.early_proposal {
             self.set_early_proposal(on);
         }
         self.set_release_at_execution(release);
         self.answer_on_release = answer_on_release;
+        self.batched_round = answer_on_release && batched_round;
     }
 
     /// Whether this node reads `Feature::AnswerOnRelease` active
     /// (task-d100, step A).
     pub const fn answer_on_release(&self) -> bool {
         self.answer_on_release
+    }
+
+    /// Whether this node reads `Feature::BatchedRound` active (task-d102,
+    /// task-d100's step B): a collector here may relay its submissions to
+    /// the leader alone. Read only beside `AnswerOnRelease`, which its
+    /// activation requires.
+    pub const fn batched_round(&self) -> bool {
+        self.batched_round
     }
 
     fn standing(&self, ballot: &Ballot) -> crate::feature::Standing {

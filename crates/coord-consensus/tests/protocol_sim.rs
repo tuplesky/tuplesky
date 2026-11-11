@@ -235,6 +235,15 @@ struct Knobs {
     /// release, but oracle 6's count of marked commands answered is an
     /// upper bound (#204 review).
     answer_on_release: u32,
+    /// Chance (parts per million) a marked command is relayed to its
+    /// ballot's leader alone (task-d102, task-d100's step B): presented,
+    /// with the relay mark, only at the leader among its hosts -- or at
+    /// its first host where none leads, which refuses it as `NotLeading`
+    /// -- and then, if no leader took it, presented to every host as a
+    /// step-A command, as the collector falls back to fan-out. The leader
+    /// proposes it with its payload, and the followers adopt it from the
+    /// proposal without pre-accepting it.
+    relay: u32,
     /// An execution's group reaches the journal after its outcome is
     /// taken, in journal order with the protocol batches, as `coordd`'s
     /// does, and the machines count an execution durable only once its
@@ -349,6 +358,7 @@ impl Knobs {
         heal_page_loss: false,
         peer_ack_loss: 0,
         answer_on_release: 0,
+        relay: 0,
         late_execution: false,
         execution_lag: 0,
         total_crash: 0,
@@ -853,6 +863,12 @@ struct Stats {
     /// releases a leader published again for a duplicate.
     answered_on_release: usize,
     released_again: usize,
+    /// Commands presented relayed at a leader (task-d102), relayed ones
+    /// a voter that isn't leading refused and that fell back to fan-out,
+    /// and proposals sent with their payload.
+    relayed: usize,
+    relay_fallbacks: usize,
+    relayed_proposals: usize,
     campaigns: u32,
     crashes: u32,
     /// Crashes of a node that was leading its ballot.
@@ -1181,7 +1197,13 @@ impl Sim {
                     // A proposal that waits on nothing left before its
                     // batch was durable: every other copy names the batch
                     // (task-d98).
-                    if let Ok(ProtocolMessage::Proposal(p)) = &message
+                    if matches!(message, Ok(ProtocolMessage::RelayedProposal { .. })) {
+                        self.stats.relayed_proposals += 1;
+                    }
+                    if let Ok(
+                        ProtocolMessage::Proposal(p)
+                        | ProtocolMessage::RelayedProposal { vote: p, .. },
+                    ) = &message
                         && requires.is_empty()
                     {
                         self.stats.early_sends += 1;
@@ -1667,11 +1689,38 @@ impl Sim {
             .unwrap();
         let command = CommandId::derive(&rk, &request).unwrap();
         let host = at.first().copied().unwrap_or(0);
-        if !self.offers.contains_key(&command)
-            && self.chance("answer-on-release", self.knobs.answer_on_release)
-        {
+        let fresh = !self.offers.contains_key(&command);
+        if fresh && self.chance("answer-on-release", self.knobs.answer_on_release) {
             self.marked.insert(command);
         }
+        // Relayed (task-d102): to the leader among the hosts, or the
+        // first host where none leads, which refuses it. Only a
+        // presentation no leader took falls back to every host.
+        let mut at = at.to_vec();
+        if self.marked.contains(&command) && self.chance("relay", self.knobs.relay) {
+            let leader = at.iter().copied().find(|&i| {
+                self.nodes[usize::from(i)].alive()
+                    && matches!(self.nodes[usize::from(i)].role, Some(Role::Leader(_)))
+            });
+            let target = leader.or_else(|| at.first().copied());
+            if let Some(t) = target
+                && self.nodes[usize::from(t)].alive()
+            {
+                let before = self.holds(t, &command);
+                self.present(command, &frame, t, true);
+                // Held at a leader, now or already (a duplicate is the
+                // leader's to answer): nothing falls back.
+                if leader.is_some() && self.holds(t, &command) {
+                    if !before {
+                        self.stats.relayed += 1;
+                    }
+                    at.clear();
+                } else {
+                    self.stats.relay_fallbacks += 1;
+                }
+            }
+        }
+        let at = at.as_slice();
         self.offers.entry(command).or_insert(Offer {
             seq,
             key,
@@ -1683,69 +1732,82 @@ impl Sim {
             if !self.nodes[usize::from(i)].alive() {
                 continue;
             }
-            let receipt = AdmissionReceipt::submitting(
-                VerifierToken::for_boundary(),
-                AttestedAdmission {
-                    cluster: ClusterId([1; 16]),
-                    domain: DomainId([2; 16]),
-                    session: SessionId([3; 16]),
-                    rule_generation: 1,
-                    scope_ceiling: u32::MAX,
-                    receipt_id: Digest32([9; 32]),
-                    admitted_at_ticks: 0,
-                },
-            );
-            self.submitted.insert(
-                command,
-                coord_core::capability::admission_digest(Some(&receipt.facts()), 0),
-            );
-            let known = self.holds(i, &command);
-            // The voter's door marks the command before the machine steps
-            // the presentation (task-d100, step A).
-            if self.marked.contains(&command) {
-                match self.nodes[usize::from(i)].role.as_mut() {
-                    Some(Role::Leader(l)) => l.mark_answer_on_release(command),
-                    Some(Role::Follower(f)) => f.mark_answer_on_release(command),
-                    None => {}
-                }
+            self.present(command, &frame, i, false);
+        }
+    }
+
+    /// Present `frame` at node `i` as its collector's submission, relayed
+    /// to it alone as its ballot's leader or not (task-d102).
+    fn present(&mut self, command: CommandId, frame: &[u8], i: u8, relayed: bool) {
+        let receipt = AdmissionReceipt::submitting(
+            VerifierToken::for_boundary(),
+            AttestedAdmission {
+                cluster: ClusterId([1; 16]),
+                domain: DomainId([2; 16]),
+                session: SessionId([3; 16]),
+                rule_generation: 1,
+                scope_ceiling: u32::MAX,
+                receipt_id: Digest32([9; 32]),
+                admitted_at_ticks: 0,
+            },
+        );
+        self.submitted.insert(
+            command,
+            coord_core::capability::admission_digest(Some(&receipt.facts()), 0),
+        );
+        let known = self.holds(i, &command);
+        // The voter's door marks the command before the machine steps
+        // the presentation (task-d100, step A).
+        // A relayed one (task-d102) is marked by the relay mark, which
+        // the machine applies once it derives the command.
+        if relayed {
+            match self.nodes[usize::from(i)].role.as_mut() {
+                Some(Role::Leader(l)) => l.mark_next_relayed(),
+                Some(Role::Follower(f)) => f.mark_next_relayed(),
+                None => {}
             }
-            self.step_node(
-                i,
-                Event::Admitted(AdmittedRequest {
-                    receipt,
-                    frame: frame.clone(),
-                }),
-            );
-            // A duplicate of a marked command its leader executed: the
-            // daemon publishes the release again from its retry record,
-            // which answers the collector when the record is there and
-            // names the admission it submitted under.
-            let again = match self.nodes[usize::from(i)].role.as_mut() {
-                Some(Role::Leader(l)) => l.take_release_again(),
-                _ => Vec::new(),
-            };
-            for (c, _, admission) in again {
-                self.stats.released_again += 1;
-                let recorded = self.nodes[usize::from(i)].executed.contains(&c);
-                if recorded && self.submitted.get(&c) == Some(&admission) && self.answered.insert(c)
-                {
-                    self.stats.answered_on_release += 1;
-                }
+        } else if self.marked.contains(&command) {
+            match self.nodes[usize::from(i)].role.as_mut() {
+                Some(Role::Leader(l)) => l.mark_answer_on_release(command),
+                Some(Role::Follower(f)) => f.mark_answer_on_release(command),
+                None => {}
             }
-            // Oracle 5: new work is admitted only into the table's
-            // unreserved part (task-d24). Work that finishes a decision
-            // -- a command a Sync or a campaign selected, or whose turn
-            // has come -- takes the reserve and does not stay in
-            // PRE-ACCEPT.
-            if !known && self.phase(i, &command) == Some(coord_consensus::Phase::PreAccept) {
-                let records = self.table_len(i);
-                let capacity = self.knobs.capacity;
-                if records > capacity - capacity / coord_consensus::RECOVERY_RESERVE_PARTS {
-                    self.fail(&format!(
-                        "node {i} admitted {} into the reserve: {records} records",
-                        short(&command)
-                    ));
-                }
+        }
+        self.step_node(
+            i,
+            Event::Admitted(AdmittedRequest {
+                receipt,
+                frame: frame.to_vec(),
+            }),
+        );
+        // A duplicate of a marked command its leader executed: the
+        // daemon publishes the release again from its retry record,
+        // which answers the collector when the record is there and
+        // names the admission it submitted under.
+        let again = match self.nodes[usize::from(i)].role.as_mut() {
+            Some(Role::Leader(l)) => l.take_release_again(),
+            _ => Vec::new(),
+        };
+        for (c, _, admission) in again {
+            self.stats.released_again += 1;
+            let recorded = self.nodes[usize::from(i)].executed.contains(&c);
+            if recorded && self.submitted.get(&c) == Some(&admission) && self.answered.insert(c) {
+                self.stats.answered_on_release += 1;
+            }
+        }
+        // Oracle 5: new work is admitted only into the table's
+        // unreserved part (task-d24). Work that finishes a decision
+        // -- a command a Sync or a campaign selected, or whose turn
+        // has come -- takes the reserve and does not stay in
+        // PRE-ACCEPT.
+        if !known && self.phase(i, &command) == Some(coord_consensus::Phase::PreAccept) {
+            let records = self.table_len(i);
+            let capacity = self.knobs.capacity;
+            if records > capacity - capacity / coord_consensus::RECOVERY_RESERVE_PARTS {
+                self.fail(&format!(
+                    "node {i} admitted {} into the reserve: {records} records",
+                    short(&command)
+                ));
             }
         }
     }
@@ -3537,6 +3599,15 @@ fn describe(m: &ProtocolMessage) -> String {
             a.path.0[0],
             a.path.0[1]
         ),
+        ProtocolMessage::RelayedProposal { vote: a, .. } => format!(
+            "RelayedProposal {} {} deps[{}] seq{:?} path {:02x}{:02x}",
+            bn(&a.ballot),
+            short(&a.command),
+            shorts(&a.deps),
+            a.seqnum,
+            a.path.0[0],
+            a.path.0[1]
+        ),
         ProtocolMessage::FastAck(a) => format!(
             "FastAck {} {} from {} deps[{}] path {:02x}{:02x}",
             bn(&a.ballot),
@@ -3800,6 +3871,14 @@ fn row_knobs(row: u8) -> Knobs {
     {
         knobs.answer_on_release = share;
     }
+    // `PROTOCOL_SIM_RELAY` (parts per million): the share of marked
+    // commands relayed to their ballot's leader alone (task-d102, step B).
+    if let Some(share) = std::env::var("PROTOCOL_SIM_RELAY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        knobs.relay = share;
+    }
     // `PROTOCOL_SIM_FAIL_QUEUE=0` fails one batch at a time where the row
     // fails the queue behind it, `=1` the queue where it doesn't.
     match std::env::var("PROTOCOL_SIM_FAIL_QUEUE").as_deref() {
@@ -3891,6 +3970,9 @@ fn run_row(row: u8) {
                     totals.left_out_executed += s.left_out_executed;
                     totals.answered_on_release += s.answered_on_release;
                     totals.released_again += s.released_again;
+                    totals.relayed += s.relayed;
+                    totals.relay_fallbacks += s.relay_fallbacks;
+                    totals.relayed_proposals += s.relayed_proposals;
                     totals.donor_crashes += s.donor_crashes;
                     totals.donor_crashes_taken += s.donor_crashes_taken;
                     totals.donor_crashes_again += s.donor_crashes_again;
@@ -3984,6 +4066,14 @@ fn run_row(row: u8) {
             "row {row} answered no marked command on its release: {totals:?}"
         );
     }
+    // A row run with relayed commands (`PROTOCOL_SIM_RELAY`) relayed
+    // some, and their leaders proposed them with the payload (task-d102).
+    if row_knobs(row).answer_on_release > 0 && row_knobs(row).relay > 0 {
+        assert!(
+            totals.relayed > 0 && totals.relayed_proposals > 0,
+            "row {row} relayed no command: {totals:?}"
+        );
+    }
     // Row 24 is defined by its donors crashed (task-d106, #213 review):
     // with a page on its way, with a page taken, and twice in a row for
     // one voter. Healing then requires every voter caught up.
@@ -4043,6 +4133,47 @@ fn answer_on_release_rows() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
     assert!(answered > 0, "no command was answered on a release alone");
     assert!(again > 0, "no leader published a release again");
+}
+
+/// task-d102, task-d100's step B: rows 1, 9 and 14 with half their
+/// commands answered on the release alone and most of those relayed to
+/// their ballot's leader alone, at three and five voters. The leader
+/// proposes a relayed command with its payload, the followers adopt it
+/// from the proposal without pre-accepting it, and one presented at a
+/// voter that isn't leading is refused and falls back to every host.
+/// Relayed, step-A and unmarked commands mix on the same keys; every
+/// oracle holds, and after healing every marked command is answered.
+#[test]
+fn relayed_rows() {
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let mut failures = Vec::new();
+    let (mut answered, mut relayed, mut proposals, mut fallbacks) =
+        (0usize, 0usize, 0usize, 0usize);
+    for row in [1u8, 9, 14] {
+        let mut knobs = row_knobs(row);
+        knobs.answer_on_release = 500_000;
+        knobs.relay = 750_000;
+        for n in [3u8, 5] {
+            for seed in 0..seeds() {
+                match run_knobs(n, knobs, seed, None) {
+                    Ok(stats) => {
+                        answered += stats.answered_on_release;
+                        relayed += stats.relayed;
+                        proposals += stats.relayed_proposals;
+                        fallbacks += stats.relay_fallbacks;
+                    }
+                    Err(e) => failures.push(e),
+                }
+            }
+        }
+    }
+    std::panic::set_hook(hook);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    assert!(answered > 0, "no command was answered on a release alone");
+    assert!(relayed > 0, "no command was relayed to a leader");
+    assert!(proposals > 0, "no proposal carried its payload");
+    assert!(fallbacks > 0, "no relayed command fell back");
 }
 
 #[test]
