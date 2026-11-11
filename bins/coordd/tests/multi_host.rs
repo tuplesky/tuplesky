@@ -411,11 +411,12 @@ async fn takes_back_a_restarted_voter(name: &str, journal: JournalPlan) {
         let mut at_three = Caller::connect(&run, &provisioned, &minter, 2, 2)
             .await
             .expect("a caller bound at voter 3");
+        // A fresh session's first read can be held at the output gate
+        // and resolved as unknown, so it is asked through `read_value`,
+        // which asks again (it failed once in CI as `Unknown`).
         assert_eq!(
-            at_three
-                .ask(&get(&provisioned, b"before"), Duration::from_secs(30))
-                .await,
-            Answer::Established,
+            read_value(&mut at_three, &provisioned, b"before").await,
+            Some(b"placed".to_vec()),
             "voter 3 did not serve the write before it was killed:\n{}",
             voters[2].said()
         );
