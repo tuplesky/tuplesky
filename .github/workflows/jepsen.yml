@@ -109,7 +109,7 @@ on:
         description: "How many base and head pairs, when pair-base is set (the order alternates from pair to pair; empty for 3); in a sweep, the steps the base runs at, comma-separated (empty for every step)"
         default: ""
       leader-profile:
-        description: "Profile the TupleSky leader's domain thread with perf for 20 s in each run's workload, into its summary: true (flat), call-graph (call graphs by frame pointer, on the first pair's runs in a paired job, with every build in the job made with frame pointers; also the busiest follower, the leader's and that follower's tokio threads and their threads' system calls), or false. Under faults, the first window labels the busiest loops leader and follower whatever their roles, and every restarted voter whose loop stays pegged is profiled while it is (leader_profile.py --watch-pegged)"
+        description: "Profile the TupleSky leader's domain thread with perf for 20 s in each run's workload, into its summary: true (flat), call-graph (call graphs by frame pointer, on the first pair's runs in a paired job, with every build in the job made with frame pointers; also the busiest follower, the leader's and that follower's tokio threads and their threads' system calls), or false. Under faults, the first window labels the busiest loops leader and follower whatever their roles, and every voter whose loop stays pegged is profiled while it is (leader_profile.py --watch-pegged)"
         type: choice
         options: ["false", "true", "call-graph"]
         default: "false"

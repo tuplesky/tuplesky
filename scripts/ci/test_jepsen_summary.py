@@ -416,7 +416,7 @@ class PeggedLoopTests(unittest.TestCase):
                         "by object: coordd 99.00%\n"
                         "  60.00%  coordd  [.] coord_consensus::executor::next_executable\n")
             out = "\n".join(js.pegged_loops(d))
-        self.assertIn("**Pegged loops after a restart**", out)
+        self.assertIn("**Pegged loops**", out)
         self.assertIn("- n1 pid 7 (boot at tick 9): pegged from B", out)
         self.assertIn("**Pegged loop 1, profiled**", out)
         self.assertIn("next_executable", out)

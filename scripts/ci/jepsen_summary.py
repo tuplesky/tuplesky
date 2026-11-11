@@ -1109,8 +1109,8 @@ def fast_path_table(voters: dict) -> list[str]:
 
 
 def pegged_loops(store: str, top: int = 30) -> list[str]:
-    """The restarted voters whose loops `leader_profile.py --watch-pegged`
-    found pegged (`leader-profile-pegged.txt`), then each loop it profiled
+    """The voters whose loops `leader_profile.py --watch-pegged` found
+    pegged (`leader-profile-pegged.txt`), then each loop it profiled
     (`leader-profile-pegged-N.txt`, with its inclusive shares where the
     profile took call graphs); [] without the list."""
     try:
@@ -1120,7 +1120,7 @@ def pegged_loops(store: str, top: int = 30) -> list[str]:
         return []
     if not lines:
         return []
-    out = [f"**Pegged loops after a restart** (`leader_profile.py --watch-pegged`): {lines[0]}", ""]
+    out = [f"**Pegged loops** (`leader_profile.py --watch-pegged`): {lines[0]}", ""]
     out += [f"- {line}" for line in lines[1:] if line.strip()] + [""]
     n = 1
     while os.path.exists(os.path.join(store, f"leader-profile-pegged-{n}.txt")):

@@ -328,7 +328,7 @@ def main() -> int:
     return 0
 
 
-# A restarted voter's loop is pegged once it has used at least this much
+# A voter's loop is pegged once it has used at least this much
 # of a core for PEGGED_SECONDS in a row.
 PEGGED_SHARE = 0.9
 PEGGED_SECONDS = 15
@@ -338,8 +338,8 @@ PEGGED_AGAIN_SECONDS = 60
 
 def watch_pegged(args, initial: set, beside, record, write_profile, graph: list[str], stopping) -> None:
     """After the leader's window, until the test ends: every voter boot
-    started after the workload did (a restart) whose loop stays pegged is
-    written down, and profiled the way the leader was, for --seconds, into
+    whose loop stays pegged, a restarted one or one running since the
+    workload started, is written down, and profiled the way the leader was, for --seconds, into
     FILE with -pegged-N before its extension (its -inclusive and -chains
     beside it with --call-graph). Each boot is profiled at most twice, at
     least PEGGED_AGAIN_SECONDS apart, and --watch-pegged profiles in all.
@@ -350,7 +350,7 @@ def watch_pegged(args, initial: set, beside, record, write_profile, graph: list[
 
     def flush() -> None:
         with open(index, "w") as f:
-            f.write(f"Restarted voters' loops at or above {PEGGED_SHARE:g} of a core for {PEGGED_SECONDS} s or more, "
+            f.write(f"Voters' loops at or above {PEGGED_SHARE:g} of a core for {PEGGED_SECONDS} s or more, "
                     f"watched from {started} UTC" + (" to " + now() + " UTC" if stopping() else "") + "\n")
             f.write("\n".join(lines) + ("\n" if lines else "No stretch so far.\n"))
 
@@ -371,7 +371,7 @@ def watch_pegged(args, initial: set, beside, record, write_profile, graph: list[
                     lines[open_stretch.pop(key)] += f", until it stopped by {now()}"
                 run.pop(key)
         for key, cpu in current.items():
-            if key in initial or key not in last:
+            if key not in last:
                 continue
             rate = cpu - last[key]
             seconds, began, used = run.get(key, (0, now(), 0.0))
@@ -390,7 +390,8 @@ def watch_pegged(args, initial: set, beside, record, write_profile, graph: list[
                 nodes[key] = node_of(key[0])
             if key not in open_stretch:
                 open_stretch[key] = len(lines)
-                lines.append(f"{nodes[key] or '?'} pid {key[0]} (boot at tick {key[1]}): pegged from {began}")
+                boot = "its first boot" if key in initial else "restarted"
+                lines.append(f"{nodes[key] or '?'} pid {key[0]} ({boot}, at tick {key[1]}): pegged from {began}")
             times, at = profiled.get(key, (0, 0.0))
             if taken >= args.watch_pegged or times >= 2 or (times and time.monotonic() - at < PEGGED_AGAIN_SECONDS):
                 continue
@@ -403,7 +404,7 @@ def watch_pegged(args, initial: set, beside, record, write_profile, graph: list[
             _, err = proc.communicate()
             ended = now()
             if proc.returncode == 0:
-                write_profile(out, f"pegged loop {taken}, restarted", key[0], used / seconds * 5, data,
+                write_profile(out, f"pegged loop {taken}", key[0], used / seconds * 5, data,
                               began_profile, ended, node=nodes[key])
             else:
                 with open(out, "w") as f:
