@@ -289,7 +289,7 @@ This is a workstream overview; the individual prerequisites are authoritative. O
 | [task-d101](#task-d101) | Let followers do less: what reads a follower's projection, and what each option saves | task-d12, task-d86, task-d90 |
 | [task-d102](#task-d102) | A contended round is a batch: one frame, one group and one acknowledgement a turn | task-d61, task-d84, task-d86, task-d99, task-d100, task-d101 |
 | [task-d103](#task-d103) | Stop writing the leader's proposal row, which nothing reads | task-d89, task-d101 |
-| [task-d104](#task-d104) | Retire the retry window in batches | task-c02, task-d26, task-d101 |
+| [task-d104](#task-d104) | Retire the retry window in batches | task-c02, task-d26, task-d99, task-d101 |
 | [task-q01](#task-q01) | Produce the combined durable WAN/Kine qualification report | task-j07, task-j08, task-o06, task-m05, task-63, task-64, task-d45, task-d46, task-d47, task-d48, task-d49, task-d51, task-d52, task-d53 |
 
 ## Task specifications
@@ -4006,13 +4006,24 @@ So every feature-gated change, task-d98's `EarlyProposal` first, would ship unre
 <a id="task-d104"></a>
 ### task-d104: Retire the retry window in batches
 
-**Prerequisites:** task-c02, task-d26, task-d101.  
+**Prerequisites:** task-c02, task-d26, task-d99, task-d101.  
 **Design:** Section 17.4 (amended by this task's design step: the retry window retired in batches).
 
 **Implement:** The second of task-d101's option 2 cuts (#185 review). `retirement()` retires a client's acknowledged sequences once at least `RETIRE_BATCH` (`K`) are acknowledged above the floor. It also retires whenever deferring would leave the command's own sequence, or the next `K`, outside the window measured from the unretired floor. A retiring command retires up to `MAX_RETIRE_PER_COMMAND + K − 1` above the floor, so the batched floor is never more than `K − 1` below today's and a retirement reaches at least today's. The rule stays a function of the durable view and the accepted payload. task-d26's bound on a session's retained results becomes `width + K`. `K` is a constant of the format, not a setting, since every voter must compute the same retirement.
+- **The rule is a replicated feature, `Feature::BatchedRetirement`,** prepared and activated through task-d99's path. Below its activation position every voter retires as today, and from it in batches. A build that doesn't know it refuses a store that names it.
+- **Second part, after the first's pair: a window that overwrites in place.**
+  - `RetryV1` is keyed by the client instance and the sequence modulo the width. A slot holds its own sequence, and a replaced one answers `Retired`.
+  - The width is carried on the floor row. `ExecutedV1` is unchanged.
+  - This takes the delete, for about −0.06 to −0.08 ms an operation with the first part.
+  - It changes `RetryV1`'s layout, so it takes task-d105's route: one layout a domain, the other refused with the reason.
+  - It is sized and its design checked against resolve and `records_for` before its code.
 
 **Acceptance:**
 - **The design step** recorded and reviewed.
+- **The feature:**
+  - a store written before the activation keeps today's rule through a restart, and switches at the activation position;
+  - every voter's common hash agrees at that position and after it;
+  - a build without the feature refuses a store that names it, with the reason.
 - **Model tests:**
   - every voter retires the same sequences at the same position, and the common hash agrees across voters through a long run with clients at and near the window's edge;
   - no request is refused `OutOfWindow` that today's rule admits, over randomized acknowledgement patterns, including an acknowledgement jump past `MAX_RETIRE_PER_COMMAND` after a deferred prefix (the case on #207);
@@ -4022,7 +4033,7 @@ So every feature-gated change, task-d98's `EarlyProposal` first, would ship unre
 - **The storage crash tests** at every cut of a retiring batch, under `strict` and `replay`.
 - **A local pair** at `K = 16` against today: rows a command at every voter, and the materializer's CPU a command and a commit.
 
-**Review boundary:** When a client's acknowledged results are retired. No change to admission, to what a retry is answered, or to the wire.
+**Review boundary:** When a client's acknowledged results are retired, and from which position. No change to admission, to what a retry is answered, or to the wire, apart from the feature's activation through task-d99's path.
 
 ## Gate checklist and deferred work
 

@@ -2045,6 +2045,31 @@ A client acknowledges on every request (`ack_through`), so `retirement()` (`retr
 
 **What it moves.** The floor row is written once every `K` commands a client instead of every command: about −(1 − 1/K) rows a command at every voter, about −0.03 to −0.04 ms an operation at `K = 16`. The `K` deletes land together on consecutive keys of one client, which redb writes as one region of its tree. Whether that is cheaper than `K` scattered deletes is read in the pair, not assumed. `ExecutedV1` stays: it is the index by command that catch-up, campaigns and boot read, and `RetryV1` is keyed by the retry key.
 
+**How the rule is introduced** (#207 review). The retirement rule is part of deterministic execution: `RetryV1` and `RetryFloorV1` are in the common hash. Two builds with different rules reach different common states at the same position. Their floor roots would disagree (task-d27), and they would answer the same retry differently at different voters. So the rule is a change to the replicated state, and a domain changes it at one position on every voter:
+- **It is a replicated feature, `Feature::BatchedRetirement`, activated through task-d99's path.** It is gated like `EarlyProposal`: a prepare marker in each voter's `ActiveFeaturesV1`, then activation at a position. Below the activation position every voter retires one sequence a command, as today; from it, every voter retires in batches. Both rules stay in the code.
+- **Why not a raised state-format version.**
+  - The store's `format_version` field (`meta_fields::FORMAT_VERSION`) is read by no open today, so that route would first need the check built.
+  - task-d99's path already has the rollback guard: a build that doesn't know the feature refuses a store that names it.
+  - The rule has no rows to convert. It changes which sequences a command retires from a position on, not the layout of rows already written. task-d105's history layout does change written rows, so it takes the other route: one layout a domain.
+- **Its tests:**
+  - a store written before the activation keeps today's rule through a restart, and switches at the activation position;
+  - every voter's common hash agrees at the activation position and after it;
+  - a build without the feature refuses a store that names it, with the reason (task-d99's guard).
+
+**Whether the delete can go too: yes, through a window that overwrites in place** (#207 review). This step batches the floor's rewrite, not the deletes: `K` deletes every `K` commands is still one a command, so the retry state falls from four rows a command to about three. At parity the delete has to go. A window that overwrites in place takes it:
+- **`RetryV1` keyed by the client instance and the sequence modulo the window's width.** A new result replaces the slot of a sequence the window has already passed, so retiring writes nothing.
+- **A slot holds its own sequence.** A lookup tells a retained result from a replaced one, and a replaced one answers `Retired`, as a deleted one does today.
+- **An unacknowledged result is never replaced.** Admission already refuses a sequence more than the width above the floor (`admit`), and a slot is reused only by a sequence a width above it.
+- **The floor row stays,** and this step's rule rewrites it once every `K` commands.
+
+What it has to answer before its code:
+- **The width is carried on the client's floor row,** fixed for the client instance, since slots are computed from it and widths can differ by client.
+- **`ExecutedV1` stays as it is.** It is the index by command, and the window changes only the retry key's rows.
+- **Resolve and `records_for`** read a slot and compare its sequence; nothing else reads `RetryV1` by range.
+- **It changes `RetryV1`'s layout,** a collection in the common hash. So, unlike this step's rule, it takes task-d105's route: one layout a domain, with a store or image of the other refused with the reason.
+
+**Its size, with this step:** the retry state falls to one put and `1/K` of a floor row a command, about −0.06 to −0.08 ms an operation together, against this step's −0.03 to −0.04 alone. It composes with this step and doesn't replace it. It is task-d104's second part, sized after the first part's pair, before its code.
+
 <a id="s17-5"></a>
 ### 17.5 MVCC and physical maintenance
 
