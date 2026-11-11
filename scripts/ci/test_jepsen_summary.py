@@ -222,6 +222,11 @@ class SummaryTests(unittest.TestCase):
     def test_counts_and_last_ok(self):
         self.assertIn("| 4 | 2 | 2 | 0 | 10:01:42 (+101 s) | 10:00:40 (+39 s) |", self.text)
 
+    def test_ok_and_invoked_per_window(self):
+        # Two invokes and one ok in the first 30 s, none in the two windows
+        # of the kill, then the final reads' two invokes and one ok.
+        self.assertIn("`ok` / invoked per 30 s: 0s:1/2 · 30s:0/0 · 60s:0/0 · 90s:1/2", self.text)
+
     def test_throughput_until_the_heal(self):
         # One ok before the heal at +39 s; the final read after it is left out.
         self.assertIn("**Throughput:** 1 `ok` in 39 s until the final heal, 0.0 `ok`/s", self.text)

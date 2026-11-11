@@ -5,7 +5,7 @@ A Jepsen job's log runs to thousands of lines. This reads the test's store
 directory (`store/latest`) and writes what a reader looks for first:
 
 * the verdict, with Elle's anomaly types when there are any;
-* the operation counts, `ok` per 30 s, the last `ok` and the final heal;
+* the operation counts, `ok` and invokes per 30 s, the last `ok` and the final heal;
 * the throughput, `ok` a second until the final heal, and each operation's
   latency percentiles, for the throughput and WAN runs;
 * under a simulated WAN, the round trips the nemesis measured at setup
@@ -2412,9 +2412,13 @@ def summarize(store: str, nodes: list[str], title: str, profile: str | None = No
         )
         out.append("")
         buckets = collections.Counter((o.at - start).seconds // BUCKET_S for o in oks)
+        # The invokes in each window beside its `ok`: a window short of
+        # `ok` with its invokes kept up is the system slowing, one short
+        # of both is the clients waiting (out of callers, or stopped).
+        invoked = collections.Counter((o.at - start).seconds // BUCKET_S for o in client if o.type == "invoke")
         end = (done[-1].at - start).seconds // BUCKET_S if done else 0
-        row = " · ".join(f"{b * BUCKET_S}s:{buckets.get(b, 0)}" for b in range(end + 1))
-        out.append(f"`ok` per {BUCKET_S} s: {row}")
+        row = " · ".join(f"{b * BUCKET_S}s:{buckets.get(b, 0)}/{invoked.get(b, 0)}" for b in range(end + 1))
+        out.append(f"`ok` / invoked per {BUCKET_S} s: {row}")
         out.append("")
 
         n_ok, secs, latencies = throughput(client, heal)

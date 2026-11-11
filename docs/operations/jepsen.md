@@ -752,7 +752,7 @@ of lines. `scripts/ci/jepsen_summary.py` reads the test's store
 (`jepsen.log`, `results.edn` and each node's log) and writes:
 
 * the verdict, with Elle's anomaly types when there are any;
-* the operation counts, `ok` per 30 s, the last `ok` and the last fault
+* the operation counts, `ok` and invokes per 30 s, the last `ok` and the last fault
   operation (the final heal);
 * the throughput, `ok` a second until the final heal (or the last
   operation, without faults) and the best 30 s, and each operation's
