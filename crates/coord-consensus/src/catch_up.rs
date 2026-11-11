@@ -130,6 +130,13 @@ pub(crate) struct CatchUp {
     /// one never starts a second chain beside the running one (task-d25
     /// at the bar's load).
     pub(crate) asked_after: Option<ExecutionPosition>,
+    /// Whether the last page answering this replica's chain stopped short
+    /// of its donor's frontier, or left executions to compare: more is
+    /// owed, and the chain is open until a page reaches a donor's
+    /// frontier. An ask or page of the chain lost in a quiet domain
+    /// leaves nothing else to ask again, so the caller's pacer asks while
+    /// this holds (#226 review).
+    pub(crate) chain_open: bool,
     /// Pages taken, for the caller's counters.
     pub(crate) pages: u64,
     /// Commands executed from pages, likewise.

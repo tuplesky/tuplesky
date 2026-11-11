@@ -457,6 +457,15 @@ impl Machine {
         }
     }
 
+    /// Whether this replica's catch-up chain is owed more (#226 review).
+    /// A leader asks for nothing.
+    pub fn catch_up_chain_open(&self) -> bool {
+        match self {
+            Machine::Leader(_) => false,
+            Machine::Follower(m) => m.catch_up_chain_open(),
+        }
+    }
+
     /// Catch-up pages taken and pulled commands executed (task-d08).
     pub const fn catch_up_counts(&self) -> (u64, u64) {
         match self {

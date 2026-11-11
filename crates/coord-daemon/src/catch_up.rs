@@ -337,6 +337,10 @@ pub struct Standing<B: Fn() -> usize> {
     pub backlog: B,
     /// Whether a page is in hand.
     pub busy: bool,
+    /// Whether its catch-up chain is owed more
+    /// (`Machine::catch_up_chain_open`): the last page stopped short of
+    /// its donor's frontier, and none has reached one since (#226 review).
+    pub chain: bool,
     /// Catch-up pages taken since the machine started
     /// (`Machine::catch_up_counts`): one more is an ask answered.
     pub pages: u64,
@@ -382,6 +386,10 @@ pub struct Pacer {
     /// The pages taken when the probe's first ask went: a different count
     /// later is a page that answered it.
     probe_pages: Option<u64>,
+    /// The pages taken when a round of every voter went unanswered while
+    /// the chain was open: nobody has more for it, so the open chain gives
+    /// no reason to ask again until a page arrives.
+    chain_given_up: Option<u64>,
     /// The frontier as the last turn saw it, and when it last moved:
     /// task-d08's still frontier, for a voter holding less than a page.
     seen: Option<ExecutionPosition>,
@@ -403,11 +411,21 @@ impl Pacer {
         leader: ReplicaId,
         voters: &[ReplicaId],
     ) -> Option<ReplicaId> {
-        if !self.probed && (standing.busy || self.probe_pages.is_some_and(|p| p != standing.pages))
+        // The probe is answered by a page that reached its donor's
+        // frontier, not by the first page: a chain's later ask or page
+        // lost in a quiet domain left a voter holding nothing that never
+        // asked again (#226 review). So while the chain is open the voter
+        // asks as one holding work, until a page reaches a frontier or a
+        // round of every voter brings none.
+        let chain = standing.chain && self.chain_given_up != Some(standing.pages);
+        if !self.probed
+            && !standing.busy
+            && !standing.chain
+            && self.probe_pages.is_some_and(|p| p != standing.pages)
         {
             self.probed = true;
         }
-        let holds = standing.holds || !self.probed;
+        let holds = standing.holds || !self.probed || chain;
         self.wanting = holds && !standing.leads && !standing.busy;
         if self.seen != Some(standing.executed) {
             self.seen = Some(standing.executed);
@@ -489,21 +507,28 @@ impl Pacer {
             *others.get(turn % others.len().max(1))?
         };
         self.asks += 1;
+        // This ask finishes a round of every voter (the leader
+        // [`LEADER_ASKS`] times, then each of the others) with no page:
+        // nothing is past this voter anywhere.
+        let round = self.unanswered as usize + 1 >= LEADER_ASKS as usize + others.len();
         if standing.holds {
             self.probed = true;
         } else {
-            // A probe: done once a page arrives, or once this ask
-            // finishes a round of every voter (the leader
-            // [`LEADER_ASKS`] times, then each of the others) with no
-            // page: nothing is past this voter anywhere.
+            // A probe, or an open chain: done once a page reaches a
+            // donor's frontier, or once a round brings no page.
             self.probe_pages.get_or_insert(standing.pages);
-            if self.unanswered as usize + 1 >= LEADER_ASKS as usize + others.len() {
+            if round {
                 self.probed = true;
+                if chain {
+                    self.chain_given_up = Some(standing.pages);
+                }
             }
         }
-        // A voter that holds nothing and is done probing has no more
-        // reason to wake for this one.
-        self.wanting = standing.holds || !self.probed;
+        // A voter that holds nothing, is done probing and owes its chain
+        // nothing has no more reason to wake for this one.
+        self.wanting = standing.holds
+            || !self.probed
+            || (standing.chain && self.chain_given_up != Some(standing.pages));
         Some(donor)
     }
 
@@ -595,6 +620,7 @@ mod tests {
             holds: backlog > 0,
             backlog: move || backlog,
             busy: false,
+            chain: false,
             pages: 0,
             leads: false,
         }
@@ -788,6 +814,7 @@ mod tests {
                     3
                 },
                 busy: false,
+                chain: false,
                 pages: 0,
                 leads: false,
             };
@@ -934,6 +961,67 @@ mod tests {
         assert_eq!(pacer.next_deadline(), None);
         let t = t + UNANSWERED * 3;
         assert_eq!(pacer.due(t, answered, r(3), r(1), &voters), None);
+    }
+
+    /// A page that leaves the chain open does not end the probe, and an
+    /// open chain is asked for like held work (#226 review): an ask or a
+    /// page of the chain lost in a quiet domain left a voter holding
+    /// nothing that never asked again. It asks until a page reaches a
+    /// donor's frontier, or until a round of every voter brings none.
+    #[test]
+    fn an_open_chain_is_asked_for_until_a_page_reaches_a_frontier() {
+        let voters = [r(1), r(2), r(3)];
+        let t0 = Instant::now();
+        let mut pacer = Pacer::default();
+        pacer.due(t0, standing(5, false), r(3), r(1), &voters);
+        let t = t0 + STILL_FOR;
+        assert_eq!(
+            pacer.due(t, standing(5, false), r(3), r(1), &voters),
+            Some(r(1))
+        );
+        // The first page arrives full, and the chain's next ask is lost:
+        // nothing held, nothing in hand, the chain open.
+        let open = Standing {
+            pages: 1,
+            chain: true,
+            ..standing(130, false)
+        };
+        let t = t + UNANSWERED;
+        assert_eq!(pacer.due(t, open, r(3), r(1), &voters), None);
+        assert!(
+            pacer.next_deadline().is_some(),
+            "an open chain has a deadline"
+        );
+        let mut t = t + STILL_FOR;
+        let mut asked = Vec::new();
+        for _ in 0..10 {
+            if let Some(donor) = pacer.due(t, open, r(3), r(1), &voters) {
+                asked.push(donor);
+            }
+            t += UNANSWERED;
+        }
+        // Nobody has more for it: a round of every voter, then no more.
+        assert_eq!(asked, vec![r(1), r(1), r(1), r(2)]);
+        assert_eq!(pacer.next_deadline(), None);
+        // A page reaches a frontier: closed, and nothing more is asked.
+        let closed = Standing {
+            pages: 2,
+            ..standing(140, false)
+        };
+        assert_eq!(pacer.due(t, closed, r(3), r(1), &voters), None);
+        assert_eq!(pacer.next_deadline(), None);
+        // A page that arrives with the chain still open asks again.
+        let reopened = Standing {
+            pages: 3,
+            chain: true,
+            ..standing(265, false)
+        };
+        let t = t + UNANSWERED;
+        assert_eq!(pacer.due(t, reopened, r(3), r(1), &voters), None);
+        assert_eq!(
+            pacer.due(t + STILL_FOR, reopened, r(3), r(1), &voters),
+            Some(r(1))
+        );
     }
 
     /// With nothing past it at any donor, nobody answers the probe: it is

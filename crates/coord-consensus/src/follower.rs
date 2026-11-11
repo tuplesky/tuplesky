@@ -3469,6 +3469,7 @@ impl Follower {
         self.catch_up.queue.clear();
         self.catch_up.running.clear();
         self.catch_up.continue_from = None;
+        self.catch_up.chain_open = false;
         self.catch_up.since_boot.done();
     }
 
@@ -3477,6 +3478,15 @@ impl Follower {
     /// process running it is to stop.
     pub const fn catch_up_divergence(&self) -> Option<&CatchUpDivergence> {
         self.diverged.as_ref()
+    }
+
+    /// Whether this replica's catch-up chain is owed more (#226 review):
+    /// the last page answering it stopped short of its donor's frontier,
+    /// and no page has reached a frontier since. The caller asks again
+    /// while it holds, since a lost ask or page of the chain leaves
+    /// nothing else to.
+    pub fn catch_up_chain_open(&self) -> bool {
+        self.catch_up.chain_open && self.halted.is_none() && self.diverged.is_none()
     }
 
     /// Whether a catch-up page is in hand (task-d08).
@@ -3787,6 +3797,12 @@ impl Follower {
                 self.catch_up.paths.stale_unasked += 1;
                 self.catch_up.continue_from = None;
             }
+        }
+        // The page answering this replica's own chain says whether more
+        // is owed: open until a page reaches its donor's frontier (#226
+        // review). A late answer to an earlier ask says nothing of it.
+        if !stale || self.catch_up.asked_after == Some(after) {
+            self.catch_up.chain_open = next < through || self.catch_up.continue_from.is_some();
         }
         if ahead {
             self.catch_up.paths.taken_ahead += 1;
