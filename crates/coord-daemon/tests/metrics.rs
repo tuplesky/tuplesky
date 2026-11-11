@@ -492,6 +492,8 @@ fn a_rendered_snapshot_carries_no_secret_or_key_shaped_text() {
                 records: 5200,
                 kept: 1400,
                 sweeps: 3,
+                entries: 9100,
+                largest_map: 1700,
             },
         }),
     };

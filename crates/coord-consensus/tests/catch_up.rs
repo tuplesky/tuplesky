@@ -889,6 +889,12 @@ fn a_failed_installation_is_installed_again() {
     cluster.tick();
     cluster.settle();
     assert_eq!(cluster.failed, 2, "both failures reached r4");
+    // The next event is the leader's commit announcement at the next
+    // tick. Proposals the leader resent used to reach r4 in the same
+    // settle, but the leader forgets an executed command by order now and
+    // resends none of its proposals (task-d111 item 4 (d)).
+    cluster.tick();
+    cluster.settle();
     assert!(
         cluster.nodes[4].executed.len() > before,
         "r4 wedged on a failed installation"
