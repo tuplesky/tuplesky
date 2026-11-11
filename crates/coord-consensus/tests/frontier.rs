@@ -140,8 +140,8 @@ struct Cluster {
     announced: Vec<(u8, u64)>,
     /// Every payload ask sent: (from, commands).
     asks: Vec<(u8, Vec<CommandId>)>,
-    /// The voters' table capacity.
-    capacity: usize,
+    /// Each voter's table capacity.
+    capacity: Vec<usize>,
     /// The most records each node's table held after a delivery.
     peak: Vec<usize>,
 }
@@ -150,8 +150,15 @@ const SETTLE_STEPS: u32 = 200_000;
 
 impl Cluster {
     fn new(seed: u64, capacity: usize) -> Self {
+        Self::sized(seed, |_| capacity)
+    }
+
+    /// A cluster whose voter `me` has a table of `capacity(me)`.
+    fn sized(seed: u64, capacity: impl Fn(usize) -> usize) -> Self {
         let mut nodes = Vec::new();
+        let capacities: Vec<usize> = (0..VOTERS as usize).map(capacity).collect();
         for me in 0..VOTERS {
+            let capacity = capacities[me as usize];
             let role = if me == 0 {
                 Role::Leader(Leader::new(
                     LeaderConfig {
@@ -196,7 +203,7 @@ impl Cluster {
             down: Vec::new(),
             announced: Vec::new(),
             asks: Vec::new(),
-            capacity,
+            capacity: capacities,
             peak: vec![0; VOTERS as usize],
         }
     }
@@ -383,7 +390,7 @@ impl Cluster {
     /// `coordd` restores a voter: its volatile state is gone, and its
     /// adoptions come back without the ballot's sequence numbers.
     fn restart(&mut self, i: usize) {
-        let capacity = self.capacity;
+        let capacity = self.capacity[i];
         let node = &mut self.nodes[i];
         node.inbox.clear();
         node.storage.crash();
@@ -593,9 +600,15 @@ fn two_followers_cut_from_their_peers_both_execute() {
 /// Its first eight commands are adopted and wait for a commit. Every later
 /// payload is refused as backpressure, and so is every later proposal's
 /// placeholder: those proposals are held with nothing in the table.
+///
+/// The other voters' tables hold the whole run, so the leader still has
+/// every proposal and payload r3 asks for: they are not history yet. Past
+/// its window a command's are dropped (task-d111 item 4 (d)), as a history
+/// sweep dropped them before, and a voter that far behind catches up by
+/// pages (task-d08).
 fn stalled(seed: u64) -> (Cluster, Vec<CommandId>) {
     let capacity = 8;
-    let mut cluster = Cluster::new(seed, capacity);
+    let mut cluster = Cluster::sized(seed, |me| if me == 3 { capacity } else { capacity * 4 });
     cluster.deaf = vec![3];
     let commands: Vec<CommandId> = (1..=(capacity as u64 * 4))
         .map(|n| {
@@ -1074,4 +1087,43 @@ fn a_proposal_a_voter_lacks_is_resent_with_a_growing_gap() {
             "a proposal r4 adopted was sent again"
         );
     }
+}
+
+/// A restarted voter queues only the restored executions its table has
+/// not forgotten yet (#221 review). Queued whole, the restored history
+/// waited at the front of the forget queue for the first execution after
+/// the restart, which let all but the queue's bound go in one call,
+/// unforgotten as far as the queue knew, and owed them to a sweep.
+#[test]
+fn a_restarted_voter_queues_only_what_it_has_not_forgotten() {
+    let capacity = 8;
+    let mut cluster = Cluster::new(37, capacity);
+    for n in 1..=(capacity as u64 * 16) {
+        cluster.admit(n);
+        cluster.settle();
+    }
+    cluster.settle_ticking(2);
+    assert_eq!(cluster.nodes[1].executed.len(), capacity * 16);
+    cluster.restart(1);
+    let queued = cluster.nodes[1]
+        .follower_mut()
+        .ledger()
+        .forget_queued()
+        .len();
+    assert!(
+        queued <= capacity * 2,
+        "{queued} restored executions queued at a capacity of {capacity}"
+    );
+    for n in 1..=(capacity as u64 * 2) {
+        cluster.admit(1_000 + n);
+        cluster.settle();
+    }
+    cluster.settle_ticking(2);
+    let f = cluster.nodes[1].follower_mut();
+    assert_eq!(f.ledger().forgets_skipped(), 0, "the queue let some go");
+    assert_eq!(f.ledger().owed_sweep(), None);
+    assert_eq!(
+        cluster.nodes[1].executed.len(),
+        cluster.nodes[0].executed.len()
+    );
 }

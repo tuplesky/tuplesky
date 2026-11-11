@@ -390,6 +390,17 @@ pub(crate) fn report_executed_as_committed(report: &mut RecoveryReport, table: &
 /// hold before the records of forgotten commands are swept.
 pub(crate) const HISTORY_SWEEP: usize = 4;
 
+/// Forgotten commands whose history an execution drops at most, from the
+/// front of the forget queue (task-d111's cut (d)). More than one, so a
+/// queue that fell behind (a burst of retirements late against the
+/// executions that let them be forgotten) catches up.
+pub(crate) const FORGET_PER_EXECUTION: usize = 4;
+
+/// Executions between two debug checks that every forgotten command left
+/// in a map keyed by history is still in the forget queue.
+#[cfg(debug_assertions)]
+pub(crate) const FORGET_CHECK_EVERY: u64 = 64;
+
 /// How many times the command table's own capacity of leader proposals
 /// this replica will hold while it has no room to record them.
 ///
@@ -1048,6 +1059,15 @@ impl Follower {
             let _ = self.table.retire(c);
         }
         self.sweep_history();
+        // What is not forgotten yet is dropped as the table forgets it,
+        // as if it had executed after the restart (task-d111's cut (d)).
+        // What the sweep just dropped is not queued: queued, the whole
+        // history would wait at the front for the first execution to let
+        // all but the queue's bound go, unforgotten as far as the queue
+        // knows, and owed to a sweep (#221 review).
+        let table = &self.table;
+        self.ledger
+            .executed_before(executed.iter().copied().filter(|c| !table.forgotten(c)));
         self.learner = Learner::with_mode(through, self.learner.mode());
         // What executes from here on is compared with a donor's by the
         // first ask, which starts here (task-d25).
@@ -2093,11 +2113,24 @@ impl Follower {
         if let Some(payload) = self.payloads.remove(command) {
             self.bindings.remove(&payload.retry_key);
         }
+        if let Some(key) = self.ledger.unbind_bare(command)
+            && self.bindings.get(&key) == Some(command)
+        {
+            self.bindings.remove(&key);
+        }
         self.served_payloads.remove(command);
         self.votes.remove(command);
         self.adopted.remove(command);
         self.held.remove(command);
         self.note_lacking(*command);
+        // Nothing waits on a released command: it will not move here
+        // again, and the sweep that pruned such an entry is rare now
+        // (task-d111's cut (d)).
+        if let Some(waiting) = self.held_waiters.remove(command) {
+            let held = &self.held;
+            self.held_check
+                .extend(waiting.into_iter().filter(|c| held.contains_key(c)));
+        }
     }
 
     /// `decision` with every command this replica holds committed that it
@@ -2750,6 +2783,22 @@ impl Follower {
         &self.ledger
     }
 
+    /// What this replica keeps of its history beside the ledger, map by
+    /// map (#221 review).
+    pub fn history_maps(&self) -> crate::summary::HistoryMaps {
+        crate::summary::HistoryMaps {
+            payloads: self.payloads.len(),
+            served_payloads: self.served_payloads.len(),
+            votes: self.votes.len(),
+            adopted: self.adopted.len(),
+            bindings: self.bindings.len(),
+            bare_bindings: self.ledger.bare_bindings(),
+            answer_on_release: self.answer_on_release.len(),
+            held_waiters: self.held_waiters.len(),
+            proposals: 0,
+        }
+    }
+
     /// Retry keys bound to a command here (task-d26): the commands still
     /// live or recently retired, never every key submitted.
     pub fn bindings_held(&self) -> usize {
@@ -3298,7 +3347,7 @@ impl Follower {
         }
         self.check_pulled(command, outcome);
         self.learn();
-        self.forget_history();
+        self.forget_history(command);
         if self.diverged.is_none() && self.catch_up.running.is_empty() {
             effects.extend(self.install_catch_up());
             if !self.catch_up.busy()
@@ -3888,15 +3937,119 @@ impl Follower {
     /// ([`DurableLedger::sweep_due`]). So it is amortized over the work
     /// that made it necessary, also at a voter behind, whose ledger holds
     /// more than that the table does not forget (task-d110).
-    fn forget_history(&mut self) {
-        self.ledger.executed();
-        if !self
+    ///
+    /// Each execution first drops the history of what the table has
+    /// forgotten since, in the order it executed (task-d111's cut (d)):
+    /// the entries of a few commands, not a walk of every map. In steady
+    /// state that keeps the ledger under the sweep's threshold, so the
+    /// sweep is a backstop, for what the queue let go unforgotten.
+    fn forget_history(&mut self, executed: CommandId) {
+        self.ledger.executed(executed);
+        self.forget_in_order();
+        #[cfg(debug_assertions)]
+        if self.ledger.executions().is_multiple_of(FORGET_CHECK_EVERY) {
+            self.check_forgetting();
+        }
+        let owed = self
             .ledger
-            .sweep_due(self.config.capacity.saturating_mul(HISTORY_SWEEP))
+            .owed_sweep()
+            .is_some_and(|c| self.table.forgotten(c));
+        if !owed
+            && !self
+                .ledger
+                .sweep_due(self.config.capacity.saturating_mul(HISTORY_SWEEP))
         {
             return;
         }
         self.sweep_history();
+    }
+
+    /// Drop the history of the commands at the front of the forget queue
+    /// that the table has forgotten (task-d111's cut (d)).
+    fn forget_in_order(&mut self) {
+        let table = &self.table;
+        let gone = self.ledger.take_forgotten(
+            |c| table.forgotten(c),
+            FORGET_PER_EXECUTION,
+            self.config.capacity.saturating_mul(HISTORY_SWEEP),
+        );
+        for c in gone {
+            self.forget_one(c);
+        }
+    }
+
+    /// Drop what this replica keeps about `command`, which the table has
+    /// forgotten, from every map the sweep walks: what
+    /// [`Follower::sweep_history`] does for it, and the indexes kept with
+    /// those maps updated for it alone.
+    fn forget_one(&mut self, command: CommandId) {
+        if let Some(key) = self.ledger.forget(&command)
+            && self.bindings.get(&key) == Some(&command)
+        {
+            self.bindings.remove(&key);
+        }
+        let payload = self.payloads.remove(&command);
+        self.served_payloads.remove(&command);
+        self.votes.remove(&command);
+        self.answer_on_release.remove(&command);
+        if self.adopted.remove(&command).is_some() {
+            self.adopted_lacking.remove(&command);
+        }
+        if let Some(payload) = payload {
+            if self.bindings.get(&payload.retry_key) == Some(&command) {
+                self.bindings.remove(&payload.retry_key);
+            }
+            if self.held.contains_key(&command) {
+                self.held_lacking.insert(command);
+            }
+        }
+        self.note_sync(command);
+        // Held proposals waiting on a command forgotten here wait on
+        // nothing that will move again: looked at again at the next
+        // adoption, as the sweep's pruning would leave them.
+        if let Some(waiting) = self.held_waiters.remove(&command) {
+            let held = &self.held;
+            self.held_check
+                .extend(waiting.into_iter().filter(|c| held.contains_key(c)));
+        }
+    }
+
+    /// Debug check of cut (d) against the sweep it replaces: every entry
+    /// the sweep would drop now is of a command still in the forget queue,
+    /// or one the queue let go unforgotten while a sweep is still owed
+    /// (#221 review): one forgotten after the owed sweep ran would be
+    /// left to the threshold's alone.
+    #[cfg(debug_assertions)]
+    fn check_forgetting(&self) {
+        let queued = self.ledger.forget_queued();
+        let kept = |c: &CommandId| {
+            !self.table.forgotten(c)
+                || queued.contains(c)
+                || (self.ledger.sweep_owes(c) && self.ledger.owed_sweep().is_some())
+        };
+        let stray = [
+            (
+                "ledger",
+                self.ledger.records().map(|(c, _)| *c).find(|c| !kept(c)),
+            ),
+            ("payloads", self.payloads.keys().copied().find(|c| !kept(c))),
+            (
+                "served payloads",
+                self.served_payloads.iter().copied().find(|c| !kept(c)),
+            ),
+            ("votes", self.votes.keys().copied().find(|c| !kept(c))),
+            ("adopted", self.adopted.keys().copied().find(|c| !kept(c))),
+            (
+                "bindings",
+                self.bindings.values().copied().find(|c| !kept(c)),
+            ),
+        ]
+        .into_iter()
+        .find_map(|(map, c)| c.map(|c| (map, c)));
+        debug_assert!(
+            stray.is_none(),
+            "a forgotten command's history was kept and is not in the forget queue: {stray:?}"
+        );
     }
 
     /// The sweep itself, whatever the ledger's size.
@@ -4773,6 +4926,9 @@ impl Follower {
             // `PayloadConflict` is not.
             Err(InitError::AlreadyInitialized) => {
                 self.bindings.insert(retry_key, command);
+                if !self.payloads.contains_key(&command) {
+                    self.ledger.bound_bare(command, retry_key);
+                }
                 self.rejections.push(FollowerRejection::Duplicate(command));
                 return self.repair_evidence(command);
             }
@@ -6251,6 +6407,13 @@ impl Follower {
             return Vec::new();
         }
         let command = vote.command();
+        // A vote for a command this replica forgot comes too late to
+        // teach it anything, and a set started for it would be dropped
+        // only by a history sweep, which forgetting in order leaves rare
+        // (task-d111 item 4 (d)).
+        if self.table.forgotten(&command) {
+            return Vec::new();
+        }
         let set = self
             .votes
             .entry(command)
@@ -6656,12 +6819,12 @@ mod tests {
             follower.swept.set(0);
             // The first execution after the recovery: the ledger has
             // grown past the threshold from nothing, so it is swept once.
-            follower.forget_history();
+            follower.forget_history(id(u64::MAX));
             let first = follower.swept.get();
             assert!(first >= behind, "{first} entries over {behind} behind");
             // Nine more executions' worth of the call `applied` makes.
             for _ in 0..9 {
-                follower.forget_history();
+                follower.forget_history(id(u64::MAX));
             }
             assert_eq!(
                 follower.ledger.len(),
@@ -6672,7 +6835,7 @@ mod tests {
             // Executions alone bring the next sweep, half of what the
             // first kept later: a backlog that drains is reclaimed.
             for _ in 0..behind / 2 {
-                follower.forget_history();
+                follower.forget_history(id(u64::MAX));
             }
             assert_eq!(follower.swept.get(), 2 * first, "one more sweep");
         }

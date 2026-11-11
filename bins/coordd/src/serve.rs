@@ -1904,10 +1904,13 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             journal_groups: journal_groups(&storage.lowering.groups),
             history: {
                 let ledger = voter.node().machine().ledger();
+                let maps = voter.node().machine().history_maps();
                 coord_daemon::metrics::History {
                     records: ledger.len() as u64,
                     kept: ledger.swept_at() as u64,
                     sweeps: ledger.sweeps(),
+                    entries: maps.total() as u64,
+                    largest_map: maps.largest() as u64,
                 }
             },
             busy,
