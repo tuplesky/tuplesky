@@ -3185,6 +3185,37 @@ This entry is the budget and the record, not a lever:
         - **B's peer-plane part is #205's proposal frame.** The frame carries a turn's proposals with their payloads, and a relayed command needs no fast acknowledgement. So it is built once, inside task-d102's `BatchedRound`, as task-d102's entry already says, and not as a separate step.
         - **B's api-plane part isn't in the batch:** the relayed submission to the leader alone, its switch and fallbacks, and the followers' `on_request` it removes. It is the larger part, about −0.3 ms an operation of B's −0.4 to −0.45. It can't ship before the frames, because a relayed command's followers get its payload only on the proposal. So it is task-d102's first code step, with frames that hold one proposal when the loop is idle.
         - **After both,** the peer plane's 7.4 and 4.7 datagrams a command are what #205's frames and acknowledgement through a position take, at about 3 and 5 to 6 commands a frame (#205's first reading).
+    - **Both bars read with etcd beside, after step A, and the block budgets restated at that reading** (#98, [6789256361](https://github.com/tuplesky/tuplesky/pull/98#issuecomment-6789256361), run [42972420731](https://github.com/tuplesky/tuplesky/actions/runs/42972420731)).
+      - **Setup:** the shim at `8df06cf`, i.e. carry `c19211a0` (#215, #216) with the shim cut. The head's features only: `early-proposal,release-at-execution,answer-on-release`. `replay`, tmpfs, one tokio worker a voter, register at etcd's mix, unthrottled. etcd 3.7.3 ran beside on the same runner (AMD EPYC 7763, four CPUs). One run a side a step.
+
+        | Callers | `ok`/s, head / etcd (bar 2) | Servers' CPU an operation, head / etcd (bar 1) | Loops | Tokio | Materializers | Appenders and the rest | Peer + api datagrams a command |
+        | --- | --- | --- | --- | --- | --- | --- | --- |
+        | 30 | 697.3 / 1,386.3 (**0.50×**) | 2.829 / 1.096 ms (**2.58×**) | 1.31 | 0.82 | 0.57 | 0.13 | 7.6 + 10.1 |
+        | 120 | 623.5 / 1,335.9 (**0.47×**) | 2.806 / 0.962 ms (**2.92×**) | 1.39 | 0.72 | 0.56 | 0.14 | 5.0 + 8.7 |
+
+        - The head sits about 10% under 2c's head side (769 and 689 `ok`/s, 2.555 and 2.530 ms) on a slower runner (2c ran on an EPYC 9V74). Its api datagrams a command match 2c's head.
+        - **The shim cut** took the clients' shims from 0.340 and 0.442 ms an operation (run [42541226779](https://github.com/tuplesky/tuplesky/actions/runs/42541226779), before the cut) to 0.196 and 0.298. That is client-side, so it counts toward bar 2 only.
+      - **Against the first milestone (2.0× and 0.5×):**
+        - Bar 2 is at the line at 30 callers and just under it at 120.
+        - Bar 1 needs the servers at 2.19 and 1.92 ms an operation: **about −0.64 ms an operation at 30 callers and −0.88 at 120.**
+      - **The block budgets, restated at this reading's etcd.** The table above (in "A budget for each block") divided etcd's 0.75 ms an operation, read on another runner, into four blocks. Restated at this run's etcd, 1.096 and 0.962 ms, with the blocks keeping their shares, in ms an operation over five voters:
+
+        | Block | Today, 30 / 120 callers | At 2.0×, 30 / 120 | Over its 2.0× budget, 30 / 120 | At parity, 30 / 120 |
+        | --- | --- | --- | --- | --- |
+        | Domain loops | 1.31 / 1.39 | 0.95 / 0.83 | 0.36 / 0.56 | 0.44 / 0.39 |
+        | Tokio threads | 0.82 / 0.72 | 0.44 / 0.38 | 0.38 / 0.34 | 0.22 / 0.19 |
+        | Materializers | 0.57 / 0.56 | 0.44 / 0.38 | 0.13 / 0.18 | 0.26 / 0.23 |
+        | Appenders and the rest | 0.13 / 0.14 | 0.37 / 0.32 | under by 0.24 / 0.18 | 0.18 / 0.15 |
+        | **Servers** | **2.83 / 2.81** | **2.19 / 1.92** | **0.64 / 0.88** | **1.10 / 0.96** |
+
+        - **Appenders and the rest are already under their parity budget.** Their slack, about 0.2 ms an operation at 2.0×, is left unassigned: it is the margin the bar's −0.64 and −0.88 already take from the other blocks' overruns (0.87 and 1.08).
+        - **The bars are read at 120 callers, as before.** There the loops' parity budget is 0.39 ms an operation, not 0.30. At the runner's 1.4× CPU and 0.93 commands an operation, that is about 295 µs a command over five voters locally, not 230. task-d111's role budgets (#219) scale with it: about 90 at the leader and 51 a follower.
+        - **Tokio's restated budget is 0.38 at 2.0× and 0.19 at parity.** At 53 µs a datagram and 0.87 commands an operation, #205's acceptance of at most 5 datagrams a command at 120 callers is about 0.23 ms an operation, inside 2.0×. Its goal of 3 is about 0.14, inside parity.
+      - **What is on record against each overrun at 120 callers:**
+        - **Tokio, 0.34 over:** step B's −0.29 (above) takes most of it. #205's frames take the peer plane's part of the rest.
+        - **Loops, 0.56 over:** step B's `on_request`, −0.12 to −0.13, then #205's batch and task-d111's three items (#219).
+        - **Materializers, 0.18 over:** task-d86 (C4) and the row cuts, #206 to #208, about −0.07 to −0.09 together.
+        - Step B alone, at −0.4 to −0.45, is about half of bar 1's −0.88 at 120 and about two thirds of its −0.64 at 30.
 - **The record:** the table below, one row a lever, each row a pair on the runner.
 
 | Row | Build | Shape | `ok`/s | Server CPU an operation | Idle cores | Expected to move |
@@ -3197,6 +3228,7 @@ This entry is the budget and the record, not a lever:
 | task-d75 | | | | | | CPU: the leader's loop |
 | The #173 carry (task-d63, task-d66, task-d74's recovery fix, task-d75, task-d77 to task-d80) against `259e0b2` | `36fe7d1` (#98) | register, 30 clients, replay, three pairs | 501.5 to 504.2 (base 505.4 to 513.4) | 3.57 to 3.59 ms (base 3.58 to 3.66) | 0.41 to 0.46 | the leader's loop: -4.1 to -6.6%; the domain loops -3.8%; tokio threads unchanged at 1.45 ms an op |
 | task-d100's step A (`answer-on-release`, #204) against the same build without it | `b7fac61` (#98, run 2c) | register at etcd's mix, `replay`, tmpfs, 30 and 120 callers | 701 → 769 and 622 → 689 (+9.7%, +10.7%) | 2.872 → 2.555 and 2.855 → 2.530 ms (−11.0%, −11.4%) | 0.06 to 0.07, 0.04 to 0.05 | api datagrams a command −37% and −30%; tokio −23% and −18% a command; loops −14% and −12% a command; peer plane unchanged |
+| The head against etcd beside, after step A | `8df06cf` (#98, carry `c19211a0` with the shim cut) | register at etcd's mix, `replay`, tmpfs, 30 and 120 callers, etcd 3.7.3 on the same runner | 697.3 and 623.5 (etcd 1,386.3 and 1,335.9): 0.50× and 0.47× | 2.829 and 2.806 ms (etcd 1.096 and 0.962): 2.58× and 2.92× | | the bars' denominator: the block budgets are restated at these etcd figures |
 | `service`, the same carry | `36fe7d1` | wr, 1,000 uniform keys, read-only ratio 0.6, 4 clients at 300/s, strict | 140.0, below the rate (etcd 290.1) | 12.41 ms (etcd 2.86), not at equal work | 1.87 (etcd 2.51) | p50 23 ms and p99 61 ms (etcd 2 and 4): task-d83, task-d84 |
 | `service` at `replay`, the matched comparison | | the same shape, replay | | | | the row the `service` target is read at (the testing session) |
 - **The local record** (this entry's PR): the same split on one host, five voters, each build against the one before it, with a profile of the leader and a follower ([notes](../tuplesky-impl-notes.md#the-budget-on-one-host-task-d72)). It does not replace the runner's rows, which the Jepsen testing session runs. It reads what a lever moved before the runner does: of a write's 7.9 to 8.7 ms of the nodes' CPU, a follower costs about 1.6 ms and the leader about 1.9, so the followers carry three quarters of it, and off the domain loops the transport's QUIC threads are a third of each node's CPU and the projection's commits a fifth.
