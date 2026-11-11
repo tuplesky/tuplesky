@@ -314,6 +314,16 @@ def parse_cost(snapshot: dict) -> Cost | None:
     )
 
 
+def history_of(v) -> tuple[int, int, int] | None:
+    """The `cost.history` of a voter's last `metrics` line (task-d110):
+    records held, what the last sweep kept, sweeps this boot; None from a
+    build without it."""
+    h = (v.cost.raw or {}).get("history") if v.cost else None
+    if not isinstance(h, dict):
+        return None
+    return (h.get("records", 0), h.get("kept", 0), h.get("sweeps", 0))
+
+
 def parse_stages(snapshot: dict) -> dict:
     """The observed stages of a coordd metrics snapshot (task-61): its
     `stages` are `{"stage": name, "metrics": {"Observed": {...}}}` or an
@@ -2558,6 +2568,8 @@ def summarize(store: str, nodes: list[str], title: str, profile: str | None = No
             ]
     if voters:
         keys = [k for k, _ in MARKERS]
+        histories = {node: history_of(v) for node, v in voters.items()}
+        with_history = any(h is not None for h in histories.values())
         out.append(
             "**Voters** (from each `coordd.log`; a refusal counts the highest \"so far\" in each boot"
             + (
@@ -2568,24 +2580,34 @@ def summarize(store: str, nodes: list[str], title: str, profile: str | None = No
                 if replay
                 else ""
             )
+            + (
+                "; history is the last `metrics` line's `cost.history` (task-d110): the durable command records the "
+                "voter's ledger holds, what its last sweep kept, and the sweeps this boot ran; a sweep is due once "
+                "the records pass the table's capacity times four"
+                if with_history
+                else ""
+            )
             + ")"
         )
         out.append("")
         out.append(
             "| Node | Boots | Executed at last boot | Executed at end | "
             + ("Projection durable | " if replay else "")
+            + ("History: records / kept / sweeps | " if with_history else "")
             + "Last role | Highest ballot | "
             + " | ".join(keys)
             + " | ProposalRepublished after the final start |"
         )
-        out.append("| --- " * (7 + (1 if replay else 0) + len(keys)) + "|")
+        out.append("| --- " * (7 + (1 if replay else 0) + (1 if with_history else 0) + len(keys)) + "|")
         for node, v in voters.items():
             counts = " | ".join(str(v.counts.get(k, 0)) for k in keys)
             ballot = "-" if v.ballot is None else str(v.ballot)
             after = v.after_start.get("ProposalRepublished", 0)
             durable = f" {projection_durable(v)} |" if replay else ""
+            h = histories[node]
+            history = (f" {h[0]} / {h[1]} / {h[2]} |" if h else " - |") if with_history else ""
             out.append(
-                f"| {node} | {v.boots} | {v.executed} | {v.executed_at_end} |{durable} {v.role} | {ballot} | {counts} | {after} |"
+                f"| {node} | {v.boots} | {v.executed} | {v.executed_at_end} |{durable}{history} {v.role} | {ballot} | {counts} | {after} |"
             )
         out.append("")
         if any(b.replayed for v in voters.values() for b in v.boot_rows):

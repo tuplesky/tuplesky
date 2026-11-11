@@ -592,6 +592,21 @@ class CheckpointTests(unittest.TestCase):
         line = "metrics " + json.dumps({"stages": [], "cost": {"Observed": cost}}) + "\n"
         self.assertIn("| n1 | 1000 | 800 | 1.25 | 500 | 2.00 | 0.82 | 300 / 200 / 290 / 10 |", self.summarize(line))
 
+    def test_the_voters_table_shows_the_history_sweep(self):
+        cost = {"executed": 1000, "busy": {"secs": 1, "nanos": 0}, "uptime": {"secs": 60, "nanos": 0},
+                "recent": {"Unavailable": "NotInstrumented"}, "reads": {"served": 0}}
+        line = "metrics " + json.dumps({"stages": [], "cost": {"Observed": cost}}) + "\n"
+        # A build from before task-d110: no column, no caption.
+        text = self.summarize(line)
+        self.assertNotIn("History: records", text)
+        self.assertNotIn("cost.history", text)
+        cost["history"] = {"records": 5200, "kept": 1400, "sweeps": 3}
+        line = "metrics " + json.dumps({"stages": [], "cost": {"Observed": cost}}) + "\n"
+        text = self.summarize(line)
+        self.assertIn("| Executed at end | History: records / kept / sweeps | Last role |", text)
+        self.assertIn("| 5200 / 1400 / 3 |", text)
+        self.assertIn("`cost.history` (task-d110)", text)
+
 
 
 class CarryReadingTests(unittest.TestCase):
