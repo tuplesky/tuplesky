@@ -45,7 +45,7 @@ on:
         description: "append, wr, register, or register-etcd-mix (register with TupleSky's client threads split as etcd's register test splits its own: n readers in all, the rest mixing write and cas); empty for the scenario's"
         default: ""
       nemesis:
-        description: "Comma-separated faults (kill, pause, partition, packet), or none; empty for the scenario's. Not clock: the containers share this runner's clock."
+        description: "Comma-separated faults (kill, pause, partition, packet), or none; empty for the scenario's. Not clock: the containers share this runner's clock. TupleSky's partitions can be partition:TARGETS[:LO-HI[/EVERY]], TARGETS any, one or follower (a voter not leading), such as partition:follower:5-10/60; etcd and SwiftPaxos get plain partitions."
         default: ""
       wan:
         description: "The network between the nodes: none, regions, or one-way milliseconds between every two; empty for the scenario's"
@@ -465,6 +465,14 @@ jobs:
               exit 1
             fi
             voter+=(--kill-targets "$KILL_TARGETS")
+          fi
+          if [ -n "$PARTITION_TARGETS$PARTITION_SECONDS" ]; then
+            if ! grep -q -- '--partition-seconds' src/jepsen/tuplesky.clj; then
+              echo "::error::tuplesky/jepsen@$JEPSEN_REF has no --partition-targets or --partition-seconds; dispatch with a jepsen-ref that has them, or a plain partition"
+              exit 1
+            fi
+            if [ -n "$PARTITION_TARGETS" ]; then voter+=(--partition-targets "$PARTITION_TARGETS"); fi
+            if [ -n "$PARTITION_SECONDS" ]; then voter+=(--partition-seconds "$PARTITION_SECONDS"); fi
           fi
           if [ -n "$READ_RATIO" ]; then
             if ! grep -q -- '--read-ratio' src/jepsen/tuplesky.clj; then

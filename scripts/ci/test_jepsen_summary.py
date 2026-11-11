@@ -1381,3 +1381,57 @@ class BootsTests(unittest.TestCase):
         self.assertEqual(set(boots), {(1, 1), (2, 1), (3, 7)})
         self.assertAlmostEqual(js.boots_delta(boots, 0), 1.5 + 0.4 + 0.5)
         self.assertEqual(js.boots_over(samples, t[1], datetime.datetime(2026, 11, 10, 0, 1)), {})
+
+
+class PartitionsTest(unittest.TestCase):
+    """A partition that cut n2 off for 10 s, with its loop sampled."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        store = self.dir.name
+        grudge = '[:isolated {"n1" #{"n2"}, "n2" #{"n1" "n3"}, "n3" #{"n2"}}]'
+        lines = [
+            file_line("10:00:00", "jepsen worker 0", "0\t:invoke\t:read\tnil"),
+            file_line("10:00:01", "jepsen worker 0", "0\t:ok\t:read\t1"),
+            file_line("10:00:10", "jepsen nemesis", ":nemesis\t:info\t:start-partition\t:follower"),
+            file_line("10:00:10", "jepsen nemesis", f":nemesis\t:info\t:start-partition\t{grudge}"),
+            file_line("10:00:20", "jepsen nemesis", ":nemesis\t:info\t:stop-partition\tnil"),
+            file_line("10:00:20", "jepsen nemesis", ":nemesis\t:info\t:stop-partition\t:network-healed"),
+            # n2's worker, invoked after the heal, answered 1.5 s after it.
+            file_line("10:00:21", "jepsen worker 1", "1\t:invoke\t:read\tnil"),
+            file_line("10:00:21", "jepsen worker 1", "1\t:ok\t:read\t1"),
+            file_line("10:00:30", "jepsen worker 0", "0\t:invoke\t:read\tnil"),
+            file_line("10:00:31", "jepsen worker 0", "0\t:ok\t:read\t1"),
+        ]
+        with open(os.path.join(store, "jepsen.log"), "w") as f:
+            f.write("".join(lines))
+        # Loop CPU, cumulative: n2 grows 0.5 s a second before the cut and
+        # 0.02 while cut off; n1 and n3 0.4 throughout.
+        rate = {101: lambda t: 0.4 * t, 103: lambda t: 0.4 * t,
+                102: lambda t: 0.5 * min(t, 10) + 0.02 * max(0, min(t, 20) - 10) + 0.5 * max(0, t - 20)}
+        with open(os.path.join(store, "cpu-samples-threads.csv"), "w") as f:
+            f.write("time,pid,start,loop_cpu_s,loop_runq_s,workers_cpu_s,workers_runq_s,workers\n")
+            for t in range(0, 32):
+                for pid, fn in rate.items():
+                    f.write(f"2026-09-27 10:00:{t:02d}.000000,{pid},7,{fn(t):.4f},0,0,0,1\n")
+        with open(os.path.join(store, "cpu-samples-nodes.csv"), "w") as f:
+            f.write("pid,start,node\n101,7,n1\n102,7,n2\n103,7,n3\n")
+        self.text = js.summarize(store, ["n1", "n2", "n3"], "TupleSky")
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def test_the_node_cut_off_is_read_from_the_grudge(self):
+        self.assertEqual(js.cut_off('[:isolated {"n1" #{"n2"}, "n2" #{"n1" "n3"}, "n3" #{"n2"}}]', ["n1", "n2", "n3"]), "n2")
+        self.assertIsNone(js.cut_off('[:isolated {"n1" #{"n3"}, "n2" #{"n3"}, "n3" #{"n1" "n2"}}]', ["n1", "n2", "n3", "n4"]))
+        self.assertIsNone(js.cut_off(":follower", ["n1", "n2"]))
+
+    def test_each_partition_with_its_loop_before_and_while_cut_off(self):
+        self.assertIn("**Partitions:** 1, held 10.0–10.0 s; the cut-off voter's loop at a median of 0.02 cores "
+                      "while cut off, 0.50 as long before; its first `ok` after the heal a median of 1.0 s", self.text)
+        self.assertIn("| n2 | 10 | 10.0 | 0.02 | 0.50 | 0.40 | 1.0 |", self.text)
+
+    def test_without_samples_the_loop_columns_are_empty(self):
+        os.remove(os.path.join(self.dir.name, "cpu-samples-nodes.csv"))
+        text = js.summarize(self.dir.name, ["n1", "n2", "n3"], "TupleSky")
+        self.assertIn("| n2 | 10 | 10.0 | - | - | - | 1.0 |", text)

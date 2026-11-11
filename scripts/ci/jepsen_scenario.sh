@@ -10,7 +10,9 @@
 #                  TupleSky's client threads split as etcd's register test
 #                  splits its own (jepsen.tuplesky's --register-mix etcd:
 #                  n readers in all, the rest mixing write and cas)
-#   IN_NEMESIS     their faults; empty for the scenario's
+#   IN_NEMESIS     their faults; empty for the scenario's. A partition
+#                  may carry TupleSky's partition options,
+#                  partition:TARGETS[:LO-HI[/EVERY]] (see below)
 #   IN_SWIFTPAXOS  SwiftPaxos's faults; empty for the scenario's
 #   IN_TIME_LIMIT  seconds of workload; empty for the scenario's
 #   IN_CONCURRENCY clients, a number or a multiple of the nodes (5n);
@@ -125,6 +127,35 @@ if [ "$workload" = register-etcd-mix ]; then
   workload=register register_mix=etcd
 fi
 nemesis=${IN_NEMESIS:-$nemesis}
+# A partition among the faults may carry TupleSky's partition options,
+# partition:TARGETS[:LO-HI[/EVERY]] (jepsen.tuplesky's --partition-targets
+# and --partition-seconds), such as partition:follower:5-10/60: one voter
+# that does not lead cut off for 5 to 10 s, the next up to 120 s after
+# each heal. The faults keep a plain partition, which is what etcd's test
+# and SwiftPaxos's get.
+partition_targets="" partition_seconds=""
+if [[ ",$nemesis," == *,partition:* ]]; then
+  faults=""
+  IFS=, read -ra items <<< "$nemesis"
+  for item in "${items[@]}"; do
+    case $item in
+      partition:*)
+        IFS=: read -r _ partition_targets partition_seconds extra <<< "$item"
+        case $partition_targets in
+          any | one | follower) ;;
+          *) echo "::error::partition targets must be any, one or follower, not '$partition_targets' in $item" >&2; exit 1 ;;
+        esac
+        if [ -n "$extra" ] || { [ -n "$partition_seconds" ] &&
+             ! [[ $partition_seconds =~ ^[0-9]+(\.[0-9]+)?(-[0-9]+(\.[0-9]+)?)?(/[0-9]+(\.[0-9]+)?)?$ ]]; }; then
+          echo "::error::$item is not partition:TARGETS[:LO-HI[/EVERY]], such as partition:follower:5-10/60" >&2
+          exit 1
+        fi
+        item=partition ;;
+    esac
+    faults+="${faults:+,}$item"
+  done
+  nemesis=$faults
+fi
 swiftpaxos=${IN_SWIFTPAXOS:-$swiftpaxos}
 time_limit=${IN_TIME_LIMIT:-$time_limit}
 concurrency=${IN_CONCURRENCY:-$concurrency}
@@ -399,6 +430,19 @@ case $kill_targets in
   *) echo "kill-targets must be leader or any, not $kill_targets" >&2; exit 2 ;;
 esac
 
+if [ -n "$partition_targets$partition_seconds" ]; then
+  case $partition_targets in
+    one) what="partitions of one node" ;;
+    follower) what="partitions of one follower" ;;
+    *) what="partitions" ;;
+  esac
+  if [ -n "$partition_seconds" ]; then
+    what+=" for ${partition_seconds%/*} s"
+    case $partition_seconds in */*) what+=", one about every ${partition_seconds#*/} s" ;; esac
+  fi
+  tuplesky_suffix+=", $what"
+fi
+
 # The profiler picks the leader and the follower by their loops' CPU before
 # its window and labels them so; under faults a recovering voter can be the
 # busiest, and either can change role within the window. A faults run takes
@@ -449,5 +493,7 @@ out=${GITHUB_ENV:-/dev/stdout}
   echo "READ_RATIO=$read_ratio"
   echo "HOLD_PEER_LINKS=$hold"
   echo "KILL_TARGETS=$kill_targets"
+  echo "PARTITION_TARGETS=$partition_targets"
+  echo "PARTITION_SECONDS=$partition_seconds"
   echo "TUPLESKY_SUFFIX=$tuplesky_suffix"
 } >> "$out"

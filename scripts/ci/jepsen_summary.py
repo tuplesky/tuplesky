@@ -2302,6 +2302,132 @@ def back_serving(client: list[Op], nemesis: list[Op], nodes: list[str], start) -
     return out
 
 
+# A grudge as Jepsen's partitioner logs it, `"n1" #{"n2" "n3"}` for each
+# node: the nodes whose traffic it drops.
+GRUDGE = re.compile(r'"([^"]+)" #\{([^}]*)\}')
+
+
+def cut_off(value: str, nodes: list[str]) -> str | None:
+    """The node a partition's completed value isolated from every other
+    node (`[:isolated {...}]`): the one whose grudge drops all the rest.
+    None for a split into larger parts, or a value that names no grudge."""
+    grudge = {n: set(re.findall(r'"([^"]+)"', members)) for n, members in GRUDGE.findall(value or "")}
+    alone = [n for n, g in grudge.items() if len(nodes) > 1 and len(g) == len(nodes) - 1]
+    return alone[0] if len(alone) == 1 else None
+
+
+def read_node_map(path: str) -> dict:
+    """`cpu_sampler.py --nodes`'s rows: each coordd (pid, start) to the
+    node it ran on; {} without the file."""
+    out: dict = {}
+    if not os.path.exists(path):
+        return out
+    with open(path) as f:
+        f.readline()
+        for line in f:
+            cells = line.strip().split(",")
+            if len(cells) == 3 and cells[0].isdigit() and cells[1].isdigit():
+                out[(int(cells[0]), int(cells[1]))] = cells[2]
+    return out
+
+
+def loop_cores(threads: dict, keys: set, t0, t1) -> float | None:
+    """The domain loop CPU, in cores, of the coordd boots `keys` over the
+    samples within [t0, t1]; None with fewer than two samples in it."""
+    inside = [t for t in threads if t0 <= t <= t1]
+    if len(inside) < 2:
+        return None
+    a, b = min(inside), max(inside)
+    span = (b - a).total_seconds()
+    boots = {k: v for k, v in boots_over(threads, a, b).items() if k in keys}
+    return boots_delta(boots, 0) / span if span > 0 and boots else None
+
+
+def partitions(client: list[Op], nemesis: list[Op], nodes: list[str], start, store: str) -> list[str]:
+    """Each partition that cut one node off (`--partition-targets
+    follower` or `one`), from the partition's completion to its heal's:
+    how long it held, the cut-off voter's domain loop CPU over it and over
+    as long before it, the other voters' (their median) over it, and the
+    cut-off node's first `ok` after the heal, of an operation invoked
+    after it. A cut-off voter with nothing to do idles: a loop as busy as
+    the connected voters' is one woken for nothing (task-d112). The loop
+    columns need `cpu_sampler.py`'s --threads and --nodes files."""
+    pairs = [(nemesis[i], nemesis[i + 1] if i + 1 < len(nemesis) else None) for i in range(0, len(nemesis), 2)]
+    cuts, open_ = [], None
+    for inv, res in pairs:
+        if res is None:
+            continue
+        if inv.f == ":start-partition":
+            open_ = (inv, res)
+        elif inv.f == ":stop-partition" and open_ is not None:
+            cuts.append((open_[0], open_[1], res.at))
+            open_ = None
+    if not cuts:
+        return []
+    threads = read_thread_samples(os.path.join(store, "cpu-samples-threads.csv"))
+    named = read_node_map(os.path.join(store, "cpu-samples-nodes.csv"))
+    keys_of = collections.defaultdict(set)
+    for key, node in named.items():
+        keys_of[node].add(key)
+    oks = collections.defaultdict(list)
+    invoked = {}
+    for o in client:
+        if o.type == "invoke":
+            invoked[o.thread] = o.at
+        elif (at := invoked.pop(o.thread, None)) is not None and o.type == "ok":
+            oks[node_of(o, nodes)].append((at, o.at))
+
+    def cores(c):
+        return f"{c:.2f}" if c is not None else "-"
+
+    rows, held_s, cut_c, before_c, back = [], [], [], [], []
+    for inv, res, healed in cuts:
+        node = cut_off(res.value, nodes)
+        held = (healed - res.at).total_seconds()
+        held_s.append(held)
+        mine = before = others = first = None
+        if node is not None and threads and named:
+            mine = loop_cores(threads, keys_of[node], res.at, healed)
+            before = loop_cores(threads, keys_of[node], res.at - (healed - res.at), res.at)
+            rest = [c for n in nodes if n != node
+                    if (c := loop_cores(threads, keys_of[n], res.at, healed)) is not None]
+            others = percentile(sorted(rest), 0.5) if rest else None
+            if mine is not None:
+                cut_c.append(mine)
+            if before is not None:
+                before_c.append(before)
+        if node is not None:
+            after = [done for began, done in oks[node] if began > healed]
+            first = (min(after) - healed).total_seconds() if after else None
+            if first is not None:
+                back.append(first)
+        rows.append(
+            f"| {node or clip(inv.value, 20)} | {(res.at - start).seconds} | {held:.1f} | {cores(mine)} | "
+            f"{cores(before)} | {cores(others)} | {f'{first:.1f}' if first is not None else 'never'} |"
+        )
+    line = (
+        f"**Partitions:** {len(cuts)}, held {min(held_s):.1f}–{max(held_s):.1f} s"
+        + (f"; the cut-off voter's loop at a median of {percentile(sorted(cut_c), 0.5):.2f} cores while cut off"
+           + (f", {percentile(sorted(before_c), 0.5):.2f} as long before" if before_c else "")
+           if cut_c else "")
+        + (f"; its first `ok` after the heal a median of {percentile(sorted(back), 0.5):.1f} s, at most {max(back):.1f} s"
+           if back else "")
+        + "."
+    )
+    return [
+        line,
+        "",
+        "<details><summary>Each partition: the node cut off, its loop and the others' (cores), its first <code>ok</code> after the heal (s)</summary>",
+        "",
+        "| Cut off | + s | Held (s) | Its loop, cut off | Its loop, as long before | Other voters' loops (median) | First `ok` after the heal |",
+        "| --- | --- | --- | --- | --- | --- | --- |",
+        *rows,
+        "",
+        "</details>",
+        "",
+    ]
+
+
 # The nemesis operations that start a fault.
 FAULT_STARTS = (":kill", ":pause", ":start-partition", ":start-packet")
 
@@ -2540,6 +2666,7 @@ def summarize(store: str, nodes: list[str], title: str, profile: str | None = No
 
         out.extend(back_serving(client, nemesis, nodes, start))
         out.extend(domain_gaps(client, nemesis, start))
+        out.extend(partitions(client, nemesis, nodes, start, store))
 
     if network:
         where = f"; clients beside {'the first node' if clients == 'first' else 'each node'}" if clients else ""

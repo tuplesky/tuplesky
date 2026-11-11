@@ -412,6 +412,22 @@ and `:release-peers` operations mark it. The two TupleSky options need a
 that still names a dead leader until the next election. It needs `kill`
 among the faults, and the title says ", kills at the leader"; SwiftPaxos
 and etcd keep their random targets.
+A partition in `nemesis` can carry TupleSky's partition options,
+`partition:TARGETS[:LO-HI[/EVERY]]`, through `--partition-targets` and
+`--partition-seconds`. TARGETS is `any` (one node, a majority or a ring of
+majorities, as a plain partition), `one` (one node) or `follower` (one
+voter that does not lead, by the same reading of the logs as the kills,
+cut off from every other node). With LO-HI each partition heals after LO
+to HI seconds, and the next starts up to twice EVERY seconds after the
+heal (twice the nemesis interval, 30 s, without it); kills keep their own
+schedule. `kill,partition:follower:5-10/60` with `kill-targets: leader`
+kills leaders as before and cuts a live follower off for 5 to 10 s about
+once a minute, so a run reads how a voter that could not learn for a
+while catches up after each heal, and what its loop does while cut off.
+The title says ", partitions of one follower for 5-10 s, one about every
+60 s"; etcd and SwiftPaxos get a plain `partition`. It needs a
+`jepsen-ref` with the options (tuplesky/jepsen's
+`claude/partition-one-follower`, `9ad6e33`).
 Each publication's `checkpoint` line in `coordd.log` says how long it held
 the domain thread and how long each of its steps took, and each restart's
 `replayed` line how many records it replayed and how long that took. The
@@ -772,6 +788,14 @@ of lines. `scripts/ci/jepsen_summary.py` reads the test's store
   partition or a packet fault): the seconds from it to the first `ok`,
   through any node, of an operation invoked after it, with the median and
   most over the run (#175's leader-kill row);
+* each partition that cut one node off (`partition:follower` or
+  `partition:one`): the node, from the grudge the partitioner logged, how
+  long it held, that voter's domain loop CPU while cut off and over as
+  long before, the other voters' median over the cut, and the node's
+  first `ok` after the heal. A cut-off voter with nothing to do should
+  idle (task-d112). The loop columns come from `cpu_sampler.py`'s
+  `--threads` rows and its `--nodes` file, `cpu-samples-nodes.csv`, which
+  names the node each `coordd` ran on;
 * in every job, where the runner's CPU went over the workload (Runner
   CPU): `jepsen_bounded.sh` runs `scripts/ci/cpu_sampler.py` beside the
   test, which reads every process's CPU time from `/proc` once a second,

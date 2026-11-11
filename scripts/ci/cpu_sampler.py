@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Sample where the runner's CPU goes while a Jepsen test runs.
 
-    scripts/ci/cpu_sampler.py --out FILE [--threads FILE] [--memory FILE] [--wakeups FILE] [--interval SECONDS]
+    scripts/ci/cpu_sampler.py --out FILE [--threads FILE] [--memory FILE] [--wakeups FILE] [--nodes FILE] [--interval SECONDS]
 
 Once an interval, until it is sent SIGTERM or SIGINT, this reads every
 process's user and system time from `/proc/<pid>/stat` and the host's from
@@ -47,6 +47,13 @@ wait for a core per wakeup. A thread that has exited keeps its last
 reading in the sums, so they stay cumulative while short-lived threads (a
 publication's) come and go.
 
+With --nodes, the first row that sees a `coordd` also appends one row for
+it to that file: its pid and start time and the node it runs on, its
+container's hostname (each Jepsen node is a container named and
+hostnamed after the node, as leader_profile.py reads it), so the summary
+can say whose loop a row of --threads is. One whose node cannot be read
+yet is tried again at the next row.
+
 It also writes the host's CPU model, its mean clock when the sampler
 starts and its CPU count to the same path with -host.txt in place of
 .csv, so a row says which kind of VM it ran on.
@@ -62,6 +69,7 @@ import argparse
 import datetime
 import os
 import signal
+import subprocess
 import sys
 import time
 
@@ -244,12 +252,30 @@ def processes():
         yield int(entry), int(fields[19]), comm, int(fields[11]) + int(fields[12])
 
 
+def node_of(pid: int) -> str | None:
+    """The node a coordd runs on, its container's hostname; None where it
+    cannot be read (the runner's user reads a container's root through
+    sudo, as leader_profile.py does)."""
+    path = f"/proc/{pid}/root/etc/hostname"
+    try:
+        with open(path) as f:
+            name = f.read().strip()
+    except OSError:
+        try:
+            done = subprocess.run(["sudo", "-n", "cat", path], capture_output=True, text=True, timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        name = done.stdout.strip() if done.returncode == 0 else ""
+    return name if name and " " not in name else None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--out", required=True)
     parser.add_argument("--threads")
     parser.add_argument("--memory")
     parser.add_argument("--wakeups")
+    parser.add_argument("--nodes")
     parser.add_argument("--interval", type=float, default=1.0)
     args = parser.parse_args()
 
@@ -279,6 +305,10 @@ def main() -> int:
     seen: dict = {}
     if wake:
         wake.write("time,pid,start,kind,threads,cpu_s,runq_s,slices\n")
+    named = open(args.nodes, "w") if args.nodes else None
+    known: set = set()
+    if named:
+        named.write("pid,start,node\n")
     with open(args.out, "w") as out:
         out.write("time,host_busy_s,host_total_s,cpus," + ",".join(f"{n}_s" for n in NAMES) + ",steal_s\n")
         while True:
@@ -314,6 +344,12 @@ def main() -> int:
                 for cells in wakeups(coordd, seen):
                     wake.write(f"{now:%Y-%m-%d %H:%M:%S.%f},{cells}\n")
                 wake.flush()
+            if named:
+                for pid, start in coordd:
+                    if (pid, start) not in known and (node := node_of(pid)):
+                        known.add((pid, start))
+                        named.write(f"{pid},{start},{node}\n")
+                named.flush()
             first = False
             if stopping:
                 return 0
