@@ -167,11 +167,18 @@ impl Machine {
     }
 
     /// How many commands this replica knows by identity and not by
-    /// content.
+    /// content, counted to [`MAX_PAYLOAD_TRANSFER`], the most one ask is
+    /// for, and no further (task-d109): the runtime asks on every turn,
+    /// and needs no more than whether any are missing and how many to ask
+    /// for.
+    ///
+    /// [`MAX_PAYLOAD_TRANSFER`]: coord_consensus::messages::MAX_PAYLOAD_TRANSFER
     pub fn missing_payloads(&self) -> usize {
         match self {
             Machine::Leader(_) => 0,
-            Machine::Follower(m) => m.missing_payloads().len(),
+            Machine::Follower(m) => {
+                m.missing_payload_count(coord_consensus::messages::MAX_PAYLOAD_TRANSFER)
+            }
         }
     }
 
@@ -1634,7 +1641,7 @@ impl<P: Persistence> Node<P> {
     }
 
     /// How many commands this replica knows by identity and not by
-    /// content.
+    /// content, counted to the most one ask is for (task-d109).
     pub fn missing_payloads(&self) -> usize {
         self.machine().missing_payloads()
     }

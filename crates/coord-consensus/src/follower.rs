@@ -530,6 +530,25 @@ pub struct Follower {
     /// stops when it is rebound, released, adopted or committed, which
     /// is why the set is filtered when it is read.
     rebinds: alloc::collections::BTreeSet<CommandId>,
+    /// The commands pending a Sync's installation with no payload here
+    /// (task-d109): the part of [`Follower::missing_payloads`] that
+    /// `sync_pending` contributes, kept as it and `payloads` change. Read
+    /// by walking `sync_pending` whole, twice a call and twice a turn, it
+    /// held a restarted voter's loop at a full core (#98, run
+    /// 42933821595).
+    sync_lacking: alloc::collections::BTreeSet<CommandId>,
+    /// Every command pending a Sync's installation that this replica
+    /// holds below COMMIT under other facts than the last Sync named
+    /// ([`Follower::awaits_named_facts`]), and perhaps some that no
+    /// longer do (task-d109). It starts to only when the Sync names its
+    /// facts, when it is pending again, or when its record's payload is
+    /// bound, and each of those notes it; the set is filtered when read,
+    /// as `rebinds` is.
+    sync_refacts: alloc::collections::BTreeSet<CommandId>,
+    /// Commands [`Follower::missing_payload_count`] looked at (task-d109),
+    /// for the tests that bound it.
+    #[cfg(test)]
+    missing_examined: core::cell::Cell<u64>,
     /// The held proposals to examine at the next `advance_pending`: the
     /// ones held since, and the ones whose blocker the table noted a
     /// change for (task-d46). Every held proposal that can be adopted is
@@ -900,6 +919,10 @@ impl Follower {
             adopted_lacking,
             held_lacking: alloc::collections::BTreeSet::new(),
             rebinds: alloc::collections::BTreeSet::new(),
+            sync_lacking: alloc::collections::BTreeSet::new(),
+            sync_refacts: alloc::collections::BTreeSet::new(),
+            #[cfg(test)]
+            missing_examined: core::cell::Cell::new(0),
             held_check: alloc::collections::BTreeSet::new(),
             held_waiters: BTreeMap::new(),
             pending: BTreeMap::new(),
@@ -979,6 +1002,7 @@ impl Follower {
                 self.sync_pending.insert(*c, e.clone());
             }
         }
+        self.note_sync_all();
         self.sync_rescan = true;
         self.table.watch_raises(!self.sync_pending.is_empty());
         self.won = None;
@@ -1098,6 +1122,10 @@ impl Follower {
             adopted_lacking: alloc::collections::BTreeSet::new(),
             held_lacking: alloc::collections::BTreeSet::new(),
             rebinds: alloc::collections::BTreeSet::new(),
+            sync_lacking: alloc::collections::BTreeSet::new(),
+            sync_refacts: alloc::collections::BTreeSet::new(),
+            #[cfg(test)]
+            missing_examined: core::cell::Cell::new(0),
             held_check: alloc::collections::BTreeSet::new(),
             held_waiters: BTreeMap::new(),
             pending: BTreeMap::new(),
@@ -2338,6 +2366,7 @@ impl Follower {
             }
             self.sync_pending.insert(*c, e.clone());
         }
+        self.note_sync_all();
         self.sync_waiters.clear();
         self.sync_rescan = true;
         self.table.watch_raises(!self.sync_pending.is_empty());
@@ -2432,6 +2461,7 @@ impl Follower {
             }
             for command in ready {
                 let entry = self.sync_pending.remove(&command).expect("ready");
+                self.note_sync(command);
                 if self.table.record(&command).is_none() {
                     // Executed here and already retired: `phase_of` answers
                     // EXECUTED from the tombstone, and there is no record
@@ -2874,6 +2904,28 @@ impl Follower {
         // command the leader proposed out of its own scheduler has no
         // submission coming at all.
         let mut out: Vec<CommandId> = self
+            .sync_missing()
+            .chain(self.adopted_lacking.iter())
+            .chain(self.held_missing())
+            .copied()
+            .chain(self.campaign_missing())
+            .collect();
+        out.sort();
+        out.dedup();
+        #[cfg(debug_assertions)]
+        debug_assert_eq!(
+            out,
+            self.missing_payloads_walked(),
+            "the missing payloads read from the indexes"
+        );
+        out
+    }
+
+    /// [`Follower::missing_payloads`] by walking `sync_pending` whole, as
+    /// it was read before task-d109: what the indexes are checked against.
+    #[cfg(debug_assertions)]
+    fn missing_payloads_walked(&self) -> Vec<CommandId> {
+        let mut out: Vec<CommandId> = self
             .sync_pending
             .keys()
             .filter(|c| !self.payloads.contains_key(c))
@@ -2891,6 +2943,31 @@ impl Follower {
         out.sort();
         out.dedup();
         out
+    }
+
+    /// How many commands [`Follower::missing_payloads`] names, counted to
+    /// `limit` and no further (task-d109). The runtime asks this on every
+    /// turn, to know whether to ask for payloads and how many one ask is
+    /// for, which is never more than [`MAX_PAYLOAD_TRANSFER`]: built
+    /// whole and sorted for that, the list cost a restarted voter's loop
+    /// a full core (#98, run 42933821595).
+    pub fn missing_payload_count(&self, limit: usize) -> usize {
+        let mut seen = BTreeSet::new();
+        let mut note = |c: &CommandId| {
+            #[cfg(test)]
+            self.missing_examined.set(self.missing_examined.get() + 1);
+            seen.insert(*c);
+            seen.len() >= limit
+        };
+        if limit == 0
+            || self.sync_missing().any(&mut note)
+            || self.adopted_lacking.iter().any(&mut note)
+            || self.held_missing().any(&mut note)
+            || self.campaign_missing().iter().any(&mut note)
+        {
+            return limit;
+        }
+        seen.len()
     }
 
     /// The commands a selection names that this replica holds nothing
@@ -3803,6 +3880,7 @@ impl Follower {
         self.bindings.retain(|_, c| !table.forgotten(c));
         self.adopted_lacking = lacking(self.adopted.keys(), &self.payloads);
         self.held_lacking = lacking(self.held.keys(), &self.payloads);
+        self.note_sync_all();
         let held = &self.held;
         self.held_waiters.retain(|_, waiting| {
             waiting.retain(|c| held.contains_key(c));
@@ -3830,6 +3908,73 @@ impl Follower {
         } else {
             self.rebinds.remove(&command);
         }
+        self.note_sync(command);
+    }
+
+    /// Re-read whether `command`, pending a Sync's installation, has no
+    /// payload here or is held under other facts than the Sync named,
+    /// after `sync_pending`, `payloads` or its record's payload changed
+    /// for it (task-d109).
+    fn note_sync(&mut self, command: CommandId) {
+        let pending = self.sync_pending.contains_key(&command);
+        if pending && !self.payloads.contains_key(&command) {
+            self.sync_lacking.insert(command);
+        } else {
+            self.sync_lacking.remove(&command);
+        }
+        if pending && self.awaits_named_facts(&command) {
+            self.sync_refacts.insert(command);
+        } else {
+            self.sync_refacts.remove(&command);
+        }
+    }
+
+    /// [`Follower::note_sync`] for every command pending a Sync's
+    /// installation, after `sync_pending` or the named facts were
+    /// replaced whole: a Sync's installation, or a sweep of `payloads`.
+    fn note_sync_all(&mut self) {
+        self.sync_lacking = lacking(self.sync_pending.keys(), &self.payloads);
+        self.sync_refacts = self
+            .sync_pending
+            .keys()
+            .filter(|c| self.awaits_named_facts(c))
+            .copied()
+            .collect();
+    }
+
+    /// The commands pending a Sync's installation that this replica lacks
+    /// a payload for or holds under other facts than the selection names,
+    /// read from the indexes `note_sync` keeps (task-d109), and from the
+    /// campaign's selection while it is unbound.
+    fn sync_missing(&self) -> impl Iterator<Item = &CommandId> {
+        debug_assert_eq!(
+            self.sync_lacking,
+            lacking(self.sync_pending.keys(), &self.payloads),
+            "the commands pending installation lacking a payload were not kept with the maps"
+        );
+        debug_assert!(
+            self.sync_pending
+                .keys()
+                .filter(|c| self.awaits_named_facts(c))
+                .all(|c| self.sync_refacts.contains(c)),
+            "a command pending installation under other facts than the Sync named was not noted"
+        );
+        // A selection the campaign has not bound names facts of its own,
+        // which come before the Sync's (`selected_admission`).
+        let selected = self
+            .campaign
+            .as_ref()
+            .filter(|c| c.binding().is_none() && !c.is_durable())
+            .and_then(Campaign::decision)
+            .into_iter()
+            .flat_map(|d| d.entries.iter())
+            .filter(|(c, e)| e.admission.is_some() && self.sync_pending.contains_key(c))
+            .map(|(c, _)| c);
+        self.sync_lacking.iter().chain(
+            selected
+                .chain(self.sync_refacts.iter())
+                .filter(|c| self.sync_pending.contains_key(c) && self.awaits_selected_facts(c)),
+        )
     }
 
     /// The held proposals whose payload this replica lacks or must
@@ -4013,6 +4158,19 @@ impl Follower {
         self.table
             .record(command)
             .is_some_and(|r| r.phase < Phase::Commit && r.payload.is_some_and(|p| p != selected))
+    }
+
+    /// Whether this replica holds `command` below COMMIT under other facts
+    /// than the last Sync it installed named (task-d14, task-d109): the
+    /// part of [`Follower::awaits_selected_facts`] a selection the
+    /// campaign has not bound does not override.
+    fn awaits_named_facts(&self, command: &CommandId) -> bool {
+        let Some(named) = self.named_facts.get(command) else {
+            return false;
+        };
+        self.table
+            .record(command)
+            .is_some_and(|r| r.phase < Phase::Commit && r.payload.is_some_and(|p| p != *named))
     }
 
     /// The leader of the current ballot announced its commit frontier.
@@ -5337,6 +5495,7 @@ impl Follower {
                         && at == self.ballots.synced()
                     {
                         self.sync_pending.entry(command).or_insert(entry);
+                        self.note_sync(command);
                         self.sync_rescan = true;
                         self.table.watch_raises(true);
                         self.sync_reinstall = true;
@@ -6246,5 +6405,83 @@ mod tests {
         assert_eq!(follower.table.take_examined(), 1);
         assert!(follower.holds_unexecuted());
         assert_eq!(follower.unexecuted_held(), 2_001);
+    }
+
+    /// A voter restarted behind a Sync of 2,000 entries it holds no
+    /// payload for (task-d109). The runtime asks every turn how many
+    /// payloads are missing, to at most an ask's worth: the count stops at
+    /// that many commands, where the list it was read from walked every
+    /// pending entry twice and sorted them all.
+    #[test]
+    fn the_missing_count_stops_at_an_asks_worth() {
+        let epoch = ConfigurationEpoch::new(1).unwrap();
+        let voters: BTreeSet<ReplicaId> = (0..3).map(r).collect();
+        let genesis = Ballot {
+            epoch,
+            number: 0,
+            leader: r(0),
+        };
+        let config = FollowerConfig {
+            identity: ConfigurationIdentity {
+                cluster: ClusterId([1; 16]),
+                domain: DomainId([2; 16]),
+                epoch,
+                voters: voters.clone(),
+                replica: r(1),
+                incarnation: ReplicaIncarnation::new(1).unwrap(),
+                role: ReplicaRole::Voter,
+            },
+            quorum: BallotConfiguration::c2(epoch, genesis, voters, [r(0), r(1)].into()).unwrap(),
+            genesis,
+            frontend: PeerId {
+                replica: ReplicaId([0xf0; 16]),
+                incarnation: ReplicaIncarnation::ZERO,
+            },
+            capacity: 8,
+        };
+        let id = |n: u64| {
+            let mut d = [0u8; 32];
+            d[..8].copy_from_slice(&n.to_be_bytes());
+            d[8] = 9;
+            CommandId(Digest32(d))
+        };
+        let entries: BTreeMap<CommandId, SyncEntry> = (0..2_000u64)
+            .map(|n| {
+                let key = alloc::vec![(n % 5) as u8];
+                (
+                    id(n),
+                    SyncEntry {
+                        command: id(n),
+                        phase: Phase::Accept,
+                        deps: Vec::new(),
+                        path: Digest32([3; 32]),
+                        paths: alloc::vec![(key, Digest32([3; 32]))],
+                        seqnum: n + 1,
+                        admission: None,
+                    },
+                )
+            })
+            .collect();
+        let decision = SyncDecision {
+            ballot: genesis,
+            source_ballot: genesis,
+            entries,
+            reproposed: BTreeSet::new(),
+        };
+        let follower = Follower::recover_with_syncs(
+            config,
+            None,
+            None,
+            [],
+            [],
+            [(genesis, decision)],
+            ExecutionPosition::ZERO,
+        );
+        assert_eq!(follower.missing_payloads().len(), 2_000);
+        follower.missing_examined.set(0);
+        let limit = crate::messages::MAX_PAYLOAD_TRANSFER;
+        assert_eq!(follower.missing_payload_count(limit), limit);
+        assert_eq!(follower.missing_examined.get(), limit as u64);
+        assert_eq!(follower.missing_payload_count(5_000), 2_000);
     }
 }
