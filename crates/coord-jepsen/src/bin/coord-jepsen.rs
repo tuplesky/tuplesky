@@ -3,8 +3,17 @@
 //! Binds a session on one voter's frontend, prints one ready line, then
 //! answers one JSON line on stdout for each request line on stdin until
 //! stdin closes. See `coord_jepsen::protocol` for the lines.
+//!
+//! Everything runs on one thread: a current-thread runtime, with stdin and
+//! stdout read and written on it as non-blocking pipes where they are
+//! pipes (as Jepsen's client starts the shim). A test runs 30 or 120 of
+//! these beside the voters, and a multi-thread runtime with tokio's stdio
+//! (which reads and writes on its blocking pool) handed each operation
+//! across four threads, twice: about 13 voluntary context switches and 32
+//! futex calls an operation, most of the shim's CPU.
 #![forbid(unsafe_code)]
 
+use std::os::fd::AsFd;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -12,7 +21,8 @@ use std::time::Duration;
 use clap::Parser;
 use coord_jepsen::{Codec, Session, Timing, protocol};
 use serde_json::json;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::net::unix::pipe;
 
 #[derive(Parser)]
 #[command(
@@ -51,8 +61,7 @@ fn main() -> ExitCode {
         eprintln!("coord-jepsen: voters are numbered from 1");
         return ExitCode::FAILURE;
     }
-    let runtime = match tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
+    let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
     {
@@ -71,7 +80,7 @@ async fn serve(cli: Cli) -> ExitCode {
         budget: Duration::from_millis(cli.budget_ms),
         connect: Duration::from_millis(cli.connect_ms),
     };
-    let mut stdout = tokio::io::stdout();
+    let mut stdout = output();
     let mut session = match Session::open(&cli.dir, cli.voter - 1, cli.instance, timing).await {
         Ok(session) => session,
         Err(e) => {
@@ -98,7 +107,7 @@ async fn serve(cli: Cli) -> ExitCode {
     {
         return ExitCode::FAILURE;
     }
-    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    let mut lines = BufReader::new(input()).lines();
     loop {
         let line = match lines.next_line().await {
             Ok(Some(line)) => line,
@@ -127,4 +136,33 @@ async fn serve(cli: Cli) -> ExitCode {
         }
     }
     ExitCode::SUCCESS
+}
+
+/// Stdin, read on the runtime's own thread where it is a pipe; tokio's
+/// stdin (a blocking-pool thread) where it is anything else, such as a
+/// terminal or a file.
+fn input() -> Box<dyn AsyncRead + Unpin> {
+    match std::io::stdin()
+        .as_fd()
+        .try_clone_to_owned()
+        .ok()
+        .and_then(|fd| pipe::Receiver::from_owned_fd(fd).ok())
+    {
+        Some(receiver) => Box::new(receiver),
+        None => Box::new(tokio::io::stdin()),
+    }
+}
+
+/// Stdout, written on the runtime's own thread where it is a pipe; tokio's
+/// stdout where it is anything else.
+fn output() -> Box<dyn AsyncWrite + Unpin> {
+    match std::io::stdout()
+        .as_fd()
+        .try_clone_to_owned()
+        .ok()
+        .and_then(|fd| pipe::Sender::from_owned_fd(fd).ok())
+    {
+        Some(sender) => Box::new(sender),
+        None => Box::new(tokio::io::stdout()),
+    }
 }
