@@ -1,9 +1,12 @@
 """Tests for jepsen_pairs.py: python3 -m unittest test_jepsen_pairs (from scripts/ci)."""
 
+import io
 import json
 import os
+import sys
 import tempfile
 import unittest
+from unittest import mock
 
 import jepsen_pairs as jp
 
@@ -89,6 +92,31 @@ class PairTests(unittest.TestCase):
     def test_pairs_take_either_order(self):
         paired = jp.pairs(self.runs)
         self.assertEqual([(b.store[-1], h.store[-1]) for b, h in paired], [("1", "2"), ("4", "3")])
+
+    def test_a_numbered_run_missing_from_its_pair_leaves_the_others_paired(self):
+        # Pair 1's head left no store: base1, head2, base2, base3, head3.
+        # Two at a time would compare base1 with head2 and drop the rest.
+        def run(label, n):
+            return jp.Run(label=label, store=f"{label}{n}", pair=n)
+
+        runs = [run("base", 1), run("head", 2), run("base", 2), jp.Run(label="etcd", store="e"),
+                run("base", 3), run("head", 3)]
+        self.assertEqual([(b.store, h.store) for b, h in jp.pairs(runs)], [("base2", "head2"), ("base3", "head3")])
+
+    def test_the_command_line_takes_a_pair_number(self):
+        argv = sys.argv
+        try:
+            sys.argv = ["jepsen_pairs.py", "base#1=" + self.runs[0].store, "head#1=" + self.runs[1].store]
+            with mock.patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": ""}), \
+                    mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+                self.assertEqual(jp.main(), 0)
+            self.assertIn("| Pair (head less base) |", out.getvalue())
+            for bad in ("etcd#1=" + self.runs[0].store, "base#x=" + self.runs[0].store):
+                sys.argv = ["jepsen_pairs.py", bad]
+                with mock.patch("sys.stderr", new_callable=io.StringIO):
+                    self.assertEqual(jp.main(), 2)
+        finally:
+            sys.argv = argv
 
     def test_the_table_gives_each_pair_and_the_mean(self):
         text = jp.render(self.runs, "Paired")

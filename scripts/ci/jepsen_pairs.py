@@ -50,6 +50,9 @@ import jepsen_summary as js
 class Run:
     label: str
     store: str
+    # The pair the run belongs to, where the job numbered it (LABEL#N): a
+    # run that left no store is then a gap, not a shift.
+    pair: int | None = None
     ok_per_s: float | None = None
     read_p99: float | None = None
     # Every `ok` operation's latency, whatever its function (ms).
@@ -675,10 +678,21 @@ def profile_table(runs: list[Run], top: int = 20) -> list[str]:
 
 
 def pairs(runs: list[Run]) -> list[tuple[Run, Run]]:
-    """Each base with the head beside it, taking TupleSky's runs two at a
-    time (the etcd runs between them aside)."""
+    """Each base with the head beside it. Numbered runs pair by their
+    number, so a pair missing a side is left out and the rest stay as they
+    ran; unnumbered ones are taken two at a time (the etcd runs between
+    them aside)."""
     out = []
     runs = [r for r in runs if r.label != "etcd"]
+    if runs and all(r.pair is not None for r in runs):
+        by_pair: dict[int, dict[str, Run]] = {}
+        for r in runs:
+            by_pair.setdefault(r.pair, {})[r.label] = r
+        for n in sorted(by_pair):
+            sides = by_pair[n]
+            if "base" in sides and "head" in sides:
+                out.append((sides["base"], sides["head"]))
+        return out
     for a, b in zip(runs[0::2], runs[1::2]):
         if {a.label, b.label} == {"base", "head"}:
             out.append((a, b) if a.label == "base" else (b, a))
@@ -883,15 +897,26 @@ def render(runs: list[Run], title: str) -> str:
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     p.add_argument("--title", default="Paired runs")
-    p.add_argument("runs", nargs="+", help="LABEL=STORE, with LABEL base, head or etcd, in the order they ran")
+    p.add_argument(
+        "runs",
+        nargs="+",
+        help="LABEL=STORE, with LABEL base, head or etcd, in the order they ran; base#N or head#N names the pair",
+    )
     a = p.parse_args()
     runs = []
     for spec in a.runs:
         label, _, store = spec.partition("=")
-        if label not in ("base", "head", "etcd") or not store:
-            print(f"not LABEL=STORE with LABEL base, head or etcd: {spec}", file=sys.stderr)
+        label, _, number = label.partition("#")
+        if (
+            label not in ("base", "head", "etcd")
+            or not store
+            or (number and (label == "etcd" or not number.isdigit()))
+        ):
+            print(f"not LABEL=STORE with LABEL base, head or etcd (base#N, head#N): {spec}", file=sys.stderr)
             return 2
-        runs.append(read_run(label, store))
+        run = read_run(label, store)
+        run.pair = int(number) if number else None
+        runs.append(run)
     text = render(runs, a.title)
     target = os.environ.get("GITHUB_STEP_SUMMARY")
     if target:

@@ -660,7 +660,9 @@ jobs:
               # The call graph on the first pair's two runs: the rest of the
               # pairs keep the flat profile, which costs the loop less.
               graph=flat; if [ "$IN_LEADER_PROFILE" = call-graph ] && [ "$i" = 1 ]; then graph=graph; fi
-              one_side "$side" "$graph" "pair $i" "$side"
+              # Numbered, so a run that leaves no store drops its own pair
+              # and not the pairing of the ones after it.
+              one_side "$side" "$graph" "pair $i" "$side#$i"
             done
             # etcd after the pair, so each pair has its own on this runner.
             if [ "$ETCD_BESIDE" = true ]; then
