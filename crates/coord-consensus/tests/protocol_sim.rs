@@ -4585,9 +4585,16 @@ fn one_seed_from_the_environment() {
 /// Row 21's queue failure reaches the order `coordd`'s journal fails a
 /// queue in (#197 review): a command's vote batch fails and then its
 /// adoption batch behind it. Kept in `seeds.json`; the rewrite at the
-/// failure, keyed on the vote batch, failed it.
+/// failure, keyed on the vote batch, failed it. The seed reaches that
+/// order under the row's own knobs, so it is replayed under them alone:
+/// a sweep's settings in the environment (answer on release, the relay,
+/// frames) change the schedule, and the seed then reaches nothing.
 #[test]
 fn row_21_fails_a_commands_vote_and_adoption_batches_in_order() {
-    let stats = run_kept(3, 21, 231, Some(true), None, false, Some(true)).unwrap();
+    let knobs = Knobs {
+        fail_queue: true,
+        ..Knobs::row(21)
+    };
+    let stats = run_knobs(3, knobs, 231, Some(true)).unwrap();
     assert!(stats.queue_orders > 0, "{stats:?}");
 }
