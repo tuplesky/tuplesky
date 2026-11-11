@@ -305,6 +305,15 @@ impl Machine {
         }
     }
 
+    /// The table's size and its oldest unexecuted record's wait, and the
+    /// pulled commands a follower's catch-up window holds (task-d25).
+    pub fn table_waits(&self) -> (coord_consensus::TableWaits, usize) {
+        match self {
+            Machine::Leader(m) => (m.table_waits(), 0),
+            Machine::Follower(m) => m.table_waits(),
+        }
+    }
+
     /// What this replica keeps of its history beside the ledger, map by
     /// map, in either role (#221 review).
     pub fn history_maps(&self) -> coord_consensus::HistoryMaps {

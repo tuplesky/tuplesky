@@ -1892,6 +1892,13 @@ impl Leader {
             .next_executable(&self.table, |c| self.proposals.get(c).map(|p| p.seqnum))
     }
 
+    /// The table's size and its oldest unexecuted record's wait, in this
+    /// leader's proposal order (task-d25, #98).
+    pub fn table_waits(&self) -> crate::TableWaits {
+        self.table
+            .waits(|c| self.proposals.get(c).map(|p| p.seqnum))
+    }
+
     /// The durable payload of a proposed command.
     pub fn payload(&self, command: &CommandId) -> Option<&PayloadRecordV1> {
         self.payloads.get(command)

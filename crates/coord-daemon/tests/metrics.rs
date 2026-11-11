@@ -9,9 +9,9 @@ use std::time::Duration;
 use coord_daemon::metrics::{
     Answered, Cost, Cpu, Datagrams, Distribution, Durability, FastPath, Frontiers, Headroom,
     History, Interval, Jobs, JournalGroups, Lane, LaneReading, Latency, MAX_REPORTED_SHARDS,
-    Measure, MetricsSnapshot, PipelineWaits, Reads, Recorder, Release, ReleaseDistributions,
-    Resends, Scheduling, ShardIndex, ShardReading, Stage, StageReading, Traffic, Unavailable,
-    UnorderedPreAcceptances, Wait,
+    Measure, MetricsSnapshot, OldestWait, PipelineWaits, Reads, Recorder, Release,
+    ReleaseDistributions, Resends, Scheduling, ShardIndex, ShardReading, Stage, StageReading,
+    Table, Traffic, Unavailable, UnorderedPreAcceptances, Wait,
 };
 use coord_daemon::role::RoleSet;
 
@@ -494,6 +494,14 @@ fn a_rendered_snapshot_carries_no_secret_or_key_shaped_text() {
                 sweeps: 3,
                 entries: 9100,
                 largest_map: 1700,
+            },
+            table: Table {
+                records: 3500,
+                capacity: 4096,
+                unexecuted: 3400,
+                ready: 0,
+                catch_up_window: 64,
+                oldest_wait: Some(OldestWait::Dependency { phase: None }),
             },
         }),
     };

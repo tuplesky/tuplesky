@@ -1898,6 +1898,22 @@ Count only adoption acknowledgements toward the slow majority, leaving the fast 
 
 Asking one page ahead (the reserve then holds two windows), or a larger page, is the next lever if the bar's load needs a voter to gain on a saturated domain. Section 13's catch-up figure is the measured one.
 
+**A voter whose table is full (#98, [6803978023](https://github.com/tuplesky/tuplesky/pull/98#issuecomment-6803978023)).** At closed-loop load locally, with three frontends at about 1,700 commands a second, a follower carrying a frontend slipped with its loop at about a third of a core. In the same second, its send queue to the leader filled and its table reached its bound. From then on:
+- its machine refused the live stream (`Backpressure`), its own frontend's submissions included;
+- it could rejoin only by catching up faster than the domain ran.
+
+One page in hand doesn't do that at a saturated domain:
+- locally, with the chain unbroken, it pulls 1,200 to 1,300 commands a second, against a domain at about 1,550;
+- on the runner (run 43076106599, [6804177252](https://github.com/tuplesky/tuplesky/pull/98#issuecomment-6804177252)), it pulls 460 to 1,300 a second sustained, with bursts near 2,000.
+
+This is its own limit, not built now and off the 2.0x path. Its two levers, in order:
+1. ask one page ahead (the table's reserve then holds two windows, and the donor's bulk lane two pages);
+2. a larger page.
+
+The relay (task-d102's step B, #224) removes the bar's shape of it: with `batched-round` on, every voter kept up. On the runner, where all five voters carry frontends at 770 to 960 commands a second, no voter fell behind ([6803845553](https://github.com/tuplesky/tuplesky/pull/98#issuecomment-6803845553)).
+
+The metrics line now carries the table (`table`): its records against its bound, those below EXECUTED and of them the ready ones, the catch-up window in hand, and what the oldest unexecuted record waits on (its payload, its commit, a dependency, or nothing in the table). So the first cause of the next slip is read rather than inferred.
+
 <a id="task-d26"></a>
 ### task-d26: State the resource contract and test its accounting
 
