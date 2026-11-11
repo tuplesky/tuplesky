@@ -1976,10 +1976,15 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             },
             relay: {
                 let collector = self.frontend.frontend.dispatcher().collector();
+                let taken = voter.node().relay_taken_since_start();
                 coord_daemon::metrics::Relay {
                     relayed: collector.relayed(),
                     fallbacks: collector.relay_fallbacks(),
                     not_leading: collector.not_leading(),
+                    frames_taken: taken.frames,
+                    payloads_taken: taken.taken,
+                    known: taken.known,
+                    not_taken: taken.not_taken,
                 }
             },
             traffic: self.plane.as_ref().map_or(

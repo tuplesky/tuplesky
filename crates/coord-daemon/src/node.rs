@@ -457,6 +457,20 @@ impl Machine {
         }
     }
 
+    /// What this replica did with relayed payloads (#224 review). A
+    /// leader takes none.
+    pub const fn relay_taken(&self) -> coord_consensus::RelayTaken {
+        match self {
+            Machine::Leader(_) => coord_consensus::RelayTaken {
+                frames: 0,
+                taken: 0,
+                known: 0,
+                not_taken: 0,
+            },
+            Machine::Follower(m) => m.relay_taken(),
+        }
+    }
+
     /// Catch-up pages taken and pulled commands executed (task-d08).
     pub const fn catch_up_counts(&self) -> (u64, u64) {
         match self {
@@ -836,6 +850,9 @@ pub struct Node<P: Persistence> {
     /// establishment is, and the acknowledgements of every role this
     /// replica left.
     fast_path: coord_consensus::FastPathCounts,
+    /// What the follower roles this node has left did with relayed
+    /// payloads (#224 review).
+    relay_before: coord_consensus::RelayTaken,
     /// From learned to released, per command this replica led (task-d62).
     release: crate::learned::ReleaseTiming,
     /// Whether a leader's result goes out as its command executes rather
@@ -936,6 +953,7 @@ impl<P: Persistence> Node<P> {
             sent_bytes: coord_consensus::SentBytes::default(),
             established: Established::default(),
             fast_path: coord_consensus::FastPathCounts::default(),
+            relay_before: coord_consensus::RelayTaken::default(),
             release: crate::learned::ReleaseTiming::default(),
             release_at_execution: false,
             release_held: std::collections::BTreeSet::new(),
@@ -1350,7 +1368,19 @@ impl<P: Persistence> Node<P> {
     fn leave_role(&mut self) {
         let counts = self.machine_mut().take_fast_path_counts();
         self.fast_path.add(&counts);
+        // A follower's relay counts start again with the role: kept here,
+        // so the metrics line counts since the node started.
+        let relay = self.machine().relay_taken();
+        self.relay_before.add(&relay);
         self.release.clear();
+    }
+
+    /// What this node did with relayed payloads since it started, through
+    /// every follower role it held (task-d102, #224 review).
+    pub fn relay_taken_since_start(&self) -> coord_consensus::RelayTaken {
+        let mut counts = self.relay_before;
+        counts.add(&self.machine().relay_taken());
+        counts
     }
 
     /// What the fast path did since boot (task-d62).
