@@ -713,6 +713,75 @@ fn a_voter_past_a_full_table_catches_up_and_its_table_drains() {
     }
 }
 
+/// Every map forgetting drops stays bounded by the table at every voter,
+/// including one that falls behind by more than a table and catches up by
+/// pages: before it falls behind, while the others run on without it,
+/// once it has caught up, and while it takes new work after (task-d111
+/// item 4 (d), #221 review). The bound is the backstop sweep's threshold,
+/// four times the capacity: forgetting in order is to keep every map
+/// under it without a sweep. Once every voter has executed everything,
+/// no map is larger than the voter's ledger: an entry made for a
+/// command after it was forgotten, as a peer's late vote made one at r4
+/// before `collect` dropped those, stays over it.
+#[test]
+fn every_history_map_stays_bounded_at_a_voter_that_falls_behind_and_catches_up() {
+    fn maps(cluster: &Cluster, i: usize) -> coord_consensus::HistoryMaps {
+        match &cluster.nodes[i].role {
+            Role::Leader(l) => l.history_maps(),
+            Role::Follower(f) => f.history_maps(),
+        }
+    }
+    fn check(cluster: &Cluster, seed: u64, at: &str, threshold: usize) {
+        for i in 0..cluster.nodes.len() {
+            let m = maps(cluster, i);
+            assert!(
+                m.largest() < threshold,
+                "seed {seed}, {at}: r{i}'s history maps reached {m:?}"
+            );
+        }
+    }
+    // Once every voter has executed everything, an entry is one of a
+    // command the ledger still records: one more, in any map, is of a
+    // command it has forgotten, which nothing but a sweep would drop.
+    fn settled(cluster: &Cluster, seed: u64, at: &str) {
+        for i in 0..cluster.nodes.len() {
+            let (ledger, m) = match &cluster.nodes[i].role {
+                Role::Leader(l) => (l.ledger().len(), l.history_maps()),
+                Role::Follower(f) => (f.ledger().len(), f.history_maps()),
+            };
+            assert!(
+                m.largest() <= ledger,
+                "seed {seed}, {at}: r{i} keeps more than its ledger's {ledger}: {m:?}"
+            );
+        }
+    }
+    for seed in 1..=4 {
+        let (mut cluster, capacity) = left_behind(seed);
+        let threshold = capacity * 4;
+        check(&cluster, seed, "left behind", threshold);
+        cluster.catching = vec![4];
+        cluster.settle_ticking(8);
+        assert_eq!(
+            cluster.nodes[4].executed, cluster.nodes[0].executed,
+            "seed {seed}: r4 did not catch up"
+        );
+        check(&cluster, seed, "caught up", threshold);
+        settled(&cluster, seed, "caught up");
+        for seq in 61..=60 + capacity as u64 * 16 {
+            cluster.admit(seq);
+            cluster.settle();
+            check(&cluster, seed, "after", threshold);
+        }
+        cluster.settle_ticking(2);
+        check(&cluster, seed, "at the end", threshold);
+        settled(&cluster, seed, "at the end");
+        assert_eq!(
+            cluster.nodes[4].executed, cluster.nodes[0].executed,
+            "seed {seed}"
+        );
+    }
+}
+
 /// Nothing a voter caught up is left reported as committed with other
 /// dependencies than the ones decided (task-d08): every dependency row it
 /// holds at COMMIT or beyond names the leader's dependencies for that

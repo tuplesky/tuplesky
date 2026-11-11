@@ -114,25 +114,24 @@ pub struct DurableLedger {
     /// bounded: only a history sweep drops their history, once the table
     /// forgets them.
     forgets_skipped: u64,
-    /// The last command the queue let go unforgotten: once the table
-    /// forgets it a history sweep is due, whatever the ledger's size
-    /// (#221 review). The table forgets in the order commands executed,
-    /// so by then it has forgotten every one let go before it too, and
-    /// that one sweep drops all their history; without it, a ledger kept
-    /// small by forgetting in order might never come due again.
-    owed_sweep: Option<CommandId>,
+    /// The commands the queue let go unforgotten that no sweep has
+    /// dropped yet, in the order it let them go: their history is a
+    /// sweep's to drop, and without one owed, a ledger kept small by
+    /// forgetting in order might never come due again (#221 review).
+    /// Once the table forgets the last of them, a history sweep is due,
+    /// whatever the ledger's size. The table mostly forgets in execution
+    /// order, so that sweep drops the earlier ones too. It doesn't
+    /// always: catch-up retires a pulled command as soon as it executes,
+    /// while one executed before it in the usual way waits for the
+    /// table's reclaim. An earlier one the sweep keeps stays here, and
+    /// the last of those is owed the next sweep.
+    owed: VecDeque<CommandId>,
     /// Retry keys bound to a command with no payload here to find them by
     /// (an exact duplicate presented after an earlier boot's rows, or a
     /// transferred payload whose binding was not kept): dropped with the
     /// command's history in order, as its payload's key would be (#221
     /// review). Only those, so it stays small.
     bare_bindings: BTreeMap<CommandId, RetryKey>,
-    /// The commands the queue let go unforgotten, whose history is the
-    /// next sweep's to drop (debug checks). One can stay in the maps past
-    /// a sweep that runs before the table forgets it (#221 review); a
-    /// sweep that drops it takes it out of this set.
-    #[cfg(debug_assertions)]
-    sweep_owes: BTreeSet<CommandId>,
     /// Executions noted since this ledger was made, for the owner's debug
     /// checks of its forgetting.
     executions: u64,
@@ -151,10 +150,8 @@ impl DurableLedger {
             executed_since: 0,
             forget_queue: VecDeque::new(),
             forgets_skipped: 0,
-            owed_sweep: None,
+            owed: VecDeque::new(),
             bare_bindings: BTreeMap::new(),
-            #[cfg(debug_assertions)]
-            sweep_owes: BTreeSet::new(),
             executions: 0,
         }
     }
@@ -171,10 +168,8 @@ impl DurableLedger {
             executed_since: 0,
             forget_queue: VecDeque::new(),
             forgets_skipped: 0,
-            owed_sweep: None,
+            owed: VecDeque::new(),
             bare_bindings: BTreeMap::new(),
-            #[cfg(debug_assertions)]
-            sweep_owes: BTreeSet::new(),
             executions: 0,
         }
     }
@@ -306,12 +301,8 @@ impl DurableLedger {
     pub fn retain(&mut self, keep: impl Fn(&CommandId) -> bool) {
         self.records.retain(|c, _| keep(c));
         self.sequences.retain(|c, _| keep(c));
-        if self.owed_sweep.as_ref().is_some_and(|c| !keep(c)) {
-            self.owed_sweep = None;
-        }
+        self.owed.retain(|c| keep(c));
         self.bare_bindings.retain(|c, _| keep(c));
-        #[cfg(debug_assertions)]
-        self.sweep_owes.retain(|c| keep(c));
     }
 
     /// `command` was executed: what a sweep could forget may have grown
@@ -364,9 +355,7 @@ impl DurableLedger {
                 break;
             };
             self.forgets_skipped += 1;
-            self.owed_sweep = Some(c);
-            #[cfg(debug_assertions)]
-            self.sweep_owes.insert(c);
+            self.owed.push_back(c);
         }
         gone
     }
@@ -377,18 +366,18 @@ impl DurableLedger {
         self.forgets_skipped
     }
 
-    /// The last command the forget queue let go unforgotten, if no sweep
-    /// has dropped it yet: a sweep is due once the table forgets it.
-    pub const fn owed_sweep(&self) -> Option<&CommandId> {
-        self.owed_sweep.as_ref()
+    /// The last command the forget queue let go unforgotten that no sweep
+    /// has dropped yet: a sweep is due once the table forgets it.
+    pub fn owed_sweep(&self) -> Option<&CommandId> {
+        self.owed.back()
     }
 
-    /// Whether `command` left the forget queue unforgotten, so that an
-    /// entry of it left in a map is the next sweep's to drop (debug
-    /// checks).
+    /// Whether `command` left the forget queue unforgotten and no sweep
+    /// has dropped it yet, so that an entry of it left in a map is an
+    /// owed sweep's to drop (debug checks).
     #[cfg(debug_assertions)]
     pub fn sweep_owes(&self, command: &CommandId) -> bool {
-        self.sweep_owes.contains(command)
+        self.owed.contains(command)
     }
 
     /// The commands waiting in the forget queue (debug checks).
@@ -897,8 +886,7 @@ mod tests {
     /// A command the bounded forget queue lets go before the table forgets
     /// it stays the sweep's to drop, past any sweep that runs before it is
     /// forgotten (#221 review): a sweep that keeps it doesn't clear it,
-    /// and one that drops it does. The owed set is kept in debug builds
-    /// only, for the voters' checks.
+    /// and one that drops it does.
     #[cfg(debug_assertions)]
     #[test]
     fn a_command_the_queue_let_go_unforgotten_stays_skipped_until_a_sweep_drops_it() {
@@ -930,6 +918,37 @@ mod tests {
         assert!(!ledger.sweep_owes(&ids[0]), "the sweep that dropped it");
         assert_eq!(ledger.owed_sweep(), None, "owes nothing more");
         assert_eq!(ledger.forgets_skipped(), 1);
+    }
+
+    /// The table doesn't always forget in execution order: catch-up
+    /// retires a pulled command as soon as it executes, while one executed
+    /// before it in the usual way waits for the table's reclaim (#221
+    /// review). Two commands the queue let go, the later forgotten first:
+    /// the sweep owed for it drops it and keeps the earlier one, which is
+    /// still owed one, and the next sweep that drops it owes nothing more.
+    #[test]
+    fn a_command_let_go_stays_owed_when_a_later_one_is_forgotten_first() {
+        let ids: Vec<CommandId> = rows(0, 4).into_iter().map(|(c, _)| c).collect();
+        let mut ledger = DurableLedger::restore(rows(0, 4));
+        for c in &ids {
+            ledger.executed(*c);
+        }
+        // Nothing forgotten, a queue of two: the two oldest leave.
+        assert!(ledger.take_forgotten(|_| false, 4, 2).is_empty());
+        assert_eq!(ledger.forgets_skipped(), 2);
+        assert_eq!(ledger.owed_sweep(), Some(&ids[1]));
+        // The table forgets ids[1] (retired at once) before ids[0]: the
+        // owed sweep drops ids[1] and keeps ids[0].
+        ledger.retain(|c| *c != ids[1]);
+        ledger.swept();
+        assert_eq!(
+            ledger.owed_sweep(),
+            Some(&ids[0]),
+            "the earlier one the queue let go is still owed a sweep"
+        );
+        ledger.retain(|c| *c != ids[0] && *c != ids[1]);
+        ledger.swept();
+        assert_eq!(ledger.owed_sweep(), None, "owes nothing more");
     }
 
     /// task-d110: a sweep is due past the threshold once the records added
