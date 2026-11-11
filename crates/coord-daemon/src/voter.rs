@@ -1040,7 +1040,7 @@ impl<P: Persistence> Voter<P> {
     }
 
     /// How many commands this replica knows by identity and not by
-    /// content.
+    /// content, counted to the most one ask is for (task-d109).
     pub fn missing_payloads(&self) -> usize {
         self.node.missing_payloads()
     }
