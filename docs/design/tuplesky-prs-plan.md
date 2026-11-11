@@ -1912,6 +1912,18 @@ This is its own limit, not built now and off the 2.0x path. Its two levers, in o
 
 The relay (task-d102's step B, #224) removes the bar's shape of it: with `batched-round` on, every voter kept up. On the runner, where all five voters carry frontends at 770 to 960 commands a second, no voter fell behind ([6803845553](https://github.com/tuplesky/tuplesky/pull/98#issuecomment-6803845553)).
 
+**With the relay on the carry, the rejoin pace matters more** (#224's review, [6805986080](https://github.com/tuplesky/tuplesky/pull/224#issuecomment-6805986080); review's reading on #98, [6806617592](https://github.com/tuplesky/tuplesky/pull/98#issuecomment-6806617592)). The setup: five voters on one four-core host, the relay on, 120 callers, and a follower without callers stopped 9 s.
+- **A page of 64 never rejoins under load.** The voter pulls 1,540–1,610 a second against the leader's 2,250–2,340. It closes only once the load ends, at about 6,000 a second.
+- **A page of 125 holds level** (2,140 against 2,190). **A page of 256 is back within 600 of the leader in 48–52 s,** under load.
+- **A page costs about 22 ms whatever its size, plus about 0.28 ms a command.** The fixed part is the round trip between one page and the next. So asking one page ahead is worth more than a larger page: about 3,500 a second by that arithmetic, unmeasured.
+- **While behind, the voter is not a voter in effect:** its table is full of pulled commands, and it refuses the leader's proposals (`Backpressure`).
+- **The page size is not a free constant.** `RECOVERY_RESERVE_PARTS` sizes the reserve for one window: at the largest table, 875 admitted, 125 recovering and 1,000 retired make the report bound of 2,000. 125 is the largest page that fits. 256 needs the reserve or the report bound changed, a design change of its own. A page asked ahead has to respect the same reserve, so it waits outside the table until the page in hand has run.
+- **Section 13's rule, that admission stays below the rate a catching-up voter executes at, is not kept by the defaults.** `limits.max_admitted_per_second` is 1,000 for each frontend, so three frontends admit up to 3,000 a second. Whether it is for the domain or for each frontend, and its value, is the owner's decision.
+- **The decision (the lead, on review's reading):** both levers in one PR, beside the CPU levers:
+  - a page of 125, within today's reserve and report bound;
+  - asking one page ahead. That changes the one-page-in-hand rule #223's one-ask-a-page logic rests on, so the PR re-argues its invariants: no command installed twice or skipped with two pages in flight, a stale or out-of-order page, a page arriving after the frontier passed it, and the reserve holding with a page in hand and one on its way. The simulator's catch-up settings are swept over it, and review's ordering test is extended to two pages in flight;
+  - acceptance, locally and then in the fault run: a voter stopped 9 s under full load with the relay active is back within 600 of the leader in a stated time while the load continues, with the donor loop's longest step read beside it.
+
 The metrics line now carries the table (`table`): its records against its bound, those below EXECUTED and of them the ready ones, the catch-up window in hand, and what the oldest unexecuted record waits on (its payload, its commit, a dependency, or nothing in the table). So the first cause of the next slip is read rather than inferred.
 
 <a id="task-d26"></a>
