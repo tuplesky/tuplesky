@@ -401,6 +401,27 @@ class ProfileTests(unittest.TestCase):
         self.assertNotIn("dispatched as", self.summarize(VOTER, "replay"))
 
 
+class PeggedLoopTests(unittest.TestCase):
+    def test_no_list_is_no_section(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(js.pegged_loops(d), [])
+
+    def test_each_stretch_then_each_profile(self):
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "leader-profile-pegged.txt"), "w") as f:
+                f.write("Restarted voters' loops at or above 0.9 of a core for 15 s or more, watched from A\n"
+                        "n1 pid 7 (boot at tick 9): pegged from B, profiled into leader-profile-pegged-1.txt\n")
+            with open(os.path.join(d, "leader-profile-pegged-1.txt"), "w") as f:
+                f.write("pegged loop 1, restarted thread 7 (n1), 0.98 of a core; 1K samples\n"
+                        "by object: coordd 99.00%\n"
+                        "  60.00%  coordd  [.] coord_consensus::executor::next_executable\n")
+            out = "\n".join(js.pegged_loops(d))
+        self.assertIn("**Pegged loops after a restart**", out)
+        self.assertIn("- n1 pid 7 (boot at tick 9): pegged from B", out)
+        self.assertIn("**Pegged loop 1, profiled**", out)
+        self.assertIn("next_executable", out)
+
+
 class RunQueueTests(unittest.TestCase):
     """task-d55: the domain loop's run-queue time, where the voters report
     it, is a column of its own; a run whose voters do not report it has

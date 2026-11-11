@@ -63,7 +63,7 @@ fi
 profiler=
 if [ -n "${JEPSEN_LEADER_PROFILE:-}" ]; then
   callgraph=(); if [ -n "${JEPSEN_LEADER_CALLGRAPH:-}" ]; then callgraph=(--call-graph); fi
-  python3 "$(dirname "$0")/leader_profile.py" --out "$JEPSEN_LEADER_PROFILE" ${callgraph[@]+"${callgraph[@]}"} &
+  python3 "$(dirname "$0")/leader_profile.py" --out "$JEPSEN_LEADER_PROFILE" --watch-pegged 6 ${callgraph[@]+"${callgraph[@]}"} &
   profiler=$!
 fi
 

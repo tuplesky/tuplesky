@@ -1103,6 +1103,29 @@ def fast_path_table(voters: dict) -> list[str]:
     return out
 
 
+def pegged_loops(store: str, top: int = 30) -> list[str]:
+    """The restarted voters whose loops `leader_profile.py --watch-pegged`
+    found pegged (`leader-profile-pegged.txt`), then each loop it profiled
+    (`leader-profile-pegged-N.txt`, with its inclusive shares where the
+    profile took call graphs); [] without the list."""
+    try:
+        with open(os.path.join(store, "leader-profile-pegged.txt")) as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return []
+    if not lines:
+        return []
+    out = [f"**Pegged loops after a restart** (`leader_profile.py --watch-pegged`): {lines[0]}", ""]
+    out += [f"- {line}" for line in lines[1:] if line.strip()] + [""]
+    n = 1
+    while os.path.exists(os.path.join(store, f"leader-profile-pegged-{n}.txt")):
+        out.extend(leader_profile(os.path.join(store, f"leader-profile-pegged-{n}.txt"), top,
+                                  title=f"Pegged loop {n}, profiled** (`perf record` on that one thread"))
+        out.extend(leader_profile_inclusive(os.path.join(store, f"leader-profile-pegged-{n}-inclusive.txt"), top))
+        n += 1
+    return out
+
+
 def leader_profile_inclusive(path: str, top: int = 30) -> list[str]:
     """A call-graph profile's symbols by their share with everything they
     called, then their own, in a folded block; [] without one."""
@@ -2411,6 +2434,7 @@ def summarize(store: str, nodes: list[str], title: str, profile: str | None = No
                                         "reported for the transport's workers and the blocking pool"))
         out.extend(leader_profile_inclusive(os.path.join(store, "leader-profile-inclusive.txt")))
         out.extend(leader_loop_split(os.path.join(store, "leader-profile-chains.txt")))
+        out.extend(pegged_loops(store))
 
         # The final reads: each worker's operations invoked after the last
         # fault operation (the final heal), with what answered them. A

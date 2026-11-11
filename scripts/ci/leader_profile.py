@@ -120,6 +120,7 @@ def main() -> int:
     parser.add_argument("--seconds", type=float, default=20.0)
     parser.add_argument("--frequency", type=int)
     parser.add_argument("--call-graph", action="store_true")
+    parser.add_argument("--watch-pegged", type=int, default=0)
     args = parser.parse_args()
     if args.frequency is None:
         args.frequency = 999
@@ -151,6 +152,8 @@ def main() -> int:
         time.sleep(1)
     if stopping:
         return 0
+    # The boots running when the workload started; a later one is a restart.
+    initial = set(history[-1])
     deadline = time.monotonic() + args.settle
     while not stopping and time.monotonic() < deadline:
         history = (history + [loops()])[-6:]
@@ -320,7 +323,101 @@ def main() -> int:
                     + "\n"
                 )
         subprocess.run(["sudo", "-n", "rm", "-f", data], capture_output=True)
+    if args.watch_pegged > 0 and not stopping:
+        watch_pegged(args, initial, beside, record, write_profile, graph, lambda: stopping)
     return 0
+
+
+# A restarted voter's loop is pegged once it has used at least this much
+# of a core for PEGGED_SECONDS in a row.
+PEGGED_SHARE = 0.9
+PEGGED_SECONDS = 15
+# The least time between two profiles of one boot.
+PEGGED_AGAIN_SECONDS = 60
+
+
+def watch_pegged(args, initial: set, beside, record, write_profile, graph: list[str], stopping) -> None:
+    """After the leader's window, until the test ends: every voter boot
+    started after the workload did (a restart) whose loop stays pegged is
+    written down, and profiled the way the leader was, for --seconds, into
+    FILE with -pegged-N before its extension (its -inclusive and -chains
+    beside it with --call-graph). Each boot is profiled at most twice, at
+    least PEGGED_AGAIN_SECONDS apart, and --watch-pegged profiles in all.
+    FILE with -pegged before its extension lists each pegged stretch: the
+    node, the boot, when it began and ended, and its share of a core."""
+    index = beside("pegged")
+    lines: list[str] = []
+
+    def flush() -> None:
+        with open(index, "w") as f:
+            f.write(f"Restarted voters' loops at or above {PEGGED_SHARE:g} of a core for {PEGGED_SECONDS} s or more, "
+                    f"watched from {started} UTC" + (" to " + now() + " UTC" if stopping() else "") + "\n")
+            f.write("\n".join(lines) + ("\n" if lines else "No stretch so far.\n"))
+
+    started = now()
+    flush()
+    last = loops()
+    run: dict = {}  # boot -> (seconds pegged in a row, when it began, CPU seconds since)
+    profiled: dict = {}  # boot -> (times, monotonic time of the last)
+    nodes: dict = {}
+    taken = 0
+    open_stretch: dict = {}  # boot -> index in lines
+    while not stopping():
+        time.sleep(1)
+        current = loops()
+        for key in list(run):
+            if key not in current:
+                if key in open_stretch:
+                    lines[open_stretch.pop(key)] += f", until it stopped by {now()}"
+                run.pop(key)
+        for key, cpu in current.items():
+            if key in initial or key not in last:
+                continue
+            rate = cpu - last[key]
+            seconds, began, used = run.get(key, (0, now(), 0.0))
+            if rate >= PEGGED_SHARE:
+                run[key] = (seconds + 1, began, used + rate)
+            else:
+                if key in open_stretch:
+                    seconds_, began_, used_ = run.get(key, (0, began, 0.0))
+                    lines[open_stretch.pop(key)] += f", until {now()} ({seconds_} s, {used_ / max(seconds_, 1):.2f} of a core)"
+                run.pop(key, None)
+                continue
+            seconds, began, used = run[key]
+            if seconds < PEGGED_SECONDS:
+                continue
+            if key not in nodes:
+                nodes[key] = node_of(key[0])
+            if key not in open_stretch:
+                open_stretch[key] = len(lines)
+                lines.append(f"{nodes[key] or '?'} pid {key[0]} (boot at tick {key[1]}): pegged from {began}")
+            times, at = profiled.get(key, (0, 0.0))
+            if taken >= args.watch_pegged or times >= 2 or (times and time.monotonic() - at < PEGGED_AGAIN_SECONDS):
+                continue
+            taken += 1
+            profiled[key] = (times + 1, time.monotonic())
+            out = beside(f"pegged-{taken}")
+            data = out + ".data"
+            began_profile = now()
+            proc = record(key[0], data, graph, args.seconds, args.frequency)
+            _, err = proc.communicate()
+            ended = now()
+            if proc.returncode == 0:
+                write_profile(out, f"pegged loop {taken}, restarted", key[0], used / seconds * 5, data,
+                              began_profile, ended, node=nodes[key])
+            else:
+                with open(out, "w") as f:
+                    f.write(f"No profile: perf record failed ({proc.returncode}): {err.strip()[-500:]}\n")
+            subprocess.run(["sudo", "-n", "rm", "-f", data], capture_output=True)
+            lines[open_stretch[key]] += f", profiled into {os.path.basename(out)} from {began_profile} to {ended}"
+            # The profile took --seconds: start the next reading afresh.
+            current = loops()
+        last = current
+        flush()
+    for key, i in open_stretch.items():
+        seconds, began, used = run.get(key, (0, "", 0.0))
+        lines[i] += f", still pegged at the end ({seconds} s, {used / max(seconds, 1):.2f} of a core)"
+    flush()
 
 
 def suffixed(path: str, suffix: str) -> str:
