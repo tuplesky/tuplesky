@@ -4024,7 +4024,7 @@ So every feature-gated change, task-d98's `EarlyProposal` first, would ship unre
 - **Item 3, the leader's `propose` and reads.** Its own code step, after task-d102's frames:
   - `propose` builds a turn's payload and dependency rows in one pass, and keeps `adopt_own`'s set rather than rebuilding it a command (70 → 18);
   - a barrier read is answered from the leader's executed state once its round confirms, without per-read planning (about 7 µs a read). At the bar's mix, under 0.1 reads a command at 120 callers, that is worth about 2 µs a command, so it isn't counted against bar 1 there.
-- **Item 4, executions at every voter, the long pole** (about 270 µs a command over five voters against 68; on record only option 3's −100, nothing at the leader):
+- **Item 4, executions at every voter, the long pole** (about 270 µs a command over five voters against 68; on record only option 3's −75 with its rotating verifier, nothing at the leader):
   - **first, the reading:** `run_executions` at the leader and at a follower by step (establishing what is ready, `apply_bound` and its parts, the retry state, `load_authorization`, `applied`, the release bookkeeping), in µs a command and by driver, at 30 and 120 callers at the bar's mix, locally on five voters;
   - **then its design:** what a follower must execute eagerly and what it can defer or batch (task-d101's option 3 folded in), and what the leader's execution can shed (53 → 16, 55 → 13).
 - **The allocator and memmove, a block across the rows** (16 to 20% of a loop): one buffer a batch, and rows written from borrowed payloads. Half of today's, counted inside each row it cuts.
@@ -4033,7 +4033,7 @@ So every feature-gated change, task-d98's `EarlyProposal` first, would ship unre
 **Acceptance:**
 - **The design step** recorded and reviewed before any code.
 - **Each code step** names its rows and reports, at 30 and 120 callers on five voters, each row's driver calls a command and CPU a call, with a profile of the leader and of a follower at each load. A row's budget is met, or its gap is stated. A lever counts only against the rows it names.
-- **What items 1 to 4 owe:** with every owned row at its budget, the loops at about 0.44 to 0.60 ms an operation on the runner at 120 callers, read by the testing session's job once they are in. The levers at their recorded sizes reach about 0.87 to 0.96, against the loops' 2.0× budget of 0.83.
+- **What items 1 to 4 owe:** with every owned row at its budget, the loops at about 0.44 to 0.60 ms an operation on the runner at 120 callers, read by the testing session's job once they are in. The levers at their recorded sizes reach about 0.90 to 0.99, against the loops' 2.0× budget of 0.83.
 - **The loops' total against bar 1,** at most 0.39 ms an operation at 120 callers (0.44 at 30), once the named rows that aren't owned have a design.
 
 ## Gate checklist and deferred work
