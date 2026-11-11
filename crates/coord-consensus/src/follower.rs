@@ -549,6 +549,11 @@ pub struct Follower {
     /// for the tests that bound it.
     #[cfg(test)]
     missing_examined: core::cell::Cell<u64>,
+    /// Commands read from a campaign's unbound selection while looking
+    /// for missing payloads, for the test that bounds it (audit item 5 on
+    /// #98).
+    #[cfg(test)]
+    selection_read: core::cell::Cell<u64>,
     /// The held proposals to examine at the next `advance_pending`: the
     /// ones held since, and the ones whose blocker the table noted a
     /// change for (task-d46). Every held proposal that can be adopted is
@@ -923,6 +928,8 @@ impl Follower {
             sync_refacts: alloc::collections::BTreeSet::new(),
             #[cfg(test)]
             missing_examined: core::cell::Cell::new(0),
+            #[cfg(test)]
+            selection_read: core::cell::Cell::new(0),
             held_check: alloc::collections::BTreeSet::new(),
             held_waiters: BTreeMap::new(),
             pending: BTreeMap::new(),
@@ -1126,6 +1133,8 @@ impl Follower {
             sync_refacts: alloc::collections::BTreeSet::new(),
             #[cfg(test)]
             missing_examined: core::cell::Cell::new(0),
+            #[cfg(test)]
+            selection_read: core::cell::Cell::new(0),
             held_check: alloc::collections::BTreeSet::new(),
             held_waiters: BTreeMap::new(),
             pending: BTreeMap::new(),
@@ -1617,7 +1626,10 @@ impl Follower {
             // result is bound: the new leader re-proposes from payloads,
             // never from identities alone. The reporting voters hold them
             // durably (they reported the command).
-            if !Self::selection_missing(&self.table, &self.payloads, &decision).is_empty() {
+            if Self::selection_missing(&self.table, &self.payloads, &decision)
+                .next()
+                .is_some()
+            {
                 // Ask again when a voter promised that has not been asked
                 // yet -- the ones asked first may be gone while a live
                 // quorum holds the payload -- or when the last ask was
@@ -2963,7 +2975,7 @@ impl Follower {
             || self.sync_missing().any(&mut note)
             || self.adopted_lacking.iter().any(&mut note)
             || self.held_missing().any(&mut note)
-            || self.campaign_missing().iter().any(&mut note)
+            || self.campaign_missing_iter().any(|c| note(&c))
         {
             return limit;
         }
@@ -2971,12 +2983,14 @@ impl Follower {
     }
 
     /// The commands a selection names that this replica holds nothing
-    /// for: what it needs before the selection can be bound.
-    fn selection_missing(
-        table: &CommandTable,
-        payloads: &BTreeMap<CommandId, PayloadRecordV1>,
-        decision: &SyncDecision,
-    ) -> Vec<CommandId> {
+    /// for: what it needs before the selection can be bound. Read lazily,
+    /// so a count that stops at its limit walks no further (audit item 5
+    /// on #98).
+    fn selection_missing<'a>(
+        table: &'a CommandTable,
+        payloads: &'a BTreeMap<CommandId, PayloadRecordV1>,
+        decision: &'a SyncDecision,
+    ) -> impl Iterator<Item = CommandId> + 'a {
         decision
             .entries
             .keys()
@@ -3013,7 +3027,6 @@ impl Follower {
                 (r.phase < Phase::Commit && r.payload.is_some_and(|p| p != selected))
                     .then_some(e.command)
             }))
-            .collect()
     }
 
     /// A selected entry this replica committed or executed under other
@@ -3066,13 +3079,23 @@ impl Follower {
     /// runtime's paced asks cover it: an ask its peers could not answer
     /// yet is asked again rather than waited on for ever.
     fn campaign_missing(&self) -> Vec<CommandId> {
-        match self.campaign.as_ref() {
-            Some(c) if c.binding().is_none() && !c.is_durable() => c
-                .decision()
-                .map(|d| Self::selection_missing(&self.table, &self.payloads, d))
-                .unwrap_or_default(),
-            _ => Vec::new(),
-        }
+        self.campaign_missing_iter().collect()
+    }
+
+    /// [`Follower::campaign_missing`], read lazily: the count stops at its
+    /// limit rather than build the list over a whole selection (audit
+    /// item 5 on #98: 0.40 ms a call at 2,000 entries, twice a turn).
+    fn campaign_missing_iter(&self) -> impl Iterator<Item = CommandId> + '_ {
+        self.campaign
+            .as_ref()
+            .filter(|c| c.binding().is_none() && !c.is_durable())
+            .and_then(|c| c.decision())
+            .into_iter()
+            .flat_map(|d| Self::selection_missing(&self.table, &self.payloads, d))
+            .inspect(|_| {
+                #[cfg(test)]
+                self.selection_read.set(self.selection_read.get() + 1);
+            })
     }
 
     /// The next bounded batch of missing payloads to ask for.
@@ -6407,13 +6430,9 @@ mod tests {
         assert_eq!(follower.unexecuted_held(), 2_001);
     }
 
-    /// A voter restarted behind a Sync of 2,000 entries it holds no
-    /// payload for (task-d109). The runtime asks every turn how many
-    /// payloads are missing, to at most an ask's worth: the count stops at
-    /// that many commands, where the list it was read from walked every
-    /// pending entry twice and sorted them all.
-    #[test]
-    fn the_missing_count_stops_at_an_asks_worth() {
+    /// A voter's configuration and a selection of 2,000 ACCEPT entries it
+    /// holds nothing for, for the tests that count what it lacks.
+    fn lacking_two_thousand() -> (FollowerConfig, Ballot, BTreeMap<CommandId, SyncEntry>) {
         let epoch = ConfigurationEpoch::new(1).unwrap();
         let voters: BTreeSet<ReplicaId> = (0..3).map(r).collect();
         let genesis = Ballot {
@@ -6462,6 +6481,17 @@ mod tests {
                 )
             })
             .collect();
+        (config, genesis, entries)
+    }
+
+    /// A voter restarted behind a Sync of 2,000 entries it holds no
+    /// payload for (task-d109). The runtime asks every turn how many
+    /// payloads are missing, to at most an ask's worth: the count stops at
+    /// that many commands, where the list it was read from walked every
+    /// pending entry twice and sorted them all.
+    #[test]
+    fn the_missing_count_stops_at_an_asks_worth() {
+        let (config, genesis, entries) = lacking_two_thousand();
         let decision = SyncDecision {
             ballot: genesis,
             source_ballot: genesis,
@@ -6482,6 +6512,45 @@ mod tests {
         let limit = crate::messages::MAX_PAYLOAD_TRANSFER;
         assert_eq!(follower.missing_payload_count(limit), limit);
         assert_eq!(follower.missing_examined.get(), limit as u64);
+        assert_eq!(follower.missing_payload_count(5_000), 2_000);
+    }
+
+    /// Audit item 5 on #98: a candidate whose selection waits for
+    /// payloads it lacks. The count read the campaign's part as a list
+    /// built over the whole selection (0.40 ms a call at 2,000 entries,
+    /// twice a turn). It stops at its limit there too.
+    #[test]
+    fn the_missing_count_stops_at_an_asks_worth_at_a_candidate() {
+        let (config, genesis, entries) = lacking_two_thousand();
+        let ballot = Ballot {
+            number: 1,
+            leader: r(1),
+            ..genesis
+        };
+        let quorum = BallotConfiguration::c2_default(
+            config.identity.epoch,
+            ballot,
+            config.identity.voters.clone(),
+        )
+        .unwrap();
+        let decision = SyncDecision {
+            ballot,
+            source_ballot: genesis,
+            entries,
+            reproposed: BTreeSet::new(),
+        };
+        let mut follower =
+            Follower::recover_with_syncs(config, None, None, [], [], [], ExecutionPosition::ZERO);
+        follower.campaign = Some(Campaign::selected(quorum, decision));
+        assert_eq!(follower.missing_payloads().len(), 2_000);
+        follower.missing_examined.set(0);
+        follower.selection_read.set(0);
+        let limit = crate::messages::MAX_PAYLOAD_TRANSFER;
+        assert_eq!(follower.missing_payload_count(limit), limit);
+        assert_eq!(follower.missing_examined.get(), limit as u64);
+        // Read from the selection no further than the count needed: built
+        // whole first, it read all 2,000.
+        assert_eq!(follower.selection_read.get(), limit as u64);
         assert_eq!(follower.missing_payload_count(5_000), 2_000);
     }
 }
