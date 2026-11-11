@@ -3220,19 +3220,19 @@ This entry is the budget and the record, not a lever:
 
       | Block | Today | Levers | Projected | 2.0× budget |
       | --- | --- | --- | --- | --- |
-      | Domain loops | 1.39 | step B's `on_request`, task-d101's option 3, the row cuts, #205's batch: about −435 µs a command locally (task-d111's table) | 0.87 to 0.96 | 0.83 |
+      | Domain loops | 1.39 | step B's `on_request`, task-d101's option 3 with its rotating verifier, the row cuts, #205's batch: about −410 µs a command locally (task-d111's table) | 0.90 to 0.99 | 0.83 |
       | Tokio threads | 0.72 | step B, −0.29; #205's frames and acknowledgement through a position, to about 5 datagrams a command | 0.23 to 0.30 | 0.38 |
       | Materializers | 0.56 | the row cuts, −0.07 to −0.09; task-d86 (C4), −0.07 at its disk size | 0.38 to 0.42 | 0.38 |
       | Appenders and the rest | 0.14 | – | 0.14 | 0.32 |
-      | **Servers** | **2.81** | | **1.62 to 1.82** | **1.92** |
+      | **Servers** | **2.81** | | **1.65 to 1.85** | **1.92** |
 
-      - **2.0× holds at 120 callers, with about 0.1 to 0.3 to spare,** but not block by block. The loops end 0.04 to 0.13 over their budget and the materializers up to 0.04 over. Tokio's and the appenders' slack covers both.
+      - **2.0× holds at 120 callers, with about 0.07 to 0.27 to spare,** but not block by block. The loops end 0.07 to 0.16 over their budget and the materializers up to 0.04 over. Tokio's and the appenders' slack covers both.
       - The loops' range is the local-to-runner conversion, 1.19 to 1.30× (#219). Tokio's assumes #205's acceptance of at most 5 datagrams a command over both planes, at 53 µs a datagram.
       - At 30 callers the bar needs −0.64. Step B is about two thirds of it, and the batch takes less there, since a frame holds about 3 commands, not 5 to 6.
     - **The order to reach 2.0× soonest** (the lead's prior: the batch first, then the row cuts, then option 3, and step B only if the batch doesn't subsume it):
       1. **#205's batch, with step B as its first code step,** not after it. The batch subsumes B's peer-plane part (the proposal frame) but not its api-plane part: the relayed submission, −0.3 of B's −0.4 to −0.45, and tokio's largest lever. That part can't ship ahead of the frames, since a relayed command's payload rides the proposal. So task-d102 starts with the relayed submission and frames of one when idle, then grows the frames. Together they take tokio under its line and about −0.26 of the loops' −0.56 (B's `on_request` and the batch's per-message rows).
       2. **The row cuts (task-d103 to task-d105, #206 to #208), with task-d86 (C4) beside them.** They are the only levers on the materializers, the other block at its line, and each is a small design step already open.
-      3. **Option 3, inside task-d111's item 4, after the executions reading.** It is the largest single loop lever on record (−100), but executions are the long pole: about 270 µs a command against 68, nothing on record at the leader, and no breakdown yet. The reading decides whether option 3 is the route or one part of it.
+      3. **Option 3, inside task-d111's item 4, after the executions reading.** It is the largest single loop lever on record (−75 with its rotating verifier), but executions are the long pole: about 270 µs a command against 68, nothing on record at the leader, and no breakdown yet. The reading decides whether option 3 is the route or one part of it.
 
       So I'd keep the lead's order, with B moved inside the batch as its first step rather than made conditional.
 - **The record:** the table below, one row a lever, each row a pair on the runner.
