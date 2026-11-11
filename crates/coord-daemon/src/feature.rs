@@ -351,10 +351,18 @@ impl Features {
             .map(|row| (row.voter, Row { row, durable: true }))
             .collect();
         let record = published_activation(view).map_err(|e| format!("the activation: {e:?}"))?;
-        if let Some(record) = &record
-            && (record.cluster != self.cluster || record.domain != self.domain)
-        {
-            return Err("the activation record is another cluster's or domain's".into());
+        if let Some(record) = &record {
+            if record.cluster != self.cluster || record.domain != self.domain {
+                return Err("the activation record is another cluster's or domain's".into());
+            }
+            // A record this build cannot run is refused, not read as
+            // nothing active (Codex on #98): `active` would turn one whose
+            // features do not parse into an empty set, and the node would
+            // vote without what the cluster activated. The store's start
+            // already refuses it; this holds for any other way a view
+            // reaches here.
+            coord_checkpoint::feature::admit_record(record)
+                .map_err(|e| format!("the activation record: {e}"))?;
         }
         self.record = record.clone();
         self.durable_record = record;

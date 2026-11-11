@@ -632,3 +632,52 @@ fn the_relay_is_activated_only_after_answer_on_release() {
         );
     }
 }
+
+/// A store whose activation record names a feature this build has never
+/// heard of is refused at open (Codex on #98), not read as nothing active:
+/// `Features::active` turns a record whose features do not parse into an
+/// empty set, so a voter opened over it would run without what its cluster
+/// activated. The same record with only features this build supports opens.
+#[test]
+fn an_activation_record_this_build_cannot_run_is_refused_at_open() {
+    let members: BTreeSet<ReplicaId> = (1..=3).map(replica).collect();
+    let voters = EpochVoters::new(epoch(3), members).unwrap();
+    for (features, opens) in [(vec![0x7fff], false), (vec![EP.id()], true)] {
+        let record = coord_checkpoint::feature::ActiveFeaturesV1 {
+            cluster: CLUSTER,
+            domain: DOMAIN,
+            configuration: epoch(3),
+            features: features.clone(),
+            reporters: vec![replica(1), replica(2), replica(3)],
+        };
+        let mut engine = ModelEngine::new();
+        let mut tx = engine.begin_write().unwrap();
+        let update = record.update().unwrap();
+        tx.put(
+            update.collection,
+            &update.key,
+            update.value.as_ref().unwrap(),
+        )
+        .unwrap();
+        tx.commit_durable().unwrap();
+        let view = engine.reader().snapshot().unwrap();
+        let opened = Features::open(
+            CLUSTER,
+            DOMAIN,
+            replica(1),
+            voters.clone(),
+            &view,
+            ReplicaIncarnation::new(1).unwrap(),
+            BootId([1; 16]),
+        );
+        match (opened, opens) {
+            (Ok(features), true) => assert_eq!(features.active(), set(&[EP])),
+            (Err(e), false) => assert!(e.contains("unknown active feature"), "{e}"),
+            (Ok(features), false) => panic!(
+                "{features:?}: opened over a record it cannot run, active {:?}",
+                features.active()
+            ),
+            (Err(e), true) => panic!("{features:?}: refused a record it can run: {e}"),
+        }
+    }
+}
