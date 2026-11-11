@@ -441,7 +441,11 @@ fn a_crash_inside_recovery_keeps_every_acknowledged_group() {
                 // What a fault-free reopen writes.
                 let probe = dir.path().join("probe");
                 copy_dir(&image, &probe);
-                let writes = reopen_on_the_kit(&probe, &options, FaultPlan::default())
+                // One reopen of the image as the crash left it: a second
+                // would find it already repaired, and count fewer of the
+                // operations recovering it takes (#211 Codex review).
+                let probed = reopen_on_the_kit(&probe, &options, FaultPlan::default());
+                let writes = probed
                     .log()
                     .iter()
                     .filter(|op| {
@@ -452,7 +456,7 @@ fn a_crash_inside_recovery_keeps_every_acknowledged_group() {
                     continue;
                 }
                 recoveries += 1;
-                let ops = reopen_on_the_kit(&probe, &options, FaultPlan::default()).ops();
+                let ops = probed.ops();
                 for j in 1..=ops {
                     for tail in [Tail::None, Tail::All] {
                         let root = dir.path().join(format!("r{j}{tail:?}"));
