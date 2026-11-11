@@ -4048,15 +4048,23 @@ So every feature-gated change, task-d98's `EarlyProposal` first, would ship unre
 - **The index.** It is held in memory, from (namespace, key) to retained (revision, ordinal)s. It is built at boot and at a local image's install from the retained events, and kept up to date by the materializer.
 - **Reads.** Reads at a past revision and range reads at a revision walk the index and read event rows.
 - **Compaction** keeps each key's newest version at or below the floor as its event row, even when the current row holds the same version, and deletes the rest below the floor.
-- **Formats.** `KvHistoryV1` leaves the common hash and the shared checkpoint, and that format's version is raised. The scrub (task-d37) reads the new layout. task-d26's contract gains the index's memory budget.
+- **Formats.** `KvHistoryV1` leaves the common hash and the shared checkpoint, and that format's version is raised. The scrub (task-d37) reads the new layout.
+  - **A domain runs one layout.** The store records its layout at initialization. Every open compares it and refuses a live store or image of the other layout, with the reason. No open reads `format_version` today, so this step builds that check.
+- **The index's budget** in task-d26's contract is counted in retained versions and key bytes, so every voter reaches it at the same position. At the limit, a write that adds a retained version is refused as resource-exhausted. Reads, deletes and compactions still run, and nothing compacts on its own.
+- **A voter votes before its index is built.** Executions, releases and reads wait for it.
+- **Second part, after the first's pair: no current row.** `KvCurrentV1` is no longer written. The latest version is an index lookup and an event row, and a range at the latest revision walks the index. It goes unless the pair's list read at the latest revision loses more than the row saves.
 
 **Acceptance:**
 - **The design step** recorded and reviewed.
-- **A differential test** over randomized histories, multi-key transactions and deletes among them, with compactions between: every read at a past revision, range read and watch replay answers as the current layout does, and a read at the floor still finds each key.
+- **A differential test** over randomized histories, multi-key transactions and deletes among them, with compactions between: every read at a past revision, range read and watch replay answers as the current layout does, and a read at the floor still finds each key. Named cases include a deleted key: its tombstone's event row is the key's newest version at or below the floor until a compaction passes it, and then the key leaves the index.
 - **Boot and install:** the index rebuilt equals the one kept live, after a restart and after a local image's install. The rebuild's time and the index's memory are measured at 10⁵ and 10⁶ retained versions.
-- **The checkpoint:** export, install, restore and scrub tests on the new format version, and an old format refused with the reason.
+  - **The bound:** the rebuild's time at the largest retained history the budget admits is under the election's patience.
+  - A restarted voter votes while its index is being built, and executes only once it is.
+- **The budget:** at the limit, every voter refuses the same write at the same position. A compaction lifts the refusal.
+- **The layout:** a live store and a local image of the other layout are each refused at open, with the reason. So are a shared checkpoint of the other format version and an old one.
+- **The checkpoint:** export, install, restore and scrub tests on the new format version.
 - **The storage crash tests** at every cut of a materializer commit and of a compaction.
-- **A local pair:** rows a command at every voter, the materializer's CPU a command, and compaction's deletes a revision.
+- **A local pair:** rows a command at every voter, the materializer's CPU a command, and compaction's deletes a revision. For the second part, add a range read at the latest revision at 10³ and 10⁴ keys, with and without the current row.
 
 **Review boundary:** How versions are stored and found, and the checkpoint format that carries them. No change to what a read at a revision or a watch returns.
 
