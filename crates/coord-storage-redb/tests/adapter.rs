@@ -708,3 +708,52 @@ fn single_page_damage_is_unreadable_or_repaired_never_a_panic() {
     );
     assert!(unreadable > 0);
 }
+
+/// A reinstall retried over the same unreadable selection reuses the
+/// number above it, removing whatever stagings earlier attempts left
+/// there: one a crash dropped, and one a refused start abandoned or
+/// could not (#212 review). A restart loop over an unreadable projection
+/// otherwise staged a new full generation every start and filled the
+/// state volume. The selection and the generations below it stay.
+#[test]
+fn a_reinstall_over_an_unreadable_selection_removes_the_stagings_left_above_it() {
+    let dir = tempfile::tempdir().unwrap();
+    drop(RedbHarness::create(dir.path()));
+    let db = dir.path().join("gen-000001/domain.redb");
+    std::fs::write(&db, vec![0x5a; 64 << 10]).unwrap();
+    let generations = || {
+        let mut names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("gen-"))
+            .collect();
+        names.sort();
+        names
+    };
+    // A crash: the staging is dropped, its directory left behind.
+    let first = Generation::stage_reinstall_unreadable(dir.path(), identity(), options())
+        .expect("stage over an unreadable selection");
+    assert!(first.directory().ends_with("gen-000002"));
+    drop(first);
+    // A stray staging further up, as a run of such crashes leaves.
+    std::fs::create_dir(dir.path().join("gen-000005")).unwrap();
+    assert_eq!(generations(), ["gen-000001", "gen-000002", "gen-000005"]);
+
+    let again = Generation::stage_reinstall_unreadable(dir.path(), identity(), options())
+        .expect("stage again");
+    assert!(
+        again.directory().ends_with("gen-000002"),
+        "{}",
+        again.directory().display()
+    );
+    assert_eq!(generations(), ["gen-000001", "gen-000002"]);
+    again.abandon().unwrap();
+    assert_eq!(generations(), ["gen-000001"]);
+    assert_eq!(std::fs::read(&db).unwrap(), vec![0x5a; 64 << 10]);
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("CURRENT"))
+            .unwrap()
+            .trim(),
+        "gen-000001"
+    );
+}

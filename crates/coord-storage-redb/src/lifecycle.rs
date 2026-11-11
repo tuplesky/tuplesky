@@ -899,6 +899,23 @@ fn panicked(what: &'static str, payload: &(dyn std::any::Any + Send)) -> OpenErr
 }
 
 /// The generation directories under a root, by number.
+/// Remove every generation of `root` numbered above `selected`, syncing
+/// the root once if any went. Only the caller holding the root lock may.
+fn remove_stagings_above(root: &Path, selected: u64) -> std::io::Result<Vec<u64>> {
+    let mut removed: Vec<u64> = generation_numbers(root)?
+        .into_iter()
+        .filter(|&n| n > selected)
+        .collect();
+    removed.sort_unstable();
+    for number in &removed {
+        std::fs::remove_dir_all(root.join(format!("gen-{number:06}")))?;
+    }
+    if !removed.is_empty() {
+        File::open(root)?.sync_all()?;
+    }
+    Ok(removed)
+}
+
 fn generation_numbers(root: &Path) -> std::io::Result<Vec<u64>> {
     let mut out = Vec::new();
     for entry in std::fs::read_dir(root)? {
@@ -1173,6 +1190,18 @@ fn stage_with_lock_for(
     obligations: Obligations,
 ) -> Result<InactiveGeneration, OpenError> {
     let previous = read_selected_for(root, &identity, &options, obligations)?;
+    // A reinstall retried over the same unreadable selection would
+    // otherwise stage above every staging an earlier attempt left: one a
+    // crash left, or one a start that refused after staging could not
+    // remove. None of them is selected, or ever was (`CURRENT` never named
+    // a generation above the selection), and the start that would prune
+    // them, one that opens the selection, never comes while it stays
+    // unreadable, so a restart loop filled the state volume (#212 review).
+    if matches!(obligations, Obligations::Unreadable)
+        && let Some(selected) = &previous
+    {
+        remove_stagings_above(root, selected.generation)?;
+    }
     let generation = generation_numbers(root)?
         .into_iter()
         .max()

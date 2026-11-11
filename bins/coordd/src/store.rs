@@ -529,22 +529,28 @@ pub fn open_storage_with(
             // Everything that can refuse the start runs on the staged
             // generation, and only then is it selected (#212 review): a
             // refusal leaves `CURRENT` where it was, naming the unreadable
-            // generation, with the staging unreferenced.
-            if let Some(before_attach) = before_attach.take() {
-                before_attach(staged.engine())?;
-            }
+            // generation, and removes the staging, which nothing names.
             let directory = staged.directory().to_path_buf();
-            rollback_guard(staged.engine(), &directory)?;
-            // Over the stream the root is stamped with: an adoption the
-            // attach carries out later has not re-keyed it yet.
-            refuse_unapplied_activation(
-                &store,
-                domain_id,
-                stamped_incarnation,
-                staged.engine(),
-                &journal_root,
-                &directory,
-            )?;
+            let checked = (|| {
+                if let Some(before_attach) = before_attach.take() {
+                    before_attach(staged.engine())?;
+                }
+                rollback_guard(staged.engine(), &directory)?;
+                // Over the stream the root is stamped with: an adoption
+                // the attach carries out later has not re-keyed it yet.
+                refuse_unapplied_activation(
+                    &store,
+                    domain_id,
+                    stamped_incarnation,
+                    staged.engine(),
+                    &journal_root,
+                    &directory,
+                )
+            })();
+            if let Err(refusal) = checked {
+                abandon(staged);
+                return Err(refusal);
+            }
             let discarded = staged.previous().map(|m| m.generation);
             let generation = staged.activate().map_err(|e| StoreError::Refused {
                 root: show(&root),
@@ -1009,6 +1015,19 @@ fn reinstall_unreadable(
     install_baseline(staged, &pointer, &image, refused)
 }
 
+/// Remove a staging a refused start leaves unselected. Failing to costs
+/// only disk, and the next reinstall over the same selection removes it
+/// (`Generation::stage_reinstall_unreadable`).
+fn abandon(staged: InactiveGeneration) {
+    let directory = staged.directory().to_path_buf();
+    if let Err(e) = staged.abandon() {
+        eprintln!(
+            "the refused staging {} could not be removed: {e}",
+            directory.display()
+        );
+    }
+}
+
 /// Fill `staged` with the baseline's image and select it.
 fn install_baseline(
     mut staged: InactiveGeneration,
@@ -1016,17 +1035,17 @@ fn install_baseline(
     image: &coord_checkpoint::LocalCheckpointV1,
     refused: impl Fn(String) -> StoreError,
 ) -> Result<InactiveGeneration, StoreError> {
-    coord_checkpoint::install_local(
+    if let Err(e) = coord_checkpoint::install_local(
         staged.engine(),
         image,
         &pointer.origin,
         &coord_checkpoint::local::InstallLocalLimits::default(),
-    )
-    .map_err(|e| {
-        refused(format!(
+    ) {
+        abandon(staged);
+        return Err(refused(format!(
             "the local checkpoint could not be installed: {e:?}"
-        ))
-    })?;
+        )));
+    }
     Ok(staged)
 }
 

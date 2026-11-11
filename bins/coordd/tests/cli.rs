@@ -2937,10 +2937,10 @@ async fn a_genesis_refused_start_leaves_an_unreadable_projection_selected() {
         std::fs::read(&database).expect("kept"),
         vec![0x5a; 64 << 10]
     );
-    assert!(
-        before.iter().all(|g| state.join(g).is_dir()),
-        "the refused start pruned a generation: {before:?} -> {:?}",
-        generations()
+    assert_eq!(
+        generations(),
+        before,
+        "the refused start pruned a generation, or left its staging"
     );
 
     // Under its own genesis the next start reinstalls and serves.
