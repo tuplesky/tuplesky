@@ -151,10 +151,27 @@ class SweepTests(unittest.TestCase):
         self.assertAlmostEqual(step.counts["api_releases"], 0.6)
         self.assertAlmostEqual(step.counts["journal_groups"], 0.4)
         self.assertNotIn("evidence_for_marked", step.counts)
+        self.assertNotIn("relayed", step.counts)
         text = sw.render([step], "Sweep")
         self.assertIn("**Counts a command, over the five voters**", text)
         # A count no voter carries gets no column.
         self.assertIn("| 30 | head | 5.00 | 1.50 | 8.00 | 1.00 | 0.20 | 0.40 | 0.60 | 0.40 | 0.50 |", text)
+        self.assertNotIn("Relayed to the leader alone", text)
+        # task-d102's relay and proposal frames, where a build counts them.
+        for node, relayed in (("n1", 0), ("n2", 8)):
+            with open(os.path.join(path, node, "coordd.log")) as f:
+                line = json.loads(f.read()[len("metrics "):])
+            line["cost"]["Observed"]["relay"] = {"relayed": relayed, "fallbacks": 1, "not_leading": 0}
+            line["cost"]["Observed"]["proposals"] = {"proposals": 40 if node == "n1" else 0, "frames": 10 if node == "n1" else 0}
+            with open(os.path.join(path, node, "coordd.log"), "w") as f:
+                f.write("metrics " + json.dumps(line) + "\n")
+        step = sw.read_step("head", "30", path)
+        self.assertAlmostEqual(step.counts["relayed"], 0.8)
+        self.assertAlmostEqual(step.counts["relay_fallbacks"], 0.2)
+        self.assertAlmostEqual(step.counts["proposals"], 4.0)
+        self.assertAlmostEqual(step.counts["proposal_frames"], 1.0)
+        self.assertNotIn("proposal_bytes", step.counts)
+        self.assertIn("Relayed to the leader alone", sw.render([step], "Sweep"))
 
     def test_labels(self):
         self.assertEqual(sw.label("head@30=/s/1"), ("head", "30", "/s/1"))

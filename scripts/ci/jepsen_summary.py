@@ -2012,6 +2012,46 @@ def resend_table(voters: dict) -> list[str]:
     return out
 
 
+def relay_table(voters: dict) -> list[str]:
+    """task-d102's leader relay and proposal frames, each voter's last
+    `metrics` line: what its collector sent to the leader alone, the ones
+    that fell back to every voter and the `NotLeading` refusals taken;
+    then what its leaders sent of fresh proposals and frontiers, framed or
+    not, per command it executed. [] from a build without either block."""
+    rows = []
+    for node, v in voters.items():
+        raw = (v.cost.raw or {}) if v.cost else {}
+        relay, sent = raw.get("relay"), raw.get("proposals")
+        if isinstance(relay, dict) or isinstance(sent, dict):
+            rows.append((node, v.cost.executed, relay if isinstance(relay, dict) else {}, sent if isinstance(sent, dict) else {}))
+    if not rows:
+        return []
+    out = [
+        "**Leader relay and proposal frames** (task-d102, each voter's last boot, from its last `metrics` line: "
+        "relayed is the submissions its collector sent to the leader alone, fell back the ones of those sent to "
+        "every voter after all, at the bound or at a `NotLeading` refusal; then what its leaders sent of fresh "
+        "proposals, one to each follower, and of frontier announcements, with the frames that carried more than "
+        "one proposal; bytes leave out the payload records relayed proposals carried, given apart; per command is "
+        "over the commands the voter executed)",
+        "",
+        "| Node | Relayed | Fell back | `NotLeading` | Proposals | Frames (proposals each) | Proposal bytes per command "
+        "| Payload bytes per command | Frontiers | Frontier bytes per command |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+    ]
+    per = lambda n, executed: f"{n / executed:.1f}" if executed else "-"
+    for node, executed, relay, sent in rows:
+        frames = sent.get("frames", 0)
+        each = f"{sent.get('framed', 0) / frames:.1f}" if frames else "-"
+        out.append(
+            f"| {node} | {relay.get('relayed', '-')} | {relay.get('fallbacks', '-')} | {relay.get('not_leading', '-')} "
+            f"| {sent.get('proposals', '-')} | {frames} ({each}) | {per(sent.get('proposal_bytes', 0), executed)} "
+            f"| {per(sent.get('payload_bytes', 0), executed)} | {sent.get('frontiers', '-')} "
+            f"| {per(sent.get('frontier_bytes', 0), executed)} |"
+        )
+    out.append("")
+    return out
+
+
 def loop_per_command(voters: dict, follower: str | None = None, leader: str | None = None,
                      sampled: dict | None = None) -> tuple[float | None, float | None]:
     """The leader's loop CPU per command and a follower's, in
@@ -2932,6 +2972,7 @@ def summarize(store: str, nodes: list[str], title: str, profile: str | None = No
             out.extend(fast_path_table(voters))
             out.extend(leadership_table(voters))
             out.extend(resend_table(voters))
+            out.extend(relay_table(voters))
             out.extend(leader_and_follower(store, voters))
             out.extend(transport_tables(store, voters))
     return "\n".join(out) + "\n"

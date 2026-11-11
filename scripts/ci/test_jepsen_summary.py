@@ -619,6 +619,25 @@ class CheckpointTests(unittest.TestCase):
         self.assertIn("| 1500 / 0 / 0; 4100 in the other maps, largest 1500 |", text)
         self.assertIn("execution order (#221)", text)
 
+    def test_the_leader_relay_and_proposal_frames(self):
+        cost = {"executed": 1000, "busy": {"secs": 1, "nanos": 0}, "uptime": {"secs": 60, "nanos": 0},
+                "recent": {"Unavailable": "NotInstrumented"}, "reads": {"served": 0}}
+        line = "metrics " + json.dumps({"stages": [], "cost": {"Observed": cost}}) + "\n"
+        # A build from before task-d102: no table.
+        self.assertNotIn("**Leader relay and proposal frames**", self.summarize(line))
+        cost["relay"] = {"relayed": 900, "fallbacks": 12, "not_leading": 3}
+        cost["proposals"] = {"proposals": 4000, "proposal_bytes": 480000, "payload_bytes": 96000,
+                             "frames": 500, "framed": 2000, "frontiers": 3000, "frontier_bytes": 60000}
+        line = "metrics " + json.dumps({"stages": [], "cost": {"Observed": cost}}) + "\n"
+        text = self.summarize(line)
+        self.assertIn("**Leader relay and proposal frames** (task-d102", text)
+        self.assertIn("| n1 | 900 | 12 | 3 | 4000 | 500 (4.0) | 480.0 | 96.0 | 3000 | 60.0 |", text)
+        # A follower that never led: its relay, no frames.
+        cost["proposals"] = {"proposals": 0, "proposal_bytes": 0, "payload_bytes": 0,
+                             "frames": 0, "framed": 0, "frontiers": 0, "frontier_bytes": 0}
+        line = "metrics " + json.dumps({"stages": [], "cost": {"Observed": cost}}) + "\n"
+        self.assertIn("| n1 | 900 | 12 | 3 | 0 | 0 (-) | 0.0 | 0.0 | 0 | 0.0 |", self.summarize(line))
+
 
 
 class CarryReadingTests(unittest.TestCase):

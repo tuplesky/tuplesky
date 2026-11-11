@@ -673,8 +673,12 @@ then gives a table of the steps, each run labelled `SIDE@STEP`:
   bucket's midpoint), beside the leader's round from submitted to learned;
 * counts a command over the five voters, from their `metrics` lines:
   each plane's datagrams, ACK frames and frames, the api plane's frames by
-  kind, the evidence for marked commands where the build counts it, and
-  the journal groups and projection commits;
+  kind, the evidence for marked commands where the build counts it,
+  task-d102's leader relay (submissions relayed to the leader alone, the
+  relays fallen back to every voter, the `NotLeading` refusals) and
+  proposal frames (proposals and frames sent, their bytes, the relayed
+  payload bytes and the frontier announcements) where the build counts
+  them, and the journal groups and projection commits;
 * whether a voter fell behind in each TupleSky run (Voters behind): each
   voter's executed position at the end against the most advanced
   voter's, its `Backpressure` refusals and the catch-up pages its last
@@ -684,7 +688,9 @@ then gives a table of the steps, each run labelled `SIDE@STEP`:
 * each TupleSky run's ratio to etcd's at its step.
 
 Each run's own summary also gives operations completed a second and the
-clients busy on average beside its `ok`/s.
+clients busy on average beside its `ok`/s, and, from a build with
+task-d102, each voter's leader relay and the proposal frames its leaders
+sent (Leader relay and proposal frames).
 
 The TupleSky job also reads each node container's CPU quota and its
 throttling (cgroup v2's `cpu.max` and `cpu.stat`), after the cluster is
