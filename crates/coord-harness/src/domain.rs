@@ -208,6 +208,11 @@ pub struct Provisioned {
     /// not the daemon's default (task-d55). Written only when set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint_after_records: Option<u64>,
+    /// `max_admitted_per_second` every voter's frontend was provisioned
+    /// with, where not the daemon's default (task-d26). Written only when
+    /// set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_admitted_per_second: Option<u32>,
 }
 
 impl Provisioned {
@@ -257,22 +262,36 @@ pub struct Plan {
     /// last local checkpoint before the next is published. Zero never
     /// publishes.
     pub checkpoint_after_records: Option<u64>,
+    /// `[limits] max_admitted_per_second` for every voter, where not the
+    /// daemon's default of 1,000 (task-d26): new requests each frontend
+    /// admits a second, the rest refused `BACKPRESSURE`.
+    pub max_admitted_per_second: Option<u32>,
 }
 
 /// The `[limits]` a voter's configuration carries when the plan sets one
 /// of them; empty otherwise, so the configuration is byte for byte what
-/// this harness has always written. The section's other fields are
-/// required, so they are written at the daemon's defaults, which
-/// `coordd`'s tests check against its own.
-fn limits_section(checkpoint_after_records: Option<u64>) -> String {
-    match checkpoint_after_records {
-        None => String::new(),
-        Some(n) => format!(
-            "\n[limits]\nmax_request_bytes = 2097152\nmax_response_bytes = 8388608\n\
-             max_outstanding_per_session = 256\nmax_live_subscriptions = 4096\n\
-             checkpoint_after_records = {n}\n"
-        ),
+/// this harness has always written. The section's other required fields
+/// are written at the daemon's defaults, which `coordd`'s tests check
+/// against its own; a limit the plan leaves unset is left out, so the
+/// daemon's default for it stands.
+fn limits_section(
+    checkpoint_after_records: Option<u64>,
+    max_admitted_per_second: Option<u32>,
+) -> String {
+    if checkpoint_after_records.is_none() && max_admitted_per_second.is_none() {
+        return String::new();
     }
+    let mut section = String::from(
+        "\n[limits]\nmax_request_bytes = 2097152\nmax_response_bytes = 8388608\n\
+         max_outstanding_per_session = 256\nmax_live_subscriptions = 4096\n",
+    );
+    if let Some(n) = checkpoint_after_records {
+        section.push_str(&format!("checkpoint_after_records = {n}\n"));
+    }
+    if let Some(n) = max_admitted_per_second {
+        section.push_str(&format!("max_admitted_per_second = {n}\n"));
+    }
+    section
 }
 
 /// The journal profile a provisioned domain's voters run, written into
@@ -366,6 +385,7 @@ impl Plan {
             issuer_listen: None,
             journal: JournalPlan::default(),
             checkpoint_after_records: None,
+            max_admitted_per_second: None,
         }
     }
 }
@@ -847,6 +867,7 @@ pub fn provision(plan: &Plan) -> std::io::Result<Provisioned> {
         edge,
         journal_profile: plan.journal.profile,
         checkpoint_after_records: plan.checkpoint_after_records,
+        max_admitted_per_second: plan.max_admitted_per_second,
     };
     std::fs::write(
         dir.join("harness.json"),
@@ -1024,7 +1045,7 @@ namespace = "{namespace}"
 {limits}"#,
         preamble = layout.preamble(),
         journal = plan.journal.lines(),
-        limits = limits_section(plan.checkpoint_after_records),
+        limits = limits_section(plan.checkpoint_after_records, plan.max_admitted_per_second),
         manifest = layout.shared("genesis.json"),
         admin_key = layout.shared(ADMIN_KEY),
         endpoints = layout.shared("endpoints.bin"),
