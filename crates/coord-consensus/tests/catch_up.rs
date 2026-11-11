@@ -1542,3 +1542,49 @@ fn after_a_boot_a_page_below_the_boot_frontier_is_still_ignored() {
 fn paths(cluster: &Cluster) -> coord_consensus::CatchUpPaths {
     cluster.follower(4).catch_up_paths()
 }
+
+/// The latest ask's page arrives while the window of a late page of an
+/// earlier ask is still in hand: it is dropped as busy, and the chain
+/// goes on once that window has executed, without the pacer (Codex on
+/// #223). Before, neither page asked again and the voter stopped short.
+#[test]
+fn the_latest_asks_page_dropped_while_a_late_window_runs_still_continues_the_chain() {
+    let (mut cluster, _) = left_behind(17);
+    cluster.serve = false;
+    let start = cluster.follower(4).executed_through();
+    cluster.ask(4);
+    let ahead = cluster.page_through(start, 3);
+    cluster.deliver_page(4, 0, &ahead);
+    cluster.settle();
+    cluster.ask(4);
+    let last = cluster.follower(4).executed_through();
+    let asks = cluster.catch_up_asks.len();
+    // The first ask's page, late and cut short, then the last ask's page,
+    // before the first one's window has run.
+    let mut late = cluster.page(0, ballot0(), start);
+    let ProtocolMessage::CatchUpPage { entries, .. } = &mut late else {
+        unreachable!()
+    };
+    entries.truncate(6);
+    let latest = cluster.page(0, ballot0(), last);
+    let before = paths(&cluster);
+    cluster.deliver_page(4, 0, &late);
+    assert!(
+        cluster.follower(4).catching_up(),
+        "the late window ran at once: the test shows nothing"
+    );
+    cluster.deliver_page(4, 0, &latest);
+    let now = paths(&cluster);
+    assert_eq!(now.ignored_busy, before.ignored_busy + 1, "{now:?}");
+    cluster.serve = true;
+    cluster.settle();
+    assert_eq!(
+        cluster.catch_up_asks.get(asks),
+        Some(&(4, start.get() + 6)),
+        "no ask followed the late window"
+    );
+    assert_eq!(
+        cluster.nodes[4].executed, cluster.nodes[0].executed,
+        "r4 stopped short with the latest ask's page dropped"
+    );
+}

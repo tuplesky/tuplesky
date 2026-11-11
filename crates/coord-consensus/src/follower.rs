@@ -3604,6 +3604,15 @@ impl Follower {
         };
         if let Some(path) = ignored {
             *path(&mut self.catch_up.paths) += 1;
+            if self.catch_up.busy() && self.catch_up.asked_after == Some(after) {
+                // The answer to the latest ask, while a window is still in
+                // hand: a late page of an earlier ask, taken and asking
+                // nothing. Dropped here, nothing would ask again once that
+                // window ran, and the chain would wait for the pacer. The
+                // next ask goes out when the window has executed, from the
+                // frontier, as one owed by this page.
+                self.catch_up.continue_from.get_or_insert(from);
+            }
             return Vec::new();
         }
         let offered = entries.len();
