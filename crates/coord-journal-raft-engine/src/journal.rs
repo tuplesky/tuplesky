@@ -430,6 +430,26 @@ pub trait DirSync {
 
 impl DirSync for DefaultFileSystem {}
 
+/// `dir` and the directories above it, the last of a relative path's
+/// being the current directory, `.`: the empty path `Path::ancestors`
+/// ends with exists nowhere, so a relative path whose first component
+/// was created found no directory that existed before it, and its sync
+/// stopped at `dir` (#210 review).
+fn ancestors(dir: &Path) -> impl Iterator<Item = &Path> {
+    dir.ancestors().map(|d| {
+        if d.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            d
+        }
+    })
+}
+
+/// The nearest of `dir` and the directories above it that exists.
+fn existing_ancestor(dir: &Path) -> Option<PathBuf> {
+    ancestors(dir).find(|d| d.exists()).map(Path::to_path_buf)
+}
+
 /// Sync `dir`, then each directory above it up to and including
 /// `existed`, the nearest one that existed before `create_dir_all`: each
 /// holds an entry made by this creation.
@@ -438,12 +458,7 @@ fn sync_created_dirs(
     dir: &Path,
     existed: Option<&Path>,
 ) -> std::io::Result<()> {
-    for d in dir.ancestors() {
-        let d = if d.as_os_str().is_empty() {
-            Path::new(".")
-        } else {
-            d
-        };
+    for d in ancestors(dir) {
         file_system.sync_dir(d)?;
         if existed.is_none_or(|e| e == d) {
             break;
@@ -489,7 +504,7 @@ impl<F: FileSystem + DirSync> RaftEngineJournal<F> {
         if dir.exists() && std::fs::read_dir(dir)?.next().is_some() {
             return Err(OpenError::AlreadyInitialized);
         }
-        let existed = dir.ancestors().find(|d| d.exists()).map(Path::to_path_buf);
+        let existed = existing_ancestor(dir);
         std::fs::create_dir_all(dir)?;
         let engine =
             Engine::open_with_file_system(cfg, Arc::new(TailGuard::new(file_system.clone())))
@@ -1173,5 +1188,60 @@ impl<F: FileSystem> JournalEngine for RaftEngineJournal<F> {
         inner.high_water = high_water;
         inner.mappings.insert(mapping.stream, *mapping);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The directories a creation syncs, in order.
+    #[derive(Default)]
+    struct Synced(Mutex<Vec<PathBuf>>);
+
+    impl DirSync for Synced {
+        fn sync_dir(&self, dir: &Path) -> std::io::Result<()> {
+            self.0.lock().unwrap().push(dir.to_path_buf());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_relative_journal_syncs_up_to_the_current_directory() {
+        // Neither component exists: the current directory holds the
+        // entry this creation would make.
+        let dir = Path::new("no-such-parent-of-a-journal/journal");
+        assert!(!Path::new("no-such-parent-of-a-journal").exists());
+        let existed = existing_ancestor(dir);
+        assert_eq!(existed.as_deref(), Some(Path::new(".")));
+        let synced = Synced::default();
+        sync_created_dirs(&synced, dir, existed.as_deref()).unwrap();
+        assert_eq!(
+            *synced.0.lock().unwrap(),
+            [
+                PathBuf::from("no-such-parent-of-a-journal/journal"),
+                PathBuf::from("no-such-parent-of-a-journal"),
+                PathBuf::from("."),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_journal_under_an_existing_directory_syncs_up_to_it() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("a/b/journal");
+        let existed = existing_ancestor(&dir);
+        assert_eq!(existed.as_deref(), Some(root.path()));
+        let synced = Synced::default();
+        sync_created_dirs(&synced, &dir, existed.as_deref()).unwrap();
+        assert_eq!(
+            *synced.0.lock().unwrap(),
+            [
+                dir.clone(),
+                root.path().join("a/b"),
+                root.path().join("a"),
+                root.path().to_path_buf(),
+            ]
+        );
     }
 }
