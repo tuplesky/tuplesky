@@ -446,8 +446,8 @@ Nothing here touches the fast path. A fanned-out command a fast-set follower pre
 
 **Its acceptance is amortization, in counts,** on the register row at five voters, read on the same counters as #185's (the cost model of datagrams and CPU a command by role is in #185's review record):
 - **Datagrams, two targets** (#205 review), with ACK-only datagrams counted on their own line beside the data datagrams:
-  - **The first milestone,** task-d72's 2.0× budget: at 120 callers, at most 5 datagrams a command over both planes (about 16.8 on step A's base). That is about 0.24 to 0.30 ms an operation.
-  - **The goal,** parity with etcd at about 0.15 ms an operation: at most 3 datagrams a command at 120 callers. Its shape includes one submission frame a collector a turn.
+  - **The first milestone,** task-d72's 2.0× budget: at 120 callers, at most 5 datagrams a command over both planes (about 16.8 on step A's base). At 53 µs a datagram and 0.87 commands an operation, that is about 0.23 ms an operation in the tokio threads, inside their 2.0× budget of 0.38 (task-d72's budgets, restated at etcd's 0.962 ms an operation read beside the head on #98).
+  - **The goal,** parity with etcd, where the tokio threads' budget is 0.19 ms an operation: at most 3 datagrams a command at 120 callers, about 0.14. Its shape includes one submission frame a collector a turn.
 - at least 10 commands a journal group at every voter (about 4.9);
 - the servers' CPU a command at 120 callers at most half of its value at 30.
 
