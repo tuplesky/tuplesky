@@ -339,7 +339,15 @@ impl Session {
     /// of the same instance could still resolve it; the caller reports
     /// it `info`.
     pub async fn execute(&mut self, request: &LogicalRequest) -> Answer {
-        self.carry(request, false).await
+        let deadline = self.deadline();
+        self.carry(request, false, deadline).await
+    }
+
+    /// [`Session::execute`] within a deadline the caller already holds,
+    /// so the phases of one operation share its budget. A deadline
+    /// already past submits nothing.
+    pub async fn execute_by(&mut self, request: &LogicalRequest, deadline: Instant) -> Answer {
+        self.carry(request, false, deadline).await
     }
 
     /// [`Session::execute`] for a request that only reads, whose caller
@@ -354,7 +362,20 @@ impl Session {
     /// no effect to resolve, so giving its retained result up loses
     /// nothing.
     pub async fn execute_read(&mut self, request: &LogicalRequest) -> Answer {
-        self.carry(request, true).await
+        let deadline = self.deadline();
+        self.carry(request, true, deadline).await
+    }
+
+    /// [`Session::execute_read`] within a deadline the caller already
+    /// holds.
+    pub async fn execute_read_by(&mut self, request: &LogicalRequest, deadline: Instant) -> Answer {
+        self.carry(request, true, deadline).await
+    }
+
+    /// The deadline of an operation starting now: one budget for all of
+    /// it, attempts, reconnects and every phase included.
+    pub fn deadline(&self) -> Instant {
+        Instant::now() + self.timing.budget
     }
 
     /// Give up on `id` whose outcome is not known: retire its identity
@@ -367,8 +388,17 @@ impl Session {
         }
     }
 
-    async fn carry(&mut self, request: &LogicalRequest, retire_unknown: bool) -> Answer {
-        let deadline = Instant::now() + self.timing.budget;
+    async fn carry(
+        &mut self,
+        request: &LogicalRequest,
+        retire_unknown: bool,
+        deadline: Instant,
+    ) -> Answer {
+        if Instant::now() >= deadline {
+            // An earlier phase spent the operation's budget: submitting
+            // now could only leave an effect the caller cannot wait for.
+            return Answer::NotSubmitted("not-submitted: budget spent".into());
+        }
         let attempt_ms = u32::try_from(self.timing.attempt.as_millis()).unwrap_or(u32::MAX);
         let id = match self.client.submit(self.now(), request, attempt_ms) {
             Ok(id) => id,

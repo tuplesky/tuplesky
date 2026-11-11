@@ -111,7 +111,11 @@ async fn run(session: &mut Session, codec: &Codec, request: &Value) -> Result<Ve
 
 async fn txn(session: &mut Session, codec: &Codec, mops: &[Micro]) -> Verdict {
     let keys = ops::keys_of(mops);
-    let answer = session.execute_read(&codec.read(&keys)).await;
+    // One budget for the whole operation: the snapshot and the guarded
+    // write share it, and a snapshot that spends it leaves the write
+    // unsubmitted.
+    let deadline = session.deadline();
+    let answer = session.execute_read_by(&codec.read(&keys), deadline).await;
     let seen = match answer {
         Answer::Established(response) => match ops::snapshot(&response, keys.len()) {
             Ok(seen) => seen,
@@ -128,7 +132,10 @@ async fn txn(session: &mut Session, codec: &Codec, mops: &[Micro]) -> Verdict {
         return Verdict::Ok(Value::Array(applied.completed));
     }
     let answer = session
-        .execute(&codec.guarded_write(&applied.observed, &applied.writes))
+        .execute_by(
+            &codec.guarded_write(&applied.observed, &applied.writes),
+            deadline,
+        )
         .await;
     let completed = Value::Array(applied.completed);
     ops::write_verdict(answer, |r| {
