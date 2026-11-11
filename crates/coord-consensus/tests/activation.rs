@@ -8887,3 +8887,81 @@ fn a_window_stopped_for_a_left_ballot_leaves_the_next_ask_at_the_frontier() {
     settle_collecting(&mut f, peer_event(r(0), rest));
     assert_eq!(f.next_executable(), Some(second));
 }
+
+/// task-d109 review: a command pending a Sync's installation, which this
+/// voter held no record of when the Sync arrived, and whose record a
+/// submission then makes under other facts than the Sync named. The
+/// voter notes it then, one command, as awaiting the named facts, and
+/// asks for its payload under them. Before this test, a control that
+/// dropped that one-command note passed every suite: every other test
+/// reached the index only through a Sync's installation, which notes
+/// every pending command at once.
+#[test]
+fn a_command_recorded_under_other_facts_after_its_sync_is_asked_for_under_the_named_ones() {
+    let mut cluster = Cluster::new(41);
+    // Nothing moves between voters but what the test hands them.
+    cluster.cut = (0..3u8)
+        .flat_map(|a| (0..3u8).map(move |b| (a, b)))
+        .filter(|(a, b)| a != b)
+        .collect();
+    // r2 holds X under the facts the Sync will name; r1 holds nothing.
+    let x = cluster.admit_presented(1, 1, &[2], 10);
+    cluster.settle();
+    let named = cluster.nodes[2]
+        .follower()
+        .payload(&x)
+        .unwrap()
+        .admission_digest();
+    assert!(cluster.nodes[1].follower().table().phase_of(&x).is_none());
+    let own = cluster.nodes[1].executed_through();
+    let decision = SyncDecision {
+        ballot: ballot(1, 2),
+        source_ballot: ballot(0, 0),
+        entries: BTreeMap::from([(
+            x,
+            coord_consensus::SyncEntry {
+                command: x,
+                phase: Phase::Accept,
+                deps: vec![],
+                path: coord_consensus::empty_path(),
+                paths: Vec::new(),
+                seqnum: 0,
+                admission: Some(named),
+            },
+        )]),
+        reproposed: Default::default(),
+    };
+    for (from, message) in [
+        (
+            r(2),
+            ProtocolMessage::NewLeader {
+                ballot: ballot(1, 2),
+                executed: own,
+            },
+        ),
+        (r(2), ProtocolMessage::Sync(decision)),
+    ] {
+        let effects = cluster.nodes[1].step(peer_event(from, message));
+        cluster.handle(1, effects);
+    }
+    assert_eq!(
+        cluster.nodes[1].follower().missing_payloads(),
+        vec![x],
+        "pending, with no payload"
+    );
+    // The submission reaches r1 under other facts: its record is made
+    // under them, and its payload is held.
+    cluster.admit_presented(1, 1, &[1], 9);
+    let f = cluster.nodes[1].follower();
+    let held = f.table().record(&x).and_then(|r| r.payload);
+    assert!(
+        held.is_some_and(|p| p != named),
+        "recorded under other facts: {held:?}"
+    );
+    assert_eq!(
+        f.missing_payloads(),
+        vec![x],
+        "the payload under the named facts is asked for"
+    );
+    assert_eq!(f.missing_payload_count(8), 1);
+}
