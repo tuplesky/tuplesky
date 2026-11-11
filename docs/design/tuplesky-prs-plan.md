@@ -3928,36 +3928,51 @@ So every feature-gated change, task-d98's `EarlyProposal` first, would ship unre
 **Design:** Section 4.3 (amended by this task's design step: a contended round is a batch), and Sections 4.8 and 4.9, which the acknowledgement through a position rests on and doesn't change.
 
 **Implement:** From #185's next steps (#185 review): every per-command message and group of a slow round folded into one a turn, for one domain. The design step is in Section 4.3; this entry is its code steps, each its own PR after its own review, in this order.
-- **First, the reading,** on step A's head at five voters, register row, 30 and 120 callers: datagrams a command by plane and kind, commands a proposal, an acknowledgement and a release frame, commands a journal group and a projection commit at each voter, and the servers' CPU a command. The figures in the acceptance below are read against it.
+- **First, the reading,** on step A's head at five voters, register row, 30 and 120 callers. It reads:
+  - datagrams a command by plane and kind, with ACK-only datagrams on their own line;
+  - the batch at each hop: commands a proposal frame, positions an acknowledgement frame, and releases a release frame (each one today, by construction);
+  - the events the leader's loop takes between two flushes, which bounds those batches;
+  - commands a journal group and a projection commit at each voter;
+  - the servers' CPU a command.
+
+  The figures in the acceptance below are read against it.
 - **The batched frames (`Feature::BatchedRound`),** with task-d100's step B built here and not alone:
-  - one proposal frame a follower a turn, carrying every proposal of the turn in sequence-number order with its vote, a relayed command's payload record, and the commit frontier; split only at the transport's frame bound;
+  - **a turn is the leader loop's work between two lowered groups.** The leader queues what it orders for each follower and each collector, and cuts the frames where the loop lowers a journal group (no event ready, `owes_flush`) or at the frame bound. No timer cuts a frame, and one caller gets a frame of one at once;
+  - one proposal frame a follower a turn, carrying every proposal of the turn in sequence-number order with its vote, a relayed command's payload record, and the commit frontier; split only at the transport's frame bound. A turn that orders nothing for a follower sends it the frontier on its own, as today;
   - step B's relay, switch, advice bit and fallbacks as Section 4.3's B1 and B2 state them, the advice bit once a release frame;
-  - one release frame a collector a turn, each entry checked as one release is today;
+  - one release frame a collector a turn, each entry checked as one release is today and independent of the others: one `check_release` holds or refuses doesn't hold or refuse the rest;
   - a follower adopts a frame's proposals in one journal group, each checked and adopted as step B adopts one.
 - **The acknowledgement through a position (`Feature::AckRanges`),** after the frames:
   - `AdoptedThrough { ballot, ranges }`, its ranges bounded, sent once a batch is durable; above the bound, and for an adoption with no sequence number, today's `SlowAck`;
-  - the leader counts a `SlowAck` with its own proposal's command and admission for each position newly covered, and drops a position it didn't number;
+  - the leader counts a `SlowAck` with its own proposal's command and admission for each position newly covered, and drops a position it didn't number. A covered position counts only for the proposal the leader holds at that position now, and counts nothing if that proposal was replaced or swept;
+  - a debug assertion in `put_proposal` that a proposal is never replaced within one ballot, which every simulator row runs. Reading `repropose`'s callers doesn't settle whether such a replacement happens; the counting rule above holds either way;
   - per voter, the contiguous position counted (`adopted_through`, task-d59) and the ranges above it.
 - **The groups and the commits, under their own entries in this order:** task-d84's parts 2 and 3 (one journal sync a turn), then task-d86's leader half and task-d101's option 1 (a follower's commit cadence). This task's acceptance reads them together.
-- **Not built:** a collector's submissions batched (the next lever if the datagram count misses, sized from the miss), and the extension across domains Section 4.3 describes.
+- **After the first milestone:** a collector's submissions folded into one frame a turn. The goal's datagram target needs it, and it is sized from the first milestone's reading.
+- **Not built:** the extension across domains Section 4.3 describes.
 
 **Acceptance:**
 - **The design step** recorded and reviewed before any code, the acknowledgement's argument with it.
 - **Model tests, the frames:**
   - a turn's proposals to a follower leave in one frame, in sequence-number order, and a follower adopts them in one journal group;
   - a payload in a frame whose identity or admission differs from its vote's is dropped and fetched, and the frame's other proposals are adopted;
-  - a turn's releases to a collector leave in one frame, and a collector answers each entry exactly as it answers one release, a held one included;
+  - a turn's releases to a collector leave in one frame, and a collector answers each entry exactly as it answers one release; an entry held or refused leaves the frame's other entries answered;
+  - a turn that orders nothing for a follower sends it the commit frontier on its own;
+  - with one caller, each frame leaves at the first flush, holding one command;
   - a frame lost, duplicated or split at the bound changes no decision, and the re-send (task-d49, task-d59) re-sends what a voter hasn't acknowledged.
 - **Model tests, the acknowledgement:**
   - a range is sent only once every adoption it covers, and every outstanding batch of the voter, is durable;
   - the leader counts a covered position once, with its own proposal's command and admission, and never toward a fast quorum;
   - a hole (a payload fetched, a lost frame) leaves the positions above it counted, and a proposal held for a rebind (`awaits_rebind`) or refused is never covered;
   - an adoption restored after a restart is acknowledged by `SlowAck` until `ProposalRequest` gives it a position;
-  - a position past the leader's numbering, or of another ballot, is dropped.
+  - a position past the leader's numbering, or of another ballot, is dropped;
+  - a covered position whose proposal the leader replaced or swept counts nothing, and the replacing proposal is counted only once a range covers its own position.
 - **The protocol simulator,** with both features on in every row and the oracle over the sweep, at three and five voters, with and without catch-up, and the weekly sweep's knob added by the testing session. Two negative controls, each caught by the oracle: a voter that covers a position before its adoption is durable, under crash; and a leader that counts a range under the admission of another proposal.
 - **The storage crash tests** at every cut between a frame's adoption batch and its acknowledgement.
 - **The counts,** at five voters on the register row, on step A's counters, in a local pair and then the runner pair in the batch job (task-d72):
-  - at 120 callers, at most 5 datagrams a command over both planes (about 16.8 on step A's base);
+  - **datagrams, two targets,** with ACK-only datagrams on their own line:
+    - the first milestone (task-d72's 2.0× budget): at 120 callers, at most 5 datagrams a command over both planes (about 16.8 on step A's base);
+    - the goal (parity): at most 3 a command at 120 callers, with a collector's submissions in one frame a turn;
   - at least 10 commands a journal group at every voter (about 4.9);
   - the servers' CPU a command at 120 callers at most half of its value at 30.
 
