@@ -4346,12 +4346,15 @@ fn a_voter_accepting_under_other_facts_rebinds_to_the_selected_ones() {
 
 /// The same for a command the voter executed and retired: its record is
 /// gone, and its payload row, where it is still kept, is what it was
-/// executed under (task-d14).
+/// executed under (task-d14). Kept means within the window the table
+/// still remembers it executed in: past that, the voter forgets the row
+/// in execution order (task-d111 item 4 (d)), so six commands follow it
+/// here, not ten.
 #[test]
 fn a_voter_handed_other_facts_for_a_command_it_retired_stops() {
     let mut cluster = Cluster::with_capacity(41, 4);
     let x = cluster.admit(1, 1);
-    for s in 2..12u64 {
+    for s in 2..8u64 {
         cluster.admit(s, s as u8);
         cluster.settle();
     }
@@ -6612,6 +6615,43 @@ fn bindings_are_bounded_by_the_commands_kept_not_by_history() {
     cluster.settle();
     assert_eq!(cluster.nodes[0].executed.len(), executed);
     assert_eq!(cluster.nodes[0].executed[0], first.unwrap());
+}
+
+/// task-d111 item 4 (d): a voter forgets its history in execution order,
+/// a few entries per execution, so the ledger stays near what the table
+/// keeps and the backstop sweep never comes due. Before, the ledger grew
+/// to four times the capacity and every voter then swept all of it in one
+/// execution (~16 ms every ~2,400 commands at the run's capacity).
+#[test]
+fn history_is_forgotten_in_order_and_the_sweep_never_comes_due() {
+    let mut cluster = Cluster::new(19);
+    let mut most = [0usize; 3];
+    for n in 0..1_000u64 {
+        cluster.admit(n + 1, (n % 200) as u8);
+        cluster.settle();
+        for (i, most) in most.iter_mut().enumerate() {
+            let ledger = match cluster.nodes[i].role.as_ref().unwrap() {
+                Role::Leader(l) => l.ledger(),
+                Role::Follower(f) => f.ledger(),
+            };
+            *most = (*most).max(ledger.len());
+        }
+    }
+    // The sweep's threshold: four times the voters' capacity of 32.
+    let threshold = 32 * 4;
+    for (i, most) in most.iter().enumerate() {
+        assert!(
+            *most < threshold,
+            "r{i}'s ledger reached {most} of a {threshold} threshold"
+        );
+        let ledger = match cluster.nodes[i].role.as_ref().unwrap() {
+            Role::Leader(l) => l.ledger(),
+            Role::Follower(f) => f.ledger(),
+        };
+        assert_eq!(ledger.sweeps(), 0, "r{i} swept its history");
+        assert!(!ledger.forget_skipped(), "r{i} skipped forgetting");
+    }
+    assert_eq!(cluster.nodes[0].executed.len(), 1_000);
 }
 
 /// task-d33 (protocol_sim row 5, three voters, seed 3): a command a

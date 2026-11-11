@@ -11,7 +11,7 @@
 //! an assembler counts a report only when every page arrived intact, and
 //! refuses advertised totals beyond the bound.
 
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::vec::Vec;
 
 use coord_core::effect::{BarrierId, PeerId};
@@ -101,6 +101,21 @@ pub struct DurableLedger {
     /// Executions since the last history sweep (task-d110): each may have
     /// made a kept record forgettable.
     executed_since: usize,
+    /// The commands executed here, in the order they executed, whose
+    /// history the owner has not dropped yet (task-d111's cut (d)). The
+    /// table forgets in that order: a command is forgotten once enough
+    /// executions are durable past it and it has left the window of
+    /// recent retirements. So the owner drops a forgotten command's
+    /// entries from the front of this queue, one at a time, as it
+    /// executes others, and a history sweep walks every map only as a
+    /// backstop.
+    forget_queue: VecDeque<CommandId>,
+    /// Whether a command left `forget_queue` unforgotten, to keep it
+    /// bounded, since the last sweep: then only a sweep drops it.
+    forget_skipped: bool,
+    /// Executions noted since this ledger was made, for the owner's debug
+    /// checks of its forgetting.
+    executions: u64,
 }
 
 impl DurableLedger {
@@ -114,6 +129,9 @@ impl DurableLedger {
             swept_at: 0,
             sweeps: 0,
             executed_since: 0,
+            forget_queue: VecDeque::new(),
+            forget_skipped: false,
+            executions: 0,
         }
     }
 
@@ -127,6 +145,9 @@ impl DurableLedger {
             swept_at: 0,
             sweeps: 0,
             executed_since: 0,
+            forget_queue: VecDeque::new(),
+            forget_skipped: false,
+            executions: 0,
         }
     }
 
@@ -259,10 +280,74 @@ impl DurableLedger {
         self.sequences.retain(|c, _| keep(c));
     }
 
-    /// A command was executed: what a sweep could forget may have grown
-    /// though the ledger did not (task-d110).
-    pub fn executed(&mut self) {
+    /// `command` was executed: what a sweep could forget may have grown
+    /// though the ledger did not (task-d110), and its history is dropped
+    /// once the table forgets it ([`DurableLedger::take_forgotten`]).
+    pub fn executed(&mut self, command: CommandId) {
         self.executed_since = self.executed_since.saturating_add(1);
+        self.executions = self.executions.wrapping_add(1);
+        self.forget_queue.push_back(command);
+    }
+
+    /// Executions noted since this ledger was made.
+    pub const fn executions(&self) -> u64 {
+        self.executions
+    }
+
+    /// Queue `commands`, executed in this order before the owner was
+    /// built, for their history to be dropped as the table forgets them:
+    /// the executions a restart restores.
+    pub fn executed_before(&mut self, commands: impl IntoIterator<Item = CommandId>) {
+        self.forget_queue.extend(commands);
+    }
+
+    /// The commands at the front of the forget queue that `forgotten`
+    /// says the table has forgotten, at most `limit` of them, in the order
+    /// they executed; the owner drops their history ([`DurableLedger::forget`]
+    /// and its own maps). Each is taken once.
+    ///
+    /// The queue holds at most `bound` commands: past it the oldest
+    /// leaves whether or not it is forgotten yet, and then only a history
+    /// sweep drops what it named ([`DurableLedger::forget_skipped`]). A
+    /// table that never forgets, an unbounded one, so costs nothing.
+    pub fn take_forgotten(
+        &mut self,
+        forgotten: impl Fn(&CommandId) -> bool,
+        limit: usize,
+        bound: usize,
+    ) -> Vec<CommandId> {
+        let mut gone = Vec::new();
+        while gone.len() < limit {
+            match self.forget_queue.front() {
+                Some(c) if forgotten(c) => {
+                    gone.extend(self.forget_queue.pop_front());
+                }
+                _ => break,
+            }
+        }
+        while self.forget_queue.len() > bound {
+            self.forget_queue.pop_front();
+            self.forget_skipped = true;
+        }
+        gone
+    }
+
+    /// Whether a command left the forget queue unforgotten since the last
+    /// history sweep, so that its history waits for the next one.
+    pub const fn forget_skipped(&self) -> bool {
+        self.forget_skipped
+    }
+
+    /// The commands waiting in the forget queue (debug checks).
+    pub fn forget_queued(&self) -> BTreeSet<CommandId> {
+        self.forget_queue.iter().copied().collect()
+    }
+
+    /// Drop the durable record of one forgotten command, as
+    /// [`DurableLedger::retain`] would.
+    pub fn forget(&mut self, command: &CommandId) {
+        self.records.remove(command);
+        self.sequences.remove(command);
     }
 
     /// Whether a history sweep is due, at `threshold` records
@@ -297,6 +382,7 @@ impl DurableLedger {
         self.swept_at = self.records.len();
         self.executed_since = 0;
         self.sweeps += 1;
+        self.forget_skipped = false;
     }
 
     /// What the last history sweep left, lowered as records left
@@ -701,18 +787,18 @@ mod tests {
         assert!(!ledger.sweep_due(40));
         ledger.records.extend(rows(121, 151));
         for _ in 0..20 {
-            ledger.executed();
+            ledger.executed(rows(0, 1)[0].0);
         }
         assert!(!ledger.sweep_due(40), "30 added and 20 executed");
-        ledger.executed();
+        ledger.executed(rows(0, 1)[0].0);
         assert!(ledger.sweep_due(40), "30 added and 21 executed");
         // A backlog that drains: nothing added, executions alone.
         ledger.swept();
         for _ in 0..65 {
-            ledger.executed();
+            ledger.executed(rows(0, 1)[0].0);
         }
         assert!(!ledger.sweep_due(40), "65 executed of 130 kept");
-        ledger.executed();
+        ledger.executed(rows(0, 1)[0].0);
         assert!(ledger.sweep_due(40), "66 executed of 130 kept");
         // Records leaving without a sweep lower the mark: 39 left of the
         // 130 kept, under the threshold.
@@ -778,7 +864,7 @@ mod tests {
         let mut ledger = DurableLedger::restore(rows(0, BEHIND));
         let (mut sweeps, mut looked) = (0u64, 0u64);
         for executed in 1..=BEHIND {
-            ledger.executed();
+            ledger.executed(rows(0, 1)[0].0);
             if ledger.sweep_due(THRESHOLD) {
                 sweeps += 1;
                 looked += ledger.len() as u64;

@@ -1039,8 +1039,31 @@ impl Leader {
     /// Due as a follower's is (task-d110): past a multiple of the table,
     /// once the records added and the commands executed since the last
     /// sweep come to more than half of what it kept.
-    fn forget_history(&mut self) {
-        self.ledger.executed();
+    ///
+    /// Each execution first drops the history of what the table has
+    /// forgotten since, in the order it executed (task-d111's cut (d)),
+    /// so the sweep below is a backstop, as at a follower.
+    fn forget_history(&mut self, executed: CommandId) {
+        self.ledger.executed(executed);
+        let table = &self.table;
+        let gone = self.ledger.take_forgotten(
+            |c| table.forgotten(c),
+            crate::follower::FORGET_PER_EXECUTION,
+            self.config
+                .capacity
+                .saturating_mul(crate::follower::HISTORY_SWEEP),
+        );
+        for c in gone {
+            self.forget_one(c);
+        }
+        #[cfg(debug_assertions)]
+        if self
+            .ledger
+            .executions()
+            .is_multiple_of(crate::follower::FORGET_CHECK_EVERY)
+        {
+            self.check_forgetting();
+        }
         if !self.ledger.sweep_due(
             self.config
                 .capacity
@@ -1064,6 +1087,49 @@ impl Leader {
         // that, and kept it grew with every key ever submitted (task-d26).
         self.bindings.retain(|_, c| !table.forgotten(c));
         self.ledger.swept();
+    }
+
+    /// Drop what this leader keeps about `command`, which the table has
+    /// forgotten, from every map [`Leader::forget_history`]'s sweep walks,
+    /// with the indexes over its proposal (task-d111's cut (d)).
+    fn forget_one(&mut self, command: CommandId) {
+        self.ledger.forget(&command);
+        let payload = self.payloads.remove(&command);
+        self.served_payloads.remove(&command);
+        if let Some(proposal) = self.proposals.remove(&command) {
+            self.unsettled.remove(&(proposal.seqnum, command));
+            self.durable.remove(&(proposal.seqnum, command));
+            if self.by_barrier.get(&proposal.barrier) == Some(&command) {
+                self.by_barrier.remove(&proposal.barrier);
+            }
+        }
+        self.answer_on_release.remove(&command);
+        self.votes.remove(&command);
+        if let Some(payload) = payload
+            && self.bindings.get(&payload.retry_key) == Some(&command)
+        {
+            self.bindings.remove(&payload.retry_key);
+        }
+    }
+
+    /// Debug check of cut (d) against the sweep it replaces, as a
+    /// follower's (`Follower::check_forgetting`).
+    #[cfg(debug_assertions)]
+    fn check_forgetting(&self) {
+        if self.ledger.forget_skipped() {
+            return;
+        }
+        let queued = self.ledger.forget_queued();
+        let kept = |c: &CommandId| !self.table.forgotten(c) || queued.contains(c);
+        debug_assert!(
+            self.ledger.records().all(|(c, _)| kept(c))
+                && self.payloads.keys().all(kept)
+                && self.served_payloads.iter().all(kept)
+                && self.proposals.keys().all(kept)
+                && self.votes.keys().all(kept)
+                && self.bindings.values().all(kept),
+            "a forgotten command's history was kept and is not in the forget queue"
+        );
     }
 
     /// Propose a known command under this ballot with `deps`. With
@@ -1847,7 +1913,7 @@ impl Leader {
             self.missed.note(command, reason, self.config.capacity);
         }
         self.learn();
-        self.forget_history();
+        self.forget_history(command);
         // A command whose result was released speculatively is already
         // disclosed; releasing it again would answer one caller twice.
         // A command whose result was *not* is only disclosed here.
@@ -4007,10 +4073,10 @@ mod tests {
         let (mut leader, _) = Leader::from_recovered(follower.into_recovered(), quorum, &decision);
         assert_eq!(leader.ledger.len(), behind as usize);
         let before = leader.ledger.sweeps();
-        leader.forget_history();
+        leader.forget_history(CommandId(Digest32([0xee; 32])));
         assert_eq!(leader.ledger.sweeps(), before + 1, "swept once at first");
         for _ in 0..9 {
-            leader.forget_history();
+            leader.forget_history(CommandId(Digest32([0xee; 32])));
         }
         assert_eq!(
             leader.ledger.sweeps(),
@@ -4019,7 +4085,7 @@ mod tests {
         );
         assert_eq!(leader.ledger.len(), behind as usize, "nothing forgotten");
         for _ in 0..behind / 2 {
-            leader.forget_history();
+            leader.forget_history(CommandId(Digest32([0xee; 32])));
         }
         assert_eq!(leader.ledger.sweeps(), before + 2, "once half was executed");
     }
