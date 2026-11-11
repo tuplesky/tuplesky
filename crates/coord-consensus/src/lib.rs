@@ -147,8 +147,8 @@ pub use ballot::{
 pub use campaign::Campaign;
 pub use catch_up::{CatchUpDivergence, CatchUpPaths, DonorExecution, OwnExecution};
 pub use commands::{
-    CommandRecord, CommandTable, InitError, Initialized, RECOVERY_RESERVE_PARTS, RetireError,
-    TableWait, TableWaits,
+    CommandRecord, CommandTable, InitError, Initialized, RECOVERY_RESERVE_PARTS, RelayRoom,
+    RetireError, TableWait, TableWaits,
 };
 pub use floor::{
     ActivatedFloor, ActivationError, Discovered, FenceVerdict, FloorCandidate, FloorConflict,
@@ -170,12 +170,13 @@ pub use handoff::{
 pub use leader::{
     CONSERVATIVE_KEY, FenceReason, Leader, LeaderConfig, MAX_PROPOSAL_ATTEMPTS, Proposal,
     REPROPOSE_BATCH, RESEND_BACKOFF_CAP, RESEND_HANDOFF_CALLS, RESEND_INTERVAL_CAP,
-    RESEND_LATENCY_SAMPLES, RESEND_PER_VOTER, Rejection, ResendCounts,
+    RESEND_LATENCY_SAMPLES, RESEND_PER_VOTER, Rejection, ResendCounts, SentBytes,
 };
 pub use learner::{AppliedOutcome, LearnError, Learner, LearningMode};
 pub use messages::{
-    CatchUpEntry, FeatureRecord, MAX_CATCH_UP_BYTES, MAX_CATCH_UP_COMMANDS, MAX_PAYLOAD_TRANSFER,
-    MAX_PROPOSAL_ASK, PathAnchors, ProtocolMessage, SubmissionRefusal, is_payload_transfer,
+    CatchUpEntry, FeatureRecord, FramedProposal, MAX_CATCH_UP_BYTES, MAX_CATCH_UP_COMMANDS,
+    MAX_PAYLOAD_TRANSFER, MAX_PROPOSAL_ASK, MAX_PROPOSAL_FRAME_BYTES, PathAnchors, ProtocolMessage,
+    SubmissionRefusal, is_payload_transfer,
 };
 pub use phase::{GuardViolation, Phase, guard_accept, guard_commit, guard_execute};
 pub use publication::{DurableRecord, Publication};

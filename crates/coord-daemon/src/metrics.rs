@@ -552,6 +552,18 @@ pub struct Cost {
     /// history sweep forgets (task-d110).
     #[serde(default)]
     pub history: History,
+    /// How many events the domain loop took between its flushes, by
+    /// plane (task-d102): a batched round's frame is cut at a flush, so
+    /// this is what a turn can hold.
+    #[serde(default)]
+    pub flushes: Flushes,
+    /// What this voter's leaders sent of their fresh proposals and their
+    /// frontier, by kind (task-d102). Zero for a voter that never led.
+    #[serde(default)]
+    pub proposals: ProposalBytes,
+    /// What this node's collector relayed to the leader alone (task-d102).
+    #[serde(default)]
+    pub relay: Relay,
     /// The command table, and what holds back its oldest unexecuted
     /// record (task-d25, #98).
     #[serde(default)]
@@ -611,6 +623,79 @@ impl OldestWait {
             coord_consensus::TableWait::Ready => Self::Ready,
         }
     }
+}
+
+/// How many events the domain loop took between flushes (task-d102),
+/// cumulative.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Flushes {
+    /// Flushes the loop took.
+    pub flushes: u64,
+    /// API-plane events taken before them, summed over the flushes.
+    pub api_events: u64,
+    /// Peer-plane events taken before them, summed over the flushes.
+    pub peer_events: u64,
+    /// Flushes by the events taken since the one before: 0, 1, 2, 3-4,
+    /// 5-8, 9-16, 17-32, 33-63, 64 and more.
+    pub by_events: [u64; 9],
+}
+
+impl Flushes {
+    /// Count a flush after `api` API-plane events and `peer` peer-plane
+    /// ones.
+    pub fn count(&mut self, api: u64, peer: u64) {
+        self.flushes += 1;
+        self.api_events += api;
+        self.peer_events += peer;
+        let bucket = match api + peer {
+            0 => 0,
+            1 => 1,
+            2 => 2,
+            3..=4 => 3,
+            5..=8 => 4,
+            9..=16 => 5,
+            17..=32 => 6,
+            33..=63 => 7,
+            _ => 8,
+        };
+        self.by_events[bucket] += 1;
+    }
+}
+
+/// What a voter's leaders sent of their fresh proposals and their
+/// frontier, by kind (task-d102), cumulative: what the batched round's
+/// frames save, and what is left to cut. A re-send, a re-presentation and
+/// an answer to a follower's ask are counted in [`Resends`], not here.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProposalBytes {
+    /// Proposals sent, one to each follower, framed or not.
+    pub proposals: u64,
+    /// Their bytes, without the payload records relayed proposals
+    /// carried: the votes, and each frame's header and length prefixes.
+    pub proposal_bytes: u64,
+    /// The payload records relayed proposals carried.
+    pub payload_bytes: u64,
+    /// Proposal frames sent: more than one proposal in one message.
+    pub frames: u64,
+    /// The proposals those frames carried.
+    pub framed: u64,
+    /// Frontier announcements (`Committed`) sent, one to each follower.
+    pub frontiers: u64,
+    /// Their bytes.
+    pub frontier_bytes: u64,
+}
+
+/// What a node's collector relayed to the leader alone (task-d102),
+/// cumulative.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Relay {
+    /// Submissions sent to the leader alone.
+    pub relayed: u64,
+    /// Of those, the ones that fell back to every voter: at the bound,
+    /// or at a `NotLeading` refusal.
+    pub fallbacks: u64,
+    /// `NotLeading` refusals taken.
+    pub not_leading: u64,
 }
 
 /// The durable command records a voter holds, and its history sweeps

@@ -40,7 +40,7 @@ use crate::campaign::Campaign;
 use crate::catch_up::{
     CatchUp, CatchUpDivergence, CatchUpPaths, DonorExecution, OwnExecution, Running, SinceBoot,
 };
-use crate::commands::{CommandRecord, CommandTable, InitError};
+use crate::commands::{CommandRecord, CommandTable, InitError, RelayRoom};
 use crate::learner::{AppliedOutcome, LearnError, Learner, LearningMode};
 use crate::messages::{
     CatchUpEntry, MAX_CATCH_UP_BYTES, MAX_CATCH_UP_COMMANDS, MAX_PAYLOAD_TRANSFER,
@@ -774,6 +774,10 @@ pub struct Follower {
     /// before stepping it, so the command is derived once, here (#204
     /// review).
     mark_next_admitted: bool,
+    /// Whether the next admitted request was relayed to this voter alone
+    /// as its ballot's leader (task-d102): a follower refuses it with
+    /// [`SubmissionRefusal::NotLeading`] and holds nothing.
+    mark_next_relayed: bool,
     /// The catch-up page in hand, if any (task-d08).
     catch_up: CatchUp,
     /// A pulled command whose execution here disagreed with the donor's
@@ -789,6 +793,11 @@ pub struct Follower {
     /// submission of one is stepped: this replica's acknowledgements of
     /// them go to the leader only, and it keeps nothing to repair.
     answer_on_release: BTreeSet<CommandId>,
+    /// Relayed proposals whose payload this replica took (task-d102):
+    /// initialized from the proposal rather than fetched.
+    relayed_taken: u64,
+    /// Proposal frames taken (task-d102).
+    frames_taken: u64,
 }
 
 /// The retry-key bindings a restart restores from the payload rows
@@ -920,6 +929,8 @@ impl Follower {
         Follower {
             replay: crate::replay::EvidenceStore::new(config.capacity),
             answer_on_release: BTreeSet::new(),
+            relayed_taken: 0,
+            frames_taken: 0,
             catch_up: CatchUp::default(),
             diverged: None,
             config,
@@ -992,6 +1003,7 @@ impl Follower {
             rejections: Vec::new(),
             admitted: None,
             mark_next_admitted: false,
+            mark_next_relayed: false,
             synced_selection: resumed.clone(),
             resumed,
             early_sync: None,
@@ -1213,6 +1225,7 @@ impl Follower {
             rejections: Vec::new(),
             admitted: None,
             mark_next_admitted: false,
+            mark_next_relayed: false,
             resumed: selection.clone(),
             early_sync: None,
             sync_behind_promise: None,
@@ -1222,6 +1235,8 @@ impl Follower {
             proposal_cursor: 0,
             replay: crate::replay::EvidenceStore::new(state.capacity),
             answer_on_release: BTreeSet::new(),
+            relayed_taken: 0,
+            frames_taken: 0,
             catch_up: CatchUp::default(),
             diverged: None,
         }
@@ -1748,14 +1763,46 @@ impl Follower {
     /// right after the Sync and peers may deliver them first.
     fn stash_until_sync(&self, message: &ProtocolMessage) -> bool {
         let ballot = match message {
-            ProtocolMessage::Proposal(a) | ProtocolMessage::FastAck(a) => a.ballot,
+            ProtocolMessage::Proposal(a)
+            | ProtocolMessage::FastAck(a)
+            | ProtocolMessage::RelayedProposal { vote: a, .. } => a.ballot,
             ProtocolMessage::SlowAck(a) => a.ballot,
+            ProtocolMessage::ProposalFrame { ballot, .. } => *ballot,
             _ => return false,
         };
         ballot == self.ballots.promised()
             && ballot != self.config.quorum.ballot()
             && self.ballots.in_flight().is_none()
             && self.awaiting_sync.len() < self.config.capacity
+    }
+
+    /// Take a leader's frame of proposals (task-d102): each entry as the
+    /// `Proposal` or `RelayedProposal` it stands for, in order, in this
+    /// one step, so the adoptions they lead to share the node's next
+    /// journal group. One this follower refuses leaves the others as
+    /// they are.
+    fn on_proposal_frame(
+        &mut self,
+        from: ReplicaId,
+        replica: ReplicaId,
+        ballot: Ballot,
+        proposals: Vec<crate::messages::FramedProposal>,
+    ) -> Vec<Effect> {
+        self.frames_taken = self.frames_taken.saturating_add(1);
+        let mut effects = Vec::new();
+        for entry in proposals {
+            let (vote, payload) = entry.into_vote(replica, ballot);
+            effects.extend(match payload {
+                Some(payload) => self.on_relayed_proposal(from, vote, payload),
+                None => self.on_proposal(from, vote),
+            });
+        }
+        effects
+    }
+
+    /// Proposal frames this follower took (task-d102).
+    pub fn frames_taken(&self) -> u64 {
+        self.frames_taken
     }
 
     /// Replay the messages held for the ballot just synchronized.
@@ -1765,6 +1812,14 @@ impl Follower {
         for (from, message) in held {
             effects.extend(match message {
                 ProtocolMessage::Proposal(p) => self.on_proposal(from, p),
+                ProtocolMessage::RelayedProposal { vote, payload } => {
+                    self.on_relayed_proposal(from, vote, payload)
+                }
+                ProtocolMessage::ProposalFrame {
+                    replica,
+                    ballot,
+                    proposals,
+                } => self.on_proposal_frame(from, replica, ballot, proposals),
                 ProtocolMessage::FastAck(a) => self.collect(from, Vote::Fast(a)),
                 ProtocolMessage::SlowAck(a) => self.collect(from, Vote::Slow(a)),
                 _ => Vec::new(),
@@ -2794,6 +2849,7 @@ impl Follower {
             bindings: self.bindings.len(),
             bare_bindings: self.ledger.bare_bindings(),
             answer_on_release: self.answer_on_release.len(),
+            relayed: 0,
             held_waiters: self.held_waiters.len(),
             proposals: 0,
         }
@@ -4576,6 +4632,19 @@ impl Follower {
         self.mark_next_admitted = true;
     }
 
+    /// Mark the next admitted request as relayed to this voter alone as
+    /// its ballot's leader (task-d102): a follower isn't, and says so.
+    pub fn mark_next_relayed(&mut self) {
+        self.mark_next_admitted = true;
+        self.mark_next_relayed = true;
+    }
+
+    /// How many relayed proposals' payloads this replica took
+    /// (task-d102): commands it learned from the proposal alone.
+    pub const fn relayed_taken(&self) -> u64 {
+        self.relayed_taken
+    }
+
     /// Whether `command`'s collector answers it on the release alone.
     pub fn answers_on_release(&self, command: &CommandId) -> bool {
         self.answer_on_release.contains(command)
@@ -4755,7 +4824,22 @@ impl Follower {
     }
 
     fn on_admitted(&mut self, frame: &[u8], admission: AdmissionFacts) -> Vec<Effect> {
-        let effects = self.admit(frame, admission);
+        let effects = if core::mem::take(&mut self.mark_next_relayed) {
+            // Relayed to this voter as the leader, which it isn't
+            // (task-d102): its collector re-routes at once. Nothing is
+            // held, so nothing stays marked.
+            // The command is named, so the voter knows which collector
+            // the refusal is owed to.
+            self.admitted = crate::leader::relayed_command(frame);
+            match self.admitted {
+                Some(command) if self.boot.is_some() => {
+                    self.refuse(command, SubmissionRefusal::NotLeading)
+                }
+                _ => Vec::new(),
+            }
+        } else {
+            self.admit(frame, admission)
+        };
         if core::mem::take(&mut self.mark_next_admitted)
             && let Some(command) = self.admitted
         {
@@ -5061,6 +5145,121 @@ impl Follower {
         effects.extend(self.advance_sync());
         effects.extend(self.advance_pending());
         effects
+    }
+
+    /// A proposal that carries its command's payload (task-d102,
+    /// task-d100's step B): the collector relayed the submission to the
+    /// leader alone, so this replica learns the command here.
+    ///
+    /// The payload is checked against the proposal -- the identity it
+    /// rehashes to and the admission it carries -- and taken as a
+    /// submission's would be, under the same bound, except that nothing
+    /// is pre-accepted, written or acknowledged for it: the record is
+    /// initialized outside this replica's suffix
+    /// ([`CommandTable::initialize_relayed`]), and the proposal is then
+    /// handled as any, so its adoption writes the payload row with the
+    /// dependency row in one batch (`advance_pending`) and the one
+    /// acknowledgement, a slow one, goes to the leader alone. The
+    /// collector answers the command on the leader's release, as in
+    /// step A. Anything this replica would not take -- a proposal it
+    /// refuses, a payload that does not match, a command it already
+    /// knows or has bound to another presentation -- leaves the payload
+    /// aside, and the proposal goes the way a proposal without one goes,
+    /// fetching the payload if it is missing.
+    fn on_relayed_proposal(
+        &mut self,
+        from: ReplicaId,
+        proposal: FastAck,
+        payload: PayloadRecordV1,
+    ) -> Vec<Effect> {
+        let takes = self.boot.is_some()
+            && self.ballots.seal_held().is_none()
+            && self.may_vote()
+            && from == self.config.quorum.leader()
+            && proposal.replica == from
+            && proposal.ballot == self.config.quorum.ballot()
+            && proposal.seqnum.is_some();
+        let held = self.held.contains_key(&proposal.command);
+        let took = takes && self.take_relayed_payload(&proposal, payload);
+        let mut effects = self.on_proposal(from, proposal);
+        // A proposal held for want of its payload, whose payload this copy
+        // brought: `on_proposal` returns at a duplicate of one held, so the
+        // hold is examined here, as a `PayloadResponse` has it examined.
+        // Left, it waited on itself for ever (task-d102's frames sweep,
+        // row 1 at 3 voters, seed 11).
+        if took && held {
+            effects.extend(self.advance_pending());
+        }
+        effects
+    }
+
+    /// Initialize the command a relayed proposal names from the payload
+    /// it carries, where this replica would take it (see
+    /// `on_relayed_proposal`). Returns whether it took it.
+    fn take_relayed_payload(&mut self, proposal: &FastAck, payload: PayloadRecordV1) -> bool {
+        let command = proposal.command;
+        let identity =
+            postcard::from_bytes::<coord_types::logical_v1::LogicalRequest>(&payload.logical)
+                .ok()
+                .and_then(|r| CommandId::derive(&payload.retry_key, &r).ok());
+        if identity != Some(command) || payload.admission_digest() != proposal.admission {
+            self.rejections
+                .push(FollowerRejection::PayloadIdentityMismatch(command));
+            return false;
+        }
+        // Known here already, in any form: the proposal path decides.
+        if self.table.is_initialized(&command)
+            || self.table.retired(&command)
+            || self.table.phase_of(&command) == Some(Phase::Executed)
+            || self.payloads.contains_key(&command)
+            || self.bindings.contains_key(&payload.retry_key)
+            || (self.sync_barrier.is_some() && self.sync_released.contains(&command))
+            || self
+                .selected_admission(&command)
+                .is_some_and(|d| d != proposal.admission)
+        {
+            return false;
+        }
+        let recovering = self.sync_pending.contains_key(&command)
+            || self.campaign.as_ref().is_some_and(|c| {
+                c.binding().is_none()
+                    && !c.is_durable()
+                    && c.decision().is_some_and(|d| {
+                        d.entries.contains_key(&command) || d.reproposed.contains(&command)
+                    })
+            });
+        // The room a submission's initialization takes (`on_request`):
+        // a command whose dependencies are all adopted here has its turn,
+        // and the proposal is what would be held for it.
+        let room = if recovering {
+            RelayRoom::Unbounded
+        } else if crate::phase::guard_accept(&proposal.deps, |d| self.table.phase_of(d)).is_ok() {
+            RelayRoom::Reserve
+        } else {
+            RelayRoom::Admission
+        };
+        let keys = alloc::vec![crate::leader::CONSERVATIVE_KEY.to_vec()];
+        if self
+            .table
+            .initialize_relayed(command, proposal.admission, keys, room)
+            .is_err()
+        {
+            // No room: the proposal is held as one without its payload,
+            // which is fetched once its turn comes.
+            self.rejections.push(FollowerRejection::Backpressure);
+            return false;
+        }
+        if let Some(c) = self.campaign.as_mut() {
+            c.supply_moved();
+        }
+        // Never pre-accepted here, so no path evidence is kept for it.
+        self.table.demote(&command);
+        self.bindings.insert(payload.retry_key, command);
+        self.payloads.insert(command, payload);
+        self.answer_on_release.insert(command);
+        self.relayed_taken = self.relayed_taken.saturating_add(1);
+        self.note_lacking(command);
+        true
     }
 
     fn on_proposal(&mut self, from: ReplicaId, proposal: FastAck) -> Vec<Effect> {
@@ -6156,6 +6355,8 @@ impl Follower {
             }
             ProtocolMessage::Sync(decision) => self.on_sync(from.replica, decision),
             ProtocolMessage::Proposal(_)
+            | ProtocolMessage::RelayedProposal { .. }
+            | ProtocolMessage::ProposalFrame { .. }
             | ProtocolMessage::FastAck(_)
             | ProtocolMessage::SlowAck(_)
                 if self.stash_until_sync(&message) =>
@@ -6164,6 +6365,14 @@ impl Follower {
                 Vec::new()
             }
             ProtocolMessage::Proposal(p) => self.on_proposal(from.replica, p),
+            ProtocolMessage::RelayedProposal { vote, payload } => {
+                self.on_relayed_proposal(from.replica, vote, payload)
+            }
+            ProtocolMessage::ProposalFrame {
+                replica,
+                ballot,
+                proposals,
+            } => self.on_proposal_frame(from.replica, replica, ballot, proposals),
             ProtocolMessage::FastAck(ack) => self.collect(from.replica, Vote::Fast(ack)),
             ProtocolMessage::SlowAck(ack) => self.collect(from.replica, Vote::Slow(ack)),
             ProtocolMessage::PayloadRequest { commands } => {

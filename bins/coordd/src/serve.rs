@@ -233,11 +233,14 @@ impl Frontend {
     ///
     /// The voter's node also says whether `Feature::AnswerOnRelease` is
     /// active (task-d100, step A); while it is, this collector marks the
-    /// commands it submits as answered on the leader's release alone.
-    fn follow(&mut self, active: coord_types::ids::Ballot, answer_on_release: bool) {
+    /// commands it submits as answered on the leader's release alone. And
+    /// whether `Feature::BatchedRound` is (task-d102, task-d100's step B):
+    /// while both are, it relays them to the ballot's leader alone.
+    fn follow(&mut self, active: coord_types::ids::Ballot, answer_on_release: bool, relay: bool) {
         self.frontend
             .dispatcher_mut()
             .set_answer_on_release(answer_on_release);
+        self.frontend.dispatcher_mut().set_relay(relay);
         if self.frontend.dispatcher_mut().ballot() != active
             && let Ok(quorum) = coord_consensus::BallotConfiguration::c2_default(
                 active.epoch,
@@ -1046,6 +1049,10 @@ pub struct Domain<P: Persistence> {
     peer_streak: u32,
     /// Events taken since the voter last flushed (task-d47).
     since_flush: u32,
+    /// Of those, the API plane's (task-d102).
+    since_flush_api: u32,
+    /// How many events the loop took between its flushes (task-d102).
+    flushes: coord_daemon::metrics::Flushes,
     budgets: Budgets,
     /// This run's stage accounting (task-61), shared with the voter's
     /// node so the journal and materialization points record into the
@@ -1800,6 +1807,8 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             fenced_stop: None,
             peer_streak: 0,
             since_flush: 0,
+            since_flush_api: 0,
+            flushes: coord_daemon::metrics::Flushes::default(),
             budgets,
             recorder,
             pacing: Pacing::default(),
@@ -1952,6 +1961,27 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 .dispatcher()
                 .collector()
                 .early_solicits(),
+            flushes: self.flushes,
+            proposals: {
+                let sent = voter.node().sent_bytes();
+                coord_daemon::metrics::ProposalBytes {
+                    proposals: sent.proposals,
+                    proposal_bytes: sent.proposal_bytes,
+                    payload_bytes: sent.payload_bytes,
+                    frames: sent.frames,
+                    framed: sent.framed,
+                    frontiers: sent.frontiers,
+                    frontier_bytes: sent.frontier_bytes,
+                }
+            },
+            relay: {
+                let collector = self.frontend.frontend.dispatcher().collector();
+                coord_daemon::metrics::Relay {
+                    relayed: collector.relayed(),
+                    fallbacks: collector.relay_fallbacks(),
+                    not_leading: collector.not_leading(),
+                }
+            },
             traffic: self.plane.as_ref().map_or(
                 Measure::Unavailable(Unavailable::NotInstrumented),
                 |plane| {
@@ -2558,6 +2588,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 Some(Arrived::Api(event)) => {
                     self.peer_streak = 0;
                     self.since_flush = self.since_flush.saturating_add(1);
+                    self.since_flush_api = self.since_flush_api.saturating_add(1);
                     self.on_transport(transport, event, &clock).await;
                 }
                 Some(Arrived::Peer(event)) => {
@@ -3060,7 +3091,11 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     /// what that released (task-d47). Returns whether the voter must
     /// stop: it cannot make its transitions durable, or it is fenced.
     fn stops_on_flush(&mut self, api: &Transport) -> bool {
+        let taken = u64::from(self.since_flush);
+        let from_api = u64::from(self.since_flush_api);
+        self.flushes.count(from_api, taken.saturating_sub(from_api));
         self.since_flush = 0;
+        self.since_flush_api = 0;
         let Backing::Voting(voter) = &mut self.backing else {
             return false;
         };
@@ -3106,6 +3141,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 self.frontend.follow(
                     voter.node().machine().active(),
                     voter.node().answer_on_release(),
+                    voter.node().batched_round(),
                 );
                 self.carry(api, out, provenance);
                 false
@@ -3335,6 +3371,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         self.frontend.follow(
             voter.node().machine().active(),
             voter.node().answer_on_release(),
+            voter.node().batched_round(),
         );
         // Work queued under a ballot this voter has left can no longer be
         // made durable, and the store refuses it rather than holding it.
@@ -4617,6 +4654,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                         self.frontend.follow(
                             voter.node().machine().active(),
                             voter.node().answer_on_release(),
+                            voter.node().batched_round(),
                         );
                         self.carry(api, out, provenance);
                     }

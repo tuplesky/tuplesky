@@ -223,6 +223,23 @@ feature activates. An exact duplicate of a marked command reaching its
 leader after execution has the release published again, rebuilt from
 the leader's retry record and its table's admission digest.
 
+**Relayed to the leader alone** (task-d102, task-d100's step B). While
+the collector's node also reads `Feature::BatchedRound` active, which is
+activated only after `AnswerOnRelease`, it submits each new marked
+command as version 3 of `Submit` to its ballot's leader alone. The
+command is answered as a version-2 one is. The leader proposes it with
+its payload (`RelayedProposal`), and each follower adopts it from that
+proposal and acknowledges it to the leader only; a grouped leader sends
+a turn's proposals to each follower in one `ProposalFrame` (see
+`spec/wire-v1.md`). A voter that isn't
+leading refuses a version-3 submission with `Refused { NotLeading }`; the
+collector then submits the command at once as version 2 to every voter,
+and does the same for a relayed command that holds neither half of a
+release `RELAY_FALLBACK_MILLIS` after its submission. Until then it is
+asked again of its ballot's leader alone, and a ballot change re-targets
+it to the new leader. `NotLeading` says nothing about the command: it is
+never a reason to settle from the record.
+
 A lone leader reply, an unmarked command's lone release, or a loosely
 counted majority never releases tentative data. The response is `ResponseV1 { command_id, Ok {
 revision, result } }` with the exact response bytes, or `Err` with the
@@ -281,7 +298,8 @@ refresh are task-m02.
 Every transition is recorded as a `CollectorEvent` (`Submitted`,
 `Attached`, `Retained`, `Refused`, `Evidence`, `Held`, `Released`,
 `Cancelled`, `Resolved`, `TimedOut`, `Reconfigured`, `SettledFromRecord`,
-`Reoffered`, `Undisseminated`) with identities in lowercase hex. The three
+`Reoffered`, `Undisseminated`, `VoterRefused`, `Solicited`,
+`SolicitedLeader`, `RelayFellBack`) with identities in lowercase hex. The three
 added in revisions 2 and 3 appear only when a delivery was lost or did not go
 straight through, so the frozen revision-1 scenario produces the same trace it
 always did. Its voters are part of the scenario, though: since task-d74 a
