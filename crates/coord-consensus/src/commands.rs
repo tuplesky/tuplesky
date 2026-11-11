@@ -177,6 +177,39 @@ pub enum RelayRoom {
     Unbounded,
 }
 
+/// What holds back a table's oldest unexecuted record
+/// ([`CommandTable::waits`], task-d25).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TableWait {
+    /// Its payload has not arrived: a placeholder.
+    Payload,
+    /// Not committed: at this phase.
+    Uncommitted(Phase),
+    /// Committed, behind its first dependency not executed: at this
+    /// phase here, or `None` for one this table has no payload of and
+    /// does not remember executing.
+    Dependency(Option<Phase>),
+    /// Ready: nothing in the table holds it. What does is its owner's (a
+    /// catch-up window in hand, a row written again, the next pass).
+    Ready,
+}
+
+/// A table's size and its oldest unexecuted record's wait
+/// ([`CommandTable::waits`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TableWaits {
+    /// Records, placeholders included.
+    pub records: usize,
+    /// The bound, if any.
+    pub capacity: Option<usize>,
+    /// Records holding their payload below EXECUTED.
+    pub unexecuted: usize,
+    /// Of those, the ones ready to execute.
+    pub ready: usize,
+    /// The oldest unexecuted record, and what it waits on.
+    pub oldest: Option<(CommandId, TableWait)>,
+}
+
 /// The command table of one replica in one domain.
 #[derive(Clone, Debug, Default)]
 pub struct CommandTable {
@@ -1079,6 +1112,50 @@ impl CommandTable {
         self.unexecuted
     }
 
+    /// The table's size and what holds back its oldest unexecuted record
+    /// (task-d25, #98): read once a metrics line, at the cost of one walk
+    /// of the records.
+    ///
+    /// The oldest is the record below EXECUTED, its payload held or not,
+    /// that is first in `order` (a leader's proposal sequence number, a
+    /// follower's adoption), then by identity among those it has none for.
+    /// A table full of commands that cannot execute names, here, the one
+    /// they are all behind.
+    pub fn waits(&self, order: impl Fn(&CommandId) -> Option<u64>) -> TableWaits {
+        let oldest = self
+            .records
+            .iter()
+            .filter(|(_, r)| r.phase < Phase::Executed)
+            .min_by_key(|(c, _)| (order(c).map_or((1, 0), |s| (0, s)), **c))
+            .map(|(command, record)| {
+                let wait = if record.payload.is_none() {
+                    TableWait::Payload
+                } else if record.phase < Phase::Commit {
+                    TableWait::Uncommitted(record.phase)
+                } else if self.ready.contains(command) {
+                    TableWait::Ready
+                } else {
+                    match record
+                        .deps
+                        .iter()
+                        .map(|d| self.phase_of(d))
+                        .find(|p| *p != Some(Phase::Executed))
+                    {
+                        Some(phase) => TableWait::Dependency(phase),
+                        None => TableWait::Ready,
+                    }
+                };
+                (*command, wait)
+            });
+        TableWaits {
+            records: self.records.len(),
+            capacity: self.capacity,
+            unexecuted: self.unexecuted,
+            ready: self.ready.len(),
+            oldest,
+        }
+    }
+
     /// Records the next command's choice has examined, since the last
     /// call (task-d107).
     #[cfg(test)]
@@ -1673,6 +1750,63 @@ pub(crate) mod tests {
             assert_eq!(table.take_examined(), 1, "{blocked} blocked");
             assert_eq!(table.unexecuted_records(), blocked as usize + 1);
         }
+    }
+
+    /// The oldest unexecuted record is the first in its owner's order,
+    /// and what holds it is named: a dependency this table has no record
+    /// of, then, once that is restored executed, nothing in the table.
+    #[test]
+    fn the_oldest_unexecuted_record_names_what_it_waits_on() {
+        let (rows, ready) = blocked_behind_a_root(3);
+        let mut table = CommandTable::restore(Some(64), rows);
+        // The owner's order puts the blocked records first, `ready` last.
+        let order = |c: &CommandId| (2..5).position(|n| id(n) == *c).map(|p| p as u64);
+        let waits = table.waits(order);
+        assert_eq!(
+            (waits.records, waits.capacity, waits.unexecuted, waits.ready),
+            (4, Some(64), 4, 1)
+        );
+        assert_eq!(waits.oldest, Some((id(2), TableWait::Dependency(None))));
+        table.restore_executed(&id(0));
+        let waits = table.waits(order);
+        assert_eq!(
+            (waits.ready, waits.oldest),
+            (4, Some((id(2), TableWait::Ready)))
+        );
+        for n in 2..5 {
+            table.execute(id(n)).unwrap();
+        }
+        // Unordered, the one left is still found.
+        assert_eq!(table.waits(order).oldest, Some((ready, TableWait::Ready)));
+        table.execute(ready).unwrap();
+        let waits = table.waits(order);
+        assert_eq!((waits.unexecuted, waits.oldest), (0, None));
+    }
+
+    /// A record not committed waits at its phase, and a placeholder on
+    /// its payload; a committed record behind one waits at that phase.
+    #[test]
+    fn the_oldest_waits_on_its_payload_its_commit_or_a_dependency_held_here() {
+        let mut table = CommandTable::new();
+        let key = || vec![b"k".to_vec()];
+        let (a, b, c) = (id(1), id(2), id(3));
+        table.initialize(a, Digest32([1; 32]), key()).unwrap();
+        table.initialize(b, Digest32([2; 32]), key()).unwrap();
+        table.expect(c).unwrap();
+        let first = |first: CommandId| move |x: &CommandId| (*x == first).then_some(0);
+        assert_eq!(
+            table.waits(first(a)).oldest,
+            Some((a, TableWait::Uncommitted(Phase::PreAccept)))
+        );
+        assert_eq!(table.waits(first(c)).oldest, Some((c, TableWait::Payload)));
+        table.accept(a, Vec::new()).unwrap();
+        table.accept(b, vec![a]).unwrap();
+        table.commit(a).unwrap();
+        table.commit(b).unwrap();
+        assert_eq!(
+            table.waits(first(b)).oldest,
+            Some((b, TableWait::Dependency(Some(Phase::Commit))))
+        );
     }
 
     /// A blocked record is looked at again when the one dependency it
