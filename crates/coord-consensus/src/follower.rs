@@ -3300,10 +3300,10 @@ impl Follower {
             .is_some_and(|needed| self.learner.executed_through() < needed)
             || !self.held.is_empty()
             || !self.sync_pending.is_empty()
-            || self
-                .table
-                .records()
-                .any(|(_, r)| r.payload.is_some() && r.phase < Phase::Executed)
+            // A count the table keeps (task-d107): the pacer reads this
+            // every pass, and a walk of the records cost the whole table
+            // whenever nothing was left to execute.
+            || self.table.holds_unexecuted()
     }
 
     /// How much work this replica holds and has not executed, counted
@@ -3313,7 +3313,7 @@ impl Follower {
     /// counts as holding without bound, since how far behind it is isn't
     /// known here. The catch-up pacer reads it to tell a voter that is
     /// behind from one with a few commands in flight, on a turn that may
-    /// ask: it scans the table, so not on every pass.
+    /// ask.
     pub fn unexecuted_held(&self) -> usize {
         if self
             .behind_voters
@@ -3321,13 +3321,7 @@ impl Follower {
         {
             return usize::MAX;
         }
-        self.held.len()
-            + self.sync_pending.len()
-            + self
-                .table
-                .records()
-                .filter(|(_, r)| r.payload.is_some() && r.phase < Phase::Executed)
-                .count()
+        self.held.len() + self.sync_pending.len() + self.table.unexecuted_records()
     }
 
     /// Ask `donor` for the commands it executed after this replica's own
@@ -6196,5 +6190,61 @@ impl crate::recovery::CandidateDecisions for OwnDecisions<'_> {
             Some(record) if record.payload.is_some() => ExecutedFacts::With(record.clone()),
             _ => ExecutedFacts::WithoutRow,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The follower's next command (task-d107), counted: what a restarted
+    //! voter behind the others holds is thousands of commits blocked on a
+    //! command it lacks.
+
+    use alloc::collections::BTreeSet;
+
+    use coord_types::ids::{ClusterId, ConfigurationEpoch, DomainId, ReplicaIncarnation};
+
+    use super::*;
+
+    fn r(i: u8) -> ReplicaId {
+        ReplicaId([i; 16])
+    }
+
+    /// With 2,000 commits restored behind a root no row names and one
+    /// ready, a call examines one record.
+    #[test]
+    fn the_next_command_is_chosen_among_the_ready_records_only() {
+        let epoch = ConfigurationEpoch::new(1).unwrap();
+        let voters: BTreeSet<ReplicaId> = (0..3).map(r).collect();
+        let genesis = Ballot {
+            epoch,
+            number: 0,
+            leader: r(0),
+        };
+        let config = FollowerConfig {
+            identity: ConfigurationIdentity {
+                cluster: ClusterId([1; 16]),
+                domain: DomainId([2; 16]),
+                epoch,
+                voters: voters.clone(),
+                replica: r(1),
+                incarnation: ReplicaIncarnation::new(1).unwrap(),
+                role: ReplicaRole::Voter,
+            },
+            quorum: BallotConfiguration::c2(epoch, genesis, voters, [r(0), r(1)].into()).unwrap(),
+            genesis,
+            frontend: PeerId {
+                replica: ReplicaId([0xf0; 16]),
+                incarnation: ReplicaIncarnation::ZERO,
+            },
+            capacity: 8,
+        };
+        let (rows, ready) = crate::commands::tests::blocked_behind_a_root(2_000);
+        let follower =
+            Follower::recover_with_syncs(config, None, None, rows, [], [], ExecutionPosition::ZERO);
+        follower.table.take_examined();
+        assert_eq!(follower.next_executable(), Some(ready));
+        assert_eq!(follower.table.take_examined(), 1);
+        assert!(follower.holds_unexecuted());
+        assert_eq!(follower.unexecuted_held(), 2_001);
     }
 }
