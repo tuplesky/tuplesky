@@ -9,9 +9,9 @@ use std::time::Duration;
 use coord_daemon::metrics::{
     Answered, Cost, Cpu, Datagrams, Distribution, Durability, FastPath, Flushes, Frontiers,
     Headroom, History, Interval, Jobs, JournalGroups, Lane, LaneReading, Latency,
-    MAX_REPORTED_SHARDS, Measure, MetricsSnapshot, OldestWait, PipelineWaits, ProposalBytes, Reads, Recorder,
-    Relay, Release, ReleaseDistributions, Resends, Scheduling, ShardIndex, ShardReading, Stage,
-    StageReading, Table, Traffic, Unavailable, UnorderedPreAcceptances, Wait,
+    MAX_REPORTED_SHARDS, Measure, MetricsSnapshot, OldestWait, PipelineWaits, ProposalBytes, Reads,
+    Recorder, Relay, Release, ReleaseDistributions, Resends, Scheduling, ShardIndex, ShardReading,
+    Stage, StageReading, Table, Traffic, Unavailable, UnorderedPreAcceptances, Wait,
 };
 use coord_daemon::role::RoleSet;
 

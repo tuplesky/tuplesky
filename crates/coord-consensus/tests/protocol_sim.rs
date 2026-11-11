@@ -4378,8 +4378,14 @@ fn row_18_the_leaders_proposal_before_its_batch_is_durable() {
 /// acknowledgement, which at three voters is a fast quorum, and commits
 /// over a vote the leader may lose. If no seed failed, the row would not
 /// reach the case the per-follower rule exists for.
+///
+/// The seeds it failed at are tried first, then the budget. A failing
+/// seed is rare (one in a few hundred), and any change to what the
+/// simulator draws moves it: the catch-up probe that goes on until a
+/// page or every voter (#98) moved the first one from seed 66 to 492.
 #[test]
 fn row_18_fails_when_the_fast_set_follower_gets_the_proposal_early_too() {
+    const FAILED_AT: [u64; 2] = [492, 66];
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
     let knobs = Knobs {
@@ -4387,7 +4393,10 @@ fn row_18_fails_when_the_fast_set_follower_gets_the_proposal_early_too() {
         ..Knobs::row(18)
     };
     let budget = NEGATIVE_CONTROL_SEEDS.max(seeds());
-    let failed = (0..budget).find_map(|seed| run_knobs(3, knobs, seed, None).err());
+    let failed = FAILED_AT
+        .into_iter()
+        .chain(0..budget)
+        .find_map(|seed| run_knobs(3, knobs, seed, None).err());
     std::panic::set_hook(hook);
     let Some(failure) = failed else {
         panic!("row 18 passed {budget} seeds with the fast-set follower sent early too");
