@@ -286,6 +286,12 @@ struct Cluster {
     now: Instant,
     sequence: u64,
     backpressure: Vec<usize>,
+    /// The next catch-up ask voter `.0` sends to voter `.1` is lost, or
+    /// with `.2`, the next catch-up page.
+    lose: Option<(usize, usize, bool)>,
+    /// Every frame voter `.0` sends to voter `.1` but catch-up's is lost:
+    /// a leader with nothing for that voter to adopt.
+    mute: Option<(usize, usize)>,
 }
 
 impl Cluster {
@@ -304,6 +310,8 @@ impl Cluster {
             now: Instant::now(),
             sequence: 0,
             backpressure: vec![0; 3],
+            lose: None,
+            mute: None,
         }
     }
 
@@ -311,9 +319,35 @@ impl Cluster {
         // The collector is not what this is about: what the voters tell
         // it is dropped.
         for (to, frame) in out.peer {
+            let to = usize::from(to.replica.0[0]);
+            if let Some((lose_from, lose_to, page)) = self.lose
+                && lose_from == from
+                && lose_to == to
+                && matches!(
+                    (page, coord_consensus::ProtocolMessage::decode(&frame)),
+                    (
+                        false,
+                        Ok(coord_consensus::ProtocolMessage::CatchUpRequest { .. })
+                    ) | (
+                        true,
+                        Ok(coord_consensus::ProtocolMessage::CatchUpPage { .. })
+                    )
+                )
+            {
+                self.lose = None;
+                continue;
+            }
+            if self.mute == Some((from, to))
+                && !matches!(
+                    coord_consensus::ProtocolMessage::decode(&frame),
+                    Ok(coord_consensus::ProtocolMessage::CatchUpRequest { .. }
+                        | coord_consensus::ProtocolMessage::CatchUpPage { .. })
+                )
+            {
+                continue;
+            }
             let prov = self.voters[from].provenance();
-            self.peers
-                .push_back((usize::from(to.replica.0[0]), prov, frame));
+            self.peers.push_back((to, prov, frame));
         }
     }
 
@@ -527,6 +561,73 @@ fn a_follower_cut_off_for_thirty_seconds_serves_within_ten_of_the_heal() {
     // Its history is the leader's, row for row: the same commands at the
     // same positions with the same results.
     assert_eq!(cluster.executed_rows(2), cluster.executed_rows(0));
+}
+
+/// A voter that restarts behind holding nothing asks, whatever it holds,
+/// since nothing else would make it ask (task-d08). When that ask, or
+/// the page that answers it, is lost in a quiet cluster, it asks again
+/// until a page arrives; with nothing past it at any donor, it stops once
+/// every voter has been asked (#98, Codex on the carry's `catch_up.rs`).
+///
+/// Two cases each. With the leader's traffic, the leader re-sends what
+/// the voter has not adopted, which gives it work to ask for. Muted, the
+/// leader has nothing for it, as one holding nothing the voter has not
+/// adopted: there the probe is the only ask. Before, the probe counted as
+/// made the moment it went, and a muted voter whose probe was lost never
+/// asked again.
+#[test]
+fn a_voter_restarted_behind_whose_first_ask_is_lost_still_catches_up_in_a_quiet_cluster() {
+    for muted in [false, true] {
+        for (lose_from, lose_to, page, what) in [(2, 0, false, "the ask"), (0, 2, true, "its page")]
+        {
+            let what = format!("{what}, muted {muted}");
+            let mut cluster = Cluster::new();
+            for _ in 0..2 {
+                cluster.second();
+            }
+            cluster.down = vec![2];
+            for _ in 0..5 {
+                cluster.second();
+            }
+            // The load stops; r2 comes back holding nothing, with the
+            // pacer a restart gives it, and the first catch-up ask it
+            // sends the leader, or the first page the leader sends it, is
+            // lost.
+            cluster.down.clear();
+            cluster.pacers[2] = Pacer::default();
+            assert!(
+                !cluster.voters[2].node().machine().holds_unexecuted(),
+                "r2 holds work: this is not the quiet case"
+            );
+            let behind = cluster.executed_through(0) - cluster.executed_through(2);
+            assert!(behind >= 5 * RATE, "r2 is only {behind} behind");
+            cluster.lose = Some((lose_from, lose_to, page));
+            cluster.mute = muted.then_some((0, 2));
+            for _ in 0..10 {
+                cluster.tick();
+            }
+            assert!(cluster.lose.is_none(), "{what}: nothing was lost");
+            assert_eq!(
+                cluster.executed_through(2),
+                cluster.executed_through(0),
+                "{what} lost: r2 never asked again ({:?})",
+                cluster.voters[2].node().machine().catch_up_paths()
+            );
+            // Level now, with nothing past it anywhere: it stops asking
+            // once every voter has been asked, and the loop has no
+            // deadline for it.
+            let asked = cluster.voters[2].node().machine().catch_up_paths().asked;
+            for _ in 0..10 {
+                cluster.tick();
+            }
+            assert_eq!(
+                cluster.voters[2].node().machine().catch_up_paths().asked,
+                asked,
+                "{what}: a level voter kept asking"
+            );
+            assert_eq!(cluster.pacers[2].next_deadline(), None, "{what}");
+        }
+    }
 }
 
 /// task-d77 (#169 review): a candidate's campaign waits on the dependency

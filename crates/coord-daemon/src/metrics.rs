@@ -39,6 +39,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use coord_consensus::Phase;
 use serde::{Deserialize, Serialize};
 
 /// Why a reading is not available.
@@ -564,6 +565,65 @@ pub struct Cost {
     /// What this node's collector relayed to the leader alone (task-d102).
     #[serde(default)]
     pub relay: Relay,
+    /// The command table, and what holds back its oldest unexecuted
+    /// record (task-d25, #98).
+    #[serde(default)]
+    pub table: Table,
+}
+
+/// A voter's command table, and what holds back its oldest unexecuted
+/// record (task-d25, #98). A voter whose table is full of work it cannot
+/// execute refuses new work; this says how full, and behind what.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Table {
+    /// Records, placeholders included.
+    pub records: u64,
+    /// The table's bound, 0 for none.
+    pub capacity: u64,
+    /// Records holding their payload below EXECUTED.
+    pub unexecuted: u64,
+    /// Of those, the ones ready to execute.
+    pub ready: u64,
+    /// Pulled commands a catch-up window holds in hand, which execute
+    /// before anything else.
+    pub catch_up_window: u64,
+    /// What the oldest unexecuted record waits on, in the voter's order
+    /// (a leader's proposals, a follower's adoptions); none when the
+    /// table holds nothing below EXECUTED.
+    pub oldest_wait: Option<OldestWait>,
+}
+
+/// What holds back a table's oldest unexecuted record ([`Table`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OldestWait {
+    /// Its payload has not arrived.
+    Payload,
+    /// Not committed: at this phase.
+    Uncommitted {
+        /// Its phase.
+        phase: Phase,
+    },
+    /// Committed, behind its first dependency not executed: at this
+    /// phase, or none for a dependency this voter holds no payload of.
+    Dependency {
+        /// The dependency's phase.
+        phase: Option<Phase>,
+    },
+    /// Ready: nothing in the table holds it.
+    Ready,
+}
+
+impl OldestWait {
+    /// The reading of a table's [`coord_consensus::TableWait`].
+    pub const fn of(wait: coord_consensus::TableWait) -> Self {
+        match wait {
+            coord_consensus::TableWait::Payload => Self::Payload,
+            coord_consensus::TableWait::Uncommitted(phase) => Self::Uncommitted { phase },
+            coord_consensus::TableWait::Dependency(phase) => Self::Dependency { phase },
+            coord_consensus::TableWait::Ready => Self::Ready,
+        }
+    }
 }
 
 /// The domain loop's flushes, cumulative, one count a flush: why it

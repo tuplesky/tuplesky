@@ -3500,6 +3500,16 @@ impl Follower {
         self.catch_up.paths
     }
 
+    /// The table's size and its oldest unexecuted record's wait, in this
+    /// follower's adoption order, and the pulled commands a catch-up
+    /// window holds in hand, which execute first (task-d25, #98).
+    pub fn table_waits(&self) -> (crate::TableWaits, usize) {
+        (
+            self.table.waits(|c| self.adopted.get(c).map(|(s, _)| *s)),
+            self.catch_up.running.len(),
+        )
+    }
+
     /// Whether this replica holds work it has not executed: a record
     /// below EXECUTED, a proposal it holds, or a Sync entry it has not
     /// installed. A replica that holds such work and does not execute it

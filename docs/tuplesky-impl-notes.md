@@ -5558,10 +5558,15 @@ behind by more than a table is sent nothing it can use.
   executed, so the pacer is the floor for an ask nobody answered. The
   pacer registers its next look as a serve-loop deadline, so an idle
   follower with held work, which has no election deadline, still wakes
-  to ask and to ask again. A voter also asks once after it starts,
+  to ask and to ask again. A voter also asks after it starts,
   whatever it holds: a restart forgets the page, and a command whose
   donor kept no row leaves none here either until it executes, so a
-  voter restarted behind can hold nothing that would prompt an ask. A
+  voter restarted behind can hold nothing that would prompt an ask. It
+  goes on asking until a page arrives or every voter has been asked
+  (the leader twice, then each of the others): a donor with nothing past
+  its frontier answers nothing, as a lost ask or page does, and with a
+  leader that has nothing for it to adopt the probe is its only ask
+  (#98, Codex on the carry). A
   page taken whole that stops short of the donor's `through` (the
   command bound or the byte bound) is followed at once.
 - The donor answers only a voter of its configuration, only at a ballot
