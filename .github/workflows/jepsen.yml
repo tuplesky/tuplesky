@@ -240,8 +240,7 @@ jobs:
         run: |
           if [ "$WAN" != none ] || [[ ",$NEMESIS," == *,packet,* ]]; then
             sudo modprobe -a sch_prio sch_netem cls_u32 || {
-              sudo apt-get update -qq
-              sudo apt-get install -y -qq --no-install-recommends "linux-modules-extra-$(uname -r)"
+              tuplesky/scripts/ci/apt_install.sh "linux-modules-extra-$(uname -r)"
               sudo modprobe -a sch_prio sch_netem cls_u32
             }
             lsmod | grep -E '^(sch_prio|sch_netem|cls_u32) '
@@ -299,9 +298,8 @@ jobs:
       - name: Install perf
         if: env.IN_LEADER_PROFILE != 'false'
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends "linux-tools-$(uname -r)" linux-tools-common \
-            || sudo apt-get install -y -qq --no-install-recommends linux-tools-azure linux-tools-common \
+          tuplesky/scripts/ci/apt_install.sh "linux-tools-$(uname -r)" linux-tools-common \
+            || tuplesky/scripts/ci/apt_install.sh linux-tools-azure linux-tools-common \
             || echo "::warning::perf could not be installed; the leader's profile will say so"
           sudo perf --version || true
           # The loop runs a few dozen frames deep in the runtime; keep whole stacks.
@@ -319,8 +317,7 @@ jobs:
           # Jepsen's perf checker plots with gnuplot, and Elle renders an
           # anomaly's cycle with graphviz; without them a clean history is
           # reported :unknown.
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends gnuplot-nox graphviz
+          tuplesky/scripts/ci/apt_install.sh gnuplot-nox graphviz
           # JDK 21: Jepsen compiles its Java sources with `--release 21`.
           # The lein script runs `java` from PATH (the runner's default is
           # 17), not JAVA_HOME's, so both PATH and JAVA_CMD name it.
@@ -851,8 +848,7 @@ jobs:
         run: |
           if [ "$WAN" != none ] || [[ ",$NEMESIS," == *,packet,* ]]; then
             sudo modprobe -a sch_prio sch_netem cls_u32 || {
-              sudo apt-get update -qq
-              sudo apt-get install -y -qq --no-install-recommends "linux-modules-extra-$(uname -r)"
+              tuplesky/scripts/ci/apt_install.sh "linux-modules-extra-$(uname -r)"
               sudo modprobe -a sch_prio sch_netem cls_u32
             }
             lsmod | grep -E '^(sch_prio|sch_netem|cls_u32) '
@@ -866,8 +862,7 @@ jobs:
           restore-keys: jepsen-etcd-m2-
       - name: Install Leiningen
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends gnuplot-nox graphviz
+          tuplesky/scripts/ci/apt_install.sh gnuplot-nox graphviz
           echo "JAVA_HOME=$JAVA_HOME_21_X64" >> "$GITHUB_ENV"
           echo "JAVA_CMD=$JAVA_HOME_21_X64/bin/java" >> "$GITHUB_ENV"
           echo "$JAVA_HOME_21_X64/bin" >> "$GITHUB_PATH"
@@ -970,8 +965,7 @@ jobs:
         run: |
           if [ "$WAN" != none ] || [[ ",$SWIFTPAXOS_NEMESIS," == *,packet,* ]]; then
             sudo modprobe -a sch_prio sch_netem cls_u32 || {
-              sudo apt-get update -qq
-              sudo apt-get install -y -qq --no-install-recommends "linux-modules-extra-$(uname -r)"
+              tuplesky/scripts/ci/apt_install.sh "linux-modules-extra-$(uname -r)"
               sudo modprobe -a sch_prio sch_netem cls_u32
             }
             lsmod | grep -E '^(sch_prio|sch_netem|cls_u32) '
@@ -993,8 +987,7 @@ jobs:
           echo "SwiftPaxos baseline: $(tail -n 1 "$RUNNER_TEMP/swiftpaxos-build.txt" | sed 's/.* from //'), faults $SWIFTPAXOS_NEMESIS" >> "$GITHUB_STEP_SUMMARY"
       - name: Install Leiningen and this repository's Jepsen
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends gnuplot-nox graphviz
+          tuplesky/scripts/ci/apt_install.sh gnuplot-nox graphviz
           echo "JAVA_HOME=$JAVA_HOME_21_X64" >> "$GITHUB_ENV"
           echo "JAVA_CMD=$JAVA_HOME_21_X64/bin/java" >> "$GITHUB_ENV"
           echo "$JAVA_HOME_21_X64/bin" >> "$GITHUB_PATH"
