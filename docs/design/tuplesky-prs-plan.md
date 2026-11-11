@@ -3936,8 +3936,29 @@ So every feature-gated change, task-d98's `EarlyProposal` first, would ship unre
   - the servers' CPU a command.
 
   The figures in the acceptance below are read against it.
+- **The first reading, local (#205 review).**
+  - **Setup:** the shim's head `b7fac614` (the carry `c19211a0`, with step A), plus a scratch counter of the events taken between two flushes, by plane. Five voters on one four-core host, tmpfs, `strict`. Features: `early-proposal,release-at-execution`, with and without `answer-on-release`. 30,000 operations at 30 callers, 60,000 at 120.
+  - **The leader:**
+
+    | Callers | `answer-on-release` | Commands a flush | Events a flush (api + peer) | Flushes cut by `FLUSH_EVENTS` |
+    | --- | --- | --- | --- | --- |
+    | 30 | off | 3.0 | 39.9 (14.4 + 25.5) | 27% |
+    | 30 | on | 3.2 | 34.2 (7.6 + 26.6) | 15% |
+    | 120 | off | 5.2 | 61.2 (24.6 + 36.6) | 89% |
+    | 120 | on | 6.1 | 58.3 (15.5 + 42.8) | 85% |
+
+  - **The followers:**
+    - The two with the bench's frontends executed 2.0 to 2.2 commands a flush at 30 callers and 4.4 to 4.5 at 120, cut by `FLUSH_EVENTS` in 8 to 20% of flushes at 120.
+    - The other two executed 1.5 to 1.6 and 2.5 to 2.7, almost always idle.
+    - No voter's flush was cut by `FLUSH_QUEUED`.
+  - **What it says:**
+    - **Proposals a frame (k) on this cut is the leader's commands a flush.** That is about 3 at 30 callers, as the runner's counters said, and 5 to 6 at 120. It is not 10.
+    - **At 120 callers the cut is the bound, not idleness.** The leader takes about 10 events a command (58.3 / 6.1, 7 of them peer), so 64 events is about 6 commands.
+    - **The bound is in events, and the batched round lowers the events a command.** Acknowledgements come by range, so the same 64 events hold more commands as the round batches. Whether `FLUSH_EVENTS` should rise, or count commands, is read again on the batched frames' own reading, not set here.
+    - **This host was saturated at 120 callers.** It served 2,600 to 2,700 operations a second at 120 against 2,250 to 2,550 at 30, and 2,080 and 5,788 operations ended `unknown`. So the 120-caller rows are a leader at its core's limit. The runner's reading at five voters is the one the acceptance's figures are read against.
+  - **The counter goes on the metrics line with the first code step:** `flushes` gains the api and peer events taken between flushes, and a histogram of them.
 - **The batched frames (`Feature::BatchedRound`),** with task-d100's step B built here and not alone:
-  - **a turn is the leader loop's work between two lowered groups.** The leader queues what it orders for each follower and each collector, and cuts the frames where the loop lowers a journal group (no event ready, `owes_flush`) or at the frame bound. No timer cuts a frame, and one caller gets a frame of one at once;
+  - **a turn is the leader loop's work between two lowered groups.** The leader queues what it orders for each follower and each collector, and cuts the frames where the loop lowers a journal group, in each of `flush_due`'s three cases (no event ready, `owes_flush`; 64 events since the last flush with one owed, `FLUSH_EVENTS`; 64 batches queued with no append out, `FLUSH_QUEUED`), or at the frame bound. No timer cuts a frame, and one caller gets a frame of one at once;
   - one proposal frame a follower a turn, carrying every proposal of the turn in sequence-number order with its vote, a relayed command's payload record, and the commit frontier; split only at the transport's frame bound. A turn that orders nothing for a follower sends it the frontier on its own, as today;
   - step B's relay, switch, advice bit and fallbacks as Section 4.3's B1 and B2 state them, the advice bit once a release frame;
   - one release frame a collector a turn, each entry checked as one release is today and independent of the others: one `check_release` holds or refuses doesn't hold or refuse the rest;
@@ -3958,6 +3979,7 @@ So every feature-gated change, task-d98's `EarlyProposal` first, would ship unre
   - a payload in a frame whose identity or admission differs from its vote's is dropped and fetched, and the frame's other proposals are adopted;
   - a turn's releases to a collector leave in one frame, and a collector answers each entry exactly as it answers one release; an entry held or refused leaves the frame's other entries answered;
   - a turn that orders nothing for a follower sends it the commit frontier on its own;
+  - with events always ready, a turn's frames leave by the 64th event (`FLUSH_EVENTS`), not only once no event is ready;
   - with one caller, each frame leaves at the first flush, holding one command;
   - a frame lost, duplicated or split at the bound changes no decision, and the re-send (task-d49, task-d59) re-sends what a voter hasn't acknowledged.
 - **Model tests, the acknowledgement:**
