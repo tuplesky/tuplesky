@@ -14,7 +14,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
 use coord_journal_faultkit::{FaultFs, FaultPlan, Op, Tail};
-use coord_journal_raft_engine::JournalOptions;
+use coord_journal_raft_engine::{DirSync, JournalOptions};
 
 use common::*;
 
@@ -135,7 +135,7 @@ fn a_failed_write_never_acknowledges_and_loses_nothing_acknowledged() {
                     fail_write_prefix: prefix,
                     ..FaultPlan::default()
                 };
-                let shared = run(
+                let (shared, _) = run(
                     plan,
                     tail,
                     &format!("write {n} fails after {prefix} bytes, then {tail:?}"),
@@ -151,7 +151,10 @@ fn enospc_never_acknowledges_and_loses_nothing_acknowledged() {
     let ops = census();
     let total = ops.len() as u64;
     for (i, op) in ops.iter().enumerate() {
-        if !matches!(op, Op::Write { .. } | Op::SetLen { .. }) {
+        if !matches!(
+            op,
+            Op::Write { .. } | Op::SetLen { .. } | Op::Allocate { .. }
+        ) {
             continue;
         }
         let n = i as u64 + 1;
@@ -189,12 +192,16 @@ fn a_failed_sync_never_acknowledges_and_loses_nothing_acknowledged() {
                     tail: persisted,
                     ..FaultPlan::default()
                 };
-                let shared = run(
-                    plan,
-                    Some(after),
-                    &format!("sync {n} fails persisting {persisted:?}, crash keeps {after:?}"),
-                );
+                let case =
+                    format!("sync {n} fails persisting {persisted:?}, crash keeps {after:?}");
+                let (shared, acked) = run(plan, Some(after), &case);
                 assert!(shared.log().contains(&Op::Failed), "sync {n} not reached");
+                // The call that issued the failed sync never returned `Ok`,
+                // frozen or not: the crash at the same ordinal would
+                // otherwise hide an engine that swallowed the error.
+                if let Some(c) = acked.call_at(n) {
+                    assert!(!c.ok, "{case}: the {} call returned Ok", c.what);
+                }
             }
         }
     }
@@ -228,12 +235,19 @@ fn a_lying_sync_is_caught_by_the_check() {
         if catch_unwind(AssertUnwindSafe(|| check(&root, &acked, "lie"))).is_err() {
             caught += 1;
         }
+        // The lie did buy an acknowledgement: the call that issued it
+        // returned `Ok`, after the crash, so the check rightly counts it
+        // as never given. Only the close's syncs belong to no call.
+        if let Some(c) = acked.call_at(n) {
+            assert!(c.ok, "lie at {n}: the {} call didn't return Ok", c.what);
+        }
     }
     // Crashing right after the lie means the acknowledgement it bought is
     // never observed. So crash one operation later instead: the lied-about
     // group's acknowledgement has returned, and the next real sync, which
     // would persist its bytes too, never runs.
     let mut caught_later = 0;
+    let mut uncaught = Vec::new();
     for &n in &syncs {
         let plan = FaultPlan {
             lie_on_sync_at: Some(n),
@@ -247,8 +261,22 @@ fn a_lying_sync_is_caught_by_the_check() {
         shared.materialize(Tail::None).unwrap();
         if catch_unwind(AssertUnwindSafe(|| check(&root, &acked, "lie"))).is_err() {
             caught_later += 1;
+        } else {
+            uncaught.push((n, acked.call_at(n).map(|c| c.what)));
         }
     }
+    // The lies that lose nothing, named: syncs no call issued (the close's,
+    // which acknowledge nothing), and at most the last group's, whose bytes
+    // a close's sync would persist. Any other is a blind spot.
+    let last_group = uncaught
+        .iter()
+        .filter(|(_, what)| *what == Some("group"))
+        .count();
+    let close = uncaught.iter().filter(|(_, what)| what.is_none()).count();
+    assert!(
+        last_group <= 1 && last_group + close == uncaught.len() && uncaught.len() <= 2,
+        "uncaught lies other than the last group's and the close's: {uncaught:?}"
+    );
     assert_eq!(
         caught, 0,
         "a lie whose acknowledgement nobody saw is no loss"
@@ -281,6 +309,7 @@ fn a_crash_image_is_the_synced_bytes_plus_the_chosen_tail() {
     ] {
         let (fs, shared) = FaultFs::new(FaultPlan::default());
         let handle = Arc::new(fs.create(&path).unwrap());
+        fs.sync_dir(dir.path()).unwrap();
         let mut writer = fs.new_writer(handle.clone()).unwrap();
         writer.write_all(b"synced").unwrap();
         handle.sync().unwrap();
@@ -312,6 +341,7 @@ fn a_sector_tear_keeps_or_loses_whole_sectors() {
         let path = dir.path().join("f");
         let (fs, shared) = FaultFs::new(FaultPlan::default());
         let handle = Arc::new(fs.create(&path).unwrap());
+        fs.sync_dir(dir.path()).unwrap();
         let mut writer = fs.new_writer(handle.clone()).unwrap();
         writer.write_all(&payload[..100]).unwrap();
         handle.sync().unwrap();
@@ -356,13 +386,15 @@ fn a_failed_sync_that_persisted_everything_leaves_nothing_pending() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("f");
         let plan = FaultPlan {
-            // Ordinal 1 is the create, 2 and 3 the writes, 4 the sync.
-            fail_sync_at: Some(4),
+            // Ordinal 1 is the create, 2 the directory sync, 3 and 4 the
+            // writes, 5 the sync.
+            fail_sync_at: Some(5),
             tail: Tail::All,
             ..FaultPlan::default()
         };
         let (fs, shared) = FaultFs::new(plan);
         let handle = Arc::new(fs.create(&path).unwrap());
+        fs.sync_dir(dir.path()).unwrap();
         let mut writer = fs.new_writer(handle.clone()).unwrap();
         writer.write_all(b"aaaa").unwrap();
         writer.seek(SeekFrom::Start(0)).unwrap();
@@ -372,6 +404,72 @@ fn a_failed_sync_that_persisted_everything_leaves_nothing_pending() {
         shared.materialize(Tail::Seeded(seed)).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"bbaa", "seed {seed}");
     }
+}
+
+/// A created file's entry needs a directory sync, and a renamed one's
+/// too: until one covers it, a crash loses the created file and puts the
+/// renamed one back under its old name, however much of their bytes were
+/// synced (#210 review).
+#[test]
+fn an_entry_no_directory_sync_covered_is_undone_at_a_crash() {
+    use raft_engine::env::{FileSystem, Handle};
+    use std::io::Write;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+    let (fs, shared) = FaultFs::new(FaultPlan::default());
+    let handle = Arc::new(fs.create(&a).unwrap());
+    let mut writer = fs.new_writer(handle.clone()).unwrap();
+    writer.write_all(b"bytes").unwrap();
+    handle.sync().unwrap();
+    assert_eq!(shared.unsynced_entries(), vec![a.clone()]);
+    shared.materialize(Tail::All).unwrap();
+    assert!(!a.exists(), "a created file outlived its unsynced entry");
+
+    let (fs, shared) = FaultFs::new(FaultPlan::default());
+    let handle = Arc::new(fs.create(&a).unwrap());
+    let mut writer = fs.new_writer(handle.clone()).unwrap();
+    writer.write_all(b"bytes").unwrap();
+    handle.sync().unwrap();
+    fs.sync_dir(dir.path()).unwrap();
+    assert!(shared.unsynced_entries().is_empty());
+    fs.rename(&a, &b).unwrap();
+    assert_eq!(shared.unsynced_entries(), vec![b.clone()]);
+    shared.materialize(Tail::All).unwrap();
+    assert!(!b.exists(), "a rename outlived its unsynced entry");
+    assert_eq!(std::fs::read(&a).unwrap(), b"bytes");
+}
+
+/// A directory sync the device lied about leaves the entries as they
+/// were: the lie is caught by the check, so the matrix depends on the
+/// adapter's directory sync and not on a kind model.
+#[test]
+fn a_directory_sync_the_device_lied_about_loses_the_created_journal() {
+    let ops = census();
+    let dir_syncs: Vec<u64> = ops
+        .iter()
+        .enumerate()
+        .filter(|(_, op)| matches!(op, Op::DirSync { .. }))
+        .map(|(i, _)| i as u64 + 1)
+        .collect();
+    // The journal's directory, then the directory that held it.
+    assert_eq!(dir_syncs.len(), 2, "{ops:?}");
+    let total = ops.len() as u64;
+    let plan = FaultPlan {
+        lie_on_dir_sync_at: Some(dir_syncs[0]),
+        // Crash once everything was acknowledged, keeping every byte: only
+        // the entry is lost.
+        crash_after: Some(total),
+        ..FaultPlan::default()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("j");
+    let (fs, shared) = FaultFs::new(plan);
+    let acked = workload(&root, fs, &shared);
+    assert!(acked.created && acked.through.is_some());
+    shared.materialize(Tail::All).unwrap();
+    let caught = catch_unwind(AssertUnwindSafe(|| check(&root, &acked, "lying dir sync")));
+    assert!(caught.is_err(), "a lost first log file went unnoticed");
 }
 
 #[test]
