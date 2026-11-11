@@ -358,6 +358,93 @@ fn a_ballot_change_asks_for_every_entry_again() {
     assert_eq!(c.half_established().len(), 2);
 }
 
+fn version(bytes: &[u8]) -> u16 {
+    let mut reader = coord_types::wire_v1::FrameReader::new();
+    reader.push(bytes).expect("bounded");
+    reader
+        .next_frame()
+        .expect("well formed")
+        .expect("complete")
+        .version
+}
+
+/// task-d102: a relayed entry goes to its ballot's leader alone, and a
+/// ballot change re-targets it to the new leader, asked at once with the
+/// relayed frame; an entry not relayed is asked of every voter as before.
+#[test]
+fn a_ballot_change_re_targets_a_relayed_entry_to_the_new_leader() {
+    let mut c = collector(4);
+    c.set_answer_on_release(true);
+    c.set_relay(true);
+    let (a, request) = admitted(1);
+    let Ok(Submitted::FanOut(fan_out)) = c.submit(MonotonicMillis::ZERO, &request) else {
+        panic!("not new work");
+    };
+    assert_eq!(fan_out.targets, vec![r(0)]);
+    assert_eq!(version(&fan_out.frame), coord_collector::VERSION_RELAYED);
+    c.set_relay(false);
+    let b = submit(&mut c, 2);
+    c.reconfigure(quorum(ballot(1, 1)));
+    let asked = c.due_solicits(MonotonicMillis::new(1), 16);
+    let relayed = asked.iter().find(|f| f.command == a).expect("asked");
+    assert_eq!(relayed.targets, vec![r(1)]);
+    assert_eq!(version(&relayed.frame), coord_collector::VERSION_RELAYED);
+    let fanned = asked.iter().find(|f| f.command == b).expect("asked");
+    assert_eq!(fanned.targets, (0..3).map(r).collect::<Vec<_>>());
+}
+
+/// task-d102: `NotLeading` says nothing about the command. A relayed
+/// entry falls back to fan-out at once; any other waits as it was, and
+/// neither is settled from the record on it.
+#[test]
+fn not_leading_falls_back_a_relayed_entry_and_settles_nothing() {
+    let mut c = collector(4);
+    c.set_answer_on_release(true);
+    let unrelayed = submit(&mut c, 1);
+    c.set_relay(true);
+    let relayed = submit(&mut c, 2);
+    for command in [unrelayed, relayed] {
+        assert_eq!(
+            c.on_evidence(from(1), refused(command, SubmissionRefusal::NotLeading)),
+            Ok(Progress::Held(HoldReason::AwaitingRelease))
+        );
+    }
+    assert_eq!(c.not_leading(), 1, "counted for the relayed entry only");
+    assert!(
+        c.half_established().is_empty(),
+        "nothing is settled from the record"
+    );
+    let due = c.due_solicits(MonotonicMillis::ZERO, 16);
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].command, relayed);
+    assert_eq!(due[0].targets, (0..3).map(r).collect::<Vec<_>>());
+    assert_eq!(
+        version(&due[0].frame),
+        coord_collector::VERSION_ANSWER_ON_RELEASE
+    );
+    assert_eq!(c.relay_fallbacks(), 1);
+    assert!(
+        c.trace()
+            .iter()
+            .any(|e| matches!(e, CollectorEvent::RelayFellBack { .. }))
+    );
+}
+
+/// task-d102: the relay only applies to marked submissions: with answer
+/// on release off, a collector set to relay still fans out version 1.
+#[test]
+fn the_relay_needs_answer_on_release() {
+    let mut c = collector(4);
+    c.set_relay(true);
+    assert!(!c.relays());
+    let (_, request) = admitted(1);
+    let Ok(Submitted::FanOut(fan_out)) = c.submit(MonotonicMillis::ZERO, &request) else {
+        panic!("not new work");
+    };
+    assert_eq!(fan_out.targets, (0..3).map(r).collect::<Vec<_>>());
+    assert_eq!(version(&fan_out.frame), coord_collector::wire::VERSION);
+}
+
 /// The golden trace is kept only by a collector made to keep it: the
 /// daemon's collector never reads its trace, so one made with `new`
 /// records nothing however many transitions it makes (task-d60), and

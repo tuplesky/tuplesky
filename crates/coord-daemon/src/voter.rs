@@ -672,6 +672,12 @@ impl<P: Persistence> Voter<P> {
         if frame.version == coord_collector::VERSION_ANSWER_ON_RELEASE {
             self.node.mark_next_admitted();
         }
+        // Relayed to this voter alone as the leader (task-d102, step B):
+        // marked the same way, proposed with its payload if this voter
+        // leads, and refused as `NotLeading` if it doesn't.
+        if frame.version == coord_collector::VERSION_RELAYED {
+            self.node.mark_next_relayed();
+        }
         let out = self.node.on_event(Event::Admitted(admitted), &self.ballot);
         let command = early.or_else(|| self.node.machine().admitted());
         #[cfg(debug_assertions)]
@@ -1136,8 +1142,9 @@ impl<P: Persistence> Voter<P> {
         self.node.settle(&self.ballot)
     }
 
-    /// Whether [`Voter::flush`] has anything to do: batches queued, or a
-    /// command to apply.
+    /// Whether [`Voter::flush`] has anything to do: batches queued, a
+    /// command to apply, or a leader's proposals waiting for the turn's
+    /// frame (task-d102).
     ///
     /// Batches queued behind a journal append that is out are not owed a
     /// flush (task-d54): nothing can be journaled until the append is
@@ -1145,7 +1152,9 @@ impl<P: Persistence> Voter<P> {
     /// then. Owed one, the runtime would flush in a loop that moves
     /// nothing.
     pub fn owes_flush(&self) -> bool {
-        (self.queued() > 0 && !self.appending()) || self.node.can_execute()
+        (self.queued() > 0 && !self.appending())
+            || self.node.can_execute()
+            || self.node.machine().frames_queued()
     }
 
     /// Whether a journal append is out on the appender's thread, its

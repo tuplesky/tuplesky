@@ -9,9 +9,9 @@ use std::time::Duration;
 use coord_daemon::metrics::{
     Answered, Cost, Cpu, Datagrams, Distribution, Durability, FastPath, Flushes, Frontiers,
     Headroom, History, Interval, Jobs, JournalGroups, Lane, LaneReading, Latency,
-    MAX_REPORTED_SHARDS, Measure, MetricsSnapshot, PipelineWaits, Reads, Recorder, Release,
-    ReleaseDistributions, Resends, Scheduling, ShardIndex, ShardReading, Stage, StageReading,
-    Traffic, Unavailable, UnorderedPreAcceptances, Wait,
+    MAX_REPORTED_SHARDS, Measure, MetricsSnapshot, PipelineWaits, ProposalBytes, Reads, Recorder,
+    Relay, Release, ReleaseDistributions, Resends, Scheduling, ShardIndex, ShardReading, Stage,
+    StageReading, Traffic, Unavailable, UnorderedPreAcceptances, Wait,
 };
 use coord_daemon::role::RoleSet;
 
@@ -496,18 +496,36 @@ fn a_rendered_snapshot_carries_no_secret_or_key_shaped_text() {
                 payload_records: 1200,
                 application_records: 1200,
             },
-            flushes: Flushes {
-                idle: 5000,
-                events: 40,
-                queued: 2,
-                appending: 900,
-            },
             history: History {
                 records: 5200,
                 kept: 1400,
                 sweeps: 3,
                 entries: 9100,
                 largest_map: 1700,
+            },
+            flushes: Flushes {
+                idle: 5000,
+                events: 40,
+                queued: 2,
+                appending: 900,
+                flushes: 900,
+                api_events: 4000,
+                peer_events: 6000,
+                by_events: [0, 100, 100, 200, 200, 200, 100, 0, 0],
+            },
+            proposals: ProposalBytes {
+                proposals: 8000,
+                proposal_bytes: 1_200_000,
+                payload_bytes: 2_000_000,
+                frames: 700,
+                framed: 6000,
+                frontiers: 900,
+                frontier_bytes: 40_000,
+            },
+            relay: Relay {
+                relayed: 4000,
+                fallbacks: 3,
+                not_leading: 1,
             },
         }),
     };

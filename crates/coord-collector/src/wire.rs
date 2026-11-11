@@ -51,6 +51,12 @@ pub const VERSION: u16 = 1;
 pub const VERSION_ANSWER_ON_RELEASE: u16 =
     coord_types::wire_v1::COLLECTOR_SUBMIT_ANSWER_ON_RELEASE_VERSION;
 
+/// The version of a submission relayed to its ballot's leader alone
+/// (task-d102, task-d100's step B): the version-1 payload, marked as
+/// version 2 is, and sent only while the collector's node reads
+/// `Feature::BatchedRound` active, which no older build admits.
+pub const VERSION_RELAYED: u16 = coord_types::wire_v1::COLLECTOR_SUBMIT_RELAYED_VERSION;
+
 /// A release for a command answered on the release alone (task-d100,
 /// step A): the released result and the admission digest of the payload
 /// the leader decided, which the collector compares with the one it
@@ -234,6 +240,13 @@ pub fn submit_frame_answer_on_release(submit: &SubmitV1) -> Result<Vec<u8>, Coll
     frame_versioned(KIND_SUBMIT, VERSION_ANSWER_ON_RELEASE, &payload)
 }
 
+/// Encode a submission relayed to its ballot's leader alone (task-d102):
+/// the version-1 payload under [`VERSION_RELAYED`].
+pub fn submit_frame_relayed(submit: &SubmitV1) -> Result<Vec<u8>, CollectorWireError> {
+    let payload = postcard::to_allocvec(submit).map_err(|_| CollectorWireError::TooLarge)?;
+    frame_versioned(KIND_SUBMIT, VERSION_RELAYED, &payload)
+}
+
 /// Decode a submission.
 pub fn decode_submit(frame: &Frame) -> Result<SubmitV1, CollectorWireError> {
     decode_submit_marked(frame).map(|(submit, _)| submit)
@@ -242,10 +255,14 @@ pub fn decode_submit(frame: &Frame) -> Result<SubmitV1, CollectorWireError> {
 /// Decode a submission, with whether its collector answers it on the
 /// leader's final release alone (task-d100, step A).
 pub fn decode_submit_marked(frame: &Frame) -> Result<(SubmitV1, bool), CollectorWireError> {
-    check_versions(frame, KIND_SUBMIT, &[VERSION, VERSION_ANSWER_ON_RELEASE])?;
+    check_versions(
+        frame,
+        KIND_SUBMIT,
+        &[VERSION, VERSION_ANSWER_ON_RELEASE, VERSION_RELAYED],
+    )?;
     Ok((
         exact(&frame.payload)?,
-        frame.version == VERSION_ANSWER_ON_RELEASE,
+        frame.version == VERSION_ANSWER_ON_RELEASE || frame.version == VERSION_RELAYED,
     ))
 }
 
