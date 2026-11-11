@@ -97,7 +97,8 @@
 //!   searched, so a tenant's payload holding a whole batch's shape, in a
 //!   write torn inside its header's sector, is refused. So is a payload
 //!   with too many batch-shaped headers to rule one out within the
-//!   search's bound (a few passes over the tail).
+//!   search's bound (a few passes over the tail). In a 64 KiB tail, 24
+//!   such headers reach it: 384 bytes of a value (#211 re-review).
 //!
 //! **After a refusal.** It names the file, the offset and the reason. The
 //! voter stays down: it is rebuilt from its peers by replacing it
@@ -110,9 +111,13 @@
 //!
 //! **A file header of zeros** with data after it is refused: a header is
 //! synced before anything in its file is acknowledged (by `rotate_imp`
-//! for a rotated file, and with the identity record by `create`, which
-//! also syncs the directory, for the first), so only damage, or a creation
-//! never acknowledged, leaves one.
+//! for a rotated file, with the identity record by `create`, which also
+//! syncs the directory, for the first, and by the adapter's open for a
+//! header the engine's recovery rewrote), so only damage, or a creation
+//! never acknowledged, leaves one. The recovery truncates a last file
+//! whose header did not read and writes a new one, in the pin's default
+//! format, version 1 (`pipe_builder.rs`): so a version 2 journal can hold
+//! a version 1 file, whose batches are unsigned (#211 re-review).
 //!
 //! The kit's recovery test crashes at every operation recovery issues,
 //! its truncation and syncs among them, on the fault seam.

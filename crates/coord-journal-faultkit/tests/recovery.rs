@@ -29,6 +29,7 @@ mod common;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 
+use coord_journal_api::engine::JournalEngine;
 use coord_journal_faultkit::{FaultFs, FaultPlan, Op, Tail};
 use coord_journal_raft_engine::{JournalOptions, OpenError, RaftEngineJournal, RecoveryPolicy};
 
@@ -478,29 +479,45 @@ fn a_crash_inside_recovery_keeps_every_acknowledged_group() {
     );
 }
 
-/// A reopen that rewrites the last file's header makes it durable before
-/// it returns (#211 review). A crash in a rotation after the next file's
-/// entry survived and before its header was synced leaves that file
-/// empty; recovery truncates it, and the writer writes a new header. Left
-/// unsynced, a crash after the next group's write could keep the group's
-/// sectors and lose the header's, which the guard refuses. Here the crash
-/// comes right after the reopen returns, and nothing unsynced is kept.
-#[test]
-fn a_reopen_that_rewrites_a_header_makes_it_durable() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().join("j");
+/// A finished workload under `root`, every group synced and acknowledged,
+/// with an empty next log file: what a crash in a rotation leaves when the
+/// next file's directory entry survives and its header was never synced
+/// (#211 review). A file system can keep such an entry, when another
+/// file's sync commits it; the kit always drops one, so the state is built
+/// by hand. Returns the workload's acknowledgements and the empty file.
+fn finished_with_an_empty_next_file(root: &Path) -> (Acked, std::path::PathBuf) {
     let (fs, shared) = FaultFs::new(FaultPlan::default());
-    let acked = workload(&root, fs, &shared);
+    let acked = workload(root, fs, &shared);
     assert_eq!(shared.unsynced(), 0);
-    let last = log_files(&root)
+    let last = log_files(root)
         .into_iter()
-        .filter(|(name, _)| name.ends_with(".raftlog"))
         .map(|(name, _)| name)
-        .next_back()
+        .rfind(|name| name.ends_with(".raftlog"))
         .expect("a log file");
     let seq: u64 = last.trim_end_matches(".raftlog").parse().unwrap();
     let next = root.join(format!("{:016}.raftlog", seq + 1));
     std::fs::write(&next, b"").unwrap();
+    (acked, next)
+}
+
+/// Whether `file` starts with a header: at least a version 1 header's
+/// length (61 bytes), not all zeros.
+fn holds_a_header(file: &Path) -> bool {
+    let bytes = std::fs::read(file).unwrap();
+    bytes.len() >= 61 && bytes[..61].iter().any(|b| *b != 0)
+}
+
+/// A reopen that rewrites the last file's header makes it durable before
+/// it returns (#211 review). Recovery truncates a last file whose header
+/// does not read and the writer writes a new one; left unsynced, a crash
+/// after the next group's write could keep the group's sectors and lose
+/// the header's, which the guard refuses. Here the crash comes right after
+/// the reopen returns, and nothing unsynced is kept.
+#[test]
+fn a_reopen_that_rewrites_a_header_makes_it_durable() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("j");
+    let (acked, next) = finished_with_an_empty_next_file(&root);
 
     let (fs, shared) = FaultFs::new(FaultPlan::default());
     let journal =
@@ -511,11 +528,103 @@ fn a_reopen_that_rewrites_a_header_makes_it_durable() {
     quietly_drop(journal);
     shared.materialize(Tail::None).unwrap();
 
-    let header = std::fs::read(&next).unwrap();
     assert!(
-        header.len() >= 61 && header.iter().any(|b| *b != 0),
-        "the rewritten header was not durable: {} bytes",
-        header.len()
+        holds_a_header(&next),
+        "the rewritten header was not durable"
     );
     check(&root, &acked, "after a reopen over an empty last file");
+}
+
+/// The review's run (#211 re-review): over the same state, reopen, write
+/// one 1.7 KB group, and crash once its write is issued, before its sync;
+/// then every remains a sector-atomic device can leave of what was not
+/// synced. Every one opens with every acknowledged group. The rewritten
+/// file is in format version 1 (the pin's default, 61-byte header) inside
+/// a journal created at version 2, so its batches are unsigned, and this
+/// is the guard's unsigned path on a torn write (#211 re-review, point 2).
+/// Without the open's sync, 7 of 24 were refused for a zero header.
+#[test]
+fn a_group_torn_after_a_rewritten_header_keeps_every_acknowledged_group() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("base");
+    let (mut acked, next) = finished_with_an_empty_next_file(&base);
+    let stream = acked.stream.expect("a mapping");
+    let last = records(stream).pop().unwrap();
+    let extra = record_after(&last, GROUPS + 1, 1700);
+    // Written, never acknowledged: it may be there or not.
+    acked.attempted = Some(extra.seq());
+    let name = next.file_name().unwrap().to_owned();
+
+    // Reopen `root` on the kit and write the group, under `plan`.
+    let reopen_and_write = |root: &Path, plan: FaultPlan| {
+        let (fs, shared) = FaultFs::new(plan);
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            let Ok(mut journal) =
+                RaftEngineJournal::open_existing_with_file_system(root, identity(), &options(), fs)
+            else {
+                return;
+            };
+            let _ =
+                journal.append_group(&group(u64::from(GROUPS) + 1, stream, vec![extra.clone()]));
+            quietly_drop(journal);
+        }));
+        shared
+    };
+
+    // Where the group's write is issued, fault-free.
+    let probe = dir.path().join("probe");
+    copy_dir(&base, &probe);
+    let shared = reopen_and_write(&probe, FaultPlan::default());
+    let log = shared.log();
+    assert_eq!(log.len() as u64, shared.ops());
+    let header = std::fs::read(probe.join(&name)).unwrap();
+    assert!(
+        header.len() > 61 + 1700,
+        "the group is in the rewritten file: {} bytes",
+        header.len()
+    );
+    let write = log
+        .iter()
+        .rposition(|op| matches!(op, Op::Write { file, len, .. } if *file == name.to_string_lossy() && *len > 1000))
+        .expect("the group's write");
+    let crash_after = write as u64 + 1;
+
+    let pieces = {
+        let root = dir.path().join("count");
+        copy_dir(&base, &root);
+        let plan = FaultPlan {
+            crash_after: Some(crash_after),
+            ..FaultPlan::default()
+        };
+        reopen_and_write(&root, plan).unsynced_pieces()
+    };
+    assert!(pieces >= 2, "the write spans sectors: {pieces} pieces");
+    let (mut headerless, mut refused) = (Vec::new(), Vec::new());
+    for mask in 0..(1u64 << pieces) {
+        let root = dir.path().join(format!("m{mask}"));
+        copy_dir(&base, &root);
+        let plan = FaultPlan {
+            crash_after: Some(crash_after),
+            ..FaultPlan::default()
+        };
+        reopen_and_write(&root, plan)
+            .materialize(Tail::Sectors(mask))
+            .unwrap();
+        if !holds_a_header(&root.join(&name)) {
+            headerless.push(mask);
+        }
+        let case = format!("a group torn after a rewritten header, mask {mask}");
+        if catch_unwind(AssertUnwindSafe(|| check(&root, &acked, &case))).is_err() {
+            refused.push(mask);
+        }
+    }
+    eprintln!(
+        "a group torn after a rewritten header: {} remains, {} without the header, {} refused \
+         or short",
+        1u64 << pieces,
+        headerless.len(),
+        refused.len()
+    );
+    assert!(headerless.is_empty(), "no header in remains {headerless:?}");
+    assert!(refused.is_empty(), "refused or short: remains {refused:?}");
 }

@@ -117,6 +117,17 @@ pub fn records(stream: StorageStreamId) -> Vec<JournalRecordV1> {
     out
 }
 
+/// A record that follows `prev` in its stream, of about `size` bytes.
+pub fn record_after(prev: &JournalRecordV1, tag: u8, size: usize) -> JournalRecordV1 {
+    JournalRecordV1::seal(RecordDraft {
+        origin: *prev.origin(),
+        seq: prev.seq().checked_next().unwrap(),
+        predecessor: prev.digest(),
+        body: transition(tag, size),
+    })
+    .unwrap()
+}
+
 pub fn group(n: u64, stream: StorageStreamId, records: Vec<JournalRecordV1>) -> GroupWrite {
     let mut g = GroupWrite::new(GroupLimits::DEFAULT);
     g.push(GroupEntry::new(barrier(n), stream, records).unwrap())
