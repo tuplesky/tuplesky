@@ -92,6 +92,12 @@ pub struct DurableLedger {
     staged: BTreeMap<BarrierId, Vec<(CommandId, CommandRecord)>>,
     /// Records a batch in flight deletes, by its barrier (task-d24).
     removals: BTreeMap<BarrierId, Vec<CommandId>>,
+    /// How many durable records the last history sweep left, lowered as
+    /// records leave otherwise: what the next sweep is measured from
+    /// (task-d110).
+    swept_at: usize,
+    /// History sweeps run since this ledger was restored (task-d110).
+    sweeps: u64,
 }
 
 impl DurableLedger {
@@ -102,6 +108,8 @@ impl DurableLedger {
             sequences: BTreeMap::new(),
             staged: BTreeMap::new(),
             removals: BTreeMap::new(),
+            swept_at: 0,
+            sweeps: 0,
         }
     }
 
@@ -112,6 +120,8 @@ impl DurableLedger {
             sequences: BTreeMap::new(),
             staged: BTreeMap::new(),
             removals: BTreeMap::new(),
+            swept_at: 0,
+            sweeps: 0,
         }
     }
 
@@ -242,6 +252,44 @@ impl DurableLedger {
     pub fn retain(&mut self, keep: impl Fn(&CommandId) -> bool) {
         self.records.retain(|c, _| keep(c));
         self.sequences.retain(|c, _| keep(c));
+    }
+
+    /// Whether a history sweep is due, at `threshold` records
+    /// (task-d110): once the ledger holds more than the threshold, and
+    /// more than half again what the last sweep left.
+    ///
+    /// A sweep forgets only what the command table forgets, executed
+    /// history. Records the table keeps, such as committed commands a
+    /// voter behind has not executed, stay through every sweep. Due at
+    /// the threshold alone, the sweep then ran on every execution once
+    /// those passed it, each a walk over all of them that removed
+    /// nothing. A sweep that kept little is due at the threshold as
+    /// before. One that kept more is due once the ledger has grown by
+    /// half of what it kept, so a sweep's walk is paid for by the growth
+    /// since the last one, and the ledger holds at most half again its
+    /// live records, or the threshold.
+    pub fn sweep_due(&mut self, threshold: usize) -> bool {
+        self.swept_at = self.swept_at.min(self.records.len());
+        self.records.len() > threshold.max(self.swept_at.saturating_add(self.swept_at / 2))
+    }
+
+    /// A history sweep has just run: the next is measured from what it
+    /// left.
+    pub fn swept(&mut self) {
+        self.swept_at = self.records.len();
+        self.sweeps += 1;
+    }
+
+    /// What the last history sweep left, lowered as records left
+    /// otherwise (task-d110): the next is due once [`DurableLedger::len`]
+    /// passes the threshold and half again this.
+    pub fn swept_at(&self) -> usize {
+        self.swept_at.min(self.records.len())
+    }
+
+    /// History sweeps run since this ledger was restored (task-d110).
+    pub const fn sweeps(&self) -> u64 {
+        self.sweeps
     }
 
     /// Stage the deletion of `command`'s record under `barrier`: it leaves
@@ -578,5 +626,71 @@ impl ReportAssembler {
             })
             .map(|(r, _)| *r)
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Phase;
+
+    fn rows(from: u64, to: u64) -> Vec<(CommandId, CommandRecord)> {
+        (from..to)
+            .map(|n| {
+                let mut d = [0u8; 32];
+                d[..8].copy_from_slice(&n.to_be_bytes());
+                (
+                    CommandId(Digest32(d)),
+                    CommandRecord {
+                        phase: Phase::Commit,
+                        deps: Vec::new(),
+                        keys: Vec::new(),
+                        payload: None,
+                        paths: Vec::new(),
+                        synced_seq: None,
+                        path: Digest32([3; 32]),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// task-d110: a sweep is due past the threshold, and, after one that
+    /// kept more than two thirds of it, past half again what it kept.
+    /// Records leaving without a sweep lower the mark.
+    #[test]
+    fn a_sweep_is_due_past_the_threshold_and_half_again_what_the_last_kept() {
+        let mut ledger = DurableLedger::restore(rows(0, 40));
+        assert!(!ledger.sweep_due(40), "40 is not past 40");
+        ledger.records.extend(rows(40, 41));
+        assert!(ledger.sweep_due(40));
+        // A sweep that kept 20 of 41: due past the threshold, as before.
+        ledger.retain(|c| c.0.0[7] >= 21);
+        ledger.swept();
+        assert!(!ledger.sweep_due(40));
+        ledger.records.extend(rows(41, 61));
+        assert!(!ledger.sweep_due(40), "40 records");
+        ledger.records.extend(rows(61, 62));
+        assert!(ledger.sweep_due(40));
+        // A sweep that forgot nothing of 100 (a voter behind): not due
+        // again until past 150, half again what it kept.
+        ledger.records.extend(rows(62, 121));
+        assert_eq!(ledger.len(), 100);
+        assert!(ledger.sweep_due(40));
+        ledger.swept();
+        assert!(!ledger.sweep_due(40));
+        ledger.records.extend(rows(121, 171));
+        assert_eq!(ledger.len(), 150);
+        assert!(!ledger.sweep_due(40), "150 is not past 150");
+        ledger.records.extend(rows(171, 172));
+        assert!(ledger.sweep_due(40));
+        // Records leaving without a sweep lower the mark: 60 left of the
+        // 100 the sweep kept, so due past 90.
+        ledger.retain(|c| c.0.0[7] >= 112);
+        assert_eq!(ledger.len(), 60);
+        assert!(!ledger.sweep_due(40));
+        ledger.records.extend(rows(172, 203));
+        assert_eq!(ledger.len(), 91);
+        assert!(ledger.sweep_due(40));
     }
 }

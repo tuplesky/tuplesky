@@ -547,6 +547,24 @@ pub struct Cost {
     /// What the journal groups this voter appended held (task-d84).
     #[serde(default)]
     pub journal_groups: JournalGroups,
+    /// The durable command records this voter holds, against what its
+    /// history sweep forgets (task-d110).
+    #[serde(default)]
+    pub history: History,
+}
+
+/// The durable command records a voter holds, and its history sweeps
+/// (task-d110). A sweep forgets only executed history, so a voter behind
+/// holds more than it can forget. The next sweep is due once `records`
+/// passes `kept` by the table's capacity times four.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct History {
+    /// Durable command records the ledger holds now.
+    pub records: u64,
+    /// What the last sweep left, lowered as records left otherwise.
+    pub kept: u64,
+    /// Sweeps run since this boot.
+    pub sweeps: u64,
 }
 
 /// What a voter's journal groups held, by their records (task-d84),

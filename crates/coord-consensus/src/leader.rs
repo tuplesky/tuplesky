@@ -1035,13 +1035,15 @@ impl Leader {
     /// forgotten commands, as a follower does (task-d05). A forgotten
     /// command executed long ago: nothing is decided, released or served
     /// for it any more.
+    ///
+    /// Due as a follower's is (task-d110): past a multiple of the table,
+    /// and half again what the last sweep left.
     fn forget_history(&mut self) {
-        if self.ledger.len()
-            <= self
-                .config
+        if !self.ledger.sweep_due(
+            self.config
                 .capacity
-                .saturating_mul(crate::follower::HISTORY_SWEEP)
-        {
+                .saturating_mul(crate::follower::HISTORY_SWEEP),
+        ) {
             return;
         }
         let table = &self.table;
@@ -1059,6 +1061,7 @@ impl Leader {
         // executed answer (`propose`), so its binding is not needed for
         // that, and kept it grew with every key ever submitted (task-d26).
         self.bindings.retain(|_, c| !table.forgotten(c));
+        self.ledger.swept();
     }
 
     /// Propose a known command under this ballot with `deps`. With

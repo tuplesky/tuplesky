@@ -1902,6 +1902,14 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             ),
             projection_commits: storage.lowering.commits,
             journal_groups: journal_groups(&storage.lowering.groups),
+            history: {
+                let ledger = voter.node().machine().ledger();
+                coord_daemon::metrics::History {
+                    records: ledger.len() as u64,
+                    kept: ledger.swept_at() as u64,
+                    sweeps: ledger.sweeps(),
+                }
+            },
             busy,
             uptime: now.saturating_duration_since(self.started),
             recent,

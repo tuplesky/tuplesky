@@ -3860,10 +3860,15 @@ impl Follower {
     /// Neither is reported or served for such a command any more, so
     /// keeping them made the memory of a long-running voter grow with its
     /// history. The sweep runs when the ledger has outgrown a multiple of
-    /// the table, so it is amortized over the growth that made it
-    /// necessary.
+    /// the table, and half again what the last sweep left
+    /// ([`DurableLedger::sweep_due`]), so it is amortized over the growth
+    /// that made it necessary, also at a voter behind, whose ledger holds
+    /// more than that the table does not forget (task-d110).
     fn forget_history(&mut self) {
-        if self.ledger.len() <= self.config.capacity.saturating_mul(HISTORY_SWEEP) {
+        if !self
+            .ledger
+            .sweep_due(self.config.capacity.saturating_mul(HISTORY_SWEEP))
+        {
             return;
         }
         self.sweep_history();
@@ -3903,6 +3908,7 @@ impl Follower {
             waiting.retain(|c| held.contains_key(c));
             !waiting.is_empty()
         });
+        self.ledger.swept();
     }
 
     /// Re-read whether `command` is adopted or held here with no
@@ -6502,14 +6508,18 @@ mod tests {
         assert_eq!(follower.missing_payload_count(5_000), 2_000);
     }
 
-    /// Audit item 1 (#98): the history sweep is amortized only while each
-    /// sweep brings the ledger back under its threshold, and the ledger
-    /// sheds only what the table forgets, which is executed history. A
-    /// voter behind by more than the threshold holds that much committed
-    /// and unexecuted, so every `applied` (which calls `forget_history`)
-    /// sweeps all of it: per execution, a walk over everything held.
+    /// task-d110 (audit item 1 on #98): the ledger sheds only what the
+    /// table forgets, which is executed history, so a voter behind by more
+    /// than the sweep's threshold holds that much committed and
+    /// unexecuted through every sweep. Measured from a fixed size, every
+    /// `applied` (which calls `forget_history`) then swept all of it: ten
+    /// executions looked at 10,000, 20,000 and 40,000 entries at 500,
+    /// 1,000 and 2,000 behind. Measured from what the last sweep left, the
+    /// first execution sweeps once and the next nine sweep nothing,
+    /// however far behind, until the ledger passes half again what that
+    /// sweep kept.
     #[test]
-    fn a_voter_behind_sweeps_its_whole_history_on_every_execution() {
+    fn a_voter_behind_sweeps_once_per_growth_of_half_what_it_keeps_not_per_execution() {
         let epoch = ConfigurationEpoch::new(1).unwrap();
         let voters: BTreeSet<ReplicaId> = (0..3).map(r).collect();
         let genesis = Ballot {
@@ -6573,8 +6583,13 @@ mod tests {
             );
             assert_eq!(follower.ledger.len(), behind as usize);
             follower.swept.set(0);
-            // Ten executions' worth of the call `applied` makes.
-            for _ in 0..10 {
+            // The first execution after the recovery: the ledger has
+            // grown past the threshold from nothing, so it is swept once.
+            follower.forget_history();
+            let first = follower.swept.get();
+            assert!(first >= behind, "{first} entries over {behind} behind");
+            // Nine more executions' worth of the call `applied` makes.
+            for _ in 0..9 {
                 follower.forget_history();
             }
             assert_eq!(
@@ -6582,12 +6597,11 @@ mod tests {
                 behind as usize,
                 "nothing was forgotten"
             );
-            swept.push(follower.swept.get());
+            swept.push(follower.swept.get() - first);
         }
-        // Each call looked at everything held: ten calls, ten times the
-        // ledger (and the maps beside it), growing with how far behind.
-        assert!(swept[0] >= 10 * 500, "{swept:?}");
-        assert!(swept[2] >= 10 * 2_000, "{swept:?}");
-        assert!(swept[2] >= 3 * swept[0], "{swept:?}");
+        // Before task-d110 each call looked at everything held, ten times
+        // the ledger over ten calls. Now none of the nine after the first
+        // looks at anything, at any distance behind.
+        assert_eq!(swept, [0, 0, 0]);
     }
 }
