@@ -600,3 +600,35 @@ fn a_voter_holding_the_record_answers_even_without_its_support_row() {
     d.resend(1);
     assert!(d.features(1).holders(EP).contains(&replica(3)));
 }
+
+/// task-d102: the relay (`BatchedRound`) is activated only once
+/// `AnswerOnRelease` is active, since a relayed command is answered on
+/// the leader's release alone. Asked first, it is refused and nothing is
+/// written; asked after, it activates as any feature does.
+#[test]
+fn the_relay_is_activated_only_after_answer_on_release() {
+    let mut d = Domain::new(3, &[]);
+    assert_eq!(
+        d.activate(1, Feature::BatchedRound),
+        Err(ActivateRefusal::Requires {
+            feature: Feature::BatchedRound,
+            before: Feature::AnswerOnRelease,
+        })
+    );
+    assert_eq!(d.record(1), None, "a refused activation wrote nothing");
+    assert_eq!(
+        d.activate(1, Feature::AnswerOnRelease),
+        Ok(Activation::Started)
+    );
+    assert_eq!(
+        d.activate(1, Feature::BatchedRound),
+        Ok(Activation::Started)
+    );
+    for n in 1..=3 {
+        assert_eq!(
+            d.features(n).active(),
+            set(&[Feature::AnswerOnRelease, Feature::BatchedRound]),
+            "voter {n}'s switches"
+        );
+    }
+}

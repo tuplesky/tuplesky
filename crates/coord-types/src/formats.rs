@@ -327,11 +327,27 @@ pub enum Feature {
     /// `AnswerOnRelease`'s prepare marker, as `EarlyProposalPrepared` is
     /// `EarlyProposal`'s.
     AnswerOnReleasePrepared = 0x0009,
+    /// A contended round is a batch (task-d102, design Section 4.3), with
+    /// task-d100's step B, the leader relay, as its first part. A
+    /// collector may send a submission to its ballot's leader alone,
+    /// marked as relayed, and the leader's proposal of it then carries
+    /// the payload to every follower (`ProtocolMessage::RelayedProposal`).
+    /// A voter of an older build could not decode that proposal, so a
+    /// collector relays only while this is active, and it is activated
+    /// only after `AnswerOnRelease`: a relayed command is marked, and
+    /// answered on the leader's release alone. It gates a wire form and
+    /// a routing, not an argument about votes: a relayed command is, to
+    /// every voter, one whose submission to the followers was lost and
+    /// whose payload arrived with the leader's proposal.
+    BatchedRound = 0x000A,
+    /// `BatchedRound`'s prepare marker, as `EarlyProposalPrepared` is
+    /// `EarlyProposal`'s.
+    BatchedRoundPrepared = 0x000B,
 }
 
 impl Feature {
     /// Every feature, in identifier order.
-    pub const ALL: [Feature; 9] = [
+    pub const ALL: [Feature; 11] = [
         Feature::CheckpointFloor,
         Feature::SealedHandoff,
         Feature::LocalCheckpoint,
@@ -341,6 +357,8 @@ impl Feature {
         Feature::ReleaseAtExecutionPrepared,
         Feature::AnswerOnRelease,
         Feature::AnswerOnReleasePrepared,
+        Feature::BatchedRound,
+        Feature::BatchedRoundPrepared,
     ];
 
     /// The frozen identifier.
@@ -360,6 +378,8 @@ impl Feature {
             Feature::ReleaseAtExecutionPrepared => "release-at-execution-prepared",
             Feature::AnswerOnRelease => "answer-on-release",
             Feature::AnswerOnReleasePrepared => "answer-on-release-prepared",
+            Feature::BatchedRound => "batched-round",
+            Feature::BatchedRoundPrepared => "batched-round-prepared",
         }
     }
 
@@ -372,6 +392,7 @@ impl Feature {
             Feature::EarlyProposal => Some(Feature::EarlyProposalPrepared),
             Feature::ReleaseAtExecution => Some(Feature::ReleaseAtExecutionPrepared),
             Feature::AnswerOnRelease => Some(Feature::AnswerOnReleasePrepared),
+            Feature::BatchedRound => Some(Feature::BatchedRoundPrepared),
             _ => None,
         }
     }
@@ -383,6 +404,7 @@ impl Feature {
             Feature::EarlyProposalPrepared => Some(Feature::EarlyProposal),
             Feature::ReleaseAtExecutionPrepared => Some(Feature::ReleaseAtExecution),
             Feature::AnswerOnReleasePrepared => Some(Feature::AnswerOnRelease),
+            Feature::BatchedRoundPrepared => Some(Feature::BatchedRound),
             _ => None,
         }
     }
@@ -418,7 +440,7 @@ impl Supported {
     /// The features this build supports, in identifier order, prepare
     /// markers included: a marker is supported exactly when the feature
     /// it marks is, and `admit` reads one as a requirement on this set.
-    pub const fn features() -> [Feature; 9] {
+    pub const fn features() -> [Feature; 11] {
         Feature::ALL
     }
 
