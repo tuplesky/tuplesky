@@ -3,7 +3,7 @@
 **Status:** Review proposal, consolidated v1.5.  
 **Date:** 2026-09-24.  
 **Companion:** [TupleSky implementation design](tuplesky-design.md).  
-**Scope:** 196 implementation tasks with stable `task-*` identifiers. The `task-01` through `task-66`, `task-s01` through `task-s04`, `task-j01` through `task-j10`, `task-o01` through `task-o06`, `task-m01` through `task-m05`, `task-c01`, `task-c02`, `task-c03`, `task-d01` through `task-d92`, `task-d94` through `task-d102` and `task-q01` suffixes and prerequisites are preserved. v1.5 adds `task-d01` through `task-d04` from review of the open implementation PRs and of multi-host readiness, `task-d05` through `task-d17` from the Jepsen client's runs, `task-d18` through `task-d33` from a review against an external SwiftPaxos correctness checklist ([review record](tuplesky-checklist-review.md)), `task-d34` from what the protocol simulator of task-d30 found, `task-d35` through `task-d44` from a review of recovery time and storage integrity (an execution chain, a scrub, and voter replacement through a prepared transition, a staged learner, terminal recovery after the seal, serving across a transition and a running membership install), `task-d45` through `task-d50` from measuring the throughput of the Jepsen client's first unthrottled runs, `task-d51` from task-d46's long runs, `task-d52` and `task-d53` from a profile of the domain thread after task-d46, `task-d54` from the Jepsen runs of task-d50, `task-d55` through `task-d57` from the Jepsen runs of task-j06, `task-d58` through `task-d61` from a profile of five voters' CPU per operation, `task-d62` through `task-d65` from a consolidated review against the reference SwiftPaxos, `task-d66` from the Jepsen runs of task-d51, `task-d67` from a Jepsen run on #98 that made no fast decision, `task-d68` from task-d62's counts after a leader change, `task-d69` from a profile of a follower's loop, `task-d70` from the Jepsen runner's profile of the transport's workers, `task-d71` from the protocol simulator's first 1,000-seed sweep, `task-d72` through `task-d75` from comparing a command's cost with etcd's on one host, `task-d76` from a Jepsen run that killed the leader, `task-d77` through `task-d81` from the protocol simulator with acknowledgements between followers lost, `task-d82` through `task-d84` from the Jepsen runs of the #173 carry, `task-d85` from the protocol simulator on task-d74's routing, `task-d86` through `task-d92` from planning the whole gap to etcd on #174, and moves committed key replacement from `task-58` to `task-m03`; the changes are listed under [Gate checklist and deferred work](#gate-checklist-and-deferred-work). Task IDs are not GitHub pull-request or issue numbers. One implementation PR corresponds to one task; its GitHub-assigned number is recorded separately. No baseline, supplement or separate amendment is needed.
+**Scope:** 197 implementation tasks with stable `task-*` identifiers. The `task-01` through `task-66`, `task-s01` through `task-s04`, `task-j01` through `task-j10`, `task-o01` through `task-o06`, `task-m01` through `task-m05`, `task-c01`, `task-c02`, `task-c03`, `task-d01` through `task-d92`, `task-d94` through `task-d102`, `task-d111` and `task-q01` suffixes and prerequisites are preserved. v1.5 adds `task-d01` through `task-d04` from review of the open implementation PRs and of multi-host readiness, `task-d05` through `task-d17` from the Jepsen client's runs, `task-d18` through `task-d33` from a review against an external SwiftPaxos correctness checklist ([review record](tuplesky-checklist-review.md)), `task-d34` from what the protocol simulator of task-d30 found, `task-d35` through `task-d44` from a review of recovery time and storage integrity (an execution chain, a scrub, and voter replacement through a prepared transition, a staged learner, terminal recovery after the seal, serving across a transition and a running membership install), `task-d45` through `task-d50` from measuring the throughput of the Jepsen client's first unthrottled runs, `task-d51` from task-d46's long runs, `task-d52` and `task-d53` from a profile of the domain thread after task-d46, `task-d54` from the Jepsen runs of task-d50, `task-d55` through `task-d57` from the Jepsen runs of task-j06, `task-d58` through `task-d61` from a profile of five voters' CPU per operation, `task-d62` through `task-d65` from a consolidated review against the reference SwiftPaxos, `task-d66` from the Jepsen runs of task-d51, `task-d67` from a Jepsen run on #98 that made no fast decision, `task-d68` from task-d62's counts after a leader change, `task-d69` from a profile of a follower's loop, `task-d70` from the Jepsen runner's profile of the transport's workers, `task-d71` from the protocol simulator's first 1,000-seed sweep, `task-d72` through `task-d75` from comparing a command's cost with etcd's on one host, `task-d76` from a Jepsen run that killed the leader, `task-d77` through `task-d81` from the protocol simulator with acknowledgements between followers lost, `task-d82` through `task-d84` from the Jepsen runs of the #173 carry, `task-d85` from the protocol simulator on task-d74's routing, `task-d86` through `task-d92` from planning the whole gap to etcd on #174, and moves committed key replacement from `task-58` to `task-m03`; the changes are listed under [Gate checklist and deferred work](#gate-checklist-and-deferred-work). Task IDs are not GitHub pull-request or issue numbers. One implementation PR corresponds to one task; its GitHub-assigned number is recorded separately. No baseline, supplement or separate amendment is needed.
 
 ## How to use this plan
 
@@ -62,6 +62,7 @@ Reference single-store and fixed-membership compositions are early increments, n
 | task-d100 | From the batch's sweep and its two runner jobs (#98, #185 review): with the disk's tail off the head is core-bound from 30 callers, and a slow-path command still costs the collector's frontend about 11 api frames, about 13 datagrams, and every follower a submission's admission for an order it only adopts | After task-d98 and task-d99, which its relayed proposal and its features rest on; step A first, step B sized on the runner after it (#202 review) |
 | task-d101 | From the two local profiles and the row count on #185, read against the runner's tmpfs job (#185 review): the four followers' executions and projections cost about 0.75 ms an operation, a fifth of the servers, and none of it is on a write's path | A design step now, beside task-d100's code step; its option 1 is task-d86's follower half |
 | task-d102 | From #185's next steps (#185 review): at 120 callers a command costs about 16.8 datagrams and a journal group holds about 4.9 commands, since every message and group of a slow round is per command | A design step now, after task-d100's step A; it builds step B, and reads task-d84's parts 2 and 3, task-d86 and task-d101's option 1 together |
+| task-d111 | From #185's reading D and its review: the five domain loops cost about 1,280 µs a command locally against a parity budget of about 230, per command rather than per pass or frame | A design step now, beside task-d102's code; its rows gate bar 1 |
 | task-q01 | Combined durable WAN/Kine qualification | Required before task-66 |
 
 ```mermaid
@@ -286,6 +287,7 @@ This is a workstream overview; the individual prerequisites are authoritative. O
 | [task-d100](#task-d100) | Answer on the release, then relay a write through the leader while rounds are slow-only | task-d74, task-d90, task-d98, task-d99 |
 | [task-d101](#task-d101) | Let followers do less: what reads a follower's projection, and what each option saves | task-d12, task-d86, task-d90 |
 | [task-d102](#task-d102) | A contended round is a batch: one frame, one group and one acknowledgement a turn | task-d61, task-d84, task-d86, task-d99, task-d100, task-d101 |
+| [task-d111](#task-d111) | The domain loops to their parity budget, by role and driver | task-d72, task-d101, task-d102 |
 | [task-q01](#task-q01) | Produce the combined durable WAN/Kine qualification report | task-j07, task-j08, task-o06, task-m05, task-63, task-64, task-d45, task-d46, task-d47, task-d48, task-d49, task-d51, task-d52, task-d53 |
 
 ## Task specifications
@@ -4001,6 +4003,33 @@ So every feature-gated change, task-d98's `EarlyProposal` first, would ship unre
   A miss is read before the next part is built: which hop's batch is small, and why.
 
 **Review boundary:** What a slow round's frames carry and how many there are, and what a slow acknowledgement's frame claims. No change to what a vote rests on, to the quorum rules, to recovery's selection or rows, or to the fast path.
+
+<a id="task-d111"></a>
+### task-d111: The domain loops to their parity budget, by role and driver
+
+**Prerequisites:** task-d72, task-d101, task-d102.  
+**Design:** Section 18.4 (this task's design step: the loops' cost model and budget).
+
+**Implement:** From #185's reading D and its review: the loops' design step, as a table by role, each role with its driver, the driver's calls a command, CPU a call, and a budget at parity. The budgets sum to 0.30 ms an operation on the runner, about 230 µs a command over five voters locally. The design step is in Section 18.4; this entry is its code steps, each its own PR after its own review.
+- **First, the counters, with the first code step that needs them:**
+  - passes counted exactly, not sampled × 16;
+  - the events taken between flushes, by plane (#205's scratch counter).
+- **Item 1, followers off the per-command protocol pipeline.**
+  - Built as task-d102's batched round with step B. This task reads it against its rows: a follower's voter protocol (76 → 8 µs a command), peer plane (16 → 3) and loop overhead (33 → 5).
+  - Driver targets at a follower: at most 1 pass and 0.5 peer events a command.
+- **Item 2, followers off the full planner.**
+  - Built as task-d101's option 3, then option 1, and task-d103 to task-d105. This task reads them against a follower's executions (55 → 10) and storage plumbing (52 → 6).
+  - Driver targets: at least 10 commands a lowering at a follower, and 4 or 5 rows a command.
+- **Item 3, the leader's `propose` and reads.** Its own code step, after task-d102's frames:
+  - `propose` builds a turn's payload and dependency rows in one pass, and keeps `adopt_own`'s set rather than rebuilding it a command (70 → 14);
+  - a barrier read is answered from the leader's executed state once its round confirms, without per-read planning (40 → 8, about 6 µs a read).
+- **The allocator and memmove, a block across the rows** (16 to 20% of a loop): one buffer a batch, and rows written from borrowed payloads. Half of today's, counted inside each row it cuts.
+- **Named, not owned:** the leader's executions (53 → 12), its collector and frontend (32 → 8), its API transport (30 → 8), and its loop overhead (40 → 8: about 2.5 passes a command, from 12.6). Each is re-read after task-d102's frames before it gets a design.
+
+**Acceptance:**
+- **The design step** recorded and reviewed before any code.
+- **Each code step** names its rows and reports, at 30 and 120 callers on five voters, each row's driver calls a command and CPU a call, with a profile of the leader and of a follower at each load. A row's budget is met, or its gap is stated. A lever counts only against the rows it names.
+- **The loops' total against bar 1:** at most 0.30 ms an operation on the runner, read by the testing session's job once items 1 to 3 are in.
 
 ## Gate checklist and deferred work
 
