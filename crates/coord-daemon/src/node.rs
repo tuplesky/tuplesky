@@ -136,6 +136,30 @@ impl Machine {
         }
     }
 
+    /// Mark the command the next admitted request becomes as answered by
+    /// its collector on the leader's release alone (task-d100, step A),
+    /// once the machine derives it; see `Leader::mark_next_admitted`.
+    ///
+    /// The mark lives in this role's machine and goes with it: a
+    /// campaign replaces the machine, and the collector voids every
+    /// entry the ballot change reaches for its node's record
+    /// (`Collector::reconfigure`, task-d22), so no entry waits on a mark
+    /// the new machine lacks.
+    pub fn mark_next_admitted(&mut self) {
+        match self {
+            Machine::Leader(l) => l.mark_next_admitted(),
+            Machine::Follower(f) => f.mark_next_admitted(),
+        }
+    }
+
+    /// Whether `command` is marked as answered on the release alone.
+    pub fn answers_on_release(&self, command: &CommandId) -> bool {
+        match self {
+            Machine::Leader(l) => l.answers_on_release(command),
+            Machine::Follower(f) => f.answers_on_release(command),
+        }
+    }
+
     /// Whether this replica is holding a command it knows by identity
     /// and not by content.
     pub fn wants_payloads(&self) -> bool {
@@ -228,6 +252,21 @@ impl Machine {
         match self {
             Machine::Leader(m) => m.executions_durable_through(position),
             Machine::Follower(m) => m.executions_durable_through(position),
+        }
+    }
+
+    /// The marked commands a leader was sent again after executing them,
+    /// whose release the voter publishes again (task-d100, step A).
+    pub fn take_release_again(
+        &mut self,
+    ) -> Vec<(
+        CommandId,
+        coord_types::RetryKey,
+        coord_types::identity::Digest32,
+    )> {
+        match self {
+            Machine::Leader(m) => m.take_release_again(),
+            Machine::Follower(_) => Vec::new(),
         }
     }
 
@@ -360,6 +399,15 @@ impl Machine {
         match self {
             Machine::Leader(_) => (0, 0),
             Machine::Follower(m) => m.catch_up_counts(),
+        }
+    }
+
+    /// How this replica's catch-up asks and pages went, by path
+    /// (task-d106 step 0). A leader asks for none.
+    pub fn catch_up_paths(&self) -> coord_consensus::CatchUpPaths {
+        match self {
+            Machine::Leader(_) => coord_consensus::CatchUpPaths::default(),
+            Machine::Follower(m) => m.catch_up_paths(),
         }
     }
 
@@ -601,6 +649,31 @@ impl core::fmt::Display for DriveError {
 
 impl core::error::Error for DriveError {}
 
+/// Catch-up asks a donor answered with nothing, by why (task-d106
+/// step 0). Each is silent at the requester, which only stops getting
+/// pages, so a donor says it here.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Unserved {
+    /// From this node itself, or from a peer that is not a voter.
+    pub sender: u64,
+    /// At a ballot this node does not serve at (`serves_catch_up_at`).
+    pub ballot: u64,
+    /// While this node is halted or diverged.
+    pub stopped: u64,
+    /// After this node's own frontier: nothing executed past it.
+    pub nothing_after: u64,
+    /// With no executed order readable from this node's rows.
+    pub no_order: u64,
+    /// With an executed order that starts above the position asked, or
+    /// holds nothing.
+    pub order_above: u64,
+    /// With no snapshot of this node's store.
+    pub no_snapshot: u64,
+    /// With the first command's rows unreadable, or its executed row at
+    /// another position than the order's.
+    pub first_row: u64,
+}
+
 /// One voter: its machine, its store and the sends it is holding.
 ///
 /// `P` is where this replica's batches become durable. A voter on the
@@ -637,6 +710,9 @@ pub struct Node<P: Persistence> {
     order: Option<crate::catch_up::ExecutedOrder>,
     /// Catch-up pages this node served (diagnostic, task-d08).
     pub pages_served: u64,
+    /// Catch-up asks this node answered with nothing, by why
+    /// (diagnostic, task-d106 step 0).
+    pub unserved: Unserved,
     /// Storage facts reached the outbox outside a round, so it may hold
     /// sends they released that no round has handed out yet.
     unreleased: bool,
@@ -679,6 +755,10 @@ pub struct Node<P: Persistence> {
     early_without_activation: bool,
     /// This voter's part in activating features (task-d99).
     features: Option<crate::feature::Features>,
+    /// Whether this node reads `Feature::AnswerOnRelease` active
+    /// (task-d100, step A): the collector beside it marks its
+    /// submissions as answered on the leader's release alone.
+    answer_on_release: bool,
     /// Commands this replica established, by the path that decided them
     /// (task-d50).
     pub established: Established,
@@ -769,6 +849,7 @@ impl<P: Persistence> Node<P> {
             won: None,
             order: None,
             pages_served: 0,
+            unserved: Unserved::default(),
             unreleased: false,
             floor: None,
             grouped: false,
@@ -781,6 +862,7 @@ impl<P: Persistence> Node<P> {
             early_holders: None,
             early_without_activation: false,
             features: None,
+            answer_on_release: false,
             established: Established::default(),
             fast_path: coord_consensus::FastPathCounts::default(),
             release: crate::learned::ReleaseTiming::default(),
@@ -1032,6 +1114,25 @@ impl<P: Persistence> Node<P> {
         self.machine
             .as_ref()
             .expect("a node always holds a machine")
+    }
+
+    /// Mark the command the next admitted request becomes as answered on
+    /// the leader's release alone (task-d100, step A; see
+    /// [`Machine::mark_next_admitted`]).
+    pub fn mark_next_admitted(&mut self) {
+        self.machine_mut().mark_next_admitted();
+    }
+
+    /// The marked commands whose release the voter publishes again
+    /// (task-d100, step A; see [`Machine::take_release_again`]).
+    pub fn take_release_again(
+        &mut self,
+    ) -> Vec<(
+        CommandId,
+        coord_types::RetryKey,
+        coord_types::identity::Digest32,
+    )> {
+        self.machine_mut().take_release_again()
     }
 
     fn machine_mut(&mut self) -> &mut Machine {
@@ -1335,11 +1436,21 @@ impl<P: Persistence> Node<P> {
         let release = features
             .active()
             .contains(&coord_types::formats::Feature::ReleaseAtExecution);
+        let answer_on_release = features
+            .active()
+            .contains(&coord_types::formats::Feature::AnswerOnRelease);
         self.set_early_holders(Some(holders));
         if on != self.early_proposal {
             self.set_early_proposal(on);
         }
         self.set_release_at_execution(release);
+        self.answer_on_release = answer_on_release;
+    }
+
+    /// Whether this node reads `Feature::AnswerOnRelease` active
+    /// (task-d100, step A).
+    pub const fn answer_on_release(&self) -> bool {
+        self.answer_on_release
     }
 
     fn standing(&self, ballot: &Ballot) -> crate::feature::Standing {
@@ -1590,29 +1701,43 @@ impl<P: Persistence> Node<P> {
         let mut out = Outbound::default();
         let machine = self.machine();
         let identity = machine.identity();
-        if from == identity.replica
-            || !identity.voters.contains(&from)
-            || !machine.serves_catch_up_at(&ballot)
-            || machine.halted().is_some()
-            || machine.catch_up_divergence().is_some()
-        {
+        if from == identity.replica || !identity.voters.contains(&from) {
+            self.unserved.sender += 1;
+            return out;
+        }
+        if !machine.serves_catch_up_at(&ballot) {
+            self.unserved.ballot += 1;
+            return out;
+        }
+        if machine.halted().is_some() || machine.catch_up_divergence().is_some() {
+            self.unserved.stopped += 1;
             return out;
         }
         let epoch = identity.epoch;
         let through = machine.executed_through();
         if after >= through {
+            self.unserved.nothing_after += 1;
             return out;
         }
         if self.order.is_none() {
             self.order = crate::catch_up::ExecutedOrder::read(&self.applier);
         }
         let Some(order) = self.order.as_ref() else {
+            self.unserved.no_order += 1;
             return out;
         };
-        let entries = crate::catch_up::page(&self.applier, order, epoch, after, through);
-        if entries.is_empty() {
-            return out;
-        }
+        let entries = match crate::catch_up::page(&self.applier, order, epoch, after, through) {
+            Ok(entries) => entries,
+            Err(why) => {
+                let count = match why {
+                    crate::catch_up::NoPage::OrderAbove => &mut self.unserved.order_above,
+                    crate::catch_up::NoPage::Snapshot => &mut self.unserved.no_snapshot,
+                    crate::catch_up::NoPage::FirstRow => &mut self.unserved.first_row,
+                };
+                *count += 1;
+                return out;
+            }
+        };
         self.pages_served += 1;
         out.peer.push((
             PeerId {

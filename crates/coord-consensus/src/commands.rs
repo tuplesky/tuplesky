@@ -218,12 +218,36 @@ pub struct CommandTable {
     /// [`CommandTable::restore`]); left lazily, by
     /// [`CommandTable::in_accept`].
     accepted: BTreeSet<CommandId>,
-    /// Every command whose record is at COMMIT (task-d46): what the next
-    /// command to execute is chosen from, instead of every record.
-    /// Entered by [`CommandTable::commit`] and [`CommandTable::restore`],
-    /// left by [`CommandTable::execute`] and
-    /// [`CommandTable::restore_executed`], the only ways out of COMMIT.
-    committed: BTreeSet<CommandId>,
+    /// Every command whose record is at COMMIT with its payload and every
+    /// dependency executed: what the next command to execute is chosen
+    /// from (task-d107). Exact: entered only when a record is examined
+    /// and found ready, left by [`CommandTable::execute`] and
+    /// [`CommandTable::restore_executed`], the only ways out of COMMIT
+    /// for a record with its payload.
+    ///
+    /// It replaced a set of every record at COMMIT (task-d46), each of
+    /// which a call checked the dependencies of. A replica behind holds
+    /// thousands of those blocked on one command it lacks, and asked
+    /// every pass, that check was most of its loop (task-d106).
+    ready: BTreeSet<CommandId>,
+    /// The records at COMMIT with their payload that are not ready, by
+    /// the one dependency each was found waiting on (task-d107): the
+    /// first of its dependencies not executed when it was examined.
+    /// Keyed by identity, so a record can wait on a command this table
+    /// has no record of yet. When that command executes, or is restored
+    /// executed, its waiters are examined again, each then ready or
+    /// waiting on its next dependency not executed; nothing else looks at
+    /// them. Left lazily: a waiter restored executed meanwhile is dropped
+    /// when its dependency wakes it.
+    waiting: BTreeMap<CommandId, Vec<CommandId>>,
+    /// How many records hold their payload below EXECUTED (task-d107):
+    /// whether this replica holds work it has not executed, without a
+    /// walk of the table, whose executed records stay until reclaimed.
+    unexecuted: usize,
+    /// Records the next command's choice examined (task-d107), for the
+    /// tests that bound it.
+    #[cfg(test)]
+    examined: core::cell::Cell<u64>,
     /// The order this replica executed commands in, as ordinals: one per
     /// command, retired ones included, the cost `history` already pays
     /// (task-d71). Execution is one order at every voter, so a candidate
@@ -263,7 +287,11 @@ impl CommandTable {
             raised: None,
             moved: None,
             accepted: BTreeSet::new(),
-            committed: BTreeSet::new(),
+            ready: BTreeSet::new(),
+            waiting: BTreeMap::new(),
+            unexecuted: 0,
+            #[cfg(test)]
+            examined: core::cell::Cell::new(0),
             execution_order: BTreeMap::new(),
             durable_executions: None,
         }
@@ -285,7 +313,11 @@ impl CommandTable {
             raised: None,
             moved: None,
             accepted: BTreeSet::new(),
-            committed: BTreeSet::new(),
+            ready: BTreeSet::new(),
+            waiting: BTreeMap::new(),
+            unexecuted: 0,
+            #[cfg(test)]
+            examined: core::cell::Cell::new(0),
             execution_order: BTreeMap::new(),
             durable_executions: None,
         }
@@ -314,18 +346,32 @@ impl CommandTable {
             raised: None,
             moved: None,
             accepted: BTreeSet::new(),
-            committed: BTreeSet::new(),
+            ready: BTreeSet::new(),
+            waiting: BTreeMap::new(),
+            unexecuted: 0,
+            #[cfg(test)]
+            examined: core::cell::Cell::new(0),
             execution_order: BTreeMap::new(),
             durable_executions: None,
         };
+        let mut committed = Vec::new();
         for (c, r) in records {
             if r.phase == Phase::Accept {
                 table.accepted.insert(c);
             }
             if r.phase == Phase::Commit {
-                table.committed.insert(c);
+                committed.push(c);
+            }
+            if r.payload.is_some() && r.phase < Phase::Executed {
+                table.unexecuted += 1;
             }
             table.records.insert(c, r);
+        }
+        // Once every record is in, so each is found ready or waiting on
+        // its first dependency not executed. The executed identities the
+        // boot restores next wake what waits on them.
+        for c in committed {
+            table.examine(c);
         }
         let mut per_key: BTreeMap<Vec<u8>, Vec<CommandId>> = BTreeMap::new();
         for (c, r) in &table.records {
@@ -460,6 +506,9 @@ impl CommandTable {
         }
         let record = self.records.remove(command).expect("checked");
         self.accepted.remove(command);
+        if record.payload.is_some() {
+            self.unexecuted -= 1;
+        }
         for key in &record.keys {
             let Some(state) = self.keys.get_mut(key) else {
                 continue;
@@ -701,6 +750,11 @@ impl CommandTable {
         }
         let path = combined_path(&paths);
         self.raise(command);
+        // A record with its payload here was refused above: this one is
+        // new, or a placeholder taking its payload. A placeholder at
+        // COMMIT, which only a restore holds, starts again at PRE-ACCEPT
+        // like any other, so its payload never makes it ready here.
+        self.unexecuted += 1;
         self.records.insert(
             command,
             CommandRecord {
@@ -944,20 +998,84 @@ impl CommandTable {
         Ok(())
     }
 
-    /// The records at COMMIT, in identity order (task-d46): those the
-    /// next command to execute is among.
-    pub fn in_commit(&self) -> impl Iterator<Item = (&CommandId, &CommandRecord)> {
+    /// The commands ready to execute, in identity order (task-d107): at
+    /// COMMIT with their payload, every dependency executed. The next
+    /// command to execute is among them. Costs the ready records, not
+    /// the ones blocked behind a dependency.
+    pub fn ready(&self) -> impl Iterator<Item = &CommandId> {
         debug_assert!(
             self.records
                 .iter()
-                .filter(|(_, r)| r.phase == Phase::Commit)
-                .all(|(c, _)| self.committed.contains(c)),
-            "a record at COMMIT is missing from the executable set"
+                .filter(|(_, r)| r.phase == Phase::Commit && r.payload.is_some())
+                .filter(|(_, r)| guard_execute(&r.deps, |d| self.phase_of(d)).is_ok())
+                .map(|(c, _)| c)
+                .eq(self.ready.iter()),
+            "the ready set is not exactly the records the full walk finds ready"
         );
-        self.committed
+        self.ready.iter().inspect(|_| {
+            #[cfg(test)]
+            self.examined.set(self.examined.get() + 1);
+        })
+    }
+
+    /// Whether any record holds its payload below EXECUTED (task-d107).
+    pub fn holds_unexecuted(&self) -> bool {
+        self.unexecuted_records() > 0
+    }
+
+    /// How many records hold their payload below EXECUTED (task-d107).
+    pub fn unexecuted_records(&self) -> usize {
+        debug_assert_eq!(
+            self.records
+                .values()
+                .filter(|r| r.payload.is_some() && r.phase < Phase::Executed)
+                .count(),
+            self.unexecuted,
+            "the unexecuted count is not the records below EXECUTED"
+        );
+        self.unexecuted
+    }
+
+    /// Records the next command's choice has examined, since the last
+    /// call (task-d107).
+    #[cfg(test)]
+    pub(crate) fn take_examined(&self) -> u64 {
+        self.examined.replace(0)
+    }
+
+    /// Find `command` ready, or waiting on its first dependency not
+    /// executed (task-d107). Nothing for a record not at COMMIT with its
+    /// payload: a record reaches COMMIT through [`CommandTable::commit`]
+    /// or [`CommandTable::restore`], which examine it.
+    fn examine(&mut self, command: CommandId) {
+        let Some(record) = self.records.get(&command) else {
+            return;
+        };
+        if record.phase != Phase::Commit || record.payload.is_none() {
+            return;
+        }
+        let blocker = record
+            .deps
             .iter()
-            .filter_map(|c| self.records.get_key_value(c))
-            .filter(|(_, r)| r.phase == Phase::Commit && r.payload.is_some())
+            .find(|d| self.phase_of(d) != Some(Phase::Executed))
+            .copied();
+        match blocker {
+            Some(dep) => self.waiting.entry(dep).or_default().push(command),
+            None => {
+                self.ready.insert(command);
+            }
+        }
+    }
+
+    /// `command` executed: it is no longer ready, and what waited on it
+    /// is examined again (task-d107).
+    fn executed_now(&mut self, command: &CommandId) {
+        self.ready.remove(command);
+        if let Some(waiters) = self.waiting.remove(command) {
+            for waiter in waiters {
+                self.examine(waiter);
+            }
+        }
     }
 
     /// The commands at ACCEPT, in identity order (task-d46): those the
@@ -1045,7 +1163,7 @@ impl CommandTable {
         guard_commit(&deps, |c| self.phase_of(c))?;
         self.initialized_mut(&command)?.phase = Phase::Commit;
         self.accepted.remove(&command);
-        self.committed.insert(command);
+        self.examine(command);
         self.raise(command);
         Ok(())
     }
@@ -1077,7 +1195,8 @@ impl CommandTable {
         guard_execute(&deps, |c| self.phase_of(c))?;
         self.initialized_mut(&command)?.phase = Phase::Executed;
         self.accepted.remove(&command);
-        self.committed.remove(&command);
+        self.unexecuted -= 1;
+        self.executed_now(&command);
         self.last_executed = Some(command);
         self.note_execution(command);
         self.unretired.push_back(command);
@@ -1168,7 +1287,6 @@ impl CommandTable {
     /// prefix): it is remembered as executed, which is all there is left
     /// to say about it.
     pub fn restore_executed(&mut self, command: &CommandId) {
-        self.committed.remove(command);
         self.last_executed = Some(*command);
         self.note_execution(*command);
         self.raise(*command);
@@ -1177,6 +1295,7 @@ impl CommandTable {
                 if r.phase != Phase::Executed {
                     r.phase = Phase::Executed;
                     self.accepted.remove(command);
+                    self.unexecuted -= 1;
                     self.unretired.push_back(*command);
                 }
             }
@@ -1185,6 +1304,7 @@ impl CommandTable {
                 self.history.insert(*command);
             }
         }
+        self.executed_now(command);
     }
 
     /// Forget an executed command. Unresolved acceptance is never deleted
@@ -1445,5 +1565,161 @@ impl CommandTable {
     /// Whether the table is empty.
     pub fn is_empty(&self) -> bool {
         self.records.is_empty()
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    //! The ready set (task-d107): what the next command's choice looks at,
+    //! counted rather than timed, with N records blocked and one ready.
+
+    use alloc::vec;
+
+    use coord_types::ids::ExecutionPosition;
+
+    use super::*;
+    use crate::learner::Learner;
+
+    fn id(n: u32) -> CommandId {
+        let mut bytes = [0u8; 32];
+        bytes[..4].copy_from_slice(&n.to_be_bytes());
+        bytes[31] = 1;
+        CommandId(Digest32(bytes))
+    }
+
+    fn record(phase: Phase, deps: Vec<CommandId>, payload: bool) -> CommandRecord {
+        CommandRecord {
+            phase,
+            deps,
+            keys: Vec::new(),
+            payload: payload.then_some(Digest32([7; 32])),
+            paths: Vec::new(),
+            synced_seq: None,
+            path: crate::graph::empty_path(),
+        }
+    }
+
+    /// `blocked` records at COMMIT behind a root no row names, and one
+    /// with nothing to wait on, which is returned with them.
+    pub(crate) fn blocked_behind_a_root(
+        blocked: u32,
+    ) -> (Vec<(CommandId, CommandRecord)>, CommandId) {
+        let root = id(0);
+        let ready = id(1);
+        let rows = (2..2 + blocked)
+            .map(|n| (id(n), record(Phase::Commit, vec![root], true)))
+            .chain([(ready, record(Phase::Commit, Vec::new(), true))])
+            .collect();
+        (rows, ready)
+    }
+
+    fn next(table: &CommandTable) -> Option<CommandId> {
+        Learner::new(ExecutionPosition::ZERO).next_executable(table, |_| None)
+    }
+
+    /// N records restored at COMMIT behind a root this table has no record
+    /// of, and one with nothing to wait on: a call looks at that one only,
+    /// whatever N is. The full walk it replaced looked at N + 1.
+    #[test]
+    fn a_call_examines_the_ready_record_only_however_many_are_blocked() {
+        for blocked in [10u32, 1_000, 5_000] {
+            let (rows, ready) = blocked_behind_a_root(blocked);
+            let table = CommandTable::restore(None, rows);
+            table.take_examined();
+            assert_eq!(next(&table), Some(ready));
+            assert_eq!(table.take_examined(), 1, "{blocked} blocked");
+            assert_eq!(table.unexecuted_records(), blocked as usize + 1);
+        }
+    }
+
+    /// A blocked record is looked at again when the one dependency it
+    /// waits on executes, and not before: executing the ready record wakes
+    /// nothing, and the root, restored executed, makes every waiter ready.
+    #[test]
+    fn the_dependency_a_record_waits_on_wakes_it() {
+        let root = id(0);
+        let ready = id(1);
+        let rows = (2..12)
+            .map(|n| (id(n), record(Phase::Commit, vec![ready, root], true)))
+            .chain([(ready, record(Phase::Commit, Vec::new(), true))]);
+        let mut table = CommandTable::restore(None, rows);
+        assert_eq!(next(&table), Some(ready));
+        table.execute(ready).unwrap();
+        table.take_examined();
+        // Each waiter moved on to its next dependency not executed, the
+        // root, which no record here names yet.
+        assert_eq!(next(&table), None);
+        assert_eq!(table.take_examined(), 0);
+        assert_eq!(table.waiting.get(&root).map(Vec::len), Some(10));
+        table.restore_executed(&root);
+        assert_eq!(table.ready().count(), 10);
+        assert!(table.waiting.is_empty());
+        assert_eq!(next(&table), Some(id(2)));
+    }
+
+    /// A record committed with every dependency executed is ready at its
+    /// commit; one committed behind a dependency is ready once that
+    /// executes.
+    #[test]
+    fn a_commit_is_ready_with_its_dependencies_executed() {
+        let mut table = CommandTable::new();
+        let key = || vec![b"k".to_vec()];
+        let a = id(1);
+        let b = id(2);
+        table.initialize(a, Digest32([1; 32]), key()).unwrap();
+        let deps = table.initialize(b, Digest32([2; 32]), key()).unwrap().deps;
+        assert_eq!(deps, vec![a]);
+        table.accept(a, Vec::new()).unwrap();
+        table.accept(b, vec![a]).unwrap();
+        table.commit(a).unwrap();
+        table.commit(b).unwrap();
+        assert_eq!(next(&table), Some(a));
+        assert_eq!(table.unexecuted_records(), 2);
+        table.execute(a).unwrap();
+        assert_eq!(next(&table), Some(b));
+        table.execute(b).unwrap();
+        assert_eq!(next(&table), None);
+        assert!(!table.holds_unexecuted());
+        // Retired, the records leave no waiter or ready entry behind.
+        assert_eq!(table.reclaim(), 2);
+        assert!(table.ready.is_empty() && table.waiting.is_empty());
+    }
+
+    /// A record restored at COMMIT without its payload is not ready, and
+    /// its payload starts it again at PRE-ACCEPT: it is ready only once
+    /// committed again.
+    #[test]
+    fn a_payload_reaching_a_restored_commit_starts_it_again() {
+        let a = id(1);
+        let mut table =
+            CommandTable::restore(None, [(a, record(Phase::Commit, Vec::new(), false))]);
+        assert_eq!(next(&table), None);
+        assert!(!table.holds_unexecuted());
+        table
+            .initialize_beyond_capacity(a, Digest32([1; 32]), Vec::new())
+            .unwrap();
+        assert_eq!(table.phase_of(&a), Some(Phase::PreAccept));
+        assert_eq!(next(&table), None);
+        assert!(table.holds_unexecuted());
+        table.accept(a, Vec::new()).unwrap();
+        table.commit(a).unwrap();
+        assert_eq!(next(&table), Some(a));
+    }
+
+    /// The unexecuted count follows a released record and a record
+    /// restored executed.
+    #[test]
+    fn the_unexecuted_count_follows_release_and_restored_execution() {
+        let mut table = CommandTable::new();
+        let a = id(1);
+        let b = id(2);
+        table.initialize(a, Digest32([1; 32]), Vec::new()).unwrap();
+        table.initialize(b, Digest32([2; 32]), Vec::new()).unwrap();
+        table.expect(id(3)).unwrap();
+        assert_eq!(table.unexecuted_records(), 2);
+        assert!(table.release(&a));
+        assert_eq!(table.unexecuted_records(), 1);
+        table.restore_executed(&b);
+        assert_eq!(table.unexecuted_records(), 0);
     }
 }

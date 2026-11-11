@@ -1393,6 +1393,9 @@ fn main() -> ExitCode {
             Ok(rendered) => eprintln!("metrics {rendered}"),
             Err(e) => eprintln!("the metrics snapshot could not be rendered: {e}"),
         }
+        if let Some(line) = domain.catch_up_line() {
+            eprintln!("{line}");
+        }
         let counts = domain.counts();
         eprintln!(
             "the api plane ended: queued_local={} queued_remote={} not_a_voter={} \

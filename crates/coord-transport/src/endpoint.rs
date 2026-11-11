@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use coord_core::event::PeerProvenance;
 use coord_types::ids::{ClusterId, DomainId, ReplicaId, ReplicaIncarnation};
 use coord_types::wire_v1::{
-    BoundedBytes, BoundedVec, COLLECTOR_READ_VERSION, COLLECTOR_SUBMIT_VERSION, CloseV1, Frame,
+    BoundedBytes, BoundedVec, COLLECTOR_READ_VERSION, COLLECTOR_SUBMIT_VERSIONS, CloseV1, Frame,
     HelloAckV1, HelloV1, KIND_COLLECTOR_READ, KIND_COLLECTOR_SUBMIT, KIND_SESSION_BIND, MessageV1,
     PeerRole, SESSION_BIND_VERSION, decode,
 };
@@ -2603,7 +2603,7 @@ async fn read_request(
                 // out of reach of a client.
                 if !peer.identity.role.may_submit_for_clients() {
                     Some(CloseReason::Rejected("submit".into()))
-                } else if frame.version != COLLECTOR_SUBMIT_VERSION {
+                } else if !COLLECTOR_SUBMIT_VERSIONS.contains(&frame.version) {
                     Some(CloseReason::Malformed(format!(
                         "submit frame version {}",
                         frame.version

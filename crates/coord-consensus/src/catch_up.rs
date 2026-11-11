@@ -125,6 +125,57 @@ pub(crate) struct CatchUp {
     pub(crate) pages: u64,
     /// Commands executed from pages, likewise.
     pub(crate) executed: u64,
+    /// What ended each ask and page that went nowhere, by path
+    /// (task-d106 step 0).
+    pub(crate) paths: CatchUpPaths,
+}
+
+/// How this follower's catch-up asks and pages went, by path, since it
+/// started (task-d106 step 0).
+///
+/// Every path counted here ends an ask or a page without a rejection or
+/// a log line of its own, so a voter that stops catching up says which
+/// one stopped it only through these. Diagnostic only: nothing reads
+/// them back.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CatchUpPaths {
+    /// Asks published to a donor.
+    pub asked: u64,
+    /// Asks declined before booting.
+    pub declined_unbooted: u64,
+    /// Asks declined while a page was in hand.
+    pub declined_busy: u64,
+    /// Asks declined by a replica that stopped: halted or diverged.
+    pub declined_stopped: u64,
+    /// Asks declined by a replica not synchronized at its ballot.
+    pub declined_unsynced: u64,
+    /// Asks declined for the donor: this replica, or not a voter.
+    pub declined_donor: u64,
+    /// Pages dropped as answered at another ballot than this replica's.
+    pub dropped_ballot: u64,
+    /// Pages dropped by a replica not synchronized at its ballot.
+    pub dropped_unsynced: u64,
+    /// Pages dropped for their sender: this replica, or not a voter.
+    pub dropped_sender: u64,
+    /// Pages ignored while another was in hand.
+    pub ignored_busy: u64,
+    /// Pages ignored by a replica that stopped.
+    pub ignored_stopped: u64,
+    /// Pages ignored while a campaign of this replica's ran.
+    pub ignored_campaign: u64,
+    /// Pages ignored for not following where this replica asked from.
+    pub ignored_after: u64,
+    /// Pages of which nothing was taken.
+    pub empty: u64,
+    /// Pages taken in part: an entry out of place or not whole ended
+    /// them.
+    pub cut_short: u64,
+    /// Windows stopped for a page answered at a ballot this replica has
+    /// left.
+    pub stopped_ballot: u64,
+    /// Windows stopped for a stale page: this replica executed past where
+    /// it starts.
+    pub stopped_stale: u64,
 }
 
 impl CatchUp {

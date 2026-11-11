@@ -17,9 +17,9 @@
 use std::collections::VecDeque;
 
 use coord_consensus::{
-    AppliedOutcome, BallotConfiguration, CatchUpEntry, ConfigurationIdentity, Follower,
-    FollowerConfig, FollowerRejection, Leader, LeaderConfig, MAX_CATCH_UP_COMMANDS, Phase,
-    ProtocolMessage, ReplicaRole,
+    AppliedOutcome, BallotConfiguration, CatchUpEntry, CatchUpPaths, ConfigurationIdentity,
+    Follower, FollowerConfig, FollowerRejection, Leader, LeaderConfig, MAX_CATCH_UP_COMMANDS,
+    Phase, ProtocolMessage, ReplicaRole,
 };
 use coord_core::capability::{AdmissionReceipt, AttestedAdmission, VerifierToken};
 use coord_core::effect::{BootId, Effect, PeerId};
@@ -1244,5 +1244,144 @@ fn a_pulled_decision_is_reported_over_the_selection_the_voter_held() {
     assert_eq!(
         entry.deps, decided,
         "the selection's acceptance was reported"
+    );
+}
+
+/// A commit restored at boot that executes in a pulled window was
+/// compared with the donor there, so nothing waits for it any more
+/// (#213 review): once caught up, a voter that then executes on its own
+/// asks from its own frontier, not from where the last page stopped.
+#[test]
+fn a_restored_commit_pulled_in_a_window_leaves_nothing_waiting() {
+    let (mut cluster, _) = left_behind(41);
+    cluster.serve = false;
+    let after = cluster.follower(4).executed_through();
+    let page = cluster.page(0, ballot0(), after);
+    let window = entries_of(&page).len();
+    // The window goes down and r4 restarts before executing any of it:
+    // every command of it is a commit restored at boot.
+    cluster.deliver_page(4, 0, &page);
+    cluster.restart(4);
+    // The same page, delivered before the restart's own execution, so
+    // the restored commits execute in a pulled window.
+    cluster.deliver_page(4, 0, &page);
+    cluster.settle();
+    assert_eq!(cluster.follower(4).catch_up_divergence(), None);
+    assert!(
+        cluster.follower(4).catch_up_counts().1 >= window as u64,
+        "the restored commits did not execute through the pulled window: {:?}",
+        cluster.follower(4).catch_up_counts()
+    );
+    cluster.serve = true;
+    cluster.catching = vec![4];
+    cluster.settle_ticking(8);
+    cluster.catching.clear();
+    assert_eq!(cluster.nodes[4].executed, cluster.nodes[0].executed);
+    for seq in 61..=64 {
+        cluster.admit(seq);
+        cluster.settle();
+    }
+    cluster.settle_ticking(2);
+    assert_eq!(
+        cluster.nodes[4].executed, cluster.nodes[0].executed,
+        "r4 did not execute the new work"
+    );
+    let frontier = cluster.follower(4).executed_through();
+    let asked = cluster.catch_up_asks.len();
+    cluster.ask(4);
+    assert_eq!(
+        cluster.catch_up_asks.get(asked),
+        Some(&(4, frontier.get())),
+        "the ask did not start at r4's own frontier"
+    );
+}
+
+/// task-d106 step 0 (#213 review): each path that ends an ask or a page
+/// without a rejection of its own is counted, by path.
+#[test]
+fn every_silent_end_of_an_ask_or_a_page_is_counted() {
+    let paths = |cluster: &Cluster| cluster.follower(4).catch_up_paths();
+    let (mut cluster, _) = left_behind(3);
+    cluster.serve = false;
+    let after = cluster.follower(4).executed_through();
+    let start = paths(&cluster);
+    assert_eq!(start, CatchUpPaths::default());
+
+    // Asks: of itself, of a stranger, and one published.
+    for donor in [4, 9] {
+        let effects = cluster.nodes[4].follower_mut().request_catch_up(r(donor));
+        assert!(effects.is_empty());
+    }
+    cluster.ask(4);
+    let now = paths(&cluster);
+    assert_eq!((now.declined_donor, now.asked), (2, 1), "{now:?}");
+
+    // Pages dropped: another ballot, a stranger.
+    let other = Ballot {
+        number: 7,
+        ..ballot0()
+    };
+    cluster.deliver_page(4, 0, &cluster.page(0, other, after));
+    let page = cluster.page(0, ballot0(), after);
+    cluster.deliver_page(4, 9, &page);
+    // Ignored: not where r4 asked from.
+    let mut elsewhere = page.clone();
+    let ProtocolMessage::CatchUpPage { after: from, .. } = &mut elsewhere else {
+        unreachable!()
+    };
+    *from = after.checked_next().unwrap();
+    cluster.deliver_page(4, 0, &elsewhere);
+    // Taken nothing: empty.
+    let mut empty = page.clone();
+    let ProtocolMessage::CatchUpPage { entries, .. } = &mut empty else {
+        unreachable!()
+    };
+    entries.clear();
+    cluster.deliver_page(4, 0, &empty);
+    let now = paths(&cluster);
+    assert_eq!(
+        (
+            now.dropped_ballot,
+            now.dropped_sender,
+            now.ignored_after,
+            now.empty
+        ),
+        (1, 1, 1, 1),
+        "{now:?}"
+    );
+
+    // Taken in part: an entry out of place ends it. With it in hand, the
+    // next page is ignored and the next ask declined.
+    let mut gap = page.clone();
+    let ProtocolMessage::CatchUpPage { entries, .. } = &mut gap else {
+        unreachable!()
+    };
+    assert!(entries.len() > 2);
+    entries.remove(1);
+    cluster.deliver_page(4, 0, &gap);
+    assert!(cluster.follower(4).catching_up());
+    cluster.deliver_page(4, 0, &page);
+    let effects = cluster.nodes[4].follower_mut().request_catch_up(r(0));
+    assert!(effects.is_empty());
+    let now = paths(&cluster);
+    assert_eq!(
+        (now.cut_short, now.ignored_busy, now.declined_busy),
+        (1, 1, 1),
+        "{now:?}"
+    );
+    // Nothing else moved.
+    assert_eq!(
+        (
+            now.declined_unbooted,
+            now.declined_stopped,
+            now.declined_unsynced,
+            now.dropped_unsynced,
+            now.ignored_stopped,
+            now.ignored_campaign,
+            now.stopped_ballot,
+            now.stopped_stale
+        ),
+        (0, 0, 0, 0, 0, 0, 0, 0),
+        "{now:?}"
     );
 }

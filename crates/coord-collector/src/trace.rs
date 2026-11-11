@@ -164,4 +164,15 @@ pub enum CollectorEvent {
         /// How many times it has been, this one included.
         times: u32,
     },
+    /// A pending command answered on the release alone, holding neither
+    /// half of a release one offer ceiling after its submission, was
+    /// submitted again to its ballot's leader only (task-d100, step A;
+    /// #204 review). Once a command, and it doesn't count toward
+    /// [`CollectorEvent::Solicited`]'s `times`.
+    SolicitedLeader {
+        /// Command.
+        command: String,
+        /// The leader it went to.
+        to: String,
+    },
 }
