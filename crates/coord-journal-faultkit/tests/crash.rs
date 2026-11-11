@@ -384,6 +384,7 @@ fn a_crash_at_every_operation_keeps_every_acknowledged_group() {
 #[test]
 fn a_failed_write_never_acknowledges_and_loses_nothing_acknowledged() {
     let ops = census();
+    let mut refused = 0;
     for (i, op) in ops.iter().enumerate() {
         if !matches!(op, Op::Write { .. }) {
             continue;
@@ -400,20 +401,28 @@ fn a_failed_write_never_acknowledges_and_loses_nothing_acknowledged() {
                     fail_write_prefix: prefix,
                     ..FaultPlan::default()
                 };
-                let (shared, _) = run(
-                    plan,
-                    tail,
-                    &format!("write {n} fails after {prefix} bytes, then {tail:?}"),
-                );
+                let case = format!("write {n} fails after {prefix} bytes, then {tail:?}");
+                let (shared, acked) = run(plan, tail, &case);
                 assert!(shared.log().contains(&Op::Failed), "write {n} not reached");
+                // The call that issued the failed write never returned
+                // `Ok`: with the crash at the same ordinal, recovery is
+                // checked only against earlier acknowledgements, which
+                // would pass an engine that swallowed the error (#210
+                // review).
+                if let Some(c) = acked.call_at(n) {
+                    assert!(!c.ok, "{case}: the {} call returned Ok", c.what);
+                    refused += 1;
+                }
             }
         }
     }
+    assert!(refused > 0, "no failed write fell inside a call");
 }
 
 #[test]
 fn enospc_never_acknowledges_and_loses_nothing_acknowledged() {
     let ops = census();
+    let mut refused = 0;
     let total = ops.len() as u64;
     for (i, op) in ops.iter().enumerate() {
         if !matches!(
@@ -431,14 +440,23 @@ fn enospc_never_acknowledges_and_loses_nothing_acknowledged() {
                     crash_after: tail.map(|_| n),
                     ..FaultPlan::default()
                 };
-                run(
-                    plan,
-                    tail,
-                    &format!("ENOSPC over {window:?} of {total}, then {tail:?}"),
-                );
+                let case = format!("ENOSPC over {window:?} of {total}, then {tail:?}");
+                let (_, acked) = run(plan, tail, &case);
+                // Nor the call whose write ENOSPC refused (#210 review). A
+                // refused length change is raft-engine's preallocation,
+                // which it logs and writes past (`LogFileWriter::write`),
+                // so that call may still return `Ok`: what it
+                // acknowledged is what recovery is checked against.
+                if matches!(op, Op::Write { .. })
+                    && let Some(c) = acked.call_at(n)
+                {
+                    assert!(!c.ok, "{case}: the {} call returned Ok", c.what);
+                    refused += 1;
+                }
             }
         }
     }
+    assert!(refused > 0, "no refused write fell inside a call");
 }
 
 #[test]
