@@ -3990,7 +3990,7 @@ So every feature-gated change, task-d98's `EarlyProposal` first, would ship unre
 
 **Implement:** The first of task-d101's option 2 cuts, each its own design step (#185 review). The journal-only cut isn't taken: boot, catch-up served, a campaign's executed rows and resolve read the protocol rows by command over history the journal has retired, and the journal has no index by command (Section 17.4's table). What holds is the leader's proposal row (`ProposalRecordV1`), written in every proposal batch and read by nothing but the checkpoint's trim plan, which nothing calls.
 - The leader writes no proposal row. `ProposalRequest` keeps answering from the leader's proposals in memory, those marked durable (`serve_proposals`).
-- The trim plan stops expecting one, and still removes one a store written before this change holds.
+- The trim plan's comment on the row ("the leader must be able to resume a proposal that is not yet settled") is removed with the write, since no leader resumes a proposal from a row. `classify` keeps its branch, so a row a store written before this change holds is still trimmed.
 - The follower's vote-time dependency row goes with task-d102's relay and is counted there, not here.
 
 **Acceptance:**

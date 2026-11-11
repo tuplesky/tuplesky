@@ -2001,12 +2001,31 @@ What a command writes there, by role:
 - **Its sequence number is ballot-scoped,** and a leader that restarts never leads its ballot again (Section 4.8's condition 4).
 - **Its dependencies and path** are the leader's ACCEPT row's.
 - **The leader's vote is its ACCEPT row,** not the proposal (Section 4.8: persist-before-send binds votes).
+- **The purpose its one comment gives is gone.** The trim plan's branch for it (`classify`, `coord-checkpoint/src/trim.rs`) says: "A proposal row follows its command: the leader must be able to resume a proposal that is not yet settled." No leader resumes a proposal from a row. A leader that restarts never leads its ballot again, and a new ballot's leader re-proposes from the voters' reports (Section 4.9). The comment goes with the write, so the next reader doesn't restore the row for it. `classify` keeps its branch for rows written before the change.
 
 `ProtocolV1` isn't in the common hash, so no scrub or checkpoint compares it.
 
-So task-d103 stops writing the proposal row and has the trim plan stop expecting one. That is one row a command at the leader, about a fifth of a row on every voter: about −0.006 to −0.008 ms an operation, on the leader's threads, which are the serial ones at high load. A store written before the change keeps its proposal rows until trim removes them. No reader depends on whether they are there.
+So task-d103 stops writing the proposal row and removes that comment. That is one row a command at the leader, about a fifth of a row on every voter: about −0.006 to −0.008 ms an operation, on the leader's threads, which are the serial ones at high load. A store written before the change keeps its proposal rows until trim removes them. No reader depends on whether they are there.
 
 **What this leaves of option 2.** The journal-only cut was most of option 2's −0.15 to −0.2. What holds is the proposal row here, the follower's vote row under task-d102's relay, and task-d104's and task-d105's cuts: about −0.07 to −0.09 an operation, before task-d102's share.
+
+**The rows a follower writes a command, against the parity budget** (#206 review). #185's budget asks for 4 or 5 rows a command. From the 12 counted on #185:
+
+| After | Rows a command at a follower |
+| --- | --- |
+| Today | 12 |
+| The relay's vote-time dependency row (task-d102) | 11 |
+| The history row (task-d105) | 10 |
+| The floor's rewrite, at `K = 16` (task-d104) | about 9 |
+
+- **task-d104 batches the retry deletes; it doesn't remove them.** K deletes every K commands is still one a command, so its step is under one row.
+- **Nine rows is about 0.27 to 0.36 ms an operation,** at −0.03 to −0.04 ms a row, against a parity budget of 0.18 for the whole materializer block. The three steps together stop well short of it.
+- **What's left to cut, each raised on its own step:**
+  - the current row, once task-d105's index exists (task-d105's step);
+  - the retry delete, with a window that overwrites in place (task-d104's step);
+  - the meta row once a commit rather than once a command, with the commit cadence (task-d86, task-d101's option 1).
+
+  With those, a follower writes about five rows a command: payload, dependency, executed, event and retry.
 
 <a id="s17-5"></a>
 ### 17.5 MVCC and physical maintenance
