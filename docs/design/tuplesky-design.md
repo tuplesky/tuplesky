@@ -2307,7 +2307,7 @@ No HashMap iteration dependence, usize wire values, host endian, floating time c
 <a id="s18-4"></a>
 ### 18.4 The domain loops' cost model and budget (task-d111)
 
-Bar 1 (task-d72) gives the five domain loops 0.30 ms an operation on the runner at parity with etcd. At the runner's 1.4× CPU and 0.93 commands an operation, that is about 230 µs a command over five voters locally, about 46 a voter. Today the five loops take about 1,280 µs a command locally (#185's reading D, and the reading below). D found the cost per command: passes and frames a command fall 12 to 17% from 30 to 120 callers, and CPU a command 2 to 6%. So a batch alone doesn't reach the budget, and each part of a loop needs its own driver and its own budget. This is the design step; the code steps are task-d111's entry in the plan.
+Bar 1 (task-d72) gives the five domain loops 0.39 ms an operation on the runner at parity with etcd, at 120 callers. That is task-d72's block budget restated at etcd's 0.962 ms an operation, read beside the head on the same runner (#98); the first cut's 0.30 divided an etcd figure read on another runner. At the runner's 1.4× CPU and 0.93 commands an operation, that is about 295 µs a command over five voters locally, about 59 a voter. Today the five loops take about 1,280 µs a command locally (#185's reading D, and the reading below). D found the cost per command: passes and frames a command fall 12 to 17% from 30 to 120 callers, and CPU a command 2 to 6%. So a batch alone doesn't reach the budget, and each part of a loop needs its own driver and its own budget. This is the design step; the code steps are task-d111's entry in the plan.
 
 **The reading.**
 - **Shares:** D's profiles at 120 callers (the leader and a follower that hosts a frontend). Each is good to about ±2 to 3 points.
@@ -2318,15 +2318,15 @@ Bar 1 (task-d72) gives the five domain loops 0.30 ms an operation on the runner 
 
 | Role | Today | Driver | Calls a command (30 → 120) | CPU a call | Budget |
 | --- | --- | --- | --- | --- | --- |
-| Voter protocol: the leader's `propose` and `collect`; a follower's `on_request`, `on_storage`, `advance_pending`, `on_committed` | 70 / 76 | Commands | 1 / 1 | 70 / 76 | 14 / 8 |
-| Executions (`run_executions`) | 53 / 55 | Commands | 1 / 1 | 53 / 55 | 12 / 10 |
-| Storage plumbing (`Node::settle`, `flush`; `lower_once` about half) | 43 / 52 | Lowerings, and commands (below) | 0.64 → 0.36 / 0.86 → 0.41 | Up to 119 / 127 a lowering | 8 / 6 |
-| Barrier reads (`pump_reads`) | 40 / 0 | Reads served | 1.37 → 1.36 at the leader | 29 a read | 8 / 0 |
-| Collector and frontend | 32 / 26 | Client operations at that node | 1 / 1 at a frontend, 0 elsewhere | 32 / 26 | 8 / 5 |
-| API transport in and out | 30 / 16 | API events | 4.8 → 4.8 / 3.9 → 4.0 | 6.3 / 4.1 | 8 / 3 |
-| Peer plane and daemon glue | 22 / 16 | Peer events | 8.5 → 7.1 / 2.6 → 2.3 | 3.0 / 7.1 | 4 / 3 |
-| Loop overhead: run-queue reads, clocks, blake3, drops | 40 / 33 | Passes | 14.5 → 12.6 / 7.9 → 6.9 | 3.2 / 4.7 | 8 / 5 |
-| **The loop** | **330 / 274** | | | | **70 / 40** |
+| Voter protocol: the leader's `propose` and `collect`; a follower's `on_request`, `on_storage`, `advance_pending`, `on_committed` | 70 / 76 | Commands | 1 / 1 | 70 / 76 | 18 / 10 |
+| Executions (`run_executions`) | 53 / 55 | Commands | 1 / 1 | 53 / 55 | 16 / 13 |
+| Storage plumbing (`Node::settle`, `flush`; `lower_once` about half) | 43 / 52 | Lowerings, and commands (below) | 0.64 → 0.36 / 0.86 → 0.41 | Up to 119 / 127 a lowering | 10 / 8 |
+| Barrier reads (`pump_reads`) | 40 / 0 | Reads served | 1.37 → 1.36 at the leader | 29 a read | 10 / 0 |
+| Collector and frontend | 32 / 26 | Client operations at that node | 1 / 1 at a frontend, 0 elsewhere | 32 / 26 | 10 / 6 |
+| API transport in and out | 30 / 16 | API events | 4.8 → 4.8 / 3.9 → 4.0 | 6.3 / 4.1 | 10 / 4 |
+| Peer plane and daemon glue | 22 / 16 | Peer events | 8.5 → 7.1 / 2.6 → 2.3 | 3.0 / 7.1 | 5 / 4 |
+| Loop overhead: run-queue reads, clocks, blake3, drops | 40 / 33 | Passes | 14.5 → 12.6 / 7.9 → 6.9 | 3.2 / 4.7 | 10 / 6 |
+| **The loop** | **330 / 274** | | | | **89 / 51** |
 
 - **Step A has since taken part of three rows** (`answer-on-release`, task-d100). On the runner the loops fell 14% and 12% a command (#98, run 2c). Locally at 120 callers, with it active:
   - the leader went 332 → 300 µs a command, its API events 4.8 → 2.6 and its passes 12.6 → 10.3;
@@ -2334,7 +2334,7 @@ Bar 1 (task-d72) gives the five domain loops 0.30 ms an operation on the runner 
   - the others went 203 → 196.
 
   What left is the collector's acknowledgement handling. So the collector and frontend, API transport and loop overhead rows are about 30 µs lower at the leader and the collectors than the table shows. The budgets don't change.
-- **What the budget sums to:** 70 at the leader and 40 at each follower is 230 µs a command over five voters, the parity budget. A follower without a frontend has no collector row, so it must come in under 40.
+- **What the budget sums to:** 89 at the leader and 51 at each follower is about 295 µs a command over five voters, the parity budget. Each row's budget is the first cut's (set against 230) scaled by 1.28, etcd's 0.962 over 0.75. A follower without a frontend has no collector row, so it must come in under 51.
 - **The allocator and memmove are their own block, across the rows.** They are 16 to 20% of a loop at either role: about 53 to 66 µs a command at the leader and 44 to 55 at a follower. They are paid per command (a payload copied into each row, records cloned between stages, a buffer each message), so they are cut where a row is cut, and also on their own: one buffer a batch, rows written from borrowed payloads. Its budget is half of today's inside each row's.
 - **Kernel leaves follow passes and groups** (12 to 16%, wakeups and syscalls). They fall with the overhead row's and the plumbing row's drivers, and have no budget of their own.
 - **Storage plumbing's driver isn't settled by these two loads.**
@@ -2344,23 +2344,23 @@ Bar 1 (task-d72) gives the five domain loops 0.30 ms an operation on the runner 
 
 **The three items, by the rows they own:**
 1. **Followers off the per-command protocol pipeline.**
-   - Rows: a follower's voter protocol (76 → 8), peer plane (16 → 3) and loop overhead (33 → 5).
+   - Rows: a follower's voter protocol (76 → 10), peer plane (16 → 4) and loop overhead (33 → 6).
    - Route: task-d102's batched round with step B. A follower adopts a turn's proposals in one batch, admits nothing per command (`on_request` goes for a relayed command), and acknowledges by range.
    - Driver targets: at most 1 pass and 0.5 peer events a command at a follower. Today it is 4.4 to 6.9 passes and 2.3 peer events.
    - On record: step B is about −110 µs a command over the followers. The batch takes the per-message rows.
 2. **Followers off the full planner.**
-   - Rows: a follower's executions (55 → 10) and storage plumbing (52 → 6).
+   - Rows: a follower's executions (55 → 13) and storage plumbing (52 → 8).
    - Route: task-d101's option 3, applying the leader's records without planning (#203). Then option 1, a commit cadence a follower's own, and the row cuts.
    - Driver targets: at least 10 commands a lowering at a follower (today 1.4 to 2.4 at 120 callers), and 4 or 5 rows a command.
 3. **The leader's `propose` and reads.**
-   - Rows: the leader's voter protocol (70 → 14) and barrier reads (40 → 8).
+   - Rows: the leader's voter protocol (70 → 18) and barrier reads (40 → 10).
    - `propose`: half of today's row is building the payload and dependency rows, `adopt_own` and `initialize_bounded`, once a command. In the batch, a turn's rows are built in one pass and `adopt_own`'s set is kept, not rebuilt.
-   - Reads: a read costs 29 µs today, against a barrier round shared by about 8 reads (0.18 rounds a command). The budget is about 6 µs a read: a read answered from the leader's executed state once its round confirms, without the per-read planning it does today.
+   - Reads: a read costs 29 µs today, against a barrier round shared by about 8 reads (0.18 rounds a command). The budget is about 7 µs a read: a read answered from the leader's executed state once its round confirms, without the per-read planning it does today.
 
 **Not owned yet, and named so a lever can't count it twice:**
-- the leader's executions (53 → 12);
-- the leader's collector and frontend (32 → 8) and API transport (30 → 8);
-- the leader's loop overhead (40 → 8), which needs passes a command at the leader from 12.6 to about 2.5.
+- the leader's executions (53 → 16);
+- the leader's collector and frontend (32 → 10) and API transport (30 → 10);
+- the leader's loop overhead (40 → 10), which needs passes a command at the leader from 12.6 to about 3.
 
 The batch shortens the leader's passes and events. #205's first reading puts the leader's events a command at about 10 to 12 today, of which 7 are peer, and a range acknowledgement takes most of the peer part. Whether the rest needs its own design is read after task-d102's frames.
 

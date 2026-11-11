@@ -4011,26 +4011,26 @@ So every feature-gated change, task-d98's `EarlyProposal` first, would ship unre
 **Prerequisites:** task-d72, task-d101, task-d102.  
 **Design:** Section 18.4 (this task's design step: the loops' cost model and budget).
 
-**Implement:** From #185's reading D and its review: the loops' design step, as a table by role, each role with its driver, the driver's calls a command, CPU a call, and a budget at parity. The budgets sum to 0.30 ms an operation on the runner, about 230 µs a command over five voters locally. The design step is in Section 18.4; this entry is its code steps, each its own PR after its own review.
+**Implement:** From #185's reading D and its review: the loops' design step, as a table by role, each role with its driver, the driver's calls a command, CPU a call, and a budget at parity. The budgets sum to 0.39 ms an operation on the runner at 120 callers (task-d72's block budget restated at etcd's figure read beside the head, #98), about 295 µs a command over five voters locally. The design step is in Section 18.4; this entry is its code steps, each its own PR after its own review.
 - **First, the counters, with the first code step that needs them:**
   - passes counted exactly, not sampled × 16;
   - the events taken between flushes, by plane (#205's scratch counter).
 - **Item 1, followers off the per-command protocol pipeline.**
-  - Built as task-d102's batched round with step B. This task reads it against its rows: a follower's voter protocol (76 → 8 µs a command), peer plane (16 → 3) and loop overhead (33 → 5).
+  - Built as task-d102's batched round with step B. This task reads it against its rows: a follower's voter protocol (76 → 10 µs a command), peer plane (16 → 4) and loop overhead (33 → 6).
   - Driver targets at a follower: at most 1 pass and 0.5 peer events a command.
 - **Item 2, followers off the full planner.**
-  - Built as task-d101's option 3, then option 1, and task-d103 to task-d105. This task reads them against a follower's executions (55 → 10) and storage plumbing (52 → 6).
+  - Built as task-d101's option 3, then option 1, and task-d103 to task-d105. This task reads them against a follower's executions (55 → 13) and storage plumbing (52 → 8).
   - Driver targets: at least 10 commands a lowering at a follower, and 4 or 5 rows a command.
 - **Item 3, the leader's `propose` and reads.** Its own code step, after task-d102's frames:
-  - `propose` builds a turn's payload and dependency rows in one pass, and keeps `adopt_own`'s set rather than rebuilding it a command (70 → 14);
-  - a barrier read is answered from the leader's executed state once its round confirms, without per-read planning (40 → 8, about 6 µs a read).
+  - `propose` builds a turn's payload and dependency rows in one pass, and keeps `adopt_own`'s set rather than rebuilding it a command (70 → 18);
+  - a barrier read is answered from the leader's executed state once its round confirms, without per-read planning (40 → 10, about 7 µs a read).
 - **The allocator and memmove, a block across the rows** (16 to 20% of a loop): one buffer a batch, and rows written from borrowed payloads. Half of today's, counted inside each row it cuts.
-- **Named, not owned:** the leader's executions (53 → 12), its collector and frontend (32 → 8), its API transport (30 → 8), and its loop overhead (40 → 8: about 2.5 passes a command, from 12.6). Each is re-read after task-d102's frames before it gets a design.
+- **Named, not owned:** the leader's executions (53 → 16), its collector and frontend (32 → 10), its API transport (30 → 10), and its loop overhead (40 → 10: about 3 passes a command, from 12.6). Each is re-read after task-d102's frames before it gets a design.
 
 **Acceptance:**
 - **The design step** recorded and reviewed before any code.
 - **Each code step** names its rows and reports, at 30 and 120 callers on five voters, each row's driver calls a command and CPU a call, with a profile of the leader and of a follower at each load. A row's budget is met, or its gap is stated. A lever counts only against the rows it names.
-- **The loops' total against bar 1:** at most 0.30 ms an operation on the runner, read by the testing session's job once items 1 to 3 are in.
+- **The loops' total against bar 1:** at most 0.39 ms an operation on the runner at 120 callers (0.44 at 30), read by the testing session's job once items 1 to 3 are in.
 
 ## Gate checklist and deferred work
 
