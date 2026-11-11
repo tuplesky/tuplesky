@@ -407,13 +407,21 @@ The section below is the design step; the code step is task-d100's entry in the 
 
 **A contended round is a batch (task-d102).** Step A takes the evidence off the collector's plane, and step B takes the fan-out off a slow round. Both still count per command: every command a slow round orders is still its own proposal frame to each follower, its own slow acknowledgement from each, its own journal group at a follower and its own release frame. At 120 callers on step A's base a command costs about 16.8 datagrams over both planes, and a journal group holds about 4.9 commands (#185 review). The CPU a command costs doesn't fall as load rises, which is what a batched path would show. task-d102 makes the contended path one shape, a batch, with every per-command message folded into one a turn. This is the design step for one domain; the code steps are task-d102's entry in the plan. It folds in task-d100's step B, task-d84's parts 2 and 3, task-d86's leader half, task-d101's option 1 (task-d86's follower half) and task-d61's and task-d96's frame candidates: each was a part of this shape, sized alone.
 
+**What a turn is, and where a frame is cut** (#205 review).
+- **Today a pass of the domain loop takes one transport event** and sends what it produced (`Domain::run` → `carry` → `send_turn`). With `EarlyProposal`, each remote submission's proposal leaves in the pass that ordered it. So a frame cut at a pass would carry one proposal, and the batch would be one command.
+- **A turn here is the loop's work between two lowered groups.** The leader queues the proposals it orders for each follower, and the releases for each collector. It cuts the frames where the loop already lowers a journal group: when no event is ready (`owes_flush`, task-d47), or when a frame reaches the transport's bound.
+- **No timer cuts a frame.** A leader with one caller gets no event between two flushes, so it sends a frame of one at once and waits for nothing. Under load, a frame holds what arrived while the loop was busy, as a journal group does.
+- **It is the cut the leader's own rows already have.** The leader's turn writes its proposals' rows as one batch at the same point (task-d89), so a frame carries what one leader group made.
+- **A follower's acknowledgement frame is cut where its adoption batch becomes durable** (below), and holds every position that batch covered.
+- **The step's reading reports the batch at each hop:** proposals a frame, positions an acknowledgement frame, and releases a release frame. With them, it reports the events the leader's loop takes between two flushes, which bounds all three. Today each batch is one by construction. This is what decides whether the counts below can be met.
+
 **The shape, at each hop of a slow round:**
-1. **One proposal frame a follower a turn, with payloads.** The leader's turn orders every submission it took. It sends each follower one frame carrying every proposal of the turn in sequence-number order, each with its vote (`FastAck`, as today) and, for a relayed command, its payload record (step B). The frame also carries the leader's commit frontier (`Committed`, task-d09), which it otherwise sends on its own. A frame is split only at the transport's frame bound. A follower checks each payload as step B checks one: its identity is the proposal's command and its admission digest the vote's.
+1. **One proposal frame a follower a turn, with payloads.** The leader's turn orders every submission it took. It sends each follower one frame carrying every proposal of the turn in sequence-number order, each with its vote (`FastAck`, as today) and, for a relayed command, its payload record (step B). The frame also carries the leader's commit frontier (`Committed`, task-d09). A turn that orders nothing for a follower still sends that follower the frontier on its own, as today, so a follower's learning never waits for new work. A frame is split only at the transport's frame bound. A follower checks each payload as step B checks one: its identity is the proposal's command and its admission digest the vote's.
 2. **One journal group a voter for that frame.** A follower adopts every proposal of the frame in one batch: the payload, dependency and ACCEPT rows of each, as step B adopts one. The leader's turn already writes its proposals' rows in one batch (task-d89).
 3. **One acknowledgement through a position, not one a command.** Once the batch is durable, the follower sends the leader one frame saying which positions of the ballot it has adopted, durably (below).
 4. **One execution group a turn,** as task-d47 lowers a turn's executions, and merged into the turn's acceptance group where task-d84's reading says the merge pays.
 5. **A projection commit on a cadence,** task-d86's at the leader and task-d101's option 1 at each follower: commits merge up to a bound of records and time, and what reads the projection asks for the next commit.
-6. **One release frame a collector a turn.** The leader groups the turn's releases by the origin each command named (`origins.remember`) and sends each collector one frame of them, each entry the `ReleaseV2` step A defines. The collector checks each entry as it checks one release today (`check_release`, the admission, the speculative flag). The advice bit (step B's B1) rides the frame once, not every entry.
+6. **One release frame a collector a turn.** The leader groups the turn's releases by the origin each command named (`origins.remember`) and sends each collector one frame of them, each entry the `ReleaseV2` step A defines. The collector checks each entry as it checks one release today (`check_release`, the admission, the speculative flag). The entries are independent: one that `check_release` holds or refuses doesn't hold or refuse the others, and each is answered as if it had come alone. The advice bit (step B's B1) rides the frame once, not every entry.
 
 Nothing here touches the fast path. A fanned-out command a fast-set follower pre-accepts still sends its fast acknowledgement on its own, since each carries its own dependencies and paths. The batch is the slow path's shape, and with step B's switch a slow-only round is relayed.
 
@@ -421,7 +429,10 @@ Nothing here touches the fast path. A fanned-out command a fast-set follower pre
 - **What it says.** `AdoptedThrough { ballot, ranges }`: the positions of the ballot (Section 4.1: the ballot whose leader numbered the proposal, and its number) whose proposals this voter has adopted and holds durably, as a short list of closed ranges of sequence numbers, lowest first. In steady state that's one range from the ballot's first position the voter hasn't reported, so it is cumulative, like Raft's `matchIndex`. A gap left by a proposal the voter doesn't hold yet (its payload is being fetched, a dependency isn't initialized, the frame was lost) splits the range, as a QUIC ACK frame's ranges do, so a hole doesn't hold back the positions after it. The list is bounded. A voter with more holes than the bound sends the lowest ranges and, for adoptions above them, today's per-command `SlowAck`.
 - **What the leader does with it.** For each position in the ranges it doesn't already count from that voter, it looks up its own proposal at that position and counts a `SlowAck { replica, ballot, command, admission }` for it, with the command and admission of that proposal. Everything after that is today's rule: `VoteSet::add`, the slow quorum of `slow_size` durable adoptions at b (task-d19), the leader's own adoption once its acceptance row is durable. Per voter the leader keeps the highest contiguous position it has counted (it keeps `adopted_through` already, task-d59) and the few ranges above it.
 - **Why it is the same evidence.** The argument is that a range covering position s at ballot b claims exactly what a `SlowAck` for the proposal at s claims:
-  - **A position names one proposal for the life of a ballot.** Only b's leader numbers proposals at b, it proposes each command once, and a leader that restarts never leads its old ballot again (Section 4.8's conditions 3 and 4, with the genesis exception closed by condition 4's durable batch). So the leader's proposal at (b, s), and the follower's adoption at (b, s), name the same command, dependencies and admission. That names more than a `SlowAck` does, which names the command and admission but no order.
+  - **A position names at most one proposal for the life of a ballot.** Only b's leader numbers proposals at b, its numbering only rises, and a leader that restarts never leads its old ballot again (Section 4.8's conditions 3 and 4, with the genesis exception closed by condition 4's durable batch). So no two proposals of b share a position, and the leader's proposal at (b, s) and the follower's adoption at (b, s) name the same command, dependencies and admission. That names more than a `SlowAck` does, which names the command and admission but no order.
+  - **A covered position counts only for the proposal the leader holds at it now.** The leader can replace a proposal of a command it already proposed (`put_proposal` takes the new one at a higher position, through `repropose` after a Sync's installation). The old position then holds nothing, and the old proposal's dependencies may differ from the new one's. So a range covering a position counts for the proposal held at that position when the range arrives, and counts nothing if that proposal was replaced or swept since. A voter's adoption of the replacing proposal is counted only when a range covers the new position.
+  - **Whether a replacement within one ballot happens is not settled by reading the code.** `propose` refuses a command already proposed (`Duplicate`). `repropose` replaces one, from `repropose_entries` at a Sync's installation, and reading its callers doesn't show whether the command can already be proposed at that ballot. So the code step adds a debug assertion in `put_proposal` that a replacement never happens within one ballot, and the simulator runs it in every row. The rule above holds either way. If the assertion never fires, the replacement case is unreachable. If it fires, the rule is what keeps the range sound.
+  - **The same case is open for `SlowAck` today.** A `SlowAck` names the command and admission, not the position. So a late `SlowAck` for a replaced proposal, under the same admission, would count toward the replacing proposal. It is reachable only if a replacement within a ballot is, which the assertion settles. The range closes it for every position it covers.
   - **Adopting a proposal is agreeing to its admission.** A follower adopts the leader's proposal only under the proposal's admission digest. One holding the command under other facts below PRE-ACCEPT holds the proposal, fetches the leader's payload and rebinds to it before adopting (`awaits_rebind`, task-d09); past PRE-ACCEPT it refuses the proposal. Either way the position stays out of its ranges until it has adopted under the proposal's admission, so the leader never counts it sooner. So counting the proposal's own admission for a covered position is what the follower's `SlowAck` would have said.
   - **It leaves at the same moment.** A range covers a position only once the adoption at it and every outstanding batch of the voter's own are durable, which is when that adoption's `SlowAck` leaves today (Section 4.8's outbox; task-d90's point 4, so a vote rests on a payload row durable at the voter).
   - **Only adoptions are counted.** A range counts toward the slow quorum and never toward a fast one, as a `SlowAck` does (task-d19).
@@ -430,10 +441,12 @@ Nothing here touches the fast path. A fanned-out command a fast-set follower pre
 - **What it is not.** It doesn't commit anything at the follower, which still learns from the leader's frontier (task-d09). It doesn't let a follower acknowledge a proposal it hasn't adopted, or the leader count one it didn't propose: a position past the leader's numbering is dropped as a `SlowAck` for an unknown command is today.
 - **It is a protocol change** to what a vote's frame says, so it needs its argument reviewed (this paragraph), the simulator over it, and a replicated feature (below).
 
-**What it moves, in counts.** At five voters, with k commands a frame and a collector's c commands a release frame, a relayed command's data frames are about 1 (its submission) + 4/k (proposals) + 4/k (acknowledgements) + 1/c (its release), with the commit frontier riding the proposals. That's about 1.8 at k = 10 and c = 2 against today's about 10, before the transport's ACK-only datagrams, which follow the data datagrams at task-d70's frequency. Groups at a voter hold what a turn ordered, so a group grows with the load where today it holds a few commands. CPU a command then falls with load, since the per-frame and per-group costs (task-d61, task-d72's profile: QUIC's per-packet work, a redb commit) are paid once a turn.
+**What it moves, in counts.** At five voters, with k commands a frame and a collector's c commands a release frame, a relayed command's data frames are about 1 (its submission) + 4/k (proposals) + 4/k (acknowledgements) + 1/c (its release), with the commit frontier riding the proposals. That's about 1.8 at k = 10 and c = 2 against today's about 10, before the transport's ACK-only datagrams, which follow the data datagrams at task-d70's frequency. The submission's 1 is then the largest term. Folding a collector's submissions into one frame a turn, at s commands a frame, makes it 1/s. That is the shape the parity target below needs. Groups at a voter hold what a turn ordered, so a group grows with the load where today it holds a few commands. CPU a command then falls with load, since the per-frame and per-group costs (task-d61, task-d72's profile: QUIC's per-packet work, a redb commit) are paid once a turn.
 
-**Its acceptance is amortization, in counts,** on the register row at five voters, read on the same counters as #185's:
-- at 120 callers, at most 5 datagrams a command over both planes (about 16.8 on step A's base);
+**Its acceptance is amortization, in counts,** on the register row at five voters, read on the same counters as #185's (the cost model of datagrams and CPU a command by role is in #185's review record):
+- **Datagrams, two targets** (#205 review), with ACK-only datagrams counted on their own line beside the data datagrams:
+  - **The first milestone,** task-d72's 2.0× budget: at 120 callers, at most 5 datagrams a command over both planes (about 16.8 on step A's base). That is about 0.24 to 0.30 ms an operation.
+  - **The goal,** parity with etcd at about 0.15 ms an operation: at most 3 datagrams a command at 120 callers. Its shape includes one submission frame a collector a turn.
 - at least 10 commands a journal group at every voter (about 4.9);
 - the servers' CPU a command at 120 callers at most half of its value at 30.
 
@@ -1988,12 +2001,31 @@ What a command writes there, by role:
 - **Its sequence number is ballot-scoped,** and a leader that restarts never leads its ballot again (Section 4.8's condition 4).
 - **Its dependencies and path** are the leader's ACCEPT row's.
 - **The leader's vote is its ACCEPT row,** not the proposal (Section 4.8: persist-before-send binds votes).
+- **The purpose its one comment gives is gone.** The trim plan's branch for it (`classify`, `coord-checkpoint/src/trim.rs`) says: "A proposal row follows its command: the leader must be able to resume a proposal that is not yet settled." No leader resumes a proposal from a row. A leader that restarts never leads its ballot again, and a new ballot's leader re-proposes from the voters' reports (Section 4.9). The comment goes with the write, so the next reader doesn't restore the row for it. `classify` keeps its branch for rows written before the change.
 
 `ProtocolV1` isn't in the common hash, so no scrub or checkpoint compares it.
 
-So task-d103 stops writing the proposal row and has the trim plan stop expecting one. That is one row a command at the leader, about a fifth of a row on every voter: about −0.006 to −0.008 ms an operation, on the leader's threads, which are the serial ones at high load. A store written before the change keeps its proposal rows until trim removes them. No reader depends on whether they are there.
+So task-d103 stops writing the proposal row and removes that comment. That is one row a command at the leader, about a fifth of a row on every voter: about −0.006 to −0.008 ms an operation, on the leader's threads, which are the serial ones at high load. A store written before the change keeps its proposal rows until trim removes them. No reader depends on whether they are there.
 
 **What this leaves of option 2.** The journal-only cut was most of option 2's −0.15 to −0.2. What holds is the proposal row here, the follower's vote row under task-d102's relay, and task-d104's and task-d105's cuts: about −0.07 to −0.09 an operation, before task-d102's share.
+
+**The rows a follower writes a command, against the parity budget** (#206 review). #185's budget asks for 4 or 5 rows a command. From the 12 counted on #185:
+
+| After | Rows a command at a follower |
+| --- | --- |
+| Today | 12 |
+| The relay's vote-time dependency row (task-d102) | 11 |
+| The history row (task-d105) | 10 |
+| The floor's rewrite, at `K = 16` (task-d104) | about 9 |
+
+- **task-d104 batches the retry deletes; it doesn't remove them.** K deletes every K commands is still one a command, so its step is under one row.
+- **Nine rows is about 0.27 to 0.36 ms an operation,** at −0.03 to −0.04 ms a row, against a parity budget of 0.18 for the whole materializer block. The three steps together stop well short of it.
+- **What's left to cut, each raised on its own step:**
+  - the current row, once task-d105's index exists (task-d105's step);
+  - the retry delete, with a window that overwrites in place (task-d104's step);
+  - the meta row once a commit rather than once a command, with the commit cadence (task-d86, task-d101's option 1).
+
+  With those, a follower writes about five rows a command: payload, dependency, executed, event and retry.
 
 **The retry window retired in batches (task-d104).** In steady state a command writes four retry rows at every voter:
 - its retained result (`RetryV1`) and its executed row (`ExecutedV1`), both put;
@@ -2013,6 +2045,31 @@ A client acknowledges on every request (`ack_through`), so `retirement()` (`retr
 
 **What it moves.** The floor row is written once every `K` commands a client instead of every command: about −(1 − 1/K) rows a command at every voter, about −0.03 to −0.04 ms an operation at `K = 16`. The `K` deletes land together on consecutive keys of one client, which redb writes as one region of its tree. Whether that is cheaper than `K` scattered deletes is read in the pair, not assumed. `ExecutedV1` stays: it is the index by command that catch-up, campaigns and boot read, and `RetryV1` is keyed by the retry key.
 
+**How the rule is introduced** (#207 review). The retirement rule is part of deterministic execution: `RetryV1` and `RetryFloorV1` are in the common hash. Two builds with different rules reach different common states at the same position. Their floor roots would disagree (task-d27), and they would answer the same retry differently at different voters. So the rule is a change to the replicated state, and a domain changes it at one position on every voter:
+- **It is a replicated feature, `Feature::BatchedRetirement`, activated through task-d99's path.** It is gated like `EarlyProposal`: a prepare marker in each voter's `ActiveFeaturesV1`, then activation at a position. Below the activation position every voter retires one sequence a command, as today; from it, every voter retires in batches. Both rules stay in the code.
+- **Why not a raised state-format version.**
+  - The store's `format_version` field (`meta_fields::FORMAT_VERSION`) is read by no open today, so that route would first need the check built.
+  - task-d99's path already has the rollback guard: a build that doesn't know the feature refuses a store that names it.
+  - The rule has no rows to convert. It changes which sequences a command retires from a position on, not the layout of rows already written. task-d105's history layout does change written rows, so it takes the other route: one layout a domain.
+- **Its tests:**
+  - a store written before the activation keeps today's rule through a restart, and switches at the activation position;
+  - every voter's common hash agrees at the activation position and after it;
+  - a build without the feature refuses a store that names it, with the reason (task-d99's guard).
+
+**Whether the delete can go too: yes, through a window that overwrites in place** (#207 review). This step batches the floor's rewrite, not the deletes: `K` deletes every `K` commands is still one a command, so the retry state falls from four rows a command to about three. At parity the delete has to go. A window that overwrites in place takes it:
+- **`RetryV1` keyed by the client instance and the sequence modulo the window's width.** A new result replaces the slot of a sequence the window has already passed, so retiring writes nothing.
+- **A slot holds its own sequence.** A lookup tells a retained result from a replaced one, and a replaced one answers `Retired`, as a deleted one does today.
+- **An unacknowledged result is never replaced.** Admission already refuses a sequence more than the width above the floor (`admit`), and a slot is reused only by a sequence a width above it.
+- **The floor row stays,** and this step's rule rewrites it once every `K` commands.
+
+What it has to answer before its code:
+- **The width is carried on the client's floor row,** fixed for the client instance, since slots are computed from it and widths can differ by client.
+- **`ExecutedV1` stays as it is.** It is the index by command, and the window changes only the retry key's rows.
+- **Resolve and `records_for`** read a slot and compare its sequence; nothing else reads `RetryV1` by range.
+- **It changes `RetryV1`'s layout,** a collection in the common hash. So, unlike this step's rule, it takes task-d105's route: one layout a domain, with a store or image of the other refused with the reason.
+
+**Its size, with this step:** the retry state falls to one put and `1/K` of a floor row a command, about −0.06 to −0.08 ms an operation together, against this step's −0.03 to −0.04 alone. It composes with this step and doesn't replace it. It is task-d104's second part, sized after the first part's pair, before its code.
+
 **One version row a revision (task-d105).** A put writes three rows for its key: the current entry (`KvCurrentV1`), a history row (`KvHistoryV1`, keyed by namespace, key and revision, holding the entry) and an event row (`EventsV1`, keyed by revision and ordinal, holding kind, namespace, key, entry and the previous entry). The event row holds everything the history row holds. They differ in their keys and their retention:
 - reads at a past revision (`scan_history`) need the newest version of a key at or below a revision, in key order;
 - a watch's replay needs versions in revision order;
@@ -2024,11 +2081,28 @@ A client acknowledges on every request (`ack_through`), so `retirement()` (`retr
 - **Compaction** keeps each key's newest version at or below the floor as its event row, even when the current row holds the same version: the index is built from event rows alone, and a later write replaces the current row while a read at the floor must still find the version (Codex review on #208). It deletes every other event below the floor. A watch from below the floor is refused as compacted, as today.
 
 **What it costs.**
-- **Memory.** The index holds about a key's bytes and 16 bytes a retained version, which task-d26's resource contract adds as a budget per domain, bounded by the compaction floor.
-- **Boot.** The rebuild reads every retained event once, before the projection serves reads. It is bounded and measured beside task-d55's replay.
-- **The checkpoint.** `KvHistoryV1` leaves the common hash and `SharedCheckpointV1`, and the events' retention changes. So this is a checkpoint format version and a scrub change (task-d37), accepted because nothing is deployed in production yet. A local image's index is rebuilt at install as at boot.
+- **Memory.** The index holds about a key's bytes and 16 bytes a retained version, which task-d26's resource contract adds as a budget per domain.
+  - **The compaction floor bounds it only if compaction runs.** A domain that never compacts grows the index without bound (#208 review).
+  - **So the budget is counted in retained versions and key bytes,** which are functions of the replicated state, not of a process's memory. Every voter then reaches the limit at the same position.
+  - **At the limit, a write that would add a retained version is refused** with a resource-exhausted reason, as etcd refuses writes over its backend quota. Reads, deletes and compactions are still served. A compaction below the limit lifts the refusal.
+  - **The limit doesn't force a compaction.** The floor is a replicated retention watermark (Section 17.5), so a voter that moved it on its own would leave the other voters' state. A compaction the domain orders lifts the refusal.
+- **Boot and failover.** The rebuild reads every retained event once, before the projection serves reads. That adds to a restart's time in proportion to retained history.
+  - **Its bound:** the rebuild's time at the largest retained history the budget above admits stays under the election's patience (how long voters wait on a silent leader before campaigning). So a restarted voter isn't still rebuilding when the domain needs it to lead.
+  - **A voter votes before its index is built.** Its votes rest on its journal and protocol rows (Section 4.8), which boot restores before the index, and no vote reads the KV state. What waits for the index is what reads the KV state: executions, and so releases, and reads. A voter elected leader before its index is built orders and proposes, and executes once the index is in.
+- **The format is a change to the replicated state, not only to the checkpoint** (#208 review). `KvHistoryV1` leaves the common hash and `SharedCheckpointV1`, and the events' retention changes. Two builds on different layouts reach different common states, and their floor roots (task-d27) disagree at the first boundary. Unlike task-d104's rule, the layout changes rows already written, so it can't switch at a position.
+  - **A domain runs one layout.** The store records its layout at initialization, and every open compares it.
+  - **A live store or an image of the other layout is refused, with the reason,** as Section 17.7 has an unsupported format fail before admission. `meta_fields::FORMAT_VERSION` is read by no open today, so the code step builds that check.
+  - **The checkpoint format's version is raised,** and the scrub reads the new layout (task-d37).
+  - **This is accepted because nothing is deployed in production yet.**
+  - A local image's index is rebuilt at install as at boot.
 
 **What it moves.** One row a mutated key a revision at every voter: about −0.03 to −0.04 ms an operation at the register row, and more for a transaction over several keys. History rows were also the larger part of compaction's deletes, which now fall to one deletion a revision below the floor.
+
+**The current row, once the index exists: it goes** (#208 review). The index gives each key's newest retained revision, so the latest version of a key is one index lookup and one read of its event row. That is how etcd serves it, and etcd keeps no current row. The two sides:
+- **What the current row costs:** one more row a mutated key at every voter, about −0.03 to −0.04 ms an operation. The row count against the parity budget (task-d103's step) needs it gone.
+- **What it buys:** a range read at the latest revision as one ordered scan of `KvCurrentV1`. Without it, that read walks the index's key range and does one point read of an event row a key, and the event rows sit in revision order, not key order. A Kubernetes list is that read.
+- **What doesn't need it:** a point read at the latest revision, and a transaction's guard on a key's modification revision, which the index answers without a read.
+- **The choice:** it goes, as task-d105's second part, after the first part's pair. `KvCurrentV1` is in the common hash and the shared checkpoint too, so it goes in the same layout change and doesn't need a second one. The pair reads a range at the latest revision at 10³ and 10⁴ keys on both layouts. If the list read's loss is larger than the row's saving at the bars' workload, the row stays, and the reading says why.
 
 <a id="s17-5"></a>
 ### 17.5 MVCC and physical maintenance
