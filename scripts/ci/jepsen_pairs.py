@@ -752,8 +752,16 @@ ETCD = (
 
 
 def beside_etcd(runs: list[Run]) -> list[tuple[Run, list[Run]]]:
-    """Each etcd run with the TupleSky runs it is compared with: those
-    since the etcd run before it."""
+    """Each etcd run with the TupleSky runs it is compared with: those of
+    its own pair where every run is numbered, so a pair whose etcd run left
+    no store is compared with none; otherwise those since the etcd run
+    before it."""
+    if runs and all(r.pair is not None for r in runs):
+        return [
+            (e, [r for r in runs if r.label != "etcd" and r.pair == e.pair])
+            for e in runs
+            if e.label == "etcd"
+        ]
     out, since = [], []
     for run in runs:
         if run.label == "etcd":
@@ -900,7 +908,7 @@ def main() -> int:
     p.add_argument(
         "runs",
         nargs="+",
-        help="LABEL=STORE, with LABEL base, head or etcd, in the order they ran; base#N or head#N names the pair",
+        help="LABEL=STORE, with LABEL base, head or etcd, in the order they ran; LABEL#N names the pair",
     )
     a = p.parse_args()
     runs = []
@@ -910,9 +918,9 @@ def main() -> int:
         if (
             label not in ("base", "head", "etcd")
             or not store
-            or (number and (label == "etcd" or not number.isdigit()))
+            or (number and not number.isdigit())
         ):
-            print(f"not LABEL=STORE with LABEL base, head or etcd (base#N, head#N): {spec}", file=sys.stderr)
+            print(f"not LABEL=STORE with LABEL base, head or etcd (or LABEL#N): {spec}", file=sys.stderr)
             return 2
         run = read_run(label, store)
         run.pair = int(number) if number else None

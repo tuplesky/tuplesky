@@ -252,8 +252,9 @@ through jepsen.tuplesky's `--voter-env` (such as
 how many; the order alternates from pair to pair, so a drift over the job
 favours neither side. Each run gets its own summary as it ends, and
 `scripts/ci/jepsen_pairs.py` then gives one row per run and the head's
-difference from the base pair by pair (the job numbers each run by its pair,
-so a run that leaves no store drops only its own pair), with the mean, smallest and
+difference from the base pair by pair (the job numbers each run, etcd's
+beside included, by its pair, so a run that leaves no store drops only its
+own pair or its own pair's etcd comparison), with the mean, smallest and
 largest: `ok`/s, read p99, the voters' CPU per operation, the servers'
 sampled CPU per operation split into the voters' domain loops and their
 tokio threads (from `cpu-samples-threads.csv`, over the same workload

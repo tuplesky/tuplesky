@@ -103,6 +103,15 @@ class PairTests(unittest.TestCase):
                 run("base", 3), run("head", 3)]
         self.assertEqual([(b.store, h.store) for b, h in jp.pairs(runs)], [("base2", "head2"), ("base3", "head3")])
 
+    def test_a_numbered_pair_whose_etcd_run_is_missing_is_compared_with_none(self):
+        # Pair 1's etcd run left no store: base#1, head#1, head#2, base#2, etcd#2.
+        def run(label, n):
+            return jp.Run(label=label, store=f"{label}{n}", pair=n)
+
+        runs = [run("base", 1), run("head", 1), run("head", 2), run("base", 2), run("etcd", 2)]
+        groups = jp.beside_etcd(runs)
+        self.assertEqual([(e.store, [r.store for r in rs]) for e, rs in groups], [("etcd2", ["head2", "base2"])])
+
     def test_the_command_line_takes_a_pair_number(self):
         argv = sys.argv
         try:
@@ -111,7 +120,7 @@ class PairTests(unittest.TestCase):
                     mock.patch("sys.stdout", new_callable=io.StringIO) as out:
                 self.assertEqual(jp.main(), 0)
             self.assertIn("| Pair (head less base) |", out.getvalue())
-            for bad in ("etcd#1=" + self.runs[0].store, "base#x=" + self.runs[0].store):
+            for bad in ("etcd#x=" + self.runs[0].store, "base#x=" + self.runs[0].store):
                 sys.argv = ["jepsen_pairs.py", bad]
                 with mock.patch("sys.stderr", new_callable=io.StringIO):
                     self.assertEqual(jp.main(), 2)
