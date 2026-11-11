@@ -314,14 +314,27 @@ def parse_cost(snapshot: dict) -> Cost | None:
     )
 
 
-def history_of(v) -> tuple[int, int, int] | None:
+def history_of(v) -> tuple | None:
     """The `cost.history` of a voter's last `metrics` line (task-d110):
-    records held, what the last sweep kept, sweeps this boot; None from a
-    build without it."""
+    records held, what the last sweep kept, sweeps this boot, then the
+    entries in every other history map and the largest of them (#221),
+    each None from a build without them; None from a build without
+    `history`."""
     h = (v.cost.raw or {}).get("history") if v.cost else None
     if not isinstance(h, dict):
         return None
-    return (h.get("records", 0), h.get("kept", 0), h.get("sweeps", 0))
+    return (h.get("records", 0), h.get("kept", 0), h.get("sweeps", 0), h.get("entries"), h.get("largest_map"))
+
+
+def history_cell(h) -> str:
+    """A Voters row's history: records / kept / sweeps, and the other
+    maps' entries and the largest map where the build reports them."""
+    if not h:
+        return "-"
+    cell = f"{h[0]} / {h[1]} / {h[2]}"
+    if h[3] is not None:
+        cell += f"; {h[3]} in the other maps, largest {h[4]}"
+    return cell
 
 
 def parse_stages(snapshot: dict) -> dict:
@@ -2715,6 +2728,13 @@ def summarize(store: str, nodes: list[str], title: str, profile: str | None = No
                 "; history is the last `metrics` line's `cost.history` (task-d110): the durable command records the "
                 "voter's ledger holds, what its last sweep kept, and the sweeps this boot ran; a sweep is due once "
                 "the records pass the table's capacity times four"
+                + (
+                    "; then, from a build that forgets history in execution order (#221), the entries in every "
+                    "other history map (payloads, served payloads, votes, adoptions, bindings, answer-on-release, "
+                    "held waiters and a leader's proposals) and the largest of them"
+                    if any(h is not None and h[3] is not None for h in histories.values())
+                    else ""
+                )
                 if with_history
                 else ""
             )
@@ -2736,7 +2756,7 @@ def summarize(store: str, nodes: list[str], title: str, profile: str | None = No
             after = v.after_start.get("ProposalRepublished", 0)
             durable = f" {projection_durable(v)} |" if replay else ""
             h = histories[node]
-            history = (f" {h[0]} / {h[1]} / {h[2]} |" if h else " - |") if with_history else ""
+            history = f" {history_cell(h)} |" if with_history else ""
             out.append(
                 f"| {node} | {v.boots} | {v.executed} | {v.executed_at_end} |{durable}{history} {v.role} | {ballot} | {counts} | {after} |"
             )

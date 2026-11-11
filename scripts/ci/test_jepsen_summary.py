@@ -611,6 +611,13 @@ class CheckpointTests(unittest.TestCase):
         self.assertIn("| Executed at end | History: records / kept / sweeps | Last role |", text)
         self.assertIn("| 5200 / 1400 / 3 |", text)
         self.assertIn("`cost.history` (task-d110)", text)
+        self.assertNotIn("execution order (#221)", text)
+        # A build that forgets history in execution order: the other maps too.
+        cost["history"] = {"records": 1500, "kept": 0, "sweeps": 0, "entries": 4100, "largest_map": 1500}
+        line = "metrics " + json.dumps({"stages": [], "cost": {"Observed": cost}}) + "\n"
+        text = self.summarize(line)
+        self.assertIn("| 1500 / 0 / 0; 4100 in the other maps, largest 1500 |", text)
+        self.assertIn("execution order (#221)", text)
 
 
 
