@@ -571,6 +571,17 @@ impl<F: FileSystem> RaftEngineJournal<F> {
         }
         let engine = Engine::open_with_file_system(cfg, Arc::new(TailGuard::new(file_system)))
             .map_err(engine_open_error)?;
+        // The engine's open can write the last file's header with no sync:
+        // where that header did not read, recovery truncates the file to
+        // nothing and the writer writes a new one (`pipe_builder.rs`,
+        // `LogFileWriter::open`). Unsynced, a crash after the next group
+        // could keep that group's sectors and lose the header's, which the
+        // guard refuses as damage ("the file header is zeros, but data
+        // follows it"): two power losses and no damage, and a voter that
+        // stays down (#211 review). Synced here, every header a group
+        // follows is durable before the group is written, as `create` and
+        // a rotation already make it.
+        engine.sync().map_err(|e| OpenError::Engine(redact(&e)))?;
         let row = match engine.get(METADATA_REGION, IDENTITY_KEY) {
             None => return Err(OpenError::NotInitialized),
             Some(bytes) => match decode_value(&bytes) {
