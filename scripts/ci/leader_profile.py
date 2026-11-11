@@ -53,6 +53,13 @@ its -inclusive and -chains beside it), and its threads counted into the
 follower profile's name with -syscalls (follower-profile-syscalls.txt), so
 the summary sets a follower's transport beside the leader's.
 
+With --loops-hz HZ, `perf record -a` samples every CPU from the start to
+SIGTERM at that rate, with call graphs by frame pointer, and each coordd
+domain loop's samples (a process's main thread) are folded by UTC second
+into FILE with -loops before its extension: `HH:MM:SS pid samples stack`.
+A stall the watch's bar misses, such as an election's winner computing for
+a few seconds before it leads, is in it with what the loop ran.
+
 Exits 0 whatever happens: a profile that cannot be taken (no `perf`, no
 permission, no load before SIGTERM) leaves FILE saying why, and the test
 is never failed by it.
@@ -60,8 +67,10 @@ is never failed by it.
 from __future__ import annotations
 
 import argparse
+import collections
 import datetime
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -113,6 +122,10 @@ def now() -> str:
     return f"{datetime.datetime.now(datetime.timezone.utc):%Y-%m-%d %H:%M:%S}"
 
 
+# Set once SIGTERM or SIGINT arrives, for main's whole-run sampler.
+STOPPED = False
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--out", required=True)
@@ -121,15 +134,27 @@ def main() -> int:
     parser.add_argument("--frequency", type=int)
     parser.add_argument("--call-graph", action="store_true")
     parser.add_argument("--watch-pegged", type=int, default=0)
+    parser.add_argument("--loops-hz", type=int, default=0)
     args = parser.parse_args()
     if args.frequency is None:
         args.frequency = 999
+    loops = start_loops(args) if args.loops_hz > 0 else None
+    rc = profile(args)
+    if loops is not None:
+        while not STOPPED:
+            time.sleep(1)
+        finish_loops(args, loops)
+    return rc
 
+
+def profile(args) -> int:
     stopping = False
 
     def stop(*_):
+        global STOPPED
         nonlocal stopping
         stopping = True
+        STOPPED = True
 
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
@@ -419,6 +444,96 @@ def watch_pegged(args, initial: set, beside, record, write_profile, graph: list[
         seconds, began, used = run.get(key, (0, "", 0.0))
         lines[i] += f", still pegged at the end ({seconds} s, {used / max(seconds, 1):.2f} of a core)"
     flush()
+
+
+def loops_path(out: str) -> str:
+    """The whole-run sample of every loop, beside the leader's profile:
+    leader-profile.txt gives leader-profile-loops.txt."""
+    return suffixed(out, "loops")
+
+
+def start_loops(args):
+    """--loops-hz: `perf record` on every CPU for the whole test, at that
+    rate, with call graphs by frame pointer, timed on CLOCK_MONOTONIC, so
+    a stall too short for the watch (an election's winner computing for a
+    few seconds) is still sampled. Returns (the recorder, the offset from
+    that clock to UTC), or None where it cannot start."""
+    data = loops_path(args.out) + ".data"
+    offset = time.time() - time.clock_gettime(time.CLOCK_MONOTONIC)
+    try:
+        proc = subprocess.Popen(
+            ["sudo", "-n", "perf", "record", "-F", str(args.loops_hz), "--call-graph", "fp", "-a",
+             "-k", "monotonic", "-o", data],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except OSError as e:
+        with open(loops_path(args.out), "w") as f:
+            f.write(f"No loop samples: perf could not start: {e}\n")
+        return None
+    return proc, offset, data
+
+
+def fold_loops(text: str, offset: float) -> dict:
+    """`perf script -F comm,pid,tid,time,ip,sym` output, each sample of a
+    process's main thread (its domain loop) folded by (UTC second, pid,
+    stack from the root) to a count; `offset` turns the sample's clock
+    into UTC."""
+    head = re.compile(r"^\s*\S+\s+(\d+)/(\d+)\s+([\d.]+):")
+    folded: dict = collections.Counter()
+    key = None
+    frames: list = []
+
+    def flush():
+        if key is not None and frames:
+            folded[key + (";".join(reversed(frames)),)] += 1
+
+    for line in text.splitlines():
+        m = head.match(line)
+        if m:
+            flush()
+            pid, tid, at = int(m[1]), int(m[2]), float(m[3])
+            frames = []
+            key = (int(at + offset), pid) if pid == tid else None
+            continue
+        cells = line.split(None, 1)
+        if key is not None and len(cells) == 2:
+            frames.append(cells[1].split("+0x")[0].strip())
+    flush()
+    return folded
+
+
+def finish_loops(args, loops) -> None:
+    """Stops the whole-run recorder and folds its samples of each coordd
+    domain loop (the process's main thread) by UTC second: one line per
+    second, pid and stack, `HH:MM:SS pid samples root;...;leaf`."""
+    proc, offset, data = loops
+    out = loops_path(args.out)
+    proc.send_signal(signal.SIGINT)
+    try:
+        _, err = proc.communicate(timeout=120)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        _, err = proc.communicate()
+    script = subprocess.run(
+        ["sudo", "-n", "perf", "script", "-i", data, "--comms", "coordd", "-F", "comm,pid,tid,time,ip,sym"],
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(["sudo", "-n", "rm", "-f", data], capture_output=True)
+    if script.returncode != 0 or not script.stdout.strip():
+        with open(out, "w") as f:
+            f.write(f"No loop samples: perf record exited {proc.returncode}, perf script {script.returncode}: "
+                    f"{(err or '').strip()[-300:]} {script.stderr.strip()[-300:]}\n")
+        return
+    folded = fold_loops(script.stdout, offset)
+    with open(out, "w") as f:
+        f.write(f"Every coordd domain loop, sampled at {args.loops_hz} Hz with call graphs by frame pointer "
+                "through the whole test (perf record -a), by UTC second: time, pid, samples, stack from the root\n")
+        for (second, pid, stack), n in sorted(folded.items()):
+            when = datetime.datetime.fromtimestamp(second, datetime.timezone.utc)
+            f.write(f"{when:%H:%M:%S} {pid} {n} {stack}\n")
 
 
 def suffixed(path: str, suffix: str) -> str:

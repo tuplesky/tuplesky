@@ -62,7 +62,9 @@ fi
 
 profiler=
 if [ -n "${JEPSEN_LEADER_PROFILE:-}" ]; then
-  callgraph=(); if [ -n "${JEPSEN_LEADER_CALLGRAPH:-}" ]; then callgraph=(--call-graph); fi
+  # With call graphs, every loop is also sampled through the whole test at
+  # 49 Hz (--loops-hz), so a stall too short for the watch is still seen.
+  callgraph=(); if [ -n "${JEPSEN_LEADER_CALLGRAPH:-}" ]; then callgraph=(--call-graph --loops-hz 49); fi
   python3 "$(dirname "$0")/leader_profile.py" --out "$JEPSEN_LEADER_PROFILE" --watch-pegged 6 ${callgraph[@]+"${callgraph[@]}"} &
   profiler=$!
 fi
