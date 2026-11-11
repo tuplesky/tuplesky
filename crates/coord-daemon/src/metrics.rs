@@ -550,6 +550,10 @@ pub struct Cost {
     /// Why the domain loop lowered when it did (task-d73).
     #[serde(default)]
     pub flushes: Flushes,
+    /// The durable command records this voter holds, against what its
+    /// history sweep forgets (task-d110).
+    #[serde(default)]
+    pub history: History,
 }
 
 /// Why the domain loop lowered what its events left queued (task-d73),
@@ -568,6 +572,22 @@ pub struct Flushes {
     /// Of all of them, the flushes taken while an append was out: what
     /// they queued waits behind it, and joins the next group (task-d54).
     pub appending: u64,
+}
+
+/// The durable command records a voter holds, and its history sweeps
+/// (task-d110). A sweep forgets only executed history, so a voter behind
+/// holds more than it can forget. The next sweep is due once `records` is
+/// past the table's capacity times four, and the records added and the
+/// commands executed since the last sweep come to more than half of
+/// `kept`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct History {
+    /// Durable command records the ledger holds now.
+    pub records: u64,
+    /// What the last sweep left, lowered as records left otherwise.
+    pub kept: u64,
+    /// Sweeps run since this boot.
+    pub sweeps: u64,
 }
 
 /// What a voter's journal groups held, by their records (task-d84),

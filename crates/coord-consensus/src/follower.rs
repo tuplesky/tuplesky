@@ -549,6 +549,10 @@ pub struct Follower {
     /// for the tests that bound it.
     #[cfg(test)]
     missing_examined: core::cell::Cell<u64>,
+    /// Entries the history sweep looked at, for the test that measures
+    /// it (audit on #98, item 1).
+    #[cfg(test)]
+    swept: core::cell::Cell<u64>,
     /// The held proposals to examine at the next `advance_pending`: the
     /// ones held since, and the ones whose blocker the table noted a
     /// change for (task-d46). Every held proposal that can be adopted is
@@ -923,6 +927,8 @@ impl Follower {
             sync_refacts: alloc::collections::BTreeSet::new(),
             #[cfg(test)]
             missing_examined: core::cell::Cell::new(0),
+            #[cfg(test)]
+            swept: core::cell::Cell::new(0),
             held_check: alloc::collections::BTreeSet::new(),
             held_waiters: BTreeMap::new(),
             pending: BTreeMap::new(),
@@ -1126,6 +1132,8 @@ impl Follower {
             sync_refacts: alloc::collections::BTreeSet::new(),
             #[cfg(test)]
             missing_examined: core::cell::Cell::new(0),
+            #[cfg(test)]
+            swept: core::cell::Cell::new(0),
             held_check: alloc::collections::BTreeSet::new(),
             held_waiters: BTreeMap::new(),
             pending: BTreeMap::new(),
@@ -3852,10 +3860,17 @@ impl Follower {
     /// Neither is reported or served for such a command any more, so
     /// keeping them made the memory of a long-running voter grow with its
     /// history. The sweep runs when the ledger has outgrown a multiple of
-    /// the table, so it is amortized over the growth that made it
-    /// necessary.
+    /// the table, and the records added and the commands executed since
+    /// the last sweep come to more than half of what it kept
+    /// ([`DurableLedger::sweep_due`]). So it is amortized over the work
+    /// that made it necessary, also at a voter behind, whose ledger holds
+    /// more than that the table does not forget (task-d110).
     fn forget_history(&mut self) {
-        if self.ledger.len() <= self.config.capacity.saturating_mul(HISTORY_SWEEP) {
+        self.ledger.executed();
+        if !self
+            .ledger
+            .sweep_due(self.config.capacity.saturating_mul(HISTORY_SWEEP))
+        {
             return;
         }
         self.sweep_history();
@@ -3863,6 +3878,15 @@ impl Follower {
 
     /// The sweep itself, whatever the ledger's size.
     fn sweep_history(&mut self) {
+        #[cfg(test)]
+        self.swept.set(
+            self.swept.get()
+                + (self.ledger.len()
+                    + self.payloads.len()
+                    + self.votes.len()
+                    + self.adopted.len()
+                    + self.bindings.len()) as u64,
+        );
         let table = &self.table;
         self.ledger.retain(|c| !table.forgotten(c));
         self.payloads.retain(|c, _| !table.forgotten(c));
@@ -3886,6 +3910,7 @@ impl Follower {
             waiting.retain(|c| held.contains_key(c));
             !waiting.is_empty()
         });
+        self.ledger.swept();
     }
 
     /// Re-read whether `command` is adopted or held here with no
@@ -6483,5 +6508,108 @@ mod tests {
         assert_eq!(follower.missing_payload_count(limit), limit);
         assert_eq!(follower.missing_examined.get(), limit as u64);
         assert_eq!(follower.missing_payload_count(5_000), 2_000);
+    }
+
+    /// task-d110 (audit item 1 on #98): the ledger sheds only what the
+    /// table forgets, which is executed history, so a voter behind by more
+    /// than the sweep's threshold holds that much committed and
+    /// unexecuted through every sweep. Measured from a fixed size, every
+    /// `applied` (which calls `forget_history`) then swept all of it: ten
+    /// executions looked at 10,000, 20,000 and 40,000 entries at 500,
+    /// 1,000 and 2,000 behind. Measured from what the last sweep left, the
+    /// first execution sweeps once and the next nine sweep nothing,
+    /// however far behind. The next sweep comes once half of what that one
+    /// kept has been added or executed.
+    #[test]
+    fn a_voter_behind_sweeps_once_per_growth_of_half_what_it_keeps_not_per_execution() {
+        let epoch = ConfigurationEpoch::new(1).unwrap();
+        let voters: BTreeSet<ReplicaId> = (0..3).map(r).collect();
+        let genesis = Ballot {
+            epoch,
+            number: 0,
+            leader: r(0),
+        };
+        let config = FollowerConfig {
+            identity: ConfigurationIdentity {
+                cluster: ClusterId([1; 16]),
+                domain: DomainId([2; 16]),
+                epoch,
+                voters: voters.clone(),
+                replica: r(1),
+                incarnation: ReplicaIncarnation::new(1).unwrap(),
+                role: ReplicaRole::Voter,
+            },
+            quorum: BallotConfiguration::c2(epoch, genesis, voters, [r(0), r(1)].into()).unwrap(),
+            genesis,
+            frontend: PeerId {
+                replica: ReplicaId([0xf0; 16]),
+                incarnation: ReplicaIncarnation::ZERO,
+            },
+            capacity: 8,
+        };
+        let id = |n: u64| {
+            let mut d = [0u8; 32];
+            d[..8].copy_from_slice(&n.to_be_bytes());
+            d[8] = 7;
+            CommandId(Digest32(d))
+        };
+        let mut swept = Vec::new();
+        for behind in [500u64, 1_000, 2_000] {
+            // Committed and waiting for their payloads: nothing here can
+            // execute, so the table forgets none of it.
+            let rows: Vec<(CommandId, CommandRecord)> = (0..behind)
+                .map(|n| {
+                    let key = alloc::vec![(n % 5) as u8];
+                    (
+                        id(n),
+                        CommandRecord {
+                            phase: Phase::Commit,
+                            deps: Vec::new(),
+                            keys: alloc::vec![key.clone()],
+                            payload: Some(Digest32([4; 32])),
+                            paths: alloc::vec![(key, Digest32([3; 32]))],
+                            synced_seq: Some(n + 1),
+                            path: Digest32([3; 32]),
+                        },
+                    )
+                })
+                .collect();
+            let mut follower = Follower::recover_with_syncs(
+                config.clone(),
+                None,
+                None,
+                rows,
+                [],
+                [],
+                ExecutionPosition::ZERO,
+            );
+            assert_eq!(follower.ledger.len(), behind as usize);
+            follower.swept.set(0);
+            // The first execution after the recovery: the ledger has
+            // grown past the threshold from nothing, so it is swept once.
+            follower.forget_history();
+            let first = follower.swept.get();
+            assert!(first >= behind, "{first} entries over {behind} behind");
+            // Nine more executions' worth of the call `applied` makes.
+            for _ in 0..9 {
+                follower.forget_history();
+            }
+            assert_eq!(
+                follower.ledger.len(),
+                behind as usize,
+                "nothing was forgotten"
+            );
+            swept.push(follower.swept.get() - first);
+            // Executions alone bring the next sweep, half of what the
+            // first kept later: a backlog that drains is reclaimed.
+            for _ in 0..behind / 2 {
+                follower.forget_history();
+            }
+            assert_eq!(follower.swept.get(), 2 * first, "one more sweep");
+        }
+        // Before task-d110 each call looked at everything held, ten times
+        // the ledger over ten calls. Now none of the nine after the first
+        // looks at anything, at any distance behind.
+        assert_eq!(swept, [0, 0, 0]);
     }
 }
