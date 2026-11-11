@@ -448,7 +448,7 @@ Nothing here touches the fast path. A fanned-out command a fast-set follower pre
 - **Datagrams, two targets** (#205 review), with ACK-only datagrams counted on their own line beside the data datagrams:
   - **The first milestone,** task-d72's 2.0× budget: at 120 callers, at most 5 datagrams a command over both planes (about 16.8 on step A's base). At 53 µs a datagram and 0.87 commands an operation, that is about 0.23 ms an operation in the tokio threads, inside their 2.0× budget of 0.38 (task-d72's budgets, restated at etcd's 0.962 ms an operation read beside the head on #98).
   - **The goal,** parity with etcd, where the tokio threads' budget is 0.19 ms an operation: at most 3 datagrams a command at 120 callers, about 0.14. Its shape includes one submission frame a collector a turn.
-- at least 10 commands a journal group at every voter (about 4.9);
+- at least 10 commands a journal sync at every voter (about 4.9): every group the voter syncs, protocol, application and lifecycle alike, as task-d84's sync budget counts them, since the disk pays a sync whatever the group holds. Protocol groups alone are read beside it, not instead (#224 review: the batch met 10 by protocol groups while the two voters without a frontend were at 7.9 to 8.3 commands a sync);
 - the servers' CPU a command at 120 callers at most half of its value at 30.
 
 A miss is read before the next part is built: which hop's batch is small, and why.
