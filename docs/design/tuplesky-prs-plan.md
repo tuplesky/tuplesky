@@ -3157,6 +3157,34 @@ This entry is the budget and the record, not a lever:
       5. task-j05, with `replay`'s case in its matrix from the start.
       6. The testing session: the cadence-split job already asked for, the shims' reading, and the three-way job at the 2.0× milestone.
       7. After the single domain matches: several domains in one daemon (task-j07), then the fleet row.
+    - **Step A, read on the runner, and step B sized again from it** (#98, [6788436403](https://github.com/tuplesky/tuplesky/pull/98#issuecomment-6788436403), run 2c). The plan sized B again on the runner after A, before it is built.
+      - **Setup:** register at etcd's mix, `replay`, tmpfs, one tokio worker a voter, the shim's head `b7fac61` on both sides, `answer-on-release` the only difference. One run a side a step.
+      - **What A did:**
+
+        | Callers | `ok`/s | Servers' CPU an operation | A command | Tokio a command | Loops a command | Api datagrams a command | Peer datagrams a command |
+        | --- | --- | --- | --- | --- | --- | --- | --- |
+        | 30 | 701 → 769 (+9.7%) | 2.872 → 2.555 ms (−11.0%) | −14.5% | −23% | −14% | 15.79 → 9.90 | 7.36 → 7.44 |
+        | 120 | 622 → 689 (+10.7%) | 2.855 → 2.530 ms (−11.4%) | −10.6% | −18% | −12% | 11.96 → 8.41 | 4.61 → 4.72 |
+
+        - That is −0.32 ms an operation, against the −0.19 to −0.24 projected.
+        - Tokio held at 52 to 55 µs a datagram in all four runs.
+        - The api plane's fast acks, slow acks and leader replies went from 1.62, 4.00 and 0.76 a command to about 0. The peer plane, the appenders and the materializers didn't move.
+      - **What is left on the api plane after A, by kind, a command:**
+        - submissions 4.00: the collector's copy to each of four voters;
+        - releases 0.75;
+        - ACK frames 6.78 at 30 callers and 4.74 at 120.
+
+        So of the 9.90 and 8.41 datagrams, about 4.75 carry data. The rest, about 5.2 and 3.7, are ACK-only, about 1.1 and 0.8 a data frame.
+      - **Step B, sized from that:**
+        - **Api plane:** a relayed submission goes to the leader only, so submissions fall from 4.00 to 1.00. Data frames fall from 4.75 to 1.75, and ACK-only datagrams in proportion. That is about 3.6 and 3.1 api datagrams a command against 9.9 and 8.4: −6.3 and −5.3.
+        - **Peer plane:** a relayed command's followers send no fast acknowledgement, and its proposal carries the payload. At 2.2 and 3.2 peer frames a datagram, that is at most about −1.5 and −1.0 datagrams a command.
+        - **In tokio, at 53 µs a datagram:** about −0.41 and −0.33 ms a command, or −0.32 and −0.29 ms an operation at 0.78 and 0.87 commands an operation.
+        - **The followers' `on_request`:** about −0.15 ms a command on the runner (D's −110 µs locally × 1.4), or −0.12 to −0.13 ms an operation.
+        - **B in the servers:** about −0.4 to −0.45 ms an operation at both steps, about a sixth of the servers after A. The kernel's share of the datagrams, outside bar 1, falls beside it.
+      - **Against #205's batch, task-d102:**
+        - **B's peer-plane part is #205's proposal frame.** The frame carries a turn's proposals with their payloads, and a relayed command needs no fast acknowledgement. So it is built once, inside task-d102's `BatchedRound`, as task-d102's entry already says, and not as a separate step.
+        - **B's api-plane part isn't in the batch:** the relayed submission to the leader alone, its switch and fallbacks, and the followers' `on_request` it removes. It is the larger part, about −0.3 ms an operation of B's −0.4 to −0.45. It can't ship before the frames, because a relayed command's followers get its payload only on the proposal. So it is task-d102's first code step, with frames that hold one proposal when the loop is idle.
+        - **After both,** the peer plane's 7.4 and 4.7 datagrams a command are what #205's frames and acknowledgement through a position take, at about 3 and 5 to 6 commands a frame (#205's first reading).
 - **The record:** the table below, one row a lever, each row a pair on the runner.
 
 | Row | Build | Shape | `ok`/s | Server CPU an operation | Idle cores | Expected to move |
@@ -3168,6 +3196,7 @@ This entry is the budget and the record, not a lever:
 | task-d74 | | | | | | CPU: acknowledgements per command |
 | task-d75 | | | | | | CPU: the leader's loop |
 | The #173 carry (task-d63, task-d66, task-d74's recovery fix, task-d75, task-d77 to task-d80) against `259e0b2` | `36fe7d1` (#98) | register, 30 clients, replay, three pairs | 501.5 to 504.2 (base 505.4 to 513.4) | 3.57 to 3.59 ms (base 3.58 to 3.66) | 0.41 to 0.46 | the leader's loop: -4.1 to -6.6%; the domain loops -3.8%; tokio threads unchanged at 1.45 ms an op |
+| task-d100's step A (`answer-on-release`, #204) against the same build without it | `b7fac61` (#98, run 2c) | register at etcd's mix, `replay`, tmpfs, 30 and 120 callers | 701 → 769 and 622 → 689 (+9.7%, +10.7%) | 2.872 → 2.555 and 2.855 → 2.530 ms (−11.0%, −11.4%) | 0.06 to 0.07, 0.04 to 0.05 | api datagrams a command −37% and −30%; tokio −23% and −18% a command; loops −14% and −12% a command; peer plane unchanged |
 | `service`, the same carry | `36fe7d1` | wr, 1,000 uniform keys, read-only ratio 0.6, 4 clients at 300/s, strict | 140.0, below the rate (etcd 290.1) | 12.41 ms (etcd 2.86), not at equal work | 1.87 (etcd 2.51) | p50 23 ms and p99 61 ms (etcd 2 and 4): task-d83, task-d84 |
 | `service` at `replay`, the matched comparison | | the same shape, replay | | | | the row the `service` target is read at (the testing session) |
 - **The local record** (this entry's PR): the same split on one host, five voters, each build against the one before it, with a profile of the leader and a follower ([notes](../tuplesky-impl-notes.md#the-budget-on-one-host-task-d72)). It does not replace the runner's rows, which the Jepsen testing session runs. It reads what a lever moved before the runner does: of a write's 7.9 to 8.7 ms of the nodes' CPU, a follower costs about 1.6 ms and the leader about 1.9, so the followers carry three quarters of it, and off the domain loops the transport's QUIC threads are a third of each node's CPU and the projection's commits a fifth.
