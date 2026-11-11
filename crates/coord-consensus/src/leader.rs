@@ -436,6 +436,17 @@ pub struct Leader {
     /// history sweep. Kept exact by [`Leader::put_proposal`],
     /// [`Leader::settle`] and the sweep.
     unsettled: BTreeSet<(u64, CommandId)>,
+    /// Where the release gate's walk starts (task-d111's cut (e)): every
+    /// unexecuted proposal numbered below it has had its result released.
+    /// The gate passes over those, so [`Leader::release_ready`] starts
+    /// here rather than at the first unsettled proposal, and walks only
+    /// as far as the gate goes. A proposal entered below it lowers it
+    /// ([`Leader::put_proposal`]).
+    release_from: u64,
+    /// Proposals the release gate was handed (task-d111's cut (e)), for
+    /// the test that bounds them.
+    #[cfg(test)]
+    release_walked: core::cell::Cell<u64>,
     /// Each proposal's current batch (task-d46): what a storage event is
     /// matched with, instead of a pass over every proposal.
     by_barrier: BTreeMap<BarrierId, CommandId>,
@@ -686,6 +697,9 @@ impl Leader {
             bindings: BTreeMap::new(),
             proposals: digest::map(),
             unsettled: BTreeSet::new(),
+            release_from: 0,
+            #[cfg(test)]
+            release_walked: core::cell::Cell::new(0),
             by_barrier: BTreeMap::new(),
             durable: BTreeSet::new(),
             adopted_through: BTreeMap::new(),
@@ -790,6 +804,9 @@ impl Leader {
             bindings: state.bindings,
             proposals: digest::map(),
             unsettled: BTreeSet::new(),
+            release_from: 0,
+            #[cfg(test)]
+            release_walked: core::cell::Cell::new(0),
             by_barrier: BTreeMap::new(),
             durable: BTreeSet::new(),
             adopted_through: BTreeMap::new(),
@@ -1937,6 +1954,25 @@ impl Leader {
             .unwrap_or_default()
     }
 
+    /// Debug check of the release gate's frontier (task-d111's cut (e))
+    /// against the walk from the first unsettled proposal it replaces:
+    /// every unexecuted proposal before it was released, so the gate
+    /// passes over them as it would have from the start.
+    #[cfg(debug_assertions)]
+    fn check_release_from(&self) {
+        for (seqnum, c) in &self.unsettled {
+            if *seqnum >= self.release_from {
+                break;
+            }
+            let executed =
+                self.proposals[c].executed || self.table.phase_of(c) >= Some(Phase::Executed);
+            debug_assert!(
+                executed || self.speculation.released(c),
+                "an unexecuted proposal below the release frontier was not released"
+            );
+        }
+    }
+
     /// Unexecuted proposals in the leader's order.
     fn unexecuted_in_order(&self) -> Vec<CommandId> {
         debug_assert!(self.indexes_agree());
@@ -1956,6 +1992,7 @@ impl Leader {
     /// them (task-d46).
     fn put_proposal(&mut self, proposal: Proposal) {
         let command = proposal.command;
+        self.release_from = self.release_from.min(proposal.seqnum);
         if let Some(old) = self.proposals.get(&command) {
             self.unsettled.remove(&(old.seqnum, command));
             self.durable.remove(&(old.seqnum, command));
@@ -2047,7 +2084,8 @@ impl Leader {
         if !self.is_leading() {
             return Vec::new();
         }
-        let proposals = self.unexecuted_in_order();
+        #[cfg(debug_assertions)]
+        self.check_release_from();
         let table = &self.table;
         let learner = &self.learner;
         let committed = |c: &CommandId| table.phase_of(c) >= Some(Phase::Commit);
@@ -2058,7 +2096,32 @@ impl Leader {
             committed: &committed,
             fast: &fast,
         };
-        match gate.release(&mut self.speculation, &proposals) {
+        // The unexecuted proposals from the frontier on, in order, read
+        // only as far as the gate walks (task-d111's cut (e)). The last
+        // one it took is where the walk stopped, or the last it passed.
+        let proposals = &self.proposals;
+        let last = core::cell::Cell::new(None);
+        let walk = self
+            .unsettled
+            .range((self.release_from, CommandId(Digest32([0; 32])))..)
+            .filter(|(_, c)| !proposals[c].executed && table.phase_of(c) < Some(Phase::Executed))
+            .inspect(|entry| {
+                last.set(Some(**entry));
+                #[cfg(test)]
+                self.release_walked.set(self.release_walked.get() + 1);
+            })
+            .map(|(_, c)| *c);
+        let released = gate.release(&mut self.speculation, walk);
+        // Every unexecuted proposal before the last one taken was
+        // released; the last one too, if the walk went past it.
+        if let Some((seqnum, c)) = last.get() {
+            self.release_from = if self.speculation.released(&c) {
+                seqnum.saturating_add(1)
+            } else {
+                seqnum
+            };
+        }
+        match released {
             // A marked command's collector holds a speculative release and
             // answers only on the final one (task-d100, step A), which
             // goes out whether or not this one did: it is not sent
@@ -3925,6 +3988,37 @@ mod tests {
         leader.table.take_examined();
         assert_eq!(leader.next_executable(), Some(ready));
         assert_eq!(leader.table.take_examined(), 1);
+    }
+
+    /// task-d111's cut (e): the release gate starts where it last
+    /// stopped. With the table full of proposals unexecuted and none
+    /// committed, each call hands the gate one, not every one, and a
+    /// proposal entered at a lower number than the frontier is walked
+    /// again.
+    #[test]
+    fn the_release_gate_walks_from_where_it_stopped() {
+        let mut leader = booted();
+        let mut commands = Vec::new();
+        for n in 1..=200 {
+            let (frame, c) = request(n);
+            let _ = leader.propose(&frame, None);
+            commands.push(c);
+        }
+        let held = leader.unexecuted_in_order().len();
+        assert!(held > 1, "{held} held");
+        leader.release_walked.set(0);
+        for _ in 0..10 {
+            assert!(leader.release_ready().is_empty());
+        }
+        assert_eq!(leader.release_walked.get(), 10, "one of {held} a call");
+        let first = leader.proposals[&commands[0]].seqnum;
+        assert_eq!(leader.release_from, first);
+        // A proposal entered below the frontier lowers it.
+        leader.release_from = first + 50;
+        let mut again = leader.proposals[&commands[1]].clone();
+        again.seqnum = first + 1;
+        leader.put_proposal(again);
+        assert_eq!(leader.release_from, first + 1);
     }
 
     /// task-d110 at the leader: the leader's `forget_history` asks the
