@@ -65,7 +65,7 @@ impl EngineKind {
     pub const fn version(self) -> &'static str {
         match self {
             EngineKind::Model => "in-tree",
-            EngineKind::Redb => "4.2.0",
+            EngineKind::Redb => "4.5.0",
             EngineKind::Fjall => "3.1.10",
         }
     }
