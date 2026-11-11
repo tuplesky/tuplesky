@@ -341,6 +341,11 @@ jobs:
       - name: Run the Jepsen project's unit tests
         working-directory: jepsen/tuplesky
         run: lein test
+      - name: Fetch the etcd test's dependencies
+        # Before the runs, so a slow fetch fails here rather than inside
+        # the etcd run's bound (scripts/ci/jepsen_etcd.sh deps).
+        if: env.ETCD_BESIDE == 'true'
+        run: tuplesky/scripts/ci/jepsen_etcd.sh deps
       - name: Stand the cluster up
         # With store tmpfs, /opt, which holds each voter's binary and store
         # (/opt/tuplesky), is a tmpfs. Not /opt/tuplesky itself: the test
@@ -869,6 +874,8 @@ jobs:
         # by process name, and the TupleSky test's kill schedule, network,
         # keys and read ratio (scripts/ci/jepsen_etcd.sh says why each).
         run: tuplesky/scripts/ci/jepsen_etcd.sh prepare
+      - name: Fetch the etcd test's dependencies
+        run: tuplesky/scripts/ci/jepsen_etcd.sh deps
       - name: Stand the cluster up
         # With store tmpfs, /opt, which holds etcd's binary and data
         # directory (/opt/etcd), is a tmpfs.

@@ -188,8 +188,27 @@ run() {
     ${wan[@]+"${wan[@]}"}
 }
 
+deps() {
+  # The etcd test's dependencies, fetched before any run. `run` is
+  # bounded at TIME_LIMIT + 1200 s, and lein fetches what it lacks inside
+  # that bound: in run 42962578917 clojars served one .pom about every
+  # 15 minutes, and both etcd-beside runs ran out of time fetching, with
+  # no store and only a warning. Fetched here, a slow or failing fetch
+  # fails this step instead, before the cluster's runs.
+  cd "$test_dir"
+  local attempt
+  for attempt in 1 2 3; do
+    if timeout 600 lein deps; then return 0; fi
+    echo "::warning::fetching the etcd test's dependencies: attempt $attempt failed"
+    sleep $((attempt * 15))
+  done
+  echo "::error::could not fetch the etcd test's dependencies in 3 attempts"
+  exit 1
+}
+
 case ${1:-} in
   prepare) prepare ;;
+  deps) deps ;;
   run) [ $# = 2 ] || { echo "usage: $0 run SAMPLES" >&2; exit 2; }; run "$2" ;;
-  *) echo "usage: $0 prepare | run SAMPLES" >&2; exit 2 ;;
+  *) echo "usage: $0 prepare | deps | run SAMPLES" >&2; exit 2 ;;
 esac
