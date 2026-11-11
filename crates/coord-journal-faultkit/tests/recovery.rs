@@ -477,3 +477,45 @@ fn a_crash_inside_recovery_keeps_every_acknowledged_group() {
         "recovery crashes: {images} images, {recoveries} recovered with writes, {points} crash points"
     );
 }
+
+/// A reopen that rewrites the last file's header makes it durable before
+/// it returns (#211 review). A crash in a rotation after the next file's
+/// entry survived and before its header was synced leaves that file
+/// empty; recovery truncates it, and the writer writes a new header. Left
+/// unsynced, a crash after the next group's write could keep the group's
+/// sectors and lose the header's, which the guard refuses. Here the crash
+/// comes right after the reopen returns, and nothing unsynced is kept.
+#[test]
+fn a_reopen_that_rewrites_a_header_makes_it_durable() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("j");
+    let (fs, shared) = FaultFs::new(FaultPlan::default());
+    let acked = workload(&root, fs, &shared);
+    assert_eq!(shared.unsynced(), 0);
+    let last = log_files(&root)
+        .into_iter()
+        .filter(|(name, _)| name.ends_with(".raftlog"))
+        .map(|(name, _)| name)
+        .next_back()
+        .expect("a log file");
+    let seq: u64 = last.trim_end_matches(".raftlog").parse().unwrap();
+    let next = root.join(format!("{:016}.raftlog", seq + 1));
+    std::fs::write(&next, b"").unwrap();
+
+    let (fs, shared) = FaultFs::new(FaultPlan::default());
+    let journal =
+        RaftEngineJournal::open_existing_with_file_system(&root, identity(), &options(), fs)
+            .expect("the reopen over an empty last file");
+    // Power is lost the moment the open returns.
+    shared.crash();
+    quietly_drop(journal);
+    shared.materialize(Tail::None).unwrap();
+
+    let header = std::fs::read(&next).unwrap();
+    assert!(
+        header.len() >= 61 && header.iter().any(|b| *b != 0),
+        "the rewritten header was not durable: {} bytes",
+        header.len()
+    );
+    check(&root, &acked, "after a reopen over an empty last file");
+}
