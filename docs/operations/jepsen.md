@@ -222,6 +222,24 @@ scenario step exports it as `COORD_HARNESS_CHECKPOINT_AFTER_RECORDS`, which
 carry with the harness of task-d55, and a carry without it keeps the
 default. The TupleSky summary's title then ends in ", checkpoint every N"
 (", no checkpoints" for 0).
+
+Each TupleSky frontend admits at most `limits.max_admitted_per_second` new
+requests a second, with a second's worth as a burst, and answers the rest
+`BACKPRESSURE` (task-d26); the daemon's default is 1,000. The scenario
+sets it rather than an input (the dispatch form holds no more inputs) and
+exports it as `COORD_HARNESS_MAX_ADMITTED_PER_SECOND`, which
+`coord-harness provision` writes into every voter's `[limits]`: 1,000
+under `faults` and `wan`, the default every fault run had before it was
+set, and 100,000 under `throughput`, `wan-throughput` and `service`, so a
+throughput row measures the servers and not the limiter. The scenario
+step prints it as `ADMISSION_RATE`, and the TupleSky title names it
+(", admission N/s a frontend"). A `pair-base` ref whose harness predates
+the setting provisions none, so its side admits the default 1,000; the
+job warns when it does. The shim never reports a `BACKPRESSURE` itself:
+the client library sends the same invocation again after its backoff, so
+a refusal shows only as time, or as an operation's budget running out,
+which is `:info` for a write and `:fail` for a read like any other
+unknown.
 The `pair-base` input runs the TupleSky job in pairs on one runner, so a
 change is measured against its base without the spread between runners
 (20% in `ok`/s and more in CPU per operation between runs of one commit on

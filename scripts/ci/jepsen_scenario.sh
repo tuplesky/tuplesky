@@ -41,6 +41,16 @@
 #                  comes later, under replay: task-d51). It
 #                  reaches the voters as COORD_HARNESS_CHECKPOINT_AFTER_RECORDS
 #                  and is named in the TupleSky title when set
+#   ADMISSION_RATE new requests each TupleSky frontend admits a second
+#                  (limits.max_admitted_per_second, task-d26), set by the
+#                  scenario rather than an input (the dispatch form holds
+#                  no more): 1000, the daemon's default, under faults and
+#                  wan, so fault runs stay comparable with those before it
+#                  was set; 100000 in throughput, wan-throughput and
+#                  service, so a throughput row reads the servers rather
+#                  than the limiter. It reaches the voters as
+#                  COORD_HARNESS_MAX_ADMITTED_PER_SECOND, and is named in
+#                  the TupleSky title
 #   IN_FEATURES    replicated features TupleSky's voters activate once all
 #                  are submittable (jepsen.tuplesky's --activate,
 #                  task-d99), comma-separated; a build without an admin
@@ -119,6 +129,13 @@ case $scenario in
   *)
     echo "::error::unknown scenario '$scenario' (faults, throughput, wan, wan-throughput, service)" >&2
     exit 1 ;;
+esac
+
+# What each frontend admits a second: the daemon's default where faults are
+# the point, out of reach where throughput is.
+case $scenario in
+  faults | wan) admission=1000 ;;
+  *) admission=100000 ;;
 esac
 
 workload=${IN_WORKLOAD:-$workload}
@@ -457,6 +474,8 @@ case ${IN_LEADER_PROFILE:-false} in
     fi ;;
 esac
 
+tuplesky_suffix+=", admission $admission/s a frontend"
+
 out=${GITHUB_ENV:-/dev/stdout}
 {
   echo "SCENARIO=$scenario"
@@ -481,6 +500,8 @@ out=${GITHUB_ENV:-/dev/stdout}
   echo "PROFILE_SUFFIX=, $profile"
   echo "COORD_HARNESS_JOURNAL_PROFILE=$profile"
   echo "COORD_HARNESS_CHECKPOINT_AFTER_RECORDS=$checkpoint"
+  echo "ADMISSION_RATE=$admission"
+  echo "COORD_HARNESS_MAX_ADMITTED_PER_SECOND=$admission"
   echo "CHECKPOINT_SUFFIX=$checkpoint_suffix"
   echo "VOTER_WORKERS=$workers"
   echo "BASE_VOTER_WORKERS=$base_workers"

@@ -582,6 +582,12 @@ jobs:
               base_bin=$head_bin base_args=(--voter-env "${IN_PAIR_BASE#env:}")
               base_name="$head_sha with ${IN_PAIR_BASE#env:}" ;;
             *)
+              # A base from before the admission rate was provisioned
+              # leaves its frontends at the daemon's 1,000 a second.
+              if ! grep -q max_admitted_per_second \
+                  "$GITHUB_WORKSPACE/tuplesky-base/crates/coord-harness/src/bin/coord-harness.rs"; then
+                echo "::warning::pair-base $IN_PAIR_BASE provisions no admission rate: its frontends admit the daemon's 1000 a second, the head's $ADMISSION_RATE"
+              fi
               base_name="$IN_PAIR_BASE at $(git -C "$GITHUB_WORKSPACE/tuplesky-base" rev-parse --short HEAD)" ;;
           esac
           rc=0 n=0 runs=() previous=""
