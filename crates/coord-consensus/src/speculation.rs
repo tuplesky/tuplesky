@@ -221,13 +221,18 @@ impl ReleaseGate<'_> {
     /// proposals in sequence order). Stops at the first proposal that is
     /// not committed or has no outcome: a later command's tentative result
     /// depends on the whole prefix.
+    ///
+    /// `proposals` is walked lazily, so a caller that passes an iterator
+    /// pays for the proposals up to where the walk stops, not for all of
+    /// them (task-d111's cut (e)).
     pub fn release(
         &self,
         speculation: &mut Speculation,
-        proposals: &[CommandId],
+        proposals: impl IntoIterator<Item = CommandId>,
     ) -> Result<Vec<ReleasedResult>, EstablishError> {
         let mut out = Vec::new();
         for c in proposals {
+            let c = &c;
             if !(self.committed)(c) {
                 break;
             }
