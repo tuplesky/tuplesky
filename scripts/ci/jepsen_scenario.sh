@@ -387,13 +387,15 @@ esac
 
 # The profiler picks the leader and the follower by their loops' CPU before
 # its window and labels them so; under faults a recovering voter can be the
-# busiest, and either can change role within the window.
+# busiest, and either can change role within the window. A faults run takes
+# the profile for its watch on restarted voters' pegged loops
+# (leader_profile.py --watch-pegged), and its first window's labels are by
+# CPU alone.
 case ${IN_LEADER_PROFILE:-false} in
   false) ;;
   *)
     if [ "$nemesis" != none ]; then
-      echo "leader-profile needs a run without faults (nemesis none), not $nemesis: the roles it samples by CPU do not hold under faults" >&2
-      exit 2
+      echo "::warning::leader-profile under faults ($nemesis): the first window's leader and follower are the busiest loops, whatever their roles; the restarted voters' pegged loops are profiled as they peg" >&2
     fi ;;
 esac
 

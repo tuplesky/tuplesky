@@ -676,6 +676,20 @@ class CarryReadingTests(unittest.TestCase):
                       "| early-proposal,release-at-execution (leads) | 1 of 2 |", text)
         self.assertIn("| n2 | early-proposal,release-at-execution |  | no admin socket |  |", text)
 
+    def test_the_features_after_an_activation_under_load(self):
+        start = ("epoch 3 leader ab12 (this node)\nactive early-proposal\nactivating -\n"
+                 "voter ab12 advertised early-proposal,answer-on-release prepared - held early-proposal\n")
+        late = ("epoch 3 leader ab12 (this node)\nactive early-proposal,answer-on-release\nactivating -\n"
+                "voter ab12 advertised early-proposal,answer-on-release prepared - held early-proposal,answer-on-release\n")
+        text = self.summarize(
+            {"n1": self.line(1, 1, 1, 1), "n2": self.line(1, 1, 1, 1)},
+            {("n1", "features-start.txt"): start, ("n1", "features-late.txt"): late,
+             ("n1", "features-end.txt"): late, ("n2", "features-end.txt"): late})
+        self.assertIn("After the activation under load: active", text)
+        self.assertIn("| n1 | early-proposal (leads) | 1 of 1 | early-proposal,answer-on-release (leads) | 1 of 1 "
+                      "| early-proposal,answer-on-release (leads) | 1 of 1 |", text)
+        self.assertIn("| n2 | - |  | - |  | early-proposal,answer-on-release (leads) | 1 of 1 |", text)
+
     def test_a_run_that_activated_nothing_prints_no_features(self):
         self.assertNotIn("**Replicated features**", self.summarize({"n1": self.line(1, 1, 1, 1)}))
 

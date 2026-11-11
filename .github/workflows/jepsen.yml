@@ -66,7 +66,7 @@ on:
         description: "etcd for the baseline: a version such as 3.7.2, latest (the newest stable release), or none to skip it; beside, or beside:VERSION, runs it in the TupleSky job, on its runner and cluster, after each pair (or after the one run), with each TupleSky run's ratio to it, instead of in a job of its own on another runner"
         default: latest
       features:
-        description: "Replicated features TupleSky's voters activate once every voter is submittable, before the nemesis and the workload (jepsen.tuplesky's --activate, task-d99), comma-separated in order, such as early-proposal,release-at-execution; a build without an admin socket (a pair's base before task-d99) is left as it is; empty for none; BASE/HEAD gives a pair's two sides their own lists (either may be empty)"
+        description: "Replicated features TupleSky's voters activate once every voter is submittable, before the nemesis and the workload (jepsen.tuplesky's --activate, task-d99), comma-separated in order, such as early-proposal,release-at-execution; NAME@SECS activates one under load, SECS into the workload (--activate-after), such as early-proposal,answer-on-release@60; a build without an admin socket (a pair's base before task-d99) is left as it is; empty for none; BASE/HEAD gives a pair's two sides their own lists (either may be empty)"
         default: ""
       store:
         description: "Where TupleSky's voters and etcd keep their stores: disk, or tmpfs to measure without the runner's disk"
@@ -109,7 +109,7 @@ on:
         description: "How many base and head pairs, when pair-base is set (the order alternates from pair to pair; empty for 3); in a sweep, the steps the base runs at, comma-separated (empty for every step)"
         default: ""
       leader-profile:
-        description: "Profile the TupleSky leader's domain thread with perf for 20 s in each run's workload, into its summary: true (flat), call-graph (call graphs by frame pointer, on the first pair's runs in a paired job, with every build in the job made with frame pointers; also the busiest follower, the leader's and that follower's tokio threads and their threads' system calls), or false"
+        description: "Profile the TupleSky leader's domain thread with perf for 20 s in each run's workload, into its summary: true (flat), call-graph (call graphs by frame pointer, on the first pair's runs in a paired job, with every build in the job made with frame pointers; also the busiest follower, the leader's and that follower's tokio threads and their threads' system calls), or false. Under faults, the first window labels the busiest loops leader and follower whatever their roles, and every restarted voter whose loop stays pegged is profiled while it is (leader_profile.py --watch-pegged)"
         type: choice
         options: ["false", "true", "call-graph"]
         default: "false"
@@ -404,9 +404,34 @@ jobs:
               echo "::error::tuplesky/jepsen@$JEPSEN_REF has no --activate; dispatch with a jepsen-ref that has it, or no features"
               exit 1
             fi
+            # A feature named NAME@SECS is activated under load, SECS into
+            # the workload (--activate-after SECS:NAMES); the rest at setup.
+            activation() {
+              local -n into=$2
+              local setup="" late="" secs="" f
+              IFS=, read -ra fs <<< "$1"
+              for f in "${fs[@]}"; do
+                case $f in
+                  *@*)
+                    if [ -n "$secs" ] && [ "$secs" != "${f#*@}" ]; then
+                      echo "::error::features $1: every NAME@SECS needs the same SECS"; exit 1
+                    fi
+                    secs=${f#*@} late=${late:+$late,}${f%@*} ;;
+                  ?*) setup=${setup:+$setup,}$f ;;
+                esac
+              done
+              if [ -n "$setup" ]; then into+=(--activate "$setup"); fi
+              if [ -n "$late" ]; then
+                if ! grep -q -- '--activate-after' src/jepsen/tuplesky.clj; then
+                  echo "::error::tuplesky/jepsen@$JEPSEN_REF has no --activate-after; dispatch with a jepsen-ref that has it"
+                  exit 1
+                fi
+                into+=(--activate-after "$secs:$late")
+              fi
+            }
             # Each side its own list: features BASE/HEAD sets them apart.
-            if [ -n "$FEATURES" ]; then head_workers+=(--activate "$FEATURES"); fi
-            if [ -n "$BASE_FEATURES" ]; then base_workers+=(--activate "$BASE_FEATURES"); fi
+            if [ -n "$FEATURES" ]; then activation "$FEATURES" head_workers; fi
+            if [ -n "$BASE_FEATURES" ]; then activation "$BASE_FEATURES" base_workers; fi
           fi
           if [ -n "$VOTER_ENV" ]; then
             if ! grep -q -- '--voter-env' src/jepsen/tuplesky.clj; then

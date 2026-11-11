@@ -1911,11 +1911,15 @@ def features_table(store: str, nodes: list[str]) -> list[str]:
     for i, _ in enumerate(nodes, 1):
         node = f"n{i}"
         start = read_features(os.path.join(store, node, "features-start.txt"))
+        late = read_features(os.path.join(store, node, "features-late.txt"))
         end = read_features(os.path.join(store, node, "features-end.txt"))
-        if start or end:
-            rows.append((node, start, end))
+        if start or late or end:
+            rows.append((node, start, late, end))
     if not rows:
         return []
+    # Columns for the activation under load (--activate-after) only where
+    # a voter saved its status after one.
+    lates = any(late for _, _, late, _ in rows)
 
     def active(f):
         if f is None:
@@ -1936,11 +1940,18 @@ def features_table(store: str, nodes: list[str]) -> list[str]:
         "harness activated them at setup and before the voter's logs were taken at the end; the leader's view is "
         "the domain's, and holding counts the voters it sees holding every active feature)",
         "",
-        "| Node | At start: active | Holding, at start | At end: active | Holding, at end |",
-        "| --- | --- | --- | --- | --- |",
+        "| Node | At start: active | Holding, at start | "
+        + ("After the activation under load: active | Holding, then | " if lates else "")
+        + "At end: active | Holding, at end |",
+        "| --- | --- | --- | " + ("--- | --- | " if lates else "") + "--- | --- |",
     ]
-    for node, start, end in rows:
-        out.append(f"| {node} | {active(start)} | {holding(start)} | {active(end)} | {holding(end)} |")
+    for node, start, late, end in rows:
+        out.append(f"| {node} | {active(start)} | {holding(start)} | "
+                   + (f"{active(late)} | {holding(late)} | " if lates else "")
+                   + f"{active(end)} | {holding(end)} |")
+    if lates:
+        out += ["", "A voter with no status after the activation under load was down, paused or cut off for its "
+                "minute; its end status says whether it holds them."]
     out.append("")
     return out
 
