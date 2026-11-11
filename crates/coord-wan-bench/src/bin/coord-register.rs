@@ -91,19 +91,41 @@ fn request(namespace: NamespaceId, operation: CanonicalOperation) -> LogicalRequ
 
 /// What a read came back with: the value and its modification revision,
 /// or `None` when the result is not a one-key range.
-fn read_result(result: &[u8]) -> Option<(Option<u64>, u64)> {
-    let response: coord_state::Response = postcard::from_bytes(result).ok()?;
+fn read_result(result: &[u8], key: &[u8]) -> Read {
+    let Ok(response) = postcard::from_bytes::<coord_state::Response>(result) else {
+        return Read::Malformed("undecodable");
+    };
     let coord_state::Outcome::Range { items, .. } = response.outcome else {
-        return None;
+        // The domain answered the read with something other than a
+        // range: refused, as an error outcome is. Nothing was read.
+        return Read::Refused;
     };
     match items.as_slice() {
-        [] => Some((None, 0)),
-        [item] => {
-            let value = u64::from_be_bytes(item.entry.value.as_slice().try_into().ok()?);
-            Some((Some(value), item.entry.mod_revision.get()))
-        }
-        _ => None,
+        [] => Read::Value(None, 0),
+        [item] if item.key != key => Read::Malformed("another key"),
+        [item] => match <[u8; 8]>::try_from(item.entry.value.as_slice()) {
+            Ok(bytes) => Read::Value(
+                Some(u64::from_be_bytes(bytes)),
+                item.entry.mod_revision.get(),
+            ),
+            Err(_) => Read::Malformed("not eight bytes"),
+        },
+        _ => Read::Malformed("several items"),
     }
+}
+
+/// What an established exact-key read came to.
+#[derive(Debug, PartialEq, Eq)]
+enum Read {
+    /// The key's value (none when absent) at its revision.
+    Value(Option<u64>, u64),
+    /// An outcome that is not a range: the read was refused.
+    Refused,
+    /// A range no write of this run could have produced. The read
+    /// completed, so its value is in the history the check judges; one
+    /// left out could hide corrupted data, so it fails the run (Codex
+    /// review).
+    Malformed(&'static str),
 }
 
 /// A write's revision, from its result.
@@ -143,6 +165,7 @@ struct Counts {
     writes: u64,
     unknown_writes: u64,
     lost_reads: u64,
+    malformed_reads: u64,
     reconnects: u64,
     /// Operations that did not complete, by kind and bounded reason.
     why: std::collections::BTreeMap<String, u64>,
@@ -281,8 +304,8 @@ async fn caller(
             let completed = plan.start.elapsed().as_nanos() as u64;
             match &outcome {
                 Ok(coord_sdk::Outcome::Established { result, .. }) => {
-                    match read_result(result) {
-                        Some((value, revision)) => {
+                    match read_result(result, &key_bytes(key)) {
+                        Read::Value(value, revision) => {
                             counts.reads += 1;
                             ops.push(Op {
                                 caller: index,
@@ -293,11 +316,18 @@ async fn caller(
                                 kind: OpKind::Read { value, revision },
                             });
                         }
-                        None => {
+                        Read::Refused => {
                             counts.lost_reads += 1;
                             *counts
                                 .why
                                 .entry(format!("read:{}", reason(&outcome)))
+                                .or_default() += 1;
+                        }
+                        Read::Malformed(why) => {
+                            counts.malformed_reads += 1;
+                            *counts
+                                .why
+                                .entry(format!("read:malformed:{why}"))
                                 .or_default() += 1;
                         }
                     }
@@ -411,6 +441,7 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
         counts.writes += c.writes;
         counts.unknown_writes += c.unknown_writes;
         counts.lost_reads += c.lost_reads;
+        counts.malformed_reads += c.malformed_reads;
         counts.reconnects += c.reconnects;
         for (why, n) in c.why {
             *counts.why.entry(why).or_default() += n;
@@ -438,6 +469,7 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
         "reads_completed": counts.reads,
         "reads_completed_by_frontend": by_frontend,
         "reads_not_completed": counts.lost_reads,
+        "reads_malformed": counts.malformed_reads,
         "writes_established": counts.writes,
         "writes_unknown": counts.unknown_writes,
         "reconnects": counts.reconnects,
@@ -448,5 +480,84 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
     let rendered = serde_json::to_string_pretty(&summary)?;
     std::fs::write(&cli.summary, &rendered)?;
     println!("{rendered}");
-    Ok(violations.is_empty())
+    Ok(violations.is_empty() && counts.malformed_reads == 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use coord_state::{KvEntry, Outcome, RangeItem, Response};
+
+    fn revision(n: u64) -> coord_types::ids::KvRevision {
+        coord_types::ids::KvRevision::new(n).expect("a revision")
+    }
+
+    fn range(items: Vec<RangeItem>) -> Vec<u8> {
+        let count = items.len() as u64;
+        postcard::to_allocvec(&Response {
+            revision: revision(9),
+            outcome: Outcome::Range {
+                items,
+                count,
+                more: false,
+            },
+        })
+        .expect("encodes")
+    }
+
+    fn item(key: &[u8], value: &[u8]) -> RangeItem {
+        RangeItem {
+            key: key.to_vec(),
+            entry: KvEntry {
+                value: value.to_vec(),
+                create_revision: revision(3),
+                mod_revision: revision(7),
+                version: 1,
+                lease: None,
+                lease_generation: None,
+            },
+        }
+    }
+
+    #[test]
+    fn a_read_of_the_key_is_its_value_or_its_absence() {
+        let key = key_bytes(4);
+        assert_eq!(read_result(&range(vec![]), &key), Read::Value(None, 0));
+        assert_eq!(
+            read_result(&range(vec![item(&key, &42u64.to_be_bytes())]), &key),
+            Read::Value(Some(42), 7)
+        );
+    }
+
+    #[test]
+    fn a_range_no_write_could_produce_is_malformed_not_lost() {
+        let key = key_bytes(4);
+        let eight = 42u64.to_be_bytes();
+        assert_eq!(
+            read_result(&range(vec![item(&key, b"short")]), &key),
+            Read::Malformed("not eight bytes")
+        );
+        assert_eq!(
+            read_result(&range(vec![item(&key, &eight), item(&key, &eight)]), &key),
+            Read::Malformed("several items")
+        );
+        assert_eq!(
+            read_result(&range(vec![item(&key_bytes(5), &eight)]), &key),
+            Read::Malformed("another key")
+        );
+        assert_eq!(
+            read_result(b"\xff\xff", &key),
+            Read::Malformed("undecodable")
+        );
+    }
+
+    #[test]
+    fn another_outcome_is_a_refusal() {
+        let refused = postcard::to_allocvec(&Response {
+            revision: revision(9),
+            outcome: Outcome::ErrCompacted,
+        })
+        .expect("encodes");
+        assert_eq!(read_result(&refused, &key_bytes(4)), Read::Refused);
+    }
 }
