@@ -296,6 +296,15 @@ impl Machine {
         }
     }
 
+    /// The durable command records this replica holds, in either role
+    /// (task-d110).
+    pub fn ledger(&self) -> &coord_consensus::DurableLedger {
+        match self {
+            Machine::Leader(m) => m.ledger(),
+            Machine::Follower(m) => m.ledger(),
+        }
+    }
+
     /// For a leader, the commands its own path logs hold pending: none, as
     /// it synchronizes each proposal as it makes it (task-d68); nothing
     /// for a follower.
