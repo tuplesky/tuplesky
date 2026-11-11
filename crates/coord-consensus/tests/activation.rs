@@ -6621,7 +6621,7 @@ fn bindings_are_bounded_by_the_commands_kept_not_by_history() {
 /// a few entries per execution, so the ledger stays near what the table
 /// keeps and the backstop sweep never comes due. Before, the ledger grew
 /// to four times the capacity and every voter then swept all of it in one
-/// execution (~16 ms every ~2,400 commands at the run's capacity).
+/// execution, every ~2,400 commands at the run's capacity.
 ///
 /// Every other map the sweep walks stays as small too, map by map, not
 /// the ledger alone: an entry the queue never drops would grow without
