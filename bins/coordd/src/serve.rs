@@ -1935,6 +1935,19 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                     largest_map: maps.largest() as u64,
                 }
             },
+            table: {
+                let (waits, window) = voter.node().machine().table_waits();
+                coord_daemon::metrics::Table {
+                    records: waits.records as u64,
+                    capacity: waits.capacity.unwrap_or(0) as u64,
+                    unexecuted: waits.unexecuted as u64,
+                    ready: waits.ready as u64,
+                    catch_up_window: window as u64,
+                    oldest_wait: waits
+                        .oldest
+                        .map(|(_, wait)| coord_daemon::metrics::OldestWait::of(wait)),
+                }
+            },
             busy,
             uptime: now.saturating_duration_since(self.started),
             recent,

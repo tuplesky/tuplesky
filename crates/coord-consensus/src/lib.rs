@@ -148,7 +148,7 @@ pub use campaign::Campaign;
 pub use catch_up::{CatchUpDivergence, CatchUpPaths, DonorExecution, OwnExecution};
 pub use commands::{
     CommandRecord, CommandTable, InitError, Initialized, RECOVERY_RESERVE_PARTS, RelayRoom,
-    RetireError,
+    RetireError, TableWait, TableWaits,
 };
 pub use floor::{
     ActivatedFloor, ActivationError, Discovered, FenceVerdict, FloorCandidate, FloorConflict,

@@ -13,10 +13,13 @@
 //! whose frontier has not moved in that time (by less than a page, if it
 //! holds a page or more), asks the
 //! leader; one that is not answered asks the other voters in turn. A
-//! voter asks once after it starts, whatever it holds, since a restart
-//! can leave it behind holding nothing. The machine asks again at once
-//! when a full page is executed, so the pacer is the floor for an ask
-//! nobody answered, not the rate a voter catches up at.
+//! voter asks after it starts, whatever it holds, since a restart can
+//! leave it behind holding nothing, and goes on asking until a page
+//! arrives or every voter has been asked: a donor with nothing past its
+//! frontier answers nothing, so a lost ask or page looks the same as
+//! nothing to fetch (#98, Codex on the carry). The machine asks again at
+//! once when a full page is executed, so the pacer is the floor for an
+//! ask nobody answered, not the rate a voter catches up at.
 //!
 //! "Less than a page", not "not at all" (task-d94): a voter restarted
 //! behind, holding pre-acceptances the others decided long ago, executes
@@ -326,6 +329,9 @@ pub struct Standing<B: Fn() -> usize> {
     pub backlog: B,
     /// Whether a page is in hand.
     pub busy: bool,
+    /// Catch-up pages taken since the machine started
+    /// (`Machine::catch_up_counts`): one more is an ask answered.
+    pub pages: u64,
     /// Whether it leads: a leader has nobody to catch up from.
     pub leads: bool,
 }
@@ -346,12 +352,20 @@ pub struct Pacer {
     /// lead, and has no page in hand. Only such a voter has a deadline
     /// ([`Pacer::next_deadline`]).
     wanting: bool,
-    /// Whether this voter has asked since it started. A voter restarted
-    /// behind can hold nothing at all -- its catch-up state is not
-    /// durable, and a page's command the donor kept no row of leaves no
-    /// row here either until it executes -- so it asks once, whatever it
-    /// holds, and a donor with nothing past its frontier answers nothing.
+    /// Whether the asks this voter makes after it starts, whatever it
+    /// holds, are done with. A voter restarted behind can hold nothing at
+    /// all -- its catch-up state is not durable, and a page's command the
+    /// donor kept no row of leaves no row here either until it executes
+    /// -- so it asks whatever it holds. A donor with nothing past its
+    /// frontier answers nothing, and so does a lost ask or page, so the
+    /// probe is done once a page arrives, or once every voter has been
+    /// asked with none arriving: before, it was done the moment it went,
+    /// and a voter whose probe was lost in a quiet cluster never asked
+    /// again (#98, Codex on the carry).
     probed: bool,
+    /// The pages taken when the probe's first ask went: a different count
+    /// later is a page that answered it.
+    probe_pages: Option<u64>,
     /// The frontier as the last turn saw it, and when it last moved:
     /// task-d08's still frontier, for a voter holding less than a page.
     seen: Option<ExecutionPosition>,
@@ -373,6 +387,10 @@ impl Pacer {
         leader: ReplicaId,
         voters: &[ReplicaId],
     ) -> Option<ReplicaId> {
+        if !self.probed && (standing.busy || self.probe_pages.is_some_and(|p| p != standing.pages))
+        {
+            self.probed = true;
+        }
         let holds = standing.holds || !self.probed;
         self.wanting = holds && !standing.leads && !standing.busy;
         if self.seen != Some(standing.executed) {
@@ -432,10 +450,21 @@ impl Pacer {
             *others.get(turn % others.len().max(1))?
         };
         self.asks += 1;
-        self.probed = true;
-        // Probed now: a voter that holds nothing has no more reason to
-        // wake for this one.
-        self.wanting = standing.holds;
+        if standing.holds {
+            self.probed = true;
+        } else {
+            // A probe: done once a page arrives, or once this ask
+            // finishes a round of every voter (the leader
+            // [`LEADER_ASKS`] times, then each of the others) with no
+            // page: nothing is past this voter anywhere.
+            self.probe_pages.get_or_insert(standing.pages);
+            if self.unanswered as usize + 1 >= LEADER_ASKS as usize + others.len() {
+                self.probed = true;
+            }
+        }
+        // A voter that holds nothing and is done probing has no more
+        // reason to wake for this one.
+        self.wanting = standing.holds || !self.probed;
         Some(donor)
     }
 
@@ -527,6 +556,7 @@ mod tests {
             holds: backlog > 0,
             backlog: move || backlog,
             busy: false,
+            pages: 0,
             leads: false,
         }
     }
@@ -718,6 +748,7 @@ mod tests {
                     3
                 },
                 busy: false,
+                pages: 0,
                 leads: false,
             };
             assert_eq!(
@@ -769,11 +800,12 @@ mod tests {
         assert_eq!(alone.next_deadline(), Some(t + UNANSWERED));
     }
 
-    /// A voter asks once after it starts, whatever it holds, and then
-    /// only when it holds work: a restart can leave it behind holding
-    /// nothing (task-d08).
+    /// A voter asks after it starts, whatever it holds, since a restart
+    /// can leave it behind holding nothing (task-d08), until a page
+    /// arrives: an ask or page lost leaves the probe owed (#98, Codex on
+    /// the carry). Then it asks only when it holds work.
     #[test]
-    fn a_started_voter_asks_once_whatever_it_holds() {
+    fn a_started_voter_asks_whatever_it_holds_until_a_page_arrives() {
         let voters = [r(1), r(2), r(3)];
         let t0 = Instant::now();
         let mut pacer = Pacer::default();
@@ -784,9 +816,46 @@ mod tests {
             pacer.due(t, standing(5, false), r(3), r(1), &voters),
             Some(r(1))
         );
+        // Unanswered: it asks again, as an ask of a voter holding work
+        // does.
+        assert_eq!(pacer.next_deadline(), Some(t + UNANSWERED));
+        let t = t + UNANSWERED;
+        assert_eq!(
+            pacer.due(t, standing(5, false), r(3), r(1), &voters),
+            Some(r(1))
+        );
+        // A page arrives: the probe is answered, and a voter holding
+        // nothing has nothing more to ask for.
+        let answered = Standing {
+            pages: 1,
+            ..standing(5, false)
+        };
+        let t = t + UNANSWERED;
+        assert_eq!(pacer.due(t, answered, r(3), r(1), &voters), None);
         assert_eq!(pacer.next_deadline(), None);
         let t = t + UNANSWERED * 3;
-        assert_eq!(pacer.due(t, standing(5, false), r(3), r(1), &voters), None);
+        assert_eq!(pacer.due(t, answered, r(3), r(1), &voters), None);
+    }
+
+    /// With nothing past it at any donor, nobody answers the probe: it is
+    /// done once every voter has been asked, the leader first, and an
+    /// idle voter level with the others then has no deadline (#98).
+    #[test]
+    fn a_probe_nobody_answers_ends_once_every_voter_was_asked() {
+        let voters = [r(1), r(2), r(3)];
+        let t0 = Instant::now();
+        let mut pacer = Pacer::default();
+        pacer.due(t0, standing(5, false), r(3), r(1), &voters);
+        let mut t = t0 + STILL_FOR;
+        let mut asked = Vec::new();
+        for _ in 0..10 {
+            if let Some(donor) = pacer.due(t, standing(5, false), r(3), r(1), &voters) {
+                asked.push(donor);
+            }
+            t += UNANSWERED;
+        }
+        assert_eq!(asked, vec![r(1), r(1), r(1), r(2)]);
+        assert_eq!(pacer.next_deadline(), None);
     }
 
     #[test]
@@ -794,11 +863,15 @@ mod tests {
         let voters = [r(1), r(2), r(3)];
         let t0 = Instant::now();
         let mut pacer = Pacer::default();
-        // The probe after start, out of the way.
+        // The probe after start, answered and out of the way.
         pacer.due(t0, standing(5, false), r(3), r(1), &voters);
         pacer.due(t0 + STILL_FOR, standing(5, false), r(3), r(1), &voters);
+        let answered = Standing {
+            pages: 1,
+            ..standing(5, false)
+        };
         let t = t0 + STILL_FOR * 3;
-        assert_eq!(pacer.due(t, standing(5, false), r(3), r(1), &voters), None);
+        assert_eq!(pacer.due(t, answered, r(3), r(1), &voters), None);
         let leads = Standing {
             leads: true,
             ..standing(5, true)
