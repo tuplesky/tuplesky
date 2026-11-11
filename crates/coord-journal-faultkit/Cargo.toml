@@ -13,6 +13,7 @@ publish.workspace = true
 role = "test-only"
 
 [dependencies]
+coord-journal-raft-engine.workspace = true
 raft-engine.workspace = true
 rand_chacha.workspace = true
 rand_core.workspace = true
@@ -21,6 +22,5 @@ rand_core.workspace = true
 coord-types.workspace = true
 coord-core.workspace = true
 coord-journal-api.workspace = true
-coord-journal-raft-engine.workspace = true
 coord-store-api.workspace = true
 tempfile.workspace = true

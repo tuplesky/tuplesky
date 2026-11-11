@@ -154,6 +154,51 @@ pub struct Acked {
     pub through: Option<LocalJournalSeq>,
     /// Highest sequence any `append_group` was called with.
     pub attempted: Option<LocalJournalSeq>,
+    /// What every call returned, frozen or not (#210 review): the fields
+    /// above count only acknowledgements given before the crash, so a test
+    /// asking whether a fault was acknowledged reads these.
+    pub calls: Vec<Call>,
+}
+
+/// One call of the workload: the operations it issued and whether it
+/// returned `Ok`.
+#[derive(Debug)]
+pub struct Call {
+    pub what: &'static str,
+    /// The ordinals the call's operations took, `from..=to`; empty when it
+    /// issued none.
+    pub from: u64,
+    pub to: u64,
+    pub ok: bool,
+}
+
+impl Acked {
+    /// The call whose operations include ordinal `n`.
+    pub fn call_at(&self, n: u64) -> Option<&Call> {
+        self.calls.iter().find(|c| (c.from..=c.to).contains(&n))
+    }
+}
+
+/// Run `f`, catching a panic, and record what it returned.
+fn call<T, E>(
+    acked: &mut Acked,
+    shared: &Shared,
+    what: &'static str,
+    f: impl FnOnce() -> Result<T, E>,
+) -> Option<T> {
+    let from = shared.ops() + 1;
+    let result = catch_unwind(AssertUnwindSafe(f));
+    let ok = matches!(result, Ok(Ok(_)));
+    acked.calls.push(Call {
+        what,
+        from,
+        to: shared.ops(),
+        ok,
+    });
+    match result {
+        Ok(Ok(value)) => Some(value),
+        _ => None,
+    }
 }
 
 /// Create the journal over `fs`, persist one stream mapping, and append
@@ -173,10 +218,10 @@ pub fn workload_with(
     options: &JournalOptions,
 ) -> Acked {
     let mut acked = Acked::default();
-    let journal = catch_unwind(AssertUnwindSafe(|| {
+    let journal = call(&mut acked, shared, "create", || {
         RaftEngineJournal::create_with_file_system(root, identity(), options, fs)
-    }));
-    let Ok(Ok(mut journal)) = journal else {
+    });
+    let Some(mut journal) = journal else {
         return acked;
     };
     // An acknowledgement after the crash was never given: the process
@@ -188,10 +233,10 @@ pub fn workload_with(
     acked.created = true;
     let mut allocator = StreamAllocator::new();
     let mapping = allocator.allocate(key(), ShardId::new(0).unwrap()).unwrap();
-    let persisted = catch_unwind(AssertUnwindSafe(|| {
+    let persisted = call(&mut acked, shared, "mapping", || {
         journal.persist_mapping(allocator.high_water(), &mapping)
-    }));
-    if !matches!(persisted, Ok(Ok(()))) || shared.is_frozen() {
+    });
+    if persisted.is_none() || shared.is_frozen() {
         quietly_drop(journal);
         return acked;
     }
@@ -204,8 +249,8 @@ pub fn workload_with(
         let last = batch.last().unwrap().seq();
         acked.attempted = Some(last);
         let g = group(i as u64 + 1, mapping.stream, batch);
-        match catch_unwind(AssertUnwindSafe(|| journal.append_group(&g))) {
-            Ok(Ok(_)) if !shared.is_frozen() => acked.through = Some(last),
+        match call(&mut acked, shared, "group", || journal.append_group(&g)) {
+            Some(_) if !shared.is_frozen() => acked.through = Some(last),
             _ => break,
         }
     }
@@ -283,7 +328,7 @@ pub fn census() -> Vec<Op> {
         .collect()
 }
 
-pub fn run(plan: FaultPlan, tail: Option<Tail>, case: &str) -> Arc<Shared> {
+pub fn run(plan: FaultPlan, tail: Option<Tail>, case: &str) -> (Arc<Shared>, Acked) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("j");
     let (fs, shared) = FaultFs::new(plan);
@@ -300,5 +345,5 @@ pub fn run(plan: FaultPlan, tail: Option<Tail>, case: &str) -> Arc<Shared> {
         shared.materialize(tail).unwrap();
     }
     check(&root, &acked, case);
-    shared
+    (shared, acked)
 }

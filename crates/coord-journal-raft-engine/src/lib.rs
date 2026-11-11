@@ -39,7 +39,8 @@ pub mod metadata;
 pub use codec::{RecordCodec, RecordExt};
 pub use guard::{SECTOR_BYTES, TailGuard, TailRefused, tail_refusal};
 pub use journal::{
-    JournalIdentity, JournalOptions, OpenError, RaftEngineJournal, RecoveryPolicy, WriteStats,
+    DirSync, JournalIdentity, JournalOptions, OpenError, RaftEngineJournal, RecoveryPolicy,
+    WriteStats,
 };
 pub use metadata::{JOURNAL_FORMAT_V1, JournalIdentityV1, METADATA_REGION};
 

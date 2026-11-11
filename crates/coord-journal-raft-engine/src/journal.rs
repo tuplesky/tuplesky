@@ -410,6 +410,48 @@ fn put_value(
         .map_err(|e| definite(format!("metadata put: {}", redact(&e))))
 }
 
+/// A directory sync: what makes an entry created in a directory survive
+/// a power loss (#210 review).
+///
+/// raft-engine's `FileSystem` has no directory operation of its own, and
+/// the pinned engine syncs a log directory only when it rotates to a new
+/// file (`pipe.rs`'s `rotate_imp`). The first log file, created when the
+/// engine opens an empty directory, never gets one, and neither does a
+/// directory `create_dir_all` made. So the adapter syncs them itself,
+/// through this trait, before [`RaftEngineJournal::create_with_file_system`]
+/// acknowledges the creation. A fault-injecting file system implements it
+/// to see the sync; the default is the real `fsync` of the directory.
+pub trait DirSync {
+    /// Make the entries of `dir` durable.
+    fn sync_dir(&self, dir: &Path) -> std::io::Result<()> {
+        std::fs::File::open(dir)?.sync_all()
+    }
+}
+
+impl DirSync for DefaultFileSystem {}
+
+/// Sync `dir`, then each directory above it up to and including
+/// `existed`, the nearest one that existed before `create_dir_all`: each
+/// holds an entry made by this creation.
+fn sync_created_dirs(
+    file_system: &impl DirSync,
+    dir: &Path,
+    existed: Option<&Path>,
+) -> std::io::Result<()> {
+    for d in dir.ancestors() {
+        let d = if d.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            d
+        };
+        file_system.sync_dir(d)?;
+        if existed.is_none_or(|e| e == d) {
+            break;
+        }
+    }
+    Ok(())
+}
+
 impl RaftEngineJournal<DefaultFileSystem> {
     /// Create a journal in an empty (or absent) directory.
     pub fn create(
@@ -430,9 +472,13 @@ impl RaftEngineJournal<DefaultFileSystem> {
     }
 }
 
-impl<F: FileSystem> RaftEngineJournal<F> {
+impl<F: FileSystem + DirSync> RaftEngineJournal<F> {
     /// [`RaftEngineJournal::create`] over a caller-provided file system
     /// (fault adapters in qualification, task-j05).
+    ///
+    /// The journal's directory, the first log file and every directory
+    /// this call created are durable entries before it returns: the
+    /// engine creates its first file with no directory sync (#210 review).
     pub fn create_with_file_system(
         dir: &Path,
         identity: JournalIdentity,
@@ -443,9 +489,12 @@ impl<F: FileSystem> RaftEngineJournal<F> {
         if dir.exists() && std::fs::read_dir(dir)?.next().is_some() {
             return Err(OpenError::AlreadyInitialized);
         }
+        let existed = dir.ancestors().find(|d| d.exists()).map(Path::to_path_buf);
         std::fs::create_dir_all(dir)?;
-        let engine = Engine::open_with_file_system(cfg, Arc::new(TailGuard::new(file_system)))
-            .map_err(engine_open_error)?;
+        let engine =
+            Engine::open_with_file_system(cfg, Arc::new(TailGuard::new(file_system.clone())))
+                .map_err(engine_open_error)?;
+        sync_created_dirs(&*file_system, dir, existed.as_deref())?;
         if !engine.is_empty() {
             return Err(OpenError::Corrupt(
                 "fresh directory holds entries".to_owned(),
@@ -484,7 +533,9 @@ impl<F: FileSystem> RaftEngineJournal<F> {
             dir,
         ))
     }
+}
 
+impl<F: FileSystem> RaftEngineJournal<F> {
     /// [`RaftEngineJournal::open_existing`] over a caller-provided file
     /// system.
     pub fn open_existing_with_file_system(
