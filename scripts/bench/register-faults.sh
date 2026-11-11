@@ -147,12 +147,15 @@ pid_of() {
   done
 }
 
-# The voter leading the highest ballot any log announces.
+# The voter leading the highest ballot any log announces. Ballots order by
+# number, then by leader, and voter n is replica [n; 16]: of two voters
+# that announce one number, the later one in n1..n3 leads it, so a tie
+# goes to the voter read last.
 leader() {
   local n best="" number=-1 last
   for n in n1 n2 n3; do
     last=$(grep -o 'this voter leads ballot [0-9]*' "$DIR/$n/coordd.log" 2>/dev/null | tail -1 | grep -o '[0-9]*$')
-    if [ -n "$last" ] && [ "$last" -gt "$number" ]; then number=$last; best=$n; fi
+    if [ -n "$last" ] && [ "$last" -ge "$number" ]; then number=$last; best=$n; fi
   done
   echo "$best"
 }
