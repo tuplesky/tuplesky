@@ -760,3 +760,29 @@ fn a_withheld_result_and_a_retired_one_are_their_own_outcomes() {
         Outcome::Failed(RetryError::NotAdmitted)
     );
 }
+
+/// A retry of a request this client holds as unknown keeps its earlier
+/// attempts: a BACKPRESSURE answer to the retry must not read as
+/// "nothing reached the domain" (Codex on #228).
+#[test]
+fn a_retried_unknown_outcome_keeps_its_attempts() {
+    let mut c = client(ClientConfig::default());
+    let c1 = connected(&mut c, 0, 1);
+    let request = put(b"a", b"1");
+    let id = c.submit(0, &request, 0).unwrap();
+    let command = c.invocation(id).unwrap().command_id;
+    let _ = c.take_actions();
+    c.on_frame(1, c1, &outcome_frame(command, OutcomeV1::Unknown))
+        .unwrap();
+    assert_eq!(c.state(id), Some(&RequestState::Done(Outcome::Unknown)));
+    let _ = c.take_completions();
+    assert_eq!(c.retry(2, id.0, &request, 0), Ok(id));
+    let _ = c.take_actions();
+    c.on_frame(3, c1, &err_frame(command, codes::BACKPRESSURE))
+        .unwrap();
+    assert_eq!(
+        (c.backpressured(id), c.attempts(id)),
+        (1, 2),
+        "the retry's refusal hid the first attempt"
+    );
+}

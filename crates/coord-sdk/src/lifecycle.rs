@@ -319,9 +319,11 @@ impl<P: CredentialProvider> Client<P> {
     /// stays queued and goes out again after the backoff, so this is how an
     /// application tells a frontend refusing it from an outcome it could not
     /// learn. When it equals [`Client::attempts`], every attempt this
-    /// client made was refused, and none of them reached the domain. An
-    /// earlier submission of the same sequence (before a restart, or a
-    /// request forgotten and retried) is not counted here.
+    /// client made was refused, and none of them reached the domain. A
+    /// retry of a request this client still holds as unknown keeps its
+    /// earlier attempts. An earlier submission of the same sequence that
+    /// this client no longer holds (before a restart, or a request
+    /// forgotten and retried) is not counted here.
     pub fn backpressured(&self, request: RequestId) -> u32 {
         self.requests.get(&request).map_or(0, |e| e.backpressured)
     }
@@ -423,7 +425,21 @@ impl<P: CredentialProvider> Client<P> {
             return Ok(id);
         }
         self.check_window()?;
+        // A retained request whose outcome was unknown keeps the attempts
+        // it made: one of them may have reached the domain, and
+        // `backpressured` equal to `attempts` must never say otherwise of
+        // a retry refused BACKPRESSURE (Codex on #228).
+        let made = self
+            .requests
+            .get(&id)
+            .map(|e| (e.attempts, e.backpressured));
         self.insert(now, id, invocation, deadline_ms);
+        if let Some((attempts, backpressured)) = made
+            && let Some(e) = self.requests.get_mut(&id)
+        {
+            e.attempts = attempts;
+            e.backpressured = backpressured;
+        }
         self.pump(now);
         Ok(id)
     }
