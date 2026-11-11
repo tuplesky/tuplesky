@@ -1064,11 +1064,19 @@ impl Leader {
         {
             self.check_forgetting();
         }
-        if !self.ledger.sweep_due(
-            self.config
-                .capacity
-                .saturating_mul(crate::follower::HISTORY_SWEEP),
-        ) {
+        // Due at the threshold, or once the table forgets the last
+        // command the queue let go unforgotten (#221 review).
+        let owed = self
+            .ledger
+            .owed_sweep()
+            .is_some_and(|c| self.table.forgotten(c));
+        if !owed
+            && !self.ledger.sweep_due(
+                self.config
+                    .capacity
+                    .saturating_mul(crate::follower::HISTORY_SWEEP),
+            )
+        {
             return;
         }
         let table = &self.table;
@@ -1093,7 +1101,11 @@ impl Leader {
     /// forgotten, from every map [`Leader::forget_history`]'s sweep walks,
     /// with the indexes over its proposal (task-d111's cut (d)).
     fn forget_one(&mut self, command: CommandId) {
-        self.ledger.forget(&command);
+        if let Some(key) = self.ledger.forget(&command)
+            && self.bindings.get(&key) == Some(&command)
+        {
+            self.bindings.remove(&key);
+        }
         let payload = self.payloads.remove(&command);
         self.served_payloads.remove(&command);
         if let Some(proposal) = self.proposals.remove(&command) {
@@ -1116,11 +1128,12 @@ impl Leader {
     /// follower's (`Follower::check_forgetting`).
     #[cfg(debug_assertions)]
     fn check_forgetting(&self) {
-        if self.ledger.forget_skipped() {
-            return;
-        }
         let queued = self.ledger.forget_queued();
-        let kept = |c: &CommandId| !self.table.forgotten(c) || queued.contains(c);
+        let kept = |c: &CommandId| {
+            !self.table.forgotten(c)
+                || queued.contains(c)
+                || (self.ledger.sweep_owes(c) && self.ledger.owed_sweep().is_some())
+        };
         debug_assert!(
             self.ledger.records().all(|(c, _)| kept(c))
                 && self.payloads.keys().all(kept)
@@ -1820,6 +1833,21 @@ impl Leader {
     /// The durable ledger (journal-durable records only).
     pub const fn ledger(&self) -> &DurableLedger {
         &self.ledger
+    }
+
+    /// What this leader keeps of its history beside the ledger, map by
+    /// map (#221 review).
+    pub fn history_maps(&self) -> crate::summary::HistoryMaps {
+        crate::summary::HistoryMaps {
+            payloads: self.payloads.len(),
+            served_payloads: self.served_payloads.len(),
+            votes: self.votes.len(),
+            bindings: self.bindings.len(),
+            bare_bindings: self.ledger.bare_bindings(),
+            answer_on_release: self.answer_on_release.len(),
+            proposals: self.proposals.len(),
+            ..crate::summary::HistoryMaps::default()
+        }
     }
 
     /// Retry keys bound to a command here (task-d26): the commands still
@@ -2630,6 +2658,9 @@ impl Leader {
             // `PayloadConflict` is not a duplicate at all.
             Err(InitError::AlreadyInitialized) => {
                 self.bindings.insert(request.retry_key, command);
+                if !self.payloads.contains_key(&command) {
+                    self.ledger.bound_bare(command, request.retry_key);
+                }
                 self.rejections.push(Rejection::Duplicate(command));
                 return self.repair_evidence(command, request.retry_key);
             }

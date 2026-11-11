@@ -567,6 +567,14 @@ pub struct History {
     pub kept: u64,
     /// Sweeps run since this boot.
     pub sweeps: u64,
+    /// Entries in every other map of history forgetting drops (#221
+    /// review): payloads, served payloads, votes, adoptions, bindings,
+    /// answer-on-release, held waiters and a leader's proposals.
+    #[serde(default)]
+    pub entries: u64,
+    /// The largest of those maps.
+    #[serde(default)]
+    pub largest_map: u64,
 }
 
 /// What a voter's journal groups held, by their records (task-d84),

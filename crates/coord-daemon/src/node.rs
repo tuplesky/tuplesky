@@ -305,6 +305,15 @@ impl Machine {
         }
     }
 
+    /// What this replica keeps of its history beside the ledger, map by
+    /// map, in either role (#221 review).
+    pub fn history_maps(&self) -> coord_consensus::HistoryMaps {
+        match self {
+            Machine::Leader(m) => m.history_maps(),
+            Machine::Follower(m) => m.history_maps(),
+        }
+    }
+
     /// For a leader, the commands its own path logs hold pending: none, as
     /// it synchronizes each proposal as it makes it (task-d68); nothing
     /// for a follower.

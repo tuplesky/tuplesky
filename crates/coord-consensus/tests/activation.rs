@@ -6622,19 +6622,34 @@ fn bindings_are_bounded_by_the_commands_kept_not_by_history() {
 /// keeps and the backstop sweep never comes due. Before, the ledger grew
 /// to four times the capacity and every voter then swept all of it in one
 /// execution (~16 ms every ~2,400 commands at the run's capacity).
+///
+/// Every other map the sweep walks stays as small too, map by map, not
+/// the ledger alone: an entry the queue never drops would grow without
+/// a sweep to drop it (#221 review).
 #[test]
 fn history_is_forgotten_in_order_and_the_sweep_never_comes_due() {
     let mut cluster = Cluster::new(19);
     let mut most = [0usize; 3];
+    let mut most_map = [coord_consensus::HistoryMaps::default(); 3];
     for n in 0..1_000u64 {
         cluster.admit(n + 1, (n % 200) as u8);
         cluster.settle();
-        for (i, most) in most.iter_mut().enumerate() {
-            let ledger = match cluster.nodes[i].role.as_ref().unwrap() {
-                Role::Leader(l) => l.ledger(),
-                Role::Follower(f) => f.ledger(),
+        for i in 0..3 {
+            let (ledger, maps) = match cluster.nodes[i].role.as_ref().unwrap() {
+                Role::Leader(l) => (l.ledger(), l.history_maps()),
+                Role::Follower(f) => (f.ledger(), f.history_maps()),
             };
-            *most = (*most).max(ledger.len());
+            most[i] = most[i].max(ledger.len());
+            let m = &mut most_map[i];
+            m.payloads = m.payloads.max(maps.payloads);
+            m.served_payloads = m.served_payloads.max(maps.served_payloads);
+            m.votes = m.votes.max(maps.votes);
+            m.adopted = m.adopted.max(maps.adopted);
+            m.bindings = m.bindings.max(maps.bindings);
+            m.bare_bindings = m.bare_bindings.max(maps.bare_bindings);
+            m.answer_on_release = m.answer_on_release.max(maps.answer_on_release);
+            m.held_waiters = m.held_waiters.max(maps.held_waiters);
+            m.proposals = m.proposals.max(maps.proposals);
         }
     }
     // The sweep's threshold: four times the voters' capacity of 32.
@@ -6644,12 +6659,17 @@ fn history_is_forgotten_in_order_and_the_sweep_never_comes_due() {
             *most < threshold,
             "r{i}'s ledger reached {most} of a {threshold} threshold"
         );
+        assert!(
+            most_map[i].largest() < threshold,
+            "r{i}'s history maps reached {:?}",
+            most_map[i]
+        );
         let ledger = match cluster.nodes[i].role.as_ref().unwrap() {
             Role::Leader(l) => l.ledger(),
             Role::Follower(f) => f.ledger(),
         };
         assert_eq!(ledger.sweeps(), 0, "r{i} swept its history");
-        assert!(!ledger.forget_skipped(), "r{i} skipped forgetting");
+        assert_eq!(ledger.forgets_skipped(), 0, "r{i} skipped forgetting");
     }
     assert_eq!(cluster.nodes[0].executed.len(), 1_000);
 }

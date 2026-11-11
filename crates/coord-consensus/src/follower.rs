@@ -1061,7 +1061,13 @@ impl Follower {
         self.sweep_history();
         // What is not forgotten yet is dropped as the table forgets it,
         // as if it had executed after the restart (task-d111's cut (d)).
-        self.ledger.executed_before(executed.iter().copied());
+        // What the sweep just dropped is not queued: queued, the whole
+        // history would wait at the front for the first execution to let
+        // all but the queue's bound go, unforgotten as far as the queue
+        // knows, and owed to a sweep (#221 review).
+        let table = &self.table;
+        self.ledger
+            .executed_before(executed.iter().copied().filter(|c| !table.forgotten(c)));
         self.learner = Learner::with_mode(through, self.learner.mode());
         // What executes from here on is compared with a donor's by the
         // first ask, which starts here (task-d25).
@@ -2107,11 +2113,24 @@ impl Follower {
         if let Some(payload) = self.payloads.remove(command) {
             self.bindings.remove(&payload.retry_key);
         }
+        if let Some(key) = self.ledger.unbind_bare(command)
+            && self.bindings.get(&key) == Some(command)
+        {
+            self.bindings.remove(&key);
+        }
         self.served_payloads.remove(command);
         self.votes.remove(command);
         self.adopted.remove(command);
         self.held.remove(command);
         self.note_lacking(*command);
+        // Nothing waits on a released command: it will not move here
+        // again, and the sweep that pruned such an entry is rare now
+        // (task-d111's cut (d)).
+        if let Some(waiting) = self.held_waiters.remove(command) {
+            let held = &self.held;
+            self.held_check
+                .extend(waiting.into_iter().filter(|c| held.contains_key(c)));
+        }
     }
 
     /// `decision` with every command this replica holds committed that it
@@ -2762,6 +2781,22 @@ impl Follower {
     /// The durable ledger (journal-durable records only).
     pub const fn ledger(&self) -> &DurableLedger {
         &self.ledger
+    }
+
+    /// What this replica keeps of its history beside the ledger, map by
+    /// map (#221 review).
+    pub fn history_maps(&self) -> crate::summary::HistoryMaps {
+        crate::summary::HistoryMaps {
+            payloads: self.payloads.len(),
+            served_payloads: self.served_payloads.len(),
+            votes: self.votes.len(),
+            adopted: self.adopted.len(),
+            bindings: self.bindings.len(),
+            bare_bindings: self.ledger.bare_bindings(),
+            answer_on_release: self.answer_on_release.len(),
+            held_waiters: self.held_waiters.len(),
+            proposals: 0,
+        }
     }
 
     /// Retry keys bound to a command here (task-d26): the commands still
@@ -3915,9 +3950,14 @@ impl Follower {
         if self.ledger.executions().is_multiple_of(FORGET_CHECK_EVERY) {
             self.check_forgetting();
         }
-        if !self
+        let owed = self
             .ledger
-            .sweep_due(self.config.capacity.saturating_mul(HISTORY_SWEEP))
+            .owed_sweep()
+            .is_some_and(|c| self.table.forgotten(c));
+        if !owed
+            && !self
+                .ledger
+                .sweep_due(self.config.capacity.saturating_mul(HISTORY_SWEEP))
         {
             return;
         }
@@ -3943,7 +3983,11 @@ impl Follower {
     /// [`Follower::sweep_history`] does for it, and the indexes kept with
     /// those maps updated for it alone.
     fn forget_one(&mut self, command: CommandId) {
-        self.ledger.forget(&command);
+        if let Some(key) = self.ledger.forget(&command)
+            && self.bindings.get(&key) == Some(&command)
+        {
+            self.bindings.remove(&key);
+        }
         let payload = self.payloads.remove(&command);
         self.served_payloads.remove(&command);
         self.votes.remove(&command);
@@ -3960,26 +4004,51 @@ impl Follower {
             }
         }
         self.note_sync(command);
+        // Held proposals waiting on a command forgotten here wait on
+        // nothing that will move again: looked at again at the next
+        // adoption, as the sweep's pruning would leave them.
+        if let Some(waiting) = self.held_waiters.remove(&command) {
+            let held = &self.held;
+            self.held_check
+                .extend(waiting.into_iter().filter(|c| held.contains_key(c)));
+        }
     }
 
     /// Debug check of cut (d) against the sweep it replaces: every entry
     /// the sweep would drop now is of a command still in the forget queue,
-    /// unless the queue let one go since the last sweep.
+    /// or one the queue let go unforgotten while a sweep is still owed
+    /// (#221 review): one forgotten after the owed sweep ran would be
+    /// left to the threshold's alone.
     #[cfg(debug_assertions)]
     fn check_forgetting(&self) {
-        if self.ledger.forget_skipped() {
-            return;
-        }
         let queued = self.ledger.forget_queued();
-        let kept = |c: &CommandId| !self.table.forgotten(c) || queued.contains(c);
+        let kept = |c: &CommandId| {
+            !self.table.forgotten(c)
+                || queued.contains(c)
+                || (self.ledger.sweep_owes(c) && self.ledger.owed_sweep().is_some())
+        };
+        let stray = [
+            (
+                "ledger",
+                self.ledger.records().map(|(c, _)| *c).find(|c| !kept(c)),
+            ),
+            ("payloads", self.payloads.keys().copied().find(|c| !kept(c))),
+            (
+                "served payloads",
+                self.served_payloads.iter().copied().find(|c| !kept(c)),
+            ),
+            ("votes", self.votes.keys().copied().find(|c| !kept(c))),
+            ("adopted", self.adopted.keys().copied().find(|c| !kept(c))),
+            (
+                "bindings",
+                self.bindings.values().copied().find(|c| !kept(c)),
+            ),
+        ]
+        .into_iter()
+        .find_map(|(map, c)| c.map(|c| (map, c)));
         debug_assert!(
-            self.ledger.records().all(|(c, _)| kept(c))
-                && self.payloads.keys().all(kept)
-                && self.served_payloads.iter().all(kept)
-                && self.votes.keys().all(kept)
-                && self.adopted.keys().all(kept)
-                && self.bindings.values().all(kept),
-            "a forgotten command's history was kept and is not in the forget queue"
+            stray.is_none(),
+            "a forgotten command's history was kept and is not in the forget queue: {stray:?}"
         );
     }
 
@@ -4857,6 +4926,9 @@ impl Follower {
             // `PayloadConflict` is not.
             Err(InitError::AlreadyInitialized) => {
                 self.bindings.insert(retry_key, command);
+                if !self.payloads.contains_key(&command) {
+                    self.ledger.bound_bare(command, retry_key);
+                }
                 self.rejections.push(FollowerRejection::Duplicate(command));
                 return self.repair_evidence(command);
             }
@@ -6335,6 +6407,13 @@ impl Follower {
             return Vec::new();
         }
         let command = vote.command();
+        // A vote for a command this replica forgot comes too late to
+        // teach it anything, and a set started for it would be dropped
+        // only by a history sweep, which forgetting in order leaves rare
+        // (task-d111 item 4 (d)).
+        if self.table.forgotten(&command) {
+            return Vec::new();
+        }
         let set = self
             .votes
             .entry(command)
