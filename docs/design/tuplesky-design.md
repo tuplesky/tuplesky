@@ -2328,6 +2328,12 @@ Bar 1 (task-d72) gives the five domain loops 0.30 ms an operation on the runner 
 | Loop overhead: run-queue reads, clocks, blake3, drops | 40 / 33 | Passes | 14.5 → 12.6 / 7.9 → 6.9 | 3.2 / 4.7 | 8 / 5 |
 | **The loop** | **330 / 274** | | | | **70 / 40** |
 
+- **Step A has since taken part of three rows** (`answer-on-release`, task-d100). On the runner the loops fell 14% and 12% a command (#98, run 2c). Locally at 120 callers, with it active:
+  - the leader went 332 → 300 µs a command, its API events 4.8 → 2.6 and its passes 12.6 → 10.3;
+  - the followers with frontends went 272 → 239, with API events 4.0 → 2.1 and passes 6.9 → 5.1;
+  - the others went 203 → 196.
+
+  What left is the collector's acknowledgement handling. So the collector and frontend, API transport and loop overhead rows are about 30 µs lower at the leader and the collectors than the table shows. The budgets don't change.
 - **What the budget sums to:** 70 at the leader and 40 at each follower is 230 µs a command over five voters, the parity budget. A follower without a frontend has no collector row, so it must come in under 40.
 - **The allocator and memmove are their own block, across the rows.** They are 16 to 20% of a loop at either role: about 53 to 66 µs a command at the leader and 44 to 55 at a follower. They are paid per command (a payload copied into each row, records cloned between stages, a buffer each message), so they are cut where a row is cut, and also on their own: one buffer a batch, rows written from borrowed payloads. Its budget is half of today's inside each row's.
 - **Kernel leaves follow passes and groups** (12 to 16%, wakeups and syscalls). They fall with the overhead row's and the plumbing row's drivers, and have no budget of their own.
