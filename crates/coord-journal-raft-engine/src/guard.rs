@@ -387,7 +387,8 @@ pub fn torn_tail(bytes: &[u8], offset: usize, seq: u64) -> Result<(), &'static s
             let unfinished = claimed > bytes.len()
                 || bytes[claimed - FOOTER_CHECKSUM_LEN..claimed]
                     .iter()
-                    .all(|&b| b == 0);
+                    .all(|&b| b == 0)
+                || torn_checksum_suffix(bytes, offset, offset + item_offset, claimed, seq);
             (claimed.min(bytes.len()), unfinished, true)
         }
         None => {
@@ -430,6 +431,31 @@ pub fn torn_tail(bytes: &[u8], offset: usize, seq: u64) -> Result<(), &'static s
     } else {
         Err("the broken batch was written whole: no sector of it is unwritten")
     }
+}
+
+/// Whether the batch `bytes[start..end]`, its item block from `items`,
+/// lost only the last one to three bytes of its checksum to an unwritten
+/// sector (Codex review on #211). Such a piece is shorter than
+/// [`has_unwritten_part`] counts, since zeros that short can be a whole
+/// batch's own bytes, and the checksum's surviving bytes are not all
+/// zero, so neither test above sees it. The item block before the
+/// checksum is all there, so its checksum is computed: the piece is torn
+/// when the surviving bytes are that checksum's first bytes. A whole
+/// batch damaged elsewhere would match them only by chance, once in at
+/// least 2^8.
+fn torn_checksum_suffix(bytes: &[u8], start: usize, items: usize, end: usize, seq: u64) -> bool {
+    let piece_start = ((end - 1) / SECTOR_BYTES * SECTOR_BYTES).max(start);
+    let lost = end - piece_start;
+    let checksum_at = end - FOOTER_CHECKSUM_LEN;
+    if lost >= FOOTER_CHECKSUM_LEN || items > checksum_at || end > bytes.len() {
+        return false;
+    }
+    if !bytes[piece_start..end].iter().all(|&b| b == 0) {
+        return false;
+    }
+    let expected =
+        (crc32(&bytes[items..checksum_at]) ^ signature(bytes, seq).unwrap_or(0)).to_le_bytes();
+    bytes[checksum_at..piece_start] == expected[..FOOTER_CHECKSUM_LEN - lost]
 }
 
 /// Whether some part of `bytes[start..end]`, split at sector boundaries,
@@ -816,6 +842,36 @@ mod tests {
     fn signed(seq: u64, entries: usize, items: usize) -> (Vec<u8>, usize, usize) {
         let (bytes, placed) = signed_file(seq, &[(entries, items)]);
         (bytes, placed[0].0, placed[0].1)
+    }
+
+    /// A batch ending one to three bytes past a sector boundary, whose
+    /// last sector never landed, lost only the end of its checksum: a
+    /// torn write, not damage (Codex review on #211). The batch starts at
+    /// 69, after the file header, as in the review's example.
+    #[test]
+    fn a_checksum_cut_short_by_its_last_sector_is_torn() {
+        for lost in 1..FOOTER_CHECKSUM_LEN {
+            let items = SECTOR_BYTES + lost - FILE_HEADER_LEN - BATCH_HEADER_LEN - 25 - 4;
+            let (mut bytes, offset, len) = signed(7, 25, items);
+            let end = offset + len;
+            assert_eq!(end, SECTOR_BYTES + lost);
+            assert!(
+                bytes[end - FOOTER_CHECKSUM_LEN..SECTOR_BYTES]
+                    .iter()
+                    .any(|&b| b != 0),
+                "the surviving checksum bytes are not all zero"
+            );
+            bytes[SECTOR_BYTES..end].fill(0);
+            assert_eq!(torn_tail(&bytes, offset, 7), Ok(()), "{lost} bytes lost");
+            // Damage before the checksum: the surviving bytes are no
+            // longer its prefix, so the batch is refused.
+            bytes[offset + BATCH_HEADER_LEN + 30] ^= 0x01;
+            assert_eq!(
+                torn_tail(&bytes, offset, 7),
+                Err("the broken batch was written whole: no sector of it is unwritten"),
+                "{lost} bytes lost, damaged"
+            );
+        }
     }
 
     /// A broken batch whose header sector never landed, then `count`
