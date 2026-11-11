@@ -298,11 +298,25 @@ case $features_in in
   */*) base_features=${features_in%%/*} features=${features_in#*/} ;;
   *) base_features=$features_in features=$features_in ;;
 esac
+# Each entry a name, or NAME@SECS for one activated under load, SECS
+# whole seconds into the workload (--activate-after).
 for list in "$base_features" "$features"; do
   if [ -n "$list" ]; then
     case $list in
-      *[!a-z,-]* | ,* | *, | *,,*) echo "features must be names separated by commas, or BASE/HEAD of such lists, not $features_in" >&2; exit 2 ;;
+      ,* | *, | *,,*) echo "features must be names separated by commas, or BASE/HEAD of such lists, not $features_in" >&2; exit 2 ;;
     esac
+    IFS=, read -ra entries <<< "$list"
+    for entry in "${entries[@]}"; do
+      name=${entry%@*}
+      case $name in
+        "" | *[!a-z-]*) echo "features must be names (or NAME@SECS) separated by commas, or BASE/HEAD of such lists, not $features_in" >&2; exit 2 ;;
+      esac
+      if [ "$entry" != "$name" ]; then
+        case ${entry#*@} in
+          "" | *[!0-9]*) echo "features: $entry must be NAME@SECS with whole seconds, such as answer-on-release@60" >&2; exit 2 ;;
+        esac
+      fi
+    done
   fi
 done
 
