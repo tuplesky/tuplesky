@@ -310,6 +310,17 @@ struct Knobs {
     /// commits a fast decision over a vote the leader may lose, and the
     /// oracle has to say so.
     early_to_fast_set: bool,
+    /// Chance per step the leader is crashed while it serves catch-up
+    /// pages to a voter behind it: a page with commands on its way to the
+    /// voter, or taken there and not yet executed (task-d106, #213
+    /// review). The voter's next donor, once it leads, is open to the
+    /// same crash, so a voter that restarted behind loses its donor twice
+    /// in a row; the third is spared, so the voter can follow its ballot.
+    donor_crash: u32,
+    /// Chance the execution of a pulled window, at a voter with a
+    /// catch-up page in hand, is put off (row 24): the page stays in hand
+    /// while its donor is crashed and a successor elected.
+    catch_up_lag: u32,
 }
 
 impl Knobs {
@@ -354,6 +365,8 @@ impl Knobs {
         window_crash: 0,
         window_depose: 0,
         early_to_fast_set: false,
+        donor_crash: 0,
+        catch_up_lag: 0,
     };
 
     /// These knobs with task-d98's early proposals and the three faults
@@ -371,7 +384,7 @@ impl Knobs {
     }
 
     /// The checklist's matrix rows 1 to 5, 9, 10, 12 and 14, rows 16
-    /// and 17, and rows 18 to 22.
+    /// and 17, and rows 18 to 24.
     fn row(row: u8) -> Knobs {
         let base = Knobs { row, ..Knobs::BASE };
         match row {
@@ -552,6 +565,23 @@ impl Knobs {
                 total_crash: 6_000,
                 capacity: 8,
                 ..Knobs::row(18)
+            },
+            // A voter restarted behind whose donor is crashed while it
+            // serves the voter's pages, and the next donor too (task-d106,
+            // #213 review): a page lost on its way, and a page taken from
+            // a donor that is gone before the voter executes it. Donors
+            // come back often enough for a second crash at three voters.
+            // A window stopped for a ballot the voter left is counted
+            // (`stopped_ballot`), not required: at these sizes a page
+            // seldom holds a second window, and the activation test
+            // `a_window_stopped_for_a_left_ballot_leaves_the_next_ask_at_the_frontier`
+            // drives that shape.
+            24 => Knobs {
+                donor_crash: 300_000,
+                catch_up_lag: 990_000,
+                crash: 2_500,
+                restart: 40_000,
+                ..base
             },
             _ => unreachable!("not a scenario of the simulator: row {row}"),
         }
@@ -789,6 +819,10 @@ struct Sim {
     probed: Vec<bool>,
     asked_at: Vec<Option<usize>>,
     unanswered: Vec<usize>,
+    /// The node whose page with commands each voter last took, and the
+    /// donors crashed serving it since it last caught up (row 24).
+    donor_of: Vec<Option<u8>>,
+    donors_lost: Vec<u32>,
     /// Oracle 7 (task-d90): the result each command was first released
     /// with, as the bytes of its response, taken when a voter executed it
     /// in memory: what the release rule may hand a caller before the
@@ -895,6 +929,18 @@ struct Stats {
     /// early was not durable (task-d98).
     window_crashes: u32,
     window_deposes: u32,
+    /// Leaders crashed while serving catch-up pages to a voter behind
+    /// them (row 24); of those, the ones with a page the voter had taken
+    /// and not installed, and the ones whose voter had lost a donor the
+    /// same way since it last caught up.
+    donor_crashes: u32,
+    donor_crashes_taken: u32,
+    donor_crashes_again: u32,
+    /// Windows voters stopped for a ballot they had left, and pages
+    /// stopped as stale (task-d106 step 0's counts), summed over every
+    /// follower machine of the run.
+    stopped_ballot: u64,
+    stopped_stale: u64,
 }
 
 /// FNV-1a over `bytes`, continuing from `hash`.
@@ -997,6 +1043,8 @@ impl Sim {
             probed: vec![false; usize::from(n)],
             asked_at: vec![None; usize::from(n)],
             unanswered: vec![0; usize::from(n)],
+            donor_of: vec![None; usize::from(n)],
+            donors_lost: vec![0; usize::from(n)],
             released: BTreeMap::new(),
             lagging: None,
             gate_seen: BTreeSet::new(),
@@ -1410,6 +1458,9 @@ impl Sim {
                         ));
                     }
                 }
+                let paths = f.catch_up_paths();
+                self.stats.stopped_ballot += paths.stopped_ballot;
+                self.stats.stopped_stale += paths.stopped_stale;
                 let q = f.quorum().clone();
                 let (mut l, effects) = Leader::from_recovered(f.into_recovered(), q, &decision);
                 l.set_learning(LearningMode::Full);
@@ -1854,6 +1905,9 @@ impl Sim {
         {
             let most = &mut self.pulled_entries[usize::from(msg.to)];
             *most = (*most).max(entries.len());
+            if !entries.is_empty() {
+                self.donor_of[usize::from(msg.to)] = Some(msg.from);
+            }
         }
         let event = Event::Peer(AuthenticatedPeerMessage::new(
             PeerProvenance::from_transport(r(msg.from), ReplicaIncarnation::new(1).unwrap(), 1),
@@ -2393,6 +2447,9 @@ impl Sim {
         self.net.retain(|m| m.from != i && m.to != i);
         self.held.retain(|m| m.from != i && m.to != i);
         self.window[usize::from(i)] = false;
+        self.fold_paths(i);
+        self.donor_of[usize::from(i)] = None;
+        self.donors_lost[usize::from(i)] = 0;
         let node = &mut self.nodes[usize::from(i)];
         node.role = None;
         node.journal.clear();
@@ -2544,6 +2601,66 @@ impl Sim {
         }
     }
 
+    /// The leader and a voter behind it that it serves catch-up pages
+    /// to (row 24), and whether the voter has taken a page of the
+    /// leader's it has not installed; otherwise a page of the leader's
+    /// with commands is on its way to the voter.
+    fn serving(&self) -> Option<(u8, u8, bool)> {
+        let l = self.leader_index()?;
+        for v in (0..self.n).filter(|v| *v != l) {
+            let Some(Role::Follower(f)) = &self.nodes[usize::from(v)].role else {
+                continue;
+            };
+            // Twice in a row at most: the third donor lives to send its
+            // Sync, so the voter can move to its ballot.
+            if self.donors_lost[usize::from(v)] >= 2 {
+                continue;
+            }
+            if self.donor_of[usize::from(v)] == Some(l) && f.catching_up() {
+                return Some((l, v, true));
+            }
+            let in_flight = self.net.iter().any(|m| {
+                m.from == l
+                    && m.to == v
+                    && matches!(
+                        ProtocolMessage::decode(&m.frame),
+                        Ok(ProtocolMessage::CatchUpPage { entries, .. }) if !entries.is_empty()
+                    )
+            });
+            if in_flight {
+                return Some((l, v, false));
+            }
+        }
+        None
+    }
+
+    /// A voter that executed as far as any live node has caught up: the
+    /// donors it lost before no longer count toward a run (row 24).
+    fn caught_up_again(&mut self) {
+        let most = self
+            .nodes
+            .iter()
+            .filter(|n| n.alive())
+            .map(|n| n.executed.len())
+            .max()
+            .unwrap_or(0);
+        for (k, node) in self.nodes.iter().enumerate() {
+            if node.alive() && node.executed.len() >= most {
+                self.donors_lost[k] = 0;
+            }
+        }
+    }
+
+    /// Add node `i`'s catch-up stops to the run's, before its machine is
+    /// replaced (task-d106 step 0's counts).
+    fn fold_paths(&mut self, i: u8) {
+        if let Some(Role::Follower(f)) = &self.nodes[usize::from(i)].role {
+            let paths = f.catch_up_paths();
+            self.stats.stopped_ballot += paths.stopped_ballot;
+            self.stats.stopped_stale += paths.stopped_stale;
+        }
+    }
+
     /// Whom node `i`'s pacer asks next: the leader for its first two
     /// asks at one frontier, then the other voters in turn.
     fn catch_up_donor(&self, i: u8) -> u8 {
@@ -2671,6 +2788,20 @@ impl Sim {
                     let who = followers[self.below("depose-candidate", followers.len())];
                     self.campaign(who);
                 }
+            } else if self.knobs.donor_crash > 0
+                && alive.len() > majority
+                && let Some((l, v, taken)) = self.serving()
+                && self.chance("donor-crash", self.knobs.donor_crash)
+            {
+                // The donor of a voter behind it, with a page of its own
+                // in flight to the voter or taken there (row 24).
+                self.stats.donor_crashes += 1;
+                self.stats.donor_crashes_taken += u32::from(taken);
+                let k = usize::from(v);
+                self.stats.donor_crashes_again += u32::from(self.donors_lost[k] > 0);
+                self.donors_lost[k] += 1;
+                self.note(|| format!("leader {l} crashes serving node {v} (taken {taken})"));
+                self.crash(l);
             } else if alive.len() > majority && self.chance("crash", self.knobs.crash) {
                 let candidates: Vec<u8> = alive
                     .iter()
@@ -2707,12 +2838,18 @@ impl Sim {
             } else {
                 self.work();
             }
+            if self.knobs.donor_crash > 0 {
+                self.caught_up_again();
+            }
             self.check_halts();
             self.check_budgets();
             self.check_forgetting();
         }
         self.heal();
         self.check_released();
+        for i in 0..self.n {
+            self.fold_paths(i);
+        }
         self.stats.ballots = self.highest_ballot;
         self.stats.gate_windows = self.gate_seen.len();
         let mut decisions = 0xcbf2_9ce4_8422_2325;
@@ -2868,6 +3005,18 @@ impl Sim {
                 }
                 _ => {
                     let i = runnable[self.below("run", runnable.len())];
+                    // A pulled window's execution put off (row 24): the
+                    // next window starts only once it has run, so a Sync
+                    // of a later ballot can be installed in between.
+                    if self.knobs.catch_up_lag > 0
+                        && matches!(
+                            &self.nodes[usize::from(i)].role,
+                            Some(Role::Follower(f)) if f.catching_up()
+                        )
+                        && self.chance("catch-up-lag", self.knobs.catch_up_lag)
+                    {
+                        return;
+                    }
                     self.execute(i);
                 }
             }
@@ -3736,6 +3885,11 @@ fn run_row(row: u8) {
                     totals.left_out_executed += s.left_out_executed;
                     totals.answered_on_release += s.answered_on_release;
                     totals.released_again += s.released_again;
+                    totals.donor_crashes += s.donor_crashes;
+                    totals.donor_crashes_taken += s.donor_crashes_taken;
+                    totals.donor_crashes_again += s.donor_crashes_again;
+                    totals.stopped_ballot += s.stopped_ballot;
+                    totals.stopped_stale += s.stopped_stale;
                 }
                 Err(e) => failures.push(e),
             }
@@ -3822,6 +3976,17 @@ fn run_row(row: u8) {
         assert!(
             totals.answered_on_release > 0,
             "row {row} answered no marked command on its release: {totals:?}"
+        );
+    }
+    // Row 24 is defined by its donors crashed (task-d106, #213 review):
+    // with a page on its way, with a page taken, and twice in a row for
+    // one voter. Healing then requires every voter caught up.
+    if row == 24 && std::env::var_os("PROTOCOL_SIM_NO_CATCH_UP").is_none() {
+        assert!(
+            totals.donor_crashes > totals.donor_crashes_taken
+                && totals.donor_crashes_taken > 0
+                && totals.donor_crashes_again > 0,
+            "row 24 missed a donor crash: {totals:?}"
         );
     }
     // Oracle 9 ran.
@@ -3960,6 +4125,11 @@ fn row_18_fails_when_the_fast_set_follower_gets_the_proposal_early_too() {
 #[test]
 fn row_23_early_proposals_with_late_execution() {
     run_row(23);
+}
+
+#[test]
+fn row_24_a_voter_behind_loses_the_donor_serving_its_pages() {
+    run_row(24);
 }
 
 #[test]

@@ -402,6 +402,15 @@ impl Machine {
         }
     }
 
+    /// How this replica's catch-up asks and pages went, by path
+    /// (task-d106 step 0). A leader asks for none.
+    pub fn catch_up_paths(&self) -> coord_consensus::CatchUpPaths {
+        match self {
+            Machine::Leader(_) => coord_consensus::CatchUpPaths::default(),
+            Machine::Follower(m) => m.catch_up_paths(),
+        }
+    }
+
     /// Ask `donor` for the commands it executed after this replica's
     /// frontier (task-d08). A leader has nobody to ask.
     pub fn request_catch_up(&mut self, donor: coord_types::ids::ReplicaId) -> Vec<Effect> {
@@ -640,6 +649,31 @@ impl core::fmt::Display for DriveError {
 
 impl core::error::Error for DriveError {}
 
+/// Catch-up asks a donor answered with nothing, by why (task-d106
+/// step 0). Each is silent at the requester, which only stops getting
+/// pages, so a donor says it here.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Unserved {
+    /// From this node itself, or from a peer that is not a voter.
+    pub sender: u64,
+    /// At a ballot this node does not serve at (`serves_catch_up_at`).
+    pub ballot: u64,
+    /// While this node is halted or diverged.
+    pub stopped: u64,
+    /// After this node's own frontier: nothing executed past it.
+    pub nothing_after: u64,
+    /// With no executed order readable from this node's rows.
+    pub no_order: u64,
+    /// With an executed order that starts above the position asked, or
+    /// holds nothing.
+    pub order_above: u64,
+    /// With no snapshot of this node's store.
+    pub no_snapshot: u64,
+    /// With the first command's rows unreadable, or its executed row at
+    /// another position than the order's.
+    pub first_row: u64,
+}
+
 /// One voter: its machine, its store and the sends it is holding.
 ///
 /// `P` is where this replica's batches become durable. A voter on the
@@ -676,6 +710,9 @@ pub struct Node<P: Persistence> {
     order: Option<crate::catch_up::ExecutedOrder>,
     /// Catch-up pages this node served (diagnostic, task-d08).
     pub pages_served: u64,
+    /// Catch-up asks this node answered with nothing, by why
+    /// (diagnostic, task-d106 step 0).
+    pub unserved: Unserved,
     /// Storage facts reached the outbox outside a round, so it may hold
     /// sends they released that no round has handed out yet.
     unreleased: bool,
@@ -812,6 +849,7 @@ impl<P: Persistence> Node<P> {
             won: None,
             order: None,
             pages_served: 0,
+            unserved: Unserved::default(),
             unreleased: false,
             floor: None,
             grouped: false,
@@ -1663,29 +1701,43 @@ impl<P: Persistence> Node<P> {
         let mut out = Outbound::default();
         let machine = self.machine();
         let identity = machine.identity();
-        if from == identity.replica
-            || !identity.voters.contains(&from)
-            || !machine.serves_catch_up_at(&ballot)
-            || machine.halted().is_some()
-            || machine.catch_up_divergence().is_some()
-        {
+        if from == identity.replica || !identity.voters.contains(&from) {
+            self.unserved.sender += 1;
+            return out;
+        }
+        if !machine.serves_catch_up_at(&ballot) {
+            self.unserved.ballot += 1;
+            return out;
+        }
+        if machine.halted().is_some() || machine.catch_up_divergence().is_some() {
+            self.unserved.stopped += 1;
             return out;
         }
         let epoch = identity.epoch;
         let through = machine.executed_through();
         if after >= through {
+            self.unserved.nothing_after += 1;
             return out;
         }
         if self.order.is_none() {
             self.order = crate::catch_up::ExecutedOrder::read(&self.applier);
         }
         let Some(order) = self.order.as_ref() else {
+            self.unserved.no_order += 1;
             return out;
         };
-        let entries = crate::catch_up::page(&self.applier, order, epoch, after, through);
-        if entries.is_empty() {
-            return out;
-        }
+        let entries = match crate::catch_up::page(&self.applier, order, epoch, after, through) {
+            Ok(entries) => entries,
+            Err(why) => {
+                let count = match why {
+                    crate::catch_up::NoPage::OrderAbove => &mut self.unserved.order_above,
+                    crate::catch_up::NoPage::Snapshot => &mut self.unserved.no_snapshot,
+                    crate::catch_up::NoPage::FirstRow => &mut self.unserved.first_row,
+                };
+                *count += 1;
+                return out;
+            }
+        };
         self.pages_served += 1;
         out.peer.push((
             PeerId {
