@@ -842,6 +842,24 @@ class WakeupTests(unittest.TestCase):
             "| 102 | domain loop | 1 | 100.00 | 0 | 5000 | 0.00 |",
         ])
 
+    def test_a_voter_restarted_in_the_window_counts_both_boots(self):
+        # 102 killed after 10:00:20, its new boot 103 started before 10:00:41.
+        wakes = (
+            "time,pid,start,kind,threads,cpu_s,runq_s,slices\n"
+            "2026-09-27 10:00:00.500000,101,7,domain loop,1,1.0,0.5,100\n"
+            "2026-09-27 10:00:00.500000,102,7,domain loop,1,1.0,0.0,100\n"
+            "2026-09-27 10:00:20.000000,101,7,domain loop,1,2.0,1.0,300\n"
+            "2026-09-27 10:00:20.000000,102,7,domain loop,1,1.2,0.0,150\n"
+            "2026-09-27 10:00:41.500000,101,7,domain loop,1,3.0,1.5,600\n"
+            "2026-09-27 10:00:41.500000,103,9,domain loop,1,0.4,0.0,40\n"
+        )
+        rows = [line for line in self.summary(wakes).splitlines() if line.startswith(("| 101", "| 102", "| 103"))]
+        self.assertEqual(rows, [
+            "| 101 (leader) | domain loop | 1 | 500.00 | 2000 | 4000 | 1000.00 |",
+            "| 102 | domain loop | 1 | 50.00 | 0 | 4000 | 0.00 |",
+            "| 103 | domain loop | 1 | 40.00 | 0 | 10000 | 0.00 |",
+        ])
+
     def test_no_file_or_a_row_that_does_not_parse_no_table(self):
         self.assertNotIn("Wakeups and the wait for a core", self.summary(None))
         self.assertNotIn("Wakeups and the wait for a core", self.summary(self.WAKES + "x,1,2,3,4,5,6,7\n"))

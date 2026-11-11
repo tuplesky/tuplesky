@@ -785,10 +785,15 @@ def wakeup_table(rows: list[dict], wakes: dict, start: datetime.datetime, end: d
     after = [r["time"] for r in rows if r["time"] >= end and r["time"] in wakes]
     if not before or not after or not completed:
         return []
-    t0, t1 = wakes[before[-1]], wakes[after[0]]
-    procs = [k for k in t1 if k in t0]
+    # Every boot over the window, a kill run's restarted voters too: each
+    # from its reading at the window's start (none for one started in it)
+    # to its last reading in the window.
+    boots = boots_over(wakes, before[-1], after[0])
+    procs = list(boots)
     if not procs:
         return []
+    t0 = {k: first or {} for k, (first, _) in boots.items()}
+    t1 = {k: last for k, (_, last) in boots.items()}
 
     def delta(k, kind):
         a, b = t0[k].get(kind), t1[k].get(kind)
