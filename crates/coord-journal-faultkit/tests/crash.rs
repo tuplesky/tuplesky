@@ -63,12 +63,15 @@ fn a_crash_at_every_operation_keeps_every_acknowledged_group() {
     }
 }
 
-/// Every remains a sector-atomic device can leave (every subset of the
-/// unsynced sectors, [`Tail::Sectors`]) at every crash point, over files
-/// small enough that the workload rotates: the guard opens each with
-/// every acknowledged group.
+/// Every subset of the unsynced sectors ([`Tail::Sectors`]) at every
+/// crash point, over files small enough that the workload rotates: the
+/// guard opens each with every acknowledged group. One mask applies to
+/// every dirty file at once, so where two files are dirty the combinations
+/// across them are those of the same mask, and the seeded sector tears
+/// sample the rest (#211 re-review): within a file this is exhaustive,
+/// across files it is not.
 #[test]
-fn every_sector_subset_at_every_crash_point_over_rotating_files_keeps_every_group() {
+fn each_sector_subset_on_every_dirty_file_at_every_crash_point_keeps_every_group() {
     let small = JournalOptions {
         target_file_size_bytes: 1024,
         ..options()

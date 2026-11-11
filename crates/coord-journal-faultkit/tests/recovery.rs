@@ -316,7 +316,7 @@ fn a_zeroed_header_on_the_last_file_with_batches_after_it_is_refused() {
         Err(OpenError::Corrupt(reason)) => {
             assert!(reason.contains(last.as_str()), "{reason}");
             assert!(
-                reason.contains("the file header is zeros, but a whole batch follows it"),
+                reason.contains("the file header is zeros, but data follows it"),
                 "{reason}"
             );
         }
@@ -369,4 +369,111 @@ fn tolerate_tail_never_opens_short_after_a_byte_torn_crash() {
     }
     assert!(held > refused, "held {held}, refused {refused}");
     eprintln!("byte tears: held {held}, refused {refused}");
+}
+
+/// Copy the files of `from` (no subdirectories) into a new `to`.
+fn copy_dir(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+    }
+}
+
+/// Reopen `root` over the kit under `plan`, and return what the open's
+/// own writes did to the device.
+fn reopen_on_the_kit(
+    root: &Path,
+    options: &JournalOptions,
+    plan: FaultPlan,
+) -> std::sync::Arc<coord_journal_faultkit::Shared> {
+    let (fs, shared) = FaultFs::new(plan);
+    let opened = catch_unwind(AssertUnwindSafe(|| {
+        RaftEngineJournal::open_existing_with_file_system(root, identity(), options, fs)
+    }));
+    if let Ok(Ok(journal)) = opened {
+        quietly_drop(journal);
+    }
+    shared
+}
+
+/// A crash inside recovery's own writes (#210 and #211 re-reviews):
+/// recovery truncates a torn tail and syncs, and until now it only ran on
+/// the real file system. Each crash image of the workload, with its tail
+/// torn by sectors, is reopened on the kit; every operation that reopen
+/// issues is a crash point, under both tails; and the image that crash
+/// leaves must still reopen with every acknowledged group, or be refused
+/// where the first reopen refused it. Over fixed-size and rotating files.
+#[test]
+fn a_crash_inside_recovery_keeps_every_acknowledged_group() {
+    let small = JournalOptions {
+        target_file_size_bytes: 1024,
+        ..options()
+    };
+    let (mut images, mut recoveries, mut points) = (0, 0, 0);
+    for options in [options(), small] {
+        let options = with_options(&options);
+        // Count the workload's operations under these options.
+        let total = {
+            let dir = tempfile::tempdir().unwrap();
+            let (fs, shared) = FaultFs::new(FaultPlan::default());
+            workload_with(&dir.path().join("j"), fs, &shared, &options);
+            shared.ops()
+        };
+        for k in 1..=total {
+            for seed in 1..=2 {
+                let dir = tempfile::tempdir().unwrap();
+                let image = dir.path().join("image");
+                let plan = FaultPlan {
+                    crash_after: Some(k),
+                    ..FaultPlan::default()
+                };
+                let (fs, shared) = FaultFs::new(plan);
+                let acked = workload_with(&image, fs, &shared, &options);
+                shared
+                    .materialize(Tail::SeededSectors(k * 16 + seed))
+                    .unwrap();
+                if !acked.created {
+                    continue;
+                }
+                images += 1;
+                // What a fault-free reopen writes.
+                let probe = dir.path().join("probe");
+                copy_dir(&image, &probe);
+                let writes = reopen_on_the_kit(&probe, &options, FaultPlan::default())
+                    .log()
+                    .iter()
+                    .filter(|op| {
+                        matches!(op, Op::Write { .. } | Op::SetLen { .. } | Op::Sync { .. })
+                    })
+                    .count();
+                if writes == 0 {
+                    continue;
+                }
+                recoveries += 1;
+                let ops = reopen_on_the_kit(&probe, &options, FaultPlan::default()).ops();
+                for j in 1..=ops {
+                    for tail in [Tail::None, Tail::All] {
+                        let root = dir.path().join(format!("r{j}{tail:?}"));
+                        copy_dir(&image, &root);
+                        let plan = FaultPlan {
+                            crash_after: Some(j),
+                            ..FaultPlan::default()
+                        };
+                        let shared = reopen_on_the_kit(&root, &options, plan);
+                        shared.materialize(tail).unwrap();
+                        points += 1;
+                        let case = format!(
+                            "crash after {k}, seed {seed}, then in recovery after {j}, {tail:?}"
+                        );
+                        check_with(&root, &acked, &case, &options);
+                    }
+                }
+            }
+        }
+    }
+    assert!(recoveries > 0, "no reopen wrote anything");
+    eprintln!(
+        "recovery crashes: {images} images, {recoveries} recovered with writes, {points} crash points"
+    );
 }

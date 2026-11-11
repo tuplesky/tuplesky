@@ -79,9 +79,12 @@
 //! * the file cut at a sector or batch boundary (a cut on a batch boundary
 //!   never reaches the guard: the engine reads a clean end);
 //! * the last file deleted;
-//! * two damages to one batch: its length flipped past a whole batch
-//!   together with its own checksum or its item offset. The batch inside
-//!   the extent it claims isn't searched for (above).
+//! * two damages to one batch: its length flipped to claim an end in the
+//!   zeros past the data, together with any byte its item block's
+//!   checksum covers (not only the checksum itself) or its item offset.
+//!   That batch and every later one go, since nothing inside the claimed
+//!   extent is searched (above); on a file's first batch the open then
+//!   answers `NotInitialized` (#211 re-review).
 //!
 //! **What it refuses that a crash can leave:**
 //! * a purge writes several batches to the `.rewrite` queue before it
@@ -92,15 +95,27 @@
 //!   caller yet, so this can't happen today;
 //! * where a broken batch's header doesn't decode, the bytes after it are
 //!   searched, so a tenant's payload holding a whole batch's shape, in a
-//!   write torn inside its header's sector, is refused. The refusal names
-//!   the file and the offset; the voter is recovered from its peers, and if
-//!   a majority refuses, an operator reads the bytes there and decides
-//!   whether to truncate at that offset by hand, which is the call the
-//!   guard declined to make.
+//!   write torn inside its header's sector, is refused. So is a payload
+//!   with too many batch-shaped headers to rule one out within the
+//!   search's bound (a few passes over the tail).
 //!
-//! A crash during recovery's own truncation is not tested yet, and the
-//! tests reopen on the real file system, so recovery's truncation and the
-//! guard's read never run on the fault seam.
+//! **After a refusal.** It names the file, the offset and the reason. The
+//! voter stays down: it is rebuilt from its peers by replacing it
+//! (task-d41, with task-d32's learner), and until that lands there is no
+//! supported repair, which a domain of three or five tolerates for one
+//! voter. A majority refusing is a lost quorum, and recovery is a restore
+//! from backup (`docs/operations/disaster-recovery.md`). Truncating by
+//! hand at the named offset is not a supported step: it discards every
+//! acknowledged group after that offset.
+//!
+//! **A file header of zeros** with data after it is refused: a header is
+//! synced before anything in its file is acknowledged (by `rotate_imp`
+//! for a rotated file, and with the identity record by `create`, which
+//! also syncs the directory, for the first), so only damage, or a creation
+//! never acknowledged, leaves one.
+//!
+//! The kit's recovery test crashes at every operation recovery issues,
+//! its truncation and syncs among them, on the fault seam.
 //!
 //! Reads go through the wrapped file system, so the check sees what the
 //! engine sees.
@@ -341,21 +356,20 @@ pub fn torn_tail(bytes: &[u8], offset: usize, seq: u64) -> Result<(), &'static s
         return Ok(());
     }
     if offset == 0 {
-        // Any sync of a file persists its header, so a header that was
-        // never written means nothing in the file was ever synced: unless
-        // a whole batch follows it, which only a sync could have put
-        // there. A zeroed header no longer says the file's version, so
-        // its batches are tried signed and unsigned.
+        // A file's header is synced before anything in the file is
+        // acknowledged: a rotated file's by `rotate_imp` before its first
+        // batch, and the first file's with the identity record, which
+        // `create` syncs, together with the directory, before it returns
+        // (#210, #211 re-review). So a header of zeros with data after it
+        // is damage, never a crash's: only a creation that was never
+        // acknowledged could leave one, and refusing it loses nothing.
         if !bytes[..FILE_HEADER_LEN.min(bytes.len())]
             .iter()
             .all(|&b| b == 0)
         {
             return Err("the file header does not decode, and it is not unwritten");
         }
-        if batches_follow(bytes, 0, Some(seq as u32)) || batches_follow(bytes, 0, None) {
-            return Err("the file header is zeros, but a whole batch follows it");
-        }
-        return Ok(());
+        return Err("the file header is zeros, but data follows it");
     }
     // Where the one write in flight would have ended, and whether its
     // end is known.
@@ -398,8 +412,18 @@ pub fn torn_tail(bytes: &[u8], offset: usize, seq: u64) -> Result<(), &'static s
     // anything a batch looks like. Where it doesn't, the write is taken to
     // run to the end of the file, and a whole batch in it can only mean
     // the header was damaged with batches after it.
-    if !end_known && batches_follow(bytes, offset, signature(bytes, seq)) {
-        return Err("a whole batch follows the broken one, so it was not the last write");
+    if !end_known {
+        match batches_follow(bytes, offset, signature(bytes, seq)) {
+            Scan::NoneFollows => {}
+            Scan::Follows => {
+                return Err("a whole batch follows the broken one, so it was not the last write");
+            }
+            Scan::OverBudget => {
+                return Err(
+                    "too many batch-shaped headers after the broken one to rule out a whole batch",
+                );
+            }
+        }
     }
     if unfinished || has_unwritten_part(bytes, offset, end) {
         Ok(())
@@ -431,17 +455,62 @@ fn has_unwritten_part(bytes: &[u8], start: usize, end: usize) -> bool {
     false
 }
 
+/// What [`batches_follow`] found.
+#[derive(Debug, PartialEq, Eq)]
+enum Scan {
+    NoneFollows,
+    Follows,
+    /// The checksums it would have to compute exceed [`scan_budget`], so it
+    /// stopped without an answer.
+    OverBudget,
+}
+
+/// The most bytes [`batches_follow`] checksums for a tail of `len` bytes:
+/// a few passes over it. A torn write's tail holds few batch-shaped
+/// headers, each checksummed only up to the data's end, so this is far
+/// from reached; a tail crafted with thousands of them is refused instead
+/// of read for minutes (#211 re-review: 7 KB of such headers in a 64 MiB
+/// file took 74 s).
+fn scan_budget(len: usize) -> usize {
+    len.saturating_mul(4).saturating_add(1 << 20)
+}
+
 /// Whether a whole batch starts after `offset`: a well-formed header
 /// whose item block's checksum matches at the end the header claims. A
 /// header alone proves nothing (the broken batch's own header, read a byte
 /// later, is often well formed); a matching checksum does.
-fn batches_follow(bytes: &[u8], offset: usize, signature: Option<u32>) -> bool {
+///
+/// A whole batch ends in its checksum, so it ends within
+/// [`FOOTER_CHECKSUM_LEN`] bytes of the last non-zero byte or before it: a
+/// candidate claiming an end further out is skipped without a checksum.
+/// What remains is bounded by [`scan_budget`].
+fn batches_follow(bytes: &[u8], offset: usize, signature: Option<u32>) -> Scan {
+    batches_follow_counting(bytes, offset, signature).0
+}
+
+/// [`batches_follow`], and the bytes it checksummed.
+fn batches_follow_counting(bytes: &[u8], offset: usize, signature: Option<u32>) -> (Scan, usize) {
     let last = bytes.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
-    (offset + 1..last).any(|at| {
-        batch_header(&bytes[at..]).is_some_and(|(len, item_offset)| {
-            at + len <= bytes.len() && whole_at(bytes, at + item_offset, at + len, signature)
-        })
-    })
+    let reach = (last + FOOTER_CHECKSUM_LEN).min(bytes.len());
+    let budget = scan_budget(last.saturating_sub(offset));
+    let mut work = 0usize;
+    for at in offset + 1..last {
+        let Some((len, item_offset)) = batch_header(&bytes[at..]) else {
+            continue;
+        };
+        let end = at.saturating_add(len);
+        if end > reach {
+            continue;
+        }
+        work = work.saturating_add(len - item_offset);
+        if work > budget {
+            return (Scan::OverBudget, work);
+        }
+        if whole_at(bytes, at + item_offset, end, signature) {
+            return (Scan::Follows, work);
+        }
+    }
+    (Scan::NoneFollows, work)
 }
 
 /// Whether the item block `bytes[items..end]` ends in its own checksum.
@@ -683,18 +752,24 @@ mod tests {
         bytes[..FILE_HEADER_LEN].fill(0);
         assert_eq!(
             torn_tail(&bytes, 0, 9),
-            Err("the file header is zeros, but a whole batch follows it")
+            Err("the file header is zeros, but data follows it")
         );
         // A version-1 file's batches are unsigned.
         let (mut unsigned, _) = signed_file(0, &[(300, 20)]);
         unsigned[..FILE_HEADER_LEN].fill(0);
         assert!(torn_tail(&unsigned, 0, 9).is_err());
         // A first write torn with its first sector lost: a zero header,
-        // and after it the rest of one batch that never ended.
+        // and after it the rest of one batch that never ended. A header is
+        // synced before anything in its file is acknowledged, so this is
+        // refused too: it empties a last file holding one batch otherwise
+        // (#211 re-review), and only an unacknowledged creation leaves it.
         let (mut torn, offset, len) = signed(9, 900, 40);
         torn[..SECTOR_BYTES].fill(0);
         assert!(offset < SECTOR_BYTES && offset + len > SECTOR_BYTES);
-        assert_eq!(torn_tail(&torn, 0, 9), Ok(()));
+        assert_eq!(
+            torn_tail(&torn, 0, 9),
+            Err("the file header is zeros, but data follows it")
+        );
     }
 
     #[test]
@@ -741,6 +816,65 @@ mod tests {
     fn signed(seq: u64, entries: usize, items: usize) -> (Vec<u8>, usize, usize) {
         let (bytes, placed) = signed_file(seq, &[(entries, items)]);
         (bytes, placed[0].0, placed[0].1)
+    }
+
+    /// A broken batch whose header sector never landed, then `count`
+    /// batch-shaped headers in what follows, each claiming an end `claim`
+    /// bytes before the end of `total` bytes of non-zero data.
+    fn crafted(total: usize, count: usize, claim: usize) -> (Vec<u8>, usize) {
+        let offset = 4096;
+        let mut bytes = vec![0x5a; total];
+        bytes[..offset].fill(0x11);
+        // The broken batch's header sector: unwritten.
+        bytes[offset..offset + SECTOR_BYTES].fill(0);
+        for i in 0..count {
+            let at = offset + SECTOR_BYTES + 64 * i;
+            let len = (total - claim - at) as u64;
+            bytes[at..at + 16].copy_from_slice(&header(len, 16));
+        }
+        (bytes, offset)
+    }
+
+    /// The scan for a whole batch after a broken one costs a bounded
+    /// number of checksummed bytes however many batch-shaped headers the
+    /// payload holds, and refuses where it would run over (#211
+    /// re-review: 7 KB of such headers in a 64 MiB file took 74 s).
+    #[test]
+    fn the_scan_after_a_broken_batch_is_bounded() {
+        let total = 2 << 20;
+        let (bytes, offset) = crafted(total, 128, 0);
+        let (scan, work) = batches_follow_counting(&bytes, offset, None);
+        assert_eq!(scan, Scan::OverBudget);
+        let budget = scan_budget(total - offset);
+        assert!(work <= budget + total, "work {work}, budget {budget}");
+        assert_eq!(
+            torn_tail(&bytes, offset, 1),
+            Err("too many batch-shaped headers after the broken one to rule out a whole batch")
+        );
+        // A few such headers fit the budget and are read as the payload.
+        let (bytes, offset) = crafted(total, 2, 0);
+        assert_eq!(
+            batches_follow_counting(&bytes, offset, None).0,
+            Scan::NoneFollows
+        );
+    }
+
+    /// A candidate claiming an end past the data costs no checksum: a whole
+    /// batch ends in its checksum, so within four bytes of the last
+    /// non-zero byte.
+    #[test]
+    fn a_candidate_ending_past_the_data_costs_nothing() {
+        let total = 1 << 20;
+        let (mut bytes, offset) = crafted(total, 512, 0);
+        // Zeros after the data: every header claims an end in them.
+        bytes.resize(total + 64 * 1024, 0);
+        for i in 0..512 {
+            let at = offset + SECTOR_BYTES + 64 * i;
+            let len = (total + 1024 - at) as u64;
+            bytes[at..at + 16].copy_from_slice(&header(len, 16));
+        }
+        let (scan, work) = batches_follow_counting(&bytes, offset, None);
+        assert_eq!((scan, work), (Scan::NoneFollows, 0));
     }
 
     #[test]
