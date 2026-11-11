@@ -3525,6 +3525,7 @@ impl Follower {
             .from
             .unwrap_or_else(|| self.learner.executed_through());
         let frame = ProtocolMessage::CatchUpRequest { ballot, after }.encode();
+        self.catch_up.asked_after = Some(after);
         if let Some(outbox) = self.outbox.as_mut() {
             outbox.publish(PendingSend {
                 context,
@@ -3582,19 +3583,36 @@ impl Follower {
             return Vec::new();
         }
         let executed = self.learner.executed_through();
+        // A page that starts below the frontier, outside the comparison
+        // after a boot: this replica executed past where it asked from
+        // while the page was on its way, from what the leader's traffic
+        // decided. What it carries past the frontier is taken; dropped
+        // whole, as before, the chain of asks broke and waited for the
+        // pacer, a second each time, which held a voter behind the
+        // domain's rate under load (#98, 6799183006).
+        let stale = self.catch_up.since_boot.from.is_none() && after < executed;
         let ignored: Option<Path> = if self.catch_up.busy() {
             Some(|p| &mut p.ignored_busy)
         } else if self.halted.is_some() || self.diverged.is_some() {
             Some(|p| &mut p.ignored_stopped)
         } else if self.campaign.is_some() {
             Some(|p| &mut p.ignored_campaign)
-        } else if after != self.catch_up.since_boot.from.unwrap_or(executed) {
+        } else if after != self.catch_up.since_boot.from.unwrap_or(executed) && !stale {
             Some(|p| &mut p.ignored_after)
         } else {
             None
         };
         if let Some(path) = ignored {
             *path(&mut self.catch_up.paths) += 1;
+            if self.catch_up.busy() && self.catch_up.asked_after == Some(after) {
+                // The answer to the latest ask, while a window is still in
+                // hand: a late page of an earlier ask, taken and asking
+                // nothing. Dropped here, nothing would ask again once that
+                // window ran, and the chain would wait for the pacer. The
+                // next ask goes out when the window has executed, from the
+                // frontier, as one owed by this page.
+                self.catch_up.continue_from.get_or_insert(from);
+            }
             return Vec::new();
         }
         let offered = entries.len();
@@ -3649,6 +3667,16 @@ impl Follower {
             // Executions this replica has made past the page are still to
             // be compared: asked for at once, as a full page's rest is.
             self.catch_up.continue_from = Some(from);
+        }
+        if stale {
+            self.catch_up.paths.taken_stale += 1;
+            // One ask a page: only the answer to the last ask goes on.
+            // A late answer to an earlier one leaves the asking to the
+            // page the last ask brings.
+            if self.catch_up.asked_after != Some(after) {
+                self.catch_up.paths.stale_unasked += 1;
+                self.catch_up.continue_from = None;
+            }
         }
         if !self.catch_up.busy() {
             // Nothing to execute: a page of comparisons only.
