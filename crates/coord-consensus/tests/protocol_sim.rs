@@ -3088,9 +3088,15 @@ impl Sim {
         // at most one page past what they take (task-d28).
         let report_pages = (2 * capacity).div_ceil(coord_consensus::MAX_PAGE_ENTRIES) + 1;
         // The ledger, payloads, votes and bindings: the live and recently
-        // retired commands, swept once they pass four tables; the peak is
-        // those four, the live table and the retirement window the sweep
-        // goes down to, six tables in all.
+        // retired commands. A sweep keeps the live table and the
+        // retirement window, two tables, and after one that kept no more
+        // than that the next is due once they pass four (task-d110: due
+        // once what was added and executed since passes half of what it
+        // kept, which a ledger past four tables has). The peak is those
+        // four, the live table and the retirement window, six tables in
+        // all. A voter behind keeps more live records than a table, holds
+        // up to half again what its last sweep kept, and comes back under
+        // as it executes them; no row here takes a voter that far behind.
         let kept = 6 * capacity;
         for i in 0..self.n {
             let node = &self.nodes[usize::from(i)];

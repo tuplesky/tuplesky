@@ -1035,13 +1035,17 @@ impl Leader {
     /// forgotten commands, as a follower does (task-d05). A forgotten
     /// command executed long ago: nothing is decided, released or served
     /// for it any more.
+    ///
+    /// Due as a follower's is (task-d110): past a multiple of the table,
+    /// once the records added and the commands executed since the last
+    /// sweep come to more than half of what it kept.
     fn forget_history(&mut self) {
-        if self.ledger.len()
-            <= self
-                .config
+        self.ledger.executed();
+        if !self.ledger.sweep_due(
+            self.config
                 .capacity
-                .saturating_mul(crate::follower::HISTORY_SWEEP)
-        {
+                .saturating_mul(crate::follower::HISTORY_SWEEP),
+        ) {
             return;
         }
         let table = &self.table;
@@ -1059,6 +1063,7 @@ impl Leader {
         // executed answer (`propose`), so its binding is not needed for
         // that, and kept it grew with every key ever submitted (task-d26).
         self.bindings.retain(|_, c| !table.forgotten(c));
+        self.ledger.swept();
     }
 
     /// Propose a known command under this ballot with `deps`. With
@@ -3920,5 +3925,102 @@ mod tests {
         leader.table.take_examined();
         assert_eq!(leader.next_executable(), Some(ready));
         assert_eq!(leader.table.take_examined(), 1);
+    }
+
+    /// task-d110 at the leader: the leader's `forget_history` asks the
+    /// same rule of the same ledger as a follower's (#217 review, point
+    /// 3). A leader that took over a ledger it holds committed and
+    /// unexecuted sweeps once, not again in the nine calls after, and
+    /// again only once half of what it kept has been executed.
+    #[test]
+    fn a_leader_behind_sweeps_once_per_half_of_what_it_keeps() {
+        let epoch = ConfigurationEpoch::new(1).unwrap();
+        let voters: BTreeSet<ReplicaId> = (0..3).map(r).collect();
+        let genesis = Ballot {
+            epoch,
+            number: 0,
+            leader: r(0),
+        };
+        let config = crate::follower::FollowerConfig {
+            identity: ConfigurationIdentity {
+                cluster: ClusterId([1; 16]),
+                domain: DomainId([2; 16]),
+                epoch,
+                voters: voters.clone(),
+                replica: r(1),
+                incarnation: ReplicaIncarnation::new(1).unwrap(),
+                role: ReplicaRole::Voter,
+            },
+            quorum: BallotConfiguration::c2(epoch, genesis, voters.clone(), [r(0), r(1)].into())
+                .unwrap(),
+            genesis,
+            frontend: FRONTEND,
+            capacity: 8,
+        };
+        let id = |n: u64| {
+            let mut d = [0u8; 32];
+            d[..8].copy_from_slice(&n.to_be_bytes());
+            d[8] = 7;
+            CommandId(Digest32(d))
+        };
+        let behind = 1_000u64;
+        // Committed and waiting for their payloads: nothing executes, so
+        // the table forgets none of it.
+        let rows: Vec<(CommandId, crate::CommandRecord)> = (0..behind)
+            .map(|n| {
+                let key = vec![(n % 5) as u8];
+                (
+                    id(n),
+                    crate::CommandRecord {
+                        phase: Phase::Commit,
+                        deps: Vec::new(),
+                        keys: vec![key.clone()],
+                        payload: Some(Digest32([4; 32])),
+                        paths: vec![(key, Digest32([3; 32]))],
+                        synced_seq: Some(n + 1),
+                        path: Digest32([3; 32]),
+                    },
+                )
+            })
+            .collect();
+        let follower = crate::follower::Follower::recover_with_syncs(
+            config,
+            None,
+            None,
+            rows,
+            [],
+            [],
+            ExecutionPosition::ZERO,
+        );
+        let ballot = Ballot {
+            epoch,
+            number: 1,
+            leader: r(1),
+        };
+        let quorum = BallotConfiguration::c2(epoch, ballot, voters, [r(0), r(1)].into()).unwrap();
+        let decision = SyncDecision {
+            ballot,
+            source_ballot: genesis,
+            entries: BTreeMap::new(),
+            reproposed: BTreeSet::new(),
+        };
+        let (mut leader, _) = Leader::from_recovered(follower.into_recovered(), quorum, &decision);
+        assert_eq!(leader.ledger.len(), behind as usize);
+        let before = leader.ledger.sweeps();
+        leader.forget_history();
+        assert_eq!(leader.ledger.sweeps(), before + 1, "swept once at first");
+        for _ in 0..9 {
+            leader.forget_history();
+        }
+        assert_eq!(
+            leader.ledger.sweeps(),
+            before + 1,
+            "not again per execution"
+        );
+        assert_eq!(leader.ledger.len(), behind as usize, "nothing forgotten");
+        for _ in 0..behind / 2 {
+            leader.forget_history();
+        }
+        assert_eq!(leader.ledger.sweeps(), before + 2, "once half was executed");
     }
 }
