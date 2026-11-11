@@ -121,6 +121,13 @@ pub(crate) struct CatchUp {
     /// a full page is followed by the next ask as soon as it is executed,
     /// rather than on the caller's timer.
     pub(crate) continue_from: Option<ReplicaId>,
+    /// Where the last ask published asked from: the page that answers it
+    /// carries the same `after`. A page that starts below this replica's
+    /// frontier is taken only for what it carries past it, and goes on
+    /// asking only if it answers this ask, so a late answer to an earlier
+    /// one never starts a second chain beside the running one (task-d25
+    /// at the bar's load).
+    pub(crate) asked_after: Option<ExecutionPosition>,
     /// Pages taken, for the caller's counters.
     pub(crate) pages: u64,
     /// Commands executed from pages, likewise.
@@ -163,8 +170,16 @@ pub struct CatchUpPaths {
     pub ignored_stopped: u64,
     /// Pages ignored while a campaign of this replica's ran.
     pub ignored_campaign: u64,
-    /// Pages ignored for not following where this replica asked from.
+    /// Pages ignored for not following where this replica asked from:
+    /// past its frontier, or, after a boot, not at the boot frontier.
     pub ignored_after: u64,
+    /// Pages taken that start below this replica's frontier: it executed
+    /// past where it asked from while the page was on its way. Only what
+    /// they carry past the frontier is installed.
+    pub taken_stale: u64,
+    /// Of those, the ones answering an earlier ask than the last: taken,
+    /// and not followed by an ask, which the last ask's page makes.
+    pub stale_unasked: u64,
     /// Pages of which nothing was taken.
     pub empty: u64,
     /// Pages taken in part: an entry out of place or not whole ended

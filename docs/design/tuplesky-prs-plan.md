@@ -1882,6 +1882,24 @@ Count only adoption acknowledgements toward the slow majority, leaving the fast 
 
 **Review boundary:** Windowed installation and its restart path, as its own PR on task-d08. No change to the page format or the donor's rules.
 
+**At the bar's load (#98, [6799183006](https://github.com/tuplesky/tuplesky/pull/98#issuecomment-6799183006), [6799256366](https://github.com/tuplesky/tuplesky/pull/98#issuecomment-6799256366)).** A page was taken only if it started exactly at the voter's frontier. A voter catching up also executes on its own, from what the leader's traffic decides. When that moved its frontier between an ask and its page, the page was dropped whole (`ignored_after`) and nothing asked again until the pacer did, a second later. On the runner each break was one dropped page and one pacer ask, every 1.5 to 2 s. Catch-up ran at about 5 pages (320 commands) a second, about the domain's own rate, and a cut's lag closed only at a leader kill.
+
+- **The change.** A page that starts below the frontier, outside the comparison after a boot, is now taken for what it carries past the frontier (`taken_stale`).
+- **One ask a page.** The chain goes on from a stale page only if it answers the latest ask. A late answer to an earlier ask is taken and starts no second chain (`stale_unasked`).
+- **What stays.**
+  - The first ask after a boot still needs a page from exactly the boot frontier while restored commits wait to be compared.
+  - One page of 64 commands is in hand, so the table's reserve and the donor's bulk lane see nothing new.
+  - Every ask still starts at the voter's own frontier (task-d10).
+  - Entries are installed only at the voter's next position.
+
+**Acceptance:**
+- unit tests where the voter executes on its own between an ask and its page, a late page of an earlier ask, and a page below the boot frontier;
+- locally, five voters on one host, tmpfs, `replay`, step A's three features, 120 callers, n5 stopped for 9 s:
+  - **at 1,000 commands a second offered:** back within 600 of the others 9.2 and 9.3 s after it resumed, from 8,000 to 9,000 behind. It stayed within the spread the other voters show between snapshots. `ignored_after` was 0 and `pacer_asks` 2 to 3 over the run. Without the change, it never came within 600 and ended 2,800 to 3,400 behind, with 33 to 35 pages dropped and 35 to 38 pacer asks.
+  - **closed loop, 1,500 to 1,600 a second:** the chain held, with `ignored_after` 0, `pacer_asks` 2 to 3, and about a quarter more pages than without the change (1,220 to 1,288 against 918 to 1,114). But one page in hand pulled 1,200 to 1,300 commands a second, below the domain's rate, so the gap grew. A voter that fell a page behind with no fault grew its gap the same way, in 3 of 4 runs.
+
+Asking one page ahead (the reserve then holds two windows), or a larger page, is the next lever if the bar's load needs a voter to gain on a saturated domain. Section 13's catch-up figure is the measured one.
+
 <a id="task-d26"></a>
 ### task-d26: State the resource contract and test its accounting
 
