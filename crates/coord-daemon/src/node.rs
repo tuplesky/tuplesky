@@ -773,6 +773,14 @@ pub struct Node<P: Persistence> {
     order: Option<crate::catch_up::ExecutedOrder>,
     /// Catch-up pages this node served (diagnostic, task-d08).
     pub pages_served: u64,
+    /// The catch-up counts of the follower roles this node has left:
+    /// pages taken, pulled commands executed, and paths.
+    catch_up_before: (u64, u64, coord_consensus::CatchUpPaths),
+    /// The domain loop's time reading and encoding those pages, in all
+    /// and the longest (diagnostic, task-d25): a page of 125 commands is
+    /// read in one step of the donor's loop, which does nothing else
+    /// meanwhile.
+    pub serve_time: (std::time::Duration, std::time::Duration),
     /// Catch-up asks this node answered with nothing, by why
     /// (diagnostic, task-d106 step 0).
     pub unserved: Unserved,
@@ -918,6 +926,8 @@ impl<P: Persistence> Node<P> {
             won: None,
             order: None,
             pages_served: 0,
+            catch_up_before: (0, 0, coord_consensus::CatchUpPaths::default()),
+            serve_time: (std::time::Duration::ZERO, std::time::Duration::ZERO),
             unserved: Unserved::default(),
             unreleased: false,
             floor: None,
@@ -1350,7 +1360,29 @@ impl<P: Persistence> Node<P> {
     fn leave_role(&mut self) {
         let counts = self.machine_mut().take_fast_path_counts();
         self.fast_path.add(&counts);
+        // A follower's catch-up counts start again with the role: kept
+        // here, so the metrics line counts since the node started (#98,
+        // 6807495802: a voter's line read 0 after a heal).
+        let (pages, pulled) = self.machine().catch_up_counts();
+        let paths = self.machine().catch_up_paths();
+        self.catch_up_before.0 += pages;
+        self.catch_up_before.1 += pulled;
+        self.catch_up_before.2.add(&paths);
         self.release.clear();
+    }
+
+    /// Catch-up pages taken, pulled commands executed, and how its asks
+    /// and pages went, since this node started, through every role it
+    /// held (task-d08, task-d106 step 0).
+    pub fn catch_up_since_start(&self) -> (u64, u64, coord_consensus::CatchUpPaths) {
+        let (pages, pulled) = self.machine().catch_up_counts();
+        let mut paths = self.catch_up_before.2;
+        paths.add(&self.machine().catch_up_paths());
+        (
+            self.catch_up_before.0 + pages,
+            self.catch_up_before.1 + pulled,
+            paths,
+        )
     }
 
     /// What the fast path did since boot (task-d62).
@@ -1861,6 +1893,7 @@ impl<P: Persistence> Node<P> {
             self.unserved.no_order += 1;
             return out;
         };
+        let started = std::time::Instant::now();
         let entries = match crate::catch_up::page(&self.applier, order, epoch, after, through) {
             Ok(entries) => entries,
             Err(why) => {
@@ -1874,18 +1907,22 @@ impl<P: Persistence> Node<P> {
             }
         };
         self.pages_served += 1;
+        let page = coord_consensus::ProtocolMessage::CatchUpPage {
+            ballot,
+            after,
+            through,
+            entries,
+        }
+        .encode();
+        let took = started.elapsed();
+        self.serve_time.0 += took;
+        self.serve_time.1 = self.serve_time.1.max(took);
         out.peer.push((
             PeerId {
                 replica: from,
                 incarnation: coord_types::ids::ReplicaIncarnation::ZERO,
             },
-            coord_consensus::ProtocolMessage::CatchUpPage {
-                ballot,
-                after,
-                through,
-                entries,
-            }
-            .encode(),
+            page,
         ));
         out
     }

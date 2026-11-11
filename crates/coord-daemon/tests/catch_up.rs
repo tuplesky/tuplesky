@@ -561,6 +561,25 @@ fn a_follower_cut_off_for_thirty_seconds_serves_within_ten_of_the_heal() {
     // Its history is the leader's, row for row: the same commands at the
     // same positions with the same results.
     assert_eq!(cluster.executed_rows(2), cluster.executed_rows(0));
+
+    // A role change keeps what the metrics line counts (#98, 6807495802,
+    // a voter's line read 0 after a heal): r2 campaigns and leads, and its
+    // node still counts the pages it took as a follower.
+    let before = cluster.voters[2].node().catch_up_since_start();
+    assert!(before.0 > 0, "r2 took no pages: the test shows nothing");
+    let (_, out) = cluster.voters[2]
+        .campaign()
+        .expect("stepped")
+        .expect("a follower campaigns");
+    cluster.carry(2, out);
+    cluster.settle();
+    assert!(cluster.voters[2].leads(), "r2 did not win its campaign");
+    assert_eq!(
+        cluster.voters[2].node().machine().catch_up_counts(),
+        (0, 0),
+        "a leader's machine counts no catch-up: the test shows nothing"
+    );
+    assert_eq!(cluster.voters[2].node().catch_up_since_start(), before);
 }
 
 /// A voter that restarts behind holding nothing asks, whatever it holds,

@@ -45,10 +45,19 @@ pub const MAX_PROPOSAL_ASK: usize = 16;
 /// How many commands one [`ProtocolMessage::CatchUpPage`] carries at
 /// most (task-d08).
 ///
-/// A page is executed before the next is asked for, so this bounds what a
-/// voter catching up holds beside its table, and what one ask can make a
-/// donor read and send on its bulk lane.
-pub const MAX_CATCH_UP_COMMANDS: usize = 64;
+/// It bounds what one ask can make a donor read and send on its bulk
+/// lane, and the window a voter installs into its table at once: a
+/// window is at most one page, so the table's recovery reserve holds it
+/// whatever else the voter has in hand (`RECOVERY_RESERVE_PARTS`). 125 is
+/// the largest window that reserve fits at the largest table, 875
+/// admitted and 125 recovering. A voter asks one page ahead of the one it
+/// executes (task-d25), and the page asked ahead waits outside the table
+/// until the window before it has run, so a voter holds at most two
+/// pages' worth beside its table.
+///
+/// An older build takes the first 64 commands of a longer page, as a page
+/// cut short: correct, and its next ask then waits for its pacer.
+pub const MAX_CATCH_UP_COMMANDS: usize = 125;
 
 /// How many payload bytes one [`ProtocolMessage::CatchUpPage`] carries
 /// at most, beyond its first command (task-d08).
