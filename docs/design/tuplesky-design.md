@@ -2304,6 +2304,153 @@ Start with source-complete protocol, conservative domain conflicts, durable prom
 
 No HashMap iteration dependence, usize wire values, host endian, floating time comparison or native engine/runtime handles in core. Revisions use checked unsigned counters capped at i64::MAX for Kine. Overflow stops; IDs/sequences do not wrap or recycle.
 
+<a id="s18-4"></a>
+### 18.4 The domain loops' cost model and budget (task-d111)
+
+Bar 1 (task-d72) gives the five domain loops 0.39 ms an operation on the runner at parity with etcd, at 120 callers. That is task-d72's block budget restated at etcd's 0.962 ms an operation, read beside the head on the same runner (#98); the first cut's 0.30 divided an etcd figure read on another runner. At the runner's 1.4× CPU and 0.93 commands an operation (1.30× from local µs a command to runner ms an operation), that is about 295 µs a command over five voters locally, about 59 a voter. The latest runner pair puts that conversion at 1.19× (1,170 µs a command locally with step A against the runner's 1.39 ms an operation, at 2c's 0.87 commands an operation), where the budget would be about 328 µs; the table keeps 295, the stricter. Today the five loops take about 1,280 µs a command locally (#185's reading D, and the reading below). D found the cost per command: passes and frames a command fall 12 to 17% from 30 to 120 callers, and CPU a command 2 to 6%. So a batch alone doesn't reach the budget, and each part of a loop needs its own driver and its own budget. This is the design step; the code steps are task-d111's entry in the plan.
+
+**The reading.**
+- **Shares:** D's profiles at 120 callers (the leader and a follower that hosts a frontend). Each is good to about ±2 to 3 points.
+- **Drivers:** each loop's own counters, read again on the carry `c19211a0` with step A (the shim's head `b7fac614`) under the same settings. That is five voters on tmpfs, `strict`, `early-proposal,release-at-execution`, at 30 and 120 callers. Passes are the sampled count × 16. Events between flushes are #205's counter.
+- **Domain CPU a command at 120 callers:** the leader 332 µs, the two followers with frontends 270 to 273, and the two without 202 to 204.
+
+**The table, by role** (µs a command, the leader / a follower with a frontend, at 120 callers):
+
+| Role | Today | Driver | Calls a command (30 → 120) | CPU a call | Budget | On record |
+| --- | --- | --- | --- | --- | --- | --- |
+| Voter protocol: the leader's `propose` and `collect`; a follower's `on_request`, `on_storage`, `advance_pending`, `on_committed` | 70 / 76 | Per command; no driver inside a command read yet | – | – | 18 / 10 | 0 / −27 (step B) |
+| Executions (`run_executions`) | 53 / 55 | Per command, flat from 30 to 120 callers (item 4's reading, at the bar's mix: 62 / 59) | 1 / 1 | 53 / 55 | 16 / 13 | −25 to −29 / −15 (item 4's cuts, (a) to (f), (d) at no CPU and (e) at −10 to −14 as built; task-d101's option 3 parked) |
+| Storage plumbing (`Node::settle`, `flush`; `lower_once` about half) | 43 / 52 | Lowerings, and commands (below) | 0.64 → 0.36 / 0.86 → 0.41 | Up to 119 / 127 a lowering | 10 / 8 | −15 / −15 (the row cuts) |
+| Barrier reads (`pump_reads`) | 40 / 0 | Reads served | 1.37 → 1.36 at the leader, at the local mix (below) | 29 a read | 7 a read / 0 | 0 / 0 |
+| Collector and frontend | 32 / 26 | Client operations at that node | 1 / 1 at a frontend, 0 elsewhere | 32 / 26 | 10 / 6 | 0 / 0 |
+| API transport in and out | 30 / 16 | API events | 4.8 → 4.8 / 3.9 → 4.0 | 6.3 / 4.1 | 10 / 4 | 0 / 0 |
+| Peer plane and daemon glue | 22 / 16 | Peer events | 8.5 → 7.1 / 2.6 → 2.3 | 3.0 / 7.1 | 5 / 4 | −13 / −9 (the batch) |
+| Loop overhead: run-queue reads, clocks, blake3, drops | 40 / 33 | Passes | 14.5 → 12.6 / 7.9 → 6.9 | 3.2 / 4.7 | 10 / 6 | −23 / −19 (the batch) |
+| **The loop** | **330 / 274** | | | | **89 / 51** | **−82 to −86 / −90** |
+
+- **The mix.** The table is the local mix: five voters on tmpfs, `strict`, without `answer-on-release`, half reads, so 1.36 barrier reads a command at the leader. The bar is read at the runner's register row, `replay` with `answer-on-release`, at 0.93 commands an operation at 120 callers. There a command carries under 0.1 reads (about 0.35 at 30 callers), so the reads row is about 2 µs a command at 120 callers and about 10 at 30, not 40. Its budget is given a read. "Today" is restated in the bar's configuration when the first code step's counters land.
+- **The drivers: the counts are measured, the attribution is not.** Each row's calls a command are the loop's own counters. Its CPU a call is one share at 120 callers divided by that count. D's shares are good to ±2 to 3 points, and a 13 to 16% move in a 22 to 40 µs row is 1 to 2 points. So D can't confirm that a row follows passes or events rather than commands. The one row read at two loads, storage plumbing, missed its driver: 76 µs predicted at 30 callers, 47 read. The rows that say "per command" have no driver inside a command read yet. The first code step's profiles are long enough to read each counted row at both loads to about ±1 point.
+- **On record** is what each row's named levers take at their recorded sizes, over five voters about −420 µs a command: step B −110, the row cuts −75 and the batch up to −150 (D's sizes, #185; the batch spread here over the per-message rows in proportion), and item 4's cuts, about −82 to −86 (its reading, below, with (d) and (e) as built). task-d101's option 3 is parked and not counted. Budget less today less on record is each row's unfunded part.
+
+- **Step A has since taken part of three rows** (`answer-on-release`, task-d100). On the runner the loops fell 14% and 12% a command (#98, run 2c). Locally at 120 callers, with it active:
+  - the leader went 332 → 300 µs a command, its API events 4.8 → 2.6 and its passes 12.6 → 10.3;
+  - the followers with frontends went 272 → 239, with API events 4.0 → 2.1 and passes 6.9 → 5.1;
+  - the others went 203 → 196.
+
+  What left is the collector's acknowledgement handling. So the collector and frontend, API transport and loop overhead rows are about 30 µs lower at the leader and the collectors than the table shows. The budgets don't change.
+- **What the budget sums to:** 89 at the leader and 51 at each follower is about 295 µs a command over five voters, the parity budget. Each row's budget is the first cut's (set against 230) scaled by 1.28, etcd's 0.962 over 0.75. A follower without a frontend has no collector row, so it must come in under 51.
+- **The allocator and memmove are their own block, across the rows.** They are 16 to 20% of a loop at either role: about 53 to 66 µs a command at the leader and 44 to 55 at a follower. They are paid per command (a payload copied into each row, records cloned between stages, a buffer each message), so they are cut where a row is cut, and also on their own: one buffer a batch, rows written from borrowed payloads. Its budget is half of today's inside each row's.
+- **Kernel leaves follow passes and groups** (12 to 16%, wakeups and syscalls). They fall with the overhead row's and the plumbing row's drivers, and have no budget of their own.
+- **Storage plumbing's driver isn't settled by these two loads.**
+  - If it were all per lowering, the leader's share at 30 callers would be about 76 µs a command. D read about 47.
+  - A two-point fit gives about 14 µs a lowering and 38 a command. The shares' ±2 to 3 points leave that open, and the first code step reads it against the lowering count.
+  - Either way the budget needs both parts cut: groups of about 10 commands (task-d102, task-d84, task-d86, task-d101's option 1), and fewer rows a command (task-d103 to task-d105).
+  - Budget it per command: by the fit, 38 of the leader's 43 µs are per command, and groups of 10 take about 4 of it. The first code step counts rows lowered a command, which is probably the driver.
+- **What the levers on record reach** (#185 review). Today's loops read 1.39 ms an operation on the runner. The levers' −420 µs a command, at 1.19 to 1.30×, is −0.50 to −0.55, which leaves 0.84 to 0.89 against the loops' 2.0× budget of 0.83. The levers are converted, not the local remainder: 1,170 µs a command at 1.30× would presume 1.52 on the runner, not the 1.39 read. So 2.0× holds for the loops only with the appenders' slack, about 0.2 (task-d72's record): (d) measured at no CPU (#221) took the low end's margin; (e) as built gives back about 0.01. Parity, 0.39, needs about 0.45 to 0.50 more, about −350 to −420 µs a command locally.
+  - **Step B as built** (task-d102's relay with its frames, #224) read −170 µs a command over the five loops at 120 callers locally, and −190 at 30, against the −110 booked for it here. If the extra −60 is on top of the batch's rows, the loops come to 0.77 to 0.82, under 0.83 without the appenders' slack. If it is the batch's frames arriving early, the range above stands. It isn't credited until the runner's pair after step B lands says which.
+  - **Step B on the runner** (#98, [6808041996](https://github.com/tuplesky/tuplesky/pull/98#issuecomment-6808041996); task-d72's record has the row). At 120 callers the loops went 1.414 → 1.015 ms an operation: the followers 1.074 → 0.730 and the leader 0.340 → 0.285. That is −0.40, against the −0.20 to −0.22 the local −170 µs a command gave at 1.19 to 1.30×.
+    - **The conversion is restated.** The runner's ms an operation over the local ms a command was 1.40 for the loops before step B and 1.21 after it, so the runner's excess was per message, and step B took most of it.
+    - So a lever that removes messages or events converts at 1.21 to about 2.35× its local size (step B's own). One that removes work inside a command converts at about 1.21: item 4's cuts, the row cuts' plumbing and item 3. The 1.19 to 1.30 above is replaced by these.
+    - **What the levers on record now reach,** converted this way: the followers 0.42 to 0.50 and the leader 0.125 to 0.15, so the loops come to about 0.55 to 0.65. That is under the 2.0× budget of 0.83, against parity's 0.41 at etcd's 1.008.
+    - **The followers can't reach their parity share (0.29) while every follower executes every command.** Executions alone, after the cuts every follower takes, are 44 to 46 µs a command a follower, 0.21 to 0.22 ms an operation over four. With every other follower row at its budget, the followers reach 0.37 to 0.38. task-d72's record has the numbers by part and what task-d101's option 3 would change.
+
+**The three items, by the rows they own:**
+1. **Followers off the per-command protocol pipeline.**
+   - Rows: a follower's voter protocol (76 → 10), peer plane (16 → 4) and loop overhead (33 → 6).
+   - Route: task-d102's batched round with step B. A follower adopts a turn's proposals in one batch, admits nothing per command (`on_request` goes for a relayed command), and acknowledges by range.
+   - Driver targets: at most 1 pass and 0.5 peer events a command at a follower. Today it is 4.4 to 6.9 passes and 2.3 peer events.
+   - On record: step B is about −110 µs a command over the followers. The batch takes the per-message rows.
+2. **A follower's storage plumbing.**
+   - Rows: a follower's storage plumbing (52 → 8).
+   - Route: task-d101's option 1, a commit cadence a follower's own, and the row cuts (task-d103 to task-d105).
+   - Driver targets: at least 10 commands a lowering at a follower (today 1.4 to 2.4 at 120 callers), and 4 or 5 rows a command.
+3. **The leader's `propose` and reads.**
+   - Rows: the leader's voter protocol (70 → 18) and barrier reads (7 µs a read).
+   - `propose`: half of today's row is building the payload and dependency rows, `adopt_own` and `initialize_bounded`, once a command. In the batch, a turn's rows are built in one pass and `adopt_own`'s set is kept, not rebuilt.
+   - Reads: a read costs 29 µs today, against a barrier round shared by about 8 reads (0.18 rounds a command). The budget is about 7 µs a read: a read answered from the leader's executed state once its round confirms, without the per-read planning it does today. At the bar's mix that is worth about 2 µs a command at 120 callers, so it isn't counted against bar 1 there.
+4. **Executions, at every voter: the long pole.**
+   - Rows: the leader's executions (53 → 16) and a follower's (55 → 13). Before this item they had about 270 µs a command over five voters against a budget of 68, and nothing on record at the leader, which must still plan.
+   - **The reading** (the carry `4449acca`, five voters on tmpfs, `replay`, `early-proposal,release-at-execution,answer-on-release`, the register row's write mix `put=50,contended=50` with no reads, 30 and 120 callers; `perf` at 299 Hz on each voter's loop for 40 s, 3,400 to 4,800 samples each; a step's share times the voter's domain CPU a command):
+
+     | Step (its driver) | Leader, 30 / 120 | Follower with a frontend | Follower without |
+     | --- | --- | --- | --- |
+     | Authorization: `load_authorization`, the session record, its trust rule and the principal's rules (a command) | 6.8 / 6.3 | 6.4 / 6.3 | 6.8 / 6.7 |
+     | Read view: the keys the command touches, the meta rows, its leases (a command) | 10.7 / 8.7 | 10.3 / 9.3 | 9.6 / 9.1 |
+     | Retry state: `retry::retirement` and `retry::admit` (a command) | 6.6 / 7.7 | 8.8 / 8.4 | 7.9 / 10.2 |
+     | Plan: `plan` (a command) | 2.3 / 2.0 | 2.4 / 1.7 | 2.0 / 1.9 |
+     | Decode, the identity check (`CommandId::derive`) and the rest of `apply_bound` (a command) | 4.6 / 4.4 | 3.2 / 4.0 | 4.4 / 4.1 |
+     | **Establishing what the command does** | **31.0 / 29.1** | **31.1 / 29.7** | **30.7 / 32.0** |
+     | Landing: `land`, preparing the batch and laying it on the overlay (rows a command) | 10.9 / 10.9 | 10.8 / 11.2 | 11.0 / 10.7 |
+     | History sweep: `forget_history` (history kept, amortized) | 6.5 / 7.0 | 6.3 / 6.7 | 6.3 / 6.6 |
+     | `Learner::established` (a command) | 3.2 / 3.8 | 4.1 / 3.8 | 4.2 / 4.1 |
+     | Release gate: `release_ready`'s `unexecuted_in_order` (unexecuted proposals, each command applied) | 2.1 / 3.5 | – | – |
+     | Rest of `applied` | 3.0 / 3.0 | 1.1 / 1.5 | 1.0 / 1.3 |
+     | Group plumbing: `begin_group`'s overlay of the groups in flight, payload clones, release and close | 4.1 / 4.7 | 2.6 / 5.9 | 3.1 / 4.9 |
+     | **`run_executions`** | **60.8 / 61.8** | **56.0 / 58.7** | **56.0 / 59.4** |
+
+     - Over five voters that is about 285 µs a command at 30 callers and 298 at 120, against 68. The table's 53 / 55 were D's, at the local mix.
+     - A row of 6 µs is good to about ±0.6. The followers with frontends are n2 and n3; at 120 callers one of them fell behind in both runs (its machine refused for backpressure) and pulled 53,000 to 61,000 commands by catch-up, which its counters don't count a command, so it is left out.
+   - **What the reading says:**
+     - **It is per command, and grouping doesn't touch it.** From 30 to 120 callers each role moves by under 4 µs, while commands an execution group rise from about 8 to 12 to 14. The two steps that grow follow what is in flight: the release gate (2.1 → 3.5) and `begin_group`'s overlay (1.2 → 2.5 at a follower).
+     - **Half of it is establishing what the command does,** 29 to 32 µs at every voter. Every follower repeats it exactly as the leader did.
+     - **The sweep is bounded but not small.** task-d110 made it amortized: a sweep runs every 2,400 to 2,500 commands (72 to 77 sweeps in 183,121, with about 1,500 commands' history kept). Each walks every map keyed by history, about 4,000 entries in each, so it costs 6 to 7 µs a command, about 16 ms on the loop at once.
+   - **What the leader sheds** (every voter that still establishes a command takes the same cuts):
+     - **(a) Authorization once a session and namespace, in the applier (−6).** The applier keeps each session's authorization keyed by the session and the namespace, since `load_authorization` keeps only the principal's rules in the request's namespace. It drops the cache whenever it lands a write to `SessionV1` or `PolicyV1`. It is the only writer of those collections, so the cache can't be stale. A restart, a reinstall and a takeover start it empty.
+     - **(b) The retry state in memory (−5 of 7 to 10).** The applier keeps each client instance's retry window, keyed by the session and the client instance as the durable floor is (`retry_floor_key`): its floor, and its records under their full retry keys. Each client instance numbers its own requests and `retirement` advances only its own floor, so one window a session would let one client's acknowledgements make another's fresh requests `TooOld` (#219 review). The applier updates the windows as it lands them and computes `retirement` and `admit` from them. The rows are written as today; only the reads go. The same argument as (a) applies.
+     - **(c) The meta rows once a group (about −2, to be read).** The KV revision, the retention floor and the lease authority are read from the view each command, though the applier writes the first and knows the others. The code step reads their share of the read view before sizing it.
+     - **(d) Forgetting by order (the 16 ms stall; no CPU as measured).** The table already knows which commands each `applied` forgets. A queue of them, in the order they were forgotten, lets a sweep remove those entries from each map rather than walk all of them, so it costs the commands forgotten, not the history kept. task-d110's counters read it.
+       - **Built (#221):** each execution drops the history of up to four commands from the queue's front, and the sweep stays as a backstop. Locally the sweeps went from about 52 a voter a run to none. `forget_history` stayed at 5 to 7 µs a command: the same removals, of entries about 1,600 commands old, spread one command at a time. So (d) removes the sweeps and keeps every history map flat and bounded by the table. It is booked at no CPU, not the −5 to −6 first sized, and it doesn't shorten the loop's longest step either. On the thread's CPU clock that step is 5 to 18 ms on both builds (#221's reading), and a sweep at these sizes costs under 1 ms. The 16 ms first given for a sweep was wall-clock time on a saturated host.
+     - **(e) The release gate from a frontier (−10 to −14 at 120 callers, as built; −3 first sized).** `release_ready` collects every unexecuted proposal after each applied command. It needs only those from the first one not yet released, so it keeps that position and walks from there.
+       - **Built (#225):** sized first on the leader loop thread's CPU clock, the walk was 2.9% and 5.1% of its samples at 30 and 120 callers, about 7.5 and 13.7 µs a command. The −3 first sized was its share inside `run_executions` alone; the CPU clock reads every call, the tentative outcomes' included. After the build `release_ready` is 0.66% and 0.67% of the leader's loop, from 3.37% and 4.81%: about −6 and −10 by that pair's own shares. So it is booked at −10 to −14 at 120 callers (−6 to −8 at 30), the leader only. The loop's CPU a command in that pair moved by less than the run-to-run noise (237 → 223 and 234 → 231 µs).
+     - **(f) The identity check once (about −1.5).** `CommandId::derive` re-serializes the request to check the payload's identity. The check stays, made once when the payload is received rather than again at execution, if the code step shows every path to execution passes through that check.
+     - Together about −25 to −29 at the leader: 62 → about 33 to 37, against 16. What is left is the plan, the keys read and landing, about 17 to 21 µs over the budget. Landing falls with rows a command (task-d103 to task-d105), which are counted under storage plumbing, so not again here. A further candidate, landing a group's plans as one batch, is named and not sized.
+     - **At a follower, which still establishes every command,** the same cuts less (e) take about −15: 59 → about 44 to 46, against 13. Together the cuts are about −82 to −86 over five voters.
+   - **How the cuts are built** (#219 review, [6792024469](https://github.com/tuplesky/tuplesky/pull/219#issuecomment-6792024469)):
+     - **(d), then (e), first.** They are bookkeeping in the machine and change no execution. Each is checked in debug builds against the walk it replaces, as task-d108's selection was. (e) feeds the release rule, so it also runs the simulator's release rows. (d) goes first, since its 16 ms stall on every loop is a latency fault.
+     - **(a), (b) and (c) after them, while every follower still executes.** They add state outside the projection that execution depends on, and a stale entry is exactly the fault only an independent execution finds: this step's first (a) had one, the namespace key. So the result digest compared at every follower (below) is built in the same step as the first of them. For (a), "the applier is their only writer" is shown against trimming (task-d27), installs and the genesis policy write, and the cached path returns `load_authorization`'s view-budget error as the read does, since it is part of the result.
+     - **(f) moves a check and adds no state.** It goes with whichever step touches the payload's receipt, on the condition above.
+     - **The result digest at every follower** (32 bytes a command, on the leader's next message, compared at `Follower::applied`). Section 17.4 records it and nothing scheduled it. Catch-up already compares a pulled command's digest with its donor's (`CatchUpDivergence`); this does it a command in steady state.
+     - The sizes are upper bounds: each assumes what replaces a step costs nothing.
+   - **Item 4 on record:** the cuts, −25 to −29 at the leader ((d) and (e) as built) and about −15 a follower, about −82 to −86 over five voters, against the reading's 298 at 120 callers. That leaves about 215 µs a command against 68: at the leader about 17 to 21 over, and at each follower about 32.
+   - **task-d101's option 3, parked: not on the path to the 2.0× milestone** (#219 review). A follower would land the leader's write set rather than establish, one follower in four establishing each command by rotation.
+     - **Its size, on top of the cuts:** a landing follower goes from about 40 to 25, on three commands in four. That is −10 to −12 a follower, about −45 over four.
+     - **Its carriage is booked nowhere.** About 1.4 KB a command to four followers is about 4 more peer datagrams a command, against task-d102's at most 5 over both planes. At 53 µs a datagram that is about +0.2 ms an operation, against the saving's −0.05 to −0.06. It is read before the argument is written, not beside the code.
+     - **It changes the fault model.** Detection comes earlier, but containment and attribution are lost:
+
+       | Fault | Today (the four checks, then task-d35 to task-d37) | Option 3 |
+       | --- | --- | --- |
+       | The leader executes wrongly, or from bad state | Four followers execute right. The leader is the odd one out at the floor's root, and under task-d36 it stops alone | Three followers land the wrong write at once. The verifier sees it at that command and stops. The wrong state is on four voters |
+       | Deciding who is wrong | A majority of independent executions | One against one. task-d36's rule would side with the leader, since three landed chains count with its own |
+       | A follower's own state is bad | Found when any command reads the row | Found when it verifies a command that reads the row, one in four, else at task-d37's scrub |
+       | The command's verifier is down or behind | Doesn't arise | Nobody executes the command independently. This reading had a follower behind at 120 callers |
+
+       A follower that landed holds the leader's result, so comparing result digests says only that the write set arrived; it would need task-d35's chain value over what the follower landed. A follower that only landed and then takes over inherits every unverified write as its base.
+     - **What its argument must contain, if it is taken up:**
+       1. The fault model with a row for each fault, as above: who detects it, when, who stops, and where a correct copy survives.
+       2. task-d36's rule for landed commands: a landed command's chain value is the leader's label and can't count, as task-d39 says of a learner's values below its install position. And what a one-against-one difference does: stop the domain (task-d36's undecided state), or settle it by a third execution, from which pre-state at a follower that already landed.
+       3. Coverage: who verifies when the rotation's follower is down or behind, how long a command can go unverified, and that forgetting doesn't pass an unverified command.
+       4. What a follower checks before it lands: the command is its own next executable, the write set's recorded base matches its state (`ApplyBase`), and its chain at the predecessor equals the leader's.
+       5. Fallback: a follower without a write set (a lost frame, catch-up, replay) establishes the command itself, so progress never waits on one. task-d35's puller keeps executing pulled commands.
+       6. Takeover: every in-memory structure establishing reads, the caches of (a) to (c) included, is valid or rebuilt at a follower that only landed.
+       7. Order: task-d35 to task-d37 first. The argument rests on the chain and the scrub, and neither is built.
+     - Whether it is pursued for parity is the owner's call, since it changes the fault model.
+   - **Eager, not deferred.** A follower still executes in order and at once, since every reader in Section 17.4's table that waits needs it, and a follower that becomes leader executes from what it has executed. Executing lazily without a bound is not taken (Section 17.4, option 4).
+
+**Not owned yet, and named so a lever can't count it twice:**
+- the leader's collector and frontend (32 → 10) and API transport (30 → 10);
+- the leader's loop overhead (40 → 10), which needs passes a command at the leader from 12.6 to about 3;
+- the leader's storage plumbing (43 → 10) and peer plane (22 → 5);
+- a follower's collector and frontend (26 → 6) and API transport (16 → 4).
+
+**What the items owe.** Items 1 to 4 own 119 of the 241 µs to cut at the leader, and 191 of 223 at a follower with a frontend. With every owned row at its budget and the rest as today, the loops are about 211 + 2 × 83 + 2 × 41 = 459 µs a command, about 0.55 to 0.60 ms an operation; less step A's 30 µs at the leader and at each collector, about 0.44 to 0.48. Items 1 to 3 alone, with executions left at today's (item 4's 37 + 4 × 42 = 205 µs back), come to about 664 µs a command: 0.68 to 0.75 ms an operation with step A, 0.79 to 0.86 without. Item 4's cuts leave it about 145 µs a command over its budget (17 to 21 at the leader, about 32 a follower), with (d) at no CPU and (e) as built, so with items 1 to 3 at their budgets and item 4 at its cuts the loops are about 605 µs a command: 0.72 to 0.79 ms an operation, or 0.61 to 0.67 less step A. These are at the local mix, where the reads row still counts. The parity budget of 0.39 needs the rows above owned too, by a design once the batch's frames have been read.
+
+The batch shortens the leader's passes and events. #205's first reading puts the leader's events a command at about 10 to 12 today, of which 7 are peer, and a range acknowledgement takes most of the peer part. Whether the rest needs its own design is read after task-d102's frames.
+
+**How a code step reads against it.**
+- Each code step names its rows. It reports their driver's calls a command and CPU a call, at 30 and 120 callers on five voters, with a profile of the leader and of a follower at each.
+- A row's budget is met, or its gap is stated. A lever counts only against the rows it names.
+- The loops' counters this needs go on the metrics line with the first code step: passes counted exactly rather than sampled, and the events between flushes by plane.
+
 <a id="s19"></a>
 ## 19. Native transport and Kine implementation detail
 
