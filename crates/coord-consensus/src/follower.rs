@@ -5141,16 +5141,24 @@ impl Follower {
             && proposal.replica == from
             && proposal.ballot == self.config.quorum.ballot()
             && proposal.seqnum.is_some();
-        if takes {
-            self.take_relayed_payload(&proposal, payload);
+        let held = self.held.contains_key(&proposal.command);
+        let took = takes && self.take_relayed_payload(&proposal, payload);
+        let mut effects = self.on_proposal(from, proposal);
+        // A proposal held for want of its payload, whose payload this copy
+        // brought: `on_proposal` returns at a duplicate of one held, so the
+        // hold is examined here, as a `PayloadResponse` has it examined.
+        // Left, it waited on itself for ever (task-d102's frames sweep,
+        // row 1 at 3 voters, seed 11).
+        if took && held {
+            effects.extend(self.advance_pending());
         }
-        self.on_proposal(from, proposal)
+        effects
     }
 
     /// Initialize the command a relayed proposal names from the payload
     /// it carries, where this replica would take it (see
-    /// `on_relayed_proposal`).
-    fn take_relayed_payload(&mut self, proposal: &FastAck, payload: PayloadRecordV1) {
+    /// `on_relayed_proposal`). Returns whether it took it.
+    fn take_relayed_payload(&mut self, proposal: &FastAck, payload: PayloadRecordV1) -> bool {
         let command = proposal.command;
         let identity =
             postcard::from_bytes::<coord_types::logical_v1::LogicalRequest>(&payload.logical)
@@ -5159,7 +5167,7 @@ impl Follower {
         if identity != Some(command) || payload.admission_digest() != proposal.admission {
             self.rejections
                 .push(FollowerRejection::PayloadIdentityMismatch(command));
-            return;
+            return false;
         }
         // Known here already, in any form: the proposal path decides.
         if self.table.is_initialized(&command)
@@ -5172,7 +5180,7 @@ impl Follower {
                 .selected_admission(&command)
                 .is_some_and(|d| d != proposal.admission)
         {
-            return;
+            return false;
         }
         let recovering = self.sync_pending.contains_key(&command)
             || self.campaign.as_ref().is_some_and(|c| {
@@ -5201,7 +5209,7 @@ impl Follower {
             // No room: the proposal is held as one without its payload,
             // which is fetched once its turn comes.
             self.rejections.push(FollowerRejection::Backpressure);
-            return;
+            return false;
         }
         if let Some(c) = self.campaign.as_mut() {
             c.supply_moved();
@@ -5213,6 +5221,7 @@ impl Follower {
         self.answer_on_release.insert(command);
         self.relayed_taken = self.relayed_taken.saturating_add(1);
         self.note_lacking(command);
+        true
     }
 
     fn on_proposal(&mut self, from: ReplicaId, proposal: FastAck) -> Vec<Effect> {

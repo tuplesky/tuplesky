@@ -2064,3 +2064,28 @@ fn a_refused_entry_leaves_the_frames_others_as_they_are() {
     assert_ne!(f.table().phase_of(&c1), Some(Phase::Accept));
     assert_eq!(f.table().phase_of(&c2), Some(Phase::Accept));
 }
+
+/// task-d102: a proposal held for want of its payload -- a plain copy
+/// arrived first -- is adopted when a relayed copy brings the payload,
+/// though that copy is a duplicate of one held. Found by the frames sweep
+/// (row 1 at 3 voters, seed 11): left, the hold waited on itself for ever.
+#[test]
+fn a_held_proposal_is_adopted_when_a_relayed_copy_brings_its_payload() {
+    let mut f = booted(1);
+    let (payload, c1) = relayed_payload(1, 1, 1);
+    let mut leader_view = coord_consensus::CommandTable::new();
+    let l1 = leader_view
+        .initialize(c1, c1.0, vec![CONSERVATIVE_KEY.to_vec()])
+        .unwrap();
+    let plain = proposal(c1, vec![], 0, l1.paths.clone(), l1.path);
+    f.step(peer(0, plain.clone()));
+    assert!(f.held().contains_key(&c1), "held without its payload");
+    let effects = f.step(peer(0, relayed(plain, payload)));
+    assert_eq!(f.relayed_taken(), 1);
+    assert!(f.held().is_empty(), "adopted once the payload came");
+    assert_eq!(f.table().phase_of(&c1), Some(Phase::Accept));
+    assert!(
+        effects.iter().any(|e| matches!(e, Effect::Persist(_))),
+        "the adoption batch: {effects:?}"
+    );
+}
