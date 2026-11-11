@@ -125,6 +125,16 @@ impl Campaign {
         c
     }
 
+    /// A campaign that has selected `decision` and not bound it yet, for
+    /// the tests that read what such a candidate lacks (audit item 5 on
+    /// #98).
+    #[cfg(test)]
+    pub(crate) fn selected(config: BallotConfiguration, decision: SyncDecision) -> Self {
+        let mut c = Campaign::new(config);
+        c.decision = Some(decision);
+        c
+    }
+
     /// Ballot.
     pub const fn ballot(&self) -> Ballot {
         self.config.ballot()

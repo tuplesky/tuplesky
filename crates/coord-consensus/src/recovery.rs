@@ -815,6 +815,25 @@ fn select_counted(
             .filter(|e| e.payload_present)
             .map(|e| e.command)
             .collect();
+        // Checked against the scan it replaces, for each re-proposal
+        // (task-d108 review), where that scan is small enough to run.
+        #[cfg(debug_assertions)]
+        if reproposed
+            .len()
+            .saturating_mul(reports.iter().map(|r| r.entries.len()).sum())
+            <= 1 << 20
+        {
+            for c in &reproposed {
+                debug_assert_eq!(
+                    held.contains(c),
+                    reports.iter().any(|r| r
+                        .entries
+                        .iter()
+                        .any(|e| e.command == *c && e.payload_present)),
+                    "held with a payload: {c:?}"
+                );
+            }
+        }
         reproposed.retain(|c| waited_on.contains(c) || held.contains(c));
     }
     let reproposed = within_bound(&entries, reproposed, MAX_REPORT_ENTRIES);
@@ -939,6 +958,29 @@ fn possible_fast_decisions(
             by_command
         })
         .collect();
+    // Checked against a scan of each report that does not go through the
+    // index: every command once, at the first record the report lists of
+    // it (task-d108 review).
+    #[cfg(debug_assertions)]
+    for (r, by_command) in reports.iter().zip(&by_report) {
+        let mut seen = BTreeSet::new();
+        for e in &r.entries {
+            if seen.insert(e.command) {
+                debug_assert!(
+                    by_command
+                        .get(&e.command)
+                        .is_some_and(|indexed| core::ptr::eq(*indexed, e)),
+                    "the index holds a record of {:?} other than the first listed",
+                    e.command
+                );
+            }
+        }
+        debug_assert_eq!(
+            seen.len(),
+            by_command.len(),
+            "the index holds no other command"
+        );
+    }
     let record = |m: usize, c: &CommandId| -> Option<&ReportEntry> {
         tick();
         by_report[m].get(c).copied()
@@ -1109,6 +1151,19 @@ fn possible_fast_decisions(
         .filter(|e| e.phase < Phase::Commit)
         .map(|e| e.command)
         .collect();
+    #[cfg(debug_assertions)]
+    {
+        let mut scanned = BTreeSet::new();
+        for r in reports {
+            let mut seen = BTreeSet::new();
+            for e in &r.entries {
+                if seen.insert(e.command) && e.phase < Phase::Commit {
+                    scanned.insert(e.command);
+                }
+            }
+        }
+        debug_assert_eq!(held_undecided, scanned, "held below COMMIT, scanned");
+    }
     // Whether the selection orders `x` after `c`: `c` is in `x`'s closure
     // over the dependencies of the selected entries and of the candidates
     // still kept. A kept candidate is selected with the dependencies it
@@ -1318,6 +1373,14 @@ fn possible_fast_decisions(
                             .copied(),
                     )
                 });
+                // Checked below against the walk it replaces, but only
+                // ever on its false case (task-d108 review). The
+                // simulator builds no C1 configuration, and no test
+                // reaches a forgotten order that puts `a` before `c`
+                // past `ordered`: `executed_closure` already follows the
+                // selected entries through what the member retired, so
+                // the walk adds a command only on a path through a
+                // candidate the member does not hold.
                 #[cfg(debug_assertions)]
                 if checked {
                     // Not counted: the walks the counted steps replace.
@@ -1727,6 +1790,78 @@ mod tests {
                     assert!(
                         steps * 10 <= half * 21,
                         "{steps} steps over {commits} commits, {half} over half as many"
+                    );
+                }
+                before = Some(steps);
+            }
+        }
+    }
+
+    /// A report listing a command twice is read at its first record, as
+    /// the scan before task-d108 read it: the selection is the one taken
+    /// without the later record. No report builder here lists a command
+    /// twice, so this is the one case where the index's check (which
+    /// record of a command it holds) can find a difference.
+    #[test]
+    fn a_report_listing_a_command_twice_is_read_at_its_first_record() {
+        let config = BallotConfiguration::c2_default(
+            ConfigurationEpoch::new(1).unwrap(),
+            ballot(1, 1),
+            (0..3).map(r).collect(),
+        )
+        .unwrap();
+        let select = |reports: &[RecoveryReport]| {
+            select_counted(
+                &config,
+                reports,
+                |_, _| false,
+                |_| None,
+                &|_: &CommandId| false,
+                SelectionRules::default(),
+                &Cell::new(0),
+            )
+            .unwrap()
+        };
+        let once = reports(20, 6, true);
+        let mut twice = once.clone();
+        // A commit listed again below COMMIT, and a pre-acceptance listed
+        // again under other dependencies and another path. (A later
+        // record at COMMIT is a decision wherever it is listed, and the
+        // selection takes it: not a case of which record is read.)
+        twice[0]
+            .entries
+            .push(entry(2, Phase::PreAccept, alloc::vec![id(21)], 9));
+        twice[0]
+            .entries
+            .push(entry(22, Phase::PreAccept, alloc::vec![id(2)], 9));
+        assert_eq!(select(&twice), select(&once));
+    }
+
+    /// The cost a pass still has (task-d108 review): each pass judges every
+    /// candidate against the selection, so the steps grow with candidates
+    /// times entries. Pinned so: at a fixed 500 commits, doubling the
+    /// pre-acceptances about doubles the steps, and never more than a few
+    /// walks of the selection per candidate.
+    #[test]
+    fn a_takeover_selects_in_steps_linear_in_the_candidates_times_the_entries() {
+        const COMMITS: u64 = 500;
+        for undecided in [false, true] {
+            let mut before = None;
+            for pre_accepted in [30u64, 60, 120, 240] {
+                let (steps, adopted) = work(&reports(COMMITS, pre_accepted, undecided));
+                assert_eq!(
+                    adopted as u64, pre_accepted,
+                    "every pre-acceptance is adopted"
+                );
+                let bound = 4 * (pre_accepted + 1) * (COMMITS + pre_accepted);
+                assert!(
+                    steps <= bound,
+                    "{steps} steps at {pre_accepted} pre-acceptances (undecided {undecided}), bound {bound}"
+                );
+                if let Some(half) = before {
+                    assert!(
+                        steps * 10 <= half * 21,
+                        "{steps} steps at {pre_accepted} pre-acceptances, {half} at half as many"
                     );
                 }
                 before = Some(steps);
