@@ -20,11 +20,14 @@
 //!    saw;
 //! 6. a read invoked after another read completed saw the same write or a
 //!    later one;
-//! 7. no two writes are at the same revision. The order above is only the
+//! 7. no two writes are at the same revision, and none is at zero, the
+//!    revision of the key's initial absence. The order above is only the
 //!    domain's if its revisions are distinct, so this is checked rather
 //!    than assumed: two writes at one revision would make every
 //!    comparison treat them as one place in the order, and reads that
-//!    alternate between them would pass.
+//!    alternate between them would pass; a write at zero would share its
+//!    place with the absence, and a read of absence after a read of that
+//!    write would pass, though this workload never deletes.
 //!
 //! Given these, the linearization is the writes in revision order with
 //! each read placed after the write it saw, the reads of one write in an
@@ -140,6 +143,17 @@ fn check_key(key: u32, ops: &[&Op], out: &mut Vec<Violation>) {
             }
             continue;
         };
+        // Zero is the absence's place: a value seen there places no write.
+        if *revision == 0 {
+            violation(
+                1,
+                format!(
+                    "a read (caller {}) saw value {value:#x} at revision 0, the revision of a key never written",
+                    read.caller
+                ),
+            );
+            continue;
+        }
         let Some(write) = writes.get_mut(value) else {
             violation(
                 1,
@@ -178,6 +192,14 @@ fn check_key(key: u32, ops: &[&Op], out: &mut Vec<Violation>) {
         let Some(revision) = w.revision else {
             continue;
         };
+        if revision == 0 {
+            violation(
+                7,
+                format!(
+                    "a write of {value:#x} is at revision 0, the revision of a key never written"
+                ),
+            );
+        }
         if let Some(other) = at_revision.insert(revision, *value) {
             violation(
                 7,
@@ -464,6 +486,25 @@ mod tests {
             write(2, (2, 3), 11, None),
             read(3, (4, 5), Some((11, 5))),
         ];
+        assert!(rules(&history).contains(&7));
+    }
+
+    #[test]
+    fn a_value_read_at_revision_zero_is_found() {
+        // Codex's history on #98: an unknown write seen at revision 0, then
+        // the key read as never written at 0. The write cannot share the
+        // absence's place, and the register cannot go back to absent.
+        let history = [
+            write(1, (0, 10), 10, None),
+            read(2, (1, 2), Some((10, 0))),
+            read(3, (3, 4), None),
+        ];
+        assert_eq!(rules(&history), vec![1]);
+    }
+
+    #[test]
+    fn a_write_established_at_revision_zero_is_found() {
+        let history = [write(1, (0, 1), 10, Some(0)), read(2, (2, 3), None)];
         assert!(rules(&history).contains(&7));
     }
 

@@ -9183,7 +9183,7 @@ confirmation of its ballot.
 `coord-register` (crates/coord-wan-bench) drives four registers through
 every frontend, two callers each, about a third of the operations
 writes of a value no other write puts, and checks the history
-(`register::check`): no two writes are at one revision, writes in
+(`register::check`): no two writes are at one revision and none at zero (a key never written), writes in
 revision order agree with real time, and every read saw a value some write put, at its revision, invoked before
 the read completed, no older than any write or read that completed
 before the read was invoked, and older than any write invoked after it
