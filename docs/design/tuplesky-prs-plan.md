@@ -4035,7 +4035,7 @@ So every feature-gated change, task-d98's `EarlyProposal` first, would ship unre
 **Acceptance:**
 - **The design step** recorded and reviewed before any code.
 - **Each code step** names its rows and reports, at 30 and 120 callers on five voters, each row's driver calls a command and CPU a call, with a profile of the leader and of a follower at each load. A row's budget is met, or its gap is stated. A lever counts only against the rows it names.
-- **What items 1 to 4 owe:** with every owned row at its budget, the loops at about 0.44 to 0.60 ms an operation on the runner at 120 callers, read by the testing session's job once they are in. The levers at their recorded sizes, item 4's cuts included ((d) and (e) as built) and option 3 not, reach about 0.84 to 0.89, against the loops' 2.0× budget of 0.83.
+- **What items 1 to 4 owe:** with every owned row at its budget, the loops at about 0.44 to 0.60 ms an operation on the runner at 120 callers, read by the testing session's job once they are in. The levers at their recorded sizes, item 4's cuts included ((d) and (e) as built) and option 3 not, reach about 0.84 to 0.89, against the loops' 2.0× budget of 0.83. Converted at the ratios restated after step B on the runner (Section 18.4, task-d72's record), they reach about 0.55 to 0.65.
 - **The loops' total against bar 1,** at most 0.39 ms an operation at 120 callers (0.44 at 30), once the named rows that aren't owned have a design.
 
 ## Gate checklist and deferred work
