@@ -38,6 +38,9 @@ or the final heal):
   as a share of the workload, and the share of its jobs and of its busy
   time in jobs served in 16.4 ms or more (a bucket's edge), beside the
   leader's round from submitted to learned;
+* whether a voter fell behind, for TupleSky: each voter's executed
+  position at the end against the most advanced voter's, its
+  `Backpressure` refusals and the catch-up pages it pulled;
 * counts a command over the five voters: datagrams, ACK frames and
   frames on each plane, the api plane's frames by kind, the evidence for
   marked commands where counted, and the journal groups and projection
@@ -96,6 +99,10 @@ class Step:
     # Counts a command over the voters (see COUNTS), from each voter's
     # last `metrics` line over the leader's executed commands.
     counts: dict = field(default_factory=dict)
+    # Whether a voter fell behind (see behind_of): node -> (commands short
+    # of the most advanced voter at the end or None, Backpressure
+    # refusals, catch-up pages pulled or None).
+    behind: dict = field(default_factory=dict)
 
 
 # Counts a command, summed over the voters: the key, the label, and the
@@ -348,6 +355,36 @@ def runner(step: Step, start, end, completed: int) -> None:
             step.cpu["followers_loops"] = per(loops * (whole - leader.cpu[0]) / whole)
 
 
+CATCH_UP = re.compile(r"^catch-up paths: .*\bpages=(\d+)\b")
+
+
+def behind_of(store: str) -> dict:
+    """Whether a voter fell behind over the run: node -> (how many
+    commands its executed position at the end, read from its store after
+    the run, is short of the most advanced voter's, or None without one;
+    its `Backpressure` refusals, the highest "so far" of each boot summed,
+    as the summary counts them; the catch-up pages its last boot pulled,
+    from its last `catch-up paths` line, or None without one). A voter
+    that fell past the leader's history pulls pages to come back, and one
+    that was refused for backpressure fell behind its frontend's load."""
+    rows = {}
+    for node in sorted(os.listdir(store)):
+        path = os.path.join(store, node, "coordd.log")
+        if not os.path.exists(path):
+            continue
+        with open(path, encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+        voter = js.parse_voter(lines)
+        end = js.read_executed_at_end(os.path.join(store, node))
+        pages = None
+        for line in lines:
+            if (m := CATCH_UP.match(line)):
+                pages = int(m[1])
+        rows[node] = (int(end) if end.isdigit() else None, voter.counts.get("Backpressure", 0), pages)
+    top = max((e for e, _, _ in rows.values() if e is not None), default=None)
+    return {n: (top - e if e is not None and top is not None else None, bp, pages) for n, (e, bp, pages) in rows.items()}
+
+
 def voter_costs(store: str) -> list:
     """Each voter's last `metrics` cost reading that has its loop's CPU and
     executed commands."""
@@ -407,6 +444,7 @@ def read_step(side: str, step_name: str, store: str) -> Step:
     if side != "etcd":
         step.pipelines = read_pipelines(store)
         step.counts = read_counts(store)
+        step.behind = behind_of(store)
     return step
 
 
@@ -540,6 +578,31 @@ def render(steps: list[Step], title: str) -> str:
         for s in rows:
             out.append(f"| {name(s)} | " + " | ".join(cell(s.counts.get(k), ".2f") for k, _ in keys) + " |")
         out.append("")
+
+    rows = [s for s in steps if s.behind]
+    if rows:
+        nodes = sorted({n for s in rows for n in s.behind})
+        out += [
+            "**Voters behind** (each TupleSky run, each voter: the commands its executed position at the end, read "
+            "from its store after the run, is short of the most advanced voter's (under the replay profile the "
+            "projection's last durable commit, so a voter that kept up can read up to one cadence short); its "
+            "`Backpressure` refusals; "
+            "and the catch-up pages its last boot pulled, which only a voter that fell past the leader's history "
+            "pulls. A voter that kept up shows a few commands or none, no refusals and no pages; one that fell "
+            "behind under the step's load distorts its throughput and CPU readings)",
+            "",
+            "| Step | Side | " + " | ".join(nodes) + " |",
+            "| --- | --- " + "| --- " * len(nodes) + "|",
+        ]
+        for s in rows:
+            cells = []
+            for n in nodes:
+                gap, bp, pages = s.behind.get(n, (None, 0, None))
+                cells.append(
+                    f"{gap if gap is not None else '-'} / {bp} / {pages if pages is not None else '-'}"
+                )
+            out.append(f"| {name(s)} | " + " | ".join(cells) + " |")
+        out += ["", "(each cell: commands short / backpressure refusals / catch-up pages)", ""]
 
     etcd = {s.step: s for s in steps if s.side == "etcd"}
     rows = [s for s in steps if s.side != "etcd" and s.step in etcd]

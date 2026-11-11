@@ -235,6 +235,27 @@ class SweepTests(unittest.TestCase):
         # No etcd at 60: no ratio row for it.
         self.assertNotIn("| 60 | head | 1.00×", text)
 
+    def test_voters_behind(self):
+        path = self.store("h120")
+        # n1 executed to 5000 and kept up; n2 stopped 2600 short, was
+        # refused for backpressure twice in its boot and pulled 41 pages.
+        with open(os.path.join(path, "n1", "executed-at-end"), "w") as f:
+            f.write("5000\n")
+        with open(os.path.join(path, "n2", "executed-at-end"), "w") as f:
+            f.write("2400\n")
+        with open(os.path.join(path, "n2", "coordd.log"), "a") as f:
+            f.write("this collector was refused: Backpressure (1 so far)\n")
+            f.write("this collector was refused: Backpressure (2 so far)\n")
+            f.write("catch-up paths: pacer_asks=3 asked=9 pages=4 pulled=256\n")
+            f.write("catch-up paths: pacer_asks=9 asked=50 pages=41 pulled=2624\n")
+        step = sw.read_step("head", "120", path)
+        self.assertEqual(step.behind, {"n1": (0, 0, None), "n2": (2600, 2, 41)})
+        text = sw.render([step, sw.read_step("etcd", "120", self.store("e120", tuplesky=False))], "Sweep")
+        self.assertIn("**Voters behind**", text)
+        self.assertIn("| Step | Side | n1 | n2 |", text)
+        self.assertIn("| 120 | head | 0 / 0 / - | 2600 / 2 / 41 |", text)
+        self.assertNotIn("| 120 | etcd | 0 / ", text)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -427,7 +427,11 @@ while catches up after each heal, and what its loop does while cut off.
 The title says ", partitions of one follower for 5-10 s, one about every
 60 s"; etcd and SwiftPaxos get a plain `partition`. It needs a
 `jepsen-ref` with the options (tuplesky/jepsen's
-`claude/partition-one-follower`, `9ad6e33`).
+`claude/partition-one-follower`, `9ad6e33`; `2057754` and later draw the
+follower among the voters whose process runs, so a cut never lands on a
+voter a kill has taken down). This is the standard fault run from #221
+on: leader kills and live-follower cuts, which take a voter through both
+recovery paths, a restart and catch-up pages.
 Each publication's `checkpoint` line in `coordd.log` says how long it held
 the domain thread and how long each of its steps took, and each restart's
 `replayed` line how many records it replayed and how long that took. The
@@ -671,6 +675,12 @@ then gives a table of the steps, each run labelled `SIDE@STEP`:
   each plane's datagrams, ACK frames and frames, the api plane's frames by
   kind, the evidence for marked commands where the build counts it, and
   the journal groups and projection commits;
+* whether a voter fell behind in each TupleSky run (Voters behind): each
+  voter's executed position at the end against the most advanced
+  voter's, its `Backpressure` refusals and the catch-up pages its last
+  boot pulled. A frontend follower that falls behind at 120 callers
+  distorts that step's throughput and CPU against etcd's, so the table
+  says whether one did;
 * each TupleSky run's ratio to etcd's at its step.
 
 Each run's own summary also gives operations completed a second and the
