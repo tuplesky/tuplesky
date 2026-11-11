@@ -229,7 +229,9 @@ activated only after `AnswerOnRelease`, it submits each new marked
 command as version 3 of `Submit` to its ballot's leader alone. The
 command is answered as a version-2 one is. The leader proposes it with
 its payload (`RelayedProposal`), and each follower adopts it from that
-proposal and acknowledges it to the leader only. A voter that isn't
+proposal and acknowledges it to the leader only; a grouped leader sends
+a turn's proposals to each follower in one `ProposalFrame` (see
+`spec/wire-v1.md`). A voter that isn't
 leading refuses a version-3 submission with `Refused { NotLeading }`; the
 collector then submits the command at once as version 2 to every voter,
 and does the same for a relayed command that holds neither half of a

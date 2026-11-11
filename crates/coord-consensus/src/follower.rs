@@ -796,6 +796,8 @@ pub struct Follower {
     /// Relayed proposals whose payload this replica took (task-d102):
     /// initialized from the proposal rather than fetched.
     relayed_taken: u64,
+    /// Proposal frames taken (task-d102).
+    frames_taken: u64,
 }
 
 /// The retry-key bindings a restart restores from the payload rows
@@ -928,6 +930,7 @@ impl Follower {
             replay: crate::replay::EvidenceStore::new(config.capacity),
             answer_on_release: BTreeSet::new(),
             relayed_taken: 0,
+            frames_taken: 0,
             catch_up: CatchUp::default(),
             diverged: None,
             config,
@@ -1233,6 +1236,7 @@ impl Follower {
             replay: crate::replay::EvidenceStore::new(state.capacity),
             answer_on_release: BTreeSet::new(),
             relayed_taken: 0,
+            frames_taken: 0,
             catch_up: CatchUp::default(),
             diverged: None,
         }
@@ -1763,12 +1767,42 @@ impl Follower {
             | ProtocolMessage::FastAck(a)
             | ProtocolMessage::RelayedProposal { vote: a, .. } => a.ballot,
             ProtocolMessage::SlowAck(a) => a.ballot,
+            ProtocolMessage::ProposalFrame { ballot, .. } => *ballot,
             _ => return false,
         };
         ballot == self.ballots.promised()
             && ballot != self.config.quorum.ballot()
             && self.ballots.in_flight().is_none()
             && self.awaiting_sync.len() < self.config.capacity
+    }
+
+    /// Take a leader's frame of proposals (task-d102): each entry as the
+    /// `Proposal` or `RelayedProposal` it stands for, in order, in this
+    /// one step, so the adoptions they lead to share the node's next
+    /// journal group. One this follower refuses leaves the others as
+    /// they are.
+    fn on_proposal_frame(
+        &mut self,
+        from: ReplicaId,
+        replica: ReplicaId,
+        ballot: Ballot,
+        proposals: Vec<crate::messages::FramedProposal>,
+    ) -> Vec<Effect> {
+        self.frames_taken = self.frames_taken.saturating_add(1);
+        let mut effects = Vec::new();
+        for entry in proposals {
+            let (vote, payload) = entry.into_vote(replica, ballot);
+            effects.extend(match payload {
+                Some(payload) => self.on_relayed_proposal(from, vote, payload),
+                None => self.on_proposal(from, vote),
+            });
+        }
+        effects
+    }
+
+    /// Proposal frames this follower took (task-d102).
+    pub fn frames_taken(&self) -> u64 {
+        self.frames_taken
     }
 
     /// Replay the messages held for the ballot just synchronized.
@@ -1781,6 +1815,11 @@ impl Follower {
                 ProtocolMessage::RelayedProposal { vote, payload } => {
                     self.on_relayed_proposal(from, vote, payload)
                 }
+                ProtocolMessage::ProposalFrame {
+                    replica,
+                    ballot,
+                    proposals,
+                } => self.on_proposal_frame(from, replica, ballot, proposals),
                 ProtocolMessage::FastAck(a) => self.collect(from, Vote::Fast(a)),
                 ProtocolMessage::SlowAck(a) => self.collect(from, Vote::Slow(a)),
                 _ => Vec::new(),
@@ -6270,6 +6309,7 @@ impl Follower {
             ProtocolMessage::Sync(decision) => self.on_sync(from.replica, decision),
             ProtocolMessage::Proposal(_)
             | ProtocolMessage::RelayedProposal { .. }
+            | ProtocolMessage::ProposalFrame { .. }
             | ProtocolMessage::FastAck(_)
             | ProtocolMessage::SlowAck(_)
                 if self.stash_until_sync(&message) =>
@@ -6281,6 +6321,11 @@ impl Follower {
             ProtocolMessage::RelayedProposal { vote, payload } => {
                 self.on_relayed_proposal(from.replica, vote, payload)
             }
+            ProtocolMessage::ProposalFrame {
+                replica,
+                ballot,
+                proposals,
+            } => self.on_proposal_frame(from.replica, replica, ballot, proposals),
             ProtocolMessage::FastAck(ack) => self.collect(from.replica, Vote::Fast(ack)),
             ProtocolMessage::SlowAck(ack) => self.collect(from.replica, Vote::Slow(ack)),
             ProtocolMessage::PayloadRequest { commands } => {

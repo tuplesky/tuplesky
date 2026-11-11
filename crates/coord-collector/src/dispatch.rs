@@ -206,6 +206,12 @@ impl Dispatcher {
         self.collector.set_answer_on_release(on);
     }
 
+    /// Relay marked submissions to the ballot's leader alone, or stop
+    /// (task-d102; [`crate::Collector::set_relay`]).
+    pub fn set_relay(&mut self, on: bool) {
+        self.collector.set_relay(on);
+    }
+
     /// Reads waiting on their leader's answer.
     pub fn reads_waiting(&self) -> usize {
         self.reads.len()

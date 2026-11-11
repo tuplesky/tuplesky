@@ -2454,3 +2454,58 @@ fn a_relayed_entry_falls_back_at_its_bound() {
     assert_eq!(w.releases.len(), 1);
     assert!(!w.collector.is_pending(&command));
 }
+
+/// task-d102: a grouped leader with `BatchedRound` holds a turn's
+/// relayed proposals until it flushes, then sends each follower one
+/// frame carrying them all with their payloads. Every follower adopts
+/// them from that frame, each command is answered on its release, and
+/// nothing is parked.
+#[test]
+fn a_turns_relayed_proposals_leave_in_one_frame_at_the_flush() {
+    let mut w = Cluster::journaled(256);
+    w.voters[0].node_mut().set_batched_round(true);
+    assert!(w.voters[0].node().batch_frames());
+    w.collector.set_answer_on_release(true);
+    w.collector.set_relay(true);
+    for sequence in 1..=3 {
+        let (targets, submit) = w.submit_to(sequence);
+        assert_eq!(targets, vec![r(0)], "relayed to the leader alone");
+        let shape = w.deliver_submission(0, &submit);
+        assert_eq!(shape.peer, 0, "nothing leaves before the flush");
+    }
+    assert!(w.peers.is_empty());
+    assert!(w.voters[0].owes_flush(), "the queued frames are owed one");
+    for _ in 0..16 {
+        if w.executed() == [3, 3, 3] && w.releases.len() == 3 {
+            break;
+        }
+        let out = w.voters[0].flush().expect("journaled");
+        w.carry(0, out);
+        let out = w.voters[0].finish().expect("materialized");
+        w.carry(0, out);
+        settle_peers(&mut w);
+        for i in 1..3 {
+            let out = w.voters[i].execute().expect("executed");
+            w.carry(i, out);
+        }
+        settle_peers(&mut w);
+    }
+    assert_eq!(w.executed(), [3, 3, 3]);
+    assert_eq!(w.releases.len(), 3);
+    assert_eq!(w.published, [0, 0, 0], "nothing was parked");
+    let sent = w.voters[0].node().sent_bytes();
+    assert_eq!(sent.frames, 2, "one frame to each follower: {sent:?}");
+    assert_eq!(sent.framed, 6);
+    assert!(sent.payload_bytes > 0);
+    for i in 1..3 {
+        let Machine::Follower(f) = w.voters[i].node().machine() else {
+            panic!("voter {i} leads");
+        };
+        assert_eq!(f.frames_taken(), 1, "voter {i} took one frame");
+        assert_eq!(f.relayed_taken(), 3);
+    }
+    for sequence in 1..=3 {
+        assert!(!w.collector.is_pending(&w.command(sequence)));
+    }
+    assert_eq!(w.collector.relay_fallbacks(), 0);
+}

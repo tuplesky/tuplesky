@@ -1142,8 +1142,9 @@ impl<P: Persistence> Voter<P> {
         self.node.settle(&self.ballot)
     }
 
-    /// Whether [`Voter::flush`] has anything to do: batches queued, or a
-    /// command to apply.
+    /// Whether [`Voter::flush`] has anything to do: batches queued, a
+    /// command to apply, or a leader's proposals waiting for the turn's
+    /// frame (task-d102).
     ///
     /// Batches queued behind a journal append that is out are not owed a
     /// flush (task-d54): nothing can be journaled until the append is
@@ -1151,7 +1152,9 @@ impl<P: Persistence> Voter<P> {
     /// then. Owed one, the runtime would flush in a loop that moves
     /// nothing.
     pub fn owes_flush(&self) -> bool {
-        (self.queued() > 0 && !self.appending()) || self.node.can_execute()
+        (self.queued() > 0 && !self.appending())
+            || self.node.can_execute()
+            || self.node.machine().frames_queued()
     }
 
     /// Whether a journal append is out on the appender's thread, its

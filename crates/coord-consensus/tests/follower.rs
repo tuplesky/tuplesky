@@ -8,8 +8,8 @@ use std::collections::BTreeSet;
 
 use coord_consensus::{
     BallotConfiguration, CONSERVATIVE_KEY, CommandRecord, ConfigurationIdentity, FastAck, Follower,
-    FollowerConfig, FollowerRejection, PayloadRecordV1, Phase, ProtocolMessage, ReplayRefusal,
-    ReplicaRole, SlowAck, decode_dependency, decode_payload, dependency_key,
+    FollowerConfig, FollowerRejection, FramedProposal, PayloadRecordV1, Phase, ProtocolMessage,
+    ReplayRefusal, ReplicaRole, SlowAck, decode_dependency, decode_payload, dependency_key,
 };
 use coord_core::capability::{AdmissionReceipt, AttestedAdmission, VerifierToken};
 use coord_core::effect::{BootId, Effect, PeerId};
@@ -1976,4 +1976,91 @@ fn a_relayed_proposal_of_a_command_held_already_adopts_as_any() {
     assert!(f.held().is_empty());
     assert!(adoption.len() <= 1, "at most the adoption batch");
     assert!(f.take_rejections().is_empty());
+}
+
+fn framed(messages: Vec<ProtocolMessage>) -> ProtocolMessage {
+    let proposals = messages
+        .into_iter()
+        .map(|m| match m {
+            ProtocolMessage::Proposal(vote) => FramedProposal::of(vote, None).unwrap(),
+            ProtocolMessage::RelayedProposal { vote, payload } => {
+                FramedProposal::of(vote, Some(payload)).unwrap()
+            }
+            other => panic!("not a proposal: {other:?}"),
+        })
+        .collect();
+    ProtocolMessage::ProposalFrame {
+        replica: r(0),
+        ballot: ballot(0, 0),
+        proposals,
+    }
+}
+
+/// task-d102: a frame's proposals are taken in one step, each as the
+/// relayed proposal it stands for: both commands are adopted at once,
+/// their batches come out of the one step, and each gets one slow
+/// acknowledgement, to the leader alone.
+#[test]
+fn a_frames_proposals_are_adopted_in_one_step() {
+    let mut f = booted(1);
+    let (p1, c1) = relayed_payload(1, 1, 1);
+    let (p2, c2) = relayed_payload(2, 2, 2);
+    let mut leader_view = coord_consensus::CommandTable::new();
+    let l1 = leader_view
+        .initialize(c1, c1.0, vec![CONSERVATIVE_KEY.to_vec()])
+        .unwrap();
+    let l2 = leader_view
+        .initialize(c2, c2.0, vec![CONSERVATIVE_KEY.to_vec()])
+        .unwrap();
+    let frame = framed(vec![
+        relayed(proposal(c1, vec![], 0, l1.paths, l1.path), p1),
+        relayed(proposal(c2, vec![c1], 1, l2.paths, l2.path), p2),
+    ]);
+    let effects = f.step(peer(0, frame));
+    assert_eq!(f.frames_taken(), 1);
+    assert_eq!(f.relayed_taken(), 2);
+    assert!(f.held().is_empty(), "adopted at once");
+    assert_eq!(f.table().phase_of(&c1), Some(Phase::Accept));
+    assert_eq!(f.table().phase_of(&c2), Some(Phase::Accept));
+    assert!(
+        sends(&effects).is_empty(),
+        "nothing leaves before the batches"
+    );
+    let mut released = Vec::new();
+    for event in durable_of(&effects, 1) {
+        released.extend(f.step(event));
+    }
+    let out = sends(&released);
+    assert_eq!(out.len(), 2, "{out:?}");
+    for (to, message) in &out {
+        assert_eq!(*to, r(0), "to the leader alone");
+        assert!(matches!(message, ProtocolMessage::SlowAck(_)));
+    }
+    assert!(f.take_rejections().is_empty());
+}
+
+/// task-d102: an entry a follower refuses leaves the frame's others as
+/// they are: a mismatched payload is not taken, and the next entry is
+/// adopted all the same.
+#[test]
+fn a_refused_entry_leaves_the_frames_others_as_they_are() {
+    let mut f = booted(1);
+    let (mut bad, c1) = relayed_payload(1, 1, 1);
+    bad.ack_through = 7;
+    let (p2, c2) = relayed_payload(2, 2, 2);
+    let mut leader_view = coord_consensus::CommandTable::new();
+    let l1 = leader_view
+        .initialize(c1, c1.0, vec![CONSERVATIVE_KEY.to_vec()])
+        .unwrap();
+    let l2 = leader_view
+        .initialize(c2, c2.0, vec![CONSERVATIVE_KEY.to_vec()])
+        .unwrap();
+    let frame = framed(vec![
+        relayed(proposal(c1, vec![], 0, l1.paths, l1.path), bad),
+        relayed(proposal(c2, vec![], 1, l2.paths, l2.path), p2),
+    ]);
+    f.step(peer(0, frame));
+    assert_eq!(f.relayed_taken(), 1, "only the matching payload");
+    assert_ne!(f.table().phase_of(&c1), Some(Phase::Accept));
+    assert_eq!(f.table().phase_of(&c2), Some(Phase::Accept));
 }

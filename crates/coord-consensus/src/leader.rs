@@ -37,7 +37,10 @@ use crate::ballot::{BallotState, ConfigurationIdentity, PromiseRejection, Replic
 use crate::commands::{CommandTable, InitError};
 use crate::digest::{self, DigestMap};
 use crate::learner::{AppliedOutcome, LearnError, Learner, LearningMode};
-use crate::messages::{MAX_PAYLOAD_TRANSFER, PathAnchors, ProtocolMessage, SubmissionRefusal};
+use crate::messages::{
+    FramedProposal, MAX_PAYLOAD_TRANSFER, MAX_PROPOSAL_FRAME_BYTES, PathAnchors, ProtocolMessage,
+    SubmissionRefusal,
+};
 use crate::phase::Phase;
 use crate::quorum::BallotConfiguration;
 use crate::recovery::{RecoveryReport, SyncDecision};
@@ -306,6 +309,67 @@ pub const RESEND_LATENCY_SAMPLES: usize = 128;
 /// back from an outage. A proposal that is not decided is never handed
 /// off: its vote may be the one the leader still needs (task-d15).
 pub const RESEND_HANDOFF_CALLS: u64 = 8;
+
+/// What this leader sent of its fresh proposals and its frontier, by
+/// kind (task-d102): the bytes the batched round's frames save, and what
+/// is left. A re-send, a re-presentation and an answer to a follower's
+/// ask aren't counted here; [`ResendCounts`] counts them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SentBytes {
+    /// Proposals sent, one to each follower, framed or not.
+    pub proposals: u64,
+    /// Their bytes, without the payload records relayed proposals carry:
+    /// the votes, and each frame's header and length prefixes.
+    pub proposal_bytes: u64,
+    /// The payload records relayed proposals carried.
+    pub payload_bytes: u64,
+    /// Proposal frames sent: more than one proposal in one message.
+    pub frames: u64,
+    /// The proposals those frames carried.
+    pub framed: u64,
+    /// Frontier announcements sent (`Committed`), one to each follower.
+    pub frontiers: u64,
+    /// Their bytes.
+    pub frontier_bytes: u64,
+}
+
+/// The bytes of the payload records `message` carries: a relayed
+/// proposal's, or a frame's relayed entries'.
+fn message_payload_bytes(message: &ProtocolMessage) -> usize {
+    let size = |p: &PayloadRecordV1| postcard::experimental::serialized_size(p).unwrap_or(0);
+    match message {
+        ProtocolMessage::RelayedProposal { payload, .. } => size(payload),
+        ProtocolMessage::ProposalFrame { proposals, .. } => proposals
+            .iter()
+            .filter_map(|p| p.payload.as_ref())
+            .map(size)
+            .sum(),
+        _ => 0,
+    }
+}
+
+impl SentBytes {
+    /// Add `other`'s counts to these.
+    pub fn add(&mut self, other: &SentBytes) {
+        self.proposals += other.proposals;
+        self.proposal_bytes += other.proposal_bytes;
+        self.payload_bytes += other.payload_bytes;
+        self.frames += other.frames;
+        self.framed += other.framed;
+        self.frontiers += other.frontiers;
+        self.frontier_bytes += other.frontier_bytes;
+    }
+}
+
+/// A follower's proposals of this turn, waiting for the turn to end
+/// (task-d102): the frame [`Leader::cut_frames`] sends it.
+#[derive(Clone, Debug)]
+struct QueuedFrame {
+    context: coord_core::effect::EffectContext,
+    ballot: Ballot,
+    requires: Vec<BarrierId>,
+    proposals: Vec<FramedProposal>,
+}
 
 /// What [`Leader::resend_unvoted`] sent and what came of it (task-d49),
 /// counted since the leader began leading; [`Leader::take_resend_counts`]
@@ -586,6 +650,15 @@ pub struct Leader {
     /// got the submission. A subset of `answer_on_release`, let go with
     /// it.
     relayed: BTreeSet<CommandId>,
+    /// Whether a turn's fresh proposals wait for the turn's end, to go to
+    /// each follower in one frame (task-d102): set by the node while
+    /// `Feature::BatchedRound` is active and it lowers its persists in
+    /// groups.
+    batch_frames: bool,
+    /// Each follower's proposals of this turn, while `batch_frames`.
+    frames: BTreeMap<ReplicaId, QueuedFrame>,
+    /// What the fresh proposals and the frontier cost, by kind.
+    sent_bytes: SentBytes,
     /// Marked commands this leader executed and was sent again as exact
     /// duplicates, with the admission digest of the payload it decided
     /// (task-d100, step A): their collector lost the release, and the
@@ -688,6 +761,9 @@ impl Leader {
             early_holders: None,
             answer_on_release: BTreeSet::new(),
             relayed: BTreeSet::new(),
+            batch_frames: false,
+            frames: BTreeMap::new(),
+            sent_bytes: SentBytes::default(),
             release_again: Vec::new(),
             config,
             boot: None,
@@ -846,6 +922,9 @@ impl Leader {
             early_holders: None,
             answer_on_release: BTreeSet::new(),
             relayed: BTreeSet::new(),
+            batch_frames: false,
+            frames: BTreeMap::new(),
+            sent_bytes: SentBytes::default(),
             release_again: Vec::new(),
         };
         // Dependency order among the entries: a command follows every
@@ -1765,6 +1844,8 @@ impl Leader {
             if *voter == me {
                 continue;
             }
+            self.sent_bytes.frontiers += 1;
+            self.sent_bytes.frontier_bytes += frame.len() as u64;
             outbox.publish(PendingSend {
                 context,
                 requires: Vec::new(),
@@ -2238,6 +2319,143 @@ impl Leader {
                 payload: payload.clone(),
             },
             None => ProtocolMessage::Proposal(proposal),
+        }
+    }
+
+    /// Whether a turn's fresh proposals wait for its end, to go to each
+    /// follower in one frame (task-d102). The node sets it while
+    /// `Feature::BatchedRound` is active and it lowers persists in
+    /// groups; turned off, whatever is queued leaves at the next
+    /// [`Leader::cut_frames`].
+    pub fn set_batch_frames(&mut self, on: bool) {
+        self.batch_frames = on;
+    }
+
+    /// Whether proposals wait for [`Leader::cut_frames`].
+    pub fn frames_queued(&self) -> bool {
+        !self.frames.is_empty()
+    }
+
+    /// What this leader sent of its fresh proposals and its frontier.
+    pub fn sent_bytes(&self) -> SentBytes {
+        self.sent_bytes
+    }
+
+    /// Send each follower the proposals this turn queued for it
+    /// (task-d102): one proposal as the message it is, more in one
+    /// [`ProtocolMessage::ProposalFrame`], split where a frame would pass
+    /// [`MAX_PROPOSAL_FRAME_BYTES`]. Each waits on every batch its
+    /// proposals wait on, which in a turn's group are durable together.
+    /// The node calls it where its loop lowers the turn's persists.
+    pub fn cut_frames(&mut self) -> Vec<Effect> {
+        if self.frames.is_empty() {
+            return Vec::new();
+        }
+        for (voter, queued) in core::mem::take(&mut self.frames) {
+            self.publish_frame(voter, queued);
+        }
+        self.release()
+    }
+
+    fn queue_frame(
+        &mut self,
+        voter: ReplicaId,
+        context: coord_core::effect::EffectContext,
+        ballot: Ballot,
+        requires: Vec<BarrierId>,
+        entry: FramedProposal,
+    ) {
+        // A frame is of one ballot and one context: a change between two
+        // proposals sends what was queued under the first.
+        if let Some(queued) = self.frames.get(&voter)
+            && (queued.context != context || queued.ballot != ballot)
+        {
+            let queued = self.frames.remove(&voter).expect("present");
+            self.publish_frame(voter, queued);
+        }
+        let queued = self.frames.entry(voter).or_insert_with(|| QueuedFrame {
+            context,
+            ballot,
+            requires: Vec::new(),
+            proposals: Vec::new(),
+        });
+        for barrier in requires {
+            if !queued.requires.contains(&barrier) {
+                queued.requires.push(barrier);
+            }
+        }
+        queued.proposals.push(entry);
+    }
+
+    fn publish_frame(&mut self, voter: ReplicaId, queued: QueuedFrame) {
+        let QueuedFrame {
+            context,
+            ballot,
+            requires,
+            proposals,
+        } = queued;
+        let mut chunk: Vec<FramedProposal> = Vec::new();
+        let mut size = 0usize;
+        for entry in proposals {
+            let len = postcard::experimental::serialized_size(&entry).unwrap_or(usize::MAX);
+            if !chunk.is_empty() && size.saturating_add(len) > MAX_PROPOSAL_FRAME_BYTES {
+                self.send_frame(
+                    voter,
+                    context,
+                    ballot,
+                    &requires,
+                    core::mem::take(&mut chunk),
+                );
+                size = 0;
+            }
+            size = size.saturating_add(len);
+            chunk.push(entry);
+        }
+        if !chunk.is_empty() {
+            self.send_frame(voter, context, ballot, &requires, chunk);
+        }
+    }
+
+    fn send_frame(
+        &mut self,
+        voter: ReplicaId,
+        context: coord_core::effect::EffectContext,
+        ballot: Ballot,
+        requires: &[BarrierId],
+        mut chunk: Vec<FramedProposal>,
+    ) {
+        let count = chunk.len() as u64;
+        let message = if chunk.len() == 1 {
+            let entry = chunk.pop().expect("one");
+            let (vote, payload) = entry.into_vote(self.config.identity.replica, ballot);
+            match payload {
+                Some(payload) => ProtocolMessage::RelayedProposal { vote, payload },
+                None => ProtocolMessage::Proposal(vote),
+            }
+        } else {
+            self.sent_bytes.frames += 1;
+            self.sent_bytes.framed += count;
+            ProtocolMessage::ProposalFrame {
+                replica: self.config.identity.replica,
+                ballot,
+                proposals: chunk,
+            }
+        };
+        let payload_bytes = message_payload_bytes(&message);
+        let frame = message.encode();
+        self.sent_bytes.proposals += count;
+        self.sent_bytes.proposal_bytes += (frame.len() - payload_bytes) as u64;
+        self.sent_bytes.payload_bytes += payload_bytes as u64;
+        if let Some(outbox) = self.outbox.as_mut() {
+            outbox.publish(PendingSend {
+                context,
+                requires: requires.to_vec(),
+                to: PeerId {
+                    replica: voter,
+                    incarnation: ReplicaIncarnation::ZERO,
+                },
+                frame,
+            });
         }
     }
 
@@ -2807,20 +3025,39 @@ impl Leader {
         // reply below always does: it is this leader's fast vote.
         let sends = self.proposal_sends(barrier);
         let early = sends.iter().any(|(_, requires)| requires.is_empty());
-        // Encoded once for every voter it goes to (task-d61).
-        let frame = self.proposal_message(proposal.clone()).encode();
-        let outbox = self.outbox.as_mut().expect("booted");
-        for (voter, requires) in sends {
-            outbox.publish(PendingSend {
-                context,
-                requires,
-                to: PeerId {
-                    replica: voter,
-                    incarnation: ReplicaIncarnation::ZERO,
-                },
-                frame: frame.clone(),
-            });
+        let message = self.proposal_message(proposal.clone());
+        if self.batch_frames {
+            // Each follower's copy waits for the turn's end, to leave in
+            // one frame with the turn's other proposals (task-d102).
+            let payload = match message {
+                ProtocolMessage::RelayedProposal { payload, .. } => Some(payload),
+                _ => None,
+            };
+            let entry = FramedProposal::of(proposal.clone(), payload).expect("a proposal");
+            for (voter, requires) in sends {
+                self.queue_frame(voter, context, ballot, requires, entry.clone());
+            }
+        } else {
+            // Encoded once for every voter it goes to (task-d61).
+            let payload_bytes = message_payload_bytes(&message);
+            let frame = message.encode();
+            let outbox = self.outbox.as_mut().expect("booted");
+            for (voter, requires) in sends {
+                self.sent_bytes.proposals += 1;
+                self.sent_bytes.proposal_bytes += (frame.len() - payload_bytes) as u64;
+                self.sent_bytes.payload_bytes += payload_bytes as u64;
+                outbox.publish(PendingSend {
+                    context,
+                    requires,
+                    to: PeerId {
+                        replica: voter,
+                        incarnation: ReplicaIncarnation::ZERO,
+                    },
+                    frame: frame.clone(),
+                });
+            }
         }
+        let outbox = self.outbox.as_mut().expect("booted");
         // A command its collector answers on the release alone gets no
         // reply: nothing at the collector counts it (task-d100, step A).
         if !self.answer_on_release.contains(&command) {
@@ -3479,6 +3716,7 @@ impl Leader {
             | ProtocolMessage::Committed { .. }
             | ProtocolMessage::Proposal(_)
             | ProtocolMessage::RelayedProposal { .. }
+            | ProtocolMessage::ProposalFrame { .. }
             | ProtocolMessage::LeaderReply { .. }
             | ProtocolMessage::Refused { .. }
             | ProtocolMessage::FloorReadiness { .. }

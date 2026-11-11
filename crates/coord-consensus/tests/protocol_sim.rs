@@ -244,6 +244,13 @@ struct Knobs {
     /// proposes it with its payload, and the followers adopt it from the
     /// proposal without pre-accepting it.
     relay: u32,
+    /// Chance (parts per million) per step that a leader holding a turn's
+    /// fresh proposals sends them, one frame to each follower (task-d102,
+    /// the batched round): set, every leader queues its fresh proposals,
+    /// and they leave at whatever step the draw cuts them, as `coordd`'s
+    /// cut where its loop lowers a group. Off, a proposal leaves as it is
+    /// made.
+    frames: u32,
     /// An execution's group reaches the journal after its outcome is
     /// taken, in journal order with the protocol batches, as `coordd`'s
     /// does, and the machines count an execution durable only once its
@@ -359,6 +366,7 @@ impl Knobs {
         peer_ack_loss: 0,
         answer_on_release: 0,
         relay: 0,
+        frames: 0,
         late_execution: false,
         execution_lag: 0,
         total_crash: 0,
@@ -869,6 +877,9 @@ struct Stats {
     relayed: usize,
     relay_fallbacks: usize,
     relayed_proposals: usize,
+    /// Proposal frames sent (task-d102), and the proposals they carried.
+    frames: usize,
+    framed: usize,
     campaigns: u32,
     crashes: u32,
     /// Crashes of a node that was leading its ballot.
@@ -989,6 +1000,7 @@ impl Sim {
                 leader.set_learning(LearningMode::Full);
                 leader.observe_learning();
                 leader.set_early_proposal(knobs.early);
+                leader.set_batch_frames(knobs.frames > 0);
                 Role::Leader(leader)
             } else {
                 let mut follower = Follower::new(FollowerConfig {
@@ -1200,10 +1212,21 @@ impl Sim {
                     if matches!(message, Ok(ProtocolMessage::RelayedProposal { .. })) {
                         self.stats.relayed_proposals += 1;
                     }
-                    if let Ok(
-                        ProtocolMessage::Proposal(p)
-                        | ProtocolMessage::RelayedProposal { vote: p, .. },
-                    ) = &message
+                    if let Ok(ProtocolMessage::ProposalFrame { proposals, .. }) = &message {
+                        self.stats.frames += 1;
+                        self.stats.framed += proposals.len();
+                        self.stats.relayed_proposals +=
+                            proposals.iter().filter(|p| p.payload.is_some()).count();
+                    }
+                    let proposed = match &message {
+                        Ok(
+                            ProtocolMessage::Proposal(p)
+                            | ProtocolMessage::RelayedProposal { vote: p, .. },
+                        ) => Some(p.ballot),
+                        Ok(ProtocolMessage::ProposalFrame { ballot, .. }) => Some(*ballot),
+                        _ => None,
+                    };
+                    if let Some(proposed) = proposed
                         && requires.is_empty()
                     {
                         self.stats.early_sends += 1;
@@ -1214,7 +1237,7 @@ impl Sim {
                         // The negative control: the copy reaches the
                         // fast-set followers as well.
                         if self.knobs.early_to_fast_set {
-                            let q = quorum(p.ballot, self.n);
+                            let q = quorum(proposed, self.n);
                             if !q.fast_eligible(&to.replica) {
                                 for f in q.fast_set().iter().map(|f| f.0[0]) {
                                     if f != i {
@@ -1490,6 +1513,7 @@ impl Sim {
                 // The node's setting, given to every leader it becomes,
                 // as `coordd`'s node does (task-d98).
                 l.set_early_proposal(self.knobs.early);
+                l.set_batch_frames(self.knobs.frames > 0);
                 node.role = Some(Role::Leader(l));
                 if let Some(t) = self.trace.as_mut() {
                     t.push_back(format!(
@@ -2754,6 +2778,24 @@ impl Sim {
             if self.chance("admit", self.knobs.admit) {
                 self.admit_next();
             }
+            // A leader's turn ends: its fresh proposals leave, one frame
+            // to each follower (task-d102). Drawn only in the runs that
+            // set it, so every other run's draws are as they were.
+            if self.knobs.frames > 0 {
+                for i in 0..self.n {
+                    let queued = matches!(
+                        &self.nodes[usize::from(i)].role,
+                        Some(Role::Leader(l)) if l.frames_queued()
+                    );
+                    if queued && self.chance("cut", self.knobs.frames) {
+                        let effects = match self.nodes[usize::from(i)].role.as_mut() {
+                            Some(Role::Leader(l)) => l.cut_frames(),
+                            _ => Vec::new(),
+                        };
+                        self.handle(i, effects);
+                    }
+                }
+            }
             if self.chance("collector-crash", self.knobs.collector_crash) {
                 // What the collector counted is gone; what reached the
                 // voters is not.
@@ -3608,6 +3650,23 @@ fn describe(m: &ProtocolMessage) -> String {
             a.path.0[0],
             a.path.0[1]
         ),
+        ProtocolMessage::ProposalFrame {
+            ballot, proposals, ..
+        } => format!(
+            "ProposalFrame {} [{}]",
+            bn(ballot),
+            proposals
+                .iter()
+                .map(|p| format!(
+                    "{} deps[{}] seq{}{}",
+                    short(&p.command),
+                    shorts(&p.deps),
+                    p.seqnum,
+                    if p.payload.is_some() { " +payload" } else { "" }
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         ProtocolMessage::FastAck(a) => format!(
             "FastAck {} {} from {} deps[{}] path {:02x}{:02x}",
             bn(&a.ballot),
@@ -3879,6 +3938,14 @@ fn row_knobs(row: u8) -> Knobs {
     {
         knobs.relay = share;
     }
+    // `PROTOCOL_SIM_FRAMES` (parts per million): the chance per step a
+    // leader sends its turn's proposals in frames (task-d102).
+    if let Some(share) = std::env::var("PROTOCOL_SIM_FRAMES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        knobs.frames = share;
+    }
     // `PROTOCOL_SIM_FAIL_QUEUE=0` fails one batch at a time where the row
     // fails the queue behind it, `=1` the queue where it doesn't.
     match std::env::var("PROTOCOL_SIM_FAIL_QUEUE").as_deref() {
@@ -3973,6 +4040,8 @@ fn run_row(row: u8) {
                     totals.relayed += s.relayed;
                     totals.relay_fallbacks += s.relay_fallbacks;
                     totals.relayed_proposals += s.relayed_proposals;
+                    totals.frames += s.frames;
+                    totals.framed += s.framed;
                     totals.donor_crashes += s.donor_crashes;
                     totals.donor_crashes_taken += s.donor_crashes_taken;
                     totals.donor_crashes_again += s.donor_crashes_again;
@@ -4072,6 +4141,14 @@ fn run_row(row: u8) {
         assert!(
             totals.relayed > 0 && totals.relayed_proposals > 0,
             "row {row} relayed no command: {totals:?}"
+        );
+    }
+    // A row run with frames (`PROTOCOL_SIM_FRAMES`) sent some, each of
+    // more than one proposal (task-d102).
+    if row_knobs(row).frames > 0 {
+        assert!(
+            totals.frames > 0 && totals.framed > totals.frames,
+            "row {row} sent no proposal frame: {totals:?}"
         );
     }
     // Row 24 is defined by its donors crashed (task-d106, #213 review):
@@ -4174,6 +4251,46 @@ fn relayed_rows() {
     assert!(relayed > 0, "no command was relayed to a leader");
     assert!(proposals > 0, "no proposal carried its payload");
     assert!(fallbacks > 0, "no relayed command fell back");
+}
+
+/// The batched round's frames (task-d102): rows 1, 9, 14 and 23 at three
+/// and five voters, each leader's fresh proposals sent in frames cut at
+/// random steps, with half the commands marked and most of those relayed,
+/// so frames carry payloads. Row 23 sends early, so a frame leaves before
+/// its batches are durable too. Every oracle holds, frames were sent with
+/// more than one proposal each, and relayed proposals rode in them.
+#[test]
+fn framed_rows() {
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let mut failures = Vec::new();
+    let (mut frames, mut framed, mut relayed) = (0usize, 0usize, 0usize);
+    for row in [1u8, 9, 14, 23] {
+        let mut knobs = row_knobs(row);
+        knobs.answer_on_release = 500_000;
+        knobs.relay = 750_000;
+        knobs.frames = 300_000;
+        for n in [3u8, 5] {
+            for seed in 0..seeds() {
+                match run_knobs(n, knobs, seed, None) {
+                    Ok(stats) => {
+                        frames += stats.frames;
+                        framed += stats.framed;
+                        relayed += stats.relayed_proposals;
+                    }
+                    Err(e) => failures.push(e),
+                }
+            }
+        }
+    }
+    std::panic::set_hook(hook);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    assert!(frames > 0, "no proposal frame was sent");
+    assert!(
+        framed > frames,
+        "frames held one proposal each: {framed} in {frames}"
+    );
+    assert!(relayed > 0, "no relayed proposal was sent");
 }
 
 #[test]

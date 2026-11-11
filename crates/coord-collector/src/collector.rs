@@ -728,6 +728,8 @@ pub struct Collector {
     relay_fallbacks: u64,
     /// `NotLeading` refusals taken for relayed entries (diagnostic).
     not_leading: u64,
+    /// Submissions sent to the leader alone (diagnostic, task-d102).
+    relayed: u64,
 }
 
 impl Collector {
@@ -748,6 +750,7 @@ impl Collector {
             relay: false,
             relay_fallbacks: 0,
             not_leading: 0,
+            relayed: 0,
         }
     }
 
@@ -804,6 +807,11 @@ impl Collector {
     /// `NotLeading` refusals this collector took for relayed entries.
     pub const fn not_leading(&self) -> u64 {
         self.not_leading
+    }
+
+    /// Submissions this collector sent to the leader alone (task-d102).
+    pub const fn relayed(&self) -> u64 {
+        self.relayed
     }
 
     /// Evidence frames this collector took for commands it submitted as
@@ -962,6 +970,7 @@ impl Collector {
         let frame: Arc<[u8]> = Arc::from(frame.into_boxed_slice());
         // A relayed submission goes to its ballot's leader alone.
         let targets: Vec<ReplicaId> = if relayed {
+            self.relayed += 1;
             vec![self.config.quorum.leader()]
         } else {
             self.config.quorum.voters().iter().copied().collect()

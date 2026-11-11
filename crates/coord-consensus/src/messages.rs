@@ -136,6 +136,11 @@ impl CatchUpEntry {
     }
 }
 
+/// The most a [`ProtocolMessage::ProposalFrame`]'s proposals take
+/// (task-d102): a turn's proposals to one follower past it go in more
+/// than one frame. A proposal above it goes alone, as the message it is.
+pub const MAX_PROPOSAL_FRAME_BYTES: usize = 1024 * 1024;
+
 /// A peer message of the ballot/promise increment.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ProtocolMessage {
@@ -414,6 +419,81 @@ pub enum ProtocolMessage {
         /// The payload record of `vote.command`.
         payload: PayloadRecordV1,
     },
+    /// A turn's fresh proposals to one follower, in one frame (task-d102,
+    /// design Section 4.3's batched round). The sender and the ballot
+    /// ride once, each proposal after them in sequence-number order, a
+    /// relayed command's with its payload. A follower takes each entry as
+    /// the `Proposal` or `RelayedProposal` it stands for, in order, in
+    /// one step, so their adoptions share its next journal group; one it
+    /// refuses leaves the others as they are. Sent only while
+    /// `Feature::BatchedRound` is active: an older build can't decode it.
+    ProposalFrame {
+        /// The leader that sent the frame.
+        replica: ReplicaId,
+        /// The ballot every proposal in it belongs to.
+        ballot: Ballot,
+        /// The proposals, in sequence-number order.
+        proposals: Vec<FramedProposal>,
+    },
+}
+
+/// One proposal in a [`ProtocolMessage::ProposalFrame`] (task-d102): a
+/// `Proposal`'s vote without the sender and ballot the frame names once,
+/// and a relayed command's payload record.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct FramedProposal {
+    /// Command.
+    pub command: CommandId,
+    /// Direct dependencies, as the leader ordered them.
+    pub deps: Vec<CommandId>,
+    /// Path digest through the command per key, in key order.
+    pub paths: Vec<(Vec<u8>, Digest32)>,
+    /// Combined path digest.
+    pub path: Digest32,
+    /// Admission digest the leader accepted the command under.
+    pub admission: Digest32,
+    /// The leader's sequence number for it.
+    pub seqnum: u64,
+    /// The command's payload record, for a relayed one.
+    pub payload: Option<PayloadRecordV1>,
+}
+
+impl FramedProposal {
+    /// The entry for `vote`, a proposal, with `payload` beside it.
+    /// `None` for a vote without a sequence number, which is no proposal.
+    pub fn of(vote: FastAck, payload: Option<PayloadRecordV1>) -> Option<Self> {
+        Some(FramedProposal {
+            seqnum: vote.seqnum?,
+            command: vote.command,
+            deps: vote.deps,
+            paths: vote.paths,
+            path: vote.path,
+            admission: vote.admission,
+            payload,
+        })
+    }
+
+    /// The `Proposal` vote this entry stands for, from the frame's sender
+    /// and ballot, and its payload.
+    pub fn into_vote(
+        self,
+        replica: ReplicaId,
+        ballot: Ballot,
+    ) -> (FastAck, Option<PayloadRecordV1>) {
+        (
+            FastAck {
+                replica,
+                ballot,
+                command: self.command,
+                deps: self.deps,
+                paths: self.paths,
+                path: self.path,
+                admission: self.admission,
+                seqnum: Some(self.seqnum),
+            },
+            self.payload,
+        )
+    }
 }
 
 /// An activation record as it travels between voters (task-d99): the
@@ -495,6 +575,7 @@ impl ProtocolMessage {
             | ProtocolMessage::FeaturePrepared { .. }
             | ProtocolMessage::FeatureActivated { .. }
             | ProtocolMessage::FeatureHeld { .. }
+            | ProtocolMessage::ProposalFrame { .. }
             | ProtocolMessage::Sync(_) => None,
         }
     }
@@ -624,14 +705,76 @@ mod tests {
         assert_eq!(ProtocolMessage::decode(&bytes).as_ref(), Ok(&relayed));
         assert_eq!(bytes[0], held[0] + 1);
         assert_eq!(relayed.command(), Some(vote.command));
-        assert!(ProtocolMessage::decode(&[held[0] + 2]).is_err());
         // The proposal's own bytes follow the index unchanged: a
         // follower reads the vote as a `Proposal` carries it.
-        let proposal = ProtocolMessage::Proposal(vote).encode();
+        let proposal = ProtocolMessage::Proposal(vote.clone()).encode();
         assert_eq!(&bytes[1..proposal.len()], &proposal[1..]);
 
         let forgotten = postcard::to_allocvec(&SubmissionRefusal::Forgotten).unwrap();
         let not_leading = postcard::to_allocvec(&SubmissionRefusal::NotLeading).unwrap();
         assert_eq!(not_leading, alloc::vec![forgotten[0] + 1]);
+
+        // task-d102's frame is appended after the relayed proposal, and
+        // nothing is past it.
+        let frame = ProtocolMessage::ProposalFrame {
+            replica: vote.replica,
+            ballot: vote.ballot,
+            proposals: alloc::vec![
+                FramedProposal::of(vote.clone(), None).unwrap(),
+                FramedProposal::of(
+                    FastAck {
+                        command: CommandId(Digest32([5; 32])),
+                        seqnum: Some(4),
+                        ..vote.clone()
+                    },
+                    match relayed.clone() {
+                        ProtocolMessage::RelayedProposal { payload, .. } => Some(payload),
+                        _ => unreachable!(),
+                    },
+                )
+                .unwrap(),
+            ],
+        };
+        let framed = frame.encode();
+        assert_eq!(framed[0], held[0] + 2);
+        assert_eq!(ProtocolMessage::decode(&framed).as_ref(), Ok(&frame));
+        assert_eq!(frame.command(), None, "a frame is about more than one");
+        assert!(ProtocolMessage::decode(&[held[0] + 3]).is_err());
+    }
+
+    /// A frame's entry is the proposal it stands for: back from the
+    /// frame's sender and ballot, it is the vote it was made from. A vote
+    /// without a sequence number is no proposal, and has no entry.
+    #[test]
+    fn a_framed_proposal_is_the_vote_it_was_made_from() {
+        let vote = FastAck {
+            replica: ReplicaId([1; 16]),
+            ballot: Ballot {
+                epoch: epoch(),
+                number: 2,
+                leader: ReplicaId([1; 16]),
+            },
+            command: CommandId(Digest32([7; 32])),
+            deps: alloc::vec![CommandId(Digest32([6; 32]))],
+            paths: alloc::vec![(alloc::vec![1], Digest32([2; 32]))],
+            path: Digest32([3; 32]),
+            admission: Digest32([8; 32]),
+            seqnum: Some(9),
+        };
+        let entry = FramedProposal::of(vote.clone(), None).unwrap();
+        assert_eq!(
+            entry.into_vote(vote.replica, vote.ballot),
+            (vote.clone(), None)
+        );
+        assert!(
+            FramedProposal::of(
+                FastAck {
+                    seqnum: None,
+                    ..vote
+                },
+                None
+            )
+            .is_none()
+        );
     }
 }

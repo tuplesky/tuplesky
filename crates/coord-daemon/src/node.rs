@@ -163,6 +163,24 @@ impl Machine {
         }
     }
 
+    /// Send each follower the proposals a leader queued this turn, in one
+    /// frame (task-d102, [`Leader::cut_frames`]). A follower queues
+    /// nothing.
+    pub fn cut_frames(&mut self) -> Vec<Effect> {
+        match self {
+            Machine::Leader(l) => l.cut_frames(),
+            Machine::Follower(_) => Vec::new(),
+        }
+    }
+
+    /// Whether a leader holds proposals for [`Machine::cut_frames`].
+    pub fn frames_queued(&self) -> bool {
+        match self {
+            Machine::Leader(l) => l.frames_queued(),
+            Machine::Follower(_) => false,
+        }
+    }
+
     /// Whether `command` is marked as answered on the release alone.
     pub fn answers_on_release(&self, command: &CommandId) -> bool {
         match self {
@@ -798,6 +816,9 @@ pub struct Node<P: Persistence> {
     /// Whether `Feature::BatchedRound` is active (task-d102): the
     /// collector beside it may relay its submissions to the leader alone.
     batched_round: bool,
+    /// What the fresh proposals and the frontier of the leaders this node
+    /// left cost, by kind (task-d102).
+    sent_bytes: coord_consensus::SentBytes,
     /// Commands this replica established, by the path that decided them
     /// (task-d50).
     pub established: Established,
@@ -903,6 +924,7 @@ impl<P: Persistence> Node<P> {
             features: None,
             answer_on_release: false,
             batched_round: false,
+            sent_bytes: coord_consensus::SentBytes::default(),
             established: Established::default(),
             fast_path: coord_consensus::FastPathCounts::default(),
             release: crate::learned::ReleaseTiming::default(),
@@ -948,6 +970,40 @@ impl<P: Persistence> Node<P> {
     /// rest of the group.
     pub fn lower_in_groups(&mut self) {
         self.grouped = true;
+        self.apply_batch_frames();
+    }
+
+    /// Read `Feature::BatchedRound` as active, or not, without the
+    /// feature's activation: what [`Node::follow_features`] sets once the
+    /// domain activates it, for a test or a local reading's build alone.
+    pub fn set_batched_round(&mut self, on: bool) {
+        self.batched_round = on;
+        self.apply_batch_frames();
+    }
+
+    /// Whether this node's leaders hold a turn's fresh proposals for one
+    /// frame to each follower (task-d102): while `Feature::BatchedRound`
+    /// is active and the node lowers in groups, since a frame is cut
+    /// where the loop lowers its group.
+    pub const fn batch_frames(&self) -> bool {
+        self.batched_round && self.grouped
+    }
+
+    fn apply_batch_frames(&mut self) {
+        let on = self.batch_frames();
+        if let Some(Machine::Leader(l)) = self.machine.as_mut() {
+            l.set_batch_frames(on);
+        }
+    }
+
+    /// What this node's leaders sent of their fresh proposals and their
+    /// frontier, by kind, since boot (task-d102).
+    pub fn sent_bytes(&self) -> coord_consensus::SentBytes {
+        let mut sent = self.sent_bytes;
+        if let Some(Machine::Leader(l)) = self.machine.as_ref() {
+            sent.add(&l.sent_bytes());
+        }
+        sent
     }
 
     /// Lower everything queued as one group and hand what that made
@@ -971,7 +1027,10 @@ impl<P: Persistence> Node<P> {
     }
 
     fn flush_queued(&mut self, ballot: &Ballot) -> Result<Outbound, DriveError> {
-        let mut next = Vec::new();
+        // The turn ends here: a leader's proposals of it leave in one
+        // frame to each follower (task-d102), published before the group
+        // that makes their batches durable is lowered.
+        let mut next = self.machine_mut().cut_frames();
         self.lower_queued(&mut next)?;
         // A round releases what became durable, even with nothing more
         // to carry out.
@@ -1240,6 +1299,10 @@ impl<P: Persistence> Node<P> {
         }
         let counts = self.machine_mut().take_resend_counts();
         self.resends.add(&counts);
+        if let Machine::Leader(l) = self.machine() {
+            let sent = l.sent_bytes();
+            self.sent_bytes.add(&sent);
+        }
         self.leave_role();
         let machine = self.machine.take().expect("a node always holds a machine");
         let (machine, effects) = match machine {
@@ -1250,6 +1313,7 @@ impl<P: Persistence> Node<P> {
                     Leader::from_recovered(f.into_recovered(), quorum, &decision);
                 leader.set_early_proposal(self.early_proposal);
                 leader.set_early_holders(self.early_holders.clone());
+                leader.set_batch_frames(self.batched_round && self.grouped);
                 self.won = Some(decision);
                 (Machine::Leader(Box::new(leader)), effects)
             }
@@ -1386,6 +1450,10 @@ impl<P: Persistence> Node<P> {
         }
         let counts = self.machine_mut().take_resend_counts();
         self.resends.add(&counts);
+        if let Machine::Leader(l) = self.machine() {
+            let sent = l.sent_bytes();
+            self.sent_bytes.add(&sent);
+        }
         self.leave_role();
         let Some(Machine::Leader(l)) = self.machine.take() else {
             unreachable!("checked above")
@@ -1494,6 +1562,7 @@ impl<P: Persistence> Node<P> {
         self.set_release_at_execution(release);
         self.answer_on_release = answer_on_release;
         self.batched_round = answer_on_release && batched_round;
+        self.apply_batch_frames();
     }
 
     /// Whether this node reads `Feature::AnswerOnRelease` active

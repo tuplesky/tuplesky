@@ -187,6 +187,24 @@ pre-accepting it; one it would not take leaves the proposal to be
 handled as a `Proposal`. An older build cannot decode the variant, which
 is why the leader sends it only for a version-3 submission.
 
+While `Feature::BatchedRound` is active and its node lowers persists in
+groups, a leader sends a turn's fresh proposals to each follower in one
+peer message (task-d102), `ProposalFrame { replica, ballot, proposals }`,
+appended after `RelayedProposal`. The sender and the ballot ride once;
+each entry is a `FramedProposal { command, deps, paths, path, admission,
+seqnum, payload }`: a `Proposal`'s vote without the two fields the frame
+names, and a relayed command's payload record (`None` for any other).
+Entries are in sequence-number order. The frame is cut where the
+leader's loop lowers the turn's group, with no timer, and waits on every
+batch its entries wait on; a turn's proposals to one follower past
+`MAX_PROPOSAL_FRAME_BYTES` (1 MiB) go in more than one frame, and a turn
+of one proposal sends it as the `Proposal` or `RelayedProposal` it is. A
+follower takes each entry as the message it stands for, in order, in one
+step, so their adoptions share its next journal group; an entry it
+refuses leaves the others as they are. Re-sends, re-presentations,
+answers to a follower's ask and the re-proposals after a Sync are never
+framed.
+
 A read is served only by the leader of the ballot named in it, after a
 confirmation round of that ballot (`ProtocolMessage::ReadConfirm` /
 `ReadConfirmed`, appended at indices 20 and 21) started after the read
