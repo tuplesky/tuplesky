@@ -226,9 +226,14 @@ fn a_payload_change_conflicts_locally_and_from_the_server() {
         .unwrap();
     assert_eq!(c.state(id3), Some(&RequestState::Queued));
     assert!(c.take_completions().is_empty());
+    // Every attempt so far was refused before admission: the application
+    // can say so rather than "no answer".
+    assert_eq!((c.backpressured(id3), c.attempts(id3)), (1, 1));
     c.tick(6 + ClientConfig::default().backoff);
     let again = sends(&c.take_actions());
     assert_eq!(again[0].2, sent[0].2, "same invocation after backpressure");
+    // The second attempt is out and unanswered: no longer all refused.
+    assert_eq!((c.backpressured(id3), c.attempts(id3)), (1, 2));
     c.on_frame(200, c1, &err_frame(command3, codes::NOT_ADMITTED))
         .unwrap();
     assert_eq!(

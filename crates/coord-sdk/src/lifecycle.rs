@@ -228,6 +228,8 @@ struct Entry {
     not_before: u64,
     /// Sends and resolves performed.
     attempts: u32,
+    /// Of those, the ones answered `BACKPRESSURE`.
+    backpressured: u32,
 }
 
 /// The SDK client of one session against one endpoint.
@@ -310,6 +312,18 @@ impl<P: CredentialProvider> Client<P> {
     /// Sends and resolves performed for a request.
     pub fn attempts(&self, request: RequestId) -> u32 {
         self.requests.get(&request).map_or(0, |e| e.attempts)
+    }
+
+    /// Of a request's attempts, those the frontend answered
+    /// `BACKPRESSURE`: refused before admission, nothing done. The request
+    /// stays queued and goes out again after the backoff, so this is how an
+    /// application tells a frontend refusing it from an outcome it could not
+    /// learn. When it equals [`Client::attempts`], every attempt this
+    /// client made was refused, and none of them reached the domain. An
+    /// earlier submission of the same sequence (before a restart, or a
+    /// request forgotten and retried) is not counted here.
+    pub fn backpressured(&self, request: RequestId) -> u32 {
+        self.requests.get(&request).map_or(0, |e| e.backpressured)
     }
 
     /// Requests not done.
@@ -542,6 +556,7 @@ impl<P: CredentialProvider> Client<P> {
                     // The same invocation, later; nothing is done.
                     e.state = RequestState::Queued;
                     e.not_before = now + self.config.backoff;
+                    e.backpressured += 1;
                     return;
                 }
                 codes::NOT_ADMITTED => {
@@ -666,6 +681,7 @@ impl<P: CredentialProvider> Client<P> {
                 deadline_ms,
                 not_before: now,
                 attempts: 0,
+                backpressured: 0,
             },
         );
     }

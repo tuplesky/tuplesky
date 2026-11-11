@@ -44,7 +44,7 @@ pub mod ingress;
 pub mod trace;
 pub mod wire;
 
-pub use admission::{Admission, AdmissionLimits, AdmissionRefusal, Caller};
+pub use admission::{Admission, AdmissionLimits, AdmissionRefusal, AdmissionRefusals, Caller};
 pub use clock::MonotonicMillis;
 pub use collector::{
     Collector, CollectorConfig, Differs, EvidenceError, Expired, FanOut, HoldReason, Mismatch,
