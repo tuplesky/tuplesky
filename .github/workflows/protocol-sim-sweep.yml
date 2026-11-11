@@ -17,7 +17,11 @@
 # seed is printed with its row and size; replay it with
 # `PROTOCOL_SIM_ONE=row,voters,seed` and `PROTOCOL_SIM_TRACE=1`, and keep
 # it in `crates/coord-consensus/fixtures/protocol_sim/seeds.json` with
-# what it found.
+# what it found. A dispatch can run every row with task-d100's marked
+# commands (`answer-on-release`, below every command, since a row checks
+# what its unmarked commands learned) and task-d102's relay and proposal
+# frames (`relay`, a share of the marked commands, and `frames`), each in
+# parts per million; the weekly run leaves them off.
 name: protocol-sim-sweep
 
 on:
@@ -26,6 +30,15 @@ on:
       seeds:
         description: "Seeds per row and size"
         default: "1000"
+      answer-on-release:
+        description: "PROTOCOL_SIM_ANSWER_ON_RELEASE, parts per million: the share of commands marked to be answered on the leader's release alone (task-d100 step A); empty for none. Below 1000000: with every command marked, a row's own check of what its unmarked commands learned fails by construction"
+        default: ""
+      relay:
+        description: "PROTOCOL_SIM_RELAY, parts per million: the share of marked commands relayed to their ballot's leader alone (task-d102); needs answer-on-release; empty for none"
+        default: ""
+      frames:
+        description: "PROTOCOL_SIM_FRAMES, parts per million: the chance per step a leader sends its turn's proposals in frames (task-d102); empty for none"
+        default: ""
   schedule:
     # Weekly (Sundays 04:41 UTC), apart from CI's Monday run.
     - cron: "41 4 * * 0"
@@ -98,8 +111,29 @@ jobs:
           NO_CATCH_UP: ${{ matrix.catch-up == 'no-catch-up' && '1' || '' }}
           ROW: ${{ matrix.row }}
           PEER_ACK_LOSS: ${{ matrix.peer-ack-loss }}
+          ANSWER_ON_RELEASE: ${{ inputs.answer-on-release }}
+          RELAY: ${{ inputs.relay }}
+          FRAMES: ${{ inputs.frames }}
         run: |
           if [ -n "$NO_CATCH_UP" ]; then export PROTOCOL_SIM_NO_CATCH_UP=1; fi
           if [ -n "$PEER_ACK_LOSS" ]; then export PROTOCOL_SIM_PEER_ACK_LOSS="$PEER_ACK_LOSS"; fi
+          # task-d100's marked commands and task-d102's relay and frames,
+          # each in parts per million. The relay is a share of the marked
+          # commands, and a row checks what its unmarked commands learned,
+          # so a relay needs some commands marked and some not.
+          for v in ANSWER_ON_RELEASE RELAY FRAMES; do
+            case ${!v} in
+              "") ;;
+              *[!0-9]*) echo "::error::$v must be whole parts per million, not ${!v}"; exit 2 ;;
+              *) if [ "${!v}" -gt 1000000 ]; then echo "::error::$v is at most 1000000, not ${!v}"; exit 2; fi
+                 export "PROTOCOL_SIM_$v=${!v}" ;;
+            esac
+          done
+          if [ "${ANSWER_ON_RELEASE:-0}" -ge 1000000 ]; then
+            echo "::error::answer-on-release must be below 1000000: with every command marked, a row's check of its unmarked commands fails by construction"; exit 2
+          fi
+          if [ "${RELAY:-0}" -gt 0 ] && [ "${ANSWER_ON_RELEASE:-0}" -eq 0 ]; then
+            echo "::error::relay is a share of the marked commands; give answer-on-release too"; exit 2
+          fi
           cargo test --locked --release -p coord-consensus --test protocol_sim -- \
             --exact "$ROW" --nocapture
