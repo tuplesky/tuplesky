@@ -814,9 +814,12 @@ struct Sim {
     /// work: a candidate installs its own selection as a Sync.
     selection_counted: Vec<Option<Ballot>>,
     /// Each node's catch-up pacer, as `coordd` keeps one (task-d08):
-    /// whether it has asked since it started, and the frontier at its last
+    /// whether the probe it makes after it starts is done, and the frontier at its last
     /// ask with the asks gone unanswered since.
     probed: Vec<bool>,
+    /// The catch-up pages a node had taken when its probe first asked:
+    /// a different count later is a page that answered it (#98).
+    probe_pages: Vec<Option<u64>>,
     asked_at: Vec<Option<usize>>,
     unanswered: Vec<usize>,
     /// The node whose page with commands each voter last took, and the
@@ -1041,6 +1044,7 @@ impl Sim {
             pages_lost: BTreeSet::new(),
             selection_counted: vec![None; usize::from(n)],
             probed: vec![false; usize::from(n)],
+            probe_pages: vec![None; usize::from(n)],
             asked_at: vec![None; usize::from(n)],
             unanswered: vec![0; usize::from(n)],
             donor_of: vec![None; usize::from(n)],
@@ -2500,6 +2504,7 @@ impl Sim {
         *most = (*most).max(rows);
         self.booted_at[usize::from(i)] = self.step;
         self.probed[usize::from(i)] = false;
+        self.probe_pages[usize::from(i)] = None;
         self.asked_at[usize::from(i)] = None;
         self.unanswered[usize::from(i)] = 0;
         let executed = ExecutionPosition::new(node.executed.len() as u64).unwrap();
@@ -2578,18 +2583,32 @@ impl Sim {
                     }
                     // `coordd`'s pacer (task-d08): a voter that holds work
                     // it cannot execute asks, and so does one that has not
-                    // asked since it started, whatever it holds; the
-                    // leader first, then the other voters in turn.
-                    let holds = f.holds_unexecuted() || !self.probed[usize::from(i)];
-                    if self.catch_up && !executable && holds && !f.catching_up() {
-                        let k = usize::from(i);
+                    // had a page since it started, whatever it holds,
+                    // until every voter has been asked (#98); the leader
+                    // first, then the other voters in turn.
+                    let k = usize::from(i);
+                    let pages = f.catch_up_counts().0;
+                    if !self.probed[k]
+                        && (f.catching_up() || self.probe_pages[k].is_some_and(|p| p != pages))
+                    {
                         self.probed[k] = true;
+                    }
+                    let holds = f.holds_unexecuted() || !self.probed[k];
+                    if self.catch_up && !executable && holds && !f.catching_up() {
                         if self.asked_at[k] == Some(at) {
                             self.unanswered[k] += 1;
                         } else {
                             self.unanswered[k] = 0;
                         }
                         self.asked_at[k] = Some(at);
+                        if f.holds_unexecuted() {
+                            self.probed[k] = true;
+                        } else {
+                            self.probe_pages[k].get_or_insert(pages);
+                            if self.unanswered[k] + 1 >= 2 + usize::from(self.n) - 1 {
+                                self.probed[k] = true;
+                            }
+                        }
                         effects.extend(f.request_catch_up(r(donor)));
                     }
                     effects

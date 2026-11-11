@@ -1088,6 +1088,7 @@ impl<P: Persistence> Voter<P> {
             holds: machine.holds_unexecuted(),
             backlog: || machine.unexecuted_held(),
             busy: machine.catching_up(),
+            pages: machine.catch_up_counts().0,
             leads: machine.leads(),
         };
         let voters: Vec<ReplicaId> = machine.identity().voters.iter().copied().collect();
