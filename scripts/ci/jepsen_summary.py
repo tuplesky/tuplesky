@@ -2021,9 +2021,10 @@ def relay_table(voters: dict) -> list[str]:
     rows = []
     for node, v in voters.items():
         raw = (v.cost.raw or {}) if v.cost else {}
-        relay, sent = raw.get("relay"), raw.get("proposals")
+        relay, sent, flushes = raw.get("relay"), raw.get("proposals"), raw.get("flushes")
         if isinstance(relay, dict) or isinstance(sent, dict):
-            rows.append((node, v.cost.executed, relay if isinstance(relay, dict) else {}, sent if isinstance(sent, dict) else {}))
+            rows.append((node, v.cost.executed, relay if isinstance(relay, dict) else {},
+                         sent if isinstance(sent, dict) else {}, flushes if isinstance(flushes, dict) else {}))
     if not rows:
         return []
     out = [
@@ -2032,21 +2033,25 @@ def relay_table(voters: dict) -> list[str]:
         "every voter after all, at the bound or at a `NotLeading` refusal; then what its leaders sent of fresh "
         "proposals, one to each follower, and of frontier announcements, with the frames that carried more than "
         "one proposal; bytes leave out the payload records relayed proposals carried, given apart; per command is "
-        "over the commands the voter executed)",
+        "over the commands the voter executed; then the domain loop's flushes and the events it took between "
+        "them, api / peer, since a frame is cut at a flush)",
         "",
         "| Node | Relayed | Fell back | `NotLeading` | Proposals | Frames (proposals each) | Proposal bytes per command "
-        "| Payload bytes per command | Frontiers | Frontier bytes per command |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        "| Payload bytes per command | Frontiers | Frontier bytes per command | Flushes | Events per flush (api / peer) |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     per = lambda n, executed: f"{n / executed:.1f}" if executed else "-"
-    for node, executed, relay, sent in rows:
+    for node, executed, relay, sent, flushes in rows:
         frames = sent.get("frames", 0)
         each = f"{sent.get('framed', 0) / frames:.1f}" if frames else "-"
+        taken = flushes.get("flushes")
+        events = (f"{flushes.get('api_events', 0) / taken:.2f} / {flushes.get('peer_events', 0) / taken:.2f}"
+                  if taken else "-")
         out.append(
             f"| {node} | {relay.get('relayed', '-')} | {relay.get('fallbacks', '-')} | {relay.get('not_leading', '-')} "
             f"| {sent.get('proposals', '-')} | {frames} ({each}) | {per(sent.get('proposal_bytes', 0), executed)} "
             f"| {per(sent.get('payload_bytes', 0), executed)} | {sent.get('frontiers', '-')} "
-            f"| {per(sent.get('frontier_bytes', 0), executed)} |"
+            f"| {per(sent.get('frontier_bytes', 0), executed)} | {taken if taken is not None else '-'} | {events} |"
         )
     out.append("")
     return out

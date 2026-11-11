@@ -128,6 +128,7 @@ COUNTS = (
     ("proposal_bytes", "Proposal bytes", ("proposals", "proposal_bytes")),
     ("relayed_payload_bytes", "Relayed payload bytes", ("proposals", "payload_bytes")),
     ("frontiers", "Frontier announcements", ("proposals", "frontiers")),
+    ("loop_flushes", "Loop flushes", ("flushes", "flushes")),
     ("journal_groups", "Journal groups", ("journal_appends",)),
     ("projection_commits", "Projection commits", ("projection_commits",)),
 )
