@@ -1460,3 +1460,200 @@ fn every_silent_end_of_an_ask_or_a_page_is_counted() {
         "{now:?}"
     );
 }
+
+impl Cluster {
+    /// A page from r0 at `after` of its first `n` commands, as if r0 had
+    /// executed no further: taken whole, it is not followed by an ask.
+    fn page_through(&self, after: ExecutionPosition, n: usize) -> ProtocolMessage {
+        let mut page = self.page(0, ballot0(), after);
+        let ProtocolMessage::CatchUpPage {
+            entries, through, ..
+        } = &mut page
+        else {
+            unreachable!()
+        };
+        entries.truncate(n);
+        *through = ExecutionPosition::new(after.get() + n as u64).unwrap();
+        page
+    }
+}
+
+/// task-d25 at the bar's load (#98, 6799183006): a voter that executed
+/// past where it asked from while the page was on its way -- here three
+/// commands, from a page that answered the same ask first -- takes what
+/// the page carries past its frontier, and the chain of asks goes on
+/// from there to the donor's frontier, with no pacer. Before, the page
+/// was dropped whole as `ignored_after`, and nothing asked again until
+/// the pacer's next ask, a second later in `coordd`.
+#[test]
+fn a_page_its_voter_executed_into_while_on_its_way_is_taken_past_the_frontier() {
+    let (mut cluster, _) = left_behind(17);
+    assert!(cluster.catching.is_empty(), "no pacer in this test");
+    cluster.serve = false;
+    let start = cluster.follower(4).executed_through();
+    cluster.ask(4);
+    assert_eq!(cluster.catch_up_asks.last(), Some(&(4, start.get())));
+    // The voter's frontier moves past the ask's start.
+    let ahead = cluster.page_through(start, 3);
+    cluster.deliver_page(4, 0, &ahead);
+    cluster.settle();
+    assert_eq!(
+        cluster.follower(4).executed_through().get(),
+        start.get() + 3
+    );
+    let asks = cluster.catch_up_asks.len();
+    // The page the ask brought, from where it asked: cut short of the
+    // donor's frontier, as a page at the byte bound is.
+    cluster.serve = true;
+    let mut stale = cluster.page(0, ballot0(), start);
+    let ProtocolMessage::CatchUpPage { entries, .. } = &mut stale else {
+        unreachable!()
+    };
+    entries.truncate(6);
+    cluster.deliver_page(4, 0, &stale);
+    cluster.settle();
+    assert_eq!(
+        cluster.catch_up_asks.get(asks),
+        Some(&(4, start.get() + 6)),
+        "the chain did not go on from the stale page's end"
+    );
+    assert_eq!(
+        cluster.nodes[4].executed, cluster.nodes[0].executed,
+        "r4 stopped at a stale page"
+    );
+    let now = paths(&cluster);
+    assert_eq!(
+        (
+            now.ignored_after,
+            now.taken_stale,
+            now.stale_unasked,
+            now.stopped_stale
+        ),
+        (0, 1, 0, 0),
+        "{now:?}"
+    );
+}
+
+/// One ask a page: a stale page answering an earlier ask than the last
+/// is taken for what it carries past the frontier, and asks nothing; the
+/// last ask's page goes on. Two chains would double the donor's reads.
+#[test]
+fn a_late_page_of_an_earlier_ask_starts_no_second_chain() {
+    let (mut cluster, _) = left_behind(17);
+    cluster.serve = false;
+    let start = cluster.follower(4).executed_through();
+    cluster.ask(4);
+    let ahead = cluster.page_through(start, 3);
+    cluster.deliver_page(4, 0, &ahead);
+    cluster.settle();
+    // The pacer asks again from the new frontier.
+    cluster.ask(4);
+    let last = cluster.follower(4).executed_through();
+    assert_eq!(cluster.catch_up_asks.last(), Some(&(4, last.get())));
+    let asks = cluster.catch_up_asks.len();
+    // The first ask's page arrives late, cut short of the donor's
+    // frontier as a page at the byte bound is: taken, and no ask
+    // follows it.
+    let mut late = cluster.page(0, ballot0(), start);
+    let ProtocolMessage::CatchUpPage { entries, .. } = &mut late else {
+        unreachable!()
+    };
+    entries.truncate(6);
+    let carried = entries_of(&late).len() as u64;
+    cluster.deliver_page(4, 0, &late);
+    cluster.settle();
+    assert_eq!(cluster.catch_up_asks.len(), asks, "a second chain started");
+    assert_eq!(
+        cluster.follower(4).executed_through().get(),
+        start.get() + carried,
+        "what the page carried past the frontier was taken"
+    );
+    let now = paths(&cluster);
+    assert_eq!(
+        (now.ignored_after, now.taken_stale, now.stale_unasked),
+        (0, 1, 1),
+        "{now:?}"
+    );
+}
+
+/// After a boot the first ask still has to be answered from exactly the
+/// boot frontier while restored commits wait to be compared (task-d25):
+/// a page that starts below it is ignored, as before, and not taken as
+/// a stale page, even after the voter executed past it.
+#[test]
+fn after_a_boot_a_page_below_the_boot_frontier_is_still_ignored() {
+    let (mut cluster, _) = left_behind(41);
+    cluster.serve = false;
+    let after = cluster.follower(4).executed_through();
+    let page = cluster.page(0, ballot0(), after);
+    cluster.deliver_page(4, 0, &page);
+    cluster.execute_at_most(4, 1);
+    cluster.restart(4);
+    let boot = cluster.follower(4).executed_through();
+    cluster.settle();
+    assert!(
+        cluster.follower(4).executed_through() > boot,
+        "the restart executed nothing past its frontier: the test shows nothing"
+    );
+    let below = ExecutionPosition::new(boot.get() - 1).unwrap();
+    let before = paths(&cluster);
+    cluster.deliver_page(4, 0, &cluster.page(0, ballot0(), below));
+    let now = paths(&cluster);
+    assert_eq!(now.ignored_after, before.ignored_after + 1, "{now:?}");
+    assert_eq!(now.taken_stale, before.taken_stale, "{now:?}");
+    // The ask from the boot frontier is still answered and compared.
+    cluster.serve = true;
+    cluster.ask(4);
+    assert_eq!(cluster.follower(4).catch_up_divergence(), None);
+    assert_eq!(cluster.nodes[4].executed, cluster.nodes[0].executed);
+}
+
+fn paths(cluster: &Cluster) -> coord_consensus::CatchUpPaths {
+    cluster.follower(4).catch_up_paths()
+}
+
+/// The latest ask's page arrives while the window of a late page of an
+/// earlier ask is still in hand: it is dropped as busy, and the chain
+/// goes on once that window has executed, without the pacer (Codex on
+/// #223). Before, neither page asked again and the voter stopped short.
+#[test]
+fn the_latest_asks_page_dropped_while_a_late_window_runs_still_continues_the_chain() {
+    let (mut cluster, _) = left_behind(17);
+    cluster.serve = false;
+    let start = cluster.follower(4).executed_through();
+    cluster.ask(4);
+    let ahead = cluster.page_through(start, 3);
+    cluster.deliver_page(4, 0, &ahead);
+    cluster.settle();
+    cluster.ask(4);
+    let last = cluster.follower(4).executed_through();
+    let asks = cluster.catch_up_asks.len();
+    // The first ask's page, late and cut short, then the last ask's page,
+    // before the first one's window has run.
+    let mut late = cluster.page(0, ballot0(), start);
+    let ProtocolMessage::CatchUpPage { entries, .. } = &mut late else {
+        unreachable!()
+    };
+    entries.truncate(6);
+    let latest = cluster.page(0, ballot0(), last);
+    let before = paths(&cluster);
+    cluster.deliver_page(4, 0, &late);
+    assert!(
+        cluster.follower(4).catching_up(),
+        "the late window ran at once: the test shows nothing"
+    );
+    cluster.deliver_page(4, 0, &latest);
+    let now = paths(&cluster);
+    assert_eq!(now.ignored_busy, before.ignored_busy + 1, "{now:?}");
+    cluster.serve = true;
+    cluster.settle();
+    assert_eq!(
+        cluster.catch_up_asks.get(asks),
+        Some(&(4, start.get() + 6)),
+        "no ask followed the late window"
+    );
+    assert_eq!(
+        cluster.nodes[4].executed, cluster.nodes[0].executed,
+        "r4 stopped short with the latest ask's page dropped"
+    );
+}
