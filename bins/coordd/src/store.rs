@@ -789,6 +789,25 @@ fn reinstall_if_invalid(
             "the local checkpoint could not be installed: {e:?}"
         ))
     })?;
+    // The rollback guard over the image just installed (#227 review). An
+    // activation inside the baseline image is in no journal record the
+    // scan before the attach reads, since that scan starts at the image's
+    // stamp. Checked here, before the reinstalled generation becomes the
+    // selected one, so a build that can't run it changes nothing.
+    {
+        use coord_store_api::engine::{LocalEngine, SnapshotSource};
+        let view = staged.engine().reader().snapshot().map_err(|e| {
+            refused(format!(
+                "the reinstalled image's activation record could not be read: {e}"
+            ))
+        })?;
+        coord_checkpoint::feature::admit(&view).map_err(|e| {
+            refused(format!(
+                "{e}: activated in the local checkpoint at {}; nothing was reinstalled",
+                pointer.represented.get()
+            ))
+        })?;
+    }
     let generation = staged
         .activate()
         .map_err(|e| refused(format!("the reinstalled generation: {e}")))?;
@@ -1086,8 +1105,15 @@ namespace = "5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e"
     /// `features` (ids), and a record after it, both applied to the
     /// projection.
     fn journal_an_activation(config: &Config, at: u64, features: Vec<u16>) {
-        use coord_storage::Persistence;
         let mut storage = serve(config, at).expect("serve").attach().expect("attach");
+        submit_an_activation(&mut storage, at, features);
+        drop(storage);
+    }
+
+    /// Submit and materialize an activation record of `features` (ids),
+    /// and a record after it, on a node attached at `at`.
+    fn submit_an_activation(storage: &mut Storage, at: u64, features: Vec<u16>) {
+        use coord_storage::Persistence;
         let record = coord_checkpoint::feature::ActiveFeaturesV1 {
             cluster: CLUSTER,
             domain: DOMAIN,
@@ -1121,7 +1147,6 @@ namespace = "5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e"
             }
         }
         assert_eq!(storage.domain.unmaterialized(), 0);
-        drop(storage);
     }
 
     /// An activation is a journaled transition, and the attach's replay
@@ -1156,7 +1181,8 @@ namespace = "5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e"
                 match serve(&config, 1).and_then(Opened::attach) {
                     Err(StoreError::Refused { reason, .. }) => {
                         assert!(
-                            reason.contains("unknown active feature")
+                            reason.contains("too old")
+                                && reason.contains("0x7fff")
                                 && reason.contains("nothing was replayed"),
                             "replay={replay}, start {start}: {reason}"
                         );
@@ -1398,6 +1424,18 @@ namespace = "5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e"
     /// the baseline a later boot published. Returns the journal's durable
     /// head and the baseline's represented sequence.
     fn a_projection_behind_its_baseline(config: &Config, dir: &Path, at: u64) -> (u64, u64) {
+        a_projection_behind_a_baseline_holding(config, dir, at, None)
+    }
+
+    /// [`a_projection_behind_its_baseline`], with an activation of
+    /// `activation` (feature ids) journaled and materialized before the
+    /// baseline is published, so the baseline's image holds it.
+    fn a_projection_behind_a_baseline_holding(
+        config: &Config,
+        dir: &Path,
+        at: u64,
+        activation: Option<Vec<u16>>,
+    ) -> (u64, u64) {
         use coord_checkpoint::LocalBaseline;
         let opened = open_storage(
             config,
@@ -1421,6 +1459,9 @@ namespace = "5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e"
         // The next boot appends its lifecycle record, materializes it
         // and publishes a baseline that represents it.
         let mut storage = serve(config, at).expect("serve").attach().expect("attach");
+        if let Some(features) = activation {
+            submit_an_activation(&mut storage, at, features);
+        }
         let published = storage
             .domain
             .publish_local(
@@ -1482,6 +1523,72 @@ namespace = "5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e"
             .expect("serve")
             .attach()
             .expect("the reinstalled generation serves again");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An activation inside the baseline image itself (#227 review): the
+    /// scan before the attach starts at the image's stamp, so only the
+    /// guard after the attach saw it, and by then the reinstalled
+    /// generation was selected and the replay written. The reinstall now
+    /// checks the image it installed before selecting it: the start
+    /// refuses as too old, and the selected generation and its rows are as
+    /// they were, on two starts.
+    #[test]
+    fn an_activation_inside_the_baseline_image_is_refused_before_the_reinstall_is_selected() {
+        let dir = workspace("reinstall-activation");
+        let mut config = config(&dir);
+        config.journal.profile = coord_daemon::config::JOURNAL_REPLAY_PROFILE.to_owned();
+        let (_, represented) =
+            a_projection_behind_a_baseline_holding(&config, &dir, 1, Some(vec![0x7fff]));
+        assert!(represented > 0);
+        let selected = selected_generation(&config);
+        let rows_were = rows_of(&selected);
+        for start in 0..2 {
+            match serve(&config, 1).and_then(Opened::attach) {
+                Err(StoreError::Refused { reason, .. }) => assert!(
+                    reason.contains("too old")
+                        && reason.contains("0x7fff")
+                        && reason.contains("nothing was reinstalled"),
+                    "start {start}: {reason}"
+                ),
+                Err(other) => panic!("start {start}: refused for another reason: {other}"),
+                Ok(_) => panic!("start {start}: served an image it cannot run"),
+            }
+            assert_eq!(
+                selected_generation(&config),
+                selected,
+                "start {start}: the reinstalled generation was selected"
+            );
+            assert!(
+                rows_of(&selected) == rows_were,
+                "start {start}: the selected projection's rows changed"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The control: the same image holding an activation this build
+    /// supports is reinstalled, and the node runs with it.
+    #[test]
+    fn a_supported_activation_inside_the_baseline_image_is_reinstalled_and_active() {
+        use coord_types::formats::Feature;
+        let dir = workspace("reinstall-supported-activation");
+        let mut config = config(&dir);
+        config.journal.profile = coord_daemon::config::JOURNAL_REPLAY_PROFILE.to_owned();
+        a_projection_behind_a_baseline_holding(
+            &config,
+            &dir,
+            1,
+            Some(vec![Feature::EarlyProposal.id()]),
+        );
+        let storage = serve(&config, 1)
+            .and_then(Opened::attach)
+            .unwrap_or_else(|e| panic!("refused: {e}"));
+        assert_eq!(
+            storage.active,
+            std::collections::BTreeSet::from([Feature::EarlyProposal])
+        );
+        drop(storage);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
