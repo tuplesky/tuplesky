@@ -790,6 +790,9 @@ fn open_verified_database(
     if meta.len() == 0 {
         return Err(OpenError::EmptyDatabase);
     }
+    if let Some(found) = file_key(&meta).and_then(held_unreadable) {
+        return Err(OpenError::DatabaseUnreadable(found));
+    }
     let db = unwinding("open", || {
         redb::Database::builder()
             .set_cache_size(options.cache_bytes)
@@ -803,6 +806,10 @@ fn open_verified_database(
             })
     })?;
     let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        #[cfg(test)]
+        if tests::PANIC_IN_READ.with(std::cell::Cell::get) {
+            panic!("injected after the open");
+        }
         let txn = db.begin_read().map_err(OpenError::from_transaction)?;
         let meta_table = txn
             .open_table(table_definition(Collection::MetaV1))
@@ -864,13 +871,65 @@ fn open_verified_database(
             // Not closed: redb's close writes its allocator state and
             // clears its recovery flag, and the file is left as it was
             // found, as evidence (#212 review). The handle's file lock
-            // stays held until the process exits; nothing in it opens
-            // this file again, since `replay` reinstalls into a new
-            // generation and `strict` stops.
+            // stays held until the process exits, so a later open of the
+            // same file in this process, the reinstall's own check that
+            // the selection is unreadable among them, would fail on the
+            // lock as an error that says nothing about the bytes, and the
+            // reinstall would be refused (#212 Codex review). The file is
+            // remembered instead, and such an open answers from what was
+            // found here.
+            let error = panicked("identity and tables", &*payload);
+            if let (Some(key), OpenError::DatabaseUnreadable(found)) = (file_key(&meta), &error) {
+                hold_unreadable(key, found.clone());
+            }
             std::mem::forget(db);
-            Err(panicked("identity and tables", &*payload))
+            Err(error)
         }
     }
+}
+
+/// The databases this process found unreadable by a panic after redb had
+/// opened them, by file, with what was found. Each one's handle was not
+/// closed, so its file lock is held for the life of the process and the
+/// file is never written again: what was found still holds, and reopening
+/// would only fail on the lock. A file is known by its device and inode,
+/// which stay its own while the leaked handle keeps it open, through a
+/// rename or the removal of its generation.
+static HELD_UNREADABLE: std::sync::Mutex<Vec<((u64, u64), String)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// A file's device and inode, where the platform has them.
+fn file_key(meta: &std::fs::Metadata) -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some((meta.dev(), meta.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        None
+    }
+}
+
+fn hold_unreadable(key: (u64, u64), found: String) {
+    let mut held = HELD_UNREADABLE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !held.iter().any(|(k, _)| *k == key) {
+        held.push((key, found));
+    }
+}
+
+/// What an earlier open in this process found in the file `key` names,
+/// if its handle is still held.
+fn held_unreadable(key: (u64, u64)) -> Option<String> {
+    HELD_UNREADABLE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .find(|(k, _)| *k == key)
+        .map(|(_, found)| format!("{found} (found by an earlier open in this process)"))
 }
 
 /// `f`, with a panic inside redb taken as proof the file is malformed:
@@ -1310,4 +1369,71 @@ fn read_selected_for(
         return Err(OpenError::ExistingObligations);
     }
     Ok(Some(manifest))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Panic in the identity read, after redb opened the file.
+        pub(super) static PANIC_IN_READ: Cell<bool> = const { Cell::new(false) };
+    }
+
+    fn identity() -> StoreIdentity {
+        StoreIdentity {
+            cluster_id: ClusterId([1; 16]),
+            domain_id: DomainId([2; 16]),
+            replica_id: ReplicaId([3; 16]),
+            incarnation: ReplicaIncarnation::new(1).unwrap(),
+        }
+    }
+
+    fn options() -> OpenOptions {
+        OpenOptions {
+            cache_bytes: 8 * 1024 * 1024,
+        }
+    }
+
+    /// A panic in the identity read leaves the database's handle open, and
+    /// its lock held; the reinstall in the same process still stages over
+    /// the selection, from what the open found, and does not fail on the
+    /// lock (#212 Codex review).
+    #[test]
+    fn a_reinstall_after_a_panicked_read_stages_in_the_same_process() {
+        let dir = tempfile::tempdir().unwrap();
+        drop(Generation::create(dir.path(), identity(), options()).unwrap());
+
+        PANIC_IN_READ.with(|p| p.set(true));
+        let opened = std::panic::catch_unwind(|| {
+            Generation::open_existing(dir.path(), identity(), options())
+        });
+        PANIC_IN_READ.with(|p| p.set(false));
+        let opened = opened.expect("the panic is caught inside the open");
+        assert!(
+            matches!(&opened, Err(e @ OpenError::DatabaseUnreadable(m))
+                if e.is_unreadable_database() && m.contains("injected")),
+            "{:?}",
+            opened.err()
+        );
+
+        // The handle is held: redb itself refuses the file.
+        let db = dir.path().join("gen-000001").join(DATABASE);
+        assert!(redb::Database::open(&db).is_err());
+
+        // Unreadable to every later open in this process, not refused on
+        // the lock.
+        let again = Generation::open_existing(dir.path(), identity(), options());
+        assert!(
+            matches!(&again, Err(e @ OpenError::DatabaseUnreadable(m))
+                if e.is_unreadable_database() && m.contains("earlier open")),
+            "{:?}",
+            again.err()
+        );
+        let staged = Generation::stage_reinstall_unreadable(dir.path(), identity(), options())
+            .expect("the reinstall stages over the selection");
+        assert!(staged.directory().ends_with("gen-000002"));
+        staged.abandon().unwrap();
+    }
 }
