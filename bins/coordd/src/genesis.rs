@@ -41,6 +41,7 @@
 use coord_daemon::{NodeJournal, Startup, StartupError, StoreGenesis};
 use coord_membership::genesis::GenesisManifest;
 use coord_membership::init::{GenesisStore, InitError, StoreFailure};
+use coord_storage_redb::RedbEngine;
 use coord_storage_redb::lifecycle::Generation;
 
 /// What the pin is being checked for.
@@ -138,8 +139,20 @@ pub fn check(
     manifest: &GenesisManifest,
     intent: Intent,
 ) -> Result<Startup, GenesisError> {
+    check_engine(generation.engine(), manifest, intent)
+}
+
+/// [`check`] over a generation's engine, before anything selects or
+/// attaches it: a start runs it inside `store::open_storage_with`, so a
+/// reinstall the genesis refuses leaves `CURRENT` and the earlier
+/// generations where they were (Codex review on #212).
+pub fn check_engine(
+    engine: &mut RedbEngine,
+    manifest: &GenesisManifest,
+    intent: Intent,
+) -> Result<Startup, GenesisError> {
     let mut history = GenerationHistory;
-    let mut store = StoreGenesis::new(generation.engine(), &mut history);
+    let mut store = StoreGenesis::new(engine, &mut history);
     if intent == Intent::Serve {
         let pin = store
             .pinned_digest()
