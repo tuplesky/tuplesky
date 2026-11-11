@@ -4016,16 +4016,14 @@ impl Follower {
 
     /// Debug check of cut (d) against the sweep it replaces: every entry
     /// the sweep would drop now is of a command still in the forget queue,
-    /// or one the queue let go unforgotten while a sweep is still owed
-    /// (#221 review): one forgotten after the owed sweep ran would be
-    /// left to the threshold's alone.
+    /// or one the queue let go unforgotten that no sweep has dropped yet,
+    /// so that a sweep is still owed (#221 review). One left out of both
+    /// would be left to the threshold's sweep alone.
     #[cfg(debug_assertions)]
     fn check_forgetting(&self) {
         let queued = self.ledger.forget_queued();
         let kept = |c: &CommandId| {
-            !self.table.forgotten(c)
-                || queued.contains(c)
-                || (self.ledger.sweep_owes(c) && self.ledger.owed_sweep().is_some())
+            !self.table.forgotten(c) || queued.contains(c) || self.ledger.sweep_owes(c)
         };
         let stray = [
             (

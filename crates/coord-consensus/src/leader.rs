@@ -1147,9 +1147,7 @@ impl Leader {
     fn check_forgetting(&self) {
         let queued = self.ledger.forget_queued();
         let kept = |c: &CommandId| {
-            !self.table.forgotten(c)
-                || queued.contains(c)
-                || (self.ledger.sweep_owes(c) && self.ledger.owed_sweep().is_some())
+            !self.table.forgotten(c) || queued.contains(c) || self.ledger.sweep_owes(c)
         };
         debug_assert!(
             self.ledger.records().all(|(c, _)| kept(c))

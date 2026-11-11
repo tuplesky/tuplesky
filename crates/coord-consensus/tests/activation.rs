@@ -1042,6 +1042,69 @@ fn a_follower_reports_a_command_until_its_execution_is_durable() {
     );
 }
 
+/// A voter whose forget queue let commands go unforgotten drops their
+/// history by the sweep that is owed once the table forgets them, not
+/// only at the ledger's threshold (task-d111 item 4 (d), #221 review).
+///
+/// The leader's and r1's executions are not durable for 200 commands, so
+/// their tables forget none of them: the queue, bounded at four times
+/// the capacity of 32, lets the oldest go, and a threshold sweep in that
+/// time keeps them all. Once they are durable, forgetting in order
+/// drains the queue and the ledger falls under the threshold, so only
+/// the owed sweep drops what the queue let go.
+#[test]
+fn a_voter_runs_the_sweep_owed_for_what_its_forget_queue_let_go() {
+    let capacity = 32usize;
+    let threshold = capacity * 4;
+    let mut cluster = Cluster::new(29);
+    // The leader, r0, and a follower, r1.
+    for i in 0..2 {
+        match cluster.nodes[i].role.as_mut().unwrap() {
+            Role::Leader(l) => l.track_execution_durability(),
+            Role::Follower(f) => f.track_execution_durability(),
+        }
+    }
+    for n in 0..200u64 {
+        cluster.admit(n + 1, (n % 250) as u8);
+        cluster.settle();
+    }
+    let mut swept = [0; 2];
+    for (i, swept) in swept.iter_mut().enumerate() {
+        let (ledger, through) = match cluster.nodes[i].role.as_ref().unwrap() {
+            Role::Leader(l) => (l.ledger(), l.executed_through()),
+            Role::Follower(f) => (f.ledger(), f.executed_through()),
+        };
+        assert!(ledger.forgets_skipped() > 0, "r{i}'s queue let nothing go");
+        assert!(ledger.owed_sweep().is_some());
+        *swept = ledger.sweeps();
+        match cluster.nodes[i].role.as_mut().unwrap() {
+            Role::Leader(l) => l.executions_durable_through(through),
+            Role::Follower(f) => f.executions_durable_through(through),
+        }
+    }
+    for n in 200..208u64 {
+        cluster.admit(n + 1, (n % 250) as u8);
+        cluster.settle();
+    }
+    for (i, swept) in swept.iter().enumerate() {
+        let (ledger, maps) = match cluster.nodes[i].role.as_ref().unwrap() {
+            Role::Leader(l) => (l.ledger(), l.history_maps()),
+            Role::Follower(f) => (f.ledger(), f.history_maps()),
+        };
+        assert!(
+            ledger.len() < threshold,
+            "r{i}'s ledger kept {} of a {threshold} threshold",
+            ledger.len()
+        );
+        assert!(
+            maps.largest() < threshold,
+            "r{i}'s history maps reached {maps:?}"
+        );
+        assert!(ledger.sweeps() > *swept, "r{i} never swept");
+        assert_eq!(ledger.owed_sweep(), None, "r{i} still owes a sweep");
+    }
+}
+
 /// An election after more history than the table holds completes in one
 /// campaign, asks for no payload of a command the candidate executed,
 /// carries a selection bounded by the table rather than the history, and
