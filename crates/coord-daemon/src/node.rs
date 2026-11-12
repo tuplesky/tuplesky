@@ -181,6 +181,25 @@ impl Machine {
         }
     }
 
+    /// Announce a leader's commit frontier if it moved since it was last
+    /// announced ([`Leader::announce_advanced`]). A follower has none.
+    pub fn announce_advanced(&mut self) -> Vec<Effect> {
+        match self {
+            Machine::Leader(l) => l.announce_advanced(),
+            Machine::Follower(_) => Vec::new(),
+        }
+    }
+
+    /// Whether a leader's commit frontier moved since it was last
+    /// announced, and waits for the end of the turn
+    /// ([`Leader::set_frontier_at_turn_end`]).
+    pub fn frontier_owed(&self) -> bool {
+        match self {
+            Machine::Leader(l) => l.frontier_owed(),
+            Machine::Follower(_) => false,
+        }
+    }
+
     /// Whether `command` is marked as answered on the release alone.
     pub fn answers_on_release(&self, command: &CommandId) -> bool {
         match self {
@@ -208,6 +227,15 @@ impl Machine {
             Machine::Follower(m) => {
                 m.missing_payload_count(coord_consensus::messages::MAX_PAYLOAD_TRANSFER)
             }
+        }
+    }
+
+    /// How many payload requests this replica sent, its campaign's own
+    /// included: zero for a leader, which asks for none.
+    pub const fn payload_asks(&self) -> u64 {
+        match self {
+            Machine::Leader(_) => 0,
+            Machine::Follower(m) => m.payload_asks(),
         }
     }
 
@@ -446,6 +474,15 @@ impl Machine {
         match self {
             Machine::Leader(_) => 0,
             Machine::Follower(m) => m.unexecuted_held(),
+        }
+    }
+
+    /// How much decided work this replica holds and has not executed
+    /// (#236 review): what a donor could give it. None for a leader.
+    pub fn decided_unexecuted_held(&self) -> usize {
+        match self {
+            Machine::Leader(_) => 0,
+            Machine::Follower(m) => m.decided_unexecuted_held(),
         }
     }
 
@@ -748,15 +785,15 @@ pub struct Unserved {
     pub stopped: u64,
     /// After this node's own frontier: nothing executed past it.
     pub nothing_after: u64,
-    /// With no executed order readable from this node's rows.
+    /// With no executed order readable from this node's rows. No longer
+    /// counted since task-d113's step 2, which reads a range of the rows
+    /// by position: kept, at zero, for the metrics line's readers.
     pub no_order: u64,
-    /// With an executed order that starts above the position asked, or
-    /// holds nothing.
+    /// With no executed row at the position after the one asked.
     pub order_above: u64,
     /// With no snapshot of this node's store.
     pub no_snapshot: u64,
-    /// With the first command's rows unreadable, or its executed row at
-    /// another position than the order's.
+    /// With the executed rows unreadable, or the first command's payload.
     pub first_row: u64,
 }
 
@@ -791,9 +828,6 @@ pub struct Node<P: Persistence> {
     /// that ballot (task-d01). A voter that was away when it was
     /// published is sent it again when it promises the ballot.
     won: Option<SyncDecision>,
-    /// This node's executed commands in position order, once a peer has
-    /// asked to catch up from them (task-d08).
-    order: Option<crate::catch_up::ExecutedOrder>,
     /// Catch-up pages this node served (diagnostic, task-d08).
     pub pages_served: u64,
     /// The catch-up counts of the follower roles this node has left:
@@ -950,7 +984,6 @@ impl<P: Persistence> Node<P> {
             recorder: None,
             awaiting: None,
             won: None,
-            order: None,
             pages_served: 0,
             catch_up_before: (0, 0, coord_consensus::CatchUpPaths::default()),
             serve_time: (std::time::Duration::ZERO, std::time::Duration::ZERO),
@@ -1016,7 +1049,7 @@ impl<P: Persistence> Node<P> {
     /// rest of the group.
     pub fn lower_in_groups(&mut self) {
         self.grouped = true;
-        self.apply_batch_frames();
+        self.apply_turn_settings();
     }
 
     /// Read `Feature::BatchedRound` as active, or not, without the
@@ -1024,7 +1057,7 @@ impl<P: Persistence> Node<P> {
     /// domain activates it, for a test or a local reading's build alone.
     pub fn set_batched_round(&mut self, on: bool) {
         self.batched_round = on;
-        self.apply_batch_frames();
+        self.apply_turn_settings();
     }
 
     /// Whether this node's leaders hold a turn's fresh proposals for one
@@ -1035,10 +1068,16 @@ impl<P: Persistence> Node<P> {
         self.batched_round && self.grouped
     }
 
-    fn apply_batch_frames(&mut self) {
+    /// What a leader holds for the end of the turn: its fresh proposals
+    /// while [`Node::batch_frames`], and its commit frontier while the
+    /// node lowers in groups, since a turn ends where the loop lowers its
+    /// group ([`Leader::set_frontier_at_turn_end`]).
+    fn apply_turn_settings(&mut self) {
         let on = self.batch_frames();
+        let grouped = self.grouped;
         if let Some(Machine::Leader(l)) = self.machine.as_mut() {
             l.set_batch_frames(on);
+            l.set_frontier_at_turn_end(grouped);
         }
     }
 
@@ -1065,11 +1104,32 @@ impl<P: Persistence> Node<P> {
     /// execution group, which materializes anyway. When no command is
     /// ready to execute, the flush materializes it itself, so the
     /// projection never waits on execution that is not coming.
+    ///
+    /// The turn ends here: a leader's commit frontier, if it moved,
+    /// goes to each voter once, after what the flush made durable
+    /// ([`Node::announce_frontier`]).
     pub fn flush(&mut self, ballot: &Ballot) -> Result<Outbound, DriveError> {
         let was = core::mem::replace(&mut self.flushing, true);
         let flushed = self.flush_queued(ballot);
         self.flushing = was;
-        flushed
+        let mut out = flushed?;
+        out.absorb(self.announce_frontier(ballot)?);
+        Ok(out)
+    }
+
+    /// Announce a leader's commit frontier if it moved since it was last
+    /// announced (#242 follow-up). Lowering in groups, the leader holds
+    /// what its steps move for this, once a turn
+    /// ([`Leader::set_frontier_at_turn_end`]): a flush, and the take-back
+    /// of an append ([`Node::settle`]), which is the other place a batch
+    /// turns durable. What a step moves after that is owed a flush
+    /// ([`Machine::frontier_owed`]).
+    fn announce_frontier(&mut self, ballot: &Ballot) -> Result<Outbound, DriveError> {
+        let effects = self.machine_mut().announce_advanced();
+        if effects.is_empty() {
+            return Ok(Outbound::default());
+        }
+        self.carry_out(effects, ballot)
     }
 
     fn flush_queued(&mut self, ballot: &Ballot) -> Result<Outbound, DriveError> {
@@ -1360,6 +1420,7 @@ impl<P: Persistence> Node<P> {
                 leader.set_early_proposal(self.early_proposal);
                 leader.set_early_holders(self.early_holders.clone());
                 leader.set_batch_frames(self.batched_round && self.grouped);
+                leader.set_frontier_at_turn_end(self.grouped);
                 self.won = Some(decision);
                 (Machine::Leader(Box::new(leader)), effects)
             }
@@ -1642,7 +1703,7 @@ impl<P: Persistence> Node<P> {
         self.set_release_at_execution(release);
         self.answer_on_release = answer_on_release;
         self.batched_round = answer_on_release && batched_round;
-        self.apply_batch_frames();
+        self.apply_turn_settings();
     }
 
     /// Whether this node reads `Feature::AnswerOnRelease` active
@@ -1851,6 +1912,12 @@ impl<P: Persistence> Node<P> {
         self.machine().payloads_answered()
     }
 
+    /// How many payload requests this node's machine sent
+    /// ([`Machine::payload_asks`]).
+    pub fn payload_asks(&self) -> u64 {
+        self.machine().payload_asks()
+    }
+
     /// Send the voters, again, the proposals they have not voted on
     /// (task-d07), and the commit frontier (task-d09).
     pub fn resend_proposals(&mut self, ballot: &Ballot) -> Result<Outbound, DriveError> {
@@ -1925,15 +1992,8 @@ impl<P: Persistence> Node<P> {
             self.unserved.nothing_after += 1;
             return out;
         }
-        if self.order.is_none() {
-            self.order = crate::catch_up::ExecutedOrder::read(&self.applier);
-        }
-        let Some(order) = self.order.as_ref() else {
-            self.unserved.no_order += 1;
-            return out;
-        };
         let started = std::time::Instant::now();
-        let entries = match crate::catch_up::page(&self.applier, order, epoch, after, through) {
+        let entries = match crate::catch_up::page(&self.applier, epoch, after, through) {
             Ok(entries) => entries,
             Err(why) => {
                 let count = match why {
@@ -2459,11 +2519,6 @@ impl<P: Persistence> Node<P> {
                     applied => applied.map_err(|e| Self::apply_error(&command, &e))?,
                 };
             self.executed += 1;
-            if let Some(order) = self.order.as_mut()
-                && !order.note(outcome.position, command)
-            {
-                self.order = None;
-            }
             // What the apply's lowerings made durable for other batches
             // is delivered by `carry_out`, after the command's own
             // outcome. This order is an observation, not a mechanism.
@@ -2662,6 +2717,7 @@ impl<P: Persistence> Node<P> {
             out.absorb(self.release_through_settled(ballot)?);
             out.absorb(self.release_journaled(ballot)?);
         }
+        out.absorb(self.announce_frontier(ballot)?);
         Ok(out)
     }
 

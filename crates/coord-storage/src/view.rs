@@ -7,6 +7,7 @@ use coord_store_api::engine::{EngineError, OrderedRead, SnapshotSource};
 use coord_store_api::seq::StoreSeq;
 
 use crate::intake::{IndexDelta, IntakeIndex};
+use crate::kv_index::KvIndex;
 use crate::lowering::DurableMeta;
 
 /// Why a view was not handed out.
@@ -45,6 +46,9 @@ pub struct Frontier {
     committing: AtomicU64,
     quarantined: std::sync::atomic::AtomicBool,
     index: RwLock<IntakeIndex>,
+    /// The key index of the retained event rows (task-d105). It moves
+    /// with the intake index: one delta carries both.
+    kv: RwLock<KvIndex>,
 }
 
 impl Frontier {
@@ -80,6 +84,7 @@ impl Frontier {
     pub(crate) fn quarantine(&self) {
         self.quarantined.store(true, Ordering::Release);
         self.index_mut().clear();
+        self.kv_mut().clear();
     }
 
     /// Install the index an open built from the projection.
@@ -89,8 +94,29 @@ impl Frontier {
 
     /// Publish a commit's changes to the index. Called before the gate
     /// moves to `stamp`.
-    pub(crate) fn publish_index(&self, delta: IndexDelta, stamp: StoreSeq) {
+    pub(crate) fn publish_index(&self, mut delta: IndexDelta, stamp: StoreSeq) {
+        let kv = std::mem::take(&mut delta.kv);
+        self.kv_mut().publish(kv);
         self.index_mut().publish(delta, stamp.journal_seq().get());
+    }
+
+    /// Install the key index an open built from the projection
+    /// (task-d105).
+    pub(crate) fn install_kv_index(&self, index: KvIndex) {
+        *self.kv_mut() = index;
+    }
+
+    /// The key index as published (task-d105).
+    pub fn kv_index(&self) -> RwLockReadGuard<'_, KvIndex> {
+        self.kv
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn kv_mut(&self) -> std::sync::RwLockWriteGuard<'_, KvIndex> {
+        self.kv
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// The index as published.
@@ -111,6 +137,11 @@ impl Frontier {
     /// Entries the index holds (diagnostic).
     pub fn index_len(&self) -> usize {
         self.index().len()
+    }
+
+    /// Entries the index's executed part holds (diagnostic).
+    pub fn index_executed_len(&self) -> usize {
+        self.index().executed_len()
     }
 
     /// Completed sequence.
@@ -162,6 +193,18 @@ impl<V: OrderedRead> GatedView<V> {
         &self.view
     }
 
+    /// Run `f` over the key index as published (task-d105), or over one
+    /// built from this snapshot when the view has no gate.
+    pub fn with_kv_index<T>(&self, f: impl FnOnce(&KvIndex) -> T) -> Result<T, EngineError>
+    where
+        V: OrderedRead,
+    {
+        match &self.gate {
+            Some(gate) => Ok(f(&gate.kv_index())),
+            None => Ok(f(&KvIndex::build(&self.view)?)),
+        }
+    }
+
     /// Durable metadata the snapshot reflects.
     pub fn meta(&self) -> &DurableMeta {
         &self.meta
@@ -183,6 +226,18 @@ pub struct GatedReader<R> {
 impl<R: SnapshotSource> GatedReader<R> {
     pub(crate) fn new(reader: R, frontier: Arc<Frontier>) -> Self {
         GatedReader { reader, frontier }
+    }
+
+    /// Entries the projection's index by command holds (task-d113;
+    /// diagnostic, for the metrics line).
+    pub fn index_len(&self) -> usize {
+        self.frontier.index_len()
+    }
+
+    /// Entries the index's executed part holds (task-d113, step 2;
+    /// diagnostic, for the metrics line).
+    pub fn index_executed_len(&self) -> usize {
+        self.frontier.index_executed_len()
     }
 
     /// Pin a snapshot and verify its stamp against the completed frontier.

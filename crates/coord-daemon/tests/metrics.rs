@@ -357,6 +357,13 @@ fn a_rendered_snapshot_carries_no_secret_or_key_shaped_text() {
             journal_appends: 6000,
             journal_syncs: Measure::Observed(6020),
             projection_commits: 6100,
+            hold_ends: coord_daemon::metrics::HoldEnds {
+                full: 100,
+                deadline: 200,
+                read: 300,
+                settle: 4,
+                other: 5,
+            },
             busy: Duration::from_secs(41),
             uptime: Duration::from_secs(60),
             recent: Measure::Observed(Interval {
@@ -526,6 +533,12 @@ fn a_rendered_snapshot_carries_no_secret_or_key_shaped_text() {
                 ready: 0,
                 catch_up_window: 64,
                 oldest_wait: Some(OldestWait::Dependency { phase: None }),
+            },
+            intake_index: coord_daemon::metrics::IntakeIndexSize {
+                entries: 7000,
+                bytes: 322_000,
+                executed: 90_000,
+                executed_bytes: 2_160_000,
             },
         }),
     };

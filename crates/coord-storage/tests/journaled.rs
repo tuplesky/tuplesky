@@ -831,7 +831,6 @@ fn replay_restores_the_exact_state_results_and_events_from_the_records_alone() {
 fn run_workload(materialize_inline: bool) -> Vec<(u16, Vec<u8>, Vec<u8>)> {
     let mut world = World::new();
     let events = coord_store_api::registry::Collection::EventsV1.id();
-    let executed = coord_store_api::registry::Collection::ExecutedV1.id();
     for step in 1..=4u64 {
         world.protocol(A, ballot(step), promise(step));
         if materialize_inline {
@@ -845,16 +844,45 @@ fn run_workload(materialize_inline: bool) -> Vec<(u16, Vec<u8>, Vec<u8>)> {
             position(step),
             vec![
                 kv_update(format!("key-{step}").as_bytes(), b"value"),
+                // A real event row: lowering reads each one into the key
+                // index (task-d105).
                 StoreUpdate {
                     collection: events,
-                    key: step.to_be_bytes().to_vec(),
-                    value: Some(vec![step as u8; 8]),
+                    key: coord_storage::codecs::event_key(KvRevision::new(step).unwrap(), 0),
+                    value: Some(
+                        coord_storage::codecs::encode_event(
+                            &coord_storage::codecs::EventRecordV1 {
+                                kind: coord_state::KvEventKind::Put,
+                                namespace: NamespaceId([0; 16]),
+                                key: format!("key-{step}").into_bytes(),
+                                entry: Some(coord_state::KvEntry {
+                                    value: b"value".to_vec(),
+                                    create_revision: KvRevision::new(step).unwrap(),
+                                    mod_revision: KvRevision::new(step).unwrap(),
+                                    version: 1,
+                                    lease: None,
+                                    lease_generation: None,
+                                }),
+                                prev: None,
+                            },
+                        )
+                        .unwrap(),
+                    ),
                 },
+                // Its payload, then its executed row, which moves the
+                // payload to the position (task-d113, step 2).
                 StoreUpdate {
-                    collection: executed,
+                    collection: coord_store_api::registry::Collection::PayloadV1.id(),
                     key: command(step as u8).as_bytes().to_vec(),
-                    value: Some(step.to_be_bytes().to_vec()),
+                    value: Some(vec![step as u8; 16]),
                 },
+                coord_storage::retry::executed_update(
+                    &command(step as u8),
+                    position(step),
+                    None,
+                    coord_types::identity::Digest32([step as u8; 32]),
+                )
+                .unwrap(),
             ],
         );
         if materialize_inline {

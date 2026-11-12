@@ -972,7 +972,7 @@ impl<P: Persistence> Voter<P> {
             self.node
                 .applier_mut()
                 .store_mut()
-                .request_projection_commit();
+                .request_projection_commit_for(coord_storage::AskCause::Read);
         }
         for held in again.into_iter().rev() {
             self.reads.hold_again(held);
@@ -1073,6 +1073,12 @@ impl<P: Persistence> Voter<P> {
         self.node.payloads_answered()
     }
 
+    /// How many payload requests this voter's machine sent, the ones it
+    /// made by itself included (a campaign's next batch).
+    pub fn payload_asks(&self) -> u64 {
+        self.node.payload_asks()
+    }
+
     /// What this voter's re-sends did since boot (task-d49).
     pub fn resend_counts(&self) -> coord_consensus::ResendCounts {
         self.node.resend_counts()
@@ -1108,7 +1114,7 @@ impl<P: Persistence> Voter<P> {
         let standing = crate::catch_up::Standing {
             executed: machine.executed_through(),
             holds: machine.holds_unexecuted(),
-            backlog: || machine.unexecuted_held(),
+            backlog: || machine.decided_unexecuted_held(),
             busy: machine.catching_up(),
             chain: machine.catch_up_chain_open(),
             pages: machine.catch_up_counts().0,
@@ -1161,8 +1167,9 @@ impl<P: Persistence> Voter<P> {
     }
 
     /// Whether [`Voter::flush`] has anything to do: batches queued, a
-    /// command to apply, or a leader's proposals waiting for the turn's
-    /// frame (task-d102).
+    /// command to apply, a leader's proposals waiting for the turn's
+    /// frame (task-d102), or a leader's commit frontier waiting for the
+    /// turn's end (#242 follow-up).
     ///
     /// Batches queued behind a journal append that is out are not owed a
     /// flush (task-d54): nothing can be journaled until the append is
@@ -1173,6 +1180,7 @@ impl<P: Persistence> Voter<P> {
         (self.queued() > 0 && !self.appending())
             || self.node.can_execute()
             || self.node.machine().frames_queued()
+            || self.node.machine().frontier_owed()
     }
 
     /// Whether a journal append is out on the appender's thread, its

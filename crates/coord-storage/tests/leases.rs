@@ -3,6 +3,8 @@
 //! current attachments in one atomic revision (all or nothing across a
 //! crash), and a retried grant neither grants twice nor takes a revision.
 
+mod support;
+
 use std::collections::BTreeMap;
 
 use coord_core::effect::{BootId, PersistBatch};
@@ -151,6 +153,7 @@ impl<E: LocalEngine> Domain<E> {
                 build_read_view(&gated, NS, principal, request, ViewBudget::default()).unwrap();
             let planned = plan(request, &view, &PlanLimits::default()).unwrap();
             drop(gated);
+            support::stage_bound(&mut self.worker, bound.as_ref(), request);
             match apply_plan(
                 &mut self.worker,
                 self.alloc.allocate(),

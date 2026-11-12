@@ -49,7 +49,9 @@ fn the_protocol_shaped_workload_produces_one_logical_state_on_every_engine() {
     // The workload really exercises the shapes the comparison claims to
     // cover: several indexes, leases, retained retries and retention.
     assert!(first.kv_revision > 0);
-    assert!(first.kv_rows > 0 && first.history_rows > 0 && first.event_rows > 0);
+    assert!(first.kv_rows > 0 && first.event_rows > 0);
+    // A key's versions are its event rows (task-d105): no history row.
+    assert_eq!(first.history_rows, 0);
     assert!(first.lease_rows > 0 && first.lease_key_rows > 0);
     // Retained retry results are present; retry floors appear only once a
     // session window is exhausted, which this bounded workload does not do.

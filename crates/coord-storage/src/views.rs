@@ -186,54 +186,6 @@ impl Budget {
 }
 
 /// Scan every row of `collection` in `[lower, upper)` within the budget.
-/// Every history row in `[lower, upper)`, read in bounded pages.
-///
-/// The work is local and the pages bound it; what the pages must not do
-/// is decide a replicated outcome, so nothing here is charged to the
-/// view budget. The range itself is bounded by the replicated retention
-/// floor, which is the same on every replica.
-///
-/// Each row is handed to `each` as its page is read, and no page is kept
-/// past it (task-d26): collected, every obsolete version still on disk in
-/// the range was held at once, however few the request reads.
-fn scan_history<V: OrderedRead>(
-    view: &V,
-    lower: Vec<u8>,
-    upper: Bound<Vec<u8>>,
-    mut each: impl FnMut(Vec<u8>, Vec<u8>) -> Result<(), ViewBuildError>,
-) -> Result<(), ViewBuildError> {
-    /// One page of history rows. Large enough for any schema-valid row.
-    const PAGE_BYTES: u32 = 16 * 1024 * 1024;
-    let mut request = ScanRequest {
-        lower: Bound::Included(lower),
-        upper,
-        direction: Direction::Forward,
-        resume_after: None,
-        max_rows: NonZeroU32::new(256).expect("nonzero"),
-        max_bytes: NonZeroU32::new(PAGE_BYTES).expect("nonzero"),
-    };
-    loop {
-        let page = view.scan_page(Collection::KvHistoryV1.id(), &request)?;
-        let last = page.rows.last().map(|r| r.key.clone());
-        for row in page.rows {
-            each(row.key, row.value)?;
-        }
-        if page.exhausted {
-            return Ok(());
-        }
-        match last {
-            Some(key) => request.resume_after = Some(key),
-            // A page that is neither exhausted nor advancing would loop.
-            None => {
-                return Err(ViewBuildError::Engine(EngineError::new(
-                    ErrorClass::Corrupt,
-                    "history scan made no progress",
-                )));
-            }
-        }
-    }
-}
-
 fn scan_all<V: OrderedRead>(
     view: &V,
     collection: Collection,
@@ -277,19 +229,6 @@ fn current_bounds(namespace: &NamespaceId, touch: &Touch) -> (Vec<u8>, Bound<Vec
         Touch::Interval(lo, hi) => (
             codecs::current_key(namespace, lo),
             Bound::Excluded(codecs::current_key(namespace, hi)),
-        ),
-    }
-}
-
-fn history_bounds(namespace: &NamespaceId, touch: &Touch) -> (Vec<u8>, Bound<Vec<u8>>) {
-    match touch {
-        Touch::Exact(k) => {
-            let (lo, hi) = ordered_key::history_bounds(namespace, k);
-            (lo, Bound::Excluded(hi))
-        }
-        Touch::Interval(lo, hi) => (
-            codecs::history_key(namespace, lo, KvRevision::ZERO),
-            Bound::Excluded(codecs::history_key(namespace, hi, KvRevision::ZERO)),
         ),
     }
 }
@@ -642,7 +581,6 @@ pub fn build_read_view<V: OrderedRead>(
             Ok(())
         };
         for touch in historical_touches(&request.operation, r) {
-            let (lower, upper) = history_bounds(&namespace, &touch);
             // Physical versions are not charged to the replicated budget.
             // How many obsolete versions of a key are still on disk is a
             // local matter: garbage collection runs at its own pace on
@@ -653,28 +591,20 @@ pub fn build_read_view<V: OrderedRead>(
             // same chosen command, one executing it and one recording a
             // rejection. The selection below is charged instead, and it
             // is the same everywhere.
-            let mut current: Option<(Vec<u8>, Option<KvEntry>)> = None;
-            scan_history(view, lower, upper, |row_key, value| {
-                let decoded = ordered_key::decode_history(&row_key)
-                    .map_err(|_| EngineError::new(ErrorClass::Corrupt, "kv_history key"))?;
-                let version = decoded.revision.expect("history key carries a revision");
-                if decoded.namespace != namespace || version > r {
-                    return Ok(());
-                }
-                let entry = codecs::decode_history(&value)?.entry;
-                match &mut current {
-                    Some((key, chosen)) if *key == decoded.key => *chosen = entry,
-                    _ => {
-                        if let Some((key, chosen)) = current.replace((decoded.key, entry)) {
-                            settle(&mut entries, key, chosen)?;
-                        }
-                    }
-                }
-                Ok(())
-            })?;
-            if let Some((key, chosen)) = current {
+            //
+            // Each key's version at R comes from the key index and the
+            // event row it names (task-d105), not from a scan of every
+            // version on disk.
+            let (lower, upper) = match &touch {
+                Touch::Exact(k) => (k.clone(), Bound::Included(k.as_slice())),
+                Touch::Interval(lo, hi) => (lo.clone(), Bound::Excluded(hi.as_slice())),
+            };
+            // Each version is read as it is settled, so the budget stops
+            // the read, not only what it keeps.
+            kv_versions_at(gated, namespace, &lower, upper, r, |key, chosen| {
                 settle(&mut entries, key, chosen)?;
-            }
+                Ok(true)
+            })?;
         }
         read_view.historical.push(HistoricalView {
             revision: r,
@@ -682,6 +612,30 @@ pub fn build_read_view<V: OrderedRead>(
         });
     }
     Ok(read_view)
+}
+
+/// Hand each key of `namespace` in `[lower, upper)` with what it holds at
+/// `at` to `each`, in key order, through the published key index and the
+/// view's own event rows above it (task-d105). A view with no gate reads
+/// every event row.
+fn kv_versions_at<V: OrderedRead>(
+    gated: &GatedView<V>,
+    namespace: NamespaceId,
+    lower: &[u8],
+    upper: Bound<&[u8]>,
+    at: KvRevision,
+    each: impl FnMut(Vec<u8>, Option<KvEntry>) -> Result<bool, ViewBuildError>,
+) -> Result<(), ViewBuildError> {
+    let empty = crate::kv_index::KvIndex::default();
+    let held;
+    let index = match gated.gate() {
+        Some(gate) => {
+            held = gate.kv_index();
+            &*held
+        }
+        None => &empty,
+    };
+    crate::kv_index::versions_at(index, gated.view(), namespace, lower, upper, at, each)
 }
 
 /// The ranges of `op` that read revision `r`.

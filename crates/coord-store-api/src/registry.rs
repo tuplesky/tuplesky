@@ -13,13 +13,17 @@ pub enum Collection {
     MetaV1,
     /// Configuration epochs and certificates.
     ConfigV1,
-    /// Immutable canonical commands by command identity.
+    /// An executed command's immutable canonical command, by its execution
+    /// position (task-d113, step 2).
     PayloadV1,
     /// Source protocol state by epoch, ballot, command.
     ProtocolV1,
-    /// Established execution positions.
+    /// Executed rows by established execution position: the command, its
+    /// position, revision and result (task-d113, step 2).
     ExecutionV1,
-    /// Applied command identity/position/result.
+    /// Applied command identity/position/result by command, as the
+    /// journal's records name it. No longer a table (task-d113, step 2):
+    /// the lowering writes each such row to [`Collection::ExecutionV1`].
     ExecutedV1,
     /// Current KV rows.
     KvCurrentV1,
@@ -43,11 +47,20 @@ pub enum Collection {
     RetryFloorV1,
     /// Checkpoint metadata.
     CheckpointV1,
+    /// A payload not yet executed, by intake order: node-private, moved to
+    /// [`Collection::PayloadV1`] when its command executes (task-d113,
+    /// step 2).
+    PendingPayloadV1,
+    /// An executed command's decided record, by execution position, with
+    /// the configuration epoch it was decided in: node-private, moved from
+    /// its dependency row in [`Collection::ProtocolV1`] when the command
+    /// executes (task-d113, step 2, the index's bound).
+    DecidedV1,
 }
 
 impl Collection {
     /// Every registered collection, in identifier order.
-    pub const ALL: [Collection; 17] = [
+    pub const ALL: [Collection; 19] = [
         Collection::MetaV1,
         Collection::ConfigV1,
         Collection::PayloadV1,
@@ -65,6 +78,8 @@ impl Collection {
         Collection::RetryV1,
         Collection::RetryFloorV1,
         Collection::CheckpointV1,
+        Collection::PendingPayloadV1,
+        Collection::DecidedV1,
     ];
 
     /// Frozen identifier.
@@ -87,6 +102,8 @@ impl Collection {
             Collection::RetryV1 => 0x000f,
             Collection::RetryFloorV1 => 0x0010,
             Collection::CheckpointV1 => 0x0011,
+            Collection::PendingPayloadV1 => 0x0012,
+            Collection::DecidedV1 => 0x0013,
         })
     }
 
@@ -110,16 +127,28 @@ impl Collection {
             Collection::RetryV1 => "retry_v1",
             Collection::RetryFloorV1 => "retry_floor_v1",
             Collection::CheckpointV1 => "checkpoint_v1",
+            Collection::PendingPayloadV1 => "pending_payload_v1",
+            Collection::DecidedV1 => "decided_v1",
         }
     }
 
     /// Whether the collection participates in the common (cross-replica)
     /// state hash. Node-private collections are excluded from common
     /// digests (Section 17.6).
+    ///
+    /// `executed_v1` names records only since task-d113's step 2: no store
+    /// holds it, so neither the hash nor an image's walk counts it.
     pub const fn in_common_hash(self) -> bool {
         !matches!(
             self,
-            Collection::MetaV1 | Collection::ProtocolV1 | Collection::CheckpointV1
+            Collection::MetaV1
+                | Collection::ProtocolV1
+                | Collection::CheckpointV1
+                | Collection::ExecutedV1
+                | Collection::PendingPayloadV1
+                | Collection::DecidedV1
+                // Written by no format since 4 (task-d105).
+                | Collection::KvHistoryV1
         )
     }
 
@@ -138,7 +167,17 @@ impl Collection {
 /// format before it keyed them by epoch, tag and command, recorded no
 /// version, and counts as `1`. A store of another format is refused, not
 /// converted.
-pub const STORE_FORMAT_VERSION: u32 = 2;
+///
+/// `3` (task-d113, step 2): an executed row is keyed by its execution
+/// position in `execution_v1`, and an executed command's payload by the
+/// same position in `payload_v1`; a payload not yet executed is in the
+/// node-private `pending_payload_v1` by intake order. `executed_v1` is no
+/// longer written.
+///
+/// `4`: `kv_history_v1` is not written. A key's versions are its event
+/// rows in `events_v1`, found through a key index held in memory
+/// (task-d105). A store holding a history row is of format 3 or before.
+pub const STORE_FORMAT_VERSION: u32 = 4;
 
 /// ASCII field names used as keys inside `meta_v1`.
 pub mod meta_fields {
@@ -185,8 +224,16 @@ mod tests {
             assert_eq!(Collection::from_id(c.id()), Some(*c));
         }
         assert_eq!(Collection::from_id(CollectionId(0)), None);
-        assert_eq!(Collection::from_id(CollectionId(0x0012)), None);
+        assert_eq!(Collection::from_id(CollectionId(0x0014)), None);
         assert!(!Collection::MetaV1.in_common_hash());
         assert!(Collection::KvCurrentV1.in_common_hash());
+        // Rows by position (task-d113, step 2): the executed rows and the
+        // executed payloads are common state, the pending payloads and the
+        // names of the rows by command are not.
+        assert!(Collection::ExecutionV1.in_common_hash());
+        assert!(Collection::PayloadV1.in_common_hash());
+        assert!(!Collection::PendingPayloadV1.in_common_hash());
+        assert!(!Collection::ExecutedV1.in_common_hash());
+        assert!(!Collection::DecidedV1.in_common_hash());
     }
 }

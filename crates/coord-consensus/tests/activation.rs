@@ -155,6 +155,11 @@ struct Cluster {
     frontend: Vec<(ReplicaId, ProtocolMessage)>,
     /// Every payload ask sent: who asked, and for what.
     asks: Vec<(usize, Vec<CommandId>)>,
+    /// Every payload answer sent: (from, to).
+    payloads_sent: Vec<(usize, u8)>,
+    /// What each voter's campaign read of its whole selection once it was
+    /// made, taken when it won (`Follower::campaign_selection_reads`).
+    selection_reads: Vec<u64>,
     /// Every proposal sent: (from, to).
     proposals_sent: Vec<(usize, u8)>,
     /// Senders whose frames are parked rather than delivered, until
@@ -170,6 +175,23 @@ struct Cluster {
     reject_unpublished: Option<(usize, Vec<CommandId>)>,
     /// The command whose batch `reject_unpublished` refused.
     rejected: Option<CommandId>,
+    /// Whether `settle` runs in turns, as the daemon's loop does lowering
+    /// in groups: a node takes every frame queued for it in one turn, and
+    /// a leader announces its commit frontier once, at the turn's end
+    /// (`Leader::set_frontier_at_turn_end`).
+    turns: bool,
+    /// `Committed` frames each (leader, voter) pair was sent in the
+    /// current turn.
+    committed_this_turn: BTreeMap<(usize, u8), usize>,
+    /// The most `Committed` frames one voter was sent in one turn.
+    most_committed_a_turn: usize,
+    /// Every `Committed` frame sent.
+    committed_sent: usize,
+    /// Each (leader, voter) pair's proposals not yet answered: sent, and
+    /// no acknowledgement of the voter's for them delivered to the leader.
+    unanswered: BTreeMap<(usize, u8), BTreeSet<CommandId>>,
+    /// The most proposals one voter had unanswered at once.
+    most_unanswered: usize,
 }
 
 /// How many rounds `Cluster::settle` runs before it calls the cluster
@@ -247,12 +269,20 @@ impl Cluster {
             voters,
             frontend: Vec::new(),
             asks: Vec::new(),
+            payloads_sent: Vec::new(),
+            selection_reads: vec![0; usize::from(voters)],
             proposals_sent: Vec::new(),
             hold_from: Vec::new(),
             parked: Vec::new(),
             proposed: Vec::new(),
             reject_unpublished: None,
             rejected: None,
+            turns: false,
+            committed_this_turn: BTreeMap::new(),
+            most_committed_a_turn: 0,
+            committed_sent: 0,
+            unanswered: BTreeMap::new(),
+            most_unanswered: 0,
         }
     }
 
@@ -307,9 +337,21 @@ impl Cluster {
                         self.asks.push((i, commands));
                     }
                     let dest = to.replica.0[0];
+                    if let Ok(ProtocolMessage::PayloadResponse { .. }) =
+                        ProtocolMessage::decode(&frame)
+                    {
+                        self.payloads_sent.push((i, dest));
+                    }
                     if let Ok(ProtocolMessage::Proposal(p)) = ProtocolMessage::decode(&frame) {
                         self.proposals_sent.push((i, dest));
                         self.proposed.push((i, dest, p.command));
+                        let out = self.unanswered.entry((i, dest)).or_default();
+                        out.insert(p.command);
+                        self.most_unanswered = self.most_unanswered.max(out.len());
+                    }
+                    if let Ok(ProtocolMessage::Committed { .. }) = ProtocolMessage::decode(&frame) {
+                        self.committed_sent += 1;
+                        *self.committed_this_turn.entry((i, dest)).or_default() += 1;
                     }
                     if self.cut.contains(&(i as u8, dest)) || !self.nodes[dest as usize].alive {
                         continue;
@@ -394,9 +436,11 @@ impl Cluster {
                     unreachable!()
                 };
                 let decision = follower.won().cloned().unwrap();
+                self.selection_reads[i] = follower.campaign_selection_reads();
                 let q = follower.quorum().clone();
-                let (leader, effects) =
+                let (mut leader, effects) =
                     Leader::from_recovered(follower.into_recovered(), q, &decision);
+                leader.set_frontier_at_turn_end(self.turns);
                 self.nodes[i].role = Some(Role::Leader(leader));
                 self.handle(i, effects);
             }
@@ -419,18 +463,24 @@ impl Cluster {
             if !candidates.is_empty() {
                 let pick = candidates[(self.rand() % candidates.len() as u64) as usize];
                 let len = self.nodes[pick].inbox.len();
-                let idx = if self.rand().is_multiple_of(3) && len > 1 {
-                    len - 1
+                if self.turns {
+                    // A turn takes every frame queued when it began.
+                    for _ in 0..len {
+                        let (from, frame) = self.nodes[pick].inbox.pop_front().unwrap();
+                        self.deliver(pick, from, frame);
+                        if !self.nodes[pick].alive {
+                            break;
+                        }
+                    }
                 } else {
-                    0
-                };
-                let (from, frame) = self.nodes[pick].inbox.remove(idx).unwrap();
-                let event = Event::Peer(AuthenticatedPeerMessage::new(
-                    PeerProvenance::from_transport(from, ReplicaIncarnation::new(1).unwrap(), 1),
-                    frame,
-                ));
-                let effects = self.nodes[pick].step(event);
-                self.handle(pick, effects);
+                    let idx = if self.rand().is_multiple_of(3) && len > 1 {
+                        len - 1
+                    } else {
+                        0
+                    };
+                    let (from, frame) = self.nodes[pick].inbox.remove(idx).unwrap();
+                    self.deliver(pick, from, frame);
+                }
                 progressed = true;
             }
             self.convert_roles();
@@ -474,10 +524,48 @@ impl Cluster {
                     }
                 }
             }
+            // The turn ends: each leader announces its commit frontier,
+            // if it moved, once.
+            if self.turns {
+                for i in 0..self.nodes.len() {
+                    if !self.nodes[i].alive {
+                        continue;
+                    }
+                    if let Some(Role::Leader(l)) = self.nodes[i].role.as_mut() {
+                        let effects = l.announce_advanced();
+                        progressed |= !effects.is_empty();
+                        self.handle(i, effects);
+                    }
+                }
+            }
+            let most = self.committed_this_turn.values().copied().max();
+            self.most_committed_a_turn = self.most_committed_a_turn.max(most.unwrap_or(0));
+            self.committed_this_turn.clear();
             if !progressed {
                 return;
             }
         }
+    }
+
+    /// Step `to` with `frame` from `from`, and carry out what it does.
+    fn deliver(&mut self, to: usize, from: ReplicaId, frame: Vec<u8>) {
+        if matches!(self.nodes[to].role, Some(Role::Leader(_)))
+            && let Ok(message) = ProtocolMessage::decode(&frame)
+            && matches!(
+                message,
+                ProtocolMessage::FastAck(_) | ProtocolMessage::SlowAck(_)
+            )
+            && let Some(command) = message.command()
+            && let Some(out) = self.unanswered.get_mut(&(to, from.0[0]))
+        {
+            out.remove(&command);
+        }
+        let event = Event::Peer(AuthenticatedPeerMessage::new(
+            PeerProvenance::from_transport(from, ReplicaIncarnation::new(1).unwrap(), 1),
+            frame,
+        ));
+        let effects = self.nodes[to].step(event);
+        self.handle(to, effects);
     }
 
     /// Messages queued at live nodes.
@@ -815,6 +903,289 @@ fn a_candidate_missing_more_payloads_than_one_answer_carries_still_wins() {
     );
     for i in [1usize, 2] {
         assert_eq!(cluster.nodes[i].executed, submitted, "node {i}");
+    }
+}
+
+/// A candidate far behind takes over in work that grows with what it
+/// lacks, not with that times its selection (the takeover gap on #98).
+///
+/// Review's reproduction: a follower paused, the leader killed, and the
+/// paused voter campaigning first when it came back, ahead of the voters
+/// that were level. It won 409 to 836 commands behind, and spent 13 to
+/// 17 ms of its domain thread on each missing command before it led. It
+/// asked every promised voter for each batch, so each payload came back
+/// once from each. And each payload frame ran the selection's checks
+/// (the gap, the conflicts, the order) and its read of what it lacked over
+/// every entry again.
+///
+/// Here, with five voters, the candidate lacks 480 commands, and three
+/// promised voters hold them. Each payload comes once, and the selection
+/// is read a constant few times. With the checks run on every frame, the
+/// candidate read its selection 1,920 times or more. With every promised
+/// voter asked for each batch, 1,440 payload frames came back.
+#[test]
+fn a_candidate_far_behind_takes_over_in_work_linear_in_what_it_lacks() {
+    const BEHIND: usize = 480;
+    let bound = coord_consensus::MAX_PAYLOAD_TRANSFER;
+    let mut cluster = Cluster::with_voters(41, 1_024, 5);
+    cluster.crash(4);
+    let mut submitted = Vec::new();
+    for n in 0..BEHIND {
+        submitted.push(cluster.admit(n as u64 + 1, (n % 7) as u8));
+        if n % 16 == 15 {
+            cluster.settle();
+        }
+    }
+    cluster.settle();
+    assert_eq!(cluster.nodes[1].executed, submitted);
+    // r4 comes back holding nothing, and the leader is lost: r4 campaigns
+    // first, and r1, r2 and r3 promise it.
+    cluster.revive(4, quorum_among(ballot(0, 0), 5));
+    cluster.crash(0);
+    cluster.asks.clear();
+    cluster.payloads_sent.clear();
+    cluster.campaign(4, ballot(1, 4));
+    cluster.settle();
+    assert!(
+        matches!(cluster.nodes[4].role, Some(Role::Leader(_))),
+        "the candidate did not lead"
+    );
+    for i in 1..5 {
+        assert_eq!(cluster.nodes[i].executed, submitted, "node {i}");
+    }
+    let frames = cluster
+        .payloads_sent
+        .iter()
+        .filter(|(_, to)| *to == 4)
+        .count();
+    let asks: Vec<&Vec<CommandId>> = cluster
+        .asks
+        .iter()
+        .filter(|(i, _)| *i == 4)
+        .map(|(_, c)| c)
+        .collect();
+    let asked: usize = asks.iter().map(|c| c.len()).sum();
+    assert!(
+        frames >= BEHIND && frames <= BEHIND + bound,
+        "{frames} payload frames for {BEHIND} missing commands"
+    );
+    assert!(
+        asked <= BEHIND + bound,
+        "{asked} payloads asked for in {} asks, for {BEHIND} missing",
+        asks.len()
+    );
+    let reads = cluster.selection_reads[4];
+    assert!(
+        (1..=16).contains(&reads),
+        "the candidate read its selection {reads} times"
+    );
+}
+
+/// A new leader with a backlog of undecided commands publishes it at the
+/// pace of its voters' answers, not of the re-send timer (the takeover gap
+/// on #98).
+///
+/// A new leader publishes its first `REPROPOSE_BATCH` re-proposals with
+/// their batches and holds the rest back. They went out only through
+/// `resend_unvoted`, 16 a voter a call, a call every 250 ms in `coordd`:
+/// review's kill-only run at 600 callers executed 96 commands, then 64 in
+/// each of seven seconds. Here the backlog is 200 commands every voter
+/// accepted and nobody committed, and the re-send timer never runs: each
+/// voter's adoptions top it up instead, at most `RESEND_PER_VOTER` first
+/// sends unanswered at a time. Without that, 32 of the 200 are proposed
+/// and the rest wait for a timer that does not come.
+#[test]
+fn a_new_leaders_backlog_goes_out_as_its_voters_answer() {
+    const BACKLOG: usize = 200;
+    // Five voters: at three, a follower learns a fast decision from the
+    // leader's proposal and its own vote alone.
+    let mut cluster = Cluster::with_voters(43, 1_024, 5);
+    // Every voter accepts what r0 proposes, and no acknowledgement reaches
+    // anyone, so nothing commits.
+    cluster.drop_acks = (0..5u8)
+        .flat_map(|a| (0..5u8).filter(move |b| *b != a).map(move |b| (a, b)))
+        .collect();
+    let mut submitted = Vec::new();
+    for n in 0..BACKLOG {
+        submitted.push(cluster.admit(n as u64 + 1, (n % 5) as u8));
+    }
+    cluster.settle();
+    for i in 0..5 {
+        assert!(cluster.nodes[i].executed.is_empty(), "node {i} executed");
+    }
+    cluster.crash(0);
+    cluster.drop_acks.clear();
+    cluster.campaign(1, ballot(1, 1));
+    cluster.settle();
+    let Some(Role::Leader(l)) = cluster.nodes[1].role.as_ref() else {
+        panic!("r1 did not lead");
+    };
+    let counts = l.resend_counts();
+    assert_eq!(counts.calls, 0, "the re-send timer never ran");
+    for i in 1..5 {
+        assert_eq!(
+            cluster.nodes[i].executed.len(),
+            BACKLOG,
+            "node {i} executed {} of the backlog",
+            cluster.nodes[i].executed.len()
+        );
+        assert_eq!(cluster.nodes[i].executed, submitted, "node {i}");
+    }
+    assert!(
+        counts.topped_up as usize >= BACKLOG - coord_consensus::leader::REPROPOSE_BATCH,
+        "{} first sends topped up",
+        counts.topped_up
+    );
+}
+
+/// A new leader's backlog sends each voter one `Committed` frame a turn,
+/// and keeps at most `RESEND_PER_VOTER` of its held-back proposals out
+/// to a voter unanswered (the follow-up to #242; review on #242).
+///
+/// The frontier went out in every step that moved it (task-d74), so each
+/// re-proposal batch that turned durable sent every voter a `Committed`
+/// frame: review's paused voter that won 823 behind put 828 a voter on
+/// the control lane in one second. Lowering in groups, the daemon holds
+/// it for the end of its turn (`Leader::set_frontier_at_turn_end`). Here
+/// the cluster runs in turns, a node taking every frame queued for it in
+/// one, and a backlog of 800 goes out with no re-send timer. Every voter
+/// learns it from at most one frontier a turn; announced in every step,
+/// a voter got many in one turn.
+///
+/// The same run pins the bound `top_up` keeps, which no test failed
+/// without: a voter has at most the first `REPROPOSE_BATCH` and
+/// `RESEND_PER_VOTER` held-back proposals out and unanswered at once.
+/// Without it, every held-back proposal that was durable went to a voter
+/// at its first answer.
+#[test]
+fn a_new_leaders_backlog_sends_each_voter_one_frontier_a_turn() {
+    const BACKLOG: usize = 800;
+    let mut cluster = Cluster::with_voters(43, 1_024, 5);
+    // As in `a_new_leaders_backlog_goes_out_as_its_voters_answer`: every
+    // voter accepts what r0 proposes, and nothing commits.
+    cluster.drop_acks = (0..5u8)
+        .flat_map(|a| (0..5u8).filter(move |b| *b != a).map(move |b| (a, b)))
+        .collect();
+    let mut submitted = Vec::new();
+    for n in 0..BACKLOG {
+        submitted.push(cluster.admit(n as u64 + 1, (n % 5) as u8));
+        if n % 100 == 99 {
+            cluster.settle();
+        }
+    }
+    cluster.settle();
+    for i in 0..5 {
+        assert!(cluster.nodes[i].executed.is_empty(), "node {i} executed");
+    }
+    cluster.crash(0);
+    cluster.drop_acks.clear();
+    cluster.unanswered.clear();
+    cluster.most_unanswered = 0;
+    cluster.committed_sent = 0;
+    cluster.most_committed_a_turn = 0;
+    cluster.turns = true;
+    cluster.campaign(1, ballot(1, 1));
+    cluster.settle();
+    let Some(Role::Leader(l)) = cluster.nodes[1].role.as_ref() else {
+        panic!("r1 did not lead");
+    };
+    assert_eq!(l.resend_counts().calls, 0, "the re-send timer never ran");
+    for i in 1..5 {
+        assert_eq!(
+            cluster.nodes[i].executed.len(),
+            BACKLOG,
+            "node {i} executed {} of the backlog",
+            cluster.nodes[i].executed.len()
+        );
+        assert_eq!(cluster.nodes[i].executed, submitted, "node {i}");
+    }
+    assert!(cluster.committed_sent > 0, "no frontier was announced");
+    assert!(
+        cluster.most_committed_a_turn <= 1,
+        "a voter was sent {} Committed frames in one turn ({} in all)",
+        cluster.most_committed_a_turn,
+        cluster.committed_sent
+    );
+    let bound = coord_consensus::leader::REPROPOSE_BATCH + coord_consensus::RESEND_PER_VOTER;
+    assert!(
+        cluster.most_unanswered <= bound,
+        "a voter had {} proposals out unanswered, past {bound}",
+        cluster.most_unanswered
+    );
+}
+
+/// A promised voter that goes silent while a candidate far behind fetches
+/// payloads is passed over: what was asked of it is asked again, once, of
+/// every promised voter, and nothing more goes to it (review of #241).
+///
+/// The candidate asks one promised voter a batch of `MAX_PAYLOAD_TRANSFER`
+/// in turn (#241). An ask that is not answered in full is asked again of
+/// every promised voter, and its voter is marked failed and left out of
+/// the turns after (`Campaign::payload_source_failed`). Here r4 lacks 480
+/// commands, and one of r1 to r3 stops answering once r4's first ask is
+/// out. It is asked one batch: 60 asks and one more of each promised
+/// voter, 63 frames naming 504 commands. Marking nothing failed, it was
+/// asked every third batch, each asked again of all three: 120 frames
+/// naming 960.
+#[test]
+fn a_silent_promised_voter_is_passed_over_in_the_payload_fetch() {
+    const BEHIND: usize = 480;
+    let bound = coord_consensus::MAX_PAYLOAD_TRANSFER;
+    let promised = 3;
+    for silent in [1u8, 2, 3] {
+        let mut cluster = Cluster::with_voters(41, 1_024, 5);
+        cluster.crash(4);
+        let mut submitted = Vec::new();
+        for n in 0..BEHIND {
+            submitted.push(cluster.admit(n as u64 + 1, (n % 7) as u8));
+            if n % 16 == 15 {
+                cluster.settle();
+            }
+        }
+        cluster.settle();
+        cluster.revive(4, quorum_among(ballot(0, 0), 5));
+        cluster.crash(0);
+        cluster.asks.clear();
+        cluster.payloads_sent.clear();
+        cluster.campaign(4, ballot(1, 4));
+        // Run until r4's first ask is out, then silence one of the voters
+        // it asks: what it sends from then on is parked, so it reads asks
+        // and its answers never arrive.
+        let mut steps = 0;
+        while !cluster.asks.iter().any(|(i, _)| *i == 4) {
+            steps += 1;
+            assert!(steps < 100_000, "no ask");
+            let pick = (0..5)
+                .find(|i| cluster.nodes[*i].alive && !cluster.nodes[*i].inbox.is_empty())
+                .expect("frames in flight");
+            let (from, frame) = cluster.nodes[pick].inbox.pop_front().unwrap();
+            cluster.deliver(pick, from, frame);
+        }
+        cluster.hold_from = vec![silent];
+        cluster.settle();
+        assert!(
+            matches!(cluster.nodes[4].role, Some(Role::Leader(_))),
+            "the candidate did not lead with r{silent} silent"
+        );
+        assert_eq!(cluster.nodes[4].executed, submitted, "r{silent} silent");
+        let asks: Vec<&Vec<CommandId>> = cluster
+            .asks
+            .iter()
+            .filter(|(i, _)| *i == 4)
+            .map(|(_, c)| c)
+            .collect();
+        let asked: usize = asks.iter().map(|c| c.len()).sum();
+        let most_asks = BEHIND.div_ceil(bound) + promised;
+        assert!(
+            asks.len() <= most_asks,
+            "r{silent} silent: {} ask frames naming {asked}, past {most_asks}",
+            asks.len()
+        );
+        assert!(
+            asked <= BEHIND + promised * bound,
+            "r{silent} silent: {asked} commands asked for in {} asks, for {BEHIND} missing",
+            asks.len()
+        );
     }
 }
 
@@ -2004,7 +2375,8 @@ fn a_proposal_refused_ahead_of_the_promise_is_sent_again() {
 
 /// A new leader publishes its re-proposals in a first batch and sends the
 /// rest as votes come back, and every one of them reaches every voter
-/// (task-d07).
+/// (task-d07). Since the takeover gap on #98, "as votes come back" is each
+/// voter's adoptions topping it up, not the re-send timer.
 ///
 /// A new leader after a long history put its whole selection on each
 /// follower's control lane in one pass, and the lane refused dozens of
@@ -2037,7 +2409,17 @@ fn a_new_leader_publishes_its_reproposals_in_batches_and_all_arrive() {
         .iter()
         .filter(|(from, to)| *from == 2 && *to == 1)
         .count();
-    assert_eq!(first, batch, "the new leader's first pass to r1");
+    // The first batch, then the rest as r1's adoptions come back (the
+    // takeover gap on #98): each sent once, and none waits for the timer.
+    assert_eq!(
+        first, proposed_again,
+        "the new leader's sends to r1 before its re-send timer ran"
+    );
+    let wanted: BTreeSet<CommandId> = commands.iter().copied().collect();
+    for i in [1usize, 2] {
+        let executed: BTreeSet<CommandId> = cluster.nodes[i].executed.iter().copied().collect();
+        assert_eq!(executed, wanted, "node {i} before the re-send timer");
+    }
     cluster.settle_resending(commands.len() / coord_consensus::RESEND_PER_VOTER + 2);
     for i in [1usize, 2] {
         let executed: BTreeSet<CommandId> = cluster.nodes[i].executed.iter().copied().collect();

@@ -16,6 +16,8 @@
 //! command has happened, and reporting an outcome on any of the others
 //! publishes a revision the next reader will not find.
 
+mod support;
+
 use coord_consensus::PayloadRecordV1;
 use coord_core::effect::{BootId, PersistBatch};
 use coord_core::outbox::BarrierAllocator;
@@ -31,6 +33,7 @@ use coord_store_testkit::model::{CommitScript, ModelEngine};
 use coord_types::ids::*;
 use coord_types::logical_v1::*;
 use coord_types::{CommandId, RetryKey};
+use support::Staged;
 
 const NS: NamespaceId = NamespaceId([5; 16]);
 const SESSION: SessionId = SessionId([3; 16]);
@@ -192,10 +195,10 @@ fn the_reference_and_journaled_drivers_agree_on_a_failure_free_workload() {
         let (command, record) = payload(seq, &request);
 
         let a = reference
-            .apply(command, &record)
+            .apply_staged(command, &record)
             .expect("reference applied");
         let b = journaled
-            .apply(command, &record)
+            .apply_staged(command, &record)
             .expect("journaled applied");
 
         assert_eq!(
@@ -357,7 +360,9 @@ fn another_batchs_completion_never_completes_this_application() {
     // Meanwhile a real command goes through and completes.
     let request = put(b"other", b"v");
     let (command, record) = payload(1, &request);
-    let applied = applier.apply(command, &record).expect("the other command");
+    let applied = applier
+        .apply_staged(command, &record)
+        .expect("the other command");
     assert!(applied.revision.is_some());
     assert!(applier.kv_revision().unwrap() > revision);
 
@@ -392,24 +397,29 @@ fn a_protocol_batch_lowered_by_an_application_is_neither_taken_for_it_nor_lost()
     let mut protocol = BarrierAllocator::new(inc(), BOOT);
     let _ = protocol.allocate();
     let vote = protocol.allocate();
+    let (command, record) = payload(1, &put(b"k", b"v"));
     applier
         .store_mut()
         .submit(
             PersistBatch {
                 barrier: vote,
                 base: None,
-                updates: vec![coord_core::effect::StoreUpdate {
-                    collection: coord_store_api::registry::Collection::ProtocolV1.id(),
-                    key: b"vote".to_vec(),
-                    value: Some(b"accepted".to_vec()),
-                }],
+                // The vote carries the command's payload, as a vote does:
+                // the execution moves it (task-d113, step 2).
+                updates: vec![
+                    coord_core::effect::StoreUpdate {
+                        collection: coord_store_api::registry::Collection::ProtocolV1.id(),
+                        key: b"vote".to_vec(),
+                        value: Some(b"accepted".to_vec()),
+                    },
+                    coord_consensus::rows::payload_update(&command, &record).unwrap(),
+                ],
             },
             TransitionKind::Protocol,
         )
         .expect("queued");
     assert_eq!(applier.store().queued(), 1);
 
-    let (command, record) = payload(1, &put(b"k", b"v"));
     let applied = applier.apply(command, &record).expect("applied");
 
     // The command's own batch is readable, not still queued behind the
@@ -461,7 +471,7 @@ fn an_applier_standing_alone_keeps_no_other_batchs_facts() {
         .expect("queued");
 
     let (command, record) = payload(1, &put(b"k", b"v"));
-    applier.apply(command, &record).expect("applied");
+    applier.apply_staged(command, &record).expect("applied");
 
     assert_eq!(
         applier.store().queued(),
@@ -488,15 +498,15 @@ fn a_retry_finds_the_retained_outcome_and_does_not_execute_again() {
 
         let (first, second, revision_after) = if label == "reference" {
             let mut a = reference();
-            let first = a.apply(command, &record).unwrap();
+            let first = a.apply_staged(command, &record).unwrap();
             let after = a.kv_revision().unwrap();
-            let second = a.apply(command, &record).unwrap();
+            let second = a.apply_staged(command, &record).unwrap();
             (first, second, (after, a.kv_revision().unwrap()))
         } else {
             let mut a = journaled();
-            let first = a.apply(command, &record).unwrap();
+            let first = a.apply_staged(command, &record).unwrap();
             let after = a.kv_revision().unwrap();
-            let second = a.apply(command, &record).unwrap();
+            let second = a.apply_staged(command, &record).unwrap();
             (first, second, (after, a.kv_revision().unwrap()))
         };
 
@@ -872,9 +882,9 @@ fn a_boot_that_ends_between_the_record_and_the_projection_recovers_the_command()
     let mut applier =
         Applier::new(domain, BarrierAllocator::new(inc(), BootId([0x88; 16]))).expect("applier");
 
-    let first = applier.apply(command, &record).expect("applied");
+    let first = applier.apply_staged(command, &record).expect("applied");
     let revision = applier.kv_revision().unwrap();
-    let retry = applier.apply(command, &record).expect("retried");
+    let retry = applier.apply_staged(command, &record).expect("retried");
     assert_eq!(first, retry, "the retry produced a different outcome");
     assert_eq!(
         applier.kv_revision().unwrap(),
@@ -1152,6 +1162,7 @@ fn a_transition_stamped_below_the_fence_is_refused_as_fenced() {
 
     let (command, record) = payload(1, &put(b"k", b"v"));
     let refused = applier
+        // Refused at the fence before it lowers, so nothing is staged.
         .apply(command, &record)
         .expect_err("an apply below the fence is refused");
     assert!(
@@ -1185,10 +1196,13 @@ fn a_group_of_commands_lowers_once_and_matches_applying_them_one_at_a_time() {
     let mut alone = journaled();
     let one_at_a_time: Vec<_> = group_workload()
         .iter()
-        .map(|(command, record)| alone.apply(*command, record).expect("applied"))
+        .map(|(command, record)| alone.apply_staged(*command, record).expect("applied"))
         .collect();
 
     let mut grouped = journaled();
+    // The payloads first, as the protocol puts them, so the group is
+    // applications only (task-d113, step 2).
+    support::stage_all(grouped.store_mut(), &group_workload());
     let revision_before = grouped.kv_revision().unwrap();
     let published_before = grouped.hub().published();
     let cost_before = grouped.store().cost().expect("counted").lowering;
@@ -1235,6 +1249,7 @@ fn a_group_of_commands_lowers_once_and_matches_applying_them_one_at_a_time() {
 #[test]
 fn a_boot_that_ends_between_a_groups_journal_sync_and_its_projection_commit_recovers_the_group() {
     let mut applier = journaled();
+    support::stage_all(applier.store_mut(), &group_workload());
     assert!(applier.begin_group());
     let outcomes: Vec<_> = group_workload()
         .iter()
@@ -1283,7 +1298,10 @@ fn a_boot_that_ends_between_a_groups_journal_sync_and_its_projection_commit_reco
     // Every command of the group is there, with the outcome it was
     // reported with, and presenting it again executes nothing.
     for ((command, record), outcome) in group_workload().iter().zip(&outcomes) {
-        assert_eq!(&applier.apply(*command, record).expect("retried"), outcome);
+        assert_eq!(
+            &applier.apply_staged(*command, record).expect("retried"),
+            outcome
+        );
     }
     assert_eq!(applier.kv_revision().unwrap(), revision);
     assert_eq!(
@@ -1300,10 +1318,11 @@ fn a_refused_projection_commit_of_a_group_is_redone_not_replanned() {
     let mut alone = journaled();
     let one_at_a_time: Vec<_> = group_workload()
         .iter()
-        .map(|(command, record)| alone.apply(*command, record).expect("applied"))
+        .map(|(command, record)| alone.apply_staged(*command, record).expect("applied"))
         .collect();
 
     let mut applier = journaled();
+    support::stage_all(applier.store_mut(), &group_workload());
     assert!(applier.begin_group());
     let together: Vec<_> = group_workload()
         .iter()

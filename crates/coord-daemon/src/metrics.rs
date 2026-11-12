@@ -483,6 +483,11 @@ pub struct Cost {
     pub journal_syncs: Measure<u64>,
     /// Projection transactions committed.
     pub projection_commits: u64,
+    /// What ended the hold of each projection commit lent while a commit
+    /// hold applies (task-d86): its records, its wait, or an ask by who
+    /// asked. Zero without a hold.
+    #[serde(default)]
+    pub hold_ends: HoldEnds,
     /// Time the domain loop spent working rather than waiting for an
     /// event, since it started. A lowering's syncs are inside it, since
     /// the loop waits for them.
@@ -568,6 +573,66 @@ pub struct Cost {
     /// record (task-d25, #98).
     #[serde(default)]
     pub table: Table,
+    /// The projection's index by command of its intake-keyed rows
+    /// (task-d113): its entries, and the bytes they take.
+    #[serde(default)]
+    pub intake_index: IntakeIndexSize,
+}
+
+/// The size of the projection's index by command of its intake-keyed rows
+/// (task-d113, the lead on #237).
+///
+/// Since step 2's bound, the intake part holds only rows of commands not
+/// yet executed, so `entries` is bounded by the table, not the history.
+/// The executed part (command to position) is what still grows until a
+/// floor forgets a prefix (task-d27): this is where that growth is read.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntakeIndexSize {
+    /// Entries held: one a live dependency or proposal row.
+    pub entries: u64,
+    /// The bytes they take, at the most review measured an entry to take
+    /// on #237 ([`coord_storage::intake::ENTRY_BYTES`]): an estimate, since
+    /// the ordered set's nodes are not counted one by one.
+    pub bytes: u64,
+    /// The executed part's entries: one an executed row kept (step 2).
+    #[serde(default)]
+    pub executed: u64,
+    /// The bytes they take, at the most an entry is inferred to take
+    /// ([`coord_storage::intake::EXECUTED_ENTRY_BYTES`]): an estimate.
+    #[serde(default)]
+    pub executed_bytes: u64,
+}
+
+/// What ended the hold of each projection commit lent while a commit hold
+/// applies (task-d86, the lead on #185), each counted once, in the first
+/// of these that applies: an ask is counted only where the hold would
+/// otherwise have gone on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HoldEnds {
+    /// The records held reached the hold's count.
+    pub full: u64,
+    /// The hold's wait ran out.
+    pub deadline: u64,
+    /// A read due and not yet answerable from the projection asked.
+    pub read: u64,
+    /// A half-established entry's look for its execution record asked.
+    pub settle: u64,
+    /// Another ask: a release published again, a group's effects beyond
+    /// its results, a watch's events, a drain, a checkpoint.
+    pub other: u64,
+}
+
+impl HoldEnds {
+    /// The store's count, as the metrics line carries it.
+    pub const fn of(ends: coord_storage::HoldEnds) -> Self {
+        Self {
+            full: ends.full,
+            deadline: ends.deadline,
+            read: ends.read,
+            settle: ends.settle,
+            other: ends.other,
+        }
+    }
 }
 
 /// A voter's command table, and what holds back its oldest unexecuted
@@ -1090,6 +1155,11 @@ pub struct Resends {
     /// First sends of re-proposals held back from a new leader's first
     /// batch; not re-sends.
     pub deferred: u64,
+    /// First sends of held-back re-proposals that went out as a voter's
+    /// adoptions arrived, not on the re-send timer (the takeover gap on
+    /// #98).
+    #[serde(default)]
+    pub topped_up: u64,
     /// Re-sends of a proposal already decided.
     pub decided: u64,
     /// Re-sends to a voter that had acknowledged the proposal on the

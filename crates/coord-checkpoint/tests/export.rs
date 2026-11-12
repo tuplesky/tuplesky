@@ -17,7 +17,7 @@ use coord_state::plan::KvEventKind;
 use coord_state::policy::{Action, KeyInterval, PolicyRule};
 use coord_state::view::KvEntry;
 use coord_storage::codecs::{
-    self, EventRecordV1, ExecutedRecordV1, HistoryRecordV1, RetryFloorV1, RetryRecordV1,
+    self, EventRecordV1, ExecutedRecordV1, ExecutionRecordV1, RetryFloorV1, RetryRecordV1,
 };
 use coord_storage::lowering::{DurableMeta, ExecutionFrontier};
 use coord_storage::policy::{bootstrap_session, rule_update};
@@ -126,26 +126,34 @@ fn rows(profile: Profile) -> Vec<Row> {
         put(
             &mut rows,
             Collection::PayloadV1,
-            command(n).as_bytes().to_vec(),
+            codecs::position_key(pos(u64::from(n))).to_vec(),
             format!("payload-{n}").into_bytes(),
         );
         put(
             &mut rows,
-            Collection::ExecutedV1,
-            codecs::executed_key(&command(n)),
-            codecs::encode_executed(&ExecutedRecordV1 {
-                position: pos(u64::from(n)),
-                revision: Some(rev(revision)),
-                result_digest: Digest32([n; 32]),
+            Collection::ExecutionV1,
+            codecs::position_key(pos(u64::from(n))).to_vec(),
+            codecs::encode_execution(&ExecutionRecordV1 {
+                command: command(n),
+                executed: ExecutedRecordV1 {
+                    position: pos(u64::from(n)),
+                    revision: Some(rev(revision)),
+                    result_digest: Digest32([n; 32]),
+                },
             })
             .unwrap(),
         );
     }
     if profile.unexecuted_payload {
+        // Pending, by intake order, in the node-private collection
+        // (task-d113, step 2): not common state.
         put(
             &mut rows,
-            Collection::PayloadV1,
-            command(4).as_bytes().to_vec(),
+            Collection::PendingPayloadV1,
+            coord_storage::intake::pending_key(
+                coord_storage::intake::IntakeOrder { seq: 9, ordinal: 0 },
+                &command(4),
+            ),
             b"payload-4-unexecuted".to_vec(),
         );
     }
@@ -161,32 +169,6 @@ fn rows(profile: Profile) -> Vec<Row> {
         Collection::KvCurrentV1,
         codecs::current_key(&NS, b"b"),
         codecs::encode_current(&entry(b"v3", 3, 3, 1)).unwrap(),
-    );
-    let history = |v: &[u8], c: u64, m: u64, ver: u64| {
-        codecs::encode_history(&HistoryRecordV1 {
-            entry: Some(entry(v, c, m, ver)),
-        })
-        .unwrap()
-    };
-    if !profile.gc_done {
-        put(
-            &mut rows,
-            Collection::KvHistoryV1,
-            codecs::history_key(&NS, b"a", rev(1)),
-            history(b"v1", 1, 1, 1),
-        );
-    }
-    put(
-        &mut rows,
-        Collection::KvHistoryV1,
-        codecs::history_key(&NS, b"a", rev(2)),
-        history(b"v2", 1, 2, 2),
-    );
-    put(
-        &mut rows,
-        Collection::KvHistoryV1,
-        codecs::history_key(&NS, b"b", rev(3)),
-        history(b"v3", 3, 3, 1),
     );
     let event = |k: &[u8], e: Option<KvEntry>, p: Option<KvEntry>| {
         codecs::encode_event(&EventRecordV1 {
@@ -460,10 +442,9 @@ fn equal_common_state_hashes_equally_across_private_differences_and_engines() {
         Collection::SessionV1,
         Collection::LeaseV1,
         Collection::LeaseKeysV1,
-        Collection::KvHistoryV1,
         Collection::EventsV1,
         Collection::PayloadV1,
-        Collection::ExecutedV1,
+        Collection::ExecutionV1,
         Collection::AuthGrantV1,
     ] {
         assert!(summary(c).unwrap() > 0, "{c:?}");
@@ -471,13 +452,13 @@ fn equal_common_state_hashes_equally_across_private_differences_and_engines() {
     for c in [
         Collection::MetaV1,
         Collection::ProtocolV1,
+        Collection::KvHistoryV1,
         Collection::CheckpointV1,
     ] {
         assert_eq!(summary(c), None, "{c:?}");
     }
-    // Canonical normalization: one history version at or below the floor
-    // per key, no event below the floor, only executed payloads.
-    assert_eq!(summary(Collection::KvHistoryV1), Some(2));
+    // Canonical normalization: below the floor, only each key's newest put
+    // at or below it (a@2, not a@1; task-d105), and only executed payloads.
     assert_eq!(summary(Collection::EventsV1), Some(2));
     assert_eq!(summary(Collection::PayloadV1), Some(3));
     assert_eq!(ca.manifest.boundary.execution_position, pos(3));
@@ -570,12 +551,15 @@ fn rows_beyond_the_boundary_are_refused() {
     let mut engine = model(Profile::default());
     let mut tx = engine.begin_write().unwrap();
     tx.put(
-        Collection::ExecutedV1.id(),
-        &codecs::executed_key(&command(9)),
-        &codecs::encode_executed(&ExecutedRecordV1 {
-            position: pos(9),
-            revision: None,
-            result_digest: Digest32([9; 32]),
+        Collection::ExecutionV1.id(),
+        &codecs::position_key(pos(9)),
+        &codecs::encode_execution(&ExecutionRecordV1 {
+            command: command(9),
+            executed: ExecutedRecordV1 {
+                position: pos(9),
+                revision: None,
+                result_digest: Digest32([9; 32]),
+            },
         })
         .unwrap(),
     )
@@ -585,7 +569,7 @@ fn rows_beyond_the_boundary_are_refused() {
     assert_eq!(
         export_shared(&view, origin(), &limits).unwrap_err(),
         ExportError::BeyondBoundary {
-            collection: Collection::ExecutedV1.id().0
+            collection: Collection::ExecutionV1.id().0
         }
     );
     // A retained retry response at or below the execution position but
@@ -638,28 +622,12 @@ fn rows_beyond_the_boundary_are_refused() {
             collection: Collection::EventsV1.id().0
         }
     );
-    let mut engine = model(Profile::default());
-    let mut tx = engine.begin_write().unwrap();
-    tx.put(
-        Collection::KvHistoryV1.id(),
-        &codecs::history_key(&NS, b"c", rev(9)),
-        b"late",
-    )
-    .unwrap();
-    tx.commit_durable().unwrap();
-    let view = engine.reader().snapshot().unwrap();
-    assert_eq!(
-        export_shared(&view, origin(), &limits).unwrap_err(),
-        ExportError::BeyondBoundary {
-            collection: Collection::KvHistoryV1.id().0
-        }
-    );
     // A row the exporter decodes must decode.
     let mut engine = model(Profile::default());
     let mut tx = engine.begin_write().unwrap();
     tx.put(
-        Collection::ExecutedV1.id(),
-        &codecs::executed_key(&command(8)),
+        Collection::ExecutionV1.id(),
+        &codecs::position_key(pos(2)),
         b"garbage",
     )
     .unwrap();
@@ -668,7 +636,7 @@ fn rows_beyond_the_boundary_are_refused() {
     assert_eq!(
         export_shared(&view, origin(), &limits).unwrap_err(),
         ExportError::Corrupt {
-            collection: Collection::ExecutedV1.id().0
+            collection: Collection::ExecutionV1.id().0
         }
     );
 }
@@ -733,11 +701,11 @@ fn chunks_are_bounded_verified_and_every_tampering_is_caught() {
         Err(VerifyError::RootMismatch)
     );
     let mut format = cp.manifest.clone();
-    format.format = 2;
+    format.format = 1;
     format.root = format.compute_root();
     assert_eq!(
         verify_shared(&format, &encoded),
-        Err(VerifyError::UnsupportedFormat { found: 2 })
+        Err(VerifyError::UnsupportedFormat { found: 1 })
     );
     let mut counts = cp.manifest.clone();
     counts.collections[6].rows += 1;

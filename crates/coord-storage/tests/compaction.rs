@@ -1,6 +1,9 @@
 //! task-14: before-floor reads return Compacted, later reads keep untouched
 //! old values, holds retain history under active views and watches, GC is
 //! incremental and crash-resumable, and model/redb agree.
+//!
+//! A key's versions are its event rows (task-d105): below the floor, GC
+//! keeps each key's newest put at or below it and deletes every other row.
 
 use std::collections::BTreeMap;
 
@@ -128,7 +131,10 @@ impl<E: LocalEngine> Domain<E> {
         let mut steps = 0;
         loop {
             let gated = self.worker.reader().snapshot().unwrap();
-            let step = plan_gc(gated.view(), &self.holds, budget).unwrap();
+            let step = gated
+                .with_kv_index(|index| plan_gc(gated.view(), index, &self.holds, budget))
+                .unwrap()
+                .unwrap();
             drop(gated);
             steps += 1;
             if !step.updates.is_empty() {
@@ -169,13 +175,24 @@ impl<E: LocalEngine> Domain<E> {
         out
     }
 
-    fn history_revisions_of(&self, key: &[u8]) -> Vec<u64> {
+    /// Each retained version: (key, revision), from the event rows.
+    fn versions(&self) -> Vec<(Vec<u8>, u64)> {
         self.history_rows()
-            .keys()
-            .filter(|k| k[0] == Collection::KvHistoryV1.id().0 as u8)
-            .filter_map(|k| coord_types::ordered_key::decode_history(&k[1..]).ok())
-            .filter(|d| d.key == key)
-            .map(|d| d.revision.unwrap().get())
+            .iter()
+            .filter(|(k, _)| k[0] == Collection::EventsV1.id().0 as u8)
+            .map(|(k, v)| {
+                let (revision, _) = coord_storage::codecs::decode_event_key(&k[1..]).unwrap();
+                let record = coord_storage::codecs::decode_event(v).unwrap();
+                (record.key, revision.get())
+            })
+            .collect()
+    }
+
+    fn history_revisions_of(&self, key: &[u8]) -> Vec<u64> {
+        self.versions()
+            .into_iter()
+            .filter(|(k, _)| k == key)
+            .map(|(_, r)| r)
             .collect()
     }
 
@@ -223,11 +240,11 @@ fn compaction_keeps_needed_versions_and_before_floor_reads_are_compacted() {
     let before = reads_at(&mut d, 6, 10);
     d.run(&compact(6));
     assert!(d.gc(GcBudget::default()) >= 1);
-    // History below the floor: only the newest version at or below 6 per key.
+    // Below the floor: only each key's newest put at or below 6.
     assert_eq!(
         d.history_revisions_of(b"a"),
-        vec![5, 8],
-        "a keeps the tombstone at 5 (newest <= 6) and the newer 8"
+        vec![8],
+        "a's newest at or below 6 is the tombstone at 5, which goes; 8 stays"
     );
     assert_eq!(
         d.history_revisions_of(b"b"),
@@ -241,8 +258,8 @@ fn compaction_keeps_needed_versions_and_before_floor_reads_are_compacted() {
     );
     assert_eq!(
         d.event_revisions(),
-        (6..=10).collect::<Vec<_>>(),
-        "events below the floor are deleted whole"
+        vec![2, 6, 7, 8, 9, 10],
+        "below the floor only b@2 stays"
     );
     // Reads at or above the floor are unchanged, including b's old value.
     let after = reads_at(&mut d, 6, 10);
@@ -285,18 +302,12 @@ fn holds_from_active_views_and_watches_retain_history() {
         vec![3, 5, 8],
         "under the hold at 3, only a@1 is collected"
     );
-    assert_eq!(d.event_revisions(), (3..=10).collect::<Vec<_>>());
+    assert_eq!(d.event_revisions(), (2..=10).collect::<Vec<_>>());
     // The pinned page is still answerable at 3 through the storage layer:
     // every key's newest version at or below 3 survives (a@3, b@2), even
     // though the API floor of 8 makes a *fresh* read at 3 `Compacted`.
-    let at_3: Vec<(Vec<u8>, u64)> = d
-        .history_rows()
-        .keys()
-        .filter(|k| k[0] == Collection::KvHistoryV1.id().0 as u8)
-        .filter_map(|k| coord_types::ordered_key::decode_history(&k[1..]).ok())
-        .filter(|h| h.revision.unwrap().get() <= 3)
-        .map(|h| (h.key, h.revision.unwrap().get()))
-        .collect();
+    let mut at_3: Vec<(Vec<u8>, u64)> = d.versions().into_iter().filter(|(_, r)| *r <= 3).collect();
+    at_3.sort();
     assert_eq!(at_3, vec![(b"a".to_vec(), 3), (b"b".to_vec(), 2)]);
     // Release the page hold: the watch hold at 4 still bounds GC.
     drop(page_hold);
@@ -306,14 +317,23 @@ fn holds_from_active_views_and_watches_retain_history() {
         vec![3, 5, 8],
         "a@3 is the newest version at or below 4"
     );
-    assert_eq!(d.event_revisions(), (4..=10).collect::<Vec<_>>());
+    assert_eq!(d.event_revisions(), (2..=10).collect::<Vec<_>>());
     // Release the watch hold: GC reaches the replicated floor of 8.
     drop(watch_hold);
     assert!(d.holds.is_empty());
     d.gc(GcBudget::default());
-    assert_eq!(d.history_revisions_of(b"a"), vec![8]);
-    assert_eq!(d.history_revisions_of(b"c"), vec![7]);
-    assert_eq!(d.event_revisions(), (8..=10).collect::<Vec<_>>());
+    assert_eq!(
+        d.history_revisions_of(b"a"),
+        vec![8],
+        "a@3, kept under the floor of 4 and behind the events cursor, goes once a@5 is below the floor"
+    );
+    assert_eq!(
+        d.history_revisions_of(b"c"),
+        vec![7],
+        "c@4, kept under the floor of 4, goes once c@6 is below the floor"
+    );
+    assert_eq!(d.history_revisions_of(b"b"), vec![2]);
+    assert_eq!(d.event_revisions(), vec![2, 7, 8, 9, 10]);
     // The replicated floor, not the hold, decides what the API promises:
     // a read at 3 is Compacted once the floor is 8, even though a hold once existed.
     assert_eq!(
@@ -367,7 +387,7 @@ fn gc_is_incremental_crash_resumable_and_identical_across_engines() {
         max_deletes: 2,
     };
     let steps = model.gc(tiny);
-    assert!(steps > 3, "tiny budget needs several steps: {steps}");
+    assert!(steps >= 3, "tiny budget needs several steps: {steps}");
     let expected = model.history_rows();
 
     // Crash between steps: a fresh boot reads the persisted cursor and
@@ -377,7 +397,10 @@ fn gc_is_incremental_crash_resumable_and_identical_across_engines() {
     crashy.run(&compact(8));
     for _ in 0..2 {
         let gated = crashy.worker.reader().snapshot().unwrap();
-        let step = plan_gc(gated.view(), &crashy.holds, tiny).unwrap();
+        let step = gated
+            .with_kv_index(|index| plan_gc(gated.view(), index, &crashy.holds, tiny))
+            .unwrap()
+            .unwrap();
         drop(gated);
         crashy
             .worker
@@ -393,10 +416,11 @@ fn gc_is_incremental_crash_resumable_and_identical_across_engines() {
     engine.crash_and_reopen();
     let mut resumed = Domain::new(engine);
     let gated = resumed.worker.reader().snapshot().unwrap();
-    let (history_cursor, _) = cursors(gated.view()).unwrap();
+    let (_, events_cursor) = cursors(gated.view()).unwrap();
     assert!(
-        history_cursor.is_some_and(|c| !c.done && c.floor == rev(8)),
-        "cursor persisted before the crash"
+        events_cursor.through > KvRevision::ZERO && events_cursor.through < rev(7),
+        "cursor persisted before the crash: {:?}",
+        events_cursor.through
     );
     drop(gated);
     resumed.gc(tiny);
@@ -414,7 +438,8 @@ fn gc_is_incremental_crash_resumable_and_identical_across_engines() {
     redb.run(&compact(10));
     redb.gc(GcBudget::default());
     assert_eq!(redb.history_revisions_of(b"d"), vec![10]);
-    assert_eq!(redb.event_revisions(), vec![10]);
+    // b@2, c@7 and a@8 stay: each is its key's newest put at or below 10.
+    assert_eq!(redb.event_revisions(), vec![2, 7, 8, 10]);
     let gated = redb.worker.reader().snapshot().unwrap();
     let (c, e) = cursors(gated.view()).unwrap();
     assert_eq!(c.map(|c| (c.floor, c.done)), Some((rev(10), true)));
@@ -448,7 +473,10 @@ fn gc_budgets_hold_inside_hot_keys_and_wide_revisions() {
     let mut steps = 0;
     loop {
         let gated = d.worker.reader().snapshot().unwrap();
-        let step = plan_gc(gated.view(), &d.holds, tiny).unwrap();
+        let step = gated
+            .with_kv_index(|index| plan_gc(gated.view(), index, &d.holds, tiny))
+            .unwrap()
+            .unwrap();
         drop(gated);
         assert!(
             step.examined <= tiny.max_examined,
@@ -476,10 +504,10 @@ fn gc_budgets_hold_inside_hot_keys_and_wide_revisions() {
         steps > 20,
         "a tiny budget takes many bounded steps: {steps}"
     );
-    // The hot key keeps only its version at the floor; every revision
-    // below the floor lost its events, including the wide one's twelve.
+    // The hot key keeps only its newest version, below the floor; the
+    // ranged keys' puts go, superseded by the wide revision's tombstones.
     assert_eq!(d.history_revisions_of(b"hot"), vec![40]);
-    assert_eq!(d.event_revisions(), vec![53]);
+    assert_eq!(d.event_revisions(), vec![40, 53]);
     // The same end state as one unbounded pass.
     let mut big = Domain::new(ModelEngine::new());
     for i in 0..40u8 {
