@@ -101,6 +101,7 @@ pub mod apply;
 pub mod codecs;
 pub mod compaction;
 pub mod cut;
+pub mod intake;
 pub mod journaled;
 pub mod latency;
 pub mod lowering;

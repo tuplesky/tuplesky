@@ -19,6 +19,8 @@
 //!   after the credential that admitted it expired, with no clock read
 //!   anywhere in application.
 
+mod support;
+
 use coord_consensus::PayloadRecordV1;
 use coord_core::capability::{
     AdmissionFacts, AttestedAdmission, AttestedEstablishment, CredentialDeadline,
@@ -36,6 +38,7 @@ use coord_types::identity::Digest32;
 use coord_types::ids::*;
 use coord_types::logical_v1::*;
 use coord_types::{CommandId, RetryKey};
+use support::Staged;
 
 const NS: NamespaceId = NamespaceId([0x5e; 16]);
 const CLUSTER: ClusterId = ClusterId([1; 16]);
@@ -173,7 +176,7 @@ fn an_establishing_admission_creates_the_session_its_verifier_attested() {
         &request(CanonicalOperation::ConsumeAdmission),
         Some(facts(SESSION, 9, ALICE, 1_000)),
     );
-    let applied = applier.apply(command, &payload).unwrap();
+    let applied = applier.apply_staged(command, &payload).unwrap();
     assert_eq!(
         outcome(&applied.response),
         Outcome::SessionCreated { session: SESSION }
@@ -204,8 +207,8 @@ fn the_session_is_the_admissions_and_never_the_payloads() {
     assert_eq!(p1.logical, p2.logical, "the same payload, byte for byte");
     assert_ne!(c1, c2, "different invocations are different commands");
 
-    applier.apply(c1, &p1).unwrap();
-    applier.apply(c2, &p2).unwrap();
+    applier.apply_staged(c1, &p1).unwrap();
+    applier.apply_staged(c2, &p2).unwrap();
     let gated = applier.store().reader().snapshot().unwrap();
     let auth = coord_storage::load_authorization(gated.view(), NS, &SESSION, ViewBudget::default())
         .unwrap();
@@ -234,7 +237,7 @@ fn an_establishing_admission_authorizes_one_action_and_nothing_else_authorizes_i
         Some(facts(SESSION, 9, ALICE, 1_000)),
     );
     assert_eq!(
-        outcome(&applier.apply(command, &payload).unwrap().response),
+        outcome(&applier.apply_staged(command, &payload).unwrap().response),
         Outcome::ErrRejected {
             reason: RejectionReason::AdmissionMismatch
         },
@@ -249,7 +252,7 @@ fn an_establishing_admission_authorizes_one_action_and_nothing_else_authorizes_i
         Some(submitting(SESSION, 7)),
     );
     assert_eq!(
-        outcome(&applier.apply(command, &payload).unwrap().response),
+        outcome(&applier.apply_staged(command, &payload).unwrap().response),
         Outcome::ErrRejected {
             reason: RejectionReason::AdmissionMismatch
         },
@@ -263,7 +266,7 @@ fn an_establishing_admission_authorizes_one_action_and_nothing_else_authorizes_i
         None,
     );
     assert_eq!(
-        outcome(&applier.apply(command, &payload).unwrap().response),
+        outcome(&applier.apply_staged(command, &payload).unwrap().response),
         Outcome::ErrRejected {
             reason: RejectionReason::AdmissionMismatch
         }
@@ -294,7 +297,7 @@ fn a_receipt_cannot_establish_a_session_the_invocation_does_not_name() {
         Some(facts(SESSION, 9, ALICE, 1_000)),
     );
     assert_eq!(
-        outcome(&applier.apply(command, &payload).unwrap().response),
+        outcome(&applier.apply_staged(command, &payload).unwrap().response),
         Outcome::ErrRejected {
             reason: RejectionReason::AdmissionMismatch
         }
@@ -312,8 +315,8 @@ fn a_duplicate_delivery_recovers_the_established_outcome() {
         &request(CanonicalOperation::ConsumeAdmission),
         Some(facts(SESSION, 9, ALICE, 1_000)),
     );
-    let first = applier.apply(command, &payload).unwrap();
-    let again = applier.apply(command, &payload).unwrap();
+    let first = applier.apply_staged(command, &payload).unwrap();
+    let again = applier.apply_staged(command, &payload).unwrap();
     assert_eq!(first.position, again.position, "one position, one command");
     assert_eq!(first.result_digest, again.result_digest);
     assert_eq!(
@@ -334,7 +337,7 @@ fn a_consumed_receipt_establishes_nothing_a_second_time() {
         &operation,
         Some(facts(SESSION, 9, ALICE, 1_000)),
     );
-    applier.apply(command, &payload).unwrap();
+    applier.apply_staged(command, &payload).unwrap();
 
     // The same receipt under another invocation: a different command,
     // so nothing recovers it from a retry record.
@@ -344,7 +347,7 @@ fn a_consumed_receipt_establishes_nothing_a_second_time() {
     };
     let (command, payload) = accepted(other, &operation, Some(facts(SESSION, 9, ALICE, 1_000)));
     assert_eq!(
-        outcome(&applier.apply(command, &payload).unwrap().response),
+        outcome(&applier.apply_staged(command, &payload).unwrap().response),
         Outcome::ErrReceiptConsumed
     );
 
@@ -356,7 +359,7 @@ fn a_consumed_receipt_establishes_nothing_a_second_time() {
         Some(facts(SESSION, 5, MALLORY, 9_000)),
     );
     assert_eq!(
-        outcome(&applier.apply(command, &payload).unwrap().response),
+        outcome(&applier.apply_staged(command, &payload).unwrap().response),
         Outcome::ErrReceiptConsumed
     );
     let gated = applier.store().reader().snapshot().unwrap();
@@ -393,7 +396,7 @@ fn a_rule_revoked_before_the_admission_is_consumed_creates_nothing() {
         Some(facts(SESSION, 9, ALICE, 1_000)),
     );
     assert_eq!(
-        outcome(&applier.apply(command, &payload).unwrap().response),
+        outcome(&applier.apply_staged(command, &payload).unwrap().response),
         Outcome::ErrTrustRuleInvalid
     );
 
@@ -417,7 +420,7 @@ fn a_rule_revoked_before_the_admission_is_consumed_creates_nothing() {
         Some(facts(SESSION, 8, ALICE, 1_000)),
     );
     assert_eq!(
-        outcome(&applier.apply(command, &payload).unwrap().response),
+        outcome(&applier.apply_staged(command, &payload).unwrap().response),
         Outcome::ErrTrustRuleInvalid
     );
 }
@@ -431,7 +434,7 @@ fn a_retired_session_is_never_established_again() {
         &request(CanonicalOperation::ConsumeAdmission),
         Some(facts(SESSION, 9, ALICE, 1_000)),
     );
-    applier.apply(command, &payload).unwrap();
+    applier.apply_staged(command, &payload).unwrap();
     administer(
         &mut applier,
         &InternalCommand::RetireSession {
@@ -445,7 +448,7 @@ fn a_retired_session_is_never_established_again() {
         Some(facts(SESSION, 4, ALICE, 9_000)),
     );
     assert_eq!(
-        outcome(&applier.apply(command, &payload).unwrap().response),
+        outcome(&applier.apply_staged(command, &payload).unwrap().response),
         Outcome::ErrReceiptConsumed,
         "retirement is permanent: the identity is spent"
     );
@@ -482,7 +485,7 @@ fn an_accepted_command_needs_no_issuer_and_no_clock() {
         Some(facts(SESSION, 9, ALICE, expired)),
     );
     assert_eq!(
-        outcome(&applier.apply(command, &payload).unwrap().response),
+        outcome(&applier.apply_staged(command, &payload).unwrap().response),
         Outcome::SessionCreated { session: SESSION }
     );
     let gated = applier.store().reader().snapshot().unwrap();

@@ -387,6 +387,12 @@ pub struct ResendCounts {
     /// First sends of re-proposals held back from the first batch: not
     /// re-sends.
     pub deferred: u64,
+    /// First sends of held-back re-proposals that went out as a voter's
+    /// adoptions arrived, not on the re-send timer (the takeover gap on
+    /// #98): each voter is kept at [`RESEND_PER_VOTER`] of them
+    /// unanswered.
+    #[serde(default)]
+    pub topped_up: u64,
     /// Re-sends of a proposal the leader had decided.
     pub decided: u64,
     /// Re-sends of an undecided proposal to a voter that had acknowledged
@@ -442,6 +448,7 @@ impl ResendCounts {
     /// Add `other`'s counts to these.
     pub const fn add(&mut self, other: &ResendCounts) {
         self.deferred += other.deferred;
+        self.topped_up += other.topped_up;
         self.decided += other.decided;
         self.acknowledged += other.acknowledged;
         self.unanswered += other.unanswered;
@@ -469,6 +476,15 @@ enum Resend {
     Acknowledged,
     /// A re-send of one the voter has not answered.
     Unanswered,
+}
+
+/// A voter's first sends of held-back re-proposals ([`Leader::top_up`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct FirstSends {
+    /// The highest sequence number in `held_back` its first sends reached.
+    through: Option<u64>,
+    /// The ones sent that it has not adopted yet.
+    out: BTreeSet<CommandId>,
 }
 
 /// One proposal's re-sends to one voter (task-d49).
@@ -606,6 +622,17 @@ pub struct Leader {
     /// Calls of `resend_unvoted` so far: the clock its back-off is
     /// counted on.
     resend_calls: u64,
+    /// Re-proposals held back from a new leader's first batch
+    /// (`REPROPOSE_BATCH`), by sequence number, until every voter has had
+    /// its first send of them. Empty but after a takeover.
+    held_back: BTreeSet<(u64, CommandId)>,
+    /// Per voter, the held-back re-proposals sent to it that it has not
+    /// adopted yet, and how far in `held_back` its first sends reached
+    /// (the takeover gap on #98). Each adoption that arrives tops the
+    /// voter up to [`RESEND_PER_VOTER`] unanswered, so the backlog goes
+    /// out at the pace of a round trip; paced by `resend_unvoted`'s timer
+    /// alone it went out 16 a voter every 250 ms, 64 commands a second.
+    first_sends: BTreeMap<ReplicaId, FirstSends>,
     /// Per proposal and voter it was re-sent to: when it may be re-sent
     /// again, and how often it was. Kept only while the proposal is held
     /// and the voter has not adopted it.
@@ -761,6 +788,8 @@ impl Leader {
             // Every voter of the genesis ballot is in it from the start.
             joined: config.identity.voters.iter().copied().collect(),
             resend_calls: 0,
+            held_back: BTreeSet::new(),
+            first_sends: BTreeMap::new(),
             resent: digest::map(),
             latency: BTreeMap::new(),
             answered: digest::map(),
@@ -928,6 +957,8 @@ impl Leader {
             // frame were lost (task-d33). A vote at this ballot joins it.
             joined: BTreeSet::from([identity.replica]),
             resend_calls: 0,
+            held_back: BTreeSet::new(),
+            first_sends: BTreeMap::new(),
             resent: digest::map(),
             latency: BTreeMap::new(),
             answered: digest::map(),
@@ -1033,8 +1064,9 @@ impl Leader {
                 last.push(c);
             }
         }
-        // Published in a first batch; the rest go out through the re-send,
-        // oldest first, as votes come back. A new leader after a long
+        // Published in a first batch; the rest go out oldest first as each
+        // voter's adoptions come back (`top_up`), and through the re-send
+        // for what is lost. A new leader after a long
         // history used to put its whole selection on each follower's
         // control lane in one pass, and the lane refused dozens of them
         // (task-d07).
@@ -1055,9 +1087,7 @@ impl Leader {
                 continue;
             }
             let deps = entry.deps.clone();
-            let publish = published < REPROPOSE_BATCH;
-            published += 1;
-            effects.extend(leader.repropose(*c, deps, publish));
+            effects.extend(leader.repropose_counted(*c, deps, &mut published));
         }
         let mut done: BTreeSet<CommandId> = BTreeSet::new();
         for c in &decision.reproposed {
@@ -1105,9 +1135,7 @@ impl Leader {
             if !ready.is_empty() {
                 last = ready_tails(decision, &last, &ready);
             }
-            let publish = published < REPROPOSE_BATCH;
-            published += 1;
-            effects.extend(leader.repropose(*c, deps, publish));
+            effects.extend(leader.repropose_counted(*c, deps, &mut published));
             effects.extend(leader.repropose_entries(decision, &ready, &mut published));
         }
         // What the candidate took in after cutting its own report, which
@@ -1125,9 +1153,7 @@ impl Leader {
                 continue;
             }
             let deps = core::mem::replace(&mut last, alloc::vec![*c]);
-            let publish = published < REPROPOSE_BATCH;
-            published += 1;
-            effects.extend(leader.repropose(*c, deps, publish));
+            effects.extend(leader.repropose_counted(*c, deps, &mut published));
         }
         // The first fresh proposal of this ballot follows the recovered
         // order's tail. Re-proposing moved nothing in the table, so its
@@ -1201,6 +1227,7 @@ impl Leader {
         let proposals = &self.proposals;
         self.unsettled.retain(|(_, c)| proposals.contains_key(c));
         self.durable.retain(|(_, c)| proposals.contains_key(c));
+        self.held_back.retain(|(_, c)| proposals.contains_key(c));
         self.by_barrier.retain(|_, c| proposals.contains_key(c));
         self.votes.retain(|c, _| !table.forgotten(c));
         // A retry of a forgotten command is refused from the table's
@@ -1224,6 +1251,7 @@ impl Leader {
         if let Some(proposal) = self.proposals.remove(&command) {
             self.unsettled.remove(&(proposal.seqnum, command));
             self.durable.remove(&(proposal.seqnum, command));
+            self.held_back.remove(&(proposal.seqnum, command));
             if self.by_barrier.get(&proposal.barrier) == Some(&command) {
                 self.by_barrier.remove(&proposal.barrier);
             }
@@ -1255,6 +1283,12 @@ impl Leader {
                 && self.bindings.values().all(kept),
             "a forgotten command's history was kept and is not in the forget queue"
         );
+        debug_assert!(
+            self.held_back
+                .iter()
+                .all(|(_, c)| self.proposals.contains_key(c)),
+            "a held-back re-proposal outlived its proposal"
+        );
     }
 
     /// Propose a known command under this ballot with `deps`. With
@@ -1275,11 +1309,27 @@ impl Leader {
             if entry.phase >= Phase::Commit && self.table.phase_of(c) == Some(Phase::Executed) {
                 continue;
             }
-            let publish = *published < REPROPOSE_BATCH;
-            *published += 1;
-            effects.extend(self.repropose(*c, entry.deps.clone(), publish));
+            effects.extend(self.repropose_counted(*c, entry.deps.clone(), published));
         }
         effects
+    }
+
+    /// [`Leader::repropose`], published with its batch while fewer than
+    /// `REPROPOSE_BATCH` have been, and counted in `published` only if a
+    /// proposal was made. Counted before, a command this leader executed
+    /// and retired, which `repropose` makes nothing of, used up a place in
+    /// the first batch (the takeover gap on #98).
+    fn repropose_counted(
+        &mut self,
+        command: CommandId,
+        deps: Vec<CommandId>,
+        published: &mut usize,
+    ) -> Vec<Effect> {
+        let made = self.repropose(command, deps, *published < REPROPOSE_BATCH);
+        if !made.is_empty() {
+            *published += 1;
+        }
+        made
     }
 
     fn repropose(
@@ -1544,6 +1594,13 @@ impl Leader {
                     let p = self.proposals.get_mut(&command).expect("in the order");
                     p.sent.get_or_insert(call);
                     self.counts.deferred += 1;
+                    // Out to the voter now: it counts in the window
+                    // `top_up` keeps, and is not sent it twice.
+                    self.first_sends
+                        .entry(voter)
+                        .or_default()
+                        .out
+                        .insert(command);
                 }
                 Resend::HandedOff => {
                     let r = self.resent.entry((command, voter)).or_insert(Resent {
@@ -2195,6 +2252,7 @@ impl Leader {
         if let Some(old) = self.proposals.get(&command) {
             self.unsettled.remove(&(old.seqnum, command));
             self.durable.remove(&(old.seqnum, command));
+            self.held_back.remove(&(old.seqnum, command));
             self.by_barrier.remove(&old.barrier);
         }
         if !(proposal.durable && proposal.executed) {
@@ -2202,6 +2260,9 @@ impl Leader {
         }
         if proposal.durable {
             self.durable.insert((proposal.seqnum, command));
+        }
+        if !proposal.published {
+            self.held_back.insert((proposal.seqnum, command));
         }
         self.by_barrier.insert(proposal.barrier, command);
         self.proposals.insert(command, proposal);
@@ -3197,6 +3258,11 @@ impl Leader {
         if let Some(outbox) = self.outbox.as_mut() {
             outbox.observe(event);
         }
+        // A held-back re-proposal became durable: a voter with room in its
+        // window takes it now (`top_up`), rather than at its next
+        // adoption, which may never come if it has adopted everything
+        // sent to it.
+        let mut held_back_durable = false;
         self.ballots.on_storage(event);
         // Ledger bookkeeping covers every batch this machine staged, not
         // only the proposal batches: an acceptance row carries its own
@@ -3258,6 +3324,7 @@ impl Leader {
                         }
                         let key = (p.seqnum, command);
                         self.durable.insert(key);
+                        held_back_durable |= self.held_back.contains(&key);
                         // An adoption counted before the proposal was
                         // durable raises the voter's highest now.
                         if let Some(set) = self.votes.get(&command) {
@@ -3295,10 +3362,125 @@ impl Leader {
             }
         }
         let mut effects = self.advance_pending();
+        if held_back_durable {
+            let me = self.config.identity.replica;
+            let voters: Vec<ReplicaId> = self
+                .config
+                .identity
+                .voters
+                .iter()
+                .copied()
+                .filter(|v| *v != me)
+                .collect();
+            for voter in voters {
+                effects.extend(self.top_up(voter));
+            }
+        }
         self.learn();
         effects.extend(self.deliver_due_report());
         effects.extend(self.release());
         effects
+    }
+
+    /// Send `voter` the next held-back re-proposals it has not had, oldest
+    /// first, until [`RESEND_PER_VOTER`] of them are out to it unadopted
+    /// (the takeover gap on #98).
+    ///
+    /// A new leader publishes its first `REPROPOSE_BATCH` re-proposals with
+    /// their batches and holds the rest back, so its first pass does not
+    /// put a long selection on every voter's control lane at once
+    /// (task-d07). Sent from `resend_unvoted` alone, the rest went out 16
+    /// a voter a call, a call every 250 ms: a backlog of N took about
+    /// (N - 32) / 64 seconds after any leader change. Called as each of
+    /// the voter's adoptions arrives, and as a held-back proposal becomes
+    /// durable, this keeps the same bound on what is in flight to a voter
+    /// and sends at the pace of its answers. `resend_unvoted` still sends
+    /// what a lost frame or a voter's silence leaves unanswered.
+    fn top_up(&mut self, voter: ReplicaId) -> Vec<Effect> {
+        if self.held_back.is_empty() || !self.is_leading() {
+            return Vec::new();
+        }
+        let Some(boot) = self.boot else {
+            return Vec::new();
+        };
+        let mut window = self.first_sends.remove(&voter).unwrap_or_default();
+        {
+            let (proposals, votes) = (&self.proposals, &self.votes);
+            window.out.retain(|c| {
+                proposals.contains_key(c) && !votes.get(c).is_some_and(|v| v.adopted_by(&voter))
+            });
+        }
+        let mut room = RESEND_PER_VOTER.saturating_sub(window.out.len());
+        let mut chosen = Vec::new();
+        let start = match window.through {
+            Some(t) => Bound::Excluded((t, CommandId(Digest32([0xff; 32])))),
+            None => Bound::Unbounded,
+        };
+        for (seqnum, command) in self.held_back.range((start, Bound::Unbounded)) {
+            // Every path that drops a proposal drops it from `held_back`
+            // too; one missing here is passed over, not a panic.
+            let Some(p) = self.proposals.get(command) else {
+                continue;
+            };
+            if room == 0 || !p.durable {
+                break;
+            }
+            window.through = Some(*seqnum);
+            if self.adopted(command, &voter) || window.out.contains(command) {
+                continue;
+            }
+            chosen.push(*command);
+            room -= 1;
+        }
+        let ballot = self.config.quorum.ballot();
+        let context = self.ballots.context(boot, ballot, LocalJournalSeq::ZERO);
+        let to = PeerId {
+            replica: voter,
+            incarnation: ReplicaIncarnation::ZERO,
+        };
+        let call = self.resend_calls;
+        let mut sends = Vec::new();
+        for command in chosen {
+            window.out.insert(command);
+            self.counts.topped_up += 1;
+            let p = self.proposals.get_mut(&command).expect("held back");
+            p.sent.get_or_insert(call);
+            let p = &self.proposals[&command];
+            sends.push(PendingSend {
+                context,
+                requires: alloc::vec![p.barrier],
+                to,
+                frame: self.proposal_frame(p),
+            });
+            sends.extend(self.own_adoption_send(command, to));
+        }
+        self.first_sends.insert(voter, window);
+        // What every voter has had its first send of is held back no
+        // longer: `resend_unvoted` re-sends it as it would any proposal.
+        let me = self.config.identity.replica;
+        let reached = self
+            .config
+            .identity
+            .voters
+            .iter()
+            .filter(|v| **v != me)
+            .map(|v| self.first_sends.get(v).and_then(|w| w.through))
+            .min()
+            .flatten();
+        while let (Some(first), Some(reached)) = (self.held_back.first(), reached) {
+            if first.0 > reached {
+                break;
+            }
+            self.held_back.pop_first();
+        }
+        if sends.is_empty() {
+            return Vec::new();
+        }
+        let outbox = self.outbox.as_mut().expect("booted");
+        for send in sends {
+            outbox.publish(send);
+        }
+        self.release()
     }
 
     /// Present a definitely rejected proposal batch again, unchanged, under
@@ -3330,6 +3512,8 @@ impl Leader {
         // a new leader's first batch has had its first send now, and its
         // re-sends are timed from its batch (task-d49).
         proposal.published = true;
+        let republished = (proposal.seqnum, command);
+        self.held_back.remove(&republished);
         let batch = PersistBatch {
             barrier,
             base: None,
@@ -3959,6 +4143,12 @@ impl Leader {
             }
             if from != self.config.identity.replica {
                 self.note_adoption(command, from);
+                // Its adoption is the voter's answer: the next held-back
+                // re-proposal goes now, not on the next timer call.
+                let mut out = self.top_up(from);
+                self.learn();
+                out.extend(self.release_ready());
+                return out;
             }
         }
         self.learn();

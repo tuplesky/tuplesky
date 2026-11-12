@@ -1073,6 +1073,12 @@ impl<P: Persistence> Voter<P> {
         self.node.payloads_answered()
     }
 
+    /// How many payload requests this voter's machine sent, the ones it
+    /// made by itself included (a campaign's next batch).
+    pub fn payload_asks(&self) -> u64 {
+        self.node.payload_asks()
+    }
+
     /// What this voter's re-sends did since boot (task-d49).
     pub fn resend_counts(&self) -> coord_consensus::ResendCounts {
         self.node.resend_counts()
@@ -1108,7 +1114,7 @@ impl<P: Persistence> Voter<P> {
         let standing = crate::catch_up::Standing {
             executed: machine.executed_through(),
             holds: machine.holds_unexecuted(),
-            backlog: || machine.unexecuted_held(),
+            backlog: || machine.decided_unexecuted_held(),
             busy: machine.catching_up(),
             chain: machine.catch_up_chain_open(),
             pages: machine.catch_up_counts().0,

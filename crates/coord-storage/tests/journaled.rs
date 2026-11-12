@@ -831,7 +831,6 @@ fn replay_restores_the_exact_state_results_and_events_from_the_records_alone() {
 fn run_workload(materialize_inline: bool) -> Vec<(u16, Vec<u8>, Vec<u8>)> {
     let mut world = World::new();
     let events = coord_store_api::registry::Collection::EventsV1.id();
-    let executed = coord_store_api::registry::Collection::ExecutedV1.id();
     for step in 1..=4u64 {
         world.protocol(A, ballot(step), promise(step));
         if materialize_inline {
@@ -850,11 +849,20 @@ fn run_workload(materialize_inline: bool) -> Vec<(u16, Vec<u8>, Vec<u8>)> {
                     key: step.to_be_bytes().to_vec(),
                     value: Some(vec![step as u8; 8]),
                 },
+                // Its payload, then its executed row, which moves the
+                // payload to the position (task-d113, step 2).
                 StoreUpdate {
-                    collection: executed,
+                    collection: coord_store_api::registry::Collection::PayloadV1.id(),
                     key: command(step as u8).as_bytes().to_vec(),
-                    value: Some(step.to_be_bytes().to_vec()),
+                    value: Some(vec![step as u8; 16]),
                 },
+                coord_storage::retry::executed_update(
+                    &command(step as u8),
+                    position(step),
+                    None,
+                    coord_types::identity::Digest32([step as u8; 32]),
+                )
+                .unwrap(),
             ],
         );
         if materialize_inline {

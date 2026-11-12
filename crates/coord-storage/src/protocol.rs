@@ -8,17 +8,18 @@ use std::ops::Bound;
 
 use coord_consensus::rows::{
     DEPENDENCY_TAG, PromiseRecordV1, SYNC_TAG, SealRecordV1, decode_dependency, decode_payload,
-    decode_promise, decode_seal, decode_sync, dependency_key, payload_key, promise_key, seal_key,
+    decode_promise, decode_seal, decode_sync, promise_key, seal_key,
 };
 use coord_consensus::{CatchUpEntry, CommandRecord, PayloadRecordV1, SyncDecision};
 use coord_store_api::engine::{Direction, EngineError, ErrorClass, OrderedRead, ScanRequest};
 use coord_store_api::registry::Collection;
-use coord_types::identity::Digest32;
 use coord_types::ids::{Ballot, ConfigurationEpoch, ExecutionPosition};
 use coord_types::logical_v1::LogicalRequest;
 use coord_types::{CommandId, RetryKey};
 
-use crate::codecs::{self, ExecutedRecordV1};
+use crate::codecs::{self, ExecutedRecordV1, ExecutionRecordV1, position_key};
+use crate::intake::ProtocolKey;
+use crate::view::GatedView;
 use crate::views::ViewBudget;
 
 /// The epoch's durable promise row, if any.
@@ -50,7 +51,7 @@ pub struct RecoveredProtocol {
     /// says this replica has no seal, never that the transition was
     /// cancelled -- that is a quorum's fact, not one replica's.
     pub seal: Option<SealRecordV1>,
-    /// Dependency rows, keyed by command.
+    /// Dependency rows, keyed by command, in command order.
     pub records: Vec<(CommandId, CommandRecord)>,
     /// Bound Sync selections, in key (ballot number, leader) order.
     pub syncs: Vec<(Ballot, SyncDecision)>,
@@ -62,7 +63,7 @@ pub struct RecoveredProtocol {
     /// Trimming may remove the dependency rows of executed commands, so
     /// this is what still has rows, not the whole executed history.
     pub executed: Vec<(CommandId, ExecutionPosition)>,
-    /// Every other executed identity: commands whose `executed_v1` row
+    /// Every other executed identity: commands whose executed row
     /// survives and whose dependency row does not, in execution order
     /// (task-d05; the order since task-d12).
     ///
@@ -162,7 +163,7 @@ fn corrupt(what: &'static str) -> EngineError {
 /// result; applied to the whole recovery, it made a healthy voter whose
 /// history outgrew it unable ever to start again. What recovery keeps in
 /// memory is what the machine keeps for the life of the process anyway,
-/// as with [`read_history`].
+/// as with its executed history.
 pub fn read_protocol<V: OrderedRead>(
     view: &V,
     epoch: ConfigurationEpoch,
@@ -194,11 +195,20 @@ pub fn read_protocol<V: OrderedRead>(
         )?;
         for row in &page.rows {
             match row.key.get(8) {
-                Some(&DEPENDENCY_TAG) if row.key.len() == 41 => {
-                    let mut id = [0u8; 32];
-                    id.copy_from_slice(&row.key[9..]);
-                    records.push((CommandId(Digest32(id)), decode_dependency(&row.value)?));
-                }
+                // Keyed by intake order (task-d113): the command is the
+                // key's suffix.
+                Some(&DEPENDENCY_TAG) => match crate::intake::parse(&row.key) {
+                    ProtocolKey::Intake { command, .. } => {
+                        records.push((command, decode_dependency(&row.value)?));
+                    }
+                    ProtocolKey::ByCommand { .. } => {
+                        return Err(corrupt(
+                            "a dependency row keyed by command: a store of the layout before \
+                             task-d113",
+                        ));
+                    }
+                    ProtocolKey::Other => {}
+                },
                 Some(&SYNC_TAG) if row.key.len() == 33 => {
                     let decision = decode_sync(&row.value)?.decision;
                     syncs.push((decision.ballot, decision));
@@ -211,11 +221,76 @@ pub fn read_protocol<V: OrderedRead>(
             _ => break,
         }
     }
+    // Every executed row, in the order executed (task-d113, step 2: keyed
+    // by position, so no sort). The commands with a decided record of this
+    // epoch are the machine's executed answers; the rest are its history.
+    let mut executions: std::collections::BTreeMap<CommandId, ExecutionPosition> =
+        std::collections::BTreeMap::new();
+    let mut in_order: Vec<CommandId> = Vec::new();
+    let mut by_position: std::collections::BTreeMap<ExecutionPosition, CommandId> =
+        std::collections::BTreeMap::new();
+    scan_executions(
+        view,
+        Bound::Unbounded,
+        Bound::Unbounded,
+        budget,
+        |position, row| {
+            if position != row.executed.position {
+                return Err(corrupt("an executed row under another position's key"));
+            }
+            executions.insert(row.command, position);
+            by_position.insert(position, row.command);
+            in_order.push(row.command);
+            Ok(())
+        },
+    )?;
+    // An executed command's decided record moved at its execution to
+    // `decided_v1`, under its position (task-d113, step 2, the bound). Those
+    // of this epoch are restored as its dependency row was before the move,
+    // so each key's latest command, which a key keeps naming after the
+    // command executes, comes back with its paths.
+    let epoch_bytes = epoch.to_be_bytes();
+    scan_rows(view, Collection::DecidedV1, budget, |key, value| {
+        let position = codecs::position_of(key)?;
+        let (decided_in, record) = codecs::split_decided(value)?;
+        if decided_in != epoch_bytes {
+            return Ok(());
+        }
+        let command = by_position
+            .get(&position)
+            .copied()
+            .ok_or_else(|| corrupt("a decided record at a position with no executed row"))?;
+        records.push((command, decode_dependency(record)?));
+        Ok(())
+    })?;
+    // In command order, as the rows were when they were keyed by command,
+    // and one row a command: a rewrite stays in place under its intake key,
+    // and a command's record moves once, so a second row of a command is a
+    // broken lowering.
+    records.sort_unstable_by_key(|(command, _)| *command);
+    if records.windows(2).any(|w| w[0].0 == w[1].0) {
+        return Err(corrupt("two dependency rows of one command in an epoch"));
+    }
+    // A payload not yet executed is pending, by intake order: read them
+    // all, which the table's capacity bounds.
+    let mut pending: std::collections::BTreeMap<CommandId, Vec<u8>> =
+        std::collections::BTreeMap::new();
+    scan_rows(view, Collection::PendingPayloadV1, budget, |key, value| {
+        let (_, command) = crate::intake::parse_pending(key)
+            .ok_or_else(|| corrupt("a pending payload key of the wrong length"))?;
+        pending.insert(command, value.to_vec());
+        Ok(())
+    })?;
     let mut payloads = Vec::with_capacity(records.len());
     let mut executed = Vec::new();
     for (command, record) in &records {
+        let position = executions.get(command).copied();
         if record.payload.is_some() {
-            match view.get(Collection::PayloadV1.id(), &payload_key(command))? {
+            let bytes = match position {
+                Some(position) => view.get(Collection::PayloadV1.id(), &position_key(position))?,
+                None => pending.get(command).cloned(),
+            };
+            match bytes {
                 Some(bytes) => {
                     let payload = decode_payload(&bytes)?;
                     // The row is only this command's payload if it rehashes
@@ -235,15 +310,21 @@ pub fn read_protocol<V: OrderedRead>(
                 None => return Err(corrupt("recovered command without its payload row")),
             }
         }
-        if let Some(bytes) =
-            view.get(Collection::ExecutedV1.id(), &codecs::executed_key(command))?
-        {
-            let ExecutedRecordV1 { position, .. } = codecs::decode_executed(&bytes)?;
+        if let Some(position) = position {
             executed.push((*command, position));
         }
     }
     executed.sort_by_key(|(_, p)| *p);
-    let history = read_history(view, &records, budget)?;
+    // Every executed identity without a dependency row among `records`
+    // (task-d05), in the order executed, not key order (task-d12): a
+    // restart replays them into the machine's table, and the last one
+    // replayed is the command a new leader chains its first proposals
+    // after when its selection gives it nothing to follow.
+    let known: std::collections::BTreeSet<CommandId> = records.iter().map(|(c, _)| *c).collect();
+    let history: Vec<CommandId> = in_order
+        .into_iter()
+        .filter(|c| !known.contains(c))
+        .collect();
     let frontier = crate::lowering::DurableMeta::read(view)?
         .frontier
         .execution_position;
@@ -259,132 +340,276 @@ pub fn read_protocol<V: OrderedRead>(
     })
 }
 
-/// Every `executed_v1` row whose position is within `radius` of one of
+/// Every executed row whose position is within `radius` of one of
 /// `around`, in position order (task-d17).
 ///
 /// What a node that stopped on a release its execution contradicts shows
 /// of its own execution: the commands it executed next to where it put
-/// the command and next to where the leader did. The table is keyed by
-/// command identity, so the whole of it is read, paged within `budget`;
-/// this is read once, at a stop, and never on a serving path.
+/// the command and next to where the leader did. Keyed by position
+/// (task-d113, step 2), each is a range of `execution_v1`.
 pub fn executed_near<V: OrderedRead>(
     view: &V,
     around: &[ExecutionPosition],
     radius: u64,
     budget: ViewBudget,
 ) -> Result<Vec<(CommandId, ExecutedRecordV1)>, EngineError> {
-    let near = |position: ExecutionPosition| {
-        around
-            .iter()
-            .any(|centre| centre.get().abs_diff(position.get()) <= radius)
-    };
-    let mut rows: Vec<(CommandId, ExecutedRecordV1)> = Vec::new();
-    let mut resume: Option<Vec<u8>> = None;
-    loop {
-        let page = view.scan_page(
-            Collection::ExecutedV1.id(),
-            &ScanRequest {
-                lower: Bound::Unbounded,
-                upper: Bound::Unbounded,
-                direction: Direction::Forward,
-                resume_after: resume.clone(),
-                max_rows: budget.max_rows.max(1).try_into().expect("non-zero"),
-                max_bytes: budget.max_bytes.max(1).try_into().expect("non-zero"),
+    let mut rows: std::collections::BTreeMap<ExecutionPosition, (CommandId, ExecutedRecordV1)> =
+        std::collections::BTreeMap::new();
+    for centre in around {
+        let low = ExecutionPosition::new(centre.get().saturating_sub(radius).max(1))
+            .map_err(|_| corrupt("a position at zero"))?;
+        let high = ExecutionPosition::new(centre.get().saturating_add(radius))
+            .map_err(|_| corrupt("a position at zero"))?;
+        scan_executions(
+            view,
+            Bound::Included(low),
+            Bound::Included(high),
+            budget,
+            |position, row| {
+                rows.insert(position, (row.command, row.executed));
+                Ok(())
             },
         )?;
-        for row in &page.rows {
-            let id: [u8; 32] = row
-                .key
-                .as_slice()
-                .try_into()
-                .map_err(|_| corrupt("an executed row's key is not a command identity"))?;
-            let record = codecs::decode_executed(&row.value)?;
-            if near(record.position) {
-                rows.push((CommandId(Digest32(id)), record));
-            }
-        }
-        match page.rows.last() {
-            Some(last) if !page.exhausted => resume = Some(last.key.clone()),
-            _ => break,
-        }
     }
-    rows.sort_unstable_by_key(|(command, record)| (record.position, *command));
-    Ok(rows)
+    Ok(rows.into_values().collect())
 }
 
-/// Every `executed_v1` row, as (position, command), in position order
-/// (task-d08).
-///
-/// What a donor serves a lagging voter from: the table is keyed by
-/// command identity, so the order of execution has to be read out of
-/// the whole of it, paged within `budget`. Read once and kept, by the
-/// caller, rather than once per page: this is O(history), and a durable
-/// position index is what would make it less.
+/// At most `max` executed rows from `after` (exclusive) through `through`
+/// (inclusive), in position order, as (position, row): what a donor serves
+/// a lagging voter from (task-d08), one range of `execution_v1` since
+/// task-d113's step 2. Fewer than `max` where the rows run out or one
+/// page of `budget` does: a page is a prefix, so a short read is one too.
+pub fn executed_between<V: OrderedRead>(
+    view: &V,
+    after: ExecutionPosition,
+    through: ExecutionPosition,
+    max: usize,
+    budget: ViewBudget,
+) -> Result<Vec<(ExecutionPosition, ExecutionRecordV1)>, EngineError> {
+    if max == 0 {
+        return Ok(Vec::new());
+    }
+    let page = view.scan_page(
+        Collection::ExecutionV1.id(),
+        &ScanRequest {
+            lower: Bound::Excluded(position_key(after).to_vec()),
+            upper: Bound::Included(position_key(through).to_vec()),
+            direction: Direction::Forward,
+            resume_after: None,
+            max_rows: budget
+                .max_rows
+                .clamp(1, u32::try_from(max).unwrap_or(u32::MAX))
+                .try_into()
+                .expect("non-zero"),
+            max_bytes: budget.max_bytes.max(1).try_into().expect("non-zero"),
+        },
+    )?;
+    page.rows
+        .iter()
+        .map(|row| {
+            Ok((
+                codecs::position_of(&row.key)?,
+                codecs::decode_execution(&row.value)?,
+            ))
+        })
+        .collect()
+}
+
+/// Every executed row at or below `through`, as (position, command), in
+/// position order: one range of `execution_v1` (task-d113, step 2). What
+/// a reader with no gate behind its view -- the trim's -- asks "executed
+/// at or below" with, since a command's position is not a lookup without
+/// the index's executed part.
+pub fn executed_through<V: OrderedRead>(
+    view: &V,
+    through: ExecutionPosition,
+    budget: ViewBudget,
+) -> Result<Vec<(ExecutionPosition, CommandId)>, EngineError> {
+    let mut out = Vec::new();
+    scan_executions(
+        view,
+        Bound::Unbounded,
+        Bound::Included(through),
+        budget,
+        |position, row| {
+            out.push((position, row.command));
+            Ok(())
+        },
+    )?;
+    Ok(out)
+}
+
+/// Every executed row, as (position, command), in position order
+/// (task-d08). Keyed by position since task-d113's step 2, so it is one
+/// scan with no sort.
 pub fn executed_order<V: OrderedRead>(
     view: &V,
     budget: ViewBudget,
 ) -> Result<Vec<(ExecutionPosition, CommandId)>, EngineError> {
-    let mut order: Vec<(ExecutionPosition, CommandId)> = Vec::new();
+    let mut order = Vec::new();
+    scan_executions(
+        view,
+        Bound::Unbounded,
+        Bound::Unbounded,
+        budget,
+        |position, row| {
+            order.push((position, row.command));
+            Ok(())
+        },
+    )?;
+    Ok(order)
+}
+
+/// The executed row of `command`, through the index's executed part of the
+/// gate `gated` came through (task-d113, step 2): the position, and the
+/// row there, which names its command.
+pub fn executed_record<V: OrderedRead>(
+    gated: &GatedView<V>,
+    command: &CommandId,
+) -> Result<Option<ExecutedRecordV1>, EngineError> {
+    let Some(gate) = gated.gate() else {
+        return Ok(None);
+    };
+    let candidates: Vec<ExecutionPosition> = gate.index().executed_candidates(command).collect();
+    for position in candidates {
+        if let Some(bytes) = gated
+            .view()
+            .get(Collection::ExecutionV1.id(), &position_key(position))?
+        {
+            let row = codecs::decode_execution(&bytes)?;
+            if row.command == *command {
+                return Ok(Some(row.executed));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Call `f` with each `execution_v1` row between `lower` and `upper`, in
+/// position order, paged within `budget`.
+fn scan_executions<V: OrderedRead>(
+    view: &V,
+    lower: Bound<ExecutionPosition>,
+    upper: Bound<ExecutionPosition>,
+    budget: ViewBudget,
+    mut f: impl FnMut(ExecutionPosition, ExecutionRecordV1) -> Result<(), EngineError>,
+) -> Result<(), EngineError> {
+    let key = |b: Bound<ExecutionPosition>| b.map(|p| position_key(p).to_vec());
+    let (lower, upper) = (key(lower), key(upper));
     let mut resume: Option<Vec<u8>> = None;
     loop {
         let page = view.scan_page(
-            Collection::ExecutedV1.id(),
+            Collection::ExecutionV1.id(),
             &ScanRequest {
-                lower: Bound::Unbounded,
-                upper: Bound::Unbounded,
+                lower: lower.clone(),
+                upper: upper.clone(),
                 direction: Direction::Forward,
-                resume_after: resume.clone(),
+                resume_after: resume.take(),
                 max_rows: budget.max_rows.max(1).try_into().expect("non-zero"),
                 max_bytes: budget.max_bytes.max(1).try_into().expect("non-zero"),
             },
         )?;
         for row in &page.rows {
-            let id: [u8; 32] = row
-                .key
-                .as_slice()
-                .try_into()
-                .map_err(|_| corrupt("an executed row's key is not a command identity"))?;
-            let ExecutedRecordV1 { position, .. } = codecs::decode_executed(&row.value)?;
-            order.push((position, CommandId(Digest32(id))));
+            f(
+                codecs::position_of(&row.key)?,
+                codecs::decode_execution(&row.value)?,
+            )?;
         }
         match page.rows.last() {
             Some(last) if !page.exhausted => resume = Some(last.key.clone()),
-            _ => break,
+            _ => return Ok(()),
         }
     }
-    order.sort_unstable();
-    Ok(order)
+}
+
+/// Call `f` with each row of `collection`, in key order, paged within
+/// `budget`.
+fn scan_rows<V: OrderedRead>(
+    view: &V,
+    collection: Collection,
+    budget: ViewBudget,
+    mut f: impl FnMut(&[u8], &[u8]) -> Result<(), EngineError>,
+) -> Result<(), EngineError> {
+    let mut resume: Option<Vec<u8>> = None;
+    loop {
+        let page = view.scan_page(
+            collection.id(),
+            &ScanRequest {
+                lower: Bound::Unbounded,
+                upper: Bound::Unbounded,
+                direction: Direction::Forward,
+                resume_after: resume.take(),
+                max_rows: budget.max_rows.max(1).try_into().expect("non-zero"),
+                max_bytes: budget.max_bytes.max(1).try_into().expect("non-zero"),
+            },
+        )?;
+        for row in &page.rows {
+            f(&row.key, &row.value)?;
+        }
+        match page.rows.last() {
+            Some(last) if !page.exhausted => resume = Some(last.key.clone()),
+            _ => return Ok(()),
+        }
+    }
 }
 
 /// What a donor sends a lagging voter of one command it executed
 /// (task-d08), read from its durable rows: the execution from
-/// `executed_v1`, the payload from `payload_v1`, and the decided record
-/// from the epoch's dependency row in `protocol_v1`, if it keeps one.
+/// `execution_v1` and the payload from `payload_v1`, both at the command's
+/// position (task-d113, step 2), and the decided record from `decided_v1`
+/// at the same position, if it keeps one of the asker's epoch.
 ///
 /// `None` when the command has no executed row or no payload here: a
 /// donor serves only what it executed and can show.
+///
+/// The position is found through the index's executed part of the gate
+/// `gated` came through, and the row there, which names its command,
+/// settles it (rule (c)). The decided record moved there from the
+/// command's dependency row at its execution (the bound), so no lookup of
+/// the intake part is needed.
 pub fn catch_up_entry<V: OrderedRead>(
-    view: &V,
+    gated: &GatedView<V>,
     epoch: ConfigurationEpoch,
     command: &CommandId,
 ) -> Result<Option<CatchUpEntry>, EngineError> {
-    let Some(executed) = view.get(Collection::ExecutedV1.id(), &codecs::executed_key(command))?
-    else {
+    let Some(executed) = executed_record(gated, command)? else {
         return Ok(None);
     };
+    catch_up_entry_at(gated, epoch, command, executed)
+}
+
+/// [`catch_up_entry`] for a command whose executed row the caller has read
+/// in `gated`'s snapshot: a range of `execution_v1` names its command.
+pub fn catch_up_entry_at<V: OrderedRead>(
+    gated: &GatedView<V>,
+    epoch: ConfigurationEpoch,
+    command: &CommandId,
+    executed: ExecutedRecordV1,
+) -> Result<Option<CatchUpEntry>, EngineError> {
+    let view = gated.view();
     let ExecutedRecordV1 {
         position,
         revision,
         result_digest,
-    } = codecs::decode_executed(&executed)?;
-    let Some(payload) = view.get(Collection::PayloadV1.id(), &payload_key(command))? else {
+    } = executed;
+    let Some(payload) = view.get(Collection::PayloadV1.id(), &position_key(position))? else {
         return Ok(None);
     };
     let payload = decode_payload(&payload)?;
-    let decided = view
-        .get(Collection::ProtocolV1.id(), &dependency_key(epoch, command))?
-        .map(|bytes| decode_dependency(&bytes))
-        .transpose()?;
+    // The decided record moved to `decided_v1` at the command's execution
+    // (the bound), under the same position: served only in its own epoch,
+    // as the epoch's dependency row was.
+    let decided = match view.get(Collection::DecidedV1.id(), &position_key(position))? {
+        Some(bytes) => {
+            let (decided_in, record) = codecs::split_decided(&bytes)?;
+            if decided_in == epoch.to_be_bytes() {
+                Some(decode_dependency(record)?)
+            } else {
+                None
+            }
+        }
+        None => None,
+    };
     Ok(Some(CatchUpEntry {
         command: *command,
         payload,
@@ -393,60 +618,4 @@ pub fn catch_up_entry<V: OrderedRead>(
         revision,
         result_digest,
     }))
-}
-
-/// Every executed identity without a dependency row among `records`,
-/// read from `executed_v1` itself (task-d05), in execution order.
-///
-/// In the order they executed, not their key order (task-d12). A restart
-/// replays them into the machine's table, and the last one replayed is
-/// the command a new leader chains its first proposals after when its
-/// selection gives it nothing to follow. In key order that was whichever
-/// identity sorts highest, which says nothing about the order, and the
-/// chain forked there.
-///
-/// Paged within `budget` per page, like the protocol rows: the answer is one identity per command executed, which
-/// the machine keeps in memory for the life of the process anyway (its
-/// executed answer). It grows with the history until a floor lets
-/// `executed_v1` forget a prefix every voter executed, which is the same
-/// bound that set is waiting for.
-fn read_history<V: OrderedRead>(
-    view: &V,
-    records: &[(CommandId, CommandRecord)],
-    budget: ViewBudget,
-) -> Result<Vec<CommandId>, EngineError> {
-    let known: std::collections::BTreeSet<CommandId> = records.iter().map(|(c, _)| *c).collect();
-    let mut history: Vec<(ExecutionPosition, CommandId)> = Vec::new();
-    let mut resume: Option<Vec<u8>> = None;
-    loop {
-        let page = view.scan_page(
-            Collection::ExecutedV1.id(),
-            &ScanRequest {
-                lower: Bound::Unbounded,
-                upper: Bound::Unbounded,
-                direction: Direction::Forward,
-                resume_after: resume.clone(),
-                max_rows: budget.max_rows.max(1).try_into().expect("non-zero"),
-                max_bytes: budget.max_bytes.max(1).try_into().expect("non-zero"),
-            },
-        )?;
-        for row in &page.rows {
-            let id: [u8; 32] = row
-                .key
-                .as_slice()
-                .try_into()
-                .map_err(|_| corrupt("an executed row's key is not a command identity"))?;
-            let command = CommandId(Digest32(id));
-            if !known.contains(&command) {
-                let ExecutedRecordV1 { position, .. } = codecs::decode_executed(&row.value)?;
-                history.push((position, command));
-            }
-        }
-        match page.rows.last() {
-            Some(last) if !page.exhausted => resume = Some(last.key.clone()),
-            _ => break,
-        }
-    }
-    history.sort_unstable();
-    Ok(history.into_iter().map(|(_, c)| c).collect())
 }

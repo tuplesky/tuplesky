@@ -1746,6 +1746,42 @@ fn the_next_page_is_asked_while_the_one_in_hand_executes() {
     );
 }
 
+/// Only the page asked ahead is taken ahead (task-d25, #236 review): a
+/// page that follows exactly what is in hand but answers no ask of this
+/// voter's -- here, after a page that reached its donor's frontier and so
+/// asked nothing ahead -- is dropped as busy, and starts no chain. Taken,
+/// it would queue a window nobody asked for and ask on from its end: a
+/// second chain beside the voter's own, doubling a donor's reads.
+#[test]
+fn a_page_that_follows_the_one_in_hand_unasked_is_not_taken_ahead() {
+    let (mut cluster, _) = left_behind(17);
+    cluster.serve = false;
+    let start = cluster.follower(4).executed_through();
+    cluster.ask(4);
+    let asks = cluster.catch_up_asks.len();
+    // Taken whole and at the donor's frontier as it says: nothing is
+    // asked ahead of it.
+    let first = cluster.page_through(start, 3);
+    cluster.deliver_page(4, 0, &first);
+    assert!(
+        cluster.follower(4).catching_up(),
+        "the first page ran at once: the test shows nothing"
+    );
+    assert_eq!(cluster.catch_up_asks.len(), asks, "an ask ahead of it");
+    // A page from exactly the end of what is in hand, unasked.
+    let unasked = cluster.page(0, ballot0(), at(start.get() + 3));
+    let before = paths(&cluster);
+    cluster.deliver_page(4, 0, &unasked);
+    let now = paths(&cluster);
+    assert_eq!(now.taken_ahead, before.taken_ahead, "{now:?}");
+    assert_eq!(now.ignored_busy, before.ignored_busy + 1, "{now:?}");
+    assert_eq!(
+        cluster.catch_up_asks.len(),
+        asks,
+        "the unasked page started a chain"
+    );
+}
+
 /// The reserve holds with a page in hand and one asked ahead: a window is
 /// at most one page, however much is queued behind it.
 #[test]
@@ -2102,4 +2138,176 @@ fn an_open_chain_closes_once_the_voter_executes_as_far_as_it_was_owed() {
         !cluster.follower(4).catch_up_chain_open(),
         "a voter level with the donor's frontier still owes its chain"
     );
+}
+
+/// r4's chain left open by r0's page cut to three, its next ask taken by
+/// a donor that is itself behind (r1 here), whose page reaches its own
+/// frontier four commands on (#236 review). Returns where r4 stood and
+/// what r0's whole first page was.
+fn answered_by_a_donor_behind(cluster: &mut Cluster) -> (ExecutionPosition, ProtocolMessage) {
+    cluster.serve = false;
+    let start = cluster.follower(4).executed_through();
+    cluster.ask(4);
+    let whole = cluster.page(0, ballot0(), start);
+    let mut cut = whole.clone();
+    let ProtocolMessage::CatchUpPage { entries, .. } = &mut cut else {
+        unreachable!()
+    };
+    entries.truncate(3);
+    cluster.deliver_page(4, 0, &cut);
+    cluster.settle();
+    assert!(cluster.follower(4).catch_up_chain_open());
+    // The chain's next ask goes to r1, which has executed only four more.
+    let effects = cluster.nodes[4].follower_mut().request_catch_up(r(1));
+    cluster.handle(4, effects);
+    cluster.settle();
+    let from = at(start.get() + 3);
+    assert_eq!(cluster.catch_up_asks.last(), Some(&(4, from.get())));
+    let mut behind = cluster.page(0, ballot0(), from);
+    let ProtocolMessage::CatchUpPage {
+        entries, through, ..
+    } = &mut behind
+    else {
+        unreachable!()
+    };
+    entries.truncate(4);
+    *through = at(from.get() + 4);
+    cluster.deliver_page(4, 1, &behind);
+    cluster.settle();
+    assert_eq!(cluster.follower(4).executed_through(), at(from.get() + 4));
+    (start, whole)
+}
+
+/// A chain answered by two donors is owed the furthest frontier either
+/// said (#236 review): a donor that is itself behind answers with a page
+/// that reaches its own frontier, and the chain stays open, short of what
+/// the first donor said. Before, that page closed it, and in a quiet
+/// domain nothing asked again: r4 stayed at 135 or 125 of 310 in review's
+/// scratches. Asking on, r4 ends level, and the chain closes there.
+#[test]
+fn a_chain_answered_by_a_donor_behind_stays_owed_the_first_donors_frontier() {
+    let (mut cluster, _) = left_behind(17);
+    answered_by_a_donor_behind(&mut cluster);
+    assert!(
+        cluster.nodes[4].executed.len() < cluster.nodes[0].executed.len(),
+        "r4 is level: the test shows nothing"
+    );
+    assert!(
+        cluster.follower(4).catch_up_chain_open(),
+        "the chain closed at the behind donor's frontier, short of what r0 said"
+    );
+    cluster.serve = true;
+    cluster.ask(4);
+    assert_eq!(cluster.nodes[4].executed, cluster.nodes[0].executed);
+    assert!(!cluster.follower(4).catch_up_chain_open());
+}
+
+/// The furthest frontier said is still one the voter can reach by itself
+/// (#236 review): after a donor behind has answered, a late answer to the
+/// first ask brings r4 level with r0, which is what r0 said, and the chain
+/// closes, with nothing left to ask for.
+#[test]
+fn a_chain_owed_two_donors_frontiers_closes_at_the_further_one() {
+    let (mut cluster, _) = left_behind(17);
+    let (_, whole) = answered_by_a_donor_behind(&mut cluster);
+    assert!(cluster.follower(4).catch_up_chain_open());
+    cluster.deliver_page(4, 0, &whole);
+    cluster.settle();
+    assert_eq!(cluster.nodes[4].executed, cluster.nodes[0].executed);
+    assert!(
+        !cluster.follower(4).catch_up_chain_open(),
+        "a voter level with the furthest frontier said still owes its chain"
+    );
+}
+
+/// A chain is open while executions since the boot are left to compare,
+/// even with the voter executed as far as the donor said (#236 review):
+/// that clause of `catch_up_chain_open` is what keeps a restart's
+/// comparisons asked for when the donor is no further on than the voter.
+/// Here the window the crash left installed runs at the restart, and a
+/// donor whose frontier is exactly that answers with a page cut to three:
+/// owed nothing more by position, r4 still has the rest of the window to
+/// compare, and the chain stays open until it has.
+#[test]
+fn a_chain_with_comparisons_left_is_open_at_the_donors_frontier() {
+    let (mut cluster, _) = left_behind(47);
+    cluster.serve = false;
+    let after = cluster.follower(4).executed_through();
+    let page = cluster.page(0, ballot0(), after);
+    assert!(
+        entries_of(&page).len() > 6,
+        "a window of {}",
+        entries_of(&page).len()
+    );
+    cluster.deliver_page(4, 0, &page);
+    cluster.restart(4);
+    cluster.settle();
+    let ran = cluster.follower(4).executed_through();
+    assert!(ran.get() > after.get() + 6, "the restart ran the window");
+    let asked = cluster.catch_up_asks.len();
+    cluster.ask(4);
+    let from = at(cluster.catch_up_asks[asked].1);
+    let mut cut = cluster.page(0, ballot0(), from);
+    let ProtocolMessage::CatchUpPage {
+        entries, through, ..
+    } = &mut cut
+    else {
+        unreachable!()
+    };
+    entries.truncate(3);
+    *through = ran;
+    cluster.deliver_page(4, 0, &cut);
+    cluster.settle();
+    assert_eq!(
+        cluster.follower(4).executed_through(),
+        ran,
+        "r4 executed past what the donor said: the test shows nothing"
+    );
+    assert!(
+        cluster.follower(4).catch_up_chain_open(),
+        "executions since the boot are left to compare, and the chain closed"
+    );
+    cluster.serve = true;
+    cluster.ask(4);
+    assert_eq!(cluster.follower(4).catch_up_divergence(), None);
+    assert_eq!(cluster.nodes[4].executed, cluster.nodes[0].executed);
+    assert!(!cluster.follower(4).catch_up_chain_open());
+}
+
+/// A command past a page's byte bound by itself is taken alone, and the
+/// chain goes on from it (#236 review): a put at the value limit is
+/// larger than `MAX_CATCH_UP_BYTES` on its own, and the one-command
+/// exemption on receipt is what gets a voter past it. Without it the
+/// voter takes nothing from such a page and stops asking.
+#[test]
+fn a_command_past_the_byte_bound_alone_is_taken_by_itself() {
+    let mut cluster = left_behind_by(9, 3, MAX_CATCH_UP_BYTES);
+    cluster.serve = false;
+    let start = cluster.follower(4).executed_through();
+    cluster.ask(4);
+    let page = cluster.page(0, ballot0(), start);
+    let entries = entries_of(&page);
+    assert!(entries.len() > 1, "a page of {}", entries.len());
+    assert!(
+        entries[0].encoded_len() > MAX_CATCH_UP_BYTES,
+        "its first command is within the bound: the test shows nothing"
+    );
+    let asks = cluster.catch_up_asks.len();
+    let before = paths(&cluster);
+    cluster.deliver_page(4, 0, &page);
+    cluster.settle();
+    assert_eq!(paths(&cluster).cut_short, before.cut_short + 1);
+    assert_eq!(
+        cluster.follower(4).executed_through(),
+        at(start.get() + 1),
+        "the command past the bound was not taken by itself"
+    );
+    assert_eq!(
+        cluster.catch_up_asks.get(asks),
+        Some(&(4, start.get() + 1)),
+        "the chain did not go on from the command taken"
+    );
+    cluster.serve = true;
+    cluster.ask(4);
+    assert_eq!(cluster.nodes[4].executed, cluster.nodes[0].executed);
 }

@@ -126,7 +126,7 @@ const CATCH_UP_PAGE_TAG: u8 = 16;
 /// Everything here is read from the donor's durable rows: the payload
 /// from `payload_v1`, the decided record from its dependency row in
 /// `protocol_v1`, the position, revision and result digest from its
-/// `executed_v1` row. The admission digest is the payload's own.
+/// executed row. The admission digest is the payload's own.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CatchUpEntry {
     /// Command.

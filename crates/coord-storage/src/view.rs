@@ -1,11 +1,12 @@
 //! The durable-view gate.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock, RwLockReadGuard};
 
 use coord_store_api::engine::{EngineError, OrderedRead, SnapshotSource};
 use coord_store_api::seq::StoreSeq;
 
+use crate::intake::{IndexDelta, IntakeIndex};
 use crate::lowering::DurableMeta;
 
 /// Why a view was not handed out.
@@ -31,13 +32,19 @@ impl From<EngineError> for ViewError {
     }
 }
 
-/// Shared frontier: completed store sequence and quarantine flag.
+/// Shared frontier: completed store sequence and quarantine flag, and the
+/// projection's index by command of its intake-keyed rows (task-d113).
+///
+/// The index lives here because it moves with the gate: a commit's
+/// changes to it are published before the gate moves to the commit's
+/// stamp, so a snapshot the gate hands out is never ahead of the index.
 #[derive(Debug, Default)]
 pub struct Frontier {
     completed: AtomicU64,
     /// The stamp of a projection commit that is running, or zero.
     committing: AtomicU64,
     quarantined: std::sync::atomic::AtomicBool,
+    index: RwLock<IntakeIndex>,
 }
 
 impl Frontier {
@@ -68,8 +75,47 @@ impl Frontier {
         self.committing.load(Ordering::Acquire)
     }
 
+    /// A quarantined store drops its index with it (rule (d)); the next
+    /// open rebuilds it from the rows.
     pub(crate) fn quarantine(&self) {
         self.quarantined.store(true, Ordering::Release);
+        self.index_mut().clear();
+    }
+
+    /// Install the index an open built from the projection.
+    pub(crate) fn install_index(&self, index: IntakeIndex) {
+        *self.index_mut() = index;
+    }
+
+    /// Publish a commit's changes to the index. Called before the gate
+    /// moves to `stamp`.
+    pub(crate) fn publish_index(&self, delta: IndexDelta, stamp: StoreSeq) {
+        self.index_mut().publish(delta, stamp.journal_seq().get());
+    }
+
+    /// The index as published.
+    pub(crate) fn index(&self) -> RwLockReadGuard<'_, IntakeIndex> {
+        // A panic while the index was written leaves it as it was then;
+        // its readers settle every answer against the rows.
+        self.index
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn index_mut(&self) -> std::sync::RwLockWriteGuard<'_, IntakeIndex> {
+        self.index
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Entries the index holds (diagnostic).
+    pub fn index_len(&self) -> usize {
+        self.index().len()
+    }
+
+    /// Entries the index's executed part holds (diagnostic).
+    pub fn index_executed_len(&self) -> usize {
+        self.index().executed_len()
     }
 
     /// Completed sequence.
@@ -87,13 +133,33 @@ impl Frontier {
 pub struct GatedView<V> {
     view: V,
     meta: DurableMeta,
+    /// The gate it came through, whose index by command it may ask about
+    /// executed commands (rule (c)); `None` for a view made without one.
+    gate: Option<Arc<Frontier>>,
 }
 
 impl<V: OrderedRead> GatedView<V> {
-    /// Bind a snapshot to the metadata it proves. Only the gate (and the
-    /// crate's own tests) may claim that pairing.
+    /// Bind a snapshot to the metadata it proves, with no gate behind it.
+    /// Only the crate's own tests make one.
+    #[cfg(test)]
     pub(crate) const fn new(view: V, meta: DurableMeta) -> Self {
-        GatedView { view, meta }
+        GatedView {
+            view,
+            meta,
+            gate: None,
+        }
+    }
+
+    /// Bind a snapshot to the metadata it proves, and to the gate whose
+    /// index answers for it. Only the gate (and the crate's own tests) may
+    /// claim that pairing.
+    pub(crate) fn with_gate(view: V, meta: DurableMeta, gate: Option<Arc<Frontier>>) -> Self {
+        GatedView { view, meta, gate }
+    }
+
+    /// The gate this view came through.
+    pub(crate) fn gate(&self) -> Option<&Arc<Frontier>> {
+        self.gate.as_ref()
     }
 
     /// The snapshot.
@@ -124,6 +190,18 @@ impl<R: SnapshotSource> GatedReader<R> {
         GatedReader { reader, frontier }
     }
 
+    /// Entries the projection's index by command holds (task-d113;
+    /// diagnostic, for the metrics line).
+    pub fn index_len(&self) -> usize {
+        self.frontier.index_len()
+    }
+
+    /// Entries the index's executed part holds (task-d113, step 2;
+    /// diagnostic, for the metrics line).
+    pub fn index_executed_len(&self) -> usize {
+        self.frontier.index_executed_len()
+    }
+
     /// Pin a snapshot and verify its stamp against the completed frontier.
     pub fn snapshot(&self) -> Result<GatedView<R::View>, ViewError> {
         if self.frontier.is_quarantined() {
@@ -152,7 +230,18 @@ impl<R: SnapshotSource> GatedReader<R> {
                 ),
             });
         }
-        Ok(GatedView::new(view, meta))
+        Ok(GatedView::with_gate(
+            view,
+            meta,
+            Some(self.frontier.clone()),
+        ))
+    }
+
+    /// A copy of the index by command as published (task-d113): for
+    /// checking it against the rows ([`IntakeIndex::build`]), and for
+    /// diagnostics. Readers ask it through the view, never through this.
+    pub fn intake_index(&self) -> IntakeIndex {
+        self.frontier.index().clone()
     }
 
     /// The journal sequence the completed frontier has reached: a

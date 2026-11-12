@@ -573,6 +573,34 @@ pub struct Cost {
     /// record (task-d25, #98).
     #[serde(default)]
     pub table: Table,
+    /// The projection's index by command of its intake-keyed rows
+    /// (task-d113): its entries, and the bytes they take.
+    #[serde(default)]
+    pub intake_index: IntakeIndexSize,
+}
+
+/// The size of the projection's index by command of its intake-keyed rows
+/// (task-d113, the lead on #237).
+///
+/// Since step 2's bound, the intake part holds only rows of commands not
+/// yet executed, so `entries` is bounded by the table, not the history.
+/// The executed part (command to position) is what still grows until a
+/// floor forgets a prefix (task-d27): this is where that growth is read.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntakeIndexSize {
+    /// Entries held: one a live dependency or proposal row.
+    pub entries: u64,
+    /// The bytes they take, at the most review measured an entry to take
+    /// on #237 ([`coord_storage::intake::ENTRY_BYTES`]): an estimate, since
+    /// the ordered set's nodes are not counted one by one.
+    pub bytes: u64,
+    /// The executed part's entries: one an executed row kept (step 2).
+    #[serde(default)]
+    pub executed: u64,
+    /// The bytes they take, at the most an entry is inferred to take
+    /// ([`coord_storage::intake::EXECUTED_ENTRY_BYTES`]): an estimate.
+    #[serde(default)]
+    pub executed_bytes: u64,
 }
 
 /// What ended the hold of each projection commit lent while a commit hold
@@ -1127,6 +1155,11 @@ pub struct Resends {
     /// First sends of re-proposals held back from a new leader's first
     /// batch; not re-sends.
     pub deferred: u64,
+    /// First sends of held-back re-proposals that went out as a voter's
+    /// adoptions arrived, not on the re-send timer (the takeover gap on
+    /// #98).
+    #[serde(default)]
+    pub topped_up: u64,
     /// Re-sends of a proposal already decided.
     pub decided: u64,
     /// Re-sends to a voter that had acknowledged the proposal on the

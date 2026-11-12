@@ -1800,11 +1800,12 @@ Protocol state cannot be reduced to a Raft-like last_applied: application snapsh
 | Executed | `execution_v1`: the execution position, big-endian. The value gains the command identity | at execution | yes, in place of `executed_v1`, which is no longer written |
 | An executed command's payload | `payload_v1`: the execution position | at execution, moved from the pending row in the same transaction | yes |
 | A payload not yet executed | `pending_payload_v1`, a new node-private collection: intake order | at intake; deleted when it moves, or at a Sync's release (task-d24) | no |
-| Dependency, and the leader's proposal row while it is written | `protocol_v1`: epoch, tag and intake order. The value gains the command identity | at intake; a rewrite stays in place | no, as today |
+| Dependency, and the leader's proposal row while it is written | `protocol_v1`: epoch, tag and intake order, with the command identity as the key's suffix: `epoch (8) \| tag (1) \| seq (8) \| ordinal (4) \| command (32)`, 53 bytes against 41 by command. The value is unchanged (step 1, #237) | at intake; a rewrite stays in place | no, as today |
 
 - **Intake order is the journal position of the record that brings the row,** `LocalJournalSeq`, the order replay applies (Section 17.16.4), and the row's ordinal within that record.
   - It is unique for a projection's life: a missing or empty journal is not permission to create (above), and a voter that starts fresh installs a shared image, which holds no node-private rows.
-  - The code step checks that the sequence never restarts under a live projection, and prefixes the stream's generation if it can.
+  - The sequence doesn't restart under a live projection: `project` refuses a record that isn't the successor, attach refuses a lost journal prefix, and the strict worker numbers each group in one stamp. The key carries no generation prefix, and needs none, since a projection that starts over holds no node-private rows (step 1, #237).
+  - The command identity is the key's suffix, not part of the value (step 1, #237, against the design step's "the value gains the command identity"). The value's format is unchanged, so every reader of it still decodes it, and the 53-byte key describes itself to trim's classification and to the layout check. It costs 32 bytes a key, on node-private rows only.
 - **The store's lowering assigns the keys, not the machine.** The journal's records keep naming these rows by command: the `StoreUpdate`s built in `coord-consensus/src/rows.rs`, used at more than twenty sites, and `retry::executed_update`. So neither the journal's format nor the consensus crate changes.
   - `lower_update` (`coord-storage/src/lowering.rs`) runs record by record from `project` (`journaled.rs`) and from the worker.
   - It maps a put or delete by command onto its intake key through the index below. It keys an application outcome's executed row by the record's own position.
@@ -1842,7 +1843,7 @@ So boot, catch-up served and resolve need no index by command here. Boot reads e
   - **This is the step's condition, not a choice among equals** (review on #185, 6812429771). A durable table keyed by command identity would put back one random page a command of the three this step removes. In review's redb measurement, at 50,000 commands retained, three rows a command cost 32.2 µs and 24.9 KB written under digest keys against 7.4 µs and 2.4 KB in key order. The digest-keyed cost grows with the table (24.9, 32.2 and 47.7 µs at 2,000, 50,000 and 300,000), and the ordered cost stays near 6 to 7.
   - **So every reader in the table above gets a command's position from memory or from an ordered scan, never from a durable row keyed by command.** Boot, catch-up served and resolve need no index (boot builds it from the rows it reads, catch-up reads by position, and resolve finds the position in the retry row). The campaign's executed rows, trim, the fence, a stop and the store's own writes take it from the in-memory index, which is rebuilt at open from scans boot already makes. The journal is not read for it.
 - **Built at open:**
-  - the intake part from the dependency rows boot already reads, and one scan of the pending payloads, which hold only what is not executed;
+  - the intake part from a scan of `protocol_v1` of its own, at attach and at the worker's open, not from boot's read (step 1, #237): review read about 0.9 s to build it at 10⁶ rows. Step 2 adds one scan of the pending payloads, which hold only what is not executed;
   - the executed part from the scan of `execution_v1` that boot makes anyway. Today `read_history` reads all of `executed_v1`, so the open reads no more pages than it does now.
   - A shared image's install builds the executed part from the image's `execution_v1` rows, whose values carry the command.
 - **The open's cost (inferred):** an insert for each executed row read, about 0.1 µs, so about 0.1 s at 10⁶ retained executions, beside the read boot already makes of them: about 90 bytes a row, some 22,000 pages at 10⁶.
@@ -1851,7 +1852,7 @@ So boot, catch-up served and resolve need no index by command here. Boot reads e
   - a row deleted after the snapshot reads as absent too, which is a later snapshot's answer and what its reader would get next.
   - A third case, a row deleted and written again under a new key after the snapshot, is ruled out for snapshot readers by rule (c) below. A commit whose outcome isn't known is rule (d), and a recovery cut's overlay is rule (e).
 - **Memory (inferred):**
-  - The intake part takes about 24 to 32 bytes a live row: the pending payloads and every dependency row the store keeps. In `coordd` today that is every dependency row, since nothing trims (task-d27).
+  - The intake part takes 39 to 46 bytes a live row, as review measured it on #237 (the design step inferred 24 to 32): a 24-byte slot in an ordered set, and the set's nodes. It holds the pending payloads and every dependency row the store keeps, and at the leader the proposal row too, so two entries a command there. In `coordd` today that is every row, since nothing trims (task-d27): about 46 MB a million commands at a follower, without bound. Its entries go on the metrics line, and what bounds it before task-d27 is in task-d113's plan entry.
   - The executed part takes about 16 to 24 bytes for each executed command retained, an 8-byte prefix and an 8-byte position with the map's overhead. That is every executed command until a floor forgets a prefix of `execution_v1`, about 24 MB at 10⁶.
   - Both are the same order as what boot already loads, every dependency row and every executed identity at 32 bytes each.
   - `ExecutedOrder`'s 32 bytes an executed command goes.
@@ -1885,6 +1886,7 @@ So boot, catch-up served and resolve need no index by command here. Boot reads e
   - So the key assignment is one function, used by the lowering and by each overlay's `extend`.
   - It takes a record's updates, its journal position and the index, and gives the lowered rows.
   - An overlay keeps the index's changes for its own records, over the index at its snapshot's stamp. The cut then reads the keys materialization will write, as it now reads its rows ("the overlay replays the same `StoreUpdate` rows the materializer would write").
+  - **The timing, as built (step 1, #237).** The index moves as a commit returns, together with the read gate, before the store takes the engine back: a commit's changes are published when it returns OK, ahead of `set_completed`. A recovery cut takes the index only when the index's stamp equals its snapshot's, so its overlay assigns keys from the index as of that snapshot, never a later one. If the two differ, it pins again, up to 64 times, then returns `Busy` ("the projection moved on under every attempt at a cut").
   - The planning view's group holds application rows, so step 1's dependency rows don't reach it. Step 2's executed and payload rows do.
 
 **2. Which order: the execution position for executed rows, and intake order before execution.**
@@ -1911,7 +1913,7 @@ So boot, catch-up served and resolve need no index by command here. Boot reads e
 - **What doesn't change:** the journal's records, the wire, the consensus crate and what a vote rests on.
 - **A domain runs one layout,** as task-d105's design step sets for its own (#208).
   - Two voters on different layouts would export different roots, and their floors (task-d27) wouldn't count together.
-  - The layout is recorded at initialization and compared at every open. `meta_fields::FORMAT_VERSION` is read by no open today, so the code step builds that check, unless task-d105's code has built it first.
+  - The layout is recorded at initialization and compared at every open. Step 1 (#237) built it: `STORE_FORMAT_VERSION` is 2 (`coord_store_api::registry`), recorded under `meta_fields::FORMAT_VERSION` when redb or fjall initializes a store. Building the index refuses a store that records another format, or holds a 41-byte dependency or proposal key, with the reason, class `Unsupported`. A local checkpoint's identity list carries the field.
   - A live store or image of the other layout is refused with the reason (Section 17.7: an unsupported format fails before admission).
   - This task doesn't wait to share task-d105's layout change. Nothing is deployed, so a second layout change costs a test domain nothing.
 - **An existing projection doesn't move in this step.** Nothing is deployed in production, so a store of the old layout is refused and a test domain starts fresh.
