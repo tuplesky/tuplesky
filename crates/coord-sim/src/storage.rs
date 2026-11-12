@@ -70,6 +70,19 @@ impl StorageModel {
             .collect()
     }
 
+    /// Whether a row of `collection` under `key` is durable, or put by a
+    /// batch submitted and not yet complete: what an execution needs of
+    /// its payload row to be in the journal before it (#243 review).
+    pub fn holds_or_writes(&self, collection: u16, key: &[u8]) -> bool {
+        self.durable_rows.contains_key(&(collection, key.to_vec()))
+            || self.volatile.values().any(|batch| {
+                batch
+                    .updates
+                    .iter()
+                    .any(|u| u.collection.0 == collection && u.key == key && u.value.is_some())
+            })
+    }
+
     /// Whether a barrier completed durably.
     pub fn is_durable(&self, barrier: &BarrierId) -> bool {
         matches!(self.completed.get(barrier), Some(Ok(_)))

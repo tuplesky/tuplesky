@@ -12,7 +12,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use coord_core::effect::{BarrierId, BootId, StoreUpdate};
 use coord_journal_api::engine::{JournalEngine, ReadBudget};
 use coord_journal_api::failure::{JournalErrorClass, JournalFailure};
-use coord_journal_api::frontier::{CheckpointPointerV1, LOCAL_CHECKPOINT_FORMAT_V1};
+use coord_journal_api::frontier::{
+    CheckpointPointerV1, LOCAL_CHECKPOINT_FORMAT_V1, OLDEST_POINTER_FORMAT,
+};
 use coord_journal_api::group::{GroupEntry, GroupLimits, GroupWrite};
 use coord_journal_api::record::{
     GENESIS_PREDECESSOR, JOURNAL_RECORD_FORMAT_V1, JournalRecordV1, LifecycleRecordV1,
@@ -842,6 +844,45 @@ fn retirement_requires_the_durable_pointer_and_keeps_the_suffix() {
         .append_group(&group(vec![(barrier(3), s.id, more)]))
         .unwrap();
     assert_eq!(read_all_from(&reopened, s.id, pointer.represented).len(), 3);
+}
+
+/// A journal that retains a pointer published before the image's format
+/// was raised opens, and the pointer reads back as it was written: the
+/// open's check of every retained record decodes it. Refusing its image is
+/// the checkpoint store's business, not a corrupt journal (#247, Codex).
+#[test]
+fn a_journal_retaining_a_pointer_of_an_older_image_format_opens() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("j");
+    let (mut journal, _, mut streams) = create(&root, Arc::new(DefaultFileSystem), &[1]);
+    let s = &mut streams[0];
+    let first = s.next(vec![transition(1, 8)]);
+    journal
+        .append_group(&group(vec![(barrier(1), s.id, first)]))
+        .unwrap();
+    let pointer = CheckpointPointerV1 {
+        origin: s.origin,
+        represented: LocalJournalSeq::new(2).unwrap(),
+        format: OLDEST_POINTER_FORMAT,
+        manifest_digest: Digest32([5; 32]),
+        checkpoint_id: Digest32([6; 32]),
+    };
+    assert_ne!(pointer.format, LOCAL_CHECKPOINT_FORMAT_V1);
+    let published = s.next(vec![RecordBody::PublishLocalCheckpoint(pointer)]);
+    journal
+        .append_group(&group(vec![(barrier(2), s.id, published)]))
+        .unwrap();
+    drop(journal);
+
+    let reopened = RaftEngineJournal::open_existing(&root, identity(), &options()).unwrap();
+    let pointers: Vec<CheckpointPointerV1> = read_all_from(&reopened, s.id, LocalJournalSeq::ZERO)
+        .iter()
+        .filter_map(|r| match r.body() {
+            RecordBody::PublishLocalCheckpoint(p) => Some(*p),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(pointers, vec![pointer]);
 }
 
 fn read_all_from(

@@ -295,11 +295,12 @@ type Slot = (u64, u64, u32);
 /// the entries by. The design step had inferred 24 to 32.
 pub const ENTRY_BYTES: u64 = 46;
 
-/// The bytes an executed part's entry takes, at most: the 16-byte pair and
-/// its share of the ordered set's nodes. Inferred, as the design step's
-/// 16 to 24 was, and not measured: the metrics line multiplies the
-/// executed entries by it.
-pub const EXECUTED_ENTRY_BYTES: u64 = 24;
+/// The bytes an executed part's entry takes: the 16-byte pair and its
+/// share of the ordered set's nodes, 27.1 as review measured it with a
+/// counting allocator over 10⁵ and 10⁶ entries (#243 review; the design
+/// step had inferred 16 to 24), rounded up. The metrics line multiplies
+/// the executed entries by it.
+pub const EXECUTED_ENTRY_BYTES: u64 = 28;
 
 /// The index by command of a projection's intake-keyed rows, in memory
 /// (design Section 17.1, "1. The index by command", its intake part).

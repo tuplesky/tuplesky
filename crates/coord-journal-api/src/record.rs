@@ -28,7 +28,7 @@ use coord_types::ids::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::frontier::{CheckpointPointerV1, LOCAL_CHECKPOINT_FORMAT_V1};
+use crate::frontier::{CheckpointPointerV1, LOCAL_CHECKPOINT_FORMAT_V1, OLDEST_POINTER_FORMAT};
 use crate::stream::StorageStreamId;
 
 /// Durable record format version. Bumped only by a reviewed schema change;
@@ -452,7 +452,11 @@ fn check_body(
             check_update_sizes(updates)
         }
         RecordBody::PublishLocalCheckpoint(pointer) => {
-            if pointer.format != LOCAL_CHECKPOINT_FORMAT_V1 {
+            // Any format a pointer has named decodes: the record's layout
+            // didn't change with the image's, and a journal that retains a
+            // pointer published before a raise must still open. The image
+            // is refused where it is loaded (#247, Codex).
+            if !(OLDEST_POINTER_FORMAT..=LOCAL_CHECKPOINT_FORMAT_V1).contains(&pointer.format) {
                 return Err(RecordError::UnsupportedFormat {
                     found: pointer.format,
                 });
