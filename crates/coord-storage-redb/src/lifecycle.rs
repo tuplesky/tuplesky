@@ -634,13 +634,30 @@ fn initialize_database(
 /// store, not damage. Its format is read through redb's read-only open,
 /// which never repairs or writes: a store of another format is left byte
 /// for byte as it was. A database that records no format is format 1, from
-/// before task-d113 recorded one. Only a list that differs while the format
-/// is this build's, or a format that can't be read, is reported as
-/// [`OpenError::Corrupt`].
+/// before task-d113 recorded one. A database that was not closed cleanly
+/// can't be read without a repair, which the read-only open rightly won't
+/// make (#247 review): it is refused as another build's store that was not
+/// closed cleanly, the upgrade after a crash. Only a list that differs while
+/// the format is this build's, or a format that can't be read for another
+/// reason, is reported as [`OpenError::Corrupt`].
 fn other_registry(db_path: &Path) -> OpenError {
     let differs = "manifest collection registry differs from this build";
+    let db = match redb::ReadOnlyDatabase::open(db_path) {
+        Ok(db) => db,
+        Err(redb::DatabaseError::RepairAborted) => {
+            return OpenError::Format(format!(
+                "{differs}: a store of another build that was not closed cleanly, so its \
+                 format can't be read without a repair; a store of another layout is not \
+                 repaired or converted"
+            ));
+        }
+        Err(e) => {
+            return OpenError::Corrupt(format!(
+                "{differs}, and its recorded format can't be read: {e}"
+            ));
+        }
+    };
     let recorded = || -> Result<Option<Vec<u8>>, String> {
-        let db = redb::ReadOnlyDatabase::open(db_path).map_err(|e| e.to_string())?;
         let txn = db.begin_read().map_err(|e| e.to_string())?;
         let meta = txn
             .open_table(table_definition(Collection::MetaV1))
