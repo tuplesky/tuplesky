@@ -998,7 +998,11 @@ fn a_synchronous_commit_restarts_the_hold() {
     assert!(!world.store.lent(A), "one record is held");
     let pointer = world.pointer();
     world.store.publish_checkpoint(A, &pointer).unwrap();
-    assert_eq!(world.store.unmaterialized(A), 0, "the publication committed it");
+    assert_eq!(
+        world.store.unmaterialized(A),
+        0,
+        "the publication committed it"
+    );
     std::thread::sleep(wait + wait / 2);
     let arrived = std::time::Instant::now();
     journal_and_hand_off(&mut world, 1);
@@ -1007,5 +1011,8 @@ fn a_synchronous_commit_restarts_the_hold() {
         "the record after the publication went out at once"
     );
     let due = world.store.projection_commit_due().expect("held");
-    assert!(due >= arrived + wait, "its wait counts from before it arrived");
+    assert!(
+        due >= arrived + wait,
+        "its wait counts from before it arrived"
+    );
 }
