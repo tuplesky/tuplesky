@@ -227,7 +227,27 @@ pub fn lower_record<W: WriteTxn>(
 #[derive(Debug, Default)]
 pub struct Lowered {
     writes: Vec<StoreUpdate>,
-    at: HashMap<(CollectionId, Vec<u8>), usize>,
+    /// Each collection's rows by key, to their place in `writes`. Looked
+    /// up by a borrowed key, so a read through the overlay allocates
+    /// nothing; a commit touches a handful of collections, found by a
+    /// scan.
+    at: Vec<(CollectionId, HashMap<Vec<u8>, usize>)>,
+}
+
+/// Rows a collection's index is sized for when a commit first writes to
+/// it: about what a commit of a dozen commands writes to its busiest
+/// collection, so a typical commit's index never rehashes.
+const ROWS_A_COLLECTION: usize = 32;
+
+/// Where `key` in `collection` stands in `writes`, if this commit wrote it.
+fn written(
+    at: &[(CollectionId, HashMap<Vec<u8>, usize>)],
+    collection: CollectionId,
+    key: &[u8],
+) -> Option<usize> {
+    at.iter()
+        .find(|(c, _)| *c == collection)
+        .and_then(|(_, rows)| rows.get(key).copied())
 }
 
 impl Lowered {
@@ -252,11 +272,11 @@ impl Lowered {
             // A row this commit has written is read from here, any other
             // from `base`: the key index's old value (task-d105) and the
             // assignment's reads alike.
-            let overlay =
-                |collection: CollectionId, key: &[u8]| match at.get(&(collection, key.to_vec())) {
-                    Some(&i) => Ok(writes[i].value.clone()),
-                    None => base.get(collection, key),
-                };
+            let overlay = |collection: CollectionId, key: &[u8]| match written(at, collection, key)
+            {
+                Some(i) => Ok(writes[i].value.clone()),
+                None => base.get(collection, key),
+            };
             assigner.observe_kv(update, |key| overlay(update.collection, key))?;
             let assigned = assigner.assign(seq, ordinal, update, overlay)?;
             match assigned {
@@ -279,8 +299,16 @@ impl Lowered {
 
     /// Keep one row; a later row for the same key is the one read.
     fn keep(&mut self, update: StoreUpdate) {
-        self.at
-            .insert((update.collection, update.key.clone()), self.writes.len());
+        let place = self.writes.len();
+        let rows = match self.at.iter().position(|(c, _)| *c == update.collection) {
+            Some(i) => &mut self.at[i].1,
+            None => {
+                self.at
+                    .push((update.collection, HashMap::with_capacity(ROWS_A_COLLECTION)));
+                &mut self.at.last_mut().expect("just pushed").1
+            }
+        };
+        rows.insert(update.key.clone(), place);
         self.writes.push(update);
     }
 
@@ -307,4 +335,54 @@ pub fn batch_bytes(batch: &PersistBatch) -> usize {
         .map(|u| u.key.len() + u.value.as_ref().map_or(0, Vec::len) + 16)
         .sum::<usize>()
         + 64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(collection: u16, key: &[u8], value: Option<&[u8]>) -> StoreUpdate {
+        StoreUpdate {
+            collection: CollectionId(collection),
+            key: key.to_vec(),
+            value: value.map(<[u8]>::to_vec),
+        }
+    }
+
+    /// The commit's own rows are found by collection and key: one key
+    /// under two collections is two rows, and a key written twice is read
+    /// as its later write, a delete included.
+    #[test]
+    fn a_commit_finds_its_own_rows_by_collection_and_key() {
+        let mut lowered = Lowered::new();
+        lowered.keep(row(1, b"k", Some(b"one")));
+        lowered.keep(row(2, b"k", Some(b"two")));
+        lowered.keep(row(1, b"other", Some(b"three")));
+        lowered.keep(row(1, b"k", None));
+        let at = &lowered.at;
+        assert_eq!(written(at, CollectionId(1), b"k"), Some(3));
+        assert_eq!(lowered.updates()[3].value, None);
+        assert_eq!(written(at, CollectionId(2), b"k"), Some(1));
+        assert_eq!(written(at, CollectionId(1), b"other"), Some(2));
+        assert_eq!(written(at, CollectionId(2), b"other"), None);
+        assert_eq!(written(at, CollectionId(3), b"k"), None);
+        // Every row stays in `writes`, in the order lowered.
+        assert_eq!(lowered.updates().len(), 4);
+    }
+
+    /// More rows than an index is sized for: it grows and still finds
+    /// every row.
+    #[test]
+    fn a_collection_past_its_sized_rows_still_finds_each_one() {
+        let mut lowered = Lowered::new();
+        for i in 0..(ROWS_A_COLLECTION * 3) {
+            lowered.keep(row(7, &i.to_be_bytes(), Some(&[1])));
+        }
+        for i in 0..(ROWS_A_COLLECTION * 3) {
+            assert_eq!(
+                written(&lowered.at, CollectionId(7), &i.to_be_bytes()),
+                Some(i)
+            );
+        }
+    }
 }
