@@ -2441,16 +2441,22 @@ About 11.8 of a follower's 13.9 rows a command leave, 85%. What stays is 2 appli
   - A pipelined commit in flight is lowered over the staged changes of the commits before it, as the index's are.
 - **What it holds, and its bound.**
   - Commands not yet executed: their dependency rows (the leader's proposal row too) and pending payloads. At most the table's capacity (`MAX_TABLE_CAPACITY`, 1,000), its reserve and a Sync's placeholders: about 2,000 commands at about 1 KB each (a dependency row and an 805-byte payload), so about 2 MB.
-  - Promises, Syncs and seals: one each a ballot, a Sync row at most about 2 MB (task-d20's cap).
+  - **Promises and seals:** the promise, and a seal a configuration epoch, as today.
+  - **Syncs: at most two** (Codex on #258).
+    - Today the lowering keeps a Sync row for every ballot (`sync_key` names it), and trim never drops one (`coord-checkpoint/src/trim.rs`, `classify`). Each is up to about 2 MB (task-d20's cap). Moved into memory as they are, they would grow with every leader change.
+    - Boot reads two of them. One is the synchronized ballot's, whose installation resumes (`Follower::recover_with_syncs`). The other is the promised ballot's when this voter leads it, whose campaign resumes rather than reselects (`RecoveredProtocol::resumable_sync`).
+    - So the map keeps those two, and drops any other once it is neither: when a later Sync is bound here, or a later ballot's synchronization is durable. Nothing reads a dropped one.
+    - The image carries the same two. A store of today's layout is refused (point 1), so none has to be dropped from one.
+    - At most about 4 MB.
   - At execution the lowering moves the command's payload and dependency row out, as it does today (`assign_executed`, `move_decided`): to the history buffer (point 3), and the payload to the retry window too (point 4). A released command's rows go at the Sync's release, and a pulled command's at its install, as today.
-  - So the map is bounded by the table, not by history: about 5 MB at the largest, against today's rows, which nothing trims.
+  - So the map is bounded by the table and two Syncs, not by history or leader changes: about 2 MB of commands, 4 MB of Syncs and the decided overlay (point 3), about 6 MB at the largest, against today's rows, which nothing trims.
 - **Who reads it.**
   - The lowering, on the materializer's thread, for the store's own writes and the move.
   - Boot's `read_protocol`, after the attach, when nothing else runs.
   - The export, which takes the version published with the commit it pins (point 6).
   - Nothing on the loop reads it while the domain runs: a campaign's report comes from the machine's ledger, which reads no rows (task-d77).
 - **CPU (inferred):** an insert or removal in a persistent map for each protocol update, about 0.3 to 0.5 µs, at about 8 updates a command: 2 to 4 µs a command a voter, against the redb rows' share of the materializer.
-- **Not taken:** a plain map copied at each pin. It would cost a copy of up to about 5 MB a publication on the materializer's thread, and the pin would have to wait for the materializer to reach a commit boundary.
+- **Not taken:** a plain map copied at each pin. It would cost a copy of up to about 6 MB a publication on the materializer's thread, and the pin would have to wait for the materializer to reach a commit boundary.
 
 **3. Executed history: a buffer, then segments.**
 - **What executed history is:** for each position, the execution record (command, revision, result digest), the payload, and this node's decided record (the dependency row moved at execution, node-private, with its epoch). Today they are `execution_v1`, `payload_v1` and `decided_v1`.
@@ -2461,11 +2467,19 @@ About 11.8 of a follower's 13.9 rows a command leave, 85%. What stays is 2 appli
   - boot: the current epoch's decided records, and the executed index's command list (point 7);
   - trim (task-d27, not run by `coordd`): below the floor.
   - Resolve no longer does: the retry window carries the request (point 4).
-- **The buffer.** The lowering appends each executed position's three parts to an in-memory buffer as it lowers the executed row, published with the commit. Its entries are immutable, so a view reads the positions at or below its frontier under a short read lock.
+- **The buffer.** The lowering appends each executed position's three parts to an in-memory buffer as it lowers the executed row, published with the commit. An entry's execution record and payload never change, so a view reads the positions at or below its frontier under a short read lock. Its decided record can change, below.
+- **A decided record can change after execution** (Codex on #258).
+  - A later ballot's re-proposal or Sync can name a command this voter already executed. Its dependency update still reaches the decided record: `Assigner::after_execution` (`coord-storage/src/intake.rs`) writes it over the record at the command's position when it is of the same or a later configuration epoch, and deletes it in its own epoch.
+  - **So the change goes to the recovery map,** under the position's decided key: an overlay over the buffer and the segments, versioned with the rest of the map. `after_execution` writes there in place of `decided_v1`, and a deletion is a tombstone.
+  - **Every reader of a decided record reads the overlay first:** boot's decided records, a donor's page, a campaign's executed rows, and the fence.
+  - **The image carries it** as part of the recovery map at `C`. A journal prefix retired below `C` therefore loses none of it.
+  - **It is folded at the next boundary.** When the checkpoint thread writes a segment, it first writes again each earlier segment the overlay touches, with the overlay's versions in place. That is a new file under the same rule as a segment's first write (temporary name, sync, rename, directory sync). Once the rewrite is durable, the map drops those entries. Until then the overlay stays the first read.
+  - **Its bound:** an executed command is named by a later protocol update only while a recovery's selection or a leader's re-proposal holds it. So the overlay holds at most a table's worth of entries for each leader change between two boundaries, about 0.2 MB each. A rewrite is a segment's write, about 4.5 MB, and happens only after a leader change that named executed commands.
 - **Segments.** When the buffer passes a multiple of `FLOOR_INTERVAL` (4,096 positions), the checkpoint thread writes the 4,096 positions below it as one segment:
   - one file, written once: to a temporary name, synced, renamed, and its directory synced;
   - by position: a header (origin, first and last position, format), the entries, and a footer holding each command's 8-byte prefix and position (the executed index's part, point 7), the history digest through the last position, and a checksum;
-  - the buffer drops a segment's positions once the segment is durable.
+  - the buffer drops a segment's positions once the segment is durable;
+  - a segment is never changed in place: the decided overlay is folded into a new file (above).
   - So the buffer holds at most about two segments' worth: about 9 MB at 1.1 KB a position.
 - **One storage write a segment** is the rule's batch taken to its limit: at the bar's load, a 4.5 MB sequential write every two seconds or so, off the loop, against today's three rows a command in the materializer's commits.
 - **The history digest.** The lowering keeps a running digest over each executed position's replicated part: `blake3(previous ‖ position ‖ command ‖ revision ‖ result_digest)`. The command identity derives from the request (`CommandId::derive`), so the digest covers the payload too. It is node-local state, not a journal or wire field. task-d35's execution chain would replace it if built, since it covers the same.
@@ -2523,6 +2537,7 @@ About 11.8 of a follower's 13.9 rows a command leave, 85%. What stays is 2 appli
 | The floor's shared image | `payload_v1` and `execution_v1` to the boundary, inline on the loop | the history digest at the boundary, and the retry window | none for history | none |
 | The local image | every collection | point 6 | O(application state + 2 segments) | the publication |
 
+- **The decided overlay** (point 3) is read first by every reader above that reads a decided record.
 - **The executed index** (Section 17.1, point 1: command prefix to position) stays in memory. It is rebuilt at open from the segments' footers and the buffer, instead of from a scan of `execution_v1`. A campaign's rows, a stop and the fence use it as today.
 - **The intake part of the index** stays as it is: the recovery map keeps intake keys, so the store's own writes find a command's row through it.
 - **`plan_trim`, `TrimFence::command`, `retire_updates` and `executed_order`** have no production caller today. They are rewritten against segments when task-d27 wires trim. Whether the fence's command lists outlive the segments' bodies is task-d27's to settle.
@@ -2547,6 +2562,11 @@ About 11.8 of a follower's 13.9 rows a command leave, 85%. What stays is 2 appli
   - the pointer durable and retirement not: the new image and the overlap replay without double effects;
   - **negative control:** an image that names a segment not yet durable, then a crash, is caught: the retired prefix holds history that neither a segment nor the image has.
 - **Every step of a segment's write** (temporary file, sync, rename, directory sync): a crash leaves no segment or a whole one.
+- **The decided overlay:**
+  - a decided record changed after its segment is durable, then a crash before the fold: boot reads the change from the image's recovery map and `(C, J]`, not the segment's older version;
+  - a crash at each step of the fold's rewrite: the old segment or the new one, and the overlay until the new one is durable;
+  - **negative control:** a fold that drops the overlay's entries before the rewrite is durable, then a crash, is caught: boot reads the older decided record.
+- **Syncs superseded:** a crash between binding a later Sync and dropping an earlier one keeps the two boot reads; a boot after many leader changes holds at most two.
 - **A damaged segment:**
   - below the image's history boundary, its positions are in no journal, so the node quarantines, as for a damaged image (`coord-checkpoint/tests/local.rs`);
   - above it, boot writes it again from the replay.
