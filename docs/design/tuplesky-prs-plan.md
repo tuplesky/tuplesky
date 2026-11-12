@@ -1294,9 +1294,68 @@ On the serving path: a running daemon publishes its own baseline, retires the pr
 
 **Implement:** Pinned filesystem injection with audited unhooked/background operations; combine actual raft-engine/redb faults, subprocess death, ENOSPC/sync errors and recovery modes. Keep independent protocol/application/retry oracles.
 
-**Acceptance:** Acknowledged outcomes survive declared failures; sync panic stops affected shared service. Distinguish model from physical evidence and report uncontrolled schedules/platforms. Inject WAL/projection-cut/order errors and same-boot callbacks; suite detects missing obligations and unauthorized late effects. No permissive recovery silently loses durable prefix.
+**The matrix, in steps, with `replay`'s case in it from the start** (#185 review). `replay` (task-j06) is the profile that may become the default, and task-j06 makes task-j05's whole matrix its gate, so every step runs under `strict` and under `replay`. Each step is its own PR.
 
-**Review boundary:** Clean close or process kill alone does not prove power-loss behavior.
+What exists today:
+- **redb.** Its faults are covered by `coord-redb-faultkit`: two images, torn, seeded and reordered tails, sync failures, ENOSPC, crash-freeze, and subprocess `abort()`. `journaled_real.rs` runs that matrix under both profiles over a real raft-engine journal.
+- **The journal** is never faulted there: it is closed cleanly and copied. Its only fault test fails `Handle::sync`.
+- **Recovery modes.** Neither recovery mode is tested against a damaged file.
+- **Oracles.** No crash test of the journal-first path runs an independent oracle; they compare rows with a reference replay.
+
+The steps:
+1. **A journal fault kit.** A raft-engine `FileSystem` adapter with a volatile image and a durable one, as the redb kit has. It faults:
+   - writes and short writes, ENOSPC and EIO on write, sync failures;
+   - a crash that freezes the files and keeps none, all, or a seeded subset of what wasn't synced, torn at byte level and reordered.
+
+   **The audit:** the operations that bypass the adapter, each named in the report as uncontrolled or, where the adapter can reach it, brought under it. These are:
+   - the directory sync in raft-engine's `pipe.rs`, which panics on failure;
+   - `pipe_builder`'s directory creation, listing and lock;
+   - the adapter's own `std::fs` calls;
+   - raft-engine's background threads, if any.
+2. **The recovery modes** against the kit: a torn or partial tail, and damage inside the durable prefix, under `TolerateTailCorruption` (the default) and `AbsoluteConsistency`. A mode may drop an unsynced tail. Neither may drop, or open past, a record that was synced and reported durable; damage there is refused with its position.
+3. **The composed crash matrix:**
+   - **The crash points.** Journal and projection crash together at every counted operation of either, with each tail policy on each, under `strict` and `replay`, over the domains' real `JournaledStore`.
+   - **Its size, and how it's cut** (#209 review). The product of crash points, tail policies, devices and profiles is enumerated exhaustively over a bounded workload, not seeded, so a pass covers every crash point of that workload. The step's PR states the count of crashes in each profile and the run time. CI runs that bounded matrix on every change. A larger matrix (more steps, rotation, both devices dirty at once) runs on a schedule, as the simulator's sweep does. A part that has to be seeded reports its seeds and the crash points it reached, so a pass says what it covered.
+   - **`replay`'s case.** The live projection is lost or unusable in four ways. For each, the node must recover the journal's state, by replay or by installing the baseline, or refuse to serve when there is no baseline:
+     - empty;
+     - a stale stamp behind the baseline;
+     - a stamp naming a record the journal doesn't hold;
+     - a file redb can't open. Today this one is refused at `open` rather than discarded and reinstalled, so the step makes it discard and reinstall.
+4. **Checkpoint and pointer publication** on a fault seam: the image's files, rename and directory sync, the pointer's append, the journal's purge, and the source switch. Each crashed at every point, under both profiles. `coord-checkpoint` uses `std::fs` directly today, so the seam is added first.
+5. **A sync failure stops the service.** On the real journal under `coordd`:
+   - the appender's panic, or a fail-stopped journal, ends the domain thread and the process with the reason, and serves nothing after it;
+   - a restart reopens the journal and doesn't reuse the uncertain handle;
+   - the uncertain record is either in the reopened journal and replayed, or absent and never acknowledged.
+6. **Subprocess death under the oracles.** `coordd` killed with `SIGKILL` at seeded points across the journal's and the projection's writes, three voters on real files, under both profiles. Each run's history is checked by:
+   - `coord-oracle`'s history check;
+   - the protocol oracle (acknowledged values durable at a quorum);
+   - the retry oracle.
+
+   None of them compares rows with a reference replay.
+
+   **Process death isn't power loss** (#209 review). A `SIGKILL` loses what the process held in memory, which under `replay` includes the working commits. So this step does exercise the projection falling behind the journal. But it keeps every byte written and not yet synced, because the kernel still holds it. A vote or a result that leaves after the write and before the sync is therefore invisible to a kill, and to every Jepsen kill run so far. Steps 1 to 4 test that case only in the kit's model.
+   - **So this step has a required variant on a filesystem that drops unsynced writes at the kill:** LazyFS, the FUSE filesystem Jepsen integrates as `jepsen.lazyfs`, under each voter's journal and projection directories. The kill is followed by LazyFS's `clear-cache`, so what wasn't synced is gone, as at a power loss, and the same three oracles check the history.
+   - **The Jepsen kill runs get the same option,** as the testing session's runner work.
+   - **If the variant can't be run on a platform,** the report names power loss as uncontrolled at the system level there, with the kit as its only evidence.
+7. **Negative controls and late effects.**
+   - **WAL, projection-cut and ordering errors, and same-boot late callbacks,** injected on the real engines.
+   - **For each guard,** a build with that guard removed, which the suite must catch:
+     - the projection commit before the journal sync;
+     - a late callback accepted after `reconcile`;
+     - the pointer published before the projection's durable stamp;
+     - the replay validation skipped.
+
+The report from each step separates model evidence from physical evidence, and names the platform, the filesystem and every uncontrolled operation or schedule.
+
+**What gates what** (#209 review).
+- **Reading the bars at `replay`** needs none of these steps. It is a reading, not a default.
+- **Making `replay` the default** needs all seven, through task-j06's gate.
+- **The order's reason:** steps 1 to 3 are the storage evidence, steps 4 and 5 are publication and fail-stop, and steps 6 and 7 are the system's.
+- **The smallest set that could say no to `replay` early** is steps 1 to 3 with step 7's four guards. If the plan needs an early answer, that set runs first.
+
+**Acceptance:** Acknowledged outcomes survive declared failures; sync panic stops affected shared service. Distinguish model from physical evidence and report uncontrolled schedules/platforms. Inject WAL/projection-cut/order errors and same-boot callbacks; suite detects missing obligations and unauthorized late effects. No permissive recovery silently loses durable prefix. Every step passes under `strict` and under `replay`, and task-j06's gate for making `replay` a default reads this matrix's result.
+
+**Review boundary:** Clean close or process kill alone does not prove power-loss behavior; step 6's variant on a filesystem that drops unsynced writes is what the system-level claim rests on.
 
 <a id="task-j06"></a>
 ### task-j06: Replay-backed working-state materialization, promoted, off by default
