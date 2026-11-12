@@ -1339,6 +1339,131 @@ fn pipelined_results_are_those_of_a_node_that_commits_on_its_own_thread() {
     }
 }
 
+/// Lend `node`'s projection commits to a manual materializer under the
+/// replay profile with a commit hold no test reaches (task-d86): records
+/// are held until something asks for their commit, or a drain.
+fn pipeline_held(
+    node: &mut Node<JournaledDomain<ModelJournal, ModelEngine>>,
+) -> coord_storage::ManualHandle<ModelEngine> {
+    let store = node.applier_mut().store_mut().store_mut();
+    store
+        .replay_projection(coord_storage::journaled::DurableCadence {
+            commits: std::num::NonZeroU32::MAX,
+            records: std::num::NonZeroU32::MAX,
+        })
+        .expect("the model engine has working state");
+    store
+        .hold_projection_commits(coord_storage::journaled::CommitHold {
+            records: std::num::NonZeroU32::MAX,
+            wait: std::time::Duration::from_secs(3600),
+        })
+        .expect("the replay profile");
+    pipeline(node)
+}
+
+/// With projection commits held (task-d86), every group after the first
+/// is planned over groups no commit has carried yet, and a retry of a
+/// command in one of them is answered from its binding there: the
+/// results, the frames to the collector and the projection a drain
+/// leaves are those of a node whose commits are not held. Every command
+/// puts the same key, so each result depends on the groups before it.
+#[test]
+fn held_commits_plan_over_the_groups_they_hold_and_answer_retries_from_them() {
+    let run = |held: bool| {
+        let mut node = grouped_lone_leader(BootId([16; 16]));
+        let handle = if held {
+            pipeline_held(&mut node)
+        } else {
+            pipeline(&mut node)
+        };
+        let base = node.applier().store().application_base().execution_position;
+        let mut frames = Vec::new();
+        for round in 0..3u64 {
+            let (admitted, flushed) = admit_and_flush(&mut node, round * 3 + 1..=round * 3 + 3);
+            frames.extend(admitted);
+            frames.extend(flushed);
+        }
+        // A retry of a command from the first group, with the same
+        // request: answered from that group's binding.
+        let retry = node
+            .on_event(Event::Admitted(admitted_putting(2, vec![2; 8])), &ballot())
+            .expect("admitted");
+        frames.extend(retry.frontend);
+        let mut out = node.stage(&ballot()).expect("staged");
+        out.absorb(node.flush(&ballot()).expect("flushed"));
+        out.absorb(node.finish(&ballot()).expect("finished"));
+        frames.extend(out.frontend);
+        if held {
+            assert_eq!(
+                node.applier().store().materialized_through().unwrap(),
+                base,
+                "no group was committed while held"
+            );
+            assert!(node.applier().store().store().commit_holds() > 0);
+        }
+        while handle.run() {
+            frames.extend(node.settle(&ballot()).expect("settled").frontend);
+        }
+        frames.extend(node.drain(&ballot()).expect("drained").frontend);
+        while handle.run() {
+            frames.extend(node.settle(&ballot()).expect("settled").frontend);
+        }
+        assert_eq!(node.executed, 9);
+        assert_eq!(node.awaiting_materialization(), 0);
+        let rows = {
+            let gated = node.applier().store().reader().snapshot().unwrap();
+            (1..=9)
+                .map(|sequence| {
+                    coord_storage::retry::lookup(gated.view(), &retry_key_of(sequence))
+                        .unwrap()
+                        .expect("every command's result is recorded")
+                })
+                .collect::<Vec<_>>()
+        };
+        frames.sort();
+        (frames, rows, node.applier().kv_revision().unwrap())
+    };
+    let (frames, rows, revision) = run(false);
+    let (held_frames, held_rows, held_revision) = run(true);
+    assert_eq!(held_revision, revision);
+    assert_eq!(held_rows, rows);
+    assert_eq!(held_frames, frames);
+}
+
+/// A watch waits for its group's commit to see the group's events, so a
+/// group with events for an open watch asks for its commit, which then
+/// goes out whatever the hold says (task-d86); with no watch open the
+/// same group is held.
+#[test]
+fn a_group_with_events_for_an_open_watch_is_not_held() {
+    for watching in [false, true] {
+        let mut node = grouped_lone_leader(BootId([17; 16]));
+        let handle = pipeline_held(&mut node);
+        if watching {
+            let registration = node
+                .applier()
+                .hub()
+                .register(coord_storage::watch::WatchSpec {
+                    namespace: NS,
+                    key: vec![],
+                    range_end: Some(vec![0xff]),
+                    start_revision: None,
+                    prev_kv: false,
+                    progress_notify: false,
+                    queue_capacity: 64,
+                })
+                .unwrap();
+            node.applier()
+                .hub()
+                .replay_complete(registration.id)
+                .unwrap();
+        }
+        admit_and_flush(&mut node, 1..=2);
+        let lent = handle.waiting() > 0;
+        assert_eq!(lent, watching, "watching {watching}");
+    }
+}
+
 /// Where a pipelined node's boot ends (task-d52).
 #[derive(Clone, Copy, Debug)]
 enum EndsAt {

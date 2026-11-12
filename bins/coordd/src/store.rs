@@ -32,7 +32,7 @@ use coord_journal_raft_engine::journal::{
 };
 use coord_storage::JournaledDomain;
 use coord_storage::journaled::{
-    DurableCadence, JournalLimits, JournaledError, JournaledStore, ProjectionProfile,
+    CommitHold, DurableCadence, JournalLimits, JournaledError, JournaledStore, ProjectionProfile,
 };
 use coord_storage_redb::RedbEngine;
 use coord_storage_redb::lifecycle::{
@@ -474,6 +474,19 @@ pub fn open_storage_with(
                 root: show(&journal_root),
                 reason: format!("{e}"),
             })?;
+        // Larger projection commits, held for a bound of records and
+        // time or until something reading the projection asks (task-d86).
+        if let Some((records, wait)) = config.journal.projection_commit_hold() {
+            store
+                .hold_projection_commits(CommitHold {
+                    records: NonZeroU32::new(records).expect("checked nonzero"),
+                    wait,
+                })
+                .map_err(|e| StoreError::Refused {
+                    root: show(&journal_root),
+                    reason: format!("{e}"),
+                })?;
+        }
     }
 
     let checkpoint_root = root_path(&config.state_directory, &config.state.checkpoints);

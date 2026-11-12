@@ -3,7 +3,7 @@
 **Status:** Review proposal, consolidated v1.5.  
 **Date:** 2026-09-24.  
 **Companion:** [TupleSky implementation design](tuplesky-design.md).  
-**Scope:** 201 implementation tasks with stable `task-*` identifiers. The `task-01` through `task-66`, `task-s01` through `task-s04`, `task-j01` through `task-j10`, `task-o01` through `task-o06`, `task-m01` through `task-m05`, `task-c01`, `task-c02`, `task-c03`, `task-d01` through `task-d100`, `task-d106` through `task-d110`, `task-d112` and `task-q01` suffixes and prerequisites are preserved. v1.5 adds `task-d01` through `task-d04` from review of the open implementation PRs and of multi-host readiness, `task-d05` through `task-d17` from the Jepsen client's runs, `task-d18` through `task-d33` from a review against an external SwiftPaxos correctness checklist ([review record](tuplesky-checklist-review.md)), `task-d34` from what the protocol simulator of task-d30 found, `task-d35` through `task-d44` from a review of recovery time and storage integrity (an execution chain, a scrub, and voter replacement through a prepared transition, a staged learner, terminal recovery after the seal, serving across a transition and a running membership install), `task-d45` through `task-d50` from measuring the throughput of the Jepsen client's first unthrottled runs, `task-d51` from task-d46's long runs, `task-d52` and `task-d53` from a profile of the domain thread after task-d46, `task-d54` from the Jepsen runs of task-d50, `task-d55` through `task-d57` from the Jepsen runs of task-j06, `task-d58` through `task-d61` from a profile of five voters' CPU per operation, `task-d62` through `task-d65` from a consolidated review against the reference SwiftPaxos, `task-d66` from the Jepsen runs of task-d51, `task-d67` from a Jepsen run on #98 that made no fast decision, `task-d68` from task-d62's counts after a leader change, `task-d69` from a profile of a follower's loop, `task-d70` from the Jepsen runner's profile of the transport's workers, `task-d71` from the protocol simulator's first 1,000-seed sweep, `task-d72` through `task-d75` from comparing a command's cost with etcd's on one host, `task-d76` from a Jepsen run that killed the leader, `task-d77` through `task-d81` from the protocol simulator with acknowledgements between followers lost, `task-d82` through `task-d84` from the Jepsen runs of the #173 carry, `task-d85` from the protocol simulator on task-d74's routing, `task-d86` through `task-d92` from planning the whole gap to etcd on #174, `task-d106` and `task-d107` from the task-d72 batch's register-kill run, `task-d108` and `task-d109` from the runs after it, `task-d110` from an audit of the walks a turn makes over history, and moves committed key replacement from `task-58` to `task-m03`; the changes are listed under [Gate checklist and deferred work](#gate-checklist-and-deferred-work). Task IDs are not GitHub pull-request or issue numbers. One implementation PR corresponds to one task; its GitHub-assigned number is recorded separately. No baseline, supplement or separate amendment is needed.
+**Scope:** 202 implementation tasks with stable `task-*` identifiers. The `task-01` through `task-66`, `task-s01` through `task-s04`, `task-j01` through `task-j10`, `task-o01` through `task-o06`, `task-m01` through `task-m05`, `task-c01`, `task-c02`, `task-c03`, `task-d01` through `task-d100`, `task-d106` through `task-d110`, `task-d112`, `task-d113` and `task-q01` suffixes and prerequisites are preserved. v1.5 adds `task-d01` through `task-d04` from review of the open implementation PRs and of multi-host readiness, `task-d05` through `task-d17` from the Jepsen client's runs, `task-d18` through `task-d33` from a review against an external SwiftPaxos correctness checklist ([review record](tuplesky-checklist-review.md)), `task-d34` from what the protocol simulator of task-d30 found, `task-d35` through `task-d44` from a review of recovery time and storage integrity (an execution chain, a scrub, and voter replacement through a prepared transition, a staged learner, terminal recovery after the seal, serving across a transition and a running membership install), `task-d45` through `task-d50` from measuring the throughput of the Jepsen client's first unthrottled runs, `task-d51` from task-d46's long runs, `task-d52` and `task-d53` from a profile of the domain thread after task-d46, `task-d54` from the Jepsen runs of task-d50, `task-d55` through `task-d57` from the Jepsen runs of task-j06, `task-d58` through `task-d61` from a profile of five voters' CPU per operation, `task-d62` through `task-d65` from a consolidated review against the reference SwiftPaxos, `task-d66` from the Jepsen runs of task-d51, `task-d67` from a Jepsen run on #98 that made no fast decision, `task-d68` from task-d62's counts after a leader change, `task-d69` from a profile of a follower's loop, `task-d70` from the Jepsen runner's profile of the transport's workers, `task-d71` from the protocol simulator's first 1,000-seed sweep, `task-d72` through `task-d75` from comparing a command's cost with etcd's on one host, `task-d76` from a Jepsen run that killed the leader, `task-d77` through `task-d81` from the protocol simulator with acknowledgements between followers lost, `task-d82` through `task-d84` from the Jepsen runs of the #173 carry, `task-d85` from the protocol simulator on task-d74's routing, `task-d86` through `task-d92` from planning the whole gap to etcd on #174, `task-d106` and `task-d107` from the task-d72 batch's register-kill run, `task-d108` and `task-d109` from the runs after it, `task-d110` from an audit of the walks a turn makes over history, `task-d113` from a profile of the materializer, and moves committed key replacement from `task-58` to `task-m03`; the changes are listed under [Gate checklist and deferred work](#gate-checklist-and-deferred-work). Task IDs are not GitHub pull-request or issue numbers. One implementation PR corresponds to one task; its GitHub-assigned number is recorded separately. No baseline, supplement or separate amendment is needed.
 
 ## How to use this plan
 
@@ -67,6 +67,7 @@ Reference single-store and fixed-membership compositions are early increments, n
 | task-d109 | From the register-kill re-run (#98, run 42933821595): a voter restarted behind the others never caught up, its loop busy 379 s of 440 s; its profile was 94% `Follower::missing_payloads`, which the loop called twice a turn for a count and which walked every command pending a Sync's installation twice and sorted the result | Liveness; before the next fault run |
 | task-d110 | From an audit of the walks a turn makes over history (#98): a voter behind holds more committed and unexecuted commands than the history sweep's threshold, which the table never forgets, so every execution swept the whole ledger and the maps beside it, and catching up was quadratic in the backlog | Liveness; before the next fault run |
 | task-d112 | From Codex's review on #98 (`election.rs`, confirmed by the testing session, [6788929248](https://github.com/tuplesky/tuplesky/pull/98#issuecomment-6788929248)): a leaderless voter that could not reach a majority, or whose own campaign was still finishing, kept a campaign instant already past as its loop's deadline, so the loop woke at once on every pass for as long as the hold lasted | Before the next fault run's CPU readings |
+| task-d113 | From the materializer's profile on #185 ([6810986014](https://github.com/tuplesky/tuplesky/pull/185#issuecomment-6810986014)): a follower writes about 2.3 KB of rows a command and 38 KB to the file, 9.4 fresh pages (11.3 at the leader), because the payload, dependency and executed rows are keyed by the command's digest and each lands on a leaf no other command in the commit touches | A design step now, then the top code priority in two steps: the dependency rows first, then the payload and executed rows. It needs neither task-d86 nor task-d105 first (the lead's order, on review's word on #233) |
 | task-q01 | Combined durable WAN/Kine qualification | Required before task-66 |
 
 ```mermaid
@@ -296,6 +297,7 @@ This is a workstream overview; the individual prerequisites are authoritative. O
 | [task-d109](#task-d109) | Count the missing payloads a turn asks for without walking what a Sync left pending | task-d46, task-d14 |
 | [task-d110](#task-d110) | Sweep the history at a pace set by what the last sweep kept, not once per execution | task-d05 |
 | [task-d112](#task-d112) | Give the loop no election deadline while a due campaign is held back | task-d01, task-d10 |
+| [task-d113](#task-d113) | Key the payload, dependency and executed rows by order | task-d08, task-d23, task-d27, task-d72, task-d77 |
 | [task-q01](#task-q01) | Produce the combined durable WAN/Kine qualification report | task-j07, task-j08, task-o06, task-m05, task-63, task-64, task-d45, task-d46, task-d47, task-d48, task-d49, task-d51, task-d52, task-d53 |
 
 ## Task specifications
@@ -3146,6 +3148,7 @@ This entry is the budget and the record, not a lever:
 | The #173 carry (task-d63, task-d66, task-d74's recovery fix, task-d75, task-d77 to task-d80) against `259e0b2` | `36fe7d1` (#98) | register, 30 clients, replay, three pairs | 501.5 to 504.2 (base 505.4 to 513.4) | 3.57 to 3.59 ms (base 3.58 to 3.66) | 0.41 to 0.46 | the leader's loop: -4.1 to -6.6%; the domain loops -3.8%; tokio threads unchanged at 1.45 ms an op |
 | `service`, the same carry | `36fe7d1` | wr, 1,000 uniform keys, read-only ratio 0.6, 4 clients at 300/s, strict | 140.0, below the rate (etcd 290.1) | 12.41 ms (etcd 2.86), not at equal work | 1.87 (etcd 2.51) | p50 23 ms and p99 61 ms (etcd 2 and 4): task-d83, task-d84 |
 | `service` at `replay`, the matched comparison | | the same shape, replay | | | | the row the `service` target is read at (the testing session) |
+- **The materializer's largest single cut is task-d113** (#185, [6810986014](https://github.com/tuplesky/tuplesky/pull/185#issuecomment-6810986014)): the payload, dependency and executed rows keyed by order, so that a commit's rows share leaves. Its design step (Section 17.1), on review's model (#233, [6813025752](https://github.com/tuplesky/tuplesky/pull/233#issuecomment-6813025752)), sizes it on the EPYC 9V74 at −0.12 to −0.17 ms an operation at 120 callers and −0.07 to −0.12 at 30, the move included. The three digest-keyed rows are 5.7 of a follower's 9 pages a command, since each copies its leaf and the branch page above it, and by order they are 0.57. That is the largest lever on record at any commit size, and it doesn't need task-d86's cadence. The leader's proposal row is counted under task-d103, not here.
 - **The local record** (this entry's PR): the same split on one host, five voters, each build against the one before it, with a profile of the leader and a follower ([notes](../tuplesky-impl-notes.md#the-budget-on-one-host-task-d72)). It does not replace the runner's rows, which the Jepsen testing session runs. It reads what a lever moved before the runner does: of a write's 7.9 to 8.7 ms of the nodes' CPU, a follower costs about 1.6 ms and the leader about 1.9, so the followers carry three quarters of it, and off the domain loops the transport's QUIC threads are a third of each node's CPU and the projection's commits a fifth.
 - **The shapes it is read in** (`docs/operations/jepsen.md`): `service`, a fixed rate where the metric is latency and CPU per operation at equal work, on the bridge and under the WAN profile; the append shape run against etcd too, so the multiple quoted has a denominator; and several domains on one cluster, if the harness can start them.
 
@@ -3442,6 +3445,36 @@ The change, in two steps:
   - **The retry lookup:** a retry answered from its record reads the same view, so it finds a binding a deferred group wrote.
   - **task-d75's settle read** (`settle_from_records`) finds an execution record only once a commit makes it visible. A half-established entry it finds no record for asks for the next commit, so an entry whose half was lost waits for no deferral.
 - **What it is expected to move (#174 review):** 0.15 to 0.3 ms of CPU an operation at the register row.
+- **Built: the commit hold (replay only, with a materializer).**
+  - **What it does:** a domain's records owed to the materializer are held for one larger commit until 32 are pending, 5 ms have passed since the first, or something that reads the projection asks (`[journal] projection_commit_records` and `projection_commit_ms`; zero for either holds nothing). It is refused under `strict`, so Section 17.3.4 is not amended.
+  - **What asks:**
+    - a barrier read due and not yet answerable;
+    - a release published again (task-d100, step A);
+    - a group whose effects beyond its results wait for its commit;
+    - a group with events for an open watch;
+    - a half-established entry (`settle_from_records`);
+    - a queued checkpoint pointer;
+    - a drain.
+
+    An ask stands until a commit is lent, so one made before its record is journaled still takes it.
+  - **What else reads the projection waits at most the 5 ms:** catch-up pages served, a frontend's retained-result read, a floor's readiness, a watch's replay. The loop wakes on the hold's time (`next_deadline`), so a quiet domain's records go out at it too. What is durable before a result's release doesn't change: the journal holds every held record, and a crash replays it.
+  - **Local pair** (the carry `413fd66a`; five voters on tmpfs, `replay`, one worker, the four features, etcd's mix; three alternating runs a side at 30 and 120 callers; the CPU clock over a 30 s window):
+
+    | | 30 callers, off → on | 120 callers, off → on |
+    | --- | --- | --- |
+    | A follower's materializer, µs a command | 126.7 → 107.1 (−15%) | 109.1 → 103.6 (−5%) |
+    | Its commands a commit | 4.1 → 13.5 | 10.9 → 19.3 |
+    | The leader's materializer, µs a command | 140.9 → 139.6 | 123.8 → 123.6 |
+    | Its commands a commit | 4.3 → 4.8 | 11.9 → 12.5 |
+    | Bytes written a command, a follower | 37.8 → 40.4 KB (+7%) | 38.2 → 39.9 KB (+5%) |
+    | Servers, ms an operation | 1.430 → 1.371 (−4.1%) | 1.222 → 1.184 (−3.1%) |
+    | `ok`/s | 2,339 → 2,356 | 2,780 → 2,860 |
+    | p99, the slowest path | 56.6 → 55.9 ms | 206 → 179 ms |
+
+    - **The leader is not held:** its barrier reads ask for nearly every commit, as they must.
+    - **Pages a command didn't fall:** a follower writes 5 to 7% more bytes a command. That is not yet explained; freed pages are reusable only after a durable commit, and fewer commits may leave more of them unreused.
+    - **On the EPYC 9V74** (#185's conversion): about −0.052 ms an operation at 30 callers and −0.018 at 120, against the −0.055 to −0.10 and −0.03 to −0.06 sized. The shortfall is the leader.
+    - **A wider hold** (64 records, 10 ms; two runs a side) took followers to 99.7 and 100.6 µs a command (24 and 32 commands a commit). It isn't the default, because at 120 callers neither `ok`/s nor p99 was better in two runs. The runner's pair can read it by configuration.
 
 **Acceptance:** The runner's group sizes and the reading recorded first. Model tests: a command planned after a deferred commit sees the earlier groups' writes, a retry is answered from a deferred group's binding, and a half-established entry's record is found within one commit. A local pair: commits a command and the materializer's CPU an operation fall, and no read, watch or event waits longer than the bound. The storage crash tests across a deferred commit, at every cut. Its runner pair is read in the batch job (task-d72).
 
@@ -4194,6 +4227,96 @@ The code is the testing session's (#98, `f1a1fc67`); this task adds its plan ent
 
 **Review boundary:** The election's deadline. No change to when a voter campaigns, to the ballot, to the rows, the messages or the format.
 
+<a id="task-d113"></a>
+### task-d113: Key the payload, dependency and executed rows by order
+
+**Prerequisites:** task-d08, task-d23, task-d27, task-d72, task-d77.  
+**Design:** Section 17.1 (amended by this task's design step: the payload, dependency and executed rows keyed by order).
+
+**Implement:** The materializer's profile on #185 ([6810986014](https://github.com/tuplesky/tuplesky/pull/185#issuecomment-6810986014); local, five voters, `replay`, tmpfs, 30 and 120 callers):
+- A follower writes 10.7 to 10.9 rows a command, about 2.3 KB, and the materializer writes 38 KB a command to the file: about 9.4 fresh 4 KiB pages, 11.3 at the leader.
+- The payload, dependency and executed rows are keyed by the command's digest, so each lands on a leaf no other command in the commit touches. Page work is 74 to 86% of the thread.
+
+This entry is task-d72's largest single cut on the materializer, owned here. The design step is in Section 17.1, and it answers the six questions the lead set:
+1. **The index by command.** Boot, catch-up served and resolve need none: boot reads every row it joins, and catch-up and resolve read by position (resolve through `RetryRecordV1::position`). A campaign's executed rows, trim and its fence (`TrimFence::command`), a divergence stop and the store's own rewrites and deletes do need one. It lives in memory in the store, keyed by an 8-byte prefix of the command, in two parts:
+   - **the intake part:** each live pending payload or dependency row to its intake order, about 24 to 32 bytes a row;
+   - **the executed part:** each retained `execution_v1` row to its position, about 16 to 24 bytes an executed command. It lives as long as the executed row, so the fence and a stop still find a command after trim or a shared-image install has left it no protocol rows (Codex on #233).
+
+   Neither part writes a page. The intake part is rebuilt at open from the dependency rows boot already reads. The executed part is rebuilt from the scan of `execution_v1` that boot makes anyway (today's `read_history` reads all of `executed_v1`), at about 0.1 s for 10⁶ rows, and at a shared image's install from its `execution_v1` rows.
+2. **The order.** Executed rows and executed payloads take the execution position, which is replicated and always appended, since no voter executes out of position order (`JournaledStore::submit`, `project`). Payload and dependency rows before execution take intake order, the journal position of the record that brings them, which is node-private.
+3. **The format.** One layout a domain, recorded at initialization and checked at every open, as task-d105's step sets (#208); the other is refused with the reason. The shared image's version is raised. The journal's records don't change, since the store's lowering assigns the keys. No existing projection moves: nothing is deployed. `replay` can rebuild only above its local image, so under either profile a move would convert an image, offline and losslessly. That conversion isn't built.
+4. **Forgetting and the image.** task-d110's sweep and task-d111's forgetting by order read no rows. task-d27's trim, not yet run by `coordd`, scans in intake order and takes positions from the index. The shared image reads `execution_v1` and `payload_v1` as ranges, without today's point read per payload.
+5. **The other rows.** Events already share leaves. History by revision is the event row, which is task-d105's. Current needs task-d105's index. Retry rows are found by retry key on admission, and their deletes and floor are task-d104's. The retry rows, floor and meta rows write 0.40 pages a command together, under −0.02 ms an operation, so folding the retry row into the execution row isn't worth it, and task-d104 stays small.
+6. **The sizes, on the EPYC 9V74, by the profile's conversion:**
+   - by review's model (#233, [6813025752](https://github.com/tuplesky/tuplesky/pull/233#issuecomment-6813025752)): redb alone, with a real follower's table shapes. Its total matches the profile's: 9.0 pages and 36.8 KB a command at 8 a commit, against 9.4 and 38;
+   - the three rows are 5.7 of those pages today and 0.57 by order at 8 a commit (6.6 and 1.0 at 3, 6.0 and 0.60 at 30). Each digest-keyed row copies its leaf and the branch page above it;
+   - −0.12 to −0.17 ms an operation at 120 callers and −0.07 to −0.12 at 30, the move included. The move costs +0.009 and +0.008 to +0.013 of that;
+   - the step's first estimate had three pages gross and −0.05 to −0.08 and −0.03 to −0.045 net. Its residual terms hold, and its gross was low;
+   - the leader's proposal row is task-d103's (#206).
+
+**The code, in two steps** (the lead's order, on review's word on #233). It is the top code priority and needs neither task-d86 nor task-d105 first:
+1. **The dependency rows alone,** its own PR on the carry.
+   - They are node-private, so this step changes no image and no common hash.
+   - Their readers are boot, catch-up, the campaign and trim, and the store's own rewrites and deletes.
+   - It builds the index's intake part, the lowering's key assignment, rules (c), (d) and (e) of Section 17.1, and the layout check. Under rule (e), the recovery cut's overlay assigns keys as the lowering does.
+   - By the table's shape it is about a third of the gain.
+   - Its evidence splits the counting build's file bytes by table, so that each row's size is read rather than inferred. That goes on the metrics line if it is cheap, since testing needs it on the runner too.
+2. **The payload and executed rows.** This step brings the pending collection, the move, the index's executed part, and rules (a) and (b). It also raises the shared image's version and changes the common hash's membership, behind whatever the format needs.
+
+What the two steps build together:
+- **Rows by order.**
+  - `execution_v1` takes the executed row by position; `executed_v1` is no longer written.
+  - `payload_v1` takes an executed command's payload by position, moved by the lowering at execution.
+  - A new node-private `pending_payload_v1` holds payloads not yet executed, by intake order.
+  - Dependency rows, and the leader's proposal row while it is written, are keyed by epoch, tag and intake order. Their values carry the command identity.
+- **The lowering assigns the keys** (`lower_update`, from `project` and the worker), and keeps the index in memory.
+- **The readers move:**
+  - `read_protocol`, `read_history`, `executed_order` and `executed_near` in `coord-storage/src/protocol.rs`;
+  - catch-up's `page`, `executed_rows` and `mismatch` (`ExecutedOrder` goes);
+  - `retained_answer`'s `requested()`;
+  - trim's `classify` and `executed_within`, and `TrimFence::command`;
+  - export, install and restore in `coord-checkpoint`.
+- **Outside the readers' table:**
+  - the emptiness checks in `install.rs`'s `check_target` and in `restore.rs` test the pending collection too;
+  - the registry says `executed_v1` names records only, so `in_common_hash` and the image's walk don't count an empty collection;
+  - `coord-store-bench`'s executed-row count, the divergence report's text in `serve.rs`, and the fjall engine's collection list.
+- **The lowering's rules** (Section 17.1: (a) to (d) from review on #233, (e) from reading for the code step):
+  - (a) a payload put for a command already executed is dropped;
+  - (b) an executed row with no pending payload is refused;
+  - (c) a snapshot reader looks up executed commands only through the index;
+  - (d) the index follows the commit's outcome, held with `pending_meta` while it isn't known;
+  - (e) an overlay (the recovery cut, and the planning view for step 2's rows) lowers its rows with the same key assignment.
+- **The layout check at open.** The shared image's version is raised, and the scrub reads the new layout (task-d37).
+- **A release condition, carried like the catch-up page size:** the first release that promises an upgrade in place needs the conversion built (Section 17.1, point 3).
+
+**Acceptance:**
+- **The design step** recorded and reviewed before any code, with the readers' table checked against every reader of these collections in the workspace.
+- **Tests:**
+  - boot restores the same machine from a store written under load, with commands pending, executed, released by a Sync (task-d24) and pulled by catch-up (task-d08);
+  - a donor's page is a range read and matches today's page row for row;
+  - a resolve of an executed command finds its request by the retry row's position;
+  - a campaign gets its executed rows through the index;
+  - trim plans the same deletions as today over the same history;
+  - after trim has removed an executed command's protocol rows, and on a voter that installed a shared image, the fence answers `BelowFloor` for a command executed at or below the floor, across a restart, with the executed part rebuilt from `execution_v1`; it answers `Admit` for a command never executed;
+  - a replay of the journal suffix writes the same keys as the first lowering;
+  - every voter's export root agrees at each floor boundary;
+  - a store or image of the other layout is refused with the reason;
+  - the storage crash tests at every cut of a commit that moves a payload, under `strict` and `replay`;
+  - the rules:
+    - a payload delivered after its command executed leaves the pending table empty;
+    - a negative control lowers an execution with no payload and sees the refusal;
+    - a snapshot reader across a Sync's release and a re-proposal under a new intake key;
+    - a commit whose outcome isn't known, settled both ways, leaves the index as the store has it;
+    - a recovery cut over a dependency row rewritten at ACCEPT and not yet materialized reads it once, with the rewrite; one over a `dependency_delete` not yet materialized doesn't read the row.
+- **The local pair, for each step:** the counting build, with the file's bytes split by table, and the profile at 30 and 120 callers, on the profile's setup.
+  - **Prediction** (review's model on #233): fresh pages a command at a follower fall from 9.4 to about 4 at 8 to 11 commands a commit, and to about 6 at 3. The first step alone takes about a third of that.
+  - The first estimate had 7.0 to 7.4, so the reading tells the two apart. A reading outside both says which term was wrong.
+  - The materializer's µs a command at each voter is read beside it.
+- **The runner pair** is in the batch job (task-d72).
+- **The index's memory and open time** are read at 10⁵ and 10⁶ live rows and retained executions.
+
+**Review boundary:** Where the projection keeps the payload, dependency and executed rows, and how their readers find them. No change to the journal's records, the protocol, what a vote rests on or what is released. The shared image's format changes under a raised version, and a domain runs one layout.
+
 ## Gate checklist and deferred work
 
 task-s01, task-s02 feed the strict storage reference through task-07. Optional task-s03, task-s04 need not merge to release redb; retired task-s05 through task-s08 are not replaced by migration or mixed-engine support gates. Same-engine crash/restore, common/local checkpoints, safe replacement and schema lifecycle remain requirements.
@@ -4227,7 +4350,7 @@ G3 requires task-43/transitive prerequisites, G4 task-48, G5 checkpoint/replacem
 - **The Jepsen runs of task-d67's code** (#98): after four of five leader changes the new leader ran 81 to 87% fast; the fifth's fixed fast set held the voter just killed, which task-d76 takes. Under load the share stayed at Section 2.2's 1 to 2%, which task-d65 records as confirming that section's decision. The publications over 10 ms spent under 2.5 ms on a CPU or waiting for one, so task-d66's job is built.
 - **Against etcd on one host**, the one matched comparison is 2.5 times behind, at 3.5 to 4.7 ms of server CPU an operation against etcd's 1.39, and none of the gap is the order. task-d72 sets the budget and keeps the record; task-d73 through task-d75 are its levers, after task-d63's build and task-d66's job.
 - **Gating.** task-d45 through task-d49 and task-d51 through task-d53 are prerequisites of task-64 and task-q01, so that the qualification and the combined report measure the protocol rather than these costs. task-d56 is a prerequisite of task-64, as liveness under faults. task-62's remaining rows, and any reference result it publishes again, wait on them and on task-d54 for the same reason. This is stated in task-62 rather than as a prerequisite, since task-62's first runs produced task-c01 and task-c02, which the throughput tasks build on. task-d50, reads and the fast path off the slow path, changes protocol behaviour and waits on its own design amendment.
-- **Design changes.** task-d45 through task-d47, task-d49, task-d51 through task-d56 and task-d58 through task-d62, task-d66, task-d69, task-d70, task-d72, task-d73, task-d75, task-d88, task-d91, task-d92, task-d93, task-d94, task-d95, task-d96 and task-d97 do not change the design; task-d98 amends Sections 4.3 and 4.8, and task-d99 Sections 13 and 17.7 with the activation path and the admission window; task-d74 amends Sections 4.1 and 4.3 if a decision reads another follower's votes, and task-d76 amends Section 4.2; task-d71 amends Sections 4.9 and 13.1, and task-d77 through task-d80 and task-d85 Section 4.9, and task-d81 Section 6.7.3 if it changes which ballot a donor serves at; task-d82 amends Section 11.4 and the O14 row, task-d83 Section 6.3 and task-d84 Section 17.3.3; task-d89 amends Section 4.7, and task-d90 Sections 4.5, 17.3.3 and 17.4; task-d86 amends Section 17.3.4 only if a commit cadence reaches `strict`, and task-d87 Section 6.3 only if a round serves a read that arrived after it began; task-d67 amends Sections 4.1, 4.7 and 4.9 with its rule, and task-d68 Sections 4.1 and 4.7 with its, and task-d63's release-rule step amends Sections 4.5, 17.3.3 and 17.4; task-d64 amends Sections 4 and 6.4, and task-d65 Section 2.2 if it changes the model. task-d48 amends Section 17.3.4's projection hardening; task-d50 amends Sections 4.5, 6.3 and 17.4; task-d57 amends Sections 2.2, 4.5 and 6.3.
+- **Design changes.** task-d45 through task-d47, task-d49, task-d51 through task-d56 and task-d58 through task-d62, task-d66, task-d69, task-d70, task-d72, task-d73, task-d75, task-d88, task-d91, task-d92, task-d93, task-d94, task-d95, task-d96 and task-d97 do not change the design; task-d98 amends Sections 4.3 and 4.8, and task-d99 Sections 13 and 17.7 with the activation path and the admission window; task-d74 amends Sections 4.1 and 4.3 if a decision reads another follower's votes, and task-d76 amends Section 4.2; task-d71 amends Sections 4.9 and 13.1, and task-d77 through task-d80 and task-d85 Section 4.9, and task-d81 Section 6.7.3 if it changes which ballot a donor serves at; task-d82 amends Section 11.4 and the O14 row, task-d83 Section 6.3 and task-d84 Section 17.3.3; task-d89 amends Section 4.7, and task-d90 Sections 4.5, 17.3.3 and 17.4; task-d86 amends Section 17.3.4 only if a commit cadence reaches `strict`, and task-d87 Section 6.3 only if a round serves a read that arrived after it began; task-d67 amends Sections 4.1, 4.7 and 4.9 with its rule, and task-d68 Sections 4.1 and 4.7 with its, and task-d63's release-rule step amends Sections 4.5, 17.3.3 and 17.4; task-d64 amends Sections 4 and 6.4, and task-d65 Section 2.2 if it changes the model. task-d48 amends Section 17.3.4's projection hardening; task-d113 amends Section 17.1 with the payload, dependency and executed rows keyed by order; task-d50 amends Sections 4.5, 6.3 and 17.4; task-d57 amends Sections 2.2, 4.5 and 6.3.
 
 task-j06 is optional and cannot silently relax durable materialization. ReadFence is its own capability gate. Observers do not improve quorum fault tolerance or acquire voting rights by catching up. Interface drift in Kine is resolved at one explicit pin, not mixed across examples. Strict per-output authorization remains authoritative even for regional observers.
 
