@@ -142,10 +142,12 @@ impl Format {
                 oldest: 1,
                 current: 1,
             },
-            // 2 (task-d113, step 2): executed rows and executed payloads
-            // by execution position, pending payloads and decided records
-            // node-private. An image of the layout before is refused, not
-            // converted (#243 review).
+            // 2, for two layouts that landed together. Task-d113, step 2:
+            // executed rows and executed payloads by execution position,
+            // pending payloads and decided records node-private. Task-d105:
+            // no `kv_history_v1` rows; below the floor, each key's newest
+            // put at or below it as its event row. An image of the layout
+            // before is refused, not converted (#243 review).
             Format::SharedCheckpoint => Window {
                 oldest: 2,
                 current: 2,

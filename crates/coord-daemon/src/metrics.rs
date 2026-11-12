@@ -483,6 +483,11 @@ pub struct Cost {
     pub journal_syncs: Measure<u64>,
     /// Projection transactions committed.
     pub projection_commits: u64,
+    /// What ended the hold of each projection commit lent while a commit
+    /// hold applies (task-d86): its records, its wait, or an ask by who
+    /// asked. Zero without a hold.
+    #[serde(default)]
+    pub hold_ends: HoldEnds,
     /// Time the domain loop spent working rather than waiting for an
     /// event, since it started. A lowering's syncs are inside it, since
     /// the loop waits for them.
@@ -596,6 +601,38 @@ pub struct IntakeIndexSize {
     /// ([`coord_storage::intake::EXECUTED_ENTRY_BYTES`]): an estimate.
     #[serde(default)]
     pub executed_bytes: u64,
+}
+
+/// What ended the hold of each projection commit lent while a commit hold
+/// applies (task-d86, the lead on #185), each counted once, in the first
+/// of these that applies: an ask is counted only where the hold would
+/// otherwise have gone on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HoldEnds {
+    /// The records held reached the hold's count.
+    pub full: u64,
+    /// The hold's wait ran out.
+    pub deadline: u64,
+    /// A read due and not yet answerable from the projection asked.
+    pub read: u64,
+    /// A half-established entry's look for its execution record asked.
+    pub settle: u64,
+    /// Another ask: a release published again, a group's effects beyond
+    /// its results, a watch's events, a drain, a checkpoint.
+    pub other: u64,
+}
+
+impl HoldEnds {
+    /// The store's count, as the metrics line carries it.
+    pub const fn of(ends: coord_storage::HoldEnds) -> Self {
+        Self {
+            full: ends.full,
+            deadline: ends.deadline,
+            read: ends.read,
+            settle: ends.settle,
+            other: ends.other,
+        }
+    }
 }
 
 /// A voter's command table, and what holds back its oldest unexecuted

@@ -64,11 +64,30 @@ fn kv(key: &[u8], value: &[u8]) -> StoreUpdate {
     }
 }
 
+/// A real event row (a put of `k<revision>`): lowering reads each event
+/// row into the key index (task-d105).
 fn event(revision: u64) -> StoreUpdate {
+    let at = coord_types::ids::KvRevision::new(revision).unwrap();
     StoreUpdate {
         collection: Collection::EventsV1.id(),
-        key: revision.to_be_bytes().to_vec(),
-        value: Some(vec![revision as u8; 12]),
+        key: coord_storage::codecs::event_key(at, 0),
+        value: Some(
+            coord_storage::codecs::encode_event(&coord_storage::codecs::EventRecordV1 {
+                kind: coord_state::KvEventKind::Put,
+                namespace: coord_types::ids::NamespaceId([0; 16]),
+                key: format!("k{revision}").into_bytes(),
+                entry: Some(coord_state::KvEntry {
+                    value: vec![revision as u8; 12],
+                    create_revision: at,
+                    mod_revision: at,
+                    version: 1,
+                    lease: None,
+                    lease_generation: None,
+                }),
+                prev: None,
+            })
+            .unwrap(),
+        ),
     }
 }
 

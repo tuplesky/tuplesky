@@ -17,8 +17,7 @@ use coord_state::plan::KvEventKind;
 use coord_state::policy::{Action, KeyInterval, PolicyRule};
 use coord_state::view::KvEntry;
 use coord_storage::codecs::{
-    self, EventRecordV1, ExecutedRecordV1, ExecutionRecordV1, HistoryRecordV1, RetryFloorV1,
-    RetryRecordV1,
+    self, EventRecordV1, ExecutedRecordV1, ExecutionRecordV1, RetryFloorV1, RetryRecordV1,
 };
 use coord_storage::lowering::{DurableMeta, ExecutionFrontier};
 use coord_storage::policy::{bootstrap_session, rule_update};
@@ -170,32 +169,6 @@ fn rows(profile: Profile) -> Vec<Row> {
         Collection::KvCurrentV1,
         codecs::current_key(&NS, b"b"),
         codecs::encode_current(&entry(b"v3", 3, 3, 1)).unwrap(),
-    );
-    let history = |v: &[u8], c: u64, m: u64, ver: u64| {
-        codecs::encode_history(&HistoryRecordV1 {
-            entry: Some(entry(v, c, m, ver)),
-        })
-        .unwrap()
-    };
-    if !profile.gc_done {
-        put(
-            &mut rows,
-            Collection::KvHistoryV1,
-            codecs::history_key(&NS, b"a", rev(1)),
-            history(b"v1", 1, 1, 1),
-        );
-    }
-    put(
-        &mut rows,
-        Collection::KvHistoryV1,
-        codecs::history_key(&NS, b"a", rev(2)),
-        history(b"v2", 1, 2, 2),
-    );
-    put(
-        &mut rows,
-        Collection::KvHistoryV1,
-        codecs::history_key(&NS, b"b", rev(3)),
-        history(b"v3", 3, 3, 1),
     );
     let event = |k: &[u8], e: Option<KvEntry>, p: Option<KvEntry>| {
         codecs::encode_event(&EventRecordV1 {
@@ -469,7 +442,6 @@ fn equal_common_state_hashes_equally_across_private_differences_and_engines() {
         Collection::SessionV1,
         Collection::LeaseV1,
         Collection::LeaseKeysV1,
-        Collection::KvHistoryV1,
         Collection::EventsV1,
         Collection::PayloadV1,
         Collection::ExecutionV1,
@@ -480,13 +452,13 @@ fn equal_common_state_hashes_equally_across_private_differences_and_engines() {
     for c in [
         Collection::MetaV1,
         Collection::ProtocolV1,
+        Collection::KvHistoryV1,
         Collection::CheckpointV1,
     ] {
         assert_eq!(summary(c), None, "{c:?}");
     }
-    // Canonical normalization: one history version at or below the floor
-    // per key, no event below the floor, only executed payloads.
-    assert_eq!(summary(Collection::KvHistoryV1), Some(2));
+    // Canonical normalization: below the floor, only each key's newest put
+    // at or below it (a@2, not a@1; task-d105), and only executed payloads.
     assert_eq!(summary(Collection::EventsV1), Some(2));
     assert_eq!(summary(Collection::PayloadV1), Some(3));
     assert_eq!(ca.manifest.boundary.execution_position, pos(3));
@@ -648,22 +620,6 @@ fn rows_beyond_the_boundary_are_refused() {
         export_shared(&view, origin(), &limits).unwrap_err(),
         ExportError::BeyondBoundary {
             collection: Collection::EventsV1.id().0
-        }
-    );
-    let mut engine = model(Profile::default());
-    let mut tx = engine.begin_write().unwrap();
-    tx.put(
-        Collection::KvHistoryV1.id(),
-        &codecs::history_key(&NS, b"c", rev(9)),
-        b"late",
-    )
-    .unwrap();
-    tx.commit_durable().unwrap();
-    let view = engine.reader().snapshot().unwrap();
-    assert_eq!(
-        export_shared(&view, origin(), &limits).unwrap_err(),
-        ExportError::BeyondBoundary {
-            collection: Collection::KvHistoryV1.id().0
         }
     );
     // A row the exporter decodes must decode.
@@ -1198,4 +1154,96 @@ fn measure_the_inline_boundary() {
             (exported + kept).as_secs_f64() * 1000.0 / mib as f64,
         );
     }
+}
+
+/// Below the retention floor the export carries each key's newest put at
+/// or below it, and nothing else (task-d105; #245 review: the fixture's
+/// key sits at the floor, so it could not tell). With the floor at 3, key
+/// `a`'s put at 2 is below it and the newest, so it goes; its put at 1
+/// does not. Key `c`, put at 1 and deleted at 2, carries nothing: its
+/// newest version below the floor is a delete. The export equals one of a
+/// store that holds only what goes, and differs from one without `a`'s
+/// put at 2.
+#[test]
+fn below_the_floor_the_export_carries_each_keys_newest_put_and_nothing_else() {
+    let at_floor_3 = |engine: &mut ModelEngine, extra: &[(Vec<u8>, Option<Vec<u8>>)]| {
+        let mut tx = engine.begin_write().unwrap();
+        tx.put(
+            Collection::MetaV1.id(),
+            meta_fields::RETENTION_FLOOR,
+            &codecs::encode_counter(3).unwrap(),
+        )
+        .unwrap();
+        for (key, value) in extra {
+            match value {
+                Some(v) => tx.put(Collection::EventsV1.id(), key, v).unwrap(),
+                None => tx.delete(Collection::EventsV1.id(), key).unwrap(),
+            }
+        }
+        tx.commit_durable().unwrap();
+    };
+    let c_event = |kind: KvEventKind, entry: Option<KvEntry>, prev: Option<KvEntry>| {
+        codecs::encode_event(&EventRecordV1 {
+            kind,
+            namespace: NS,
+            key: b"c".to_vec(),
+            entry,
+            prev,
+        })
+        .unwrap()
+    };
+    // Every row: a@1, a@2, b@3, and c put at 1 and deleted at 2.
+    let mut full = model(Profile::default());
+    at_floor_3(
+        &mut full,
+        &[
+            (
+                codecs::event_key(rev(1), 1),
+                Some(c_event(KvEventKind::Put, Some(entry(b"c1", 1, 1, 1)), None)),
+            ),
+            (
+                codecs::event_key(rev(2), 1),
+                Some(c_event(
+                    KvEventKind::Delete,
+                    None,
+                    Some(entry(b"c1", 1, 1, 1)),
+                )),
+            ),
+        ],
+    );
+    // Only what goes: a@2 and b@3.
+    let mut kept = model(Profile {
+        gc_done: true,
+        ..Profile::default()
+    });
+    at_floor_3(&mut kept, &[]);
+    // And without a@2.
+    let mut without = model(Profile {
+        gc_done: true,
+        ..Profile::default()
+    });
+    at_floor_3(&mut without, &[(codecs::event_key(rev(2), 0), None)]);
+
+    let limits = ExportLimits::default();
+    let (cf, ck, cw) = (
+        export(&full, &limits),
+        export(&kept, &limits),
+        export(&without, &limits),
+    );
+    assert_eq!(cf.manifest.boundary.retention_floor, rev(3));
+    let events = |cp: &SharedCheckpointV1| {
+        cp.manifest
+            .collections
+            .iter()
+            .find(|s| s.collection == Collection::EventsV1.id().0)
+            .map(|s| s.rows)
+    };
+    assert_eq!(events(&cf), Some(2), "a@2 and b@3");
+    assert_eq!(cf.manifest, ck.manifest);
+    assert_eq!(cf.chunks, ck.chunks);
+    assert_eq!(events(&cw), Some(1));
+    assert_ne!(
+        cf.manifest.root, cw.manifest.root,
+        "the newest put below the floor is carried"
+    );
 }

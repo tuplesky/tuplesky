@@ -972,7 +972,7 @@ impl<P: Persistence> Voter<P> {
             self.node
                 .applier_mut()
                 .store_mut()
-                .request_projection_commit();
+                .request_projection_commit_for(coord_storage::AskCause::Read);
         }
         for held in again.into_iter().rev() {
             self.reads.hold_again(held);
@@ -1167,8 +1167,9 @@ impl<P: Persistence> Voter<P> {
     }
 
     /// Whether [`Voter::flush`] has anything to do: batches queued, a
-    /// command to apply, or a leader's proposals waiting for the turn's
-    /// frame (task-d102).
+    /// command to apply, a leader's proposals waiting for the turn's
+    /// frame (task-d102), or a leader's commit frontier waiting for the
+    /// turn's end (#242 follow-up).
     ///
     /// Batches queued behind a journal append that is out are not owed a
     /// flush (task-d54): nothing can be journaled until the append is
@@ -1179,6 +1180,7 @@ impl<P: Persistence> Voter<P> {
         (self.queued() > 0 && !self.appending())
             || self.node.can_execute()
             || self.node.machine().frames_queued()
+            || self.node.machine().frontier_owed()
     }
 
     /// Whether a journal append is out on the appender's thread, its

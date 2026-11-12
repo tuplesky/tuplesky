@@ -825,10 +825,45 @@ fn replay_restores_the_exact_state_results_and_events_from_the_records_alone() {
     );
 }
 
+/// The journaled store's open builds the key index it publishes (task-d105;
+/// #245 review): a restarted voter reads past revisions through it, and
+/// without the build it would find no key there. Event rows materialized
+/// before the restart, and those of records replayed at the attach when
+/// the projection was left behind, are in the index after it, as the
+/// projection holds them.
+#[test]
+fn the_journaled_stores_open_builds_the_key_index_from_the_projection() {
+    for materialize_inline in [true, false] {
+        let next = workload_store(materialize_inline);
+        let view = next.reader(A).unwrap().snapshot().unwrap();
+        let live = view
+            .with_kv_index(coord_storage::kv_index::KvIndex::clone)
+            .unwrap();
+        assert_eq!(
+            live.versions(),
+            4,
+            "inline {materialize_inline}: the four event rows of the workload"
+        );
+        assert_eq!(
+            live,
+            coord_storage::kv_index::KvIndex::build(view.view()).unwrap(),
+            "inline {materialize_inline}"
+        );
+    }
+}
+
 /// Journal a fixed workload of protocol transitions and application
 /// outcomes. When `materialize_inline` is false the projection is left
 /// behind and the pipeline is reopened, which replays `(M, J]`.
 fn run_workload(materialize_inline: bool) -> Vec<(u16, Vec<u8>, Vec<u8>)> {
+    workload_store(materialize_inline)
+        .projection(A)
+        .unwrap()
+        .durable_rows()
+}
+
+/// [`run_workload`]'s store, reopened and attached after the boot ends.
+fn workload_store(materialize_inline: bool) -> JournaledStore<ModelJournal, ModelEngine> {
     let mut world = World::new();
     let events = coord_store_api::registry::Collection::EventsV1.id();
     for step in 1..=4u64 {
@@ -844,10 +879,30 @@ fn run_workload(materialize_inline: bool) -> Vec<(u16, Vec<u8>, Vec<u8>)> {
             position(step),
             vec![
                 kv_update(format!("key-{step}").as_bytes(), b"value"),
+                // A real event row: lowering reads each one into the key
+                // index (task-d105).
                 StoreUpdate {
                     collection: events,
-                    key: step.to_be_bytes().to_vec(),
-                    value: Some(vec![step as u8; 8]),
+                    key: coord_storage::codecs::event_key(KvRevision::new(step).unwrap(), 0),
+                    value: Some(
+                        coord_storage::codecs::encode_event(
+                            &coord_storage::codecs::EventRecordV1 {
+                                kind: coord_state::KvEventKind::Put,
+                                namespace: NamespaceId([0; 16]),
+                                key: format!("key-{step}").into_bytes(),
+                                entry: Some(coord_state::KvEntry {
+                                    value: b"value".to_vec(),
+                                    create_revision: KvRevision::new(step).unwrap(),
+                                    mod_revision: KvRevision::new(step).unwrap(),
+                                    version: 1,
+                                    lease: None,
+                                    lease_generation: None,
+                                }),
+                                prev: None,
+                            },
+                        )
+                        .unwrap(),
+                    ),
                 },
                 // Its payload, then its executed row, which moves the
                 // payload to the position (task-d113, step 2).
@@ -893,7 +948,7 @@ fn run_workload(materialize_inline: bool) -> Vec<(u16, Vec<u8>, Vec<u8>)> {
     let recovered = next.frontiers(A).unwrap();
     assert_eq!(recovered.materialized(), recovered.durable());
     assert_eq!(next.status(A), Some(DomainStatus::Ready));
-    next.projection(A).unwrap().durable_rows()
+    next
 }
 
 #[test]

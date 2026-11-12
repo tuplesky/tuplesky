@@ -2175,6 +2175,85 @@ fn a_duplicate_ahead_of_the_projection_waits_for_its_commit() {
     assert!(!w.collector.is_pending(&command));
 }
 
+/// [`a_duplicate_ahead_of_the_projection_waits_for_its_commit`] with the
+/// leader's projection commits lent to a manual materializer and held for
+/// larger ones under a hold no test reaches (task-d86): the release
+/// waiting to be published again asks for the commit its record is in,
+/// and the next hand-off lends it. Nothing else asks, so without that ask
+/// the record would wait the hold's hour and the release with it.
+#[test]
+fn a_release_waiting_to_be_published_again_asks_for_the_held_commit() {
+    let mut w = Cluster::journaled(256);
+    let handle = {
+        use coord_storage::journaled::{CommitHold, DurableCadence};
+        let store = w.voters[0].node_mut().applier_mut().store_mut().store_mut();
+        store
+            .replay_projection(DurableCadence {
+                commits: std::num::NonZeroU32::MAX,
+                records: std::num::NonZeroU32::MAX,
+            })
+            .expect("the model engine has working state");
+        store
+            .hold_projection_commits(CommitHold {
+                records: std::num::NonZeroU32::MAX,
+                wait: Duration::from_secs(3600),
+            })
+            .expect("the replay profile");
+        let (materializer, handle) = coord_storage::ManualMaterializer::new();
+        store
+            .pipeline(Box::new(materializer))
+            .expect("nothing out yet");
+        handle
+    };
+    w.collector.set_answer_on_release(true);
+    w.lose = Lose::Releases;
+    let submit = w.submit(1);
+    let command = w.command(1);
+    for i in 0..3 {
+        w.deliver_submission(i, &submit);
+    }
+    for _ in 0..8 {
+        settle_peers(&mut w);
+        if w.voters[0].node().executed == 1 {
+            break;
+        }
+        let out = w.voters[0].flush().expect("journaled");
+        w.carry(0, out);
+    }
+    assert_eq!(w.voters[0].node().executed, 1);
+    // The group is handed off, and its commit held.
+    let out = w.voters[0].finish().expect("handed off");
+    w.carry(0, out);
+    let out = w.voters[0].settle().expect("settled");
+    w.carry(0, out);
+    assert_eq!(handle.waiting(), 0, "the group's commit is held");
+    assert!(
+        records_for(w.voters[0].node().applier(), [(command, retry_key(1))]).is_empty(),
+        "the projection does not hold the record yet"
+    );
+
+    w.lose = Lose::Nothing;
+    let shape = w.deliver_submission(0, &submit);
+    assert_eq!(shape.frontend, 0, "nothing to publish yet");
+    assert_eq!(w.voters[0].releases_waiting(), 1, "it waits");
+    let out = w.voters[0].settle().expect("settled");
+    w.carry(0, out);
+    assert_eq!(
+        handle.waiting(),
+        1,
+        "the waiting release's ask lends the held commit at the next hand-off"
+    );
+    assert!(handle.run());
+    let out = w.voters[0].settle().expect("settled");
+    w.carry(0, out);
+    let out = w.voters[0].pump_reads(MonotonicMillis::ZERO);
+    w.carry(0, out);
+    assert_eq!(w.voters[0].releases_waiting(), 0);
+    assert_eq!(w.releases.len(), 1);
+    assert_eq!(w.releases[0].command, command);
+    assert!(!w.collector.is_pending(&command));
+}
+
 /// A follower that learns a marked command from the leader's proposal
 /// before its own copy of the submission arrives sends today's evidence
 /// for it: the mark rides the submission, not the proposal (#204 review,
@@ -2668,4 +2747,56 @@ fn a_turns_relayed_proposals_leave_in_one_frame_at_the_flush() {
         assert!(!w.collector.is_pending(&w.command(sequence)));
     }
     assert_eq!(w.collector.relay_fallbacks(), 0);
+}
+
+/// A leader lowering in groups announces its commit frontier once a
+/// turn, where it flushes, not in each step that moves it (the follow-up
+/// to #242). Here every command commits inside a flush, as the leader's
+/// own batches are lowered there: announced in each step, one flush sent
+/// the two followers 8 frontiers. Now no peer event sends one, each flush
+/// sends each follower at most one and leaves nothing owed, and a
+/// frontier left owed is owed a flush. The followers learn every command
+/// from those frontiers and execute it.
+#[test]
+fn a_grouped_leader_announces_its_frontier_once_a_turn() {
+    let mut w = Cluster::journaled(256);
+    for sequence in 1..=4 {
+        let submit = w.submit(sequence);
+        for i in 0..3 {
+            w.deliver_submission(i, &submit);
+        }
+    }
+    let frontiers = |w: &Cluster<Journaled>| w.voters[0].node().sent_bytes().frontiers;
+    for _ in 0..16 {
+        if w.executed() == [4, 4, 4] {
+            break;
+        }
+        let before = frontiers(&w);
+        settle_peers(&mut w);
+        assert_eq!(frontiers(&w), before, "a peer event announced the frontier");
+        if w.voters[0].node().machine().frontier_owed() {
+            assert!(w.voters[0].owes_flush(), "an owed frontier is owed a flush");
+        }
+        let before = frontiers(&w);
+        let out = w.voters[0].flush().expect("journaled");
+        w.carry(0, out);
+        assert!(
+            frontiers(&w) - before <= 2,
+            "one flush sent {} frontiers to two followers",
+            frontiers(&w) - before
+        );
+        assert!(
+            !w.voters[0].node().machine().frontier_owed(),
+            "the flush left the frontier unannounced"
+        );
+        let out = w.voters[0].finish().expect("materialized");
+        w.carry(0, out);
+        settle_peers(&mut w);
+        for i in 1..3 {
+            let out = w.voters[i].execute().expect("executed");
+            w.carry(i, out);
+        }
+    }
+    assert_eq!(w.executed(), [4, 4, 4]);
+    assert!(frontiers(&w) > 0, "no frontier was announced");
 }

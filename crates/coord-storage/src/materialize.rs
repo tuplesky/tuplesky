@@ -16,7 +16,7 @@ use crate::journaled::TransitionKind;
 use crate::persistence::{Persistence, Refused};
 
 /// Lower a plan into the immutable batch materialization will apply:
-/// current rows, history versions, complete events of the revision, lease
+/// current rows, complete events (each mutated key's version, task-d105) of the revision, lease
 /// records and reverse-index rows, the KV revision frontier, the retention floor and, when the
 /// command has a stable invocation identity, its retry record and executed
 /// identity. The batch carries the plan's base so the worker rechecks it in
@@ -45,34 +45,22 @@ pub fn plan_to_batch(
     let revision = plan.revision;
     for m in &plan.mutations {
         match m {
+            // A write's or a delete's version is its revision's event row
+            // (task-d105): no history row is written.
             Mutation::Write { key, entry } => {
-                let rev = revision.expect("write implies a revision");
+                debug_assert!(revision.is_some(), "a write implies a revision");
                 updates.push(StoreUpdate {
                     collection: Collection::KvCurrentV1.id(),
                     key: codecs::current_key(&namespace, key),
                     value: Some(codecs::encode_current(entry)?),
                 });
-                updates.push(StoreUpdate {
-                    collection: Collection::KvHistoryV1.id(),
-                    key: codecs::history_key(&namespace, key, rev),
-                    value: Some(codecs::encode_history(&codecs::HistoryRecordV1 {
-                        entry: Some(entry.clone()),
-                    })?),
-                });
             }
             Mutation::Delete { key, .. } => {
-                let rev = revision.expect("delete implies a revision");
+                debug_assert!(revision.is_some(), "a delete implies a revision");
                 updates.push(StoreUpdate {
                     collection: Collection::KvCurrentV1.id(),
                     key: codecs::current_key(&namespace, key),
                     value: None,
-                });
-                updates.push(StoreUpdate {
-                    collection: Collection::KvHistoryV1.id(),
-                    key: codecs::history_key(&namespace, key, rev),
-                    value: Some(codecs::encode_history(&codecs::HistoryRecordV1 {
-                        entry: None,
-                    })?),
                 });
             }
             Mutation::LeaseAttach {

@@ -1945,6 +1945,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 Measure::Observed,
             ),
             projection_commits: storage.lowering.commits,
+            hold_ends: coord_daemon::metrics::HoldEnds::of(storage.lowering.hold_ends),
             journal_groups: journal_groups(&storage.lowering.groups),
             history: {
                 let ledger = voter.node().machine().ledger();
@@ -4344,7 +4345,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         self.backing
             .applier_mut()
             .store_mut()
-            .request_projection_commit();
+            .request_projection_commit_for(coord_storage::AskCause::Settle);
         // Bounded per turn and rotated across turns: the bound is on
         // this turn's reads, and the rotation is what keeps it from
         // becoming a bound on which commands are ever read.
@@ -7582,5 +7583,455 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
         assert!(said.contains(&"c7".repeat(32)), "{said}");
         assert!(!said.contains(&"c8".repeat(32)), "{said}");
         assert!(said.contains(", ..."), "{said}");
+    }
+
+    /// The projection commit hold (task-d86) as the serve loop drives it:
+    /// a lone leader over the journal-first store, its projection commits
+    /// lent to a manual materializer under the replay profile and held.
+    mod held_commits {
+        use coord_collector::{
+            Admission, AdmissionLimits, Collector, CollectorConfig, Dispatcher, MonotonicMillis,
+            Progress, Submitted,
+        };
+        use coord_core::capability::AttestedAdmission;
+        use coord_core::effect::{BootId, PeerId};
+        use coord_core::event::AdmittedRequest;
+        use coord_core::outbox::BarrierAllocator;
+        use coord_daemon::mailbox::{Ingress, IngressBudget};
+        use coord_daemon::node::{Machine, Node};
+        use coord_daemon::voter::{Origin, Voter};
+        use coord_state::policy::{Action as PolicyAction, KeyInterval, PolicyRule};
+        use coord_storage::Persistence as _;
+        use coord_storage::journaled::{
+            CommitHold, DurableCadence, JournalLimits, JournaledStore, Submission, TransitionKind,
+        };
+        use coord_storage::policy::{bootstrap_session, rule_update};
+        use coord_storage::{Applier, JournaledDomain, ManualHandle};
+        use coord_store_testkit::journal::ModelJournal;
+        use coord_store_testkit::model::ModelEngine;
+        use coord_types::RetryKey;
+        use coord_types::identity::Digest32;
+        use coord_types::ids::{
+            Ballot, ClientInstanceId, ClusterId, ConfigurationEpoch, DomainId, NamespaceId,
+            PolicyRuleId, PrincipalId, ReplicaId, ReplicaIncarnation, RequestSequence, SessionId,
+        };
+        use coord_types::logical_v1::{CanonicalOperation, LogicalRequest, PutOp};
+        use coord_types::wire_v1::{FrameReader, MessageV1, PeerRole, RequestV1};
+        use std::time::{Duration, Instant};
+
+        /// The cluster and domain of the test module's `membership`.
+        const CLUSTER: ClusterId = ClusterId([0x11; 16]);
+        const DOMAIN: DomainId = DomainId([0x22; 16]);
+        const NS: NamespaceId = NamespaceId([5; 16]);
+        const SESSION: SessionId = SessionId([3; 16]);
+        const ALICE: PrincipalId = PrincipalId([0xa; 16]);
+        const FRONTEND: PeerId = PeerId {
+            replica: ReplicaId([0xf0; 16]),
+            incarnation: ReplicaIncarnation::ZERO,
+        };
+
+        type Journaled = JournaledDomain<ModelJournal, ModelEngine>;
+
+        /// Voter 1 of the test module's `membership`, at its committed
+        /// incarnation.
+        fn me() -> ReplicaId {
+            ReplicaId([1; 16])
+        }
+
+        fn inc() -> ReplicaIncarnation {
+            ReplicaIncarnation::new(7).unwrap()
+        }
+
+        fn epoch() -> ConfigurationEpoch {
+            ConfigurationEpoch::new(1).unwrap()
+        }
+
+        fn ballot() -> Ballot {
+            Ballot {
+                epoch: epoch(),
+                number: 0,
+                leader: me(),
+            }
+        }
+
+        fn retry_key(sequence: u64) -> RetryKey {
+            RetryKey {
+                cluster_id: CLUSTER,
+                domain_id: DOMAIN,
+                session_id: SESSION,
+                client_instance_id: ClientInstanceId([4; 16]),
+                request_sequence: RequestSequence::new(sequence).unwrap(),
+            }
+        }
+
+        fn admitted(sequence: u64) -> AdmittedRequest {
+            let mut logical = LogicalRequest::new(
+                NS,
+                CanonicalOperation::Put(PutOp {
+                    key: b"k".to_vec(),
+                    value: b"v".to_vec(),
+                    lease: None,
+                    prev_kv: false,
+                }),
+            );
+            logical.canonicalize();
+            let request = RequestV1::new(retry_key(sequence), &logical, 0, 0).unwrap();
+            AdmittedRequest {
+                receipt: coord_store_testkit::admission::submitting(AttestedAdmission {
+                    cluster: CLUSTER,
+                    domain: DOMAIN,
+                    session: SESSION,
+                    rule_generation: 1,
+                    scope_ceiling: u32::MAX,
+                    receipt_id: Digest32([7; 32]),
+                    admitted_at_ticks: 0,
+                }),
+                frame: MessageV1::Request(request).encode().unwrap(),
+            }
+        }
+
+        fn frame(bytes: &[u8]) -> coord_types::wire_v1::Frame {
+            let mut reader = FrameReader::new();
+            reader.push(bytes).unwrap();
+            reader.next_frame().unwrap().unwrap()
+        }
+
+        /// One session and the policy rules for it.
+        fn bootstrap_updates() -> Vec<coord_core::effect::StoreUpdate> {
+            let mut updates = bootstrap_session(&SESSION, ALICE, 64, true).unwrap();
+            for (i, action) in PolicyAction::ALL.iter().enumerate() {
+                updates.push(
+                    rule_update(
+                        &PolicyRuleId([i as u8 + 1; 16]),
+                        &PolicyRule {
+                            principal: ALICE,
+                            action: *action,
+                            namespace: NS,
+                            interval: KeyInterval {
+                                lower: vec![],
+                                upper: Some(b"z".to_vec()),
+                            },
+                        },
+                    )
+                    .unwrap(),
+                );
+            }
+            updates
+        }
+
+        /// A lone leader -- the only voter of its ballot -- over the
+        /// journal-first store, lowering in groups, its projection
+        /// commits lent to a manual materializer under the replay profile
+        /// and held for `wait` or 2^32 records.
+        fn held_leader(wait: Duration) -> (Voter<Journaled>, ManualHandle<ModelEngine>) {
+            let boot = BootId([1; 16]);
+            let mut store = JournaledStore::open(
+                ModelJournal::new(),
+                CLUSTER,
+                me(),
+                inc(),
+                boot,
+                JournalLimits::default(),
+            )
+            .unwrap();
+            store
+                .attach(
+                    DOMAIN,
+                    coord_journal_api::stream::ShardId::new(0).unwrap(),
+                    ModelEngine::new(),
+                )
+                .unwrap();
+            let mut alloc = BarrierAllocator::new(inc(), boot);
+            let base = store.application_base(DOMAIN).unwrap();
+            let genesis = Ballot {
+                epoch: base.configuration,
+                number: 0,
+                leader: me(),
+            };
+            store
+                .submit(Submission {
+                    domain: DOMAIN,
+                    ballot: genesis,
+                    kind: TransitionKind::Application {
+                        position: base.execution_position.checked_next().unwrap(),
+                        revision: None,
+                        result_digest: Digest32([0; 32]),
+                    },
+                    batch: coord_core::effect::PersistBatch {
+                        barrier: alloc.allocate(),
+                        base: Some(base),
+                        updates: bootstrap_updates(),
+                    },
+                })
+                .unwrap();
+            store.flush().unwrap();
+            store
+                .replay_projection(DurableCadence {
+                    commits: std::num::NonZeroU32::MAX,
+                    records: std::num::NonZeroU32::MAX,
+                })
+                .expect("the model engine has working state");
+            store
+                .hold_projection_commits(CommitHold {
+                    records: std::num::NonZeroU32::MAX,
+                    wait,
+                })
+                .expect("the replay profile");
+            let (materializer, handle) = coord_storage::ManualMaterializer::new();
+            store
+                .pipeline(Box::new(materializer))
+                .expect("nothing out yet");
+            let domain = JournaledDomain::new(store, DOMAIN, genesis).expect("attached");
+            let applier = Applier::new(domain, alloc).unwrap();
+            let bootstrapped = applier.store().application_base().execution_position;
+            let alone: std::collections::BTreeSet<ReplicaId> = [me()].into_iter().collect();
+            let mut machine = coord_consensus::Leader::new(
+                coord_consensus::LeaderConfig {
+                    identity: coord_consensus::ConfigurationIdentity {
+                        cluster: CLUSTER,
+                        domain: DOMAIN,
+                        epoch: epoch(),
+                        voters: alone.clone(),
+                        replica: me(),
+                        incarnation: inc(),
+                        role: coord_consensus::ReplicaRole::Voter,
+                    },
+                    quorum: coord_consensus::BallotConfiguration::c2(
+                        epoch(),
+                        ballot(),
+                        alone.clone(),
+                        alone,
+                    )
+                    .unwrap(),
+                    genesis: ballot(),
+                    frontend: FRONTEND,
+                    capacity: 64,
+                },
+                None,
+                bootstrapped,
+            );
+            machine.set_learning(coord_consensus::LearningMode::Full);
+            let mut node = Node::new(Machine::Leader(Box::new(machine)), applier, FRONTEND);
+            node.lower_in_groups();
+            let ingress = Ingress::new(
+                &super::membership(),
+                me(),
+                PeerRole::Frontend,
+                IngressBudget::default(),
+            )
+            .expect("a committed voter");
+            let mut voter = Voter::new(node, ingress, (CLUSTER, DOMAIN), ballot());
+            voter.boot(boot, inc()).expect("boot");
+            (voter, handle)
+        }
+
+        /// A collector over the three voters of `membership`.
+        fn collector() -> Collector {
+            Collector::new(CollectorConfig {
+                quorum: coord_consensus::BallotConfiguration::c2_default(
+                    epoch(),
+                    ballot(),
+                    (1..=3u8).map(|n| ReplicaId([n; 16])).collect(),
+                )
+                .unwrap(),
+                max_pending: 16,
+                max_resolved: 16,
+                max_undelivered_bytes: usize::MAX,
+            })
+        }
+
+        /// `collector` submits command `sequence` and `voter` executes it
+        /// and hands its group off, its commit held. Returns the frames
+        /// the voter sent the collector.
+        fn execute(voter: &mut Voter<Journaled>, collector: &mut Collector) -> Vec<Vec<u8>> {
+            let Submitted::FanOut(fan_out) = collector
+                .submit(MonotonicMillis::ZERO, &admitted(1))
+                .expect("submitted")
+            else {
+                panic!("not new work")
+            };
+            let mut frames = voter
+                .on_submission(
+                    PeerRole::Frontend,
+                    &frame(&fan_out.frame),
+                    Origin::Connection(7),
+                )
+                .expect("driven")
+                .expect("admitted")
+                .frontend;
+            for _ in 0..8 {
+                if voter.node().executed == 1 {
+                    break;
+                }
+                frames.extend(voter.flush().expect("journaled").frontend);
+            }
+            assert_eq!(voter.node().executed, 1);
+            frames.extend(voter.finish().expect("handed off").frontend);
+            frames.extend(voter.settle().expect("settled").frontend);
+            frames
+        }
+
+        /// A domain serving over `voter`, its frontend's collector
+        /// `collector`.
+        fn domain(
+            voter: Voter<Journaled>,
+            collector: Collector,
+        ) -> super::super::Domain<Journaled> {
+            let membership = super::membership();
+            let dispatcher = Dispatcher::new(
+                Admission::new(CLUSTER, DOMAIN, AdmissionLimits::default()),
+                collector,
+                16,
+            );
+            let frontend = super::super::Frontend {
+                frontend: coord_session::BoundFrontend::new(
+                    dispatcher,
+                    coord_session::BindingConfig {
+                        issuer: "https://sts.cluster-1".into(),
+                        resource: "tuplesky://cluster-1".into(),
+                        jwks: serde_json::json!({ "keys": [] }),
+                        cluster: CLUSTER,
+                        domain: DOMAIN,
+                    },
+                    super::super::PUMP_BOUND,
+                    16,
+                ),
+                membership,
+                pending: coord_daemon::pending::Pending::new(),
+                answered: coord_daemon::metrics::Answered::default(),
+                local: None,
+                watches: std::collections::BTreeMap::new(),
+                counts: super::super::Counts::default(),
+            };
+            super::super::Domain::new(
+                frontend,
+                super::super::Backing::Voting(Box::new(voter)),
+                super::super::Budgets::default(),
+            )
+        }
+
+        fn voter(domain: &mut super::super::Domain<Journaled>) -> &mut Voter<Journaled> {
+            match &mut domain.backing {
+                super::super::Backing::Voting(voter) => voter,
+                super::super::Backing::Serving(_) => unreachable!("a voting domain"),
+            }
+        }
+
+        /// An api-plane transport for a turn to send through; nothing in
+        /// these tests reaches it.
+        fn transport() -> coord_transport::Transport {
+            use coord_transport_testkit::{TestBinder, TestCa};
+            let ca = TestCa::new();
+            let node = ca.issue("node-1", me(), inc(), coord_types::wire_v1::PeerRole::Voter);
+            let mut binder = TestBinder::new(CLUSTER, DOMAIN);
+            binder.register(&node);
+            let mut local = node.local(&ca, CLUSTER, DOMAIN, vec![1, 2]);
+            local.serves = Some(coord_transport::Class::Api);
+            coord_transport::Transport::bind(
+                "127.0.0.1:0".parse().unwrap(),
+                local,
+                std::sync::Arc::new(binder),
+                coord_transport::Limits::default(),
+            )
+            .unwrap()
+        }
+
+        /// The loop wakes when a held projection commit is due, and the
+        /// turn it takes then lends it (task-d86): on a quiet domain
+        /// nothing else arrives, so these two are what bound a record's
+        /// wait by the hold's. The deadline is the held commit's due time
+        /// and nothing earlier; before it a turn lends nothing, and at it
+        /// a turn lends the commit.
+        #[tokio::test]
+        async fn the_loop_wakes_when_a_held_commit_is_due_and_its_turn_lends_it() {
+            let wait = Duration::from_secs(1);
+            let started = Instant::now();
+            let (mut leader, handle) = held_leader(wait);
+            let mut collector = collector();
+            execute(&mut leader, &mut collector);
+            assert_eq!(handle.waiting(), 0, "the group's commit is held");
+            let due = leader
+                .node()
+                .applier()
+                .store()
+                .projection_commit_due()
+                .expect("records are held");
+            assert!(due >= started + wait);
+            let mut domain = domain(leader, collector);
+            let api = transport();
+            assert_eq!(
+                domain.next_deadline(),
+                Some(due),
+                "the loop wakes at the held commit's due time"
+            );
+            // A turn well before then lends nothing.
+            if Instant::now() + wait / 2 < due {
+                domain.turn(&api).await.expect("a turn");
+                assert_eq!(handle.waiting(), 0, "not lent before it is due");
+            }
+            while Instant::now() < due {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            domain.turn(&api).await.expect("a turn");
+            assert_eq!(handle.waiting(), 1, "the turn at the due time lends it");
+            assert_eq!(
+                voter(&mut domain)
+                    .node()
+                    .applier()
+                    .store()
+                    .projection_commit_due(),
+                None
+            );
+        }
+
+        /// A half-established entry's record is found within one commit
+        /// (task-d86): the collector holds the leader's release and not
+        /// the votes, and this node's record of the command is journaled
+        /// and held for an hour. Looking for it asks for the commit, so
+        /// the next hand-off lends it, and once that commit is back the
+        /// next look finds the record and settles the entry.
+        #[tokio::test]
+        async fn a_half_established_entrys_record_is_found_within_one_commit() {
+            let (mut leader, handle) = held_leader(Duration::from_secs(3600));
+            let mut collector = collector();
+            let frames = execute(&mut leader, &mut collector);
+            let provenance = leader.provenance();
+            let mut released = 0;
+            for bytes in &frames {
+                let f = frame(bytes);
+                if f.kind == coord_collector::KIND_RELEASE {
+                    released += 1;
+                    let progress = collector
+                        .on_release(provenance, coord_collector::decode_release(&f).unwrap())
+                        .expect("taken");
+                    assert!(matches!(progress, Progress::Held(_)), "{progress:?}");
+                }
+            }
+            assert_eq!(released, 1, "the leader released the command");
+            assert_eq!(collector.half_established().len(), 1, "half established");
+            assert_eq!(handle.waiting(), 0, "the group's commit is held");
+            let mut domain = domain(leader, collector);
+
+            assert!(domain.settle_from_records().is_none());
+            assert_eq!(domain.frontend.counts.settled_from_record, 0, "not yet");
+            voter(&mut domain).settle().expect("settled");
+            assert_eq!(
+                handle.waiting(),
+                1,
+                "the look asked for the commit, and the next hand-off lends it"
+            );
+            assert!(handle.run());
+            voter(&mut domain).settle().expect("settled");
+            assert!(domain.settle_from_records().is_none());
+            assert_eq!(domain.frontend.counts.settled_from_record, 1);
+            assert!(
+                domain
+                    .frontend
+                    .frontend
+                    .dispatcher()
+                    .half_established()
+                    .is_empty()
+            );
+        }
     }
 }
