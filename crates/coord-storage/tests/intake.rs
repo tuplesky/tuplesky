@@ -1348,3 +1348,173 @@ fn a_commit_lowered_as_one_batch_writes_what_lowering_a_row_at_a_time_writes() {
         committed
     );
 }
+
+/// How many rows `all` holds in `collection`.
+fn rows_in(all: &AllRows, collection: Collection) -> usize {
+    all[Collection::ALL
+        .iter()
+        .position(|c| *c == collection)
+        .unwrap()]
+    .len()
+}
+
+/// Lower `commit` over `before` both ways, check that one batch writes
+/// what a row at a time writes, and return the rows (#244 review).
+fn lower_both(before: &[StoreUpdate], commit: &[Vec<StoreUpdate>]) -> AllRows {
+    let one_at_a_time = lower_commit(before, commit, false);
+    let batched = lower_commit(before, commit, true);
+    assert_eq!(batched, one_at_a_time);
+    batched.0
+}
+
+/// Step 2's cases for the batch (#244 review), each in one commit. The
+/// payload an execution moves is a row only this commit holds: read past
+/// the batch's own rows, the execution finds no pending payload and rule
+/// (b) refuses it.
+#[test]
+fn a_payload_and_its_execution_in_one_commit_lower_as_one_batch_as_a_row_at_a_time() {
+    let c1 = command_of(1);
+    let before = vec![dependency_update(epoch(), &c1, &record(Phase::Commit, &[])).unwrap()];
+    let commit = vec![
+        vec![payload_update(&c1, &payload_of(1)).unwrap()],
+        vec![executed(&c1, 1)],
+    ];
+    let rows = lower_both(&before, &commit);
+    assert_eq!(
+        [
+            rows_in(&rows, Collection::ExecutionV1),
+            rows_in(&rows, Collection::PayloadV1),
+            rows_in(&rows, Collection::PendingPayloadV1),
+            rows_in(&rows, Collection::DecidedV1),
+            rows_in(&rows, Collection::ProtocolV1),
+        ],
+        [1, 1, 0, 1, 0],
+        "executed rows, payloads moved, none pending, decided records moved, none left by command"
+    );
+}
+
+/// A dependency row and a payload for a command written after it executed
+/// in the same commit (#244 review): one batch writes what a row at a
+/// time writes.
+#[test]
+fn a_late_dependency_row_after_an_execution_in_one_commit_lowers_as_one_batch_as_a_row_at_a_time() {
+    let c1 = command_of(1);
+    let before = vec![
+        dependency_update(epoch(), &c1, &record(Phase::Commit, &[])).unwrap(),
+        payload_update(&c1, &payload_of(1)).unwrap(),
+    ];
+    let commit = vec![
+        vec![executed(&c1, 1)],
+        vec![
+            dependency_update(epoch(), &c1, &record(Phase::Commit, &[])).unwrap(),
+            payload_update(&c1, &payload_of(1)).unwrap(),
+        ],
+    ];
+    let rows = lower_both(&before, &commit);
+    assert_eq!(
+        [
+            rows_in(&rows, Collection::ExecutionV1),
+            rows_in(&rows, Collection::PayloadV1),
+            rows_in(&rows, Collection::PendingPayloadV1),
+            rows_in(&rows, Collection::DecidedV1),
+            rows_in(&rows, Collection::ProtocolV1),
+        ],
+        [1, 1, 0, 1, 0],
+        "executed rows, payloads moved, none pending, decided records moved, none left by command"
+    );
+}
+
+/// A decided record written and moved by its command's execution in the
+/// same commit (#244 review): the record the execution moves to
+/// `decided_v1` is a row only this commit holds.
+#[test]
+fn a_decided_record_moved_in_the_commit_that_wrote_it_lowers_as_one_batch_as_a_row_at_a_time() {
+    let (c1, c2) = (command_of(1), command_of(2));
+    let before = vec![
+        dependency_update(epoch(), &c1, &record(Phase::Commit, &[])).unwrap(),
+        payload_update(&c1, &payload_of(1)).unwrap(),
+    ];
+    let commit = vec![
+        vec![
+            payload_update(&c2, &payload_of(2)).unwrap(),
+            dependency_update(epoch(), &c2, &record(Phase::Commit, &[c1])).unwrap(),
+            executed(&c1, 1),
+        ],
+        vec![executed(&c2, 2)],
+    ];
+    let rows = lower_both(&before, &commit);
+    assert_eq!(
+        [
+            rows_in(&rows, Collection::ExecutionV1),
+            rows_in(&rows, Collection::PayloadV1),
+            rows_in(&rows, Collection::PendingPayloadV1),
+            rows_in(&rows, Collection::DecidedV1),
+            rows_in(&rows, Collection::ProtocolV1),
+        ],
+        [2, 2, 0, 2, 0],
+        "executed rows, payloads moved, none pending, decided records moved, none left by command"
+    );
+}
+
+/// The event row of a put of `k<revision>` (task-d105).
+fn event_put(revision: u64) -> StoreUpdate {
+    let at = KvRevision::new(revision).unwrap();
+    StoreUpdate {
+        collection: Collection::EventsV1.id(),
+        key: coord_storage::codecs::event_key(at, 0),
+        value: Some(
+            coord_storage::codecs::encode_event(&coord_storage::codecs::EventRecordV1 {
+                kind: coord_state::KvEventKind::Put,
+                namespace: NamespaceId([0; 16]),
+                key: format!("k{revision}").into_bytes(),
+                entry: Some(coord_state::KvEntry {
+                    value: vec![revision as u8; 4],
+                    create_revision: at,
+                    mod_revision: at,
+                    version: 1,
+                    lease: None,
+                    lease_generation: None,
+                }),
+                prev: None,
+            })
+            .unwrap(),
+        ),
+    }
+}
+
+/// The delete of the event row at `revision`, as compaction writes it.
+fn event_delete(revision: u64) -> StoreUpdate {
+    StoreUpdate {
+        collection: Collection::EventsV1.id(),
+        key: coord_storage::codecs::event_key(KvRevision::new(revision).unwrap(), 0),
+        value: None,
+    }
+}
+
+/// A commit lowered as one batch leaves the key index's delta as lowering
+/// a row at a time does (#244 review, after #245): each event row is
+/// observed as it is lowered, and a deleted one, which names its key only
+/// in its old value, is read through the batch's own rows. Here an event
+/// row only this commit holds is deleted, beside one the store held.
+/// Without the observation the batch's delta holds none of it; read past
+/// the batch's rows, the row this commit wrote stays added.
+#[test]
+fn a_commit_lowered_as_one_batch_leaves_the_key_index_as_a_row_at_a_time_does() {
+    let before = vec![event_put(1)];
+    let revision = |n: u64| StoreUpdate {
+        collection: Collection::MetaV1.id(),
+        key: meta_fields::KV_REVISION.to_vec(),
+        value: Some(coord_storage::codecs::encode_counter(n).unwrap()),
+    };
+    let commit = vec![
+        vec![event_put(2), event_put(3), revision(3)],
+        vec![event_delete(2), event_delete(1)],
+    ];
+    let one_at_a_time = lower_commit(&before, &commit, false);
+    let batched = lower_commit(&before, &commit, true);
+    assert!(
+        !one_at_a_time.1.is_empty(),
+        "the commit changes the key index: the test shows nothing"
+    );
+    assert_eq!(batched, one_at_a_time);
+}

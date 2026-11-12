@@ -249,26 +249,39 @@ impl Lowered {
             let ordinal = u32::try_from(i)
                 .map_err(|_| EngineError::new(ErrorClass::Limit, "a record of too many updates"))?;
             let (writes, at) = (&self.writes, &self.at);
-            let assigned = assigner.assign(seq, ordinal, update, |key| {
-                match at.get(&(update.collection, key.to_vec())) {
-                    Some(&i) => Ok(writes[i].value.is_some()),
-                    None => Ok(base.get(update.collection, key)?.is_some()),
+            // A row this commit has written is read from here, any other
+            // from `base`: the key index's old value (task-d105) and the
+            // assignment's reads alike.
+            let overlay =
+                |collection: CollectionId, key: &[u8]| match at.get(&(collection, key.to_vec())) {
+                    Some(&i) => Ok(writes[i].value.clone()),
+                    None => base.get(collection, key),
+                };
+            assigner.observe_kv(update, |key| overlay(update.collection, key))?;
+            let assigned = assigner.assign(seq, ordinal, update, overlay)?;
+            match assigned {
+                Assigned::AsIs => self.keep(update.clone()),
+                Assigned::Key(key) => self.keep(StoreUpdate {
+                    collection: update.collection,
+                    key,
+                    value: update.value.clone(),
+                }),
+                Assigned::Skip => {}
+                Assigned::Writes(writes) => {
+                    for write in writes {
+                        self.keep(write);
+                    }
                 }
-            })?;
-            let key = match assigned {
-                Assigned::AsIs => update.key.clone(),
-                Assigned::Key(key) => key,
-                Assigned::Skip => continue,
-            };
-            self.at
-                .insert((update.collection, key.clone()), self.writes.len());
-            self.writes.push(StoreUpdate {
-                collection: update.collection,
-                key,
-                value: update.value.clone(),
-            });
+            }
         }
         Ok(())
+    }
+
+    /// Keep one row; a later row for the same key is the one read.
+    fn keep(&mut self, update: StoreUpdate) {
+        self.at
+            .insert((update.collection, update.key.clone()), self.writes.len());
+        self.writes.push(update);
     }
 
     /// The rows, in the order lowered: a key written twice keeps its last
