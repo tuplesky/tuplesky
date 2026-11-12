@@ -1983,6 +1983,53 @@ So these wait on a follower's commit in steady state: its frontend's gate for a 
 
 **The order:** option 1 first, as task-d86's follower half, since it needs no protocol change; then option 2's cuts, each its own design step. Option 3 is gated on the domain loops' cost model (task-d72's order, after the owner set the goal at parity with etcd, #185): "only if bar 1 is still out of reach" would always hold at parity, so what decides it is whether a follower's executions are a block the loops' budget needs cut, and then only with its argument written and reviewed. Option 4 without a bound is not taken.
 
+**Protocol rows: what stays in the projection, and the row nobody reads (task-d103).** Option 2's first cut was to keep the protocol rows (`PayloadV1`, `ProtocolV1`) in the journal only and read them back over a bounded window. It isn't taken, because their readers look rows up by command over history the journal no longer holds. The journal is read only sequentially (`read_suffix`, `retained_from`), has no index by command, and its prefix is retired at each published checkpoint (every 4,096 records under `strict`, 65,536 or 30 s under `replay`). The readers:
+
+| Reader | What it reads | Could the journal serve it? |
+| --- | --- | --- |
+| Boot (`read_protocol`, `restore_payloads`) | the promise, the seal, every dependency and Sync row of the epoch, and a payload per record | No. It needs every untrimmed row, older than the journal keeps |
+| Catch-up served (`catch_up_entry`) and a campaign's `executed_rows` | executed, payload and dependency rows by command, over any old history | No. Random access by command, beyond the retained journal |
+| Resolve (`retained_answer`'s `requested()`) | the payload, to recover the logical request | No. No index by command |
+| The shared checkpoint | `PayloadV1` of executed commands, which is in the common hash | Only by changing `SharedCheckpointV1` |
+
+`PayloadRequest` is answered from the machine's memory, which boot refills from the rows, so it needs the rows too.
+
+What a command writes there, by role:
+- **A follower:** fanned out, the payload row and the dependency row at its vote (PRE-ACCEPT), then the dependency row again at adoption (ACCEPT). The two dependency rows record two phases recovery reads, so neither can go while the command is fanned out. A relayed command has no vote, so it writes one dependency row. task-d102's relay takes that row off and counts it.
+- **The leader:** the payload row, the dependency row and a proposal row (`ProposalRecordV1`: ballot, sequence number, dependencies, path), all in its proposal batch. Its ACCEPT row is in the same batch when the guard passes there (task-d89), and is written again by `advance_pending` when it doesn't.
+
+**The proposal row is written and never read.** Boot doesn't read it (`read_protocol` reads promise, seal, dependency and Sync rows). Recovery reports dependency rows. `ProposalRequest` is answered from the leader's proposals in memory, those marked durable (`serve_proposals`). The only reader is the checkpoint's trim plan, which nothing calls. It also has no reader it could need:
+- **Its sequence number is ballot-scoped,** and a leader that restarts never leads its ballot again (Section 4.8's condition 4).
+- **Its dependencies and path** are the leader's ACCEPT row's.
+- **The leader's vote is its ACCEPT row,** not the proposal (Section 4.8: persist-before-send binds votes).
+- **The purpose its one comment gives is gone.** The trim plan's branch for it (`classify`, `coord-checkpoint/src/trim.rs`) says: "A proposal row follows its command: the leader must be able to resume a proposal that is not yet settled." No leader resumes a proposal from a row. A leader that restarts never leads its ballot again, and a new ballot's leader re-proposes from the voters' reports (Section 4.9). The comment goes with the write, so the next reader doesn't restore the row for it. `classify` keeps its branch for rows written before the change.
+
+`ProtocolV1` isn't in the common hash, so no scrub or checkpoint compares it.
+
+So task-d103 stops writing the proposal row and removes that comment. That is one row a command at the leader, about a fifth of a row on every voter: about −0.006 to −0.008 ms an operation, on the leader's threads, which are the serial ones at high load. A store written before the change keeps its proposal rows until trim removes them. No reader depends on whether they are there.
+
+**What this leaves of option 2.** The journal-only cut was most of option 2's −0.15 to −0.2. What holds is the proposal row here, the follower's vote row under task-d102's relay, and task-d104's and task-d105's cuts: about −0.07 to −0.09 an operation, before task-d102's share.
+
+**The rows a follower writes a command, against the parity budget** (#206 review). #185's budget asks for 4 or 5 rows a command. From the 12 counted on #185:
+
+| After | Rows a command at a follower |
+| --- | --- |
+| Today | 12 |
+| The relay's vote-time dependency row (task-d102) | 11 |
+| The history row (task-d105) | 10 |
+| The floor's rewrite, at `K = 16` (task-d104) | about 9 |
+
+- **task-d104 batches the retry deletes; it doesn't remove them.** K deletes every K commands is still one a command, so its step is under one row.
+- **The price is a page, not a row** (review on #185, 6812429771, from task-d86's profile). A row that lands on a leaf no other row of its commit touches costs a fresh 4 KiB page: copied on write, rebuilt, checksummed at the working commit and written at the durable one. A row rewritten on a page its commit has already copied costs a few µs. At the sweep's fit, about 9.2 µs a page a voter, a page a command at every voter is about −0.036 to −0.040 ms an operation on the EPYC 9V74.
+  - **So the table counts rows, but the cost follows pages.** A follower writes about 10.8 rows and 9.4 fresh pages a command today. The meta rows and the retry deletes mostly land on pages already copied.
+  - **The three steps together stop well short of the parity budget** for the whole materializer block (0.18 then, restated on the 9V74 in task-d72's record): each takes at most one page a command, and task-d104's first part takes almost none at the bar (its own step).
+- **What's left to cut, each raised on its own step:**
+  - the current row, once task-d105's index exists (task-d105's step);
+  - the retry delete, with a window that overwrites in place (task-d104's step);
+  - the meta row once a commit rather than once a command, with the commit cadence (task-d86, task-d101's option 1).
+
+  With those, a follower writes about five rows a command: payload, dependency, executed, event and retry. Three of them, the payload, dependency and executed rows, are keyed by the command's digest and pay a page each. Keying them by order, so that a commit's rows share leaves, is task-d113's step (#233), the largest single cut on the materializers.
+
 <a id="s17-5"></a>
 ### 17.5 MVCC and physical maintenance
 
