@@ -4240,14 +4240,43 @@ This entry is task-d72's largest single cut on the materializer, owned here. The
    - It builds the index's intake part, the lowering's key assignment, rules (c), (d) and (e) of Section 17.1, and the layout check. Under rule (e), the recovery cut's overlay assigns keys as the lowering does.
    - By the table's shape it is about a third of the gain.
    - Its evidence splits the counting build's file bytes by table, so that each row's size is read rather than inferred. That goes on the metrics line if it is cheap, since testing needs it on the runner too.
+   - **Built (#237, merged at `38e488dd`).** The key is `epoch | tag | seq | ordinal | command`, 53 bytes, the command the key's suffix and the value unchanged. The index's intake part is a per-(epoch, tag) ordered set of (8-byte command prefix, seq, ordinal), built at attach and at the worker's open by a scan of `protocol_v1` of its own, with a prefix collision settled by a point read of the full key. Rules (c), (d) and (e) as Section 17.1 records them, with (e)'s timing; `STORE_FORMAT_VERSION` 2 and the layout check at open. Excluded: step 2, and the generation prefix, which isn't needed.
+     - **The local pair** (base `beb37f8b`, head `82dd6abe`; five voters, `replay`, tmpfs, one tokio worker, a counting build): a follower's fresh pages a command 9.11 → 7.44 at 30 callers and 9.31 → 7.63 at 120, of which `protocol_v1` 1.86 → 0.20 and 1.87 → 0.17, every other table unchanged; the leader's 10.36 → 7.38 and 10.84 → 7.75. Materializer −10 to −11 µs a command at a follower and −19 to −23 at the leader; servers ms an operation −0.044 at 120 and within spread at 30.
+     - **Review's pairs on its host** (#237, 6816192222): a follower 1.7 pages fewer a command in each of three pairs (9.40 → 7.71, 9.61 → 7.89, 9.72 → 8.01), the leader 3.0 to 3.2 fewer; servers' CPU −5.6% and −5.0% at 120 writes only and −6.1% at 30 thirds, about −0.09 ms an operation, more than the design step's prediction. The runner pair is testing's, on the EPYC 9V74.
+     - **The index's memory, measured by review:** 39 to 46 bytes a row (the design step said 24 to 32), about 0.9 s to build at 10⁶ rows, two entries a command at the leader. Nothing trims it in `coordd` yet (task-d27), so it grows about 46 MB a million commands at a follower. Its entries go on the metrics line (`cost.intake_index`).
+   - **What bounds the intake part before task-d27 (the lead on #237; proposed, settled with step 2).** It grows because rows are never deleted. A dependency row is deleted only at a Sync's release and at a catch-up install with no decided record, and the leader's proposal row is never deleted. What each reader asks the index for, and how far back:
+     - **Boot:** nothing. It scans every row it joins.
+     - **Resolve:** nothing. It reads by position, through the retry row.
+     - **The store's own writes** (ACCEPT's rewrite in place, a Sync's release, a catch-up install's rewrite or delete): commands not yet executed here, which the table bounds.
+     - **Catch-up served:** the decided record of each command executed after the asker's frontier. That reaches back to the slowest voter's frontier, or further for a voter that has lost its store.
+     - **A campaign's executed rows** (task-d77): the decided record of a command a behind voter's report names, which this voter executed and forgot. That is a command executed above the slowest reporting voter's frontier.
+     - So the executed commands' entries are the ones that grow, and they are read only for their decided record.
+   - **The smallest bound: move the decided record at execution, as step 2 moves the payload.** When the lowering lowers a command's executed row, it deletes the command's dependency row (and, at the leader, its proposal row) and writes the decided record under the execution position, in a node-private collection, since a record's paths and `synced_seq` are node-private.
+     - The intake part then holds only rows of commands not yet executed: at most the table's capacity, its reserve and a Sync's placeholders, whatever the history.
+     - Catch-up served reads the decided record by position, in the same range as the payload, with no index.
+     - The campaign's executed rows read it through the index's executed part (command to position). That part is the one still growing until a floor forgets a prefix (task-d27). It is smaller (16 to 24 bytes a command inferred, to be measured), and its entries go on the metrics line too.
+     - It costs one row written a command at execution, keyed by position at the right-hand end, and one delete in `protocol_v1` near its right-hand end, since a command executes soon after its intake. The pair reads both.
+     - The alternative is to drop the entries of commands executed below the slowest voter's frontier, with no move. That needs every voter's executed frontier, which `coordd` doesn't keep yet (it is task-d27's floor), and it keeps the rows on disk. So it isn't smaller.
 2. **The payload and executed rows.** This step brings the pending collection, the move, the index's executed part, and rules (a) and (b). It also raises the shared image's version and changes the common hash's membership, behind whatever the format needs.
+   - **Built (#243), with the bound above.**
+     - **Layout:** store format 3. `execution_v1` and `payload_v1` by position; `pending_payload_v1` (0x0012) by intake order; and the bound's `decided_v1` (0x0013), keyed by position, whose value is the epoch followed by the dependency row's bytes.
+     - **At execution:** the lowering moves the pending payload, deletes the command's dependency and proposal rows in every epoch, and writes the latest epoch's record to `decided_v1`.
+     - **Later writes by command for an executed command:** a dependency put or delete follows the record to `decided_v1`; a proposal put writes nothing.
+     - **Boot** reads its epoch's decided records back as records, so each key's latest command comes back with its paths.
+     - **Trim** surveys `decided_v1` under the same pins. A record above the boundary pins its dependencies (Codex's P2 on #243).
+     - **The local pair** (base `b1730c04`, head `31d9473c`; five voters, `replay`, tmpfs, the counting build, three rounds; [#243, 6820336729](https://github.com/tuplesky/tuplesky/pull/243#issuecomment-6820336729)):
+       - **Pages a command:** a follower 7.61 → 4.04 at 30 callers and 7.75 → 4.47 at 120; the leader 7.56 → 3.85 and 7.66 → 4.32. `payload_v1` goes 2.3 → 0.3 (plus 0.1 to 0.2 pending) and the executed rows 1.5 → 0.1.
+       - **Materializer:** 16 to 20 µs a command less in both roles.
+       - **Servers' ms an operation:** 1.336 → 1.234 at 30 and 1.159 → 1.106 at 120.
+       - **Completed a second:** +7.7% and +4.9%.
+       - **The index at the run's end:** the intake part empty at every voter, against one entry a command at a follower and two at the leader on the base. The executed part holds one entry a command.
 
 What the two steps build together:
 - **Rows by order.**
   - `execution_v1` takes the executed row by position; `executed_v1` is no longer written.
   - `payload_v1` takes an executed command's payload by position, moved by the lowering at execution.
   - A new node-private `pending_payload_v1` holds payloads not yet executed, by intake order.
-  - Dependency rows, and the leader's proposal row while it is written, are keyed by epoch, tag and intake order. Their values carry the command identity.
+  - Dependency rows, and the leader's proposal row while it is written, are keyed by epoch, tag and intake order, with the command identity as the key's suffix (53 bytes). Their values are unchanged.
 - **The lowering assigns the keys** (`lower_update`, from `project` and the worker), and keeps the index in memory.
 - **The readers move:**
   - `read_protocol`, `read_history`, `executed_order` and `executed_near` in `coord-storage/src/protocol.rs`;

@@ -4,8 +4,11 @@
 //! identifier order, each in unsigned key order through bounded pages, and
 //! decides per row whether it is common state at the boundary:
 //!
-//! * `payload_v1`: only commands present in `executed_v1` (an unexecuted
-//!   payload is post-boundary evidence the donor supplies separately);
+//! * `payload_v1` and `execution_v1`: keyed by position (task-d113, step
+//!   2), every row at or below the boundary; `payload_v1` holds executed
+//!   commands' payloads only (an unexecuted payload is pending in the
+//!   node-private `pending_payload_v1`, post-boundary evidence the donor
+//!   supplies separately);
 //! * `kv_history_v1`: for every key, the newest version at or below the
 //!   replicated retention floor plus every newer version (what local
 //!   garbage collection converges to, whatever its progress);
@@ -333,15 +336,26 @@ fn traverse<V: OrderedRead>(
                 value: engine_row.value.clone(),
             };
             match collection {
+                // Keyed by position since task-d113's step 2, and only an
+                // executed command's: a payload not yet executed is pending
+                // in the node-private `pending_payload_v1`.
                 Collection::PayloadV1 => {
-                    // Only executed commands are closed state.
-                    if view.get(Collection::ExecutedV1.id(), &row.key)?.is_some() {
-                        include(row, writer)?;
+                    let position =
+                        codecs::position_of(&row.key).map_err(|_| corrupt(collection))?;
+                    if position > boundary.execution_position {
+                        return Err(beyond(collection));
                     }
+                    include(row, writer)?;
                 }
-                Collection::ExecutedV1 => {
-                    let record =
-                        codecs::decode_executed(&row.value).map_err(|_| corrupt(collection))?;
+                Collection::ExecutionV1 => {
+                    let position =
+                        codecs::position_of(&row.key).map_err(|_| corrupt(collection))?;
+                    let record = codecs::decode_execution(&row.value)
+                        .map_err(|_| corrupt(collection))?
+                        .executed;
+                    if record.position != position {
+                        return Err(corrupt(collection));
+                    }
                     if record.position > boundary.execution_position {
                         return Err(beyond(collection));
                     }

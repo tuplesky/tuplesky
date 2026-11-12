@@ -2,11 +2,11 @@
 //! the two runtime halves the protocol machine does not hold.
 //!
 //! The donor half answers a [`coord_consensus::ProtocolMessage::CatchUpRequest`]
-//! from its own durable rows. Its store keys `executed_v1` by command
-//! identity, so which command it executed at a position is not a lookup:
-//! [`ExecutedOrder`] reads the whole table once, the first time a peer
-//! asks, and is kept current from this node's own executions after that.
-//! A page reads nothing but the rows of the commands it carries.
+//! from its own durable rows. Its store keys `execution_v1` and
+//! `payload_v1` by position (task-d113, step 2), so a page is one range of
+//! the executed rows and a read of each command's payload and dependency
+//! row: no order of the whole table is held in memory, as it was while
+//! the table was keyed by command.
 //!
 //! The requester half, [`Pacer`], decides when a voter asks and whom. A
 //! voter that has held work it is not executing for [`STILL_FOR`], and
@@ -88,132 +88,57 @@ pub const BEHIND_HELD: usize = 2 * MAX_CATCH_UP_COMMANDS;
 /// reading is a moment of a load that comes and goes.
 pub const BEHIND_WINDOWS: u8 = 2;
 
-/// This node's executed commands in position order, in memory (task-d08).
-///
-/// Built once from `executed_v1` -- a read of the whole table, O(history)
-/// in time and memory -- and extended by [`ExecutedOrder::note`] as this
-/// node executes, so no page rescans the table. A durable position index
-/// is what would make it cheaper, and is out of this task's scope.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ExecutedOrder {
-    /// The position of `commands[0]`.
-    first: u64,
-    commands: Vec<CommandId>,
-}
-
-impl ExecutedOrder {
-    /// The order of `rows`, as (position, command) in position order.
-    ///
-    /// Only the contiguous run that ends at the highest position is kept:
-    /// a page is contiguous from the requester's frontier, and a gap
-    /// below the run -- which a store that forgot a prefix would show --
-    /// is simply not served.
-    pub fn from_rows(rows: &[(ExecutionPosition, CommandId)]) -> Self {
-        let Some(&(last, _)) = rows.last() else {
-            return ExecutedOrder::default();
-        };
-        let mut start = rows.len() - 1;
-        while start > 0 && rows[start - 1].0.get() + 1 == rows[start].0.get() {
-            start -= 1;
-        }
-        let commands: Vec<CommandId> = rows[start..].iter().map(|(_, c)| *c).collect();
-        ExecutedOrder {
-            first: last.get() + 1 - commands.len() as u64,
-            commands,
-        }
-    }
-
-    /// Read this node's order from its store.
-    pub fn read<P: Persistence>(applier: &Applier<P>) -> Option<Self> {
-        let gated = applier.store().reader().snapshot().ok()?;
-        let rows =
-            coord_storage::protocol::executed_order(gated.view(), ViewBudget::default()).ok()?;
-        Some(ExecutedOrder::from_rows(&rows))
-    }
-
-    /// This node executed `command` at `position`. Returns `false` when
-    /// that is not the next position the order holds, and the order is to
-    /// be read again.
-    pub fn note(&mut self, position: ExecutionPosition, command: CommandId) -> bool {
-        if self.commands.is_empty() {
-            self.first = position.get();
-        }
-        if position.get() != self.first + self.commands.len() as u64 {
-            return false;
-        }
-        self.commands.push(command);
-        true
-    }
-
-    /// Whether a page after `after` can start in this order: it holds
-    /// something, and nothing below the position after `after` is
-    /// missing from it (as [`ExecutedOrder::between`] reads it).
-    pub fn reaches(&self, after: ExecutionPosition) -> bool {
-        !self.commands.is_empty() && after.get().saturating_add(1) >= self.first
-    }
-
-    /// The commands executed after `after`, through `through`, as
-    /// (position, command).
-    pub fn between(
-        &self,
-        after: ExecutionPosition,
-        through: ExecutionPosition,
-    ) -> impl Iterator<Item = (ExecutionPosition, CommandId)> + '_ {
-        let from = after.get().saturating_add(1);
-        let skip = if from >= self.first && !self.commands.is_empty() {
-            usize::try_from(from - self.first).unwrap_or(usize::MAX)
-        } else {
-            // Below what this order holds, or nothing held: a page has to
-            // start at the requester's frontier, and cannot.
-            usize::MAX
-        };
-        self.commands
-            .iter()
-            .enumerate()
-            .skip(skip)
-            .map(|(i, c)| (self.first + i as u64, *c))
-            .take_while(move |(p, _)| *p <= through.get())
-            .filter_map(|(p, c)| ExecutionPosition::new(p).ok().map(|p| (p, c)))
-    }
-}
-
 /// The page a donor sends for `after` (task-d08): the commands it
 /// executed after `after` and through `through`, read from its durable
 /// rows, contiguous, at most [`MAX_CATCH_UP_COMMANDS`] of them and at most
 /// [`MAX_CATCH_UP_BYTES`] beyond the first.
 ///
-/// Stops at the first command whose rows it cannot read, or whose
-/// executed row does not say the position the order does: the page is a
-/// prefix of what the donor can show, never a page with a hole.
+/// The commands are one range of `execution_v1` (task-d113, step 2).
+/// Stops at a gap in the positions, and at the first command whose
+/// payload it cannot read: the page is a prefix of what the donor can
+/// show, never a page with a hole.
 ///
 /// An empty page says why ([`NoPage`]), which the donor counts (task-d106
 /// step 0).
 pub fn page<P: Persistence>(
     applier: &Applier<P>,
-    order: &ExecutedOrder,
     epoch: ConfigurationEpoch,
     after: ExecutionPosition,
     through: ExecutionPosition,
 ) -> Result<Vec<CatchUpEntry>, NoPage> {
-    if !order.reaches(after) {
-        return Err(NoPage::OrderAbove);
-    }
     let Ok(gated) = applier.store().reader().snapshot() else {
         return Err(NoPage::Snapshot);
     };
+    let Ok(rows) = coord_storage::protocol::executed_between(
+        gated.view(),
+        after,
+        through,
+        MAX_CATCH_UP_COMMANDS,
+        ViewBudget::default(),
+    ) else {
+        return Err(NoPage::FirstRow);
+    };
+    // A store with no row at the position after `after` -- one that
+    // forgot a prefix -- cannot start a contiguous page.
+    if rows
+        .first()
+        .is_none_or(|(position, _)| position.get() != after.get().saturating_add(1))
+    {
+        return Err(NoPage::OrderAbove);
+    }
     let mut entries = Vec::new();
     let mut bytes = 0usize;
-    for (position, command) in order.between(after, through) {
-        if entries.len() >= MAX_CATCH_UP_COMMANDS {
+    let mut next = after.get().saturating_add(1);
+    for (position, row) in rows {
+        if position.get() != next {
             break;
         }
-        let Ok(Some(entry)) = coord_storage::protocol::catch_up_entry(&gated, epoch, &command)
+        next = next.saturating_add(1);
+        let Ok(Some(entry)) =
+            coord_storage::protocol::catch_up_entry_at(&gated, epoch, &row.command, row.executed)
         else {
             break;
         };
-        if entry.position != position {
-            break;
-        }
         let len = entry.encoded_len();
         if !entries.is_empty() && bytes.saturating_add(len) > MAX_CATCH_UP_BYTES {
             break;
@@ -230,13 +155,13 @@ pub fn page<P: Persistence>(
 /// Why a donor had no page for an ask (task-d106 step 0).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NoPage {
-    /// Its executed order starts above the position asked, or holds
-    /// nothing: a store that forgot a prefix.
+    /// It holds no executed row at the position after the one asked: a
+    /// store that forgot a prefix.
     OrderAbove,
     /// No snapshot of its store could be taken.
     Snapshot,
-    /// The first command's rows could not be read, or its executed row
-    /// does not say the position the order does.
+    /// The executed rows could not be read, or the first command's
+    /// payload could not.
     FirstRow,
 }
 
@@ -270,7 +195,7 @@ pub fn executed_rows<P: Persistence>(
 /// release side, this node's on its own.
 ///
 /// Where this node had executed the command already, before the position
-/// the donor names, its own side is its `executed_v1` row of it, read
+/// the donor names, its own side is its executed row of it, read
 /// from `applier`; one that cannot be read shows position zero.
 pub fn mismatch<P: Persistence>(
     applier: &Applier<P>,
@@ -326,19 +251,16 @@ pub fn mismatch<P: Persistence>(
     }
 }
 
-/// This node's `executed_v1` row of `command`, if it has one.
+/// This node's executed row of `command`, if it has one: through the
+/// index's executed part, at its position (task-d113, step 2).
 fn executed_record<P: Persistence>(
     applier: &Applier<P>,
     command: &CommandId,
 ) -> Option<coord_storage::codecs::ExecutedRecordV1> {
     let gated = applier.store().reader().snapshot().ok()?;
-    let bytes = coord_store_api::engine::OrderedRead::get(
-        gated.view(),
-        coord_store_api::registry::Collection::ExecutedV1.id(),
-        &coord_storage::codecs::executed_key(command),
-    )
-    .ok()??;
-    coord_storage::codecs::decode_executed(&bytes).ok()
+    coord_storage::protocol::executed_record(&gated, command)
+        .ok()
+        .flatten()
 }
 
 /// What a voter's catch-up looks like to the pacer on one turn.
@@ -614,11 +536,6 @@ impl Pacer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use coord_types::identity::Digest32;
-
-    fn c(n: u8) -> CommandId {
-        CommandId(Digest32([n; 32]))
-    }
 
     fn p(n: u64) -> ExecutionPosition {
         ExecutionPosition::new(n).expect("position")
@@ -626,44 +543,6 @@ mod tests {
 
     fn r(n: u8) -> ReplicaId {
         ReplicaId([n; 16])
-    }
-
-    #[test]
-    fn the_order_keeps_the_run_ending_at_the_highest_position() {
-        let order = ExecutedOrder::from_rows(&[(p(1), c(1)), (p(3), c(3)), (p(4), c(4))]);
-        let served: Vec<_> = order.between(p(2), p(10)).collect();
-        assert_eq!(served, vec![(p(3), c(3)), (p(4), c(4))]);
-        // A frontier below the run cannot start a contiguous page.
-        assert_eq!(order.between(p(1), p(10)).count(), 0);
-    }
-
-    #[test]
-    fn the_order_is_extended_by_execution_and_bounded_by_through() {
-        let mut order = ExecutedOrder::from_rows(&[(p(1), c(1)), (p(2), c(2))]);
-        assert!(order.note(p(3), c(3)));
-        assert!(!order.note(p(5), c(5)), "a gap is refused");
-        let served: Vec<_> = order.between(p(1), p(2)).collect();
-        assert_eq!(served, vec![(p(2), c(2))]);
-        assert_eq!(order.between(ExecutionPosition::ZERO, p(3)).count(), 3);
-    }
-
-    #[test]
-    fn an_empty_order_starts_at_the_first_execution_it_sees() {
-        let mut order = ExecutedOrder::default();
-        assert!(order.note(p(7), c(7)));
-        assert_eq!(order.between(p(6), p(7)).count(), 1);
-    }
-
-    /// A page can start only where the order holds the position after the
-    /// one asked, which a donor counts apart when it cannot (task-d106).
-    #[test]
-    fn an_order_reaches_an_ask_from_its_first_position_on() {
-        let mut order = ExecutedOrder::default();
-        assert!(!order.reaches(p(6)), "an empty order reaches nothing");
-        assert!(order.note(p(7), c(7)));
-        assert!(order.reaches(p(6)));
-        assert!(order.reaches(p(7)));
-        assert!(!order.reaches(p(5)), "position 6 is below the order");
     }
 
     /// A voter's standing, holding a backlog of a page or more when it

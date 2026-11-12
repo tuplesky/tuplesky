@@ -118,6 +118,14 @@ fn domain() -> Applier<StoreWorker<ModelEngine>> {
 /// for every request. It runs until the Go process is done.
 async fn serve(mut transport: Transport, config: BindingConfig) {
     let mut applier = domain();
+    // The barriers of the protocol batches that put each request's payload
+    // before it executes, as a node's proposal batch does (task-d113, step
+    // 2): from the runtime's sequences, which the domain's own allocator
+    // never reaches.
+    let mut payloads = BarrierAllocator::new(ReplicaIncarnation::new(1).expect("positive"), {
+        coord_core::effect::BootId([1; 16])
+    })
+    .for_runtime();
     let mut bound = false;
     while let Some(event) = transport.next_event().await {
         let TransportEvent::ApiRequest {
@@ -168,9 +176,16 @@ async fn serve(mut transport: Transport, config: BindingConfig) {
                 logical: request.logical.as_slice().to_vec(),
                 admission: None,
             };
+            let put = coord_consensus::rows::payload_update(&command, &payload).expect("bounded");
             applier
-                .apply(command, &payload)
+                .store_mut()
+                .submit(coord_core::effect::PersistBatch {
+                    barrier: payloads.allocate(),
+                    base: None,
+                    updates: vec![put],
+                })
                 .ok()
+                .and_then(|()| applier.apply(command, &payload).ok())
                 .and_then(|_| {
                     let gated = applier.store().reader().snapshot().ok()?;
                     coord_storage::retry::lookup(gated.view(), &request.retry_key).ok()?
