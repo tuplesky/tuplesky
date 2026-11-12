@@ -237,6 +237,10 @@ kill_leader() {
   sleep "$FAULT_FOR"
   ( cd "$cwd" && exec "${cmd[@]}" >> "$DIR/$who/coordd.log" 2>&1 ) &
   RESTARTED="$RESTARTED $!"
+  # Named to the harness's supervisor, which otherwise counts only the
+  # voters it started: with the first one killed and this a second, it
+  # would see one of three, stop, and take the third down with it.
+  echo "$!" > "$DIR/$who/replacement.pid"
   note "start $who again (pid $!)"
 }
 

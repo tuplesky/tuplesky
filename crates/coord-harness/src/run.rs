@@ -52,6 +52,35 @@ impl Drop for Daemon {
     }
 }
 
+/// The file, in a voter's directory, that a driver which starts a
+/// stopped voter again writes the new process's identifier into.
+pub const REPLACEMENT_FILE: &str = "replacement.pid";
+
+/// The process a driver started in place of a voter, while it runs.
+///
+/// `up` watches only the processes it started itself. A driver that kills
+/// one voter, starts it again, and then kills a different one would
+/// otherwise leave `up` counting one of three, so `up` would stop and take
+/// the last voter down with it -- a failure nobody injected
+/// (`scripts/bench/register-faults.sh kill`). The identifier counts only
+/// while its process's command line still names this voter's
+/// configuration, so neither an exited replacement nor an identifier the
+/// system has since reused is counted. That is read from `/proc`;
+/// elsewhere no replacement is ever seen and `up` counts as it did.
+pub fn replacement(directory: &Path, config: &Path) -> Option<u32> {
+    let pid: u32 = std::fs::read_to_string(directory.join(REPLACEMENT_FILE))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    let config = config.as_os_str().as_encoded_bytes();
+    cmdline
+        .split(|byte| *byte == 0)
+        .any(|arg| !arg.is_empty() && (arg == config || arg.ends_with(config)))
+        .then_some(pid)
+}
+
 /// Voters that make a quorum of `voters` committed ones: a majority.
 pub const fn quorum(voters: usize) -> usize {
     voters / 2 + 1
@@ -378,7 +407,48 @@ pub fn start_node(
 
 #[cfg(test)]
 mod tests {
-    use super::{Standing, quorum, standing};
+    use super::{REPLACEMENT_FILE, Standing, quorum, replacement, standing};
+
+    /// A replacement counts while it runs and names the voter's
+    /// configuration; an identifier that names something else, an exited
+    /// process, and no file at all do not.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_replacement_counts_only_while_it_runs_as_that_voter() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = dir.path().join("coordd.toml");
+        assert_eq!(replacement(dir.path(), &config), None);
+
+        // `sh -c SCRIPT NAME` keeps NAME in its command line, and a
+        // script of two commands keeps the shell from exec'ing `sleep`.
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("sleep 30; :")
+            .arg(&config)
+            .spawn()
+            .expect("sh");
+        std::fs::write(
+            dir.path().join(REPLACEMENT_FILE),
+            format!("{}\n", child.id()),
+        )
+        .expect("write");
+        assert_eq!(replacement(dir.path(), &config), Some(child.id()));
+        assert_eq!(
+            replacement(dir.path(), &dir.path().join("other.toml")),
+            None
+        );
+
+        child.kill().expect("kill");
+        child.wait().expect("wait");
+        assert_eq!(replacement(dir.path(), &config), None);
+
+        std::fs::write(
+            dir.path().join(REPLACEMENT_FILE),
+            std::process::id().to_string(),
+        )
+        .expect("write");
+        assert_eq!(replacement(dir.path(), &config), None);
+    }
 
     /// Losing one voter of three leaves a quorum, so the harness keeps
     /// the other two serving; losing a second does not, so it stops.

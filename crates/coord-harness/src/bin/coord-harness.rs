@@ -463,12 +463,21 @@ fn up(
     // it would certify an outage instead. Only once fewer than a quorum
     // remain does the harness stop, because a run that kept going then
     // would report the wrong thing about the domain it was measuring.
+    // A voter a driver started again, and named in its directory's
+    // replacement file, counts as running while that process does
+    // (`coord_harness::run::replacement`).
     let mut stopped = vec![false; daemons.len()];
+    let mut replaced: Vec<Option<u32>> = vec![None; daemons.len()];
     loop {
         std::thread::sleep(std::time::Duration::from_millis(500));
         let mut alive = 0;
         let mut changed = false;
-        for (daemon, gone) in daemons.iter_mut().zip(stopped.iter_mut()) {
+        for (((daemon, gone), standing_in), voter) in daemons
+            .iter_mut()
+            .zip(stopped.iter_mut())
+            .zip(replaced.iter_mut())
+            .zip(&provisioned.voters)
+        {
             if daemon.alive() {
                 alive += 1;
                 continue;
@@ -481,6 +490,18 @@ fn up(
                     daemon.node,
                     daemon.log.display()
                 );
+            }
+            let now = coord_harness::run::replacement(&voter.directory, &voter.config);
+            if now.is_some() {
+                alive += 1;
+            }
+            if now != *standing_in {
+                changed = true;
+                match now {
+                    Some(pid) => println!("harness voter-replaced node={} pid={pid}", daemon.node),
+                    None => println!("harness replacement-stopped node={}", daemon.node),
+                }
+                *standing_in = now;
             }
         }
         match coord_harness::run::standing(alive, daemons.len()) {
