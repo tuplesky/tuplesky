@@ -4473,7 +4473,7 @@ Nearly all of the step is history the follower reads, builds and then forgets in
   - a binding, an adopted entry and a served-payload entry for each command.
 - **After:** `sweep_history` drops the follower's copies, and `RecoveredProtocol` goes when `voter()` returns.
   - Locally the resident set was still 563 to 618 MiB 2 s after `phase=live`, with the other voters down and nothing executing.
-  - The runner's fall to 260 MiB came later. What holds the difference until then is the step's first reading.
+  - The runner's fall to 260 MiB came later. What holds the difference until then is the step's first reading, starting with the allocator: freed memory it hasn't returned looks like this, and the heap's in-use figure beside the resident set says which (review on #255).
 
 **The step.** A design first, and no code before its review.
 1. **The boot line splits the step:** the protocol read, building the follower, and the rest, each timed, with the resident set at each.
@@ -4481,11 +4481,14 @@ Nearly all of the step is history the follower reads, builds and then forgets in
    - the records not executed: pending, and bounded by the table's capacity;
    - the executed ones still in its recent window.
    An executed command beyond that comes back as its identity in execution order, from `execution_v1`, with no record and no payload.
-3. **Decided records: only each key's latest.** A key keeps naming its latest command after that command executes, so the chain needs that record and its paths. The design picks one of two ways:
-   - read only those, through the key index or the intake index;
-   - delete a decided row once every key it names has a later executed command. That is a store change, with its own crash cut.
+3. **Decided records: only each key's latest,** decided in task-d117's terms (review on #255, [6839439954](https://github.com/tuplesky/tuplesky/pull/255#issuecomment-6839439954)). A key keeps naming its latest command after that command executes, so the chain needs that record and its paths.
+   - **Neither index can find them.** The key index holds a key's versions, and a refused conditional write names its key and becomes its latest command without writing a version; an event row holds no command or position. The intake index is by command, so it doesn't lead from a key.
+   - **So a key's latest decided record is live protocol state:** it stays in task-d117's recovery map for as long as the table keeps it, and goes to history only once every key it names has a later command.
+   - **Boot then reads records from the image and the journal above it,** and reads history for identities alone. `decided_v1` leaves the projection in task-d117's step 4, so deleting superseded rows from it isn't taken.
 4. **No copies.** The records and payloads move into the follower, and `restore_payloads` reads the follower's own map.
 5. **What stays a command, until task-d27's trim:** the table's executed set and the intake index's executed part (27 bytes an entry, task-d27's note).
+
+**With task-d117.** Both tasks rewrite `read_protocol`. Whichever lands second ports the other, and the test of the same follower (below) is what carries across.
 
 **Not here:**
 - the key index's phase (task-d114);
@@ -4501,7 +4504,7 @@ Nearly all of the step is history the follower reads, builds and then forgets in
   Both followers have the same table, ledger, bindings, payloads and next executable command.
 - **Restarts stay right:** the restart, catch-up and election suites pass, and a restarted voter's first proposal chains after the last command it executed (task-d12).
 
-**Review boundary:** what a restart reads and builds. No change to the rows written, the wire or the journal, unless the design picks step 3's deletion, which then carries its own crash cut.
+**Review boundary:** what a restart reads and builds. No change to the rows written, the wire or the journal; step 3's records move with task-d117's recovery map.
 
 <a id="task-d117"></a>
 ### task-d117: Keep protocol state in the journal only
