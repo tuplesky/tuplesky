@@ -1164,3 +1164,112 @@ fn a_cut_whose_snapshot_is_one_commit_ahead_of_the_take_back_lays_its_rows_where
         summary.records
     );
 }
+
+/// Every collection's rows, in [`Collection::ALL`]'s order.
+type AllRows = Vec<Vec<(Vec<u8>, Vec<u8>)>>;
+
+/// One commit's records lowered by `batched` (each record's rows kept in a
+/// [`Lowered`] and applied as one batch, task-d86) or a row at a time, over
+/// a store that already holds `before`. Returns every collection's rows and
+/// the index's delta.
+fn lower_commit(
+    before: &[StoreUpdate],
+    commit: &[Vec<StoreUpdate>],
+    batched: bool,
+) -> (AllRows, intake::IndexDelta) {
+    use coord_storage::lowering::{Lowered, lower_record};
+    let mut engine = ModelEngine::new();
+    let index = IntakeIndex::build(&engine.reader().snapshot().unwrap(), 0).unwrap();
+    let mut assigner = intake::Assigner::new(&index);
+    let mut tx = engine.begin_write().unwrap();
+    lower_record(&mut tx, &mut assigner, 1, before).unwrap();
+    tx.commit_durable().unwrap();
+    let index = IntakeIndex::build(&engine.reader().snapshot().unwrap(), 1).unwrap();
+    let mut assigner = intake::Assigner::new(&index);
+    let mut tx = engine.begin_write().unwrap();
+    if batched {
+        let mut lowered = Lowered::new();
+        for (i, updates) in commit.iter().enumerate() {
+            lowered
+                .lower_record(&tx, &mut assigner, 2 + i as u64, updates)
+                .unwrap();
+        }
+        tx.apply_updates(lowered.updates()).unwrap();
+    } else {
+        for (i, updates) in commit.iter().enumerate() {
+            lower_record(&mut tx, &mut assigner, 2 + i as u64, updates).unwrap();
+        }
+    }
+    let delta = assigner.into_delta();
+    tx.commit_durable().unwrap();
+    let view = engine.reader().snapshot().unwrap();
+    let all = Collection::ALL.iter().map(|c| rows(&view, *c)).collect();
+    (all, delta)
+}
+
+#[test]
+fn a_commit_lowered_as_one_batch_writes_what_lowering_a_row_at_a_time_writes() {
+    let (c1, c2) = (command_of(1), command_of(2));
+    let proposal = ProposalRecordV1 {
+        ballot: ballot(1),
+        seqnum: 4,
+        deps: Vec::new(),
+        path: Digest32([0x7; 32]),
+    };
+    let before = vec![
+        dependency_update(epoch(), &c1, &record(Phase::PreAccept, &[])).unwrap(),
+        payload_update(&c1, &payload_of(1)).unwrap(),
+    ];
+    let committed = record(Phase::Commit, &[c1]);
+    let commit = vec![
+        // c2 taken in with its proposal row; c1, a row the store holds,
+        // rewritten in place.
+        vec![
+            payload_update(&c2, &payload_of(2)).unwrap(),
+            dependency_update(epoch(), &c2, &record(Phase::PreAccept, &[])).unwrap(),
+            proposal_update(epoch(), &c2, &proposal).unwrap(),
+            dependency_update(epoch(), &c1, &record(Phase::Accept, &[c2])).unwrap(),
+        ],
+        // c2's row, which only this commit holds, rewritten and then
+        // deleted.
+        vec![
+            dependency_update(epoch(), &c2, &record(Phase::Accept, &[c1])).unwrap(),
+            dependency_delete(epoch(), &c2),
+        ],
+        // A delete of a row that is no longer there; c2 taken in again;
+        // c1 deleted and executed.
+        vec![
+            dependency_delete(epoch(), &c2),
+            dependency_update(epoch(), &c2, &committed).unwrap(),
+            dependency_delete(epoch(), &c1),
+            executed(&c1, 1),
+        ],
+    ];
+    let one_at_a_time = lower_commit(&before, &commit, false);
+    let batched = lower_commit(&before, &commit, true);
+    assert_eq!(batched, one_at_a_time);
+
+    // What both wrote: c2's one row, under the key its last intake took
+    // (the third record's second update), with the last value; c1's row
+    // gone; its proposal row from the first record.
+    let e = epoch().to_be_bytes();
+    let protocol = &batched.0[Collection::ALL
+        .iter()
+        .position(|c| *c == Collection::ProtocolV1)
+        .unwrap()];
+    let intake: Vec<_> = protocol
+        .iter()
+        .filter(|(k, _)| matches!(intake::parse(k), ProtocolKey::Intake { .. }))
+        .collect();
+    assert_eq!(
+        intake.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(),
+        vec![
+            intake::intake_key(e, DEPENDENCY_TAG, IntakeOrder { seq: 4, ordinal: 1 }, &c2),
+            intake::intake_key(e, PROPOSAL_TAG, IntakeOrder { seq: 2, ordinal: 2 }, &c2),
+        ]
+    );
+    assert_eq!(
+        coord_consensus::rows::decode_dependency(&intake[0].1).unwrap(),
+        committed
+    );
+}
