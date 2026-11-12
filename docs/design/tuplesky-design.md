@@ -1581,7 +1581,7 @@ Every resource a node holds for a domain has a stated limit, and the limit belon
 | Memory | Sync being installed | the Sync's entries, at most 5 × `max_report_entries(capacity)`; installation examines an entry once per change to what it waits on, so it costs time linear in entries and edges |
 | Memory | Candidate reports | per reporter, `ceil(2 × capacity / 256) + 1` pages of 256 entries; the complete reports are assembled, a copy of every entry, only once a majority could be complete, so at most `voters - majority + 1` times per campaign |
 | Memory | Sync binding | the selection and one encoding of it; the frame size is counted from that encoding |
-| Memory | Catch-up window | one page: 64 commands and 1 MiB |
+| Memory | Catch-up window | one page: 125 commands and 1 MiB; the page asked ahead waits outside the table, so at most two pages are in hand (task-d25) |
 | Memory | Collector | `limits.max_outstanding_per_session` entries per session, and undelivered bytes of that many requests of `limits.max_request_bytes` plus 128 KiB each |
 | Memory | Transport send | 16 MiB in flight per destination and 64 MiB per node, 2 MiB of each reserved for the control lane |
 | Memory | Transport receive | 64 MiB of frames being received per node, the same control reserve; a frame takes its whole length once its header is in and waits for room before its payload is read |
