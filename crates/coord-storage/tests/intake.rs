@@ -171,6 +171,9 @@ enum Store {
 
 type Raw = <ModelEngine as LocalEngine>::Reader;
 
+/// A row as (key, value).
+type RawRow = (Vec<u8>, Vec<u8>);
+
 impl Store {
     fn journaled() -> Self {
         let mut store = JournaledStore::open(
@@ -205,7 +208,7 @@ impl Store {
         // A barrier is unique within a boot; the allocator is per boot.
         thread_local! {
             static ALLOC: std::cell::RefCell<BTreeMap<u8, BarrierAllocator>> =
-                std::cell::RefCell::new(BTreeMap::new());
+                const { std::cell::RefCell::new(BTreeMap::new()) };
         }
         let boots = match self {
             Store::Journaled { boots, .. } | Store::Worker { boots, .. } => *boots,
@@ -845,7 +848,7 @@ fn a_worker_group_whose_outcome_is_not_known_settled_either_way_leaves_the_index
 
 /// The intake rows of a journaled store that took the load below in, all
 /// of it materialized.
-fn loaded(materialize_every: usize) -> (Store, Vec<(Vec<u8>, Vec<u8>)>) {
+fn loaded(materialize_every: usize) -> (Store, Vec<RawRow>) {
     let mut store = Store::journaled();
     let mut rng = Lcg(7);
     for i in 0..60u64 {
@@ -867,7 +870,7 @@ fn loaded(materialize_every: usize) -> (Store, Vec<(Vec<u8>, Vec<u8>)>) {
             }
         }
         store.protocol(updates);
-        if materialize_every != 0 && i as usize % materialize_every == 0 {
+        if materialize_every != 0 && (i as usize).is_multiple_of(materialize_every) {
             store.materialize();
         }
     }
@@ -903,7 +906,7 @@ fn a_replay_of_the_journal_suffix_writes_the_same_keys_as_the_first_lowering() {
                 }
             }
             store.protocol(updates);
-            if every != 0 && i as usize % every == 0 {
+            if every != 0 && (i as usize).is_multiple_of(every) {
                 store.materialize();
             }
         }
