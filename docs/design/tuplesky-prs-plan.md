@@ -1896,7 +1896,7 @@ Count only adoption acknowledgements toward the slow majority, leaving the fast 
   - **at 1,000 commands a second offered:** back within 600 of the others 9.2 and 9.3 s after it resumed, from 8,000 to 9,000 behind. It stayed within the spread the other voters show between snapshots. `ignored_after` was 0 and `pacer_asks` 2 to 3 over the run. Without the change, it never came within 600 and ended 2,800 to 3,400 behind, with 33 to 35 pages dropped and 35 to 38 pacer asks.
   - **closed loop, 1,500 to 1,600 a second:** the chain held, with `ignored_after` 0, `pacer_asks` 2 to 3, and about a quarter more pages than without the change (1,220 to 1,288 against 918 to 1,114). But one page in hand pulled 1,200 to 1,300 commands a second, below the domain's rate, so the gap grew. A voter that fell a page behind with no fault grew its gap the same way, in 3 of 4 runs.
 
-Asking one page ahead (the reserve then holds two windows), or a larger page, is the next lever if the bar's load needs a voter to gain on a saturated domain. Section 13's catch-up figure is the measured one.
+Asking one page ahead (the page asked ahead waits outside the table, so the reserve still holds one window), or a larger page, is the next lever if the bar's load needs a voter to gain on a saturated domain. Section 13's catch-up figure is the measured one.
 
 **A voter whose table is full (#98, [6803978023](https://github.com/tuplesky/tuplesky/pull/98#issuecomment-6803978023)).** At closed-loop load locally, with three frontends at about 1,700 commands a second, a follower carrying a frontend slipped with its loop at about a third of a core. In the same second, its send queue to the leader filled and its table reached its bound. From then on:
 - its machine refused the live stream (`Backpressure`), its own frontend's submissions included;
@@ -1907,7 +1907,7 @@ One page in hand doesn't do that at a saturated domain:
 - on the runner (run 43076106599, [6804177252](https://github.com/tuplesky/tuplesky/pull/98#issuecomment-6804177252)), it pulls 460 to 1,300 a second sustained, with bursts near 2,000.
 
 This is its own limit, not built now and off the 2.0x path. Its two levers, in order:
-1. ask one page ahead (the table's reserve then holds two windows, and the donor's bulk lane two pages);
+1. ask one page ahead (the page asked ahead waits outside the table, so the reserve still holds one window; the donor's bulk lane carries two pages);
 2. a larger page.
 
 The relay (task-d102's step B, #224) removes the bar's shape of it: with `batched-round` on, every voter kept up. On the runner, where all five voters carry frontends at 770 to 960 commands a second, no voter fell behind ([6803845553](https://github.com/tuplesky/tuplesky/pull/98#issuecomment-6803845553)).
@@ -1923,6 +1923,7 @@ The relay (task-d102's step B, #224) removes the bar's shape of it: with `batche
   - a page of 125, within today's reserve and report bound;
   - asking one page ahead. That changes the one-page-in-hand rule #223's one-ask-a-page logic rests on, so the PR re-argues its invariants: no command installed twice or skipped with two pages in flight, a stale or out-of-order page, a page arriving after the frontier passed it, and the reserve holding with a page in hand and one on its way. The simulator's catch-up settings are swept over it, and review's ordering test is extended to two pages in flight;
   - acceptance, locally and then in the fault run: a voter stopped 9 s under full load with the relay active is back within 600 of the leader in a stated time while the load continues, with the donor loop's longest step read beside it.
+- **Built (the rejoin PR, 2026-11-11):** a page of 125, and one page asked ahead from the end of what is in hand, taken only at that exact tail and queued outside the table, so a window is still one page. The pacer also asks for a voter that moves without closing its gap (at least two pages held and not a page fewer after a page of progress), and the paths line counts across a change of role (#98, [6807495802](https://github.com/tuplesky/tuplesky/pull/98#issuecomment-6807495802)). Locally, at the setup above (two runs each, the relay on): the stopped voter is back within 600 of the leader 16 to 20 s after it resumes, about 30 s before the load ends, executing 2,475 to 2,632 a second against the leader's 1,670 to 1,707. On #226's head it executes 1,085 to 1,104 a second and ends 37,000 to 41,000 behind. The donor spends 3.4 to 3.7 ms of its loop a page of 125, 13 ms at the longest. The fault run's reading is testing's.
 
 The metrics line now carries the table (`table`): its records against its bound, those below EXECUTED and of them the ready ones, the catch-up window in hand, and what the oldest unexecuted record waits on (its payload, its commit, a dependency, or nothing in the table). So the first cause of the next slip is read rather than inferred.
 
@@ -1937,6 +1938,8 @@ The metrics line now carries the table (`table`): its records against its bound,
 **Acceptance:** Each limit has a test that drives it and fails when it is exceeded. A long run shows memory flat in history once admission stops.
 
 **Review boundary:** The contract text, the accounting and the bounds it adds. No change to protocol messages or rows. The executed-history set (`CommandTable.history`) and the per-key tombstones in memory are not bounded here: their owner is task-d46, which retires in-memory history above the floor continuously; the durable rows below the floor are task-d27's.
+
+**The admission rate's scope: the owner's decision, for now (2026-11-11).** `limits.max_admitted_per_second` stays a bound for each frontend, and its default stays 1,000 a second. #228 counts its refusals and states it in every bench reading, and changes neither. What this leaves open: the rule above, that the admitted rate stays below the rate a catching-up voter executes, does not hold on the defaults for a domain of several frontends. Three frontends admit up to 3,000 a second and five up to 5,000, against 1,540 to 1,610 a second caught up under load at a page of 64 (#98, 6806617592). The question is revisited against the rate the rejoin PR (a page of 125, one page asked ahead) measures.
 
 <a id="task-d27"></a>
 ### task-d27: Wire quorum-safe forgetting into coordd

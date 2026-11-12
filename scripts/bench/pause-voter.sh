@@ -31,6 +31,10 @@
 #   MIX          the bench's operation mix            (default
 #                put=15,get=55,contended=20,txn=5)
 #   STATE_ROOT   where the domain is kept             (default /dev/shm)
+#   ADMITTED_PER_SECOND  new requests each frontend admits a second,
+#                written into every voter's [limits] and stated in each
+#                reading's label (default 1000, the daemon's own default,
+#                set explicitly so a reading says what it ran under)
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
@@ -47,6 +51,11 @@ PAUSE_AT=${PAUSE_AT:-5}
 PAUSE_FOR=${PAUSE_FOR:-5}
 MIX=${MIX:-put=15,get=55,contended=20,txn=5}
 STATE_ROOT=${STATE_ROOT:-/dev/shm}
+# The admission rate every frontend runs under, set rather than left to
+# the daemon's default: at a few hundred commands a second per frontend
+# it binds, so a reading states it (task-d26).
+ADMITTED_PER_SECOND=${ADMITTED_PER_SECOND:-1000}
+export COORD_HARNESS_MAX_ADMITTED_PER_SECOND=$ADMITTED_PER_SECOND
 
 for binary in "$COORDD" "$HARNESS" "$BENCH"; do
   [ -x "$binary" ] || { echo "pause-voter.sh: $binary is not executable; build it first" >&2; exit 1; }
@@ -166,7 +175,7 @@ PY
 
 note "pause-voter.sh: $MEASURED operations at $CALLERS callers; n3 (pid $PAUSED) stopped at ${PAUSE_AT}s for ${PAUSE_FOR}s"
 "$BENCH" --dir "$DIR" \
-  --label "pause one voter, 3 voters, $CALLERS callers" \
+  --label "pause one voter, 3 voters, $CALLERS callers, admitting $ADMITTED_PER_SECOND/s a frontend" \
   --durability "journal-first, one fsync per record" \
   --topology "single-host loopback, 3 voters" \
   --arrival-ns 0 --warmup-ops 100 --measured-ops "$MEASURED" --mix "$MIX" \

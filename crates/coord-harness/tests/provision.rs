@@ -1115,3 +1115,89 @@ fn the_checkpoint_interval_is_written_into_every_voter_and_recorded() {
     assert!(!ok, "an interval that does not parse was accepted");
     assert!(config.is_none());
 }
+
+/// task-d26: the admission rate each voter's frontend holds to is part of
+/// what is provisioned, so a run can say what it ran and a throughput run
+/// can lift it out of the way. Without it nothing is written and the
+/// daemon's 1,000 a second stands; with it every voter's `[limits]`
+/// carries it beside any checkpoint interval, and the description
+/// records it. The binary takes it from `--max-admitted-per-second` or
+/// `COORD_HARNESS_MAX_ADMITTED_PER_SECOND`, and refuses zero, which the
+/// daemon would refuse at start.
+#[test]
+fn the_admission_rate_is_written_into_every_voter_and_recorded() {
+    let dir = tempfile::tempdir().expect("a run directory");
+    let out = provision(&Plan {
+        max_admitted_per_second: Some(100_000),
+        ..Plan::loopback(dir.path().to_path_buf(), 3, 0)
+    })
+    .expect("provisioned");
+    for node in &out.voters {
+        let config = std::fs::read_to_string(&node.config).expect("config");
+        let limits = &config[config.find("\n[limits]\n").expect("a limits section")..];
+        assert!(
+            limits.contains("\nmax_admitted_per_second = 100000\n"),
+            "{limits}"
+        );
+        assert!(!limits.contains("checkpoint_after_records"), "{limits}");
+    }
+    assert_eq!(
+        Provisioned::read(dir.path())
+            .expect("the description")
+            .max_admitted_per_second,
+        Some(100_000)
+    );
+
+    let binary = env!("CARGO_BIN_EXE_coord-harness");
+    let run = |args: &[&str], env: &[(&str, &str)]| {
+        let dir = tempfile::tempdir().expect("a run directory");
+        let output = std::process::Command::new(binary)
+            .arg("provision")
+            .arg("--dir")
+            .arg(dir.path())
+            .arg("--voters")
+            .arg("3")
+            .args(args)
+            .env_remove("COORD_HARNESS_CHECKPOINT_AFTER_RECORDS")
+            .env_remove("COORD_HARNESS_MAX_ADMITTED_PER_SECOND")
+            .envs(env.iter().copied())
+            .output()
+            .expect("ran");
+        let config = std::fs::read_to_string(dir.path().join("n1/coordd.toml")).ok();
+        (output.status.success(), config)
+    };
+    let (ok, config) = run(
+        &["--max-admitted-per-second", "1000"],
+        &[("COORD_HARNESS_CHECKPOINT_AFTER_RECORDS", "65536")],
+    );
+    assert!(ok);
+    let config = config.expect("config");
+    assert!(
+        config.contains("checkpoint_after_records = 65536\n"),
+        "{config}"
+    );
+    assert!(
+        config.contains("max_admitted_per_second = 1000\n"),
+        "{config}"
+    );
+    let (ok, config) = run(&[], &[("COORD_HARNESS_MAX_ADMITTED_PER_SECOND", "100000")]);
+    assert!(ok);
+    assert!(
+        config
+            .expect("config")
+            .contains("max_admitted_per_second = 100000\n")
+    );
+    let (ok, config) = run(&[], &[("COORD_HARNESS_MAX_ADMITTED_PER_SECOND", "")]);
+    assert!(ok);
+    assert!(!config.expect("config").contains("[limits]"));
+    for zero in [&["--max-admitted-per-second", "0"][..], &[]] {
+        let env: &[(&str, &str)] = if zero.is_empty() {
+            &[("COORD_HARNESS_MAX_ADMITTED_PER_SECOND", "0")]
+        } else {
+            &[]
+        };
+        let (ok, config) = run(zero, env);
+        assert!(!ok, "a rate of zero was accepted");
+        assert!(config.is_none());
+    }
+}

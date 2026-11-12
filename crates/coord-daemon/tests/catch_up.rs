@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use coord_collector::{Collector, CollectorConfig, MonotonicMillis, Submitted};
 use coord_consensus::{
     BallotConfiguration, ConfigurationIdentity, Follower, FollowerConfig, Leader, LeaderConfig,
-    LearningMode, ReplicaRole,
+    LearningMode, MAX_CATCH_UP_COMMANDS, ReplicaRole,
 };
 use coord_core::capability::{AdmissionReceipt, AttestedAdmission, VerifierToken};
 use coord_core::effect::{BootId, PeerId};
@@ -289,6 +289,8 @@ struct Cluster {
     /// The next catch-up ask voter `.0` sends to voter `.1` is lost, or
     /// with `.2`, the next catch-up page.
     lose: Option<(usize, usize, bool)>,
+    /// How many of those to let through before the one lost.
+    lose_after: usize,
     /// Every frame voter `.0` sends to voter `.1` but catch-up's is lost:
     /// a leader with nothing for that voter to adopt.
     mute: Option<(usize, usize)>,
@@ -311,6 +313,7 @@ impl Cluster {
             sequence: 0,
             backpressure: vec![0; 3],
             lose: None,
+            lose_after: 0,
             mute: None,
         }
     }
@@ -334,8 +337,11 @@ impl Cluster {
                     )
                 )
             {
-                self.lose = None;
-                continue;
+                if self.lose_after == 0 {
+                    self.lose = None;
+                    continue;
+                }
+                self.lose_after -= 1;
             }
             if self.mute == Some((from, to))
                 && !matches!(
@@ -561,6 +567,25 @@ fn a_follower_cut_off_for_thirty_seconds_serves_within_ten_of_the_heal() {
     // Its history is the leader's, row for row: the same commands at the
     // same positions with the same results.
     assert_eq!(cluster.executed_rows(2), cluster.executed_rows(0));
+
+    // A role change keeps what the metrics line counts (#98, 6807495802,
+    // a voter's line read 0 after a heal): r2 campaigns and leads, and its
+    // node still counts the pages it took as a follower.
+    let before = cluster.voters[2].node().catch_up_since_start();
+    assert!(before.0 > 0, "r2 took no pages: the test shows nothing");
+    let (_, out) = cluster.voters[2]
+        .campaign()
+        .expect("stepped")
+        .expect("a follower campaigns");
+    cluster.carry(2, out);
+    cluster.settle();
+    assert!(cluster.voters[2].leads(), "r2 did not win its campaign");
+    assert_eq!(
+        cluster.voters[2].node().machine().catch_up_counts(),
+        (0, 0),
+        "a leader's machine counts no catch-up: the test shows nothing"
+    );
+    assert_eq!(cluster.voters[2].node().catch_up_since_start(), before);
 }
 
 /// A voter that restarts behind holding nothing asks, whatever it holds,
@@ -626,6 +651,66 @@ fn a_voter_restarted_behind_whose_first_ask_is_lost_still_catches_up_in_a_quiet_
                 "{what}: a level voter kept asking"
             );
             assert_eq!(cluster.pacers[2].next_deadline(), None, "{what}");
+        }
+    }
+}
+
+/// A chain's later ask or page lost in a quiet domain (#226 review): the
+/// probe used to end at the first page, after which the asks were the
+/// chain's alone, so a voter holding nothing whose second ask or page was
+/// lost never asked again (review's case: r2 at 105 of 141 for 30 ticks).
+/// Each ask and each page of a chain of several pages is lost in turn,
+/// with the leader muted and with its traffic: r2 must end level, and then
+/// stop asking.
+#[test]
+fn a_voter_whose_chain_loses_any_ask_or_page_still_catches_up_in_a_quiet_cluster() {
+    for muted in [true, false] {
+        for nth in 0..4 {
+            for (lose_from, lose_to, page, what) in [(2, 0, false, "ask"), (0, 2, true, "page")] {
+                let what = format!("{what} {nth}, muted {muted}");
+                let mut cluster = Cluster::new();
+                for _ in 0..2 {
+                    cluster.second();
+                }
+                cluster.down = vec![2];
+                for _ in 0..25 {
+                    cluster.second();
+                }
+                cluster.down.clear();
+                cluster.pacers[2] = Pacer::default();
+                assert!(
+                    !cluster.voters[2].node().machine().holds_unexecuted(),
+                    "{what}: r2 holds work, so this is not the quiet case"
+                );
+                let behind = cluster.executed_through(0) - cluster.executed_through(2);
+                assert!(
+                    behind > 3 * MAX_CATCH_UP_COMMANDS as u64,
+                    "{what}: r2 is only {behind} behind, a chain of under four pages"
+                );
+                cluster.lose = Some((lose_from, lose_to, page));
+                cluster.lose_after = nth;
+                cluster.mute = muted.then_some((0, 2));
+                for _ in 0..30 {
+                    cluster.tick();
+                }
+                assert!(cluster.lose.is_none(), "{what}: nothing was lost");
+                assert_eq!(
+                    cluster.executed_through(2),
+                    cluster.executed_through(0),
+                    "{what} lost: r2 stopped short ({:?})",
+                    cluster.voters[2].node().machine().catch_up_paths()
+                );
+                let asked = cluster.voters[2].node().machine().catch_up_paths().asked;
+                for _ in 0..10 {
+                    cluster.tick();
+                }
+                assert_eq!(
+                    cluster.voters[2].node().machine().catch_up_paths().asked,
+                    asked,
+                    "{what}: a level voter kept asking"
+                );
+                assert_eq!(cluster.pacers[2].next_deadline(), None, "{what}");
+            }
         }
     }
 }

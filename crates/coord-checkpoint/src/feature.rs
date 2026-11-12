@@ -484,11 +484,28 @@ pub fn activation_over(
 pub struct TooOld {
     /// Active features this build does not support.
     pub missing: Vec<Feature>,
+    /// Active feature ids this build does not know at all: a build older
+    /// than the feature, which is what a real downgrade meets. Refused as
+    /// too old, not as a corrupt record (#227 review).
+    pub unknown: Vec<u16>,
 }
 
 impl core::fmt::Display for TooOld {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "this build is too old for this cluster: ")?;
+        if !self.unknown.is_empty() {
+            f.write_str("it does not know the active feature id ")?;
+            for (i, id) in self.unknown.iter().enumerate() {
+                if i > 0 {
+                    f.write_str(", ")?;
+                }
+                write!(f, "{id:#06x}")?;
+            }
+            if self.missing.is_empty() {
+                return Ok(());
+            }
+            f.write_str("; and ")?;
+        }
         for (i, feature) in self.missing.iter().enumerate() {
             if i > 0 {
                 f.write_str(", ")?;
@@ -526,14 +543,45 @@ pub fn admit_encoded(bytes: &[u8]) -> Result<BTreeSet<Feature>, AdmitError> {
 /// Whether this build can do every feature `record` makes active, and
 /// what it turns on.
 pub fn admit_record(record: &ActiveFeaturesV1) -> Result<BTreeSet<Feature>, AdmitError> {
-    let active = record.features()?;
     let supported: BTreeSet<Feature> = Supported::features().into_iter().collect();
+    if let Some(too_old) = unknown_ids(record, &supported) {
+        return Err(AdmitError::TooOld(too_old));
+    }
+    let active = record.features()?;
     ActiveFeatures::recovered(active.clone())
         .admits(&supported)
-        .map_err(|missing| AdmitError::TooOld(TooOld { missing }))?;
+        .map_err(|missing| {
+            AdmitError::TooOld(TooOld {
+                missing,
+                unknown: Vec::new(),
+            })
+        })?;
     // A prepare marker is a requirement on this build, read above, and
     // turns nothing on: only a feature's own id does (task-d99).
     Ok(active.into_iter().filter(|f| !f.is_marker()).collect())
+}
+
+/// A record naming an id this build doesn't know: refused as too old,
+/// with the ids it doesn't know and the known ones it doesn't support.
+/// `None` when every id is known (a duplicate is still read as corrupt
+/// by [`ActiveFeaturesV1::features`]).
+fn unknown_ids(record: &ActiveFeaturesV1, supported: &BTreeSet<Feature>) -> Option<TooOld> {
+    let unknown: Vec<u16> = record
+        .features
+        .iter()
+        .copied()
+        .filter(|id| Feature::from_id(*id).is_none())
+        .collect();
+    if unknown.is_empty() {
+        return None;
+    }
+    let missing = record
+        .features
+        .iter()
+        .filter_map(|id| Feature::from_id(*id))
+        .filter(|f| !supported.contains(f))
+        .collect();
+    Some(TooOld { missing, unknown })
 }
 
 /// Why a store was not admitted.
@@ -767,6 +815,10 @@ pub fn installed_record(
     {
         return Err(InstallActivationError::OtherDomain);
     }
+    let supported: BTreeSet<Feature> = Supported::features().into_iter().collect();
+    if let Some(too_old) = unknown_ids(offered, &supported) {
+        return Err(InstallActivationError::TooOld(too_old));
+    }
     let features = offered.features()?;
     let unsupported: Vec<Feature> = features
         .iter()
@@ -776,6 +828,7 @@ pub fn installed_record(
     if !unsupported.is_empty() {
         return Err(InstallActivationError::TooOld(TooOld {
             missing: unsupported,
+            unknown: Vec::new(),
         }));
     }
     let offered_active: BTreeSet<Feature> = features

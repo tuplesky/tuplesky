@@ -78,12 +78,14 @@ pub struct Limits {
     /// as a burst (task-d26). A retry of a request still outstanding is
     /// not a new one.
     ///
-    /// Bounded below the rate at which a voter catching up executes: a
-    /// page of up to 64 commands installed in one batch (task-d25). A
+    /// Meant to be below the rate at which a voter catching up executes,
+    /// a page of up to 64 commands installed in one batch (task-d25). A
     /// voter returning behind gains on the domain by the difference, so
     /// the time it takes to close a gap is bounded by the gap; admitted
     /// faster than it can execute, it never closes it. The bound is per
-    /// frontend: a domain served by several admits their sum.
+    /// frontend: a domain served by several admits their sum, which the
+    /// default no longer keeps below that rate
+    /// ([`DEFAULT_MAX_ADMITTED_PER_SECOND`]).
     #[serde(default = "default_max_admitted_per_second")]
     pub max_admitted_per_second: u32,
 }
@@ -101,13 +103,25 @@ pub const DEFAULT_REPLAY_CHECKPOINT_AFTER_RECORDS: u64 = 65_536;
 pub const DEFAULT_REPLAY_CHECKPOINT_AFTER_SECONDS: u64 = 30;
 
 /// The admission rate a configuration that names none gets (task-d26): a
-/// design target and a ceiling, not a proved bound. It is under a sixth
-/// of what catch-up would execute at one 64-command window per durable
-/// batch of 10 ms, which nothing has measured; task-d33's budget oracle
-/// is its check. At the 35 to 100 commands a second a domain sustains
-/// today it never binds. It gates client requests only: resolves,
+/// design target and a ceiling, not a proved bound; task-d33's budget
+/// oracle is its check. It gates client requests only: resolves,
 /// watches and held retries bypass it, and every session of a frontend
 /// shares one bucket.
+///
+/// It is close to binding. Five voters on one four-core host with three
+/// frontends sustain about 1,500 to 1,700 commands a second at 120
+/// callers (#224, #225). The busiest frontend admits 630 to 770 of them
+/// a second at the median, and up to 977 in its busiest second, within
+/// 3% of this bound. A faster domain, or one served by fewer frontends,
+/// is refused here first. So a reading states the rate it ran under,
+/// and the `admission` line says what the rate refused.
+///
+/// Catch-up is measured now, not the 64-command window every 10 ms
+/// assumed here before. A page costs about 22 ms plus 0.28 ms a command,
+/// so a voter rejoining at full load with the relay executes about 1,600
+/// commands a second at 64 a page and 2,200 at 125 (#98). That is not
+/// the sixfold margin over this bound it was set with, and a domain
+/// admitting the sum of several frontends' bounds outruns it.
 pub const DEFAULT_MAX_ADMITTED_PER_SECOND: u32 = 1000;
 
 const fn default_max_admitted_per_second() -> u32 {

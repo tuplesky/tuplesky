@@ -672,7 +672,7 @@ fn an_activation_record_this_build_cannot_run_is_refused_at_open() {
         );
         match (opened, opens) {
             (Ok(features), true) => assert_eq!(features.active(), set(&[EP])),
-            (Err(e), false) => assert!(e.contains("unknown active feature"), "{e}"),
+            (Err(e), false) => assert!(e.contains("too old") && e.contains("0x7fff"), "{e}"),
             (Ok(features), false) => panic!(
                 "{features:?}: opened over a record it cannot run, active {:?}",
                 features.active()

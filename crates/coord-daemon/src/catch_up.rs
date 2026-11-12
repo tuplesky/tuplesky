@@ -59,6 +59,12 @@ pub const UNANSWERED: Duration = Duration::from_secs(1);
 /// asked in turn.
 pub const LEADER_ASKS: u32 = 2;
 
+/// What a voter holds at the start of a window, at least, to count as
+/// behind while it moves (#98, 6807495802): two pages. A follower keeping
+/// up holds a few commands in flight; one a thousand behind executing the
+/// live stream holds its whole gap.
+pub const BEHIND_HELD: usize = 2 * MAX_CATCH_UP_COMMANDS;
+
 /// This node's executed commands in position order, in memory (task-d08).
 ///
 /// Built once from `executed_v1` -- a read of the whole table, O(history)
@@ -315,9 +321,11 @@ fn executed_record<P: Persistence>(
 
 /// What a voter's catch-up looks like to the pacer on one turn.
 ///
-/// `B` counts the work it holds. Counting is a scan of the command
-/// table, so the pacer calls it only on a turn that may ask, once a
-/// window has run, and not on every pass of the loop (#189 review).
+/// `B` counts the work it holds. Counting was a scan of the command
+/// table, and is a count the table keeps now (task-d107) except in debug
+/// builds, which check it by a scan; the pacer still calls it only on a
+/// turn that may ask, once a window has run, and once a page of progress
+/// (#98, 6807495802), not on every pass of the loop (#189 review).
 #[derive(Clone, Copy)]
 pub struct Standing<B: Fn() -> usize> {
     /// What it executed through.
@@ -329,6 +337,10 @@ pub struct Standing<B: Fn() -> usize> {
     pub backlog: B,
     /// Whether a page is in hand.
     pub busy: bool,
+    /// Whether its catch-up chain is owed more
+    /// (`Machine::catch_up_chain_open`): the last page stopped short of
+    /// its donor's frontier, and none has reached one since (#226 review).
+    pub chain: bool,
     /// Catch-up pages taken since the machine started
     /// (`Machine::catch_up_counts`): one more is an ask answered.
     pub pages: u64,
@@ -343,6 +355,14 @@ pub struct Pacer {
     /// with no page in hand, and when: the window a page's worth of
     /// progress has to fill to count as catching up.
     still: Option<(ExecutionPosition, Instant)>,
+    /// What the voter held when the window began, where it was read: a
+    /// window begun by a page's progress reads it. A voter that held
+    /// [`BEHIND_HELD`] or more then, and holds no less than a page fewer
+    /// once it has moved a page, is moving without closing its gap.
+    held_at: usize,
+    /// Whether this window found the voter moving without closing its gap
+    /// (#98, 6807495802): its progress no longer resets the window.
+    moving_behind: bool,
     /// When the last ask went, if one is outstanding.
     asked: Option<Instant>,
     /// Asks gone unanswered since the window last began.
@@ -366,6 +386,10 @@ pub struct Pacer {
     /// The pages taken when the probe's first ask went: a different count
     /// later is a page that answered it.
     probe_pages: Option<u64>,
+    /// The pages taken when a round of every voter went unanswered while
+    /// the chain was open: nobody has more for it, so the open chain gives
+    /// no reason to ask again until a page arrives.
+    chain_given_up: Option<u64>,
     /// The frontier as the last turn saw it, and when it last moved:
     /// task-d08's still frontier, for a voter holding less than a page.
     seen: Option<ExecutionPosition>,
@@ -387,11 +411,21 @@ impl Pacer {
         leader: ReplicaId,
         voters: &[ReplicaId],
     ) -> Option<ReplicaId> {
-        if !self.probed && (standing.busy || self.probe_pages.is_some_and(|p| p != standing.pages))
+        // The probe is answered by a page that reached its donor's
+        // frontier, not by the first page: a chain's later ask or page
+        // lost in a quiet domain left a voter holding nothing that never
+        // asked again (#226 review). So while the chain is open the voter
+        // asks as one holding work, until a page reaches a frontier or a
+        // round of every voter brings none.
+        let chain = standing.chain && self.chain_given_up != Some(standing.pages);
+        if !self.probed
+            && !standing.busy
+            && !standing.chain
+            && self.probe_pages.is_some_and(|p| p != standing.pages)
         {
             self.probed = true;
         }
-        let holds = standing.holds || !self.probed;
+        let holds = standing.holds || !self.probed || chain;
         self.wanting = holds && !standing.leads && !standing.busy;
         if self.seen != Some(standing.executed) {
             self.seen = Some(standing.executed);
@@ -402,12 +436,35 @@ impl Pacer {
         // this turn, or it leads. Catching up is a page's worth executed
         // in the window: one that creeps through its backlog a command
         // per re-send asks (task-d94).
-        let caught_up = self.still.is_none_or(|(at, _)| {
-            standing.executed < at
-                || standing.executed.get() - at.get() >= MAX_CATCH_UP_COMMANDS as u64
+        //
+        // Not a voter that moves without closing its gap, though (#98,
+        // 6807495802): one that stood 1,000 behind after a heal and
+        // executed the live stream at the domain's pace made a page's
+        // progress in every window and never asked. So a page's progress
+        // reads what it holds, once a page, and counts as catching up only
+        // if that is under [`BEHIND_HELD`] or fell by a page in the window.
+        let moved_a_page = self.still.is_some_and(|(at, _)| {
+            standing.executed >= at
+                && standing.executed.get() - at.get() >= MAX_CATCH_UP_COMMANDS as u64
         });
+        let mut held_now = None;
+        if moved_a_page
+            && standing.holds
+            && !standing.busy
+            && !standing.leads
+            && !self.moving_behind
+        {
+            let held = (standing.backlog)();
+            held_now = Some(held);
+            self.moving_behind = self.held_at >= BEHIND_HELD
+                && held.saturating_add(MAX_CATCH_UP_COMMANDS) > self.held_at;
+        }
+        let caught_up = self.still.is_none_or(|(at, _)| standing.executed < at)
+            || (moved_a_page && !self.moving_behind);
         if caught_up || standing.busy || standing.leads || !holds {
             self.still = Some((standing.executed, now));
+            self.held_at = held_now.unwrap_or(0);
+            self.moving_behind = false;
             self.asked = None;
             self.unanswered = 0;
             return None;
@@ -427,7 +484,7 @@ impl Pacer {
         // movement is catching up, as task-d08 had it: a follower with a
         // few commands always in flight asks only once its frontier has
         // stood still for the window, which then starts at its last move.
-        if self.probed && (standing.backlog)() < MAX_CATCH_UP_COMMANDS {
+        if self.probed && !self.moving_behind && (standing.backlog)() < MAX_CATCH_UP_COMMANDS {
             let moved = self.moved.unwrap_or(since);
             if now.saturating_duration_since(moved) < STILL_FOR {
                 self.still = Some((standing.executed, moved));
@@ -450,21 +507,28 @@ impl Pacer {
             *others.get(turn % others.len().max(1))?
         };
         self.asks += 1;
+        // This ask finishes a round of every voter (the leader
+        // [`LEADER_ASKS`] times, then each of the others) with no page:
+        // nothing is past this voter anywhere.
+        let round = self.unanswered as usize + 1 >= LEADER_ASKS as usize + others.len();
         if standing.holds {
             self.probed = true;
         } else {
-            // A probe: done once a page arrives, or once this ask
-            // finishes a round of every voter (the leader
-            // [`LEADER_ASKS`] times, then each of the others) with no
-            // page: nothing is past this voter anywhere.
+            // A probe, or an open chain: done once a page reaches a
+            // donor's frontier, or once a round brings no page.
             self.probe_pages.get_or_insert(standing.pages);
-            if self.unanswered as usize + 1 >= LEADER_ASKS as usize + others.len() {
+            if round {
                 self.probed = true;
+                if chain {
+                    self.chain_given_up = Some(standing.pages);
+                }
             }
         }
-        // A voter that holds nothing and is done probing has no more
-        // reason to wake for this one.
-        self.wanting = standing.holds || !self.probed;
+        // A voter that holds nothing, is done probing and owes its chain
+        // nothing has no more reason to wake for this one.
+        self.wanting = standing.holds
+            || !self.probed
+            || (standing.chain && self.chain_given_up != Some(standing.pages));
         Some(donor)
     }
 
@@ -556,6 +620,7 @@ mod tests {
             holds: backlog > 0,
             backlog: move || backlog,
             busy: false,
+            chain: false,
             pages: 0,
             leads: false,
         }
@@ -725,10 +790,11 @@ mod tests {
         assert!(asked >= 20, "a voter behind asked {asked} times in 60 s");
     }
 
-    /// The backlog is a scan of the command table, so the pacer counts it
-    /// only on a turn that may ask, not on every pass (#189 review): a
-    /// follower moving 50 commands a second with three held, over 60 s
-    /// of 20 ms turns, counts about once a window, not 3,000 times.
+    /// The pacer counts the backlog only on a turn that may ask and once a
+    /// page of progress, not on every pass (#189 review): a follower
+    /// moving 50 commands a second with three held, over 60 s of 20 ms
+    /// turns, counts about once a window and once a page, not 3,000
+    /// times.
     #[test]
     fn the_backlog_is_counted_once_a_window_not_every_turn() {
         let voters = [r(1), r(2), r(3)];
@@ -748,6 +814,7 @@ mod tests {
                     3
                 },
                 busy: false,
+                chain: false,
                 pages: 0,
                 leads: false,
             };
@@ -757,12 +824,71 @@ mod tests {
             );
         }
         let windows = (tick * 3000).as_secs_f64() / STILL_FOR.as_secs_f64();
+        let pages = 3000.0 / MAX_CATCH_UP_COMMANDS as f64;
         assert!(
-            f64::from(counted.get()) <= windows + 1.0,
-            "counted {} times in {windows} windows",
+            f64::from(counted.get()) <= windows + pages + 1.0,
+            "counted {} times in {windows} windows and {pages} pages",
             counted.get()
         );
         assert!(counted.get() >= 1, "never counted");
+    }
+
+    /// A voter a thousand behind that executes the live stream at the
+    /// domain's pace moves a page in every window without closing its gap
+    /// (#98, 6807495802: n2 and n3 after a heal, 30-40 s behind with no
+    /// ask). It asks once a window has shown that. One closing its gap as
+    /// it moves, and a follower keeping up, do not.
+    #[test]
+    fn a_voter_behind_but_moving_asks() {
+        let voters = [r(1), r(2), r(3)];
+        let t0 = Instant::now();
+        let tick = Duration::from_millis(20);
+        // 2,000 commands a second, a thousand held throughout.
+        let mut behind = Pacer {
+            probed: true,
+            ..Pacer::default()
+        };
+        let asked = (0..500u64).find_map(|i| {
+            let at = t0 + tick * i as u32;
+            behind
+                .due(at, held(5 + 40 * i, 1000), r(3), r(1), &voters)
+                .map(|donor| (i, donor))
+        });
+        let (i, donor) = asked.expect("a voter moving a thousand behind never asked");
+        assert_eq!(donor, r(1), "the leader first");
+        assert!(
+            tick * i as u32 <= 3 * STILL_FOR,
+            "asked only after {:?}",
+            tick * i as u32
+        );
+        // The same pace draining its gap, a page fewer held for each page
+        // executed, as once the load stops: catching up.
+        let mut closing = Pacer {
+            probed: true,
+            ..Pacer::default()
+        };
+        for i in 0..70u64 {
+            let at = t0 + tick * i as u32;
+            let held_now = 3000usize.saturating_sub(40 * i as usize).max(1);
+            assert_eq!(
+                closing.due(at, held(5 + 40 * i, held_now), r(3), r(1), &voters),
+                None,
+                "a voter closing its gap asked at {i}"
+            );
+        }
+        // A follower keeping up at the same pace, a few in flight.
+        let mut keeping_up = Pacer {
+            probed: true,
+            ..Pacer::default()
+        };
+        for i in 0..500u64 {
+            let at = t0 + tick * i as u32;
+            assert_eq!(
+                keeping_up.due(at, held(5 + 40 * i, 30), r(3), r(1), &voters),
+                None,
+                "a follower keeping up asked at {i}"
+            );
+        }
     }
 
     /// The pacer registers when it next has to look, so an idle loop
@@ -835,6 +961,67 @@ mod tests {
         assert_eq!(pacer.next_deadline(), None);
         let t = t + UNANSWERED * 3;
         assert_eq!(pacer.due(t, answered, r(3), r(1), &voters), None);
+    }
+
+    /// A page that leaves the chain open does not end the probe, and an
+    /// open chain is asked for like held work (#226 review): an ask or a
+    /// page of the chain lost in a quiet domain left a voter holding
+    /// nothing that never asked again. It asks until a page reaches a
+    /// donor's frontier, or until a round of every voter brings none.
+    #[test]
+    fn an_open_chain_is_asked_for_until_a_page_reaches_a_frontier() {
+        let voters = [r(1), r(2), r(3)];
+        let t0 = Instant::now();
+        let mut pacer = Pacer::default();
+        pacer.due(t0, standing(5, false), r(3), r(1), &voters);
+        let t = t0 + STILL_FOR;
+        assert_eq!(
+            pacer.due(t, standing(5, false), r(3), r(1), &voters),
+            Some(r(1))
+        );
+        // The first page arrives full, and the chain's next ask is lost:
+        // nothing held, nothing in hand, the chain open.
+        let open = Standing {
+            pages: 1,
+            chain: true,
+            ..standing(130, false)
+        };
+        let t = t + UNANSWERED;
+        assert_eq!(pacer.due(t, open, r(3), r(1), &voters), None);
+        assert!(
+            pacer.next_deadline().is_some(),
+            "an open chain has a deadline"
+        );
+        let mut t = t + STILL_FOR;
+        let mut asked = Vec::new();
+        for _ in 0..10 {
+            if let Some(donor) = pacer.due(t, open, r(3), r(1), &voters) {
+                asked.push(donor);
+            }
+            t += UNANSWERED;
+        }
+        // Nobody has more for it: a round of every voter, then no more.
+        assert_eq!(asked, vec![r(1), r(1), r(1), r(2)]);
+        assert_eq!(pacer.next_deadline(), None);
+        // A page reaches a frontier: closed, and nothing more is asked.
+        let closed = Standing {
+            pages: 2,
+            ..standing(140, false)
+        };
+        assert_eq!(pacer.due(t, closed, r(3), r(1), &voters), None);
+        assert_eq!(pacer.next_deadline(), None);
+        // A page that arrives with the chain still open asks again.
+        let reopened = Standing {
+            pages: 3,
+            chain: true,
+            ..standing(265, false)
+        };
+        let t = t + UNANSWERED;
+        assert_eq!(pacer.due(t, reopened, r(3), r(1), &voters), None);
+        assert_eq!(
+            pacer.due(t + STILL_FOR, reopened, r(3), r(1), &voters),
+            Some(r(1))
+        );
     }
 
     /// With nothing past it at any donor, nobody answers the probe: it is

@@ -4379,20 +4379,25 @@ fn row_18_the_leaders_proposal_before_its_batch_is_durable() {
 /// over a vote the leader may lose. If no seed failed, the row would not
 /// reach the case the per-follower rule exists for.
 ///
-/// The seeds it failed at are tried first, then the budget. A failing
-/// seed is rare (one in a few hundred), and any change to what the
-/// simulator draws moves it: the catch-up probe that goes on until a
-/// page or every voter (#98) moved the first one from seed 66 to 492.
+/// The seeds it failed at are tried first, then a budget wide enough to
+/// find another. A failing seed is rare (one in a few hundred), and any
+/// change to what the simulator draws moves it: the catch-up probe that
+/// goes on until a page or every voter (#98) moved the first one from
+/// seed 66 to 492. Re-pinning after each such change would rot (#226
+/// review), so the search goes on to `ROW_18_CONTROL_SEEDS`: it stops
+/// at the first failure, so while a pinned seed still fails it costs
+/// nothing, and it runs long only when the draws moved.
 #[test]
 fn row_18_fails_when_the_fast_set_follower_gets_the_proposal_early_too() {
     const FAILED_AT: [u64; 2] = [492, 66];
+    const ROW_18_CONTROL_SEEDS: u64 = 5_000;
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
     let knobs = Knobs {
         early_to_fast_set: true,
         ..Knobs::row(18)
     };
-    let budget = NEGATIVE_CONTROL_SEEDS.max(seeds());
+    let budget = ROW_18_CONTROL_SEEDS.max(seeds());
     let failed = FAILED_AT
         .into_iter()
         .chain(0..budget)
