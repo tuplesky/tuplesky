@@ -1008,8 +1008,11 @@ fn mvcc_collection_and_protocol_trimming_decide_different_retention() {
     let mut engine = trimmable_store();
     let protocol_before = protocol_keys(&engine);
 
+    let snapshot = engine.reader().snapshot().unwrap();
+    let index = coord_storage::kv_index::KvIndex::build(&snapshot).unwrap();
     let gc = plan_gc(
-        &engine.reader().snapshot().unwrap(),
+        &snapshot,
+        &index,
         &RetentionHolds::default(),
         GcBudget::default(),
     )

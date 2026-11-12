@@ -6,10 +6,9 @@
 //!
 //! * `payload_v1`: only commands present in `executed_v1` (an unexecuted
 //!   payload is post-boundary evidence the donor supplies separately);
-//! * `kv_history_v1`: for every key, the newest version at or below the
-//!   replicated retention floor plus every newer version (what local
-//!   garbage collection converges to, whatever its progress);
-//! * `events_v1`: only revisions at or above the floor;
+//! * `events_v1`: every revision at or above the floor and, below it,
+//!   each key's newest put at or below the floor (task-d105: the version a
+//!   read at the floor finds, which the key index is rebuilt from);
 //! * every other common collection: every row.
 //!
 //! Rows past the boundary (an executed or retry record above the
@@ -26,10 +25,9 @@ use std::fmt;
 
 use coord_storage::codecs;
 use coord_storage::lowering::DurableMeta;
-use coord_store_api::engine::{EngineError, OrderedRead, ScanRequest};
+use coord_store_api::engine::{EngineError, ErrorClass, OrderedRead, ScanRequest};
 use coord_store_api::registry::{Collection, meta_fields};
 use coord_types::ids::{ClusterId, DomainId, KvRevision};
-use coord_types::ordered_key;
 
 use crate::manifest::{
     CHUNK_TARGET_BYTES, CheckpointBoundary, ChunkDescriptorV1, ChunkV1, CollectionSummaryV1,
@@ -181,13 +179,6 @@ impl ChunkWriter {
     }
 }
 
-/// Per-collection canonical filter state.
-struct HistoryState {
-    group: Option<(Vec<u8>, Vec<u8>)>,
-    /// The newest version at or below the floor seen for `group`.
-    below: Option<RowV1>,
-}
-
 fn corrupt(collection: Collection) -> ExportError {
     ExportError::Corrupt {
         collection: collection.id().0,
@@ -308,9 +299,21 @@ fn traverse<V: OrderedRead>(
 ) -> Result<(u64, u64), ExportError> {
     let id = collection.id();
     let mut request = ScanRequest::all(limits.page_rows, limits.page_bytes);
-    let mut history = HistoryState {
-        group: None,
-        below: None,
+    // Below the floor, the event rows kept are each key's newest put at or
+    // below it (task-d105): found through a key index of this view's own
+    // event rows at or below the floor, built once for the traversal. A row
+    // that does not decode there is the same corruption the traversal
+    // reports for it.
+    let index = if collection == Collection::EventsV1 {
+        Some(
+            coord_storage::kv_index::KvIndex::build_at_or_below(view, boundary.retention_floor)
+                .map_err(|e| match e.class {
+                    ErrorClass::Corrupt => corrupt(collection),
+                    _ => ExportError::Engine(e),
+                })?,
+        )
+    } else {
+        None
     };
     let mut rows = 0u64;
     let mut bytes = 0u64;
@@ -374,38 +377,20 @@ fn traverse<V: OrderedRead>(
                     }
                     include(row, writer)?;
                 }
-                Collection::KvHistoryV1 => {
-                    let decoded =
-                        ordered_key::decode_history(&row.key).map_err(|_| corrupt(collection))?;
-                    let revision = decoded.revision.ok_or_else(|| corrupt(collection))?;
-                    if revision > boundary.kv_revision {
-                        return Err(beyond(collection));
-                    }
-                    let group = (decoded.namespace.as_bytes().to_vec(), decoded.key);
-                    if history.group.as_ref() != Some(&group) {
-                        if let Some(kept) = history.below.take() {
-                            include(kept, writer)?;
-                        }
-                        history.group = Some(group);
-                    }
-                    if revision <= boundary.retention_floor {
-                        // Ascending revisions: the last one at or below the
-                        // floor is the newest.
-                        history.below = Some(row);
-                    } else {
-                        if let Some(kept) = history.below.take() {
-                            include(kept, writer)?;
-                        }
-                        include(row, writer)?;
-                    }
-                }
                 Collection::EventsV1 => {
                     let (revision, _) =
                         codecs::decode_event_key(&row.key).map_err(|_| corrupt(collection))?;
                     if revision > boundary.kv_revision {
                         return Err(beyond(collection));
                     }
-                    if revision >= boundary.retention_floor || revision == KvRevision::ZERO {
+                    let kept = revision >= boundary.retention_floor
+                        || revision == KvRevision::ZERO
+                        || index
+                            .as_ref()
+                            .expect("built for events")
+                            .keeps_below_floor(&row.key, &row.value, boundary.retention_floor)
+                            .map_err(|_| corrupt(collection))?;
+                    if kept {
                         include(row, writer)?;
                     }
                 }
@@ -425,9 +410,6 @@ fn traverse<V: OrderedRead>(
                 .into());
             }
         }
-    }
-    if let Some(kept) = history.below.take() {
-        include(kept, writer)?;
     }
     Ok((rows, bytes))
 }

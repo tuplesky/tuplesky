@@ -937,25 +937,25 @@ fn a_replay_of_the_journal_suffix_writes_the_same_keys_as_the_first_lowering() {
 
 #[test]
 fn a_store_of_the_other_layout_is_refused_with_the_reason() {
-    // Recorded as another format.
-    let engine = ModelEngine::new();
-    {
-        let mut engine = engine;
+    // Recorded as another format: 1 (dependency rows by command) or 2
+    // (versions in history rows, before task-d105).
+    for format in [1u32, 2] {
+        let mut engine = ModelEngine::new();
         let mut tx = engine.begin_write().unwrap();
         tx.put(
             Collection::MetaV1.id(),
             meta_fields::FORMAT_VERSION,
-            &1u32.to_be_bytes(),
+            &format.to_be_bytes(),
         )
         .unwrap();
         tx.commit_durable().unwrap();
         let refused = StoreWorker::open(engine, boot(1), inc(), GroupLimits::default())
             .err()
-            .expect("a store of format 1 is refused");
+            .expect("a store of another format is refused");
         assert!(
             refused
                 .diagnostic
-                .contains("store format 1 is not this build's (2)"),
+                .contains(&format!("store format {format} is not this build's (3)")),
             "{refused:?}"
         );
     }

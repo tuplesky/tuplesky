@@ -39,7 +39,7 @@
     [
       "kv_history_v1",
       8,
-      true
+      false
     ],
     [
       "events_v1",

@@ -348,7 +348,8 @@ impl<E: LocalEngine> Domain<E> {
     /// complete at the current effective floor.
     pub fn maintenance_step(&mut self, budget: GcBudget) -> Result<bool, DriveError> {
         let gated = self.applier.store().reader().snapshot()?;
-        let step = plan_gc(gated.view(), &self.holds, budget)?;
+        let step =
+            gated.with_kv_index(|index| plan_gc(gated.view(), index, &self.holds, budget))??;
         drop(gated);
         if !step.updates.is_empty() {
             let barrier = self.applier.alloc().allocate();
@@ -376,7 +377,7 @@ impl<E: LocalEngine> Domain<E> {
         let revision = self.applier.kv_revision()?;
         let hold = self.holds.hold(revision);
         let pinned = self.applier.store().reader().snapshot()?;
-        let collections = [Collection::KvCurrentV1, Collection::KvHistoryV1];
+        let collections = [Collection::KvCurrentV1, Collection::EventsV1];
         let first = std::time::Instant::now();
         let before = digest_of(pinned.view(), &collections)?;
         let mut read_ns = first.elapsed();

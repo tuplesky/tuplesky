@@ -258,8 +258,9 @@ impl IntakeIndex {
             return Err(EngineError::new(
                 ErrorClass::Unsupported,
                 format!(
-                    "store format {} is not this build's ({}): task-d113 keys the dependency \
-                     rows by intake order, and a store of another layout is not converted",
+                    "store format {} is not this build's ({}): a store of another layout \
+                     is not converted (task-d113 keyed the dependency rows by intake order; \
+                     task-d105 writes no history rows)",
                     describe(recorded),
                     STORE_FORMAT_VERSION
                 ),
@@ -295,8 +296,11 @@ impl IntakeIndex {
                     ProtocolKey::ByCommand { .. } => {
                         return Err(EngineError::new(
                             ErrorClass::Unsupported,
-                            "store format 1 (dependency rows keyed by command, before task-d113) \
-                             is not this build's (2): a store of another layout is not converted",
+                            format!(
+                                "store format 1 (dependency rows keyed by command, before \
+                                 task-d113) is not this build's ({STORE_FORMAT_VERSION}): a store \
+                                 of another layout is not converted"
+                            ),
                         ));
                     }
                     ProtocolKey::Other => {}
@@ -411,12 +415,15 @@ fn describe(recorded: &[u8]) -> String {
 pub struct IndexDelta {
     added: BTreeSet<Entry>,
     removed: BTreeSet<Entry>,
+    /// The same commit's changes to the key index (task-d105), which
+    /// moves with this one.
+    pub(crate) kv: crate::kv_index::KvDelta,
 }
 
 impl IndexDelta {
     /// Whether it changes nothing.
     pub fn is_empty(&self) -> bool {
-        self.added.is_empty() && self.removed.is_empty()
+        self.added.is_empty() && self.removed.is_empty() && self.kv.is_empty()
     }
 
     fn add(&mut self, e: Entry) {
@@ -467,6 +474,16 @@ impl<'a> Assigner<'a> {
     /// The changes made so far.
     pub fn into_delta(self) -> IndexDelta {
         self.delta
+    }
+
+    /// Take `update` into the key index's changes (task-d105), before it
+    /// is written: `old` reads a row as it stands before it.
+    pub fn observe_kv(
+        &mut self,
+        update: &StoreUpdate,
+        old: impl FnOnce(&[u8]) -> Result<Option<Vec<u8>>, EngineError>,
+    ) -> Result<(), EngineError> {
+        self.delta.kv.observe(update, old)
     }
 
     fn live(&self, epoch: [u8; 8], tag: u8, command: &CommandId) -> Vec<IntakeOrder> {

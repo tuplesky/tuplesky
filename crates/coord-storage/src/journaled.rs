@@ -1356,10 +1356,12 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
         // The index by command of the intake-keyed rows (task-d113), from
         // the rows themselves; a store of another layout is refused here,
         // before anything is replayed into it.
-        gate.install_index(IntakeIndex::build(
-            &reader.snapshot()?,
-            applied.materialized.get(),
-        )?);
+        let snapshot = reader.snapshot()?;
+        gate.install_index(IntakeIndex::build(&snapshot, applied.materialized.get())?);
+        // The key index of the retained event rows (task-d105), from the
+        // same snapshot, before the replay lowers into it.
+        gate.install_kv_index(crate::kv_index::KvIndex::build(&snapshot)?);
+        drop(snapshot);
         gate.set_completed(meta.stamp.store_seq());
         let mut state = Domain {
             origin,

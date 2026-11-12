@@ -119,7 +119,11 @@ impl Collection {
     pub const fn in_common_hash(self) -> bool {
         !matches!(
             self,
-            Collection::MetaV1 | Collection::ProtocolV1 | Collection::CheckpointV1
+            Collection::MetaV1
+                | Collection::ProtocolV1
+                | Collection::CheckpointV1
+                // Written by no format since 3 (task-d105).
+                | Collection::KvHistoryV1
         )
     }
 
@@ -138,7 +142,11 @@ impl Collection {
 /// format before it keyed them by epoch, tag and command, recorded no
 /// version, and counts as `1`. A store of another format is refused, not
 /// converted.
-pub const STORE_FORMAT_VERSION: u32 = 2;
+///
+/// `3`: `kv_history_v1` is not written. A key's versions are its event
+/// rows in `events_v1`, found through a key index held in memory
+/// (task-d105). A store holding a history row is of format 2.
+pub const STORE_FORMAT_VERSION: u32 = 3;
 
 /// ASCII field names used as keys inside `meta_v1`.
 pub mod meta_fields {

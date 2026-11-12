@@ -14,9 +14,7 @@ use coord_checkpoint::restore::{
 };
 use coord_state::plan::KvEventKind;
 use coord_state::view::KvEntry;
-use coord_storage::codecs::{
-    self, EventRecordV1, ExecutedRecordV1, HistoryRecordV1, RetryRecordV1,
-};
+use coord_storage::codecs::{self, EventRecordV1, ExecutedRecordV1, RetryRecordV1};
 use coord_storage::lowering::{DurableMeta, ExecutionFrontier};
 use coord_store_api::engine::{LocalEngine, OrderedRead, ScanRequest, SnapshotSource, WriteTxn};
 use coord_store_api::envelope::AppliedStamp;
@@ -130,14 +128,6 @@ fn common_rows() -> Vec<Row> {
         Collection::KvCurrentV1,
         codecs::current_key(&NS, b"held"),
         codecs::encode_current(&leased(b"b5", 4, 5)).unwrap(),
-    );
-    put(
-        Collection::KvHistoryV1,
-        codecs::history_key(&NS, b"plain", rev(3)),
-        codecs::encode_history(&HistoryRecordV1 {
-            entry: Some(entry(b"a3", 1, 3, 3)),
-        })
-        .unwrap(),
     );
     put(
         Collection::EventsV1,
@@ -343,7 +333,8 @@ fn a_restore_establishes_a_new_cluster_and_carries_only_what_survives_it() {
     // What the backup is for.
     let current = rows_of(&mut engine, Collection::KvCurrentV1);
     assert_eq!(current.len(), 2, "the KV rows were not restored");
-    assert!(!rows_of(&mut engine, Collection::KvHistoryV1).is_empty());
+    // A key's versions are its event rows (task-d105): no history row.
+    assert!(rows_of(&mut engine, Collection::KvHistoryV1).is_empty());
     assert!(!rows_of(&mut engine, Collection::EventsV1).is_empty());
     // Retries stay: dropping a retained result turns a caller's retry
     // into a second execution, which is worse than a stale answer.

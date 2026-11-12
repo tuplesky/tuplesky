@@ -845,10 +845,30 @@ fn run_workload(materialize_inline: bool) -> Vec<(u16, Vec<u8>, Vec<u8>)> {
             position(step),
             vec![
                 kv_update(format!("key-{step}").as_bytes(), b"value"),
+                // A real event row: lowering reads each one into the key
+                // index (task-d105).
                 StoreUpdate {
                     collection: events,
-                    key: step.to_be_bytes().to_vec(),
-                    value: Some(vec![step as u8; 8]),
+                    key: coord_storage::codecs::event_key(KvRevision::new(step).unwrap(), 0),
+                    value: Some(
+                        coord_storage::codecs::encode_event(
+                            &coord_storage::codecs::EventRecordV1 {
+                                kind: coord_state::KvEventKind::Put,
+                                namespace: NamespaceId([0; 16]),
+                                key: format!("key-{step}").into_bytes(),
+                                entry: Some(coord_state::KvEntry {
+                                    value: b"value".to_vec(),
+                                    create_revision: KvRevision::new(step).unwrap(),
+                                    mod_revision: KvRevision::new(step).unwrap(),
+                                    version: 1,
+                                    lease: None,
+                                    lease_generation: None,
+                                }),
+                                prev: None,
+                            },
+                        )
+                        .unwrap(),
+                    ),
                 },
                 StoreUpdate {
                     collection: executed,

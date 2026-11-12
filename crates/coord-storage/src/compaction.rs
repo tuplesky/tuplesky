@@ -33,6 +33,7 @@ use coord_types::ordered_key;
 use serde::{Deserialize, Serialize};
 
 use crate::codecs;
+use crate::kv_index::KvIndex;
 use crate::sync::{Arc, Mutex, lock};
 
 /// Logical identity of a history row: `(namespace, key)`.
@@ -218,8 +219,25 @@ pub fn effective_floor<V: OrderedRead>(
 }
 
 /// Compute one bounded GC step from a gated snapshot.
+///
+/// `index` is the key index as published (task-d105). An event row below
+/// the floor is deleted unless it is its key's newest version at or below
+/// the floor and a put: a read at or above the floor finds that version
+/// through the index and its event row. A tombstone there reads as no
+/// entry with or without its row, and its key leaves the index.
+///
+/// The published index is never behind `view` (it moves before the
+/// gate), and whatever it holds past `view` is above the floor, so its
+/// newest version at or below the floor is `view`'s.
+///
+/// A row kept under one floor lies behind the events cursor when the floor
+/// rises, so the pass does not visit it again; a newer row of its key that
+/// the raised floor brings below it deletes it instead. A kept row whose
+/// newer version is at or above the floor stays until the floor passes
+/// that version: it answers no read, and an export leaves it out.
 pub fn plan_gc<V: OrderedRead>(
     view: &V,
+    index: &KvIndex,
     holds: &RetentionHolds,
     budget: GcBudget,
 ) -> Result<GcPlan, EngineError> {
@@ -324,6 +342,9 @@ pub fn plan_gc<V: OrderedRead>(
 
     // ---- events ----
     let mut events_through = events_cursor.through;
+    // Rows at or below `settled` are what earlier passes kept.
+    let settled = events_cursor.through;
+    let mut superseded: std::collections::BTreeSet<Vec<u8>> = std::collections::BTreeSet::new();
     let mut events_done = true;
     if floor > KvRevision::ZERO {
         let target = KvRevision::new(floor.get() - 1).expect("bounded");
@@ -354,12 +375,34 @@ pub fn plan_gc<V: OrderedRead>(
                     partial = true;
                     break;
                 }
-                updates.push(StoreUpdate {
-                    collection: Collection::EventsV1.id(),
-                    key: row.key,
-                    value: None,
-                });
-                deleted += 1;
+                // A version of this key at or below the cursor where this
+                // pass started was kept by an earlier pass, as the newest at
+                // or below that pass's floor; this row, newer and below the
+                // floor, supersedes it.
+                let record = codecs::decode_event(&row.value)?;
+                let mut owed: Vec<Vec<u8>> = index
+                    .versions_of(record.namespace, &record.key)
+                    .iter()
+                    .take_while(|v| v.revision <= settled)
+                    .map(|v| codecs::event_key(v.revision, v.ordinal))
+                    .filter(|key| !superseded.contains(key))
+                    .collect();
+                if !index.keeps_below_floor(&row.key, &row.value, floor)? {
+                    owed.push(row.key);
+                }
+                if deleted > 0 && deleted + owed.len() > budget.max_deletes {
+                    partial = true;
+                    break;
+                }
+                for key in owed {
+                    superseded.insert(key.clone());
+                    updates.push(StoreUpdate {
+                        collection: Collection::EventsV1.id(),
+                        key,
+                        value: None,
+                    });
+                    deleted += 1;
+                }
             }
             if partial {
                 events_done = false;
