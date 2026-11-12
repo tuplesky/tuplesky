@@ -368,8 +368,13 @@ def final_read():
 
 def check(ops, final):
     problems, failed, reads = [], set(), {}
+    # When each (key, element) was first invoked as an append, whatever
+    # its answer: a read may see an element only once its append began.
+    invoked = {}
     for _, _, mops, answer, t0, t1 in ops:
         for m in mops:
+            if m[0] == "append":
+                invoked[(m[1], m[2])] = min(t0, invoked.get((m[1], m[2]), t0))
             if m[0] == "append" and answer["type"] == "fail":
                 failed.add(m[2])
         if answer["type"] == "ok":
@@ -391,6 +396,8 @@ def check(ops, final):
             if len(set(r)) != len(r):
                 problems.append(f"key {k}: duplicate element in {r}")
             problems += [f"key {k}: failed append {v} was read" for v in r if v in failed]
+            problems += [f"key {k}: read {r} holds {v}, which no append invoked before the read ended"
+                         for v in r if not invoked.get((k, v), float("inf")) < e]
             problems += [f"key {k}: read {r2} began after read {r} ended and is shorter"
                          for r2, s2, _ in rs if s2 > e and len(r2) < len(r)]
     # Two ok transactions that read the same value of a key and then both
