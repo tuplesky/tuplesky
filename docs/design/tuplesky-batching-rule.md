@@ -258,7 +258,7 @@ There is nothing per record to halve, so this proposal stays unsized until a pro
 
 ## 6. Levers 1 and 2 and the leader-log end state
 
-**Parked by the owner (Section 8):** the leader log and option 3 (6.1 to 6.4), witnesses as 6.5 has them, and lever 2 as Section 7 sizes it. They stay here as the record of the trade. Section 6.6 is the alternative still open.
+**Parked by the owner (Section 8):** the leader log and option 3 (6.1 to 6.4), witnesses as 6.5 has them, and lever 2 as Section 7's parked row sizes it. They stay here as the record of the trade. Section 6.6 is the alternative still open, and Section 6.7 redesigns lever 2 without a protocol change.
 
 ### 6.1 The end state
 
@@ -335,7 +335,7 @@ What needs the owner's decision:
 - **Option 3:** followers no longer execute every command.
 - **The frame as the only proposal path:** no fast path without the leader.
 
-Both are parked (Section 8). Lever 2 is being redesigned to need neither.
+Both are parked (Section 8). Section 6.7 redesigns lever 2 to need neither.
 
 ### 6.5 An alternative: voters that journal and vote but keep no projection
 
@@ -477,7 +477,7 @@ The last three columns are the servers' ms an operation, from 1.20.
 - **Recovery is linear in it.** So the interval should be short.
 - **The floor's boundaries** bound the tail by positions at any load, and reuse the floor's exchange of roots for the agreement.
 - **The choice that moves the CPU is `e`:** −0.02 for (a), −0.07 at `e = 2` and −0.10 at `e = 1`.
-- **It adds to proposals 1 and 2, the appender's encode and the levers that need no decision.** With lever 2's redesign it overlaps in `Follower::applied`, which both take part of: about 7 µs a lazy voter, counted once.
+- **It adds to proposals 1 and 2, the appender's encode and the levers that need no decision.** With lever 2's redesign (Section 6.7) it overlaps in `Follower::applied`, which both take part of: about 5 µs a lazy voter, counted once.
 - **Every figure is inferred** from the cost table's shares, not from a pair.
 
 **Against the alternatives.**
@@ -515,13 +515,106 @@ The last three columns are the servers' ms an operation, from 1.20.
   - it executes for itself and comes back within one batch;
   - kill the eager voters while it is past the window: a lazy voter within the window takes over, within the window's bound.
 
+### 6.7 Lever 2 redesigned: a frame taken as a unit, without a protocol change
+
+**Why this section.** The owner isn't yet convinced the leader log is needed "if batching is done correctly" (Section 8). Lever 2 as Section 7 sized it assumed a single proposer, and is parked. This section redesigns it under four conditions:
+- any voter may still propose;
+- the fast path stays;
+- a follower's work is batched by the frame it already receives (task-d102's `ProposalFrame`);
+- each command's vote still reaches whoever counts it.
+
+**What a follower does today.** This is read from the code at `b614c162`.
+- A follower does almost everything once a command, from intake to forgetting.
+- Its only once-a-turn work is at the daemon: one journal append for the turn's batches, and execution groups of up to 32 (`GROUP_COMMANDS`).
+- The leader already has once-a-turn hooks (`cut_frames`, the frontier announced at a turn's end). The follower has none:
+  - **`on_proposal_frame`** counts the frame, then runs the whole of `on_proposal` or `on_relayed_proposal` for each entry. Each of those ends in `advance_pending` and `learn`.
+  - **The daemon decodes each peer frame twice**: once in the voter and again in the follower.
+
+**What the protocol needs per command, against what we do.**
+
+| Stage | What the protocol needs | What the code does per command | Under this lever |
+| --- | --- | --- | --- |
+| Taking the leader's proposals in | The sender is the ballot's leader and the ballot is current: once a message. Per command: the admission matches, and the guard holds (direct dependencies at ACCEPT or COMMIT before ACCEPT, [design Section 4.7](tuplesky-design.md#s4-7)). | The seal, fence and sender checks again for each entry. `held`, `held_check`, a `VoteSet` built from a clone of the proposal, `note_lacking` (four indexes), and `advance_pending` and `learn` after each entry. | The frame's checks once. An entry whose payload is in hand and whose guard holds is adopted in the frame's one pass, without `held` or a `VoteSet`. The rest go the held way as today. `advance_pending` and `learn` run once, at the frame's end. |
+| The path logs ([design Section 4.1](tuplesky-design.md#s4-1)) | The leader's order enters a replica's logs at adoption, key by key. An equal path means an equal history. | `PathLog::sync`, then `recompute` for each key of each command, hashing the remaining suffix each time. | A frame's synchronizations applied key by key in sequence order, with each key's suffix recomputed once, at the frame's end. |
+| The adoption's durability | A vote leaves only once what it claims is durable ([design Section 4.8](tuplesky-design.md#s4-8)). Each command's dependencies are its own. | One `PersistBatch`, one barrier, one `pending` entry and one deferred vote per command. `payload_row` scans the in-flight batches twice. `carry_unwritten` walks the dependencies, and `ledger.written` scans the staged batches. | One batch a frame, holding each adopted command's dependency row and payload row. One barrier and one `pending` entry name the frame's adoptions. `ledger.stage` already takes several records a barrier. The payload rows in flight are looked up through an index, not scanned. |
+| The vote out | Each command's slow vote reaches the leader. An unmarked command's also reaches its frontend. A `SlowAck` is `{replica, ballot, command, admission}`. | One encode and one `PendingSend` per command. Its `requires` lists every pending barrier, so the k-th entry of a frame waits on at least k barriers. | One vote message a frame to the leader, carrying each command's vote as a range of the leader's sequence numbers, with the exceptions listed (below). |
+| Learning | A follower commits what it adopted up to the leader's commit frontier (`Committed { through }`, task-d09). That is already a range. | `learn` after every entry and every storage event. Each call allocates the ACCEPT set twice (`commit_learned`, `commit_through_leader`), so a frame of N commands costs at least 2N passes. | `learn` once a frame and once a step of storage events. The commit frontier is applied through an index of durable adoptions by sequence number, with no allocation of the ACCEPT set. |
+| Storage events | Durability, as above. | One machine step per `JournalDurable` event. The `served_payloads` check scans the other in-flight barriers. | One barrier a frame, so one event a frame, and an index for the check. |
+| `Follower::applied` | Execution in the decided order, a command's dependencies executed first. | `Learner::established` per command: a clone of the dependencies, a closure walk that allocates, `table.execute`. Then `EstablishedResult::establish`, `learn` and `forget_history`. | Execution's order bookkeeping stays per command (`table.execute`). The closure walk, `learn` and forgetting run once an execution group. |
+| Forgetting | Nothing. It is memory, not protocol. A command is forgotten only once its execution is durable (task-d90, point 2). | Up to four commands a call (`FORGET_PER_EXECUTION`), each taken out of about ten maps. | By range, at an execution group's end, up to the durable execution frontier. The rule that a command waits for its durable execution is kept. |
+| Settle and flush | — | Each event stepped one at a time. | Fewer events: one a frame. |
+
+**The vote message.**
+- **Its content:** the follower's replica, the ballot, the first and last sequence numbers of the leader's proposals it is voting on, and the sequence numbers in that range it isn't voting on yet. A command that is held for its payload, refused, or being rebound is an exception, and its vote goes later, alone or in a later frame's range.
+- **The leader expands it into the votes it counts today.** For each sequence number in the range and not an exception, it adds `SlowAck { replica, ballot, command, admission }` to that command's `VoteSet`. The command and admission come from its own proposal under that number.
+- **Why that is the same vote:**
+  - A follower adopts a proposal only under the proposal's admission. It refuses a mismatch, or holds the proposal and rebinds it to the leader's payload first.
+  - So the admission the leader fills in is the one the `SlowAck` would have carried. The ballot is the frame's.
+  - A `SlowAck` carries nothing else: no dependencies, sequence number or path. The adoption row behind it is a function of the proposal too.
+- **Its prerequisites:** the frame's one barrier, and its payload rows. So the votes it carries are durable before it leaves, as each `SlowAck` is today.
+- **The frontend.** A relayed command is marked, and its acknowledgement goes to the leader only (task-d100), so at load the vote message is the follower's only acknowledgement. An unmarked command's acknowledgement to its frontend stays per command, as today. That frontend doesn't hold the leader's numbering to read a range by.
+- **Fast acknowledgements stay per command in content.** A follower's `FastAck` is its own pre-acceptance of a submission it took, sent before the leader's proposal arrives. Its dependencies and paths are the follower's own, and can differ from the leader's. They can share a hand-off a turn (lever 8), but they can't become a range.
+- **Re-acknowledgement** (task-d07). A leader re-sends a proposal it lacks a vote for, and the follower answers with a range as well: the commands it holds adopted in that range.
+- **On the wire it is a new message,** sent only while a replicated feature is active (task-d99), as `ProposalFrame` is behind `BatchedRound`.
+
+**Taking a frame's path synchronizations at once: why it's the same.**
+- A frame's entries are taken in one step, and no acknowledgement leaves between two of them. So no head between two adoptions is ever observed.
+- What is observed is the logs' state at the frame's end.
+- Each synchronization's set-aside and position change are applied as today, in sequence order. Only the suffix's digest is deferred. It is a function of the synchronized digest and the suffix, so it is recomputed once a key at the frame's end instead of after each. The position, the suffix and the digest come out the same.
+- An early synchronization held for an append ([design Section 4.1](tuplesky-design.md#s4-1)) is applied at that append, as today.
+- **The code step's test:** for random frames, suffixes and early synchronizations, a frame taken as a unit leaves every path log equal to taking its entries one at a time.
+
+**What would need a protocol change, and isn't proposed:**
+- **The frame as the unit of decision,** all of it or none. That is the leader log (Section 6.1).
+- **Recording a frame's order in place of each command's dependencies.** Recovery reads each command's dependency record ([design Section 4.9](tuplesky-design.md#s4-9)), so its reports would change.
+- **Folding a follower's fast acknowledgement into the leader's proposal.** A fast acknowledgement comes before the proposal by design. That is the fast path.
+- **Ending an unmarked command's acknowledgement to its frontend.** The frontend's learning of the fast path needs them.
+
+So nothing in this lever changes what is voted, what a quorum is, what is durable before a vote leaves, or what recovery reads.
+
+**Its size** (inferred from shares, at `k` = 9.55). A follower's loop is about 145 µs a command. By review's profile on #252, its shares are:
+
+| Share of a follower's loop | Profile | Under this lever, a follower |
+| --- | --- | --- |
+| Taking each proposal in: accept state | 8.0 to 8.4% (about 12 µs) | half to two thirds: −6 to −8 µs |
+| Taking each proposal in: the payload | 6.1 to 7.0% (about 10 µs) | stays: its decode and hashes are per command |
+| Settle: batches, barriers, events, votes out | 10.0% (about 14.5 µs) | a third to a half: −5 to −7 µs |
+| `Follower::applied` | 7.1 to 7.5% (about 11 µs) | forgetting by range and `learn` once a group: −4 to −6 µs |
+| Flush: the lowering | 7.3% (about 10.6 µs) | stays: rows are per command, and proposal 2 removes most of them |
+
+- **Per follower:** −15 to −21 µs a command, plus about 4 µs a frame.
+- **The leader's acknowledgements in and tokio's bytes** were counted in lever 4's row, as its acknowledgement by range. They are not counted again here.
+- **Section 7 takes −18 a follower:** followers' loops 439 + 388/k become 367 + 404/k. That is −0.075 ms an operation on the 7763: 1.20 becomes 1.13.
+- **Every figure here is inferred,** and each step's acceptance reads its own pair.
+
+**With lazy voters (Section 6.6).**
+- The two overlap only in `Follower::applied`, about 5 µs a lazy voter here, counted once.
+- At `e = 1` together they come to about 1.04 on the 7763, and with the transport on the loop's turn about 0.97.
+
+**Code steps, each its own PR:**
+1. **Learning once a frame and once a step of events,** and the commit frontier through an index by sequence number. No wire or row change.
+2. **`Follower::applied` and forgetting once an execution group.** No wire or row change.
+3. **The frame's intake in one pass,** with the path logs once a key, and the property test above. No wire or row change.
+4. **One batch and one barrier a frame,** with an index of payload rows in flight. A crash loses a frame's adoptions whole, as it loses a batch today. The leader's re-send (task-d07) brings them back.
+5. **The vote message,** behind a replicated feature, and the leader's expansion of it.
+
+Steps 1 to 4 need no wire change and no decision. Step 5 needs a feature activation, not a protocol decision. About 3 to 4 weeks for steps 1 to 4, and 1 to 2 for step 5.
+
+**Each step's acceptance.**
+- **A pair** of the followers' loops.
+- **The audit's counts a turn:** persist batches, barriers and storage events at a follower, acknowledgement frames out, and passes over the ACCEPT set.
+- **Step 5's tests:**
+  - **A property test:** a vote message expands at the leader to exactly the votes that per-command acknowledgements would have added.
+  - **`protocol_sim` rows with frames taken as a unit and vote messages,** under loss. A lost vote message is repaired by the leader's re-send and a re-acknowledgement by range.
+  - **The crash matrix's cuts** at a frame's batch.
+
 ## 7. The cost model after each step
 
 **Reading the table.**
 - Each row is cumulative: the per-command `a` and per-turn `b` of each part, five voters, local, in µs.
 - The last four columns are predicted ms an operation at 4, 8 and 16 commands a turn locally, and on the 7763 at the measured turn size (9.55).
 - "Moves" says whether the step moves work from the per-command column to the per-turn column.
-- The rows marked parked are the leader log's (Section 8). They stay so the trade can be read.
+- The rows marked parked are the leader log's (Section 8). They stay so the trade can be read, and they continue from the Lever 3 row, not from lever 2 redesigned.
 
 | Step (cumulative) | Leader loop | Followers' loops | Tokio | Materializers | Appenders | Moves? | k=4 | k=8 | k=16 | 7763 |
 |---|---|---|---|---|---|---|---:|---:|---:|---:|
@@ -533,6 +626,7 @@ The last three columns are the servers' ms an operation, from 1.20.
 | Lever 4: release frame, acks by range | 181 + 147/k | 447 + 388/k | 179 + 733/k | 94 + 64/k | 63 + 86/k | Yes | 0.870 | 0.753 | 0.695 | 1.27 |
 | Lever 8: one hand-off a turn | 176 + 147/k | 447 + 388/k | 159 + 733/k | 94 + 64/k | 63 + 86/k | Yes | 0.854 | 0.737 | 0.678 | 1.23 |
 | Lever 3: the payload by reference | 176 + 147/k | 439 + 388/k | 143 + 733/k | 94 + 64/k | 63 + 86/k | No: fewer bytes | 0.838 | 0.721 | 0.662 | 1.20 |
+| Lever 2 redesigned: a frame taken as a unit (Section 6.7) | 176 + 147/k | 367 + 404/k | 143 + 733/k | 94 + 64/k | 63 + 86/k | Yes | 0.793 | 0.675 | 0.616 | 1.13 |
 | Lever 2: the frame as a unit (parked) | 170 + 147/k | 351 + 428/k | 135 + 733/k | 94 + 64/k | 63 + 86/k | Yes | 0.777 | 0.657 | 0.597 | 1.10 |
 | Lever 1: option 3 with rotation (parked) | 170 + 147/k | 315 + 428/k | 145 + 733/k | 94 + 64/k | 63 + 86/k | No: removes executions | 0.760 | 0.640 | 0.580 | 1.07 |
 | End state: a follower's plumbing per frame (parked) | 153 + 167/k | 236 + 476/k | 145 + 733/k | 94 + 64/k | 63 + 86/k | Yes | 0.708 | 0.582 | 0.519 | 0.98 |
@@ -550,6 +644,7 @@ The last three columns are the servers' ms an operation, from 1.20.
   - peer datagrams fall from 7.3 to about 3.5 a command;
   - at about a quarter of tokio's cost, which is per datagram under GSO (crypto 7%, quinn's per-packet work, kernel segments), that is −16;
   - plus −2 of each follower's hashing and decoding.
+- **Lever 2 redesigned (Section 6.7):** −15 to −21 a follower, inferred from the follower loop's shares; the table takes −18, and +4 a frame a follower. The leader's acknowledgements in and tokio's bytes stay in lever 4's row.
 - **Lever 2 (parked):** half to two thirds of a follower's intake and of its learning and forgetting (`Follower::applied`), −22 a follower. +10 a frame a follower, plus the leader's acks in.
 - **Lever 1 (parked):**
   - a follower's execution after proposal 1 (34.5) becomes landing (about 10) plus a quarter of the executions by rotation (8.6);
@@ -588,7 +683,8 @@ Neither crypto (7% of tokio) nor QUIC itself is the difference.
 - **Without a protocol decision** (proposals 1 and 2, the appender's encode, and levers 3, 4, 6 and 8), the servers end at about 1.20 ms an operation on the 7763. That is −0.38, more than review's −0.20 to −0.32 on #185 because proposal 2 is now sized from the measured rows.
 - **Read the end state at the measured turn.** The 16-a-turn column is outside what either host reached: at 240 callers review's leader turn is 10.5 commands. A turn of 16 at the bar's load means holding a turn open, which is latency paid for CPU (review on #252).
 - **The leader-log end state (parked)** reaches 0.98 at the measured turn, and 0.91 with the transport on the loop's turn.
-- **Lazy voters (Section 6.6)** at `e = 1` take the no-decision row to 1.10. With lever 2 as sized here and the transport, about 0.95, counting `Follower::applied` once.
+- **Lever 2 redesigned (Section 6.7)** takes the no-decision row to 1.13.
+- **Lazy voters (Section 6.6)** at `e = 1` take the Lever 3 row to 1.10. With lever 2 redesigned, about 1.04, and with the transport too, about 0.97, counting `Follower::applied` once.
 - **Against the owner's exit,** which is completions (Section 8), parity needs the servers at about 0.80 to 0.87. No modeled row reaches it at the measured turn.
 
 Every figure but the measured ones above is modeled from counts and profile shares, not measured as a pair. Each step's acceptance reads its own pair.
@@ -599,10 +695,10 @@ Every figure but the measured ones above is modeled from counts and profile shar
 - **On the 7763's four CPUs, completions follow the whole box's CPU an operation.** Summing testing's columns at 120 callers ([#98, 6833683813](https://github.com/tuplesky/tuplesky/pull/98#issuecomment-6833683813) and [6835373016](https://github.com/tuplesky/tuplesky/pull/98#issuecomment-6835373016)) gives 2.09 ms for us and 1.30 for etcd. That predicts 0.63× etcd's completions, and the sweep read 0.66×. At 30 callers it predicts 0.71×, and the sweep read 0.72×.
 - **Our client side and kernel cost 0.50 against etcd's 0.42.** So completions parity at 120 callers needs the servers at about 0.80 to 0.87, a little under 0.887.
 - **No modeled row reaches it at the measured turn** (Section 7):
-  - without a decision, 1.20;
+  - without a decision, 1.20, and 1.13 with lever 2 redesigned (Section 6.7);
   - lazy voters at `e = 1`, 1.10;
   - the leader-log end state, 0.98, and 0.91 with the transport on the loop's turn;
-  - lazy voters with lever 2 as sized here and the transport, about 0.95.
+  - lazy voters with lever 2 redesigned, about 1.04, and with the transport too, about 0.97.
 - **The bar may move.** etcd's 0.887 is from `--snapshot-count 100`, which testing is re-reading at etcd's default.
 
 **The owner's answers on #252,** relayed by the lead on #185:
@@ -612,11 +708,12 @@ Every figure but the measured ones above is modeled from counts and profile shar
 **Parked:**
 - **The leader log and option 3** (Sections 6.1 to 6.4), with lever 1 and the end state in Section 7.
 - **Witnesses as Section 6.5 has them.** They can't lead without a rebuild, and the owner's condition is that any journal-only voter can recover as a leader.
-- **Lever 2 as Section 7 sizes it.** It is being redesigned as batching without a protocol change, in a design step of its own:
-  - a follower takes a frame in one pass, its accept state handled by range;
-  - it votes once a frame, the message still carrying each command's vote;
-  - it forgets by range, and settles and flushes once a frame;
-  - the fast path and any voter's right to propose stay.
+- **Lever 2 as Section 7's parked row sizes it.** Section 6.7 redesigns it as batching without a protocol change, and that version needs no decision:
+  - a follower takes a frame in one pass, and learns, settles and flushes once a frame;
+  - it votes once a frame, the message carrying each command's vote as a range of sequence numbers with the exceptions listed;
+  - it forgets by range, once an execution group;
+  - the fast path and any voter's right to propose stay;
+  - nothing voted, counted, made durable or read by recovery changes. Only its vote message needs a feature activation.
 
 **Undecided: the transport on the loop's turn** (Section 7).
 - **Its size beside the leader log's,** on the 7763 at the measured turn: the transport −0.07, the leader log's three rows −0.23.
@@ -638,6 +735,7 @@ Every figure but the measured ones above is modeled from counts and profile shar
 7. The appender's one encode, in place of proposal 3.
 8. Lever 3.
 9. Lever 6's rest.
+10. Lever 2 redesigned (Section 6.7): its four steps without a wire change, then its vote message behind a feature.
 
 **For the owner:**
 - **Lazy voters (Section 6.6):** voters that vote on the hot path and land the eager voters' agreed batches behind, at a lag of one floor interval. Any of them can lead after executing its tail: one batch in steady state, and at most an enforced window of two while any voter within it is up. At one eager follower beside the leader, about −0.10 ms an operation on the 7763. The domain keeps five copies of the store, three of them behind.
