@@ -1815,6 +1815,36 @@ def journal_table(voters: dict) -> list[str]:
     return out
 
 
+
+def intake_index_table(voters: dict) -> list[str]:
+    """Each voter's projection index by command (task-d113), from its last
+    `metrics` line's `intake_index`: the live entries and the executed
+    part's, each with the bytes the line infers for them, and the executed
+    part's bytes per executed command; [] from a build without it."""
+    rows = []
+    for node, v in voters.items():
+        ix = (v.cost.raw or {}).get("intake_index") if v.cost else None
+        if isinstance(ix, dict):
+            rows.append((node, v.cost.executed, ix))
+    if not rows:
+        return []
+    mib = lambda b: f"{b / 2**20:.2f}"
+    out = [
+        "**The intake index** (task-d113, each voter's last boot, from its last `metrics` line's `intake_index`: its "
+        "live entries, a dependency or proposal row each, and the executed part's, an executed row kept each, with the "
+        "MiB the line infers for each at its per-entry estimate; executed is the commands the voter executed)",
+        "",
+        "| Node | Executed | Entries | Their MiB | Executed entries | Their MiB | Executed entries per command |",
+        "| --- " * 7 + "|",
+    ]
+    for node, executed, ix in rows:
+        e = ix.get("executed", 0)
+        per = f"{e / executed:.2f}" if executed else "-"
+        out.append(f"| {node} | {executed or 0} | {ix.get('entries', 0)} | {mib(ix.get('bytes', 0))} | {e} | "
+                   f"{mib(ix.get('executed_bytes', 0))} | {per} |")
+    out.append("")
+    return out
+
 # task-d97's distributions, in command_cost.py's order, with what each is.
 TAIL_ROWS = (
     ("answered_writes", "Writes, arrival to answer, at the node that took them"),
@@ -3136,6 +3166,7 @@ def summarize(store: str, nodes: list[str], title: str, profile: str | None = No
         out.extend(features_table(store, nodes))
         out.extend(admission_table(store, nodes))
         out.extend(journal_table(voters))
+        out.extend(intake_index_table(voters))
         out.extend(leader_groups_series(voters))
         out.extend(tails_table(voters))
         timed = [(node, name, r) for node, v in voters.items() for name, r in v.stages.items() if r[1] or r[2]]

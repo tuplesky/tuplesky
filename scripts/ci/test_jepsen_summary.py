@@ -686,6 +686,18 @@ class CheckpointTests(unittest.TestCase):
         line = "metrics " + json.dumps({"stages": [], "cost": {"Observed": cost}}) + "\n"
         self.assertIn("| n1 | 1000 | 800 | 1.25 | 500 | 2.00 | 0.82 | 300 / 200 / 290 / 10 |", self.summarize(line))
 
+    def test_the_intake_index_from_the_metrics_line(self):
+        cost = {"executed": 1000, "busy": {"secs": 1, "nanos": 0}, "uptime": {"secs": 60, "nanos": 0},
+                "recent": {"Unavailable": "NotInstrumented"}, "reads": {"served": 0}}
+        line = "metrics " + json.dumps({"stages": [], "cost": {"Observed": cost}}) + "\n"
+        # A build from before task-d113: no table.
+        self.assertNotIn("**The intake index**", self.summarize(line))
+        cost["intake_index"] = {"entries": 40, "bytes": 4096, "executed": 800, "executed_bytes": 2 * 2**20}
+        line = "metrics " + json.dumps({"stages": [], "cost": {"Observed": cost}}) + "\n"
+        text = self.summarize(line)
+        self.assertIn("**The intake index**", text)
+        self.assertIn("| n1 | 1000 | 40 | 0.00 | 800 | 2.00 | 0.80 |", text)
+
     def test_the_voters_table_shows_the_history_sweep(self):
         cost = {"executed": 1000, "busy": {"secs": 1, "nanos": 0}, "uptime": {"secs": 60, "nanos": 0},
                 "recent": {"Unavailable": "NotInstrumented"}, "reads": {"served": 0}}

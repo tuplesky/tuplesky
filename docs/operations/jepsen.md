@@ -468,7 +468,10 @@ represented, over every publication (task-d92), and a table after it each
 voter's journal groups and projection commits from its last `metrics`
 line, with commands per group and per commit, the journal's synced writes
 per command and, where the line has them, the groups by what they carried
-(task-d84, task-d86).
+(task-d84, task-d86). From a build with task-d113's index, a table after
+that gives each voter's `intake_index`: its live entries and the executed
+part's, with the MiB the line infers for each and the executed entries per
+command executed.
 
 | Scenario | Workload | Faults (SwiftPaxos) | Load | Network | Time |
 | --- | --- | --- | --- | --- | --- |
