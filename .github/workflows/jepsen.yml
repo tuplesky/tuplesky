@@ -103,7 +103,7 @@ on:
         description: "Seconds every TupleSky voter's inbound peer-plane traffic is dropped from the workload's start, the collectors still reaching every voter (through --hold-peer-links; task-d67's start-up row); empty or 0 for none"
         default: ""
       pair-base:
-        description: "Run TupleSky in pairs on one runner against this base: a tuplesky ref (a branch, a tag or a full commit SHA, which actions/checkout needs whole) built beside the head, env:NAME=VALUE for the head's own build with that variable on every voter, profile:strict or profile:replay for the head's own build on that journal profile (the profile input is the head's), or same for the head's own build (voter-workers BASE/HEAD then sets the sides apart); empty for one run"
+        description: "Run TupleSky in pairs on one runner against this base: a tuplesky ref (a branch, a tag or a full commit SHA, which actions/checkout needs whole) built beside the head, env:NAME=VALUE for the head's own build with that variable on every voter, harness:COORD_HARNESS_NAME=VALUE for the head's own build with that variable where the harness provisions it (a setting the harness writes into every voter's coordd.toml, such as COORD_HARNESS_PROJECTION_COMMIT_RECORDS=0), profile:strict or profile:replay for the head's own build on that journal profile (the profile input is the head's), or same for the head's own build (voter-workers BASE/HEAD then sets the sides apart); empty for one run"
         default: ""
       pairs:
         description: "How many base and head pairs, when pair-base is set (the order alternates from pair to pair; empty for 3); in a sweep, the steps the base runs at, comma-separated (empty for every step)"
@@ -269,7 +269,7 @@ jobs:
             cp "tuplesky/target/release/$b" "$RUNNER_TEMP/head-bin/" 2>/dev/null || true
           done
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
-        if: env.IN_PAIR_BASE != '' && env.IN_PAIR_BASE != 'same' && !startsWith(env.IN_PAIR_BASE, 'env:') && !startsWith(env.IN_PAIR_BASE, 'profile:')
+        if: env.IN_PAIR_BASE != '' && env.IN_PAIR_BASE != 'same' && !startsWith(env.IN_PAIR_BASE, 'env:') && !startsWith(env.IN_PAIR_BASE, 'harness:') && !startsWith(env.IN_PAIR_BASE, 'profile:')
         with:
           ref: ${{ inputs.pair-base }}
           path: tuplesky-base
@@ -277,7 +277,7 @@ jobs:
       - name: Build the pair's base
         # Into the head's target directory, so the dependencies the two
         # share are not built twice; the head's binaries are put back after.
-        if: env.IN_PAIR_BASE != '' && env.IN_PAIR_BASE != 'same' && !startsWith(env.IN_PAIR_BASE, 'env:') && !startsWith(env.IN_PAIR_BASE, 'profile:')
+        if: env.IN_PAIR_BASE != '' && env.IN_PAIR_BASE != 'same' && !startsWith(env.IN_PAIR_BASE, 'env:') && !startsWith(env.IN_PAIR_BASE, 'harness:') && !startsWith(env.IN_PAIR_BASE, 'profile:')
         working-directory: tuplesky-base
         run: |
           rustup show active-toolchain || rustup toolchain install
@@ -555,7 +555,7 @@ jobs:
           fi
           # Paired, or a sweep: TupleSky's sides in turn on this runner,
           # each run summarized as it ends.
-          head_bin="$RUNNER_TEMP/head-bin" base_bin="$RUNNER_TEMP/base-bin" base_args=() base_name=""
+          head_bin="$RUNNER_TEMP/head-bin" base_bin="$RUNNER_TEMP/base-bin" base_args=() base_name="" base_harness=""
           base_profile=$PROFILE
           # A sweep's head is the build in the target directory, which the
           # base's build puts back; a single-sided sweep keeps no copy.
@@ -581,6 +581,21 @@ jobs:
               fi
               base_bin=$head_bin base_args=(--voter-env "${IN_PAIR_BASE#env:}")
               base_name="$head_sha with ${IN_PAIR_BASE#env:}" ;;
+            harness:*)
+              # The head's own build with one of the harness's settings,
+              # which `coord-harness provision` reads from the environment
+              # and writes into every voter's coordd.toml.
+              base_harness=${IN_PAIR_BASE#harness:}
+              case $base_harness in
+                COORD_HARNESS_[A-Z_]*=*) ;;
+                *) echo "::error::pair-base $IN_PAIR_BASE: give harness:COORD_HARNESS_NAME=VALUE"; exit 1 ;;
+              esac
+              if ! grep -q "\"${base_harness%%=*}\"" "$GITHUB_WORKSPACE/tuplesky/crates/coord-harness/src/bin/coord-harness.rs"; then
+                echo "::error::pair-base $IN_PAIR_BASE: coord-harness reads no ${base_harness%%=*}"
+                exit 1
+              fi
+              base_bin=$head_bin
+              base_name="$head_sha with $base_harness" ;;
             *)
               # A base from before the admission rate was provisioned
               # leaves its frontends at the daemon's 1,000 a second.
@@ -601,9 +616,11 @@ jobs:
             local profile=$PROFILE
             if [ "$side" = base ]; then
               profile=$base_profile
+              if [ -n "$base_harness" ]; then export "${base_harness?}"; fi
               COORD_HARNESS_JOURNAL_PROFILE=$base_profile \
                 run_one "$base_bin" "$dir" "$graph" ${base_workers[@]+"${base_workers[@]}"} \
                 ${base_args[@]+"${base_args[@]}"} || rc=$?
+              if [ -n "$base_harness" ]; then unset "${base_harness%%=*}"; fi
               name=$base_name
             else
               run_one "$head_bin" "$dir" "$graph" ${head_workers[@]+"${head_workers[@]}"} || rc=$?

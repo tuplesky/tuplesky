@@ -248,7 +248,12 @@ SHA: `actions/checkout` does not take a short one), built beside the head into t
 target directory (a base without `coord-jepsen` runs the head's shim), or
 `env:NAME=VALUE`, the head's own build with that variable on every voter
 through jepsen.tuplesky's `--voter-env` (such as
-`env:COORDD_PEER_STREAM_FRAMES=1` against the default). `pairs` (3) sets
+`env:COORDD_PEER_STREAM_FRAMES=1` against the default), or
+`harness:COORD_HARNESS_NAME=VALUE`, the head's own build with one of
+`coord-harness provision`'s settings, which it writes into every voter's
+`coordd.toml` (such as `harness:COORD_HARNESS_PROJECTION_COMMIT_RECORDS=0`,
+task-d86's hold off, against its default; the job refuses a name the
+head's harness does not read). `pairs` (3) sets
 how many; the order alternates from pair to pair, so a drift over the job
 favours neither side. Each run gets its own summary as it ends, and
 `scripts/ci/jepsen_pairs.py` then gives one row per run and the head's
@@ -703,7 +708,9 @@ then gives a table of the steps, each run labelled `SIDE@STEP`:
   each plane's datagrams, ACK frames and frames, the api plane's frames by
   kind, the evidence for marked commands where the build counts it,
   task-d102's leader relay (submissions relayed to the leader alone, the
-  relays fallen back to every voter, the `NotLeading` refusals) and
+  relays fallen back to every voter, the `NotLeading` refusals, and from
+  a build with #230 what a follower took of relayed proposals: frames,
+  payloads, those for a command it knew and those it did not take) and
   proposal frames (proposals and frames sent, their bytes, the relayed
   payload bytes and the frontier announcements) where the build counts
   them, and the journal groups and projection commits;
@@ -719,7 +726,16 @@ then gives a table of the steps, each run labelled `SIDE@STEP`:
 Each run's own summary also gives operations completed a second and the
 clients busy on average beside its `ok`/s, and, from a build with
 task-d102, each voter's leader relay and the proposal frames its leaders
-sent (Leader relay and proposal frames).
+sent (Leader relay and proposal frames). From a build with #230 that table
+also gives what each voter took as a follower of the relayed proposals:
+the frames, the payloads, the proposals for a command it knew already,
+and those whose payload it did not take. Not taken also counts every
+relayed proposal that arrives while the voter may not vote at the
+leader's ballot, so it is above 0 after a leader change and 0 in a run
+without faults. Each frontend's admission refusals (Admission) are
+summed over its boots: the rate limit's (task-d26), a session busy,
+other, and from a build with #232 the collector's own bound behind the
+gate; a caller sees each as `BACKPRESSURE`.
 
 The TupleSky job also reads each node container's CPU quota and its
 throttling (cgroup v2's `cpu.max` and `cpu.stat`), after the cluster is

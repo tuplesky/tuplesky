@@ -619,6 +619,33 @@ class CheckpointTests(unittest.TestCase):
         self.assertIn("| 1500 / 0 / 0; 4100 in the other maps, largest 1500 |", text)
         self.assertIn("execution order (#221)", text)
 
+    def test_admission_refusals_summed_over_boots(self):
+        with tempfile.TemporaryDirectory() as store:
+            os.mkdir(os.path.join(store, "n1"))
+            with open(os.path.join(store, "n1", "coordd.log"), "w") as f:
+                f.write("coordd domain=d roles=[Voter]\n"
+                        "admission: per_second=1000 rate_limited=1 session_busy=0 other=0\n"
+                        "admission: per_second=1000 rate_limited=4 session_busy=1 other=0\n"
+                        "coordd domain=d roles=[Voter]\n"
+                        "admission: per_second=1000 rate_limited=2 session_busy=0 other=3 collection_bound=5\n")
+            text = js.admission_table(store, ["n1"])
+        self.assertIn("**Admission** (each frontend's `admission` line", "\n".join(text))
+        # The last line of each boot, summed: 4 + 2 rate-limited; the first
+        # boot's build had no collector's bound, the second's 5.
+        self.assertIn("| n1 | 2 | 1000 | 6 | 1 | 3 | 5 |", text)
+        with tempfile.TemporaryDirectory() as store:
+            os.mkdir(os.path.join(store, "n1"))
+            with open(os.path.join(store, "n1", "coordd.log"), "w") as f:
+                f.write("coordd domain=d roles=[Voter]\n"
+                        "admission: per_second=1000 rate_limited=0 session_busy=0 other=0\n")
+            self.assertIn("| n1 | 1 | 1000 | 0 | 0 | 0 | - |", js.admission_table(store, ["n1"]))
+            self.assertEqual(js.admission_table(store, ["n1", "n2"])[-2], "| n1 | 1 | 1000 | 0 | 0 | 0 | - |")
+        with tempfile.TemporaryDirectory() as store:
+            os.mkdir(os.path.join(store, "n1"))
+            with open(os.path.join(store, "n1", "coordd.log"), "w") as f:
+                f.write("coordd domain=d roles=[Voter]\n")
+            self.assertEqual(js.admission_table(store, ["n1"]), [])
+
     def test_the_leader_relay_and_proposal_frames(self):
         cost = {"executed": 1000, "busy": {"secs": 1, "nanos": 0}, "uptime": {"secs": 60, "nanos": 0},
                 "recent": {"Unavailable": "NotInstrumented"}, "reads": {"served": 0}}

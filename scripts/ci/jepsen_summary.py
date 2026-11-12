@@ -1930,6 +1930,54 @@ def read_features(path: str) -> dict | None:
     return out
 
 
+ADMISSION_COUNTS = ("rate_limited", "session_busy", "other", "collection_bound")
+
+
+def admission_table(store: str, nodes: list[str]) -> list[str]:
+    """The frontends' admission refusals (task-d26, #228, #232): each
+    voter's last `admission` line in each of its boots, summed over its
+    boots; [] from a build that prints none."""
+    rows = []
+    for i, _ in enumerate(nodes, 1):
+        node = f"n{i}"
+        path = os.path.join(store, node, "coordd.log")
+        if not os.path.exists(path):
+            continue
+        boots, last = [], None
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if line.startswith("coordd domain="):
+                    if last is not None:
+                        boots.append(last)
+                    last = None
+                elif line.startswith("admission:"):
+                    last = dict(kv.split("=", 1) for kv in line.split()[1:] if "=" in kv)
+        if last is not None:
+            boots.append(last)
+        if boots:
+            rows.append((node, boots))
+    if not rows:
+        return []
+    out = [
+        "**Admission** (each frontend's `admission` line, the last in each boot, summed over its boots: its rate "
+        "limit a second, then the frames it refused for the rate (task-d26), for a session already busy, for "
+        "another reason, and at the collector's own bound behind the gate (#232; `-` from a build without it); "
+        "a caller sees each refusal as `BACKPRESSURE` and retries)",
+        "",
+        "| Node | Boots | Rate limit a second | Rate limited | Session busy | Other | Collector's bound |",
+        "| --- | --- | --- | --- | --- | --- | --- |",
+    ]
+    for node, boots in rows:
+        limits = sorted({b.get("per_second", "-") for b in boots})
+        cells = []
+        for key in ADMISSION_COUNTS:
+            values = [b[key] for b in boots if key in b]
+            cells.append(str(sum(int(v) for v in values if v.isdigit())) if values else "-")
+        out.append(f"| {node} | {len(boots)} | {' / '.join(limits)} | " + " | ".join(cells) + " |")
+    out.append("")
+    return out
+
+
 def features_table(store: str, nodes: list[str]) -> list[str]:
     """The replicated features each voter reported after the harness
     activated them at setup and again before its logs were taken
@@ -2879,6 +2927,7 @@ def summarize(store: str, nodes: list[str], title: str, profile: str | None = No
                 )
             out.append("")
         out.extend(features_table(store, nodes))
+        out.extend(admission_table(store, nodes))
         out.extend(journal_table(voters))
         out.extend(leader_groups_series(voters))
         out.extend(tails_table(voters))
