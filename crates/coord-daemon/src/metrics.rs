@@ -713,6 +713,21 @@ pub struct Relay {
     pub fallbacks: u64,
     /// `NotLeading` refusals taken.
     pub not_leading: u64,
+    /// As a follower, since the node started (#224 review): proposal
+    /// frames taken.
+    #[serde(default)]
+    pub frames_taken: u64,
+    /// Payloads taken from relayed proposals.
+    #[serde(default)]
+    pub payloads_taken: u64,
+    /// Relayed proposals for a command it knew already.
+    #[serde(default)]
+    pub known: u64,
+    /// Relayed proposals whose payload it didn't take, so fetched if
+    /// wanted: not from the leader at its ballot, a payload that didn't
+    /// match the vote, or no room.
+    #[serde(default)]
+    pub not_taken: u64,
 }
 
 /// The durable command records a voter holds, and its history sweeps

@@ -319,12 +319,9 @@ impl Caller {
             // same invocation again for after its backoff. This call's one
             // attempt refused that way had nothing submitted, so the run
             // counts it as refused, not as an outcome it failed to learn.
-            let refused = self.client.backpressured(id) == self.client.attempts(id);
+            let answer = uncompleted(self.client.backpressured(id), self.client.attempts(id));
             self.release(id);
-            if refused {
-                return Err(Answer::Refused(BACKPRESSURE.into()));
-            }
-            return Err(Answer::Unknown);
+            return Err(answer);
         };
         // Release the invocation. The SDK retains a completed request so
         // that a caller which never saw the answer can still resolve it
@@ -338,6 +335,19 @@ impl Caller {
             self.client.forget(id);
         }
         Ok(outcome)
+    }
+}
+
+/// How a call the SDK completed nothing for ends. The SDK queues an
+/// invocation refused `BACKPRESSURE` again for after its backoff, so a
+/// call whose every attempt was refused that way had nothing submitted:
+/// the run counts it as refused, under [`BACKPRESSURE`]. Any other
+/// attempt may have been submitted, so its outcome is unknown.
+fn uncompleted(backpressured: u32, attempts: u32) -> Answer {
+    if backpressured == attempts {
+        Answer::Refused(BACKPRESSURE.into())
+    } else {
+        Answer::Unknown
     }
 }
 
@@ -402,4 +412,21 @@ fn load_roots(path: &Path) -> Result<rustls::RootCertStore, CallerError> {
             .map_err(|e| CallerError::Material(format!("trust bundle: {e}")))?;
     }
     Ok(roots)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Answer, BACKPRESSURE, uncompleted};
+
+    /// A call refused `BACKPRESSURE` on every attempt is a refusal under
+    /// its own reason, and one with any other attempt is an unknown
+    /// outcome (#228 review: without the classification, a run's rate
+    /// refusals read as outcomes it failed to learn).
+    #[test]
+    fn a_call_refused_backpressure_on_every_attempt_is_refused() {
+        assert_eq!(uncompleted(1, 1), Answer::Refused(BACKPRESSURE.into()));
+        assert_eq!(uncompleted(3, 3), Answer::Refused(BACKPRESSURE.into()));
+        assert_eq!(uncompleted(2, 3), Answer::Unknown);
+        assert_eq!(uncompleted(0, 1), Answer::Unknown);
+    }
 }

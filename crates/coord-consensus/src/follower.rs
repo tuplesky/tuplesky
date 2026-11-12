@@ -798,6 +798,39 @@ pub struct Follower {
     relayed_taken: u64,
     /// Proposal frames taken (task-d102).
     frames_taken: u64,
+    /// Relayed proposals whose command this replica knew already, so the
+    /// proposal path decided and nothing was fetched (#224 review).
+    relayed_known: u64,
+    /// Relayed proposals whose payload this replica didn't take: not from
+    /// the leader at its ballot, a payload that didn't match the vote, or
+    /// no room. Each such command's payload is fetched, if it is wanted
+    /// (#224 review).
+    relayed_not_taken: u64,
+}
+
+/// What a follower did with the payloads relayed proposals carried
+/// (task-d102, #224 review): whether it took them from the proposals or
+/// had to fetch them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RelayTaken {
+    /// Proposal frames taken.
+    pub frames: u64,
+    /// Payloads taken from relayed proposals.
+    pub taken: u64,
+    /// Relayed proposals for a command known here already.
+    pub known: u64,
+    /// Relayed proposals whose payload wasn't taken, to be fetched.
+    pub not_taken: u64,
+}
+
+impl RelayTaken {
+    /// Add `other`'s counts to these.
+    pub fn add(&mut self, other: &Self) {
+        self.frames = self.frames.saturating_add(other.frames);
+        self.taken = self.taken.saturating_add(other.taken);
+        self.known = self.known.saturating_add(other.known);
+        self.not_taken = self.not_taken.saturating_add(other.not_taken);
+    }
 }
 
 /// The retry-key bindings a restart restores from the payload rows
@@ -931,6 +964,8 @@ impl Follower {
             answer_on_release: BTreeSet::new(),
             relayed_taken: 0,
             frames_taken: 0,
+            relayed_known: 0,
+            relayed_not_taken: 0,
             catch_up: CatchUp::default(),
             diverged: None,
             config,
@@ -1237,6 +1272,8 @@ impl Follower {
             answer_on_release: BTreeSet::new(),
             relayed_taken: 0,
             frames_taken: 0,
+            relayed_known: 0,
+            relayed_not_taken: 0,
             catch_up: CatchUp::default(),
             diverged: None,
         }
@@ -1803,6 +1840,16 @@ impl Follower {
     /// Proposal frames this follower took (task-d102).
     pub fn frames_taken(&self) -> u64 {
         self.frames_taken
+    }
+
+    /// What this follower did with relayed payloads (#224 review).
+    pub const fn relay_taken(&self) -> RelayTaken {
+        RelayTaken {
+            frames: self.frames_taken,
+            taken: self.relayed_taken,
+            known: self.relayed_known,
+            not_taken: self.relayed_not_taken,
+        }
     }
 
     /// Replay the messages held for the ballot just synchronized.
@@ -5244,6 +5291,9 @@ impl Follower {
             && proposal.seqnum.is_some();
         let held = self.held.contains_key(&proposal.command);
         let took = takes && self.take_relayed_payload(&proposal, payload);
+        if !takes {
+            self.relayed_not_taken = self.relayed_not_taken.saturating_add(1);
+        }
         let mut effects = self.on_proposal(from, proposal);
         // A proposal held for want of its payload, whose payload this copy
         // brought: `on_proposal` returns at a duplicate of one held, so the
@@ -5268,6 +5318,7 @@ impl Follower {
         if identity != Some(command) || payload.admission_digest() != proposal.admission {
             self.rejections
                 .push(FollowerRejection::PayloadIdentityMismatch(command));
+            self.relayed_not_taken = self.relayed_not_taken.saturating_add(1);
             return false;
         }
         // Known here already, in any form: the proposal path decides.
@@ -5281,6 +5332,7 @@ impl Follower {
                 .selected_admission(&command)
                 .is_some_and(|d| d != proposal.admission)
         {
+            self.relayed_known = self.relayed_known.saturating_add(1);
             return false;
         }
         let recovering = self.sync_pending.contains_key(&command)
@@ -5310,6 +5362,7 @@ impl Follower {
             // No room: the proposal is held as one without its payload,
             // which is fetched once its turn comes.
             self.rejections.push(FollowerRejection::Backpressure);
+            self.relayed_not_taken = self.relayed_not_taken.saturating_add(1);
             return false;
         }
         if let Some(c) = self.campaign.as_mut() {

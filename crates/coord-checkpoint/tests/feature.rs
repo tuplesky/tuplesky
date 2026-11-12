@@ -289,10 +289,20 @@ fn a_build_that_cannot_read_the_active_state_refuses_it() {
     tx.commit_durable().unwrap();
 
     let view = engine.reader().snapshot().unwrap();
-    assert!(
-        matches!(admit(&view), Err(AdmitError::Engine(_))),
-        "an unknown active feature decoded to a smaller set"
-    );
+    // It is refused as too old, naming the id, not as a corrupt record:
+    // this is what a real downgrade meets (#227 review).
+    match admit(&view) {
+        Err(AdmitError::TooOld(too_old)) => {
+            assert_eq!(too_old.unknown, vec![0x7fff]);
+            assert!(too_old.missing.is_empty(), "{too_old:?}");
+            let text = too_old.to_string();
+            assert!(
+                text.contains("too old") && text.contains("0x7fff"),
+                "{text}"
+            );
+        }
+        other => panic!("an unknown active feature was not refused as too old: {other:?}"),
+    }
     assert!(future.features().is_err());
 }
 

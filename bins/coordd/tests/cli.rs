@@ -4478,6 +4478,15 @@ fn a_node_refuses_a_store_that_activated_something_this_build_cannot_do() {
         refused.out,
         refused.err
     );
+    // It says why as an operator needs it: this build is too old, and the
+    // id it doesn't know, not a corrupt record (#227 review).
+    assert!(
+        format!("{}{}", refused.out, refused.err).contains("too old")
+            && format!("{}{}", refused.out, refused.err).contains("0x7fff"),
+        "the refusal didn't say this build is too old:\n{}{}",
+        refused.out,
+        refused.err
+    );
 
     // And one it does support is admitted again: the guard is about
     // capability, not about the record existing.

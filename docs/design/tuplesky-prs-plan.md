@@ -3966,7 +3966,7 @@ So every feature-gated change, task-d98's `EarlyProposal` first, would ship unre
     - A relayed command is answered on the release alone, as every marked command is under step A, the fallback included.
     - On a ballot change it re-sends to the new leader. On no release within a bound it falls back to today's all-voter submission.
     - A collector with no voter beside it keeps fanning out.
-  - **The switch:** `Feature::LeaderRelay`, activated after `AnswerOnRelease`. Until both are active, nothing relays.
+  - **The switch:** `Feature::BatchedRound` (`batched-round`), activated after `AnswerOnRelease`, which turns on the relay and task-d102's proposal frames together (Section 4.3's B3; named `LeaderRelay` before it was built, #224 review). Until both are active, nothing relays. There is no advice bit yet (B1) and no way back, since a feature can't be deactivated: while it is active every marked command is relayed, whatever the fast share.
   - **task-d84's sync budget, its parts 2 and 3 (on #185), serve fanned-out rounds only:** a relayed adoption is part 2 for every relayed command, and part 3 doesn't arise. Their size is read at the fan-out share the switch leaves, on the `service` row.
 - **What it is expected to move** (Section 4.3), on the runner, at its register mix of 0.74 commands an operation at 30 callers and 0.93 at 120:
   - **step A:** about −0.26 ms a command in the voters' threads and up to −0.28 in the kernel, from about two thirds of the datagrams; about −0.19 to −0.24 ms an operation in the servers;

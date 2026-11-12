@@ -2529,6 +2529,156 @@ fn a_relayed_entry_falls_back_at_its_bound() {
     assert!(!w.collector.is_pending(&command));
 }
 
+/// Voter 0, the leader, stops; voter 1 campaigns and wins with voter 2,
+/// and the collector counts under the new ballot, as coordd has it do.
+/// Then whatever the collector asks again at once is delivered.
+fn voter_1_takes_over<P: Persistence>(w: &mut Cluster<P>) {
+    w.down = Some(0);
+    let (campaigned, out) = w.voters[1]
+        .campaign()
+        .expect("stepped")
+        .expect("a follower campaigns");
+    w.carry(1, out);
+    w.settle();
+    assert!(w.voters[1].leads(), "voter 1 won: {:?}", w.rejections());
+    w.collector.reconfigure(
+        BallotConfiguration::c2_default(epoch(), campaigned, (0..3).map(r).collect()).unwrap(),
+    );
+}
+
+/// What the collector asks again at once after the ballot moved,
+/// delivered where it says. Returns the versions and targets it sent.
+fn deliver_due<P: Persistence>(w: &mut Cluster<P>) -> Vec<(u16, Vec<ReplicaId>)> {
+    let due = w.collector.due_solicits(MonotonicMillis::ZERO, 16);
+    let mut sent = Vec::new();
+    for solicit in due {
+        let bytes = solicit.frame.to_vec();
+        for target in &solicit.targets {
+            let to = usize::from(target.0[0]);
+            if w.down != Some(to) {
+                w.deliver_submission(to, &bytes);
+            }
+        }
+        sent.push((frame(&bytes).version, solicit.targets.clone()));
+    }
+    w.settle();
+    sent
+}
+
+/// task-d102, step B's acceptance, leader change (a): a relayed command
+/// the old leader never proposed -- its submission lost on the way, or
+/// its proposal written but never sent. The collector asks the new leader
+/// alone with the relayed frame, the new leader proposes it, and the
+/// other survivor takes the payload from that proposal. It executes once
+/// and is answered on the release, with no fallback (#224 review).
+#[test]
+fn a_relayed_command_never_proposed_is_proposed_by_the_next_leader() {
+    for written in [false, true] {
+        let mut w = Cluster::new(256);
+        w.collector.set_answer_on_release(true);
+        w.collector.set_relay(true);
+        let (targets, submit) = w.submit_to(1);
+        assert_eq!(targets, vec![r(0)]);
+        let command = w.command(1);
+        if written {
+            // The leader proposed it, and the proposals never left.
+            w.deliver_submission(0, &submit);
+            w.peers.clear();
+        }
+        voter_1_takes_over(&mut w);
+        assert_eq!(&w.executed()[1..], [0, 0], "written={written}");
+        let sent = deliver_due(&mut w);
+        assert_eq!(
+            sent,
+            vec![(coord_collector::VERSION_RELAYED, vec![r(1)])],
+            "written={written}: asked of the new leader alone, relayed"
+        );
+        assert_eq!(&w.executed()[1..], [1, 1], "written={written}");
+        assert_eq!(
+            relayed_taken(&w, 2),
+            1,
+            "written={written}: from the proposal"
+        );
+        assert_eq!(w.releases.len(), 1, "written={written}");
+        assert!(!w.collector.is_pending(&command), "written={written}");
+        assert_eq!(w.collector.relay_fallbacks(), 0, "written={written}");
+        assert!(w.rejected.is_empty(), "written={written}: {:?}", w.rejected);
+    }
+}
+
+/// Leader change (b): a relayed command one follower adopted from the
+/// proposal, whose acknowledgement the leader never heard, and the other
+/// follower never saw. The new leader -- the follower that adopted it --
+/// recovers it from its own ACCEPT row, the other survivor gets the
+/// payload from it, both execute it once, and the submission the
+/// collector sends again is released. The payload the new leader took as
+/// a follower stays counted through its change of role (#224 review).
+#[test]
+fn a_relayed_command_adopted_below_a_slow_quorum_is_recovered_once() {
+    let mut w = Cluster::new(256);
+    w.collector.set_answer_on_release(true);
+    w.collector.set_relay(true);
+    let (_, submit) = w.submit_to(1);
+    let command = w.command(1);
+    w.deliver_submission(0, &submit);
+    // Voter 1 alone receives the proposal; what it sends back is lost.
+    let to_1: Vec<_> = w.peers.drain(..).filter(|(to, _, _)| *to == 1).collect();
+    assert!(!to_1.is_empty());
+    for (to, prov, bytes) in to_1 {
+        let out = w.voters[to].on_peer(prov, bytes).expect("driven");
+        w.carry(to, out);
+    }
+    w.peers.clear();
+    assert_eq!(
+        relayed_taken(&w, 1),
+        1,
+        "voter 1 adopted it from the proposal"
+    );
+    assert_eq!(w.executed(), [0, 0, 0]);
+
+    voter_1_takes_over(&mut w);
+    deliver_due(&mut w);
+    assert_eq!(&w.executed()[1..], [1, 1], "each survivor executed it once");
+    assert_eq!(w.releases.len(), 1);
+    assert!(!w.collector.is_pending(&command));
+    assert_eq!(w.collector.relay_fallbacks(), 0);
+    assert!(w.rejected.is_empty(), "{:?}", w.rejected);
+    assert_eq!(
+        w.voters[1].node().relay_taken_since_start().taken,
+        1,
+        "the count survives voter 1's change of role"
+    );
+}
+
+/// Leader change (c): a relayed command decided and executed everywhere
+/// whose release was lost. The new leader publishes the release again
+/// when the collector asks, nothing executes twice, and nothing falls
+/// back (#224 review).
+#[test]
+fn a_decided_relayed_command_whose_release_was_lost_is_released_again() {
+    let mut w = Cluster::new(256);
+    w.collector.set_answer_on_release(true);
+    w.collector.set_relay(true);
+    w.lose = Lose::Releases;
+    let (_, submit) = w.submit_to(1);
+    let command = w.command(1);
+    w.deliver_submission(0, &submit);
+    w.settle();
+    assert_eq!(w.executed(), [1, 1, 1]);
+    assert!(w.releases.is_empty(), "the release was lost");
+    assert!(w.collector.is_pending(&command));
+    w.lose = Lose::Nothing;
+
+    voter_1_takes_over(&mut w);
+    let sent = deliver_due(&mut w);
+    assert_eq!(sent.len(), 1, "asked again once: {sent:?}");
+    assert_eq!(&w.executed()[1..], [1, 1], "nothing executed twice");
+    assert_eq!(w.releases.len(), 1, "released again");
+    assert!(!w.collector.is_pending(&command));
+    assert_eq!(w.collector.relay_fallbacks(), 0);
+    assert!(w.rejected.is_empty(), "{:?}", w.rejected);
+}
+
 /// task-d102: a grouped leader with `BatchedRound` holds a turn's
 /// relayed proposals until it flushes, then sends each follower one
 /// frame carrying them all with their payloads. Every follower adopts
@@ -2577,6 +2727,16 @@ fn a_turns_relayed_proposals_leave_in_one_frame_at_the_flush() {
         };
         assert_eq!(f.frames_taken(), 1, "voter {i} took one frame");
         assert_eq!(f.relayed_taken(), 3);
+        // What the metrics line reads (#224 review).
+        assert_eq!(
+            w.voters[i].node().relay_taken_since_start(),
+            coord_consensus::RelayTaken {
+                frames: 1,
+                taken: 3,
+                known: 0,
+                not_taken: 0,
+            }
+        );
     }
     for sequence in 1..=3 {
         assert!(!w.collector.is_pending(&w.command(sequence)));
