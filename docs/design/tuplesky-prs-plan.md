@@ -1308,10 +1308,21 @@ The steps:
    - a crash that freezes the files and keeps none, all, or a seeded subset of what wasn't synced, torn at byte level and reordered.
 
    **The audit:** the operations that bypass the adapter, each named in the report as uncontrolled or, where the adapter can reach it, brought under it. These are:
-   - the directory sync in raft-engine's `pipe.rs`, which panics on failure;
+   - the directory sync in raft-engine's `pipe.rs`, which panics on failure. In the pin (`097c499`) its one caller is `rotate_imp`, so it runs only at rotation. The first log file, created by `SinglePipe::open`, got no directory sync (#210 review);
    - `pipe_builder`'s directory creation, listing and lock;
-   - the adapter's own `std::fs` calls;
+   - the adapter's own `std::fs` calls, including `create_dir_all`, which synced no parent;
    - raft-engine's background threads, if any.
+
+   **Directory entries** (#210 review).
+   - **The model:** a created or renamed file's entry survives a crash only once a directory sync covers it. Until then a crash loses the created file, or leaves the renamed one under its old name.
+   - **The adapter's fix:** it now syncs the journal's directory and every directory `create_dir_all` made, up to the one that existed, through a `DirSync` trait the kit implements. This happens after the engine creates its first file and before `create` returns.
+   - **raft-engine's own rotation sync** is inferred from the pin's order, since it bypasses the kit.
+   - **What's named, not modelled:** a delete is modelled as standing, and a directory's own entry isn't modelled.
+   - **The controls:** with the adapter's sync removed, the matrix fails, because the created journal is lost. A directory sync the kit lies about is caught.
+
+   **Not in this step:**
+   - After a failed `fsync`, Linux can mark the pages clean, so a later `fsync` reports success without persisting them. The engine panics on a failed sync, so that case belongs to step 5's fail-stop.
+   - Steps 1 and 2 test the journal alone, so they are profile-independent: `strict` and `replay` don't differ there.
 2. **The recovery modes** against the kit: a torn or partial tail, and damage inside the durable prefix, under `TolerateTailCorruption` (the default) and `AbsoluteConsistency`. A mode may drop an unsynced tail. Neither may drop, or open past, a record that was synced and reported durable; damage there is refused with its position.
 3. **The composed crash matrix:**
    - **The crash points.** Journal and projection crash together at every counted operation of either, with each tail policy on each, under `strict` and `replay`, over the domains' real `JournaledStore`.

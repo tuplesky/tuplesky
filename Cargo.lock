@@ -724,6 +724,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "coord-journal-faultkit"
+version = "0.1.0"
+dependencies = [
+ "coord-core",
+ "coord-journal-api",
+ "coord-journal-raft-engine",
+ "coord-store-api",
+ "coord-types",
+ "raft-engine",
+ "rand_chacha 0.10.0",
+ "rand_core 0.10.0",
+ "tempfile",
+]
+
+[[package]]
 name = "coord-journal-raft-engine"
 version = "0.1.0"
 dependencies = [
@@ -3425,9 +3440,9 @@ dependencies = [
 
 [[package]]
 name = "rustix"
-version = "1.1.5"
+version = "1.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "891efababe418670775f199f0d233d84843c227a0949a883ce15b37c78d6629d"
+checksum = "e5e76742e5294153d4dde1207dbec5bdd81eef6fabdc0d2118babadabfd858aa"
 dependencies = [
  "bitflags 2.13.2",
  "errno",
