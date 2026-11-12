@@ -197,8 +197,7 @@ pub fn page<P: Persistence>(
         if entries.len() >= MAX_CATCH_UP_COMMANDS {
             break;
         }
-        let Ok(Some(entry)) =
-            coord_storage::protocol::catch_up_entry(gated.view(), epoch, &command)
+        let Ok(Some(entry)) = coord_storage::protocol::catch_up_entry(&gated, epoch, &command)
         else {
             break;
         };
@@ -246,7 +245,7 @@ pub fn executed_rows<P: Persistence>(
         .into_iter()
         .map(|command| {
             let decided = gated.as_ref().and_then(|g| {
-                coord_storage::protocol::catch_up_entry(g.view(), epoch, &command)
+                coord_storage::protocol::catch_up_entry(g, epoch, &command)
                     .ok()
                     .flatten()
                     .and_then(|entry| entry.decided)

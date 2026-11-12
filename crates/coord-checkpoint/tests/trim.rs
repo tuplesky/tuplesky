@@ -34,6 +34,7 @@ use coord_core::effect::StoreUpdate;
 use coord_state::view::KvEntry;
 use coord_storage::codecs::{self, ExecutedRecordV1, HistoryRecordV1};
 use coord_storage::compaction::{GcBudget, RetentionHolds, plan_gc};
+use coord_storage::intake;
 use coord_storage::lowering::{DurableMeta, ExecutionFrontier};
 use coord_storage::protocol::read_protocol;
 use coord_storage::views::ViewBudget;
@@ -365,10 +366,21 @@ fn identity_rows() -> Vec<Row> {
     ]
 }
 
+/// Write `rows` as the store writes them: a dependency or proposal row
+/// named by command goes in under its intake key (task-d113), one record a
+/// row, in the order given. That order is the history trim surveys.
 fn seed<E: LocalEngine>(engine: &mut E, rows: Vec<Row>) {
+    let index = intake::IntakeIndex::build(&engine.reader().snapshot().unwrap(), 0).unwrap();
+    let mut assigner = intake::Assigner::new(&index);
     let mut tx = engine.begin_write().unwrap();
-    for (c, k, v) in rows {
-        tx.put(c.id(), &k, &v).unwrap();
+    for (i, (c, k, v)) in rows.into_iter().enumerate() {
+        let update = StoreUpdate {
+            collection: c.id(),
+            key: k,
+            value: Some(v),
+        };
+        coord_storage::lowering::lower_record(&mut tx, &mut assigner, 1 + i as u64, &[update])
+            .unwrap();
     }
     let seq = LocalJournalSeq::new(17).unwrap();
     DurableMeta {
@@ -410,14 +422,17 @@ fn trimmable_store() -> ModelEngine {
     engine
 }
 
+/// Apply `updates` as the store lowers one record: a trim step's deletions
+/// by intake key as they are, a row named by command under its intake key
+/// (task-d113).
 fn apply<E: LocalEngine>(engine: &mut E, updates: &[StoreUpdate]) {
+    let index = intake::IntakeIndex::build(&engine.reader().snapshot().unwrap(), 0).unwrap();
+    let mut assigner = intake::Assigner::new(&index);
     let mut tx = engine.begin_write().unwrap();
-    for update in updates {
-        match &update.value {
-            Some(value) => tx.put(update.collection, &update.key, value).unwrap(),
-            None => tx.delete(update.collection, &update.key).unwrap(),
-        }
-    }
+    // After every record `seed` lowered: a record of its own.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1 << 32);
+    let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    coord_storage::lowering::lower_record(&mut tx, &mut assigner, seq, updates).unwrap();
     tx.commit_durable().unwrap();
 }
 
@@ -440,10 +455,17 @@ fn rows_of<E: LocalEngine>(engine: &E, collection: Collection) -> Vec<(Vec<u8>, 
     out
 }
 
+/// The key the machine names a row by: an intake key's command key, any
+/// other key as it is. So the assertions below read the same rows whatever
+/// the layout (task-d113).
+fn logical(key: &[u8]) -> Vec<u8> {
+    intake::command_key_of(key).unwrap_or_else(|| key.to_vec())
+}
+
 fn protocol_keys<E: LocalEngine>(engine: &E) -> BTreeSet<Vec<u8>> {
     rows_of(engine, Collection::ProtocolV1)
         .into_iter()
-        .map(|(k, _)| k)
+        .map(|(k, _)| logical(&k))
         .collect()
 }
 
@@ -738,7 +760,7 @@ fn a_retained_command_pins_the_protocol_rows_of_the_dependencies_it_names() {
         plan.pinned, 6,
         "the dependency and proposal rows of commands 1, 2 and 3"
     );
-    let deleted: BTreeSet<Vec<u8>> = plan.updates.iter().map(|u| u.key.clone()).collect();
+    let deleted: BTreeSet<Vec<u8>> = plan.updates.iter().map(|u| logical(&u.key)).collect();
     for n in [1u8, 2, 3] {
         assert!(
             !deleted.contains(&dependency_key(e, &command(n))),
@@ -777,7 +799,7 @@ fn a_retained_command_pins_the_protocol_rows_of_the_dependencies_it_names() {
     seed(&mut settled, rows);
     publish(&mut settled);
     let plan = step(&settled, &TrimLimits::default());
-    let deleted: BTreeSet<Vec<u8>> = plan.updates.iter().map(|u| u.key.clone()).collect();
+    let deleted: BTreeSet<Vec<u8>> = plan.updates.iter().map(|u| logical(&u.key)).collect();
     assert_eq!(plan.pinned, 0);
     assert!(deleted.contains(&dependency_key(e, &command(3))));
     assert!(deleted.contains(&proposal_key(e, &command(3))));
@@ -1050,7 +1072,7 @@ fn an_unrecognized_protocol_row_is_retained_rather_than_deleted() {
     publish(&mut engine);
 
     let plan = step(&engine, &TrimLimits::default());
-    let deleted: BTreeSet<Vec<u8>> = plan.updates.iter().map(|u| u.key.clone()).collect();
+    let deleted: BTreeSet<Vec<u8>> = plan.updates.iter().map(|u| logical(&u.key)).collect();
     assert!(!deleted.contains(&unknown_tag));
     assert!(!deleted.contains(&short_key));
     assert!(plan.retained >= 2);
