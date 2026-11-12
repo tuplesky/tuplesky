@@ -148,6 +148,8 @@ This proposal leads, as review asked ([6835409559](https://github.com/tuplesky/t
 
 **Build.** A design step for the recovery readers, then about 3 to 4 weeks.
 
+**Its design step** is task-d117 ([design Section 17.17](tuplesky-design.md#s17-17)). It changes the readers' table above in one place: executed history is served from immutable segments written off the loop, not from the journal by position, so the journal's retention still ends at the published image and doesn't follow the slowest voter.
+
 ### 4.2 Proposal 1: execution from memory, the store written behind
 
 **What it removes.**

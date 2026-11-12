@@ -3,7 +3,7 @@
 **Status:** Review proposal, consolidated v1.5.  
 **Date:** 2026-09-24.  
 **Companion:** [TupleSky implementation design](tuplesky-design.md).  
-**Scope:** 203 implementation tasks with stable `task-*` identifiers. The `task-01` through `task-66`, `task-s01` through `task-s04`, `task-j01` through `task-j10`, `task-o01` through `task-o06`, `task-m01` through `task-m05`, `task-c01`, `task-c02`, `task-c03`, `task-d01` through `task-d92`, `task-d94` through `task-d100`, `task-d106` through `task-d110`, `task-d112`, `task-d113`, `task-d115` and `task-q01` suffixes and prerequisites are preserved. v1.5 adds `task-d01` through `task-d04` from review of the open implementation PRs and of multi-host readiness, `task-d05` through `task-d17` from the Jepsen client's runs, `task-d18` through `task-d33` from a review against an external SwiftPaxos correctness checklist ([review record](tuplesky-checklist-review.md)), `task-d34` from what the protocol simulator of task-d30 found, `task-d35` through `task-d44` from a review of recovery time and storage integrity (an execution chain, a scrub, and voter replacement through a prepared transition, a staged learner, terminal recovery after the seal, serving across a transition and a running membership install), `task-d45` through `task-d50` from measuring the throughput of the Jepsen client's first unthrottled runs, `task-d51` from task-d46's long runs, `task-d52` and `task-d53` from a profile of the domain thread after task-d46, `task-d54` from the Jepsen runs of task-d50, `task-d55` through `task-d57` from the Jepsen runs of task-j06, `task-d58` through `task-d61` from a profile of five voters' CPU per operation, `task-d62` through `task-d65` from a consolidated review against the reference SwiftPaxos, `task-d66` from the Jepsen runs of task-d51, `task-d67` from a Jepsen run on #98 that made no fast decision, `task-d68` from task-d62's counts after a leader change, `task-d69` from a profile of a follower's loop, `task-d70` from the Jepsen runner's profile of the transport's workers, `task-d71` from the protocol simulator's first 1,000-seed sweep, `task-d72` through `task-d75` from comparing a command's cost with etcd's on one host, `task-d76` from a Jepsen run that killed the leader, `task-d77` through `task-d81` from the protocol simulator with acknowledgements between followers lost, `task-d82` through `task-d84` from the Jepsen runs of the #173 carry, `task-d85` from the protocol simulator on task-d74's routing, `task-d86` through `task-d92` from planning the whole gap to etcd on #174, `task-d106` and `task-d107` from the task-d72 batch's register-kill run, `task-d108` and `task-d109` from the runs after it, `task-d110` from an audit of the walks a turn makes over history, `task-d113` from a profile of the materializer, `task-d115` from the owner's batching rule, and moves committed key replacement from `task-58` to `task-m03`; the changes are listed under [Gate checklist and deferred work](#gate-checklist-and-deferred-work). Task IDs are not GitHub pull-request or issue numbers. One implementation PR corresponds to one task; its GitHub-assigned number is recorded separately. No baseline, supplement or separate amendment is needed.
+**Scope:** 205 implementation tasks with stable `task-*` identifiers. The `task-01` through `task-66`, `task-s01` through `task-s04`, `task-j01` through `task-j10`, `task-o01` through `task-o06`, `task-m01` through `task-m05`, `task-c01`, `task-c02`, `task-c03`, `task-d01` through `task-d92`, `task-d94` through `task-d100`, `task-d106` through `task-d110`, `task-d112`, `task-d113`, `task-d115` through `task-d117` and `task-q01` suffixes and prerequisites are preserved. v1.5 adds `task-d01` through `task-d04` from review of the open implementation PRs and of multi-host readiness, `task-d05` through `task-d17` from the Jepsen client's runs, `task-d18` through `task-d33` from a review against an external SwiftPaxos correctness checklist ([review record](tuplesky-checklist-review.md)), `task-d34` from what the protocol simulator of task-d30 found, `task-d35` through `task-d44` from a review of recovery time and storage integrity (an execution chain, a scrub, and voter replacement through a prepared transition, a staged learner, terminal recovery after the seal, serving across a transition and a running membership install), `task-d45` through `task-d50` from measuring the throughput of the Jepsen client's first unthrottled runs, `task-d51` from task-d46's long runs, `task-d52` and `task-d53` from a profile of the domain thread after task-d46, `task-d54` from the Jepsen runs of task-d50, `task-d55` through `task-d57` from the Jepsen runs of task-j06, `task-d58` through `task-d61` from a profile of five voters' CPU per operation, `task-d62` through `task-d65` from a consolidated review against the reference SwiftPaxos, `task-d66` from the Jepsen runs of task-d51, `task-d67` from a Jepsen run on #98 that made no fast decision, `task-d68` from task-d62's counts after a leader change, `task-d69` from a profile of a follower's loop, `task-d70` from the Jepsen runner's profile of the transport's workers, `task-d71` from the protocol simulator's first 1,000-seed sweep, `task-d72` through `task-d75` from comparing a command's cost with etcd's on one host, `task-d76` from a Jepsen run that killed the leader, `task-d77` through `task-d81` from the protocol simulator with acknowledgements between followers lost, `task-d82` through `task-d84` from the Jepsen runs of the #173 carry, `task-d85` from the protocol simulator on task-d74's routing, `task-d86` through `task-d92` from planning the whole gap to etcd on #174, `task-d106` and `task-d107` from the task-d72 batch's register-kill run, `task-d108` and `task-d109` from the runs after it, `task-d110` from an audit of the walks a turn makes over history, `task-d113` from a profile of the materializer, `task-d115` from the owner's batching rule, `task-d116` from a restarted voter's boot in a fault run, `task-d117` from its proposal 2, and moves committed key replacement from `task-58` to `task-m03`; the changes are listed under [Gate checklist and deferred work](#gate-checklist-and-deferred-work). Task IDs are not GitHub pull-request or issue numbers. One implementation PR corresponds to one task; its GitHub-assigned number is recorded separately. No baseline, supplement or separate amendment is needed.
 
 ## How to use this plan
 
@@ -69,6 +69,8 @@ Reference single-store and fixed-membership compositions are early increments, n
 | task-d113 | From the materializer's profile on #185 ([6810986014](https://github.com/tuplesky/tuplesky/pull/185#issuecomment-6810986014)): a follower writes about 2.3 KB of rows a command and 38 KB to the file, 9.4 fresh pages (11.3 at the leader), because the payload, dependency and executed rows are keyed by the command's digest and each lands on a leaf no other command in the commit touches | A design step now, then the top code priority in two steps: the dependency rows first, then the payload and executed rows. It needs neither task-d86 nor task-d105 first (the lead's order, on review's word on #233) |
 | task-d114 | From #245's merge (the lead and review, on #245 and #185 [6829224686](https://github.com/tuplesky/tuplesky/pull/185#issuecomment-6829224686)): the key index grows with every put until something compacts, and nothing in `coordd` does | A design step, then the GC driver: after #244, and before the key index's bound is counted on |
 | task-d115 | From the owner's rule on #185 (the lead's order): journal and store are for recovery, one storage round trip a batch and one syscall a batch a peer. The audit against it ([6835865051](https://github.com/tuplesky/tuplesky/pull/185#issuecomment-6835865051)) found execution's store reads, protocol rows and wake-ups per command | A design step only ([the batching rule](tuplesky-batching-rule.md)); its code steps are their own tasks, and option 3 and the leader log wait for the owner |
+| task-d116 | From the fault run on D (#98, [6835528337](https://github.com/tuplesky/tuplesky/pull/98#issuecomment-6835528337)) and the lead on #185: a restarted voter's `voter_ms` step is 73 to 82% of a long boot and its memory peaks at about 5 KiB a key version, because the boot reads every executed command's record and payload and the follower then forgets them | A design step first, with no code before its review |
+| task-d117 | From the batching rule's proposal 2 (the lead's order on #185): about 11.8 of a follower's 13.9 rows a command are protocol, retry and executed-history rows, copies of what the journal holds | A design step first ([Section 17.17](tuplesky-design.md#s17-17)), then four code steps, `meta_v1` once a commit first |
 | task-q01 | Combined durable WAN/Kine qualification | Required before task-66 |
 
 ```mermaid
@@ -300,6 +302,8 @@ This is a workstream overview; the individual prerequisites are authoritative. O
 | [task-d113](#task-d113) | Key the payload, dependency and executed rows by order | task-d08, task-d23, task-d27, task-d72, task-d77 |
 | [task-d114](#task-d114) | Collect the key index's old versions in `coordd` | task-14, task-d113 |
 | [task-d115](#task-d115) | Hold the single domain to the batching rule | task-d72, task-d84 |
+| [task-d116](#task-d116) | Build a restarted voter from what it keeps, not from its history | task-d26, task-d113 |
+| [task-d117](#task-d117) | Keep protocol state in the journal only | task-j05, task-j06, task-d113, task-d115 |
 | [task-q01](#task-q01) | Produce the combined durable WAN/Kine qualification report | task-j07, task-j08, task-o06, task-m05, task-63, task-64, task-d45, task-d46, task-d47, task-d48, task-d49, task-d51, task-d52, task-d53 |
 
 ## Task specifications
@@ -4426,6 +4430,118 @@ From the owner's rule, given on #185 by the lead: "Journal and store are for rec
 - **The document is reviewed against the audit and the profiles it cites.**
 - **Each code step's acceptance reads its own pair** against the cost model's prediction for that step, locally and on the runner. Every figure in the model but #251's is from counts and profile shares, not measured as a pair.
 
+<a id="task-d116"></a>
+### task-d116: Build a restarted voter from what it keeps, not from its history
+
+**Prerequisites:** task-d26, task-d113.  
+**Design:** Section 4.8 (the authoritative cut), with task-d27's forgetting.
+
+From the fault run on D (#98, [6835528337](https://github.com/tuplesky/tuplesky/pull/98#issuecomment-6835528337)) and the lead on #185:
+- **Time:** the boot line's `voter_ms` step is 73 to 82% of a long boot (2.9 to 6.9 s), at 25 to 37 µs a key version.
+- **Memory:** a restarted voter's resident set peaks at 0.87 to 1.09 GiB in its first seconds, at about 200,000 key versions (about 5 KiB a version), before falling to 260 MiB.
+- Both grow with history.
+
+**Read locally.** The setup is `boot.sh`'s: five voters on tmpfs, `replay`, the bar's mix at 120 callers, every voter stopped after N operations, then voter 2 restarted alone.
+
+| Commands executed | `voter_ms` | µs a command | Share of the boot |
+|---:|---:|---:|---:|
+| 20,476 | 272 | 13 | 29% |
+| 132,500 | 2,666 to 2,808 | 20 to 21 | 46 to 58% |
+| 297,637 | 7,856 | 26 | 58% |
+
+At every size the startup's `recovered` line reads `records`, `payloads` and `executed` all equal to every command executed since genesis, with `history` 0.
+
+**What builds the voter.** `voter_ms` times `voter()`, `keep_floor` and `pipeline` in `bins/coordd/src/main.rs`. Its CPU at 132,500 commands (perf, 2.56 s of samples):
+- **`read_protocol`, 43%.** `Persistence::recovered` reads the authoritative cut:
+  - every executed row (`execution_v1`), into a map by command, a map by position and a list;
+  - every decided record of the epoch (`decided_v1`). A decided row goes only with its dependency row's delete after execution, and these runs made none, so every executed command comes back as a record;
+  - for each record with a payload, a point get of its `payload_v1` row (38% of `read_protocol`), the payload's decode (18%), the request's decode (5%) and the identity's rehash (9%).
+- **`restore_execution`, 32%.** Every executed command is restored into the table, retired, and swept from the ledger and the maps beside it (`sweep_history`).
+- **`recover_with_syncs`, 16%.** A binding for every payload, and the table and the ledger restored from every record.
+- **The copies, 6%.** `voter()` clones the payloads twice and the records once.
+- **The rest is under 1%:** `Features::open`, the boot record, `keep_floor` and `pipeline`.
+
+Nearly all of the step is history the follower reads, builds and then forgets in the same call. A command restored as executed is forgotten unless it is in the table's recent window, and a forgotten command keeps no record, payload, binding or vote.
+
+**What holds the memory.** The resident set was sampled every 20 ms against the startup lines, at 132,500 commands:
+- **Before the step:** about 270 MiB after the attach (the key index's phase, task-d114).
+- **During `read_protocol`:** to about 355 MiB. The decoded payloads are 53% of its first touches of a page and the decided records 25% (perf's page faults).
+- **Building the follower:** to the peak, 610 to 618 MiB, about 4.7 KiB a command, which is the lead's 5 KiB a version. Live at once:
+  - `RecoveredProtocol`: every executed command's record (its dependencies, keys and paths) and its payload (the request's bytes and the admission facts);
+  - the follower's payload map, and its ledger's and table's copies of every record;
+  - the payloads' second copy, for `restore_payloads`;
+  - a binding, an adopted entry and a served-payload entry for each command.
+- **After:** `sweep_history` drops the follower's copies, and `RecoveredProtocol` goes when `voter()` returns.
+  - Locally the resident set was still 563 to 618 MiB 2 s after `phase=live`, with the other voters down and nothing executing.
+  - The runner's fall to 260 MiB came later. What holds the difference until then is the step's first reading.
+
+**The step.** A design first, and no code before its review.
+1. **The boot line splits the step:** the protocol read, building the follower, and the rest, each timed, with the resident set at each.
+2. **Read only what the follower keeps.** `read_protocol` reads payloads only for the records the table won't forget:
+   - the records not executed: pending, and bounded by the table's capacity;
+   - the executed ones still in its recent window.
+   An executed command beyond that comes back as its identity in execution order, from `execution_v1`, with no record and no payload.
+3. **Decided records: only each key's latest.** A key keeps naming its latest command after that command executes, so the chain needs that record and its paths. The design picks one of two ways:
+   - read only those, through the key index or the intake index;
+   - delete a decided row once every key it names has a later executed command. That is a store change, with its own crash cut.
+4. **No copies.** The records and payloads move into the follower, and `restore_payloads` reads the follower's own map.
+5. **What stays a command, until task-d27's trim:** the table's executed set and the intake index's executed part (27 bytes an entry, task-d27's note).
+
+**Not here:**
+- the key index's phase (task-d114);
+- the journal's open and the baseline, each about 1 s at 132,500 commands. They grow with the journal's retained records and are task-d27's and task-d55's.
+
+**Acceptance.**
+- **Time:** between 20,000 and 300,000 commands executed, `voter_ms` grows by under 2 µs a further command (26 today).
+- **Memory:** the boot's peak resident set is within 25% of the resident set a minute after `phase=live`, at both sizes.
+- **The same follower:** a test builds a follower from the bounded read and from today's full read, over a store with:
+  - executed commands inside and beyond the recent window;
+  - a key whose latest command executed long ago;
+  - pending records and a Sync row.
+  Both followers have the same table, ledger, bindings, payloads and next executable command.
+- **Restarts stay right:** the restart, catch-up and election suites pass, and a restarted voter's first proposal chains after the last command it executed (task-d12).
+
+**Review boundary:** what a restart reads and builds. No change to the rows written, the wire or the journal, unless the design picks step 3's deletion, which then carries its own crash cut.
+
+<a id="task-d117"></a>
+### task-d117: Keep protocol state in the journal only
+
+**Prerequisites:** task-j05, task-j06, task-d113, task-d115.  
+**Design:** Section 17.17, with Sections 17.1, 17.3.4 and 17.16 amended by each code step as it lands.
+
+Proposal 2 of [the batching rule](tuplesky-batching-rule.md#41-proposal-2-protocol-state-in-the-journal-only-lever-7) (the lead's order on #185). The audit counted about 14 rows a command at a follower; about 11.8 of them are copies of what the journal holds: protocol rows, payloads, retry rows and executed history, and a meta row a command.
+
+**The design step (this task's first PR, docs only)** is Section 17.17. What it settles:
+- **Where each collection goes.** Live protocol state to a recovery map in memory, kept by the store's lowering and carried by the local image. The retry window to memory, versioned for views, with each retained result's request beside it. Executed history to an in-memory buffer, then to immutable segments of `FLOOR_INTERVAL` positions written off the loop. `meta_v1` once a commit.
+- **What each reader reads instead,** with its cost and bound: boot, catch-up served, a campaign's report and its executed rows, resolve, settlement, planning, a divergence stop, trim and its fence, and both images.
+- **Journal retention still ends at the published image.** No reader of history reads the journal.
+- **Boot replays `(C, J]` into memory** under both profiles: at most 4,096 records under `strict` and 65,536 under `replay` (inferred 10 to 30 ms and 0.2 to 0.4 s).
+- **The store and image formats,** raised by each step, and the conversion, a release condition that isn't built.
+- **The crash matrix and fault runs** each step re-earns.
+- **Not taken:** history from the journal by position (retention would follow the slowest voter, and boot reads every retained record), one history row a commit in the projection, and history in memory.
+
+**The code, in four steps, one PR each:**
+1. **`meta_v1` once a commit.** No format change. It can go now.
+2. **Live protocol state in the recovery map,** the image's recovery section and the recovery replay. Node-private only. It waits for task-j05's composed matrix (#212) on the carry.
+3. **The retry window in memory,** with the request beside each result. It changes `retry_v1` in the common hash and both images.
+4. **Executed history in segments,** with the history digest in the floor's root in place of `payload_v1` and `execution_v1`.
+
+**Size** (Section 17.17, point 9, on the batching rule's terms): net about −155 to −165 µs a command over five voters, −0.10 to −0.11 ms an operation locally and −0.14 to −0.15 on the 7763. By step: −0.007, −0.032 to −0.039, −0.033 and −0.028 locally. Every figure is from row counts and the materializer's profile shares, not a pair.
+
+**What it supersedes:** task-d103's proposal row, task-d104's retry rows (its rules apply to the window in memory), lever 6's part 2, and task-d113's keying by order for the rows that leave. task-d113's intake keys and its index stay, in memory.
+
+**Acceptance.**
+- **The design step** reviewed against the readers it names. Every reader of the collections that leave is in Section 17.17's table.
+- **Each code step:**
+  - its pair, local and on the runner: the counting build's bytes by table and the materializer's µs a command at each voter, against its row in point 9;
+  - the crash cuts of point 8 at every cut under `strict` and `replay`, with the negative control;
+  - the tests point 8 lists, rewritten to the same claim;
+  - the boot line's new phases at 10⁵ and 10⁶ commands;
+  - the fault runs point 8 lists, on the runner (testing's).
+- **A release condition,** carried like task-d113's: the first release that promises an upgrade in place needs the conversion built.
+
+**Review boundary:** Where the projection keeps protocol, retry and executed-history state, and what boot, donors, campaigns, resolve and the images read instead. No change to the journal's records, the wire, the protocol, what a vote rests on or what is released. The store and both images change format under raised versions, and a domain runs one layout.
+
 ## Gate checklist and deferred work
 
 task-s01, task-s02 feed the strict storage reference through task-07. Optional task-s03, task-s04 need not merge to release redb; retired task-s05 through task-s08 are not replaced by migration or mixed-engine support gates. Same-engine crash/restore, common/local checkpoints, safe replacement and schema lifecycle remain requirements.
@@ -4459,7 +4575,7 @@ G3 requires task-43/transitive prerequisites, G4 task-48, G5 checkpoint/replacem
 - **The Jepsen runs of task-d67's code** (#98): after four of five leader changes the new leader ran 81 to 87% fast; the fifth's fixed fast set held the voter just killed, which task-d76 takes. Under load the share stayed at Section 2.2's 1 to 2%, which task-d65 records as confirming that section's decision. The publications over 10 ms spent under 2.5 ms on a CPU or waiting for one, so task-d66's job is built.
 - **Against etcd on one host**, the one matched comparison is 2.5 times behind, at 3.5 to 4.7 ms of server CPU an operation against etcd's 1.39, and none of the gap is the order. task-d72 sets the budget and keeps the record; task-d73 through task-d75 are its levers, after task-d63's build and task-d66's job.
 - **Gating.** task-d45 through task-d49 and task-d51 through task-d53 are prerequisites of task-64 and task-q01, so that the qualification and the combined report measure the protocol rather than these costs. task-d56 is a prerequisite of task-64, as liveness under faults. task-62's remaining rows, and any reference result it publishes again, wait on them and on task-d54 for the same reason. This is stated in task-62 rather than as a prerequisite, since task-62's first runs produced task-c01 and task-c02, which the throughput tasks build on. task-d50, reads and the fast path off the slow path, changes protocol behaviour and waits on its own design amendment.
-- **Design changes.** task-d45 through task-d47, task-d49, task-d51 through task-d56 and task-d58 through task-d62, task-d66, task-d69, task-d70, task-d72, task-d73, task-d75, task-d88, task-d91, task-d92, task-d94, task-d95, task-d96 and task-d97 do not change the design; task-d98 amends Sections 4.3 and 4.8, and task-d99 Sections 13 and 17.7 with the activation path and the admission window; task-d74 amends Sections 4.1 and 4.3 if a decision reads another follower's votes, and task-d76 amends Section 4.2; task-d71 amends Sections 4.9 and 13.1, and task-d77 through task-d80 and task-d85 Section 4.9, and task-d81 Section 6.7.3 if it changes which ballot a donor serves at; task-d82 amends Section 11.4 and the O14 row, task-d83 Section 6.3 and task-d84 Section 17.3.3; task-d89 amends Section 4.7, and task-d90 Sections 4.5, 17.3.3 and 17.4; task-d86 amends Section 17.3.4 only if a commit cadence reaches `strict`, and task-d87 Section 6.3 only if a round serves a read that arrived after it began; task-d67 amends Sections 4.1, 4.7 and 4.9 with its rule, and task-d68 Sections 4.1 and 4.7 with its, and task-d63's release-rule step amends Sections 4.5, 17.3.3 and 17.4; task-d64 amends Sections 4 and 6.4, and task-d65 Section 2.2 if it changes the model. task-d48 amends Section 17.3.4's projection hardening; task-d113 amends Section 17.1 with the payload, dependency and executed rows keyed by order; task-d50 amends Sections 4.5, 6.3 and 17.4; task-d57 amends Sections 2.2, 4.5 and 6.3. task-d115 amends no section: it adds [the batching rule](tuplesky-batching-rule.md), and each of its code steps amends the sections it changes.
+- **Design changes.** task-d45 through task-d47, task-d49, task-d51 through task-d56 and task-d58 through task-d62, task-d66, task-d69, task-d70, task-d72, task-d73, task-d75, task-d88, task-d91, task-d92, task-d94, task-d95, task-d96 and task-d97 do not change the design; task-d98 amends Sections 4.3 and 4.8, and task-d99 Sections 13 and 17.7 with the activation path and the admission window; task-d74 amends Sections 4.1 and 4.3 if a decision reads another follower's votes, and task-d76 amends Section 4.2; task-d71 amends Sections 4.9 and 13.1, and task-d77 through task-d80 and task-d85 Section 4.9, and task-d81 Section 6.7.3 if it changes which ballot a donor serves at; task-d82 amends Section 11.4 and the O14 row, task-d83 Section 6.3 and task-d84 Section 17.3.3; task-d89 amends Section 4.7, and task-d90 Sections 4.5, 17.3.3 and 17.4; task-d86 amends Section 17.3.4 only if a commit cadence reaches `strict`, and task-d87 Section 6.3 only if a round serves a read that arrived after it began; task-d67 amends Sections 4.1, 4.7 and 4.9 with its rule, and task-d68 Sections 4.1 and 4.7 with its, and task-d63's release-rule step amends Sections 4.5, 17.3.3 and 17.4; task-d64 amends Sections 4 and 6.4, and task-d65 Section 2.2 if it changes the model. task-d48 amends Section 17.3.4's projection hardening; task-d113 amends Section 17.1 with the payload, dependency and executed rows keyed by order; task-d50 amends Sections 4.5, 6.3 and 17.4; task-d57 amends Sections 2.2, 4.5 and 6.3. task-d115 amends no section: it adds [the batching rule](tuplesky-batching-rule.md), and each of its code steps amends the sections it changes. task-d117 adds Section 17.17, and its code steps amend Sections 17.1, 17.3.4 and 17.16 as they land.
 
 task-j06 is optional and cannot silently relax durable materialization. ReadFence is its own capability gate. Observers do not improve quorum fault tolerance or acquire voting rights by catching up. Interface drift in Kine is resolved at one explicit pin, not mixed across examples. Strict per-output authorization remains authoritative even for regional observers.
 
