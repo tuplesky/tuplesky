@@ -5411,6 +5411,7 @@ fn resends(
         time,
         longest,
         deferred: counts.deferred,
+        topped_up: counts.topped_up,
         decided: counts.decided,
         acknowledged: counts.acknowledged,
         unanswered: counts.unanswered,

@@ -906,6 +906,63 @@ fn a_candidate_far_behind_takes_over_in_work_linear_in_what_it_lacks() {
     );
 }
 
+/// A new leader with a backlog of undecided commands publishes it at the
+/// pace of its voters' answers, not of the re-send timer (the takeover gap
+/// on #98).
+///
+/// A new leader publishes its first `REPROPOSE_BATCH` re-proposals with
+/// their batches and holds the rest back. They went out only through
+/// `resend_unvoted`, 16 a voter a call, a call every 250 ms in `coordd`:
+/// review's kill-only run at 600 callers executed 96 commands, then 64 in
+/// each of seven seconds. Here the backlog is 200 commands every voter
+/// accepted and nobody committed, and the re-send timer never runs: each
+/// voter's adoptions top it up instead, at most `RESEND_PER_VOTER` first
+/// sends unanswered at a time. Without that, 32 of the 200 are proposed
+/// and the rest wait for a timer that does not come.
+#[test]
+fn a_new_leaders_backlog_goes_out_as_its_voters_answer() {
+    const BACKLOG: usize = 200;
+    // Five voters: at three, a follower learns a fast decision from the
+    // leader's proposal and its own vote alone.
+    let mut cluster = Cluster::with_voters(43, 1_024, 5);
+    // Every voter accepts what r0 proposes, and no acknowledgement reaches
+    // anyone, so nothing commits.
+    cluster.drop_acks = (0..5u8)
+        .flat_map(|a| (0..5u8).filter(move |b| *b != a).map(move |b| (a, b)))
+        .collect();
+    let mut submitted = Vec::new();
+    for n in 0..BACKLOG {
+        submitted.push(cluster.admit(n as u64 + 1, (n % 5) as u8));
+    }
+    cluster.settle();
+    for i in 0..5 {
+        assert!(cluster.nodes[i].executed.is_empty(), "node {i} executed");
+    }
+    cluster.crash(0);
+    cluster.drop_acks.clear();
+    cluster.campaign(1, ballot(1, 1));
+    cluster.settle();
+    let Some(Role::Leader(l)) = cluster.nodes[1].role.as_ref() else {
+        panic!("r1 did not lead");
+    };
+    let counts = l.resend_counts();
+    assert_eq!(counts.calls, 0, "the re-send timer never ran");
+    for i in 1..5 {
+        assert_eq!(
+            cluster.nodes[i].executed.len(),
+            BACKLOG,
+            "node {i} executed {} of the backlog",
+            cluster.nodes[i].executed.len()
+        );
+        assert_eq!(cluster.nodes[i].executed, submitted, "node {i}");
+    }
+    assert!(
+        counts.topped_up as usize >= BACKLOG - coord_consensus::leader::REPROPOSE_BATCH,
+        "{} first sends topped up",
+        counts.topped_up
+    );
+}
+
 /// A Sync naming commands a voter already executed and retired installs
 /// without them.
 ///
@@ -2092,7 +2149,8 @@ fn a_proposal_refused_ahead_of_the_promise_is_sent_again() {
 
 /// A new leader publishes its re-proposals in a first batch and sends the
 /// rest as votes come back, and every one of them reaches every voter
-/// (task-d07).
+/// (task-d07). Since the takeover gap on #98, "as votes come back" is each
+/// voter's adoptions topping it up, not the re-send timer.
 ///
 /// A new leader after a long history put its whole selection on each
 /// follower's control lane in one pass, and the lane refused dozens of
@@ -2125,7 +2183,17 @@ fn a_new_leader_publishes_its_reproposals_in_batches_and_all_arrive() {
         .iter()
         .filter(|(from, to)| *from == 2 && *to == 1)
         .count();
-    assert_eq!(first, batch, "the new leader's first pass to r1");
+    // The first batch, then the rest as r1's adoptions come back (the
+    // takeover gap on #98): each sent once, and none waits for the timer.
+    assert_eq!(
+        first, proposed_again,
+        "the new leader's sends to r1 before its re-send timer ran"
+    );
+    let wanted: BTreeSet<CommandId> = commands.iter().copied().collect();
+    for i in [1usize, 2] {
+        let executed: BTreeSet<CommandId> = cluster.nodes[i].executed.iter().copied().collect();
+        assert_eq!(executed, wanted, "node {i} before the re-send timer");
+    }
     cluster.settle_resending(commands.len() / coord_consensus::RESEND_PER_VOTER + 2);
     for i in [1usize, 2] {
         let executed: BTreeSet<CommandId> = cluster.nodes[i].executed.iter().copied().collect();
