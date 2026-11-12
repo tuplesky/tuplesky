@@ -18,8 +18,8 @@ use coord_journal_api::frontier::CheckpointPointerV1;
 use coord_journal_api::stream::ShardId;
 use coord_storage::ManualMaterializer;
 use coord_storage::journaled::{
-    DomainStatus, DurableCadence, JournalLimits, JournaledError, JournaledStore, ProjectionProfile,
-    Submission, TransitionKind,
+    CommitHold, DomainStatus, DurableCadence, JournalLimits, JournaledError, JournaledStore,
+    ProjectionProfile, Submission, TransitionKind,
 };
 use coord_store_api::engine::LocalEngine;
 use coord_store_testkit::journal::ModelJournal;
@@ -671,4 +671,178 @@ fn a_publication_times_its_steps_by_the_store_s_thread_clock() {
     let pointer = world.pointer();
     let published = world.store.publish_checkpoint(A, &pointer).unwrap();
     assert_eq!(published.phases.thread, None);
+}
+
+/// A commit hold of `records` records and `wait`.
+fn hold(records: u32, wait: std::time::Duration) -> CommitHold {
+    CommitHold {
+        records: NonZeroU32::new(records).unwrap(),
+        wait,
+    }
+}
+
+/// A store under the replay profile with a manual materializer and the
+/// commit hold `hold` (task-d86), its attach synced so the counts start
+/// from nothing.
+fn held(hold: CommitHold) -> (World, coord_storage::ManualHandle<ModelEngine>) {
+    let mut world = World::new(ProjectionProfile::Replay(never()));
+    world.store.sync_projections().unwrap();
+    world.store.hold_projection_commits(hold).unwrap();
+    let (materializer, handle) = ManualMaterializer::new();
+    world.store.pipeline(Box::new(materializer)).unwrap();
+    (world, handle)
+}
+
+/// Queue and journal `count` transitions, then hand off.
+fn journal_and_hand_off(world: &mut World, count: u64) {
+    world.queue(count);
+    world.store.append().unwrap();
+    world.store.hand_off().unwrap();
+}
+
+/// The hold keeps records back until there are as many as it names, and
+/// then they go out as one commit (task-d86).
+#[test]
+fn a_held_commit_goes_out_once_the_hold_s_records_are_pending() {
+    let (mut world, handle) = held(hold(3, std::time::Duration::from_secs(3600)));
+    let before = world.materialized();
+    journal_and_hand_off(&mut world, 1);
+    assert!(!world.store.lent(A), "one record is held");
+    assert_eq!(world.store.unmaterialized(A), 1);
+    let due = world
+        .store
+        .projection_commit_due()
+        .expect("something is held");
+    assert!(due > std::time::Instant::now() + std::time::Duration::from_secs(3000));
+    journal_and_hand_off(&mut world, 1);
+    assert!(!world.store.lent(A), "two are held");
+    assert!(world.store.commit_holds() >= 2);
+    journal_and_hand_off(&mut world, 1);
+    assert!(world.store.lent(A), "the third lends all three");
+    assert_eq!(world.store.projection_commit_due(), None);
+    assert!(handle.run());
+    world.store.hand_off().unwrap();
+    assert!(!world.store.lent(A));
+    assert_eq!(world.store.unmaterialized(A), 0);
+    assert_eq!(world.materialized().get(), before.get() + 3);
+    assert_eq!(world.engine().working_commits(), 1, "one commit for three");
+    assert_eq!(kv_only(world.engine().visible_rows()), reference_kv(3));
+}
+
+/// Something that waits for the projection asks, and the next hand-off
+/// lends what is held at once (task-d86).
+#[test]
+fn an_asked_commit_is_not_held() {
+    let (mut world, handle) = held(hold(100, std::time::Duration::from_secs(3600)));
+    journal_and_hand_off(&mut world, 1);
+    assert!(!world.store.lent(A));
+    world.store.request_projection_commit();
+    let due = world.store.projection_commit_due().expect("held");
+    assert!(due <= std::time::Instant::now(), "an ask is due now");
+    world.store.hand_off().unwrap();
+    assert!(world.store.lent(A));
+    assert!(handle.run());
+    world.store.hand_off().unwrap();
+    // The ask went with the commit it lent: the next record is held.
+    journal_and_hand_off(&mut world, 1);
+    assert!(!world.store.lent(A));
+}
+
+/// An ask made before the record it waits for is journaled stands until
+/// a commit is lent, so that record is not held when it arrives
+/// (task-d86): a group's watch events are asked for as it is handed off,
+/// with its append possibly still out.
+#[test]
+fn an_ask_made_before_its_record_is_journaled_lends_the_record() {
+    let (mut world, _handle) = held(hold(100, std::time::Duration::from_secs(3600)));
+    world.store.request_projection_commit();
+    journal_and_hand_off(&mut world, 1);
+    assert!(world.store.lent(A));
+}
+
+/// Held records go out at the hold's time on a domain nothing else
+/// arrives on (task-d86): the due time is what the caller's loop wakes
+/// on.
+#[test]
+fn a_held_commit_goes_out_at_the_hold_s_time() {
+    let wait = std::time::Duration::from_millis(30);
+    let (mut world, handle) = held(hold(100, wait));
+    let started = std::time::Instant::now();
+    journal_and_hand_off(&mut world, 1);
+    assert!(!world.store.lent(A));
+    let due = world.store.projection_commit_due().expect("held");
+    assert!(due >= started + wait);
+    assert!(due <= std::time::Instant::now() + wait);
+    while std::time::Instant::now() < due {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    world.store.hand_off().unwrap();
+    assert!(world.store.lent(A));
+    assert!(handle.run());
+    world.store.hand_off().unwrap();
+    assert_eq!(world.store.unmaterialized(A), 0);
+}
+
+/// A checkpoint queued for a projection not durable through it waits for
+/// the next commit, so that commit is not held (task-d86).
+#[test]
+fn a_queued_checkpoint_asks_for_the_held_commit() {
+    let (mut world, handle) = held(hold(100, std::time::Duration::from_secs(3600)));
+    journal_and_hand_off(&mut world, 1);
+    assert!(!world.store.lent(A));
+    world.store.request_projection_commit();
+    world.store.hand_off().unwrap();
+    assert!(handle.run());
+    world.store.hand_off().unwrap();
+    journal_and_hand_off(&mut world, 1);
+    assert!(!world.store.lent(A), "held again");
+    let pointer = world.pointer();
+    world.store.queue_checkpoint(A, &pointer).unwrap();
+    world.store.hand_off().unwrap();
+    assert!(world.store.lent(A), "the queued pointer asked for it");
+}
+
+/// The hold is refused under the strict profile, where a commit is a
+/// record's durability, and over a store that materializes on its
+/// caller's thread it holds nothing (task-d86).
+#[test]
+fn the_hold_is_the_pipelined_replay_profile_s_alone() {
+    let mut strict = World::new(ProjectionProfile::Strict);
+    assert!(matches!(
+        strict
+            .store
+            .hold_projection_commits(hold(8, std::time::Duration::from_secs(1))),
+        Err(JournaledError::HoldUnderStrict)
+    ));
+    let mut unpipelined = World::new(ProjectionProfile::Replay(never()));
+    unpipelined
+        .store
+        .hold_projection_commits(hold(8, std::time::Duration::from_secs(1)))
+        .unwrap();
+    unpipelined.queue(1);
+    unpipelined.store.append().unwrap();
+    let report = unpipelined.store.hand_off().unwrap();
+    assert_eq!(report.commits, 1, "materialized on the caller's thread");
+    assert_eq!(unpipelined.store.projection_commit_due(), None);
+}
+
+/// Records held when the node crashes are in the journal, and the next
+/// attach replays them as it replays any working commit (task-d86).
+#[test]
+fn records_held_at_a_crash_are_replayed_from_the_journal() {
+    let profile = ProjectionProfile::Replay(never());
+    let (mut world, handle) = held(hold(100, std::time::Duration::from_secs(3600)));
+    let durable = world.projection_durable();
+    journal_and_hand_off(&mut world, 2);
+    world.store.request_projection_commit();
+    world.store.hand_off().unwrap();
+    assert!(handle.run());
+    world.store.hand_off().unwrap();
+    // Two more journaled and held, never committed.
+    journal_and_hand_off(&mut world, 2);
+    assert!(!world.store.lent(A));
+    assert_eq!(world.store.unmaterialized(A), 2);
+    drop(handle);
+    let next = crash_and_attach(world, profile, durable).unwrap();
+    assert_recovered(&next, 4);
 }

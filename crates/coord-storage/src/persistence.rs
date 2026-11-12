@@ -230,6 +230,19 @@ pub trait Persistence {
     /// there is nothing to ask for there.
     fn request_durable_projection(&mut self) {}
 
+    /// Have the next projection commit go out at the next hand-off,
+    /// whatever a commit hold says (task-d86): for a caller that waits
+    /// for the projection to show a record. It waits for nothing. Nothing
+    /// is held where nothing is pipelined, so there is nothing to ask.
+    fn request_projection_commit(&mut self) {}
+
+    /// When a held projection commit is due to go out (task-d86), for a
+    /// caller that hands off on events and must also hand off then.
+    /// `None` when nothing is held.
+    fn projection_commit_due(&self) -> Option<std::time::Instant> {
+        None
+    }
+
     /// Make durable now the working projection commits a request has
     /// been waiting on with no commit to take it (task-j06): the half of
     /// the time bound an idle domain needs, since it has no next commit.
@@ -627,6 +640,14 @@ impl<J: coord_journal_api::JournalEngine, E: coord_store_api::engine::LocalEngin
 
     fn request_durable_projection(&mut self) {
         self.store.request_durable_projection();
+    }
+
+    fn request_projection_commit(&mut self) {
+        self.store.request_projection_commit();
+    }
+
+    fn projection_commit_due(&self) -> Option<std::time::Instant> {
+        self.store.projection_commit_due()
     }
 
     fn sync_projections(&mut self) -> Result<Lowered, EngineError> {

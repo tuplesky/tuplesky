@@ -859,6 +859,8 @@ fn the_journal_profile_is_written_into_every_voter_and_recorded() {
             projection_durable_commits: Some(32),
             projection_durable_records: None,
             projection_durable_ms: Some(50),
+            projection_commit_records: Some(16),
+            projection_commit_ms: None,
         },
         ..Plan::loopback(dir.path().to_path_buf(), 3, 0)
     })
@@ -874,13 +876,18 @@ fn the_journal_profile_is_written_into_every_voter_and_recorded() {
         assert_eq!(
             journal_section(&node.config),
             "[journal]\nroot = \"journal\"\nshards = 1\nprofile = \"journaled-replay-v1\"\n\
-             projection_durable_commits = 32\nprojection_durable_ms = 50\n"
+             projection_durable_commits = 32\nprojection_durable_ms = 50\n\
+             projection_commit_records = 16\n"
         );
     }
 
     for journal in [
         JournalPlan {
             projection_durable_ms: Some(50),
+            ..JournalPlan::default()
+        },
+        JournalPlan {
+            projection_commit_ms: Some(5),
             ..JournalPlan::default()
         },
         JournalPlan {

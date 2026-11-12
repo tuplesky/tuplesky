@@ -287,6 +287,7 @@ async fn a_voter_killed_under_the_replay_profile_comes_back_and_serves() {
             projection_durable_commits: Some(u32::MAX),
             projection_durable_records: Some(u32::MAX),
             projection_durable_ms: Some(3_600_000),
+            ..JournalPlan::default()
         },
     )
     .await;

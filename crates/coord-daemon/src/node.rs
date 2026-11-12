@@ -2514,6 +2514,12 @@ impl<P: Persistence> Node<P> {
         let mut out = match position {
             Some(position) => {
                 let (results, rest) = split_results(effects);
+                // What the group led to beyond its results goes out once
+                // its commit is back, so that commit is not held for a
+                // larger one (task-d86).
+                if !rest.is_empty() {
+                    self.applier.store_mut().request_projection_commit();
+                }
                 self.releases.push_back((position, rest));
                 self.results.push_back((position, results));
                 Outbound::default()
@@ -2524,6 +2530,9 @@ impl<P: Persistence> Node<P> {
             // with that group's, or go now if that group's have gone.
             None => {
                 let (results, rest) = split_results(effects);
+                if !rest.is_empty() {
+                    self.applier.store_mut().request_projection_commit();
+                }
                 let last = self.releases.back_mut().expect("checked above");
                 last.1.extend(rest);
                 let position = last.0;
