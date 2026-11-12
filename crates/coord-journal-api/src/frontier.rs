@@ -296,7 +296,7 @@ mod tests {
         let newest = pointer(1, 30);
         let other_domain = pointer(2, 90);
         let wrong_format = CheckpointPointerV1 {
-            format: 2,
+            format: LOCAL_CHECKPOINT_FORMAT_V1 + 1,
             ..pointer(1, 50)
         };
         let published = [older, other_domain, newest, wrong_format];

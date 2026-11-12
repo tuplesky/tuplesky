@@ -776,7 +776,7 @@ fn a_crash_anywhere_around_a_publication_under_the_replay_profile_continues_the_
         let pointer = CheckpointPointerV1 {
             origin: store.origin(A).unwrap(),
             represented: store.frontiers(A).unwrap().materialized(),
-            format: 1,
+            format: coord_journal_api::frontier::LOCAL_CHECKPOINT_FORMAT_V1,
             manifest_digest: Digest32([0x5a; 32]),
             checkpoint_id: Digest32([0x5b; 32]),
         };

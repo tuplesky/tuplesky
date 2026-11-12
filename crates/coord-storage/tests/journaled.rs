@@ -942,7 +942,7 @@ fn end_a_boot_with_a_baseline() -> (
     let pointer = CheckpointPointerV1 {
         origin: world.store.origin(A).unwrap(),
         represented,
-        format: 1,
+        format: coord_journal_api::frontier::LOCAL_CHECKPOINT_FORMAT_V1,
         manifest_digest: Digest32([0x5a; 32]),
         checkpoint_id: Digest32([0x5b; 32]),
     };
