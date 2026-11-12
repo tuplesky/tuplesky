@@ -2949,6 +2949,19 @@ async fn a_held_wake_up_leaves_the_frames_queued_until_it_is_released() {
     five.extend(said(2));
     assert_eq!(sorted(payloads(&mut b, 5).await), sorted(five));
 
+    // Code with no hold at hand releases the thread's (#256 review).
+    let sent = a.send_many(dest(1, Lane::Control), DOMAIN, numbered(2));
+    assert!(sent.iter().all(Result::is_ok), "{sent:?}");
+    assert!(
+        timeout(Duration::from_millis(300), payloads(&mut b, 1))
+            .await
+            .is_err(),
+        "a held frame went out"
+    );
+    assert_eq!(coord_transport::WakeHold::release_this_thread(), 1);
+    assert_eq!(hold.held_since(), None);
+    assert_eq!(sorted(payloads(&mut b, 2).await), sorted(said(2)));
+
     // Still holding after a release; dropping the hold releases.
     let sent = a.send_many(dest(1, Lane::Control), DOMAIN, numbered(2));
     assert!(sent.iter().all(Result::is_ok), "{sent:?}");

@@ -1474,8 +1474,10 @@ const REDIAL_CHECK_EVERY: std::time::Duration = std::time::Duration::from_millis
 /// (task-d115, lever 8).
 ///
 /// It hands off when no event is waiting, which on a busy leader is
-/// about once a turn, and before every flush. This bounds a loop that
-/// never runs out of events: what it held waits a millisecond at most.
+/// about once a turn, before every flush, and before a pass waits on a
+/// caller's stream (an inline answer that has no room, a watch's push).
+/// This bounds a loop that never runs out of events: what it held waits a
+/// millisecond at most.
 const HAND_OFF_WITHIN: std::time::Duration = std::time::Duration::from_millis(1);
 
 /// How often a leader sends its voters, again, the proposals they have
@@ -1672,6 +1674,21 @@ fn hand_off_due(
         .chain(answers)
         .min()
         .is_some_and(|since| now.saturating_duration_since(since) >= HAND_OFF_WITHIN)
+}
+
+/// Run `work` to its end, calling `before_waiting` first if it cannot end
+/// on its first poll (#256 review): what the domain loop holds for the
+/// runtime goes before the loop waits on anything, not after.
+async fn unless_ready<F: std::future::Future>(work: F, before_waiting: impl FnOnce()) -> F::Output {
+    let mut work = std::pin::pin!(work);
+    let first = std::future::poll_fn(|cx| std::task::Poll::Ready(work.as_mut().poll(cx))).await;
+    match first {
+        std::task::Poll::Ready(out) => out,
+        std::task::Poll::Pending => {
+            before_waiting();
+            work.await
+        }
+    }
 }
 
 /// Whether the loop lowers before it takes another event: a full journal
@@ -2453,7 +2470,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         // answers here, and the wake-ups as the hold is dropped.
         let hold = coord_transport::WakeHold::new();
         self.serve(transport, clock, &hold).await;
-        self.hand_off(&hold);
+        self.hand_off();
     }
 
     /// [`Domain::run`]'s passes, under its hold.
@@ -2501,7 +2518,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             // What the loop held goes once it has waited its bound,
             // however busy the loop still is (task-d115, lever 8).
             if self.hand_off_due(hold, started) {
-                self.hand_off(hold);
+                self.hand_off();
             }
             self.report_if_due();
             // The leaf this node presents first, every pass: a node whose
@@ -2527,7 +2544,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             if flush_due(self.queued(), appending, owed, self.since_flush) {
                 // What the events so far owe the runtime goes before the
                 // flush, not after it (task-d115, lever 8).
-                self.hand_off(hold);
+                self.hand_off();
                 if self.stops_on_flush(transport) {
                     return;
                 }
@@ -2652,7 +2669,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 && !transport.has_event()
                 && !self.plane.as_ref().is_some_and(|p| p.transport.has_event())
             {
-                self.hand_off(hold);
+                self.hand_off();
             }
             let owes_flush = matches!(&self.backing, Backing::Voting(v) if v.owes_flush());
             let materialized = self.materialized.clone();
@@ -2804,8 +2821,8 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     /// starts one task an answer from inside the runtime. Each answer is
     /// still its own task, so a slow reader holds up no other caller and
     /// not the voter's next turn.
-    fn hand_off(&mut self, hold: &coord_transport::WakeHold) {
-        hold.release();
+    fn hand_off(&mut self) {
+        coord_transport::WakeHold::release_this_thread();
         self.answering_since = None;
         if self.answering.is_empty() {
             return;
@@ -2818,6 +2835,18 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 });
             }
         });
+    }
+
+    /// Answer a caller from inside a pass, handing off what the loop holds
+    /// first if the answer has to wait (#256 review).
+    ///
+    /// An answer written inline waits when the lane's budget or the
+    /// stream's flow control has no room, for up to the responder's
+    /// deadline. The pass waits with it, and so would every frame and
+    /// answer the loop holds, which before lever 8 went out on their own.
+    /// An answer that goes at once hands off nothing.
+    async fn respond_inline(&mut self, responder: Responder, frame: Vec<u8>) {
+        let _ = unless_ready(responder.respond(frame), || self.hand_off()).await;
     }
 
     /// Whether the loop holds anything for the runtime.
@@ -4789,7 +4818,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 if let Some(answer) = self.retained(&health, connection.0, &frame) {
                     self.frontend.counts.released += 1;
                     self.frontend.answered(&responder, false);
-                    let _ = responder.respond(answer).await;
+                    self.respond_inline(responder, answer).await;
                     return;
                 }
                 let policy = StorePolicySource {
@@ -5023,7 +5052,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     ) {
         match decided {
             Step::Answer(frame) => {
-                let _ = responder.respond(frame).await;
+                self.respond_inline(responder, frame).await;
             }
             Step::Hold(key) => {
                 // A retry held behind its invocation in flight, counted
@@ -5085,6 +5114,9 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 registration,
             } => {
                 self.frontend.counts.watches += 1;
+                // Opening may write to the stream and wait on it; what the
+                // loop holds goes first (#256 review).
+                self.hand_off();
                 self.open_watch(connection.0, watch_id, registration, responder)
                     .await;
             }
@@ -5241,6 +5273,10 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 if frames.is_empty() {
                     break;
                 }
+                // A push waits on the consumer's flow control, for up to the
+                // responder's deadline: what the loop holds goes first
+                // (#256 review).
+                self.hand_off();
                 let Some(responder) = self.frontend.watches.get_mut(&(connection, watch_id)) else {
                     break;
                 };
@@ -6489,6 +6525,27 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
         assert!(super::redial_now(true, None, Some(at), soon));
         assert!(super::redial_now(false, Some(soon), Some(at), soon));
         assert!(super::redial_now(false, None, Some(at), at + bound));
+    }
+
+    /// Work that ends on its first poll hands nothing off; work that has
+    /// to wait hands off once, before it waits, and still ends with its
+    /// own result (#256 review).
+    #[tokio::test]
+    async fn what_the_loop_holds_goes_before_an_answer_waits_not_otherwise() {
+        let mut handed = 0;
+        let out = super::unless_ready(async { 7 }, || handed += 1).await;
+        assert_eq!((out, handed), (7, 0));
+
+        let mut handed = 0;
+        let out = super::unless_ready(
+            async {
+                tokio::task::yield_now().await;
+                8
+            },
+            || handed += 1,
+        )
+        .await;
+        assert_eq!((out, handed), (8, 1));
     }
 
     /// What the loop holds goes once the oldest of it has waited the

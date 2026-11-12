@@ -717,6 +717,13 @@ impl WakeHold {
     pub fn release(&self) -> usize {
         release_held()
     }
+
+    /// [`WakeHold::release`] for code that has no hold at hand. A hold is
+    /// the thread's, not the value's, so this releases what the calling
+    /// thread holds, and is a no-op on a thread that holds nothing.
+    pub fn release_this_thread() -> usize {
+        release_held()
+    }
 }
 
 impl Default for WakeHold {
