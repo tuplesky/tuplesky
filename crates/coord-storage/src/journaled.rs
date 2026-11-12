@@ -1778,6 +1778,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                 state.head.complete_durable(barrier)?;
                 state.frontiers.advance_durable(record.seq())?;
                 state.head_digest = record.digest();
+                state.held_since.get_or_insert_with(Instant::now);
                 state.pending.push(Durable {
                     barrier: None,
                     record,
@@ -2663,6 +2664,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                                 journal_seq: record.seq(),
                             });
                         }
+                        state.held_since.get_or_insert_with(Instant::now);
                         state.pending.push(item);
                     }
                     // The pointer this entry carried is durable, and its
@@ -3090,6 +3092,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                                     journal_seq: item.record.seq(),
                                 });
                             }
+                            state.held_since.get_or_insert_with(Instant::now);
                             state.pending.push(item);
                         }
                         state.status = DomainStatus::Ready;
@@ -3132,6 +3135,9 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                     // ran, and those are still owed.
                     let taken = taken.min(state.pending.len());
                     let applied: Vec<Durable> = state.pending.drain(..taken).collect();
+                    if state.pending.is_empty() {
+                        state.held_since = None;
+                    }
                     report.materialized = applied.len();
                     report.commits = 1;
                     for item in applied {
@@ -3633,6 +3639,13 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
             }
         }
         for (id, state) in &mut self.domains {
+            // The hold runs from when the records arrived, even if a
+            // commit was out then (stamped as they joined `pending`);
+            // records given back by a commit that did not take them wait
+            // from now at the latest.
+            if !state.pending.is_empty() {
+                state.held_since.get_or_insert(now);
+            }
             if state.lent.is_some()
                 || state.pending.is_empty()
                 || refused.contains(id)
@@ -3643,7 +3656,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
             {
                 continue;
             }
-            let since = *state.held_since.get_or_insert(now);
+            let since = state.held_since.unwrap_or(now);
             if let Some(hold) = hold
                 && !state.commit_asked
                 && state.pending.len() < hold.records.get() as usize

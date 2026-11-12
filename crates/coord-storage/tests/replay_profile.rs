@@ -729,6 +729,38 @@ fn a_held_commit_goes_out_once_the_hold_s_records_are_pending() {
     assert_eq!(kv_only(world.engine().visible_rows()), reference_kv(3));
 }
 
+/// Records journaled while an earlier commit is out wait from when they
+/// arrived, not from when that commit came back (task-d86): once it is
+/// back, records that have already waited the hold's `wait` go out at
+/// once.
+#[test]
+fn records_journaled_while_a_commit_is_out_wait_from_their_arrival() {
+    let wait = std::time::Duration::from_millis(20);
+    let (mut world, handle) = held(hold(100, wait));
+    journal_and_hand_off(&mut world, 1);
+    world.store.request_projection_commit();
+    world.store.hand_off().unwrap();
+    assert!(world.store.lent(A), "the asked record is out");
+    journal_and_hand_off(&mut world, 1);
+    assert!(world.store.lent(A), "the second waits behind the first");
+    let arrived = std::time::Instant::now();
+    std::thread::sleep(wait * 2);
+    assert!(handle.run());
+    world.store.hand_off().unwrap();
+    assert!(
+        world.store.lent(A),
+        "the second has waited longer than the hold and goes out as the first comes back"
+    );
+    assert!(handle.run());
+    world.store.hand_off().unwrap();
+    assert_eq!(world.store.unmaterialized(A), 0);
+    // And the due time a caller sleeps to is the arrival's, not later.
+    journal_and_hand_off(&mut world, 1);
+    let due = world.store.projection_commit_due().expect("held");
+    assert!(due <= std::time::Instant::now() + wait);
+    assert!(due >= arrived + wait);
+}
+
 /// Something that waits for the projection asks, and the next hand-off
 /// lends what is held at once (task-d86).
 #[test]
