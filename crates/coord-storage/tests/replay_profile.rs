@@ -761,6 +761,37 @@ fn records_journaled_while_a_commit_is_out_wait_from_their_arrival() {
     assert!(due >= arrived + wait);
 }
 
+/// Records journaled behind a commit that is out are stamped as they
+/// arrive, not by the next hand-off (task-d86): with nothing handed off
+/// between their append and the commit's return, those that have
+/// already waited the hold's `wait` go out as that commit comes back.
+/// Stamped only by the hand-off, they would wait a whole `wait` again
+/// from then.
+#[test]
+fn records_journaled_behind_a_lent_commit_are_stamped_without_a_hand_off() {
+    let wait = std::time::Duration::from_millis(100);
+    let (mut world, handle) = held(hold(100, wait));
+    journal_and_hand_off(&mut world, 1);
+    world.store.request_projection_commit();
+    world.store.hand_off().unwrap();
+    assert!(world.store.lent(A), "the asked record is out");
+    // Journaled behind it, and nothing handed off.
+    world.queue(1);
+    world.store.append().unwrap();
+    assert!(world.store.lent(A));
+    assert_eq!(world.store.unmaterialized(A), 2);
+    std::thread::sleep(wait * 3);
+    assert!(handle.run());
+    world.store.hand_off().unwrap();
+    assert!(
+        world.store.lent(A),
+        "the second has waited longer than the hold since it was journaled"
+    );
+    assert!(handle.run());
+    world.store.hand_off().unwrap();
+    assert_eq!(world.store.unmaterialized(A), 0);
+}
+
 /// Something that waits for the projection asks, and the next hand-off
 /// lends what is held at once (task-d86).
 #[test]
