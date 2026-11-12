@@ -116,6 +116,22 @@ CHECKPOINT_FAILED = "could not publish a recovery checkpoint"
 REPLAYED = re.compile(
     r"^replayed records=(\d+) from=(\d+) through=(\d+) took_ms=([\d.]+) attach_ms=([\d.]+)"
 )
+# The startup report's `boot` line (#245): each step before the runtime
+# starts, in ms, with the sizes the attach indexed.
+BOOT_PHASES = re.compile(r"^boot ((?:\w+=[\d.]+ ?)+)$")
+# Its fields, in the order the Boot phases table gives them.
+BOOT_FIELDS = (
+    ("journal_open_ms", "Journal open"),
+    ("projection_open_ms", "Projection open"),
+    ("baseline_ms", "Baseline"),
+    ("guard_scan_ms", "Guard scan"),
+    ("intake_index_ms", "Intake index"),
+    ("key_index_ms", "Key index"),
+    ("replay_ms", "Replay"),
+    ("attach_ms", "Attach in all"),
+    ("voter_ms", "Voter"),
+    ("total_ms", "Total"),
+)
 # Written into the log by Jepsen's start-daemon!, one per :start of the node.
 STARTING = "Jepsen starting "
 # jepsen.tuplesky.wan's setup: "WAN round trip n1 -> n2 : 66.2 ms, profile 66 ms".
@@ -143,6 +159,8 @@ class Boot:
     executed: str = "-"
     # (records, from, through, took_ms, attach_ms), or None without the line.
     replayed: tuple | None = None
+    # The `boot` line's fields (#245), name to number, or None without it.
+    phases: dict | None = None
     # The `cost` reading of this boot's last `metrics` line, or None.
     cost: "Cost | None" = None
     # Every `cost` reading of this boot, in order.
@@ -500,6 +518,9 @@ def parse_voter(lines) -> Voter:
         m = REPLAYED.match(line)
         if m and v.boot_rows:
             v.boot_rows[-1].replayed = (int(m[1]), int(m[2]), int(m[3]), float(m[4]), float(m[5]))
+        m = BOOT_PHASES.match(line.rstrip("\n"))
+        if m and v.boot_rows:
+            v.boot_rows[-1].phases = {k: float(x) for k, x in (f.split("=") for f in m[1].split())}
         m = ROLE.search(line)
         if m:
             v.role = m[1]
@@ -736,6 +757,34 @@ def read_thread_samples(path: str) -> dict:
     except (OSError, ValueError):
         return {}
     return by_time
+
+
+def boot_phases_table(voters: dict) -> list[str]:
+    """The Boot phases table (#245): each boot's steps before the runtime
+    starts, from its `boot` line, with the key index's versions and the
+    intake index's entries beside their builds."""
+    out = [
+        "**Boot phases** (#245, each boot's `boot` line: each step before the runtime starts, in ms, in the order "
+        "the voter takes them; the intake index, the key index and the replay are inside the attach, which "
+        "counts its checks too; the voter is building it over the attached store; total runs from the journal's "
+        "open to the voter built; the key index's versions and the intake index's entries are what the attach "
+        "indexed; `-` for a boot without the line)",
+        "",
+        "| Node | Boot | " + " | ".join(name for _, name in BOOT_FIELDS) + " | Key versions | Intake entries |",
+        "| --- " * (4 + len(BOOT_FIELDS)) + "|",
+    ]
+    for node, v in voters.items():
+        for i, b in enumerate(v.boot_rows, 1):
+            p = b.phases
+            if p:
+                cells = " | ".join(f"{p[k]:.1f}" if k in p else "-" for k, _ in BOOT_FIELDS)
+                sizes = " | ".join(str(int(p[k])) if k in p else "-" for k in ("key_versions", "intake_entries"))
+            else:
+                cells = " | ".join("-" for _ in BOOT_FIELDS)
+                sizes = "- | -"
+            out.append(f"| {node} | {i} | {cells} | {sizes} |")
+    out.append("")
+    return out
 
 
 def boots_over(samples: dict, t0, t1) -> dict:
@@ -3198,6 +3247,8 @@ def summarize(store: str, nodes: list[str], title: str, profile: str | None = No
                     runtime = f"{d[0]:.1f} | {d[1]:.1f}" if d else "- | -"
                     out.append(f"| {node} | {i} | {b.started or '-'} | {replayed} | {runtime} | {b.executed} |")
             out.append("")
+        if any(b.phases for v in voters.values() for b in v.boot_rows):
+            out.extend(boot_phases_table(voters))
         if any(v.checkpoints or v.checkpoints_failed for v in voters.values()):
             out.append(
                 "**Checkpoints** (every local checkpoint each voter published, over all its boots, from its "

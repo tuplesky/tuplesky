@@ -325,7 +325,7 @@ side of the window (its last, where it was killed first), each timed as the boot
 the reading's uptime. A voter's uptime counts from its runtime, which starts once the store is open and
 attached, so the Leader changes table also adds each boot's time to its runtime, read from
 `cpu-samples-threads.csv` (the first 1 s sample with a tokio worker), which the Boots table prints beside the
-attach with the main thread's CPU in it. A restart within the window leaves the profile
+attach with the main thread's CPU in it. From #245 each boot also prints a `boot` line, its steps before the runtime starts in ms (the journal's and the projection's open, the baseline, the guard's scan, the intake and key index builds and the replay inside the attach, the voter's build, the total), with the key index's versions and the intake index's entries, and the Boot phases table gives one row a boot. A restart within the window leaves the profile
 uncosted. A 10 s DWARF sample of the leader
 follows (`leader-profile-alloc-chains.txt`): it unwinds out of libc's
 allocator, which the frame-pointer walk cannot, and names the TupleSky

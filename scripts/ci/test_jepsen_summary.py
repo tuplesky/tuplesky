@@ -634,6 +634,30 @@ class BootTests(unittest.TestCase):
 
     def test_voters_that_report_no_replay_have_no_table(self):
         self.assertNotIn("**Boots**", self.summarize(REPLAY_VOTER))
+        self.assertNotIn("**Boot phases**", self.summarize(REPLAY_VOTER))
+
+    BOOT = (
+        "boot journal_open_ms=120.5 projection_open_ms=3.0 baseline_ms=40.2 guard_scan_ms=1.5 attach_ms=900.0 "
+        "intake_index_ms=210.0 intake_entries=4096 key_index_ms=480.5 key_versions=150000 replay_ms=12.0 "
+        "voter_ms=60.0 total_ms=1125.2"
+    )
+
+    def test_a_boots_phases_from_its_boot_line(self):
+        log = (
+            booted("2026-10-03 01:41:25", 0, "replayed records=0 from=0 through=0 took_ms=0.0 attach_ms=3.1")
+            + booted("2026-10-03 01:43:05", 95,
+                     "replayed records=90 from=200 through=290 took_ms=41.5 attach_ms=52.0\n" + self.BOOT)
+        )
+        boots = js.parse_voter(log.splitlines(keepends=True)).boot_rows
+        self.assertIsNone(boots[0].phases)
+        self.assertEqual(boots[1].phases["key_index_ms"], 480.5)
+        self.assertEqual(boots[1].phases["key_versions"], 150000)
+        text = self.summarize(log)
+        self.assertIn("**Boot phases** (#245", text)
+        self.assertIn("| n1 | 1 | - | - | - | - | - | - | - | - | - | - | - | - |", text)
+        self.assertIn(
+            "| n1 | 2 | 120.5 | 3.0 | 40.2 | 1.5 | 210.0 | 480.5 | 12.0 | 900.0 | 60.0 | 1125.2 | 150000 | 4096 |", text
+        )
 
 
 
