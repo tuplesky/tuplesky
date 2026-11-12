@@ -294,6 +294,10 @@ struct Cluster {
     /// Every frame voter `.0` sends to voter `.1` but catch-up's is lost:
     /// a leader with nothing for that voter to adopt.
     mute: Option<(usize, usize)>,
+    /// Every catch-up ask from voter `.0` and every page to it is lost,
+    /// once `.1` more of them have gone through: a voter cut off from
+    /// every donor's catch-up for a while.
+    cut: Option<(usize, usize)>,
 }
 
 impl Cluster {
@@ -315,6 +319,7 @@ impl Cluster {
             lose: None,
             lose_after: 0,
             mute: None,
+            cut: None,
         }
     }
 
@@ -342,6 +347,19 @@ impl Cluster {
                     continue;
                 }
                 self.lose_after -= 1;
+            }
+            if let Some((cut, through)) = self.cut.as_mut()
+                && (*cut == from || *cut == to)
+                && matches!(
+                    coord_consensus::ProtocolMessage::decode(&frame),
+                    Ok(coord_consensus::ProtocolMessage::CatchUpRequest { .. }
+                        | coord_consensus::ProtocolMessage::CatchUpPage { .. })
+                )
+            {
+                if *through == 0 {
+                    continue;
+                }
+                *through -= 1;
             }
             if self.mute == Some((from, to))
                 && !matches!(
@@ -465,10 +483,9 @@ impl Cluster {
         order
             .into_iter()
             .map(|(position, command)| {
-                let entry =
-                    coord_storage::protocol::catch_up_entry(gated.view(), epoch(), &command)
-                        .expect("read")
-                        .expect("executed and held");
+                let entry = coord_storage::protocol::catch_up_entry(&gated, epoch(), &command)
+                    .expect("read")
+                    .expect("executed and held");
                 (position.get(), command, entry.result_digest)
             })
             .collect()
@@ -715,7 +732,78 @@ fn a_voter_whose_chain_loses_any_ask_or_page_still_catches_up_in_a_quiet_cluster
     }
 }
 
-/// task-d77 (#169 review): a candidate's campaign waits on the dependency
+/// An open chain whose every ask and page is lost for a round of every
+/// voter, in a quiet domain (task-d25 review): r2 takes its first page,
+/// and then no catch-up frame reaches it or leaves it for longer than a
+/// round, four asks with three voters. A donor with nothing past an ask
+/// answers nothing, so the round read as nobody having more, and the voter
+/// gave its chain up: muted, it stayed at 166 of 541 with no ask and no
+/// deadline. Now it asks on every `CHAIN_RETRY` while its chain is open,
+/// so once the frames flow again it ends level, and then stops asking.
+#[test]
+fn a_voter_whose_chain_loses_every_answer_for_a_round_still_catches_up_in_a_quiet_cluster() {
+    for muted in [true, false] {
+        for lost_for in [8, 16] {
+            let what = format!("lost for {lost_for} ticks, muted {muted}");
+            let mut cluster = Cluster::new();
+            for _ in 0..2 {
+                cluster.second();
+            }
+            cluster.down = vec![2];
+            for _ in 0..25 {
+                cluster.second();
+            }
+            cluster.down.clear();
+            cluster.pacers[2] = Pacer::default();
+            assert!(
+                !cluster.voters[2].node().machine().holds_unexecuted(),
+                "{what}: r2 holds work, so this is not the quiet case"
+            );
+            // The probe and its page go through; nothing else does.
+            cluster.cut = Some((2, 2));
+            cluster.mute = muted.then_some((0, 2));
+            for _ in 0..lost_for {
+                cluster.tick();
+            }
+            let paths = cluster.voters[2].node().machine().catch_up_paths();
+            assert!(
+                cluster.executed_through(2) < cluster.executed_through(0),
+                "{what}: r2 caught up while cut off ({paths:?})"
+            );
+            assert!(
+                cluster.voters[2].node().machine().catch_up_counts().0 >= 1,
+                "{what}: r2 never took its first page ({paths:?})"
+            );
+            assert!(
+                paths.asked >= 6,
+                "{what}: fewer asks than a round lost ({paths:?})"
+            );
+            cluster.cut = None;
+            for _ in 0..30 {
+                cluster.tick();
+            }
+            assert_eq!(
+                cluster.executed_through(2),
+                cluster.executed_through(0),
+                "{what}: r2 stopped short ({:?}, deadline {:?})",
+                cluster.voters[2].node().machine().catch_up_paths(),
+                cluster.pacers[2].next_deadline()
+            );
+            let asked = cluster.voters[2].node().machine().catch_up_paths().asked;
+            for _ in 0..20 {
+                cluster.tick();
+            }
+            assert_eq!(
+                cluster.voters[2].node().machine().catch_up_paths().asked,
+                asked,
+                "{what}: a level voter kept asking"
+            );
+            assert_eq!(cluster.pacers[2].next_deadline(), None, "{what}");
+        }
+    }
+}
+
+/// task-d77 (#169 review): a campaign waits on the dependency
 /// rows of commands it executed and forgot, and the runtime reads them as
 /// a donor reads a page. A command whose rows are still held is answered
 /// with its row, the record catch-up serves; one with no dependency row
@@ -739,7 +827,7 @@ fn a_campaign_is_answered_a_forgotten_commands_row_from_the_store() {
     let applier = cluster.voters[2].node().applier();
     let held = {
         let gated = applier.store().reader().snapshot().expect("snapshot");
-        coord_storage::protocol::catch_up_entry(gated.view(), epoch(), &forgotten)
+        coord_storage::protocol::catch_up_entry(&gated, epoch(), &forgotten)
             .expect("read")
             .expect("executed and held")
             .decided

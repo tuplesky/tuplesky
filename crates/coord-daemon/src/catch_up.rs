@@ -17,7 +17,10 @@
 //! leave it behind holding nothing, and goes on asking until a page
 //! arrives or every voter has been asked: a donor with nothing past its
 //! frontier answers nothing, so a lost ask or page looks the same as
-//! nothing to fetch (#98, Codex on the carry). The machine asks again at
+//! nothing to fetch (#98, Codex on the carry). A voter whose chain of
+//! asks is open -- a donor said it had more than the voter executed --
+//! asks on after such a round too, every [`CHAIN_RETRY`] (task-d25
+//! review): there the silence was lost frames. The machine asks again at
 //! once when a full page is executed, so the pacer is the floor for an
 //! ask nobody answered, not the rate a voter catches up at.
 //!
@@ -58,6 +61,16 @@ pub const UNANSWERED: Duration = Duration::from_secs(1);
 /// How many unanswered asks go to the leader before the other voters are
 /// asked in turn.
 pub const LEADER_ASKS: u32 = 2;
+
+/// How often a voter whose catch-up chain is open asks once a round of
+/// every voter brought no page (task-d25 review). A donor with nothing
+/// past an ask answers nothing, so such a round reads as nobody having
+/// more; but an open chain says a donor had more than this voter has
+/// executed, so the round was lost, not empty. Before, the voter gave the
+/// chain up there and, in a domain with no traffic for it, stayed behind
+/// until some arrived. It asks on at this period until a page reaches a
+/// frontier or it executes as far as the chain was owed.
+pub const CHAIN_RETRY: Duration = Duration::from_secs(10);
 
 /// What a voter holds at the start of a window, at least, to count as
 /// behind while it moves (#98, 6807495802): two pages. A follower keeping
@@ -184,8 +197,7 @@ pub fn page<P: Persistence>(
         if entries.len() >= MAX_CATCH_UP_COMMANDS {
             break;
         }
-        let Ok(Some(entry)) =
-            coord_storage::protocol::catch_up_entry(gated.view(), epoch, &command)
+        let Ok(Some(entry)) = coord_storage::protocol::catch_up_entry(&gated, epoch, &command)
         else {
             break;
         };
@@ -233,7 +245,7 @@ pub fn executed_rows<P: Persistence>(
         .into_iter()
         .map(|command| {
             let decided = gated.as_ref().and_then(|g| {
-                coord_storage::protocol::catch_up_entry(g.view(), epoch, &command)
+                coord_storage::protocol::catch_up_entry(g, epoch, &command)
                     .ok()
                     .flatten()
                     .and_then(|entry| entry.decided)
@@ -387,9 +399,13 @@ pub struct Pacer {
     /// later is a page that answered it.
     probe_pages: Option<u64>,
     /// The pages taken when a round of every voter went unanswered while
-    /// the chain was open: nobody has more for it, so the open chain gives
-    /// no reason to ask again until a page arrives.
+    /// the chain was open: from then on the open chain asks once every
+    /// [`CHAIN_RETRY`] rather than every [`UNANSWERED`], until a page
+    /// arrives.
     chain_given_up: Option<u64>,
+    /// Whether the last turn found the voter asking at [`CHAIN_RETRY`]'s
+    /// period: its deadline is that far from its last ask.
+    retrying: bool,
     /// The frontier as the last turn saw it, and when it last moved:
     /// task-d08's still frontier, for a voter holding less than a page.
     seen: Option<ExecutionPosition>,
@@ -416,8 +432,13 @@ impl Pacer {
         // lost in a quiet domain left a voter holding nothing that never
         // asked again (#226 review). So while the chain is open the voter
         // asks as one holding work, until a page reaches a frontier or a
-        // round of every voter brings none.
+        // round of every voter brings none; then at [`CHAIN_RETRY`]'s
+        // period.
         let chain = standing.chain && self.chain_given_up != Some(standing.pages);
+        // An open chain a round brought no page for still owes this voter
+        // what a donor had: it asks on, at a longer period (task-d25
+        // review).
+        let retrying = standing.chain && !chain && !standing.holds && self.probed;
         if !self.probed
             && !standing.busy
             && !standing.chain
@@ -425,8 +446,9 @@ impl Pacer {
         {
             self.probed = true;
         }
-        let holds = standing.holds || !self.probed || chain;
+        let holds = standing.holds || !self.probed || chain || retrying;
         self.wanting = holds && !standing.leads && !standing.busy;
+        self.retrying = retrying;
         if self.seen != Some(standing.executed) {
             self.seen = Some(standing.executed);
             self.moved = Some(now);
@@ -473,9 +495,10 @@ impl Pacer {
         if now.saturating_duration_since(since) < STILL_FOR {
             return None;
         }
+        let period = if retrying { CHAIN_RETRY } else { UNANSWERED };
         if self
             .asked
-            .is_some_and(|at| now.saturating_duration_since(at) < UNANSWERED)
+            .is_some_and(|at| now.saturating_duration_since(at) < period)
         {
             return None;
         }
@@ -525,10 +548,13 @@ impl Pacer {
             }
         }
         // A voter that holds nothing, is done probing and owes its chain
-        // nothing has no more reason to wake for this one.
-        self.wanting = standing.holds
-            || !self.probed
-            || (standing.chain && self.chain_given_up != Some(standing.pages));
+        // nothing has no more reason to wake for this one. One whose open
+        // chain a round brought nothing for wakes at the longer period.
+        self.retrying = standing.chain
+            && !standing.holds
+            && self.probed
+            && self.chain_given_up == Some(standing.pages);
+        self.wanting = standing.holds || !self.probed || standing.chain;
         Some(donor)
     }
 
@@ -544,8 +570,13 @@ impl Pacer {
         if !self.wanting {
             return None;
         }
+        let period = if self.retrying {
+            CHAIN_RETRY
+        } else {
+            UNANSWERED
+        };
         match (self.asked, self.still) {
-            (Some(at), _) => Some(at + UNANSWERED),
+            (Some(at), _) => Some(at + period),
             (None, Some((_, since))) => Some(since + STILL_FOR),
             (None, None) => None,
         }
@@ -967,7 +998,9 @@ mod tests {
     /// open chain is asked for like held work (#226 review): an ask or a
     /// page of the chain lost in a quiet domain left a voter holding
     /// nothing that never asked again. It asks until a page reaches a
-    /// donor's frontier, or until a round of every voter brings none.
+    /// donor's frontier, every [`UNANSWERED`] for a round of every voter,
+    /// and then every [`CHAIN_RETRY`] (task-d25 review): a round lost
+    /// whole left the voter behind until traffic arrived.
     #[test]
     fn an_open_chain_is_asked_for_until_a_page_reaches_a_frontier() {
         let voters = [r(1), r(2), r(3)];
@@ -1000,9 +1033,17 @@ mod tests {
             }
             t += UNANSWERED;
         }
-        // Nobody has more for it: a round of every voter, then no more.
+        // A round of every voter, then the longer period.
         assert_eq!(asked, vec![r(1), r(1), r(1), r(2)]);
-        assert_eq!(pacer.next_deadline(), None);
+        let last = t - UNANSWERED * 7;
+        assert_eq!(pacer.next_deadline(), Some(last + CHAIN_RETRY));
+        assert_eq!(
+            pacer.due(last + CHAIN_RETRY - UNANSWERED, open, r(3), r(1), &voters),
+            None
+        );
+        let t = last + CHAIN_RETRY;
+        assert!(pacer.due(t, open, r(3), r(1), &voters).is_some());
+        assert_eq!(pacer.next_deadline(), Some(t + CHAIN_RETRY));
         // A page reaches a frontier: closed, and nothing more is asked.
         let closed = Standing {
             pages: 2,

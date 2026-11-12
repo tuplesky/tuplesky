@@ -82,7 +82,7 @@ use coord_consensus::rows::{
     DEPENDENCY_TAG, PROPOSAL_TAG, SYNC_TAG, decode_dependency, decode_proposal,
 };
 use coord_core::effect::StoreUpdate;
-use coord_storage::codecs;
+use coord_storage::{codecs, intake};
 use coord_store_api::engine::{
     Direction, EngineError, ErrorClass, OrderedRead, ScanRequest, WriteTxn,
 };
@@ -862,6 +862,10 @@ enum Verdict {
 /// Decide one `protocol_v1` row. Anything whose tag or key shape this build
 /// does not recognize is retained: an unreadable row is never a licence to
 /// delete it.
+///
+/// Dependency and proposal rows are keyed by intake order (task-d113):
+/// epoch, tag, intake order, command. The survey reads them in that order,
+/// and the command is the key's suffix.
 fn classify<V: OrderedRead>(
     view: &V,
     key: &[u8],
@@ -877,7 +881,7 @@ fn classify<V: OrderedRead>(
         // obligation. The row's own phase says nothing either way: the
         // durable row stays at `Accept` or `Commit` after execution, which
         // is recorded only in `executed_v1`.
-        DEPENDENCY_TAG if key.len() == 41 => {
+        DEPENDENCY_TAG if key.len() == intake::INTAKE_KEY_LEN => {
             let command = command_of(key)?;
             let record = decode_dependency(value)?;
             if executed_within(view, &command, boundary)? {
@@ -888,7 +892,7 @@ fn classify<V: OrderedRead>(
         }
         // A proposal row follows its command: the leader must be able to
         // resume a proposal that is not yet settled.
-        PROPOSAL_TAG if key.len() == 41 => {
+        PROPOSAL_TAG if key.len() == intake::INTAKE_KEY_LEN => {
             let command = command_of(key)?;
             let proposal_deps = decode_proposal(value)?.deps;
             if executed_within(view, &command, boundary)? {
@@ -909,9 +913,10 @@ fn classify<V: OrderedRead>(
 }
 
 fn command_of(key: &[u8]) -> Result<CommandId, TrimError> {
-    let mut id = [0u8; 32];
-    id.copy_from_slice(key.get(9..41).ok_or_else(|| corrupt("protocol row key"))?);
-    Ok(CommandId(Digest32(id)))
+    match intake::parse(key) {
+        intake::ProtocolKey::Intake { command, .. } => Ok(command),
+        _ => Err(corrupt("protocol row key").into()),
+    }
 }
 
 /// Whether `command` is executed at or below the boundary. `executed_v1` is

@@ -3529,11 +3529,20 @@ impl Follower {
 
     /// Whether this replica's catch-up chain is owed more (#226 review):
     /// the last page answering it stopped short of its donor's frontier,
-    /// and no page has reached a frontier since. The caller asks again
-    /// while it holds, since a lost ask or page of the chain leaves
-    /// nothing else to.
+    /// no page has reached a frontier since, and this replica has not
+    /// executed that far by itself (task-d25 review); or that page left
+    /// executions since its boot to compare. The caller asks again while
+    /// it holds, since a lost ask or page of the chain leaves nothing else
+    /// to.
     pub fn catch_up_chain_open(&self) -> bool {
-        self.catch_up.chain_open && self.halted.is_none() && self.diverged.is_none()
+        self.catch_up.chain_open
+            && self.halted.is_none()
+            && self.diverged.is_none()
+            && (self.catch_up.since_boot.from.is_some()
+                || self
+                    .catch_up
+                    .owed_through
+                    .is_none_or(|through| self.learner.executed_through() < through))
     }
 
     /// Whether a catch-up page is in hand (task-d08).
@@ -3627,11 +3636,18 @@ impl Follower {
     /// Go on with the chain of asks a full page left owed
     /// (`continue_from`, task-d25): from this replica's frontier once
     /// nothing is in hand, or, ahead, from the end of what it holds once
-    /// that is at most one page. So while one page executes the next is on
-    /// its way, and a page costs its execution rather than its execution
-    /// and a round trip. What is in hand is at most two pages' worth
-    /// (`MAX_CATCH_UP_COMMANDS` when it asks, and the page it asks for),
-    /// and one ask is out: the continuation is one slot, taken once.
+    /// that is one page. So while one page executes the next is on its
+    /// way, and a page costs its execution rather than its execution and a
+    /// round trip. What is in hand is at most two pages, the one it holds
+    /// when it asks and the one it asks for, each at most
+    /// `MAX_CATCH_UP_COMMANDS` commands and `MAX_CATCH_UP_BYTES` unless it
+    /// is one command; and one ask is out: the continuation is one slot,
+    /// taken once.
+    ///
+    /// Pages, not commands (task-d25 review): asked ahead while at most a
+    /// page's worth of commands was held, a donor whose byte bound cut its
+    /// pages to one large command each was asked for the next on every
+    /// arrival, 126 pages in hand with nothing executed.
     ///
     /// Nothing is asked ahead after a boot while executions wait to be
     /// compared: those asks go on from where the last page stopped.
@@ -3645,7 +3661,7 @@ impl Follower {
         let Some(tail) = self.catch_up.tail() else {
             return Vec::new();
         };
-        if self.catch_up.since_boot.from.is_some() || self.catch_up.held() > MAX_CATCH_UP_COMMANDS {
+        if self.catch_up.since_boot.from.is_some() || self.catch_up.pages_held() > 1 {
             return Vec::new();
         }
         let Some(donor) = self.catch_up.continue_from.take() else {
@@ -3785,13 +3801,32 @@ impl Follower {
         let offered = entries.len();
         let mut next = after;
         let mut taken = 0usize;
-        for entry in entries.into_iter().take(MAX_CATCH_UP_COMMANDS) {
+        // A page is bounded here as the donor bounds it, in commands and
+        // in bytes unless it is one command, whatever the donor sent: what
+        // is in hand is two pages at most, in both (task-d25 review). A
+        // page cut at these bounds and nowhere else goes on as a full page
+        // does, so a donor of a later build with a larger page is followed
+        // at full pace rather than at the pacer's.
+        let mut bytes = 0usize;
+        let mut at_bound = false;
+        let mut newest = None;
+        for entry in entries {
+            if taken == MAX_CATCH_UP_COMMANDS {
+                at_bound = true;
+                break;
+            }
             let Ok(position) = next.checked_next() else {
                 break;
             };
             if entry.position != position || !pulled_entry_is_whole(&entry) {
                 break;
             }
+            let len = entry.encoded_len();
+            if taken > 0 && bytes.saturating_add(len) > MAX_CATCH_UP_BYTES {
+                at_bound = true;
+                break;
+            }
+            bytes = bytes.saturating_add(len);
             next = position;
             taken += 1;
             if position <= executed {
@@ -3801,7 +3836,11 @@ impl Follower {
                 }
                 continue;
             }
+            newest.get_or_insert(position);
             self.catch_up.queue.push_back((from, ballot, entry));
+        }
+        if newest.is_some() {
+            self.catch_up.newest_page = newest;
         }
         if self.catch_up.since_boot.from.is_some() {
             if taken == 0 {
@@ -3829,7 +3868,8 @@ impl Follower {
         // -- it hit the command bound or the byte bound -- is followed by
         // the next ask as soon as it is executed: a replica thousands of
         // commands behind should not wait a timer's period per page.
-        self.catch_up.continue_from = (taken == offered && next < through).then_some(from);
+        self.catch_up.continue_from =
+            ((taken == offered || at_bound) && next < through).then_some(from);
         if self.catch_up.since_boot.from.is_some() && next < executed {
             // Executions this replica has made past the page are still to
             // be compared: asked for at once, as a full page's rest is.
@@ -3850,6 +3890,7 @@ impl Follower {
         // review). A late answer to an earlier ask says nothing of it.
         if !stale || self.catch_up.asked_after == Some(after) {
             self.catch_up.chain_open = next < through || self.catch_up.continue_from.is_some();
+            self.catch_up.owed_through = Some(through);
         }
         if ahead {
             self.catch_up.paths.taken_ahead += 1;

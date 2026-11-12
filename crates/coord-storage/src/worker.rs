@@ -13,7 +13,8 @@ use coord_store_api::seq::StoreSeq;
 use coord_types::identity::Digest32;
 use coord_types::ids::{LocalJournalSeq, ReplicaIncarnation};
 
-use crate::lowering::{DurableMeta, ExecutionFrontier, batch_bytes, batch_digest, lower_update};
+use crate::intake::{Assigner, IndexDelta, IntakeIndex};
+use crate::lowering::{DurableMeta, ExecutionFrontier, batch_bytes, batch_digest, lower_record};
 use crate::view::{Frontier, GatedReader};
 
 /// Grouping budgets (design Section 17.3.3: 64 records / 256 KiB targets,
@@ -98,6 +99,9 @@ struct PendingGroup {
     batches: Vec<PersistBatch>,
     seqs: Vec<LocalJournalSeq>,
     expected: DurableMeta,
+    /// The group's changes to the index by command, published only if it
+    /// landed (task-d113, rule (d)).
+    delta: IndexDelta,
 }
 
 /// The worker.
@@ -131,8 +135,15 @@ impl<E: LocalEngine> StoreWorker<E> {
         incarnation: ReplicaIncarnation,
         limits: GroupLimits,
     ) -> Result<Self, EngineError> {
-        let meta = DurableMeta::read(&engine.reader().snapshot()?)?;
+        let snapshot = engine.reader().snapshot()?;
+        let meta = DurableMeta::read(&snapshot)?;
         let frontier = Arc::new(Frontier::default());
+        // The index by command of the intake-keyed rows (task-d113); a
+        // store of another layout is refused here.
+        frontier.install_index(IntakeIndex::build(
+            &snapshot,
+            meta.stamp.journal_seq().get(),
+        )?);
         frontier.set_completed(meta.stamp.store_seq());
         Ok(StoreWorker {
             engine,
@@ -312,6 +323,8 @@ impl<E: LocalEngine> StoreWorker<E> {
         let mut seqs: Vec<LocalJournalSeq> = Vec::new();
         let mut meta = self.meta;
         let mut remaining = group.into_iter();
+        let gate = self.frontier.clone();
+        let delta: IndexDelta;
         // Everything up to `commit_durable` is definitely not committed:
         // the transaction is dropped (aborted) on the way out.
         let commit_result = {
@@ -334,6 +347,8 @@ impl<E: LocalEngine> StoreWorker<E> {
                 let err = self.quarantine("durable metadata diverged from the worker's record");
                 return Err((remaining.collect(), err));
             }
+            let index = gate.index();
+            let mut assigner = Assigner::new(&index);
             while let Some(batch) = remaining.next() {
                 if let Some(base) = batch.base
                     && base != meta.frontier.as_base()
@@ -346,12 +361,12 @@ impl<E: LocalEngine> StoreWorker<E> {
                     continue;
                 }
                 let lowered: Result<(), EngineError> = (|| {
-                    for update in &batch.updates {
-                        lower_update(&mut tx, update)?;
-                    }
                     let seq = meta.stamp.journal_seq().checked_next().map_err(|_| {
                         EngineError::new(ErrorClass::Limit, "store sequence exhausted")
                     })?;
+                    // Intake order is the batch's store sequence, the one
+                    // its stamp takes below (task-d113).
+                    lower_record(&mut tx, &mut assigner, seq.get(), &batch.updates)?;
                     let digest = batch_digest(&meta.stamp.last_batch_digest(), &batch);
                     meta.stamp = AppliedStamp::new(StoreSeq::from_journal(seq), digest);
                     if let Some(base) = batch.base {
@@ -383,6 +398,8 @@ impl<E: LocalEngine> StoreWorker<E> {
                 }
                 accepted.push(batch);
             }
+            delta = assigner.into_delta();
+            drop(index);
             if accepted.is_empty() {
                 if let Err(e) = tx.abort() {
                     self.deferred_events.append(&mut outcome.events);
@@ -400,6 +417,7 @@ impl<E: LocalEngine> StoreWorker<E> {
         match commit_result {
             Ok(()) => {
                 self.meta = meta;
+                self.frontier.publish_index(delta, meta.stamp.store_seq());
                 self.frontier.set_completed(meta.stamp.store_seq());
                 outcome.committed = accepted.len();
                 outcome
@@ -423,6 +441,7 @@ impl<E: LocalEngine> StoreWorker<E> {
                     batches: accepted,
                     seqs,
                     expected: meta,
+                    delta,
                 });
                 outcome.indeterminate = true;
                 Ok(outcome)
@@ -446,6 +465,10 @@ impl<E: LocalEngine> StoreWorker<E> {
         if observed == expected {
             let pending = self.pending.take().expect("pending group");
             self.meta = observed;
+            // The group landed: its changes to the index are published
+            // before the gate moves to it (task-d113, rule (d)).
+            self.frontier
+                .publish_index(pending.delta, observed.stamp.store_seq());
             self.frontier.set_completed(observed.stamp.store_seq());
             self.state = WorkerState::Ready;
             outcome.committed = pending.batches.len();
