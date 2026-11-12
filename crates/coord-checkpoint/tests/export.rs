@@ -709,6 +709,24 @@ fn chunks_are_bounded_verified_and_every_tampering_is_caught() {
             found: SHARED_CHECKPOINT_FORMAT_V1 + 1
         })
     );
+    // What this build says it reads is what it verifies (#247 review): the
+    // format window's `oldest` is read by `supports`, not on this path, so
+    // nothing else holds the two together. Format 1, the layout before
+    // step 2 and task-d105, is the one an older image carries.
+    for version in 0..=SHARED_CHECKPOINT_FORMAT_V1 + 1 {
+        let mut format = cp.manifest.clone();
+        format.format = version;
+        format.root = format.compute_root();
+        let verified = !matches!(
+            verify_shared(&format, &encoded),
+            Err(VerifyError::UnsupportedFormat { .. })
+        );
+        assert_eq!(
+            verified,
+            coord_types::formats::Format::SharedCheckpoint.supports(u32::from(version)),
+            "format {version}: what `supports` says and what `verify_shared` reads differ"
+        );
+    }
     let mut counts = cp.manifest.clone();
     counts.collections[6].rows += 1;
     counts.root = counts.compute_root();

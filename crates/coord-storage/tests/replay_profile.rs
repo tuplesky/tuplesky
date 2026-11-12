@@ -1123,6 +1123,37 @@ fn a_lent_commit_given_back_leaves_its_wait_and_ask_standing() {
     assert_eq!(world.store.status(A), Some(DomainStatus::Ready));
 }
 
+/// A record lent because its wait ran out, with no ask, whose commit is
+/// refused (#248 review): given back, it is due from when it was first
+/// held, not a whole hold from the take-back. The test above goes out on
+/// an ask, which makes a held record due whatever its wait, so it can't
+/// tell the wait put back from one dropped.
+#[test]
+fn a_lent_commit_given_back_keeps_its_wait() {
+    let wait = std::time::Duration::from_millis(300);
+    let (mut world, handle) = held(hold(100, wait));
+    world
+        .engine()
+        .script_commit(CommitScript::DefinitelyNotCommitted);
+    journal_and_hand_off(&mut world, 1);
+    assert!(!world.store.lent(A), "one record is held");
+    std::thread::sleep(wait + std::time::Duration::from_millis(20));
+    world.store.hand_off().unwrap();
+    assert!(world.store.lent(A), "its wait ran out, so it is lent");
+    assert!(handle.run(), "the commit is refused");
+    world.store.hand_off().unwrap();
+    assert!(!world.store.lent(A));
+    let due = world
+        .store
+        .projection_commit_due()
+        .expect("the record given back is still held");
+    assert!(
+        due <= std::time::Instant::now(),
+        "due from when it was first held, not {:?} from now",
+        due.saturating_duration_since(std::time::Instant::now())
+    );
+}
+
 /// The ask made while its record is queued (task-d86, #238 review): the
 /// record's group is then sealed and lent to the appender, and a
 /// hand-off lends the record held from before while that append is still
