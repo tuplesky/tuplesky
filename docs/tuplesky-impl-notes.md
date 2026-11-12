@@ -7368,11 +7368,12 @@ contract needed and a test for each.
   1,000, is enforced per frontend as a token bucket with a second's
   burst. A retry of an outstanding request takes nothing, and a refused
   request is answered `BACKPRESSURE` ("admission rate").
-  - Catch-up executes up to 64 commands per durable batch (task-d25), so
-    the default leaves a returning voter most of its rate to gain on the
+  - Catch-up executes up to 125 commands per durable batch, with the
+    next page asked ahead while a page executes (task-d25), so the
+    default leaves a returning voter most of its rate to gain on the
     domain with. The time it needs is then bounded by its gap.
   - The default is a design target and a ceiling, not a proved bound
-    (review): the 64-per-10-ms rate it is set under is unmeasured, and
+    (review): the 64-per-10-ms rate it was set under was never measured, and
     task-d33's budget oracle is its check. It gates only client
     requests, after the session-busy check and before the pending
     insert; resolves, watches and held retries bypass it, and one bucket

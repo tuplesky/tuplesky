@@ -337,6 +337,13 @@ struct Knobs {
     /// catch-up page in hand, is put off (row 24): the page stays in hand
     /// while its donor is crashed and a successor elected.
     catch_up_lag: u32,
+    /// The most commands a donor's page carries: `MAX_CATCH_UP_COMMANDS`,
+    /// or fewer, as a donor whose byte bound cuts its pages (task-d25
+    /// review). A row runs 60 to 260 commands, so at a page of 125 no page
+    /// leaves the next asked ahead of a window in hand; at a few commands
+    /// a page the ask ahead runs under every fault the row has.
+    /// `PROTOCOL_SIM_PAGE` sets it in every row.
+    page: usize,
 }
 
 impl Knobs {
@@ -385,6 +392,7 @@ impl Knobs {
         early_to_fast_set: false,
         donor_crash: 0,
         catch_up_lag: 0,
+        page: coord_consensus::MAX_CATCH_UP_COMMANDS,
     };
 
     /// These knobs with task-d98's early proposals and the three faults
@@ -971,6 +979,10 @@ struct Stats {
     /// follower machine of the run.
     stopped_ballot: u64,
     stopped_stale: u64,
+    /// Pages asked ahead of a window in hand, and taken behind it
+    /// (task-d25), likewise.
+    asked_ahead: u64,
+    taken_ahead: u64,
 }
 
 /// FNV-1a over `bytes`, continuing from `hash`.
@@ -1510,6 +1522,8 @@ impl Sim {
                 let paths = f.catch_up_paths();
                 self.stats.stopped_ballot += paths.stopped_ballot;
                 self.stats.stopped_stale += paths.stopped_stale;
+                self.stats.asked_ahead += paths.asked_ahead;
+                self.stats.taken_ahead += paths.taken_ahead;
                 let q = f.quorum().clone();
                 let (mut l, effects) = Leader::from_recovered(f.into_recovered(), q, &decision);
                 l.set_learning(LearningMode::Full);
@@ -2023,7 +2037,7 @@ impl Sim {
             .iter()
             .enumerate()
             .skip(usize::try_from(after.get()).unwrap_or(usize::MAX))
-            .take(coord_consensus::MAX_CATCH_UP_COMMANDS)
+            .take(self.knobs.page)
         {
             let Some(payload) = payloads.get(c) else {
                 break;
@@ -2763,6 +2777,8 @@ impl Sim {
             let paths = f.catch_up_paths();
             self.stats.stopped_ballot += paths.stopped_ballot;
             self.stats.stopped_stale += paths.stopped_stale;
+            self.stats.asked_ahead += paths.asked_ahead;
+            self.stats.taken_ahead += paths.taken_ahead;
         }
     }
 
@@ -3965,6 +3981,14 @@ fn row_knobs(row: u8) -> Knobs {
     {
         knobs.frames = share;
     }
+    // `PROTOCOL_SIM_PAGE`: the most commands a donor's page carries
+    // (task-d25 review), at least one.
+    if let Some(page) = std::env::var("PROTOCOL_SIM_PAGE")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+    {
+        knobs.page = page.max(1);
+    }
     // `PROTOCOL_SIM_FAIL_QUEUE=0` fails one batch at a time where the row
     // fails the queue behind it, `=1` the queue where it doesn't.
     match std::env::var("PROTOCOL_SIM_FAIL_QUEUE").as_deref() {
@@ -4066,6 +4090,8 @@ fn run_row(row: u8) {
                     totals.donor_crashes_again += s.donor_crashes_again;
                     totals.stopped_ballot += s.stopped_ballot;
                     totals.stopped_stale += s.stopped_stale;
+                    totals.asked_ahead += s.asked_ahead;
+                    totals.taken_ahead += s.taken_ahead;
                 }
                 Err(e) => failures.push(e),
             }
@@ -4310,6 +4336,47 @@ fn framed_rows() {
         "frames held one proposal each: {framed} in {frames}"
     );
     assert!(relayed > 0, "no relayed proposal was sent");
+}
+
+/// Pages asked ahead under faults (task-d25 review): at a page of 125 no
+/// row's page leaves the next asked ahead of a window in hand, so the
+/// simulator never reached the ask ahead (0 of 1.19 M pages at 100 seeds)
+/// and its only randomized cover was the ordering test in `catch_up.rs`,
+/// with one ballot and one donor. Here rows 1, 9, 12 and 24 run with
+/// pages of three commands, as a donor whose byte bound cuts its pages:
+/// crashes, elections, lost and held-back frames, and donors crashed while
+/// they serve, with a page asked ahead. Every oracle holds, and pages were
+/// asked ahead and taken behind a window in hand. Catch-up is on whatever
+/// `PROTOCOL_SIM_NO_CATCH_UP` says: this is its test.
+#[test]
+fn rows_with_pages_of_three_ask_ahead() {
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let mut failures = Vec::new();
+    let (mut pages, mut asked, mut taken) = (0u64, 0u64, 0u64);
+    for row in [1u8, 9, 12, 24] {
+        let mut knobs = row_knobs(row);
+        knobs.page = 3;
+        for n in [3u8, 5] {
+            for seed in 0..seeds() {
+                match run_knobs(n, knobs, seed, Some(true)) {
+                    Ok(stats) => {
+                        pages += u64::from(stats.catch_up_pages);
+                        asked += stats.asked_ahead;
+                        taken += stats.taken_ahead;
+                    }
+                    Err(e) => failures.push(e),
+                }
+            }
+        }
+    }
+    std::panic::set_hook(hook);
+    println!("pages of three: {pages} pages, {asked} asked ahead, {taken} taken ahead");
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    assert!(
+        asked > 0 && taken > 0,
+        "no page asked ahead ({asked}) or taken ahead ({taken}) of {pages}"
+    );
 }
 
 #[test]

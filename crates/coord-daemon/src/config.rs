@@ -79,7 +79,8 @@ pub struct Limits {
     /// not a new one.
     ///
     /// Meant to be below the rate at which a voter catching up executes,
-    /// a page of up to 64 commands installed in one batch (task-d25). A
+    /// a page of up to 125 commands installed in one batch, the next asked
+    /// ahead while it executes (task-d25). A
     /// voter returning behind gains on the domain by the difference, so
     /// the time it takes to close a gap is bounded by the gap; admitted
     /// faster than it can execute, it never closes it. The bound is per
