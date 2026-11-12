@@ -1227,6 +1227,7 @@ impl Leader {
         let proposals = &self.proposals;
         self.unsettled.retain(|(_, c)| proposals.contains_key(c));
         self.durable.retain(|(_, c)| proposals.contains_key(c));
+        self.held_back.retain(|(_, c)| proposals.contains_key(c));
         self.by_barrier.retain(|_, c| proposals.contains_key(c));
         self.votes.retain(|c, _| !table.forgotten(c));
         // A retry of a forgotten command is refused from the table's
@@ -1281,6 +1282,12 @@ impl Leader {
                 && self.votes.keys().all(kept)
                 && self.bindings.values().all(kept),
             "a forgotten command's history was kept and is not in the forget queue"
+        );
+        debug_assert!(
+            self.held_back
+                .iter()
+                .all(|(_, c)| self.proposals.contains_key(c)),
+            "a held-back re-proposal outlived its proposal"
         );
     }
 
@@ -3410,7 +3417,12 @@ impl Leader {
             None => Bound::Unbounded,
         };
         for (seqnum, command) in self.held_back.range((start, Bound::Unbounded)) {
-            if room == 0 || !self.proposals[command].durable {
+            // Every path that drops a proposal drops it from `held_back`
+            // too; one missing here is passed over, not a panic.
+            let Some(p) = self.proposals.get(command) else {
+                continue;
+            };
+            if room == 0 || !p.durable {
                 break;
             }
             window.through = Some(*seqnum);
