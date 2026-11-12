@@ -203,6 +203,32 @@ class ReduceTests(unittest.TestCase):
         self.assertIn("5.00/4.50 (4.80, 2.00)", table)
         self.assertNotIn("traffic_per_command", cost.per_command("n1", snapshot()))
 
+    def test_what_a_leader_sent_is_read_per_command_when_reported(self):
+        snap = snapshot()
+        snap["cost"]["Observed"]["proposals"] = {
+            "proposals": 400, "proposal_bytes": 48000, "payload_bytes": 120000,
+            "frames": 50, "framed": 300, "frontiers": 74, "frontier_bytes": 2960,
+        }
+        reading = cost.per_command("n1", snap)
+        sent = reading["proposals_per_command"]
+        self.assertAlmostEqual(sent["proposals"], 4.0)
+        self.assertAlmostEqual(sent["frames"], 0.5)
+        self.assertAlmostEqual(sent["frontiers"], 0.74)
+        self.assertAlmostEqual(sent["frontier_bytes"], 29.6)
+        table = cost.paths_table({"runs": [{"callers": 1, "voters": [reading]}]})
+        self.assertIn("| 4.00/0.50/0.74 |", table)
+        # A follower sent nothing as leader, and an older binary has no
+        # counts: neither reads as zero.
+        follower = snapshot()
+        follower["cost"]["Observed"]["proposals"] = dict.fromkeys(
+            snap["cost"]["Observed"]["proposals"], 0)
+        self.assertNotIn("proposals_per_command", cost.per_command("n2", follower))
+        self.assertNotIn("proposals_per_command", cost.per_command("n1", snapshot()))
+        row = cost.paths_table({"runs": [{"callers": 1, "voters": [
+            cost.per_command("n2", follower)]}]}).splitlines()[-1]
+        self.assertEqual(row.count("|"), cost.paths_table(
+            {"runs": []}).splitlines()[0].count("|"))
+
     def test_journal_groups_are_read_per_command_when_reported(self):
         snap = snapshot(executed=100, appends=180, syncs=190)
         snap["cost"]["Observed"]["journal_groups"] = {
