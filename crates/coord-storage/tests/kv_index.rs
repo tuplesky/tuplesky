@@ -427,3 +427,118 @@ fn compaction_keeps_each_keys_newest_put_at_or_below_the_floor_and_drops_its_tom
         ])
     );
 }
+
+fn put_op(k: &[u8], v: &[u8]) -> CanonicalOperation {
+    CanonicalOperation::Put(PutOp {
+        key: k.to_vec(),
+        value: v.to_vec(),
+        lease: None,
+        prev_kv: false,
+    })
+}
+
+/// A view pinned before a compaction and its collection reads, at a
+/// revision the newer floor has passed, the versions the view still holds:
+/// the live index has dropped them, so the read takes the view's own event
+/// rows (Codex P1 on #245).
+#[test]
+fn a_view_pinned_before_compaction_reads_the_versions_it_holds() {
+    let mut d = Domain::open(ModelEngine::new());
+    d.run(NS, put_op(b"a", b"a1")); // 1
+    d.run(NS, put_op(b"b", b"b1")); // 2
+    let pinned = d.worker().reader().snapshot().unwrap();
+    d.run(NS, put_op(b"a", b"a2")); // 3
+    d.run(NS, put_op(b"b", b"b2")); // 4
+    d.run(NS, CanonicalOperation::Compact { revision: rev(4) });
+    d.gc();
+    // The live index lost a@1 and b@2.
+    let (live, _) = d.indexes();
+    assert_eq!(live.versions_of(NS, b"a").len(), 1);
+    assert!(live.floor() >= rev(4));
+    // The pinned view still answers at 1 and 2 as it did when pinned.
+    for (at, want) in [
+        (1, vec![(b"a".to_vec(), b"a1".to_vec())]),
+        (
+            2,
+            vec![
+                (b"a".to_vec(), b"a1".to_vec()),
+                (b"b".to_vec(), b"b1".to_vec()),
+            ],
+        ),
+    ] {
+        let request = LogicalRequest::new(NS, range_all_at(at));
+        let view = build_read_view(
+            &pinned,
+            NS,
+            PrincipalId([0xaa; 16]),
+            &request,
+            ViewBudget::default(),
+        )
+        .unwrap();
+        let planned = plan(&request, &view, &PlanLimits::default()).unwrap();
+        assert_eq!(
+            items(&planned.response.outcome),
+            want.into_iter().collect::<BTreeMap<_, _>>(),
+            "at {at}"
+        );
+    }
+}
+
+/// A view that counts its point reads.
+struct Counting<'a, V> {
+    view: &'a V,
+    gets: std::cell::Cell<usize>,
+}
+
+impl<V: OrderedRead> OrderedRead for Counting<'_, V> {
+    fn get(
+        &self,
+        collection: coord_store_api::engine::CollectionId,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>, coord_store_api::engine::EngineError> {
+        self.gets.set(self.gets.get() + 1);
+        self.view.get(collection, key)
+    }
+
+    fn scan_page(
+        &self,
+        collection: coord_store_api::engine::CollectionId,
+        request: &ScanRequest,
+    ) -> Result<coord_store_api::engine::RowPage, coord_store_api::engine::EngineError> {
+        self.view.scan_page(collection, request)
+    }
+}
+
+/// A historical read reads each chosen version's event row only as its
+/// caller takes it, so a caller that stops (a spent budget) stops the
+/// reads too (Codex P2 on #245).
+#[test]
+fn a_historical_read_reads_versions_only_as_its_caller_takes_them() {
+    let mut d = Domain::open(ModelEngine::new());
+    for i in 0..50u8 {
+        d.run(NS, put_op(&[b'k', i], b"v"));
+    }
+    let gated = d.worker().reader().snapshot().unwrap();
+    let index = KvIndex::build(gated.view()).unwrap();
+    let counting = Counting {
+        view: gated.view(),
+        gets: std::cell::Cell::new(0),
+    };
+    let mut taken = Vec::new();
+    coord_storage::kv_index::versions_at(
+        &index,
+        &counting,
+        NS,
+        b"k",
+        std::ops::Bound::Excluded(b"l".as_slice()),
+        rev(50),
+        |key, chosen| -> Result<bool, coord_store_api::engine::EngineError> {
+            assert!(chosen.is_some());
+            taken.push(key);
+            Ok(taken.len() < 3)
+        },
+    )
+    .unwrap();
+    assert_eq!(taken, vec![vec![b'k', 0], vec![b'k', 1], vec![b'k', 2]]);
+    assert_eq!(counting.gets.get(), 3, "one point read a key taken");
+}

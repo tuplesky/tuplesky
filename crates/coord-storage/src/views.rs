@@ -599,9 +599,12 @@ pub fn build_read_view<V: OrderedRead>(
                 Touch::Exact(k) => (k.clone(), Bound::Included(k.as_slice())),
                 Touch::Interval(lo, hi) => (lo.clone(), Bound::Excluded(hi.as_slice())),
             };
-            for (key, chosen) in kv_versions_at(gated, namespace, &lower, upper, r)? {
+            // Each version is read as it is settled, so the budget stops
+            // the read, not only what it keeps.
+            kv_versions_at(gated, namespace, &lower, upper, r, |key, chosen| {
                 settle(&mut entries, key, chosen)?;
-            }
+                Ok(true)
+            })?;
         }
         read_view.historical.push(HistoricalView {
             revision: r,
@@ -611,16 +614,18 @@ pub fn build_read_view<V: OrderedRead>(
     Ok(read_view)
 }
 
-/// Each key of `namespace` in `[lower, upper)` with what it holds at `at`,
-/// through the published key index and the view's own event rows above
-/// it (task-d105). A view with no gate reads every event row.
+/// Hand each key of `namespace` in `[lower, upper)` with what it holds at
+/// `at` to `each`, in key order, through the published key index and the
+/// view's own event rows above it (task-d105). A view with no gate reads
+/// every event row.
 fn kv_versions_at<V: OrderedRead>(
     gated: &GatedView<V>,
     namespace: NamespaceId,
     lower: &[u8],
     upper: Bound<&[u8]>,
     at: KvRevision,
-) -> Result<BTreeMap<Vec<u8>, Option<KvEntry>>, ViewBuildError> {
+    each: impl FnMut(Vec<u8>, Option<KvEntry>) -> Result<bool, ViewBuildError>,
+) -> Result<(), ViewBuildError> {
     let empty = crate::kv_index::KvIndex::default();
     let held;
     let index = match gated.gate() {
@@ -630,14 +635,7 @@ fn kv_versions_at<V: OrderedRead>(
         }
         None => &empty,
     };
-    Ok(crate::kv_index::versions_at(
-        index,
-        gated.view(),
-        namespace,
-        lower,
-        upper,
-        at,
-    )?)
+    crate::kv_index::versions_at(index, gated.view(), namespace, lower, upper, at, each)
 }
 
 /// The ranges of `op` that read revision `r`.

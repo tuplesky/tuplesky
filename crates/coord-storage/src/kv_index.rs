@@ -62,6 +62,12 @@ pub struct KvIndex {
     keys: BTreeMap<(NamespaceId, Vec<u8>), Vec<Version>>,
     /// Every event row at or below this revision is in the index.
     through: Option<KvRevision>,
+    /// The retention floor of the newest commit published. Compaction
+    /// removes a version only once a newer one at or below the floor it
+    /// ran under exists, so the index answers every read at or above this
+    /// floor as any view would; below it, a view pinned before compaction
+    /// may hold versions the index has dropped.
+    floor: Option<KvRevision>,
     versions: usize,
     key_bytes: usize,
 }
@@ -81,6 +87,7 @@ impl KvIndex {
         })?;
         index.publish(delta);
         index.through = through_of(view)?;
+        index.floor = Some(codecs::read_retention_floor(view)?);
         Ok(index)
     }
 
@@ -101,6 +108,7 @@ impl KvIndex {
         )?;
         index.publish(delta);
         index.through = through_of(view)?.map(|t| t.min(floor));
+        index.floor = Some(codecs::read_retention_floor(view)?);
         Ok(index)
     }
 
@@ -133,6 +141,9 @@ impl KvIndex {
         if let Some(through) = delta.through {
             self.through = Some(self.through.map_or(through, |t| t.max(through)));
         }
+        if let Some(floor) = delta.floor {
+            self.floor = Some(self.floor.map_or(floor, |f| f.max(floor)));
+        }
     }
 
     /// Drop everything (a quarantined store; the next open rebuilds it).
@@ -143,6 +154,11 @@ impl KvIndex {
     /// The revision through which every event row is in the index.
     pub fn through(&self) -> Option<KvRevision> {
         self.through
+    }
+
+    /// The retention floor of the newest commit published.
+    pub fn floor(&self) -> KvRevision {
+        self.floor.unwrap_or(KvRevision::ZERO)
     }
 
     /// Retained versions held.
@@ -249,12 +265,16 @@ pub struct KvDelta {
     added: Vec<(NamespaceId, Vec<u8>, Version)>,
     removed: Vec<(NamespaceId, Vec<u8>, Version)>,
     through: Option<KvRevision>,
+    floor: Option<KvRevision>,
 }
 
 impl KvDelta {
     /// Whether the commit changed nothing the index holds.
     pub fn is_empty(&self) -> bool {
-        self.added.is_empty() && self.removed.is_empty() && self.through.is_none()
+        self.added.is_empty()
+            && self.removed.is_empty()
+            && self.through.is_none()
+            && self.floor.is_none()
     }
 
     /// Take `update` into the delta, before it is written. A deleted event
@@ -284,6 +304,13 @@ impl KvDelta {
             let revision = KvRevision::new(codecs::decode_counter(value)?)
                 .map_err(|_| EngineError::new(ErrorClass::Corrupt, "kv revision"))?;
             self.through = Some(self.through.map_or(revision, |t| t.max(revision)));
+        } else if update.collection == Collection::MetaV1.id()
+            && update.key == meta_fields::RETENTION_FLOOR
+            && let Some(value) = &update.value
+        {
+            let floor = KvRevision::new(codecs::decode_counter(value)?)
+                .map_err(|_| EngineError::new(ErrorClass::Corrupt, "retention floor"))?;
+            self.floor = Some(self.floor.map_or(floor, |f| f.max(floor)));
         }
         Ok(())
     }
@@ -303,6 +330,9 @@ impl KvDelta {
         self.added.extend(later.added);
         if let Some(t) = later.through {
             self.through = Some(self.through.map_or(t, |s| s.max(t)));
+        }
+        if let Some(f) = later.floor {
+            self.floor = Some(self.floor.map_or(f, |s| s.max(f)));
         }
     }
 }
@@ -362,29 +392,40 @@ fn scan_events<V: OrderedRead>(
 /// or deleted).
 pub type Chosen = Option<coord_state::KvEntry>;
 
-/// Each key of `namespace` in `[lower, upper)` with what it holds at `at`,
-/// in key order, read through `index` and `view`'s event rows: the index's
-/// versions up to its [`KvIndex::through`], the view's own event rows
-/// above it (an overlay, or commits the index has not been handed yet).
+/// Hand each key of `namespace` in `[lower, upper)` with what it holds at
+/// `at` to `each`, in key order, read through `index` and `view`'s event
+/// rows: the index's versions up to its [`KvIndex::through`], the view's
+/// own event rows above it (an overlay, or commits the index has not been
+/// handed yet). Each chosen version's event row is read as it is handed
+/// on, so `each` returning `false` (or an error) stops the read there: a
+/// caller's budget bounds the rows read, not only the rows kept.
+///
+/// The index serves a read at `at` only at or above its
+/// [`KvIndex::floor`]. Below it, compaction may have removed a version
+/// that `view`, pinned before it, still holds; such a read takes every
+/// event row of `view` at or below `at` instead.
 ///
 /// A key whose newest version at or below `at` is a delete is reported
 /// with `None`; the caller decides whether to keep it.
-pub fn versions_at<V: OrderedRead>(
+pub fn versions_at<V: OrderedRead, E: From<EngineError>>(
     index: &KvIndex,
     view: &V,
     namespace: NamespaceId,
     lower: &[u8],
     upper: Bound<&[u8]>,
     at: KvRevision,
-) -> Result<BTreeMap<Vec<u8>, Chosen>, EngineError> {
-    let covered = index.through().map_or(at, |t| t.min(at));
-    let mut newest: BTreeMap<Vec<u8>, Version> = BTreeMap::new();
-    if index.through().is_some() {
-        for (key, version) in index.newest_at(namespace, lower, upper, covered) {
-            newest.insert(key.to_vec(), version);
-        }
-    }
-    // The view's event rows the index doesn't cover, up to `at`.
+    mut each: impl FnMut(Vec<u8>, Chosen) -> Result<bool, E>,
+) -> Result<(), E> {
+    let usable = index.through().is_some() && at >= index.floor();
+    // The view's event rows the index doesn't cover, up to `at`: each
+    // key's newest version among them. They are above anything the index
+    // holds for this read, so they take its place.
+    let from = match index.through() {
+        _ if !usable => Some(Bound::Unbounded),
+        Some(t) if t >= at => None,
+        Some(t) => Some(Bound::Excluded(codecs::event_key(t, u32::MAX))),
+        None => Some(Bound::Unbounded),
+    };
     let in_range = |key: &[u8]| {
         key >= lower
             && match upper {
@@ -393,12 +434,7 @@ pub fn versions_at<V: OrderedRead>(
                 Bound::Unbounded => true,
             }
     };
-    let from = match index.through() {
-        Some(t) if t >= at => None,
-        Some(t) => Some(Bound::Excluded(codecs::event_key(t, u32::MAX))),
-        None => Some(Bound::Unbounded),
-    };
-    let mut values: BTreeMap<Vec<u8>, Chosen> = BTreeMap::new();
+    let mut overlay: BTreeMap<Vec<u8>, Version> = BTreeMap::new();
     if let Some(from) = from {
         let to = Bound::Included(codecs::event_key(at, u32::MAX));
         scan_events(view, from, to, |row_key, value| {
@@ -406,37 +442,60 @@ pub fn versions_at<V: OrderedRead>(
             let record = codecs::decode_event(value)?;
             if record.namespace == namespace && in_range(&record.key) {
                 let version = Version { revision, ordinal };
-                if newest.get(&record.key).is_none_or(|v| *v < version) {
-                    newest.insert(record.key.clone(), version);
-                    values.insert(record.key, entry_of(record.kind, record.entry));
-                }
+                let slot = overlay.entry(record.key).or_insert(version);
+                *slot = (*slot).max(version);
             }
             Ok(())
         })?;
     }
-    let mut out = BTreeMap::new();
-    for (key, version) in newest {
-        let chosen = match values.remove(&key) {
-            Some(chosen) => chosen,
-            None => {
-                let row = view
-                    .get(Collection::EventsV1.id(), &version.event_key())?
-                    .ok_or_else(|| {
-                        EngineError::new(ErrorClass::Corrupt, "an indexed version has no event row")
-                    })?;
-                let record = codecs::decode_event(&row)?;
-                if record.namespace != namespace || record.key != key {
-                    return Err(EngineError::new(
-                        ErrorClass::Corrupt,
-                        "an indexed version's event row names another key",
-                    ));
-                }
-                entry_of(record.kind, record.entry)
+    let covered = index.through().map_or(at, |t| t.min(at));
+    let mut indexed = usable
+        .then(|| index.newest_at(namespace, lower, upper, covered))
+        .into_iter()
+        .flatten()
+        .peekable();
+    let mut overlay = overlay.into_iter().peekable();
+    loop {
+        let (key, version) = match (indexed.peek(), overlay.peek()) {
+            (None, None) => return Ok(()),
+            (Some((k, _)), Some((o, _))) if *k == o.as_slice() => {
+                indexed.next();
+                overlay.next().expect("peeked")
             }
+            (Some((k, _)), Some((o, _))) if *k > o.as_slice() => overlay.next().expect("peeked"),
+            (Some(_), _) => {
+                let (k, v) = indexed.next().expect("peeked");
+                (k.to_vec(), v)
+            }
+            (None, Some(_)) => overlay.next().expect("peeked"),
         };
-        out.insert(key, chosen);
+        let chosen = read_version(view, namespace, &key, version)?;
+        if !each(key, chosen)? {
+            return Ok(());
+        }
     }
-    Ok(out)
+}
+
+/// What the event row of `version` says `key` holds.
+fn read_version<V: OrderedRead>(
+    view: &V,
+    namespace: NamespaceId,
+    key: &[u8],
+    version: Version,
+) -> Result<Chosen, EngineError> {
+    let row = view
+        .get(Collection::EventsV1.id(), &version.event_key())?
+        .ok_or_else(|| {
+            EngineError::new(ErrorClass::Corrupt, "an indexed version has no event row")
+        })?;
+    let record = codecs::decode_event(&row)?;
+    if record.namespace != namespace || record.key != key {
+        return Err(EngineError::new(
+            ErrorClass::Corrupt,
+            "an indexed version's event row names another key",
+        ));
+    }
+    Ok(entry_of(record.kind, record.entry))
 }
 
 fn entry_of(kind: KvEventKind, entry: Option<coord_state::KvEntry>) -> Chosen {
