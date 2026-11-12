@@ -983,3 +983,29 @@ fn a_commit_in_doubt_leaves_nothing_due_until_it_is_reconciled() {
     world.store.hand_off().unwrap();
     assert!(world.store.lent(A), "lent once reconciled");
 }
+
+/// A commit made on the caller's thread carries everything held, so the
+/// hold runs again from the next record (task-d86): a checkpoint
+/// published synchronously on a held store commits what was pending, and
+/// the record after it waits the hold's time from its own arrival. Left
+/// to count from the records the publication committed, it went out at
+/// the next hand-off.
+#[test]
+fn a_synchronous_commit_restarts_the_hold() {
+    let wait = std::time::Duration::from_millis(200);
+    let (mut world, _handle) = held(hold(100, wait));
+    journal_and_hand_off(&mut world, 1);
+    assert!(!world.store.lent(A), "one record is held");
+    let pointer = world.pointer();
+    world.store.publish_checkpoint(A, &pointer).unwrap();
+    assert_eq!(world.store.unmaterialized(A), 0, "the publication committed it");
+    std::thread::sleep(wait + wait / 2);
+    let arrived = std::time::Instant::now();
+    journal_and_hand_off(&mut world, 1);
+    assert!(
+        !world.store.lent(A),
+        "the record after the publication went out at once"
+    );
+    let due = world.store.projection_commit_due().expect("held");
+    assert!(due >= arrived + wait, "its wait counts from before it arrived");
+}
