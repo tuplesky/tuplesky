@@ -356,7 +356,7 @@ def profile(args) -> int:
 # A voter's loop is pegged once it has used at least this much
 # of a core for PEGGED_SECONDS in a row.
 PEGGED_SHARE = 0.9
-PEGGED_SECONDS = 15
+PEGGED_SECONDS = 5
 # The least time between two profiles of one boot.
 PEGGED_AGAIN_SECONDS = 60
 

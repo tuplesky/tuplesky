@@ -414,7 +414,7 @@ class PeggedLoopTests(unittest.TestCase):
     def test_each_stretch_then_each_profile(self):
         with tempfile.TemporaryDirectory() as d:
             with open(os.path.join(d, "leader-profile-pegged.txt"), "w") as f:
-                f.write("Restarted voters' loops at or above 0.9 of a core for 15 s or more, watched from A\n"
+                f.write("Restarted voters' loops at or above 0.9 of a core for 5 s or more, watched from A\n"
                         "n1 pid 7 (boot at tick 9): pegged from B, profiled into leader-profile-pegged-1.txt\n")
             with open(os.path.join(d, "leader-profile-pegged-1.txt"), "w") as f:
                 f.write("pegged loop 1, restarted thread 7 (n1), 0.98 of a core; 1K samples\n"
@@ -425,6 +425,95 @@ class PeggedLoopTests(unittest.TestCase):
         self.assertIn("- n1 pid 7 (boot at tick 9): pegged from B", out)
         self.assertIn("**Pegged loop 1, profiled**", out)
         self.assertIn("next_executable", out)
+
+
+class LeaderChangeTests(unittest.TestCase):
+    """Each change of leader: the kill that answered it, the stall in
+    `ok`s, whether the new leader had just been cut off or restarted, and
+    its loop in the stall, with the frames its whole-run samples took."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        store = self.dir.name
+        t0 = datetime.datetime(2026, 9, 27, 10, 0, 0)
+
+        def at(s):
+            return t0 + datetime.timedelta(seconds=s)
+
+        def log(node, lines):
+            os.makedirs(os.path.join(store, node))
+            with open(os.path.join(store, node, "coordd.log"), "w") as f:
+                f.write("2026-09-27 10:00:00 Jepsen starting /opt/tuplesky/coordd\ncoordd domain=d roles=[Voter]\n")
+                for line in lines:
+                    if isinstance(line, int):
+                        line = f'metrics {{"cost":{{"Observed":{{"uptime":{{"secs":{line},"nanos":0}}}}}}}}'
+                    f.write(line + "\n")
+
+        log("n1", ["this voter leads ballot 0", 10])
+        # n2 takes ballot 1 after n1's kill at +12; n3, cut off from +22 to
+        # +27, takes ballot 2 from n2 with no kill.
+        log("n2", [10, "this voter leads ballot 1", 20, 30, "this voter follows ballot 2 led by 03030303", 40])
+        log("n3", [10, 20, 30, "this voter leads ballot 2", 40])
+        # Ten `ok`s a second, none from +12 to +15 or from +33 to +36.
+        self.client = [js.Op(at(i / 10), "jepsen worker 0", "0", "ok", ":read", "", "")
+                       for i in range(450) if not (120 <= i < 150 or 330 <= i < 360)]
+
+        def nem(s, f, v):
+            return js.Op(at(s), "jepsen nemesis", ":nemesis", "info", f, v, "")
+
+        self.nemesis = [
+            nem(11, ":kill", ":primaries"), nem(12, ":kill", '{"n1" ""}'),
+            nem(16, ":start", ":all"), nem(17, ":start", '{"n1" :started, "n2" :already-running}'),
+            nem(21, ":start-partition", ":follower"),
+            nem(22, ":start-partition", '[:isolated {"n3" #{"n1" "n2"}, "n1" #{"n3"}, "n2" #{"n3"}}]'),
+            nem(27, ":stop-partition", "nil"), nem(27, ":stop-partition", ":network-healed"),
+        ]
+        # Loop CPU, cumulative: n3's at a full core from +33 to +36, the
+        # others' at 0.1 throughout.
+        rate = {101: lambda t: 0.1 * t, 102: lambda t: 0.1 * t,
+                103: lambda t: 0.1 * min(t, 33) + 1.0 * max(0, min(t, 36) - 33) + 0.1 * max(0, t - 36)}
+        with open(os.path.join(store, "cpu-samples-threads.csv"), "w") as f:
+            f.write("time,pid,start,loop_cpu_s,loop_runq_s,workers_cpu_s,workers_runq_s,workers\n")
+            for t in range(45):
+                for pid, fn in rate.items():
+                    f.write(f"2026-09-27 10:00:{t:02d}.000000,{pid},7,{fn(t):.4f},0,0,0,1\n")
+        with open(os.path.join(store, "cpu-samples-nodes.csv"), "w") as f:
+            f.write("pid,start,node\n101,7,n1\n102,7,n2\n103,7,n3\n")
+        with open(os.path.join(store, "leader-profile-loops.txt"), "w") as f:
+            f.write("Every coordd domain loop, sampled at 49 Hz\n")
+            for t in (33, 34, 35):
+                f.write(f"10:00:{t} 103 40 main;coordd::main;coord_consensus::follower::Follower::advance_campaign;"
+                        "coord_consensus::recovery::entry_order;alloc::collections::btree::search::find_key_index\n")
+                f.write(f"10:00:{t} 103 9 main;coordd::main;coord_consensus::follower::Follower::advance_campaign"
+                        "::{{closure}};__memcmp_avx2_movbe\n")
+            f.write("10:00:13 102 2 main;coordd::main;coord_daemon::node::Node::on_event\n")
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def changes(self) -> str:
+        return "\n".join(js.leader_changes(self.client, self.nemesis, ["n1", "n2", "n3"], self.client[0].at, self.dir.name))
+
+    def test_a_kill_answers_the_change_after_it_and_a_heal_can_take_the_lead(self):
+        text = self.changes()
+        self.assertIn("**Leader changes:** 2 after the first ballot, 1 after a kill of the leader and 1 with no kill before.", text)
+        self.assertIn("| 1 | n2 | n1 | n1 at +12 | 3 (+12 to +15) | no | 0.10 | 0 | 2 samples |", text)
+        self.assertIn("| 2 | n3 | n2 | none | 3 (+33 to +36) | cut off +22 to +27 | 1.00 | 3 | "
+                      "147 samples: `recovery::entry_order` 82%, `Follower::advance_campaign` 18% |", text)
+
+    def test_without_samples_the_loop_and_frames_are_empty(self):
+        for name in ("cpu-samples-threads.csv", "leader-profile-loops.txt"):
+            os.remove(os.path.join(self.dir.name, name))
+        self.assertIn("| 2 | n3 | n2 | none | 3 (+33 to +36) | cut off +22 to +27 | - | 0 | - |", self.changes())
+
+    def test_one_ballot_is_no_section(self):
+        for node in ("n2", "n3"):
+            os.remove(os.path.join(self.dir.name, node, "coordd.log"))
+        self.assertEqual(self.changes(), "")
+
+    def test_a_lead_line_is_timed_between_its_metrics_lines(self):
+        lines = js.lead_lines(os.path.join(self.dir.name, "n2", "coordd.log"))
+        self.assertEqual(lines, [(1, datetime.datetime(2026, 9, 27, 10, 0, 10), datetime.datetime(2026, 9, 27, 10, 0, 20))])
 
 
 class RunQueueTests(unittest.TestCase):

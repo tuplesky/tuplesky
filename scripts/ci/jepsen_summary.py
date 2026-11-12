@@ -2589,6 +2589,212 @@ def domain_gaps(client: list[Op], nemesis: list[Op], start) -> list[str]:
     ]
 
 
+# A frame of TupleSky's own crates in a whole-run loop sample.
+OWN_FRAME = re.compile(r"^coord")
+
+
+def lead_lines(path: str) -> list[tuple[int, datetime.datetime | None, datetime.datetime | None]]:
+    """Each `leads ballot N` line of a voter's `coordd.log`, as (N, the
+    time of the `metrics` line before it in its boot, or the boot's start,
+    and of the one after it, or None). Those lines carry no time of their
+    own: a `metrics` line's is its boot's start plus its uptime."""
+    out: list = []
+    boot = pending = before = None
+    waiting: list = []  # indexes in out whose next metrics time is unknown
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            if STARTING in line:
+                m = re.match(r"(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) ", line)
+                if m:
+                    pending = datetime.datetime.strptime(m[1], "%Y-%m-%d %H:%M:%S")
+                continue
+            if line.startswith("coordd domain="):
+                boot, before, waiting = pending, pending, []
+                continue
+            if line.startswith("metrics {") and boot is not None:
+                try:
+                    up = json.loads(line[8:])["cost"]["Observed"]["uptime"]
+                except (ValueError, KeyError, TypeError):
+                    continue
+                at = boot + datetime.timedelta(seconds=up["secs"] + up.get("nanos", 0) / 1e9)
+                for i in waiting:
+                    out[i] = (out[i][0], out[i][1], at)
+                waiting, before = [], at
+                continue
+            m = re.search(r"this voter leads ballot (\d+)", line)
+            if m and boot is not None:
+                waiting.append(len(out))
+                out.append((int(m[1]), before, None))
+    return out
+
+
+def read_loop_samples(path: str) -> list[tuple[str, int, int, str]]:
+    """`leader_profile.py --loops-hz`'s whole-run samples of every domain
+    loop (`leader-profile-loops.txt`): (UTC HH:MM:SS, pid, samples,
+    stack from the root); [] without the file."""
+    if not os.path.exists(path):
+        return []
+    out = []
+    with open(path, encoding="utf-8", errors="replace") as f:
+        f.readline()
+        for line in f:
+            cells = line.rstrip("\n").split(" ", 3)
+            if len(cells) == 4 and cells[1].isdigit() and cells[2].isdigit():
+                out.append((cells[0], int(cells[1]), int(cells[2]), cells[3]))
+    return out
+
+
+def own_frame(stack: str) -> str | None:
+    """The innermost frame of TupleSky's own crates in a sampled stack,
+    without generic parameters, closures or the crate's path."""
+    for frame in reversed(stack.split(";")):
+        name = frame.replace(" (inlined)", "")
+        for _ in range(4):
+            name = re.sub(r"<[^<>]*>", "", name)
+        name = name.replace("::{{closure}}", "")
+        if OWN_FRAME.match(name):
+            return "::".join(name.split("::")[-2:])
+    return None
+
+
+def leader_changes(client: list[Op], nemesis: list[Op], nodes: list[str], start, store: str) -> list[str]:
+    """Each change of leader after the first ballot, from the voters'
+    `leads ballot` lines (timed between the `metrics` lines around them,
+    10 s apart): the kill of the last leader that answered it, where one
+    completed from 15 s before that window to its end; the longest stall
+    in `ok`s in it (whole seconds under half the run's median rate, from
+    2 s before the kill where one did); whether the new leader had been
+    cut off or restarted from 15 s before the stall to its end; its domain
+    loop over the stall (`cpu_sampler.py`'s 1 s samples), and the own
+    frames its loop sampled most in it with `leader_profile.py
+    --loops-hz` (`leader-profile-loops.txt`). A change with no kill
+    before it is a voter that took the leadership from a live leader."""
+    changes = []
+    for node in nodes:
+        path = os.path.join(store, node, "coordd.log")
+        if os.path.isfile(path):
+            changes += [(b, node, lo, hi) for b, lo, hi in lead_lines(path) if lo is not None]
+    changes.sort()
+    if not any(b > 0 for b, _, _, _ in changes):
+        return []
+    pairs = [(nemesis[i], nemesis[i + 1] if i + 1 < len(nemesis) else None) for i in range(0, len(nemesis), 2)]
+    kills, restarts, cuts, open_ = [], [], [], None
+    for inv, res in pairs:
+        if res is None:
+            continue
+        if inv.f == ":kill":
+            kills += [(res.at, n) for n in re.findall(r'"([^"]+)"', res.value) if n in nodes]
+        elif inv.f == ":start":
+            restarts += [(res.at, n) for n in re.findall(r'"([^"]+)" :started', res.value)]
+        elif inv.f == ":start-partition":
+            open_ = res
+        elif inv.f == ":stop-partition" and open_ is not None:
+            alone = cut_off(open_.value, nodes)
+            if alone:
+                cuts.append((open_.at, res.at, alone))
+            open_ = None
+    # `ok`s a whole second; a second under half the run's median is a
+    # stalled one.
+    per_second = collections.Counter(o.at.replace(microsecond=0) for o in client if o.type == "ok")
+    if not per_second:
+        return []
+    first, final = min(per_second), max(per_second)
+    seconds = [first + datetime.timedelta(seconds=i) for i in range(int((final - first).total_seconds()) + 1)]
+    median = percentile(sorted(per_second[t] for t in seconds), 0.5)
+    stalls, run_ = [], None
+    for t in seconds:
+        if per_second[t] < median / 2:
+            run_ = (run_[0], t) if run_ else (t, t)
+        elif run_:
+            stalls.append(run_)
+            run_ = None
+    if run_:
+        stalls.append(run_)
+    threads = read_thread_samples(os.path.join(store, "cpu-samples-threads.csv"))
+    named = read_node_map(os.path.join(store, "cpu-samples-nodes.csv"))
+    keys_of = collections.defaultdict(set)
+    for key, node in named.items():
+        keys_of[node].add(key)
+    samples = read_loop_samples(os.path.join(store, "leader-profile-loops.txt"))
+    def plus(t) -> str:
+        return f"+{int((t - start).total_seconds())}"
+
+    rows, previous, used = [], None, set()
+    for b, node, lo, hi in changes:
+        last, previous = previous, node
+        if b == 0:
+            continue
+        hi = hi or lo + datetime.timedelta(seconds=10)
+        # A kill answers one change: one of the last leader, from 15 s
+        # before the window, unless the new leader is the voter killed and
+        # it had not restarted by the window's end.
+        took = [(t, n) for t, n in kills
+                if (t, n) not in used and lo - datetime.timedelta(seconds=15) <= t <= hi
+                and (last is None or n == last)
+                and (n != node or any(r == node and t < at <= hi for at, r in restarts))]
+        kill = took[-1] if took else None
+        if kill:
+            used.add(kill)
+        w0 = (kill[0] if kill else lo) - datetime.timedelta(seconds=2)
+        inside = [(a, z + datetime.timedelta(seconds=1)) for a, z in stalls if z >= w0 and a <= hi]
+        stall = max(inside, key=lambda r: r[1] - r[0]) if inside else None
+        ps, pe = stall if stall else (w0, w0)
+        since = ps - datetime.timedelta(seconds=15)
+        recent = [f"cut off {plus(a)} to {plus(z)}" for a, z, n in cuts if n == node and z >= since and a <= pe]
+        recent += [f"restarted {plus(t)}" for t, n in restarts if n == node and since <= t <= pe]
+        cores = loop_cores(threads, keys_of[node], ps, pe) if threads else None
+        pegged = 0
+        inside = sorted(t for t in threads if ps <= t <= pe)
+        for t0, t1 in zip(inside, inside[1:]):
+            span = (t1 - t0).total_seconds()
+            got = boots_delta({k: v for k, v in boots_over(threads, t0, t1).items() if k in keys_of[node]}, 0)
+            if span > 0 and got / span >= 0.9:
+                pegged += 1
+        frames = "-"
+        pids = {pid for pid, _ in keys_of[node]}
+        a, z = f"{ps:%H:%M:%S}", f"{pe:%H:%M:%S}"
+        own = collections.Counter()
+        total = 0
+        for at, pid, n, stack in samples:
+            if pid in pids and a <= at <= z:
+                total += n
+                own[own_frame(stack) or "(outside TupleSky's crates)"] += n
+        # Below a core-second of samples, an idle loop's few are noise.
+        if total >= 49:
+            frames = f"{total} samples: " + ", ".join(f"`{f}` {n / total:.0%}" for f, n in own.most_common(3))
+        elif samples:
+            frames = f"{total} samples"
+        rows.append(
+            f"| {b} | {node} | {last or '-'} | "
+            + (f"{kill[1]} at {plus(kill[0])}" if kill else "none")
+            + (f" | {int((pe - ps).total_seconds())} ({plus(ps)} to {plus(pe)})" if stall else " | none")
+            + f" | {'; '.join(recent) or 'no'} | "
+            + (f"{cores:.2f}" if cores is not None else "-") + f" | {pegged} | {frames} |"
+        )
+    unkilled = sum(1 for r in rows if "| none |" in r)
+    return [
+        f"**Leader changes:** {len(rows)} after the first ballot, {len(rows) - unkilled} after a kill of the leader"
+        + (f" and {unkilled} with no kill before" if unkilled else "") + ".",
+        "",
+        "<details><summary>Each change of leader: the kill before it, the stall in <code>ok</code>s, "
+        "and the new leader's loop in it</summary>",
+        "",
+        f"Stall: the longest run of whole seconds with fewer than half the run's median `ok`s a second ({median}), "
+        "from 2 s before the kill (or the `metrics` reading before the `leads ballot` line) to the reading after it. "
+        "Cut off or restarted: from 15 s before the stall to its end. "
+        "Loop: the new leader's domain loop over the stall, in cores, and its seconds at 0.9 of a core or more. "
+        "Frames: the innermost TupleSky frame of its loop's whole-run samples in the stall, where it took a "
+        "core-second of them or more.",
+        "",
+        "| Ballot | New leader | Last leader | Kill | Stall (s) | Cut off or restarted | Loop (cores) | Seconds ≥ 0.9 | Frames |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        *rows,
+        "",
+        "</details>",
+        "",
+    ]
+
+
 def reason(op: Op) -> str:
     """Why an operation was not ok, short: a client that could not start
     reads as its exception type and message rather than the whole map."""
@@ -2780,6 +2986,7 @@ def summarize(store: str, nodes: list[str], title: str, profile: str | None = No
         out.extend(back_serving(client, nemesis, nodes, start))
         out.extend(domain_gaps(client, nemesis, start))
         out.extend(partitions(client, nemesis, nodes, start, store))
+        out.extend(leader_changes(client, nemesis, nodes, start, store))
 
     if network:
         where = f"; clients beside {'the first node' if clients == 'first' else 'each node'}" if clients else ""

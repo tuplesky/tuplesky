@@ -859,6 +859,21 @@ of lines. `scripts/ci/jepsen_summary.py` reads the test's store
   idle (task-d112). The loop columns come from `cpu_sampler.py`'s
   `--threads` rows and its `--nodes` file, `cpu-samples-nodes.csv`, which
   names the node each `coordd` ran on;
+* each change of leader after the first ballot, from the voters' `leads
+  ballot` lines, which carry no time of their own and are timed between
+  the `metrics` lines around them, 10 s apart: the new and last leader;
+  the kill that answered it, a kill of the last leader from 15 s before
+  that window (a change with no kill is a voter that took the leadership
+  from a live leader); the stall, the longest run of whole seconds with
+  under half the run's median `ok`s a second; whether the new leader had
+  been cut off or restarted from 15 s before the stall; its domain loop
+  over the stall, in cores and in seconds at 0.9 of a core or more; and,
+  with `leader-profile: call-graph`, the innermost TupleSky frames of its
+  loop's samples in the stall from `leader-profile-loops.txt`, where
+  `leader_profile.py --loops-hz 49` samples every voter's loop through
+  the whole test, whoever leads. Its pegged-loop watch
+  (`leader-profile-pegged.txt`) lists each loop at 0.9 of a core or more
+  for 5 s or more and profiles the first six;
 * in every job, where the runner's CPU went over the workload (Runner
   CPU): `jepsen_bounded.sh` runs `scripts/ci/cpu_sampler.py` beside the
   test, which reads every process's CPU time from `/proc` once a second,
