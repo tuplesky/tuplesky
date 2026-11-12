@@ -107,6 +107,10 @@ class Step:
     # last `metrics` line since it started: node -> (commands a commit,
     # whether it is the leader).
     per_projection_commit: dict = field(default_factory=dict)
+    # Each voter's memory (see memory_of): node -> (resident set at its
+    # last boot's last sample, the largest high-water mark of its boots),
+    # in MiB.
+    memory: dict = field(default_factory=dict)
 
 
 # Counts a command, summed over the voters: the key, the label, and the
@@ -446,6 +450,23 @@ def read_per_projection_commit(store: str) -> dict:
     return out
 
 
+def memory_of(store: str) -> dict:
+    """Each voter's memory from `cpu_sampler.py --memory`, named by its
+    `--nodes` file: node -> (its resident set at the last sample of its
+    last boot, the largest high-water mark, `VmHWM`, of its boots), in
+    MiB; {} without both files."""
+    samples = js.read_memory(os.path.join(store, "cpu-samples-memory.csv"))
+    named = js.read_node_map(os.path.join(store, "cpu-samples-nodes.csv"))
+    boots: dict = {}
+    for key, rows in samples.items():
+        if key in named and rows:
+            boots.setdefault(named[key], []).append(rows)
+    return {
+        node: (max(runs, key=lambda r: r[-1][0])[-1][1], max(r[-1][2] for r in runs))
+        for node, runs in sorted(boots.items())
+    }
+
+
 def read_step(side: str, step_name: str, store: str) -> Step:
     step = Step(side, step_name, store)
     log = os.path.join(store, "jepsen.log")
@@ -487,6 +508,7 @@ def read_step(side: str, step_name: str, store: str) -> Step:
         step.counts = read_counts(store)
         step.per_projection_commit = read_per_projection_commit(store)
         step.behind = behind_of(store)
+        step.memory = memory_of(store)
     return step
 
 
@@ -664,6 +686,26 @@ def render(steps: list[Step], title: str) -> str:
                 )
             out.append(f"| {name(s)} | " + " | ".join(cells) + " |")
         out += ["", "(each cell: commands short / backpressure refusals / catch-up pages)", ""]
+
+    rows = [s for s in steps if s.memory]
+    if rows:
+        nodes = sorted({n for s in rows for n in s.memory})
+        out += [
+            "**The voters' memory** (each TupleSky run, each voter, from `cpu_sampler.py --memory` once a second: "
+            "its resident set at its last sample and its high-water mark, `VmHWM`, the largest over its boots; MiB; "
+            "the leader, by its commands a projection commit's reading, starred)",
+            "",
+            "| Step | Side | " + " | ".join(nodes) + " |",
+            "| --- | --- " + "| --- " * len(nodes) + "|",
+        ]
+        for s in rows:
+            cells = []
+            for n in nodes:
+                end, peak = s.memory.get(n, (None, None))
+                star = "*" if s.per_projection_commit.get(n, (None, False))[1] else ""
+                cells.append(f"{cell(end, '.0f')} / {cell(peak, '.0f')}{star}")
+            out.append(f"| {name(s)} | " + " | ".join(cells) + " |")
+        out += ["", "(each cell: resident at the end / high-water mark)", ""]
 
     etcd = {s.step: s for s in steps if s.side == "etcd"}
     rows = [s for s in steps if s.side != "etcd" and s.step in etcd]

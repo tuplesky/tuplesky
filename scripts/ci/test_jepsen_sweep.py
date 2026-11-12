@@ -308,6 +308,26 @@ class SweepTests(unittest.TestCase):
         self.assertIn("| 120 | head | 0 / 0 / - | 2600 / 2 / 41 |", text)
         self.assertNotIn("| 120 | etcd | 0 / ", text)
 
+    def test_the_voters_memory(self):
+        path = self.store("m")
+        # n1 led (its commits) and was sampled twice; n2 restarted, so its
+        # end is its second boot's and its peak the larger high-water mark.
+        with open(os.path.join(path, "cpu-samples-memory.csv"), "w") as f:
+            f.write("time,pid,start,rss_kib,hwm_kib\n"
+                    "2026-09-27 10:00:00.000000,1,1,102400,102400\n"
+                    "2026-09-27 10:00:10.000000,1,1,153600,204800\n"
+                    "2026-09-27 10:00:00.000000,2,1,51200,307200\n"
+                    "2026-09-27 10:00:10.000000,3,9,40960,61440\n")
+        with open(os.path.join(path, "cpu-samples-nodes.csv"), "w") as f:
+            f.write("pid,start,node\n1,1,n1\n2,1,n2\n3,9,n2\n")
+        step = sw.read_step("head", "30", path)
+        self.assertEqual(step.memory, {"n1": (150.0, 200.0), "n2": (40.0, 300.0)})
+        text = sw.render([step, sw.read_step("etcd", "30", self.store("e", tuplesky=False))], "Sweep")
+        self.assertIn("**The voters' memory**", text)
+        self.assertIn("| 30 | head | 150 / 200* | 40 / 300 |", text)
+        section = text[text.index("**The voters' memory**"):text.index("**Against etcd")]
+        self.assertNotIn("| 30 | etcd |", section)
+
 
 if __name__ == "__main__":
     unittest.main()

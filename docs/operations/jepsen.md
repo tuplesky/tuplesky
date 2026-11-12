@@ -722,6 +722,11 @@ then gives a table of the steps, each run labelled `SIDE@STEP`:
   boot pulled. A frontend follower that falls behind at 120 callers
   distorts that step's throughput and CPU against etcd's, so the table
   says whether one did;
+* each voter's memory in each TupleSky run (The voters' memory): its
+  resident set at its last sample and its high-water mark, `VmHWM`,
+  from `cpu_sampler.py --memory` and the `--nodes` file, the leader
+  starred, so a change that holds an index in memory shows its cost at
+  each voter against the base's;
 * each TupleSky run's ratio to etcd's at its step, the runner's CPU
   model in the caption.
 
