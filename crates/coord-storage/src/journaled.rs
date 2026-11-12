@@ -115,7 +115,7 @@ use coord_types::ids::{
 };
 
 use crate::cut::{CutOverlay, RecoveryCut};
-use crate::lowering::{DurableMeta, ExecutionFrontier, batch_bytes, lower_update};
+use crate::lowering::{DurableMeta, ExecutionFrontier, batch_bytes};
 use crate::view::{Frontier, GatedReader};
 
 /// Durability profile implemented here (design Section 17.3.4): journal
@@ -3696,13 +3696,17 @@ fn project<E: LocalEngine>(
                     execution_position: *position,
                 };
             }
-            for update in record.body().updates() {
-                lower_update(&mut tx, update)?;
-            }
             // The journal sequence is derived from the store sequence
             // by the constructor, never chosen alongside it.
             meta.stamp = AppliedStamp::new(StoreSeq::from_journal(record.seq()), record.digest());
             expect = record.seq().checked_next().ok();
+        }
+        // Every record's rows in journal order, as one batch: the engine
+        // opens each collection once for the commit rather than once a
+        // row (task-d86). The checks above read no row, so nothing is
+        // written for a commit they refuse.
+        if failure.is_none() {
+            tx.apply_updates(pending.iter().flat_map(|item| item.record.body().updates()))?;
         }
     }
     if failure.is_some() {
