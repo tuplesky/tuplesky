@@ -4247,6 +4247,18 @@ This entry is task-d72's largest single cut on the materializer, owned here. The
      - It costs one row written a command at execution, keyed by position at the right-hand end, and one delete in `protocol_v1` near its right-hand end, since a command executes soon after its intake. The pair reads both.
      - The alternative is to drop the entries of commands executed below the slowest voter's frontier, with no move. That needs every voter's executed frontier, which `coordd` doesn't keep yet (it is task-d27's floor), and it keeps the rows on disk. So it isn't smaller.
 2. **The payload and executed rows.** This step brings the pending collection, the move, the index's executed part, and rules (a) and (b). It also raises the shared image's version and changes the common hash's membership, behind whatever the format needs.
+   - **Built (#243), with the bound above.**
+     - **Layout:** store format 3. `execution_v1` and `payload_v1` by position; `pending_payload_v1` (0x0012) by intake order; and the bound's `decided_v1` (0x0013), keyed by position, whose value is the epoch followed by the dependency row's bytes.
+     - **At execution:** the lowering moves the pending payload, deletes the command's dependency and proposal rows in every epoch, and writes the latest epoch's record to `decided_v1`.
+     - **Later writes by command for an executed command:** a dependency put or delete follows the record to `decided_v1`; a proposal put writes nothing.
+     - **Boot** reads its epoch's decided records back as records, so each key's latest command comes back with its paths.
+     - **Trim** surveys `decided_v1` under the same pins. A record above the boundary pins its dependencies (Codex's P2 on #243).
+     - **The local pair** (base `b1730c04`, head `31d9473c`; five voters, `replay`, tmpfs, the counting build, three rounds; [#243, 6820336729](https://github.com/tuplesky/tuplesky/pull/243#issuecomment-6820336729)):
+       - **Pages a command:** a follower 7.61 → 4.04 at 30 callers and 7.75 → 4.47 at 120; the leader 7.56 → 3.85 and 7.66 → 4.32. `payload_v1` goes 2.3 → 0.3 (plus 0.1 to 0.2 pending) and the executed rows 1.5 → 0.1.
+       - **Materializer:** 16 to 20 µs a command less in both roles.
+       - **Servers' ms an operation:** 1.336 → 1.234 at 30 and 1.159 → 1.106 at 120.
+       - **Completed a second:** +7.7% and +4.9%.
+       - **The index at the run's end:** the intake part empty at every voter, against one entry a command at a follower and two at the leader on the base. The executed part holds one entry a command.
 
 What the two steps build together:
 - **Rows by order.**
