@@ -4082,11 +4082,12 @@ So every feature-gated change, task-d98's `EarlyProposal` first, would ship unre
 **Design:** Section 17.4 (amended by this task's design step: the retry window retired in batches).
 
 **Implement:** The second of task-d101's option 2 cuts (#185 review). `retirement()` retires a client's acknowledged sequences once at least `RETIRE_BATCH` (`K`) are acknowledged above the floor. It also retires whenever deferring would leave the command's own sequence, or the next `K`, outside the window measured from the unretired floor. A retiring command retires up to `MAX_RETIRE_PER_COMMAND + K − 1` above the floor, so the batched floor is never more than `K − 1` below today's and a retirement reaches at least today's. The rule stays a function of the durable view and the accepted payload. task-d26's bound on a session's retained results becomes `width + K`. `K` is a constant of the format, not a setting, since every voter must compute the same retirement.
+- **Sized before it is built:** about −0.009 ms an operation at the materializer at the bar (task-d86's profile). Its share of the domain loop is read on the CPU clock first, and the task is kept or dropped on the two together. A domain with thousands of clients, whose floor rows each cost a page, is where its first part would save about a page a command; that is read in the same step if it decides the task.
 - **The rule is a replicated feature, `Feature::BatchedRetirement`,** prepared and activated through task-d99's path. Below its activation position every voter retires as today, and from it in batches. A build that doesn't know it refuses a store that names it.
 - **Second part, after the first's pair: a window that overwrites in place.**
   - `RetryV1` is keyed by the client instance and the sequence modulo the width. A slot holds its own sequence, and a replaced one answers `Retired`.
   - The width is carried on the floor row. `ExecutedV1` is unchanged.
-  - This takes the delete, for about −0.06 to −0.08 ms an operation with the first part.
+  - This takes the delete. It was priced at about −0.06 to −0.08 ms an operation with the first part, a row at a page's price. At the bar, task-d86's profile reads both parts at the materializer at about −0.009 (the deletes, 2.1 to 2.3% of the thread, and nothing for the floor's rewrite with 30 to 240 clients), so that size doesn't hold (review on #185, 6812429771).
   - It changes `RetryV1`'s layout, so it takes task-d105's route: one layout a domain, the other refused with the reason.
   - It is sized and its design checked against resolve and `records_for` before its code.
 
