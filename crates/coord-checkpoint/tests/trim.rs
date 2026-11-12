@@ -1148,6 +1148,45 @@ fn an_unrecognized_protocol_row_is_retained_rather_than_deleted() {
     assert!(after.contains(&unknown_tag) && after.contains(&short_key));
 }
 
+/// A command executed above the boundary keeps reaching what it depends on
+/// below it: its decided record, moved to `decided_v1` at its execution
+/// (task-d113, step 2), is retained and pins its dependencies, as its
+/// dependency row did in `protocol_v1` (#243, Codex's P2).
+#[test]
+fn a_command_executed_above_the_boundary_pins_its_dependencies_below_it() {
+    let e = epoch(EPOCH);
+    let mut engine = ModelEngine::new();
+    let mut rows: Vec<Row> = common_rows()
+        .into_iter()
+        .chain(protocol_rows())
+        .chain(identity_rows())
+        .collect();
+    // Command 5 executed beyond the boundary; it names command 8, which
+    // executed below it and is otherwise reclaimable.
+    rows.retain(|(c, k, _)| *c != Collection::ProtocolV1 || *k != dependency_key(e, &command(5)));
+    rows.push((
+        Collection::ProtocolV1,
+        dependency_key(e, &command(5)),
+        encode_dependency(&record(Phase::Commit, &[8])).unwrap(),
+    ));
+    seed(&mut engine, rows);
+    publish(&mut engine);
+
+    let plan = step(&engine, &TrimLimits::default());
+    let deleted = deleted_keys(&engine, &plan);
+    assert!(
+        !deleted.contains(&dependency_key(e, &command(8))),
+        "command 8 is reachable from command 5, executed above the boundary"
+    );
+    assert!(!deleted.contains(&dependency_key(e, &command(5))));
+    assert!(
+        deleted.contains(&dependency_key(e, &command(7))),
+        "what nothing retained reaches still goes"
+    );
+    apply(&mut engine, &plan.updates);
+    assert!(protocol_keys(&engine).contains(&dependency_key(e, &command(8))));
+}
+
 /// An executed command's record of a later epoch replaces its earlier one
 /// in `decided_v1` (task-d113, step 2): below the boundary, but of an epoch
 /// above the floor's, it is outside the acknowledged history and stays, as

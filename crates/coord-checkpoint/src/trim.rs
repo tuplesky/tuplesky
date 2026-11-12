@@ -770,9 +770,11 @@ pub fn plan_trim<V: OrderedRead>(
         }
     }
     // An executed command's decided record moved at its execution to
-    // `decided_v1`, under its position (task-d113, step 2, the bound): those
-    // at or below the boundary, of an epoch at or below the floor's, are
-    // eligible as their dependency rows were, and the same pins hold them.
+    // `decided_v1`, under its position (task-d113, step 2, the bound). Of an
+    // epoch at or below the floor's, they are decided as their dependency
+    // rows were: at or below the boundary, eligible under the same pins;
+    // above it, retained, and pinning what they depend on, so a command
+    // executed after the boundary keeps reaching its dependencies below it.
     let floor_epoch = floor.configuration.to_be_bytes();
     let mut resume: Option<Vec<u8>> = None;
     loop {
@@ -780,7 +782,7 @@ pub fn plan_trim<V: OrderedRead>(
             Collection::DecidedV1.id(),
             &ScanRequest {
                 lower: Bound::Unbounded,
-                upper: Bound::Included(coord_storage::codecs::position_key(boundary).to_vec()),
+                upper: Bound::Unbounded,
                 direction: Direction::Forward,
                 resume_after: resume.clone(),
                 max_rows: limits.page_rows(),
@@ -801,10 +803,15 @@ pub fn plan_trim<V: OrderedRead>(
                     limit: limits.max_examined_rows,
                 });
             }
+            let deps = decode_dependency(record)?.deps;
+            if position > boundary {
+                retained += 1;
+                pins.extend(deps);
+                continue;
+            }
             let command = *at_position
                 .get(&position)
                 .ok_or_else(|| corrupt("a decided record at a position with no executed row"))?;
-            let deps = decode_dependency(record)?.deps;
             deps_of.entry(command).or_insert(deps);
             candidates.push((Collection::DecidedV1, row.key.clone(), command));
         }
