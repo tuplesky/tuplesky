@@ -1495,7 +1495,9 @@ fn event_delete(revision: u64) -> StoreUpdate {
 /// a row at a time does (#244 review, after #245): each event row is
 /// observed as it is lowered, and a deleted one, which names its key only
 /// in its old value, is read through the batch's own rows. Here an event
-/// row only this commit holds is deleted, beside one the store held.
+/// row only this commit holds is deleted, beside one the store held, and
+/// the store's row is deleted again (#244 review): the second delete must
+/// read the first's absence from the batch, not the store's row beneath.
 /// Without the observation the batch's delta holds none of it; read past
 /// the batch's rows, the row this commit wrote stays added.
 #[test]
@@ -1509,6 +1511,7 @@ fn a_commit_lowered_as_one_batch_leaves_the_key_index_as_a_row_at_a_time_does() 
     let commit = vec![
         vec![event_put(2), event_put(3), revision(3)],
         vec![event_delete(2), event_delete(1)],
+        vec![event_delete(1)],
     ];
     let one_at_a_time = lower_commit(&before, &commit, false);
     let batched = lower_commit(&before, &commit, true);

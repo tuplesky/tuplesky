@@ -509,6 +509,64 @@ fn a_store_of_another_format_is_refused_with_its_format_and_left_as_it_was() {
     ));
 }
 
+/// A store of another layout that was not closed cleanly, the upgrade after
+/// a crash, is refused as another build's store, not as damage (#247
+/// review). redb's read-only open won't read a file that needs a repair,
+/// so its format can't be named, and the refusal says why. It changes
+/// nothing: the file needs the same repair after it as before.
+#[test]
+fn a_store_of_another_format_not_closed_cleanly_is_refused_as_another_builds() {
+    let dir = tempfile::tempdir().unwrap();
+    drop(Generation::create(dir.path(), identity(), options()).unwrap());
+    let generation = dir.path().join("gen-000001");
+    let db_path = generation.join("domain.redb");
+    let manifest_path = generation.join("manifest.v1");
+    let mut manifest = coord_storage_redb::StoreManifestV1::read(&manifest_path).unwrap();
+    manifest.collections.retain(|(id, _)| {
+        *id != Collection::PendingPayloadV1.id().0 && *id != Collection::DecidedV1.id().0
+    });
+    manifest.write(&manifest_path).unwrap();
+    // A commit, then the file as a kill leaves it: the bytes taken while
+    // the database is still open, before a clean close writes its state.
+    let killed = {
+        let db = redb::Database::open(&db_path).unwrap();
+        let txn = db.begin_write().unwrap();
+        {
+            let mut table = txn
+                .open_table(coord_storage_redb::engine::table_definition(
+                    Collection::MetaV1,
+                ))
+                .unwrap();
+            table
+                .insert(b"format_version".as_slice(), 2u32.to_be_bytes().as_slice())
+                .unwrap();
+        }
+        txn.commit().unwrap();
+        std::fs::read(&db_path).unwrap()
+    };
+    std::fs::write(&db_path, &killed).unwrap();
+    assert!(
+        matches!(
+            redb::ReadOnlyDatabase::open(&db_path),
+            Err(redb::DatabaseError::RepairAborted)
+        ),
+        "the file needs a repair: the test shows nothing"
+    );
+    let reason = match Generation::open_existing(dir.path(), identity(), options()) {
+        Err(OpenError::Format(reason)) => reason,
+        Err(other) => panic!("refused as {other:?}, not as another build's store"),
+        Ok(_) => panic!("a store of another format opened"),
+    };
+    assert!(
+        reason.contains("a store of another build that was not closed cleanly"),
+        "{reason}"
+    );
+    assert!(
+        std::fs::read(&db_path).unwrap() == killed,
+        "the refusal changed the store"
+    );
+}
+
 /// Staging over a selected generation applies the checks an open does: a
 /// database swapped in under an intact manifest is refused, and nothing is
 /// staged, rather than the generation being silently replaced and pruned.
