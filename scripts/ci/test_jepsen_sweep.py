@@ -214,6 +214,26 @@ class SweepTests(unittest.TestCase):
         self.assertAlmostEqual(step.steal_cores, 1 / 12)
         self.assertEqual((step.model, step.cpus), ("Some CPU", "4"))
 
+    def test_commands_a_projection_commit_at_each_voter(self):
+        path = self.store("h")
+        # n2, a follower, executed 10 commands in 4 projection commits; n1,
+        # the leader, in 5.
+        with open(os.path.join(path, "n2", "coordd.log"), "w") as f:
+            f.write(metrics(0, 10, 1.0, 4, 4))
+        step = sw.read_step("head", "30", path)
+        self.assertEqual(step.per_projection_commit, {"n1": (2.0, True), "n2": (2.5, False)})
+        text = sw.render([step], "Sweep")
+        self.assertIn("| Idle cores | Steal cores | Commands a projection commit, by voter |", text)
+        self.assertIn(" | 2.00* / 2.50 |", text)
+        self.assertIn("not the rows each writes", text)
+
+    def test_a_voter_without_projection_commits_is_left_out(self):
+        step = sw.read_step("head", "30", self.store("h"))
+        self.assertEqual(step.per_projection_commit, {"n1": (2.0, True)})
+        etcd = sw.read_step("etcd", "30", self.store("e", tuplesky=False))
+        self.assertEqual(etcd.per_projection_commit, {})
+        self.assertIn("| 30 | etcd |", sw.render([etcd], "Sweep"))
+
     def test_the_leaders_commands_groups_and_run_queue(self):
         step = sw.read_step("head", "30", self.store("h"))
         self.assertAlmostEqual(step.commands_per_op, 2.0)
@@ -248,6 +268,7 @@ class SweepTests(unittest.TestCase):
         self.assertIn("| 30 | head | 2.000 | 1200.000 | 200.000 | 400.000 | 6000.000 | 2.50 | 2.00 | 2.000 | - |", text)
         self.assertIn("| 30 | etcd | - | - | - | - | 6000.000 | - | - | - | - |", text)
         self.assertIn("**Against etcd at the same step**", text)
+        self.assertIn("on this runner, Some CPU (4 CPUs);", text)
         self.assertIn("| 30 | head | 1.00× | 1.00× | 1.00× | 1.00× | 1.00× | 1.00× | - |", text)
         # No etcd at 60: no ratio row for it.
         self.assertNotIn("| 60 | head | 1.00×", text)

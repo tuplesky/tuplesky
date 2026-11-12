@@ -776,6 +776,17 @@ def ratio(value, etcd) -> float | None:
     return value / etcd if value is not None and etcd else None
 
 
+def runner_models(runs: list[Run]) -> str:
+    """The runners' CPU models, from each run's sampler host file, for a
+    caption: `; on an X (4 CPUs)`; empty without one."""
+    models = set()
+    for run in runs:
+        host = js.read_host(os.path.join(run.store, "cpu-samples-host.txt"))
+        if host.get("model"):
+            models.add(f"{host['model']} ({host.get('cpus', '?')} CPUs)")
+    return f"; on {' and '.join(sorted(models))}" if models else ""
+
+
 def etcd_table(runs: list[Run]) -> list[str]:
     """Each TupleSky run's measures and their ratio to its etcd run's, then
     each build's mean ratio, smallest to largest, over the etcd runs."""
@@ -786,7 +797,8 @@ def etcd_table(runs: list[Run]) -> list[str]:
         "**Against etcd on this runner** (`etcd-beside`: the etcd test on this job's runner and cluster after each "
         "pair, or after the one run, with the same workload, faults, rate and clients; each TupleSky run's value, "
         "then its ratio to the etcd run after it; the servers' CPU is the runner's samples of `coordd` or `etcd`, "
-        "over the operations completed)",
+        f"over the operations completed{runner_models(runs)}; a ratio read on one CPU model is not comparable with "
+        "one read on another without saying so)",
         "",
         "| Pair | Run | " + " | ".join(h for _, h, _ in ETCD) + " |",
         "| --- " * (len(ETCD) + 2) + "|",

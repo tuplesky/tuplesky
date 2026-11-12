@@ -382,6 +382,8 @@ class PairTests(unittest.TestCase):
             f.write("time,host_busy_s,host_total_s,cpus,servers_s,steal_s\n"
                     "2026-09-27 09:59:59.000000,0,0,4,10,0\n"
                     "2026-09-27 10:00:11.000000,0,0,4,14,0\n")
+        with open(os.path.join(self.runs[0].store, "cpu-samples-host.txt"), "w") as f:
+            f.write("model=Some CPU\nmhz=2000\ncpus=4\n")
         first = jp.read_run("base", self.runs[0].store)
         runs = [first, self.runs[1], self.etcd_store("e1", 10, 2), self.runs[2], self.runs[3], self.etcd_store("e2", 20)]
         # The etcd runs between them leave the pairs as they were.
@@ -389,6 +391,7 @@ class PairTests(unittest.TestCase):
         self.assertEqual((first.ok_p50, first.ok_p99), (50, 50))
         text = jp.render(runs, "Paired")
         self.assertIn("**Against etcd on this runner**", text)
+        self.assertIn("over the operations completed; on Some CPU (4 CPUs); a ratio read on one CPU model", text)
         # 2 s of etcd's CPU over its four operations; 4 s of the base's.
         self.assertIn("| 1 | etcd | 0.4 | 10 | 10 | 500.00 |", text)
         self.assertIn("| 1 | base | 0.4 (1.00×) | 50 (5.00×) | 50 (5.00×) | 1000.00 (2.00×) |", text)

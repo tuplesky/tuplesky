@@ -103,6 +103,10 @@ class Step:
     # of the most advanced voter at the end or None, Backpressure
     # refusals, catch-up pages pulled or None).
     behind: dict = field(default_factory=dict)
+    # Each voter's executed commands over its projection commits, from its
+    # last `metrics` line since it started: node -> (commands a commit,
+    # whether it is the leader).
+    per_projection_commit: dict = field(default_factory=dict)
 
 
 # Counts a command, summed over the voters: the key, the label, and the
@@ -414,6 +418,30 @@ def lead(costs: list):
     return max(costs, key=lambda c: (c.served, c.cpu[0] / c.executed))
 
 
+def read_per_projection_commit(store: str) -> dict:
+    """Each voter's executed commands over its projection commits, from its
+    last `metrics` line since it started, by node, with whether it is the
+    leader; a voter whose line has no commits is left out."""
+    readings = {}
+    for node in sorted(os.listdir(store)):
+        path = os.path.join(store, node, "coordd.log")
+        if not os.path.exists(path):
+            continue
+        with open(path, encoding="utf-8", errors="replace") as f:
+            voter = js.parse_voter(f.readlines())
+        if voter.cost and voter.cost.cpu and voter.cost.executed and voter.cost.raw:
+            readings[node] = voter.cost
+    if not readings:
+        return {}
+    leader = lead(list(readings.values()))
+    out = {}
+    for node, cost in readings.items():
+        commits = count_at(cost.raw, ("projection_commits",))
+        if commits:
+            out[node] = (cost.executed / commits, cost is leader)
+    return out
+
+
 def read_step(side: str, step_name: str, store: str) -> Step:
     step = Step(side, step_name, store)
     log = os.path.join(store, "jepsen.log")
@@ -453,6 +481,7 @@ def read_step(side: str, step_name: str, store: str) -> Step:
     if side != "etcd":
         step.pipelines = read_pipelines(store)
         step.counts = read_counts(store)
+        step.per_projection_commit = read_per_projection_commit(store)
         step.behind = behind_of(store)
     return step
 
@@ -463,6 +492,21 @@ def cell(value, fmt: str) -> str:
 
 def name(step: Step) -> str:
     return f"{step.step} | {step.side}"
+
+
+def per_commit_cell(readings: dict) -> str:
+    """Commands a projection commit at each voter, in node order, the
+    leader's marked `*`; `-` without readings."""
+    if not readings:
+        return "-"
+    return " / ".join(f"{value:.2f}{'*' if leader else ''}" for value, leader in readings.values())
+
+
+def model_note(steps: list[Step]) -> str:
+    """The runner's CPU model for a caption, `, an X (4 CPUs)`; empty
+    without one."""
+    models = sorted({f"{s.model} ({s.cpus} CPUs)" for s in steps if s.model})
+    return f", {' and '.join(models)}" if models else ""
 
 
 def render(steps: list[Step], title: str) -> str:
@@ -498,15 +542,19 @@ def render(steps: list[Step], title: str) -> str:
         "followers as their `metrics` lines' loop CPU is; tokio threads and the other threads by kind are the "
         "voters' (`--threads` and `--wakeups`); servers in all is `coordd` or `etcd`; everything else is the "
         "host's busy time outside every named process, the kernel's packet work most of it; idle and steal in "
-        "cores)",
+        "cores; the materializer's commands a projection commit at each voter, n1 to n5, from its last "
+        "`metrics` line since it started, the leader's marked `*`: the line counts the materializer's commits, "
+        "not the rows each writes, so rows a command are not read here)",
         "",
-        "| Step | Side | " + " | ".join(label for _, label in PARTS) + " | Idle cores | Steal cores |",
-        "| --- | --- " + "| --- " * (len(PARTS) + 2) + "|",
+        "| Step | Side | " + " | ".join(label for _, label in PARTS)
+        + " | Idle cores | Steal cores | Commands a projection commit, by voter |",
+        "| --- | --- " + "| --- " * (len(PARTS) + 3) + "|",
     ]
     for s in steps:
         cells = [cell(s.cpu.get(key), ".3f") for key, _ in PARTS]
         out.append(
-            f"| {name(s)} | " + " | ".join(cells) + f" | {cell(s.idle_cores, '.2f')} | {cell(s.steal_cores, '.2f')} |"
+            f"| {name(s)} | " + " | ".join(cells) + f" | {cell(s.idle_cores, '.2f')} | {cell(s.steal_cores, '.2f')} | "
+            f"{per_commit_cell(s.per_projection_commit)} |"
         )
     out.append("")
 
@@ -618,7 +666,8 @@ def render(steps: list[Step], title: str) -> str:
     if rows:
         out += [
             "**Against etcd at the same step** (each TupleSky run's value over the etcd run's at its step, on "
-            "this runner)",
+            f"this runner{model_note(steps)}; a ratio read on one CPU model is not comparable with one read on "
+            "another without saying so)",
             "",
             "| Step | Side | `ok`/s | Completed/s | Servers' CPU per operation | Servers' CPU per write | "
             "Read p99 | Write p99 | Cas p99 |",

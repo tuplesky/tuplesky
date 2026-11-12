@@ -644,6 +644,11 @@ the etcd test itself instead, on its own runner and cluster, and the
   TupleSky run's `ok`/s, p50, p99 and servers' CPU per operation beside its
   ratio to the etcd run after it, then each build's mean ratio over the
   pairs. A target set against etcd is then a ratio read within one job.
+  The table's caption names the runner's CPU model: etcd and TupleSky do
+  not gain alike from a faster CPU (#98's confirmation runs: etcd's CPU
+  per operation 36 to 44% lower on an EPYC 9V74 than on a 7763,
+  TupleSky's 24 to 26%), so a ratio read on one model is compared with
+  one read on another only with the models stated.
 * **What it costs:** one etcd run per pair: a register pair job of three
   pairs runs nine tests.
 * **In a sweep** (below), after each step's TupleSky runs, at the step's
@@ -679,7 +684,10 @@ then gives a table of the steps, each run labelled `SIDE@STEP`:
   `cpu_sampler.py --wakeups`), the servers in all, the Jepsen JVM, the
   clients' shims, the containers' plumbing and everything else (the
   kernel's packet work most of it), with the host's idle and steal cores
-  and the runner's CPU model;
+  and the runner's CPU model, and each voter's commands a projection
+  commit (its executed commands over its materializer's commits since it
+  started, the leader's marked; the `metrics` line counts commits, not
+  the rows each writes);
 * per command (the leader's executed commands over the operations
   completed): the servers', the loops' and the tokio threads' CPU, the
   leader's commands per journal group and per projection commit, and its
@@ -705,7 +713,8 @@ then gives a table of the steps, each run labelled `SIDE@STEP`:
   boot pulled. A frontend follower that falls behind at 120 callers
   distorts that step's throughput and CPU against etcd's, so the table
   says whether one did;
-* each TupleSky run's ratio to etcd's at its step.
+* each TupleSky run's ratio to etcd's at its step, the runner's CPU
+  model in the caption.
 
 Each run's own summary also gives operations completed a second and the
 clients busy on average beside its `ok`/s, and, from a build with
