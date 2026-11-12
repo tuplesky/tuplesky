@@ -2029,6 +2029,52 @@ So task-d103 stops writing the proposal row and removes that comment. That is on
 
   With those, a follower writes about five rows a command: payload, dependency, executed, event and retry. Three of them, the payload, dependency and executed rows, are keyed by the command's digest and pay a page each. Keying them by order, so that a commit's rows share leaves, is task-d113's step (#233), the largest single cut on the materializers.
 
+**The retry window retired in batches (task-d104).** In steady state a command writes four retry rows at every voter:
+- its retained result (`RetryV1`) and its executed row (`ExecutedV1`), both put;
+- the sequence its client just acknowledged, deleted from `RetryV1`;
+- the client's floor (`RetryFloorV1`), put.
+
+A client acknowledges on every request (`ack_through`), so `retirement()` (`retry.rs`) retires one sequence a command, inline in the command's batch.
+
+**The rule.** A command retires only once its client has acknowledged at least `RETIRE_BATCH` sequences above the floor, `K`. It also retires whenever deferring would leave its own sequence, or the next `K`, outside the window measured from the unretired floor. When it retires, it retires everything acknowledged, up to `MAX_RETIRE_PER_COMMAND + K − 1` above the floor: the per-command cap plus the most that can have been deferred (Codex review on #207).
+- **Why no request becomes `OutOfWindow`.** Today's floor rises by at most `MAX_RETIRE_PER_COMMAND` a command, and never past the acknowledgement. So the batched floor is never more than `K − 1` below today's, because a client with `K` or more acknowledged above it retires. A command that retires moves it to at least where today's rule would, since its cap starts `K − 1` higher. Admission measures the window from the floor this command's own retirement leaves (`admit`). So a request that today's rule admits is either admitted from the deferred floor, or triggers the second clause and is admitted from a floor at least today's.
+- **The cost of the higher cap:** a retiring batch deletes at most `MAX_RETIRE_PER_COMMAND + K − 1` rows instead of `MAX_RETIRE_PER_COMMAND`.
+
+**What it keeps:**
+- **It is a function of the durable view and the accepted payload,** as `retirement()` is today, so every replica retires the same sequences at the same position. `RetryV1` and `RetryFloorV1` are in the common hash, and their state stays equal across voters at every agreed position.
+- **An acknowledged sequence still retained answers with its result,** not `Retired`. Both are correct answers to a retry of a request whose result the client already holds. A client's retry of its own acknowledged sequence is outside its contract, and nothing compares the two answers.
+- **The window's bound grows by `K` retained results a client,** at most. Under task-d26's resource contract, the session's retained bytes are bounded by `width + K` results, not `width`.
+
+**What it moves.** The floor row is written once every `K` commands a client instead of every command: about −(1 − 1/K) rows a command at every voter. That was first priced at about −0.03 to −0.04 ms an operation at `K = 16`, a row at a page's price, and at the bar it doesn't hold (review on #185, 6812429771).
+- **At the materializer, task-d86's profile reads only the retry deletes,** 2.1 to 2.3% of the thread, about −0.009 ms an operation at 120 callers on the EPYC 9V74. A delete lands on a leaf the command's own retry row has already copied.
+- **It reads nothing for the floor's rewrite.** With the bench's 30 to 240 clients the floor rows sit on a few leaves that every commit copies anyway. A domain with thousands of clients would pay a page for each rewrite, and this step would then save about a page a command. That isn't measured.
+- **So at the bar this step is sized at about −0.009 at the materializer.** Its share of the domain loop (`retirement()` and the reads it makes) is read on the CPU clock before it is built, and the step is kept or dropped on that reading with the materializer's. The `K` deletes land together on consecutive keys of one client, which redb writes as one region of its tree. Whether that is cheaper than `K` scattered deletes is read in the pair, not assumed. `ExecutedV1` stays: it is the index by command that catch-up, campaigns and boot read, and `RetryV1` is keyed by the retry key.
+
+**How the rule is introduced** (#207 review). The retirement rule is part of deterministic execution: `RetryV1` and `RetryFloorV1` are in the common hash. Two builds with different rules reach different common states at the same position. Their floor roots would disagree (task-d27), and they would answer the same retry differently at different voters. So the rule is a change to the replicated state, and a domain changes it at one position on every voter:
+- **It is a replicated feature, `Feature::BatchedRetirement`, activated through task-d99's path.** It is gated like `EarlyProposal`: a prepare marker in each voter's `ActiveFeaturesV1`, then activation at a position. Below the activation position every voter retires one sequence a command, as today; from it, every voter retires in batches. Both rules stay in the code.
+- **Why not a raised state-format version.**
+  - The store's `format_version` field (`meta_fields::FORMAT_VERSION`) is read by no open today, so that route would first need the check built.
+  - task-d99's path already has the rollback guard: a build that doesn't know the feature refuses a store that names it.
+  - The rule has no rows to convert. It changes which sequences a command retires from a position on, not the layout of rows already written. task-d105's history layout does change written rows, so it takes the other route: one layout a domain.
+- **Its tests:**
+  - a store written before the activation keeps today's rule through a restart, and switches at the activation position;
+  - every voter's common hash agrees at the activation position and after it;
+  - a build without the feature refuses a store that names it, with the reason (task-d99's guard).
+
+**Whether the delete can go too: yes, through a window that overwrites in place** (#207 review). This step batches the floor's rewrite, not the deletes: `K` deletes every `K` commands is still one a command, so the retry state falls from four rows a command to about three. At parity the delete has to go. A window that overwrites in place takes it:
+- **`RetryV1` keyed by the client instance and the sequence modulo the window's width.** A new result replaces the slot of a sequence the window has already passed, so retiring writes nothing.
+- **A slot holds its own sequence.** A lookup tells a retained result from a replaced one, and a replaced one answers `Retired`, as a deleted one does today.
+- **An unacknowledged result is never replaced.** Admission already refuses a sequence more than the width above the floor (`admit`), and a slot is reused only by a sequence a width above it.
+- **The floor row stays,** and this step's rule rewrites it once every `K` commands.
+
+What it has to answer before its code:
+- **The width is carried on the client's floor row,** fixed for the client instance, since slots are computed from it and widths can differ by client.
+- **`ExecutedV1` stays as it is.** It is the index by command, and the window changes only the retry key's rows.
+- **Resolve and `records_for`** read a slot and compare its sequence; nothing else reads `RetryV1` by range.
+- **It changes `RetryV1`'s layout,** a collection in the common hash. So, unlike this step's rule, it takes task-d105's route: one layout a domain, with a store or image of the other refused with the reason.
+
+**Its size, with this step:** the retry state falls to one put and `1/K` of a floor row a command. That was priced at about −0.06 to −0.08 ms an operation together, counting each row at a page, and doesn't hold at the bar either: the deletes it takes are the profile's 2.1 to 2.3%, rewritten on a page already copied. It composes with this step and doesn't replace it. It is task-d104's second part, sized from the first part's pair and its loop share on the CPU clock, before its code.
+
 <a id="s17-5"></a>
 ### 17.5 MVCC and physical maintenance
 

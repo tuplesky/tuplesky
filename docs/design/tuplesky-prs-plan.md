@@ -3,7 +3,7 @@
 **Status:** Review proposal, consolidated v1.5.  
 **Date:** 2026-09-24.  
 **Companion:** [TupleSky implementation design](tuplesky-design.md).  
-**Scope:** 197 implementation tasks with stable `task-*` identifiers. The `task-01` through `task-66`, `task-s01` through `task-s04`, `task-j01` through `task-j10`, `task-o01` through `task-o06`, `task-m01` through `task-m05`, `task-c01`, `task-c02`, `task-c03`, `task-d01` through `task-d92`, `task-d94` through `task-d103` and `task-q01` suffixes and prerequisites are preserved. v1.5 adds `task-d01` through `task-d04` from review of the open implementation PRs and of multi-host readiness, `task-d05` through `task-d17` from the Jepsen client's runs, `task-d18` through `task-d33` from a review against an external SwiftPaxos correctness checklist ([review record](tuplesky-checklist-review.md)), `task-d34` from what the protocol simulator of task-d30 found, `task-d35` through `task-d44` from a review of recovery time and storage integrity (an execution chain, a scrub, and voter replacement through a prepared transition, a staged learner, terminal recovery after the seal, serving across a transition and a running membership install), `task-d45` through `task-d50` from measuring the throughput of the Jepsen client's first unthrottled runs, `task-d51` from task-d46's long runs, `task-d52` and `task-d53` from a profile of the domain thread after task-d46, `task-d54` from the Jepsen runs of task-d50, `task-d55` through `task-d57` from the Jepsen runs of task-j06, `task-d58` through `task-d61` from a profile of five voters' CPU per operation, `task-d62` through `task-d65` from a consolidated review against the reference SwiftPaxos, `task-d66` from the Jepsen runs of task-d51, `task-d67` from a Jepsen run on #98 that made no fast decision, `task-d68` from task-d62's counts after a leader change, `task-d69` from a profile of a follower's loop, `task-d70` from the Jepsen runner's profile of the transport's workers, `task-d71` from the protocol simulator's first 1,000-seed sweep, `task-d72` through `task-d75` from comparing a command's cost with etcd's on one host, `task-d76` from a Jepsen run that killed the leader, `task-d77` through `task-d81` from the protocol simulator with acknowledgements between followers lost, `task-d82` through `task-d84` from the Jepsen runs of the #173 carry, `task-d85` from the protocol simulator on task-d74's routing, `task-d86` through `task-d92` from planning the whole gap to etcd on #174, and moves committed key replacement from `task-58` to `task-m03`; the changes are listed under [Gate checklist and deferred work](#gate-checklist-and-deferred-work). Task IDs are not GitHub pull-request or issue numbers. One implementation PR corresponds to one task; its GitHub-assigned number is recorded separately. No baseline, supplement or separate amendment is needed.
+**Scope:** 198 implementation tasks with stable `task-*` identifiers. The `task-01` through `task-66`, `task-s01` through `task-s04`, `task-j01` through `task-j10`, `task-o01` through `task-o06`, `task-m01` through `task-m05`, `task-c01`, `task-c02`, `task-c03`, `task-d01` through `task-d92`, `task-d94` through `task-d104` and `task-q01` suffixes and prerequisites are preserved. v1.5 adds `task-d01` through `task-d04` from review of the open implementation PRs and of multi-host readiness, `task-d05` through `task-d17` from the Jepsen client's runs, `task-d18` through `task-d33` from a review against an external SwiftPaxos correctness checklist ([review record](tuplesky-checklist-review.md)), `task-d34` from what the protocol simulator of task-d30 found, `task-d35` through `task-d44` from a review of recovery time and storage integrity (an execution chain, a scrub, and voter replacement through a prepared transition, a staged learner, terminal recovery after the seal, serving across a transition and a running membership install), `task-d45` through `task-d50` from measuring the throughput of the Jepsen client's first unthrottled runs, `task-d51` from task-d46's long runs, `task-d52` and `task-d53` from a profile of the domain thread after task-d46, `task-d54` from the Jepsen runs of task-d50, `task-d55` through `task-d57` from the Jepsen runs of task-j06, `task-d58` through `task-d61` from a profile of five voters' CPU per operation, `task-d62` through `task-d65` from a consolidated review against the reference SwiftPaxos, `task-d66` from the Jepsen runs of task-d51, `task-d67` from a Jepsen run on #98 that made no fast decision, `task-d68` from task-d62's counts after a leader change, `task-d69` from a profile of a follower's loop, `task-d70` from the Jepsen runner's profile of the transport's workers, `task-d71` from the protocol simulator's first 1,000-seed sweep, `task-d72` through `task-d75` from comparing a command's cost with etcd's on one host, `task-d76` from a Jepsen run that killed the leader, `task-d77` through `task-d81` from the protocol simulator with acknowledgements between followers lost, `task-d82` through `task-d84` from the Jepsen runs of the #173 carry, `task-d85` from the protocol simulator on task-d74's routing, `task-d86` through `task-d92` from planning the whole gap to etcd on #174, and moves committed key replacement from `task-58` to `task-m03`; the changes are listed under [Gate checklist and deferred work](#gate-checklist-and-deferred-work). Task IDs are not GitHub pull-request or issue numbers. One implementation PR corresponds to one task; its GitHub-assigned number is recorded separately. No baseline, supplement or separate amendment is needed.
 
 ## How to use this plan
 
@@ -63,6 +63,7 @@ Reference single-store and fixed-membership compositions are early increments, n
 | task-d101 | From the two local profiles and the row count on #185, read against the runner's tmpfs job (#185 review): the four followers' executions and projections cost about 0.75 ms an operation, a fifth of the servers, and none of it is on a write's path | A design step now, beside task-d100's code step; its option 1 is task-d86's follower half |
 | task-d102 | From #185's next steps (#185 review): at 120 callers a command costs about 16.8 datagrams and a journal group holds about 4.9 commands, since every message and group of a slow round is per command | A design step now, after task-d100's step A; it builds step B, and reads task-d84's parts 2 and 3, task-d86 and task-d101's option 1 together |
 | task-d103 | The first of task-d101's option 2 cuts, its own design step (#185 review): the protocol rows can't move to the journal, whose readers look them up by command past its retention, but the leader's proposal row is written in every proposal batch and read by nothing | A design step now; a row at the leader |
+| task-d104 | The second of task-d101's option 2 cuts (#185 review): a client acknowledges on every request, so each command retires one sequence and rewrites its client's floor | A design step now; about a row a command at every voter |
 | task-q01 | Combined durable WAN/Kine qualification | Required before task-66 |
 
 ```mermaid
@@ -288,6 +289,7 @@ This is a workstream overview; the individual prerequisites are authoritative. O
 | [task-d101](#task-d101) | Let followers do less: what reads a follower's projection, and what each option saves | task-d12, task-d86, task-d90 |
 | [task-d102](#task-d102) | A contended round is a batch: one frame, one group and one acknowledgement a turn | task-d61, task-d84, task-d86, task-d99, task-d100, task-d101 |
 | [task-d103](#task-d103) | Stop writing the leader's proposal row, which nothing reads | task-d89, task-d101 |
+| [task-d104](#task-d104) | Retire the retry window in batches | task-c02, task-d26, task-d99, task-d101 |
 | [task-q01](#task-q01) | Produce the combined durable WAN/Kine qualification report | task-j07, task-j08, task-o06, task-m05, task-63, task-64, task-d45, task-d46, task-d47, task-d48, task-d49, task-d51, task-d52, task-d53 |
 
 ## Task specifications
@@ -4000,6 +4002,39 @@ So every feature-gated change, task-d98's `EarlyProposal` first, would ship unre
 - **A local pair:** rows a command at the leader fall by one, and the leader's materializer CPU a command beside it.
 
 **Review boundary:** Which rows a leader's proposal batch writes. No change to what a vote rests on, to recovery's rows or to the wire.
+
+<a id="task-d104"></a>
+### task-d104: Retire the retry window in batches
+
+**Prerequisites:** task-c02, task-d26, task-d99, task-d101.  
+**Design:** Section 17.4 (amended by this task's design step: the retry window retired in batches).
+
+**Implement:** The second of task-d101's option 2 cuts (#185 review). `retirement()` retires a client's acknowledged sequences once at least `RETIRE_BATCH` (`K`) are acknowledged above the floor. It also retires whenever deferring would leave the command's own sequence, or the next `K`, outside the window measured from the unretired floor. A retiring command retires up to `MAX_RETIRE_PER_COMMAND + K − 1` above the floor, so the batched floor is never more than `K − 1` below today's and a retirement reaches at least today's. The rule stays a function of the durable view and the accepted payload. task-d26's bound on a session's retained results becomes `width + K`. `K` is a constant of the format, not a setting, since every voter must compute the same retirement.
+- **Sized before it is built:** about −0.009 ms an operation at the materializer at the bar (task-d86's profile). Its share of the domain loop is read on the CPU clock first, and the task is kept or dropped on the two together. A domain with thousands of clients, whose floor rows each cost a page, is where its first part would save about a page a command; that is read in the same step if it decides the task.
+- **The rule is a replicated feature, `Feature::BatchedRetirement`,** prepared and activated through task-d99's path. Below its activation position every voter retires as today, and from it in batches. A build that doesn't know it refuses a store that names it.
+- **Second part, after the first's pair: a window that overwrites in place.**
+  - `RetryV1` is keyed by the client instance and the sequence modulo the width. A slot holds its own sequence, and a replaced one answers `Retired`.
+  - The width is carried on the floor row. `ExecutedV1` is unchanged.
+  - This takes the delete. It was priced at about −0.06 to −0.08 ms an operation with the first part, a row at a page's price. At the bar, task-d86's profile reads both parts at the materializer at about −0.009 (the deletes, 2.1 to 2.3% of the thread, and nothing for the floor's rewrite with 30 to 240 clients), so that size doesn't hold (review on #185, 6812429771).
+  - It changes `RetryV1`'s layout, so it takes task-d105's route: one layout a domain, the other refused with the reason.
+  - It is sized and its design checked against resolve and `records_for` before its code.
+
+**Acceptance:**
+- **The design step** recorded and reviewed.
+- **The feature:**
+  - a store written before the activation keeps today's rule through a restart, and switches at the activation position;
+  - every voter's common hash agrees at that position and after it;
+  - a build without the feature refuses a store that names it, with the reason.
+- **Model tests:**
+  - every voter retires the same sequences at the same position, and the common hash agrees across voters through a long run with clients at and near the window's edge;
+  - no request is refused `OutOfWindow` that today's rule admits, over randomized acknowledgement patterns, including an acknowledgement jump past `MAX_RETIRE_PER_COMMAND` after a deferred prefix (the case on #207);
+  - a retry of an acknowledged sequence still retained answers with its result, and one retired answers `Retired` as today;
+  - resolve and `records_for` answer as today;
+  - a session's retained results never exceed `width + K`.
+- **The storage crash tests** at every cut of a retiring batch, under `strict` and `replay`.
+- **A local pair** at `K = 16` against today: rows a command at every voter, and the materializer's CPU a command and a commit.
+
+**Review boundary:** When a client's acknowledged results are retired, and from which position. No change to admission, to what a retry is answered, or to the wire, apart from the feature's activation through task-d99's path.
 
 ## Gate checklist and deferred work
 
