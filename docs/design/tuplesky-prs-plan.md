@@ -4203,7 +4203,7 @@ What the two steps build together:
   - the emptiness checks in `install.rs`'s `check_target` and in `restore.rs` test the pending collection too;
   - the registry says `executed_v1` names records only, so `in_common_hash` and the image's walk don't count an empty collection;
   - `coord-store-bench`'s executed-row count, the divergence report's text in `serve.rs`, and the fjall engine's collection list.
-- **The lowering's four rules** (Section 17.1, from review on #233):
+- **The lowering's rules** (Section 17.1: (a) to (d) from review on #233, (e) from reading for the code step):
   - (a) a payload put for a command already executed is dropped;
   - (b) an executed row with no pending payload is refused;
   - (c) a snapshot reader looks up executed commands only through the index;
@@ -4225,7 +4225,7 @@ What the two steps build together:
   - every voter's export root agrees at each floor boundary;
   - a store or image of the other layout is refused with the reason;
   - the storage crash tests at every cut of a commit that moves a payload, under `strict` and `replay`;
-  - the four rules:
+  - the rules:
     - a payload delivered after its command executed leaves the pending table empty;
     - a negative control lowers an execution with no payload and sees the refusal;
     - a snapshot reader across a Sync's release and a re-proposal under a new intake key;

@@ -1847,7 +1847,7 @@ So boot, catch-up served and resolve need no index by command here. Boot reads e
 - **Kept by the lowering.** Each commit's changes are published with the commit. A reader pins its snapshot first and then asks the index:
   - a row added after the snapshot reads as absent, which is that snapshot's answer;
   - a row deleted after the snapshot reads as absent too, which is a later snapshot's answer and what its reader would get next.
-  - A third case, a row deleted and written again under a new key after the snapshot, is ruled out for snapshot readers by rule (c) below. A commit whose outcome isn't known is rule (d).
+  - A third case, a row deleted and written again under a new key after the snapshot, is ruled out for snapshot readers by rule (c) below. A commit whose outcome isn't known is rule (d), and a recovery cut's overlay is rule (e).
 - **Memory (inferred):**
   - The intake part takes about 24 to 32 bytes a live row: the pending payloads and every dependency row the store keeps. In `coordd` today that is every dependency row, since nothing trims (task-d27).
   - The executed part takes about 16 to 24 bytes for each executed command retained, an 8-byte prefix and an 8-byte position with the map's overhead. That is every executed command until a floor forgets a prefix of `execution_v1`, about 24 MB at 10⁶.
@@ -1858,7 +1858,7 @@ So boot, catch-up served and resolve need no index by command here. Boot reads e
   - a durable index keyed by command, which is the random leaf again;
   - a durable index batched by order (one row a commit listing its commands). It would let the open read about 40 bytes a command instead of dependency rows, but the open reads those anyway.
 
-**The lowering's four rules** (review on #233, [6813025752](https://github.com/tuplesky/tuplesky/pull/233#issuecomment-6813025752)). None changes the layout. Each has a test in the code step.
+**The lowering's rules:** (a) to (d) from review on #233 ([6813025752](https://github.com/tuplesky/tuplesky/pull/233#issuecomment-6813025752)), and (e) from reading for the code step. None changes the layout. Each has a test in the code step.
 - **(a) A payload put for a command already executed is dropped.**
   - Today such a put overwrites the same row with the same bytes, so none of the `payload_update` sites (thirteen in `coord-consensus` and one in `serve.rs`) has had to rule it out: a late fetch, a vote or an adoption that arrives after the command executed.
   - Under this layout it would write a pending row that nothing moves or deletes. So the lowering writes nothing for it when the index's executed part holds the command.
@@ -1875,6 +1875,15 @@ So boot, catch-up served and resolve need no index by command here. Boot reads e
   - A commit that returns an error publishes nothing.
   - A commit whose outcome isn't known already puts the store in `MaterializationUncertain` with the meta it wrote (`pending_meta`), and the store settles it by reading the meta back. The index's changes for that commit are held with `pending_meta`. They are published if the meta shows the commit landed, and dropped if it didn't.
   - A store that quarantines drops the index with it, and the next open rebuilds it from the store.
+- **(e) An overlay lowers its rows with the same key assignment** (found reading for the code step, after review). Two readers lay rows the projection doesn't hold yet over a pinned snapshot, and both hold the journal's updates as they are, keyed by command:
+  - **the recovery cut** (`RecoveryCut`, `cut.rs`): built in `journaled.rs` from the records between the snapshot's stamp and the durable head. `read_protocol` and the campaign's report run over it under `replay`;
+  - **the planning view** (`apply.rs`): an execution group's own writes, laid over the projection while the group is open.
+
+  Laid over a projection keyed by intake order and position, a by-command row would not replace the row it rewrites. A dependency row rewritten at ACCEPT but not yet materialized would then read twice, once under each key, and a delete wouldn't hide its row.
+  - So the key assignment is one function, used by the lowering and by each overlay's `extend`.
+  - It takes a record's updates, its journal position and the index, and gives the lowered rows.
+  - An overlay keeps the index's changes for its own records, over the index at its snapshot's stamp. The cut then reads the keys materialization will write, as it now reads its rows ("the overlay replays the same `StoreUpdate` rows the materializer would write").
+  - The planning view's group holds application rows, so step 1's dependency rows don't reach it. Step 2's executed and payload rows do.
 
 **2. Which order: the execution position for executed rows, and intake order before execution.**
 - **Executed rows and executed payloads take the execution position:**
