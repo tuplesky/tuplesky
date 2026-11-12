@@ -226,9 +226,14 @@ fn a_payload_change_conflicts_locally_and_from_the_server() {
         .unwrap();
     assert_eq!(c.state(id3), Some(&RequestState::Queued));
     assert!(c.take_completions().is_empty());
+    // Every attempt so far was refused before admission: the application
+    // can say so rather than "no answer".
+    assert_eq!((c.backpressured(id3), c.attempts(id3)), (1, 1));
     c.tick(6 + ClientConfig::default().backoff);
     let again = sends(&c.take_actions());
     assert_eq!(again[0].2, sent[0].2, "same invocation after backpressure");
+    // The second attempt is out and unanswered: no longer all refused.
+    assert_eq!((c.backpressured(id3), c.attempts(id3)), (1, 2));
     c.on_frame(200, c1, &err_frame(command3, codes::NOT_ADMITTED))
         .unwrap();
     assert_eq!(
@@ -753,5 +758,31 @@ fn a_withheld_result_and_a_retired_one_are_their_own_outcomes() {
     assert_eq!(
         c.take_completions()[0].outcome,
         Outcome::Failed(RetryError::NotAdmitted)
+    );
+}
+
+/// A retry of a request this client holds as unknown keeps its earlier
+/// attempts: a BACKPRESSURE answer to the retry must not read as
+/// "nothing reached the domain" (Codex on #228).
+#[test]
+fn a_retried_unknown_outcome_keeps_its_attempts() {
+    let mut c = client(ClientConfig::default());
+    let c1 = connected(&mut c, 0, 1);
+    let request = put(b"a", b"1");
+    let id = c.submit(0, &request, 0).unwrap();
+    let command = c.invocation(id).unwrap().command_id;
+    let _ = c.take_actions();
+    c.on_frame(1, c1, &outcome_frame(command, OutcomeV1::Unknown))
+        .unwrap();
+    assert_eq!(c.state(id), Some(&RequestState::Done(Outcome::Unknown)));
+    let _ = c.take_completions();
+    assert_eq!(c.retry(2, id.0, &request, 0), Ok(id));
+    let _ = c.take_actions();
+    c.on_frame(3, c1, &err_frame(command, codes::BACKPRESSURE))
+        .unwrap();
+    assert_eq!(
+        (c.backpressured(id), c.attempts(id)),
+        (1, 2),
+        "the retry's refusal hid the first attempt"
     );
 }

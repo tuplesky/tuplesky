@@ -39,6 +39,10 @@
 #   WARMUP       warm-up operations, not measured     (default 100)
 #   STATE_ROOT   where the domains are kept           (default /dev/shm,
 #                so that the disk is not what is measured)
+#   ADMITTED_PER_SECOND  new requests each frontend admits a second,
+#                written into every voter's [limits] and stated in each
+#                reading's label (default 1000, the daemon's own default,
+#                set explicitly so a reading says what it ran under)
 #   ACTIVATE     replicated features to activate once each domain is up,
 #                through `coordctl feature` (scripts/bench/activate.sh,
 #                task-d99), e.g. `early-proposal`   (default none)
@@ -63,6 +67,11 @@ MIX=${MIX:-put=15,get=55,contended=20,txn=5}
 STATE_ROOT=${STATE_ROOT:-/dev/shm}
 ACTIVATE=${ACTIVATE:-}
 INTERVAL=1
+# The admission rate every frontend runs under, set rather than left to
+# the daemon's default: at a few hundred commands a second per frontend
+# it binds, so a reading states it (task-d26).
+ADMITTED_PER_SECOND=${ADMITTED_PER_SECOND:-1000}
+export COORD_HARNESS_MAX_ADMITTED_PER_SECOND=$ADMITTED_PER_SECOND
 CALLER_COUNTS=${*:-1 10}
 
 for binary in "$COORDD" "$HARNESS" "$BENCH"; do
@@ -146,7 +155,7 @@ for repeat in $(seq 1 "$REPEATS"); do
   note "command-cost.sh: $MEASURED operations at $callers callers, run $repeat of $REPEATS"
   started=$(date +%s.%N)
   "$BENCH" --dir "$dir" \
-    --label "command cost, 3 voters, $callers callers" \
+    --label "command cost, 3 voters, $callers callers, admitting $ADMITTED_PER_SECOND/s a frontend" \
     --durability "journal-first, one fsync per record, stores on tmpfs" \
     --topology "single-host loopback, 3 voters" \
     --arrival-ns 0 --warmup-ops "$WARMUP" --measured-ops "$MEASURED" --mix "$MIX" \

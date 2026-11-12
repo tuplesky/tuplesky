@@ -125,6 +125,46 @@ pub struct Admission {
     /// were counted at: a token bucket of `max_admitted_per_second`.
     tokens: u64,
     counted_at: Option<crate::clock::MonotonicMillis>,
+    refusals: AdmissionRefusals,
+}
+
+/// Requests a gate refused, by why, since it started. Cumulative.
+///
+/// The two `BACKPRESSURE` refusals are apart: a session at its pending
+/// bound is the caller's own window, while the admission rate is this
+/// frontend's bound on the domain (task-d26). A load generator that sees
+/// only the code cannot tell them apart.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AdmissionRefusals {
+    /// Refused by the admission rate (`RateLimited`).
+    pub rate_limited: u64,
+    /// Refused because the session was at its pending bound
+    /// (`SessionBusy`).
+    pub session_busy: u64,
+    /// Refused for any other reason: malformed, too large, or not
+    /// admitted here.
+    pub other: u64,
+}
+
+impl AdmissionRefusals {
+    fn count(&mut self, refusal: &AdmissionRefusal) {
+        let n = match refusal {
+            AdmissionRefusal::RateLimited { .. } => &mut self.rate_limited,
+            AdmissionRefusal::SessionBusy { .. } => &mut self.session_busy,
+            AdmissionRefusal::RoleNotAdmitted(_)
+            | AdmissionRefusal::Malformed
+            | AdmissionRefusal::WrongCluster
+            | AdmissionRefusal::WrongDomain
+            | AdmissionRefusal::SessionMismatch
+            | AdmissionRefusal::RequestTooLarge { .. } => &mut self.other,
+        };
+        *n += 1;
+    }
+
+    /// Every refusal counted.
+    pub const fn total(&self) -> u64 {
+        self.rate_limited + self.session_busy + self.other
+    }
 }
 
 impl Admission {
@@ -138,6 +178,11 @@ impl Admission {
             minted: 0,
             tokens: 0,
             counted_at: None,
+            refusals: AdmissionRefusals {
+                rate_limited: 0,
+                session_busy: 0,
+                other: 0,
+            },
         }
     }
 
@@ -191,6 +236,30 @@ impl Admission {
     }
 
     fn admit_inner(
+        &mut self,
+        now_ticks: u64,
+        now: Option<crate::clock::MonotonicMillis>,
+        caller: &Caller,
+        request: &RequestV1,
+    ) -> Result<Admitted, AdmissionRefusal> {
+        let decided = self.decide(now_ticks, now, caller, request);
+        if let Err(refusal) = &decided {
+            self.refusals.count(refusal);
+        }
+        decided
+    }
+
+    /// What this gate has refused since it started.
+    pub const fn refusals(&self) -> AdmissionRefusals {
+        self.refusals
+    }
+
+    /// The limits this gate admits under.
+    pub const fn limits(&self) -> &AdmissionLimits {
+        &self.limits
+    }
+
+    fn decide(
         &mut self,
         now_ticks: u64,
         now: Option<crate::clock::MonotonicMillis>,

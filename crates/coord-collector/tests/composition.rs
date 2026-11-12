@@ -19,10 +19,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use coord_collector::{
-    Action, Admission, AdmissionLimits, AdmissionRefusal, Caller, Collector, CollectorConfig,
-    CollectorEvent, Delivery, Dispatcher, EvidenceError, HoldReason, KIND_EVIDENCE, KIND_RELEASE,
-    MonotonicMillis, OfferOutcome, Offered, Progress, SubmitRefusal, Submitted,
-    admitted_from_submit, codes, decode_evidence, decode_release, frontend_frame,
+    Action, Admission, AdmissionLimits, AdmissionRefusal, AdmissionRefusals, Caller, Collector,
+    CollectorConfig, CollectorEvent, Delivery, Dispatcher, EvidenceError, HoldReason,
+    KIND_EVIDENCE, KIND_RELEASE, MonotonicMillis, OfferOutcome, Offered, Progress, SubmitRefusal,
+    Submitted, admitted_from_submit, codes, decode_evidence, decode_release, frontend_frame,
 };
 use coord_consensus::{
     AppliedOutcome, BallotConfiguration, ConfigurationIdentity, FastAck, Follower, FollowerConfig,
@@ -1603,6 +1603,15 @@ fn a_retry_of_an_unresolved_request_takes_no_second_admission_slot() {
     gate.settled(&first.retry_key);
     gate.admit(0, &caller(), &other).expect("the slot is free");
     assert_eq!(gate.pending(&SESSION), 1);
+    // The one refusal was the session's bound, counted as such.
+    assert_eq!(
+        gate.refusals(),
+        AdmissionRefusals {
+            rate_limited: 0,
+            session_busy: 1,
+            other: 0,
+        }
+    );
 }
 
 /// New requests are admitted at no more than the configured rate, with a
@@ -1649,6 +1658,16 @@ fn admission_is_bounded_by_its_rate_and_a_retry_takes_nothing() {
     }
     let (_, tenth) = request(10, put(b"a", b"1"), 0);
     assert!(gate.admit_at(0, at(60_000), &caller(), &tenth).is_err());
+    // Each refusal is counted by why, for the metrics line: the rate
+    // refused four, and nothing else was refused.
+    assert_eq!(
+        gate.refusals(),
+        AdmissionRefusals {
+            rate_limited: 4,
+            session_busy: 0,
+            other: 0,
+        }
+    );
 }
 
 #[test]

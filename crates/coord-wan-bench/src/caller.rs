@@ -315,7 +315,15 @@ impl Caller {
         }
         let completions = self.client.take_completions();
         let Some(completion) = completions.iter().find(|c| c.request == id) else {
+            // The SDK completes nothing on `BACKPRESSURE`: it queues the
+            // same invocation again for after its backoff. This call's one
+            // attempt refused that way had nothing submitted, so the run
+            // counts it as refused, not as an outcome it failed to learn.
+            let refused = self.client.backpressured(id) == self.client.attempts(id);
             self.release(id);
+            if refused {
+                return Err(Answer::Refused(BACKPRESSURE.into()));
+            }
             return Err(Answer::Unknown);
         };
         // Release the invocation. The SDK retains a completed request so
@@ -332,6 +340,11 @@ impl Caller {
         Ok(outcome)
     }
 }
+
+/// The reason a report groups the frontend's `BACKPRESSURE` refusals
+/// under: a session at its pending bound, or the frontend's admission
+/// rate (task-d26). The daemon's metrics line counts the two apart.
+pub const BACKPRESSURE: &str = "backpressure";
 
 /// A bounded name for a refusal. Never the detail bytes: a report is
 /// published and a detail is not a label.

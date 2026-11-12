@@ -28,6 +28,10 @@
 #   WARMUP        warm-up operations per row            (default 200)
 #   MEASURED      measured operations per row           (default 2000)
 #   DEADLINE_MS   per-operation deadline                (default 10000)
+#   ADMITTED_PER_SECOND  new requests each frontend admits a second,
+#                written into every voter's [limits] and stated in each
+#                reading's label (default 1000, the daemon's own default,
+#                set explicitly so a reading says what it ran under)
 #   RATES         inter-arrival times in ns, space separated
 #                 (default "0 10000000 5000000")
 #   MIX           the offered mix                       (default the
@@ -58,6 +62,11 @@ CALLERS=${CALLERS:-8}
 WARMUP=${WARMUP:-200}
 MEASURED=${MEASURED:-2000}
 DEADLINE_MS=${DEADLINE_MS:-10000}
+# The admission rate every frontend runs under, set rather than left to
+# the daemon's default: at a few hundred commands a second per frontend
+# it binds, so a reading states it (task-d26).
+ADMITTED_PER_SECOND=${ADMITTED_PER_SECOND:-1000}
+export COORD_HARNESS_MAX_ADMITTED_PER_SECOND=$ADMITTED_PER_SECOND
 RATES=${RATES:-"0 10000000 5000000"}
 MIX=${MIX:-"put=15,get=55,cas=25,scan=5"}
 DURABILITY=${DURABILITY:-"journal-first, one fsync per record"}
@@ -114,7 +123,7 @@ offer() {
   local ok=0
   if [ "$arm" = native ]; then
     "$NATIVE" --dir "$RUN_DIR" \
-      --label "$row native (${VOTERS} voters, ${CALLERS} callers, ${rate}ns)" \
+      --label "$row native (${VOTERS} voters, ${CALLERS} callers, ${rate}ns, admitting ${ADMITTED_PER_SECOND}/s a frontend)" \
       --durability "$DURABILITY" \
       --topology "single-host loopback, ${VOTERS} voters" \
       --arrival-ns "$rate" --warmup-ops "$warmup" --measured-ops "$MEASURED" \
@@ -127,7 +136,7 @@ offer() {
     [ -n "$IMPAIRMENT" ] && declared=(-impairment "$IMPAIRMENT")
     "$KINE_BENCH" -harness "$RUN_DIR/harness.json" -arm "$arm" \
       "${credentials[@]}" \
-      -label "$row $arm (${VOTERS} voters, ${CALLERS} callers, ${rate}ns)" \
+      -label "$row $arm (${VOTERS} voters, ${CALLERS} callers, ${rate}ns, admitting ${ADMITTED_PER_SECOND}/s a frontend)" \
       -durability "$DURABILITY" \
       -topology "single-host loopback, ${VOTERS} voters" \
       "${declared[@]}" \

@@ -48,6 +48,10 @@
 #   FAULT_AT, FAULT_FOR         seconds                (default 10, 5)
 #   FAULT_GAP                   seconds between faults       (default 12)
 #   STATE_ROOT                  where the domain is kept (default /dev/shm)
+#   ADMITTED_PER_SECOND  new requests each frontend admits a second,
+#                written into every voter's [limits] and stated in each
+#                reading's label (default 1000, the daemon's own default,
+#                set explicitly so a reading says what it ran under)
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
@@ -73,6 +77,11 @@ fi
 CALLERS=${CALLERS:-2}
 KEYS=${KEYS:-4}
 STATE_ROOT=${STATE_ROOT:-/dev/shm}
+# The admission rate every frontend runs under, set rather than left to
+# the daemon's default: at a few hundred commands a second per frontend
+# it binds, so a reading states it (task-d26).
+ADMITTED_PER_SECOND=${ADMITTED_PER_SECOND:-1000}
+export COORD_HARNESS_MAX_ADMITTED_PER_SECOND=$ADMITTED_PER_SECOND
 
 case "$SCENARIO" in pause|kill|partition) ;; *)
   echo "register-faults.sh: unknown scenario $SCENARIO" >&2; exit 2 ;;
@@ -168,7 +177,7 @@ wait_for_leader() {
 
 LEADER=$(wait_for_leader)
 [ -n "$LEADER" ] || { note "no voter announced a ballot"; domain_down; exit 2; }
-note "scenario $SCENARIO; the leader is $LEADER"
+note "scenario $SCENARIO; the leader is $LEADER; admitting $ADMITTED_PER_SECOND/s a frontend"
 INDEX=${LEADER#n}
 
 READ_ONLY=""
