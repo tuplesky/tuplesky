@@ -16,11 +16,11 @@ use coord_core::effect::{BarrierId, BootId, PersistBatch, StoreUpdate};
 use coord_core::outbox::BarrierAllocator;
 use coord_journal_api::frontier::CheckpointPointerV1;
 use coord_journal_api::stream::ShardId;
-use coord_storage::ManualMaterializer;
 use coord_storage::journaled::{
     CommitHold, DomainStatus, DurableCadence, JournalLimits, JournaledError, JournaledStore,
     ProjectionProfile, Submission, TransitionKind,
 };
+use coord_storage::{AskCause, HoldEnds, ManualMaterializer};
 use coord_store_api::engine::LocalEngine;
 use coord_store_testkit::journal::ModelJournal;
 use coord_store_testkit::model::{CommitScript, ModelEngine, ModelReader, ModelWrite};
@@ -982,6 +982,55 @@ fn a_commit_in_doubt_leaves_nothing_due_until_it_is_reconciled() {
     assert!(due <= std::time::Instant::now());
     world.store.hand_off().unwrap();
     assert!(world.store.lent(A), "lent once reconciled");
+}
+
+/// Each commit lent while a hold applies is counted once by what ended its
+/// hold (task-d86, the lead on #185): its records reaching the hold's
+/// count, its wait running out, or an ask, by who asked. An ask made where
+/// the count was reached anyway is counted as the count.
+#[test]
+fn each_commit_lent_is_counted_by_what_ended_its_hold() {
+    let wait = std::time::Duration::from_millis(100);
+    let (mut world, handle) = held(hold(3, wait));
+    let lend = |world: &mut World| {
+        assert!(world.store.lent(A), "lent");
+        assert!(handle.run());
+        world.store.hand_off().unwrap();
+        assert!(!world.store.lent(A));
+    };
+    // Three records: the count.
+    journal_and_hand_off(&mut world, 3);
+    lend(&mut world);
+    // One, and the wait runs out.
+    journal_and_hand_off(&mut world, 1);
+    assert!(!world.store.lent(A), "one record is held");
+    std::thread::sleep(wait + wait / 2);
+    world.store.hand_off().unwrap();
+    lend(&mut world);
+    // One, and each ask in turn.
+    for cause in [AskCause::Read, AskCause::Settle, AskCause::Other] {
+        journal_and_hand_off(&mut world, 1);
+        assert!(!world.store.lent(A), "{cause:?}: one record is held");
+        world.store.request_projection_commit_for(cause);
+        world.store.hand_off().unwrap();
+        lend(&mut world);
+    }
+    // Three records and a read's ask: the count ended it.
+    world.queue(3);
+    world.store.append().unwrap();
+    world.store.request_projection_commit_for(AskCause::Read);
+    world.store.hand_off().unwrap();
+    lend(&mut world);
+    assert_eq!(
+        world.store.cost().hold_ends,
+        HoldEnds {
+            full: 2,
+            deadline: 1,
+            read: 1,
+            settle: 1,
+            other: 1,
+        }
+    );
 }
 
 /// A commit on the caller's thread that gives its records back leaves

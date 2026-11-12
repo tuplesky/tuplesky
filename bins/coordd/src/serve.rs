@@ -1939,6 +1939,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 Measure::Observed,
             ),
             projection_commits: storage.lowering.commits,
+            hold_ends: coord_daemon::metrics::HoldEnds::of(storage.lowering.hold_ends),
             journal_groups: journal_groups(&storage.lowering.groups),
             history: {
                 let ledger = voter.node().machine().ledger();
@@ -4321,7 +4322,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         self.backing
             .applier_mut()
             .store_mut()
-            .request_projection_commit();
+            .request_projection_commit_for(coord_storage::AskCause::Settle);
         // Bounded per turn and rotated across turns: the bound is on
         // this turn's reads, and the rotation is what keeps it from
         // becoming a bound on which commands are ever read.

@@ -717,6 +717,42 @@ struct Domain<E: LocalEngine> {
     /// commits go out whatever the hold says until one is lent that
     /// carries everything submitted when the ask was made.
     commit_asked: Option<CommitAsk>,
+    /// Who made the standing ask, for the count of what ended each hold
+    /// ([`HoldEnds`]): the latest, since a later ask replaces an earlier.
+    ask_cause: AskCause,
+}
+
+/// Who asked for a projection commit (task-d86), for the count of what
+/// ended each hold ([`HoldEnds`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AskCause {
+    /// A read due and not yet answerable from the projection.
+    Read,
+    /// A look for a half-established entry's execution record.
+    Settle,
+    /// Anything else: a release published again, a group's effects
+    /// beyond its results, a watch's events, a drain.
+    #[default]
+    Other,
+}
+
+/// What ended the hold of each commit lent while a hold applies
+/// (task-d86, the lead on #185): the records reached the hold's count,
+/// its wait ran out, or an ask cut it short, by who asked. Each commit is
+/// counted once, in the first that applies in that order, so an ask is
+/// counted only where the hold would otherwise have gone on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HoldEnds {
+    /// The records held reached the hold's count.
+    pub full: u64,
+    /// The hold's wait ran out.
+    pub deadline: u64,
+    /// A read's ask.
+    pub read: u64,
+    /// A half-established entry's look for its record.
+    pub settle: u64,
+    /// Any other ask.
+    pub other: u64,
 }
 
 /// How far an ask for a projection commit reaches (task-d86): the
@@ -913,7 +949,8 @@ impl<E: LocalEngine> Domain<E> {
     /// Ask for commits that carry everything submitted so far (task-d86).
     /// A later ask reaches as far as an earlier one and further, so it
     /// replaces it.
-    fn ask_for_commit(&mut self) {
+    fn ask_for_commit(&mut self, cause: AskCause) {
+        self.ask_cause = cause;
         self.commit_asked = Some(match self.queue.back() {
             Some(last) => CommitAsk::Queued(last.batch.barrier),
             None => CommitAsk::Through(self.submitted_through()),
@@ -1102,6 +1139,9 @@ pub struct LoweringCost {
     pub commits: u64,
     /// What the groups appended held (task-d84).
     pub groups: GroupMix,
+    /// What ended the hold of each commit lent while a hold applies
+    /// (task-d86).
+    pub hold_ends: HoldEnds,
 }
 
 /// What the journal groups a store appended held, by the records in
@@ -1437,6 +1477,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
             checkpoint: None,
             held_since: None,
             commit_asked: None,
+            ask_cause: AskCause::Other,
         };
         let started = Instant::now();
         Self::replay(
@@ -1949,7 +1990,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
             state.working.requested = true;
             // The pointer waits for the projection, so its commit is not
             // held (task-d86).
-            state.ask_for_commit();
+            state.ask_for_commit(AskCause::Other);
         }
         state.checkpoint = Some(Queued {
             pointer: *pointer,
@@ -3492,11 +3533,17 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
     /// it, not after the hold, even if a commit of records held from
     /// before is lent first.
     pub fn request_projection_commit(&mut self) {
+        self.request_projection_commit_for(AskCause::Other);
+    }
+
+    /// [`JournaledStore::request_projection_commit`], saying who asks, for
+    /// the count of what ended each hold (task-d86).
+    pub fn request_projection_commit_for(&mut self, cause: AskCause) {
         if self.hold.is_none() {
             return;
         }
         for state in self.domains.values_mut() {
-            state.ask_for_commit();
+            state.ask_for_commit(cause);
         }
     }
 
@@ -3747,6 +3794,21 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
             let Some(engine) = state.engine.take() else {
                 continue;
             };
+            if let Some(hold) = hold {
+                let ends = &mut self.cost.hold_ends;
+                let end = if state.pending.len() >= hold.records.get() as usize {
+                    &mut ends.full
+                } else if now.saturating_duration_since(since) >= hold.wait {
+                    &mut ends.deadline
+                } else {
+                    match state.ask_cause {
+                        AskCause::Read => &mut ends.read,
+                        AskCause::Settle => &mut ends.settle,
+                        AskCause::Other => &mut ends.other,
+                    }
+                };
+                *end += 1;
+            }
             state.held_since = None;
             if state.ask_spent() {
                 state.commit_asked = None;

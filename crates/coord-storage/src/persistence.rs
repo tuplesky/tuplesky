@@ -236,6 +236,13 @@ pub trait Persistence {
     /// is held where nothing is pipelined, so there is nothing to ask.
     fn request_projection_commit(&mut self) {}
 
+    /// [`Persistence::request_projection_commit`], saying who asks, for
+    /// the count of what ended each hold (task-d86).
+    fn request_projection_commit_for(&mut self, cause: crate::journaled::AskCause) {
+        let _ = cause;
+        self.request_projection_commit();
+    }
+
     /// When a held projection commit is due to go out (task-d86), for a
     /// caller that hands off on events and must also hand off then.
     /// `None` when nothing is held.
@@ -644,6 +651,10 @@ impl<J: coord_journal_api::JournalEngine, E: coord_store_api::engine::LocalEngin
 
     fn request_projection_commit(&mut self) {
         self.store.request_projection_commit();
+    }
+
+    fn request_projection_commit_for(&mut self, cause: crate::journaled::AskCause) {
+        self.store.request_projection_commit_for(cause);
     }
 
     fn projection_commit_due(&self) -> Option<std::time::Instant> {
