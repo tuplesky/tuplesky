@@ -45,6 +45,7 @@ use raft_engine::env::{DefaultFileSystem, FileSystem};
 use raft_engine::{Command, Config, Engine, LogBatch, ReadableSize, RecoveryMode};
 
 use crate::codec::{RecordCodec, RecordExt};
+use crate::guard::{TailGuard, tail_refusal};
 use crate::metadata::{
     HIGH_WATER_KEY, IDENTITY_KEY, JOURNAL_FORMAT_V1, JournalIdentityV1, METADATA_REGION,
     MetadataValueV1, POINTER_KEY, STREAM_KEY_PREFIX, decode_value, encode_value, stream_key,
@@ -67,8 +68,13 @@ pub struct JournalIdentity {
 pub enum RecoveryPolicy {
     /// Any corruption stops recovery.
     AbsoluteConsistency,
-    /// Only a corrupted tail record is tolerated (the qualified torn-tail
-    /// case); damage inside the durable prefix stops recovery.
+    /// Only a torn tail is tolerated: the remains of the one write in
+    /// flight at a crash, in the last file of its queue, are truncated.
+    /// The engine alone would truncate at the first broken batch of the
+    /// last file, whatever followed it; [`TailGuard`](crate::guard::TailGuard)
+    /// refuses every truncation that is not of a torn write, so damage
+    /// anywhere else stops recovery with [`OpenError::Corrupt`] and leaves
+    /// the files as they were.
     TolerateTailCorruption,
 }
 
@@ -190,7 +196,7 @@ impl StreamState {
 }
 
 struct Inner<F: FileSystem> {
-    engine: Engine<F>,
+    engine: Engine<TailGuard<F>>,
     identity: JournalIdentityV1,
     high_water: StreamHighWater,
     mappings: BTreeMap<StorageStreamId, StreamMappingV1>,
@@ -248,7 +254,10 @@ fn engine_open_error(e: raft_engine::Error) -> OpenError {
     match e {
         raft_engine::Error::InvalidArgument(m) => OpenError::InvalidOptions(m),
         raft_engine::Error::Corruption(m) => OpenError::Corrupt(m),
-        raft_engine::Error::Io(io) => OpenError::Io(io),
+        raft_engine::Error::Io(io) => match tail_refusal(&io) {
+            Some(refused) => OpenError::Corrupt(refused.to_string()),
+            None => OpenError::Io(io),
+        },
         raft_engine::Error::Other(o) if o.to_string().contains("lock") => OpenError::Busy,
         other => OpenError::Engine(redact(&other)),
     }
@@ -324,7 +333,7 @@ const OPEN_VERIFY_BYTES: usize = 8 * 1024 * 1024;
 /// written entirely under the old one. The generation still never
 /// decreases along the stream and never exceeds the mapping's.
 fn verify_retained<F: FileSystem>(
-    engine: &Engine<F>,
+    engine: &Engine<TailGuard<F>>,
     region: u64,
     origin: RecordOrigin,
     first: u64,
@@ -498,7 +507,8 @@ impl<F: FileSystem + DirSync> RaftEngineJournal<F> {
         let existed = existing_ancestor(dir);
         std::fs::create_dir_all(dir)?;
         let engine =
-            Engine::open_with_file_system(cfg, file_system.clone()).map_err(engine_open_error)?;
+            Engine::open_with_file_system(cfg, Arc::new(TailGuard::new(file_system.clone())))
+                .map_err(engine_open_error)?;
         sync_created_dirs(&*file_system, dir, existed.as_deref())?;
         if !engine.is_empty() {
             return Err(OpenError::Corrupt(
@@ -559,7 +569,19 @@ impl<F: FileSystem> RaftEngineJournal<F> {
         if !has_engine_files(dir)? {
             return Err(OpenError::NotInitialized);
         }
-        let engine = Engine::open_with_file_system(cfg, file_system).map_err(engine_open_error)?;
+        let engine = Engine::open_with_file_system(cfg, Arc::new(TailGuard::new(file_system)))
+            .map_err(engine_open_error)?;
+        // The engine's open can write the last file's header with no sync:
+        // where that header did not read, recovery truncates the file to
+        // nothing and the writer writes a new one (`pipe_builder.rs`,
+        // `LogFileWriter::open`). Unsynced, a crash after the next group
+        // could keep that group's sectors and lose the header's, which the
+        // guard refuses as damage ("the file header is zeros, but data
+        // follows it"): two power losses and no damage, and a voter that
+        // stays down (#211 review). Synced here, every header a group
+        // follows is durable before the group is written, as `create` and
+        // a rotation already make it.
+        engine.sync().map_err(|e| OpenError::Engine(redact(&e)))?;
         let row = match engine.get(METADATA_REGION, IDENTITY_KEY) {
             None => return Err(OpenError::NotInitialized),
             Some(bytes) => match decode_value(&bytes) {
@@ -677,7 +699,7 @@ impl<F: FileSystem> RaftEngineJournal<F> {
     }
 
     fn assemble(
-        engine: Engine<F>,
+        engine: Engine<TailGuard<F>>,
         identity: JournalIdentityV1,
         high_water: StreamHighWater,
         mappings: BTreeMap<StorageStreamId, StreamMappingV1>,

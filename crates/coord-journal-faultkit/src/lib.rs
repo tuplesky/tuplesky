@@ -95,13 +95,27 @@ pub enum Tail {
     /// Everything unsynced survives (as if the OS had flushed it).
     All,
     /// A seeded subset survives, each write possibly torn to a prefix and
-    /// applied in an arbitrary order.
+    /// applied in an arbitrary order. The prefix ends at any byte: a
+    /// deliberately pessimistic model, past what a device that writes
+    /// whole sectors can leave.
     Seeded(u64),
+    /// As [`Tail::Seeded`], but a torn write keeps or loses whole sectors
+    /// ([`SECTOR_BYTES`], by file offset), in any combination: the remains
+    /// of a write to a device that writes a sector whole or not at all.
+    SeededSectors(u64),
+    /// Exactly the sector pieces bit `i` of the mask names survive: each
+    /// unsynced write split at sector boundaries (by file offset), and
+    /// each length change one piece, numbered in issue order and applied
+    /// in it. Enumerating every mask below `1 << unsynced_pieces()` tries
+    /// every remains a sector-atomic device can leave of that file's
+    /// unsynced tail; pieces past the 64th never survive.
+    Sectors(u64),
 }
 
 /// Granularity at which a failing write is torn: a real disk persists or
-/// drops whole sectors, never part of one. (The seeded crash tail still
-/// tears at byte granularity, as a deliberately pessimistic model.)
+/// drops whole sectors, never part of one. ([`Tail::SeededSectors`] tears
+/// a crash's tail the same way; [`Tail::Seeded`] tears it at any byte, as a
+/// deliberately pessimistic model.)
 pub const SECTOR_BYTES: usize = 512;
 
 /// `EIO`, the error a failing device returns for a write.
@@ -290,6 +304,18 @@ impl Shared {
             .sum()
     }
 
+    /// The most sector pieces ([`Tail::Sectors`]) any tracked file's
+    /// unsynced operations split into.
+    pub fn unsynced_pieces(&self) -> usize {
+        self.files
+            .lock()
+            .unwrap()
+            .values()
+            .map(|f| sector_pieces(&f.lock().unwrap().unsynced).len())
+            .max()
+            .unwrap_or(0)
+    }
+
     /// The tracked files, by path.
     pub fn files(&self) -> Vec<PathBuf> {
         self.files.lock().unwrap().keys().cloned().collect()
@@ -331,6 +357,7 @@ impl Shared {
             let images = images.lock().unwrap();
             let tail = match tail {
                 Tail::Seeded(seed) => Tail::Seeded(seed ^ ((i as u64 + 1) << 32)),
+                Tail::SeededSectors(seed) => Tail::SeededSectors(seed ^ ((i as u64 + 1) << 32)),
                 other => other,
             };
             let bytes = apply_tail(&images, tail);
@@ -435,11 +462,24 @@ fn split_tail(images: &Images, tail: Tail) -> (Vec<u8>, Vec<Unsynced>) {
         // Everything unsynced survives in issue order: exactly the volatile
         // image, including a shrink that followed an earlier write.
         Tail::All => return (images.volatile.clone(), Vec::new()),
-        Tail::Seeded(seed) => seed,
+        Tail::Seeded(seed) | Tail::SeededSectors(seed) => seed,
+        Tail::Sectors(mask) => {
+            let (mut out, mut rest) = (images.durable.clone(), Vec::new());
+            for (j, op) in sector_pieces(&images.unsynced).into_iter().enumerate() {
+                if j < 64 && mask & (1 << j) != 0 {
+                    apply(&mut out, op);
+                } else {
+                    rest.push(op);
+                }
+            }
+            return (out, rest);
+        }
     };
+    let sectors = matches!(tail, Tail::SeededSectors(_));
     let mut rng = ChaCha12Rng::seed_from_u64(seed);
-    // Keep each operation with probability 1/2, tear surviving writes to a
-    // prefix sometimes, and shuffle the survivors. A length change is one
+    // Keep each operation with probability 1/2, tear surviving writes
+    // sometimes (to a prefix, or to a subset of their sectors), and
+    // shuffle the survivors. A length change is one
     // of the operations: it survives, or not, and lands wherever the
     // shuffle puts it.
     let (mut kept, mut rest) = (Vec::new(), Vec::new());
@@ -450,42 +490,95 @@ fn split_tail(images: &Images, tail: Tail) -> (Vec<u8>, Vec<Unsynced>) {
             rest.push((i, op.clone()));
         }
     }
-    for (i, op) in &mut kept {
-        if let Unsynced::Write { offset, bytes } = op
-            && rng.next_u32() % 4 == 0
-        {
-            let keep = (rng.next_u32() as usize) % (bytes.len() + 1);
-            let unwritten = bytes.split_off(keep);
-            if !unwritten.is_empty() {
-                rest.push((
-                    *i,
-                    Unsynced::Write {
-                        offset: *offset + keep as u64,
-                        bytes: unwritten,
-                    },
-                ));
+    let mut survivors = Vec::with_capacity(kept.len());
+    for (i, op) in kept {
+        match op {
+            Unsynced::Write { offset, mut bytes } if rng.next_u32() % 4 == 0 => {
+                if sectors {
+                    let mut at = offset as usize;
+                    while !bytes.is_empty() {
+                        let n = ((at / SECTOR_BYTES + 1) * SECTOR_BYTES - at).min(bytes.len());
+                        let after = bytes.split_off(n);
+                        let piece = Unsynced::Write {
+                            offset: at as u64,
+                            bytes,
+                        };
+                        if rng.next_u32() % 2 == 0 {
+                            survivors.push((i, piece));
+                        } else {
+                            rest.push((i, piece));
+                        }
+                        at += n;
+                        bytes = after;
+                    }
+                } else {
+                    let keep = (rng.next_u32() as usize) % (bytes.len() + 1);
+                    let unwritten = bytes.split_off(keep);
+                    if !unwritten.is_empty() {
+                        rest.push((
+                            i,
+                            Unsynced::Write {
+                                offset: offset + keep as u64,
+                                bytes: unwritten,
+                            },
+                        ));
+                    }
+                    survivors.push((i, Unsynced::Write { offset, bytes }));
+                }
             }
+            op => survivors.push((i, op)),
         }
     }
+    let mut kept = survivors;
     for i in (1..kept.len()).rev() {
         let j = (rng.next_u32() as usize) % (i + 1);
         kept.swap(i, j);
     }
     let mut out = images.durable.clone();
     for (_, op) in kept {
-        match op {
-            Unsynced::Write { offset, bytes } => {
-                let end = offset as usize + bytes.len();
-                if end > out.len() {
-                    out.resize(end, 0);
-                }
-                out[offset as usize..end].copy_from_slice(&bytes);
-            }
-            Unsynced::SetLen { len } => out.resize(len as usize, 0),
-        }
+        apply(&mut out, op);
     }
     rest.sort_by_key(|(i, _)| *i);
     (out, rest.into_iter().map(|(_, op)| op).collect())
+}
+
+fn apply(out: &mut Vec<u8>, op: Unsynced) {
+    match op {
+        Unsynced::Write { offset, bytes } => {
+            let end = offset as usize + bytes.len();
+            if end > out.len() {
+                out.resize(end, 0);
+            }
+            out[offset as usize..end].copy_from_slice(&bytes);
+        }
+        Unsynced::SetLen { len } => out.resize(len as usize, 0),
+    }
+}
+
+/// `unsynced` in issue order, each write split at sector boundaries by
+/// file offset, each length change one piece: what [`Tail::Sectors`]
+/// numbers.
+fn sector_pieces(unsynced: &[Unsynced]) -> Vec<Unsynced> {
+    let mut pieces = Vec::new();
+    for op in unsynced {
+        match op {
+            Unsynced::Write { offset, bytes } => {
+                let mut at = *offset as usize;
+                let mut rest = bytes.as_slice();
+                while !rest.is_empty() {
+                    let n = ((at / SECTOR_BYTES + 1) * SECTOR_BYTES - at).min(rest.len());
+                    pieces.push(Unsynced::Write {
+                        offset: at as u64,
+                        bytes: rest[..n].to_vec(),
+                    });
+                    rest = &rest[n..];
+                    at += n;
+                }
+            }
+            op @ Unsynced::SetLen { .. } => pieces.push(op.clone()),
+        }
+    }
+    pieces
 }
 
 fn name(path: &Path) -> String {

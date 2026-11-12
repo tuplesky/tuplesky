@@ -7,338 +7,16 @@
 //! and sync failures are scripted at every ordinal they can hit. The audit
 //! names the files the journal touches without the adapter.
 
+mod common;
+
 use std::collections::BTreeSet;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::Path;
 use std::sync::Arc;
 
-use coord_core::effect::{BarrierId, BootId, StoreUpdate};
-use coord_journal_api::engine::{JournalEngine, ReadBudget};
-use coord_journal_api::group::{GroupEntry, GroupLimits, GroupWrite};
-use coord_journal_api::record::{
-    GENESIS_PREDECESSOR, JOURNAL_RECORD_FORMAT_V1, JournalRecordV1, LifecycleRecordV1, RecordBody,
-    RecordDraft, RecordExpectation, RecordOrigin, TransitionContext,
-};
-use coord_journal_api::stream::{ShardId, StorageStreamId, StreamAllocator, StreamKey};
-use coord_journal_faultkit::{FaultFs, FaultPlan, Op, Shared, Tail};
-use coord_journal_raft_engine::{JournalIdentity, JournalOptions, RaftEngineJournal};
-use coord_store_api::registry::Collection;
-use coord_types::ids::{
-    Ballot, ClusterId, ConfigurationEpoch, DomainId, LocalJournalSeq, ReplicaId, ReplicaIncarnation,
-};
+use coord_journal_faultkit::{FaultFs, FaultPlan, Op, Tail};
+use coord_journal_raft_engine::{DirSync, JournalOptions};
 
-/// Groups the workload appends after creating the journal and its stream.
-const GROUPS: u8 = 6;
-
-// ---------------------------------------------------------------------------
-// Fixtures (as in coord-journal-raft-engine's own tests)
-// ---------------------------------------------------------------------------
-
-fn identity() -> JournalIdentity {
-    JournalIdentity {
-        cluster: ClusterId([1; 16]),
-        replica: ReplicaId([7; 16]),
-    }
-}
-
-fn options() -> JournalOptions {
-    JournalOptions {
-        target_file_size_bytes: 1024 * 1024,
-        purge_threshold_bytes: 8 * 1024 * 1024,
-        ..JournalOptions::default()
-    }
-}
-
-fn key() -> StreamKey {
-    StreamKey {
-        cluster: ClusterId([1; 16]),
-        domain: DomainId([1; 16]),
-        incarnation: ReplicaIncarnation::new(1).unwrap(),
-    }
-}
-
-fn origin(stream: StorageStreamId) -> RecordOrigin {
-    let k = key();
-    RecordOrigin {
-        cluster: k.cluster,
-        domain: k.domain,
-        replica: ReplicaId([7; 16]),
-        incarnation: k.incarnation,
-        stream,
-    }
-}
-
-fn barrier(n: u64) -> BarrierId {
-    BarrierId {
-        node_generation: ReplicaIncarnation::new(1).unwrap(),
-        boot_id: BootId([0xb0; 16]),
-        sequence: n,
-    }
-}
-
-fn transition(tag: u8, size: usize) -> RecordBody {
-    let epoch = ConfigurationEpoch::new(1).unwrap();
-    RecordBody::ProtocolTransition {
-        context: TransitionContext {
-            boot: BootId([0xb0; 16]),
-            configuration: epoch,
-            ballot: Ballot {
-                epoch,
-                number: 1,
-                leader: ReplicaId([7; 16]),
-            },
-        },
-        updates: vec![StoreUpdate {
-            collection: Collection::ProtocolV1.id(),
-            key: vec![tag],
-            value: Some(vec![tag; size]),
-        }],
-    }
-}
-
-/// The chain the workload appends: a genesis, then one record a group.
-fn records(stream: StorageStreamId) -> Vec<JournalRecordV1> {
-    let origin = origin(stream);
-    let genesis = JournalRecordV1::seal(RecordDraft {
-        origin,
-        seq: LocalJournalSeq::new(1).unwrap(),
-        predecessor: GENESIS_PREDECESSOR,
-        body: RecordBody::Lifecycle(LifecycleRecordV1::Genesis {
-            format: JOURNAL_RECORD_FORMAT_V1,
-        }),
-    })
-    .unwrap();
-    let mut out = vec![genesis];
-    for tag in 1..=GROUPS {
-        let prev = out.last().unwrap();
-        let next = JournalRecordV1::seal(RecordDraft {
-            origin,
-            seq: prev.seq().checked_next().unwrap(),
-            predecessor: prev.digest(),
-            // Sizes that straddle a sector, so torn writes land mid-record.
-            body: transition(tag, 300 + 97 * tag as usize),
-        })
-        .unwrap();
-        out.push(next);
-    }
-    out
-}
-
-fn group(n: u64, stream: StorageStreamId, records: Vec<JournalRecordV1>) -> GroupWrite {
-    let mut g = GroupWrite::new(GroupLimits::DEFAULT);
-    g.push(GroupEntry::new(barrier(n), stream, records).unwrap())
-        .unwrap();
-    g
-}
-
-fn read_all(journal: &impl JournalEngine, stream: StorageStreamId) -> Vec<JournalRecordV1> {
-    let mut out = Vec::new();
-    let mut after = LocalJournalSeq::ZERO;
-    loop {
-        let page = journal
-            .read_suffix(stream, after, ReadBudget::new(2, u32::MAX))
-            .unwrap();
-        if let Some(last) = page.records.last() {
-            after = last.seq();
-        }
-        out.extend(page.records);
-        if page.exhausted {
-            return out;
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// The workload and its check
-// ---------------------------------------------------------------------------
-
-/// What the workload saw acknowledged before the faults stopped it.
-#[derive(Debug, Default)]
-struct Acked {
-    created: bool,
-    stream: Option<StorageStreamId>,
-    /// Highest sequence an `append_group` returned `Ok` for.
-    through: Option<LocalJournalSeq>,
-    /// Highest sequence any `append_group` was called with.
-    attempted: Option<LocalJournalSeq>,
-    /// What every call returned, frozen or not (#210 review): the fields
-    /// above count only acknowledgements given before the crash, so a test
-    /// asking whether a fault was acknowledged reads these.
-    calls: Vec<Call>,
-}
-
-/// One call of the workload: the operations it issued and whether it
-/// returned `Ok`.
-#[derive(Debug)]
-struct Call {
-    what: &'static str,
-    /// The ordinals the call's operations took, `from..=to`; empty when it
-    /// issued none.
-    from: u64,
-    to: u64,
-    ok: bool,
-}
-
-impl Acked {
-    /// The call whose operations include ordinal `n`.
-    fn call_at(&self, n: u64) -> Option<&Call> {
-        self.calls.iter().find(|c| (c.from..=c.to).contains(&n))
-    }
-}
-
-/// Run `f`, catching a panic, and record what it returned.
-fn call<T, E>(
-    acked: &mut Acked,
-    shared: &Shared,
-    what: &'static str,
-    f: impl FnOnce() -> Result<T, E>,
-) -> Option<T> {
-    let from = shared.ops() + 1;
-    let result = catch_unwind(AssertUnwindSafe(f));
-    let ok = matches!(result, Ok(Ok(_)));
-    acked.calls.push(Call {
-        what,
-        from,
-        to: shared.ops(),
-        ok,
-    });
-    match result {
-        Ok(Ok(value)) => Some(value),
-        _ => None,
-    }
-}
-
-/// Create the journal over `fs`, persist one stream mapping, and append
-/// the genesis group and then one group a record, stopping at the first
-/// error or panic. Panics are caught: the pinned engine panics on a failed
-/// sync (`expect("pipe::sync()")`), and a frozen file system fails every
-/// sync after the crash.
-fn workload(root: &Path, fs: Arc<FaultFs>, shared: &Shared) -> Acked {
-    let mut acked = Acked::default();
-    let journal = call(&mut acked, shared, "create", || {
-        RaftEngineJournal::create_with_file_system(root, identity(), &options(), fs)
-    });
-    let Some(mut journal) = journal else {
-        return acked;
-    };
-    // An acknowledgement after the crash was never given: the process
-    // died before it.
-    if shared.is_frozen() {
-        quietly_drop(journal);
-        return acked;
-    }
-    acked.created = true;
-    let mut allocator = StreamAllocator::new();
-    let mapping = allocator.allocate(key(), ShardId::new(0).unwrap()).unwrap();
-    let persisted = call(&mut acked, shared, "mapping", || {
-        journal.persist_mapping(allocator.high_water(), &mapping)
-    });
-    if persisted.is_none() || shared.is_frozen() {
-        quietly_drop(journal);
-        return acked;
-    }
-    acked.stream = Some(mapping.stream);
-    let all = records(mapping.stream);
-    // The genesis and the first record together, then one record a group.
-    let mut batches = vec![all[..2].to_vec()];
-    batches.extend(all[2..].iter().map(|r| vec![r.clone()]));
-    for (i, batch) in batches.into_iter().enumerate() {
-        let last = batch.last().unwrap().seq();
-        acked.attempted = Some(last);
-        let g = group(i as u64 + 1, mapping.stream, batch);
-        match call(&mut acked, shared, "group", || journal.append_group(&g)) {
-            Some(_) if !shared.is_frozen() => acked.through = Some(last),
-            _ => break,
-        }
-    }
-    quietly_drop(journal);
-    acked
-}
-
-fn quietly_drop<T>(value: T) {
-    let _ = catch_unwind(AssertUnwindSafe(move || drop(value)));
-}
-
-/// Reopen over the files as they now are, with the real file system, and
-/// check what the journal holds against what was acknowledged.
-fn check(root: &Path, acked: &Acked, case: &str) {
-    let opened = RaftEngineJournal::open_existing(root, identity(), &options());
-    let journal = match opened {
-        Ok(journal) => journal,
-        Err(e) => {
-            // Only a journal whose creation was never acknowledged may be
-            // missing or unreadable.
-            assert!(!acked.created, "{case}: created journal refused: {e:?}");
-            return;
-        }
-    };
-    let Some(stream) = acked.stream else {
-        // The mapping was never acknowledged; whether it is there or not,
-        // no record was.
-        return;
-    };
-    let mappings = journal.mappings().unwrap();
-    let Some(_) = mappings.1.iter().find(|m| m.stream == stream) else {
-        panic!("{case}: acknowledged mapping lost");
-    };
-    let held = read_all(&journal, stream);
-    let mut expect = RecordExpectation::genesis(origin(stream));
-    for r in &held {
-        r.verify(&expect)
-            .unwrap_or_else(|e| panic!("{case}: chain broken at {:?}: {e:?}", r.seq()));
-        expect = expect.after(r).unwrap();
-    }
-    let head = held.last().map(|r| r.seq());
-    if let Some(through) = acked.through {
-        assert!(
-            head.is_some_and(|h| h >= through),
-            "{case}: acknowledged through {through:?}, reopened head {head:?}"
-        );
-    }
-    match acked.attempted {
-        Some(attempted) => assert!(
-            head.is_none_or(|h| h <= attempted),
-            "{case}: head {head:?} past anything attempted ({attempted:?})"
-        ),
-        None => assert!(head.is_none(), "{case}: records nobody appended"),
-    }
-}
-
-/// The ordinals and kinds of a fault-free run, to choose fault points from.
-fn census() -> Vec<Op> {
-    let dir = tempfile::tempdir().unwrap();
-    let (fs, shared) = FaultFs::new(FaultPlan::default());
-    let acked = workload(&dir.path().join("j"), fs, &shared);
-    assert_eq!(
-        acked.through,
-        Some(LocalJournalSeq::new(u64::from(GROUPS) + 1).unwrap())
-    );
-    shared
-        .log()
-        .into_iter()
-        .filter(|op| !matches!(op, Op::Rejected | Op::Failed))
-        .collect()
-}
-
-fn run(plan: FaultPlan, tail: Option<Tail>, case: &str) -> (Arc<Shared>, Acked) {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().join("j");
-    let (fs, shared) = FaultFs::new(plan);
-    let acked = workload(&root, fs, &shared);
-    if let Some(tail) = tail {
-        // A scripted crash halted the device before the journal's close
-        // could sync what the fault left behind.
-        if plan.crash_after.is_some() {
-            assert!(
-                shared.is_frozen(),
-                "{case}: the crash point was never reached"
-            );
-        }
-        shared.materialize(tail).unwrap();
-    }
-    check(&root, &acked, case);
-    (shared, acked)
-}
+use common::*;
 
 // ---------------------------------------------------------------------------
 // The matrix
@@ -359,12 +37,16 @@ fn the_census_counts_writes_and_syncs_of_the_log() {
 #[test]
 fn a_crash_at_every_operation_keeps_every_acknowledged_group() {
     let total = census().len() as u64;
+    // Sector tears: the remains a device that writes a sector whole or
+    // not at all can leave, which the tail guard must open with everything
+    // acknowledged. Byte tears are `recovery.rs`'s.
     let tails = [
         Tail::None,
         Tail::All,
-        Tail::Seeded(1),
-        Tail::Seeded(2),
-        Tail::Seeded(3),
+        Tail::SeededSectors(1),
+        Tail::SeededSectors(2),
+        Tail::SeededSectors(3),
+        Tail::SeededSectors(4),
     ];
     for k in 1..=total {
         for tail in tails {
@@ -381,6 +63,62 @@ fn a_crash_at_every_operation_keeps_every_acknowledged_group() {
     }
 }
 
+/// Every subset of the unsynced sectors ([`Tail::Sectors`]) at every
+/// crash point, over files small enough that the workload rotates: the
+/// guard opens each with every acknowledged group. One mask applies to
+/// every dirty file at once, so where two files are dirty the combinations
+/// across them are those of the same mask, and the seeded sector tears
+/// sample the rest (#211 re-review): within a file this is exhaustive,
+/// across files it is not.
+#[test]
+fn each_sector_subset_on_every_dirty_file_at_every_crash_point_keeps_every_group() {
+    let small = JournalOptions {
+        target_file_size_bytes: 1024,
+        ..options()
+    };
+    let total = {
+        let dir = tempfile::tempdir().unwrap();
+        let (fs, shared) = FaultFs::new(FaultPlan::default());
+        workload_with(&dir.path().join("j"), fs, &shared, &small);
+        shared
+            .log()
+            .iter()
+            .filter(|op| !matches!(op, Op::Rejected | Op::Failed))
+            .count() as u64
+    };
+    let (mut cases, mut widest) = (0u64, 0usize);
+    for k in 1..=total {
+        let plan = FaultPlan {
+            crash_after: Some(k),
+            ..FaultPlan::default()
+        };
+        let mut mask = 0u64;
+        loop {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("j");
+            let (fs, shared) = FaultFs::new(plan);
+            let acked = workload_with(&root, fs, &shared, &small);
+            assert!(shared.is_frozen(), "crash after {k}: never reached");
+            let pieces = shared.unsynced_pieces();
+            assert!(pieces <= 12, "crash after {k}: {pieces} pieces");
+            widest = widest.max(pieces);
+            shared.materialize(Tail::Sectors(mask)).unwrap();
+            check_with(
+                &root,
+                &acked,
+                &format!("crash after {k} of {total}, sectors {mask:#b} of {pieces}"),
+                &small,
+            );
+            cases += 1;
+            mask += 1;
+            if mask >= 1 << pieces {
+                break;
+            }
+        }
+    }
+    eprintln!("sector subsets: {cases} crash images over {total} crash points, widest {widest}");
+}
+
 #[test]
 fn a_failed_write_never_acknowledges_and_loses_nothing_acknowledged() {
     let ops = census();
@@ -391,7 +129,7 @@ fn a_failed_write_never_acknowledges_and_loses_nothing_acknowledged() {
         }
         let n = i as u64 + 1;
         for prefix in [0, 512, 4096] {
-            for tail in [None, Some(Tail::None), Some(Tail::Seeded(n))] {
+            for tail in [None, Some(Tail::None), Some(Tail::SeededSectors(n))] {
                 // With a crash tail, the crash lands at the fault itself,
                 // so no later sync (the close's among them) persists what
                 // the fault left unsynced.
@@ -467,7 +205,7 @@ fn a_failed_sync_never_acknowledges_and_loses_nothing_acknowledged() {
             continue;
         }
         let n = i as u64 + 1;
-        for persisted in [Tail::None, Tail::All, Tail::Seeded(n)] {
+        for persisted in [Tail::None, Tail::All, Tail::SeededSectors(n)] {
             for after in [Tail::None, Tail::All] {
                 let plan = FaultPlan {
                     fail_sync_at: Some(n),
@@ -520,7 +258,7 @@ fn a_lying_sync_is_caught_by_the_check() {
         }
         // The lie did buy an acknowledgement: the call that issued it
         // returned `Ok`, after the crash, so the check rightly counts it
-        // as never given. Only the close's sync belongs to no call.
+        // as never given. Only the close's syncs belong to no call.
         if let Some(c) = acked.call_at(n) {
             assert!(c.ok, "lie at {n}: the {} call didn't return Ok", c.what);
         }
@@ -545,7 +283,7 @@ fn a_lying_sync_is_caught_by_the_check() {
         if catch_unwind(AssertUnwindSafe(|| check(&root, &acked, "lie"))).is_err() {
             caught_later += 1;
         } else {
-            uncaught.push((n, acked.call_at(n).map(|c| c.what), acked.calls.len()));
+            uncaught.push((n, acked.call_at(n).map(|c| c.what)));
         }
     }
     // The lies that lose nothing, named: syncs no call issued (the close's,
@@ -553,12 +291,9 @@ fn a_lying_sync_is_caught_by_the_check() {
     // a close's sync would persist. Any other is a blind spot.
     let last_group = uncaught
         .iter()
-        .filter(|(_, what, _)| *what == Some("group"))
+        .filter(|(_, what)| *what == Some("group"))
         .count();
-    let close = uncaught
-        .iter()
-        .filter(|(_, what, _)| what.is_none())
-        .count();
+    let close = uncaught.iter().filter(|(_, what)| what.is_none()).count();
     assert!(
         last_group <= 1 && last_group + close == uncaught.len() && uncaught.len() <= 2,
         "uncaught lies other than the last group's and the close's: {uncaught:?}"
@@ -584,7 +319,6 @@ fn a_lying_sync_is_caught_by_the_check() {
 
 #[test]
 fn a_crash_image_is_the_synced_bytes_plus_the_chosen_tail() {
-    use coord_journal_raft_engine::DirSync;
     use raft_engine::env::{FileSystem, Handle};
     use std::io::Write;
 
@@ -613,12 +347,59 @@ fn a_crash_image_is_the_synced_bytes_plus_the_chosen_tail() {
     }
 }
 
+/// A sector tear keeps or loses whole sectors of a write, by file offset,
+/// and nothing finer: every sector a torn write covers holds all of its
+/// bytes or none of them.
+#[test]
+fn a_sector_tear_keeps_or_loses_whole_sectors() {
+    use raft_engine::env::{FileSystem, Handle};
+    use std::io::Write;
+
+    let payload: Vec<u8> = (0..3000u32).map(|i| (i % 251) as u8 | 1).collect();
+    let (mut torn, mut whole) = (0, 0);
+    for seed in 0..64 {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f");
+        let (fs, shared) = FaultFs::new(FaultPlan::default());
+        let handle = Arc::new(fs.create(&path).unwrap());
+        fs.sync_dir(dir.path()).unwrap();
+        let mut writer = fs.new_writer(handle.clone()).unwrap();
+        writer.write_all(&payload[..100]).unwrap();
+        handle.sync().unwrap();
+        writer.write_all(&payload[100..]).unwrap();
+        shared.materialize(Tail::SeededSectors(seed)).unwrap();
+        let image = std::fs::read(&path).unwrap();
+        assert_eq!(
+            image[..100],
+            payload[..100],
+            "seed {seed}: the synced write"
+        );
+        let mut kept = Vec::new();
+        for start in (0..payload.len()).step_by(512) {
+            let (from, to) = (start.max(100), (start + 512).min(payload.len()));
+            let got = image.get(from..to.min(image.len())).unwrap_or(&[]);
+            let all = got == &payload[from..to];
+            let none = got.iter().all(|&b| b == 0);
+            assert!(
+                all || none,
+                "seed {seed}: sector at {start} is part written"
+            );
+            kept.push(all);
+        }
+        if kept.iter().all(|&k| k) {
+            whole += 1;
+        } else if kept.iter().any(|&k| k) {
+            torn += 1;
+        }
+    }
+    assert!(torn > 0 && whole > 0, "torn {torn}, whole {whole}");
+}
+
 /// A failed sync that persisted everything leaves nothing pending, so no
 /// later crash image replays an older overlapping write over what it
 /// persisted (Codex review on #210).
 #[test]
 fn a_failed_sync_that_persisted_everything_leaves_nothing_pending() {
-    use coord_journal_raft_engine::DirSync;
     use raft_engine::env::{FileSystem, Handle};
     use std::io::{Seek, SeekFrom, Write};
 
@@ -652,7 +433,6 @@ fn a_failed_sync_that_persisted_everything_leaves_nothing_pending() {
 /// synced (#210 review).
 #[test]
 fn an_entry_no_directory_sync_covered_is_undone_at_a_crash() {
-    use coord_journal_raft_engine::DirSync;
     use raft_engine::env::{FileSystem, Handle};
     use std::io::Write;
 

@@ -32,10 +32,12 @@
 #![warn(missing_docs)]
 
 pub mod codec;
+pub mod guard;
 pub mod journal;
 pub mod metadata;
 
 pub use codec::{RecordCodec, RecordExt};
+pub use guard::{SECTOR_BYTES, TailGuard, TailRefused, tail_refusal};
 pub use journal::{
     DirSync, JournalIdentity, JournalOptions, OpenError, RaftEngineJournal, RecoveryPolicy,
     WriteStats,
