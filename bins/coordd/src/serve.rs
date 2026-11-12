@@ -1083,6 +1083,10 @@ pub struct Domain<P: Persistence> {
     /// What reads the leader read barrier did not serve came to, waiting
     /// for a turn that can send it (task-d50).
     read_orders: Vec<coord_collector::Action>,
+    /// Whether a connection opened or closed on either plane since the
+    /// loop last looked at its links, and when it last did (task-d115).
+    links_moved: bool,
+    links_checked: Option<std::time::Instant>,
     /// Dials out after the first ones, one task each (task-d03). A dial is
     /// mostly waiting -- an absent voter costs a whole handshake timeout
     /// -- so it runs beside the loop rather than inside it, and ends with
@@ -1369,8 +1373,8 @@ struct Pacing {
         u64,
         Option<std::time::Duration>,
     )>,
-    /// Passes the loop has started (task-d97).
-    passes: u64,
+    /// When the last sampled pass started (task-d97).
+    sampled_at: Option<std::time::Instant>,
     /// The run-queue time and the commands executed, read at the start
     /// of a sampled pass, until the next pass starts.
     sampled_from: Option<(std::time::Duration, u64)>,
@@ -1398,23 +1402,29 @@ impl Pacing {
     /// of the loop, and nowhere else. [`woke`] is also called after the
     /// event select, so a pass can call it more than once.
     ///
-    /// One pass in [`RUN_QUEUE_SAMPLE_EVERY`] has its run-queue time read
-    /// from here to the next pass's start (task-d97): its own
-    /// preemptions, and the wait to run once something woke it, which
-    /// the snapshot's run-queue total only gives as a sum.
+    /// The first pass to start [`RUN_QUEUE_SAMPLE_PERIOD`] or more after
+    /// the last sampled one has its run-queue time read from here to the
+    /// next pass's start (task-d97): its own preemptions, and the wait to
+    /// run once something woke it, which the snapshot's run-queue total
+    /// only gives as a sum.
     ///
     /// [`woke`]: Pacing::woke
-    /// [`RUN_QUEUE_SAMPLE_EVERY`]: coord_daemon::metrics::RUN_QUEUE_SAMPLE_EVERY
+    /// [`RUN_QUEUE_SAMPLE_PERIOD`]: coord_daemon::metrics::RUN_QUEUE_SAMPLE_PERIOD
     ///
     /// `executed` is the commands the loop has executed so far: a sample
     /// whose pass executed one also goes into the working passes'
-    /// distribution.
-    fn pass_started(&mut self, executed: u64) {
-        self.pass_started_with(executed, crate::cpu::this_thread_run_queue);
+    /// distribution. `now` is when the pass started.
+    fn pass_started(&mut self, executed: u64, now: std::time::Instant) {
+        self.pass_started_with(executed, now, crate::cpu::this_thread_run_queue);
     }
 
     /// [`Pacing::pass_started`], reading the run-queue time from `read`.
-    fn pass_started_with(&mut self, executed: u64, read: impl Fn() -> Option<std::time::Duration>) {
+    fn pass_started_with(
+        &mut self,
+        executed: u64,
+        now: std::time::Instant,
+        read: impl Fn() -> Option<std::time::Duration>,
+    ) {
         if let Some((from, executed_from)) = self.sampled_from.take()
             && let Some(now) = read()
         {
@@ -1424,11 +1434,10 @@ impl Pacing {
                 self.run_queue_per_working_pass.record(waited);
             }
         }
-        self.passes += 1;
-        if self
-            .passes
-            .is_multiple_of(coord_daemon::metrics::RUN_QUEUE_SAMPLE_EVERY)
-        {
+        if self.sampled_at.is_none_or(|at| {
+            now.saturating_duration_since(at) >= coord_daemon::metrics::RUN_QUEUE_SAMPLE_PERIOD
+        }) {
+            self.sampled_at = Some(now);
             self.sampled_from = read().map(|run_queue| (run_queue, executed));
         }
     }
@@ -1447,6 +1456,14 @@ impl Pacing {
 /// the first time -- its own proposal was not durable yet -- and nothing
 /// else is going to happen on an idle domain to prompt a second try.
 const PAYLOAD_RETRY: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// The longest the domain loop goes without looking at its links when
+/// nothing has said they moved (task-d115).
+///
+/// The loop looks when a connection opens or closes on either plane, when
+/// a dial ends and when a re-dial is due; this bounds a change that came
+/// some other way. A lost link waits a re-dial floor (250 ms) anyway.
+const REDIAL_CHECK_EVERY: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// How often a leader sends its voters, again, the proposals they have
 /// not voted on (task-d07). Longer than a round trip on any link this
@@ -1613,6 +1630,21 @@ const FLUSH_QUEUED: usize = 64;
 /// Events the loop takes before it flushes what they left owed, however
 /// many more are ready (task-d47).
 const FLUSH_EVENTS: u32 = 64;
+
+/// Whether the domain loop looks at its links this pass (task-d115):
+/// something said they moved -- a connection opened or closed, a dial
+/// ended -- or a re-dial is `due` by `now`, or the loop last looked
+/// [`REDIAL_CHECK_EVERY`] ago or more, or never has.
+fn redial_now(
+    moved: bool,
+    due: Option<std::time::Instant>,
+    checked: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> bool {
+    moved
+        || due.is_some_and(|at| at <= now)
+        || checked.is_none_or(|at| now.saturating_duration_since(at) >= REDIAL_CHECK_EVERY)
+}
 
 /// Whether the loop lowers before it takes another event: a full journal
 /// group's worth is queued, or a run of events left a flush owed.
@@ -1848,6 +1880,8 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             materialized: None,
             pipeline_waits: None,
             read_orders: Vec::new(),
+            links_moved: false,
+            links_checked: None,
         }
     }
 
@@ -2416,7 +2450,8 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 Backing::Voting(voter) => voter.node().executed,
                 _ => 0,
             };
-            self.pacing.pass_started(executed);
+            let started = std::time::Instant::now();
+            self.pacing.pass_started(executed, started);
             self.report_if_due();
             // The leaf this node presents first, every pass: a node whose
             // leaf has expired serves nothing more on it, however much
@@ -2501,7 +2536,9 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             self.reoffer(transport);
             // A link that went down is dialled again, and one that came
             // back lets what was waiting for it go (task-d03).
-            self.redial(transport);
+            if self.redial_due(started) {
+                self.redial(transport);
+            }
             // Two planes and one voter. The peer plane is polled first:
             // a vote, an adoption or a recovery summary from a peer is
             // the work that lets a caller's request finish, and a
@@ -2669,6 +2706,30 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         }
     }
 
+    /// Whether [`Domain::redial`] has anything to look at this pass
+    /// (task-d115): it used to run on every pass, and a busy leader's
+    /// loop takes some sixty a turn.
+    ///
+    /// Dials that have ended are taken here, on every pass, and not only
+    /// by the loop's select: that arm is polled after the voter's own work
+    /// and after both planes' sockets, so on a busy domain it may never be
+    /// reached, and a dial whose end is never taken leaves its voter in
+    /// flight -- never dialled again. One that ended is a change
+    /// ([`Domain::dialled`] marks it).
+    fn redial_due(&mut self, now: std::time::Instant) -> bool {
+        while let Some(done) = self.dials.try_join_next_with_id() {
+            self.dialled(done);
+        }
+        let due = [
+            self.plane.as_ref().and_then(|p| p.redial.next_deadline()),
+            self.links.redial.next_deadline(),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        redial_now(self.links_moved, due, self.links_checked, now)
+    }
+
     /// Keep both planes' links to the other voters up (task-d03).
     ///
     /// Looks at which voters a connection is holding, starts the dials the
@@ -2677,15 +2738,9 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     /// pass rather than at the backed-off time it had reached. Cheap when
     /// nothing is due: a look at a handful of links.
     fn redial(&mut self, api: &Transport) {
-        // Dials that have ended are taken here, on every pass, and not
-        // only by the loop's select: that arm is polled after the voter's
-        // own work and after both planes' sockets, so on a busy domain it
-        // may never be reached, and a dial whose end is never taken
-        // leaves its voter in flight -- never dialled again.
-        while let Some(done) = self.dials.try_join_next_with_id() {
-            self.dialled(done);
-        }
         let now = std::time::Instant::now();
+        self.links_moved = false;
+        self.links_checked = Some(now);
         let mut returned = Vec::new();
         if let Some(plane) = &mut self.plane {
             for i in 0..plane.peers.len() {
@@ -2809,6 +2864,9 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
 
     /// A dial started by [`Domain::redial`] has ended.
     fn dialled(&mut self, done: Result<(tokio::task::Id, Dialled), tokio::task::JoinError>) {
+        // A dial that ended, whichever path took it, is a change the next
+        // look at the links acts on (task-d115).
+        self.links_moved = true;
         let now = std::time::Instant::now();
         let (plane, index, reached, error) = match done {
             Ok((id, d)) => {
@@ -4679,6 +4737,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                     .await;
             }
             TransportEvent::Closed { connection, .. } => {
+                self.links_moved = true;
                 // Both sides of the same closing: the frontend forgets
                 // the binding and the watches, and every stream this
                 // connection held is released rather than dropped, so
@@ -4711,7 +4770,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             TransportEvent::PeerFrame { .. } => {
                 self.frontend.counts.unserved += 1;
             }
-            TransportEvent::Connected { .. } => {}
+            TransportEvent::Connected { .. } => self.links_moved = true,
         }
     }
 
@@ -4782,6 +4841,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             // before is forgotten -- a restart draws only new links -- and
             // it is told this voter's (task-d99).
             TransportEvent::Connected { identity, .. } => {
+                self.links_moved = true;
                 if let Some(plane) = &mut self.plane {
                     plane.report();
                 }
@@ -4798,6 +4858,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 }
             }
             TransportEvent::Closed { .. } => {
+                self.links_moved = true;
                 if let Some(plane) = &mut self.plane {
                     plane.report();
                 }
@@ -6284,25 +6345,50 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
         poll_api_first,
     };
 
-    /// One pass in sixteen is sampled, counted by the loop's passes
-    /// alone: the event paths' extra `woke` calls neither start nor end a
-    /// sample (task-d97, #191 review).
+    /// The first pass to start a period or more after the last sampled
+    /// one is sampled, and only passes start or end a sample: the event
+    /// paths' extra `woke` calls neither (task-d97, #191 review). By
+    /// time, not one pass in sixteen (task-d115).
     #[test]
-    fn the_run_queue_is_sampled_once_in_sixteen_passes() {
+    fn the_run_queue_is_sampled_once_a_period() {
+        let period = coord_daemon::metrics::RUN_QUEUE_SAMPLE_PERIOD;
+        let start = std::time::Instant::now();
         let mut pacing = super::Pacing::default();
-        for pass in 0..(2 * coord_daemon::metrics::RUN_QUEUE_SAMPLE_EVERY + 1) {
+        // A pass every tenth of a period, for two and a half periods.
+        for pass in 0..25u32 {
             pacing.woke();
-            // A command executed in every pass but the 16th.
-            let executed = pass.min(15) + pass.saturating_sub(16);
-            pacing.pass_started_with(executed, || Some(std::time::Duration::ZERO));
+            // A command executed in every pass but pass 10.
+            let executed = u64::from(pass - u32::from(pass > 10));
+            pacing.pass_started_with(executed, start + period * pass / 10, || {
+                Some(std::time::Duration::ZERO)
+            });
             pacing.woke();
             pacing.woke();
         }
-        // Passes 16 and 32 start a sample; passes 17 and 33 end them.
-        assert_eq!(pacing.run_queue_per_pass.count(), 2);
+        // Passes 0, 10 and 20 start a sample; 1, 11 and 21 end them.
+        assert_eq!(pacing.run_queue_per_pass.count(), 3);
         assert!(pacing.sampled_from.is_none());
-        // The 16th executed nothing, so only the 32nd's sample worked.
-        assert_eq!(pacing.run_queue_per_working_pass.count(), 1);
+        // Pass 10 executed nothing, so two samples worked.
+        assert_eq!(pacing.run_queue_per_working_pass.count(), 2);
+    }
+
+    /// The loop looks at its links when something said they moved, when a
+    /// re-dial is due, and otherwise once its bound has passed; not on
+    /// every pass (task-d115).
+    #[test]
+    fn the_links_are_looked_at_on_a_change_a_due_redial_or_the_bound() {
+        let at = std::time::Instant::now();
+        let bound = super::REDIAL_CHECK_EVERY;
+        let soon = at + bound / 2;
+        // Never looked: look.
+        assert!(super::redial_now(false, None, None, at));
+        // Looked just now, nothing moved or due: not this pass.
+        assert!(!super::redial_now(false, None, Some(at), soon));
+        assert!(!super::redial_now(false, Some(at + bound), Some(at), soon));
+        // A change, a re-dial due, or the bound passed: look.
+        assert!(super::redial_now(true, None, Some(at), soon));
+        assert!(super::redial_now(false, Some(soon), Some(at), soon));
+        assert!(super::redial_now(false, None, Some(at), at + bound));
     }
 
     /// A session this node has not projected yet is "not yet", not a
