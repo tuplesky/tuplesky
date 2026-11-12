@@ -1147,6 +1147,11 @@ pub struct Resends {
     /// First sends of re-proposals held back from a new leader's first
     /// batch; not re-sends.
     pub deferred: u64,
+    /// First sends of held-back re-proposals that went out as a voter's
+    /// adoptions arrived, not on the re-send timer (the takeover gap on
+    /// #98).
+    #[serde(default)]
+    pub topped_up: u64,
     /// Re-sends of a proposal already decided.
     pub decided: u64,
     /// Re-sends to a voter that had acknowledged the proposal on the
