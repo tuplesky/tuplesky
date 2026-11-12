@@ -2075,6 +2075,42 @@ What it has to answer before its code:
 
 **Its size, with this step:** the retry state falls to one put and `1/K` of a floor row a command. That was priced at about −0.06 to −0.08 ms an operation together, counting each row at a page, and doesn't hold at the bar either: the deletes it takes are the profile's 2.1 to 2.3%, rewritten on a page already copied. It composes with this step and doesn't replace it. It is task-d104's second part, sized from the first part's pair and its loop share on the CPU clock, before its code.
 
+**One version row a revision (task-d105).** A put writes three rows for its key: the current entry (`KvCurrentV1`), a history row (`KvHistoryV1`, keyed by namespace, key and revision, holding the entry) and an event row (`EventsV1`, keyed by revision and ordinal, holding kind, namespace, key, entry and the previous entry). The event row holds everything the history row holds. They differ in their keys and their retention:
+- reads at a past revision (`scan_history`) need the newest version of a key at or below a revision, in key order;
+- a watch's replay needs versions in revision order;
+- compaction keeps each key's newest version at or below the floor, and deletes whole revisions of events below it.
+
+**The layout: etcd's.** One row a mutated key a revision, keyed by revision: the event row, which keeps its key and its contents. The key order comes from an index held in memory, from each (namespace, key) to its retained (revision, ordinal)s, as etcd's `treeIndex` does (`server/storage/mvcc/index.go`).
+- **Reads.** A read at revision r finds a key's newest revision at or below r in the index, and reads that event row. A range read at r walks the index's key range.
+- **Building the index.** The index is built at boot from the retained event rows and kept up to date by the materializer as each revision lands.
+- **Compaction** keeps each key's newest version at or below the floor as its event row, even when the current row holds the same version: the index is built from event rows alone, and a later write replaces the current row while a read at the floor must still find the version (Codex review on #208). It deletes every other event below the floor. A watch from below the floor is refused as compacted, as today.
+
+**What it costs.**
+- **Memory.** The index holds about a key's bytes and 16 bytes a retained version, which task-d26's resource contract adds as a budget per domain.
+  - **The compaction floor bounds it only if compaction runs.** A domain that never compacts grows the index without bound (#208 review).
+  - **So the budget is counted in retained versions and key bytes,** which are functions of the replicated state, not of a process's memory. Every voter then reaches the limit at the same position.
+  - **The count is taken against the replicated floor, not the rows a voter holds** (Codex review on #208). A voter keeps rows below the floor for its own reasons: `effective_floor` lowers the floor to the oldest local hold (a pinned pagination view, a watch), and GC deletes in bounded steps, so rows wait for it. Those differ by voter. The charge is the versions at or above the replicated floor, plus each key's newest version below it, which is what every voter keeps once its GC is through. A write's admission then depends on the replicated state alone.
+  - **The rows held past that are bounded locally, apart from the budget.** Today a hold lasts until its guard drops (`RetentionHolds::hold`). The code step gives it a lifetime limit, and a hold past it is dropped, its view or watch ended with the compacted reason, as a watch from below the floor is refused today. GC's step budget is sized so a node keeps up with the compactions the budget admits. A voter whose local excess passes its own bound stops admitting new holds; it never refuses a write, since that would differ by voter. A node's index memory is then the budget plus that local bound.
+  - **At the limit, a write that would add a retained version is refused** with a resource-exhausted reason, as etcd refuses writes over its backend quota. Reads, deletes and compactions are still served. A compaction below the limit lifts the refusal.
+  - **The limit doesn't force a compaction.** The floor is a replicated retention watermark (Section 17.5), so a voter that moved it on its own would leave the other voters' state. A compaction the domain orders lifts the refusal.
+- **Boot and failover.** The rebuild reads every retained event once, before the projection serves reads. That adds to a restart's time in proportion to retained history.
+  - **Its bound:** the rebuild's time at the largest retained history the budget above admits stays under the election's patience (how long voters wait on a silent leader before campaigning). So a restarted voter isn't still rebuilding when the domain needs it to lead.
+  - **A voter votes before its index is built.** Its votes rest on its journal and protocol rows (Section 4.8), which boot restores before the index, and no vote reads the KV state. What waits for the index is what reads the KV state: executions, and so releases, and reads. A voter elected leader before its index is built orders and proposes, and executes once the index is in.
+- **The format is a change to the replicated state, not only to the checkpoint** (#208 review). `KvHistoryV1` leaves the common hash and `SharedCheckpointV1`, and the events' retention changes. Two builds on different layouts reach different common states, and their floor roots (task-d27) disagree at the first boundary. Unlike task-d104's rule, the layout changes rows already written, so it can't switch at a position.
+  - **A domain runs one layout.** The store records its layout at initialization, and every open compares it.
+  - **A live store or an image of the other layout is refused, with the reason,** as Section 17.7 has an unsupported format fail before admission. `meta_fields::FORMAT_VERSION` is read by no open today, so the code step builds that check.
+  - **The checkpoint format's version is raised,** and the scrub reads the new layout (task-d37).
+  - **This is accepted because nothing is deployed in production yet.**
+  - A local image's index is rebuilt at install as at boot.
+
+**What it moves.** One row a mutated key a revision at every voter: about −0.03 to −0.04 ms an operation at the register row, and more for a transaction over several keys. History rows were also the larger part of compaction's deletes, which now fall to one deletion a revision below the floor.
+
+**The current row, once the index exists: it goes** (#208 review). The index gives each key's newest retained revision, so the latest version of a key is one index lookup and one read of its event row. That is how etcd serves it, and etcd keeps no current row. The two sides:
+- **What the current row costs:** one more row a mutated key at every voter, about −0.03 to −0.04 ms an operation. The row count against the parity budget (task-d103's step) needs it gone.
+- **What it buys:** a range read at the latest revision as one ordered scan of `KvCurrentV1`. Without it, that read walks the index's key range and does one point read of an event row a key, and the event rows sit in revision order, not key order. A Kubernetes list is that read.
+- **What doesn't need it:** a point read at the latest revision, and a transaction's guard on a key's modification revision, which the index answers without a read.
+- **The choice:** it goes, as task-d105's second part, after the first part's pair. `KvCurrentV1` is in the common hash and the shared checkpoint too, so it goes in the same layout change and doesn't need a second one. The pair reads a range at the latest revision at 10³ and 10⁴ keys on both layouts. If the list read's loss is larger than the row's saving at the bars' workload, the row stays, and the reading says why.
+
 <a id="s17-5"></a>
 ### 17.5 MVCC and physical maintenance
 
