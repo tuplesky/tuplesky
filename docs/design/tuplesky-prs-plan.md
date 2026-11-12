@@ -68,6 +68,7 @@ Reference single-store and fixed-membership compositions are early increments, n
 | task-d110 | From an audit of the walks a turn makes over history (#98): a voter behind holds more committed and unexecuted commands than the history sweep's threshold, which the table never forgets, so every execution swept the whole ledger and the maps beside it, and catching up was quadratic in the backlog | Liveness; before the next fault run |
 | task-d112 | From Codex's review on #98 (`election.rs`, confirmed by the testing session, [6788929248](https://github.com/tuplesky/tuplesky/pull/98#issuecomment-6788929248)): a leaderless voter that could not reach a majority, or whose own campaign was still finishing, kept a campaign instant already past as its loop's deadline, so the loop woke at once on every pass for as long as the hold lasted | Before the next fault run's CPU readings |
 | task-d113 | From the materializer's profile on #185 ([6810986014](https://github.com/tuplesky/tuplesky/pull/185#issuecomment-6810986014)): a follower writes about 2.3 KB of rows a command and 38 KB to the file, 9.4 fresh pages (11.3 at the leader), because the payload, dependency and executed rows are keyed by the command's digest and each lands on a leaf no other command in the commit touches | A design step now, then the top code priority in two steps: the dependency rows first, then the payload and executed rows. It needs neither task-d86 nor task-d105 first (the lead's order, on review's word on #233) |
+| task-d114 | From #245's merge (the lead and review, on #245 and #185 [6829224686](https://github.com/tuplesky/tuplesky/pull/185#issuecomment-6829224686)): the key index grows with every put until something compacts, and nothing in `coordd` does | A design step, then the GC driver: after #244, and before the key index's bound is counted on |
 | task-q01 | Combined durable WAN/Kine qualification | Required before task-66 |
 
 ```mermaid
@@ -298,6 +299,7 @@ This is a workstream overview; the individual prerequisites are authoritative. O
 | [task-d110](#task-d110) | Sweep the history at a pace set by what the last sweep kept, not once per execution | task-d05 |
 | [task-d112](#task-d112) | Give the loop no election deadline while a due campaign is held back | task-d01, task-d10 |
 | [task-d113](#task-d113) | Key the payload, dependency and executed rows by order | task-d08, task-d23, task-d27, task-d72, task-d77 |
+| [task-d114](#task-d114) | Collect the key index's old versions in `coordd` | task-14, task-d113 |
 | [task-q01](#task-q01) | Produce the combined durable WAN/Kine qualification report | task-j07, task-j08, task-o06, task-m05, task-63, task-64, task-d45, task-d46, task-d47, task-d48, task-d49, task-d51, task-d52, task-d53 |
 
 ## Task specifications
@@ -1984,6 +1986,8 @@ The metrics line now carries the table (`table`): its records against its bound,
 - **The process steps up once publications start, and does not slope (#174 review).** The leader's process goes from 1.345 ms a command in the first window to 1.45 to 1.48 in every later full window but the publication's (1.892), and a follower's from 1.151 to 1.27 to 1.31. So the 10 to 14% is the publications starting, the first near the end of the first window, not history slowing the path, which is task-d46's question answered for this run. Each publication's export and write rise roughly in proportion to the journal position it represents: 1.0 to 1.3 s and 0.2 to 0.3 s at 73,000 records, 9.3 to 11.0 s and 6.5 to 8.0 s at 790,000, about 16 to 26 µs a record. The rate held: 24,800 commands in the first window and 24,000 in the last full one.
 - **So the batch's lever is the publication's own cost (task-d92), not this trim.** Trimming stays off by default until task-d32 is in, and task-d32 needs task-d41's chain, so the trim cannot be in the batch. It stays the long-run bound: its first reading, when it is built, is the rows the publication exports by kind at two positions, to show how much of an image is rows it reclaims (the payload, executed, dependency and proposal rows) rather than the application's keys.
 
+**The intake index's executed part grows until this trim (#243 review, [6825093758](https://github.com/tuplesky/tuplesky/pull/243#issuecomment-6825093758)).** task-d113 step 2 keeps one entry a command executed (command to position) and nothing removes it before a floor forgets a prefix. Review measured 27.1 bytes an entry with a counting allocator over 10⁵ and 10⁶ entries, so about 27 MB a million commands at each voter. The metrics line reports it as `executed_bytes` at 28 bytes an entry (`EXECUTED_ENTRY_BYTES`). The trim drops the entries below the floor with the rows.
+
 <a id="task-d28"></a>
 ### task-d28: Let a recovery report survive a lost page
 
@@ -3501,7 +3505,7 @@ The change, in two steps:
     - **On the EPYC 9V74** (#185's conversion): about −0.052 ms an operation at 30 callers and −0.018 at 120, against the −0.055 to −0.10 and −0.03 to −0.06 sized. The shortfall is the leader.
     - **A wider hold** (64 records, 10 ms; two runs a side) took followers to 99.7 and 100.6 µs a command (24 and 32 commands a commit). It isn't the default, because at 120 callers neither `ok`/s nor p99 was better in two runs. The runner's pair can read it by configuration.
     - **Review's pairs (#234):** −4.9% and −6.4% of the servers at 30 callers on the bar's mix, from 4 commands a commit; nothing measurable at 120, or with writes only, from 7 or more. The gain follows the commit size it starts from, as #233's model does (77.6 µs a command at 3 a commit, 67.4 at 8, 61.2 at 30). No get waited longer, and #229's acceptance held with the hold on.
-    - **The default stays 32 records and 5 ms.** Under load the count lends, and the time is rarely reached; a wider hold starts from commits already large. Look again after task-d113: by order a commit's own cost is a larger share of a command (#233's model: 51.9 µs at 3 a commit, 35.5 at 8, 29.8 at 30), so the hold and its width are worth more then.
+    - **The default stays 32 records and 5 ms.** Under load the count lends, and the time is rarely reached; a wider hold starts from commits already large. Look again after task-d113: by order a commit's own cost is a larger share of a command (#233's model: 51.9 µs at 3 a commit, 35.5 at 8, 29.8 at 30), so the hold and its width are worth more then. Review's reading on #238 checked the width again with the hold's ends counted: 64 records and 10 ms saved nothing, and cost 5 to 11% of completions.
   - **What each ask is pinned by (#234 review's controls, closed in the follow-up):** each call site has a test that fails with it taken out.
     - **A read held at the barrier** (`pump_reads`): `a_read_held_at_the_barrier_asks_for_the_held_commit` (`coord-daemon` `reads.rs`).
     - **A release published again:** `a_release_waiting_to_be_published_again_asks_for_the_held_commit` (`repair.rs`).
@@ -3510,8 +3514,10 @@ The change, in two steps:
     - **The loop's deadline and the due turn,** which make the 5 ms a bound: `the_loop_wakes_when_a_held_commit_is_due_and_its_turn_lends_it` (`serve.rs`).
     - **The stamp as records arrive:** the one in `complete_group` is what counts a record journaled behind a lent commit from its arrival, with no hand-off between (`records_journaled_behind_a_lent_commit_are_stamped_without_a_hand_off`). The other two are followed by a commit or a hand-off that stamps anyway.
     - **A commit on the caller's thread restarts the hold:** a checkpoint published synchronously commits what was pending, and the hold's start and any ask its records spent are cleared with it. Before, the next record counted its wait from records already committed and went out at once (`a_synchronous_commit_restarts_the_hold`).
+    - **A lent commit given back keeps its wait and its ask (#238 review):** a lend took the hold's start and a spent ask before the outcome was known, so a commit that came back not committed went out again with neither: its records lost their wait, and a read's ask was gone until the next one. The lend now keeps both aside and the give-back restores them (the earlier start, and the ask unless a newer one stands); a commit that lands spends them (`a_lent_commit_given_back_leaves_its_wait_and_ask_standing`). An ask made while its records' group is out stands at the seal (`an_ask_stands_while_its_records_group_is_out`).
   - **Crash tests "at every cut":** one test is at one cut (`records_held_at_a_crash_are_replayed_from_the_journal`). The crash matrix (task-j05) materializes on its caller's thread, where nothing is held, but a held record is a journaled record not yet materialized, and the matrix already crashes on those at every cut. So the acceptance's crash tests are covered in kind.
   - **What ends the hold, counted (the lead on #185, after C4's runner pair, where the leader committed 2.3 times as often as a follower).** Each commit lent while a hold applies is counted once on the metrics line (`cost.hold_ends`): its records reached the count (`full`), its wait ran out (`deadline`), or an ask cut it short, by who asked: a read due and not yet answerable (`read`), a half-established entry's look for its record (`settle`), any other ask (`other`: a release published again, a group's effects beyond its results, a watch's events, a drain, a checkpoint). The count and the wait come first, so an ask is counted only where the hold would otherwise have gone on (`each_commit_lent_is_counted_by_what_ended_its_hold`).
+    - **Read on #238 (review's pairs):** on the leader the reads end the holds, 98% of its lent commits at 30 callers and 75% at 120. That is why the leader's commits stay short, at a cost of about 20 µs a command. Holding the leader is the item under "Left for later" below, not a wider hold.
   - **What a read needs: the commit, not only its barrier's position.** A read is due once its index has executed in memory, and is evaluated against a snapshot of the projection (`pump_reads` pins one, `evaluate` reads the keys from it). The snapshot shows only what a commit has applied to the engine, and the gate hands out none ahead of the completed frontier. So a due read waits for a commit that carries its position, not for durability: under `replay` a working commit is enough. Its barrier position alone says nothing about the keys it reads. Answering it before the commit is the planning-view item below.
   - **Left for later (#234 review):**
     - **The ask is store-wide.** `request_projection_commit` marks every domain of the store; with one domain a process that is the same thing. Under multi-domain hosting one tenant's read would lend every tenant's commit, so the ask should take the domain its caller has in hand.
@@ -4338,6 +4344,12 @@ This entry is task-d72's largest single cut on the materializer, owned here. The
        - **Servers' ms an operation:** 1.336 → 1.234 at 30 and 1.159 → 1.106 at 120.
        - **Completed a second:** +7.7% and +4.9%.
        - **The index at the run's end:** the intake part empty at every voter, against one entry a command at a follower and two at the leader on the base. The executed part holds one entry a command.
+     - **After review (#243, [6825093758](https://github.com/tuplesky/tuplesky/pull/243#issuecomment-6825093758); a PR of its own on the carry `58b2ee79`):**
+       - **A store of another layout is refused with its format first.** When the manifest's collection list differs from this build's, the open reads the recorded format through redb's read-only open, which writes nothing, and refuses with `OpenError::Format`, naming that format and this build's. Staging refuses the same way. The mismatch stays `Corrupt` only when the recorded format is this build's or can't be read. The test (`coord-storage-redb/tests/adapter.rs`) builds a format-2 and a format-1 store and checks that each file is left byte for byte.
+       - **The images' versions are raised.** The shared and local checkpoints go to format 2, since `execution_v1` and `payload_v1` are keyed by position. An image of the old layout (`shared_checkpoint_format1.json`) is refused as `UnsupportedFormat { found: 1 }`. task-d105 raises the shared image to 2 too; whichever lands second keeps 2.
+       - **A pointer to an old image still decodes (#247, Codex).** The journal's `PublishLocalCheckpoint` record kept its layout, so every format a pointer has named (`OLDEST_POINTER_FORMAT` = 1 through the current) decodes, and a journal retaining one published before the raise opens rather than reading as corrupt. The newest pointer stays the baseline whatever its format: an older pointer, or none, would not be continued by the retained suffix. Its image is refused where it is loaded, so a node upgraded over a format-1 image stops at boot with the reason "the selected pointer names a checkpoint format this build does not read", as for any image it can't read, not as a corrupt journal (`a_journal_retaining_a_pointer_of_an_older_image_format_opens`, `a_pointer_naming_an_older_image_format_is_refused_at_load`).
+       - **Rule (b) is held by the follower and checked by the simulator.** `next_executable` holds back a command whose payload batch failed until the row is written again, which `carry_stale` does at the next event that isn't a failure. The simulator's oracle fails a node that executes a command whose payload it holds with no payload row durable or in a submitted batch. With the hold taken out, `a_decided_command_whose_payload_batch_failed_executes_only_over_its_row_written_again` (`coord-consensus/tests/follower.rs`) fails. No simulator row reaches that case yet: with the hold taken out, every row still passes, so the oracle guards the rule but the follower test is what shows the hold.
+       - **Still open, with task-d103 (#206): the proposal row at a Sync's release.** `on_sync` deletes a released command's dependency and payload rows, not the leader's proposal row, and a released command never executes, so the move never deletes it either. That is one row and one index entry a released command at a voter that led: it grows with leader changes, not with load. task-d103 stops writing the row.
 
 What the two steps build together:
 - **Rows by order.**
@@ -4392,6 +4404,39 @@ What the two steps build together:
 - **The index's memory and open time** are read at 10⁵ and 10⁶ live rows and retained executions.
 
 **Review boundary:** Where the projection keeps the payload, dependency and executed rows, and how their readers find them. No change to the journal's records, the protocol, what a vote rests on or what is released. The shared image's format changes under a raised version, and a domain runs one layout.
+
+<a id="task-d114"></a>
+### task-d114: Collect the key index's old versions in `coordd`
+
+**Prerequisites:** task-14, task-d113.  
+**Design:** Sections 6.4 and 17.5 (bounded compaction), with task-d105's key index.
+
+From #245's merge (the lead and review, on #245 and #185 [6829224686](https://github.com/tuplesky/tuplesky/pull/185#issuecomment-6829224686)). The key index is now a debt on the carry.
+
+**The debt.**
+- **Memory:** the index holds every retained event row's version. Review measured 210 bytes for a new 24-byte key with one version, and 17 to 21 bytes for each further version (#245). It grows with every put until something compacts.
+- **Nothing in `coordd` compacts:** `plan_gc` (task-14) is called only by the store bench.
+- **A view pinned below the index's floor** builds an index of its own from the event rows, scanning every one on each call: about 3 s a million rows.
+- **At boot** the index costs 2.6 µs a retained version, and the event rows are part of the file redb checks at open (#185 [6829224686](https://github.com/tuplesky/tuplesky/pull/185#issuecomment-6829224686)).
+
+**The step.** A GC driver in the domain loop:
+- **At most one bounded `plan_gc` batch a turn** (`GcBudget`), under the effective floor: the replicated `RETENTION_FLOOR` lowered by the `RetentionHolds` of pinned views and watches.
+- **Committed through the projection's materializer,** so the batch's removals reach the published index with it, as a commit's changes do (#244's overlay serves the reads).
+
+**Review's two asks.**
+1. **The index answers down to what GC has in fact removed,** not down to the replicated floor. A read below the floor but above the last completed pass is served from the index, not from a scan.
+2. **A read doesn't hold the index's read lock across its row fetches.** It takes the versions it needs, drops the lock, then fetches the event rows, so GC's write lock never waits on a read's I/O.
+
+**What it depends on.**
+- **#245 (merged) and #244:** the materializer's lowering through `Lowered`, which the GC batch goes through.
+- **How the batch is recorded:** local maintenance isn't in the journal today (`TransitionKind` is `Protocol` or `Application`). The batch either gets a journal record kind of its own, or is a projection-only commit that a replay need not repeat: its deletions are all below the floor, where a replay never writes. The design step picks one, with the crash cut between the batch and the index's publication.
+- **Not task-d27:** semantic forgetting is a different floor with different rules.
+
+**Acceptance.**
+- **Bounded growth:** under a steady put load with the floor moving, the index's bytes and the event rows stay bounded (the bench's trial, with the driver).
+- **Reads stay right:** a read at every retained revision answers as the model does with GC running (`kv_index.rs`'s history test, with the driver).
+- **Hot keys:** the hot-key case (one key, 1,000,000 versions) holds the index's lock within the bound of #245's one-pass removal.
+- **Boot:** the key index's phase scales with the retained versions, not with history.
 
 ## Gate checklist and deferred work
 

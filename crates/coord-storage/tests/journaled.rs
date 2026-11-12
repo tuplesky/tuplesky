@@ -825,10 +825,45 @@ fn replay_restores_the_exact_state_results_and_events_from_the_records_alone() {
     );
 }
 
+/// The journaled store's open builds the key index it publishes (task-d105;
+/// #245 review): a restarted voter reads past revisions through it, and
+/// without the build it would find no key there. Event rows materialized
+/// before the restart, and those of records replayed at the attach when
+/// the projection was left behind, are in the index after it, as the
+/// projection holds them.
+#[test]
+fn the_journaled_stores_open_builds_the_key_index_from_the_projection() {
+    for materialize_inline in [true, false] {
+        let next = workload_store(materialize_inline);
+        let view = next.reader(A).unwrap().snapshot().unwrap();
+        let live = view
+            .with_kv_index(coord_storage::kv_index::KvIndex::clone)
+            .unwrap();
+        assert_eq!(
+            live.versions(),
+            4,
+            "inline {materialize_inline}: the four event rows of the workload"
+        );
+        assert_eq!(
+            live,
+            coord_storage::kv_index::KvIndex::build(view.view()).unwrap(),
+            "inline {materialize_inline}"
+        );
+    }
+}
+
 /// Journal a fixed workload of protocol transitions and application
 /// outcomes. When `materialize_inline` is false the projection is left
 /// behind and the pipeline is reopened, which replays `(M, J]`.
 fn run_workload(materialize_inline: bool) -> Vec<(u16, Vec<u8>, Vec<u8>)> {
+    workload_store(materialize_inline)
+        .projection(A)
+        .unwrap()
+        .durable_rows()
+}
+
+/// [`run_workload`]'s store, reopened and attached after the boot ends.
+fn workload_store(materialize_inline: bool) -> JournaledStore<ModelJournal, ModelEngine> {
     let mut world = World::new();
     let events = coord_store_api::registry::Collection::EventsV1.id();
     for step in 1..=4u64 {
@@ -913,7 +948,7 @@ fn run_workload(materialize_inline: bool) -> Vec<(u16, Vec<u8>, Vec<u8>)> {
     let recovered = next.frontiers(A).unwrap();
     assert_eq!(recovered.materialized(), recovered.durable());
     assert_eq!(next.status(A), Some(DomainStatus::Ready));
-    next.projection(A).unwrap().durable_rows()
+    next
 }
 
 #[test]
@@ -962,7 +997,7 @@ fn end_a_boot_with_a_baseline() -> (
     let pointer = CheckpointPointerV1 {
         origin: world.store.origin(A).unwrap(),
         represented,
-        format: 1,
+        format: coord_journal_api::frontier::LOCAL_CHECKPOINT_FORMAT_V1,
         manifest_digest: Digest32([0x5a; 32]),
         checkpoint_id: Digest32([0x5b; 32]),
     };
@@ -1869,4 +1904,86 @@ fn an_uncertain_entry_of_several_records_reconciles_all_or_none() {
             seq(if applied { 5 } else { 2 })
         );
     }
+}
+
+/// The event row of a put of `key-<step>` at revision `step` (task-d105).
+fn event_row(step: u64) -> StoreUpdate {
+    let at = KvRevision::new(step).unwrap();
+    StoreUpdate {
+        collection: coord_store_api::registry::Collection::EventsV1.id(),
+        key: coord_storage::codecs::event_key(at, 0),
+        value: Some(
+            coord_storage::codecs::encode_event(&coord_storage::codecs::EventRecordV1 {
+                kind: coord_state::KvEventKind::Put,
+                namespace: NamespaceId([0; 16]),
+                key: format!("key-{step}").into_bytes(),
+                entry: Some(coord_state::KvEntry {
+                    value: b"value".to_vec(),
+                    create_revision: at,
+                    mod_revision: at,
+                    version: 1,
+                    lease: None,
+                    lease_generation: None,
+                }),
+                prev: None,
+            })
+            .unwrap(),
+        ),
+    }
+}
+
+/// The commits the journaled store's materializer makes keep the key
+/// index it publishes (task-d105) as the projection has it (#244 review):
+/// each event row lowered is observed, a deleted one through the rows of
+/// its own commit. Steps 2 and 3 go in one commit, and step 3 deletes
+/// step 2's event row, which only that commit holds, and step 1's, which
+/// the store holds. Not observed, the published index stays as the open
+/// built it, without any of them.
+#[test]
+fn the_materializers_commits_keep_the_published_key_index_as_the_projection_has_it() {
+    let mut world = World::new();
+    let events = coord_store_api::registry::Collection::EventsV1.id();
+    let step = |world: &mut World, step: u64, mut updates: Vec<StoreUpdate>| {
+        world.protocol(A, ballot(step), promise(step));
+        updates.extend([
+            StoreUpdate {
+                collection: coord_store_api::registry::Collection::PayloadV1.id(),
+                key: command(step as u8).as_bytes().to_vec(),
+                value: Some(vec![step as u8; 16]),
+            },
+            coord_storage::retry::executed_update(
+                &command(step as u8),
+                position(step),
+                None,
+                coord_types::identity::Digest32([step as u8; 32]),
+            )
+            .unwrap(),
+        ]);
+        world.application(A, step, position(step), updates);
+    };
+    let published = |world: &World| {
+        let view = world.store.reader(A).unwrap().snapshot().unwrap();
+        let live = view
+            .with_kv_index(coord_storage::kv_index::KvIndex::clone)
+            .unwrap();
+        let rebuilt = coord_storage::kv_index::KvIndex::build(view.view()).unwrap();
+        (live, rebuilt)
+    };
+    step(&mut world, 1, vec![event_row(1)]);
+    world.store.flush().unwrap();
+    let (live, rebuilt) = published(&world);
+    assert_eq!(live.versions(), 1, "step 1's event row is in the index");
+    assert_eq!(live, rebuilt);
+
+    step(&mut world, 2, vec![event_row(2)]);
+    let delete = |revision: u64| StoreUpdate {
+        collection: events,
+        key: coord_storage::codecs::event_key(KvRevision::new(revision).unwrap(), 0),
+        value: None,
+    };
+    step(&mut world, 3, vec![event_row(3), delete(2), delete(1)]);
+    world.store.flush().unwrap();
+    let (live, rebuilt) = published(&world);
+    assert_eq!(live.versions(), 1, "only step 3's event row is left");
+    assert_eq!(live, rebuilt);
 }

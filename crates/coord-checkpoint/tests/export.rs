@@ -701,11 +701,13 @@ fn chunks_are_bounded_verified_and_every_tampering_is_caught() {
         Err(VerifyError::RootMismatch)
     );
     let mut format = cp.manifest.clone();
-    format.format = 1;
+    format.format = SHARED_CHECKPOINT_FORMAT_V1 + 1;
     format.root = format.compute_root();
     assert_eq!(
         verify_shared(&format, &encoded),
-        Err(VerifyError::UnsupportedFormat { found: 1 })
+        Err(VerifyError::UnsupportedFormat {
+            found: SHARED_CHECKPOINT_FORMAT_V1 + 1
+        })
     );
     let mut counts = cp.manifest.clone();
     counts.collections[6].rows += 1;
@@ -1050,6 +1052,34 @@ fn shared_checkpoint_fixture_is_frozen() {
     );
 }
 
+/// An image of the layout before task-d113's step 2 is refused (#243
+/// review): the image #240's build exported from the same model, frozen as
+/// it was, carries format 1, and a build of format 2 verifies none of it.
+/// Its rows are by command where this layout's are by position, so it is
+/// refused, not read.
+#[test]
+fn an_image_of_the_layout_before_rows_by_position_is_refused() {
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/shared_checkpoint_format1.json");
+    let old: CheckpointFixture =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(old.format, 1);
+    assert_eq!(SHARED_CHECKPOINT_FORMAT_V1, 2);
+    let bytes: Vec<u8> = (0..old.manifest_hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&old.manifest_hex[i..i + 2], 16).unwrap())
+        .collect();
+    let manifest = SharedManifestV1::decode(&bytes).unwrap();
+    assert_eq!(manifest.format, 1);
+    assert!(matches!(
+        verify_shared(&manifest, &[]),
+        Err(VerifyError::UnsupportedFormat { found: 1 })
+    ));
+    // The model's image today differs from it in its root: the layout moved.
+    let cp = export(&model(Profile::default()), &ExportLimits::default());
+    assert_ne!(hex(&cp.manifest.root.0), old.root_hex);
+}
+
 /// What an inline export costs as common state grows: the floor runs
 /// [`export_shared`] and [`SharedImageStore::keep`] on the serving loop,
 /// so their time is time the domain does not serve. Run by hand:
@@ -1124,4 +1154,96 @@ fn measure_the_inline_boundary() {
             (exported + kept).as_secs_f64() * 1000.0 / mib as f64,
         );
     }
+}
+
+/// Below the retention floor the export carries each key's newest put at
+/// or below it, and nothing else (task-d105; #245 review: the fixture's
+/// key sits at the floor, so it could not tell). With the floor at 3, key
+/// `a`'s put at 2 is below it and the newest, so it goes; its put at 1
+/// does not. Key `c`, put at 1 and deleted at 2, carries nothing: its
+/// newest version below the floor is a delete. The export equals one of a
+/// store that holds only what goes, and differs from one without `a`'s
+/// put at 2.
+#[test]
+fn below_the_floor_the_export_carries_each_keys_newest_put_and_nothing_else() {
+    let at_floor_3 = |engine: &mut ModelEngine, extra: &[(Vec<u8>, Option<Vec<u8>>)]| {
+        let mut tx = engine.begin_write().unwrap();
+        tx.put(
+            Collection::MetaV1.id(),
+            meta_fields::RETENTION_FLOOR,
+            &codecs::encode_counter(3).unwrap(),
+        )
+        .unwrap();
+        for (key, value) in extra {
+            match value {
+                Some(v) => tx.put(Collection::EventsV1.id(), key, v).unwrap(),
+                None => tx.delete(Collection::EventsV1.id(), key).unwrap(),
+            }
+        }
+        tx.commit_durable().unwrap();
+    };
+    let c_event = |kind: KvEventKind, entry: Option<KvEntry>, prev: Option<KvEntry>| {
+        codecs::encode_event(&EventRecordV1 {
+            kind,
+            namespace: NS,
+            key: b"c".to_vec(),
+            entry,
+            prev,
+        })
+        .unwrap()
+    };
+    // Every row: a@1, a@2, b@3, and c put at 1 and deleted at 2.
+    let mut full = model(Profile::default());
+    at_floor_3(
+        &mut full,
+        &[
+            (
+                codecs::event_key(rev(1), 1),
+                Some(c_event(KvEventKind::Put, Some(entry(b"c1", 1, 1, 1)), None)),
+            ),
+            (
+                codecs::event_key(rev(2), 1),
+                Some(c_event(
+                    KvEventKind::Delete,
+                    None,
+                    Some(entry(b"c1", 1, 1, 1)),
+                )),
+            ),
+        ],
+    );
+    // Only what goes: a@2 and b@3.
+    let mut kept = model(Profile {
+        gc_done: true,
+        ..Profile::default()
+    });
+    at_floor_3(&mut kept, &[]);
+    // And without a@2.
+    let mut without = model(Profile {
+        gc_done: true,
+        ..Profile::default()
+    });
+    at_floor_3(&mut without, &[(codecs::event_key(rev(2), 0), None)]);
+
+    let limits = ExportLimits::default();
+    let (cf, ck, cw) = (
+        export(&full, &limits),
+        export(&kept, &limits),
+        export(&without, &limits),
+    );
+    assert_eq!(cf.manifest.boundary.retention_floor, rev(3));
+    let events = |cp: &SharedCheckpointV1| {
+        cp.manifest
+            .collections
+            .iter()
+            .find(|s| s.collection == Collection::EventsV1.id().0)
+            .map(|s| s.rows)
+    };
+    assert_eq!(events(&cf), Some(2), "a@2 and b@3");
+    assert_eq!(cf.manifest, ck.manifest);
+    assert_eq!(cf.chunks, ck.chunks);
+    assert_eq!(events(&cw), Some(1));
+    assert_ne!(
+        cf.manifest.root, cw.manifest.root,
+        "the newest put below the floor is carried"
+    );
 }

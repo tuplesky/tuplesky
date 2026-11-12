@@ -1820,6 +1820,122 @@ fn a_commit_whose_adoption_failed_executes_only_over_its_rows_written_again() {
     assert_eq!(f.next_executable(), Some(c1));
 }
 
+/// A decided command whose payload's batch failed (#243 review, rule (b)):
+/// its dependency row is durable and its payload is in memory, with no
+/// payload row durable or in flight. Executed then, the store's lowering
+/// refuses the execution (rule (b): no pending payload to move), and the
+/// voter is lost until its state is cleared. So it executes only over a
+/// payload row, written again by the next event that is not a failure.
+#[test]
+fn a_decided_command_whose_payload_batch_failed_executes_only_over_its_row_written_again() {
+    // Durable: c1's accepted dependency row, and no payload row.
+    let (e1, c1) = admitted(1, 1, 1);
+    let mut f = booted(1);
+    let mut storage = StorageModel::default();
+    let mut seq = 0;
+    let mut durable = |f: &mut Follower, effects: &[Effect], storage: &mut StorageModel| {
+        for b in persisted(effects) {
+            storage.submit(b.clone());
+            storage.complete(b.barrier).unwrap();
+            seq += 1;
+            f.step(Event::Storage(StorageEvent::JournalDurable {
+                barrier_id: b.barrier,
+                journal_seq: LocalJournalSeq::new(seq).unwrap(),
+            }));
+        }
+    };
+    let effects = f.step(e1);
+    durable(&mut f, &effects, &mut storage);
+    let record = f.table().record(&c1).unwrap().clone();
+    let effects = f.step(peer(
+        0,
+        proposal(c1, vec![], 0, record.paths.clone(), record.path),
+    ));
+    durable(&mut f, &effects, &mut storage);
+    storage.crash();
+    let (rows, mut payloads) = (restore_rows(&storage), restore_payloads(&storage));
+    let payload = payloads.remove(0).1;
+    let mut g = Follower::recover(config(1), None, rows, Vec::new(), ExecutionPosition::ZERO);
+    g.step(boot_event());
+    assert_eq!(g.table().phase_of(&c1), Some(Phase::Accept));
+    assert!(g.payload(&c1).is_none());
+    // The leader proposes it again, the payload arrives, and the adoption
+    // turns durable while the payload's row is still in flight.
+    let record = g.table().record(&c1).unwrap().clone();
+    g.step(peer(
+        0,
+        proposal(c1, vec![], 0, record.paths.clone(), record.path),
+    ));
+    let batches = persisted(&g.step(peer(
+        0,
+        ProtocolMessage::PayloadResponse {
+            command: c1,
+            payload,
+        },
+    )));
+    assert_eq!(batches.len(), 2, "the payload row's batch and the adoption");
+    let (written, adoption) = (&batches[0], &batches[1]);
+    assert!(
+        written
+            .updates
+            .iter()
+            .all(|u| u.collection == Collection::PayloadV1.id())
+    );
+    g.step(Event::Storage(StorageEvent::JournalDurable {
+        barrier_id: adoption.barrier,
+        journal_seq: LocalJournalSeq::new(1).unwrap(),
+    }));
+    // The leader's frontier commits it.
+    assert!(
+        persisted(&g.step(peer(
+            0,
+            ProtocolMessage::Committed {
+                ballot: ballot(0, 0),
+                through: 0,
+            },
+        )))
+        .is_empty()
+    );
+    assert_eq!(g.table().phase_of(&c1), Some(Phase::Commit));
+    assert_eq!(
+        g.next_executable(),
+        Some(c1),
+        "over its payload row in flight"
+    );
+    // That batch fails: nothing is written at the failure, and the
+    // payload stays in memory with no row of it durable or in flight.
+    let failed = g.step(Event::Storage(StorageEvent::Failed {
+        barrier_id: written.barrier,
+        error: StorageError::NoSpace,
+    }));
+    assert!(
+        persisted(&failed).is_empty(),
+        "nothing is written at the failure"
+    );
+    assert!(g.payload(&c1).is_some(), "the payload stays in memory");
+    assert_eq!(
+        g.next_executable(),
+        None,
+        "not with its payload in no row, durable or in flight"
+    );
+    // The next event that is not a failure writes the payload row again.
+    let again = persisted(&g.step(peer(
+        0,
+        ProtocolMessage::Committed {
+            ballot: ballot(0, 0),
+            through: 0,
+        },
+    )));
+    assert_eq!(again.len(), 1, "the payload row written again: {again:?}");
+    assert!(
+        again[0]
+            .updates
+            .iter()
+            .any(|u| u.collection == Collection::PayloadV1.id() && u.value.is_some())
+    );
+    assert_eq!(g.next_executable(), Some(c1));
+}
+
 /// The payload record a relayed proposal of request `seq` carries
 /// (task-d102): what the collector submitted, under the admission
 /// [`admitted_under`] names.

@@ -5,7 +5,9 @@ use std::path::PathBuf;
 
 use coord_core::effect::{ApplyBase, BarrierId, BootId, StoreUpdate};
 use coord_core::event::StorageEvent;
-use coord_journal_api::frontier::{CheckpointPointerV1, LOCAL_CHECKPOINT_FORMAT_V1};
+use coord_journal_api::frontier::{
+    CheckpointPointerV1, LOCAL_CHECKPOINT_FORMAT_V1, OLDEST_POINTER_FORMAT,
+};
 use coord_journal_api::group::{GroupEntry, GroupError, GroupLimits, GroupWrite};
 use coord_journal_api::head::WrittenBytes;
 use coord_journal_api::record::{
@@ -141,6 +143,31 @@ fn seal(
         predecessor,
         body,
     })
+}
+
+/// A pointer published before the image's format was raised seals and
+/// decodes: the record's layout is the same, so a journal that retains one
+/// still opens. What refuses it is loading the image (#247, Codex).
+#[test]
+fn a_pointer_naming_an_older_image_format_still_decodes() {
+    const { assert!(OLDEST_POINTER_FORMAT < LOCAL_CHECKPOINT_FORMAT_V1) };
+    let g = genesis();
+    for format in OLDEST_POINTER_FORMAT..=LOCAL_CHECKPOINT_FORMAT_V1 {
+        let record = seal(
+            seq(2),
+            g.digest(),
+            RecordBody::PublishLocalCheckpoint(CheckpointPointerV1 {
+                format,
+                ..pointer(1)
+            }),
+        )
+        .expect("seals");
+        let decoded = JournalRecordV1::decode(&record.encode().unwrap()).expect("decodes");
+        assert_eq!(decoded, record);
+        decoded
+            .verify(&RecordExpectation::genesis(origin()).after(&g).unwrap())
+            .expect("verifies");
+    }
 }
 
 #[test]
@@ -432,6 +459,15 @@ fn seal_rejects_bounds_and_guards() {
                 ..pointer(1)
             }),
             RecordError::UnsupportedFormat { found: 7 },
+        ),
+        (
+            seq(2),
+            g.digest(),
+            RecordBody::PublishLocalCheckpoint(CheckpointPointerV1 {
+                format: 0,
+                ..pointer(1)
+            }),
+            RecordError::UnsupportedFormat { found: 0 },
         ),
         (
             seq(1),
