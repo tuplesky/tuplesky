@@ -37,7 +37,8 @@ full Elle run:
   append to it (a lost update).
 
 Exit status: 0 clean, 1 an anomaly, 2 the domain did not serve the final
-read (a liveness failure; the history checks still ran). The run
+read, or no workload operation completed `ok`, so the faults exercised
+nothing (a liveness failure, or no run; the history checks still ran). The run
 directory keeps each voter's log and `history.json`.
 """
 
@@ -481,6 +482,14 @@ def main():
         sys.exit(1)
     if final is None:
         log("no anomaly in the history, but the domain did not serve the final read")
+        sys.exit(2)
+    # A history with no ok operation checks nothing: every client may have
+    # failed to open its session, or every operation timed out, and the
+    # final read alone proves only that the domain answered after the heal.
+    if not any(op[3]["type"] == "ok" for op in ops):
+        opens = sum(1 for h in history if h[0] == "open-fail")
+        log(f"no workload operation completed ok ({len(ops)} recorded, {opens} sessions failed to open): "
+            "the faults exercised nothing, so this is no pass")
         sys.exit(2)
     log(f"no anomaly; final list lengths {[len(final[k]) for k in sorted(final)]}")
 

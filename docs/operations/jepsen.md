@@ -1108,7 +1108,9 @@ scripts/e2e/shim-stress.py /tmp/stress-run --seconds 120 --fault leader
 
 It exits 0 when the history is clean and the domain served the final
 read, 1 on an anomaly, and 2 when the history is clean but the domain did
-not serve the final read. It prints the `ok` operations per 10 seconds,
+not serve the final read, or no workload operation completed `ok`. A run
+whose clients never got a session open exercised nothing, so it isn't a
+pass. It prints the `ok` operations per 10 seconds,
 so a domain that stops serving shows when. The directory keeps each
 voter's `coordd.log` and `history.json`.
 
