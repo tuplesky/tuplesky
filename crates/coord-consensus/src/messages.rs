@@ -51,12 +51,19 @@ pub const MAX_PROPOSAL_ASK: usize = 16;
 /// whatever else the voter has in hand (`RECOVERY_RESERVE_PARTS`). 125 is
 /// the largest window that reserve fits at the largest table, 875
 /// admitted and 125 recovering. A voter asks one page ahead of the one it
-/// executes (task-d25), and the page asked ahead waits outside the table
-/// until the window before it has run, so a voter holds at most two
-/// pages' worth beside its table.
+/// executes (task-d25), only while it holds one page, and the page asked
+/// ahead waits outside the table until the window before it has run, so a
+/// voter holds at most two pages beside its table: 250 commands, and
+/// twice [`MAX_CATCH_UP_BYTES`] or twice its largest command.
 ///
-/// An older build takes the first 64 commands of a longer page, as a page
-/// cut short: correct, and its next ask then waits for its pacer.
+/// An older build, with a page of 64, takes the first 64 commands of a
+/// longer page as a page cut short: correct, but its next ask then waits
+/// for its pacer, so behind a donor of this build it pulls about 64
+/// commands a second (task-d25 review). No release is tagged with a page
+/// of 64; a release that promises a rolling upgrade from one needs the
+/// size the asker takes said in the ask or behind an activation (the plan's
+/// task-d25 entry). This build and later ones go on at once from a page
+/// cut at their own bounds, so a later, larger page costs them nothing.
 pub const MAX_CATCH_UP_COMMANDS: usize = 125;
 
 /// How many payload bytes one [`ProtocolMessage::CatchUpPage`] carries

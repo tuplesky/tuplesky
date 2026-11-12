@@ -137,10 +137,24 @@ struct KeyState {
 /// 125) or its placeholders and still report within twice the table: at
 /// the largest table, 875 admitted, 125 recovering and 1,000 retired is
 /// 2,000. A window is at most one page whatever a voter has in hand: the
-/// page it asks ahead waits outside the table (task-d25). Below a table
-/// of 1,000 the reserve is smaller than a window and the beyond-capacity
-/// path carries the rest; at the smallest table, 32, it is 4. A Sync's entries are made to fit by the release rule and the
+/// page it asks ahead waits outside the table (task-d25), and
+/// `a_window_is_one_page_when_the_first_ends_early` fails without that
+/// limit. Below a table of 1,000 the reserve is smaller than a window and
+/// the beyond-capacity path carries the rest; at the smallest table, 32,
+/// it is 4. A Sync's entries are made to fit by the release rule and the
 /// Sync's cap, not by the reserve.
+///
+/// The sum leaves no slack at the largest table, and that is meant: 125
+/// is the page chosen as the largest the reserve holds (task-d25). It is
+/// safe because the report bound is inclusive (2,000 entries are taken)
+/// and is a bound on liveness, not on what is decided: a report past it
+/// is set aside, never selected over, while a majority remains without it
+/// (task-d20), and a candidate's own is refused by name. Other work past
+/// the capacity -- a Sync's entries, the record of a held proposal whose
+/// turn has come (task-d71) -- can already take a voter past it, which
+/// costs that voter's report for a campaign. What the reserve keeps is
+/// that a voter admitted to its limit and holding one window still
+/// reports; a window of two pages would not.
 pub const RECOVERY_RESERVE_PARTS: usize = 8;
 
 /// How far an initialization may fill the table.
