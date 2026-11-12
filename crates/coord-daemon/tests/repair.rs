@@ -2249,6 +2249,85 @@ fn a_duplicate_ahead_of_the_projection_waits_for_its_commit() {
     assert!(!w.collector.is_pending(&command));
 }
 
+/// [`a_duplicate_ahead_of_the_projection_waits_for_its_commit`] with the
+/// leader's projection commits lent to a manual materializer and held for
+/// larger ones under a hold no test reaches (task-d86): the release
+/// waiting to be published again asks for the commit its record is in,
+/// and the next hand-off lends it. Nothing else asks, so without that ask
+/// the record would wait the hold's hour and the release with it.
+#[test]
+fn a_release_waiting_to_be_published_again_asks_for_the_held_commit() {
+    let mut w = Cluster::journaled(256);
+    let handle = {
+        use coord_storage::journaled::{CommitHold, DurableCadence};
+        let store = w.voters[0].node_mut().applier_mut().store_mut().store_mut();
+        store
+            .replay_projection(DurableCadence {
+                commits: std::num::NonZeroU32::MAX,
+                records: std::num::NonZeroU32::MAX,
+            })
+            .expect("the model engine has working state");
+        store
+            .hold_projection_commits(CommitHold {
+                records: std::num::NonZeroU32::MAX,
+                wait: Duration::from_secs(3600),
+            })
+            .expect("the replay profile");
+        let (materializer, handle) = coord_storage::ManualMaterializer::new();
+        store
+            .pipeline(Box::new(materializer))
+            .expect("nothing out yet");
+        handle
+    };
+    w.collector.set_answer_on_release(true);
+    w.lose = Lose::Releases;
+    let submit = w.submit(1);
+    let command = w.command(1);
+    for i in 0..3 {
+        w.deliver_submission(i, &submit);
+    }
+    for _ in 0..8 {
+        settle_peers(&mut w);
+        if w.voters[0].node().executed == 1 {
+            break;
+        }
+        let out = w.voters[0].flush().expect("journaled");
+        w.carry(0, out);
+    }
+    assert_eq!(w.voters[0].node().executed, 1);
+    // The group is handed off, and its commit held.
+    let out = w.voters[0].finish().expect("handed off");
+    w.carry(0, out);
+    let out = w.voters[0].settle().expect("settled");
+    w.carry(0, out);
+    assert_eq!(handle.waiting(), 0, "the group's commit is held");
+    assert!(
+        records_for(w.voters[0].node().applier(), [(command, retry_key(1))]).is_empty(),
+        "the projection does not hold the record yet"
+    );
+
+    w.lose = Lose::Nothing;
+    let shape = w.deliver_submission(0, &submit);
+    assert_eq!(shape.frontend, 0, "nothing to publish yet");
+    assert_eq!(w.voters[0].releases_waiting(), 1, "it waits");
+    let out = w.voters[0].settle().expect("settled");
+    w.carry(0, out);
+    assert_eq!(
+        handle.waiting(),
+        1,
+        "the waiting release's ask lends the held commit at the next hand-off"
+    );
+    assert!(handle.run());
+    let out = w.voters[0].settle().expect("settled");
+    w.carry(0, out);
+    let out = w.voters[0].pump_reads(MonotonicMillis::ZERO);
+    w.carry(0, out);
+    assert_eq!(w.voters[0].releases_waiting(), 0);
+    assert_eq!(w.releases.len(), 1);
+    assert_eq!(w.releases[0].command, command);
+    assert!(!w.collector.is_pending(&command));
+}
+
 /// A follower that learns a marked command from the leader's proposal
 /// before its own copy of the submission arrives sends today's evidence
 /// for it: the mark rides the submission, not the proposal (#204 review,

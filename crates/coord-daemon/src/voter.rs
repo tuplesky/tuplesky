@@ -972,7 +972,7 @@ impl<P: Persistence> Voter<P> {
             self.node
                 .applier_mut()
                 .store_mut()
-                .request_projection_commit();
+                .request_projection_commit_for(coord_storage::AskCause::Read);
         }
         for held in again.into_iter().rev() {
             self.reads.hold_again(held);
