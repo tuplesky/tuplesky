@@ -745,11 +745,13 @@ fn chunks_are_bounded_verified_and_every_tampering_is_caught() {
         Err(VerifyError::RootMismatch)
     );
     let mut format = cp.manifest.clone();
-    format.format = 2;
+    format.format = SHARED_CHECKPOINT_FORMAT_V1 + 1;
     format.root = format.compute_root();
     assert_eq!(
         verify_shared(&format, &encoded),
-        Err(VerifyError::UnsupportedFormat { found: 2 })
+        Err(VerifyError::UnsupportedFormat {
+            found: SHARED_CHECKPOINT_FORMAT_V1 + 1
+        })
     );
     let mut counts = cp.manifest.clone();
     counts.collections[6].rows += 1;
@@ -1092,6 +1094,34 @@ fn shared_checkpoint_fixture_is_frozen() {
         stored, fixture,
         "shared checkpoint fixture drifted; the canonical traversal and root are frozen"
     );
+}
+
+/// An image of the layout before task-d113's step 2 is refused (#243
+/// review): the image #240's build exported from the same model, frozen as
+/// it was, carries format 1, and a build of format 2 verifies none of it.
+/// Its rows are by command where this layout's are by position, so it is
+/// refused, not read.
+#[test]
+fn an_image_of_the_layout_before_rows_by_position_is_refused() {
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/shared_checkpoint_format1.json");
+    let old: CheckpointFixture =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(old.format, 1);
+    assert_eq!(SHARED_CHECKPOINT_FORMAT_V1, 2);
+    let bytes: Vec<u8> = (0..old.manifest_hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&old.manifest_hex[i..i + 2], 16).unwrap())
+        .collect();
+    let manifest = SharedManifestV1::decode(&bytes).unwrap();
+    assert_eq!(manifest.format, 1);
+    assert!(matches!(
+        verify_shared(&manifest, &[]),
+        Err(VerifyError::UnsupportedFormat { found: 1 })
+    ));
+    // The model's image today differs from it in its root: the layout moved.
+    let cp = export(&model(Profile::default()), &ExportLimits::default());
+    assert_ne!(hex(&cp.manifest.root.0), old.root_hex);
 }
 
 /// What an inline export costs as common state grows: the floor runs

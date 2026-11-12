@@ -2796,8 +2796,21 @@ impl Follower {
 
     /// Whether `command`'s record is ahead of its rows because the batch
     /// that wrote it failed, and is not yet written again.
+    ///
+    /// Or its payload is (#243 review): held in memory, with the batch
+    /// that wrote its row failed and no row durable or in flight. The
+    /// store's lowering moves a command's pending payload to its position
+    /// when it executes, and refuses an execution with none (task-d113's
+    /// rule (b)); executed here, the voter would be lost until its state
+    /// is cleared. Held back only where [`Follower::carry_stale`] writes
+    /// the row again at the next event that is not a failure: a
+    /// dependency row of it is written, or its record is itself due.
     fn stale(&self, command: &CommandId) -> bool {
-        self.unwritten.contains(command) && !self.row_current(command)
+        (self.unwritten.contains(command) && !self.row_current(command))
+            || (self.payload_unwritten.contains(command)
+                && self.payloads.contains_key(command)
+                && self.payload_row(command).is_none()
+                && (self.ledger.written(command) || self.unwritten.contains(command)))
     }
 
     /// Write again, in a batch of their own, the records the gate in

@@ -2204,6 +2204,21 @@ impl Sim {
             }
         };
         let position = position.checked_next().unwrap();
+        // Oracle: an execution follows its payload row into the journal
+        // (#243 review, rule (b)). `coordd`'s lowering moves the pending
+        // payload to the execution's position, and refuses an execution
+        // with none: the voter is lost until its state is cleared. So a
+        // command whose payload is held executes only with a payload row
+        // durable or in a batch submitted before it. (One whose payload is
+        // not held is the simulator's: `coordd` waits there for it.)
+        let held = match node.role.as_ref().expect("alive") {
+            Role::Leader(m) => m.payload(&c).is_some(),
+            Role::Follower(m) => m.payload(&c).is_some(),
+        };
+        let unwritten = held
+            && !node
+                .storage
+                .holds_or_writes(Collection::PayloadV1.id().0, &c.0.0);
         let response = response_of(&node.executed, &c, |x| self.offers.get(x).map(|o| o.key));
         let outcome = AppliedOutcome {
             position,
@@ -2229,6 +2244,12 @@ impl Sim {
             Ok(e) => e,
             Err(e) => self.fail(&format!("node {i} could not apply {c:?}: {e:?}")),
         };
+        if unwritten {
+            self.fail(&format!(
+                "node {i} executed {c:?} with its payload held and no payload row durable \
+                 or in a batch submitted"
+            ));
+        }
         if pulled {
             self.stats.caught_up += 1;
         }

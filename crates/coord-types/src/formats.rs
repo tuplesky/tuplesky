@@ -142,13 +142,21 @@ impl Format {
                 oldest: 1,
                 current: 1,
             },
+            // 2 (task-d113, step 2): executed rows and executed payloads
+            // by execution position, pending payloads and decided records
+            // node-private. An image of the layout before is refused, not
+            // converted (#243 review).
             Format::SharedCheckpoint => Window {
-                oldest: 1,
-                current: 1,
+                oldest: 2,
+                current: 2,
             },
+            // 2 (task-d113, step 2): executed rows and executed payloads
+            // by execution position, pending payloads and decided records
+            // node-private. An image of the layout before is refused, not
+            // converted (#243 review).
             Format::LocalCheckpoint => Window {
-                oldest: 1,
-                current: 1,
+                oldest: 2,
+                current: 2,
             },
             Format::Backup => Window {
                 oldest: 1,

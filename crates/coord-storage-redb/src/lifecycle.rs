@@ -90,6 +90,11 @@ pub enum OpenError {
     EmptyDatabase,
     /// redb refused the database or a required table is absent.
     Corrupt(String),
+    /// The store is another build's layout: its manifest lists another
+    /// registry of collections, and its database records another format
+    /// (task-d113). Not damage: a store of another format is refused with
+    /// that reason, not converted, and is left as it was.
+    Format(String),
     /// In-database identity record disagrees with the manifest.
     IdentityRecordMismatch(&'static str),
     /// The selected generation holds protocol obligations (promises,
@@ -120,6 +125,7 @@ impl std::fmt::Display for OpenError {
             OpenError::MissingDatabase => f.write_str("database file missing"),
             OpenError::EmptyDatabase => f.write_str("database file empty"),
             OpenError::Corrupt(e) => write!(f, "database corrupt or unusable: {e}"),
+            OpenError::Format(e) => write!(f, "store of another format: {e}"),
             OpenError::IdentityRecordMismatch(field) => {
                 write!(f, "in-database {field} differs from manifest")
             }
@@ -307,9 +313,7 @@ impl Generation {
             return Err(OpenError::GenerationMismatch);
         }
         if manifest.collections != StoreManifestV1::registry_snapshot() {
-            return Err(OpenError::Corrupt(
-                "manifest collection registry differs from this build".into(),
-            ));
+            return Err(other_registry(&directory.join(DATABASE)));
         }
         let db_path = directory.join(DATABASE);
         let db = open_verified_database(&db_path, &manifest, &options)?;
@@ -620,6 +624,59 @@ fn initialize_database(
             .map_err(|e| OpenError::Corrupt(e.to_string()))?;
     }
     Ok((db, db_path))
+}
+
+/// Why a generation whose manifest lists another registry of collections is
+/// refused (#243 review): the store format its database records, read
+/// before anything else is opened.
+///
+/// The manifest's digest held, so a different list is another build's
+/// store, not damage. Its format is read through redb's read-only open,
+/// which never repairs or writes: a store of another format is left byte
+/// for byte as it was. A database that records no format is format 1, from
+/// before task-d113 recorded one. Only a list that differs while the format
+/// is this build's, or a format that can't be read, is reported as
+/// [`OpenError::Corrupt`].
+fn other_registry(db_path: &Path) -> OpenError {
+    let differs = "manifest collection registry differs from this build";
+    let recorded = || -> Result<Option<Vec<u8>>, String> {
+        let db = redb::ReadOnlyDatabase::open(db_path).map_err(|e| e.to_string())?;
+        let txn = db.begin_read().map_err(|e| e.to_string())?;
+        let meta = txn
+            .open_table(table_definition(Collection::MetaV1))
+            .map_err(|e| e.to_string())?;
+        let value = meta
+            .get(meta_fields::FORMAT_VERSION)
+            .map_err(|e| e.to_string())?;
+        Ok(value.map(|v| v.value().to_vec()))
+    };
+    let this = coord_store_api::registry::STORE_FORMAT_VERSION;
+    let format = match recorded() {
+        Ok(None) => 1,
+        Ok(Some(bytes)) => match <[u8; 4]>::try_from(bytes.as_slice()) {
+            Ok(b) => u32::from_be_bytes(b),
+            Err(_) => {
+                return OpenError::Corrupt(format!(
+                    "{differs}, and its recorded format is {} bytes long",
+                    bytes.len()
+                ));
+            }
+        },
+        Err(e) => {
+            return OpenError::Corrupt(format!(
+                "{differs}, and its recorded format can't be read: {e}"
+            ));
+        }
+    };
+    if format == this {
+        return OpenError::Corrupt(format!(
+            "{differs}, though its recorded format is this build's"
+        ));
+    }
+    OpenError::Format(format!(
+        "store format {format} is not this build's ({this}): a store of another layout is \
+         not converted"
+    ))
 }
 
 /// Open the database of a generation whose manifest has already been
@@ -1041,9 +1098,7 @@ fn read_selected_for(
         )));
     }
     if manifest.collections != StoreManifestV1::registry_snapshot() {
-        return Err(OpenError::Corrupt(
-            "manifest collection registry differs from this build".into(),
-        ));
+        return Err(other_registry(&directory.join(DATABASE)));
     }
     if format!("gen-{:06}", manifest.generation) != current {
         return Err(OpenError::GenerationMismatch);
