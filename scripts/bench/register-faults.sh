@@ -36,7 +36,9 @@
 # `coord-register` records each operation's invocation and completion
 # and checks the history (crates/coord-wan-bench/src/register.rs); its
 # summary and the voters' logs are written to OUT_DIR. The exit status is
-# the checker's: 0 linearizable, 1 a violation, 2 the run did not happen.
+# the checker's: 0 linearizable, 1 a violation, 2 the run did not happen
+# (a fault that could not be injected, such as a cut iptables refused, is
+# no run of its scenario: a clean history then exits 2).
 #
 # Inputs, all optional:
 #   COORDD, HARNESS, REGISTER   binaries (default target/release)
@@ -200,6 +202,14 @@ fi
 REGISTER_PID=$!
 started=$(date +%s)
 
+# Set when a fault could not be injected: the run then checked a
+# workload no fault touched, so a clean history is no verdict (exit 2).
+FAULT_FAILED=""
+not_injected() { # WHY
+  note "$1: the fault was not injected"
+  FAULT_FAILED=1
+}
+
 at() { # wait until N seconds into the run
   while [ $(( $(date +%s) - started )) -lt "$1" ]; do sleep 0.2; done
 }
@@ -207,7 +217,7 @@ at() { # wait until N seconds into the run
 pause_leader() { # SECONDS
   local who pid
   who=$(leader); pid=$(pid_of "$who")
-  [ -n "$pid" ] || { note "no process for $who"; return; }
+  [ -n "$pid" ] || { not_injected "no process for $who"; return; }
   note "stop $who (pid $pid) for $1 s"
   kill -STOP "$pid"; STOPPED=$pid
   sleep "$1"
@@ -218,7 +228,7 @@ pause_leader() { # SECONDS
 kill_leader() {
   local who pid cmd
   who=$(leader); pid=$(pid_of "$who")
-  [ -n "$pid" ] || { note "no process for $who"; return; }
+  [ -n "$pid" ] || { not_injected "no process for $who"; return; }
   # How it was started, to start it again the same way (never --init).
   mapfile -d '' cmd < "/proc/$pid/cmdline"
   local cwd; cwd=$(readlink "/proc/$pid/cwd")
@@ -246,7 +256,12 @@ partition_leader() {
   local rule
   for rule in "${CUT[@]}"; do
     # shellcheck disable=SC2086
-    iptables -I INPUT $rule || { note "iptables refused: $rule"; }
+    if ! iptables -I INPUT $rule; then
+      # A partial cut is no partition: take back what went in.
+      heal
+      not_injected "iptables refused: $rule"
+      return
+    fi
   done
   note "cut $who off (ports $mine from $theirs)"
   sleep "$FAULT_FOR"
@@ -266,6 +281,10 @@ case "$SCENARIO" in
 esac
 wait "$REGISTER_PID"; status=$?
 note "the register run exited $status; the leader is now $(leader)"
+if [ -n "$FAULT_FAILED" ] && [ "$status" = 0 ]; then
+  note "a fault was not injected, so the clean history is no verdict"
+  status=2
+fi
 domain_down
 for n in n1 n2 n3; do cp "$DIR/$n/coordd.log" "$OUT_DIR/$n.log"; done
 cp "$DIR/harness.log" "$OUT_DIR/harness.log"
