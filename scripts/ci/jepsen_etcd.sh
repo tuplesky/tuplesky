@@ -101,18 +101,28 @@ PY
   # The swiftpaxos register mix (REGISTER_MIX, the workflow's
   # register-swiftpaxos-mix): reads and writes alone, n readers in each
   # key's group of 2n, as jepsen.swiftpaxos's register test draws them, so
-  # etcd runs the reference's workload with TupleSky and SwiftPaxos.
+  # etcd runs the reference's workload with TupleSky and SwiftPaxos. Not
+  # with gen/reserve: the etcd test's Jepsen (0.3.11, io.jepsen/generator
+  # 0.1.1) reserves by the threads' indices from 0, so inside a key's group
+  # only the first group's threads read, 5 in all, where the reference's
+  # Jepsen (generator 0.1.5) reserves within each group. Run 43303296311
+  # drew etcd 17% and 4% reads at 30 and 120 against the reference's 45%
+  # and 40%. The readers here are chosen by the thread's place in its group
+  # of 2n, the groups being consecutive threads.
   if [ "${REGISTER_MIX:-}" = swiftpaxos ]; then
     python3 - "$test_dir/src/jepsen/etcd/register.clj" <<'PY'
 import sys
 path = sys.argv[1]
 src = open(path).read()
 old = "(->> (gen/mix [w cas])\n                         (gen/reserve n r)"
+new = ("(->> (gen/any\n"
+       "                           (gen/on-threads #(and (integer? %) (< (mod % (* 2 n)) n)) r)\n"
+       "                           (gen/on-threads #(and (integer? %) (<= n (mod % (* 2 n)))) w))")
 if src.count(old) != 1:
     sys.exit(f"{path} no longer has: {old!r}")
-open(path, "w").write(src.replace(old, "(->> (gen/reserve n r w)"))
+open(path, "w").write(src.replace(old, new))
 PY
-    grep -n 'gen/reserve' "$test_dir/src/jepsen/etcd/register.clj"
+    grep -n -A2 'gen/any' "$test_dir/src/jepsen/etcd/register.clj"
   fi
 
   # cu/grepkill! runs `pgrep -f etcd | xargs kill -stop` in a `bash -c`
