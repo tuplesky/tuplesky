@@ -16,11 +16,11 @@ use coord_core::effect::{BarrierId, BootId, PersistBatch, StoreUpdate};
 use coord_core::outbox::BarrierAllocator;
 use coord_journal_api::frontier::CheckpointPointerV1;
 use coord_journal_api::stream::ShardId;
-use coord_storage::ManualMaterializer;
 use coord_storage::journaled::{
     CommitHold, DomainStatus, DurableCadence, JournalLimits, JournaledError, JournaledStore,
     ProjectionProfile, Submission, TransitionKind,
 };
+use coord_storage::{AskCause, HoldEnds, ManualMaterializer};
 use coord_store_api::engine::LocalEngine;
 use coord_store_testkit::journal::ModelJournal;
 use coord_store_testkit::model::{CommitScript, ModelEngine, ModelReader, ModelWrite};
@@ -761,6 +761,37 @@ fn records_journaled_while_a_commit_is_out_wait_from_their_arrival() {
     assert!(due >= arrived + wait);
 }
 
+/// Records journaled behind a commit that is out are stamped as they
+/// arrive, not by the next hand-off (task-d86): with nothing handed off
+/// between their append and the commit's return, those that have
+/// already waited the hold's `wait` go out as that commit comes back.
+/// Stamped only by the hand-off, they would wait a whole `wait` again
+/// from then.
+#[test]
+fn records_journaled_behind_a_lent_commit_are_stamped_without_a_hand_off() {
+    let wait = std::time::Duration::from_millis(100);
+    let (mut world, handle) = held(hold(100, wait));
+    journal_and_hand_off(&mut world, 1);
+    world.store.request_projection_commit();
+    world.store.hand_off().unwrap();
+    assert!(world.store.lent(A), "the asked record is out");
+    // Journaled behind it, and nothing handed off.
+    world.queue(1);
+    world.store.append().unwrap();
+    assert!(world.store.lent(A));
+    assert_eq!(world.store.unmaterialized(A), 2);
+    std::thread::sleep(wait * 3);
+    assert!(handle.run());
+    world.store.hand_off().unwrap();
+    assert!(
+        world.store.lent(A),
+        "the second has waited longer than the hold since it was journaled"
+    );
+    assert!(handle.run());
+    world.store.hand_off().unwrap();
+    assert_eq!(world.store.unmaterialized(A), 0);
+}
+
 /// Something that waits for the projection asks, and the next hand-off
 /// lends what is held at once (task-d86).
 #[test]
@@ -877,4 +908,204 @@ fn records_held_at_a_crash_are_replayed_from_the_journal() {
     drop(handle);
     let next = crash_and_attach(world, profile, durable).unwrap();
     assert_recovered(&next, 4);
+}
+
+/// An ask reaches the records submitted when it is made, so a commit of
+/// records held from before it does not spend it (task-d86): the record
+/// it was made for goes out as soon as it is journaled, not after the
+/// hold. Review's case on #234: one record held, a second queued and the
+/// ask made, the hand-off lending the first.
+#[test]
+fn an_ask_is_not_spent_by_a_commit_of_records_held_before_it() {
+    let (mut world, handle) = held(hold(100, std::time::Duration::from_secs(3600)));
+    journal_and_hand_off(&mut world, 1);
+    assert!(!world.store.lent(A), "one record is held");
+    world.queue(1);
+    world.store.request_projection_commit();
+    world.store.hand_off().unwrap();
+    assert!(world.store.lent(A), "the held record goes out on the ask");
+    world.store.append().unwrap();
+    assert!(handle.run());
+    world.store.hand_off().unwrap();
+    assert!(
+        world.store.lent(A),
+        "the record the ask was made for goes out once journaled, not an hour later"
+    );
+    assert!(handle.run());
+    world.store.hand_off().unwrap();
+    assert_eq!(world.store.unmaterialized(A), 0);
+    // That commit spent it: the next record is held.
+    journal_and_hand_off(&mut world, 1);
+    assert!(!world.store.lent(A));
+}
+
+/// A domain whose last commit is in doubt is not lent by a hand-off, so
+/// the records journaled behind it are not due either until it is
+/// reconciled (task-d86): a caller that hands off at the due time would
+/// otherwise spin on a time in the past.
+#[test]
+fn a_commit_in_doubt_leaves_nothing_due_until_it_is_reconciled() {
+    let (mut world, handle) = held(hold(100, std::time::Duration::from_millis(1)));
+    world
+        .engine()
+        .script_commit(CommitScript::Indeterminate { applied: true });
+    journal_and_hand_off(&mut world, 1);
+    world.store.request_projection_commit();
+    world.store.hand_off().unwrap();
+    assert!(world.store.lent(A));
+    // Two journaled behind the commit while it is out.
+    journal_and_hand_off(&mut world, 2);
+    assert!(handle.run());
+    let report = world.store.hand_off().unwrap();
+    assert!(report.indeterminate);
+    assert_eq!(
+        world.store.status(A),
+        Some(DomainStatus::MaterializationUncertain)
+    );
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    for pass in 0..3 {
+        assert_eq!(
+            world.store.projection_commit_due(),
+            None,
+            "pass {pass}: due while the hand-off lends nothing"
+        );
+        world.store.hand_off().unwrap();
+        assert!(!world.store.lent(A));
+    }
+    world.store.reconcile(A).unwrap();
+    assert_eq!(world.store.status(A), Some(DomainStatus::Ready));
+    assert_eq!(world.store.unmaterialized(A), 2);
+    let due = world
+        .store
+        .projection_commit_due()
+        .expect("the two are held");
+    assert!(due <= std::time::Instant::now());
+    world.store.hand_off().unwrap();
+    assert!(world.store.lent(A), "lent once reconciled");
+}
+
+/// Each commit lent while a hold applies is counted once by what ended its
+/// hold (task-d86, the lead on #185): its records reaching the hold's
+/// count, its wait running out, or an ask, by who asked. An ask made where
+/// the count was reached anyway is counted as the count.
+#[test]
+fn each_commit_lent_is_counted_by_what_ended_its_hold() {
+    let wait = std::time::Duration::from_millis(100);
+    let (mut world, handle) = held(hold(3, wait));
+    let lend = |world: &mut World| {
+        assert!(world.store.lent(A), "lent");
+        assert!(handle.run());
+        world.store.hand_off().unwrap();
+        assert!(!world.store.lent(A));
+    };
+    // Three records: the count.
+    journal_and_hand_off(&mut world, 3);
+    lend(&mut world);
+    // One, and the wait runs out.
+    journal_and_hand_off(&mut world, 1);
+    assert!(!world.store.lent(A), "one record is held");
+    std::thread::sleep(wait + wait / 2);
+    world.store.hand_off().unwrap();
+    lend(&mut world);
+    // One, and each ask in turn.
+    for cause in [AskCause::Read, AskCause::Settle, AskCause::Other] {
+        journal_and_hand_off(&mut world, 1);
+        assert!(!world.store.lent(A), "{cause:?}: one record is held");
+        world.store.request_projection_commit_for(cause);
+        world.store.hand_off().unwrap();
+        lend(&mut world);
+    }
+    // Three records and a read's ask: the count ended it.
+    world.queue(3);
+    world.store.append().unwrap();
+    world.store.request_projection_commit_for(AskCause::Read);
+    world.store.hand_off().unwrap();
+    lend(&mut world);
+    assert_eq!(
+        world.store.cost().hold_ends,
+        HoldEnds {
+            full: 2,
+            deadline: 1,
+            read: 1,
+            settle: 1,
+            other: 1,
+        }
+    );
+}
+
+/// A commit on the caller's thread that gives its records back leaves
+/// their wait and the ask as they were (task-d86, Codex on #238): the
+/// records are still due when they were, and the ask still lends them at
+/// the next hand-off. Cleared before the commit's outcome was known, a
+/// publication whose commit failed left the records with nothing due and
+/// no ask, held until another record arrived.
+#[test]
+fn a_synchronous_commit_that_gives_its_records_back_keeps_their_wait_and_ask() {
+    let wait = std::time::Duration::from_secs(3600);
+    let (mut world, _handle) = held(hold(100, wait));
+    let before = std::time::Instant::now();
+    journal_and_hand_off(&mut world, 1);
+    assert!(!world.store.lent(A), "one record is held");
+    world.store.request_projection_commit();
+    world
+        .engine()
+        .script_commit(CommitScript::DefinitelyNotCommitted);
+    let pointer = world.pointer();
+    world.store.publish_checkpoint(A, &pointer).unwrap();
+    assert_eq!(
+        world.store.status(A),
+        Some(DomainStatus::MaterializationDeferred)
+    );
+    assert_eq!(
+        world.store.unmaterialized(A),
+        2,
+        "the held record and the pointer's are given back"
+    );
+    let due = world
+        .store
+        .projection_commit_due()
+        .expect("the records given back are still held");
+    assert!(
+        due <= std::time::Instant::now(),
+        "the ask still stands, so they are due now"
+    );
+    assert!(due >= before, "{due:?} before the record arrived");
+    world.store.hand_off().unwrap();
+    assert!(
+        world.store.lent(A),
+        "the ask lends them at the next hand-off, an hour before the wait ends"
+    );
+}
+
+/// A commit made on the caller's thread carries everything held, so the
+/// hold runs again from the next record (task-d86): a checkpoint
+/// published synchronously on a held store commits what was pending, and
+/// the record after it waits the hold's time from its own arrival. Left
+/// to count from the records the publication committed, it went out at
+/// the next hand-off.
+#[test]
+fn a_synchronous_commit_restarts_the_hold() {
+    let wait = std::time::Duration::from_millis(200);
+    let (mut world, _handle) = held(hold(100, wait));
+    journal_and_hand_off(&mut world, 1);
+    assert!(!world.store.lent(A), "one record is held");
+    let pointer = world.pointer();
+    world.store.publish_checkpoint(A, &pointer).unwrap();
+    assert_eq!(
+        world.store.unmaterialized(A),
+        0,
+        "the publication committed it"
+    );
+    std::thread::sleep(wait + wait / 2);
+    let arrived = std::time::Instant::now();
+    journal_and_hand_off(&mut world, 1);
+    assert!(
+        !world.store.lent(A),
+        "the record after the publication went out at once"
+    );
+    let due = world.store.projection_commit_due().expect("held");
+    assert!(
+        due >= arrived + wait,
+        "its wait counts from before it arrived"
+    );
 }

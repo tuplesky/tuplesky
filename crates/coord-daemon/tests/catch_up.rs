@@ -896,3 +896,272 @@ fn a_donor_serves_a_command_past_the_byte_bound_by_itself() {
         taken - pages
     );
 }
+
+/// The journal-first store coordd runs (task-d52).
+type Journaled =
+    coord_storage::JournaledDomain<coord_store_testkit::journal::ModelJournal, ModelEngine>;
+
+/// Follower `me` over the journal-first store, booted and lowering in
+/// groups, its projection commits lent to a manual materializer under the
+/// replay profile with a commit hold no test reaches (task-d86): what it
+/// journals is held until something asks for the commit.
+fn held_follower(me: u8) -> (Voter<Journaled>, coord_storage::ManualHandle<ModelEngine>) {
+    use coord_storage::Persistence as _;
+    use coord_storage::journaled::{
+        CommitHold, DurableCadence, JournalLimits, JournaledStore, Submission, TransitionKind,
+    };
+    let boot = BootId([me + 1; 16]);
+    let mut store = JournaledStore::open(
+        coord_store_testkit::journal::ModelJournal::new(),
+        CLUSTER,
+        r(me),
+        inc(),
+        boot,
+        JournalLimits::default(),
+    )
+    .unwrap();
+    store
+        .attach(
+            DOMAIN,
+            coord_journal_api::stream::ShardId::new(0).unwrap(),
+            ModelEngine::new(),
+        )
+        .unwrap();
+    let mut alloc = BarrierAllocator::new(inc(), boot);
+    let base = store.application_base(DOMAIN).unwrap();
+    let genesis = Ballot {
+        epoch: base.configuration,
+        number: 0,
+        leader: r(0),
+    };
+    store
+        .submit(Submission {
+            domain: DOMAIN,
+            ballot: genesis,
+            kind: TransitionKind::Application {
+                position: base.execution_position.checked_next().unwrap(),
+                revision: None,
+                result_digest: Digest32([0; 32]),
+            },
+            batch: coord_core::effect::PersistBatch {
+                barrier: alloc.allocate(),
+                base: Some(base),
+                updates: bootstrap_updates(),
+            },
+        })
+        .unwrap();
+    store.flush().unwrap();
+    store
+        .replay_projection(DurableCadence {
+            commits: std::num::NonZeroU32::MAX,
+            records: std::num::NonZeroU32::MAX,
+        })
+        .expect("the model engine has working state");
+    store
+        .hold_projection_commits(CommitHold {
+            records: std::num::NonZeroU32::MAX,
+            wait: Duration::from_secs(3600),
+        })
+        .expect("the replay profile");
+    let (materializer, handle) = coord_storage::ManualMaterializer::new();
+    store
+        .pipeline(Box::new(materializer))
+        .expect("nothing out yet");
+    let domain = coord_storage::JournaledDomain::new(store, DOMAIN, genesis).expect("attached");
+    let applier = Applier::new(domain, alloc).unwrap();
+    let bootstrapped = applier.store().application_base().execution_position;
+    let mut machine = Follower::new(FollowerConfig {
+        identity: identity(me),
+        quorum: quorum(),
+        genesis: ballot(),
+        frontend: FRONTEND,
+        capacity: CAPACITY,
+    })
+    .restore_execution(bootstrapped, []);
+    machine.set_learning(LearningMode::Full);
+    let mut node = Node::new(Machine::Follower(Box::new(machine)), applier, FRONTEND);
+    node.lower_in_groups();
+    let ingress = Ingress::new(
+        &membership(),
+        r(me),
+        PeerRole::Frontend,
+        IngressBudget::default(),
+    )
+    .expect("a committed voter");
+    let mut voter = Voter::new(node, ingress, (CLUSTER, DOMAIN), ballot());
+    voter.boot(boot, inc()).expect("boot");
+    (voter, handle)
+}
+
+/// Two voters over the reference store and a third, `lagging`, whose
+/// projection commits are held (task-d86).
+struct Held {
+    voters: Vec<Voter<StoreWorker<ModelEngine>>>,
+    lagging: Voter<Journaled>,
+    collector: Collector,
+    peers: std::collections::VecDeque<(usize, PeerProvenance, Vec<u8>)>,
+    sequence: u64,
+    /// Whether `lagging` is cut off: nothing reaches it and nothing it
+    /// sends leaves.
+    cut: bool,
+}
+
+impl Held {
+    fn carry(&mut self, from: PeerProvenance, out: Outbound) {
+        for (to, frame) in out.peer {
+            self.peers
+                .push_back((usize::from(to.replica.0[0]), from, frame));
+        }
+    }
+
+    /// One client request, submitted to every voter not cut off.
+    fn submit(&mut self) {
+        self.sequence += 1;
+        let Submitted::FanOut(fan_out) = self
+            .collector
+            .submit(MonotonicMillis::ZERO, &admitted(self.sequence, 1))
+            .expect("submitted")
+        else {
+            panic!("not new work")
+        };
+        let submit = frame(&fan_out.frame);
+        for to in 0..2 {
+            let out = self.voters[to]
+                .on_submission(PeerRole::Frontend, &submit, Origin::Connection(7))
+                .expect("driven")
+                .expect("admitted");
+            self.carry(self.voters[to].provenance(), out);
+        }
+        if !self.cut {
+            let out = self
+                .lagging
+                .on_submission(PeerRole::Frontend, &submit, Origin::Connection(7))
+                .expect("driven")
+                .expect("admitted");
+            self.carry(self.lagging.provenance(), out);
+        }
+    }
+
+    /// The peer plane and execution until nothing moves; `lagging`
+    /// journals, executes and hands off as coordd's loop does, and its
+    /// commits are never run here.
+    fn settle(&mut self) {
+        loop {
+            let mut moved = false;
+            while let Some((to, prov, bytes)) = self.peers.pop_front() {
+                if self.cut && (to == 2 || prov.from() == r(2)) {
+                    continue;
+                }
+                moved = true;
+                let out = if to == 2 {
+                    self.lagging.on_peer(prov, bytes)
+                } else {
+                    self.voters[to].on_peer(prov, bytes)
+                }
+                .expect("driven");
+                let from = if to == 2 {
+                    self.lagging.provenance()
+                } else {
+                    self.voters[to].provenance()
+                };
+                self.carry(from, out);
+            }
+            for i in 0..2 {
+                let out = self.voters[i].execute().expect("executed");
+                moved |= !out.is_empty();
+                self.carry(self.voters[i].provenance(), out);
+            }
+            if !self.cut {
+                let executed = self.lagging.node().executed;
+                let mut out = self.lagging.flush().expect("journaled");
+                out.absorb(self.lagging.finish().expect("handed off"));
+                out.absorb(self.lagging.settle().expect("settled"));
+                moved |= !out.peer.is_empty()
+                    || self.lagging.node().executed > executed
+                    || self.lagging.owes_flush();
+                self.carry(self.lagging.provenance(), out);
+            }
+            if !moved {
+                break;
+            }
+        }
+    }
+}
+
+/// A group whose execution led to more than its results asks for its
+/// commit, since what it led to goes out only once that commit is back
+/// (task-d86): here the batch installing the next catch-up window, which
+/// a window's last pulled command leads to (the next page was asked for
+/// and taken while the first window ran). The lagging voter's commits
+/// are held for an hour and nothing else asks: without the group's ask
+/// the next window would wait that long.
+#[test]
+fn a_group_that_leads_to_the_next_catch_up_window_is_not_held() {
+    let (lagging, handle) = held_follower(2);
+    let mut w = Held {
+        voters: (0..2).map(|me| voter(me, CAPACITY)).collect(),
+        lagging,
+        collector: Collector::new(CollectorConfig {
+            quorum: quorum(),
+            max_pending: 1 << 16,
+            max_resolved: 16,
+            max_undelivered_bytes: usize::MAX,
+        }),
+        peers: std::collections::VecDeque::new(),
+        sequence: 0,
+        cut: false,
+    };
+    w.submit();
+    w.settle();
+    let through = |w: &Held| w.lagging.node().machine().executed_through().get();
+    let start = through(&w);
+    assert_eq!(
+        start,
+        w.voters[0].node().machine().executed_through().get(),
+        "the lagging voter executed the first command with the others"
+    );
+    // Cut off for more than a page.
+    w.cut = true;
+    let behind = MAX_CATCH_UP_COMMANDS as u64 + 5;
+    for _ in 0..behind {
+        w.submit();
+        w.settle();
+    }
+    let leader = w.voters[0].node().machine().executed_through().get();
+    assert_eq!(leader, start + behind);
+    assert_eq!(through(&w), start);
+    w.cut = false;
+    assert_eq!(
+        handle.waiting(),
+        0,
+        "every commit of the lagging voter is held"
+    );
+
+    // It asks the leader; the first page fills a window, the second is
+    // asked for and taken while the window runs, and the window's last
+    // command leads to the batch installing it, which waits for its
+    // group's commit.
+    let out = w
+        .lagging
+        .node_mut()
+        .request_catch_up(r(0), &ballot())
+        .expect("asked");
+    w.carry(w.lagging.provenance(), out);
+    w.settle();
+    assert_eq!(
+        through(&w),
+        start + MAX_CATCH_UP_COMMANDS as u64,
+        "one window executed"
+    );
+    assert_eq!(
+        handle.waiting(),
+        1,
+        "the group that led to the next window asked for its commit"
+    );
+    // The commit comes back, the window is installed, and the rest is
+    // executed.
+    while handle.run() {
+        w.settle();
+    }
+    assert_eq!(through(&w), leader);
+}

@@ -122,10 +122,10 @@ pub use apply::{AppliedOutcomeParts, Applier, ApplyError};
 pub use compaction::{GcBudget, GcPlan, HoldGuard, RetentionHolds, plan_gc};
 pub use cut::{CutOverlay, RecoveryCut};
 pub use journaled::{
-    AppendDone, AppendJob, Appender, CutError, DomainStatus, FlushReport, GroupMix, JournalLimits,
-    JournaledError, JournaledStore, LoweringCost, MaterializeDone, MaterializeJob, Materializer,
-    PublishPhases, PublishThread, Published, Replayed, Submission, SubmitRefused, ThreadClock,
-    ThreadTime, TransitionKind,
+    AppendDone, AppendJob, Appender, AskCause, CutError, DomainStatus, FlushReport, GroupMix,
+    HoldEnds, JournalLimits, JournaledError, JournaledStore, LoweringCost, MaterializeDone,
+    MaterializeJob, Materializer, PublishPhases, PublishThread, Published, Replayed, Submission,
+    SubmitRefused, ThreadClock, ThreadTime, TransitionKind,
 };
 pub use lowering::{GroupDigest, batch_digest};
 pub use materialize::{

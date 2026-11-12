@@ -542,3 +542,175 @@ fn response_bytes(answer: &[u8]) -> Vec<u8> {
     };
     response
 }
+
+/// The journal-first store coordd runs (task-d52).
+type Journaled =
+    coord_storage::JournaledDomain<coord_store_testkit::journal::ModelJournal, ModelEngine>;
+
+/// A lone leader -- the only voter of its ballot, so a read needs no
+/// peer's confirmation -- over the journal-first store, lowering in
+/// groups, its projection commits lent to a manual materializer under the
+/// replay profile with a commit hold no test reaches (task-d86): what it
+/// journals is held until something asks for the commit.
+fn held_lone_leader() -> (Voter<Journaled>, coord_storage::ManualHandle<ModelEngine>) {
+    use coord_storage::Persistence as _;
+    use coord_storage::journaled::{
+        CommitHold, DurableCadence, JournalLimits, JournaledStore, Submission, TransitionKind,
+    };
+    let boot = BootId([1; 16]);
+    let mut store = JournaledStore::open(
+        coord_store_testkit::journal::ModelJournal::new(),
+        CLUSTER,
+        r(0),
+        inc(),
+        boot,
+        JournalLimits::default(),
+    )
+    .unwrap();
+    store
+        .attach(
+            DOMAIN,
+            coord_journal_api::stream::ShardId::new(0).unwrap(),
+            ModelEngine::new(),
+        )
+        .unwrap();
+    let mut alloc = BarrierAllocator::new(inc(), boot);
+    let base = store.application_base(DOMAIN).unwrap();
+    let genesis = Ballot {
+        epoch: base.configuration,
+        number: 0,
+        leader: r(0),
+    };
+    store
+        .submit(Submission {
+            domain: DOMAIN,
+            ballot: genesis,
+            kind: TransitionKind::Application {
+                position: base.execution_position.checked_next().unwrap(),
+                revision: None,
+                result_digest: Digest32([0; 32]),
+            },
+            batch: coord_core::effect::PersistBatch {
+                barrier: alloc.allocate(),
+                base: Some(base),
+                updates: bootstrap_updates(),
+            },
+        })
+        .unwrap();
+    store.flush().unwrap();
+    store
+        .replay_projection(DurableCadence {
+            commits: std::num::NonZeroU32::MAX,
+            records: std::num::NonZeroU32::MAX,
+        })
+        .expect("the model engine has working state");
+    store
+        .hold_projection_commits(CommitHold {
+            records: std::num::NonZeroU32::MAX,
+            wait: std::time::Duration::from_secs(3600),
+        })
+        .expect("the replay profile");
+    let (materializer, handle) = coord_storage::ManualMaterializer::new();
+    store
+        .pipeline(Box::new(materializer))
+        .expect("nothing out yet");
+    let domain = coord_storage::JournaledDomain::new(store, DOMAIN, genesis).expect("attached");
+    let applier = Applier::new(domain, alloc).unwrap();
+    let bootstrapped = applier.store().application_base().execution_position;
+    let alone = ConfigurationIdentity {
+        voters: [r(0)].into_iter().collect(),
+        ..identity(0)
+    };
+    let mut machine = Leader::new(
+        LeaderConfig {
+            identity: alone,
+            quorum: BallotConfiguration::c2(
+                epoch(),
+                ballot(),
+                [r(0)].into_iter().collect(),
+                [r(0)].into_iter().collect(),
+            )
+            .unwrap(),
+            genesis: ballot(),
+            frontend: FRONTEND,
+            capacity: 64,
+        },
+        None,
+        bootstrapped,
+    );
+    machine.set_learning(LearningMode::Full);
+    let mut node = Node::new(Machine::Leader(Box::new(machine)), applier, FRONTEND);
+    node.lower_in_groups();
+    let ingress = Ingress::new(
+        &membership(),
+        r(0),
+        PeerRole::Frontend,
+        IngressBudget::default(),
+    )
+    .expect("a committed voter");
+    let mut voter = Voter::new(node, ingress, (CLUSTER, DOMAIN), ballot());
+    voter.boot(boot, inc()).expect("boot");
+    (voter, handle)
+}
+
+/// A read held at the barrier until the projection shows what its index
+/// covers asks for the projection's commit, so a commit held for a larger
+/// one goes out at the next hand-off (task-d86). The put it reads is
+/// executed and journaled, its group's commit held, and nothing else
+/// asks: without the read's ask the hand-off lends nothing for the hour
+/// the hold names.
+#[test]
+fn a_read_held_at_the_barrier_asks_for_the_held_commit() {
+    let (mut voter, handle) = held_lone_leader();
+    let mut collector = Collector::new(CollectorConfig {
+        quorum: quorum(),
+        max_pending: 16,
+        max_resolved: 16,
+        max_undelivered_bytes: usize::MAX,
+    });
+    let Submitted::FanOut(fan_out) = collector
+        .submit(MonotonicMillis::ZERO, &admitted(1))
+        .expect("submitted")
+    else {
+        panic!("not new work")
+    };
+    voter
+        .on_submission(
+            PeerRole::Frontend,
+            &frame(&fan_out.frame),
+            Origin::Connection(7),
+        )
+        .expect("driven")
+        .expect("admitted");
+    for _ in 0..8 {
+        if voter.node().executed == 1 {
+            break;
+        }
+        voter.flush().expect("journaled");
+    }
+    assert_eq!(voter.node().executed, 1);
+    voter.finish().expect("handed off");
+    voter.settle().expect("settled");
+    assert_eq!(handle.waiting(), 0, "the group's commit is held");
+
+    let t0 = MonotonicMillis::ZERO;
+    let out = voter.on_read(&read(2), Origin::Connection(9), t0);
+    assert!(out.reads.is_empty(), "the read waits for the projection");
+    voter.settle().expect("settled");
+    assert_eq!(
+        handle.waiting(),
+        1,
+        "the read's ask lends the held commit at the next hand-off"
+    );
+    assert!(handle.run());
+    voter.settle().expect("settled");
+    let out = voter.pump_reads(t0);
+    let [(_, bytes)] = &out.reads[..] else {
+        panic!("one answer: {:?}", out.reads.len());
+    };
+    let answer = decode_read_answer(&frame(bytes)).expect("a read answer");
+    assert!(
+        matches!(answer.outcome, ReadOutcomeV1::Served { .. }),
+        "{answer:?}"
+    );
+}
