@@ -217,12 +217,18 @@ impl Election {
     }
 
     /// When the schedule next wants to be looked at: the next campaign,
-    /// if one is scheduled and nothing holds it back. A request is acted
-    /// on at the next pass, which the signal that carried it has already
-    /// woken.
+    /// if one is scheduled and nothing holds it back; or, while a promise
+    /// that has not synchronized counts as a leader, the end of its
+    /// ceiling, when it stops counting. A candidate that stands down sends
+    /// nothing, so on a quiet domain nothing else would wake the voter to
+    /// find itself leaderless (Codex review on #98, election.rs:227). A
+    /// request is acted on at the next pass, which the signal that carried
+    /// it has already woken.
     pub fn next_deadline(&self) -> Option<Instant> {
         match self.held {
-            Held::No => self.next,
+            Held::No => self
+                .next
+                .or_else(|| self.unsynced.map(|(_, since)| since + self.ceiling)),
             Held::Majority => None,
             Held::Until(at) => self.next.map(|next| next.max(at)),
         }
@@ -468,6 +474,33 @@ mod tests {
         // A ballot that names this voter is its own to lead.
         assert!(!e.led(false, me, ballot(5, 3), ballot(5, 3), true, t));
         assert!(e.led(true, me, ballot(5, 3), ballot(5, 3), true, t));
+    }
+
+    /// A promise still awaiting its Sync is a deadline: the voter is woken
+    /// when its ceiling ends, finds itself leaderless and schedules a
+    /// campaign, with nothing arriving to wake it.
+    #[test]
+    fn a_promise_awaiting_its_sync_wakes_the_voter_when_its_ceiling_ends() {
+        let me = ReplicaId([3; 16]);
+        let t = Instant::now();
+        let mut e = schedule(1);
+        // Synchronized and linked: nothing to wake for.
+        let led = e.led(false, me, ballot(2, 5), ballot(2, 5), true, t);
+        assert_eq!(e.observe(led, true, false, t), None);
+        assert_eq!(e.next_deadline(), None);
+        // Promised ballot 3, not synchronized: the end of its ceiling.
+        let led = e.led(false, me, ballot(3, 5), ballot(2, 5), true, t);
+        assert_eq!(e.observe(led, true, false, t), None);
+        assert_eq!(e.next_deadline(), Some(t + C));
+        // Woken then: leaderless, with a campaign scheduled after it.
+        let led = e.led(false, me, ballot(3, 5), ballot(2, 5), true, t + C);
+        assert!(!led);
+        assert_eq!(e.observe(led, true, false, t + C), None);
+        assert!(e.next_deadline().is_some_and(|at| at > t + C));
+        // Its Sync comes after all: nothing to wake for again.
+        let led = e.led(false, me, ballot(3, 5), ballot(3, 5), true, t + C);
+        assert_eq!(e.observe(led, true, false, t + C), None);
+        assert_eq!(e.next_deadline(), None);
     }
 
     /// A voter held by a promise that never synchronizes campaigns once the
