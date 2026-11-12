@@ -2019,13 +2019,15 @@ So task-d103 stops writing the proposal row and removes that comment. That is on
 | The floor's rewrite, at `K = 16` (task-d104) | about 9 |
 
 - **task-d104 batches the retry deletes; it doesn't remove them.** K deletes every K commands is still one a command, so its step is under one row.
-- **Nine rows is about 0.27 to 0.36 ms an operation,** at −0.03 to −0.04 ms a row, against a parity budget of 0.18 for the whole materializer block. The three steps together stop well short of it.
+- **The price is a page, not a row** (review on #185, 6812429771, from task-d86's profile). A row that lands on a leaf no other row of its commit touches costs a fresh 4 KiB page: copied on write, rebuilt, checksummed at the working commit and written at the durable one. A row rewritten on a page its commit has already copied costs a few µs. At the sweep's fit, about 9.2 µs a page a voter, a page a command at every voter is about −0.036 to −0.040 ms an operation on the EPYC 9V74.
+  - **So the table counts rows, but the cost follows pages.** A follower writes about 10.8 rows and 9.4 fresh pages a command today. The meta rows and the retry deletes mostly land on pages already copied.
+  - **The three steps together stop well short of the parity budget** for the whole materializer block (0.18 then, restated on the 9V74 in task-d72's record): each takes at most one page a command, and task-d104's first part takes almost none at the bar (its own step).
 - **What's left to cut, each raised on its own step:**
   - the current row, once task-d105's index exists (task-d105's step);
   - the retry delete, with a window that overwrites in place (task-d104's step);
   - the meta row once a commit rather than once a command, with the commit cadence (task-d86, task-d101's option 1).
 
-  With those, a follower writes about five rows a command: payload, dependency, executed, event and retry.
+  With those, a follower writes about five rows a command: payload, dependency, executed, event and retry. Three of them, the payload, dependency and executed rows, are keyed by the command's digest and pay a page each. Keying them by order, so that a commit's rows share leaves, is task-d113's step (#233), the largest single cut on the materializers.
 
 **The retry window retired in batches (task-d104).** In steady state a command writes four retry rows at every voter:
 - its retained result (`RetryV1`) and its executed row (`ExecutedV1`), both put;
