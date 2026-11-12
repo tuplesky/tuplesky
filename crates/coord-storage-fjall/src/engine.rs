@@ -32,6 +32,7 @@ pub const GROUPS: [(&str, &[Collection]); 4] = [
         "protocol",
         &[
             Collection::PayloadV1,
+            Collection::PendingPayloadV1,
             Collection::ProtocolV1,
             Collection::ExecutionV1,
             Collection::ExecutedV1,

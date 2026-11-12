@@ -15,7 +15,7 @@ use coord_checkpoint::restore::{
 use coord_state::plan::KvEventKind;
 use coord_state::view::KvEntry;
 use coord_storage::codecs::{
-    self, EventRecordV1, ExecutedRecordV1, HistoryRecordV1, RetryRecordV1,
+    self, EventRecordV1, ExecutedRecordV1, ExecutionRecordV1, HistoryRecordV1, RetryRecordV1,
 };
 use coord_storage::lowering::{DurableMeta, ExecutionFrontier};
 use coord_store_api::engine::{LocalEngine, OrderedRead, ScanRequest, SnapshotSource, WriteTxn};
@@ -107,16 +107,19 @@ fn common_rows() -> Vec<Row> {
     for (n, position, revision) in [(1u8, 1u64, 1u64), (2, 2, 3), (3, 3, 4), (4, 4, 5)] {
         put(
             Collection::PayloadV1,
-            command(n).as_bytes().to_vec(),
+            codecs::position_key(pos(position)).to_vec(),
             format!("payload-{n}").into_bytes(),
         );
         put(
-            Collection::ExecutedV1,
-            codecs::executed_key(&command(n)),
-            codecs::encode_executed(&ExecutedRecordV1 {
-                position: pos(position),
-                revision: Some(rev(revision)),
-                result_digest: Digest32([n; 32]),
+            Collection::ExecutionV1,
+            codecs::position_key(pos(position)).to_vec(),
+            codecs::encode_execution(&ExecutionRecordV1 {
+                command: command(n),
+                executed: ExecutedRecordV1 {
+                    position: pos(position),
+                    revision: Some(rev(revision)),
+                    result_digest: Digest32([n; 32]),
+                },
             })
             .unwrap(),
         );

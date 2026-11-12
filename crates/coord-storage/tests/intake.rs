@@ -785,8 +785,9 @@ fn a_commit_whose_outcome_is_not_known_settled_either_way_leaves_the_index_as_th
             // Not yet known: the index is the one before the commit.
             assert_eq!(
                 s.reader(A).unwrap().intake_index().len(),
-                2,
-                "{what}: nothing published while the outcome is not known"
+                4,
+                "{what}: nothing published while the outcome is not known \
+                 (two dependency rows and two pending payloads)"
             );
             s.reconcile(A).unwrap();
             assert_eq!(s.status(A), Some(DomainStatus::Ready), "{what}");
@@ -955,7 +956,7 @@ fn a_store_of_the_other_layout_is_refused_with_the_reason() {
         assert!(
             refused
                 .diagnostic
-                .contains("store format 1 is not this build's (2)"),
+                .contains("store format 1 is not this build's (3)"),
             "{refused:?}"
         );
     }
@@ -1000,6 +1001,29 @@ fn a_store_of_the_other_layout_is_refused_with_the_reason() {
             .contains("dependency rows keyed by command"),
         "{refused}"
     );
+    // Recording nothing, with an executed row keyed by command: the format
+    // before task-d113's step 2.
+    let executed = || {
+        let mut engine = ModelEngine::new();
+        let mut tx = engine.begin_write().unwrap();
+        tx.put(
+            Collection::ExecutedV1.id(),
+            &coord_storage::codecs::executed_key(&command_of(1)),
+            &coord_storage::codecs::encode_executed(&coord_storage::codecs::ExecutedRecordV1 {
+                position: coord_types::ids::ExecutionPosition::new(1).unwrap(),
+                revision: None,
+                result_digest: coord_types::identity::Digest32([1; 32]),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        tx.commit_durable().unwrap();
+        engine
+    };
+    let refused = StoreWorker::open(executed(), boot(1), inc(), GroupLimits::default())
+        .err()
+        .expect("a store of format 2 is refused");
+    assert!(refused.diagnostic.contains("store format 2"), "{refused:?}");
     // This build's format, recorded, opens.
     let mut engine = ModelEngine::new();
     let mut tx = engine.begin_write().unwrap();

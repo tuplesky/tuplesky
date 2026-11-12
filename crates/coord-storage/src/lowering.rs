@@ -178,7 +178,9 @@ impl DurableMeta {
 
 /// Lower one record's updates, the record at `seq`, into the transaction,
 /// through the key assignment (task-d113): a dependency or proposal row
-/// named by command is written under its intake key.
+/// named by command is written under its intake key, a payload to the
+/// pending collection by intake order, and an executed row by its
+/// position with its payload moved (step 2).
 ///
 /// Each update is written before the next is assigned, so a later update
 /// of the same record finds an earlier one's row.
@@ -191,8 +193,8 @@ pub fn lower_record<W: WriteTxn>(
     for (i, update) in updates.iter().enumerate() {
         let ordinal = u32::try_from(i)
             .map_err(|_| EngineError::new(ErrorClass::Limit, "a record of too many updates"))?;
-        let assigned = assigner.assign(seq, ordinal, update, |key| {
-            Ok(tx.get(update.collection, key)?.is_some())
+        let assigned = assigner.assign(seq, ordinal, update, |collection, key| {
+            tx.get(collection, key)
         })?;
         match assigned {
             Assigned::AsIs => lower_update(tx, update)?,
@@ -201,6 +203,11 @@ pub fn lower_record<W: WriteTxn>(
                 None => tx.delete(update.collection, &key)?,
             },
             Assigned::Skip => {}
+            Assigned::Writes(writes) => {
+                for write in &writes {
+                    lower_update(tx, write)?;
+                }
+            }
         }
     }
     Ok(())

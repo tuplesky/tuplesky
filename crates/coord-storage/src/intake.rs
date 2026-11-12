@@ -40,21 +40,52 @@
 //! A snapshot reader looks up only executed commands through the index
 //! (rule (c)): [`crate::protocol::catch_up_entry`] reads the command's
 //! executed row in its snapshot first.
+//!
+//! **Step 2: the payload and executed rows by order.** The machine and the
+//! applier name a command's payload (`payload_v1`) and its executed row
+//! (`executed_v1`) by command too, and the lowering keys them by order:
+//!
+//! * a payload not yet executed goes to the node-private
+//!   `pending_payload_v1`, by intake order ([`pending_key`]), and the
+//!   index's intake part holds it as it holds a dependency row;
+//! * an executed row goes to `execution_v1` under its position
+//!   ([`crate::codecs::position_key`]), its value naming the command, and
+//!   the command's pending payload **moves** in the same transaction to
+//!   `payload_v1` under the same position. The index's **executed part**
+//!   maps the command's prefix to the position, for as long as the row is
+//!   kept;
+//! * rule (a): a payload put for a command the executed part holds writes
+//!   nothing, since its payload has moved;
+//! * rule (b): an executed row with no pending payload to move is refused,
+//!   so `payload_v1` has no hole at a position.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
 
 use coord_consensus::rows::{DEPENDENCY_TAG, PROPOSAL_TAG};
-use coord_core::effect::StoreUpdate;
+use coord_core::effect::{CollectionId, StoreUpdate};
 use coord_store_api::engine::{Direction, EngineError, ErrorClass, OrderedRead, ScanRequest};
 use coord_store_api::registry::{Collection, meta_fields};
 use coord_types::CommandId;
 use coord_types::identity::Digest32;
+use coord_types::ids::ExecutionPosition;
+
+use crate::codecs::{
+    ExecutionRecordV1, decode_executed, decode_execution, encode_execution, position_key,
+    position_of,
+};
 
 /// Length of a by-command key: epoch, tag, command.
 pub const COMMAND_KEY_LEN: usize = 8 + 1 + 32;
 /// Length of an intake key: epoch, tag, sequence, ordinal, command.
 pub const INTAKE_KEY_LEN: usize = 8 + 1 + 8 + 4 + 32;
+/// Length of a `pending_payload_v1` key: sequence, ordinal, command.
+pub const PENDING_KEY_LEN: usize = 8 + 4 + 32;
+
+/// The index region the pending payloads are kept in: an epoch no store
+/// reaches and a tag no protocol row has, so it is apart from every
+/// epoch's dependency and proposal rows.
+const PENDING_REGION: ([u8; 8], u8) = (u64::MAX.to_be_bytes(), 0xff);
 
 pub use coord_store_api::registry::STORE_FORMAT_VERSION;
 
@@ -96,6 +127,33 @@ pub fn intake_key(epoch: [u8; 8], tag: u8, order: IntakeOrder, command: &Command
     out.extend_from_slice(&order.ordinal.to_be_bytes());
     out.extend_from_slice(command.as_bytes());
     out
+}
+
+/// The `pending_payload_v1` key of a payload not yet executed (step 2).
+pub fn pending_key(order: IntakeOrder, command: &CommandId) -> Vec<u8> {
+    let mut out = Vec::with_capacity(PENDING_KEY_LEN);
+    out.extend_from_slice(&order.seq.to_be_bytes());
+    out.extend_from_slice(&order.ordinal.to_be_bytes());
+    out.extend_from_slice(command.as_bytes());
+    out
+}
+
+/// Read a `pending_payload_v1` key.
+pub fn parse_pending(key: &[u8]) -> Option<(IntakeOrder, CommandId)> {
+    if key.len() != PENDING_KEY_LEN {
+        return None;
+    }
+    let mut seq = [0u8; 8];
+    seq.copy_from_slice(&key[..8]);
+    let mut ordinal = [0u8; 4];
+    ordinal.copy_from_slice(&key[8..12]);
+    Some((
+        IntakeOrder {
+            seq: u64::from_be_bytes(seq),
+            ordinal: u32::from_be_bytes(ordinal),
+        },
+        command_at(key, 12),
+    ))
 }
 
 /// What a `protocol_v1` key is to this layout.
@@ -242,6 +300,9 @@ pub const ENTRY_BYTES: u64 = 46;
 pub struct IntakeIndex {
     regions: BTreeMap<(u64, u8), BTreeSet<Slot>>,
     len: usize,
+    /// The executed part (step 2): each kept `execution_v1` row, as the
+    /// command's prefix and the position.
+    executed: BTreeSet<(u64, u64)>,
     /// The journal sequence of the last commit published into it.
     stamp: u64,
 }
@@ -274,43 +335,69 @@ impl IntakeIndex {
             stamp,
             ..IntakeIndex::default()
         };
-        let mut resume: Option<Vec<u8>> = None;
-        loop {
-            let page = view.scan_page(
-                Collection::ProtocolV1.id(),
+        scan_all(view, Collection::ProtocolV1, |key, _| match parse(key) {
+            ProtocolKey::Intake {
+                epoch,
+                tag,
+                order,
+                command,
+            } => {
+                index.insert(entry(epoch, tag, order, &command));
+                Ok(())
+            }
+            ProtocolKey::ByCommand { .. } => Err(EngineError::new(
+                ErrorClass::Unsupported,
+                format!(
+                    "store format 1 (dependency rows keyed by command, before task-d113) is \
+                     not this build's ({STORE_FORMAT_VERSION}): a store of another layout is \
+                     not converted"
+                ),
+            )),
+            ProtocolKey::Other => Ok(()),
+        })?;
+        scan_all(view, Collection::PendingPayloadV1, |key, _| {
+            let (order, command) = parse_pending(key).ok_or_else(|| {
+                EngineError::new(
+                    ErrorClass::Corrupt,
+                    "a pending payload key of the wrong length",
+                )
+            })?;
+            let (epoch, tag) = PENDING_REGION;
+            index.insert(entry(epoch, tag, order, &command));
+            Ok(())
+        })?;
+        scan_all(view, Collection::ExecutionV1, |key, value| {
+            let position = position_of(key)?;
+            let record = decode_execution(value)?;
+            index
+                .executed
+                .insert((prefix(&record.command), position.get()));
+            Ok(())
+        })?;
+        // A store of format 2 kept its executed rows in `executed_v1`.
+        if !view
+            .scan_page(
+                Collection::ExecutedV1.id(),
                 &ScanRequest {
                     lower: Bound::Unbounded,
                     upper: Bound::Unbounded,
                     direction: Direction::Forward,
-                    resume_after: resume.take(),
-                    max_rows: 4096.try_into().expect("non-zero"),
-                    max_bytes: (4 << 20).try_into().expect("non-zero"),
+                    resume_after: None,
+                    max_rows: 1.try_into().expect("non-zero"),
+                    max_bytes: (1 << 20).try_into().expect("non-zero"),
                 },
-            )?;
-            for row in &page.rows {
-                match parse(&row.key) {
-                    ProtocolKey::Intake {
-                        epoch,
-                        tag,
-                        order,
-                        command,
-                    } => {
-                        index.insert(entry(epoch, tag, order, &command));
-                    }
-                    ProtocolKey::ByCommand { .. } => {
-                        return Err(EngineError::new(
-                            ErrorClass::Unsupported,
-                            "store format 1 (dependency rows keyed by command, before task-d113) \
-                             is not this build's (2): a store of another layout is not converted",
-                        ));
-                    }
-                    ProtocolKey::Other => {}
-                }
-            }
-            match page.rows.last() {
-                Some(last) if !page.exhausted => resume = Some(last.key.clone()),
-                _ => break,
-            }
+            )?
+            .rows
+            .is_empty()
+        {
+            return Err(EngineError::new(
+                ErrorClass::Unsupported,
+                format!(
+                    "store format 2 (executed rows in executed_v1 by command, before task-d113's \
+                     step 2) is not this build's ({STORE_FORMAT_VERSION}): a store of another \
+                     layout is not converted"
+                ),
+            ));
         }
         Ok(index)
     }
@@ -384,6 +471,24 @@ impl IntakeIndex {
         self.of(epoch, tag, command).map(|(_, _, _, order)| order)
     }
 
+    /// The positions `command` may have executed at, in order: every
+    /// executed entry whose prefix is the command's. The row at the
+    /// position, which names its command, settles whose each is.
+    pub fn executed_candidates(
+        &self,
+        command: &CommandId,
+    ) -> impl Iterator<Item = ExecutionPosition> + '_ {
+        let p = prefix(command);
+        self.executed
+            .range((p, 0)..=(p, u64::MAX))
+            .filter_map(|&(_, position)| ExecutionPosition::new(position).ok())
+    }
+
+    /// Executed entries held: the executed part's size.
+    pub fn executed_len(&self) -> usize {
+        self.executed.len()
+    }
+
     /// Publish `delta`, the changes of the commit stamped `stamp`.
     pub fn publish(&mut self, delta: IndexDelta, stamp: u64) {
         for e in delta.removed {
@@ -392,6 +497,10 @@ impl IntakeIndex {
         for e in delta.added {
             self.insert(e);
         }
+        for e in delta.executed_removed {
+            self.executed.remove(&e);
+        }
+        self.executed.extend(delta.executed_added);
         self.stamp = stamp;
     }
 
@@ -399,6 +508,35 @@ impl IntakeIndex {
     /// it from the rows.
     pub fn clear(&mut self) {
         *self = IntakeIndex::default();
+    }
+}
+
+/// Call `f` with each row of `collection` in `view`, in key order.
+fn scan_all<V: OrderedRead>(
+    view: &V,
+    collection: Collection,
+    mut f: impl FnMut(&[u8], &[u8]) -> Result<(), EngineError>,
+) -> Result<(), EngineError> {
+    let mut resume: Option<Vec<u8>> = None;
+    loop {
+        let page = view.scan_page(
+            collection.id(),
+            &ScanRequest {
+                lower: Bound::Unbounded,
+                upper: Bound::Unbounded,
+                direction: Direction::Forward,
+                resume_after: resume.take(),
+                max_rows: 4096.try_into().expect("non-zero"),
+                max_bytes: (4 << 20).try_into().expect("non-zero"),
+            },
+        )?;
+        for row in &page.rows {
+            f(&row.key, &row.value)?;
+        }
+        match page.rows.last() {
+            Some(last) if !page.exhausted => resume = Some(last.key.clone()),
+            _ => return Ok(()),
+        }
     }
 }
 
@@ -416,12 +554,29 @@ fn describe(recorded: &[u8]) -> String {
 pub struct IndexDelta {
     added: BTreeSet<Entry>,
     removed: BTreeSet<Entry>,
+    executed_added: BTreeSet<(u64, u64)>,
+    executed_removed: BTreeSet<(u64, u64)>,
 }
 
 impl IndexDelta {
     /// Whether it changes nothing.
     pub fn is_empty(&self) -> bool {
-        self.added.is_empty() && self.removed.is_empty()
+        self.added.is_empty()
+            && self.removed.is_empty()
+            && self.executed_added.is_empty()
+            && self.executed_removed.is_empty()
+    }
+
+    fn execute(&mut self, e: (u64, u64)) {
+        if !self.executed_removed.remove(&e) {
+            self.executed_added.insert(e);
+        }
+    }
+
+    fn unexecute(&mut self, e: (u64, u64)) {
+        if !self.executed_added.remove(&e) {
+            self.executed_removed.insert(e);
+        }
     }
 
     fn add(&mut self, e: Entry) {
@@ -444,16 +599,21 @@ pub enum Assigned {
     AsIs,
     /// Write it under this key.
     Key(Vec<u8>),
-    /// Write nothing: a delete of a row by command that is not there.
+    /// Write nothing: a delete of a row by command that is not there, or a
+    /// payload put for a command already executed (rule (a)).
     Skip,
+    /// Write these in its place, in order: an executed row, written by
+    /// position with its payload moved (step 2), or a payload written to
+    /// the pending collection.
+    Writes(Vec<StoreUpdate>),
 }
 
 /// The key assignment (rules (d) and (e)): the one function the lowering
 /// and the recovery cut's overlay both lower a record's updates through.
 ///
 /// It reads the index at the state its rows are at (`base`), keeps its own
-/// changes (`delta`), and asks `exists` whether a key is a row at that
-/// state, its own earlier updates included. Each update is to be applied
+/// changes (`delta`), and reads a row through `read` at that state, its
+/// own earlier updates included. Each update is to be applied
 /// before the next is assigned.
 pub struct Assigner<'a> {
     base: &'a IntakeIndex,
@@ -487,14 +647,74 @@ impl<'a> Assigner<'a> {
         out
     }
 
-    /// Assign `update`, the `ordinal`th of the record at `seq`.
+    fn live_executed(&self, command: &CommandId) -> Vec<u64> {
+        let p = prefix(command);
+        let mut out: Vec<u64> = self
+            .base
+            .executed
+            .range((p, 0)..=(p, u64::MAX))
+            .filter(|e| !self.delta.executed_removed.contains(e))
+            .chain(self.delta.executed_added.range((p, 0)..=(p, u64::MAX)))
+            .map(|&(_, position)| position)
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// The position `command` executed at, if the executed part names one
+    /// whose row is the command's.
+    fn executed_at(
+        &self,
+        command: &CommandId,
+        read: &mut impl FnMut(CollectionId, &[u8]) -> Result<Option<Vec<u8>>, EngineError>,
+    ) -> Result<Option<ExecutionPosition>, EngineError> {
+        for position in self.live_executed(command) {
+            let position = ExecutionPosition::new(position)
+                .map_err(|_| EngineError::new(ErrorClass::Corrupt, "an executed entry at zero"))?;
+            if let Some(row) = read(Collection::ExecutionV1.id(), &position_key(position))?
+                && decode_execution(&row)?.command == *command
+            {
+                return Ok(Some(position));
+            }
+        }
+        Ok(None)
+    }
+
+    /// `command`'s pending payload, if one is there: its intake order and
+    /// its bytes.
+    fn pending_of(
+        &self,
+        command: &CommandId,
+        read: &mut impl FnMut(CollectionId, &[u8]) -> Result<Option<Vec<u8>>, EngineError>,
+    ) -> Result<Option<(IntakeOrder, Vec<u8>)>, EngineError> {
+        let (epoch, tag) = PENDING_REGION;
+        for order in self.live(epoch, tag, command) {
+            if let Some(value) = read(
+                Collection::PendingPayloadV1.id(),
+                &pending_key(order, command),
+            )? {
+                return Ok(Some((order, value)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Assign `update`, the `ordinal`th of the record at `seq`. `read`
+    /// reads a row at the state the record's earlier updates have left.
     pub fn assign(
         &mut self,
         seq: u64,
         ordinal: u32,
         update: &StoreUpdate,
-        mut exists: impl FnMut(&[u8]) -> Result<bool, EngineError>,
+        mut read: impl FnMut(CollectionId, &[u8]) -> Result<Option<Vec<u8>>, EngineError>,
     ) -> Result<Assigned, EngineError> {
+        if update.collection == Collection::PayloadV1.id() {
+            return self.assign_payload(seq, ordinal, update, &mut read);
+        }
+        if update.collection == Collection::ExecutedV1.id() {
+            return self.assign_executed(update, &mut read);
+        }
         if update.collection != Collection::ProtocolV1.id() {
             return Ok(Assigned::AsIs);
         }
@@ -523,7 +743,12 @@ impl<'a> Assigner<'a> {
             } => {
                 let mut found = None;
                 for order in self.live(epoch, tag, &command) {
-                    if exists(&intake_key(epoch, tag, order, &command))? {
+                    if read(
+                        Collection::ProtocolV1.id(),
+                        &intake_key(epoch, tag, order, &command),
+                    )?
+                    .is_some()
+                    {
                         found = Some(order);
                         break;
                     }
@@ -548,6 +773,131 @@ impl<'a> Assigner<'a> {
                 }
             }
         }
+    }
+
+    /// A payload named by command (step 2): to the pending collection, or
+    /// nothing if the command has executed (rule (a)).
+    fn assign_payload(
+        &mut self,
+        seq: u64,
+        ordinal: u32,
+        update: &StoreUpdate,
+        read: &mut impl FnMut(CollectionId, &[u8]) -> Result<Option<Vec<u8>>, EngineError>,
+    ) -> Result<Assigned, EngineError> {
+        let Ok(bytes) = <[u8; 32]>::try_from(update.key.as_slice()) else {
+            // Keyed by position already: an image's row, or a trim step's.
+            return Ok(Assigned::AsIs);
+        };
+        let command = CommandId(Digest32(bytes));
+        let pending = Collection::PendingPayloadV1.id();
+        let (epoch, tag) = PENDING_REGION;
+        if self.executed_at(&command, read)?.is_some() {
+            // Rule (a): its payload has moved to its position, and a put
+            // would leave a pending row nothing moves or deletes. A delete
+            // never takes an executed command's payload.
+            return Ok(Assigned::Skip);
+        }
+        let found = self.pending_of(&command, read)?;
+        match (&update.value, found) {
+            (Some(value), Some((order, _))) => Ok(Assigned::Writes(vec![StoreUpdate {
+                collection: pending,
+                key: pending_key(order, &command),
+                value: Some(value.clone()),
+            }])),
+            (Some(value), None) => {
+                let order = IntakeOrder { seq, ordinal };
+                self.delta.add(entry(epoch, tag, order, &command));
+                Ok(Assigned::Writes(vec![StoreUpdate {
+                    collection: pending,
+                    key: pending_key(order, &command),
+                    value: Some(value.clone()),
+                }]))
+            }
+            (None, Some((order, _))) => {
+                self.delta.remove(entry(epoch, tag, order, &command));
+                Ok(Assigned::Writes(vec![StoreUpdate {
+                    collection: pending,
+                    key: pending_key(order, &command),
+                    value: None,
+                }]))
+            }
+            (None, None) => Ok(Assigned::Skip),
+        }
+    }
+
+    /// An executed row named by command (step 2): written to `execution_v1`
+    /// under its position, with the command's pending payload moved to
+    /// `payload_v1` under the same position. With no pending payload to
+    /// move, it is refused (rule (b)).
+    fn assign_executed(
+        &mut self,
+        update: &StoreUpdate,
+        read: &mut impl FnMut(CollectionId, &[u8]) -> Result<Option<Vec<u8>>, EngineError>,
+    ) -> Result<Assigned, EngineError> {
+        let bytes = <[u8; 32]>::try_from(update.key.as_slice()).map_err(|_| {
+            EngineError::new(ErrorClass::Corrupt, "an executed row not named by command")
+        })?;
+        let command = CommandId(Digest32(bytes));
+        let execution = Collection::ExecutionV1.id();
+        let payloads = Collection::PayloadV1.id();
+        let Some(value) = &update.value else {
+            // Its rows by position go with it.
+            let Some(position) = self.executed_at(&command, read)? else {
+                return Ok(Assigned::Skip);
+            };
+            self.delta.unexecute((prefix(&command), position.get()));
+            let key = position_key(position).to_vec();
+            return Ok(Assigned::Writes(vec![
+                StoreUpdate {
+                    collection: execution,
+                    key: key.clone(),
+                    value: None,
+                },
+                StoreUpdate {
+                    collection: payloads,
+                    key,
+                    value: None,
+                },
+            ]));
+        };
+        let executed = decode_executed(value)?;
+        let position = executed.position;
+        let key = position_key(position).to_vec();
+        let row = StoreUpdate {
+            collection: execution,
+            key: key.clone(),
+            value: Some(encode_execution(&ExecutionRecordV1 { command, executed })?),
+        };
+        if self.executed_at(&command, read)? == Some(position) {
+            // Written again with the same position: its payload has moved.
+            return Ok(Assigned::Writes(vec![row]));
+        }
+        let Some((order, payload)) = self.pending_of(&command, read)? else {
+            return Err(EngineError::new(
+                ErrorClass::Corrupt,
+                format!(
+                    "a command executed at position {} with no pending payload to move \
+                     (task-d113, rule (b))",
+                    position.get()
+                ),
+            ));
+        };
+        let (epoch, tag) = PENDING_REGION;
+        self.delta.remove(entry(epoch, tag, order, &command));
+        self.delta.execute((prefix(&command), position.get()));
+        Ok(Assigned::Writes(vec![
+            row,
+            StoreUpdate {
+                collection: Collection::PendingPayloadV1.id(),
+                key: pending_key(order, &command),
+                value: None,
+            },
+            StoreUpdate {
+                collection: payloads,
+                key,
+                value: Some(payload),
+            },
+        ]))
     }
 }
 
@@ -617,7 +967,9 @@ mod tests {
         };
         for (i, c) in [a, b].iter().enumerate() {
             let Assigned::Key(k) = assigner
-                .assign(5, i as u32, &put(c), |k| Ok(rows.contains(k)))
+                .assign(5, i as u32, &put(c), |_, k| {
+                    Ok(rows.contains(k).then(Vec::new))
+                })
                 .unwrap()
             else {
                 panic!("a new row is keyed");
@@ -626,7 +978,7 @@ mod tests {
         }
         // b's rewrite lands on b's row, not on a's under the same prefix.
         let Assigned::Key(k) = assigner
-            .assign(6, 0, &put(&b), |k| Ok(rows.contains(k)))
+            .assign(6, 0, &put(&b), |_, k| Ok(rows.contains(k).then(Vec::new)))
             .unwrap()
         else {
             panic!("a rewrite is keyed");
@@ -641,5 +993,203 @@ mod tests {
             )
         );
         assert_eq!(assigner.into_delta().added.len(), 2);
+    }
+
+    /// The rows an assignment's updates leave, by collection and key: what
+    /// the tests below read through, applying each assignment as the
+    /// lowering does.
+    #[derive(Default)]
+    struct Rows(std::collections::BTreeMap<(u16, Vec<u8>), Vec<u8>>);
+
+    impl Rows {
+        fn get(&self, collection: CollectionId, key: &[u8]) -> Option<Vec<u8>> {
+            self.0.get(&(collection.0, key.to_vec())).cloned()
+        }
+
+        fn apply(&mut self, update: &StoreUpdate) {
+            let k = (update.collection.0, update.key.clone());
+            match &update.value {
+                Some(v) => {
+                    self.0.insert(k, v.clone());
+                }
+                None => {
+                    self.0.remove(&k);
+                }
+            }
+        }
+
+        fn assign(
+            &mut self,
+            assigner: &mut Assigner<'_>,
+            seq: u64,
+            ordinal: u32,
+            update: StoreUpdate,
+        ) -> Result<Assigned, EngineError> {
+            let assigned = assigner.assign(seq, ordinal, &update, |c, k| Ok(self.get(c, k)))?;
+            match &assigned {
+                Assigned::AsIs => self.apply(&update),
+                Assigned::Key(key) => self.apply(&StoreUpdate {
+                    key: key.clone(),
+                    ..update
+                }),
+                Assigned::Skip => {}
+                Assigned::Writes(writes) => writes.iter().for_each(|w| self.apply(w)),
+            }
+            Ok(assigned)
+        }
+
+        fn of(&self, collection: Collection) -> usize {
+            let id = collection.id().0;
+            self.0.keys().filter(|(c, _)| *c == id).count()
+        }
+    }
+
+    fn payload(command: &CommandId, value: Option<u8>) -> StoreUpdate {
+        StoreUpdate {
+            collection: Collection::PayloadV1.id(),
+            key: command.as_bytes().to_vec(),
+            value: value.map(|v| vec![v]),
+        }
+    }
+
+    fn executed(command: &CommandId, position: u64) -> StoreUpdate {
+        StoreUpdate {
+            collection: Collection::ExecutedV1.id(),
+            key: crate::codecs::executed_key(command),
+            value: Some(
+                crate::codecs::encode_executed(&crate::codecs::ExecutedRecordV1 {
+                    position: ExecutionPosition::new(position).unwrap(),
+                    revision: None,
+                    result_digest: Digest32([position as u8; 32]),
+                })
+                .unwrap(),
+            ),
+        }
+    }
+
+    /// A payload is pending by intake order until its command executes;
+    /// then the executed row is written by position and the payload moves
+    /// to the same position in the same assignment (step 2).
+    #[test]
+    fn an_execution_moves_the_pending_payload_to_its_position() {
+        let base = IntakeIndex::default();
+        let mut rows = Rows::default();
+        let mut assigner = Assigner::new(&base);
+        let c = cmd(4);
+        let Assigned::Writes(w) = rows
+            .assign(&mut assigner, 3, 1, payload(&c, Some(9)))
+            .unwrap()
+        else {
+            panic!("a payload is written pending");
+        };
+        let pending = pending_key(IntakeOrder { seq: 3, ordinal: 1 }, &c);
+        assert_eq!(w[0].key, pending);
+        assert_eq!(
+            parse_pending(&pending),
+            Some((IntakeOrder { seq: 3, ordinal: 1 }, c))
+        );
+        assert_eq!(rows.of(Collection::PendingPayloadV1), 1);
+        assert_eq!(rows.of(Collection::PayloadV1), 0);
+        // Written again before it executes: in place.
+        rows.assign(&mut assigner, 4, 0, payload(&c, Some(9)))
+            .unwrap();
+        assert_eq!(rows.of(Collection::PendingPayloadV1), 1);
+
+        rows.assign(&mut assigner, 5, 0, executed(&c, 17)).unwrap();
+        let at = position_key(ExecutionPosition::new(17).unwrap());
+        assert_eq!(
+            rows.of(Collection::PendingPayloadV1),
+            0,
+            "the pending row is gone"
+        );
+        assert_eq!(rows.get(Collection::PayloadV1.id(), &at), Some(vec![9]));
+        let row = decode_execution(&rows.get(Collection::ExecutionV1.id(), &at).unwrap()).unwrap();
+        assert_eq!(row.command, c);
+        assert_eq!(row.executed.position.get(), 17);
+        assert_eq!(
+            rows.of(Collection::ExecutedV1),
+            0,
+            "nothing is keyed by command"
+        );
+
+        // Rule (a): a payload put after the command executed writes
+        // nothing, and the moved payload stays.
+        assert_eq!(
+            rows.assign(&mut assigner, 6, 0, payload(&c, Some(1)))
+                .unwrap(),
+            Assigned::Skip
+        );
+        assert_eq!(rows.of(Collection::PendingPayloadV1), 0);
+        assert_eq!(rows.get(Collection::PayloadV1.id(), &at), Some(vec![9]));
+
+        // The same execution written again: only its row.
+        let Assigned::Writes(w) = rows.assign(&mut assigner, 7, 0, executed(&c, 17)).unwrap()
+        else {
+            panic!("a re-put is written");
+        };
+        assert_eq!(w.len(), 1);
+        assert_eq!(rows.get(Collection::PayloadV1.id(), &at), Some(vec![9]));
+
+        let delta = assigner.into_delta();
+        assert_eq!(delta.executed_added.len(), 1);
+        assert!(
+            delta.added.is_empty(),
+            "the pending entry was added and moved: {delta:?}"
+        );
+    }
+
+    /// Rule (b): an execution with no pending payload to move is refused,
+    /// rather than leaving an executed command without its payload. The
+    /// negative control: with the payload pending, the same row is taken.
+    #[test]
+    fn an_execution_without_a_pending_payload_is_refused() {
+        let base = IntakeIndex::default();
+        let mut rows = Rows::default();
+        let mut assigner = Assigner::new(&base);
+        let err = rows
+            .assign(&mut assigner, 1, 0, executed(&cmd(2), 5))
+            .unwrap_err();
+        assert_eq!(err.class, ErrorClass::Corrupt);
+        assert!(err.diagnostic.contains("rule (b)"), "{}", err.diagnostic);
+
+        rows.assign(&mut assigner, 1, 0, payload(&cmd(2), Some(1)))
+            .unwrap();
+        rows.assign(&mut assigner, 1, 1, executed(&cmd(2), 5))
+            .unwrap();
+        assert_eq!(rows.of(Collection::ExecutionV1), 1);
+    }
+
+    /// A payload delete takes a pending row, and nothing of an executed
+    /// command's (rule (a)); an executed row's delete takes its rows by
+    /// position with it.
+    #[test]
+    fn deletes_take_the_rows_they_name() {
+        let base = IntakeIndex::default();
+        let mut rows = Rows::default();
+        let mut assigner = Assigner::new(&base);
+        let (a, b) = (cmd(1), cmd(2));
+        rows.assign(&mut assigner, 1, 0, payload(&a, Some(1)))
+            .unwrap();
+        rows.assign(&mut assigner, 1, 1, payload(&b, Some(2)))
+            .unwrap();
+        rows.assign(&mut assigner, 2, 0, executed(&b, 3)).unwrap();
+        rows.assign(&mut assigner, 3, 0, payload(&a, None)).unwrap();
+        assert_eq!(rows.of(Collection::PendingPayloadV1), 0);
+        assert_eq!(
+            rows.assign(&mut assigner, 3, 1, payload(&b, None)).unwrap(),
+            Assigned::Skip
+        );
+        assert_eq!(rows.of(Collection::PayloadV1), 1);
+        let gone = StoreUpdate {
+            value: None,
+            ..executed(&b, 3)
+        };
+        rows.assign(&mut assigner, 4, 0, gone.clone()).unwrap();
+        assert_eq!(rows.of(Collection::PayloadV1), 0);
+        assert_eq!(rows.of(Collection::ExecutionV1), 0);
+        assert_eq!(
+            rows.assign(&mut assigner, 4, 1, gone).unwrap(),
+            Assigned::Skip
+        );
     }
 }

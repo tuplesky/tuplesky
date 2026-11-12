@@ -5296,7 +5296,7 @@ fn describe_divergence(
     );
     let _ = write!(
         out,
-        "\n  executed_v1 within {} of positions {} and {} (position revision digest command):",
+        "\n  execution_v1 within {} of positions {} and {} (position revision digest command):",
         coord_daemon::settle::NEAR_POSITIONS,
         mismatch.own.position,
         mismatch.release.position,
@@ -6047,6 +6047,10 @@ fn retained_answer<P: Persistence>(
 /// `command` (task-d23): only a row under the invocation's own retry key,
 /// whose request derives the command's identity again.
 ///
+/// An executed command's payload is keyed by its position (task-d113,
+/// step 2), which the retry row of the invocation names; a command not
+/// executed has no retained result to read the request for.
+///
 /// The row's `admission` is not consulted: re-deriving the identity from
 /// the key and the request binds the bytes, whichever admission carried
 /// them.
@@ -6055,10 +6059,14 @@ fn requested<V: coord_store_api::OrderedRead>(
     key: RetryKey,
     command: CommandId,
 ) -> Option<coord_types::logical_v1::LogicalRequest> {
+    let retry = coord_storage::retry::lookup(view, &key).ok()??;
+    if retry.command_id != command {
+        return None;
+    }
     let bytes = view
         .get(
             coord_store_api::Collection::PayloadV1.id(),
-            &coord_consensus::rows::payload_key(&command),
+            &coord_storage::codecs::position_key(retry.position),
         )
         .ok()??;
     let payload = coord_consensus::rows::decode_payload(&bytes).ok()?;
@@ -6663,14 +6671,17 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
             assert_eq!(store.flush().unwrap().committed, 1);
         };
         // The executed record of an invocation this frontend never saw,
-        // and the payload row that says what it asked. The retained
-        // outcome is a denial, which any caller may have replayed.
+        // and the payload row that says what it asked: put, then moved to
+        // the command's position by its executed row (task-d113, step 2).
+        // The retained outcome is a denial, which any caller may have
+        // replayed.
         let executed = |key: RetryKey, command: CommandId, payload: bool| {
             let response = postcard::to_allocvec(&Response {
                 revision: KvRevision::new(3).unwrap(),
                 outcome: Outcome::ErrPermissionDenied,
             })
             .unwrap();
+            let digest = coord_storage::retry::result_digest(&response);
             let mut updates = vec![coord_core::StoreUpdate {
                 collection: coord_store_api::Collection::RetryV1.id(),
                 key: coord_storage::codecs::retry_key(&key),
@@ -6695,6 +6706,15 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
                             admission: None,
                             ack_through: 0,
                         },
+                    )
+                    .unwrap(),
+                );
+                updates.push(
+                    coord_storage::retry::executed_update(
+                        &command,
+                        coord_types::ids::ExecutionPosition::new(3).unwrap(),
+                        None,
+                        digest,
                     )
                     .unwrap(),
                 );
@@ -7435,7 +7455,7 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
         );
         assert!(
             said.contains(
-                "\n  executed_v1 within 8 of positions 121 and 122 (position revision digest \
+                "\n  execution_v1 within 8 of positions 121 and 122 (position revision digest \
                  command):\n    120 - 2222"
             ),
             "{said}"

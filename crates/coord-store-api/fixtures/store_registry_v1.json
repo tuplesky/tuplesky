@@ -29,7 +29,7 @@
     [
       "executed_v1",
       6,
-      true
+      false
     ],
     [
       "kv_current_v1",
@@ -84,6 +84,11 @@
     [
       "checkpoint_v1",
       17,
+      false
+    ],
+    [
+      "pending_payload_v1",
+      18,
       false
     ]
   ],

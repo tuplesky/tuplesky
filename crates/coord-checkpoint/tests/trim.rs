@@ -57,7 +57,7 @@ const OBSERVER: ReplicaId = ReplicaId([0xd4; 16]);
 /// Configuration epoch the acknowledged boundary was reached under.
 const EPOCH: u64 = 7;
 /// Execution position the acknowledged checkpoint closes at.
-const FLOOR_POSITION: u64 = 3;
+const FLOOR_POSITION: u64 = 6;
 
 fn rev(n: u64) -> KvRevision {
     KvRevision::new(n).unwrap()
@@ -217,8 +217,9 @@ fn common_rows() -> Vec<Row> {
         meta_fields::LEASE_AUTHORITY.to_vec(),
         codecs::encode_counter(1).unwrap(),
     );
-    // Commands 1..=3 are executed at or below the boundary; command 5 is
-    // executed beyond it; commands 4 and 6 are not executed at all.
+    // Commands 1..=3, 7 and 8 are executed at or below the boundary;
+    // command 5 is executed beyond it; commands 4 and 6 are not executed
+    // at all.
     // Commands with a dependency record but no execution still need a
     // payload row: recovery treats a recovered command without one as
     // corruption.
@@ -229,7 +230,19 @@ fn common_rows() -> Vec<Row> {
             encode_payload(&payload_of(n)).unwrap(),
         );
     }
-    for (n, position) in [(1u8, 1u64), (2, 2), (3, 3), (5, 4), (7, 1), (8, 2)] {
+    // Each payload goes in before its command's executed row, which the
+    // lowering turns into rows by position and moves the payload to
+    // (task-d113, step 2). Commands 7 and 8 are settled below the floor
+    // too, each at a position of its own; position 6, the floor's, is left
+    // for a test to execute command 4 at.
+    for (n, position, revision) in [
+        (1u8, 1u64, 1u64),
+        (2, 2, 2),
+        (3, 3, 3),
+        (7, 4, 3),
+        (8, 5, 3),
+        (5, 7, 4),
+    ] {
         put(
             Collection::PayloadV1,
             payload_key(&command(n)),
@@ -240,7 +253,7 @@ fn common_rows() -> Vec<Row> {
             codecs::executed_key(&command(n)),
             codecs::encode_executed(&ExecutedRecordV1 {
                 position: pos(position),
-                revision: Some(rev(position)),
+                revision: Some(rev(revision)),
                 result_digest: Digest32([n; 32]),
             })
             .unwrap(),
@@ -387,7 +400,7 @@ fn seed<E: LocalEngine>(engine: &mut E, rows: Vec<Row>) {
         stamp: AppliedStamp::new(StoreSeq::from_journal(seq), Digest32([0xcd; 32])),
         frontier: ExecutionFrontier {
             configuration: epoch(EPOCH),
-            execution_position: pos(4),
+            execution_position: pos(7),
         },
     }
     .write(&mut tx)
@@ -1091,8 +1104,8 @@ fn a_corrupt_protocol_or_execution_record_stops_the_trim_without_deleting_anythi
             b"not a dependency record".to_vec(),
         ),
         (
-            Collection::ExecutedV1,
-            codecs::executed_key(&command(1)),
+            Collection::ExecutionV1,
+            codecs::position_key(pos(1)).to_vec(),
             b"not an execution record".to_vec(),
         ),
     ] {
@@ -1209,7 +1222,7 @@ fn recovery_after_a_trim_knows_how_far_the_store_executed() {
     );
     assert_eq!(
         recovered.execution_frontier(),
-        pos(4),
+        pos(7),
         "the durable baseline says how far the store executed"
     );
 }
@@ -2263,18 +2276,16 @@ fn a_trimmed_history_comes_back_in_the_order_it_executed() {
     let before = read_protocol(&view, e, ViewBudget::default()).unwrap();
     assert!(before.history.len() > 1, "the fixture trims a prefix");
     // The trimmed commands' positions, reversed against their key order
-    // and kept within the prefix they occupy.
-    let mut positions: Vec<ExecutionPosition> = before
-        .history
-        .iter()
-        .map(|c| {
-            let bytes = view
-                .get(Collection::ExecutedV1.id(), &codecs::executed_key(c))
-                .unwrap()
-                .expect("an executed row");
-            codecs::decode_executed(&bytes).unwrap().position
-        })
-        .collect();
+    // and kept within the prefix they occupy. Rows by position since
+    // task-d113's step 2: written straight to `execution_v1`, which the
+    // lowering takes as it is.
+    let mut positions: Vec<ExecutionPosition> =
+        coord_storage::protocol::executed_order(&view, ViewBudget::default())
+            .unwrap()
+            .into_iter()
+            .filter(|(_, c)| before.history.contains(c))
+            .map(|(at, _)| at)
+            .collect();
     positions.sort_unstable();
     let mut by_key = before.history.clone();
     by_key.sort_unstable();
@@ -2282,13 +2293,16 @@ fn a_trimmed_history_comes_back_in_the_order_it_executed() {
         .iter()
         .zip(positions.iter().rev())
         .map(|(c, at)| StoreUpdate {
-            collection: Collection::ExecutedV1.id(),
-            key: codecs::executed_key(c),
+            collection: Collection::ExecutionV1.id(),
+            key: codecs::position_key(*at).to_vec(),
             value: Some(
-                codecs::encode_executed(&ExecutedRecordV1 {
-                    position: *at,
-                    revision: None,
-                    result_digest: Digest32([0; 32]),
+                codecs::encode_execution(&codecs::ExecutionRecordV1 {
+                    command: *c,
+                    executed: ExecutedRecordV1 {
+                        position: *at,
+                        revision: None,
+                        result_digest: Digest32([0; 32]),
+                    },
                 })
                 .unwrap(),
             ),

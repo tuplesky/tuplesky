@@ -617,7 +617,8 @@ fn check_target<V: OrderedRead>(view: &V, manifest: &SharedManifestV1) -> Result
     if installed_baseline(view)?.is_some() {
         return Err(InstallError::AlreadyInstalled);
     }
-    if !empty(view, Collection::ProtocolV1)? {
+    // Payloads pending execution are obligations too (task-d113, step 2).
+    if !empty(view, Collection::ProtocolV1)? || !empty(view, Collection::PendingPayloadV1)? {
         return Err(InstallError::ExistingObligations);
     }
     for collection in Collection::ALL {

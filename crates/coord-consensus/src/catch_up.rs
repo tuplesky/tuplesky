@@ -6,7 +6,7 @@
 //! table, and a voter behind by more than a table's worth lacks commands
 //! the leader executed and retired long ago. Every peer still holds them
 //! on disk -- the payload in `payload_v1`, the decided record in
-//! `protocol_v1`, the execution in `executed_v1` -- and nothing trims
+//! `protocol_v1`, the execution in `execution_v1` -- and nothing trims
 //! those rows while a voter has not acknowledged a floor past them.
 //!
 //! So the voter asks a peer synchronized at its own ballot for the

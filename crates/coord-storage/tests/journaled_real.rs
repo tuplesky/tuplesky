@@ -72,12 +72,25 @@ fn event(revision: u64) -> StoreUpdate {
     }
 }
 
-fn executed(tag: u8, position: u64) -> StoreUpdate {
-    StoreUpdate {
-        collection: Collection::ExecutedV1.id(),
-        key: vec![tag; 32],
-        value: Some(position.to_be_bytes().to_vec()),
-    }
+/// The command `tag` executed at `position`: its payload, then its
+/// executed row, which moves the payload to the position (task-d113,
+/// step 2).
+fn executed(tag: u8, position: u64) -> [StoreUpdate; 2] {
+    let command = coord_types::CommandId(Digest32([tag; 32]));
+    [
+        StoreUpdate {
+            collection: Collection::PayloadV1.id(),
+            key: command.as_bytes().to_vec(),
+            value: Some(vec![tag; 16]),
+        },
+        coord_storage::retry::executed_update(
+            &command,
+            ExecutionPosition::new(position).unwrap(),
+            Some(KvRevision::new(position).unwrap()),
+            Digest32([tag; 32]),
+        )
+        .unwrap(),
+    ]
 }
 
 /// Every row of a projection, as (collection, key, value).
@@ -168,11 +181,11 @@ fn run(dir: &Path, materialize_inline: bool) -> Vec<(u16, Vec<u8>, Vec<u8>)> {
                 batch: PersistBatch {
                     barrier: barriers.allocate(),
                     base: Some(base),
-                    updates: vec![
-                        kv(format!("key-{step}").as_bytes(), b"value"),
-                        event(step),
-                        executed(step as u8, step),
-                    ],
+                    updates: [
+                        vec![kv(format!("key-{step}").as_bytes(), b"value"), event(step)],
+                        executed(step as u8, step).to_vec(),
+                    ]
+                    .concat(),
                 },
             })
             .unwrap();
@@ -234,7 +247,7 @@ fn replay_over_the_real_journal_and_projection_restores_the_same_rows_as_inline_
     assert!(
         reference
             .iter()
-            .any(|(collection, ..)| *collection == Collection::ExecutedV1.id().0),
+            .any(|(collection, ..)| *collection == Collection::ExecutionV1.id().0),
         "the workload records executed identities"
     );
 }
@@ -466,11 +479,11 @@ fn materialize_range(
             batch: PersistBatch {
                 barrier: barriers.allocate(),
                 base: Some(base),
-                updates: vec![
-                    kv(format!("key-{step}").as_bytes(), b"value"),
-                    event(step),
-                    executed(step as u8, step),
-                ],
+                updates: [
+                    vec![kv(format!("key-{step}").as_bytes(), b"value"), event(step)],
+                    executed(step as u8, step).to_vec(),
+                ]
+                .concat(),
             },
         });
         if protocol.is_err() || application.is_err() || store.flush().is_err() {
@@ -623,7 +636,7 @@ fn crash_matrix(replay: Option<DurableCadence>) {
             with_intake = with_intake.max(intake);
             if recovered
                 .iter()
-                .filter(|(c, ..)| *c == Collection::ExecutedV1.id().0)
+                .filter(|(c, ..)| *c == Collection::ExecutionV1.id().0)
                 .count()
                 > 0
             {
