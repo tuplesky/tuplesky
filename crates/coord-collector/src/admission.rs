@@ -144,6 +144,11 @@ pub struct AdmissionRefusals {
     /// Refused for any other reason: malformed, too large, or not
     /// admitted here.
     pub other: u64,
+    /// Admitted here, then refused `BACKPRESSURE` by the collector's own
+    /// bound: the domain's pending commands at this frontend, or the
+    /// bytes it still owes its destinations (#228 review). Not the gate's
+    /// decision, but the same answer to the caller, so counted beside it.
+    pub collection_bound: u64,
 }
 
 impl AdmissionRefusals {
@@ -163,7 +168,7 @@ impl AdmissionRefusals {
 
     /// Every refusal counted.
     pub const fn total(&self) -> u64 {
-        self.rate_limited + self.session_busy + self.other
+        self.rate_limited + self.session_busy + self.other + self.collection_bound
     }
 }
 
@@ -182,6 +187,7 @@ impl Admission {
                 rate_limited: 0,
                 session_busy: 0,
                 other: 0,
+                collection_bound: 0,
             },
         }
     }
@@ -247,6 +253,12 @@ impl Admission {
             self.refusals.count(refusal);
         }
         decided
+    }
+
+    /// Count a request this gate admitted and the collector then refused
+    /// at its own bound (`SubmitRefusal::Backpressure`).
+    pub fn refused_at_collection_bound(&mut self) {
+        self.refusals.collection_bound += 1;
     }
 
     /// What this gate has refused since it started.

@@ -1154,6 +1154,18 @@ fn collection_is_bounded_per_domain_without_evicting_unresolved_work() {
         Action::Respond(d) => assert_eq!(err_code(&response_of(&d)), codes::BACKPRESSURE),
         other => panic!("{other:?}"),
     }
+    // The gate admitted it and the collector refused it: counted apart
+    // from the gate's own refusals, and in their total (#228 review).
+    assert_eq!(
+        w.frontend.admission().refusals(),
+        AdmissionRefusals {
+            rate_limited: 0,
+            session_busy: 0,
+            other: 0,
+            collection_bound: 1,
+        }
+    );
+    assert_eq!(w.frontend.admission().refusals().total(), 1);
     w.settle();
     assert_eq!(w.frontend.collector().pending(), 2, "nothing evicted");
     assert!(w.frontend.collector().is_pending(&c1) && w.frontend.collector().is_pending(&c2));
@@ -1610,6 +1622,7 @@ fn a_retry_of_an_unresolved_request_takes_no_second_admission_slot() {
             rate_limited: 0,
             session_busy: 1,
             other: 0,
+            collection_bound: 0,
         }
     );
 }
@@ -1666,6 +1679,7 @@ fn admission_is_bounded_by_its_rate_and_a_retry_takes_nothing() {
             rate_limited: 4,
             session_busy: 0,
             other: 0,
+            collection_bound: 0,
         }
     );
 }
