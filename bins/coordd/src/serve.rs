@@ -1218,13 +1218,22 @@ unserved_order_above={} unserved_no_snapshot={} unserved_first_row={}",
     }
 }
 
+/// Whether the admission stage refused a frame: the stream closed, or
+/// the gate's refusal count moved while it was decided. That count holds
+/// the admission rate, which the caller sees as `BACKPRESSURE` and
+/// retries, and the collector's own bound behind the gate (#228 review).
+fn refused_at_admission(closed: bool, refused_before: u64, refused_now: u64) -> bool {
+    closed || refused_now > refused_before
+}
+
 /// The admission line (task-d26): the frontend's rate, `none` where it
 /// has none, and its refusals by why.
 fn admission_text(per_second: Option<u32>, r: coord_collector::AdmissionRefusals) -> String {
     let per_second = per_second.map_or_else(|| "none".to_owned(), |n| n.to_string());
     format!(
-        "admission: per_second={per_second} rate_limited={} session_busy={} other={}",
-        r.rate_limited, r.session_busy, r.other
+        "admission: per_second={per_second} rate_limited={} session_busy={} other={} \
+         collection_bound={}",
+        r.rate_limited, r.session_busy, r.other, r.collection_bound
     )
 }
 
@@ -4612,9 +4621,11 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 // Refused at the door: the stream closed, or the gate
                 // answered with a refusal (the admission rate above all,
                 // which the caller sees as `BACKPRESSURE` and retries).
-                if matches!(decided, Step::Close { .. })
-                    || self.admission_refusals().total() > refused_before
-                {
+                if refused_at_admission(
+                    matches!(decided, Step::Close { .. }),
+                    refused_before,
+                    self.admission_refusals().total(),
+                ) {
                     self.recorder.refused(Stage::Admission);
                 } else {
                     self.recorder.completed(Stage::Admission, started.elapsed());
@@ -6118,6 +6129,17 @@ impl core::error::Error for TransportError {}
 
 #[cfg(test)]
 mod tests {
+    /// A frame the gate (or the collector behind it) refused is refused at
+    /// the admission stage though its stream stays open, as a closed
+    /// stream is; one that moved no refusal count completed (#228 review:
+    /// without the count, a rate refusal read as a completed admission).
+    #[test]
+    fn a_refusal_the_gate_counted_is_refused_at_the_admission_stage() {
+        assert!(super::refused_at_admission(false, 4, 5));
+        assert!(super::refused_at_admission(true, 4, 4));
+        assert!(!super::refused_at_admission(false, 4, 4));
+    }
+
     /// The admission line names the rate and every refusal count, each
     /// with its own value, and says `none` for a frontend with no rate.
     #[test]
@@ -6126,14 +6148,15 @@ mod tests {
             rate_limited: 7,
             session_busy: 3,
             other: 1,
+            collection_bound: 5,
         };
         assert_eq!(
             super::admission_text(Some(1000), refusals),
-            "admission: per_second=1000 rate_limited=7 session_busy=3 other=1"
+            "admission: per_second=1000 rate_limited=7 session_busy=3 other=1 collection_bound=5"
         );
         assert_eq!(
             super::admission_text(None, coord_collector::AdmissionRefusals::default()),
-            "admission: per_second=none rate_limited=0 session_busy=0 other=0"
+            "admission: per_second=none rate_limited=0 session_busy=0 other=0 collection_bound=0"
         );
     }
 

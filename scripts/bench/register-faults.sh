@@ -78,8 +78,9 @@ CALLERS=${CALLERS:-2}
 KEYS=${KEYS:-4}
 STATE_ROOT=${STATE_ROOT:-/dev/shm}
 # The admission rate every frontend runs under, set rather than left to
-# the daemon's default: at a few hundred commands a second per frontend
-# it binds, so a reading states it (task-d26).
+# the daemon's default: the busiest frontend admits up to about 1,000 new
+# requests a second at full load, the default's own value, so the rate
+# can bind and a reading states it (task-d26).
 ADMITTED_PER_SECOND=${ADMITTED_PER_SECOND:-1000}
 export COORD_HARNESS_MAX_ADMITTED_PER_SECOND=$ADMITTED_PER_SECOND
 
