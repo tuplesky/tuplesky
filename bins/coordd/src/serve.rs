@@ -984,6 +984,11 @@ pub struct Domain<P: Persistence> {
     /// that ask was for, so a partial answer is not mistaken for a
     /// complete one.
     asked: Option<(std::time::Instant, u64, u64)>,
+    /// How many payload requests the machine had sent when this loop
+    /// last looked. One it sent by itself since (a campaign's next
+    /// batch, once the last was answered in full) is this loop's ask
+    /// too: asked again in the same turn, the batch went out twice.
+    payload_asks_seen: u64,
     /// When this leader last sent its voters the proposals they had not
     /// voted on (task-d07).
     resent: Option<std::time::Instant>,
@@ -1805,6 +1810,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             admin: None,
             expiry: None,
             asked: None,
+            payload_asks_seen: 0,
             resent: None,
             features_resent: None,
             features_started: false,
@@ -3336,9 +3342,14 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             // over.
             let answered = voter.payloads_answered();
             let want = payload_batch_size(missing);
+            if voter.payload_asks() != self.payload_asks_seen {
+                self.payload_asks_seen = voter.payload_asks();
+                self.asked = Some((now, answered, want));
+            }
             if ask_for_payloads_now(self.asked, answered, now) {
                 self.asked = Some((now, answered, want));
                 out.absorb(voter.request_payloads()?);
+                self.payload_asks_seen = voter.payload_asks();
             }
         } else {
             self.asked = None;
@@ -5412,6 +5423,7 @@ fn resends(
         time,
         longest,
         deferred: counts.deferred,
+        topped_up: counts.topped_up,
         decided: counts.decided,
         acknowledged: counts.acknowledged,
         unanswered: counts.unanswered,

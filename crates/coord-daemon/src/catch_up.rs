@@ -76,7 +76,17 @@ pub const CHAIN_RETRY: Duration = Duration::from_secs(10);
 /// behind while it moves (#98, 6807495802): two pages. A follower keeping
 /// up holds a few commands in flight; one a thousand behind executing the
 /// live stream holds its whole gap.
+///
+/// What it holds is what a donor could give it: decided work it has not
+/// executed (`Machine::decided_unexecuted_held`), never work still in
+/// flight. A follower at full load holds hundreds of commands not yet
+/// committed, and counted, they made it look behind (#236 review).
 pub const BEHIND_HELD: usize = 2 * MAX_CATCH_UP_COMMANDS;
+
+/// How many windows in a row have to find a voter moving without closing
+/// its gap before it counts as behind (#236 review): two. One window's
+/// reading is a moment of a load that comes and goes.
+pub const BEHIND_WINDOWS: u8 = 2;
 
 /// The page a donor sends for `after` (task-d08): the commands it
 /// executed after `after` and through `through`, read from its durable
@@ -266,8 +276,10 @@ pub struct Standing<B: Fn() -> usize> {
     pub executed: ExecutionPosition,
     /// Whether it holds work it has not executed.
     pub holds: bool,
-    /// How much of that work it holds (`Machine::unexecuted_held`): a
-    /// voter behind holds hundreds, a healthy one a handful in flight.
+    /// How much decided work it holds and has not executed
+    /// (`Machine::decided_unexecuted_held`), what a donor could give it: a
+    /// voter behind holds hundreds, a healthy one a handful, however much
+    /// it holds in flight (#236 review).
     pub backlog: B,
     /// Whether a page is in hand.
     pub busy: bool,
@@ -294,9 +306,13 @@ pub struct Pacer {
     /// [`BEHIND_HELD`] or more then, and holds no less than a page fewer
     /// once it has moved a page, is moving without closing its gap.
     held_at: usize,
-    /// Whether this window found the voter moving without closing its gap
-    /// (#98, 6807495802): its progress no longer resets the window.
+    /// Whether [`BEHIND_WINDOWS`] windows in a row found the voter moving
+    /// without closing its gap (#98, 6807495802): its progress no longer
+    /// resets the window.
     moving_behind: bool,
+    /// How many windows in a row, each ended by a page's progress, found
+    /// the voter moving without closing its gap (#236 review).
+    behind_windows: u8,
     /// When the last ask went, if one is outstanding.
     asked: Option<Instant>,
     /// Asks gone unanswered since the window last began.
@@ -386,7 +402,8 @@ impl Pacer {
         // executed the live stream at the domain's pace made a page's
         // progress in every window and never asked. So a page's progress
         // reads what it holds, once a page, and counts as catching up only
-        // if that is under [`BEHIND_HELD`] or fell by a page in the window.
+        // if that is under [`BEHIND_HELD`] or fell by a page in the window,
+        // in one of the last [`BEHIND_WINDOWS`] windows.
         let moved_a_page = self.still.is_some_and(|(at, _)| {
             standing.executed >= at
                 && standing.executed.get() - at.get() >= MAX_CATCH_UP_COMMANDS as u64
@@ -400,14 +417,25 @@ impl Pacer {
         {
             let held = (standing.backlog)();
             held_now = Some(held);
-            self.moving_behind = self.held_at >= BEHIND_HELD
+            let behind = self.held_at >= BEHIND_HELD
                 && held.saturating_add(MAX_CATCH_UP_COMMANDS) > self.held_at;
+            self.behind_windows = if behind {
+                self.behind_windows.saturating_add(1)
+            } else {
+                0
+            };
+            self.moving_behind = self.behind_windows >= BEHIND_WINDOWS;
         }
         let caught_up = self.still.is_none_or(|(at, _)| standing.executed < at)
             || (moved_a_page && !self.moving_behind);
         if caught_up || standing.busy || standing.leads || !holds {
             self.still = Some((standing.executed, now));
             self.held_at = held_now.unwrap_or(0);
+            // A window begun by anything but a page's progress breaks the
+            // run of windows found behind.
+            if held_now.is_none() {
+                self.behind_windows = 0;
+            }
             self.moving_behind = false;
             self.asked = None;
             self.unanswered = 0;
@@ -797,6 +825,77 @@ mod tests {
                 keeping_up.due(at, held(5 + 40 * i, 30), r(3), r(1), &voters),
                 None,
                 "a follower keeping up asked at {i}"
+            );
+        }
+    }
+
+    /// A voter at full load holding 700 in flight asks nothing (#236
+    /// review): what the pacer reads is the decided work a donor could
+    /// give, a handful here, not the 700 still undecided. Read as before,
+    /// the 700 were two pages and more held while it moved, and it asked
+    /// as one behind.
+    #[test]
+    fn a_voter_at_full_load_holding_700_in_flight_asks_nothing() {
+        let voters = [r(1), r(2), r(3)];
+        let t0 = Instant::now();
+        let tick = Duration::from_millis(20);
+        // 2,000 commands a second for 60 s, 700 in flight throughout and
+        // up to 30 of them decided and waiting for the next pass.
+        let mut at_load = Pacer {
+            probed: true,
+            ..Pacer::default()
+        };
+        for i in 0..3000u64 {
+            let at = t0 + tick * i as u32;
+            let decided = 5 + (i as usize * 7) % 26;
+            assert_eq!(
+                at_load.due(at, held(5 + 40 * i, decided), r(3), r(1), &voters),
+                None,
+                "a voter at full load asked at {i}"
+            );
+        }
+        // Its 700 in flight counted, as the pacer did before: it asks.
+        let mut as_before = Pacer {
+            probed: true,
+            ..Pacer::default()
+        };
+        assert!(
+            (0..3000u64).any(|i| as_before
+                .due(
+                    t0 + tick * i as u32,
+                    held(5 + 40 * i, 700),
+                    r(3),
+                    r(1),
+                    &voters
+                )
+                .is_some()),
+            "700 counted never asked: the test shows nothing"
+        );
+    }
+
+    /// One window that finds a voter moving without closing its gap is not
+    /// enough (#236 review): it asks only once two windows in a row have.
+    /// Here what it holds swings between a thousand and a handful every
+    /// two pages, so no two windows in a row find it behind, and it never
+    /// asks. Read from one window, it asked within its first second.
+    #[test]
+    fn a_voter_behind_for_one_window_at_a_time_asks_nothing() {
+        let voters = [r(1), r(2), r(3)];
+        let t0 = Instant::now();
+        let tick = Duration::from_millis(20);
+        let mut swinging = Pacer {
+            probed: true,
+            ..Pacer::default()
+        };
+        // 40 commands a tick: a page every 3 to 4 ticks, so two pages in
+        // 7 ticks.
+        for i in 0..3000u64 {
+            let at = t0 + tick * i as u32;
+            let held_now = if (i / 7) % 2 == 0 { 1000 } else { 10 };
+            assert_eq!(
+                swinging.due(at, held(5 + 40 * i, held_now), r(3), r(1), &voters),
+                None,
+                "a voter behind one window at a time asked at {i}"
             );
         }
     }

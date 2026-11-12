@@ -155,6 +155,11 @@ struct Cluster {
     frontend: Vec<(ReplicaId, ProtocolMessage)>,
     /// Every payload ask sent: who asked, and for what.
     asks: Vec<(usize, Vec<CommandId>)>,
+    /// Every payload answer sent: (from, to).
+    payloads_sent: Vec<(usize, u8)>,
+    /// What each voter's campaign read of its whole selection once it was
+    /// made, taken when it won (`Follower::campaign_selection_reads`).
+    selection_reads: Vec<u64>,
     /// Every proposal sent: (from, to).
     proposals_sent: Vec<(usize, u8)>,
     /// Senders whose frames are parked rather than delivered, until
@@ -247,6 +252,8 @@ impl Cluster {
             voters,
             frontend: Vec::new(),
             asks: Vec::new(),
+            payloads_sent: Vec::new(),
+            selection_reads: vec![0; usize::from(voters)],
             proposals_sent: Vec::new(),
             hold_from: Vec::new(),
             parked: Vec::new(),
@@ -307,6 +314,11 @@ impl Cluster {
                         self.asks.push((i, commands));
                     }
                     let dest = to.replica.0[0];
+                    if let Ok(ProtocolMessage::PayloadResponse { .. }) =
+                        ProtocolMessage::decode(&frame)
+                    {
+                        self.payloads_sent.push((i, dest));
+                    }
                     if let Ok(ProtocolMessage::Proposal(p)) = ProtocolMessage::decode(&frame) {
                         self.proposals_sent.push((i, dest));
                         self.proposed.push((i, dest, p.command));
@@ -394,6 +406,7 @@ impl Cluster {
                     unreachable!()
                 };
                 let decision = follower.won().cloned().unwrap();
+                self.selection_reads[i] = follower.campaign_selection_reads();
                 let q = follower.quorum().clone();
                 let (leader, effects) =
                     Leader::from_recovered(follower.into_recovered(), q, &decision);
@@ -816,6 +829,138 @@ fn a_candidate_missing_more_payloads_than_one_answer_carries_still_wins() {
     for i in [1usize, 2] {
         assert_eq!(cluster.nodes[i].executed, submitted, "node {i}");
     }
+}
+
+/// A candidate far behind takes over in work that grows with what it
+/// lacks, not with that times its selection (the takeover gap on #98).
+///
+/// Review's reproduction: a follower paused, the leader killed, and the
+/// paused voter campaigning first when it came back, ahead of the voters
+/// that were level. It won 409 to 836 commands behind, and spent 13 to
+/// 17 ms of its domain thread on each missing command before it led. It
+/// asked every promised voter for each batch, so each payload came back
+/// once from each. And each payload frame ran the selection's checks
+/// (the gap, the conflicts, the order) and its read of what it lacked over
+/// every entry again.
+///
+/// Here, with five voters, the candidate lacks 480 commands, and three
+/// promised voters hold them. Each payload comes once, and the selection
+/// is read a constant few times. With the checks run on every frame, the
+/// candidate read its selection 1,920 times or more. With every promised
+/// voter asked for each batch, 1,440 payload frames came back.
+#[test]
+fn a_candidate_far_behind_takes_over_in_work_linear_in_what_it_lacks() {
+    const BEHIND: usize = 480;
+    let bound = coord_consensus::MAX_PAYLOAD_TRANSFER;
+    let mut cluster = Cluster::with_voters(41, 1_024, 5);
+    cluster.crash(4);
+    let mut submitted = Vec::new();
+    for n in 0..BEHIND {
+        submitted.push(cluster.admit(n as u64 + 1, (n % 7) as u8));
+        if n % 16 == 15 {
+            cluster.settle();
+        }
+    }
+    cluster.settle();
+    assert_eq!(cluster.nodes[1].executed, submitted);
+    // r4 comes back holding nothing, and the leader is lost: r4 campaigns
+    // first, and r1, r2 and r3 promise it.
+    cluster.revive(4, quorum_among(ballot(0, 0), 5));
+    cluster.crash(0);
+    cluster.asks.clear();
+    cluster.payloads_sent.clear();
+    cluster.campaign(4, ballot(1, 4));
+    cluster.settle();
+    assert!(
+        matches!(cluster.nodes[4].role, Some(Role::Leader(_))),
+        "the candidate did not lead"
+    );
+    for i in 1..5 {
+        assert_eq!(cluster.nodes[i].executed, submitted, "node {i}");
+    }
+    let frames = cluster
+        .payloads_sent
+        .iter()
+        .filter(|(_, to)| *to == 4)
+        .count();
+    let asks: Vec<&Vec<CommandId>> = cluster
+        .asks
+        .iter()
+        .filter(|(i, _)| *i == 4)
+        .map(|(_, c)| c)
+        .collect();
+    let asked: usize = asks.iter().map(|c| c.len()).sum();
+    assert!(
+        frames >= BEHIND && frames <= BEHIND + bound,
+        "{frames} payload frames for {BEHIND} missing commands"
+    );
+    assert!(
+        asked <= BEHIND + bound,
+        "{asked} payloads asked for in {} asks, for {BEHIND} missing",
+        asks.len()
+    );
+    let reads = cluster.selection_reads[4];
+    assert!(
+        (1..=16).contains(&reads),
+        "the candidate read its selection {reads} times"
+    );
+}
+
+/// A new leader with a backlog of undecided commands publishes it at the
+/// pace of its voters' answers, not of the re-send timer (the takeover gap
+/// on #98).
+///
+/// A new leader publishes its first `REPROPOSE_BATCH` re-proposals with
+/// their batches and holds the rest back. They went out only through
+/// `resend_unvoted`, 16 a voter a call, a call every 250 ms in `coordd`:
+/// review's kill-only run at 600 callers executed 96 commands, then 64 in
+/// each of seven seconds. Here the backlog is 200 commands every voter
+/// accepted and nobody committed, and the re-send timer never runs: each
+/// voter's adoptions top it up instead, at most `RESEND_PER_VOTER` first
+/// sends unanswered at a time. Without that, 32 of the 200 are proposed
+/// and the rest wait for a timer that does not come.
+#[test]
+fn a_new_leaders_backlog_goes_out_as_its_voters_answer() {
+    const BACKLOG: usize = 200;
+    // Five voters: at three, a follower learns a fast decision from the
+    // leader's proposal and its own vote alone.
+    let mut cluster = Cluster::with_voters(43, 1_024, 5);
+    // Every voter accepts what r0 proposes, and no acknowledgement reaches
+    // anyone, so nothing commits.
+    cluster.drop_acks = (0..5u8)
+        .flat_map(|a| (0..5u8).filter(move |b| *b != a).map(move |b| (a, b)))
+        .collect();
+    let mut submitted = Vec::new();
+    for n in 0..BACKLOG {
+        submitted.push(cluster.admit(n as u64 + 1, (n % 5) as u8));
+    }
+    cluster.settle();
+    for i in 0..5 {
+        assert!(cluster.nodes[i].executed.is_empty(), "node {i} executed");
+    }
+    cluster.crash(0);
+    cluster.drop_acks.clear();
+    cluster.campaign(1, ballot(1, 1));
+    cluster.settle();
+    let Some(Role::Leader(l)) = cluster.nodes[1].role.as_ref() else {
+        panic!("r1 did not lead");
+    };
+    let counts = l.resend_counts();
+    assert_eq!(counts.calls, 0, "the re-send timer never ran");
+    for i in 1..5 {
+        assert_eq!(
+            cluster.nodes[i].executed.len(),
+            BACKLOG,
+            "node {i} executed {} of the backlog",
+            cluster.nodes[i].executed.len()
+        );
+        assert_eq!(cluster.nodes[i].executed, submitted, "node {i}");
+    }
+    assert!(
+        counts.topped_up as usize >= BACKLOG - coord_consensus::leader::REPROPOSE_BATCH,
+        "{} first sends topped up",
+        counts.topped_up
+    );
 }
 
 /// A Sync naming commands a voter already executed and retired installs
@@ -2004,7 +2149,8 @@ fn a_proposal_refused_ahead_of_the_promise_is_sent_again() {
 
 /// A new leader publishes its re-proposals in a first batch and sends the
 /// rest as votes come back, and every one of them reaches every voter
-/// (task-d07).
+/// (task-d07). Since the takeover gap on #98, "as votes come back" is each
+/// voter's adoptions topping it up, not the re-send timer.
 ///
 /// A new leader after a long history put its whole selection on each
 /// follower's control lane in one pass, and the lane refused dozens of
@@ -2037,7 +2183,17 @@ fn a_new_leader_publishes_its_reproposals_in_batches_and_all_arrive() {
         .iter()
         .filter(|(from, to)| *from == 2 && *to == 1)
         .count();
-    assert_eq!(first, batch, "the new leader's first pass to r1");
+    // The first batch, then the rest as r1's adoptions come back (the
+    // takeover gap on #98): each sent once, and none waits for the timer.
+    assert_eq!(
+        first, proposed_again,
+        "the new leader's sends to r1 before its re-send timer ran"
+    );
+    let wanted: BTreeSet<CommandId> = commands.iter().copied().collect();
+    for i in [1usize, 2] {
+        let executed: BTreeSet<CommandId> = cluster.nodes[i].executed.iter().copied().collect();
+        assert_eq!(executed, wanted, "node {i} before the re-send timer");
+    }
     cluster.settle_resending(commands.len() / coord_consensus::RESEND_PER_VOTER + 2);
     for i in [1usize, 2] {
         let executed: BTreeSet<CommandId> = cluster.nodes[i].executed.iter().copied().collect();
