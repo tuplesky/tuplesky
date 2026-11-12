@@ -6,7 +6,7 @@
 - the proposals that follow from the rule;
 - levers 1 and 2 (option 3 and the proposal frame as a unit) and the leader-log end state they lead to.
 
-What can be built without deciding the end state is in [Section 6.4](#64-what-can-be-built-without-deciding). Building option 3 or the leader log waits for the owner.
+What can be built without deciding the end state is in [Section 6.4](#64-what-can-be-built-without-deciding). The owner has parked option 3 and the leader log ([Section 8](#8-order-and-what-the-owner-decides)).
 
 **Measured on:** the carry `4e12af9b`, locally. Five voters on tmpfs, `replay`, one tokio worker each, the four features (`early-proposal`, `release-at-execution`, `answer-on-release`, `batched-round`), the bar's mix (put 33, get 34, contended 33), five frontends. Figures for the runner (AMD EPYC 7763) are scaled from the local ones part by part (Section 3). Lever numbers are the budget's on #185 ([6834470684](https://github.com/tuplesky/tuplesky/pull/185#issuecomment-6834470684)).
 
@@ -33,6 +33,7 @@ The full table is on #185 ([6835865051](https://github.com/tuplesky/tuplesky/pul
 | Store read transactions, by execution | 15.0 | 17.0 | 0 from memory | ×15 / ×17 |
 | Point gets, by execution | 204 | 177 | 0 | about 200 a turn |
 | Store reads by intake | 0 | 0 | 0 | Follows the rule |
+| Reads inside the materializer's write transaction | 30 (3.2 a command) | 26 (2.1 a command) | 0 | proposal 2 removes them (review on #252) |
 | Peer send syscalls | 1.9 a follower | 2.2 | 1 a peer | ×1.9 / ×2.2 |
 | Peer datagrams sent | 6.5 a follower | 2.7 | the frame's bytes | follows the bytes |
 | Client-plane send syscalls | 16.5 | 10.9 | about 6.9 / 3.9 | ×2.4 / ×2.8, mostly ACK-only datagrams |
@@ -52,6 +53,12 @@ The full table is on #185 ([6835865051](https://github.com/tuplesky/tuplesky/pul
 | `KvCurrentV1`, `EventsV1` | 6.2% each | 7.0% each | 1 each | **stay: what reads need** |
 
 Of about 14 rows a command at a follower, 2 are application rows. A commit writes them in lowering order, not sorted.
+
+**Review's check (#252, [6837290600](https://github.com/tuplesky/tuplesky/pull/252#issuecomment-6837290600)).** Review ran the same setup untraced, with a build that counts every row a commit applies, not the first 240:
+- every row of the table above that its counters reach agrees: commands, commits, peer sends and datagrams, ACK-only datagrams, and rows a command (15.51 and 13.51);
+- a follower writes 2.0 `ProtocolV1` and 2.0 `PendingPayloadV1` rows a command, 2.51 `RetryV1`, and one each of the other seven;
+- by bytes the application rows are more than by count: 873 B of a follower's 2,801 B a command, 31%;
+- the store reads, wake-ups and `epoll_wait`s need the tracer, and weren't checked.
 
 ## 3. The cost model today
 
@@ -128,6 +135,9 @@ This proposal leads, as review asked ([6835409559](https://github.com/tuplesky/t
 - The materializer's work that scales with rows is about 75 to 85% of it: assignment 24%, inserts and removes 40%, and its commits 20 to 28%, whose dirty pages follow the rows.
 - So the materializers fall 65 to 72%: about −0.12 ms an operation locally and −0.16 to −0.18 on the 7763.
 - That is larger than the budget's −0.05 to −0.08, which had no count of the rows, and larger than review's −0.07 to −0.14, which left out the retry and meta rows.
+- **Review's knockout holds it** (#252): a lowering that skipped the payload, protocol and executed rows and wrote the meta row once a commit took a follower from 13.5 rows and 2,801 B a command to 5.6 and 1,028 B. The materializers fell 48%; with the retry rows, which can't leave until their window is in memory, 59 to 69%. That is −0.13 measured and −0.16 to −0.18 in all on the 7763.
+- **The knockout pays nothing for what the design adds back.** task-d117's design step (#258) adds 20 to 30 µs a command over five voters, for the recovery map, the history buffer and the retry window's versions, so net −155 to −165. Section 7 keeps the gross until that step's pair.
+- **The retry rows go only with their window in memory.** Review's first knockout dropped them without it: each command's record carried 63 retry updates in place of 2.5, and the run slowed. That orders task-d117's steps.
 
 **Per command to per turn?** No. It removes the per-command rows. What is left, 2 application rows a command, stays per command.
 
@@ -175,11 +185,17 @@ The choice is the step's.
 
 **Today:**
 - one append and one sync a turn, which already follows the rule;
-- inside each append, two records a command (a payload record and a protocol record), so about 20 records a turn.
+- inside each append, three records a command at every voter (a protocol, a payload and an application record, by `journal_groups`), so about 29 a turn at the leader (review on #252).
 
 **Is it right?** Yes. Under the leader log a turn's frame is one record.
 
-**Size: not measured.** The appenders' per-command part is 79 µs. If half of it is per record, this takes off about −0.02 ms an operation locally and on the 7763. The copy, checksum and compression work stays per byte.
+**Size: none; the earlier estimate is withdrawn.** Review's profile of the appender (#252) finds its work per byte, not per record:
+- encoding 40%, half of it a second encode inside `JournalRecordV1::verify`;
+- the digest 16%, lz4 19%, the file write 7%, and waiting for a job 5%.
+
+There is nothing per record to halve, so this proposal stays unsized until a profile shows something per record.
+
+**The lever that is there:** one encode for both the digest and the write. `verify` encodes the body to hash it, and the engine encodes it again to write it. One encode is about a fifth of the thread, −0.015 ms an operation on the 7763, with no format change. It is a small PR (Section 5).
 
 **Per command to per turn?** Yes, the records.
 
@@ -229,22 +245,25 @@ The choice is the step's.
 
 **What would take it lower:** clients that share a connection, such as a proxy, kine's adapter or a pipelined SDK. One send then carries a turn's answers to that connection.
 
-## 5. The four small PRs under the rule
+## 5. The small PRs under the rule
 
 - **Lever 4 (release frame, acks by range): agrees.** It moves releases from one frame a release to one a collector a turn. Goes ahead first.
 - **Lever 8 (one hand-off a turn): agrees.** It is the audit's largest wake-up miss.
   - The audit also found that task-d97's run-queue sample reads `/proc/thread-self/schedstat` at one pass in 16: 35 of the leader loop's 55 syscalls a turn. It should go by time. That fix goes ahead of lever 8, with the loop's other per-pass housekeeping (Section 8).
 - **Lever 5 (one read view a group): agrees, reshaped** as proposal 1's first step: one read view a turn, tables opened once.
 - **Lever 6: agrees, last** (it reaches 3.7% of the materializer).
-  - Part 1 (#251) is a map indexed by collection: −4.3% at the materializers.
+  - Part 1 (#251) is a map indexed by collection. Review's pair reads −1.2% at the materializers, not this document's −4.3%: −3 to −6 µs a command over five voters, −0.003 to −0.007 ms an operation on the 7763.
   - Part 2, the retry window in memory, agrees with the rule and is folded into proposal 2.
+- **The appender's one encode (review on #252): agrees.** One encode for the record's digest and its write, about a fifth of the appender, −0.015 ms an operation on the 7763.
 
 ## 6. Levers 1 and 2 and the leader-log end state
+
+**Parked by the owner (Section 8):** the leader log and option 3 (6.1 to 6.4), witnesses as 6.5 has them, and lever 2 as Section 7 sizes it. They stay here as the record of the trade. Section 6.6 is the alternative still open.
 
 ### 6.1 The end state
 
 **The leader log:**
-- **The leader** executes from memory and puts a turn's commands and their write sets in one frame, which is one journal record.
+- **The leader** puts a turn's commands in one frame, which is one journal record. It executes each command from memory once it is decided, as every voter does today, and the command's write set goes in the leader's next frame. So a frame carries a turn's new commands and the write sets of the commands decided since the last one.
 - **A follower:**
   - journals the frame;
   - acknowledges it once (lever 2);
@@ -254,6 +273,13 @@ The choice is the step's.
 - **A follower's plumbing** (settle, flush, pacing) is paid per frame, not per command.
 - **What a follower still does per command:** its frontend role, landing the rows, and the executions its rotation assigns it.
 
+**Why the leader executes after the decision, not ahead of it** (review on #252).
+- **Ahead of it,** a turn's write sets would go in the same frame as its commands. Whoever holds a decided command would then hold its write set, and Section 6.3's second case couldn't arise.
+- **But the leader would execute in memory what it may lose.** A command it proposed and that isn't decided when it loses the lead may be decided at another position by the next leader, or not at all. Its execution has to be undone.
+- **The undo** is the one task-29's speculation states (task-d63): results held in an overlay in memory, the overlay dropped on a role change, and nothing released before the command and its prefix are learned. `coordd` doesn't drive that speculation today (task-d50).
+- **Today a voter executes only what is decided, so nothing is undone.** Executing ahead would be a fourth thing given up (Section 6.2).
+- **This end state executes after the decision,** and Section 6.3's second case is the price.
+
 ### 6.2 What the single domain gives up
 
 - **The fast path without the leader.** Today a collector proposes to its fast set, which includes the leader, and decides in one round trip to that set. In the leader log every command goes collector → leader → a majority → collector.
@@ -261,6 +287,7 @@ The choice is the step's.
   - On a WAN, a collector far from the leader pays the leg to the leader and then the leader's round trip, where the fast path pays its round trip to the fast set. That is the latency the design chose SwiftPaxos for ([leader locality remains relevant](README.md#performance-interpretation-leader-locality-remains-relevant)).
 - **Independent execution at every voter,** and so detecting a divergence by a majority of executions.
 - **Contended commands decided in rounds of their own:** they take the leader's order.
+- **If the leader executed ahead of the decision** (Section 6.1), execution thrown away at each leader change, and a speculative overlay held at every leader. The end state above doesn't execute ahead, so it doesn't give this up.
 
 ### 6.3 The fault model
 
@@ -292,7 +319,7 @@ The choice is the step's.
   3. ships those write sets before it serves.
 - **Correctness rests on determinism,** as it does today: the new leader's execution at position p over the state at p − 1 equals the old leader's.
 - **Every voter keeps the execution engine,** which rotation runs anyway.
-- **An election takes longer** by executing that tail: a turn or two in steady state, bounded by the decided-not-landed window.
+- **An election takes longer** by executing that tail. Its bound is the decided-not-landed window: the command table, at most 1,000 commands (`MAX_TABLE_CAPACITY`). Since a write set follows its decision by one frame, in practice it is a frame or two.
 - **If the old leader was diverging,** the recomputed write set differs from one some follower already landed. That follower compares the two for the same position and stops on a difference, and the first case above applies.
 
 ### 6.4 What can be built without deciding
@@ -307,6 +334,8 @@ Everything that helps either end state:
 What needs the owner's decision:
 - **Option 3:** followers no longer execute every command.
 - **The frame as the only proposal path:** no fast path without the leader.
+
+Both are parked (Section 8). Lever 2 is being redesigned to need neither.
 
 ### 6.5 An alternative: voters that journal and vote but keep no projection
 
@@ -326,6 +355,7 @@ What needs the owner's decision:
 
 **What it gives up:**
 - **Projection copies:** five become three. An executor lost with its disk is rebuilt from the other two.
+  - **Against etcd it isn't like for like** (review on #252): each of etcd's five members holds the whole store. If the bar is etcd's five, the owner says whether three copies of five may be read against it.
 - **Who can lead:** only an executor can lead without first installing an image and replaying. While witnesses are fewer than a majority, every majority holds an executor, so the domain stays live through any two failures. With two executors down, the last one must lead, and nothing can take over from it without a rebuild.
 - **Reads:** reads and retained answers are served only where a projection is. A witness's frontend forwards them, or witnesses run no frontend.
 - **Catch-up donors:** only executors can serve executed history (task-d08). A witness behind catches up its journal only.
@@ -336,7 +366,7 @@ What needs the owner's decision:
 - **Proposal 2.** Until protocol state is in the journal only, a witness would still keep a store for its protocol rows and would save only execution and the application rows.
 - **The forgetting floor and checkpoints follow the executors.** A witness trims its journal at the floor the executors' images cover.
 
-**Not built.** It needs a voter role in the configuration, an election rule that prefers executors, and read, frontend and catch-up rules for witnesses. It is a decision for the owner beside option 3, not a step toward it.
+**Not built, and parked** (Section 8). It needs a voter role in the configuration, an election rule that prefers executors, and read, frontend and catch-up rules for witnesses. It is a decision for the owner beside option 3, not a step toward it.
 
 ### 6.6 Voters that don't execute or materialize on the hot path
 
@@ -404,7 +434,7 @@ So this section asks what a voter has to do on the hot path, and what it can do 
 **5. The trade.**
 
 **The terms:**
-- **Baseline:** Section 7's costs after every step that needs no decision: the "Lever 3" row, 1.19 ms an operation on the 7763.
+- **Baseline:** Section 7's costs after every step that needs no decision: the "Lever 3" row, 1.20 ms an operation on the 7763.
 - **No double counting with proposals 1 and 2:** a follower's execution is the 34.5 µs a command left after proposal 1, and a voter's materializer the 17.4 left after proposal 2.
 - **Converted per part:** the followers' loops ×1.61, materializers ×1.37, tokio ×1.99, at 0.66 commands an operation.
 
@@ -429,24 +459,25 @@ So this section asks what a voter has to do on the hot path, and what it can do 
 
 | Lag or batch interval | Batch, commands | Recovery at takeover: the tail | (a), 4 lazy voters | (b), `e = 2` (2 lazy) | (b), `e = 1` (3 lazy) |
 |---|---:|---:|---:|---:|---:|
-| 1 s | 2,400 | 0.17 s | 1.17 | 1.12 | 1.09 |
-| 3 s | 7,200 | 0.51 s | 1.17 | 1.12 | 1.09 |
-| 10 s | 24,000 | 1.7 s | 1.17 | 1.12 | 1.09 |
-| 4,096 positions (recommended) | 4,096 | at most 0.3 s | 1.17 | 1.12 | 1.09 |
+| 1 s | 2,400 | 0.17 s | 1.19 | 1.14 | 1.10 |
+| 3 s | 7,200 | 0.51 s | 1.19 | 1.14 | 1.10 |
+| 10 s | 24,000 | 1.7 s | 1.19 | 1.14 | 1.10 |
+| 4,096 positions (recommended) | 4,096 | at most 0.3 s | 1.19 | 1.14 | 1.10 |
 
-The last three columns are the servers' ms an operation, from 1.19.
+The last three columns are the servers' ms an operation, from 1.20.
 
 **What the curve says:**
 - **The CPU is flat in the interval.** A longer batch merges more current rows, but the difference is under 0.003 ms an operation across the table.
 - **Recovery is linear in it.** So the interval should be short.
 - **The floor's boundaries** bound the tail by positions at any load, and reuse the floor's exchange of roots for the agreement.
-- **The choice that moves the CPU is `e`:** −0.07 at `e = 2` and −0.10 at `e = 1`.
-- **It adds to proposals 1 to 3 and the levers that need no decision,** and to lever 2's redesign, which takes per-command intake and learning rather than execution.
+- **The choice that moves the CPU is `e`:** −0.02 for (a), −0.07 at `e = 2` and −0.10 at `e = 1`.
+- **It adds to proposals 1 and 2, the appender's encode and the levers that need no decision.** With lever 2's redesign it overlaps in `Follower::applied`, which both take part of: about 7 µs a lazy voter, counted once.
 - **Every figure is inferred** from the cost table's shares, not from a pair.
 
 **Against the alternatives.**
-- **Option 3 with rotation (Section 7's lever 1):** −0.05 on the 7763, with one execution a command and rotation for detection. (b) at `e = 1` saves more, −0.10, keeps two executions and the lazy voters' tie-break, keeps the fast path, and needs no leader log.
+- **Option 3 with rotation (Section 7's lever 1):** −0.03 on the 7763 with `Follower::applied` counted once, with one execution a command and rotation for detection. (b) at `e = 1` saves more, −0.10, keeps two executions and the lazy voters' tie-break, keeps the fast path, and needs no leader log.
 - **Witnesses (Section 6.5):** they can't lead without a rebuild. A lazy voter can, within the tail's bound, which is the owner's condition.
+- **Copies of the store:** a lazy voter keeps a full one, behind by at most a batch. So the domain keeps five copies, as etcd's five members do; with witnesses it keeps three.
 
 **6. What it costs to build.** About 5 to 7 weeks, after proposals 1 and 2 (task-d117), which it rests on: history digests and segments, and execution from memory.
 - **Roles from the ballot,** and an election that prefers eager voters.
@@ -479,77 +510,125 @@ The last three columns are the servers' ms an operation, from 1.19.
 - Each row is cumulative: the per-command `a` and per-turn `b` of each part, five voters, local, in µs.
 - The last four columns are predicted ms an operation at 4, 8 and 16 commands a turn locally, and on the 7763 at the measured turn size (9.55).
 - "Moves" says whether the step moves work from the per-command column to the per-turn column.
+- The rows marked parked are the leader log's (Section 8). They stay so the trade can be read.
 
 | Step (cumulative) | Leader loop | Followers' loops | Tokio | Materializers | Appenders | Moves? | k=4 | k=8 | k=16 | 7763 |
 |---|---|---|---|---|---|---|---:|---:|---:|---:|
 | Today (fit) | 198 + 147/k | 539 + 388/k | 191 + 733/k | 284 + 64/k | 79 + 108/k | — | 1.090 | 0.971 | 0.911 | 1.58 |
-| #251, lever 6 part 1 (measured) | 198 + 147/k | 539 + 388/k | 191 + 733/k | 272 + 64/k | 79 + 108/k | No: cheaper | 1.082 | 0.963 | 0.904 | 1.57 |
-| Proposal 2: protocol state in the journal | 198 + 147/k | 539 + 388/k | 191 + 733/k | 87 + 64/k | 79 + 108/k | No: removes rows | 0.960 | 0.841 | 0.781 | 1.41 |
-| Proposal 1: execution from memory | 191 + 147/k | 455 + 388/k | 191 + 733/k | 87 + 64/k | 79 + 108/k | Partly | 0.900 | 0.781 | 0.721 | 1.31 |
-| Proposal 3: one record a turn | 191 + 147/k | 455 + 388/k | 191 + 733/k | 87 + 64/k | 49 + 108/k | Yes | 0.880 | 0.761 | 0.702 | 1.28 |
-| Lever 4: release frame, acks by range | 181 + 147/k | 447 + 388/k | 179 + 733/k | 87 + 64/k | 49 + 108/k | Yes | 0.860 | 0.741 | 0.682 | 1.25 |
-| Lever 8: one hand-off a turn | 176 + 147/k | 447 + 388/k | 159 + 733/k | 87 + 64/k | 49 + 108/k | Yes | 0.843 | 0.725 | 0.665 | 1.22 |
-| Lever 3: the payload by reference | 176 + 147/k | 439 + 388/k | 143 + 733/k | 87 + 64/k | 49 + 108/k | No: fewer bytes | 0.828 | 0.709 | 0.649 | 1.19 |
-| Lever 2: the frame as a unit | 170 + 147/k | 351 + 428/k | 135 + 733/k | 87 + 64/k | 49 + 108/k | Yes | 0.767 | 0.645 | 0.584 | 1.08 |
-| Lever 1: option 3 with rotation | 170 + 147/k | 287 + 428/k | 145 + 733/k | 87 + 64/k | 49 + 108/k | No: removes executions | 0.731 | 0.609 | 0.548 | 1.03 |
-| End state: a follower's plumbing per frame | 153 + 167/k | 208 + 476/k | 145 + 733/k | 87 + 64/k | 49 + 108/k | Yes | 0.679 | 0.551 | 0.488 | 0.93 |
+| #251, lever 6 part 1 (review's pair) | 198 + 147/k | 539 + 388/k | 191 + 733/k | 279 + 64/k | 79 + 108/k | No: cheaper | 1.086 | 0.968 | 0.908 | 1.58 |
+| Proposal 2: protocol state in the journal | 198 + 147/k | 539 + 388/k | 191 + 733/k | 94 + 64/k | 79 + 108/k | No: removes rows | 0.964 | 0.845 | 0.786 | 1.41 |
+| Proposal 1: execution from memory | 191 + 147/k | 455 + 388/k | 191 + 733/k | 94 + 64/k | 79 + 108/k | Partly | 0.904 | 0.785 | 0.726 | 1.32 |
+| The appender's one encode (in place of proposal 3) | 191 + 147/k | 455 + 388/k | 191 + 733/k | 94 + 64/k | 63 + 86/k | No: removes an encode | 0.890 | 0.773 | 0.715 | 1.30 |
+| Lever 4: release frame, acks by range | 181 + 147/k | 447 + 388/k | 179 + 733/k | 94 + 64/k | 63 + 86/k | Yes | 0.870 | 0.753 | 0.695 | 1.27 |
+| Lever 8: one hand-off a turn | 176 + 147/k | 447 + 388/k | 159 + 733/k | 94 + 64/k | 63 + 86/k | Yes | 0.854 | 0.737 | 0.678 | 1.23 |
+| Lever 3: the payload by reference | 176 + 147/k | 439 + 388/k | 143 + 733/k | 94 + 64/k | 63 + 86/k | No: fewer bytes | 0.838 | 0.721 | 0.662 | 1.20 |
+| Lever 2: the frame as a unit (parked) | 170 + 147/k | 351 + 428/k | 135 + 733/k | 94 + 64/k | 63 + 86/k | Yes | 0.777 | 0.657 | 0.597 | 1.10 |
+| Lever 1: option 3 with rotation (parked) | 170 + 147/k | 315 + 428/k | 145 + 733/k | 94 + 64/k | 63 + 86/k | No: removes executions | 0.760 | 0.640 | 0.580 | 1.07 |
+| End state: a follower's plumbing per frame (parked) | 153 + 167/k | 236 + 476/k | 145 + 733/k | 94 + 64/k | 63 + 86/k | Yes | 0.708 | 0.582 | 0.519 | 0.98 |
 
 **The basis of each step** (local µs a command, five voters):
-- **#251:** measured, −12 at the materializers.
+- **#251:** review's pair reads −1.2% at the materializers, −3 to −6 (Section 5). The table takes −5.
 - **Proposal 2:** −185 at the materializers (Section 4.1). Range −175 to −195.
+  - Review's knockout holds it: −0.13 measured on the 7763, and −0.16 to −0.18 with the retry rows.
+  - task-d117's design (#258) adds 20 to 30 back. The table keeps the gross until that step's pair.
 - **Proposal 1:** the read view and snapshot, −21 a follower and −7 at the leader.
-- **Proposal 3:** half the appenders' per-command part, −30. Not measured.
+- **Proposal 3: withdrawn** (Section 4.3). In its place, the appender's one encode: a fifth of the appenders' terms, −16 a command and −22 a turn, by review's profile.
 - **Lever 4:** the budget's −0.02 to −0.05 on the 7763, split over the leader's loop, the followers' acks in and tokio.
 - **Lever 8:** −20 of tokio's park and wake (14 to 28% of tokio), and −5 of the leader loop's `eventfd` writes.
 - **Lever 3:**
   - peer datagrams fall from 7.3 to about 3.5 a command;
   - at about a quarter of tokio's cost, which is per datagram under GSO (crypto 7%, quinn's per-packet work, kernel segments), that is −16;
   - plus −2 of each follower's hashing and decoding.
-- **Lever 2:** half to two thirds of a follower's intake and of its learning and forgetting (`Follower::applied`), −22 a follower. +10 a frame a follower, plus the leader's acks in.
-- **Lever 1:**
-  - a follower's execution after proposal 1 (34.5) becomes landing (about 10) plus a quarter of the executions by rotation (8.6): −16 a follower;
+- **Lever 2 (parked):** half to two thirds of a follower's intake and of its learning and forgetting (`Follower::applied`), −22 a follower. +10 a frame a follower, plus the leader's acks in.
+- **Lever 1 (parked):**
+  - a follower's execution after proposal 1 (34.5) becomes landing (about 10) plus a quarter of the executions by rotation (8.6);
+  - that was −16 a follower, but about 7 of it is `Follower::applied`, which lever 2 already takes: a follower that lands a write set still learns and forgets the command (review on #252);
+  - counted once, −9 a follower;
   - +10 at tokio for the write sets' bytes.
-- **End state:** three quarters of a follower's settle, flush and pacing per frame (−20 a follower, +12 a frame), and half of the leader's settle and flush.
+- **End state (parked):** three quarters of a follower's settle, flush and pacing per frame (−20 a follower, +12 a frame), and half of the leader's settle and flush.
 
-**What takes tokio and the client plane lower.** In the end state tokio is the largest part: 0.29 ms an operation on the 7763.
+**Measured so far,** each a local pair on #185's setup:
+- **#251:** −1.2% at the materializers (review's pair).
+- **Lever 4 (#253, merged):** −0.049 ms an operation, on a saturated host. The model has −0.020 locally.
+- **The loop's housekeeping (#254):** the leader's loop −0.0045 ms an operation. It has no row.
+- **Lever 8 (#256):** tokio −0.017 ms an operation, and the leader's loop unchanged. That is the modeled total (−0.0165), but it comes from the followers' wake-ups and tokio's syscalls, not the leader's hand-offs.
+- **Proposal 1's snapshot half (#257):** −7 to −9 a follower and −6 to −12 at the leader, against the row's −21 and −7. The rest of the row, the view build and the table opens, is its next step.
+
+**The 7763 column** takes one factor a part and the local turn size. Testing's batch-depth table ([#98, 6835373016](https://github.com/tuplesky/tuplesky/pull/98#issuecomment-6835373016)) gives the runner's own turn, and the column is re-read with it.
+
+**What takes tokio and the client plane lower.** In the end state tokio is 0.29 ms an operation on the 7763, beside the followers' loops' 0.30.
 - **Per turn, 733 µs over five voters:** the hand-offs, the wake-ups and the runtime's scheduling.
 - **Per command, about 145:** the datagrams (quinn's per-packet work, crypto, the kernel).
 
 Two things go further than the levers:
 1. **The transport driven from the loop's turn.** quinn-proto is sans-IO. The loop would read its sockets once a turn (`recvmmsg`) and write each peer's transmits with one GSO `sendmsg` at the turn's end, with no hand-off, no `epoll` a datagram and no runtime. That is the rule's network form taken literally.
    - **It removes** park, wake, `epoll` and the runtime's scheduling, about 30 to 40% of tokio by the profile.
-   - **Modeled as** tokio at 120 + 450/k: the end state goes from 0.93 to 0.86 on the 7763 at the measured turn size, and 0.80 at 16 a turn.
+   - **Modeled as** tokio at 120 + 450/k: the end state goes from 0.98 to 0.91 on the 7763 at the measured turn size.
    - **The cost:**
      - the transport is rewritten around quinn-proto;
      - the client plane's connections are served from the loop or from a second loop of their own;
      - a datagram that arrives mid-turn waits for the turn's end.
-   - **Its own design step.** About 4 to 6 weeks.
+   - **Its own design step,** about 4 to 6 weeks, and undecided (Section 8).
 2. **Fewer datagrams a command:** lever 3 on the peer plane, and shared client connections on the client plane (Section 4.5).
 
 Neither crypto (7% of tokio) nor QUIC itself is the difference.
 
 **Does it reach parity?**
-- **Without a protocol decision** (proposals 1 to 3, and levers 3, 4, 6 and 8), the servers end at about 1.19 ms an operation on the 7763. That is −0.39, more than review's −0.20 to −0.32 because proposal 2 is now sized from the measured rows.
-- **The leader-log end state** reaches 0.93 at the measured turn size and 0.86 at 16 a turn, against etcd's 0.887 (#185, run with `--snapshot-count 100`; testing re-reads it against etcd's default).
-- **With the transport on the loop's turn,** 0.86 and 0.80.
+- **Without a protocol decision** (proposals 1 and 2, the appender's encode, and levers 3, 4, 6 and 8), the servers end at about 1.20 ms an operation on the 7763. That is −0.38, more than review's −0.20 to −0.32 on #185 because proposal 2 is now sized from the measured rows.
+- **Read the end state at the measured turn.** The 16-a-turn column is outside what either host reached: at 240 callers review's leader turn is 10.5 commands. A turn of 16 at the bar's load means holding a turn open, which is latency paid for CPU (review on #252).
+- **The leader-log end state (parked)** reaches 0.98 at the measured turn, and 0.91 with the transport on the loop's turn.
+- **Lazy voters (Section 6.6)** at `e = 1` take the no-decision row to 1.10. With lever 2 as sized here and the transport, about 0.95, counting `Follower::applied` once.
+- **Against the owner's exit,** which is completions (Section 8), parity needs the servers at about 0.80 to 0.87. No modeled row reaches it at the measured turn.
 
-So parity needs the leader log and either larger turns or the transport change. Every figure but #251's is modeled from counts and profile shares, not measured as a pair. Each step's acceptance reads its own pair.
+Every figure but the measured ones above is modeled from counts and profile shares, not measured as a pair. Each step's acceptance reads its own pair.
 
 ## 8. Order, and what the owner decides
 
+**The exit is completions,** meeting etcd's, as the lead has relayed the owner's bar. Section 7 reads servers' CPU against etcd's 0.887. In the owner's terms (review on #252, [6837290600](https://github.com/tuplesky/tuplesky/pull/252#issuecomment-6837290600)):
+- **On the 7763's four CPUs, completions follow the whole box's CPU an operation.** Summing testing's columns at 120 callers ([#98, 6833683813](https://github.com/tuplesky/tuplesky/pull/98#issuecomment-6833683813) and [6835373016](https://github.com/tuplesky/tuplesky/pull/98#issuecomment-6835373016)) gives 2.09 ms for us and 1.30 for etcd. That predicts 0.63× etcd's completions, and the sweep read 0.66×. At 30 callers it predicts 0.71×, and the sweep read 0.72×.
+- **Our client side and kernel cost 0.50 against etcd's 0.42.** So completions parity at 120 callers needs the servers at about 0.80 to 0.87, a little under 0.887.
+- **No modeled row reaches it at the measured turn** (Section 7):
+  - without a decision, 1.20;
+  - lazy voters at `e = 1`, 1.10;
+  - the leader-log end state, 0.98, and 0.91 with the transport on the loop's turn;
+  - lazy voters with lever 2 as sized here and the transport, about 0.95.
+- **The bar may move.** etcd's 0.887 is from `--snapshot-count 100`, which testing is re-reading at etcd's default.
+
+**The owner's answers on #252,** relayed by the lead on #185:
+
+> 1. Not yet convinced the leader log is needed if batching is done correctly. 2. Ditto [witnesses]. OTOH, as long as any of the journal-only voters can recover as a leader, it's OK. I'm willing to trade (reasonable) recovery time for maximum throughput.
+
+**Parked:**
+- **The leader log and option 3** (Sections 6.1 to 6.4), with lever 1 and the end state in Section 7.
+- **Witnesses as Section 6.5 has them.** They can't lead without a rebuild, and the owner's condition is that any journal-only voter can recover as a leader.
+- **Lever 2 as Section 7 sizes it.** It is being redesigned as batching without a protocol change, in a design step of its own:
+  - a follower takes a frame in one pass, its accept state handled by range;
+  - it votes once a frame, the message still carrying each command's vote;
+  - it forgets by range, and settles and flushes once a frame;
+  - the fast path and any voter's right to propose stay.
+
+**Undecided: the transport on the loop's turn** (Section 7).
+- **Its size beside the leader log's,** on the 7763 at the measured turn: the transport −0.07, the leader log's three rows −0.23.
+- **Its own design step,** about 4 to 6 weeks.
+- **Lever 8 is built and measured first** (#256): tokio −0.017 ms an operation locally. What it leaves of tokio's per-turn part sizes the transport's step.
+
+**Three choices left to a step, which the owner should know** (review on #252):
+- **Proposal 1's memory:** every key's current value in memory, or a cache. That is memory a domain, which is cost a tenant under the multi-tenant goal.
+- **What decides a mismatch** (Section 6.3): a second execution, or the domain stops for an operator. That is availability against one execution's word. Rotation under option 3 meets it a command at a time, and lazy voters at `e = 1` meet it a batch at a time, with their own executions as the tie-break (Section 6.6).
+- **Proposal 2's price beyond its weeks:** it supersedes task-d113's rows by order, merged this week, and every recovery reader changes at once. So the crash matrix and the fault runs are earned again (#258). It follows from the rule, so it isn't a new decision, but its price is the owner's to see.
+
 **Without a decision, in order:**
-1. Lever 4 (#253).
-2. The loop's per-pass housekeeping (review's check on #185): the run-queue sample on a timer, and `redial` only on a change.
-3. Execution a group at a time at every voter, not only the leader (the same check). It brings the followers under the rule's one read view a batch.
-4. Lever 8.
-5. Proposal 2's design step, then its code.
-6. Proposal 1: lever 5 reshaped as its first step, then memory.
-7. Proposal 3.
+1. Lever 4 (#253, merged).
+2. The loop's per-pass housekeeping (#254): the run-queue sample on a timer, and `redial` only on a change.
+3. Execution a group at a time at every voter (#257). It brings the followers under one read snapshot a group.
+4. Lever 8 (#256).
+5. Proposal 2's design step (#258), then its code.
+6. Proposal 1: each table opened once a group, then memory.
+7. The appender's one encode, in place of proposal 3.
 8. Lever 3.
 9. Lever 6's rest.
 
 **For the owner:**
-- **Option 3 and the leader log,** with Section 6.2's trade and Section 6.3's open arguments.
-- **Or witnesses (Section 6.5):** two voters that journal and vote but keep no projection. They keep the fast path and three independent executions, and give up two projection copies and leadership at the witnesses.
-- **Or lazy voters (Section 6.6):** voters that vote on the hot path and land the eager voters' agreed batches behind, at a lag of one floor interval. Any of them can lead after executing a tail of at most one batch. At one eager follower beside the leader, about −0.10 ms an operation on the 7763.
-- **Whether the transport moves onto the loop's turn.**
+- **Lazy voters (Section 6.6):** voters that vote on the hot path and land the eager voters' agreed batches behind, at a lag of one floor interval. Any of them can lead after executing a tail of at most one batch. At one eager follower beside the leader, about −0.10 ms an operation on the 7763. The domain keeps five copies of the store, three of them behind.
+- **Whether the transport moves onto the loop's turn,** once lever 8 is on the carry.
+- **If witnesses are reopened:** whether three copies of five may be read against etcd's five (Section 6.5).
