@@ -103,6 +103,7 @@ pub mod compaction;
 pub mod cut;
 pub mod intake;
 pub mod journaled;
+pub mod kv_index;
 pub mod latency;
 pub mod lowering;
 pub mod materialize;

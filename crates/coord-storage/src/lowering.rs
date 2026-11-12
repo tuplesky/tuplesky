@@ -193,6 +193,7 @@ pub fn lower_record<W: WriteTxn>(
     for (i, update) in updates.iter().enumerate() {
         let ordinal = u32::try_from(i)
             .map_err(|_| EngineError::new(ErrorClass::Limit, "a record of too many updates"))?;
+        assigner.observe_kv(update, |key| tx.get(update.collection, key))?;
         let assigned = assigner.assign(seq, ordinal, update, |collection, key| {
             tx.get(collection, key)
         })?;

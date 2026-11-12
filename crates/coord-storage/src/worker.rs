@@ -144,6 +144,7 @@ impl<E: LocalEngine> StoreWorker<E> {
             &snapshot,
             meta.stamp.journal_seq().get(),
         )?);
+        frontier.install_kv_index(crate::kv_index::KvIndex::build(&snapshot)?);
         frontier.set_completed(meta.stamp.store_seq());
         Ok(StoreWorker {
             engine,
