@@ -714,9 +714,23 @@ struct Domain<E: LocalEngine> {
     /// (task-d86): what the hold's `wait` is counted from.
     held_since: Option<Instant>,
     /// Something reading the projection waits for a record (task-d86):
-    /// the next commit goes out whatever the hold says. Cleared when one
-    /// is lent.
-    commit_asked: bool,
+    /// commits go out whatever the hold says until one is lent that
+    /// carries everything submitted when the ask was made.
+    commit_asked: Option<CommitAsk>,
+}
+
+/// How far an ask for a projection commit reaches (task-d86): the
+/// records submitted when it was made, which a commit lent must carry
+/// before the ask is spent. A commit lent with only records held from
+/// before leaves it standing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommitAsk {
+    /// The last submission queued when the ask was made, not yet in a
+    /// group: its journal sequence is not known until it is sealed.
+    Queued(BarrierId),
+    /// The last journal sequence submitted when the ask was made, in a
+    /// group out or already durable.
+    Through(LocalJournalSeq),
 }
 
 /// A checkpoint pointer on its way through the journal worker (task-d66).
@@ -877,6 +891,48 @@ impl<E: LocalEngine> Domain<E> {
             self.queued_bytes = self
                 .queued_bytes
                 .saturating_sub(batch_bytes(&submission.batch));
+            // Sealed now: the head has reserved its sequences (each seal
+            // reserves before it dequeues), so the ask that named it
+            // reaches the group's last.
+            if self.commit_asked == Some(CommitAsk::Queued(submission.batch.barrier)) {
+                self.commit_asked = Some(CommitAsk::Through(self.submitted_through()));
+            }
+        }
+    }
+
+    /// The last journal sequence sealed into a group: the outstanding
+    /// group's last, whatever its outcome turns out to be, or the
+    /// durable head with none out.
+    fn submitted_through(&self) -> LocalJournalSeq {
+        match self.head.state() {
+            HeadState::Pending(p) | HeadState::Uncertain(p) => p.last,
+            HeadState::Idle => self.head.durable(),
+        }
+    }
+
+    /// Ask for commits that carry everything submitted so far (task-d86).
+    /// A later ask reaches as far as an earlier one and further, so it
+    /// replaces it.
+    fn ask_for_commit(&mut self) {
+        self.commit_asked = Some(match self.queue.back() {
+            Some(last) => CommitAsk::Queued(last.batch.barrier),
+            None => CommitAsk::Through(self.submitted_through()),
+        });
+    }
+
+    /// Whether the commit lent now spends the ask (task-d86). It carries
+    /// every durable record not materialized, so it spends an ask whose
+    /// records are durable. One whose submission was dropped unjournaled
+    /// is spent too: nothing it waits for is coming. A sequence a
+    /// definite failure released is taken again by the next record, so
+    /// an ask for it stands at most until that record is lent.
+    fn ask_spent(&self) -> bool {
+        match self.commit_asked {
+            None => true,
+            Some(CommitAsk::Queued(barrier)) => {
+                !self.queue.iter().any(|s| s.batch.barrier == barrier)
+            }
+            Some(CommitAsk::Through(seq)) => seq <= self.frontiers.durable(),
         }
     }
 
@@ -1380,7 +1436,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
             },
             checkpoint: None,
             held_since: None,
-            commit_asked: false,
+            commit_asked: None,
         };
         let started = Instant::now();
         Self::replay(
@@ -1893,7 +1949,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
             state.working.requested = true;
             // The pointer waits for the projection, so its commit is not
             // held (task-d86).
-            state.commit_asked = true;
+            state.ask_for_commit();
         }
         state.checkpoint = Some(Queued {
             pointer: *pointer,
@@ -3418,15 +3474,17 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
     /// the caller hands off as it does already, and
     /// [`JournaledStore::projection_commit_due`] says it is due now.
     ///
-    /// The ask stands until a commit is lent, so a record that is still
-    /// on its way to the journal when it is made goes out with the
-    /// commit that carries it, not after the hold.
+    /// The ask reaches every record submitted when it is made, and
+    /// stands until a commit carrying them all is lent. So a record still
+    /// on its way to the journal goes out with the commit that carries
+    /// it, not after the hold, even if a commit of records held from
+    /// before is lent first.
     pub fn request_projection_commit(&mut self) {
         if self.hold.is_none() {
             return;
         }
         for state in self.domains.values_mut() {
-            state.commit_asked = true;
+            state.ask_for_commit();
         }
     }
 
@@ -3440,10 +3498,19 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
         let hold = self.held_hold()?;
         self.domains
             .values()
-            .filter(|d| d.lent.is_none() && !d.pending.is_empty())
+            // What a hand-off would lend: it skips a domain quarantined
+            // or with a commit in doubt, so those are not due either.
+            .filter(|d| {
+                d.lent.is_none()
+                    && !d.pending.is_empty()
+                    && !matches!(
+                        d.status,
+                        DomainStatus::Quarantined | DomainStatus::MaterializationUncertain
+                    )
+            })
             .filter_map(|d| {
                 let since = d.held_since?;
-                Some(if d.commit_asked {
+                Some(if d.commit_asked.is_some() {
                     since
                 } else {
                     since + hold.wait
@@ -3658,7 +3725,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
             }
             let since = state.held_since.unwrap_or(now);
             if let Some(hold) = hold
-                && !state.commit_asked
+                && state.commit_asked.is_none()
                 && state.pending.len() < hold.records.get() as usize
                 && now.saturating_duration_since(since) < hold.wait
             {
@@ -3669,7 +3736,9 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                 continue;
             };
             state.held_since = None;
-            state.commit_asked = false;
+            if state.ask_spent() {
+                state.commit_asked = None;
+            }
             let records = std::mem::take(&mut state.pending);
             state.lent = Some(records.len());
             materializer.submit(MaterializeJob {

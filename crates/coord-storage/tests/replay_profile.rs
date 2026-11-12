@@ -878,3 +878,77 @@ fn records_held_at_a_crash_are_replayed_from_the_journal() {
     let next = crash_and_attach(world, profile, durable).unwrap();
     assert_recovered(&next, 4);
 }
+
+/// An ask reaches the records submitted when it is made, so a commit of
+/// records held from before it does not spend it (task-d86): the record
+/// it was made for goes out as soon as it is journaled, not after the
+/// hold. Review's case on #234: one record held, a second queued and the
+/// ask made, the hand-off lending the first.
+#[test]
+fn an_ask_is_not_spent_by_a_commit_of_records_held_before_it() {
+    let (mut world, handle) = held(hold(100, std::time::Duration::from_secs(3600)));
+    journal_and_hand_off(&mut world, 1);
+    assert!(!world.store.lent(A), "one record is held");
+    world.queue(1);
+    world.store.request_projection_commit();
+    world.store.hand_off().unwrap();
+    assert!(world.store.lent(A), "the held record goes out on the ask");
+    world.store.append().unwrap();
+    assert!(handle.run());
+    world.store.hand_off().unwrap();
+    assert!(
+        world.store.lent(A),
+        "the record the ask was made for goes out once journaled, not an hour later"
+    );
+    assert!(handle.run());
+    world.store.hand_off().unwrap();
+    assert_eq!(world.store.unmaterialized(A), 0);
+    // That commit spent it: the next record is held.
+    journal_and_hand_off(&mut world, 1);
+    assert!(!world.store.lent(A));
+}
+
+/// A domain whose last commit is in doubt is not lent by a hand-off, so
+/// the records journaled behind it are not due either until it is
+/// reconciled (task-d86): a caller that hands off at the due time would
+/// otherwise spin on a time in the past.
+#[test]
+fn a_commit_in_doubt_leaves_nothing_due_until_it_is_reconciled() {
+    let (mut world, handle) = held(hold(100, std::time::Duration::from_millis(1)));
+    world
+        .engine()
+        .script_commit(CommitScript::Indeterminate { applied: true });
+    journal_and_hand_off(&mut world, 1);
+    world.store.request_projection_commit();
+    world.store.hand_off().unwrap();
+    assert!(world.store.lent(A));
+    // Two journaled behind the commit while it is out.
+    journal_and_hand_off(&mut world, 2);
+    assert!(handle.run());
+    let report = world.store.hand_off().unwrap();
+    assert!(report.indeterminate);
+    assert_eq!(
+        world.store.status(A),
+        Some(DomainStatus::MaterializationUncertain)
+    );
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    for pass in 0..3 {
+        assert_eq!(
+            world.store.projection_commit_due(),
+            None,
+            "pass {pass}: due while the hand-off lends nothing"
+        );
+        world.store.hand_off().unwrap();
+        assert!(!world.store.lent(A));
+    }
+    world.store.reconcile(A).unwrap();
+    assert_eq!(world.store.status(A), Some(DomainStatus::Ready));
+    assert_eq!(world.store.unmaterialized(A), 2);
+    let due = world
+        .store
+        .projection_commit_due()
+        .expect("the two are held");
+    assert!(due <= std::time::Instant::now());
+    world.store.hand_off().unwrap();
+    assert!(world.store.lent(A), "lent once reconciled");
+}
