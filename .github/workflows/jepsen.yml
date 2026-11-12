@@ -63,7 +63,7 @@ on:
         description: Voters (containers), 3 or 5
         default: "5"
       etcd-version:
-        description: "etcd for the baseline: a version such as 3.7.2, latest (the newest stable release), or none to skip it; beside, or beside:VERSION, runs it in the TupleSky job, on its runner and cluster, after each pair (or after the one run), with each TupleSky run's ratio to it, instead of in a job of its own on another runner. etcd runs at its own default snapshot count; /COUNT after any of them (beside/100) also runs it at --snapshot-count COUNT at each sweep step, labelled etcd-snapCOUNT"
+        description: "etcd for the baseline: a version such as 3.7.2, latest (the newest stable release), or none to skip it; beside, or beside:VERSION, runs it in the TupleSky job, on its runner and cluster, after each pair (or after the one run), with each TupleSky run's ratio to it, instead of in a job of its own on another runner. etcd runs at its own default snapshot count; /COUNT after any of them (beside/100) also runs it at --snapshot-count COUNT at each sweep step, labelled etcd-snapCOUNT; +tls or +tls+auth before it (beside+tls, beside+tls+auth/100) also runs it secured at each sweep step, TLS with client certificates on both planes and with +auth a non-root user checked against a role's grant, labelled etcd-tls or etcd-tlsauth; in a sweep TupleSky runs first at odd steps and etcd at even ones"
         default: latest
       features:
         description: "Replicated features TupleSky's voters activate once every voter is submittable, before the nemesis and the workload (jepsen.tuplesky's --activate, task-d99), comma-separated in order, such as early-proposal,release-at-execution; NAME@SECS activates one under load, SECS into the workload (--activate-after), such as early-proposal,answer-on-release@60; a build without an admin socket (a pair's base before task-d99) is left as it is; empty for none; BASE/HEAD gives a pair's two sides their own lists (either may be empty)"
@@ -554,10 +554,11 @@ jobs:
           # named $2; its store in etcd_store.
           etcd_previous="" etcd_store=""
           etcd_one() {
-            local dir=$1 label=$2 snapshots=${3:-} store
+            local dir=$1 label=$2 snapshots=${3:-} secure=${4:-} store
             mkdir -p "$dir"
             # $3: a snapshot count for this run; etcd's own default without.
-            (cd "$GITHUB_WORKSPACE" && ETCD_SNAPSHOT_COUNT=$snapshots "$ci/jepsen_etcd.sh" run "$dir/cpu-samples.csv") \
+            # $4: tls or tls+auth, this run secured (etcd-version VERSION+tls).
+            (cd "$GITHUB_WORKSPACE" && ETCD_SNAPSHOT_COUNT=$snapshots ETCD_SECURE=$secure "$ci/jepsen_etcd.sh" run "$dir/cpu-samples.csv") \
               || echo "::warning::$label: the etcd test ended with status $?"
             store=$(readlink -f "$GITHUB_WORKSPACE/etcd-test/store/latest" || true)
             if [ -z "$store" ] || [ "$store" = "$etcd_previous" ]; then
@@ -567,7 +568,7 @@ jobs:
             etcd_previous=$store etcd_store=$store
             cp "$dir"/cpu-samples* "$store"/ 2>/dev/null || true
             python3 "$ci/jepsen_summary.py" "$store" --nodes-file "$RUNNER_TEMP/cluster/nodes" \
-              --title "etcd $ETCD_VERSION${snapshots:+ at --snapshot-count $snapshots}: $WORKLOAD, $NEMESIS$TITLE_SUFFIX$STORE_SUFFIX: $label" || true
+              --title "etcd $ETCD_VERSION${snapshots:+ at --snapshot-count $snapshots}${secure:+ with $secure}: $WORKLOAD, $NEMESIS$TITLE_SUFFIX$STORE_SUFFIX: $label" || true
           }
           # With SwiftPaxos beside TupleSky, its register test once on this
           # runner and cluster without faults, at $3 clients, its samples in
@@ -601,7 +602,7 @@ jobs:
               --title "SwiftPaxos: register, none, at $clients clients: $label" || true
           }
           head_sha=$(git -C "$GITHUB_WORKSPACE/tuplesky" rev-parse --short HEAD)
-          beside=""; if [ "$ETCD_BESIDE" = true ]; then beside=", beside etcd $ETCD_VERSION"; fi
+          beside=""; if [ "$ETCD_BESIDE" = true ]; then beside=", beside etcd $ETCD_VERSION${ETCD_SECURE_EXTRA:+ (and with $ETCD_SECURE_EXTRA)}"; fi
           if [ "$SWIFTPAXOS_BESIDE" = true ]; then beside+=", beside SwiftPaxos"; fi
           if [ -z "$IN_PAIR_BASE" ] && [ -z "$SWEEP" ]; then
             graph=flat; if [ "$IN_LEADER_PROFILE" = call-graph ]; then graph=graph; fi
@@ -723,9 +724,37 @@ jobs:
             runs+=("$label=$store")
           }
           if [ -n "$SWEEP" ]; then
-            # Each step in turn: the head, the base where it runs at this
-            # step (the order alternating from step to step), then etcd.
+            # Each step in turn: TupleSky (the head, and the base where it
+            # runs at this step, the two in an order alternating from step
+            # to step) and etcd, TupleSky first at odd steps and etcd first
+            # at even ones, so neither system always runs on the runner the
+            # other just warmed or heated; then SwiftPaxos.
             i=0
+            tuplesky_step() {
+              local side
+              for side in $sides; do
+                one_side "$side" "$graph" "step $step" "$side@$step"
+              done
+            }
+            etcd_step() {
+              [ "$ETCD_BESIDE" = true ] || return 0
+              n=$((n + 1))
+              if etcd_one "$RUNNER_TEMP/run-$n" "step $step"; then runs+=("etcd@$step=$etcd_store"); fi
+              # etcd-version .../COUNT: etcd again at that snapshot count.
+              if [ -n "${ETCD_SNAPSHOT_EXTRA:-}" ]; then
+                n=$((n + 1))
+                if etcd_one "$RUNNER_TEMP/run-$n" "step $step, --snapshot-count $ETCD_SNAPSHOT_EXTRA" "$ETCD_SNAPSHOT_EXTRA"; then
+                  runs+=("etcd-snap$ETCD_SNAPSHOT_EXTRA@$step=$etcd_store")
+                fi
+              fi
+              # etcd-version VERSION+tls or +tls+auth: etcd again, secured.
+              if [ -n "${ETCD_SECURE_EXTRA:-}" ]; then
+                n=$((n + 1))
+                if etcd_one "$RUNNER_TEMP/run-$n" "step $step, $ETCD_SECURE_EXTRA" "" "$ETCD_SECURE_EXTRA"; then
+                  runs+=("etcd-${ETCD_SECURE_EXTRA//+/}@$step=$etcd_store")
+                fi
+              fi
+            }
             for step in $SWEEP; do
               i=$((i + 1))
               CONCURRENCY=$step
@@ -734,19 +763,10 @@ jobs:
                 if [ $((i % 2)) = 1 ]; then sides="head base"; else sides="base head"; fi
               fi
               graph=flat; if [ "$IN_LEADER_PROFILE" = call-graph ] && [ "$i" = 1 ]; then graph=graph; fi
-              for side in $sides; do
-                one_side "$side" "$graph" "step $step" "$side@$step"
-              done
-              if [ "$ETCD_BESIDE" = true ]; then
-                n=$((n + 1))
-                if etcd_one "$RUNNER_TEMP/run-$n" "step $step"; then runs+=("etcd@$step=$etcd_store"); fi
-                # etcd-version .../COUNT: etcd again at that snapshot count.
-                if [ -n "${ETCD_SNAPSHOT_EXTRA:-}" ]; then
-                  n=$((n + 1))
-                  if etcd_one "$RUNNER_TEMP/run-$n" "step $step, --snapshot-count $ETCD_SNAPSHOT_EXTRA" "$ETCD_SNAPSHOT_EXTRA"; then
-                    runs+=("etcd-snap$ETCD_SNAPSHOT_EXTRA@$step=$etcd_store")
-                  fi
-                fi
+              if [ $((i % 2)) = 1 ]; then
+                tuplesky_step; etcd_step
+              else
+                etcd_step; tuplesky_step
               fi
               # SwiftPaxos at this step's clients, raised as a register
               # step is (SWIFTPAXOS_STEPS, one a step, in order).

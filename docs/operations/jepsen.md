@@ -835,6 +835,34 @@ the flag only when a run asks for a count. `etcd-version: beside/100` (or
 run at each sweep step. A sweep's table labels it `etcd-snap100`, with its
 ratio to the default run, so the setting's cost has a size.
 
+The plain etcd run speaks HTTP and has auth off, while TupleSky runs QUIC
+with TLS 1.3, client certificates and a grant check on every command.
+`etcd-version: beside+tls` (or `VERSION+tls`, before any `/COUNT`) also
+runs etcd secured at each sweep step, labelled `etcd-tls`:
+- TLS on both planes, with client certificates required from clients and
+  from peers (`--client-cert-auth`, `--peer-client-cert-auth`).
+- jetcd presents the certificate and trusts the CA.
+- `jepsen_etcd.sh` makes the CA and one certificate per job on the runner.
+  The certificate names every node by its name and by its address in the
+  runner's `/etc/hosts`.
+
+`beside+tls+auth` adds auth, labelled `etcd-tlsauth`:
+- Once the members are up, the first one creates a root user and a user
+  `jepsen`, which isn't root.
+- `jepsen`'s role grants read-write on the whole key space.
+- The workload's clients log in as `jepsen`, so etcd checks every request
+  against that grant.
+
+`jepsen_etcd_secure.py` makes these edits to the etcd test. They do
+nothing in the plain runs. The clients the etcd test opens with no test
+map, for its nemeses' membership calls, send no credentials, so a
+secured run takes no faults. Every ratio stays over the plain run, and
+the secured run is a row beside it.
+
+In a sweep, TupleSky runs first at odd steps and etcd runs first at even
+steps. That way neither system always runs on a runner the other has
+just warmed. SwiftPaxos runs after both.
+
 Each test runs under `timeout`, bounded at the time limit plus 20
 minutes. A test whose final phase hangs then fails in that time, instead
 of holding its job until the job's own timeout (90 or 120 minutes). The

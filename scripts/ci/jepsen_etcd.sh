@@ -25,7 +25,7 @@ prepare() {
   # default snapshot count, and in a TupleSky sweep a second run at each
   # step with --snapshot-count COUNT (ETCD_SNAPSHOT_EXTRA), so a setting's
   # cost has a size. Without it, etcd's default alone.
-  local extra=""
+  local extra="" secure=""
   case $ETCD_VERSION in
     */*) extra=${ETCD_VERSION#*/} ETCD_VERSION=${ETCD_VERSION%%/*} ;;
   esac
@@ -33,6 +33,18 @@ prepare() {
     echo "::error::not a snapshot count: '$extra' (etcd-version VERSION/COUNT)"; exit 1
   fi
   echo "ETCD_SNAPSHOT_EXTRA=$extra" >> "${GITHUB_ENV:-/dev/null}"
+  # VERSION+tls or VERSION+tls+auth (beside+tls, beside+tls+auth/100): in
+  # a TupleSky sweep, etcd again at each step secured as TupleSky is
+  # (ETCD_SECURE_EXTRA): TLS with client certificates on both planes, and
+  # with +auth a user whose role grants the test's keys, so every request
+  # carries a token and is checked against that grant. etcd plain stays the
+  # row every ratio is over; the secured run is a row beside it.
+  case $ETCD_VERSION in
+    *+tls+auth) secure=tls+auth ETCD_VERSION=${ETCD_VERSION%+tls+auth} ;;
+    *+tls) secure=tls ETCD_VERSION=${ETCD_VERSION%+tls} ;;
+    *+*) echo "::error::not an etcd security setting: '${ETCD_VERSION#*+}' (etcd-version VERSION+tls or VERSION+tls+auth)"; exit 1 ;;
+  esac
+  echo "ETCD_SECURE_EXTRA=$secure" >> "${GITHUB_ENV:-/dev/null}"
   # `beside` or `beside:VERSION` (etcd in the TupleSky job) names the
   # version after it, `latest` without one.
   case $ETCD_VERSION in
@@ -125,6 +137,14 @@ for old, new in edits:
 open(path, "w").write(src)
 PY
   grep -n 'cu/signal!' "$test_dir/src/jepsen/etcd/db.clj"
+
+  # The secured runs (ETCD_SECURE_EXTRA): the test reads the certificates'
+  # directory from JEPSEN_ETCD_TLS and JEPSEN_ETCD_AUTH for auth, which
+  # `run` sets for those runs alone, so a plain run on the same edits is
+  # the test as it was.
+  if [ -n "$secure" ]; then
+    python3 "$ci/jepsen_etcd_secure.py" "$test_dir/src/jepsen/etcd"
+  fi
 
   # The combined nemesis draws kill/start and pause/resume from one mix, so
   # a start can wait minutes after a kill. jepsen.tuplesky staggers the two
@@ -222,6 +242,17 @@ run() {
   if [ "$WAN" != none ]; then wan=(--wan "$WAN"); fi
   # ETCD_SNAPSHOT_COUNT: a snapshot count for this run; etcd's own without.
   if [ -n "${ETCD_SNAPSHOT_COUNT:-}" ]; then snapshots=(--snapshot-count "$ETCD_SNAPSHOT_COUNT"); fi
+  # ETCD_SECURE (tls or tls+auth): this run secured, on the edits
+  # `prepare` made for ETCD_SECURE_EXTRA.
+  unset JEPSEN_ETCD_TLS JEPSEN_ETCD_AUTH
+  case ${ETCD_SECURE:-} in
+    "") ;;
+    tls|tls+auth)
+      export JEPSEN_ETCD_TLS="$RUNNER_TEMP/etcd-tls"
+      certificates "$JEPSEN_ETCD_TLS"
+      if [ "$ETCD_SECURE" = tls+auth ]; then export JEPSEN_ETCD_AUTH=1; fi ;;
+    *) echo "::error::not an etcd security setting: '$ETCD_SECURE'"; exit 1 ;;
+  esac
   export JEPSEN_CPU_SAMPLES=$samples
   unset JEPSEN_LEADER_PROFILE JEPSEN_LEADER_CALLGRAPH
   cd "$test_dir"
@@ -239,6 +270,33 @@ run() {
     --concurrency "$CONCURRENCY" \
     ${snapshots[@]+"${snapshots[@]}"} \
     ${wan[@]+"${wan[@]}"}
+}
+
+certificates() {
+  # A CA and one certificate for every member, as server, peer and client,
+  # naming each node by name and by the address the runner's /etc/hosts
+  # gives it (docker/up.sh writes them): the test reaches a member by its
+  # address, and both gRPC and etcd's peers check the name they dialled.
+  # Made once a job; a key that never leaves the runner and its nodes.
+  local dir=$1 nodes="$RUNNER_TEMP/cluster/nodes" san="DNS:localhost,IP:127.0.0.1" node ip
+  [ -s "$dir/node.crt" ] && return 0
+  mkdir -p "$dir"
+  for node in $(cat "$nodes"); do
+    ip=$(getent ahostsv4 "$node" | awk 'NR == 1 {print $1}')
+    [ -n "$ip" ] || { echo "::error::no address for $node to name in etcd's certificate"; exit 1; }
+    san+=",DNS:$node,IP:$ip"
+  done
+  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 2 \
+    -subj "/CN=jepsen etcd CA" -keyout "$dir/ca.key" -out "$dir/ca.crt" 2>/dev/null
+  openssl req -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+    -subj "/CN=etcd" -keyout "$dir/node.key" -out "$dir/node.csr" 2>/dev/null
+  printf 'subjectAltName=%s\nextendedKeyUsage=serverAuth,clientAuth\nkeyUsage=digitalSignature,keyEncipherment\n' "$san" > "$dir/node.ext"
+  openssl x509 -req -in "$dir/node.csr" -CA "$dir/ca.crt" -CAkey "$dir/ca.key" -CAcreateserial \
+    -days 2 -extfile "$dir/node.ext" -out "$dir/node.crt" 2>/dev/null
+  # PKCS#8, which netty's SslContextBuilder (jetcd) reads.
+  openssl pkcs8 -topk8 -nocrypt -in "$dir/node.key" -out "$dir/node.pk8"
+  mv "$dir/node.pk8" "$dir/node.key"
+  echo "etcd's certificates: $san"
 }
 
 deps() {

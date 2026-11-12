@@ -7,7 +7,9 @@ job.
 
 Each argument is one run's store directory, labelled with its side
 (`head`, `base`, `etcd` at its default snapshot count, `etcd-snapCOUNT` at
-`--snapshot-count COUNT`, or `swiftpaxos`, the reference beside TupleSky)
+`--snapshot-count COUNT`, `etcd-tls` or `etcd-tlsauth` secured as TupleSky is
+(TLS with client certificates, and auth checked on every request), or
+`swiftpaxos`, the reference beside TupleSky)
 and its step (the clients it ran at, as the
 workflow names them: `30`, or `6n`), in the order the job ran them. For
 every run it reads, with `jepsen_summary.py`'s parsers, over the workload (the first invocation to the last completion,
@@ -282,9 +284,11 @@ TUPLESKY = ("head", "base")
 
 def label(arg: str) -> tuple[str, str, str]:
     """SIDE@STEP=STORE as its three parts."""
-    m = re.fullmatch(r"(head|base|etcd|etcd-snap[0-9]+|swiftpaxos)@([0-9]+n?)=(.+)", arg)
+    m = re.fullmatch(r"(head|base|etcd|etcd-snap[0-9]+|etcd-tls|etcd-tlsauth|swiftpaxos)@([0-9]+n?)=(.+)", arg)
     if not m:
-        raise ValueError(f"not SIDE@STEP=STORE (SIDE head, base, etcd, etcd-snapCOUNT or swiftpaxos): {arg}")
+        raise ValueError(
+            f"not SIDE@STEP=STORE (SIDE head, base, etcd, etcd-snapCOUNT, etcd-tls, etcd-tlsauth or swiftpaxos): {arg}"
+        )
     return m[1], m[2], m[3]
 
 
@@ -764,8 +768,8 @@ def render(steps: list[Step], title: str) -> str:
     rows = [s for s in steps if s.side != "etcd" and s.step in etcd]
     if rows:
         out += [
-            "**Against etcd at the same step** (each TupleSky run's value, SwiftPaxos's and etcd's at another "
-            "snapshot count, over the etcd run's at its default snapshot count at its step, on "
+            "**Against etcd at the same step** (each TupleSky run's value, SwiftPaxos's, and etcd's at another "
+            "snapshot count or secured, over the plain etcd run's at its default snapshot count at its step, on "
             f"this runner{model_note(steps)}; a ratio read on one CPU model is not comparable with one read on "
             "another without saying so)",
             "",

@@ -192,6 +192,10 @@ class SweepTests(unittest.TestCase):
         self.assertEqual(sw.label("etcd@6n=/s/2"), ("etcd", "6n", "/s/2"))
         self.assertEqual(sw.label("swiftpaxos@120=/s/3"), ("swiftpaxos", "120", "/s/3"))
         self.assertEqual(sw.label("etcd-snap100@30=/s/4"), ("etcd-snap100", "30", "/s/4"))
+        self.assertEqual(sw.label("etcd-tls@30=/s/5"), ("etcd-tls", "30", "/s/5"))
+        self.assertEqual(sw.label("etcd-tlsauth@120=/s/6"), ("etcd-tlsauth", "120", "/s/6"))
+        with self.assertRaises(ValueError):
+            sw.label("etcd-auth@30=/s/7")
         with self.assertRaises(ValueError):
             sw.label("other@30=/s/1")
 
@@ -273,11 +277,15 @@ class SweepTests(unittest.TestCase):
         self.assertAlmostEqual(step.cpu["servers"], 2400.0)
         text = sw.render([step, sw.read_step("etcd", "30", self.store("e", tuplesky=False))], "Sweep")
         self.assertIn("| 30 | swiftpaxos | 1.00× | 1.00× | 1.00× |", text)
-        self.assertIn("SwiftPaxos's and etcd's at another snapshot count", text)
+        self.assertIn("SwiftPaxos's, and etcd's at another snapshot count or secured", text)
         snap = sw.read_step("etcd-snap100", "30", self.store("e100", tuplesky=False))
         self.assertIsNone(snap.commands_per_op)
         text = sw.render([snap, sw.read_step("etcd", "30", self.store("e2", tuplesky=False))], "Sweep")
         self.assertIn("| 30 | etcd-snap100 | 1.00× |", text)
+        tls = sw.read_step("etcd-tlsauth", "30", self.store("et", tuplesky=False))
+        self.assertIsNone(tls.commands_per_op)
+        text = sw.render([tls, sw.read_step("etcd", "30", self.store("e3", tuplesky=False))], "Sweep")
+        self.assertIn("| 30 | etcd-tlsauth | 1.00× |", text)
         self.assertNotIn("| 30 | swiftpaxos | 0 / ", text)
 
     def test_the_batch_depth(self):
