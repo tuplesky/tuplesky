@@ -33,7 +33,7 @@ use coord_store_api::registry::{Collection, meta_fields};
 use coord_types::ids::{ClusterId, DomainId, ReplicaId, ReplicaIncarnation};
 use redb::{ReadableDatabase, ReadableTableMetadata, TableDefinition};
 
-use crate::engine::{RedbEngine, check_integrity, table_definition};
+use crate::engine::{RedbEngine, table_definition};
 use crate::manifest::{ENGINE_NAME, ManifestError, PROFILE_NAME, StoreManifestV1};
 
 /// Identity a generation must carry.
@@ -88,8 +88,19 @@ pub enum OpenError {
     MissingDatabase,
     /// Database file empty (never a fresh database on open).
     EmptyDatabase,
-    /// redb refused the database or a required table is absent.
+    /// The store root's own records (`CURRENT`, a generation directory,
+    /// the manifest's registry) are malformed or disagree with the request.
     Corrupt(String),
+    /// The database file's bytes are wrong: redb reports it corrupted, it
+    /// is not a redb database, a registered table is missing, or the
+    /// integrity check fails (task-j05). Only this, an absent file and an
+    /// empty one say the file itself cannot be used.
+    DatabaseUnreadable(String),
+    /// redb could not open or read the database for a reason that says
+    /// nothing about its bytes: another opener holds it, it needs an
+    /// upgrade, a repair was aborted, an I/O error. Refused under every
+    /// profile; the file may be whole.
+    Database(String),
     /// In-database identity record disagrees with the manifest.
     IdentityRecordMismatch(&'static str),
     /// The selected generation holds protocol obligations (promises,
@@ -119,7 +130,9 @@ impl std::fmt::Display for OpenError {
             }
             OpenError::MissingDatabase => f.write_str("database file missing"),
             OpenError::EmptyDatabase => f.write_str("database file empty"),
-            OpenError::Corrupt(e) => write!(f, "database corrupt or unusable: {e}"),
+            OpenError::Corrupt(e) => write!(f, "store root inconsistent: {e}"),
+            OpenError::DatabaseUnreadable(e) => write!(f, "database unreadable: {e}"),
+            OpenError::Database(e) => write!(f, "database could not be opened: {e}"),
             OpenError::IdentityRecordMismatch(field) => {
                 write!(f, "in-database {field} differs from manifest")
             }
@@ -138,6 +151,75 @@ impl std::fmt::Display for OpenError {
 }
 
 impl std::error::Error for OpenError {}
+
+impl OpenError {
+    /// Whether this is how a selected generation's database fails when
+    /// the file itself cannot be used: absent, empty, or bytes redb proves
+    /// wrong (task-j05). Not an identity record that disagrees with the
+    /// manifest (a database that belongs to someone else), not the root's
+    /// own records, and not an error that says nothing about the bytes
+    /// ([`OpenError::Database`]: a lock, a format upgrade, I/O): those stay
+    /// refused.
+    ///
+    /// The staging that acts on it, [`Generation::stage_reinstall_unreadable`],
+    /// verifies the root and the manifest again first.
+    pub const fn is_unreadable_database(&self) -> bool {
+        matches!(
+            self,
+            OpenError::MissingDatabase
+                | OpenError::EmptyDatabase
+                | OpenError::DatabaseUnreadable(_)
+        )
+    }
+
+    /// Classify an error from opening a database file.
+    fn from_database(e: redb::DatabaseError) -> Self {
+        match e {
+            redb::DatabaseError::Storage(e) => Self::from_storage(e),
+            other => OpenError::Database(other.to_string()),
+        }
+    }
+
+    /// Classify an error from reading a database: only redb's own
+    /// corruption, or a file that is not a redb database (which redb
+    /// reports as I/O of kind `InvalidData`), proves the bytes wrong.
+    fn from_storage(e: redb::StorageError) -> Self {
+        match e {
+            redb::StorageError::Corrupted(m) => OpenError::DatabaseUnreadable(m),
+            redb::StorageError::Io(io) if io.kind() == std::io::ErrorKind::InvalidData => {
+                OpenError::DatabaseUnreadable(io.to_string())
+            }
+            other => OpenError::Database(other.to_string()),
+        }
+    }
+
+    fn from_transaction(e: redb::TransactionError) -> Self {
+        match e {
+            redb::TransactionError::Storage(e) => Self::from_storage(e),
+            other => OpenError::Database(other.to_string()),
+        }
+    }
+
+    /// A registered table that is absent, or present under another type,
+    /// is the file's fault.
+    fn from_table(table: &str, e: redb::TableError) -> Self {
+        match e {
+            redb::TableError::Storage(e) => match Self::from_storage(e) {
+                OpenError::DatabaseUnreadable(m) => {
+                    OpenError::DatabaseUnreadable(format!("table {table}: {m}"))
+                }
+                other => other,
+            },
+            e @ (redb::TableError::TableDoesNotExist(_)
+            | redb::TableError::TableTypeMismatch { .. }
+            | redb::TableError::TableIsMultimap(_)
+            | redb::TableError::TypeDefinitionChanged { .. }) => {
+                OpenError::DatabaseUnreadable(format!("table {table}: {e}"))
+            }
+            other => OpenError::Database(format!("table {table}: {other}")),
+        }
+    }
+}
 
 impl From<std::io::Error> for OpenError {
     fn from(e: std::io::Error) -> Self {
@@ -514,12 +596,65 @@ impl Generation {
         InactiveGeneration::stage_migration_with_lock(&root, lock, identity, options)
     }
 
+    /// Stage the next generation of `root` to reinstall this node's own
+    /// local recovery image into, when the selected generation's database
+    /// cannot be opened at all (task-j05 step 3; Section 17.16.4). Under
+    /// the replay-backed profile the projection is derived state: the
+    /// journal and the image of a published baseline rebuild it, so a
+    /// file redb cannot open is discarded and reinstalled like a
+    /// projection that does not continue the journal.
+    ///
+    /// Everything about the root is verified as any staging verifies it:
+    /// `CURRENT`, the selected manifest, its engine, profile and registry,
+    /// and that `identity` is the same replica of the same domain, no
+    /// earlier than the manifest. Only the database is not opened, and it
+    /// must fail as [`OpenError::is_unreadable_database`] says: a database
+    /// that opens is not discarded, and one whose identity record names
+    /// another node is refused. The selected generation stays selected
+    /// until the staging is activated, so a crash before that finds the
+    /// same unreadable file and reinstalls again.
+    pub fn stage_reinstall_unreadable(
+        root: &Path,
+        identity: StoreIdentity,
+        options: OpenOptions,
+    ) -> Result<InactiveGeneration, OpenError> {
+        let lock = RootLock::acquire(root, false)?;
+        if !root.join(CURRENT).is_file() {
+            return Err(OpenError::NotInitialized);
+        }
+        stage_with_lock_for(root, lock, identity, options, Obligations::Unreadable)
+    }
+
     /// Remove every generation directory of this root except the selected
     /// one, reclaiming replaced and abandoned stagings. Only safe once the
     /// selection is durable, which it is for an open generation: this reads
     /// the selected directory it was opened with and never touches `CURRENT`.
     /// Returns the generation numbers removed.
     pub fn prune_unselected(&self) -> std::io::Result<Vec<u64>> {
+        self.prune_unselected_except(None)
+    }
+
+    /// [`Generation::prune_unselected`], keeping generation `keep` as well:
+    /// the one a reinstall just replaced, kept as evidence of what was
+    /// discarded, while every earlier one goes (#212 review).
+    pub fn prune_unselected_except(&self, keep: Option<u64>) -> std::io::Result<Vec<u64>> {
+        self.prune_where(|number| Some(number) != keep)
+    }
+
+    /// Remove the stagings a stopped attempt left above the selected
+    /// generation, on an ordinary start (#212 re-review). A staging takes
+    /// the next number and `CURRENT` never named one that is above the
+    /// selection, so none of them holds anything a start reads. The
+    /// generations below the selection, a reinstall's discarded one among
+    /// them, are kept: they are evidence, and the reinstall prunes them.
+    pub fn prune_abandoned_stagings(&self) -> std::io::Result<Vec<u64>> {
+        let selected = self.manifest.generation;
+        self.prune_where(|number| number > selected)
+    }
+
+    /// Remove every generation other than the selected one that `remove`
+    /// names, syncing the root once if any went.
+    fn prune_where(&self, remove: impl Fn(u64) -> bool) -> std::io::Result<Vec<u64>> {
         let (Some(root), Some(selected)) = (self.directory.parent(), self.directory.file_name())
         else {
             return Ok(Vec::new());
@@ -527,7 +662,7 @@ impl Generation {
         let mut removed = Vec::new();
         for number in generation_numbers(root)? {
             let name = format!("gen-{number:06}");
-            if name.as_str() == selected {
+            if name.as_str() == selected || !remove(number) {
                 continue;
             }
             std::fs::remove_dir_all(root.join(&name))?;
@@ -576,22 +711,22 @@ fn initialize_database(
     let db = redb::Database::builder()
         .set_cache_size(options.cache_bytes)
         .create(&db_path)
-        .map_err(|e| OpenError::Corrupt(e.to_string()))?;
+        .map_err(|e| OpenError::Database(e.to_string()))?;
     {
         let mut txn = db
             .begin_write()
-            .map_err(|e| OpenError::Corrupt(e.to_string()))?;
+            .map_err(|e| OpenError::Database(e.to_string()))?;
         txn.set_durability(redb::Durability::Immediate)
-            .map_err(|e| OpenError::Corrupt(e.to_string()))?;
+            .map_err(|e| OpenError::Database(e.to_string()))?;
         txn.set_two_phase_commit(true);
         for c in Collection::ALL {
             txn.open_table(table_definition(c))
-                .map_err(|e| OpenError::Corrupt(e.to_string()))?;
+                .map_err(|e| OpenError::Database(e.to_string()))?;
         }
         {
             let mut meta = txn
                 .open_table(table_definition(Collection::MetaV1))
-                .map_err(|e| OpenError::Corrupt(e.to_string()))?;
+                .map_err(|e| OpenError::Database(e.to_string()))?;
             let rows: [(&[u8], Vec<u8>); 6] = [
                 (meta_fields::CLUSTER_ID, identity.cluster_id.0.to_vec()),
                 (meta_fields::DOMAIN_ID, identity.domain_id.0.to_vec()),
@@ -605,21 +740,41 @@ fn initialize_database(
             ];
             for (k, v) in rows {
                 meta.insert(k, v.as_slice())
-                    .map_err(|e| OpenError::Corrupt(e.to_string()))?;
+                    .map_err(|e| OpenError::Database(e.to_string()))?;
             }
         }
         txn.commit()
-            .map_err(|e| OpenError::Corrupt(e.to_string()))?;
+            .map_err(|e| OpenError::Database(e.to_string()))?;
     }
     Ok((db, db_path))
 }
 
 /// Open the database of a generation whose manifest has already been
 /// verified, and apply the in-database checks every selected generation
-/// must pass before anything reads or replaces it: the file exists and is
-/// not empty, every registered table exists, the `meta_v1` identity rows
-/// agree with the manifest (so a copied manifest cannot lend identity to a
-/// foreign database), and every table's checksums verify.
+/// must pass before anything reads or replaces it, in this order:
+///
+/// 1. the file exists and is not empty;
+/// 2. redb opens it with its integrity check on open
+///    (`set_check_integrity_on_open`, redb 4.5): every page of the
+///    committed trees is verified and the allocator state rebuilt, so
+///    damage anywhere in the file is found before any of its rows is
+///    read, and is redb's `Corrupted` rather than a panic (#212 review);
+/// 3. the `meta_v1` identity rows agree with the manifest, so a copied
+///    manifest cannot lend identity to a foreign database;
+/// 4. every registered table exists.
+///
+/// Damage is [`OpenError::DatabaseUnreadable`]: redb's `Corrupted`, a file
+/// that isn't redb's, a missing table, and a panic inside redb, which redb
+/// 4.2 raised on some single-page damage and which is still caught as a
+/// backstop. Identity is read only from a file that verified, so a
+/// damaged identity leaf is unreadable, never another node's database,
+/// and a foreign database is refused for its identity whatever tables it
+/// lacks. A file the check repaired (its allocator rebuilt, or a last
+/// commit rolled back) verified after the repair and is used: its stamp
+/// is checked against the journal like any other projection's. redb does
+/// not say whether the open repaired anything, so no line is written for
+/// it; a second `check_integrity()` would say, at the cost of reading the
+/// whole file again at every start.
 fn open_verified_database(
     db_path: &Path,
     manifest: &StoreManifestV1,
@@ -635,28 +790,33 @@ fn open_verified_database(
     if meta.len() == 0 {
         return Err(OpenError::EmptyDatabase);
     }
-    let mut db = redb::Database::builder()
-        .set_cache_size(options.cache_bytes)
-        .open(db_path)
-        .map_err(|e| OpenError::Corrupt(e.to_string()))?;
-    // Every registered table must exist, and the identity record must
-    // agree with the manifest.
-    {
-        let txn = db
-            .begin_read()
-            .map_err(|e| OpenError::Corrupt(e.to_string()))?;
-        for c in Collection::ALL {
-            txn.open_table(table_definition(c))
-                .map_err(|e| OpenError::Corrupt(format!("table {}: {e}", c.name())))?;
+    if let Some(found) = file_key(&meta).and_then(held_unreadable) {
+        return Err(OpenError::DatabaseUnreadable(found));
+    }
+    let db = unwinding("open", || {
+        redb::Database::builder()
+            .set_cache_size(options.cache_bytes)
+            .set_check_integrity_on_open(true)
+            .open(db_path)
+            .map_err(|e| match OpenError::from_database(e) {
+                OpenError::DatabaseUnreadable(m) => {
+                    OpenError::DatabaseUnreadable(format!("integrity: {m}"))
+                }
+                other => other,
+            })
+    })?;
+    let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        #[cfg(test)]
+        if tests::PANIC_IN_READ.with(std::cell::Cell::get) {
+            panic!("injected after the open");
         }
+        let txn = db.begin_read().map_err(OpenError::from_transaction)?;
         let meta_table = txn
             .open_table(table_definition(Collection::MetaV1))
-            .map_err(|e| OpenError::Corrupt(e.to_string()))?;
+            .map_err(|e| OpenError::from_table(Collection::MetaV1.name(), e))?;
         let check =
             |field: &'static str, key: &[u8], expected_bytes: &[u8]| -> Result<(), OpenError> {
-                let value = meta_table
-                    .get(key)
-                    .map_err(|e| OpenError::Corrupt(e.to_string()))?;
+                let value = meta_table.get(key).map_err(OpenError::from_storage)?;
                 match value {
                     Some(v) if v.value() == expected_bytes => Ok(()),
                     _ => Err(OpenError::IdentityRecordMismatch(field)),
@@ -686,7 +846,7 @@ fn open_verified_database(
         {
             let value = meta_table
                 .get(meta_fields::INCARNATION)
-                .map_err(|e| OpenError::Corrupt(e.to_string()))?;
+                .map_err(OpenError::from_storage)?;
             let recorded = value
                 .as_ref()
                 .map(|v| ReplicaIncarnation::from_be_slice(v.value()))
@@ -698,14 +858,123 @@ fn open_verified_database(
         }
         check("engine", meta_fields::ENGINE, ENGINE_NAME.as_bytes())?;
         check("profile", meta_fields::PROFILE, PROFILE_NAME.as_bytes())?;
+        for c in Collection::ALL {
+            txn.open_table(table_definition(c))
+                .map_err(|e| OpenError::from_table(c.name(), e))?;
+        }
+        Ok(())
+    }));
+    match read {
+        Ok(Ok(())) => Ok(db),
+        Ok(Err(e)) => Err(e),
+        Err(payload) => {
+            // Not closed: redb's close writes its allocator state and
+            // clears its recovery flag, and the file is left as it was
+            // found, as evidence (#212 review). The handle's file lock
+            // stays held until the process exits, so a later open of the
+            // same file in this process, the reinstall's own check that
+            // the selection is unreadable among them, would fail on the
+            // lock as an error that says nothing about the bytes, and the
+            // reinstall would be refused (#212 Codex review). The file is
+            // remembered instead, and such an open answers from what was
+            // found here.
+            let error = panicked("identity and tables", &*payload);
+            if let (Some(key), OpenError::DatabaseUnreadable(found)) = (file_key(&meta), &error) {
+                hold_unreadable(key, found.clone());
+            }
+            std::mem::forget(db);
+            Err(error)
+        }
     }
-    // Damage outside the meta pages does not stop `open`; verify every
-    // table before the database is used, and fail closed on damage.
-    check_integrity(&mut db).map_err(|e| OpenError::Corrupt(format!("integrity: {e}")))?;
-    Ok(db)
+}
+
+/// The databases this process found unreadable by a panic after redb had
+/// opened them, by file, with what was found. Each one's handle was not
+/// closed, so its file lock is held for the life of the process and the
+/// file is never written again: what was found still holds, and reopening
+/// would only fail on the lock. A file is known by its device and inode,
+/// which stay its own while the leaked handle keeps it open, through a
+/// rename or the removal of its generation.
+static HELD_UNREADABLE: std::sync::Mutex<Vec<((u64, u64), String)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// A file's device and inode, where the platform has them.
+fn file_key(meta: &std::fs::Metadata) -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some((meta.dev(), meta.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        None
+    }
+}
+
+fn hold_unreadable(key: (u64, u64), found: String) {
+    let mut held = HELD_UNREADABLE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !held.iter().any(|(k, _)| *k == key) {
+        held.push((key, found));
+    }
+}
+
+/// What an earlier open in this process found in the file `key` names,
+/// if its handle is still held.
+fn held_unreadable(key: (u64, u64)) -> Option<String> {
+    HELD_UNREADABLE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .find(|(k, _)| *k == key)
+        .map(|(_, found)| format!("{found} (found by an earlier open in this process)"))
+}
+
+/// `f`, with a panic inside redb taken as proof the file is malformed:
+/// redb 4.2 panicked rather than erred on some damaged pages (an
+/// allocator or tree page whose bytes pass its checks badly), and did so
+/// on every open of the same file. 4.5's integrity check on open reports
+/// them as `Corrupted`; this stays as the backstop.
+fn unwinding<T>(
+    what: &'static str,
+    f: impl FnOnce() -> Result<T, OpenError>,
+) -> Result<T, OpenError> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(result) => result,
+        Err(payload) => Err(panicked(what, &*payload)),
+    }
+}
+
+/// A panic inside redb, as the unreadable database it shows.
+fn panicked(what: &'static str, payload: &(dyn std::any::Any + Send)) -> OpenError {
+    let message = payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "no message".to_owned());
+    OpenError::DatabaseUnreadable(format!("redb panicked in its {what}: {message}"))
 }
 
 /// The generation directories under a root, by number.
+/// Remove every generation of `root` numbered above `selected`, syncing
+/// the root once if any went. Only the caller holding the root lock may.
+fn remove_stagings_above(root: &Path, selected: u64) -> std::io::Result<Vec<u64>> {
+    let mut removed: Vec<u64> = generation_numbers(root)?
+        .into_iter()
+        .filter(|&n| n > selected)
+        .collect();
+    removed.sort_unstable();
+    for number in &removed {
+        std::fs::remove_dir_all(root.join(format!("gen-{number:06}")))?;
+    }
+    if !removed.is_empty() {
+        File::open(root)?.sync_all()?;
+    }
+    Ok(removed)
+}
+
 fn generation_numbers(root: &Path) -> std::io::Result<Vec<u64>> {
     let mut out = Vec::new();
     for entry in std::fs::read_dir(root)? {
@@ -966,6 +1235,10 @@ pub(crate) enum Obligations {
     Refused,
     /// Obligations are carried forward by the caller.
     Carried,
+    /// The selected database cannot be opened, so its obligations cannot
+    /// be read; the caller carries them forward from this node's own
+    /// recovery image (task-j05). A database that opens is refused.
+    Unreadable,
 }
 
 fn stage_with_lock_for(
@@ -976,6 +1249,18 @@ fn stage_with_lock_for(
     obligations: Obligations,
 ) -> Result<InactiveGeneration, OpenError> {
     let previous = read_selected_for(root, &identity, &options, obligations)?;
+    // A reinstall retried over the same unreadable selection would
+    // otherwise stage above every staging an earlier attempt left: one a
+    // crash left, or one a start that refused after staging could not
+    // remove. None of them is selected, or ever was (`CURRENT` never named
+    // a generation above the selection), and the start that would prune
+    // them, one that opens the selection, never comes while it stays
+    // unreadable, so a restart loop filled the state volume (#212 review).
+    if matches!(obligations, Obligations::Unreadable)
+        && let Some(selected) = &previous
+    {
+        remove_stagings_above(root, selected.generation)?;
+    }
     let generation = generation_numbers(root)?
         .into_iter()
         .max()
@@ -1058,24 +1343,97 @@ fn read_selected_for(
     // generation that open would refuse (a swapped or foreign database, a
     // missing table, damaged pages) fails closed here too, rather than being
     // silently replaced and later pruned.
-    let db = open_verified_database(&directory.join(DATABASE), &manifest, options)?;
+    let opened = open_verified_database(&directory.join(DATABASE), &manifest, options);
+    if obligations == Obligations::Unreadable {
+        return match opened {
+            Ok(_) => Err(OpenError::Corrupt(
+                "the selected database opens; only an unreadable one is discarded".into(),
+            )),
+            Err(e) if e.is_unreadable_database() => Ok(Some(manifest)),
+            Err(e) => Err(e),
+        };
+    }
+    let db = opened?;
     // The selected generation must hold no protocol obligations: promises and
     // votes are never replaced or reset by an install. An offline migration
     // says `Carried` and copies them forward itself (task-60).
     if obligations == Obligations::Carried {
         return Ok(Some(manifest));
     }
-    let txn = db
-        .begin_read()
-        .map_err(|e| OpenError::Corrupt(e.to_string()))?;
+    let txn = db.begin_read().map_err(OpenError::from_transaction)?;
     let protocol = txn
         .open_table(table_definition(Collection::ProtocolV1))
-        .map_err(|e| OpenError::Corrupt(e.to_string()))?;
-    let obligations = protocol
-        .len()
-        .map_err(|e| OpenError::Corrupt(e.to_string()))?;
+        .map_err(|e| OpenError::from_table(Collection::ProtocolV1.name(), e))?;
+    let obligations = protocol.len().map_err(OpenError::from_storage)?;
     if obligations > 0 {
         return Err(OpenError::ExistingObligations);
     }
     Ok(Some(manifest))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Panic in the identity read, after redb opened the file.
+        pub(super) static PANIC_IN_READ: Cell<bool> = const { Cell::new(false) };
+    }
+
+    fn identity() -> StoreIdentity {
+        StoreIdentity {
+            cluster_id: ClusterId([1; 16]),
+            domain_id: DomainId([2; 16]),
+            replica_id: ReplicaId([3; 16]),
+            incarnation: ReplicaIncarnation::new(1).unwrap(),
+        }
+    }
+
+    fn options() -> OpenOptions {
+        OpenOptions {
+            cache_bytes: 8 * 1024 * 1024,
+        }
+    }
+
+    /// A panic in the identity read leaves the database's handle open, and
+    /// its lock held; the reinstall in the same process still stages over
+    /// the selection, from what the open found, and does not fail on the
+    /// lock (#212 Codex review).
+    #[test]
+    fn a_reinstall_after_a_panicked_read_stages_in_the_same_process() {
+        let dir = tempfile::tempdir().unwrap();
+        drop(Generation::create(dir.path(), identity(), options()).unwrap());
+
+        PANIC_IN_READ.with(|p| p.set(true));
+        let opened = std::panic::catch_unwind(|| {
+            Generation::open_existing(dir.path(), identity(), options())
+        });
+        PANIC_IN_READ.with(|p| p.set(false));
+        let opened = opened.expect("the panic is caught inside the open");
+        assert!(
+            matches!(&opened, Err(e @ OpenError::DatabaseUnreadable(m))
+                if e.is_unreadable_database() && m.contains("injected")),
+            "{:?}",
+            opened.err()
+        );
+
+        // The handle is held: redb itself refuses the file.
+        let db = dir.path().join("gen-000001").join(DATABASE);
+        assert!(redb::Database::open(&db).is_err());
+
+        // Unreadable to every later open in this process, not refused on
+        // the lock.
+        let again = Generation::open_existing(dir.path(), identity(), options());
+        assert!(
+            matches!(&again, Err(e @ OpenError::DatabaseUnreadable(m))
+                if e.is_unreadable_database() && m.contains("earlier open")),
+            "{:?}",
+            again.err()
+        );
+        let staged = Generation::stage_reinstall_unreadable(dir.path(), identity(), options())
+            .expect("the reinstall stages over the selection");
+        assert!(staged.directory().ends_with("gen-000002"));
+        staged.abandon().unwrap();
+    }
 }

@@ -120,7 +120,7 @@ jsonwebtoken = { version = "=11.0.0", default-features = false, features = ["aws
 reqwest = { version = "=0.12.28", default-features = false, features = ["json", "rustls-tls-webpki-roots-no-provider"] }
 
 # Storage (production state engine; not linked by common semantics).
-redb = { version = "=4.2.0", default-features = false, features = ["std"] }
+redb = { version = "=4.5.0", default-features = false, features = ["std"] }
 # Experimental state engine (Section 16.1, task-s03): linked only by the
 # test-only coord-storage-fjall crate, never by a production role. The
 # feature set is explicit and audited by `cargo xtask check-deps`.

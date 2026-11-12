@@ -2855,6 +2855,109 @@ fn a_node_serves_only_under_the_genesis_it_was_initialized_with() {
     }
 }
 
+/// A start the genesis refuses changes nothing on disk, even where its
+/// projection is unreadable and the replay profile would reinstall it:
+/// the pin is checked on the staged generation before it is selected,
+/// on the path a real start takes (Codex review on #212). Checked after
+/// the store opened, the reinstall had already moved `CURRENT` and
+/// pruned the earlier generations by the time the start was refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_genesis_refused_start_leaves_an_unreadable_projection_selected() {
+    let dir = workspace("pinned-reinstall");
+    let ca = credentials(&dir, 1, coord_types::wire_v1::PeerRole::Voter);
+    genesis_of(&dir, 1, Some(&ca.node_spki));
+    let ring = sts_keys(&dir);
+    let path = config_only(&dir);
+    let text = std::fs::read_to_string(&path).expect("read");
+    std::fs::write(
+        &path,
+        text.replace(
+            "[journal]\nroot",
+            "[journal]\nprofile = \"journaled-replay-v1\"\nroot",
+        ),
+    )
+    .expect("write");
+    checkpoint_after(&path, 1);
+    // The replay profile's 30 s between publications, lifted.
+    let text = std::fs::read_to_string(&path).expect("read");
+    std::fs::write(&path, format!("{text}checkpoint_after_seconds = 0\n")).expect("write");
+    let init = run(&path, &["init"]);
+    assert_eq!(init.code, Some(0), "{}{}", init.out, init.err);
+    // A write, and the checkpoint a reinstall starts from.
+    {
+        let daemon = start(&path);
+        let caller = Caller::bind(&daemon, &ca, &ring, [0x44; 16]).await;
+        ask(&caller.connection, &caller.put(1, b"k", b"v"))
+            .await
+            .unwrap_or_else(|| panic!("the daemon answered the request\n{}", daemon.said()));
+        assert!(
+            daemon.waits_to_say("retired=true"),
+            "the daemon never published a recovery checkpoint\n{}",
+            daemon.said()
+        );
+    }
+    let state = dir.join("state");
+    let current = std::fs::read_to_string(state.join("CURRENT")).expect("CURRENT");
+    let database = state.join(current.trim()).join("domain.redb");
+    std::fs::write(&database, vec![0x5a; 64 << 10]).expect("garbage");
+    let generations = || {
+        let mut names: Vec<String> = std::fs::read_dir(&state)
+            .expect("state")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("gen-"))
+            .collect();
+        names.sort();
+        names
+    };
+    let before = generations();
+
+    let manifest = std::fs::read_to_string(dir.join("genesis.json")).expect("read");
+    // Two more voters beside this one, signed by the same admin: what
+    // refuses it is the pin.
+    resign(&dir, |m| {
+        for id in [4u8, 5] {
+            let mut stranger = m["voters"][0].clone();
+            stranger["node"] = serde_json::json!(hex(&[id; 16]));
+            m["voters"].as_array_mut().expect("voters").push(stranger);
+        }
+    });
+    let refused = comes_up(&path).expect_err("a start under another genesis");
+    assert_eq!(refused.code, Some(2), "{}{}", refused.out, refused.err);
+    assert!(
+        refused.err.contains("genesis quarantine"),
+        "the refusal did not say why: {}",
+        refused.err
+    );
+    assert_eq!(
+        std::fs::read_to_string(state.join("CURRENT")).expect("CURRENT"),
+        current,
+        "the refused start selected the reinstall"
+    );
+    assert_eq!(
+        std::fs::read(&database).expect("kept"),
+        vec![0x5a; 64 << 10]
+    );
+    assert_eq!(
+        generations(),
+        before,
+        "the refused start pruned a generation, or left its staging"
+    );
+
+    // Under its own genesis the next start reinstalls and serves.
+    std::fs::write(dir.join("genesis.json"), manifest).expect("restore");
+    if let Err(refused) = comes_up(&path) {
+        panic!(
+            "the node did not reinstall under its own genesis: {}{}",
+            refused.out, refused.err
+        );
+    }
+    assert_ne!(
+        std::fs::read_to_string(state.join("CURRENT")).expect("CURRENT"),
+        current,
+        "the start under its own genesis did not reinstall"
+    );
+}
+
 /// A manifest is read only through the admin's signature: at `init`,
 /// where an unsigned one pins nothing, and at every start, where a
 /// signed manifest replaced by the same content unsigned is refused.

@@ -513,6 +513,18 @@ pub fn admit<V: OrderedRead>(view: &V) -> Result<BTreeSet<Feature>, AdmitError> 
     let Some(record) = published_activation(view)? else {
         return Ok(BTreeSet::new());
     };
+    admit_record(&record)
+}
+
+/// [`admit`] over an encoded activation record, as an update to
+/// [`ACTIVE_KEY`] carries it: what a start checks in the journal's records
+/// the projection has not applied yet, before replaying any of them.
+pub fn admit_encoded(bytes: &[u8]) -> Result<BTreeSet<Feature>, AdmitError> {
+    admit_record(&ActiveFeaturesV1::decode(bytes)?)
+}
+
+/// Whether this build can do every feature `record` makes active.
+fn admit_record(record: &ActiveFeaturesV1) -> Result<BTreeSet<Feature>, AdmitError> {
     let active = record.features()?;
     let supported: BTreeSet<Feature> = Supported::features().into_iter().collect();
     ActiveFeatures::recovered(active.clone())

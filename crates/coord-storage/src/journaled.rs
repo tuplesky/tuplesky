@@ -87,7 +87,7 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use coord_core::effect::{ApplyBase, BarrierId, BootId, PersistBatch};
+use coord_core::effect::{ApplyBase, BarrierId, BootId, PersistBatch, StoreUpdate};
 use coord_core::event::{StorageError, StorageEvent};
 use coord_journal_api::engine::{JournalEngine, ReadBudget};
 use coord_journal_api::failure::{JournalError, JournalFailure};
@@ -1886,6 +1886,83 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
             .is_some_and(|d| d.checkpoint.is_some())
     }
 
+    /// Show `visit` every update of `domain`'s journaled records the
+    /// projection `engine` has not applied, `(M, J]`, in order, without
+    /// applying any: the first answer `visit` gives is returned with the
+    /// record's sequence, and nothing after it is read. A start uses it to
+    /// refuse a record before the attach's replay writes anything (an
+    /// activation of a feature this build can't do, #212 review). It reads
+    /// what [`attach`](Self::attach) would replay and verifies nothing;
+    /// the replay verifies the chain.
+    pub fn scan_unapplied<T>(
+        &self,
+        domain: DomainId,
+        engine: &E,
+        visit: impl FnMut(&StoreUpdate) -> Option<T>,
+    ) -> Result<Option<(LocalJournalSeq, T)>, JournaledError> {
+        self.scan_unapplied_of(domain, self.incarnation, engine, visit)
+    }
+
+    /// [`JournaledStore::scan_unapplied`] over the stream `incarnation`
+    /// allocated, looked up as [`JournaledStore::recovery_baseline_of`]
+    /// looks it up: before an authorized replacement's adoption the
+    /// stream is still keyed by the incarnation the root is stamped with,
+    /// and a start scans before it adopts anything (#212 review).
+    ///
+    /// A projection stamped below the stream's retained prefix has nothing
+    /// here to scan: it is behind the published baseline, which the start
+    /// reinstalls under the replay-backed profile and refuses under the
+    /// strict one, and a reinstalled image is scanned before it is
+    /// selected.
+    pub fn scan_unapplied_of<T>(
+        &self,
+        domain: DomainId,
+        incarnation: ReplicaIncarnation,
+        engine: &E,
+        mut visit: impl FnMut(&StoreUpdate) -> Option<T>,
+    ) -> Result<Option<(LocalJournalSeq, T)>, JournaledError> {
+        let key = |incarnation| StreamKey {
+            cluster: self.cluster,
+            domain,
+            incarnation,
+        };
+        let Some(stream) = self
+            .allocator
+            .lookup(&key(incarnation))
+            .or_else(|| self.allocator.lookup(&key(self.incarnation)))
+        else {
+            return Ok(None);
+        };
+        let journal = self.journal.as_ref().ok_or(JournaledError::JournalLent)?;
+        let durable = journal.durable_head(stream)?;
+        let meta = DurableMeta::read(&engine.reader().snapshot()?)?;
+        let mut after = AppliedFrontier::from_stamp(&meta.stamp).materialized;
+        if after < durable && after < journal.retained_from(stream)? {
+            return Ok(None);
+        }
+        while after < durable {
+            let page = journal.read_suffix(stream, after, self.limits.read)?;
+            let Some(last) = page.records.last() else {
+                break;
+            };
+            after = last.seq();
+            for record in &page.records {
+                if record.seq() > durable {
+                    return Ok(None);
+                }
+                for update in record.body().updates() {
+                    if let Some(answer) = visit(update) {
+                        return Ok(Some((record.seq(), answer)));
+                    }
+                }
+            }
+            if page.exhausted {
+                break;
+            }
+        }
+        Ok(None)
+    }
+
     /// Whether `engine`, the projection a boot found, continues `domain`'s
     /// stream (task-j06, Section 17.16.4), checked before anything is
     /// attached and without writing anything.
@@ -1982,19 +2059,43 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
         &self,
         domain: DomainId,
     ) -> Result<Option<CheckpointPointerV1>, JournaledError> {
-        let key = StreamKey {
+        self.recovery_baseline_of(domain, self.incarnation)
+    }
+
+    /// [`JournaledStore::recovery_baseline`] of the stream `incarnation`
+    /// allocated: before an authorized replacement's adoption
+    /// ([`JournaledStore::adopt_stream`]) the node's stream and its
+    /// pointers are still keyed by the incarnation the root is stamped
+    /// with, not by this coordinator's (task-j05 step 3: a projection
+    /// reinstalled before the adoption that follows it).
+    ///
+    /// An adoption stopped between its two writes has re-keyed the stream
+    /// to this coordinator's incarnation and left the root stamped with
+    /// `incarnation`, so the stream is looked up under either key. Its
+    /// pointers were published under `incarnation` either way, and are
+    /// selected against that origin (#212 review).
+    pub fn recovery_baseline_of(
+        &self,
+        domain: DomainId,
+        incarnation: ReplicaIncarnation,
+    ) -> Result<Option<CheckpointPointerV1>, JournaledError> {
+        let key = |incarnation| StreamKey {
             cluster: self.cluster,
             domain,
-            incarnation: self.incarnation,
+            incarnation,
         };
-        let Some(stream) = self.allocator.lookup(&key) else {
+        let Some(stream) = self
+            .allocator
+            .lookup(&key(incarnation))
+            .or_else(|| self.allocator.lookup(&key(self.incarnation)))
+        else {
             return Ok(None);
         };
         let origin = RecordOrigin {
             cluster: self.cluster,
             domain,
             replica: self.replica,
-            incarnation: self.incarnation,
+            incarnation,
             stream,
         };
         let mut found: Vec<CheckpointPointerV1> = Vec::new();

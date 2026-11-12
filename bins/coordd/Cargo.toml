@@ -63,6 +63,7 @@ mimalloc.workspace = true
 coord-sdk.workspace = true
 coord-state.workspace = true
 postcard.workspace = true
+redb.workspace = true
 jsonwebtoken.workspace = true
 coord-node-issuer.workspace = true
 coord-membership.workspace = true

@@ -1347,7 +1347,10 @@ fn an_error_after_selection_never_falls_back_to_the_old_generation() {
             options(),
         ));
         assert!(
-            matches!(err, OpenError::Manifest(_) | OpenError::Corrupt(_)),
+            matches!(
+                err,
+                OpenError::Manifest(_) | OpenError::Corrupt(_) | OpenError::DatabaseUnreadable(_)
+            ),
             "{damage}: {err}"
         );
         assert_eq!(

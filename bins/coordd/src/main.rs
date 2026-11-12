@@ -823,30 +823,30 @@ fn main() -> ExitCode {
         // A backup is taken from this node's store as a start opens it:
         // under the genesis it was initialized with, and with the
         // journal's suffix replayed into the projection.
-        let opened = store::open_storage(
+        // The genesis is checked before the generation is selected or
+        // attached, so a refused one changes nothing (Codex review on
+        // #212).
+        let opened = store::open_storage_with(
             &config,
             store::Intent::Serve,
             placed.membership.cluster(),
             placed.membership.domain(),
             placed.replica,
             placed.incarnation,
+            |engine| {
+                genesis::check_engine(engine, &placed.manifest, genesis::Intent::Serve)
+                    .map(|_| ())
+                    .map_err(|e| store::StoreError::Refused {
+                        root: config
+                            .state
+                            .root_path(&config.state_directory)
+                            .display()
+                            .to_string(),
+                        reason: e.to_string(),
+                    })
+            },
         )
-        .and_then(|mut opened| {
-            genesis::check(
-                &mut opened.generation,
-                &placed.manifest,
-                genesis::Intent::Serve,
-            )
-            .map_err(|e| store::StoreError::Refused {
-                root: config
-                    .state
-                    .root_path(&config.state_directory)
-                    .display()
-                    .to_string(),
-                reason: e.to_string(),
-            })?;
-            opened.attach()
-        });
+        .and_then(store::Opened::attach);
         return match opened {
             Ok(storage) => {
                 let origin = coord_checkpoint::export::CheckpointOrigin {
@@ -988,35 +988,53 @@ fn main() -> ExitCode {
     // The store is opened before a listener exists. A process that bound
     // first would accept connections it could not serve, and a caller
     // cannot tell that from one it is merely slow to answer.
-    let mut opened = match store::open_storage(
+    // The store is this node's only under the manifest it was
+    // initialized with. Anything else -- another set of voters, another
+    // policy, under the same cluster and domain -- is a genesis
+    // quarantine, not a new configuration to adopt. It is settled on the
+    // projection before the journal replays anything into it, and before
+    // a reinstalled generation is selected, so a refused start leaves
+    // the selection and the earlier generations as they were (Codex
+    // review on #212).
+    let mut refused_genesis = None;
+    let opened = store::open_storage_with(
         &config,
         store::Intent::Serve,
         placed.membership.cluster(),
         placed.membership.domain(),
         placed.replica,
         placed.incarnation,
-    ) {
+        |engine| match genesis::check_engine(engine, &placed.manifest, genesis::Intent::Serve) {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let refused = store::StoreError::Refused {
+                    root: config
+                        .state
+                        .root_path(&config.state_directory)
+                        .display()
+                        .to_string(),
+                    reason: e.to_string(),
+                };
+                refused_genesis = Some(e);
+                Err(refused)
+            }
+        },
+    );
+    let opened = match opened {
         Ok(o) => o,
         Err(e) => {
-            lifecycle.quarantine(QuarantineReason::Disk);
-            eprintln!("{e}");
+            let reason = refused_genesis.as_ref().map_or(
+                QuarantineReason::Disk,
+                genesis::GenesisError::quarantine_reason,
+            );
+            lifecycle.quarantine(reason);
+            match refused_genesis {
+                Some(genesis) => eprintln!("{genesis}"),
+                None => eprintln!("{e}"),
+            }
             return ExitCode::from(2);
         }
     };
-    // The store is this node's only under the manifest it was
-    // initialized with. Anything else -- another set of voters, another
-    // policy, under the same cluster and domain -- is a genesis
-    // quarantine, not a new configuration to adopt. It is settled on the
-    // projection before the journal replays anything into it.
-    if let Err(e) = genesis::check(
-        &mut opened.generation,
-        &placed.manifest,
-        genesis::Intent::Serve,
-    ) {
-        lifecycle.quarantine(e.quarantine_reason());
-        eprintln!("{e}");
-        return ExitCode::from(2);
-    }
     let attaching = std::time::Instant::now();
     let storage = match opened.attach() {
         Ok(s) => s,

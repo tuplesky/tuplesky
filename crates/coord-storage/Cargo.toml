@@ -28,6 +28,7 @@ coord-store-testkit.workspace = true
 coord-journal-raft-engine.workspace = true
 coord-storage-redb.workspace = true
 coord-redb-faultkit.workspace = true
+coord-journal-faultkit.workspace = true
 coord-oracle.workspace = true
 tempfile.workspace = true
 

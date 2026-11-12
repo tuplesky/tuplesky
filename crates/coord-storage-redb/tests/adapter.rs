@@ -341,12 +341,15 @@ fn damaged_files_fail_closed() {
         Generation::open_existing(dir.path(), identity(), options()),
         Err(OpenError::EmptyDatabase)
     ));
-    // Garbage database file.
+    // Garbage database file: redb says so (I/O of kind InvalidData), and
+    // that proves the bytes wrong.
     std::fs::write(&db, b"not a redb file at all").unwrap();
-    assert!(matches!(
-        Generation::open_existing(dir.path(), identity(), options()),
-        Err(OpenError::Corrupt(_))
-    ));
+    let garbage = Generation::open_existing(dir.path(), identity(), options());
+    assert!(
+        matches!(&garbage, Err(e @ OpenError::DatabaseUnreadable(_)) if e.is_unreadable_database()),
+        "{:?}",
+        garbage.err()
+    );
     // Missing database file.
     std::fs::remove_file(&db).unwrap();
     assert!(matches!(
@@ -355,6 +358,19 @@ fn damaged_files_fail_closed() {
     ));
     std::fs::write(&db, &good_db).unwrap();
     assert!(!db.exists() || Generation::open_existing(dir.path(), identity(), options()).is_ok());
+
+    // A whole database another opener holds: an error that says nothing
+    // about its bytes, never read as unreadable (#212 review).
+    {
+        let _held = redb::Database::open(&db).unwrap();
+        let locked = Generation::open_existing(dir.path(), identity(), options());
+        assert!(
+            matches!(&locked, Err(e @ OpenError::Database(_)) if !e.is_unreadable_database()),
+            "{:?}",
+            locked.err()
+        );
+    }
+    assert!(Generation::open_existing(dir.path(), identity(), options()).is_ok());
 
     // CURRENT pointing at a missing generation.
     std::fs::write(dir.path().join("CURRENT"), b"gen-000009").unwrap();
@@ -375,6 +391,34 @@ fn damaged_files_fail_closed() {
         Generation::open_existing(other.path(), identity(), options()),
         Err(OpenError::IdentityRecordMismatch("domain_id"))
     ));
+
+    // A registered table missing: unreadable in our own database, but a
+    // foreign one is still foreign. The identity is read before the other
+    // tables, so `replay` never discards someone else's file (#212
+    // re-review).
+    let drop_table = |db: &Path| {
+        let db = redb::Database::open(db).unwrap();
+        let txn = db.begin_write().unwrap();
+        assert!(
+            txn.delete_table(coord_storage_redb::lifecycle::raw_table(
+                Collection::EventsV1.name()
+            ))
+            .unwrap()
+        );
+        txn.commit().unwrap();
+    };
+    drop_table(&other.path().join("gen-000001/domain.redb"));
+    assert!(matches!(
+        Generation::open_existing(other.path(), identity(), options()),
+        Err(OpenError::IdentityRecordMismatch("domain_id"))
+    ));
+    drop_table(&db);
+    let missing = Generation::open_existing(dir.path(), identity(), options());
+    assert!(
+        matches!(&missing, Err(e @ OpenError::DatabaseUnreadable(_)) if e.is_unreadable_database()),
+        "{:?}",
+        missing.err()
+    );
 }
 
 #[test]
@@ -566,4 +610,150 @@ fn an_authorized_replacement_adopts_the_state_and_a_stale_one_is_fenced() {
             "adoption accepted a root belonging to somebody else"
         );
     }
+}
+
+/// Every damaged copy of a byte tree, by page: each non-zero 4 KiB page of
+/// the file damaged four ways (one byte flipped at offset 0, 2 or 100, or
+/// the page zeroed).
+fn damaged_pages(good: &[u8]) -> Vec<(usize, &'static str, Vec<u8>)> {
+    const PAGE: usize = 4096;
+    let mut out = Vec::new();
+    for page in 0..good.len().div_ceil(PAGE) {
+        let range = page * PAGE..((page + 1) * PAGE).min(good.len());
+        if good[range.clone()].iter().all(|&b| b == 0) {
+            continue;
+        }
+        for (how, at) in [
+            ("flip 0", Some(0)),
+            ("flip 2", Some(2)),
+            ("flip 100", Some(100)),
+        ] {
+            let mut bad = good.to_vec();
+            if let Some(at) = at.filter(|at| range.start + at < range.end) {
+                bad[range.start + at] ^= 0x5a;
+                out.push((page, how, bad));
+            }
+        }
+        let mut bad = good.to_vec();
+        bad[range].fill(0);
+        out.push((page, "zeroed", bad));
+    }
+    out
+}
+
+/// Single-page damage to a valid projection never panics at open and
+/// never reads as another node's database (#212 re-review): the open is
+/// `Ok` (redb found nothing, or repaired the file and it verifies) or
+/// `DatabaseUnreadable`, and a second open says the same. Before, some
+/// pages made redb panic at open, on every start, and a flipped identity
+/// leaf read as `IdentityRecordMismatch`, which no profile reinstalls.
+#[test]
+fn single_page_damage_is_unreadable_or_repaired_never_a_panic() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut h = RedbHarness::create(dir.path());
+        for batch in 0..8u32 {
+            let mut tx = h.engine().begin_write().unwrap();
+            for i in 0..64u32 {
+                let key = format!("k{batch:02}-{i:03}");
+                tx.put(
+                    Collection::KvCurrentV1.id(),
+                    key.as_bytes(),
+                    &[batch as u8; 96],
+                )
+                .unwrap();
+                tx.put(Collection::EventsV1.id(), key.as_bytes(), b"put")
+                    .unwrap();
+            }
+            tx.commit_durable().unwrap();
+        }
+    }
+    let db = dir.path().join("gen-000001/domain.redb");
+    let good = std::fs::read(&db).unwrap();
+    let cases = damaged_pages(&good);
+    assert!(cases.len() > 20, "{} cases", cases.len());
+    let (mut ok, mut unreadable) = (0, 0);
+    let quiet = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let mut failures = Vec::new();
+    for (page, how, bad) in &cases {
+        std::fs::write(&db, bad).unwrap();
+        let mut seen = Vec::new();
+        for _ in 0..2 {
+            let opened = std::panic::catch_unwind(|| {
+                Generation::open_existing(dir.path(), identity(), options())
+            });
+            seen.push(match opened {
+                Err(_) => "panic".to_owned(),
+                Ok(Ok(_)) => "ok".to_owned(),
+                Ok(Err(e @ OpenError::DatabaseUnreadable(_))) if e.is_unreadable_database() => {
+                    "unreadable".to_owned()
+                }
+                Ok(Err(e)) => format!("{e:?}"),
+            });
+        }
+        match (seen[0].as_str(), seen[1].as_str()) {
+            ("ok", "ok") => ok += 1,
+            ("unreadable", "unreadable") => unreadable += 1,
+            _ => failures.push(format!("page {page}, {how}: {seen:?}")),
+        }
+    }
+    std::panic::set_hook(quiet);
+    std::fs::write(&db, &good).unwrap();
+    assert!(failures.is_empty(), "{failures:#?}");
+    eprintln!(
+        "single-page damage: {} cases, {ok} open (nothing found, or repaired), \
+         {unreadable} unreadable",
+        cases.len()
+    );
+    assert!(unreadable > 0);
+}
+
+/// A reinstall retried over the same unreadable selection reuses the
+/// number above it, removing whatever stagings earlier attempts left
+/// there: one a crash dropped, and one a refused start abandoned or
+/// could not (#212 review). A restart loop over an unreadable projection
+/// otherwise staged a new full generation every start and filled the
+/// state volume. The selection and the generations below it stay.
+#[test]
+fn a_reinstall_over_an_unreadable_selection_removes_the_stagings_left_above_it() {
+    let dir = tempfile::tempdir().unwrap();
+    drop(RedbHarness::create(dir.path()));
+    let db = dir.path().join("gen-000001/domain.redb");
+    std::fs::write(&db, vec![0x5a; 64 << 10]).unwrap();
+    let generations = || {
+        let mut names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("gen-"))
+            .collect();
+        names.sort();
+        names
+    };
+    // A crash: the staging is dropped, its directory left behind.
+    let first = Generation::stage_reinstall_unreadable(dir.path(), identity(), options())
+        .expect("stage over an unreadable selection");
+    assert!(first.directory().ends_with("gen-000002"));
+    drop(first);
+    // A stray staging further up, as a run of such crashes leaves.
+    std::fs::create_dir(dir.path().join("gen-000005")).unwrap();
+    assert_eq!(generations(), ["gen-000001", "gen-000002", "gen-000005"]);
+
+    let again = Generation::stage_reinstall_unreadable(dir.path(), identity(), options())
+        .expect("stage again");
+    assert!(
+        again.directory().ends_with("gen-000002"),
+        "{}",
+        again.directory().display()
+    );
+    assert_eq!(generations(), ["gen-000001", "gen-000002"]);
+    again.abandon().unwrap();
+    assert_eq!(generations(), ["gen-000001"]);
+    assert_eq!(std::fs::read(&db).unwrap(), vec![0x5a; 64 << 10]);
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("CURRENT"))
+            .unwrap()
+            .trim(),
+        "gen-000001"
+    );
 }
