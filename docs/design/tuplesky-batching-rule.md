@@ -232,8 +232,8 @@ The choice is the step's.
 ## 5. The four small PRs under the rule
 
 - **Lever 4 (release frame, acks by range): agrees.** It moves releases from one frame a release to one a collector a turn. Goes ahead first.
-- **Lever 8 (one hand-off a turn): agrees.** It is the audit's largest wake-up miss. Goes ahead second.
-  - It carries one fix the audit found. task-d97's run-queue sample reads `/proc/thread-self/schedstat` at one pass in 16: 35 of the leader loop's 55 syscalls a turn. It should go once a turn, or by time.
+- **Lever 8 (one hand-off a turn): agrees.** It is the audit's largest wake-up miss.
+  - The audit also found that task-d97's run-queue sample reads `/proc/thread-self/schedstat` at one pass in 16: 35 of the leader loop's 55 syscalls a turn. It should go by time. That fix goes ahead of lever 8, with the loop's other per-pass housekeeping (Section 8).
 - **Lever 5 (one read view a group): agrees, reshaped** as proposal 1's first step: one read view a turn, tables opened once.
 - **Lever 6: agrees, last** (it reaches 3.7% of the materializer).
   - Part 1 (#251) is a map indexed by collection: −4.3% at the materializers.
@@ -308,6 +308,36 @@ What needs the owner's decision:
 - **Option 3:** followers no longer execute every command.
 - **The frame as the only proposal path:** no fast path without the leader.
 
+### 6.5 An alternative: voters that journal and vote but keep no projection
+
+**The shape.** Of five voters, three keep a projection and execute every command: the leader and two followers. The other two are witnesses.
+- A witness takes proposals in, journals them, votes and acknowledges.
+- It keeps no projection, executes nothing and runs no materializer.
+- It counts toward every quorum it counts toward today. Intake reads nothing from the store (Section 2), so its votes and dependencies need no projection.
+
+**What it saves.** Per witness, a follower's execution (Section 3: 55.5 µs a command) and its materializer (about 57 µs a command a follower, in the run Section 3 was fitted to).
+- For two witnesses that is about 225 µs a command: about 0.15 ms an operation locally and 0.22 on the 7763, at today's costs.
+- Built after proposals 1 and 2, it saves less: they shrink both parts at every voter.
+- The leader log saves more: four followers stop executing, and rotation executes a quarter at each.
+
+**What it keeps that the leader log gives up (Section 6.2):**
+- the fast path without the leader;
+- independent execution of every command at three voters. A divergence is decided two executions against one, not one against one.
+
+**What it gives up:**
+- **Projection copies:** five become three. An executor lost with its disk is rebuilt from the other two.
+- **Who can lead:** only an executor can lead without first installing an image and replaying. While witnesses are fewer than a majority, every majority holds an executor, so the domain stays live through any two failures. With two executors down, the last one must lead, and nothing can take over from it without a rebuild.
+- **Reads:** reads and retained answers are served only where a projection is. A witness's frontend forwards them, or witnesses run no frontend.
+- **Catch-up donors:** only executors can serve executed history (task-d08). A witness behind catches up its journal only.
+- **Detection by every voter:** the floor's root and the release checks (Section 6.3) compare three executions, not five.
+- **Even load:** executors carry more CPU than witnesses. On identical hosts, capacity is set by an executor's host, which the servers' sum doesn't show.
+
+**What it depends on:**
+- **Proposal 2.** Until protocol state is in the journal only, a witness would still keep a store for its protocol rows and would save only execution and the application rows.
+- **The forgetting floor and checkpoints follow the executors.** A witness trims its journal at the floor the executors' images cover.
+
+**Not built.** It needs a voter role in the configuration, an election rule that prefers executors, and read, frontend and catch-up rules for witnesses. It is a decision for the owner beside option 3, not a step toward it.
+
 ## 7. The cost model after each step
 
 **Reading the table.**
@@ -373,14 +403,17 @@ So parity needs the leader log and either larger turns or the transport change. 
 ## 8. Order, and what the owner decides
 
 **Without a decision, in order:**
-1. Lever 4.
-2. Lever 8, with the run-queue sample's fix.
-3. Proposal 2's design step, then its code.
-4. Proposal 1: lever 5 reshaped as its first step, then memory.
-5. Proposal 3.
-6. Lever 3.
-7. Lever 6's rest.
+1. Lever 4 (#253).
+2. The loop's per-pass housekeeping (review's check on #185): the run-queue sample on a timer, and `redial` only on a change.
+3. Execution a group at a time at every voter, not only the leader (the same check). It brings the followers under the rule's one read view a batch.
+4. Lever 8.
+5. Proposal 2's design step, then its code.
+6. Proposal 1: lever 5 reshaped as its first step, then memory.
+7. Proposal 3.
+8. Lever 3.
+9. Lever 6's rest.
 
 **For the owner:**
 - **Option 3 and the leader log,** with Section 6.2's trade and Section 6.3's open arguments.
+- **Or witnesses (Section 6.5):** two voters that journal and vote but keep no projection. They keep the fast path and three independent executions, and give up two projection copies and leadership at the witnesses.
 - **Whether the transport moves onto the loop's turn.**
