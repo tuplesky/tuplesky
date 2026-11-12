@@ -148,8 +148,9 @@ pub(crate) struct CatchUp {
     /// leaves nothing else to ask again, so the caller's pacer asks while
     /// this holds (#226 review).
     pub(crate) chain_open: bool,
-    /// The donor's frontier the open chain is owed through: the `through`
-    /// of the page that left it open. A voter that executes that far by
+    /// The donor's frontier the open chain is owed through: the furthest
+    /// `through` a page answering it has said since it opened, whichever
+    /// donor said it (#236 review). A voter that executes that far by
     /// itself, from the leader's traffic, is owed nothing more by it.
     pub(crate) owed_through: Option<ExecutionPosition>,
     /// Pages taken, for the caller's counters.

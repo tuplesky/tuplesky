@@ -449,6 +449,15 @@ impl Machine {
         }
     }
 
+    /// How much decided work this replica holds and has not executed
+    /// (#236 review): what a donor could give it. None for a leader.
+    pub fn decided_unexecuted_held(&self) -> usize {
+        match self {
+            Machine::Leader(_) => 0,
+            Machine::Follower(m) => m.decided_unexecuted_held(),
+        }
+    }
+
     /// Whether a catch-up page is in hand (task-d08).
     pub fn catching_up(&self) -> bool {
         match self {
