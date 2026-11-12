@@ -5572,7 +5572,7 @@ behind by more than a table is sent nothing it can use.
 - The donor answers only a voter of its configuration, only at a ballot
   it is synchronized at (it leads it, or follows it with its Sync
   installed), only while it has not itself stopped, and only up to its
-  own `executed_through`. A page is at most 64 commands and 1 MiB beyond
+  own `executed_through`. A page is at most 125 commands and 1 MiB beyond
   its first, each read from the donor's durable rows: the payload row,
   the epoch's dependency row if it keeps one, and the executed row
   (`coord_storage::protocol::catch_up_entry`). The page stops at the
@@ -7055,7 +7055,7 @@ never closed its gap.
 
 - **A window per batch.** `install_catch_up` installs as many of the
   page's commands as install cleanly, from its head, in one batch: at
-  most the page, so 64 commands and 1 MiB (`MAX_CATCH_UP_COMMANDS`,
+  most the page, so 125 commands and 1 MiB (`MAX_CATCH_UP_COMMANDS`,
   `MAX_CATCH_UP_BYTES`). Each command is installed under task-d08's rules
   unchanged (task-d14's COMMIT-entry rules, the donor's dependencies,
   let into a full table). A window joins a command only when:
