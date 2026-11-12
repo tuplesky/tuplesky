@@ -4181,7 +4181,7 @@ This entry is task-d72's largest single cut on the materializer, owned here. The
 1. **The dependency rows alone,** its own PR on the carry.
    - They are node-private, so this step changes no image and no common hash.
    - Their readers are boot, catch-up, the campaign and trim, and the store's own rewrites and deletes.
-   - It builds the index's intake part, the lowering's key assignment, rules (c) and (d) of Section 17.1, and the layout check.
+   - It builds the index's intake part, the lowering's key assignment, rules (c), (d) and (e) of Section 17.1, and the layout check. Under rule (e), the recovery cut's overlay assigns keys as the lowering does.
    - By the table's shape it is about a third of the gain.
    - Its evidence splits the counting build's file bytes by table, so that each row's size is read rather than inferred. That goes on the metrics line if it is cheap, since testing needs it on the runner too.
 2. **The payload and executed rows.** This step brings the pending collection, the move, the index's executed part, and rules (a) and (b). It also raises the shared image's version and changes the common hash's membership, behind whatever the format needs.
@@ -4207,7 +4207,8 @@ What the two steps build together:
   - (a) a payload put for a command already executed is dropped;
   - (b) an executed row with no pending payload is refused;
   - (c) a snapshot reader looks up executed commands only through the index;
-  - (d) the index follows the commit's outcome, held with `pending_meta` while it isn't known.
+  - (d) the index follows the commit's outcome, held with `pending_meta` while it isn't known;
+  - (e) an overlay (the recovery cut, and the planning view for step 2's rows) lowers its rows with the same key assignment.
 - **The layout check at open.** The shared image's version is raised, and the scrub reads the new layout (task-d37).
 - **A release condition, carried like the catch-up page size:** the first release that promises an upgrade in place needs the conversion built (Section 17.1, point 3).
 
@@ -4228,7 +4229,8 @@ What the two steps build together:
     - a payload delivered after its command executed leaves the pending table empty;
     - a negative control lowers an execution with no payload and sees the refusal;
     - a snapshot reader across a Sync's release and a re-proposal under a new intake key;
-    - a commit whose outcome isn't known, settled both ways, leaves the index as the store has it.
+    - a commit whose outcome isn't known, settled both ways, leaves the index as the store has it;
+    - a recovery cut over a dependency row rewritten at ACCEPT and not yet materialized reads it once, with the rewrite; one over a `dependency_delete` not yet materialized doesn't read the row.
 - **The local pair, for each step:** the counting build, with the file's bytes split by table, and the profile at 30 and 120 callers, on the profile's setup.
   - **Prediction** (review's model on #233): fresh pages a command at a follower fall from 9.4 to about 4 at 8 to 11 commands a commit, and to about 6 at 3. The first step alone takes about a third of that.
   - The first estimate had 7.0 to 7.4, so the reading tells the two apart. A reading outside both says which term was wrong.
