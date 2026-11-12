@@ -407,16 +407,17 @@ async fn takes_back_a_restarted_voter(name: &str, journal: JournalPlan) {
     );
 
     // Voter 3 has applied the write before it goes: under the replay
-    // profile, a working commit its kill loses.
+    // profile, a working commit its kill loses. The caller's session is
+    // a moment old, and a voter that has not projected it yet answers
+    // the read pending (the output gate's "not yet"), so the read is
+    // asked again until it is answered, as `read_value` does.
     if replay {
         let mut at_three = Caller::connect(&run, &provisioned, &minter, 2, 2)
             .await
             .expect("a caller bound at voter 3");
         assert_eq!(
-            at_three
-                .ask(&get(&provisioned, b"before"), Duration::from_secs(30))
-                .await,
-            Answer::Established,
+            read_value(&mut at_three, &provisioned, b"before").await,
+            Some(b"placed".to_vec()),
             "voter 3 did not serve the write before it was killed:\n{}",
             voters[2].said()
         );
