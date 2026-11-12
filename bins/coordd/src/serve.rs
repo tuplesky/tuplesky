@@ -7899,32 +7899,41 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
             })
         }
 
-        /// `collector` submits command `sequence` and `voter` executes it
-        /// and hands its group off, its commit held. Returns the frames
-        /// the voter sent the collector.
+        /// `collector` submits command 1 on connection 7 and `voter`
+        /// executes it and hands its group off, its commit held. Returns
+        /// the frames the voter sent the collector.
         fn execute(voter: &mut Voter<Journaled>, collector: &mut Collector) -> Vec<Vec<u8>> {
+            execute_from(voter, collector, 1, Origin::Connection(7))
+        }
+
+        /// `collector` submits command `sequence` from `origin` and
+        /// `voter` executes it and hands its group off, its commit held.
+        /// Returns the frames the voter made for the collector.
+        fn execute_from(
+            voter: &mut Voter<Journaled>,
+            collector: &mut Collector,
+            sequence: u64,
+            origin: Origin,
+        ) -> Vec<Vec<u8>> {
+            let executed = voter.node().executed;
             let Submitted::FanOut(fan_out) = collector
-                .submit(MonotonicMillis::ZERO, &admitted(1))
+                .submit(MonotonicMillis::ZERO, &admitted(sequence))
                 .expect("submitted")
             else {
                 panic!("not new work")
             };
             let mut frames = voter
-                .on_submission(
-                    PeerRole::Frontend,
-                    &frame(&fan_out.frame),
-                    Origin::Connection(7),
-                )
+                .on_submission(PeerRole::Frontend, &frame(&fan_out.frame), origin)
                 .expect("driven")
                 .expect("admitted")
                 .frontend;
             for _ in 0..8 {
-                if voter.node().executed == 1 {
+                if voter.node().executed == executed + 1 {
                     break;
                 }
                 frames.extend(voter.flush().expect("journaled").frontend);
             }
-            assert_eq!(voter.node().executed, 1);
+            assert_eq!(voter.node().executed, executed + 1);
             frames.extend(voter.finish().expect("handed off").frontend);
             frames.extend(voter.settle().expect("settled").frontend);
             frames
@@ -7993,6 +8002,141 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
                 coord_transport::Limits::default(),
             )
             .unwrap()
+        }
+
+        /// Every frame a round owes a collector in another process reaches
+        /// that collector, in one hand-off a collector (task-d115, lever 4;
+        /// review on #253). A collector re-offers what it has not heard
+        /// back about, and the re-offer is answered, so a hand-off that
+        /// carried only a collector's first frame still completed every
+        /// command of every other test. Here nothing re-offers: a frame is
+        /// what reaches the collector's end of the link, or nothing does.
+        ///
+        /// Three commands are submitted on a collector's connection and a
+        /// fourth on a connection that has gone, and their frames are
+        /// carried as one round.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn every_frame_a_round_owes_a_collector_reaches_it_in_one_hand_off() {
+            use coord_transport::{Class, Lane, Limits, Transport, TransportEvent};
+            use coord_transport_testkit::{TestBinder, TestCa};
+
+            // This voter's api plane, and a collector's endpoint that
+            // dialled it as a collector link does.
+            let ca = TestCa::new();
+            let node = ca.issue("node-1", me(), inc(), PeerRole::Voter);
+            let other = ca.issue(
+                "collector-1",
+                FRONTEND.replica,
+                ReplicaIncarnation::new(1).unwrap(),
+                PeerRole::Frontend,
+            );
+            let mut binder = TestBinder::new(CLUSTER, DOMAIN);
+            binder.register(&node);
+            binder.register(&other);
+            let binder = std::sync::Arc::new(binder);
+            let mut local = node.local(&ca, CLUSTER, DOMAIN, vec![1, 2]);
+            local.serves = Some(Class::Api);
+            let address = "127.0.0.1:0".parse().unwrap();
+            let mut api = Transport::bind(address, local, binder.clone(), Limits::default())
+                .expect("the api plane");
+            let mut far = Transport::bind(
+                address,
+                other.local(&ca, CLUSTER, DOMAIN, vec![1, 2]),
+                binder,
+                Limits::default(),
+            )
+            .expect("the collector's endpoint");
+            far.connect(
+                api.local_addr().unwrap(),
+                &node.name,
+                PeerRole::Frontend,
+                None,
+                Lane::Unary,
+                node.expected(),
+            )
+            .await
+            .expect("the collector dialled");
+            let accepted = loop {
+                let event = tokio::time::timeout(Duration::from_secs(5), api.next_event())
+                    .await
+                    .expect("the dial arrives")
+                    .expect("the api plane is open");
+                if let TransportEvent::Connected { connection, .. } = event {
+                    break connection;
+                }
+            };
+            let open = Origin::Connection(accepted.0);
+            let gone = Origin::Connection(accepted.0 + 1000);
+
+            let (mut leader, _handle) = held_leader(Duration::from_secs(3600));
+            let mut collector = collector();
+            let mut frames = Vec::new();
+            for sequence in 1..=3 {
+                frames.extend(execute_from(&mut leader, &mut collector, sequence, open));
+            }
+            frames.extend(execute_from(&mut leader, &mut collector, 4, gone));
+            let provenance = leader.provenance();
+            let mut domain = domain(leader, collector);
+            let owed = |to: Origin| {
+                frames
+                    .iter()
+                    .filter(|bytes| domain.owed_to(&frame(bytes)) == Some(to))
+                    .map(|bytes| frame(bytes))
+                    .collect::<Vec<_>>()
+            };
+            let (mut owed_open, owed_gone) = (owed(open), owed(gone));
+            // A release for each command at least, so the open
+            // connection's group is several frames.
+            assert!(owed_open.len() >= 3, "{} frames", owed_open.len());
+            assert!(!owed_gone.is_empty());
+            assert_eq!(owed_open.len() + owed_gone.len(), frames.len());
+
+            domain.carry(
+                &api,
+                coord_daemon::Outbound {
+                    frontend: frames,
+                    ..Default::default()
+                },
+                provenance,
+            );
+            let counts = &domain.frontend.counts;
+            assert_eq!(
+                (counts.returned, counts.unreturnable, counts.returned_sends),
+                (owed_open.len() as u64, owed_gone.len() as u64, 2),
+                "every frame handed off, one hand-off a collector"
+            );
+
+            // The collector's end hears every frame owed to it. One frame
+            // a stream on the api plane, so the streams may be read in
+            // any order.
+            let mut heard = Vec::new();
+            while heard.len() < owed_open.len() {
+                let event = tokio::time::timeout(Duration::from_secs(5), far.next_event())
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!("heard {} of {} frames", heard.len(), owed_open.len())
+                    })
+                    .expect("the collector's endpoint is open");
+                if let TransportEvent::ApiDelivery { frame, .. } = event {
+                    heard.push(frame);
+                }
+            }
+            // And nothing else: not the gone collector's frames.
+            let more = tokio::time::timeout(Duration::from_millis(200), async {
+                loop {
+                    match far.next_event().await {
+                        Some(TransportEvent::ApiDelivery { frame, .. }) => return Some(frame),
+                        Some(_) => {}
+                        None => return None,
+                    }
+                }
+            })
+            .await;
+            assert!(matches!(more, Err(_) | Ok(None)), "{more:?}");
+            let key = |f: &coord_types::wire_v1::Frame| (f.kind, f.version, f.payload.clone());
+            heard.sort_by_key(key);
+            owed_open.sort_by_key(key);
+            assert_eq!(heard, owed_open);
         }
 
         /// The loop wakes when a held projection commit is due, and the
