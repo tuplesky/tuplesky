@@ -819,7 +819,21 @@ none`. Its workload is its own, reads and writes half and half a key with no
 compare-and-set, so set the mix against etcd's and TupleSky's when reading
 the ratios. Its master, on the runner, counts among the servers. Its runs
 are packed as `jepsen-store-swiftpaxos.tgz` in the TupleSky job's store
-artifact.
+artifact. `workload: register-swiftpaxos-mix` gives TupleSky and etcd the
+reference's own workload, so all three run it. In each key's group of 2n
+threads, n read and the rest write, with no compare-and-set. TupleSky draws
+it with SwiftPaxos's own generator (jepsen.tuplesky's `--register-mix
+swiftpaxos`). The etcd test's register generator is edited to draw it the
+same way.
+
+etcd runs at its own default snapshot count. Jepsen's etcd test passes
+`--snapshot-count 100` by its own default. A member then snapshots every
+100 applied entries, 29 to 38 times a second in a throughput run (run
+43289869422), which a shipped etcd doesn't do. So `jepsen_etcd.sh` passes
+the flag only when a run asks for a count. `etcd-version: beside/100` (or
+`VERSION/100`) also runs etcd at `--snapshot-count 100` after the default
+run at each sweep step. A sweep's table labels it `etcd-snap100`, with its
+ratio to the default run, so the setting's cost has a size.
 
 Each test runs under `timeout`, bounded at the time limit plus 20
 minutes. A test whose final phase hangs then fails in that time, instead

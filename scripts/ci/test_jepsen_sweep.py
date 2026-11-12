@@ -191,6 +191,7 @@ class SweepTests(unittest.TestCase):
         self.assertEqual(sw.label("head@30=/s/1"), ("head", "30", "/s/1"))
         self.assertEqual(sw.label("etcd@6n=/s/2"), ("etcd", "6n", "/s/2"))
         self.assertEqual(sw.label("swiftpaxos@120=/s/3"), ("swiftpaxos", "120", "/s/3"))
+        self.assertEqual(sw.label("etcd-snap100@30=/s/4"), ("etcd-snap100", "30", "/s/4"))
         with self.assertRaises(ValueError):
             sw.label("other@30=/s/1")
 
@@ -272,8 +273,33 @@ class SweepTests(unittest.TestCase):
         self.assertAlmostEqual(step.cpu["servers"], 2400.0)
         text = sw.render([step, sw.read_step("etcd", "30", self.store("e", tuplesky=False))], "Sweep")
         self.assertIn("| 30 | swiftpaxos | 1.00× | 1.00× | 1.00× |", text)
-        self.assertIn("SwiftPaxos's on its own register workload", text)
+        self.assertIn("SwiftPaxos's and etcd's at another snapshot count", text)
+        snap = sw.read_step("etcd-snap100", "30", self.store("e100", tuplesky=False))
+        self.assertIsNone(snap.commands_per_op)
+        text = sw.render([snap, sw.read_step("etcd", "30", self.store("e2", tuplesky=False))], "Sweep")
+        self.assertIn("| 30 | etcd-snap100 | 1.00× |", text)
         self.assertNotIn("| 30 | swiftpaxos | 0 / ", text)
+
+    def test_the_batch_depth(self):
+        path = self.store("h")
+        # The leader n1: 10 executed, 40 proposals in 8 frames, 5 turns.
+        with open(os.path.join(path, "n1", "coordd.log")) as f:
+            line = json.loads(f.read()[len("metrics "):])
+        line["cost"]["Observed"]["proposals"] = {"proposals": 40, "frames": 8}
+        line["cost"]["Observed"]["flushes"] = {"flushes": 5}
+        with open(os.path.join(path, "n1", "coordd.log"), "w") as f:
+            f.write("metrics " + json.dumps(line) + "\n")
+        step = sw.read_step("head", "30", path)
+        self.assertAlmostEqual(step.batch["per_frame"], 5.0)
+        self.assertAlmostEqual(step.batch["per_turn"], 2.0)
+        etcd = sw.read_step("etcd", "30", self.store("e", tuplesky=False))
+        text = sw.render([step, etcd], "Sweep")
+        # 2400 ms of servers' CPU an operation; 10 commands a group of 4,
+        # 2 a commit of 5 at the leader; no follower commits.
+        self.assertIn("| 30 | head | 2400.000 | 5.00 | 2.00 | 2.50 | 2.00 | - |", text)
+        section = text[text.index("**Batch depth**"):]
+        section = section[:section.index("\n\n", section.index("| ---"))]
+        self.assertNotIn("| 30 | etcd |", section)
 
     def test_a_run_without_samples(self):
         step = sw.read_step("head", "30", self.store("h", samples=False))

@@ -42,7 +42,7 @@ on:
         options: [faults, throughput, wan, wan-throughput, service]
         default: faults
       workload:
-        description: "append, wr, register, or register-etcd-mix (register with TupleSky's client threads split as etcd's register test splits its own: n readers in all, the rest mixing write and cas); empty for the scenario's"
+        description: "append, wr, register, register-etcd-mix (register with TupleSky's client threads split as etcd's register test splits its own: n readers in all, the rest mixing write and cas), or register-swiftpaxos-mix (register with TupleSky's and etcd's operations drawn as SwiftPaxos's register test draws its own: n readers in each key's group of 2n, the rest writing, no cas); empty for the scenario's"
         default: ""
       nemesis:
         description: "Comma-separated faults (kill, pause, partition, packet), or none; empty for the scenario's. Not clock: the containers share this runner's clock. TupleSky's partitions can be partition:TARGETS[:LO-HI[/EVERY]], TARGETS any, one or follower (a voter not leading), such as partition:follower:5-10/60; etcd and SwiftPaxos get plain partitions."
@@ -63,7 +63,7 @@ on:
         description: Voters (containers), 3 or 5
         default: "5"
       etcd-version:
-        description: "etcd for the baseline: a version such as 3.7.2, latest (the newest stable release), or none to skip it; beside, or beside:VERSION, runs it in the TupleSky job, on its runner and cluster, after each pair (or after the one run), with each TupleSky run's ratio to it, instead of in a job of its own on another runner"
+        description: "etcd for the baseline: a version such as 3.7.2, latest (the newest stable release), or none to skip it; beside, or beside:VERSION, runs it in the TupleSky job, on its runner and cluster, after each pair (or after the one run), with each TupleSky run's ratio to it, instead of in a job of its own on another runner. etcd runs at its own default snapshot count; /COUNT after any of them (beside/100) also runs it at --snapshot-count COUNT at each sweep step, labelled etcd-snapCOUNT"
         default: latest
       features:
         description: "Replicated features TupleSky's voters activate once every voter is submittable, before the nemesis and the workload (jepsen.tuplesky's --activate, task-d99), comma-separated in order, such as early-proposal,release-at-execution; NAME@SECS activates one under load, SECS into the workload (--activate-after), such as early-proposal,answer-on-release@60; a build without an admin socket (a pair's base before task-d99) is left as it is; empty for none; BASE/HEAD gives a pair's two sides their own lists (either may be empty)"
@@ -509,7 +509,8 @@ jobs:
             voter+=(--read-ratio "$READ_RATIO")
           fi
           if [ -n "$REGISTER_MIX" ]; then
-            if ! grep -q -- '--register-mix' src/jepsen/tuplesky.clj; then
+            if ! grep -q -- '--register-mix' src/jepsen/tuplesky.clj || \
+               { [ "$REGISTER_MIX" = swiftpaxos ] && ! grep -q 'swiftpaxos-register-generator' src/jepsen/tuplesky.clj; }; then
               echo "::error::tuplesky/jepsen@$JEPSEN_REF has no --register-mix; dispatch with a jepsen-ref that has it, or the register workload"
               exit 1
             fi
@@ -553,9 +554,10 @@ jobs:
           # named $2; its store in etcd_store.
           etcd_previous="" etcd_store=""
           etcd_one() {
-            local dir=$1 label=$2 store
+            local dir=$1 label=$2 snapshots=${3:-} store
             mkdir -p "$dir"
-            (cd "$GITHUB_WORKSPACE" && "$ci/jepsen_etcd.sh" run "$dir/cpu-samples.csv") \
+            # $3: a snapshot count for this run; etcd's own default without.
+            (cd "$GITHUB_WORKSPACE" && ETCD_SNAPSHOT_COUNT=$snapshots "$ci/jepsen_etcd.sh" run "$dir/cpu-samples.csv") \
               || echo "::warning::$label: the etcd test ended with status $?"
             store=$(readlink -f "$GITHUB_WORKSPACE/etcd-test/store/latest" || true)
             if [ -z "$store" ] || [ "$store" = "$etcd_previous" ]; then
@@ -565,7 +567,7 @@ jobs:
             etcd_previous=$store etcd_store=$store
             cp "$dir"/cpu-samples* "$store"/ 2>/dev/null || true
             python3 "$ci/jepsen_summary.py" "$store" --nodes-file "$RUNNER_TEMP/cluster/nodes" \
-              --title "etcd $ETCD_VERSION: $WORKLOAD, $NEMESIS$TITLE_SUFFIX$STORE_SUFFIX: $label" || true
+              --title "etcd $ETCD_VERSION${snapshots:+ at --snapshot-count $snapshots}: $WORKLOAD, $NEMESIS$TITLE_SUFFIX$STORE_SUFFIX: $label" || true
           }
           # With SwiftPaxos beside TupleSky, its register test once on this
           # runner and cluster without faults, at $3 clients, its samples in
@@ -738,6 +740,13 @@ jobs:
               if [ "$ETCD_BESIDE" = true ]; then
                 n=$((n + 1))
                 if etcd_one "$RUNNER_TEMP/run-$n" "step $step"; then runs+=("etcd@$step=$etcd_store"); fi
+                # etcd-version .../COUNT: etcd again at that snapshot count.
+                if [ -n "${ETCD_SNAPSHOT_EXTRA:-}" ]; then
+                  n=$((n + 1))
+                  if etcd_one "$RUNNER_TEMP/run-$n" "step $step, --snapshot-count $ETCD_SNAPSHOT_EXTRA" "$ETCD_SNAPSHOT_EXTRA"; then
+                    runs+=("etcd-snap$ETCD_SNAPSHOT_EXTRA@$step=$etcd_store")
+                  fi
+                fi
               fi
               # SwiftPaxos at this step's clients, raised as a register
               # step is (SWIFTPAXOS_STEPS, one a step, in order).

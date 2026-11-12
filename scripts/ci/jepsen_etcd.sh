@@ -21,6 +21,18 @@ test_dir=${ETCD_TEST_DIR:-etcd-test}
 jepsen_dir=${JEPSEN_DIR:-jepsen}
 
 prepare() {
+  # VERSION/COUNT (beside/100, beside:3.7.3/100, 3.7.3/100): etcd at its
+  # default snapshot count, and in a TupleSky sweep a second run at each
+  # step with --snapshot-count COUNT (ETCD_SNAPSHOT_EXTRA), so a setting's
+  # cost has a size. Without it, etcd's default alone.
+  local extra=""
+  case $ETCD_VERSION in
+    */*) extra=${ETCD_VERSION#*/} ETCD_VERSION=${ETCD_VERSION%%/*} ;;
+  esac
+  if [ -n "$extra" ] && ! [[ "$extra" =~ ^[0-9]+$ ]]; then
+    echo "::error::not a snapshot count: '$extra' (etcd-version VERSION/COUNT)"; exit 1
+  fi
+  echo "ETCD_SNAPSHOT_EXTRA=$extra" >> "${GITHUB_ENV:-/dev/null}"
   # `beside` or `beside:VERSION` (etcd in the TupleSky job) names the
   # version after it, `latest` without one.
   case $ETCD_VERSION in
@@ -52,6 +64,44 @@ prepare() {
   # The test passes --enable-v2, which etcd 3.6 removed ("flag provided
   # but not defined"). The workloads here use only the v3 API.
   sed -i '/^[[:space:]]*:--enable-v2$/d' "$test_dir/src/jepsen/etcd/db.clj"
+
+  # The test passes --snapshot-count, 100 by its own default against
+  # etcd's 10,000: each member then snapshots every 100 applied entries,
+  # 29 to 38 times a second in a throughput run (run 43289869422), work a
+  # default etcd doesn't do. TupleSky is read against etcd as it ships, so
+  # the flag goes only when a run asks for a count (`run` with
+  # ETCD_SNAPSHOT_COUNT set).
+  python3 - "$test_dir/src/jepsen/etcd/db.clj" "$test_dir/src/jepsen/etcd.clj" <<'PY'
+import sys
+def edit(path, old, new):
+    src = open(path).read()
+    if src.count(old) != 1:
+        sys.exit(f"{path} no longer has: {old!r}")
+    open(path, "w").write(src.replace(old, new))
+edit(sys.argv[1], ":--snapshot-count               (:snapshot-count test)",
+     "(when (:snapshot-count test) [:--snapshot-count (:snapshot-count test)])")
+edit(sys.argv[2],
+     '"Number of committed transactions to trigger a snapshot to disk. Passed to etcd."\n    :default 100\n',
+     '"Number of committed transactions to trigger a snapshot to disk. Passed to etcd; etcd\'s own default without it."\n')
+PY
+  grep -n 'snapshot-count' "$test_dir/src/jepsen/etcd/db.clj" "$test_dir/src/jepsen/etcd.clj"
+
+  # The swiftpaxos register mix (REGISTER_MIX, the workflow's
+  # register-swiftpaxos-mix): reads and writes alone, n readers in each
+  # key's group of 2n, as jepsen.swiftpaxos's register test draws them, so
+  # etcd runs the reference's workload with TupleSky and SwiftPaxos.
+  if [ "${REGISTER_MIX:-}" = swiftpaxos ]; then
+    python3 - "$test_dir/src/jepsen/etcd/register.clj" <<'PY'
+import sys
+path = sys.argv[1]
+src = open(path).read()
+old = "(->> (gen/mix [w cas])\n                         (gen/reserve n r)"
+if src.count(old) != 1:
+    sys.exit(f"{path} no longer has: {old!r}")
+open(path, "w").write(src.replace(old, "(->> (gen/reserve n r w)"))
+PY
+    grep -n 'gen/reserve' "$test_dir/src/jepsen/etcd/register.clj"
+  fi
 
   # cu/grepkill! runs `pgrep -f etcd | xargs kill -stop` in a `bash -c`
   # naming etcd. pgrep can list the pipeline's own xargs while it is still
@@ -168,8 +218,10 @@ run() {
   # two etcd runs stopped on a :pause :all that never returned, one of them
   # for 84 minutes after its time limit. No leader profile: it reads
   # TupleSky's voters.
-  local samples=$1 wan=()
+  local samples=$1 wan=() snapshots=()
   if [ "$WAN" != none ]; then wan=(--wan "$WAN"); fi
+  # ETCD_SNAPSHOT_COUNT: a snapshot count for this run; etcd's own without.
+  if [ -n "${ETCD_SNAPSHOT_COUNT:-}" ]; then snapshots=(--snapshot-count "$ETCD_SNAPSHOT_COUNT"); fi
   export JEPSEN_CPU_SAMPLES=$samples
   unset JEPSEN_LEADER_PROFILE JEPSEN_LEADER_CALLGRAPH
   cd "$test_dir"
@@ -185,6 +237,7 @@ run() {
     --rate "$ETCD_RATE" \
     --time-limit "$TIME_LIMIT" \
     --concurrency "$CONCURRENCY" \
+    ${snapshots[@]+"${snapshots[@]}"} \
     ${wan[@]+"${wan[@]}"}
 }
 

@@ -6,8 +6,9 @@ job.
     scripts/ci/jepsen_sweep.py [--title TITLE] SIDE@STEP=STORE [SIDE@STEP=STORE ...]
 
 Each argument is one run's store directory, labelled with its side
-(`head`, `base`, `etcd` or `swiftpaxos`, the reference beside TupleSky,
-its register workload) and its step (the clients it ran at, as the
+(`head`, `base`, `etcd` at its default snapshot count, `etcd-snapCOUNT` at
+`--snapshot-count COUNT`, or `swiftpaxos`, the reference beside TupleSky)
+and its step (the clients it ran at, as the
 workflow names them: `30`, or `6n`), in the order the job ran them. For
 every run it reads, with `jepsen_summary.py`'s parsers, over the workload (the first invocation to the last completion,
 or the final heal):
@@ -113,6 +114,9 @@ class Step:
     # last boot's last sample, the largest high-water mark of its boots),
     # in MiB.
     memory: dict = field(default_factory=dict)
+    # The batch depth (see batch_of): commands a proposal frame and a
+    # leader turn, from the leader's last `metrics` line.
+    batch: dict = field(default_factory=dict)
 
 
 # Counts a command, summed over the voters: the key, the label, and the
@@ -278,9 +282,9 @@ TUPLESKY = ("head", "base")
 
 def label(arg: str) -> tuple[str, str, str]:
     """SIDE@STEP=STORE as its three parts."""
-    m = re.fullmatch(r"(head|base|etcd|swiftpaxos)@([0-9]+n?)=(.+)", arg)
+    m = re.fullmatch(r"(head|base|etcd|etcd-snap[0-9]+|swiftpaxos)@([0-9]+n?)=(.+)", arg)
     if not m:
-        raise ValueError(f"not SIDE@STEP=STORE (SIDE head, base, etcd or swiftpaxos): {arg}")
+        raise ValueError(f"not SIDE@STEP=STORE (SIDE head, base, etcd, etcd-snapCOUNT or swiftpaxos): {arg}")
     return m[1], m[2], m[3]
 
 
@@ -426,6 +430,24 @@ def voter_costs(store: str) -> list:
     return costs
 
 
+def batch_of(leader) -> dict:
+    """The leader's batch depth from its last `metrics` line: the proposals
+    its frames carried, a frame (each proposal one command to one
+    follower, so the commands a frame on the wire), and its executed
+    commands a turn of its loop (each turn ends in one flush, task-d102);
+    a reading the build lacks is left out."""
+    out = {}
+    raw = leader.raw or {}
+    proposals = count_at(raw, ("proposals", "proposals"))
+    frames = count_at(raw, ("proposals", "frames"))
+    if proposals and frames:
+        out["per_frame"] = proposals / frames
+    flushes = count_at(raw, ("flushes", "flushes"))
+    if flushes and leader.executed:
+        out["per_turn"] = leader.executed / flushes
+    return out
+
+
 def lead(costs: list):
     """The leader among the voters' readings: the voter whose read barrier
     served reads, as the pair table takes it."""
@@ -509,6 +531,7 @@ def read_step(side: str, step_name: str, store: str) -> Step:
                 step.run_queue_p99_ms = tails["run_queue_per_working_pass"]["p99_ms"]
             if "release_round" in tails:
                 step.round_ms = (tails["release_round"]["p50_ms"], tails["release_round"]["p99_ms"])
+            step.batch = batch_of(leader)
     if side in TUPLESKY:
         step.pipelines = read_pipelines(store)
         step.counts = read_counts(store)
@@ -617,6 +640,30 @@ def render(steps: list[Step], title: str) -> str:
         )
     out.append("")
 
+    rows = [s for s in steps if s.side in TUPLESKY]
+    if rows:
+        out += [
+            "**Batch depth** (TupleSky, beside servers' CPU per operation: the leader's proposals a proposal frame, "
+            "each proposal one command to one follower, so the commands a frame on the wire; the leader's executed "
+            "commands a turn of its loop (a turn ends in one flush), a journal group and a projection commit; and "
+            "the followers' commands a projection commit, their mean; each from the voter's last `metrics` line. "
+            "etcd and SwiftPaxos give no such counts, so they have no row)",
+            "",
+            "| Step | Side | Servers' CPU per operation (ms) | Commands a proposal frame | Commands a leader turn | "
+            "Leader's commands a journal group | Leader's commands a projection commit | "
+            "Followers' commands a projection commit |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- |",
+        ]
+        for s in rows:
+            followers = [v for v, leader in s.per_projection_commit.values() if not leader]
+            mean = sum(followers) / len(followers) if followers else None
+            out.append(
+                f"| {name(s)} | {cell(s.cpu.get('servers'), '.3f')} | {cell(s.batch.get('per_frame'), '.2f')} | "
+                f"{cell(s.batch.get('per_turn'), '.2f')} | {cell(s.per_group, '.2f')} | {cell(s.per_commit, '.2f')} | "
+                f"{cell(mean, '.2f')} |"
+            )
+        out.append("")
+
     rows = [s for s in steps if s.pipelines]
     if rows:
         out += [
@@ -717,8 +764,8 @@ def render(steps: list[Step], title: str) -> str:
     rows = [s for s in steps if s.side != "etcd" and s.step in etcd]
     if rows:
         out += [
-            "**Against etcd at the same step** (each TupleSky run's value, and SwiftPaxos's on its own register "
-            "workload, over the etcd run's at its step, on "
+            "**Against etcd at the same step** (each TupleSky run's value, SwiftPaxos's and etcd's at another "
+            "snapshot count, over the etcd run's at its default snapshot count at its step, on "
             f"this runner{model_note(steps)}; a ratio read on one CPU model is not comparable with one read on "
             "another without saying so)",
             "",

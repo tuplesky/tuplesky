@@ -146,6 +146,8 @@ workload=${IN_WORKLOAD:-$workload}
 register_mix=""
 if [ "$workload" = register-etcd-mix ]; then
   workload=register register_mix=etcd
+elif [ "$workload" = register-swiftpaxos-mix ]; then
+  workload=register register_mix=swiftpaxos
 fi
 nemesis=${IN_NEMESIS:-$nemesis}
 # A partition among the faults may carry TupleSky's partition options,
@@ -314,7 +316,10 @@ load_suffix() {
 }
 steps_title=${sweep// /, }
 suffix=$(load_suffix "${steps_title:-$concurrency}" "$raised")
-if [ -n "$register_mix" ]; then suffix+=", etcd's register mix"; fi
+case $register_mix in
+  etcd) suffix+=", etcd's register mix" ;;
+  swiftpaxos) suffix+=", SwiftPaxos's register mix (reads and writes, no cas)" ;;
+esac
 swiftpaxos_suffix=$(load_suffix "$swiftpaxos_concurrency" "$swiftpaxos_raised")
 
 store=${IN_STORE:-disk}
