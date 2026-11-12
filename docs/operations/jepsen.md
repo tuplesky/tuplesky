@@ -253,7 +253,9 @@ through jepsen.tuplesky's `--voter-env` (such as
 `coord-harness provision`'s settings, which it writes into every voter's
 `coordd.toml` (such as `harness:COORD_HARNESS_PROJECTION_COMMIT_RECORDS=0`,
 task-d86's hold off, against its default; the job refuses a name the
-head's harness does not read). `pairs` (3) sets
+head's harness does not read, and the setting holds for the base's runs
+alone, so a head run keeps any value the scenario set, such as its
+admission rate). `pairs` (3) sets
 how many; the order alternates from pair to pair, so a drift over the job
 favours neither side. Each run gets its own summary as it ends, and
 `scripts/ci/jepsen_pairs.py` then gives one row per run and the head's

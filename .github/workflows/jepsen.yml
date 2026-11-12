@@ -616,11 +616,22 @@ jobs:
             local profile=$PROFILE
             if [ "$side" = base ]; then
               profile=$base_profile
-              if [ -n "$base_harness" ]; then export "${base_harness?}"; fi
+              # The base's harness setting holds for its run alone: the
+              # head's own value, if the scenario exported one, comes back.
+              local harness_name="" harness_was=""
+              if [ -n "$base_harness" ]; then
+                harness_name=${base_harness%%=*}
+                if [ -n "${!harness_name+x}" ]; then harness_was="=${!harness_name}"; fi
+                export "${base_harness?}"
+              fi
               COORD_HARNESS_JOURNAL_PROFILE=$base_profile \
                 run_one "$base_bin" "$dir" "$graph" ${base_workers[@]+"${base_workers[@]}"} \
                 ${base_args[@]+"${base_args[@]}"} || rc=$?
-              if [ -n "$base_harness" ]; then unset "${base_harness%%=*}"; fi
+              if [ -n "$harness_was" ]; then
+                export "$harness_name${harness_was}"
+              elif [ -n "$harness_name" ]; then
+                unset "$harness_name"
+              fi
               name=$base_name
             else
               run_one "$head_bin" "$dir" "$graph" ${head_workers[@]+"${head_workers[@]}"} || rc=$?
