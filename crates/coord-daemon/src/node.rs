@@ -211,6 +211,15 @@ impl Machine {
         }
     }
 
+    /// How many payload requests this replica sent, its campaign's own
+    /// included: zero for a leader, which asks for none.
+    pub const fn payload_asks(&self) -> u64 {
+        match self {
+            Machine::Leader(_) => 0,
+            Machine::Follower(m) => m.payload_asks(),
+        }
+    }
+
     /// How many payload transfers a peer has answered this replica
     /// with.
     ///
@@ -1858,6 +1867,12 @@ impl<P: Persistence> Node<P> {
     /// with.
     pub fn payloads_answered(&self) -> u64 {
         self.machine().payloads_answered()
+    }
+
+    /// How many payload requests this node's machine sent
+    /// ([`Machine::payload_asks`]).
+    pub fn payload_asks(&self) -> u64 {
+        self.machine().payload_asks()
     }
 
     /// Send the voters, again, the proposals they have not voted on
