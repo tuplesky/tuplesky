@@ -41,9 +41,11 @@ thread to that file (task-d91's R4): the time, its pid and start time, the
 kind (`domain loop` for the main thread, `tokio threads`, and the others by
 their name: `appender`, `materializer`, `checkpoint`, else `other`), how
 many such threads it has seen, and their CPU and run-queue seconds and
-timeslices, `schedstat`'s three fields, summed. A timeslice is a turn on a
-CPU, so it counts the thread's wakeups, and the run queue over them is the
-wait for a core per wakeup. A thread that has exited keeps its last
+timeslices, `schedstat`'s three fields, summed, and their voluntary
+context switches (`voluntary_ctxt_switches` in each thread's `status`),
+summed. A timeslice is a turn on a CPU, so it counts the thread's wakeups,
+and the run queue over them is the wait for a core per wakeup; a voluntary
+switch is the thread giving up its CPU to wait, so it counts its parks. A thread that has exited keeps its last
 reading in the sums, so they stay cumulative while short-lived threads (a
 publication's) come and go.
 
@@ -129,6 +131,19 @@ def schedstat3(path: str) -> tuple[float, float, int] | None:
     return int(on_cpu) / 1e9, int(queued) / 1e9, int(slices)
 
 
+def parks(path: str) -> int:
+    """A thread's voluntary context switches, from its `status`: each one
+    the thread blocking to wait (a park); 0 when it cannot be read."""
+    try:
+        with open(path) as f:
+            for line in f:
+                if line.startswith("voluntary_ctxt_switches:"):
+                    return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0
+
+
 # The voter's own named threads, as `comm` gives them.
 NAMED_THREADS = ("appender", "materializer", "checkpoint")
 
@@ -145,8 +160,8 @@ def thread_kind(pid: int, tid: int, comm: str) -> str:
 def wakeups(pids, seen: dict) -> list[str]:
     """One `--wakeups` row's cells after the time for each coordd in `pids`
     (pid, start) and each kind of its threads. `seen` keeps each thread's
-    last reading, (pid, start) -> {tid: (kind, cpu, queued, slices)}, so a
-    thread that exits still counts."""
+    last reading, (pid, start) -> {tid: (kind, cpu, queued, slices,
+    parks)}, so a thread that exits still counts."""
     out = []
     for pid, start in pids:
         threads = seen.setdefault((pid, start), {})
@@ -162,14 +177,15 @@ def wakeups(pids, seen: dict) -> list[str]:
                 continue
             times = schedstat3(f"/proc/{pid}/task/{tid}/schedstat")
             if times:
-                threads[int(tid)] = (thread_kind(pid, int(tid), comm),) + times
+                waits = parks(f"/proc/{pid}/task/{tid}/status")
+                threads[int(tid)] = (thread_kind(pid, int(tid), comm),) + times + (waits,)
         sums: dict = {}
-        for kind, cpu, queued, slices in threads.values():
-            n, c, q, s = sums.get(kind, (0, 0.0, 0.0, 0))
-            sums[kind] = (n + 1, c + cpu, q + queued, s + slices)
+        for kind, cpu, queued, slices, waits in threads.values():
+            n, c, q, s, w = sums.get(kind, (0, 0.0, 0.0, 0, 0))
+            sums[kind] = (n + 1, c + cpu, q + queued, s + slices, w + waits)
         for kind in sorted(sums):
-            n, c, q, s = sums[kind]
-            out.append(f"{pid},{start},{kind},{n},{c:.4f},{q:.4f},{s}")
+            n, c, q, s, w = sums[kind]
+            out.append(f"{pid},{start},{kind},{n},{c:.4f},{q:.4f},{s},{w}")
     return out
 
 
@@ -304,7 +320,7 @@ def main() -> int:
     wake = open(args.wakeups, "w") if args.wakeups else None
     seen: dict = {}
     if wake:
-        wake.write("time,pid,start,kind,threads,cpu_s,runq_s,slices\n")
+        wake.write("time,pid,start,kind,threads,cpu_s,runq_s,slices,parks\n")
     named = open(args.nodes, "w") if args.nodes else None
     known: set = set()
     if named:

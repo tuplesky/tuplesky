@@ -1096,11 +1096,11 @@ class WakeupTests(unittest.TestCase):
         self.assertIn("over the 41 s between the samples around the workload", text)
         rows = [line for line in text.splitlines() if line.startswith(("| 101", "| 102"))]
         self.assertEqual(rows, [
-            "| 101 (leader) | domain loop | 1 | 500.00 | 2000 | 4000 | 1000.00 |",
-            "| 101 (leader) | tokio threads | 2 | 2000.00 | 1000 | 500 | 2000.00 |",
+            "| 101 (leader) | domain loop | 1 | 500.00 | - | 2000 | 4000 | 1000.00 |",
+            "| 101 (leader) | tokio threads | 2 | 2000.00 | - | 1000 | 500 | 2000.00 |",
             # A kind first seen inside the window counts from nothing.
-            "| 101 (leader) | checkpoint | 1 | 10.00 | 2000 | 10000 | 20.00 |",
-            "| 102 | domain loop | 1 | 100.00 | 0 | 5000 | 0.00 |",
+            "| 101 (leader) | checkpoint | 1 | 10.00 | - | 2000 | 10000 | 20.00 |",
+            "| 102 | domain loop | 1 | 100.00 | - | 0 | 5000 | 0.00 |",
         ])
 
     def test_a_voter_restarted_in_the_window_counts_both_boots(self):
@@ -1116,9 +1116,23 @@ class WakeupTests(unittest.TestCase):
         )
         rows = [line for line in self.summary(wakes).splitlines() if line.startswith(("| 101", "| 102", "| 103"))]
         self.assertEqual(rows, [
-            "| 101 (leader) | domain loop | 1 | 500.00 | 2000 | 4000 | 1000.00 |",
-            "| 102 | domain loop | 1 | 50.00 | 0 | 4000 | 0.00 |",
-            "| 103 | domain loop | 1 | 40.00 | 0 | 10000 | 0.00 |",
+            "| 101 (leader) | domain loop | 1 | 500.00 | - | 2000 | 4000 | 1000.00 |",
+            "| 102 | domain loop | 1 | 50.00 | - | 0 | 4000 | 0.00 |",
+            "| 103 | domain loop | 1 | 40.00 | - | 0 | 10000 | 0.00 |",
+        ])
+
+    def test_parks_per_operation_from_a_sampler_that_counts_them(self):
+        wakes = (
+            "time,pid,start,kind,threads,cpu_s,runq_s,slices,parks\n"
+            "2026-09-27 10:00:00.500000,101,7,domain loop,1,1.0,0.5,100,80\n"
+            "2026-09-27 10:00:00.500000,101,7,tokio threads,1,1.0,1.0,1000,900\n"
+            "2026-09-27 10:00:41.500000,101,7,tokio threads,1,2.0,3.0,3000,2500\n"
+            "2026-09-27 10:00:41.500000,101,7,domain loop,1,3.0,1.5,600,480\n"
+        )
+        rows = [line for line in self.summary(wakes).splitlines() if line.startswith("| 101")]
+        self.assertEqual(rows, [
+            "| 101 (leader) | domain loop | 1 | 500.00 | 400.00 | 2000 | 4000 | 1000.00 |",
+            "| 101 (leader) | tokio threads | 1 | 2000.00 | 1600.00 | 1000 | 500 | 2000.00 |",
         ])
 
     def test_no_file_or_a_row_that_does_not_parse_no_table(self):

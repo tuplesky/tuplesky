@@ -822,8 +822,8 @@ def boots_delta(boots: dict, index: int) -> float:
 def read_wakeups(path: str) -> dict:
     """The rows `cpu_sampler.py --wakeups` wrote, by their time cell: each
     coordd (pid, start) to {kind: (threads, CPU s, run queue s,
-    timeslices)}, cumulative; {} without the file or with a row that does
-    not parse."""
+    timeslices, parks)}, cumulative, parks None from a sampler that did not
+    count them; {} without the file or with a row that does not parse."""
     if not os.path.exists(path):
         return {}
     by_time: dict = {}
@@ -832,12 +832,13 @@ def read_wakeups(path: str) -> dict:
             f.readline()
             for line in f:
                 cells = line.strip().split(",")
-                if len(cells) != 8:
+                if len(cells) not in (8, 9):
                     continue
                 when = datetime.datetime.strptime(cells[0], "%Y-%m-%d %H:%M:%S.%f")
                 key = (int(cells[1]), int(cells[2]))
                 by_time.setdefault(when, {}).setdefault(key, {})[cells[3]] = (
-                    int(cells[4]), float(cells[5]), float(cells[6]), int(cells[7]))
+                    int(cells[4]), float(cells[5]), float(cells[6]), int(cells[7]),
+                    int(cells[8]) if len(cells) == 9 else None)
     except (OSError, ValueError):
         return {}
     return by_time
@@ -871,8 +872,9 @@ def wakeup_table(rows: list[dict], wakes: dict, start: datetime.datetime, end: d
         a, b = t0[k].get(kind), t1[k].get(kind)
         if b is None:
             return None
-        a = a or (0, 0.0, 0.0, 0)
-        return b[0], b[1] - a[1], b[2] - a[2], b[3] - a[3]
+        a = a or (0, 0.0, 0.0, 0, 0)
+        parks = None if b[4] is None or a[4] is None else b[4] - a[4]
+        return b[0], b[1] - a[1], b[2] - a[2], b[3] - a[3], parks
 
     def loop_cpu(k):
         d = delta(k, "domain loop")
@@ -883,13 +885,15 @@ def wakeup_table(rows: list[dict], wakes: dict, start: datetime.datetime, end: d
     out = [
         f"**Wakeups and the wait for a core, by thread** (task-d91's R4, from `cpu_sampler.py --wakeups` over the "
         f"{span:.0f} s between the samples around the workload: each `coordd`'s threads by kind, their `schedstat` "
-        "summed; a wakeup is a timeslice, a turn on a CPU; run delay is the time ready to run and waiting for a core; "
+        "summed; a wakeup is a timeslice, a turn on a CPU; a park is a voluntary context switch, the thread blocking "
+        "to wait (`voluntary_ctxt_switches`; - from a sampler that did not count them); run delay is the time ready "
+        "to run and waiting for a core; "
         f"per operation is over the {completed} operations completed in that time; the leader is the voter whose "
         "domain loop used the most CPU over it)",
         "",
-        "| Process (pid) | Kind | Threads | Wakeups per operation | Run delay per wakeup (µs) "
+        "| Process (pid) | Kind | Threads | Wakeups per operation | Parks per operation | Run delay per wakeup (µs) "
         "| CPU per wakeup (µs) | Run delay per operation (ms) |",
-        "| --- | --- | --- | --- | --- | --- | --- |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for k in [leader] + sorted(p for p in procs if p != leader):
         name = f"{k[0]}{' (leader)' if k == leader else ''}"
@@ -898,9 +902,10 @@ def wakeup_table(rows: list[dict], wakes: dict, start: datetime.datetime, end: d
             d = delta(k, kind)
             if not d or d[3] <= 0:
                 continue
-            n, cpu, queued, slices = d
+            n, cpu, queued, slices, waits = d
+            parked = "-" if waits is None else f"{waits / completed:.2f}"
             out.append(
-                f"| {name} | {kind} | {n} | {slices / completed:.2f} | {queued * 1e6 / slices:.0f} "
+                f"| {name} | {kind} | {n} | {slices / completed:.2f} | {parked} | {queued * 1e6 / slices:.0f} "
                 f"| {cpu * 1e6 / slices:.0f} | {queued * 1000 / completed:.2f} |"
             )
     out.append("")
