@@ -21,6 +21,15 @@ use crate::record::RecordOrigin;
 pub const LOCAL_CHECKPOINT_FORMAT_V1: u16 =
     coord_types::formats::Format::LocalCheckpoint.current() as u16;
 
+/// The oldest image format a published pointer has named. The pointer
+/// record has kept its layout through every raise of the image's format
+/// (`Format::LocalCheckpoint`), so a pointer naming any format from this
+/// one through [`LOCAL_CHECKPOINT_FORMAT_V1`] decodes: a journal that
+/// retains a pointer published before a raise still opens. Whether the
+/// image it names loads is the checkpoint store's question, and an image
+/// outside the window is refused there, with its format (#247, Codex).
+pub const OLDEST_POINTER_FORMAT: u16 = 1;
+
 /// The durable pointer appended (as a `PublishLocalCheckpoint` record) once
 /// a complete inactive checkpoint and its manifest are synced. The newest
 /// durable pointer, never the newest directory, selects recovery state
@@ -42,13 +51,19 @@ pub struct CheckpointPointerV1 {
 /// Choose the recovery baseline among durably published pointers of one
 /// origin: the highest represented sequence. Pointers of another origin are
 /// ignored; a directory listing is not an input to this decision.
+///
+/// The format is not a filter. The newest pointer is the baseline whether
+/// or not this build reads the image it names, because the journal below
+/// it may be reclaimed: an older pointer, or none, would be a baseline the
+/// retained suffix doesn't continue. An image this build doesn't read is
+/// refused where it is loaded.
 pub fn select_recovery_pointer<'a>(
     origin: &RecordOrigin,
     published: impl IntoIterator<Item = &'a CheckpointPointerV1>,
 ) -> Option<&'a CheckpointPointerV1> {
     published
         .into_iter()
-        .filter(|p| p.origin == *origin && p.format == LOCAL_CHECKPOINT_FORMAT_V1)
+        .filter(|p| p.origin == *origin)
         .max_by_key(|p| p.represented)
 }
 
@@ -295,15 +310,30 @@ mod tests {
         let older = pointer(1, 10);
         let newest = pointer(1, 30);
         let other_domain = pointer(2, 90);
-        let wrong_format = CheckpointPointerV1 {
-            format: LOCAL_CHECKPOINT_FORMAT_V1 + 1,
-            ..pointer(1, 50)
-        };
-        let published = [older, other_domain, newest, wrong_format];
+        let published = [older, other_domain, newest];
         assert_eq!(
             select_recovery_pointer(&origin(1), &published),
             Some(&newest)
         );
         assert_eq!(select_recovery_pointer(&origin(3), &published), None);
+    }
+
+    /// A pointer published before the image's format was raised is still
+    /// the newest baseline, not skipped for an older pointer of the
+    /// current format: the journal below it may be gone. Loading its
+    /// image is what refuses it (#247, Codex).
+    #[test]
+    fn a_pointer_of_an_older_image_format_is_still_the_newest_baseline() {
+        let current = pointer(1, 10);
+        let before_the_raise = CheckpointPointerV1 {
+            format: OLDEST_POINTER_FORMAT,
+            ..pointer(1, 30)
+        };
+        assert_ne!(before_the_raise.format, LOCAL_CHECKPOINT_FORMAT_V1);
+        let published = [current, before_the_raise];
+        assert_eq!(
+            select_recovery_pointer(&origin(1), &published),
+            Some(&before_the_raise)
+        );
     }
 }
