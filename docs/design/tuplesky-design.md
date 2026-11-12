@@ -1767,6 +1767,8 @@ Common schema owns stable logical collection IDs, canonical values and reviewed 
 
 Protocol state cannot be reduced to a Raft-like last_applied: application snapshots do not recreate unresolved dependency/vote obligations. Physical placement is adapter-private; logical schema/index maintenance is common.
 
+*Proposed by task-d117's design step ([Section 17.17](#s17-17)), not built:* the per-command protocol rows (`protocol_v1`'s dependency and proposal rows, `pending_payload_v1`), the retry rows (`retry_v1`, `retry_floor_v1`) and executed history (`execution_v1`, `payload_v1`, `decided_v1`) leave the projection, and `meta_v1` is written once a commit. Each of its code steps amends this table as it lands.
+
 *Amended by task-d113's design step: the payload, dependency and executed rows keyed by order.* This is a design step; nothing below is built. The table above keeps today's keys until the code step lands.
 
 **Why: the materializer's profile** (#185, [6810986014](https://github.com/tuplesky/tuplesky/pull/185#issuecomment-6810986014); local, the carry at `413fd66a`, five voters, `replay`, tmpfs, 30 and 120 callers).
@@ -2088,6 +2090,7 @@ Immediate and local two-phase hardening are selected from the reviewed redb cont
   - the collector answers a resolve from the projection (`retained_answer` and `settle_from_records` in `coordd`, `settle_from_record` in the collector), so a command the journal holds is never answered `Unknown` or `Forgotten`; the projection must have replayed the journal before the node answers;
   - the divergence tooling reads `executed_v1` from the projection;
   - an engine not under the journal (the strict single-store reference, a restore's fill, a checkpoint's install target) keeps two-phase commit.
+  - *Under task-d117's design step ([Section 17.17](#s17-17)), not built:* a resolve is answered from the retry window in memory, which boot rebuilds from the image and the journal before the node answers; the divergence tooling reads executed history from the buffer and the segments; and the reference store keeps its rows.
 
 Optional `journaled-replay`: after task-j06 qualification, atomic working-state updates need not fsync each transaction because durable redo plus a published durable checkpoint reconstruct acknowledged state. Discard or validate working generations after crash; never depend on an unsynced live database as the only source. Provide a separate internal atomic-working-state capability and durable checkpoint method; do not weaken commit_durable or expose an unsafe actor/operator switch. Keep strict mode until the full composed matrix and measured benefit justify enabling replay mode.
 
@@ -2327,6 +2330,8 @@ Bound backlog, retained bytes, per-domain transitions, memory indexes, rewrite a
 | SharedCheckpointV1 | Agreed common state/floor and catch-up lineage, not unrelated local promises/obligations |
 | Observer snapshot | Declared capability's common state/history and finalized cursor; may not even be full MVCC |
 
+*Under task-d117's design step ([Section 17.17](#s17-17)), not built:* the local image carries the recovery map, the retry window and the history tail beside the application state, and names the history segments below its boundary; the shared image carries the retry window and the history digest in place of `payload_v1` and `execution_v1`.
+
 Local checkpoints are same-engine lifecycle artifacts, not migration interfaces. Restoring a common/observer image cannot reset an existing voter's obligations. Logical encodings aid verification but imply no conversion command.
 
 <a id="s17-16-2"></a>
@@ -2379,6 +2384,239 @@ Physical redo reclamation preserves unresolved obligations inside complete local
 | Sync panic or shard corruption | Stop publication, recover/quarantine explicitly |
 
 Previously durable-prefix damage is not normal torn tail. Pin/test engine recovery mode; permissive mode cannot silently discard acknowledged state.
+
+<a id="s17-17"></a>
+### 17.17 Protocol state in the journal only
+
+*Added by task-d117's design step: proposal 2 of [the batching rule](tuplesky-batching-rule.md#41-proposal-2-protocol-state-in-the-journal-only-lever-7).* This is a design step; nothing below is built. Sections 17.1, 17.3.4 and 17.16 keep today's text until each code step lands, and each step amends them as it lands.
+
+**Why.** The owner's rule: "Journal and store are for recovery. Storing command state individually, paying a storage round trip per command, is not batching." The audit against it (#185, [6835865051](https://github.com/tuplesky/tuplesky/pull/185#issuecomment-6835865051)) counted about 14 rows a command at a follower, 2 of them application rows. Every other row is a copy of what the journal already holds, written so that a restart, a donor or a resolve can read it.
+
+**What this step decides.**
+- **The projection keeps what reads need:** the application collections, the identity and configuration rows, `checkpoint_v1`, and `meta_v1` once a commit.
+- **The rest leaves it,** for three places:
+  - **live protocol state** (promises, Syncs, seals, dependency and proposal rows, payloads not yet executed): an in-memory recovery map kept by the store's lowering, carried by the local image, and rebuilt from the journal above the image;
+  - **the retry window** (`retry_v1`, `retry_floor_v1`): in memory, versioned for views, carried by both images, rebuilt from the journal above the image;
+  - **executed history** (`execution_v1`, `payload_v1`, `decided_v1`): an in-memory buffer above the last segment, and below it immutable history segments, one every `FLOOR_INTERVAL` (4,096) positions, written off the loop.
+- **The journal's retention still ends at the published image (`C`).** No reader of history reads the journal, so no voter's frontier pins it.
+
+**The collections, by where they go.** Rows a command at a follower are the audit's.
+
+| Collection | Rows a command, follower | Under this step | Durable in | Code step |
+| --- | ---: | --- | --- | --- |
+| `meta_v1` | 1 | `kv_revision`, `retention_floor` and `lease_authority` once a commit (point 5) | the projection | 1 |
+| `protocol_v1`: dependency, proposal | 2.2 | the recovery map (point 2) | the local image and the journal above it | 2 |
+| `protocol_v1`: promise, Sync, seal | under 0.01 | the recovery map | the local image and the journal above it | 2 |
+| `pending_payload_v1` | 2.2 | the recovery map | the local image and the journal above it | 2 |
+| `retry_v1`, `retry_floor_v1` | 2.5 and 1 | the retry window (point 4) | both images and the journal above them | 3 |
+| `payload_v1`, `execution_v1`, `decided_v1` | 1 each | the history buffer, then segments (point 3) | segments, the local image's tail, and the journal above it | 4 |
+| `kv_current_v1`, `events_v1`, sessions, leases, policy, grants | 2 | unchanged | the projection | |
+| `config_v1`, `checkpoint_v1` | 0 | unchanged | the projection | |
+
+About 11.8 of a follower's 13.9 rows a command leave, 85%. What stays is 2 application rows a command and a tenth of a meta row.
+
+**1. The store's layout, and its conversion.**
+- **Each code step raises `STORE_FORMAT_VERSION`** (4 today) and removes its collections' tables from the projection. A domain runs one layout, recorded at initialization and checked at every open (Section 17.1, point 3). A store of another layout is refused with the reason.
+- **The images' versions are raised with the steps that change them:**
+  - the local image (`LocalRecoveryCheckpointV1`, format 2) gains the recovery section at step 2, the retry window at step 3, and the history tail at step 4;
+  - the shared image (`SharedCheckpointV1`, format 2) carries the retry window at step 3, and the history digest in place of `payload_v1` and `execution_v1` at step 4.
+- **The journal's records don't change.** The machine keeps writing the same `StoreUpdate`s to the same collections by command, through more than twenty sites in `coord-consensus`. Only the store's lowering decides where each lands. So the consensus crate, the wire and what a vote rests on don't change.
+- **The reference store (`StoreWorker`) keeps today's rows.** It has no journal to recover from, so its protocol rows stay in its store. Under task-j08's comparison, the two are compared on application state and on the machine each recovers (`read_protocol`), not on the tables.
+- **No existing store moves.** Nothing is deployed, so a store or image of the old layout is refused and a test domain starts fresh, as for task-d113 and task-d105.
+- **The conversion is a release condition,** carried in the plan like task-d113's. It is offline, mechanical and lossless:
+  - the protocol rows and pending payloads become the local image's recovery section;
+  - `execution_v1`, `payload_v1` and `decided_v1` become segments by position, and the history digest is computed over them in order;
+  - `retry_v1` and `retry_floor_v1` become the retry window, each retained result with its request read from `payload_v1` at its position.
+
+  It isn't built: it is built only if a deployment needs it.
+
+**2. The recovery map: live protocol state in memory.**
+- **What it is.** An ordered map in the store, keyed exactly as the rows are today: intake keys for dependency and proposal rows (Section 17.1's layout), the pending key for payloads, the epoch keys for promises, Syncs and seals. The lowering applies each protocol update to it instead of to a redb table. So `read_protocol` (`coord-storage/src/protocol.rs`), the recovery cut (`cut.rs`) and the `Assigner` read it as they read rows today, through the same `OrderedRead`.
+- **Why the store keeps it, not the machine.** The machine's state on the loop is ahead of the projection and mixes durable state with what isn't journaled yet. The image must hold the state the journal implies at exactly `C`. The lowering already folds the journal in order into rows. Folding it into memory instead keeps that state, at every commit's stamp, with no change to the machine.
+- **Kept as the intake index is (Section 17.1, rules (d) and (e)).**
+  - It is a persistent ordered map: each version shares what didn't change with the one before. So publishing a version a commit costs the commit's updates, not a copy. That is a new dependency (a crate such as `im`), or a B-tree of shared nodes of our own; the code step picks one.
+  - A commit's changes are staged with the commit, and published when it returns OK, together with the read gate and the index.
+  - An uncertain commit holds them with `pending_meta`, and they are published or dropped as the meta read back says.
+  - A quarantine drops the map, and the next open rebuilds it (point 7).
+  - A pipelined commit in flight is lowered over the staged changes of the commits before it, as the index's are.
+- **What it holds, and its bound.**
+  - Commands not yet executed: their dependency rows (the leader's proposal row too) and pending payloads. At most the table's capacity (`MAX_TABLE_CAPACITY`, 1,000), its reserve and a Sync's placeholders: about 2,000 commands at about 1 KB each (a dependency row and an 805-byte payload), so about 2 MB.
+  - **Promises and seals:** the promise, and a seal a configuration epoch, as today.
+  - **Syncs: at most two** (Codex on #258).
+    - Today the lowering keeps a Sync row for every ballot (`sync_key` names it), and trim never drops one (`coord-checkpoint/src/trim.rs`, `classify`). Each is up to about 2 MB (task-d20's cap). Moved into memory as they are, they would grow with every leader change.
+    - Boot reads two of them. One is the synchronized ballot's, whose installation resumes (`Follower::recover_with_syncs`). The other is the promised ballot's when this voter leads it, whose campaign resumes rather than reselects (`RecoveredProtocol::resumable_sync`).
+    - So the map keeps those two, and drops any other once it is neither: when a later Sync is bound here, or a later ballot's synchronization is durable. Nothing reads a dropped one.
+    - The image carries the same two. A store of today's layout is refused (point 1), so none has to be dropped from one.
+    - At most about 4 MB.
+  - At execution the lowering moves the command's payload and dependency row out, as it does today (`assign_executed`, `move_decided`): to the history buffer (point 3), and the payload to the retry window too (point 4). A released command's rows go at the Sync's release, and a pulled command's at its install, as today.
+  - So the map is bounded by the table and two Syncs, not by history or leader changes: about 2 MB of commands, 4 MB of Syncs and the decided overlay (point 3), about 6 MB at the largest, against today's rows, which nothing trims.
+- **Who reads it.**
+  - The lowering, on the materializer's thread, for the store's own writes and the move.
+  - Boot's `read_protocol`, after the attach, when nothing else runs.
+  - The export, which takes the version published with the commit it pins (point 6).
+  - Nothing on the loop reads it while the domain runs: a campaign's report comes from the machine's ledger, which reads no rows (task-d77).
+- **CPU (inferred):** an insert or removal in a persistent map for each protocol update, about 0.3 to 0.5 µs, at about 8 updates a command: 2 to 4 µs a command a voter, against the redb rows' share of the materializer.
+- **Not taken:** a plain map copied at each pin. It would cost a copy of up to about 6 MB a publication on the materializer's thread, and the pin would have to wait for the materializer to reach a commit boundary.
+
+**3. Executed history: a buffer, then segments.**
+- **What executed history is:** for each position, the execution record (command, revision, result digest), the payload, and this node's decided record (the dependency row moved at execution, node-private, with its epoch). Today they are `execution_v1`, `payload_v1` and `decided_v1`.
+- **Who reads it, and how far back:**
+  - a donor (task-d08's catch-up): from the asker's frontier;
+  - a campaign's executed rows (task-d77): commands executed above the slowest reporting voter's frontier;
+  - a divergence stop: around two positions;
+  - boot: the current epoch's decided records, and the executed index's command list (point 7);
+  - trim (task-d27, not run by `coordd`): below the floor.
+  - Resolve no longer does: the retry window carries the request (point 4).
+- **The buffer.** The lowering appends each executed position's three parts to an in-memory buffer as it lowers the executed row, published with the commit. An entry's execution record and payload never change, so a view reads the positions at or below its frontier under a short read lock. Its decided record can change, below.
+- **A decided record can change after execution** (Codex on #258).
+  - A later ballot's re-proposal or Sync can name a command this voter already executed. Its dependency update still reaches the decided record: `Assigner::after_execution` (`coord-storage/src/intake.rs`) writes it over the record at the command's position when it is of the same or a later configuration epoch, and deletes it in its own epoch.
+  - **So the change goes to the recovery map,** under the position's decided key: an overlay over the buffer and the segments, versioned with the rest of the map. `after_execution` writes there in place of `decided_v1`, and a deletion is a tombstone.
+  - **Every reader of a decided record reads the overlay first:** boot's decided records, a donor's page, a campaign's executed rows, and the fence.
+  - **The image carries it** as part of the recovery map at `C`. A journal prefix retired below `C` therefore loses none of it.
+  - **It is folded at the next boundary.** When the checkpoint thread writes a segment, it first writes again each earlier segment the overlay touches, with the overlay's versions in place. That is a new file under the same rule as a segment's first write (temporary name, sync, rename, directory sync). Once the rewrite is durable, the map drops those entries. Until then the overlay stays the first read.
+  - **Its bound:** an executed command is named by a later protocol update only while a recovery's selection or a leader's re-proposal holds it. So the overlay holds at most a table's worth of entries for each leader change between two boundaries, about 0.2 MB each. A rewrite is a segment's write, about 4.5 MB, and happens only after a leader change that named executed commands.
+- **Segments.** When the buffer passes a multiple of `FLOOR_INTERVAL` (4,096 positions), the checkpoint thread writes the 4,096 positions below it as one segment:
+  - one file, written once: to a temporary name, synced, renamed, and its directory synced;
+  - by position: a header (origin, first and last position, format), the entries, and a footer holding each command's 8-byte prefix and position (the executed index's part, point 7), the history digest through the last position, and a checksum;
+  - the buffer drops a segment's positions once the segment is durable;
+  - a segment is never changed in place: the decided overlay is folded into a new file (above).
+  - So the buffer holds at most about two segments' worth: about 9 MB at 1.1 KB a position.
+- **One storage write a segment** is the rule's batch taken to its limit: at the bar's load, a 4.5 MB sequential write every two seconds or so, off the loop, against today's three rows a command in the materializer's commits.
+- **The history digest.** The lowering keeps a running digest over each executed position's replicated part: `blake3(previous ‖ position ‖ command ‖ revision ‖ result_digest)`. The command identity derives from the request (`CommandId::derive`), so the digest covers the payload too. It is node-local state, not a journal or wire field. task-d35's execution chain would replace it if built, since it covers the same.
+- **The common hash and the floor.** `payload_v1` and `execution_v1` leave the common hash. The shared image at a floor boundary carries the history digest through the boundary in their place. Segments end on the floor's boundaries, so the digest through a boundary is the segment's footer, or the buffer's when the segment isn't written yet. Two voters with different executed histories below a boundary still export different roots. The floor's export no longer reads history: today `export.rs` reads `payload_v1` and `execution_v1` up to the boundary, inline on the loop every 4,096 positions.
+- **Not taken:**
+  - **History from the journal by position**, as the batching rule first had it. A command's history is in up to three records at different positions (its intake, its decision, its execution), so the index would cost about 36 bytes a command. Retention would then follow the slowest voter's frontier, and boot reads every retained record at open (`open_existing` walks and verifies them all). The reach would still end somewhere, and the same question would return below it.
+  - **One row a commit in the projection holding the commit's history.** It meets "one write a batch", but it is a second copy written on the hot path: about 0.3 pages a command on the materializer, against segments written off the loop.
+  - **History in memory:** about 1.1 KB a command, without bound until task-d27.
+
+**4. The retry window in memory.**
+- **What it holds:** each retained result (`RetryRecordV1`) and each client's floor and width, as `retry_v1` and `retry_floor_v1` do today. Each retained result also holds its command's request, the payload's logical request, moved there at execution (point 2).
+- **Why the request.** A resolve authorizes a retained result against its request (`requested`, `bins/coordd/src/serve.rs`), which today reads `payload_v1` at the retry row's position. With the request beside the result, a resolve reads no history. A retained result can outlive any history a voter keeps, since an idle client keeps its last results until its session ends. A restored domain's resolves then work too.
+- **Versioned for views,** as task-d105's key index is. Each entry keeps its versions by execution position. A view reads the newest at or below its frontier, and versions behind the oldest pinned view are dropped. The planning view's overlay (the group's own writes) is unchanged.
+- **Its readers:** planning (`retry::admit`, `lookup`, `floor`, `retirement`), resolve (`resolve_retained`, `requested`), settlement from the record (`records_for`, `conflicts_for`), release-again (`voter.rs`), and the shared and local exports. Each reads memory instead of a redb get, which is proposal 1's gain, not counted here.
+- **Its bound is task-d26's.** At most the width plus task-d104's `K` retained results a client, each up to the request and response limits. In steady state a client acknowledges each request, so it holds one or two. The bench's 120 clients hold about 240 results, about 0.3 MB. A domain of many clients that never acknowledge reaches the contract's bound, which is memory now, not disk, so task-d26's contract has to state it as memory.
+- **It agrees with task-d104 (#207):** its batched retirement and its window that overwrites in place both still apply, to memory.
+
+**5. `meta_v1` once a commit.**
+- Today application batches put `kv_revision`, `retention_floor` and `lease_authority` as ordinary updates (`materialize.rs`): about one meta row a command in the audit. The stamp and the execution frontier are already written once a commit (`DurableMeta::write`).
+- The lowering keeps the last put of each `meta_v1` key in a commit and writes it once. Nothing reads the values in between from the projection: the planning view's overlay holds the group's own, and the recovery cut lays the journal's updates over its snapshot as they are.
+- It needs no format change, and it is its own small PR, first.
+
+**6. The images, and what journal retention depends on.**
+- **The local image at `C`** holds:
+  - the projection's application collections at `C`, as today;
+  - the recovery section: the recovery map at `C`;
+  - the retry window at `C`;
+  - its history boundary: the end of the last segment durable at the pin;
+  - the history tail: every executed position above the boundary, through `C`'s execution position. That is at most about two segments' worth, when a segment's write is still in flight at the pin.
+- **The pin.** `pin_local` takes the recovery map's version, the retry window's versions and the buffer's entries as published with the commit it pins, so all three are at the projection's snapshot's stamp.
+- **A publication's order (Section 17.16.3, step 2, extended).** An image names only segments already durable, and carries every executed position above them. So once the image is durable, the pointer may be appended, as today. A segment that becomes durable after the pin is above the image's boundary, which is harmless (boot, step 4).
+- **What journal retention depends on.** The prefix through `C` is retired once the pointer is durable, as today. Nothing else pins the journal:
+  - the recovery map and the retry window are in the image at `C`;
+  - executed history at or below `C` is in segments or the image's tail;
+  - no reader of history reads the journal.
+
+  So the journal's length stays bounded by the publication's cadence (4,096 records under `strict`; 65,536 records and 30 s under `replay`) and the tolerance of `J − C` (Section 17.16.3), as today.
+- **Under `strict` the projection no longer recovers alone.** Its application rows are durable at every commit, as now. The recovery state is in the image at `C` and the journal above it. So under both profiles boot reads the image and replays `(C, J]` into memory.
+- **The image is smaller.** Today `export_local` copies every collection, executed history included, at every publication. After step 4 it copies the application state, the recovery section, the retry window and at most about two segments of history. That saves checkpoint-thread work that grows with history; it isn't sized here.
+- **Segments are reclaimed at the floor** (task-d27): a segment wholly below the forgetting floor goes whole. Until `coordd` runs task-d27, nothing reclaims them, as nothing trims executed rows today.
+
+**7. What each reader reads, its cost and its bound.**
+
+| Reader | Today | Under this step | Cost | Bound |
+| --- | --- | --- | --- | --- |
+| Boot (`read_protocol`, `restore_execution`, `restore_payloads`) | the epoch's protocol rows, all of `execution_v1`, the epoch's `decided_v1`, the pending payloads, `payload_v1` for executed records | the recovery map (image at `C`, then `(C, J]`); the executed index from the segments' footers and the buffer; the epoch's decided records from the segments and the buffer | the recovery replay below; the footers at about 16 bytes a command, against today's scan of `execution_v1` | the recovery replay by the publication's cadence; the footers by history, as today, until task-d27 |
+| Catch-up served (`catch_up::page`, task-d08) | a range of `execution_v1`, then `payload_v1` and `decided_v1` by position | the buffer above the last segment; one segment's range below | one sequential read a page, against three point reads a command | what segments keep, as today's rows: everything until task-d27 |
+| A campaign's report | the machine's ledger, no rows | unchanged | none | the table |
+| A campaign's executed rows (task-d77, `catch_up::executed_rows`) | the index's executed part, then three rows | the index's executed part, then the buffer or a segment | a point read in a segment | as catch-up |
+| Resolve (`retained_answer`, `requested`) | `retry_v1`, then `payload_v1` at its position | the retry window, with the request | a lookup in memory | task-d26's retained results |
+| Settlement from the record (`records_for`, `conflicts_for`) and release-again | `retry_v1` | the retry window | a lookup in memory | the same |
+| Planning (`retry::admit`, `retirement`) | `retry_v1`, `retry_floor_v1` through the planning view | the retry window at the view's frontier, with the group's overlay | a lookup in memory | the same |
+| A divergence stop (`mismatch`, `executed_near`) | `execution_v1` around two positions | the buffer or a segment around them | once, at a stop | as catch-up |
+| Trim and its fence (task-d27; no production caller) | `protocol_v1` and `decided_v1` surveyed; `execution_v1` by the index | segments below the floor go whole; the recovery map holds no executed command, so there are no protocol rows to plan | a file delete a segment | the floor |
+| The floor's shared image | `payload_v1` and `execution_v1` to the boundary, inline on the loop | the history digest at the boundary, and the retry window | none for history | none |
+| The local image | every collection | point 6 | O(application state + 2 segments) | the publication |
+
+- **The decided overlay** (point 3) is read first by every reader above that reads a decided record.
+- **The executed index** (Section 17.1, point 1: command prefix to position) stays in memory. It is rebuilt at open from the segments' footers and the buffer, instead of from a scan of `execution_v1`. A campaign's rows, a stop and the fence use it as today.
+- **The intake part of the index** stays as it is: the recovery map keeps intake keys, so the store's own writes find a command's row through it.
+- **`plan_trim`, `TrimFence::command`, `retire_updates` and `executed_order`** have no production caller today. They are rewritten against segments when task-d27 wires trim. Whether the fence's command lists outlive the segments' bodies is task-d27's to settle.
+
+**Boot, step by step.**
+1. The journal opens, walking its retained records, as today: at most `J − C`.
+2. The projection opens. It is smaller: no protocol or history tables.
+3. The baseline is read (`recovery_baseline`), and the image at `C` is loaded, as today. Its recovery section, retry window and history tail load into memory. Under `replay`, an invalid projection is reinstalled from the image's application part, as today.
+4. The segments' footers are read for the executed index. A segment above the image's history boundary is checked against what the replay below rebuilds: equal, it is kept; torn or different, it is written again.
+5. **The recovery replay:** `(C, J]` is lowered into the recovery map, the retry window and the buffer. `(M, J]` is lowered into the projection's application rows too, as today, where `M` is the projection's stamp. The records `(C, M]` are lowered into memory only, since their application rows are already in the projection.
+6. `read_protocol` reads the recovery map, the buffer and the segments, and the voter starts.
+
+**Its cost (inferred):** the recovery replay lowers into memory, a few µs a record. Under `strict` that is at most 4,096 records, about 10 to 30 ms. Under `replay` it is at most 65,536 records, about 0.2 to 0.4 s, or what `J − C` reached after a failed publication. Against that, the open no longer scans `protocol_v1` (task-d113's intake index: about 0.9 s at 10⁶ rows) or `execution_v1`. The boot line gains the phases: `recovery_section`, `recovery_replay` and `segments`. Acceptance reads them at 10⁵ and 10⁶ commands. The owner accepts "(reasonable) recovery time for maximum throughput"; this is a bounded addition, not one that grows with history.
+
+**8. The crash matrix and fault runs it re-earns.**
+
+**The crash cuts, each a test at every cut under `strict` and `replay`:**
+- **Every operation of the journal and the projection,** task-j05's composed matrix (#212, not yet on the carry; the code steps wait for it). The recovered machine (`read_protocol` over the recovery map) and the retry window equal what a replay of the whole journal into an empty store gives. Today's checks of the protocol and executed rows become checks of the map, the window and the history.
+- **Every step of a publication with its segment:**
+  - a segment durable and the image not: the prior image and its history boundary hold, and the segment above the boundary is checked at boot (boot, step 4);
+  - the image durable and its pointer not: the prior image holds, and the new files aren't selected;
+  - the pointer durable and retirement not: the new image and the overlap replay without double effects;
+  - **negative control:** an image that names a segment not yet durable, then a crash, is caught: the retired prefix holds history that neither a segment nor the image has.
+- **Every step of a segment's write** (temporary file, sync, rename, directory sync): a crash leaves no segment or a whole one.
+- **The decided overlay:**
+  - a decided record changed after its segment is durable, then a crash before the fold: boot reads the change from the image's recovery map and `(C, J]`, not the segment's older version;
+  - a crash at each step of the fold's rewrite: the old segment or the new one, and the overlay until the new one is durable;
+  - **negative control:** a fold that drops the overlay's entries before the rewrite is durable, then a crash, is caught: boot reads the older decided record.
+- **Syncs superseded:** a crash between binding a later Sync and dropping an earlier one keeps the two boot reads; a boot after many leader changes holds at most two.
+- **A damaged segment:**
+  - below the image's history boundary, its positions are in no journal, so the node quarantines, as for a damaged image (`coord-checkpoint/tests/local.rs`);
+  - above it, boot writes it again from the replay.
+- **The recovery replay stopped part way and restarted:** it writes only memory, so it starts again.
+- **An uncertain commit, settled both ways:** the recovery map, the retry window and the buffer are left as the store has them (rule (d)).
+- **A pipelined commit taken back by `settle`:** its staged changes go with it.
+- **Under `strict`:** a projection at `M` with the recovery state from the image at `C` and `(C, J]`.
+
+**The tests today that rest on the rows, each rewritten to the same claim:**
+- `coord-storage`:
+  - `journaled_real.rs`: the matrices at every projection write and sync, under `strict`, under `replay` with a cadence, and around a publication;
+  - `replay_profile.rs`: lost working commits replayed, the cadence, a publication that syncs before it retires, a projection behind the baseline;
+  - `journaled.rs`: the recovery cut behind materialization, replay restoring exact state, the seal recovered through the cut, a replaced node;
+  - `composed.rs`: boot between the record and the projection, a promise recovered before materialization, a group's boot;
+  - `pipelined.rs` and `appender.rs`: a boot with a commit or an append out;
+  - `intake.rs`: boot rebuilding the same machine, the cut over a rewrite or a delete not yet materialized, a replay writing the same keys.
+- `coord-checkpoint`: `cycle.rs` (a retired prefix recovered from the image and the suffix), `local.rs` (the image is the whole recovery state, a crash at each publication step, a damaged image, an installed image equal to the pinned state), `off_thread.rs` and `pointer_job.rs`.
+- `coordd`: `cli.rs`'s restart, a restarted replica recovering what it owed, a baseline published and come back on, answers kept across a restart, a killed and restarted leader, a late restart catching up; `store.rs`'s reinstall cases; and `coord-daemon/tests/node.rs`'s resolve after a pipelined boot.
+- **Unchanged:** `recovery.rs` (the reference store keeps its rows), and the simulators. `protocol_sim.rs` and `catch_up.rs` restart from a model of the durable rows, which stands for the logical state recovery gives back, not for the layout.
+
+**The fault runs** (testing's, on the runner, after each step):
+- a follower killed under load and restarted: its boot line, and catch-up served from the donors' buffers;
+- a follower down longer than a segment and longer than a publication interval: catch-up served from segments;
+- the leader killed: the campaign, and task-d77's executed rows from history;
+- a kill during a publication, between the segment and the pointer;
+- under `replay`, a lost projection reinstalled from the image;
+- a retry after a kill, answered from the rebuilt retry window, and a resolve after a restore from backup.
+
+**9. Sizes.** On the batching rule's terms (Sections 3 and 7): local µs a command over five voters, then ms an operation at 0.66 commands an operation, and the 7763 scaled at the materializers' 1.37.
+- **Gross:** −185 µs a command at the materializers (the batching rule's Section 4.1, range −175 to −195).
+- **What this design adds back (inferred):** the recovery map's updates, 2 to 4 µs a command a voter; the buffer and the digest, about 1; the retry window's versions, about 1; the segments' write, about 0.3 a command off the loop. That is 4 to 6 µs a voter, +20 to +30 µs five voters.
+- **Net:** about −155 to −165 µs a command: **−0.10 to −0.11 ms an operation locally, −0.14 to −0.15 on the 7763.**
+- **By code step,** split by each step's share of the rows that leave (the pair reads each):
+
+| Step | Rows a command, follower | Gross µs | Added µs | Net, ms an operation locally |
+| --- | ---: | ---: | ---: | ---: |
+| 1. `meta_v1` once a commit | −0.9 | −10 (its leaf is copied anyway) | 0 | −0.007 |
+| 2. Live protocol state in the recovery map | −4.4 | −69 | +10 to +20 | −0.032 to −0.039 |
+| 3. The retry window | −3.5 | −55 | +5 | −0.033 |
+| 4. Executed history in segments | −3.0 | −47 | +5 | −0.028 |
+
+- **Not counted:** the retry and planning reads served from memory (proposal 1's), the image's smaller export, and the floor's export reading no history. None of them shows in a 25 s pair.
+
+**10. The order of the code steps.** One PR each, each with its own pair (the counting build's bytes by table, and the materializer's µs a command at each voter) and its crash tests:
+1. **`meta_v1` once a commit.** No format change. It can go now.
+2. **Live protocol state in the recovery map,** with the image's recovery section and the recovery replay. Node-private only: no image shared, no common hash changed. It needs task-j05's composed matrix on the carry first.
+3. **The retry window,** with the request beside each result. It changes the common hash's `retry_v1` and both images. It goes before step 4, so that step 4 owes resolve nothing.
+4. **Executed history in segments,** with the history digest in the floor's root.
+
+**What it supersedes:** task-d103's proposal row (the row leaves with step 2), task-d104's retry rows (its rules apply to the window in memory), lever 6's part 2 (the retry window in memory), and, for the rows that leave, task-d113's keying by order. task-d113's intake keys and its index stay, in memory.
 
 <a id="s18"></a>
 ## 18. Deterministic core and production execution
