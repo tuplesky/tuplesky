@@ -734,6 +734,21 @@ class CheckpointTests(unittest.TestCase):
         self.assertIn("**The intake index**", text)
         self.assertIn("| n1 | 1000 | 40 | 0.00 | 800 | 2.00 | 0.80 |", text)
 
+    def test_what_ended_each_hold(self):
+        cost = {"executed": 1000, "busy": {"secs": 1, "nanos": 0}, "uptime": {"secs": 60, "nanos": 0},
+                "recent": {"Unavailable": "NotInstrumented"}, "reads": {"served": 0}}
+        line = "metrics " + json.dumps({"stages": [], "cost": {"Observed": cost}}) + "\n"
+        self.assertNotIn("**What ended each hold**", self.summarize(line))
+        # A build with the counts but no hold: no table either.
+        cost["hold_ends"] = {"full": 0, "deadline": 0, "read": 0, "settle": 0, "other": 0}
+        line = "metrics " + json.dumps({"stages": [], "cost": {"Observed": cost}}) + "\n"
+        self.assertNotIn("**What ended each hold**", self.summarize(line))
+        cost["hold_ends"] = {"full": 10, "deadline": 5, "read": 80, "settle": 3, "other": 2}
+        line = "metrics " + json.dumps({"stages": [], "cost": {"Observed": cost}}) + "\n"
+        text = self.summarize(line)
+        self.assertIn("**What ended each hold**", text)
+        self.assertIn("| n1 | 100 | 10 (10%) | 5 (5%) | 80 (80%) | 3 (3%) | 2 (2%) |", text)
+
     def test_the_voters_table_shows_the_history_sweep(self):
         cost = {"executed": 1000, "busy": {"secs": 1, "nanos": 0}, "uptime": {"secs": 60, "nanos": 0},
                 "recent": {"Unavailable": "NotInstrumented"}, "reads": {"served": 0}}

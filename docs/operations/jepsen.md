@@ -474,7 +474,9 @@ per command and, where the line has them, the groups by what they carried
 (task-d84, task-d86). From a build with task-d113's index, a table after
 that gives each voter's `intake_index`: its live entries and the executed
 part's, with the MiB the line infers for each and the executed entries per
-command executed.
+command executed. From a build with task-d86's counts, another gives what
+ended each voter's held projection commits (`cost.hold_ends`): the count,
+the wait, a read due, a settle's look or another ask, each with its share.
 
 | Scenario | Workload | Faults (SwiftPaxos) | Load | Network | Time |
 | --- | --- | --- | --- | --- | --- |

@@ -1845,6 +1845,40 @@ def intake_index_table(voters: dict) -> list[str]:
     out.append("")
     return out
 
+
+# task-d86's causes for a held commit's end, in the line's order.
+HOLD_ENDS = (("full", "records reached the count"), ("deadline", "its wait ran out"),
+             ("read", "a read due"), ("settle", "a half-established entry's look"), ("other", "another ask"))
+
+
+def hold_ends_table(voters: dict) -> list[str]:
+    """What ended each commit lent while a hold applied (task-d86), from
+    each voter's last `metrics` line's `cost.hold_ends`, by cause, with
+    each cause's share; [] from a build without it, or where no voter held
+    a commit."""
+    rows = []
+    for node, v in voters.items():
+        ends = (v.cost.raw or {}).get("hold_ends") if v.cost else None
+        if isinstance(ends, dict) and sum(ends.get(k, 0) for k, _ in HOLD_ENDS):
+            rows.append((node, ends))
+    if not rows:
+        return []
+    out = [
+        "**What ended each hold** (task-d86, each voter's last boot, from its last `metrics` line's "
+        "`cost.hold_ends`: each projection commit lent while the hold applied, by what ended its hold: "
+        + "; ".join(f"`{k}`, {what}" for k, what in HOLD_ENDS)
+        + "; each with its share of the voter's held commits)",
+        "",
+        "| Node | Held commits | " + " | ".join(f"`{k}`" for k, _ in HOLD_ENDS) + " |",
+        "| --- " * (2 + len(HOLD_ENDS)) + "|",
+    ]
+    for node, ends in rows:
+        total = sum(ends.get(k, 0) for k, _ in HOLD_ENDS)
+        cells = " | ".join(f"{ends.get(k, 0)} ({100 * ends.get(k, 0) / total:.0f}%)" for k, _ in HOLD_ENDS)
+        out.append(f"| {node} | {total} | {cells} |")
+    out.append("")
+    return out
+
 # task-d97's distributions, in command_cost.py's order, with what each is.
 TAIL_ROWS = (
     ("answered_writes", "Writes, arrival to answer, at the node that took them"),
@@ -3211,6 +3245,7 @@ def summarize(store: str, nodes: list[str], title: str, profile: str | None = No
         out.extend(admission_table(store, nodes))
         out.extend(journal_table(voters))
         out.extend(intake_index_table(voters))
+        out.extend(hold_ends_table(voters))
         out.extend(leader_groups_series(voters))
         out.extend(tails_table(voters))
         timed = [(node, name, r) for node, v in voters.items() for name, r in v.stages.items() if r[1] or r[2]]
