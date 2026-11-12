@@ -4161,7 +4161,11 @@ The code is the testing session's (#98, `f1a1fc67`); this task adds its plan ent
 - The payload, dependency and executed rows are keyed by the command's digest, so each lands on a leaf no other command in the commit touches. Page work is 74 to 86% of the thread.
 
 This entry is task-d72's largest single cut on the materializer, owned here. The design step is in Section 17.1, and it answers the six questions the lead set:
-1. **The index by command.** Boot, catch-up served and resolve need none: boot reads every row it joins, and catch-up and resolve read by position (resolve through `RetryRecordV1::position`). A campaign's executed rows, trim, a divergence stop and the store's own rewrites and deletes do need one. It lives in memory in the store: from an 8-byte prefix of the command to the row's intake order and its position. It writes no page, takes about 24 to 32 bytes a live row, and is rebuilt at open from rows boot already reads.
+1. **The index by command.** Boot, catch-up served and resolve need none: boot reads every row it joins, and catch-up and resolve read by position (resolve through `RetryRecordV1::position`). A campaign's executed rows, trim and its fence (`TrimFence::command`), a divergence stop and the store's own rewrites and deletes do need one. It lives in memory in the store, keyed by an 8-byte prefix of the command, in two parts:
+   - **the intake part:** each live pending payload or dependency row to its intake order, about 24 to 32 bytes a row;
+   - **the executed part:** each retained `execution_v1` row to its position, about 16 to 24 bytes an executed command. It lives as long as the executed row, so the fence and a stop still find a command after trim or a shared-image install has left it no protocol rows (Codex on #233).
+
+   Neither part writes a page. The intake part is rebuilt at open from the dependency rows boot already reads. The executed part is rebuilt from the scan of `execution_v1` that boot makes anyway (today's `read_history` reads all of `executed_v1`), at about 0.1 s for 10⁶ rows, and at a shared image's install from its `execution_v1` rows.
 2. **The order.** Executed rows and executed payloads take the execution position, which is replicated and always appended, since no voter executes out of position order (`JournaledStore::submit`, `project`). Payload and dependency rows before execution take intake order, the journal position of the record that brings them, which is node-private.
 3. **The format.** One layout a domain, recorded at initialization and checked at every open, as task-d105's step sets (#208); the other is refused with the reason. The shared image's version is raised. The journal's records don't change, since the store's lowering assigns the keys. No existing projection moves: nothing is deployed. `replay` can rebuild only above its local image, so under either profile a move would convert an image, offline and losslessly. That conversion isn't built.
 4. **Forgetting and the image.** task-d110's sweep and task-d111's forgetting by order read no rows. task-d27's trim, not yet run by `coordd`, scans in intake order and takes positions from the index. The shared image reads `execution_v1` and `payload_v1` as ranges, without today's point read per payload.
@@ -4194,6 +4198,7 @@ This entry is task-d72's largest single cut on the materializer, owned here. The
   - a resolve of an executed command finds its request by the retry row's position;
   - a campaign gets its executed rows through the index;
   - trim plans the same deletions as today over the same history;
+  - after trim has removed an executed command's protocol rows, and on a voter that installed a shared image, the fence answers `BelowFloor` for a command executed at or below the floor, across a restart, with the executed part rebuilt from `execution_v1`; it answers `Admit` for a command never executed;
   - a replay of the journal suffix writes the same keys as the first lowering;
   - every voter's export root agrees at each floor boundary;
   - a store or image of the other layout is refused with the reason;
@@ -4202,7 +4207,7 @@ This entry is task-d72's largest single cut on the materializer, owned here. The
   - Fresh pages a command at a follower fall from 9.4 to about 7.0 to 7.4 at 120 callers and 7.8 to 8.1 at 30. A reading outside that says which term of the residual was wrong.
   - The materializer's µs a command at each voter is read beside it.
 - **The runner pair** is in the batch job (task-d72).
-- **The index's memory and open time** are read at 10⁵ and 10⁶ live rows.
+- **The index's memory and open time** are read at 10⁵ and 10⁶ live rows and retained executions.
 
 **Review boundary:** Where the projection keeps the payload, dependency and executed rows, and how their readers find them. No change to the journal's records, the protocol, what a vote rests on or what is released. The shared image's format changes under a raised version, and a domain runs one layout.
 

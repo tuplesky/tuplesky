@@ -1815,23 +1815,31 @@ Protocol state cannot be reduced to a Raft-like last_applied: application snapsh
 | A campaign's executed rows (`catch_up::executed_rows`, task-d77) | `catch_up_entry` by command | the dependency row through the index | yes |
 | Resolve (`retained_answer`'s `requested()`, `bins/coordd/src/serve.rs`) | `payload_v1` by command | the retry row, read by retry key as now, names the position (`RetryRecordV1::position`); the payload is `payload_v1` at that position | no. A resolve is answered with a result only from a retry row, and only then is the request needed |
 | Settling from the record (`records_for`, `coord-daemon/src/settle.rs`) | retry rows | unchanged | no |
-| Trim (`plan_trim`, `classify`, `executed_within`, `coord-checkpoint/src/trim.rs`; `coordd` doesn't run it yet, task-d27) | scans the protocol rows; reads `executed_v1` by command for each dependency row | scans them in intake order; takes the position from the index | yes |
-| A divergence stop (`catch_up::mismatch`'s `executed_record`; `settle::executed_near`, which scans all of `executed_v1`) | by command; a whole-table scan | a range of `execution_v1` around the two positions; the command's own row through the index, or by one scan at the stop | once, at a stop |
+| Trim (`plan_trim`, `classify`, `executed_within`, `coord-checkpoint/src/trim.rs`; `coordd` doesn't run it yet, task-d27) | scans the protocol rows; reads `executed_v1` by command for each dependency row | scans them in intake order; takes the position from the index's executed part | yes |
+| The trim fence (`TrimFence::command`, `coord-checkpoint/src/trim.rs`; a library reader whose only callers are tests today, for task-d27's wiring) | `executed_v1` by command, after trim has removed the command's protocol rows; no row means `Admit` | the index's executed part gives the position, and `execution_v1` at that position confirms the command; no entry means `Admit`, as today | yes, and it must outlive the protocol rows (Codex on #233) |
+| A divergence stop (`catch_up::mismatch`'s `executed_record`; `settle::executed_near`, which scans all of `executed_v1`) | by command; a whole-table scan | a range of `execution_v1` around the two positions; the command's own row through the index's executed part | once, at a stop |
 | The store's own writes: ACCEPT's rewrite, a pulled command's `dependency_delete` (task-d08), `payload_delete` (task-d24), the move | by key | through the index | yes |
 
-So boot, catch-up served and resolve need no index by command here. Boot reads every row it joins, and catch-up and resolve read by position. What does need it is the campaign, trim, a stop and the store's own writes.
+So boot, catch-up served and resolve need no index by command here. Boot reads every row it joins, and catch-up and resolve read by position. What does need it is the campaign, trim and its fence, a stop and the store's own writes.
 
-**The index lives in memory, in the store.** It maps an 8-byte prefix of each live intake-keyed row's command identity to the row's intake order, and to its execution position once it has one. The row's value carries the whole identity, so a prefix collision is settled by reading the row.
-- **Pages: none.** No durable row is written for it, so it can't put the random leaf back.
-- **Built at open** from the dependency rows boot already reads, and one scan of the pending payloads, which hold only what is not executed.
+**The index lives in memory, in the store, in two parts with their own lifetimes** (the second from Codex's review on #233). Each maps an 8-byte prefix of a command identity, and the row named carries the whole identity, so a prefix collision is settled by reading the row. A prefix held by two commands keeps both entries.
+- **The intake part:** each live intake-keyed row, a pending payload or a dependency row, to its intake order. An entry lives as long as its row: it goes at the move, at a Sync's release, at a pulled command's `dependency_delete` and at trim.
+- **The executed part:** each retained `execution_v1` row to its position. An entry lives as long as the executed row, not the intake rows. After trim has removed a command's protocol rows, or on a voter that installed a shared image and never held them, the fence, a stop and trim still find the command's position.
+- **Pages: none.** No durable row is written for either part, so neither puts the random leaf back.
+- **Built at open:**
+  - the intake part from the dependency rows boot already reads, and one scan of the pending payloads, which hold only what is not executed;
+  - the executed part from the scan of `execution_v1` that boot makes anyway. Today `read_history` reads all of `executed_v1`, so the open reads no more pages than it does now.
+  - A shared image's install builds the executed part from the image's `execution_v1` rows, whose values carry the command.
+- **The open's cost (inferred):** an insert for each executed row read, about 0.1 µs, so about 0.1 s at 10⁶ retained executions, beside the read boot already makes of them: about 90 bytes a row, some 22,000 pages at 10⁶.
 - **Kept by the lowering.** Each commit's changes are published with the commit. A reader pins its snapshot first and then asks the index:
   - a row added after the snapshot reads as absent, which is that snapshot's answer;
   - a row deleted after the snapshot reads as absent too, which is a later snapshot's answer and what its reader would get next.
-- **Memory (inferred):** about 24 to 32 bytes a live row.
-  - Live rows are the pending payloads and every dependency row the store keeps. In `coordd` today that is every dependency row, since nothing trims (task-d27).
-  - It is the same order as what boot already loads, every dependency row and every executed identity.
+- **Memory (inferred):**
+  - The intake part takes about 24 to 32 bytes a live row: the pending payloads and every dependency row the store keeps. In `coordd` today that is every dependency row, since nothing trims (task-d27).
+  - The executed part takes about 16 to 24 bytes for each executed command retained, an 8-byte prefix and an 8-byte position with the map's overhead. That is every executed command until a floor forgets a prefix of `execution_v1`, about 24 MB at 10⁶.
+  - Both are the same order as what boot already loads, every dependency row and every executed identity at 32 bytes each.
   - `ExecutedOrder`'s 32 bytes an executed command goes.
-- **CPU (inferred):** a map insert or removal for each row lowered: under a microsecond a command a voter, below 0.001 ms an operation.
+- **CPU (inferred):** a map insert or removal for each row lowered, one more insert for each command executed: under a microsecond a command a voter, below 0.001 ms an operation. The sizes below are unchanged by the executed part.
 - **Not taken:**
   - a durable index keyed by command, which is the random leaf again;
   - a durable index batched by order (one row a commit listing its commands). It would let the open read about 40 bytes a command instead of dependency rows, but the open reads those anyway.
@@ -1874,7 +1882,7 @@ So boot, catch-up served and resolve need no index by command here. Boot reads e
   - The layout doesn't touch them.
 - **Durable forgetting is task-d27's trim, and `coordd` doesn't run it yet.** No payload, executed, dependency or proposal row is reclaimed today.
   - Its plan scans the protocol rows through the floor's epoch, and for each dependency row reads `executed_v1` by command to see whether it executed at or below the boundary (`executed_within`).
-  - Under order keys it scans the same range in intake order and takes the position from the index. Its deletes fall in runs of intake order, not one leaf each.
+  - Under order keys it scans the same range in intake order and takes the position from the index's executed part. Its deletes fall in runs of intake order, not one leaf each.
 - **Once a floor forgets executed history,** the prefix of `execution_v1` and `payload_v1` below it is one range delete. Today nothing deletes either, and `executed_v1` is read whole at boot (`read_history`) and at a donor's first catch-up ask.
 - **The shared image** (`export.rs`'s `traverse`, inline on the domain's loop every `FLOOR_INTERVAL`, 4,096 positions, `coord-daemon/src/floor.rs`).
   - Today it reads `executed_v1` once for every `payload_v1` row, to keep the executed ones.
