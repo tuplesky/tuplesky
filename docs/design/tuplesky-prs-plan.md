@@ -1943,6 +1943,10 @@ The metrics line now carries the table (`table`): its records against its bound,
 
 **The admission rate's scope: the owner's decision, for now (2026-11-11).** `limits.max_admitted_per_second` stays a bound for each frontend, and its default stays 1,000 a second. #228 counts its refusals and states it in every bench reading, and changes neither. What this leaves open: the rule above, that the admitted rate stays below the rate a catching-up voter executes, does not hold on the defaults for a domain of several frontends. Three frontends admit up to 3,000 a second and five up to 5,000, against 1,540 to 1,610 a second caught up under load at a page of 64 (#98, 6806617592). The question is revisited against the rate the rejoin PR (a page of 125, one page asked ahead) measures.
 
+**Open after #232 (#228's follow-ups; review, nothing blocking).**
+- **The two new tests guard the extracted functions, not their calls.** `caller::uncompleted` (`coord-wan-bench`) and `serve::refused_at_admission` (`coordd`) are each tested, but with either call taken out of its caller every test still passes. That part of #228's finding is still open: each needs a test through its caller (the bench's classification of a call, the stage's count of a frame).
+- **A read ordered late at a full collector** is counted on the `admission` line (`collection_bound`) but not as refused at the admission stage. The stage's refused count and the line disagree by those reads.
+
 <a id="task-d27"></a>
 ### task-d27: Wire quorum-safe forgetting into coordd
 
@@ -3927,6 +3931,8 @@ So every feature-gated change, task-d98's `EarlyProposal` first, would ship unre
 - `coordctl`'s command works against a running domain;
 - the harnesses' activation runs.
 
+**Open after #231 (#227's follow-ups; review, nothing blocking):** the id check in `installed_record` (`coord-checkpoint/src/feature.rs`, the runtime install path) has no test. Its control fails nothing: with the check taken out, every test passes. A test installs a peer's activation naming an id this build doesn't know and expects `TooOld { unknown }`.
+
 **Review boundary:** How a feature becomes active in a running domain. No feature's behavior changes here.
 
 <a id="task-d100"></a>
@@ -3982,6 +3988,8 @@ So every feature-gated change, task-d98's `EarlyProposal` first, would ship unre
   - a local pair for each step, with frames and datagrams a command, the followers' `on_request`, rows and journal groups a command at a follower, the voters' CPU an operation and the leader's tokio CPU a command, and the fast share, at 30 and 120 callers;
   - the switch's settings chosen from a pair against the `service` row's p99;
   - the runner pair for each step in the batch job (task-d72), step A's before step B is built.
+
+**Open after #230 (#224's follow-ups; review, nothing blocking):** repair's model (`coord-daemon/tests/repair.rs`) has three voters, so the leader-change case where the follower that adopted a relayed command is outside the new leader's quorum is covered only by the simulator's relay rows. A five-voter case in repair's model, with the adopter outside the campaign's majority, would cover it directly.
 
 **Review boundary:** How a write reaches the voters and how its result reaches the collector. No change to the learning predicates, recovery, what a vote rests on, or the result's bytes.
 
