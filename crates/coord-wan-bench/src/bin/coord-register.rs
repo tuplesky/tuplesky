@@ -480,7 +480,22 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
     let rendered = serde_json::to_string_pretty(&summary)?;
     std::fs::write(&cli.summary, &rendered)?;
     println!("{rendered}");
-    Ok(violations.is_empty() && counts.malformed_reads == 0)
+    verdict(&counts, violations.len()).map_err(Into::into)
+}
+
+/// The run's verdict: linearizable (`true`), a violation or a malformed
+/// read (`false`), or no verdict when no operation completed. An empty
+/// history checks clean, so a run whose callers never reached a frontend
+/// would otherwise pass; it is a run that did not happen (exit 2).
+fn verdict(counts: &Counts, violations: usize) -> Result<bool, String> {
+    if counts.reads + counts.writes == 0 {
+        return Err(format!(
+            "no operation completed ({} reads not completed, {} writes unknown, {} reconnects): \
+             the run did not happen",
+            counts.lost_reads, counts.unknown_writes, counts.reconnects
+        ));
+    }
+    Ok(violations == 0 && counts.malformed_reads == 0)
 }
 
 #[cfg(test)]
@@ -517,6 +532,24 @@ mod tests {
                 lease_generation: None,
             },
         }
+    }
+
+    #[test]
+    fn a_run_that_completed_no_operation_has_no_verdict() {
+        let mut counts = Counts {
+            lost_reads: 7,
+            reconnects: 3,
+            ..Counts::default()
+        };
+        let none = verdict(&counts, 0).expect_err("an empty history is no verdict");
+        assert!(none.contains("no operation completed"), "{none}");
+        counts.reads = 1;
+        assert_eq!(verdict(&counts, 0), Ok(true));
+        assert_eq!(verdict(&counts, 1), Ok(false));
+        counts.reads = 0;
+        counts.writes = 1;
+        counts.malformed_reads = 1;
+        assert_eq!(verdict(&counts, 0), Ok(false));
     }
 
     #[test]
