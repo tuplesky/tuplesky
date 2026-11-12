@@ -565,6 +565,24 @@ def booted(at: str, executed: int, replayed: str | None = None) -> str:
     return "\n".join(lines) + "\n"
 
 
+class LeadLineTests(unittest.TestCase):
+    """A voter's uptime counts from its runtime, after the store opens, so
+    its lines are its boot's start plus that time plus their uptime."""
+
+    def test_a_boots_time_to_its_runtime_moves_its_lines(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "coordd.log")
+            with open(path, "w") as f:
+                f.write("2026-09-27 10:00:00 Jepsen starting /opt/tuplesky/coordd\ncoordd domain=d roles=[Voter]\n")
+                f.write('metrics {"cost":{"Observed":{"uptime":{"secs":10,"nanos":0}}}}\n')
+                f.write("2026-09-27 10:01:00 Jepsen starting /opt/tuplesky/coordd\ncoordd domain=d roles=[Voter]\n")
+                f.write("this voter leads ballot 3\n")
+                f.write('metrics {"cost":{"Observed":{"uptime":{"secs":10,"nanos":0}}}}\n')
+            t = lambda s: datetime.datetime(2026, 9, 27, 10, 0, 0) + datetime.timedelta(seconds=s)
+            self.assertEqual(js.lead_lines(path), [(3, t(60), t(70))])
+            self.assertEqual(js.lead_lines(path, [(0.0, 0.0), (8.0, 7.0)]), [(3, t(68), t(78))])
+
+
 class BootTests(unittest.TestCase):
     """task-d55: every start of every voter, with what its attach replayed."""
 
@@ -592,9 +610,27 @@ class BootTests(unittest.TestCase):
     def test_the_table_has_a_row_a_boot(self):
         text = self.summarize(self.LOG)
         self.assertIn("**Boots** (every start of each voter", text)
-        self.assertIn("| n1 | 1 | 2026-10-03 01:41:25 | 0 | 0 | 0 | 0.0 | 3.1 | 0 |", text)
-        self.assertIn("| n1 | 2 | 2026-10-03 01:43:05 | 90 | 200 | 290 | 41.5 | 52.0 | 95 |", text)
-        self.assertIn("| n1 | 3 | 2026-10-03 01:44:00 | - | - | - | - | - | 95 |", text)
+        # No thread samples: the time to the runtime reads `-`.
+        self.assertIn("| n1 | 1 | 2026-10-03 01:41:25 | 0 | 0 | 0 | 0.0 | 3.1 | - | - | 0 |", text)
+        self.assertIn("| n1 | 2 | 2026-10-03 01:43:05 | 90 | 200 | 290 | 41.5 | 52.0 | - | - | 95 |", text)
+        self.assertIn("| n1 | 3 | 2026-10-03 01:44:00 | - | - | - | - | - | - | - | 95 |", text)
+
+    def test_a_boot_to_its_runtime_from_the_thread_samples(self):
+        # Two processes on n1: the first sampled with its workers up, the
+        # second with none for 3 s, its main thread at 0.8 of a core.
+        rows = [("2026-10-03 01:41:26.0", 100, 1.0, 1), ("2026-10-03 01:43:05.5", 200, 0.1, 0),
+                ("2026-10-03 01:43:06.5", 200, 0.9, 0), ("2026-10-03 01:43:07.5", 200, 1.7, 0),
+                ("2026-10-03 01:43:08.5", 200, 2.5, 1)]
+        threads = {}
+        for when, pid, cpu, workers in rows:
+            at = datetime.datetime.strptime(when, "%Y-%m-%d %H:%M:%S.%f")
+            threads.setdefault(at, {})[(pid, pid)] = (cpu, 0.0, 0.0, 0.0, workers)
+        named = {(100, 100): "n1", (200, 200): "n1", (300, 300): "n2"}
+        delays = js.boot_delays(threads, named)
+        self.assertEqual(delays["n1"][0], (0.0, 0.0))
+        self.assertAlmostEqual(delays["n1"][1][0], 3.0)
+        self.assertAlmostEqual(delays["n1"][1][1], 2.4)
+        self.assertNotIn("n2", delays)
 
     def test_voters_that_report_no_replay_have_no_table(self):
         self.assertNotIn("**Boots**", self.summarize(REPLAY_VOTER))

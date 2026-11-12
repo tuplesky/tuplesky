@@ -2474,6 +2474,32 @@ def read_node_map(path: str) -> dict:
     return out
 
 
+def boot_delays(threads: dict, named: dict) -> dict:
+    """Each node's boots in order, from `cpu_sampler.py --threads`'s 1 s
+    samples: (seconds from the process's first sample to the first with a
+    tokio worker, its main thread's CPU seconds over them), or None for a
+    boot the sampler never saw run its runtime. The runtime starts once the
+    store is open and attached, and a voter's uptime, which times its
+    `metrics` lines, counts from about then, so a boot's lines are its
+    "Jepsen starting" time plus this plus their uptime. A boot sampled
+    first with its workers already up (one started before the sampler)
+    reads 0."""
+    first: dict = {}
+    for when in sorted(threads):
+        for key, values in threads[when].items():
+            if key not in named:
+                continue
+            seen = first.setdefault(key, [when, values[0], None])
+            if seen[2] is None and values[4] > 0:
+                seen[2] = (when, values[0])
+    out: dict = {}
+    for key, (t0, cpu0, live) in sorted(first.items(), key=lambda kv: kv[1][0]):
+        out.setdefault(named[key], []).append(
+            None if live is None else ((live[0] - t0).total_seconds(), live[1] - cpu0)
+        )
+    return out
+
+
 def loop_cores(threads: dict, keys: set, t0, t1) -> float | None:
     """The domain loop CPU, in cores, of the coordd boots `keys` over the
     samples within [t0, t1]; None with fewer than two samples in it."""
@@ -2623,13 +2649,17 @@ def domain_gaps(client: list[Op], nemesis: list[Op], start) -> list[str]:
 OWN_FRAME = re.compile(r"^coord")
 
 
-def lead_lines(path: str) -> list[tuple[int, datetime.datetime | None, datetime.datetime | None]]:
+def lead_lines(path: str, delays=()) -> list[tuple[int, datetime.datetime | None, datetime.datetime | None]]:
     """Each `leads ballot N` line of a voter's `coordd.log`, as (N, the
     time of the `metrics` line before it in its boot, or the boot's start,
     and of the one after it, or None). Those lines carry no time of their
-    own: a `metrics` line's is its boot's start plus its uptime."""
+    own: a `metrics` line's is its boot's start plus its uptime, the boot's
+    start being its "Jepsen starting" time plus, where `delays` (from
+    `boot_delays`, in boot order) has it, the boot's time to its runtime,
+    before which uptime does not count."""
     out: list = []
     boot = pending = before = None
+    boots = 0
     waiting: list = []  # indexes in out whose next metrics time is unknown
     with open(path, encoding="utf-8", errors="replace") as f:
         for line in f:
@@ -2640,6 +2670,11 @@ def lead_lines(path: str) -> list[tuple[int, datetime.datetime | None, datetime.
                 continue
             if line.startswith("coordd domain="):
                 boot, before, waiting = pending, pending, []
+                delay = delays[boots] if boots < len(delays) else None
+                if boot is not None and delay:
+                    boot += datetime.timedelta(seconds=delay[0])
+                    before = boot
+                boots += 1
                 continue
             if line.startswith("metrics {") and boot is not None:
                 try:
@@ -2699,11 +2734,13 @@ def leader_changes(client: list[Op], nemesis: list[Op], nodes: list[str], start,
     frames its loop sampled most in it with `leader_profile.py
     --loops-hz` (`leader-profile-loops.txt`). A change with no kill
     before it is a voter that took the leadership from a live leader."""
+    delays = boot_delays(read_thread_samples(os.path.join(store, "cpu-samples-threads.csv")),
+                         read_node_map(os.path.join(store, "cpu-samples-nodes.csv")))
     changes = []
     for node in nodes:
         path = os.path.join(store, node, "coordd.log")
         if os.path.isfile(path):
-            changes += [(b, node, lo, hi) for b, lo, hi in lead_lines(path) if lo is not None]
+            changes += [(b, node, lo, hi) for b, lo, hi in lead_lines(path, delays.get(node, ())) if lo is not None]
     changes.sort()
     if not any(b > 0 for b, _, _, _ in changes):
         return []
@@ -3103,14 +3140,18 @@ def summarize(store: str, nodes: list[str], title: str, profile: str | None = No
                 "**Boots** (every start of each voter, from its `coordd.log`; replayed is what the attach replayed "
                 "from the journal into the projection, from where it found the projection, which after a kill is how "
                 "far the projection was durable when the voter died, to the journal's durable head; attach is the whole "
-                "attach, a reinstall included, which replay is not)"
+                "attach, a reinstall included, which replay is not; to the runtime is from the process's first 1 s "
+                "sample to the first with a tokio worker (`cpu_sampler.py --threads`), the store's open and the attach "
+                "with it, and its main thread's CPU in that time, `-` where the sampler did not see it)"
             )
             out.append("")
             out.append(
                 "| Node | Boot | Started | Replayed records | From | Through "
-                "| Replay (ms) | Attach (ms) | Executed at recovery |"
+                "| Replay (ms) | Attach (ms) | To the runtime (s) | Its main thread's CPU (s) | Executed at recovery |"
             )
-            out.append("| --- " * 9 + "|")
+            out.append("| --- " * 11 + "|")
+            delays = boot_delays(read_thread_samples(os.path.join(store, "cpu-samples-threads.csv")),
+                                 read_node_map(os.path.join(store, "cpu-samples-nodes.csv")))
             for node, v in voters.items():
                 for i, b in enumerate(v.boot_rows, 1):
                     if b.replayed:
@@ -3118,7 +3159,10 @@ def summarize(store: str, nodes: list[str], title: str, profile: str | None = No
                         replayed = f"{records} | {start} | {through} | {took:.1f} | {attach:.1f}"
                     else:
                         replayed = "- | - | - | - | -"
-                    out.append(f"| {node} | {i} | {b.started or '-'} | {replayed} | {b.executed} |")
+                    d = delays.get(node, [])
+                    d = d[i - 1] if i - 1 < len(d) else None
+                    runtime = f"{d[0]:.1f} | {d[1]:.1f}" if d else "- | -"
+                    out.append(f"| {node} | {i} | {b.started or '-'} | {replayed} | {runtime} | {b.executed} |")
             out.append("")
         if any(v.checkpoints or v.checkpoints_failed for v in voters.values()):
             out.append(

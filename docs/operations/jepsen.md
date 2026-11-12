@@ -322,7 +322,10 @@ that voter and the followers' mean. That CPU per command is the profile's
 window's: the boot that ran over it (a voter killed and restarted since
 has a later boot's last line), between its `metrics` readings either
 side of the window (its last, where it was killed first), each timed as the boot's "Jepsen starting" time plus
-the reading's uptime. A restart within the window leaves the profile
+the reading's uptime. A voter's uptime counts from its runtime, which starts once the store is open and
+attached, so the Leader changes table also adds each boot's time to its runtime, read from
+`cpu-samples-threads.csv` (the first 1 s sample with a tokio worker), which the Boots table prints beside the
+attach with the main thread's CPU in it. A restart within the window leaves the profile
 uncosted. A 10 s DWARF sample of the leader
 follows (`leader-profile-alloc-chains.txt`): it unwinds out of libc's
 allocator, which the frame-pointer walk cannot, and names the TupleSky
@@ -934,7 +937,9 @@ of lines. `scripts/ci/jepsen_summary.py` reads the test's store
 * for the TupleSky job, one row per voter from its `coordd.log`: boots,
   the position it last recovered at, the highest position it executed by
   the end (read from its store by `coord-jepsen-executed --last`, so a
-  voter left behind shows even when its log says nothing), its last role,
+  voter left behind shows even when its log says nothing; a store of
+  format 3, task-d113's step 2, keeps its executed rows in `execution_v1`
+  by position, which the tool reads when `executed_v1` holds none), its last role,
   its highest ballot, and its stops, panics, `HalfInitialized`,
   `IncompatibleAccepted`, `CandidateBehind`, `BehindVoters`,
   `Backpressure`, `ProposalRepublished`, and "cannot reach" on the peer
