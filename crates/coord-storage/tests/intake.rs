@@ -1061,3 +1061,103 @@ fn catch_up_finds_an_executed_commands_dependency_row_through_the_index() {
         None
     );
 }
+
+/// Rule (e)'s timing (review on #233, 6813935632): the materializer moves
+/// the gate as its commit returns, before the store takes the commit back,
+/// so a cut's snapshot can be one commit ahead of the take-back. The
+/// overlay's index is the one at the snapshot's stamp: it moved with the
+/// gate, not at the take-back.
+#[test]
+fn a_cut_whose_snapshot_is_one_commit_ahead_of_the_take_back_lays_its_rows_where_materialization_will()
+ {
+    let (materializer, handle) = coord_storage::ManualMaterializer::new();
+    let mut store = JournaledStore::open(
+        ModelJournal::new(),
+        CLUSTER,
+        REPLICA,
+        inc(),
+        boot(1),
+        JournalLimits::default(),
+    )
+    .unwrap();
+    store.attach(A, shard(), ModelEngine::new()).unwrap();
+    store.pipeline(Box::new(materializer)).unwrap();
+    let mut barriers = BarrierAllocator::new(inc(), boot(1));
+    let mut protocol = |store: &mut JournaledStore<ModelJournal, ModelEngine>, updates| {
+        store
+            .submit(Submission {
+                domain: A,
+                ballot: ballot(1),
+                kind: TransitionKind::Protocol,
+                batch: PersistBatch {
+                    barrier: barriers.allocate(),
+                    base: None,
+                    updates,
+                },
+            })
+            .unwrap();
+        store.append().unwrap();
+    };
+    let (c1, c3) = (command_of(1), command_of(3));
+    // Record 3: c1 taken in, materialized and taken back.
+    protocol(
+        &mut store,
+        vec![
+            dependency_update(epoch(), &c1, &record(Phase::PreAccept, &[])).unwrap(),
+            payload_update(&c1, &payload_of(1)).unwrap(),
+        ],
+    );
+    store.hand_off().unwrap();
+    assert!(handle.run());
+    store.hand_off().unwrap();
+    // Record 4: c3 taken in, its commit lent and run, not taken back.
+    protocol(
+        &mut store,
+        vec![
+            dependency_update(epoch(), &c3, &record(Phase::PreAccept, &[])).unwrap(),
+            payload_update(&c3, &payload_of(3)).unwrap(),
+        ],
+    );
+    store.hand_off().unwrap();
+    assert!(store.lent(A));
+    assert!(handle.run());
+    assert_eq!(
+        store.frontiers(A).unwrap().materialized().get(),
+        3,
+        "the store has not taken record 4's commit back"
+    );
+    // Record 5, journaled only: c3 rewritten at ACCEPT, c1 deleted.
+    let accepted = record(Phase::Accept, &[c1]);
+    protocol(
+        &mut store,
+        vec![
+            dependency_update(epoch(), &c3, &accepted).unwrap(),
+            dependency_delete(epoch(), &c1),
+        ],
+    );
+    let cut = store.recovery_cut(A).unwrap();
+    assert_eq!(
+        cut.materialized().get(),
+        4,
+        "the snapshot is ahead of the take-back"
+    );
+    let summary = read_protocol(&cut, epoch(), ViewBudget::default()).unwrap();
+    assert_eq!(
+        summary.records,
+        vec![(c3, accepted)],
+        "c3 once, rewritten in place; c1 hidden"
+    );
+    drop(cut);
+    // Materialized, the projection reads what the cut did.
+    store.drain().unwrap();
+    store.hand_off().unwrap();
+    assert!(handle.run());
+    store.drain().unwrap();
+    let gated = store.reader(A).unwrap().snapshot().unwrap();
+    assert_eq!(
+        read_protocol(gated.view(), epoch(), ViewBudget::default())
+            .unwrap()
+            .records,
+        summary.records
+    );
+}

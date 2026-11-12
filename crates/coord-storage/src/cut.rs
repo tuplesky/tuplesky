@@ -17,8 +17,10 @@
 //! same `StoreUpdate` rows the materializer would write, under the keys it
 //! would write them: a dependency or proposal row named by command is laid
 //! at its intake key by the same assignment the lowering makes, over the
-//! index at the snapshot's stamp (task-d113, rule (e);
-//! [`CutOverlay::extend_assigned`]).
+//! index as of the snapshot's stamp (task-d113, rule (e);
+//! [`CutOverlay::extend_assigned`]). The index moves with the gate, as a
+//! commit returns and before the store takes it back, so the index at the
+//! snapshot's stamp is the one published when the gate reached it.
 //!
 //! The cut is a read of durable facts, never an authorization: a row that
 //! is only journaled is evidence a recovery summary must include, not a

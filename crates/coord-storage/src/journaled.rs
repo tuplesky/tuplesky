@@ -3239,10 +3239,15 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
         let reader = GatedReader::new(state.reader.clone(), state.gate.clone());
         let durable = state.frontiers.durable();
         // The overlay lays the suffix's rows at the keys materialization
-        // will write, over the index at the snapshot's stamp (task-d113,
-        // rule (e)). The materializer may publish a commit between the
-        // snapshot and the index's lock; the cut is then taken again over
-        // the newer snapshot.
+        // will write, over the index as of the snapshot's stamp (task-d113,
+        // rule (e)). When the index moves: a commit's changes are published
+        // as the commit returns, on whichever thread ran it, before the gate
+        // moves to it and before the store takes it back. So a snapshot the
+        // gate hands out, one commit ahead of the take-back or not, has an
+        // index at its stamp, and the cut never reads the store's own state
+        // of the take-back. Only a commit that publishes between the
+        // snapshot and the index's lock leaves the index ahead of it; the
+        // cut is then taken again over the newer snapshot.
         for _ in 0..CUT_ATTEMPTS {
             let snapshot = reader.snapshot().map_err(CutError::View)?;
             let records = self.cut_suffix(state, &snapshot, durable)?;
@@ -3879,7 +3884,9 @@ fn take_back<E: LocalEngine>(
 ///
 /// The records' dependency and proposal rows are keyed by intake order
 /// through the index by command (task-d113). A commit that returns
-/// publishes its changes to the index before it moves the gate; one whose
+/// publishes its changes to the index before it moves the gate, here and
+/// not at the store's take-back, so the index is always at the stamp of
+/// the newest snapshot the gate hands out (rule (e)); one whose
 /// outcome is not known leaves them in `held`, for the settling to publish
 /// or drop (rule (d)); any other outcome drops them.
 #[allow(clippy::too_many_arguments)]

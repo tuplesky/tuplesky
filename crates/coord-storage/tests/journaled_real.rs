@@ -635,7 +635,10 @@ fn crash_matrix(replay: Option<DurableCadence>) {
         with_executed > 0,
         "some crashes left executed rows to recover"
     );
-    assert!(with_intake > 2, "some crashes left dependency rows to recover");
+    assert!(
+        with_intake > 2,
+        "some crashes left dependency rows to recover"
+    );
 }
 
 /// task-j06 over redb: `sync_projections` makes every working commit
