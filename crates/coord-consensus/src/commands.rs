@@ -1109,6 +1109,15 @@ impl CommandTable {
         })
     }
 
+    /// How many records are at COMMIT, placeholders included: decided
+    /// here and not executed (#236 review). One walk of the records.
+    pub fn committed_records(&self) -> usize {
+        self.records
+            .values()
+            .filter(|r| r.phase == Phase::Commit)
+            .count()
+    }
+
     /// Whether any record holds its payload below EXECUTED (task-d107).
     pub fn holds_unexecuted(&self) -> bool {
         self.unexecuted_records() > 0
@@ -1736,6 +1745,21 @@ pub(crate) mod tests {
 
     /// `blocked` records at COMMIT behind a root no row names, and one
     /// with nothing to wait on, which is returned with them.
+    /// `in_flight` records at ACCEPT, undecided, beside
+    /// [`blocked_behind_a_root`]'s `decided` (#236 review): what a
+    /// follower at full load holds, most of it not yet committed.
+    pub(crate) fn in_flight_beside_decided(
+        in_flight: u32,
+        decided: u32,
+    ) -> Vec<(CommandId, CommandRecord)> {
+        let (mut rows, _) = blocked_behind_a_root(decided - 1);
+        let base = decided + 1;
+        rows.extend(
+            (base..base + in_flight).map(|n| (id(n), record(Phase::Accept, Vec::new(), true))),
+        );
+        rows
+    }
+
     pub(crate) fn blocked_behind_a_root(
         blocked: u32,
     ) -> (Vec<(CommandId, CommandRecord)>, CommandId) {
