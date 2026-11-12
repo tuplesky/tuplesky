@@ -3101,6 +3101,9 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             .durable_projection
             .filter(|_| self.backing.applier().store().projection_volatile())
             .map(|(every, last)| last + every / 2);
+        // A held projection commit goes out at its bound on a quiet
+        // domain too, and nothing arrives to say it is due (task-d86).
+        let held_commit = self.backing.applier().store().projection_commit_due();
         [
             expiry,
             parked,
@@ -3114,6 +3117,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             report,
             read,
             durable_projection,
+            held_commit,
         ]
         .into_iter()
         .flatten()
@@ -3223,6 +3227,17 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             return Ok(false);
         };
         let (mut out, refused) = voter.serve_local(self.budgets.local_per_turn)?;
+        // A projection commit held past its bound, or asked for, goes out
+        // now (task-d86): the hand-off is what lends it.
+        if voter
+            .node()
+            .applier()
+            .store()
+            .projection_commit_due()
+            .is_some_and(|due| due <= std::time::Instant::now())
+        {
+            out.absorb(voter.settle()?);
+        }
         // Leadership (task-d01): campaign when this voter has had no
         // leader for its patience, or an operator asked, and follow
         // whatever ballot the machine has moved to by any path.
@@ -4301,6 +4316,12 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         if half.is_empty() {
             return None;
         }
+        // A half-established entry's record shows once a commit carries
+        // it, so that commit is not held for a larger one (task-d86).
+        self.backing
+            .applier_mut()
+            .store_mut()
+            .request_projection_commit();
         // Bounded per turn and rotated across turns: the bound is on
         // this turn's reads, and the rotation is what keeps it from
         // becoming a bound on which commands are ever read.

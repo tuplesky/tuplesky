@@ -84,6 +84,16 @@ struct Provisioning {
     /// commit waits for a durable one (`COORD_HARNESS_PROJECTION_DURABLE_MS`).
     #[arg(long)]
     projection_durable_ms: Option<u64>,
+    /// Under `--journal-profile replay`, journal records a projection
+    /// commit is held for, zero for none (task-d86;
+    /// `COORD_HARNESS_PROJECTION_COMMIT_RECORDS`).
+    #[arg(long)]
+    projection_commit_records: Option<u32>,
+    /// Under `--journal-profile replay`, milliseconds at most a record is
+    /// held for a larger projection commit, zero for none (task-d86;
+    /// `COORD_HARNESS_PROJECTION_COMMIT_MS`).
+    #[arg(long)]
+    projection_commit_ms: Option<u64>,
     /// Journal records each voter holds past its last local checkpoint
     /// before it publishes the next, where not the daemon's 4096; zero
     /// never publishes (`COORD_HARNESS_CHECKPOINT_AFTER_RECORDS`).
@@ -140,6 +150,14 @@ impl Provisioning {
             projection_durable_ms: match self.projection_durable_ms {
                 Some(n) => Some(n),
                 None => from_env("COORD_HARNESS_PROJECTION_DURABLE_MS")?,
+            },
+            projection_commit_records: match self.projection_commit_records {
+                Some(n) => Some(n),
+                None => from_env("COORD_HARNESS_PROJECTION_COMMIT_RECORDS")?,
+            },
+            projection_commit_ms: match self.projection_commit_ms {
+                Some(n) => Some(n),
+                None => from_env("COORD_HARNESS_PROJECTION_COMMIT_MS")?,
             },
         })
     }

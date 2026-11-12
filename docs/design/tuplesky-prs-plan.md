@@ -3425,6 +3425,36 @@ The change, in two steps:
   - **The retry lookup:** a retry answered from its record reads the same view, so it finds a binding a deferred group wrote.
   - **task-d75's settle read** (`settle_from_records`) finds an execution record only once a commit makes it visible. A half-established entry it finds no record for asks for the next commit, so an entry whose half was lost waits for no deferral.
 - **What it is expected to move (#174 review):** 0.15 to 0.3 ms of CPU an operation at the register row.
+- **Built: the commit hold (replay only, with a materializer).**
+  - **What it does:** a domain's records owed to the materializer are held for one larger commit until 32 are pending, 5 ms have passed since the first, or something that reads the projection asks (`[journal] projection_commit_records` and `projection_commit_ms`; zero for either holds nothing). It is refused under `strict`, so Section 17.3.4 is not amended.
+  - **What asks:**
+    - a barrier read due and not yet answerable;
+    - a release published again (task-d100, step A);
+    - a group whose effects beyond its results wait for its commit;
+    - a group with events for an open watch;
+    - a half-established entry (`settle_from_records`);
+    - a queued checkpoint pointer;
+    - a drain.
+
+    An ask stands until a commit is lent, so one made before its record is journaled still takes it.
+  - **What else reads the projection waits at most the 5 ms:** catch-up pages served, a frontend's retained-result read, a floor's readiness, a watch's replay. The loop wakes on the hold's time (`next_deadline`), so a quiet domain's records go out at it too. What is durable before a result's release doesn't change: the journal holds every held record, and a crash replays it.
+  - **Local pair** (the carry `413fd66a`; five voters on tmpfs, `replay`, one worker, the four features, etcd's mix; three alternating runs a side at 30 and 120 callers; the CPU clock over a 30 s window):
+
+    | | 30 callers, off → on | 120 callers, off → on |
+    | --- | --- | --- |
+    | A follower's materializer, µs a command | 126.7 → 107.1 (−15%) | 109.1 → 103.6 (−5%) |
+    | Its commands a commit | 4.1 → 13.5 | 10.9 → 19.3 |
+    | The leader's materializer, µs a command | 140.9 → 139.6 | 123.8 → 123.6 |
+    | Its commands a commit | 4.3 → 4.8 | 11.9 → 12.5 |
+    | Bytes written a command, a follower | 37.8 → 40.4 KB (+7%) | 38.2 → 39.9 KB (+5%) |
+    | Servers, ms an operation | 1.430 → 1.371 (−4.1%) | 1.222 → 1.184 (−3.1%) |
+    | `ok`/s | 2,339 → 2,356 | 2,780 → 2,860 |
+    | p99, the slowest path | 56.6 → 55.9 ms | 206 → 179 ms |
+
+    - **The leader is not held:** its barrier reads ask for nearly every commit, as they must.
+    - **Pages a command didn't fall:** a follower writes 5 to 7% more bytes a command. That is not yet explained; freed pages are reusable only after a durable commit, and fewer commits may leave more of them unreused.
+    - **On the EPYC 9V74** (#185's conversion): about −0.052 ms an operation at 30 callers and −0.018 at 120, against the −0.055 to −0.10 and −0.03 to −0.06 sized. The shortfall is the leader.
+    - **A wider hold** (64 records, 10 ms; two runs a side) took followers to 99.7 and 100.6 µs a command (24 and 32 commands a commit). It isn't the default, because at 120 callers neither `ok`/s nor p99 was better in two runs. The runner's pair can read it by configuration.
 
 **Acceptance:** The runner's group sizes and the reading recorded first. Model tests: a command planned after a deferred commit sees the earlier groups' writes, a retry is answered from a deferred group's binding, and a half-established entry's record is found within one commit. A local pair: commits a command and the materializer's CPU an operation fall, and no read, watch or event waits longer than the bound. The storage crash tests across a deferred commit, at every cut. Its runner pair is read in the batch job (task-d72).
 
