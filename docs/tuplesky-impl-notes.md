@@ -5572,7 +5572,7 @@ behind by more than a table is sent nothing it can use.
 - The donor answers only a voter of its configuration, only at a ballot
   it is synchronized at (it leads it, or follows it with its Sync
   installed), only while it has not itself stopped, and only up to its
-  own `executed_through`. A page is at most 64 commands and 1 MiB beyond
+  own `executed_through`. A page is at most 125 commands and 1 MiB beyond
   its first, each read from the donor's durable rows: the payload row,
   the epoch's dependency row if it keeps one, and the executed row
   (`coord_storage::protocol::catch_up_entry`). The page stops at the
@@ -7055,7 +7055,7 @@ never closed its gap.
 
 - **A window per batch.** `install_catch_up` installs as many of the
   page's commands as install cleanly, from its head, in one batch: at
-  most the page, so 64 commands and 1 MiB (`MAX_CATCH_UP_COMMANDS`,
+  most the page, so 125 commands and 1 MiB (`MAX_CATCH_UP_COMMANDS`,
   `MAX_CATCH_UP_BYTES`). Each command is installed under task-d08's rules
   unchanged (task-d14's COMMIT-entry rules, the donor's dependencies,
   let into a full table). A window joins a command only when:
@@ -7368,11 +7368,12 @@ contract needed and a test for each.
   1,000, is enforced per frontend as a token bucket with a second's
   burst. A retry of an outstanding request takes nothing, and a refused
   request is answered `BACKPRESSURE` ("admission rate").
-  - Catch-up executes up to 64 commands per durable batch (task-d25), so
-    the default leaves a returning voter most of its rate to gain on the
+  - Catch-up executes up to 125 commands per durable batch, with the
+    next page asked ahead while a page executes (task-d25), so the
+    default leaves a returning voter most of its rate to gain on the
     domain with. The time it needs is then bounded by its gap.
   - The default is a design target and a ceiling, not a proved bound
-    (review): the 64-per-10-ms rate it is set under is unmeasured, and
+    (review): the 64-per-10-ms rate it was set under was never measured, and
     task-d33's budget oracle is its check. It gates only client
     requests, after the session-busy check and before the pending
     insert; resolves, watches and held retries bypass it, and one bucket
@@ -7381,8 +7382,9 @@ contract needed and a test for each.
     with three frontends sustain about 1,500 to 1,700 commands a second
     at 120 callers (#224, #225). The busiest frontend admits 630 to 770
     a second at the median and up to 977 in its busiest second. No
-    reading so far was refused (#224's and (e)'s runs counted no refused
-    or unknown operation), but a faster build will be. Catch-up is
+    throughput pair so far was refused (#224's and (e)'s counted no
+    refused or unknown operation), but a faster build's will be. Review's
+    stall runs, with a voter stopped under load, were (#228 review). Catch-up is
     measured now too: about 22 ms a page plus 0.28 ms a command, so a
     voter rejoining at full load with the relay executes about 1,600 a
     second at 64 a page and 2,200 at 125 (#98). That is not the margin
@@ -7391,7 +7393,9 @@ contract needed and a test for each.
   - **What a reading shows.** A refusal counts as refused at the
     admission stage, and an `admission` line with every metrics
     snapshot gives the frontend's rate and its refusals by why
-    (`rate_limited`, `session_busy`, `other`). The bench counts
+    (`rate_limited`, `session_busy`, `other`, and `collection_bound` for
+    a request the gate admitted and the collector's own bound then
+    refused). The bench counts
     `BACKPRESSURE` as a refusal, `backpressure`, not as an unknown
     outcome. Every script in `scripts/bench` sets the rate explicitly
     (`ADMITTED_PER_SECOND`, default 1,000) and states it in its readings'

@@ -308,6 +308,14 @@ pub struct JournalPlan {
     pub projection_durable_records: Option<u32>,
     /// `projection_durable_ms`, where not the daemon's default.
     pub projection_durable_ms: Option<u64>,
+    /// `projection_commit_records`, where not the daemon's default: the
+    /// records a projection commit is held for (task-d86). Zero holds
+    /// nothing.
+    pub projection_commit_records: Option<u32>,
+    /// `projection_commit_ms`, where not the daemon's default: the
+    /// longest a record is held for a larger commit (task-d86). Zero
+    /// holds nothing.
+    pub projection_commit_ms: Option<u64>,
 }
 
 /// A journal profile `coordd` serves.
@@ -366,6 +374,12 @@ impl JournalPlan {
         }
         if let Some(n) = self.projection_durable_ms {
             out.push_str(&format!("projection_durable_ms = {n}\n"));
+        }
+        if let Some(n) = self.projection_commit_records {
+            out.push_str(&format!("projection_commit_records = {n}\n"));
+        }
+        if let Some(n) = self.projection_commit_ms {
+            out.push_str(&format!("projection_commit_ms = {n}\n"));
         }
         out
     }
@@ -591,6 +605,17 @@ pub fn provision(plan: &Plan) -> std::io::Result<Provisioned> {
         journal.projection_durable_records.map(u64::from),
         journal.projection_durable_ms,
     ];
+    // The commit hold is the replay profile's too (task-d86); zero is
+    // how it is turned off, so only the profile is checked for it.
+    let hold = [
+        journal.projection_commit_records.map(u64::from),
+        journal.projection_commit_ms,
+    ];
+    if journal.profile == JournalProfile::Strict && hold.iter().any(Option::is_some) {
+        return Err(invalid(
+            "a projection commit hold is the replay profile's: name it as well".into(),
+        ));
+    }
     if journal.profile == JournalProfile::Strict && cadence.iter().any(Option::is_some) {
         return Err(invalid(
             "a projection cadence is the replay profile's: name it as well".into(),

@@ -798,6 +798,39 @@ pub struct Follower {
     relayed_taken: u64,
     /// Proposal frames taken (task-d102).
     frames_taken: u64,
+    /// Relayed proposals whose command this replica knew already, so the
+    /// proposal path decided and nothing was fetched (#224 review).
+    relayed_known: u64,
+    /// Relayed proposals whose payload this replica didn't take: not from
+    /// the leader at its ballot, a payload that didn't match the vote, or
+    /// no room. Each such command's payload is fetched, if it is wanted
+    /// (#224 review).
+    relayed_not_taken: u64,
+}
+
+/// What a follower did with the payloads relayed proposals carried
+/// (task-d102, #224 review): whether it took them from the proposals or
+/// had to fetch them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RelayTaken {
+    /// Proposal frames taken.
+    pub frames: u64,
+    /// Payloads taken from relayed proposals.
+    pub taken: u64,
+    /// Relayed proposals for a command known here already.
+    pub known: u64,
+    /// Relayed proposals whose payload wasn't taken, to be fetched.
+    pub not_taken: u64,
+}
+
+impl RelayTaken {
+    /// Add `other`'s counts to these.
+    pub fn add(&mut self, other: &Self) {
+        self.frames = self.frames.saturating_add(other.frames);
+        self.taken = self.taken.saturating_add(other.taken);
+        self.known = self.known.saturating_add(other.known);
+        self.not_taken = self.not_taken.saturating_add(other.not_taken);
+    }
 }
 
 /// The retry-key bindings a restart restores from the payload rows
@@ -931,6 +964,8 @@ impl Follower {
             answer_on_release: BTreeSet::new(),
             relayed_taken: 0,
             frames_taken: 0,
+            relayed_known: 0,
+            relayed_not_taken: 0,
             catch_up: CatchUp::default(),
             diverged: None,
             config,
@@ -1237,6 +1272,8 @@ impl Follower {
             answer_on_release: BTreeSet::new(),
             relayed_taken: 0,
             frames_taken: 0,
+            relayed_known: 0,
+            relayed_not_taken: 0,
             catch_up: CatchUp::default(),
             diverged: None,
         }
@@ -1803,6 +1840,16 @@ impl Follower {
     /// Proposal frames this follower took (task-d102).
     pub fn frames_taken(&self) -> u64 {
         self.frames_taken
+    }
+
+    /// What this follower did with relayed payloads (#224 review).
+    pub const fn relay_taken(&self) -> RelayTaken {
+        RelayTaken {
+            frames: self.frames_taken,
+            taken: self.relayed_taken,
+            known: self.relayed_known,
+            not_taken: self.relayed_not_taken,
+        }
     }
 
     /// Replay the messages held for the ballot just synchronized.
@@ -3406,11 +3453,7 @@ impl Follower {
         self.forget_history(command);
         if self.diverged.is_none() && self.catch_up.running.is_empty() {
             effects.extend(self.install_catch_up());
-            if !self.catch_up.busy()
-                && let Some(donor) = self.catch_up.continue_from.take()
-            {
-                effects.extend(self.request_catch_up(donor));
-            }
+            effects.extend(self.continue_catch_up());
         }
         Ok(effects)
     }
@@ -3473,6 +3516,7 @@ impl Follower {
         self.catch_up.queue.clear();
         self.catch_up.running.clear();
         self.catch_up.continue_from = None;
+        self.catch_up.chain_open = false;
         self.catch_up.since_boot.done();
     }
 
@@ -3481,6 +3525,24 @@ impl Follower {
     /// process running it is to stop.
     pub const fn catch_up_divergence(&self) -> Option<&CatchUpDivergence> {
         self.diverged.as_ref()
+    }
+
+    /// Whether this replica's catch-up chain is owed more (#226 review):
+    /// the last page answering it stopped short of its donor's frontier,
+    /// no page has reached a frontier since, and this replica has not
+    /// executed that far by itself (task-d25 review); or that page left
+    /// executions since its boot to compare. The caller asks again while
+    /// it holds, since a lost ask or page of the chain leaves nothing else
+    /// to.
+    pub fn catch_up_chain_open(&self) -> bool {
+        self.catch_up.chain_open
+            && self.halted.is_none()
+            && self.diverged.is_none()
+            && (self.catch_up.since_boot.from.is_some()
+                || self
+                    .catch_up
+                    .owed_through
+                    .is_none_or(|through| self.learner.executed_through() < through))
     }
 
     /// Whether a catch-up page is in hand (task-d08).
@@ -3550,22 +3612,78 @@ impl Follower {
     /// Ask `donor` for the commands it executed after this replica's own
     /// frontier (task-d08).
     ///
-    /// Nothing is asked while a page is in hand -- one page at a time,
-    /// executed before the next -- nor by a replica that is not
-    /// synchronized at its ballot, has stopped, or would ask itself or a
-    /// peer that is not a voter of this configuration. Published under
-    /// the promised ballot, as payload transfer is: it is not a voting
-    /// transition.
+    /// Nothing is asked here while a page is in hand: the page asked
+    /// ahead of it is this replica's own ask ([`Self::continue_catch_up`]),
+    /// never its caller's. Nor by a replica that is not synchronized at
+    /// its ballot, has stopped, or would ask itself or a peer that is not
+    /// a voter of this configuration. Published under the promised
+    /// ballot, as payload transfer is: it is not a voting transition.
     pub fn request_catch_up(&mut self, donor: ReplicaId) -> Vec<Effect> {
+        if self.catch_up.busy() {
+            self.catch_up.paths.declined_busy += 1;
+            return Vec::new();
+        }
+        // After a boot, from the boot frontier until a page has covered
+        // what executed since (task-d25).
+        let after = self
+            .catch_up
+            .since_boot
+            .from
+            .unwrap_or_else(|| self.learner.executed_through());
+        self.ask_catch_up(donor, after)
+    }
+
+    /// Go on with the chain of asks a full page left owed
+    /// (`continue_from`, task-d25): from this replica's frontier once
+    /// nothing is in hand, or, ahead, from the end of what it holds once
+    /// that is one page. So while one page executes the next is on its
+    /// way, and a page costs its execution rather than its execution and a
+    /// round trip. What is in hand is at most two pages, the one it holds
+    /// when it asks and the one it asks for, each at most
+    /// `MAX_CATCH_UP_COMMANDS` commands and `MAX_CATCH_UP_BYTES` unless it
+    /// is one command; and one ask is out: the continuation is one slot,
+    /// taken once.
+    ///
+    /// Pages, not commands (task-d25 review): asked ahead while at most a
+    /// page's worth of commands was held, a donor whose byte bound cut its
+    /// pages to one large command each was asked for the next on every
+    /// arrival, 126 pages in hand with nothing executed.
+    ///
+    /// Nothing is asked ahead after a boot while executions wait to be
+    /// compared: those asks go on from where the last page stopped.
+    fn continue_catch_up(&mut self) -> Vec<Effect> {
+        if !self.catch_up.busy() {
+            return match self.catch_up.continue_from.take() {
+                Some(donor) => self.request_catch_up(donor),
+                None => Vec::new(),
+            };
+        }
+        let Some(tail) = self.catch_up.tail() else {
+            return Vec::new();
+        };
+        if self.catch_up.since_boot.from.is_some() || self.catch_up.pages_held() > 1 {
+            return Vec::new();
+        }
+        let Some(donor) = self.catch_up.continue_from.take() else {
+            return Vec::new();
+        };
+        let asked = self.catch_up.paths.asked;
+        let effects = self.ask_catch_up(donor, tail);
+        if self.catch_up.paths.asked > asked {
+            self.catch_up.paths.asked_ahead += 1;
+        }
+        effects
+    }
+
+    /// Publish an ask to `donor` for what it executed after `after`.
+    fn ask_catch_up(&mut self, donor: ReplicaId, after: ExecutionPosition) -> Vec<Effect> {
         type Path = fn(&mut CatchUpPaths) -> &mut u64;
         let Some(boot) = self.boot else {
             self.catch_up.paths.declined_unbooted += 1;
             return Vec::new();
         };
         let ballot = self.config.quorum.ballot();
-        let declined: Option<Path> = if self.catch_up.busy() {
-            Some(|p| &mut p.declined_busy)
-        } else if self.halted.is_some() || self.diverged.is_some() {
+        let declined: Option<Path> = if self.halted.is_some() || self.diverged.is_some() {
             Some(|p| &mut p.declined_stopped)
         } else if self.ballots.synced() != ballot {
             Some(|p| &mut p.declined_unsynced)
@@ -3583,13 +3701,6 @@ impl Follower {
         let context = self
             .ballots
             .context(boot, self.ballots.promised(), LocalJournalSeq::ZERO);
-        // After a boot, from the boot frontier until a page has covered
-        // what executed since (task-d25).
-        let after = self
-            .catch_up
-            .since_boot
-            .from
-            .unwrap_or_else(|| self.learner.executed_through());
         let frame = ProtocolMessage::CatchUpRequest { ballot, after }.encode();
         self.catch_up.asked_after = Some(after);
         if let Some(outbox) = self.outbox.as_mut() {
@@ -3657,13 +3768,19 @@ impl Follower {
         // pacer, a second each time, which held a voter behind the
         // domain's rate under load (#98, 6799183006).
         let stale = self.catch_up.since_boot.from.is_none() && after < executed;
-        let ignored: Option<Path> = if self.catch_up.busy() {
+        // The answer to the ask made ahead (task-d25): it follows exactly
+        // what is in hand, and is queued after it, outside the table.
+        let ahead = self.catch_up.busy()
+            && self.catch_up.since_boot.from.is_none()
+            && self.catch_up.tail() == Some(after)
+            && self.catch_up.asked_after == Some(after);
+        let ignored: Option<Path> = if self.catch_up.busy() && !ahead {
             Some(|p| &mut p.ignored_busy)
         } else if self.halted.is_some() || self.diverged.is_some() {
             Some(|p| &mut p.ignored_stopped)
         } else if self.campaign.is_some() {
             Some(|p| &mut p.ignored_campaign)
-        } else if after != self.catch_up.since_boot.from.unwrap_or(executed) && !stale {
+        } else if after != self.catch_up.since_boot.from.unwrap_or(executed) && !stale && !ahead {
             Some(|p| &mut p.ignored_after)
         } else {
             None
@@ -3684,13 +3801,32 @@ impl Follower {
         let offered = entries.len();
         let mut next = after;
         let mut taken = 0usize;
-        for entry in entries.into_iter().take(MAX_CATCH_UP_COMMANDS) {
+        // A page is bounded here as the donor bounds it, in commands and
+        // in bytes unless it is one command, whatever the donor sent: what
+        // is in hand is two pages at most, in both (task-d25 review). A
+        // page cut at these bounds and nowhere else goes on as a full page
+        // does, so a donor of a later build with a larger page is followed
+        // at full pace rather than at the pacer's.
+        let mut bytes = 0usize;
+        let mut at_bound = false;
+        let mut newest = None;
+        for entry in entries {
+            if taken == MAX_CATCH_UP_COMMANDS {
+                at_bound = true;
+                break;
+            }
             let Ok(position) = next.checked_next() else {
                 break;
             };
             if entry.position != position || !pulled_entry_is_whole(&entry) {
                 break;
             }
+            let len = entry.encoded_len();
+            if taken > 0 && bytes.saturating_add(len) > MAX_CATCH_UP_BYTES {
+                at_bound = true;
+                break;
+            }
+            bytes = bytes.saturating_add(len);
             next = position;
             taken += 1;
             if position <= executed {
@@ -3700,7 +3836,11 @@ impl Follower {
                 }
                 continue;
             }
+            newest.get_or_insert(position);
             self.catch_up.queue.push_back((from, ballot, entry));
+        }
+        if newest.is_some() {
+            self.catch_up.newest_page = newest;
         }
         if self.catch_up.since_boot.from.is_some() {
             if taken == 0 {
@@ -3728,7 +3868,8 @@ impl Follower {
         // -- it hit the command bound or the byte bound -- is followed by
         // the next ask as soon as it is executed: a replica thousands of
         // commands behind should not wait a timer's period per page.
-        self.catch_up.continue_from = (taken == offered && next < through).then_some(from);
+        self.catch_up.continue_from =
+            ((taken == offered || at_bound) && next < through).then_some(from);
         if self.catch_up.since_boot.from.is_some() && next < executed {
             // Executions this replica has made past the page are still to
             // be compared: asked for at once, as a full page's rest is.
@@ -3744,14 +3885,22 @@ impl Follower {
                 self.catch_up.continue_from = None;
             }
         }
-        if !self.catch_up.busy() {
-            // Nothing to execute: a page of comparisons only.
-            return match self.catch_up.continue_from.take() {
-                Some(donor) => self.request_catch_up(donor),
-                None => Vec::new(),
-            };
+        // The page answering this replica's own chain says whether more
+        // is owed: open until a page reaches its donor's frontier (#226
+        // review). A late answer to an earlier ask says nothing of it.
+        if !stale || self.catch_up.asked_after == Some(after) {
+            self.catch_up.chain_open = next < through || self.catch_up.continue_from.is_some();
+            self.catch_up.owed_through = Some(through);
         }
-        self.install_catch_up()
+        if ahead {
+            self.catch_up.paths.taken_ahead += 1;
+        }
+        // Nothing to execute is a page of comparisons only, and asks again
+        // from the frontier; otherwise its first window is installed, if
+        // none is running, and the next page asked ahead of it.
+        let mut effects = self.install_catch_up();
+        effects.extend(self.continue_catch_up());
+        effects
     }
 
     /// Compare a page's command at a position this replica executed since
@@ -3812,7 +3961,11 @@ impl Follower {
         }
         let mut batch: Option<(BarrierId, Vec<StoreUpdate>)> = None;
         let mut bytes = 0usize;
-        while let Some((donor, ballot, entry)) = self.catch_up.queue.pop_front() {
+        // A window is at most one page, whatever is in hand: the table's
+        // recovery reserve is sized for one (`RECOVERY_RESERVE_PARTS`).
+        while self.catch_up.running.len() < MAX_CATCH_UP_COMMANDS
+            && let Some((donor, ballot, entry)) = self.catch_up.queue.pop_front()
+        {
             let first = self.catch_up.running.is_empty();
             if !first {
                 bytes = bytes.saturating_add(entry.encoded_len());
@@ -5179,6 +5332,9 @@ impl Follower {
             && proposal.seqnum.is_some();
         let held = self.held.contains_key(&proposal.command);
         let took = takes && self.take_relayed_payload(&proposal, payload);
+        if !takes {
+            self.relayed_not_taken = self.relayed_not_taken.saturating_add(1);
+        }
         let mut effects = self.on_proposal(from, proposal);
         // A proposal held for want of its payload, whose payload this copy
         // brought: `on_proposal` returns at a duplicate of one held, so the
@@ -5203,6 +5359,7 @@ impl Follower {
         if identity != Some(command) || payload.admission_digest() != proposal.admission {
             self.rejections
                 .push(FollowerRejection::PayloadIdentityMismatch(command));
+            self.relayed_not_taken = self.relayed_not_taken.saturating_add(1);
             return false;
         }
         // Known here already, in any form: the proposal path decides.
@@ -5216,6 +5373,7 @@ impl Follower {
                 .selected_admission(&command)
                 .is_some_and(|d| d != proposal.admission)
         {
+            self.relayed_known = self.relayed_known.saturating_add(1);
             return false;
         }
         let recovering = self.sync_pending.contains_key(&command)
@@ -5245,6 +5403,7 @@ impl Follower {
             // No room: the proposal is held as one without its payload,
             // which is fetched once its turn comes.
             self.rejections.push(FollowerRejection::Backpressure);
+            self.relayed_not_taken = self.relayed_not_taken.saturating_add(1);
             return false;
         }
         if let Some(c) = self.campaign.as_mut() {

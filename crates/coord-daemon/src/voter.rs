@@ -798,6 +798,14 @@ impl<P: Persistence> Voter<P> {
             }
         }
         self.release_again_seen_at = (!self.release_again.is_empty()).then_some(completed);
+        // A release still waiting looks for its record in the next
+        // commit, which is not held for a larger one (task-d86).
+        if !self.release_again.is_empty() {
+            self.node
+                .applier_mut()
+                .store_mut()
+                .request_projection_commit();
+        }
         out
     }
 
@@ -958,6 +966,14 @@ impl<P: Persistence> Voter<P> {
             self.reads.pinned(again.len());
             self.reads_behind_at = (!again.is_empty()).then_some(completed);
         }
+        // A read due and not yet answerable waits for the projection, so
+        // its next commit is not held for a larger one (task-d86).
+        if !again.is_empty() {
+            self.node
+                .applier_mut()
+                .store_mut()
+                .request_projection_commit();
+        }
         for held in again.into_iter().rev() {
             self.reads.hold_again(held);
         }
@@ -1094,6 +1110,7 @@ impl<P: Persistence> Voter<P> {
             holds: machine.holds_unexecuted(),
             backlog: || machine.unexecuted_held(),
             busy: machine.catching_up(),
+            chain: machine.catch_up_chain_open(),
             pages: machine.catch_up_counts().0,
             leads: machine.leads(),
         };

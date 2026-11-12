@@ -1,12 +1,16 @@
 //! Lowering of immutable batches into engine rows, stamps and digests.
 
-use coord_core::effect::{ApplyBase, PersistBatch, StoreUpdate};
-use coord_store_api::engine::{EngineError, ErrorClass, WriteTxn};
+use std::collections::HashMap;
+
+use coord_core::effect::{ApplyBase, CollectionId, PersistBatch, StoreUpdate};
+use coord_store_api::engine::{EngineError, ErrorClass, OrderedRead, WriteTxn};
 use coord_store_api::envelope::{AppliedStamp, StoreEnvelopeV1};
 use coord_store_api::registry::{Collection, meta_fields};
 use coord_store_api::seq::StoreSeq;
 use coord_types::identity::{Digest32, HashDomain};
 use coord_types::ids::{ConfigurationEpoch, ExecutionPosition};
+
+use crate::intake::{Assigned, Assigner};
 use serde::{Deserialize, Serialize};
 
 /// Digest of one batch bound to its guard context.
@@ -174,7 +178,99 @@ impl DurableMeta {
     }
 }
 
-/// Lower one update into the transaction.
+/// Lower one record's updates, the record at `seq`, into the transaction,
+/// through the key assignment (task-d113): a dependency or proposal row
+/// named by command is written under its intake key.
+///
+/// Each update is written before the next is assigned, so a later update
+/// of the same record finds an earlier one's row.
+pub fn lower_record<W: WriteTxn>(
+    tx: &mut W,
+    assigner: &mut Assigner<'_>,
+    seq: u64,
+    updates: &[StoreUpdate],
+) -> Result<(), EngineError> {
+    for (i, update) in updates.iter().enumerate() {
+        let ordinal = u32::try_from(i)
+            .map_err(|_| EngineError::new(ErrorClass::Limit, "a record of too many updates"))?;
+        let assigned = assigner.assign(seq, ordinal, update, |key| {
+            Ok(tx.get(update.collection, key)?.is_some())
+        })?;
+        match assigned {
+            Assigned::AsIs => lower_update(tx, update)?,
+            Assigned::Key(key) => match &update.value {
+                Some(v) => tx.put(update.collection, &key, v)?,
+                None => tx.delete(update.collection, &key)?,
+            },
+            Assigned::Skip => {}
+        }
+    }
+    Ok(())
+}
+
+/// A commit's rows, lowered through the key assignment ahead of writing
+/// them, so the engine can take them as one batch
+/// ([`WriteTxn::apply_updates`]: each table opened once a commit, not once
+/// a row, task-d86) while each update is still assigned against the rows
+/// the updates before it leave (task-d113).
+///
+/// A row this commit has written is read from here; any other from the
+/// transaction, which holds none of this commit's rows yet.
+#[derive(Debug, Default)]
+pub struct Lowered {
+    writes: Vec<StoreUpdate>,
+    at: HashMap<(CollectionId, Vec<u8>), usize>,
+}
+
+impl Lowered {
+    /// Nothing lowered yet.
+    pub fn new() -> Self {
+        Lowered::default()
+    }
+
+    /// Lower the record at `seq` as [`lower_record`] does, reading `base`
+    /// under the rows lowered so far, and keep its rows.
+    pub fn lower_record<R: OrderedRead>(
+        &mut self,
+        base: &R,
+        assigner: &mut Assigner<'_>,
+        seq: u64,
+        updates: &[StoreUpdate],
+    ) -> Result<(), EngineError> {
+        for (i, update) in updates.iter().enumerate() {
+            let ordinal = u32::try_from(i)
+                .map_err(|_| EngineError::new(ErrorClass::Limit, "a record of too many updates"))?;
+            let (writes, at) = (&self.writes, &self.at);
+            let assigned = assigner.assign(seq, ordinal, update, |key| {
+                match at.get(&(update.collection, key.to_vec())) {
+                    Some(&i) => Ok(writes[i].value.is_some()),
+                    None => Ok(base.get(update.collection, key)?.is_some()),
+                }
+            })?;
+            let key = match assigned {
+                Assigned::AsIs => update.key.clone(),
+                Assigned::Key(key) => key,
+                Assigned::Skip => continue,
+            };
+            self.at
+                .insert((update.collection, key.clone()), self.writes.len());
+            self.writes.push(StoreUpdate {
+                collection: update.collection,
+                key,
+                value: update.value.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    /// The rows, in the order lowered: a key written twice keeps its last
+    /// value when they are applied in order.
+    pub fn updates(&self) -> &[StoreUpdate] {
+        &self.writes
+    }
+}
+
+/// Lower one update into the transaction, under its own key.
 pub fn lower_update<W: WriteTxn>(tx: &mut W, update: &StoreUpdate) -> Result<(), EngineError> {
     match &update.value {
         Some(v) => tx.put(update.collection, &update.key, v),

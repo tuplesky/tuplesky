@@ -18,8 +18,8 @@ use std::collections::VecDeque;
 
 use coord_consensus::{
     AppliedOutcome, BallotConfiguration, CatchUpEntry, CatchUpPaths, ConfigurationIdentity,
-    Follower, FollowerConfig, FollowerRejection, Leader, LeaderConfig, MAX_CATCH_UP_COMMANDS,
-    Phase, ProtocolMessage, ReplicaRole,
+    Follower, FollowerConfig, FollowerRejection, Leader, LeaderConfig, MAX_CATCH_UP_BYTES,
+    MAX_CATCH_UP_COMMANDS, Phase, ProtocolMessage, ReplicaRole,
 };
 use coord_core::capability::{AdmissionReceipt, AttestedAdmission, VerifierToken};
 use coord_core::effect::{BootId, Effect, PeerId};
@@ -145,6 +145,9 @@ struct Cluster {
     /// The most commands a served page carries: a donor whose byte bound
     /// cuts pages short.
     page_limit: usize,
+    /// The length of each put's value: 1, or large values for the byte
+    /// bound.
+    value_len: usize,
 }
 
 const SETTLE_STEPS: u32 = 200_000;
@@ -206,6 +209,7 @@ impl Cluster {
             batches: vec![0; VOTERS as usize],
             catch_up_asks: Vec::new(),
             page_limit: MAX_CATCH_UP_COMMANDS,
+            value_len: 1,
         }
     }
 
@@ -503,7 +507,7 @@ impl Cluster {
             NamespaceId([5; 16]),
             CanonicalOperation::Put(PutOp {
                 key: vec![key],
-                value: vec![key],
+                value: vec![key; self.value_len],
                 lease: None,
                 prev_kv: false,
             }),
@@ -1655,5 +1659,447 @@ fn the_latest_asks_page_dropped_while_a_late_window_runs_still_continues_the_cha
     assert_eq!(
         cluster.nodes[4].executed, cluster.nodes[0].executed,
         "r4 stopped short with the latest ask's page dropped"
+    );
+}
+
+/// Cut r4 off while the domain executes `missed` commands, then bring it
+/// back with the leader's traffic flowing, as `left_behind` does.
+fn left_far_behind(seed: u64, missed: u64) -> Cluster {
+    let cluster = left_behind_by(seed, missed, 1);
+    assert!(
+        cluster.nodes[4].executed.len() + 2 * MAX_CATCH_UP_COMMANDS
+            < cluster.nodes[0].executed.len(),
+        "r4 is less than two pages behind: the test shows nothing"
+    );
+    cluster
+}
+
+/// [`left_far_behind`] with values of `value_len` bytes.
+fn left_behind_by(seed: u64, missed: u64, value_len: usize) -> Cluster {
+    let mut cluster = Cluster::new(seed, 8);
+    cluster.value_len = value_len;
+    cluster.down = vec![4];
+    for seq in 1..=missed {
+        cluster.admit(seq);
+        cluster.settle();
+    }
+    cluster.settle_ticking(2);
+    cluster.down.clear();
+    for seq in missed + 1..=missed + 20 {
+        cluster.admit(seq);
+        cluster.settle();
+    }
+    cluster.settle_ticking(3);
+    cluster
+}
+
+fn at(n: u64) -> ExecutionPosition {
+    if n == 0 {
+        ExecutionPosition::ZERO
+    } else {
+        ExecutionPosition::new(n).unwrap()
+    }
+}
+
+/// One page ahead (task-d25): a page taken whole and short of the
+/// donor's frontier is followed by the next ask at once, from the end of
+/// what is in hand, while its window still waits to execute. That page
+/// is queued after it, outside the table, and the chain goes on.
+#[test]
+fn the_next_page_is_asked_while_the_one_in_hand_executes() {
+    let (mut cluster, _) = left_behind(17);
+    cluster.serve = false;
+    cluster.page_limit = 10;
+    let start = cluster.follower(4).executed_through();
+    cluster.ask(4);
+    let asks = cluster.catch_up_asks.len();
+    let first = cluster.page(0, ballot0(), start);
+    cluster.deliver_page(4, 0, &first);
+    assert!(
+        cluster.follower(4).catching_up(),
+        "the first page ran at once: the test shows nothing"
+    );
+    assert_eq!(
+        cluster.catch_up_asks.get(asks),
+        Some(&(4, start.get() + 10)),
+        "no ask ahead of the page in hand"
+    );
+    // The page asked ahead arrives before the first window has run.
+    let second = cluster.page(0, ballot0(), at(start.get() + 10));
+    let before = paths(&cluster);
+    cluster.serve = true;
+    cluster.deliver_page(4, 0, &second);
+    let now = paths(&cluster);
+    assert_eq!(now.taken_ahead, before.taken_ahead + 1, "{now:?}");
+    assert_eq!(now.ignored_busy, before.ignored_busy, "{now:?}");
+    cluster.settle();
+    assert_eq!(
+        cluster.nodes[4].executed, cluster.nodes[0].executed,
+        "r4 stopped short with a page asked ahead"
+    );
+    let now = paths(&cluster);
+    assert!(now.asked_ahead >= 2, "{now:?}");
+    assert_eq!(
+        (now.ignored_after, now.stopped_stale, now.stale_unasked),
+        (0, 0, 0),
+        "{now:?}"
+    );
+}
+
+/// The reserve holds with a page in hand and one asked ahead: a window is
+/// at most one page, however much is queued behind it.
+#[test]
+fn a_window_is_one_page_with_two_in_hand() {
+    let mut cluster = left_far_behind(5, 2 * MAX_CATCH_UP_COMMANDS as u64 + 40);
+    cluster.serve = false;
+    let start = cluster.follower(4).executed_through();
+    cluster.ask(4);
+    let first = cluster.page(0, ballot0(), start);
+    assert_eq!(entries_of(&first).len(), MAX_CATCH_UP_COMMANDS);
+    cluster.deliver_page(4, 0, &first);
+    let second = cluster.page(0, ballot0(), at(start.get() + MAX_CATCH_UP_COMMANDS as u64));
+    cluster.deliver_page(4, 0, &second);
+    assert_eq!(paths(&cluster).taken_ahead, 1, "{:?}", paths(&cluster));
+    let mut largest = 0;
+    let mut windows = 0;
+    while cluster.follower(4).catching_up() {
+        let (_, window) = cluster.follower(4).table_waits();
+        assert!(
+            window <= MAX_CATCH_UP_COMMANDS,
+            "a window of {window} with two pages in hand"
+        );
+        largest = largest.max(window);
+        windows += usize::from(window == MAX_CATCH_UP_COMMANDS);
+        cluster.execute_at_most(4, 1);
+    }
+    // A window shrinks as it executes: each page was one whole window.
+    assert_eq!(largest, MAX_CATCH_UP_COMMANDS);
+    assert_eq!(windows, 2, "the two pages were not two whole windows");
+    cluster.serve = true;
+    cluster.ask(4);
+    assert_eq!(cluster.nodes[4].executed, cluster.nodes[0].executed);
+}
+
+/// review's ordering test on #223, with pages asked ahead: seeded random
+/// orders of pacer asks, answers cut at random lengths, late answers,
+/// duplicates and answers to asks never made, with the voter executing a
+/// few commands at a time and moving by itself from the leader's traffic.
+/// After every step r4's executed sequence is a prefix of the leader's,
+/// and once served it ends level. `CATCH_UP_ORDERS` sets the seeds (400 by
+/// default).
+#[test]
+fn two_pages_in_flight_in_any_order_never_install_twice_or_skip() {
+    let seeds: u64 = std::env::var("CATCH_UP_ORDERS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(400);
+    let mut totals = coord_consensus::CatchUpPaths::default();
+    for seed in 1..=seeds {
+        let (mut cluster, _) = left_behind(1000 + seed);
+        cluster.serve = false;
+        cluster.page_limit = 3 + (cluster.rand() % 10) as usize;
+        let mut answered: Vec<ProtocolMessage> = Vec::new();
+        for _ in 0..60 {
+            let pick = cluster.rand() % 8;
+            match pick {
+                0 => {
+                    let effects = cluster.nodes[4].follower_mut().request_catch_up(r(0));
+                    cluster.handle(4, effects);
+                }
+                1..=3 => {
+                    // An answer to a recorded ask, or to one near the
+                    // frontier, cut at a random length.
+                    let mine: Vec<u64> = cluster
+                        .catch_up_asks
+                        .iter()
+                        .filter(|(i, _)| *i == 4)
+                        .map(|(_, a)| *a)
+                        .collect();
+                    let after = if pick < 3 && !mine.is_empty() {
+                        mine[(cluster.rand() % mine.len() as u64) as usize]
+                    } else {
+                        let frontier = cluster.follower(4).executed_through().get();
+                        (frontier + cluster.rand() % 5).saturating_sub(2)
+                    };
+                    let mut page = cluster.page(0, ballot0(), at(after));
+                    if let ProtocolMessage::CatchUpPage { entries, .. } = &mut page {
+                        let keep = (cluster.rand() % (entries.len() as u64 + 1)) as usize;
+                        if cluster.rand() % 2 == 0 {
+                            entries.truncate(keep);
+                        }
+                    }
+                    if std::env::var_os("CATCH_UP_DEBUG").is_some() {
+                        let f = cluster.follower(4);
+                        eprintln!(
+                            "seed {seed} after {after} busy {} last ask {:?} window {:?}",
+                            f.catching_up(),
+                            cluster.catch_up_asks.iter().rev().find(|(i, _)| *i == 4),
+                            f.table_waits().1
+                        );
+                    }
+                    cluster.deliver_page(4, 0, &page);
+                    answered.push(page);
+                }
+                4 if !answered.is_empty() => {
+                    // A duplicate, or a late answer.
+                    let i = (cluster.rand() % answered.len() as u64) as usize;
+                    let page = answered[i].clone();
+                    cluster.deliver_page(4, 0, &page);
+                }
+                5 | 6 => {
+                    let n = 1 + (cluster.rand() % 6) as usize;
+                    cluster.execute_at_most(4, n);
+                }
+                _ => {
+                    // The leader's traffic: r4 may move by itself.
+                    cluster.settle();
+                }
+            }
+            let mine = &cluster.nodes[4].executed;
+            assert_eq!(
+                mine[..],
+                cluster.nodes[0].executed[..mine.len()],
+                "seed {seed}: r4 left the leader's order"
+            );
+            assert_eq!(
+                cluster.follower(4).catch_up_divergence(),
+                None,
+                "seed {seed}"
+            );
+            let (_, window) = cluster.follower(4).table_waits();
+            assert!(
+                window <= MAX_CATCH_UP_COMMANDS,
+                "seed {seed}: a window of {window}"
+            );
+        }
+        cluster.serve = true;
+        cluster.ask(4);
+        cluster.settle_ticking(2);
+        if cluster.nodes[4].executed != cluster.nodes[0].executed {
+            cluster.ask(4);
+        }
+        assert_eq!(
+            cluster.nodes[4].executed, cluster.nodes[0].executed,
+            "seed {seed}: r4 did not end level"
+        );
+        let p = paths(&cluster);
+        totals.taken_ahead += p.taken_ahead;
+        totals.asked_ahead += p.asked_ahead;
+        totals.taken_stale += p.taken_stale;
+        totals.stopped_stale += p.stopped_stale;
+        totals.ignored_after += p.ignored_after;
+        totals.ignored_busy += p.ignored_busy;
+        totals.cut_short += p.cut_short;
+        totals.asked += p.asked;
+    }
+    eprintln!("{totals:?}");
+    assert!(
+        totals.taken_ahead > 0,
+        "no page was taken ahead: {totals:?}"
+    );
+    assert!(
+        totals.taken_stale > 0,
+        "no stale page was taken: {totals:?}"
+    );
+}
+
+/// What a voter holds is two pages, however small they are (task-d25
+/// review). Asked ahead while it held at most a page's worth of commands,
+/// a voter served pages of one command -- a donor whose byte bound cuts
+/// every page to one large command -- asked for the next on every
+/// arrival, and held 126 pages with nothing executed: about 250 MiB at
+/// the largest request. Now it asks ahead only while it holds one page.
+/// Every ask is answered at once here, and nothing executes.
+#[test]
+fn what_a_voter_holds_is_two_pages_however_small_they_are() {
+    for limit in [1, 10, MAX_CATCH_UP_COMMANDS] {
+        let mut cluster = left_far_behind(5, 2 * MAX_CATCH_UP_COMMANDS as u64 + 40);
+        cluster.serve = false;
+        cluster.page_limit = limit;
+        let executed = cluster.nodes[4].executed.len();
+        let mut answered = cluster.catch_up_asks.len();
+        cluster.ask(4);
+        while answered < cluster.catch_up_asks.len() && answered < 1_000 {
+            let (i, after) = cluster.catch_up_asks[answered];
+            answered += 1;
+            if i == 4 {
+                let page = cluster.page(0, ballot0(), at(after));
+                cluster.deliver_page(4, 0, &page);
+            }
+        }
+        assert_eq!(
+            cluster.nodes[4].executed.len(),
+            executed,
+            "pages of {limit}: r4 executed meanwhile, so the test shows nothing"
+        );
+        let (pages, _) = cluster.follower(4).catch_up_counts();
+        assert_eq!(
+            pages,
+            2,
+            "pages of {limit}: {pages} pages in hand with nothing executed ({:?})",
+            paths(&cluster)
+        );
+        assert_eq!(paths(&cluster).asked_ahead, 1, "pages of {limit}");
+        // Executed, the chain goes on and ends level.
+        cluster.serve = true;
+        cluster.settle();
+        assert_eq!(
+            cluster.nodes[4].executed, cluster.nodes[0].executed,
+            "pages of {limit}: r4 stopped short"
+        );
+    }
+}
+
+/// A page is bounded in bytes where it is taken, as the donor bounds it
+/// (task-d25 review), so two pages in hand are two pages' bytes whatever
+/// the donor sent. A page cut at that bound, or at the command bound, and
+/// nowhere else goes on at once from the cut, as a full page does: a
+/// donor of a later build with a larger page is followed at full pace,
+/// not at the pacer's, as an older build here follows a page of 125.
+#[test]
+fn a_page_past_the_bounds_is_taken_to_them_and_the_chain_goes_on() {
+    for (value_len, limit) in [(64 * 1024, MAX_CATCH_UP_COMMANDS), (1, 200)] {
+        let what = format!("values of {value_len}, pages of {limit}");
+        let mut cluster = if value_len == 1 {
+            left_far_behind(5, 2 * MAX_CATCH_UP_COMMANDS as u64 + 40)
+        } else {
+            left_behind_by(7, 40, value_len)
+        };
+        // A donor that bounds its pages by neither.
+        cluster.serve = false;
+        cluster.page_limit = limit;
+        let start = cluster.follower(4).executed_through();
+        cluster.ask(4);
+        let page = cluster.page(0, ballot0(), start);
+        let entries = entries_of(&page);
+        let mut bytes = 0usize;
+        let mut fit = 0usize;
+        for e in entries {
+            let len = e.encoded_len();
+            if fit == MAX_CATCH_UP_COMMANDS || fit > 0 && bytes + len > MAX_CATCH_UP_BYTES {
+                break;
+            }
+            bytes += len;
+            fit += 1;
+        }
+        assert!(
+            fit < entries.len(),
+            "{what}: a page of {} is within the bounds, so the test shows nothing",
+            entries.len()
+        );
+        let asks = cluster.catch_up_asks.len();
+        let before = paths(&cluster);
+        cluster.deliver_page(4, 0, &page);
+        let now = paths(&cluster);
+        assert_eq!(now.cut_short, before.cut_short + 1, "{what}: {now:?}");
+        assert_eq!(
+            cluster.catch_up_asks.get(asks),
+            Some(&(4, start.get() + fit as u64)),
+            "{what}: the next ask is not from where the bound cut the page"
+        );
+        // That ask answered, the chain runs to the end.
+        cluster.serve = true;
+        let next = cluster.page(0, ballot0(), at(start.get() + fit as u64));
+        cluster.deliver_page(4, 0, &next);
+        cluster.settle();
+        assert_eq!(
+            cluster.nodes[4].executed, cluster.nodes[0].executed,
+            "{what}: r4 stopped short"
+        );
+    }
+}
+
+/// A window is at most one page when the page in hand ends a window early
+/// and the page asked ahead queues behind its rest (task-d25 review's
+/// case): the first page's window ends at its tenth command, which the
+/// donor kept no row of. Without the limit in `install_catch_up`, the
+/// third window took the first page's last 115 and the whole second page,
+/// 240, past what the table's reserve is sized for
+/// (`RECOVERY_RESERVE_PARTS`).
+#[test]
+fn a_window_is_one_page_when_the_first_ends_early() {
+    let mut cluster = left_far_behind(5, 2 * MAX_CATCH_UP_COMMANDS as u64 + 40);
+    cluster.serve = false;
+    let start = cluster.follower(4).executed_through();
+    cluster.ask(4);
+    let asks = cluster.catch_up_asks.len();
+    let mut first = cluster.page(0, ballot0(), start);
+    let ProtocolMessage::CatchUpPage { entries, .. } = &mut first else {
+        unreachable!()
+    };
+    assert_eq!(entries.len(), MAX_CATCH_UP_COMMANDS);
+    entries[9].decided = None;
+    cluster.deliver_page(4, 0, &first);
+    assert_eq!(cluster.follower(4).table_waits().1, 9, "the first window");
+    let next = start.get() + MAX_CATCH_UP_COMMANDS as u64;
+    assert_eq!(
+        cluster.catch_up_asks.get(asks),
+        Some(&(4, next)),
+        "no ask ahead of the page in hand"
+    );
+    let second = cluster.page(0, ballot0(), at(next));
+    assert_eq!(entries_of(&second).len(), MAX_CATCH_UP_COMMANDS);
+    cluster.deliver_page(4, 0, &second);
+    assert_eq!(paths(&cluster).taken_ahead, 1, "{:?}", paths(&cluster));
+    // A window is installed only once the one before has run, so a window
+    // starts where the last ended.
+    let mut windows = Vec::new();
+    let mut last = 0;
+    while cluster.follower(4).catching_up() {
+        let (_, window) = cluster.follower(4).table_waits();
+        if last <= 1 {
+            windows.push(window);
+        }
+        last = window;
+        cluster.execute_at_most(4, 1);
+    }
+    assert_eq!(
+        windows,
+        vec![9, 1, MAX_CATCH_UP_COMMANDS, MAX_CATCH_UP_COMMANDS - 10],
+        "windows over two pages in hand"
+    );
+    cluster.serve = true;
+    cluster.ask(4);
+    assert_eq!(cluster.nodes[4].executed, cluster.nodes[0].executed);
+}
+
+/// An open chain closes once the voter executes as far as the page that
+/// left it open said its donor had (task-d25 review), however it got
+/// there: here from a late answer to an earlier ask, which says nothing
+/// of the chain itself. Before, it stayed open until a page reached a
+/// frontier, and with the pacer asking on an open chain every
+/// `CHAIN_RETRY`, a voter level by itself would have asked for ever in a
+/// quiet domain, where nobody answers an ask with nothing past it.
+#[test]
+fn an_open_chain_closes_once_the_voter_executes_as_far_as_it_was_owed() {
+    let (mut cluster, _) = left_behind(17);
+    cluster.serve = false;
+    let start = cluster.follower(4).executed_through();
+    cluster.ask(4);
+    let whole = cluster.page(0, ballot0(), start);
+    let mut cut = whole.clone();
+    let ProtocolMessage::CatchUpPage { entries, .. } = &mut cut else {
+        unreachable!()
+    };
+    entries.truncate(3);
+    cluster.deliver_page(4, 0, &cut);
+    cluster.settle();
+    // The chain's next ask, from the end of the first page, is never
+    // answered.
+    assert_eq!(
+        cluster.catch_up_asks.last(),
+        Some(&(4, start.get() + 3)),
+        "no ask followed the cut page"
+    );
+    assert!(cluster.follower(4).catch_up_chain_open());
+    // The first ask's whole page arrives late, and is taken past the
+    // frontier.
+    cluster.deliver_page(4, 0, &whole);
+    cluster.settle();
+    assert_eq!(paths(&cluster).stale_unasked, 1, "{:?}", paths(&cluster));
+    assert_eq!(cluster.nodes[4].executed, cluster.nodes[0].executed);
+    assert!(
+        !cluster.follower(4).catch_up_chain_open(),
+        "a voter level with the donor's frontier still owes its chain"
     );
 }

@@ -493,6 +493,15 @@ impl<P: Persistence> Applier<P> {
             // Nothing of its own to materialize; what it publishes may
             // still name a revision a group in flight wrote.
             if let Some(flight) = self.inflight.back_mut() {
+                // Its events wait for that group's commit (task-d86).
+                if self.hub.open_watches() > 0
+                    && group
+                        .publications
+                        .iter()
+                        .any(|p| matches!(p, Publication::Events { .. }))
+                {
+                    self.store.request_projection_commit();
+                }
                 flight.publications.extend(group.publications);
                 return Ok(Some(flight.position));
             }
@@ -522,6 +531,17 @@ impl<P: Persistence> Applier<P> {
             attempts -= 1;
         }
         let group = self.group.take().expect("open");
+        // A watch's events wait for their group's commit, so a group that
+        // has some for an open watch is not held for a larger one
+        // (task-d86).
+        if self.hub.open_watches() > 0
+            && group
+                .publications
+                .iter()
+                .any(|p| matches!(p, Publication::Events { .. }))
+        {
+            self.store.request_projection_commit();
+        }
         self.inflight.push_back(InFlight {
             position,
             own: group.own,
@@ -555,6 +575,9 @@ impl<P: Persistence> Applier<P> {
     pub fn drain(&mut self) -> Result<coord_types::ids::ExecutionPosition, ApplyError> {
         if self.store.pipelined() {
             for _ in 0..GROUP_LOWERINGS {
+                // A drain waits for every group, so none is held for a
+                // larger commit (task-d86).
+                self.store.request_projection_commit();
                 let barriers = self.in_flight_barriers();
                 let drained = self.store.drain()?;
                 self.take_lowered(drained, &barriers)?;
@@ -727,9 +750,11 @@ impl<P: Persistence> Applier<P> {
             None => Arc::new(CutOverlay::new()),
         };
         let durable = gated.meta().stamp.journal_seq();
-        Ok(GatedView::new(
+        let gate = gated.gate().cloned();
+        Ok(GatedView::with_gate(
             RecoveryCut::new(gated, overlay, durable),
             meta,
+            gate,
         ))
     }
 

@@ -9,7 +9,8 @@ use std::collections::BTreeSet;
 use coord_consensus::{
     BallotConfiguration, CONSERVATIVE_KEY, CommandRecord, ConfigurationIdentity, FastAck, Follower,
     FollowerConfig, FollowerRejection, FramedProposal, PayloadRecordV1, Phase, ProtocolMessage,
-    ReplayRefusal, ReplicaRole, SlowAck, decode_dependency, decode_payload, dependency_key,
+    RelayTaken, ReplayRefusal, ReplicaRole, SlowAck, decode_dependency, decode_payload,
+    dependency_key,
 };
 use coord_core::capability::{AdmissionReceipt, AttestedAdmission, VerifierToken};
 use coord_core::effect::{BootId, Effect, PeerId};
@@ -1935,6 +1936,14 @@ fn a_relayed_payload_that_does_not_match_its_proposal_is_not_taken() {
         relayed(proposal(c1, vec![], 0, l1.paths, l1.path), payload),
     ));
     assert_eq!(f.relayed_taken(), 0);
+    assert_eq!(
+        f.relay_taken(),
+        RelayTaken {
+            not_taken: 1,
+            ..RelayTaken::default()
+        },
+        "counted as not taken (#224 review)"
+    );
     assert!(
         !effects.iter().any(|e| matches!(e, Effect::Persist(_))),
         "nothing written"
@@ -1969,6 +1978,14 @@ fn a_relayed_proposal_of_a_command_held_already_adopts_as_any() {
         relayed(proposal(c1, vec![], 0, l1.paths, l1.path), payload),
     ));
     assert_eq!(f.relayed_taken(), 0);
+    assert_eq!(
+        f.relay_taken(),
+        RelayTaken {
+            known: 1,
+            ..RelayTaken::default()
+        },
+        "counted as known (#224 review)"
+    );
     assert!(!f.answers_on_release(&c1), "not marked by the relay");
     // Its own durable fast vote and the leader's proposal are a fast
     // quorum here: decided, as a plain proposal would leave it.
@@ -2019,6 +2036,14 @@ fn a_frames_proposals_are_adopted_in_one_step() {
     let effects = f.step(peer(0, frame));
     assert_eq!(f.frames_taken(), 1);
     assert_eq!(f.relayed_taken(), 2);
+    assert_eq!(
+        f.relay_taken(),
+        RelayTaken {
+            frames: 1,
+            taken: 2,
+            ..RelayTaken::default()
+        }
+    );
     assert!(f.held().is_empty(), "adopted at once");
     assert_eq!(f.table().phase_of(&c1), Some(Phase::Accept));
     assert_eq!(f.table().phase_of(&c2), Some(Phase::Accept));
@@ -2061,6 +2086,15 @@ fn a_refused_entry_leaves_the_frames_others_as_they_are() {
     ]);
     f.step(peer(0, frame));
     assert_eq!(f.relayed_taken(), 1, "only the matching payload");
+    assert_eq!(
+        f.relay_taken(),
+        RelayTaken {
+            frames: 1,
+            taken: 1,
+            known: 0,
+            not_taken: 1,
+        }
+    );
     assert_ne!(f.table().phase_of(&c1), Some(Phase::Accept));
     assert_eq!(f.table().phase_of(&c2), Some(Phase::Accept));
 }

@@ -789,6 +789,7 @@ impl Dispatcher {
                         "retry key bound to another payload",
                     ),
                     SubmitRefusal::Backpressure { .. } => {
+                        self.admission.refused_at_collection_bound();
                         (codes::BACKPRESSURE, "domain at its collection bound")
                     }
                 };
