@@ -1773,7 +1773,12 @@ Protocol state cannot be reduced to a Raft-like last_applied: application snapsh
   - Yet the materializer writes 38 KB a command to the file at a follower and 46 KB at the leader: about 9.4 and 11.3 fresh 4 KiB pages, the same at both loads.
   - A commit holds 4.3 and 11.3 commands locally, and 3.25 and 7.55 at the runner's leader.
   - The thread is 116 to 138 µs a command at the leader and 100 to 120 at a follower.
-- **Why a row costs a page:** the payload, dependency and executed rows are keyed by the command's digest, and the history, current, retry and retry-floor rows by key or by client. So each lands on a leaf no other command in the commit touches. redb copies that page on write, rebuilds it, checksums it at the working commit and writes it at the next durable commit.
+- **Why a row costs a page, and the digest-keyed rows two** (review on #233, [6813025752](https://github.com/tuplesky/tuplesky/pull/233#issuecomment-6813025752)):
+  - The payload, dependency and executed rows are keyed by the command's digest, so each lands on a leaf no other command in the commit touches.
+  - Their tables are large: after 100,000 operations a follower's `payload_v1` has 25,597 leaves under 533 branch pages, `protocol_v1` 6,988 under 153, and `executed_v1` 2,988 under 65. So a commit's commands share neither a leaf nor the branch page above it, and each row copies both.
+  - History and current rows are keyed by key, so they share a leaf only where a commit's commands write nearby keys.
+  - The retry and retry-floor tables are small (14 leaves and 2 in that run, whatever its length), so their rows cost a fraction of a page. Every commit copies those leaves anyway.
+  - redb copies a page on write, rebuilds it, checksums it at the working commit and writes it at the next durable commit.
 - **The thread's split:** copy-on-write allocation 17 to 19%, the leaf's rebuild 16 to 17%, page lookups 11 to 14%, working-commit checksums 11 to 12%, durable-commit `pwrite` 12 to 15%, freed pages 7 to 9% in all. That is 74 to 86% that follows pages. Reopening the table for every row is another 5 to 6.5%, and it follows rows, not pages.
 
 **What is keyed by what today:**
@@ -1822,6 +1827,12 @@ Protocol state cannot be reduced to a Raft-like last_applied: application snapsh
 
 So boot, catch-up served and resolve need no index by command here. Boot reads every row it joins, and catch-up and resolve read by position. What does need it is the campaign, trim and its fence, a stop and the store's own writes.
 
+**The table is complete** (review on #233 went through every use outside tests of the three collections and of `executed_key`, `payload_key`, `dependency_key` and `proposal_key`). Outside it, the code step also touches:
+- **The two emptiness checks:** `check_target` in `coord-checkpoint`'s `install.rs`, and `restore.rs`. They test the common-hash collections and `protocol_v1`, so they must test the new pending collection too, or a target holding pending payloads passes as empty.
+- **`executed_v1` as a name.** The records keep it (`0x0006`, keyed by command), and the table goes. The registry says so, or `in_common_hash` and the image's walk still count an empty collection.
+- **Unchanged:** `ADMISSION_COLLECTIONS` in `worker.rs` reads a batch's updates, not the tables, so it stays as it is.
+- **Smaller:** `coord-store-bench`'s executed-row count, the divergence report's text in `bins/coordd/src/serve.rs`, and the fjall engine's collection list.
+
 **The index lives in memory, in the store, in two parts with their own lifetimes** (the second from Codex's review on #233). Each maps an 8-byte prefix of a command identity, and the row named carries the whole identity, so a prefix collision is settled by reading the row. A prefix held by two commands keeps both entries.
 - **The intake part:** each live intake-keyed row, a pending payload or a dependency row, to its intake order. An entry lives as long as its row: it goes at the move, at a Sync's release, at a pulled command's `dependency_delete` and at trim.
 - **The executed part:** each retained `execution_v1` row to its position. An entry lives as long as the executed row, not the intake rows. After trim has removed a command's protocol rows, or on a voter that installed a shared image and never held them, the fence, a stop and trim still find the command's position.
@@ -1836,6 +1847,7 @@ So boot, catch-up served and resolve need no index by command here. Boot reads e
 - **Kept by the lowering.** Each commit's changes are published with the commit. A reader pins its snapshot first and then asks the index:
   - a row added after the snapshot reads as absent, which is that snapshot's answer;
   - a row deleted after the snapshot reads as absent too, which is a later snapshot's answer and what its reader would get next.
+  - A third case, a row deleted and written again under a new key after the snapshot, is ruled out for snapshot readers by rule (c) below. A commit whose outcome isn't known is rule (d).
 - **Memory (inferred):**
   - The intake part takes about 24 to 32 bytes a live row: the pending payloads and every dependency row the store keeps. In `coordd` today that is every dependency row, since nothing trims (task-d27).
   - The executed part takes about 16 to 24 bytes for each executed command retained, an 8-byte prefix and an 8-byte position with the map's overhead. That is every executed command until a floor forgets a prefix of `execution_v1`, about 24 MB at 10⁶.
@@ -1845,6 +1857,24 @@ So boot, catch-up served and resolve need no index by command here. Boot reads e
 - **Not taken:**
   - a durable index keyed by command, which is the random leaf again;
   - a durable index batched by order (one row a commit listing its commands). It would let the open read about 40 bytes a command instead of dependency rows, but the open reads those anyway.
+
+**The lowering's four rules** (review on #233, [6813025752](https://github.com/tuplesky/tuplesky/pull/233#issuecomment-6813025752)). None changes the layout. Each has a test in the code step.
+- **(a) A payload put for a command already executed is dropped.**
+  - Today such a put overwrites the same row with the same bytes, so none of the `payload_update` sites (thirteen in `coord-consensus` and one in `serve.rs`) has had to rule it out: a late fetch, a vote or an adoption that arrives after the command executed.
+  - Under this layout it would write a pending row that nothing moves or deletes. So the lowering writes nothing for it when the index's executed part holds the command.
+  - The test delivers one after execution and checks that the pending table stays empty.
+- **(b) An executed row with no pending payload is refused.**
+  - The move needs the payload in the pending table, or earlier in the same commit. A command executes only after its payload is in hand (a vote, the proposal batch, a Sync's installation, a fetch or a catch-up install), and each of those puts the payload first. So an executed row with no payload to move is a broken invariant, not a case with a rule.
+  - The projection refuses it, as it refuses a base that doesn't extend it. Otherwise `payload_v1` would have a hole at that position, and a donor's range read and the shared image would be short a row.
+  - The code step checks each executing path against the rule. A negative control lowers an execution with no payload and sees the refusal.
+- **(c) Through the index, a snapshot reader looks up executed commands only.**
+  - A row deleted after a reader's snapshot and written again under a new intake key would give an answer neither snapshot holds. That is a command a Sync released and the next leader proposed again. The index then names the new key, and the reader, finding no row there in its snapshot, sees "absent" for a row both snapshots hold.
+  - An executed command's rows are never deleted and rewritten under a new key: its execution and payload rows are keyed by position, its dependency row's rewrite stays in place, and a Sync releases only commands that aren't executed. So the lookups the readers' table makes are safe: catch-up, the campaign, trim, the fence and a stop all ask about executed commands.
+  - The store's own writes read the intake part inside the write transaction, which holds the latest state. The code step keeps any snapshot reader that asks about a command not executed out of the intake part. If one is ever needed, each entry gains the sequence that wrote it, so a reader can tell an entry newer than its snapshot.
+- **(d) The index follows the commit's outcome.**
+  - A commit that returns an error publishes nothing.
+  - A commit whose outcome isn't known already puts the store in `MaterializationUncertain` with the meta it wrote (`pending_meta`), and the store settles it by reading the meta back. The index's changes for that commit are held with `pending_meta`. They are published if the meta shows the commit landed, and dropped if it didn't.
+  - A store that quarantines drops the index with it, and the next open rebuilds it from the store.
 
 **2. Which order: the execution position for executed rows, and intake order before execution.**
 - **Executed rows and executed payloads take the execution position:**
@@ -1871,8 +1901,10 @@ So boot, catch-up served and resolve need no index by command here. Boot reads e
 - **A domain runs one layout,** as task-d105's design step sets for its own (#208).
   - Two voters on different layouts would export different roots, and their floors (task-d27) wouldn't count together.
   - The layout is recorded at initialization and compared at every open. `meta_fields::FORMAT_VERSION` is read by no open today, so the code step builds that check, unless task-d105's code has built it first.
-  - A live store or image of the other layout is refused with the reason (Section 17.7: an unsupported format fails before admission). If both tasks are taken, one layout change carries both.
+  - A live store or image of the other layout is refused with the reason (Section 17.7: an unsupported format fails before admission).
+  - This task doesn't wait to share task-d105's layout change. Nothing is deployed, so a second layout change costs a test domain nothing.
 - **An existing projection doesn't move in this step.** Nothing is deployed in production, so a store of the old layout is refused and a test domain starts fresh.
+- **The conversion is a release condition** (review on #233), carried in the plan the way the catch-up page size is. The first release that promises an upgrade in place needs the conversion below built.
 - **`replay` rebuilds from the journal only above its selected local checkpoint** (correcting the order's premise). The journal's prefix is retired at each publication under both profiles (Section 17.16.3, step 4), so below C the rows are only in the local image, in the old layout (Section 17.16.4). Under both profiles a move needs the image converted. They differ in which artifact:
   - **`replay`:** convert the selected local image offline into a new generation, then replay `(C, J]` onto it. The suffix replays as it is, since its records name rows by command and the new lowering keys them.
   - **`strict`:** the projection is the durable state at every commit, and a restart replays only above its stamp. So the live projection itself is converted offline as a new generation, selected only once durable, with the old kept until then (Section 17.7's generation replacement).
@@ -1903,31 +1935,57 @@ So boot, catch-up served and resolve need no index by command here. Boot reads e
 | Retry deletes | the same | task-d104's window that overwrites in place removes them | task-d104 |
 | Retry floor (`retry_floor_v1`) | session, client | no: one row a client, found by client. task-d104 writes it once every K commands | task-d104 |
 
-**Folding the retry row into the execution row.** The retry record holds the command, position, revision and digest, which are the executed row's fields, plus the response. So it could be the execution row carrying the response, found through an index by retry key in memory, bounded by clients times the window's width. That saves another page a command, about −0.03 ms an operation. But it moves an admission collection's lookups into memory. It is task-d104's to weigh beside its window, and not this task's.
+**The retry rows are small already** (review on #233). In review's model, at 8 commands a commit, the retry rows, the retry floor and the three meta rows a commit together write 0.40 pages a command, 4.5 µs a voter: under −0.02 ms an operation for all of them. The retry and floor tables stay a few leaves wide whatever the run's length, and every commit copies those leaves anyway. So folding the retry row into the execution row isn't worth a page a command, as this step first had it. It would save a fraction of 0.40 pages, and task-d104 stays small.
 
-**6. The sizes,** converted by the profile's rule: a local µs a command over five voters is 0.00079 ms an operation at 120 callers and 0.00066 at 30, on the EPYC 9V74.
-- **The cost of a page (inferred).** Page work is 74 to 86% of the thread, so a page costs a voter 7.6 to 9.1 µs at 120 callers and 9.0 to 11.0 at 30: the leader's and a follower's µs a command, over their pages.
-- **A page a command at every voter** is then about −0.03 to −0.036 ms an operation at either load.
-- **If the leaf's rebuild is paid per row rather than per page,** a page is worth about a fifth less, and every figure below shrinks with it.
+**6. The sizes** (review's model on #233, [6813025752](https://github.com/tuplesky/tuplesky/pull/233#issuecomment-6813025752), replacing this step's first estimate), converted by the profile's rule: a local µs a command over five voters is 0.00079 ms an operation at 120 callers and 0.00066 at 30, on the EPYC 9V74.
+- **The model:**
+  - **Setup.** redb 4.2.0, opened as the adapter opens it, on tmpfs. It uses a real follower's table shapes after 100,000 operations (five voters, `replay`, 120 callers, the carry at `5ffa09e6`).
+  - **What each command writes:** a follower's rows, each into a table of its own. The payload and dependency rows come at intake. Twelve commands later come the executed, event, history, current and retry rows, a retry delete and the floor. There are three meta rows a commit.
+  - **The run:** 50,000 commands are in the tables first, then 30,000 are measured.
+  - **Its total matches the profile's:** 9.0 pages and 36.8 KB a command at 8 a commit, where the profile has 9.4 and 38.
+  - **What it isn't:** it is redb alone. It reads no journal and encodes no row, and its µs are its host's.
+- **By table at 8 commands a commit:** the three rows 5.7 pages, history 1.8, current 1.25, events 0.30, and the retry rows, floor and meta rows 0.40 together.
 
-| Part | Pages a command | ms an operation, 120 callers | ms an operation, 30 callers | Basis |
-| --- | --- | --- | --- | --- |
-| The three rows, gross | −3 at every voter | −0.09 to −0.11 | −0.09 to −0.11 | rows and pages measured; the cost a page inferred |
-| The leader's proposal row | −1 at the leader | −0.006 to −0.007 | −0.006 to −0.007 | counted under task-d103, which stops writing it (#206), not here |
-| What the ordered rows still cost: five right-hand leaves a commit | +5 / commands a commit: +0.66 at the runner's 7.55, +1.54 at its 3.25 | | | inferred; commands a commit measured on the runner |
-| Their bytes, about 0.75 to 1.1 KB: two copies of the payload, the dependency row and the execution row, on half-full to full leaves | +0.2 to +0.55 | | | inferred: the profile doesn't split bytes by table |
-| **Net** | −1.8 to −2.1 a voter at 120 callers, −0.9 to −1.3 at 30 | **−0.05 to −0.08** | **−0.03 to −0.045** | inferred, and a floor: each right-hand leaf is counted as a whole page, though its durable write comes once a durable commit, not once a working commit |
-| Inside the net: the move at execution, against leaving the payload in place behind a node-private locator by position | +0.2 to +0.35 a voter at 120 callers | +0.006 to +0.012 | +0.011 to +0.018 | inferred |
-| With task-d86's cadence at about 30 commands a commit | net −2.3 to −2.6 a voter | −0.07 to −0.095 | toward the same, as far as its time bound fills a commit | inferred |
-| The index | 0 | under 0.001, CPU | under 0.001 | inferred |
+| Commands a commit | Today: µs and pages a command | By order, move included: µs and pages a command | The three rows alone: today, then by order |
+| ---: | --- | --- | --- |
+| 3 | 77.6, 11.1 | 51.9, 5.8 | 44.1 µs and 6.6 pages, then 18.8 and 1.0 |
+| 8 | 67.4, 9.0 | 35.5, 3.9 | 37.9 and 5.7, then 7.7 and 0.57 |
+| 30 | 61.2, 10.0 | 29.8, 4.5 | 31.7 and 6.0, then 4.6 and 0.60 |
+
+- **The three rows don't depend on the mix.** With every write on 16 keys, history is 0.8 pages and current 0.13, and the total goes from 7.0 to 1.9 by order. With 100,000 commands in the tables, the three rows are 6.2 pages today and 0.60 by order.
+- **In ms an operation, two ways:**
+  - **By the model's µs and the conversion:** 30 to 35 µs a voter at 8 a commit is −0.12 to −0.14 at 120 callers, and 22 to 26 µs at 3 a commit is −0.07 to −0.085 at 30.
+  - **As a share of the thread:** the model's thread falls 47% at 8 a commit, 33% at 3 and about half at 30. Applied to the 74 to 86% of the real thread that follows pages, that is −0.14 to −0.17 at 120 callers and −0.10 to −0.12 at 30.
+
+| Part | ms an operation, 120 callers | ms an operation, 30 callers | Basis |
+| --- | --- | --- | --- |
+| **The three rows by order, the move included** | **−0.12 to −0.17** | **−0.07 to −0.12** | review's model, converted both ways above |
+| Inside that: the move at execution, against leaving the payload in place behind a node-private locator by position | +0.009 (2.4 µs a voter at 8 a commit) | +0.008 to +0.013 (2.3 to 3.9 µs at 3) | review's model |
+| The leader's proposal row | −0.006 to −0.007 | −0.006 to −0.007 | counted under task-d103, which stops writing it (#206), not here |
+| The index | under 0.001, CPU | under 0.001 | inferred |
+
+**What the first estimate had, and why it was low.** It had three pages a command gross, −0.09 to −0.11 ms an operation, and −0.05 to −0.08 net at 120 callers and −0.03 to −0.045 at 30.
+- **Its residual terms hold.** The model's ordered rows cost about 47 µs a commit, which fits their five right-hand leaves.
+- **Its gross was low.** A digest-keyed row in a table that large copies its leaf and the branch page above it, so the three rows are 5.7 to 6.6 pages, not 3.
 
 **What the sizes say:**
-- **The net is about half to three quarters of the gross at 120 callers, and under half at 30.** A commit of 3.25 commands shares little.
-- **The cadence and this task compound.** task-d86 raises commands a commit, which lifts this task's net toward its gross.
-- **The move at execution costs about 0.01 ms an operation.** It buys three things: executed history read by position with no index (resolve, catch-up, the image), a pending table bounded by what is unexecuted, and a common hash with no node-private key in it.
-- **Not touched here:** the table reopened every row (5 to 6.5%) is lever 3 on #185, and the commit's fixed cost is task-d86's.
+- **This is the largest lever on record at any commit size.** It is about half to three quarters of the gap to 2.0× at 30 callers (−0.156 ms an operation), and a third to a half of it at 120 (−0.362).
+- **It doesn't need task-d86's cadence.** By order the model's thread is 35.5 µs at 8 a commit and 29.8 at 30, so the cadence adds to this task and isn't needed for it.
+- **The move at execution costs about 0.01 ms an operation.** It buys three things:
+  - executed history read by position with no index (resolve, catch-up, the image);
+  - a pending table bounded by what is unexecuted;
+  - a common hash with no node-private key in it.
+- **What the pair reads.** A follower's fresh pages should fall from 9.4 to about 4 a command at 8 to 11 commands a commit, and to about 6 at 3. The first estimate had 7.0 to 7.4, so the pair's reading tells the two apart at once.
+- **The counting build splits the file's bytes by table,** so that each row's size is read rather than inferred, here and for task-d104 and task-d105.
+- **Not touched here:** the table reopened every row (5 to 6.5% of the thread) is lever 3 on #185, and the commit's fixed cost is task-d86's.
 
-**The order (proposed; the lead sets it):** after task-d86's cadence, for the reason above, and inside task-d105's layout change if that is taken, so that a domain changes layout once.
+**The order (the lead's, on review's word):** the top code priority, needing neither task-d86 nor task-d105 first. The code goes in two steps:
+1. **The dependency rows alone.**
+   - They are node-private, so this step changes no image and no common hash.
+   - Their readers are boot, catch-up, the campaign and trim, and the store's own rewrites and deletes.
+   - It builds the index's intake part, the lowering's key assignment, rules (c) and (d), and the layout check.
+   - By the table's shape it is about a third of the gain; review didn't measure it apart. Its evidence splits the counting build's file bytes by table.
+2. **The payload and executed rows.** This step brings the pending collection, the move, the index's executed part, and rules (a) and (b). It also raises the shared image's version and changes the common hash's membership.
 
 <a id="s17-2"></a>
 ### 17.2 Ordered keys and views

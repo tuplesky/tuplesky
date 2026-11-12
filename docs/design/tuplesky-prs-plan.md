@@ -66,7 +66,7 @@ Reference single-store and fixed-membership compositions are early increments, n
 | task-d109 | From the register-kill re-run (#98, run 42933821595): a voter restarted behind the others never caught up, its loop busy 379 s of 440 s; its profile was 94% `Follower::missing_payloads`, which the loop called twice a turn for a count and which walked every command pending a Sync's installation twice and sorted the result | Liveness; before the next fault run |
 | task-d110 | From an audit of the walks a turn makes over history (#98): a voter behind holds more committed and unexecuted commands than the history sweep's threshold, which the table never forgets, so every execution swept the whole ledger and the maps beside it, and catching up was quadratic in the backlog | Liveness; before the next fault run |
 | task-d112 | From Codex's review on #98 (`election.rs`, confirmed by the testing session, [6788929248](https://github.com/tuplesky/tuplesky/pull/98#issuecomment-6788929248)): a leaderless voter that could not reach a majority, or whose own campaign was still finishing, kept a campaign instant already past as its loop's deadline, so the loop woke at once on every pass for as long as the hold lasted | Before the next fault run's CPU readings |
-| task-d113 | From the materializer's profile on #185 ([6810986014](https://github.com/tuplesky/tuplesky/pull/185#issuecomment-6810986014)): a follower writes about 2.3 KB of rows a command and 38 KB to the file, 9.4 fresh pages (11.3 at the leader), because the payload, dependency and executed rows are keyed by the command's digest and each lands on a leaf no other command in the commit touches | A design step now; its code after task-d86's cadence, and in task-d105's layout change if that is taken (proposed; the order is the lead's) |
+| task-d113 | From the materializer's profile on #185 ([6810986014](https://github.com/tuplesky/tuplesky/pull/185#issuecomment-6810986014)): a follower writes about 2.3 KB of rows a command and 38 KB to the file, 9.4 fresh pages (11.3 at the leader), because the payload, dependency and executed rows are keyed by the command's digest and each lands on a leaf no other command in the commit touches | A design step now, then the top code priority in two steps: the dependency rows first, then the payload and executed rows. It needs neither task-d86 nor task-d105 first (the lead's order, on review's word on #233) |
 | task-q01 | Combined durable WAN/Kine qualification | Required before task-66 |
 
 ```mermaid
@@ -3145,7 +3145,7 @@ This entry is the budget and the record, not a lever:
 | The #173 carry (task-d63, task-d66, task-d74's recovery fix, task-d75, task-d77 to task-d80) against `259e0b2` | `36fe7d1` (#98) | register, 30 clients, replay, three pairs | 501.5 to 504.2 (base 505.4 to 513.4) | 3.57 to 3.59 ms (base 3.58 to 3.66) | 0.41 to 0.46 | the leader's loop: -4.1 to -6.6%; the domain loops -3.8%; tokio threads unchanged at 1.45 ms an op |
 | `service`, the same carry | `36fe7d1` | wr, 1,000 uniform keys, read-only ratio 0.6, 4 clients at 300/s, strict | 140.0, below the rate (etcd 290.1) | 12.41 ms (etcd 2.86), not at equal work | 1.87 (etcd 2.51) | p50 23 ms and p99 61 ms (etcd 2 and 4): task-d83, task-d84 |
 | `service` at `replay`, the matched comparison | | the same shape, replay | | | | the row the `service` target is read at (the testing session) |
-- **The materializer's largest single cut is task-d113** (#185, [6810986014](https://github.com/tuplesky/tuplesky/pull/185#issuecomment-6810986014)): the payload, dependency and executed rows keyed by order, so that a commit's rows share leaves. Its design step (Section 17.1) sizes it on the EPYC 9V74 at −0.09 to −0.11 ms an operation gross. Net of the leaves the ordered rows still dirty, that is −0.05 to −0.08 at 120 callers and −0.03 to −0.045 at 30, rising to about −0.07 to −0.095 at 120 with task-d86's cadence (inferred). The leader's proposal row is counted under task-d103, not here.
+- **The materializer's largest single cut is task-d113** (#185, [6810986014](https://github.com/tuplesky/tuplesky/pull/185#issuecomment-6810986014)): the payload, dependency and executed rows keyed by order, so that a commit's rows share leaves. Its design step (Section 17.1), on review's model (#233, [6813025752](https://github.com/tuplesky/tuplesky/pull/233#issuecomment-6813025752)), sizes it on the EPYC 9V74 at −0.12 to −0.17 ms an operation at 120 callers and −0.07 to −0.12 at 30, the move included. The three digest-keyed rows are 5.7 of a follower's 9 pages a command, since each copies its leaf and the branch page above it, and by order they are 0.57. That is the largest lever on record at any commit size, and it doesn't need task-d86's cadence. The leader's proposal row is counted under task-d103, not here.
 - **The local record** (this entry's PR): the same split on one host, five voters, each build against the one before it, with a profile of the leader and a follower ([notes](../tuplesky-impl-notes.md#the-budget-on-one-host-task-d72)). It does not replace the runner's rows, which the Jepsen testing session runs. It reads what a lever moved before the runner does: of a write's 7.9 to 8.7 ms of the nodes' CPU, a follower costs about 1.6 ms and the leader about 1.9, so the followers carry three quarters of it, and off the domain loops the transport's QUIC threads are a third of each node's CPU and the projection's commits a fifth.
 - **The shapes it is read in** (`docs/operations/jepsen.md`): `service`, a fixed rate where the metric is latency and CPU per operation at equal work, on the bridge and under the WAN profile; the append shape run against etcd too, so the multiple quoted has a denominator; and several domains on one cluster, if the harness can start them.
 
@@ -4169,13 +4169,24 @@ This entry is task-d72's largest single cut on the materializer, owned here. The
 2. **The order.** Executed rows and executed payloads take the execution position, which is replicated and always appended, since no voter executes out of position order (`JournaledStore::submit`, `project`). Payload and dependency rows before execution take intake order, the journal position of the record that brings them, which is node-private.
 3. **The format.** One layout a domain, recorded at initialization and checked at every open, as task-d105's step sets (#208); the other is refused with the reason. The shared image's version is raised. The journal's records don't change, since the store's lowering assigns the keys. No existing projection moves: nothing is deployed. `replay` can rebuild only above its local image, so under either profile a move would convert an image, offline and losslessly. That conversion isn't built.
 4. **Forgetting and the image.** task-d110's sweep and task-d111's forgetting by order read no rows. task-d27's trim, not yet run by `coordd`, scans in intake order and takes positions from the index. The shared image reads `execution_v1` and `payload_v1` as ranges, without today's point read per payload.
-5. **The other rows.** Events already share leaves. History by revision is the event row, which is task-d105's. Current needs task-d105's index. Retry rows are found by retry key on admission, and their deletes and floor are task-d104's. Folding the retry row into the execution row is noted for task-d104.
+5. **The other rows.** Events already share leaves. History by revision is the event row, which is task-d105's. Current needs task-d105's index. Retry rows are found by retry key on admission, and their deletes and floor are task-d104's. The retry rows, floor and meta rows write 0.40 pages a command together, under −0.02 ms an operation, so folding the retry row into the execution row isn't worth it, and task-d104 stays small.
 6. **The sizes, on the EPYC 9V74, by the profile's conversion:**
-   - gross, three pages a command at every voter: −0.09 to −0.11 ms an operation at both loads. The leader's fourth page is its proposal row, task-d103's (#206);
-   - net of the five right-hand leaves a commit and the rows' bytes: −0.05 to −0.08 at 120 callers and −0.03 to −0.045 at 30, inferred and a floor;
-   - with task-d86's cadence at about 30 commands a commit: −0.07 to −0.095 at 120 callers.
+   - by review's model (#233, [6813025752](https://github.com/tuplesky/tuplesky/pull/233#issuecomment-6813025752)): redb alone, with a real follower's table shapes. Its total matches the profile's: 9.0 pages and 36.8 KB a command at 8 a commit, against 9.4 and 38;
+   - the three rows are 5.7 of those pages today and 0.57 by order at 8 a commit (6.6 and 1.0 at 3, 6.0 and 0.60 at 30). Each digest-keyed row copies its leaf and the branch page above it;
+   - −0.12 to −0.17 ms an operation at 120 callers and −0.07 to −0.12 at 30, the move included. The move costs +0.009 and +0.008 to +0.013 of that;
+   - the step's first estimate had three pages gross and −0.05 to −0.08 and −0.03 to −0.045 net. Its residual terms hold, and its gross was low;
+   - the leader's proposal row is task-d103's (#206).
 
-**The code step,** after this design step's review:
+**The code, in two steps** (the lead's order, on review's word on #233). It is the top code priority and needs neither task-d86 nor task-d105 first:
+1. **The dependency rows alone,** its own PR on the carry.
+   - They are node-private, so this step changes no image and no common hash.
+   - Their readers are boot, catch-up, the campaign and trim, and the store's own rewrites and deletes.
+   - It builds the index's intake part, the lowering's key assignment, rules (c) and (d) of Section 17.1, and the layout check.
+   - By the table's shape it is about a third of the gain.
+   - Its evidence splits the counting build's file bytes by table, so that each row's size is read rather than inferred. That goes on the metrics line if it is cheap, since testing needs it on the runner too.
+2. **The payload and executed rows.** This step brings the pending collection, the move, the index's executed part, and rules (a) and (b). It also raises the shared image's version and changes the common hash's membership, behind whatever the format needs.
+
+What the two steps build together:
 - **Rows by order.**
   - `execution_v1` takes the executed row by position; `executed_v1` is no longer written.
   - `payload_v1` takes an executed command's payload by position, moved by the lowering at execution.
@@ -4188,7 +4199,17 @@ This entry is task-d72's largest single cut on the materializer, owned here. The
   - `retained_answer`'s `requested()`;
   - trim's `classify` and `executed_within`, and `TrimFence::command`;
   - export, install and restore in `coord-checkpoint`.
-- **The layout check at open,** unless task-d105's code built it first. The shared image's version is raised, and the scrub reads the new layout (task-d37).
+- **Outside the readers' table:**
+  - the emptiness checks in `install.rs`'s `check_target` and in `restore.rs` test the pending collection too;
+  - the registry says `executed_v1` names records only, so `in_common_hash` and the image's walk don't count an empty collection;
+  - `coord-store-bench`'s executed-row count, the divergence report's text in `serve.rs`, and the fjall engine's collection list.
+- **The lowering's four rules** (Section 17.1, from review on #233):
+  - (a) a payload put for a command already executed is dropped;
+  - (b) an executed row with no pending payload is refused;
+  - (c) a snapshot reader looks up executed commands only through the index;
+  - (d) the index follows the commit's outcome, held with `pending_meta` while it isn't known.
+- **The layout check at open.** The shared image's version is raised, and the scrub reads the new layout (task-d37).
+- **A release condition, carried like the catch-up page size:** the first release that promises an upgrade in place needs the conversion built (Section 17.1, point 3).
 
 **Acceptance:**
 - **The design step** recorded and reviewed before any code, with the readers' table checked against every reader of these collections in the workspace.
@@ -4202,9 +4223,15 @@ This entry is task-d72's largest single cut on the materializer, owned here. The
   - a replay of the journal suffix writes the same keys as the first lowering;
   - every voter's export root agrees at each floor boundary;
   - a store or image of the other layout is refused with the reason;
-  - the storage crash tests at every cut of a commit that moves a payload, under `strict` and `replay`.
-- **The local pair:** the counting build and the profile at 30 and 120 callers, on the profile's setup.
-  - Fresh pages a command at a follower fall from 9.4 to about 7.0 to 7.4 at 120 callers and 7.8 to 8.1 at 30. A reading outside that says which term of the residual was wrong.
+  - the storage crash tests at every cut of a commit that moves a payload, under `strict` and `replay`;
+  - the four rules:
+    - a payload delivered after its command executed leaves the pending table empty;
+    - a negative control lowers an execution with no payload and sees the refusal;
+    - a snapshot reader across a Sync's release and a re-proposal under a new intake key;
+    - a commit whose outcome isn't known, settled both ways, leaves the index as the store has it.
+- **The local pair, for each step:** the counting build, with the file's bytes split by table, and the profile at 30 and 120 callers, on the profile's setup.
+  - **Prediction** (review's model on #233): fresh pages a command at a follower fall from 9.4 to about 4 at 8 to 11 commands a commit, and to about 6 at 3. The first step alone takes about a third of that.
+  - The first estimate had 7.0 to 7.4, so the reading tells the two apart. A reading outside both says which term was wrong.
   - The materializer's µs a command at each voter is read beside it.
 - **The runner pair** is in the batch job (task-d72).
 - **The index's memory and open time** are read at 10⁵ and 10⁶ live rows and retained executions.
