@@ -75,7 +75,7 @@ pub struct KvIndex {
 impl KvIndex {
     /// Build the index from `view`'s event rows, through its KV revision.
     ///
-    /// A store of format 2, whose versions are history rows this index
+    /// A store of format 3 or before, whose versions are history rows this index
     /// does not see, is refused before this by the recorded format
     /// ([`crate::intake::IntakeIndex::build`]); `kv_history_v1` is not
     /// read.

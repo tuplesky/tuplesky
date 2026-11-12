@@ -211,6 +211,15 @@ impl Machine {
         }
     }
 
+    /// How many payload requests this replica sent, its campaign's own
+    /// included: zero for a leader, which asks for none.
+    pub const fn payload_asks(&self) -> u64 {
+        match self {
+            Machine::Leader(_) => 0,
+            Machine::Follower(m) => m.payload_asks(),
+        }
+    }
+
     /// How many payload transfers a peer has answered this replica
     /// with.
     ///
@@ -757,15 +766,15 @@ pub struct Unserved {
     pub stopped: u64,
     /// After this node's own frontier: nothing executed past it.
     pub nothing_after: u64,
-    /// With no executed order readable from this node's rows.
+    /// With no executed order readable from this node's rows. No longer
+    /// counted since task-d113's step 2, which reads a range of the rows
+    /// by position: kept, at zero, for the metrics line's readers.
     pub no_order: u64,
-    /// With an executed order that starts above the position asked, or
-    /// holds nothing.
+    /// With no executed row at the position after the one asked.
     pub order_above: u64,
     /// With no snapshot of this node's store.
     pub no_snapshot: u64,
-    /// With the first command's rows unreadable, or its executed row at
-    /// another position than the order's.
+    /// With the executed rows unreadable, or the first command's payload.
     pub first_row: u64,
 }
 
@@ -800,9 +809,6 @@ pub struct Node<P: Persistence> {
     /// that ballot (task-d01). A voter that was away when it was
     /// published is sent it again when it promises the ballot.
     won: Option<SyncDecision>,
-    /// This node's executed commands in position order, once a peer has
-    /// asked to catch up from them (task-d08).
-    order: Option<crate::catch_up::ExecutedOrder>,
     /// Catch-up pages this node served (diagnostic, task-d08).
     pub pages_served: u64,
     /// The catch-up counts of the follower roles this node has left:
@@ -959,7 +965,6 @@ impl<P: Persistence> Node<P> {
             recorder: None,
             awaiting: None,
             won: None,
-            order: None,
             pages_served: 0,
             catch_up_before: (0, 0, coord_consensus::CatchUpPaths::default()),
             serve_time: (std::time::Duration::ZERO, std::time::Duration::ZERO),
@@ -1860,6 +1865,12 @@ impl<P: Persistence> Node<P> {
         self.machine().payloads_answered()
     }
 
+    /// How many payload requests this node's machine sent
+    /// ([`Machine::payload_asks`]).
+    pub fn payload_asks(&self) -> u64 {
+        self.machine().payload_asks()
+    }
+
     /// Send the voters, again, the proposals they have not voted on
     /// (task-d07), and the commit frontier (task-d09).
     pub fn resend_proposals(&mut self, ballot: &Ballot) -> Result<Outbound, DriveError> {
@@ -1934,15 +1945,8 @@ impl<P: Persistence> Node<P> {
             self.unserved.nothing_after += 1;
             return out;
         }
-        if self.order.is_none() {
-            self.order = crate::catch_up::ExecutedOrder::read(&self.applier);
-        }
-        let Some(order) = self.order.as_ref() else {
-            self.unserved.no_order += 1;
-            return out;
-        };
         let started = std::time::Instant::now();
-        let entries = match crate::catch_up::page(&self.applier, order, epoch, after, through) {
+        let entries = match crate::catch_up::page(&self.applier, epoch, after, through) {
             Ok(entries) => entries,
             Err(why) => {
                 let count = match why {
@@ -2468,11 +2472,6 @@ impl<P: Persistence> Node<P> {
                     applied => applied.map_err(|e| Self::apply_error(&command, &e))?,
                 };
             self.executed += 1;
-            if let Some(order) = self.order.as_mut()
-                && !order.note(outcome.position, command)
-            {
-                self.order = None;
-            }
             // What the apply's lowerings made durable for other batches
             // is delivered by `carry_out`, after the command's own
             // outcome. This order is an observation, not a mechanism.

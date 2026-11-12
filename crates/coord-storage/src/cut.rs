@@ -85,19 +85,30 @@ impl CutOverlay {
             let ordinal = u32::try_from(i)
                 .map_err(|_| EngineError::new(ErrorClass::Limit, "a record of too many updates"))?;
             let rows = &self.rows;
-            let assigned = assigner.assign(seq, ordinal, update, |key| {
-                match rows.get(&(update.collection, key.to_vec())) {
-                    Some(value) => Ok(value.is_some()),
-                    None => Ok(base.get(update.collection, key)?.is_some()),
+            let assigned = assigner.assign(seq, ordinal, update, |collection, key| {
+                match rows.get(&(collection, key.to_vec())) {
+                    Some(value) => Ok(value.clone()),
+                    None => base.get(collection, key),
                 }
             })?;
-            let key = match assigned {
-                Assigned::AsIs => update.key.clone(),
-                Assigned::Key(key) => key,
-                Assigned::Skip => continue,
-            };
-            self.rows
-                .insert((update.collection, key), update.value.clone());
+            match assigned {
+                Assigned::AsIs => {
+                    self.rows.insert(
+                        (update.collection, update.key.clone()),
+                        update.value.clone(),
+                    );
+                }
+                Assigned::Key(key) => {
+                    self.rows
+                        .insert((update.collection, key), update.value.clone());
+                }
+                Assigned::Skip => {}
+                Assigned::Writes(writes) => {
+                    for write in writes {
+                        self.rows.insert((write.collection, write.key), write.value);
+                    }
+                }
+            }
         }
         Ok(())
     }

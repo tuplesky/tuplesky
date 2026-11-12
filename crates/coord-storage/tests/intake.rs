@@ -591,12 +591,25 @@ fn under_load(mut store: Store, seed: u64, steps: usize) {
         "after the last restart"
     );
     // One row a command: a rewrite stays in place, and a released
-    // command's row is gone before its new one comes.
+    // command's row is gone before its new one comes. An executed
+    // command's moved to `decided_v1` at its execution (task-d113, step 2,
+    // the bound), so the intake part holds only the others.
     let dependency_rows = intake_rows(&store.raw())
         .into_iter()
         .filter(|(k, _)| k.get(8) == Some(&DEPENDENCY_TAG))
         .count();
-    assert_eq!(dependency_rows, model.deps.len());
+    let executed_records = model
+        .deps
+        .keys()
+        .filter(|c| model.executed.contains_key(c))
+        .count();
+    assert_eq!(dependency_rows, model.deps.len() - executed_records);
+    let decided = rows(&store.raw().snapshot().unwrap(), Collection::DecidedV1).len();
+    assert_eq!(decided, executed_records, "each executed record moved once");
+    assert!(
+        executed_records > 0,
+        "the run executed commands with records"
+    );
     store.assert_index_is_the_rows("after the run");
     assert!(seen.len() > 3, "the run held rows");
 }
@@ -785,8 +798,9 @@ fn a_commit_whose_outcome_is_not_known_settled_either_way_leaves_the_index_as_th
             // Not yet known: the index is the one before the commit.
             assert_eq!(
                 s.reader(A).unwrap().intake_index().len(),
-                2,
-                "{what}: nothing published while the outcome is not known"
+                4,
+                "{what}: nothing published while the outcome is not known \
+                 (two dependency rows and two pending payloads)"
             );
             s.reconcile(A).unwrap();
             assert_eq!(s.status(A), Some(DomainStatus::Ready), "{what}");
@@ -937,9 +951,10 @@ fn a_replay_of_the_journal_suffix_writes_the_same_keys_as_the_first_lowering() {
 
 #[test]
 fn a_store_of_the_other_layout_is_refused_with_the_reason() {
-    // Recorded as another format: 1 (dependency rows by command) or 2
-    // (versions in history rows, before task-d105).
-    for format in [1u32, 2] {
+    // Recorded as another format: 1 (dependency rows by command), 2
+    // (executed rows by command, before task-d113's step 2) or 3 (versions
+    // in history rows, before task-d105).
+    for format in [1u32, 2, 3] {
         let mut engine = ModelEngine::new();
         let mut tx = engine.begin_write().unwrap();
         tx.put(
@@ -955,7 +970,7 @@ fn a_store_of_the_other_layout_is_refused_with_the_reason() {
         assert!(
             refused
                 .diagnostic
-                .contains(&format!("store format {format} is not this build's (3)")),
+                .contains(&format!("store format {format} is not this build's (4)")),
             "{refused:?}"
         );
     }
@@ -1000,6 +1015,29 @@ fn a_store_of_the_other_layout_is_refused_with_the_reason() {
             .contains("dependency rows keyed by command"),
         "{refused}"
     );
+    // Recording nothing, with an executed row keyed by command: the format
+    // before task-d113's step 2.
+    let executed = || {
+        let mut engine = ModelEngine::new();
+        let mut tx = engine.begin_write().unwrap();
+        tx.put(
+            Collection::ExecutedV1.id(),
+            &coord_storage::codecs::executed_key(&command_of(1)),
+            &coord_storage::codecs::encode_executed(&coord_storage::codecs::ExecutedRecordV1 {
+                position: coord_types::ids::ExecutionPosition::new(1).unwrap(),
+                revision: None,
+                result_digest: coord_types::identity::Digest32([1; 32]),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        tx.commit_durable().unwrap();
+        engine
+    };
+    let refused = StoreWorker::open(executed(), boot(1), inc(), GroupLimits::default())
+        .err()
+        .expect("a store of format 2 is refused");
+    assert!(refused.diagnostic.contains("store format 2"), "{refused:?}");
     // This build's format, recorded, opens.
     let mut engine = ModelEngine::new();
     let mut tx = engine.begin_write().unwrap();
@@ -1063,6 +1101,43 @@ fn catch_up_finds_an_executed_commands_dependency_row_through_the_index() {
         catch_up_entry(&gated, other, &c1).unwrap().unwrap().decided,
         None
     );
+}
+
+/// Two executed commands whose identities share the index's 8-byte prefix
+/// (the lead on #237): catch-up finds each one's own dependency row,
+/// whichever of them is first under the prefix. The index holds both
+/// entries, and the full key, which carries the command, settles whose
+/// each is. Tried with only the first candidate, the second command's
+/// lookup reads a key no row is under and serves it with no decided
+/// record.
+#[test]
+fn catch_up_finds_each_of_two_executed_commands_that_share_a_prefix() {
+    let mut store = Store::journaled();
+    let sharing = |tail: u8| {
+        let mut bytes = [0x3c; 32];
+        bytes[8..].fill(tail);
+        CommandId(Digest32(bytes))
+    };
+    let (first, second) = (sharing(1), sharing(2));
+    let first_row = record(Phase::Commit, &[]);
+    let second_row = record(Phase::Commit, &[first]);
+    for (n, command, row) in [(1, first, &first_row), (2, second, &second_row)] {
+        store.protocol(vec![
+            dependency_update(epoch(), &command, row).unwrap(),
+            payload_update(&command, &payload_of(n)).unwrap(),
+        ]);
+    }
+    store.application(1, vec![executed(&first, 1)]);
+    store.application(2, vec![executed(&second, 2)]);
+    store.materialize();
+    let gated = store.reader().snapshot().unwrap();
+    for (command, row) in [(first, first_row), (second, second_row)] {
+        let entry = catch_up_entry(&gated, epoch(), &command)
+            .unwrap()
+            .expect("executed and held");
+        assert_eq!(entry.command, command);
+        assert_eq!(entry.decided, Some(row), "{command:?}'s own row");
+    }
 }
 
 /// Rule (e)'s timing (review on #233, 6813935632): the materializer moves

@@ -984,6 +984,11 @@ pub struct Domain<P: Persistence> {
     /// that ask was for, so a partial answer is not mistaken for a
     /// complete one.
     asked: Option<(std::time::Instant, u64, u64)>,
+    /// How many payload requests the machine had sent when this loop
+    /// last looked. One it sent by itself since (a campaign's next
+    /// batch, once the last was answered in full) is this loop's ask
+    /// too: asked again in the same turn, the batch went out twice.
+    payload_asks_seen: u64,
     /// When this leader last sent its voters the proposals they had not
     /// voted on (task-d07).
     resent: Option<std::time::Instant>,
@@ -1805,6 +1810,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             admin: None,
             expiry: None,
             asked: None,
+            payload_asks_seen: 0,
             resent: None,
             features_resent: None,
             features_started: false,
@@ -1962,6 +1968,18 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                     oldest_wait: waits
                         .oldest
                         .map(|(_, wait)| coord_daemon::metrics::OldestWait::of(wait)),
+                }
+            },
+            intake_index: {
+                let reader = voter.node().applier().store().reader();
+                let entries = reader.index_len() as u64;
+                let executed = reader.index_executed_len() as u64;
+                coord_daemon::metrics::IntakeIndexSize {
+                    entries,
+                    bytes: entries.saturating_mul(coord_storage::intake::ENTRY_BYTES),
+                    executed,
+                    executed_bytes: executed
+                        .saturating_mul(coord_storage::intake::EXECUTED_ENTRY_BYTES),
                 }
             },
             busy,
@@ -3324,9 +3342,14 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             // over.
             let answered = voter.payloads_answered();
             let want = payload_batch_size(missing);
+            if voter.payload_asks() != self.payload_asks_seen {
+                self.payload_asks_seen = voter.payload_asks();
+                self.asked = Some((now, answered, want));
+            }
             if ask_for_payloads_now(self.asked, answered, now) {
                 self.asked = Some((now, answered, want));
                 out.absorb(voter.request_payloads()?);
+                self.payload_asks_seen = voter.payload_asks();
             }
         } else {
             self.asked = None;
@@ -5289,7 +5312,7 @@ fn describe_divergence(
     );
     let _ = write!(
         out,
-        "\n  executed_v1 within {} of positions {} and {} (position revision digest command):",
+        "\n  execution_v1 within {} of positions {} and {} (position revision digest command):",
         coord_daemon::settle::NEAR_POSITIONS,
         mismatch.own.position,
         mismatch.release.position,
@@ -5400,6 +5423,7 @@ fn resends(
         time,
         longest,
         deferred: counts.deferred,
+        topped_up: counts.topped_up,
         decided: counts.decided,
         acknowledged: counts.acknowledged,
         unanswered: counts.unanswered,
@@ -6040,6 +6064,10 @@ fn retained_answer<P: Persistence>(
 /// `command` (task-d23): only a row under the invocation's own retry key,
 /// whose request derives the command's identity again.
 ///
+/// An executed command's payload is keyed by its position (task-d113,
+/// step 2), which the retry row of the invocation names; a command not
+/// executed has no retained result to read the request for.
+///
 /// The row's `admission` is not consulted: re-deriving the identity from
 /// the key and the request binds the bytes, whichever admission carried
 /// them.
@@ -6048,10 +6076,14 @@ fn requested<V: coord_store_api::OrderedRead>(
     key: RetryKey,
     command: CommandId,
 ) -> Option<coord_types::logical_v1::LogicalRequest> {
+    let retry = coord_storage::retry::lookup(view, &key).ok()??;
+    if retry.command_id != command {
+        return None;
+    }
     let bytes = view
         .get(
             coord_store_api::Collection::PayloadV1.id(),
-            &coord_consensus::rows::payload_key(&command),
+            &coord_storage::codecs::position_key(retry.position),
         )
         .ok()??;
     let payload = coord_consensus::rows::decode_payload(&bytes).ok()?;
@@ -6656,14 +6688,17 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
             assert_eq!(store.flush().unwrap().committed, 1);
         };
         // The executed record of an invocation this frontend never saw,
-        // and the payload row that says what it asked. The retained
-        // outcome is a denial, which any caller may have replayed.
+        // and the payload row that says what it asked: put, then moved to
+        // the command's position by its executed row (task-d113, step 2).
+        // The retained outcome is a denial, which any caller may have
+        // replayed.
         let executed = |key: RetryKey, command: CommandId, payload: bool| {
             let response = postcard::to_allocvec(&Response {
                 revision: KvRevision::new(3).unwrap(),
                 outcome: Outcome::ErrPermissionDenied,
             })
             .unwrap();
+            let digest = coord_storage::retry::result_digest(&response);
             let mut updates = vec![coord_core::StoreUpdate {
                 collection: coord_store_api::Collection::RetryV1.id(),
                 key: coord_storage::codecs::retry_key(&key),
@@ -6688,6 +6723,15 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
                             admission: None,
                             ack_through: 0,
                         },
+                    )
+                    .unwrap(),
+                );
+                updates.push(
+                    coord_storage::retry::executed_update(
+                        &command,
+                        coord_types::ids::ExecutionPosition::new(3).unwrap(),
+                        None,
+                        digest,
                     )
                     .unwrap(),
                 );
@@ -7428,7 +7472,7 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
         );
         assert!(
             said.contains(
-                "\n  executed_v1 within 8 of positions 121 and 122 (position revision digest \
+                "\n  execution_v1 within 8 of positions 121 and 122 (position revision digest \
                  command):\n    120 - 2222"
             ),
             "{said}"

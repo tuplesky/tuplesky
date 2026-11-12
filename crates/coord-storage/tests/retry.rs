@@ -3,6 +3,8 @@
 //! duplicates, retired/unknown sessions and retired sequences never execute
 //! as new work, and floors bound retention.
 
+mod support;
+
 use coord_core::effect::{BootId, PersistBatch};
 use coord_core::outbox::BarrierAllocator;
 use coord_redb_faultkit::{FaultBackend, FaultPlan, Tail};
@@ -119,6 +121,7 @@ impl<E: LocalEngine> Domain<E> {
         .unwrap();
         let planned = plan(request, &view, &PlanLimits::default()).unwrap();
         drop(gated);
+        support::stage_bound(&mut self.worker, Some(&b), request);
         match apply_plan(
             &mut self.worker,
             self.alloc.allocate(),
@@ -179,6 +182,7 @@ impl<E: LocalEngine> Domain<E> {
         .unwrap();
         let planned = plan(request, &view, &PlanLimits::default()).unwrap();
         drop(gated);
+        support::stage_bound(&mut self.worker, Some(&b), request);
         match apply_plan(
             &mut self.worker,
             self.alloc.allocate(),
@@ -233,20 +237,28 @@ fn lost_response_with_the_same_identity_returns_the_same_result() {
     let stored: coord_state::Response = postcard::from_bytes(&record.response).unwrap();
     assert_eq!(stored, response);
     // Session activation is an ordered step, so the command is position 2.
+    let position = record.position;
     assert_eq!(record.position.get(), 2);
     // Resolution returns the same record only under current authorization.
     assert_eq!(d.resolve(1, &request, true), Resolution::Result(record));
     assert_eq!(d.resolve(1, &request, false), Resolution::Unauthorized);
-    // The executed identity is recorded.
+    // The executed identity is recorded, at its position (task-d113,
+    // step 2).
     let gated = d.worker.reader().snapshot().unwrap();
     let executed = gated
         .view()
         .get(
-            Collection::ExecutedV1.id(),
-            &coord_storage::codecs::executed_key(&binding(1, &request).command_id),
+            Collection::ExecutionV1.id(),
+            &coord_storage::codecs::position_key(position),
         )
-        .unwrap();
-    assert!(executed.is_some());
+        .unwrap()
+        .expect("an executed row");
+    assert_eq!(
+        coord_storage::codecs::decode_execution(&executed)
+            .unwrap()
+            .command,
+        binding(1, &request).command_id
+    );
 }
 
 #[test]
@@ -392,6 +404,7 @@ fn crash_between_materialization_and_notification_never_duplicates() {
             .unwrap();
             let planned = plan(&request, &view, &PlanLimits::default()).unwrap();
             drop(gated);
+            support::stage_bound(&mut d.worker, Some(&b), &request);
             let _ = apply_plan(&mut d.worker, d.alloc.allocate(), NS, &planned, Some(&b));
             assert!(shared.is_frozen());
             let image = shared.crash_image(tail);
@@ -495,6 +508,7 @@ fn admission_is_revalidated_atomically_with_the_application_batch() {
     d.admin(update);
     // The bound command's batch carries the base its admission was checked
     // at, so it is rejected instead of executing under a retired session.
+    support::stage_bound(&mut d.worker, Some(&b), &request);
     let outcome = apply_plan(&mut d.worker, d.alloc.allocate(), NS, &planned, Some(&b)).unwrap();
     assert_eq!(outcome, ApplyOutcome::Replan);
     assert_eq!(d.kv_revision(), 0);

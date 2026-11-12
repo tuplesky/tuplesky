@@ -16,7 +16,9 @@ use coord_checkpoint::verify::{VerifyError, verify_shared};
 use coord_state::plan::KvEventKind;
 use coord_state::policy::{Action, KeyInterval, PolicyRule};
 use coord_state::view::KvEntry;
-use coord_storage::codecs::{self, EventRecordV1, ExecutedRecordV1, RetryFloorV1, RetryRecordV1};
+use coord_storage::codecs::{
+    self, EventRecordV1, ExecutedRecordV1, ExecutionRecordV1, RetryFloorV1, RetryRecordV1,
+};
 use coord_storage::lowering::{DurableMeta, ExecutionFrontier};
 use coord_storage::policy::{bootstrap_session, rule_update};
 use coord_storage_redb::{Generation, OpenOptions, StoreIdentity};
@@ -124,26 +126,34 @@ fn rows(profile: Profile) -> Vec<Row> {
         put(
             &mut rows,
             Collection::PayloadV1,
-            command(n).as_bytes().to_vec(),
+            codecs::position_key(pos(u64::from(n))).to_vec(),
             format!("payload-{n}").into_bytes(),
         );
         put(
             &mut rows,
-            Collection::ExecutedV1,
-            codecs::executed_key(&command(n)),
-            codecs::encode_executed(&ExecutedRecordV1 {
-                position: pos(u64::from(n)),
-                revision: Some(rev(revision)),
-                result_digest: Digest32([n; 32]),
+            Collection::ExecutionV1,
+            codecs::position_key(pos(u64::from(n))).to_vec(),
+            codecs::encode_execution(&ExecutionRecordV1 {
+                command: command(n),
+                executed: ExecutedRecordV1 {
+                    position: pos(u64::from(n)),
+                    revision: Some(rev(revision)),
+                    result_digest: Digest32([n; 32]),
+                },
             })
             .unwrap(),
         );
     }
     if profile.unexecuted_payload {
+        // Pending, by intake order, in the node-private collection
+        // (task-d113, step 2): not common state.
         put(
             &mut rows,
-            Collection::PayloadV1,
-            command(4).as_bytes().to_vec(),
+            Collection::PendingPayloadV1,
+            coord_storage::intake::pending_key(
+                coord_storage::intake::IntakeOrder { seq: 9, ordinal: 0 },
+                &command(4),
+            ),
             b"payload-4-unexecuted".to_vec(),
         );
     }
@@ -434,7 +444,7 @@ fn equal_common_state_hashes_equally_across_private_differences_and_engines() {
         Collection::LeaseKeysV1,
         Collection::EventsV1,
         Collection::PayloadV1,
-        Collection::ExecutedV1,
+        Collection::ExecutionV1,
         Collection::AuthGrantV1,
     ] {
         assert!(summary(c).unwrap() > 0, "{c:?}");
@@ -541,12 +551,15 @@ fn rows_beyond_the_boundary_are_refused() {
     let mut engine = model(Profile::default());
     let mut tx = engine.begin_write().unwrap();
     tx.put(
-        Collection::ExecutedV1.id(),
-        &codecs::executed_key(&command(9)),
-        &codecs::encode_executed(&ExecutedRecordV1 {
-            position: pos(9),
-            revision: None,
-            result_digest: Digest32([9; 32]),
+        Collection::ExecutionV1.id(),
+        &codecs::position_key(pos(9)),
+        &codecs::encode_execution(&ExecutionRecordV1 {
+            command: command(9),
+            executed: ExecutedRecordV1 {
+                position: pos(9),
+                revision: None,
+                result_digest: Digest32([9; 32]),
+            },
         })
         .unwrap(),
     )
@@ -556,7 +569,7 @@ fn rows_beyond_the_boundary_are_refused() {
     assert_eq!(
         export_shared(&view, origin(), &limits).unwrap_err(),
         ExportError::BeyondBoundary {
-            collection: Collection::ExecutedV1.id().0
+            collection: Collection::ExecutionV1.id().0
         }
     );
     // A retained retry response at or below the execution position but
@@ -613,8 +626,8 @@ fn rows_beyond_the_boundary_are_refused() {
     let mut engine = model(Profile::default());
     let mut tx = engine.begin_write().unwrap();
     tx.put(
-        Collection::ExecutedV1.id(),
-        &codecs::executed_key(&command(8)),
+        Collection::ExecutionV1.id(),
+        &codecs::position_key(pos(2)),
         b"garbage",
     )
     .unwrap();
@@ -623,7 +636,7 @@ fn rows_beyond_the_boundary_are_refused() {
     assert_eq!(
         export_shared(&view, origin(), &limits).unwrap_err(),
         ExportError::Corrupt {
-            collection: Collection::ExecutedV1.id().0
+            collection: Collection::ExecutionV1.id().0
         }
     );
 }

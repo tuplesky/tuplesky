@@ -154,6 +154,10 @@ pub struct PinnedRead {
 /// One replica's common paths over the engine under test.
 pub struct Domain<E: LocalEngine> {
     applier: Applier<StoreWorker<E>>,
+    /// The barriers of the protocol batches that put each command's
+    /// payload before it executes (task-d113, step 2), from the runtime's
+    /// sequences, which neither the bootstrap's nor the applier's reach.
+    payloads: BarrierAllocator,
     holds: RetentionHolds,
     watch: WatchId,
     outcomes: BTreeMap<u64, (Option<KvRevision>, Digest32)>,
@@ -186,10 +190,16 @@ impl<E: LocalEngine> Domain<E> {
         let incarnation = ReplicaIncarnation::new(2).expect("non-zero");
         let worker = StoreWorker::open(engine, boot, incarnation, limits)?;
         let alloc = BarrierAllocator::new(incarnation, boot);
-        Domain::with(Applier::new(worker, alloc)?)
+        Domain::with(
+            Applier::new(worker, alloc)?,
+            BarrierAllocator::new(incarnation, boot).for_runtime(),
+        )
     }
 
-    fn with(applier: Applier<StoreWorker<E>>) -> Result<Domain<E>, DriveError> {
+    fn with(
+        applier: Applier<StoreWorker<E>>,
+        payloads: BarrierAllocator,
+    ) -> Result<Domain<E>, DriveError> {
         let watch = applier
             .hub()
             .register(WatchSpec {
@@ -205,6 +215,7 @@ impl<E: LocalEngine> Domain<E> {
             .id;
         Ok(Domain {
             applier,
+            payloads,
             holds: RetentionHolds::default(),
             watch,
             outcomes: BTreeMap::new(),
@@ -246,7 +257,10 @@ impl<E: LocalEngine> Domain<E> {
             })
             .map_err(|e| DriveError::Apply(format!("bootstrap batch: {e:?}")))?;
         worker.flush()?;
-        Domain::with(Applier::new(worker, alloc)?)
+        Domain::with(
+            Applier::new(worker, alloc)?,
+            BarrierAllocator::new(incarnation, boot).for_runtime(),
+        )
     }
 
     /// Apply one generated operation through the full common path.
@@ -285,6 +299,19 @@ impl<E: LocalEngine> Domain<E> {
             admission: None,
         };
         self.logical_bytes += logical_bytes(&request);
+        // The payload is in the store before the command executes, as a
+        // node's proposal batch or vote puts it: the execution moves it to
+        // its position (task-d113, step 2), and one with nothing to move
+        // is refused. A repeat's put is dropped, its command executed.
+        let put = coord_consensus::rows::payload_update(&command, &payload)?;
+        self.applier
+            .store_mut()
+            .submit(PersistBatch {
+                barrier: self.payloads.allocate(),
+                base: None,
+                updates: vec![put],
+            })
+            .map_err(|e| DriveError::Apply(format!("payload batch: {e:?}")))?;
         let repeat = matches!(op, Op::Repeat { .. });
         let outcome = match self.applier.apply(command, &payload) {
             Ok(outcome) => outcome,
@@ -437,7 +464,7 @@ impl<E: LocalEngine> Domain<E> {
             session_rows: count(Collection::SessionV1)?,
             policy_rows: count(Collection::PolicyV1)?,
             grant_rows: count(Collection::AuthGrantV1)?,
-            executed_rows: count(Collection::ExecutedV1)?,
+            executed_rows: count(Collection::ExecutionV1)?,
             common_digest: digest_of(view, &common)?,
         };
         Ok(observable)
