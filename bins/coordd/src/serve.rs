@@ -7548,7 +7548,7 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
             Admission, AdmissionLimits, Collector, CollectorConfig, Dispatcher, MonotonicMillis,
             Progress, Submitted,
         };
-        use coord_core::capability::{AdmissionReceipt, AttestedAdmission, VerifierToken};
+        use coord_core::capability::AttestedAdmission;
         use coord_core::effect::{BootId, PeerId};
         use coord_core::event::AdmittedRequest;
         use coord_core::outbox::BarrierAllocator;
@@ -7632,18 +7632,15 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
             logical.canonicalize();
             let request = RequestV1::new(retry_key(sequence), &logical, 0, 0).unwrap();
             AdmittedRequest {
-                receipt: AdmissionReceipt::submitting(
-                    VerifierToken::for_boundary(),
-                    AttestedAdmission {
-                        cluster: CLUSTER,
-                        domain: DOMAIN,
-                        session: SESSION,
-                        rule_generation: 1,
-                        scope_ceiling: u32::MAX,
-                        receipt_id: Digest32([7; 32]),
-                        admitted_at_ticks: 0,
-                    },
-                ),
+                receipt: coord_store_testkit::admission::submitting(AttestedAdmission {
+                    cluster: CLUSTER,
+                    domain: DOMAIN,
+                    session: SESSION,
+                    rule_generation: 1,
+                    scope_ceiling: u32::MAX,
+                    receipt_id: Digest32([7; 32]),
+                    admitted_at_ticks: 0,
+                }),
                 frame: MessageV1::Request(request).encode().unwrap(),
             }
         }

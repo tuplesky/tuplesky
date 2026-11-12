@@ -3330,15 +3330,6 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
             return Ok(report);
         }
         let durable = state.commit_durably(profile, state.pending.len());
-        // This commit carries everything held (task-d86): the hold runs
-        // again from the next record to arrive, and an ask whose records
-        // are among these is spent, as a lent commit spends it. Left set,
-        // the next record would count its wait from records already
-        // committed and go out at once.
-        state.held_since = None;
-        if state.ask_spent() {
-            state.commit_asked = None;
-        }
         let Some(engine) = state.engine.as_mut() else {
             // Every caller takes a lent engine back first.
             return Err(JournaledError::Quarantined(
@@ -3384,6 +3375,18 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                 state.pending_meta = None;
                 state.status = DomainStatus::Ready;
                 state.committed(durable, pending.len());
+                // This commit carried everything held (task-d86): the hold
+                // runs again from the next record to arrive, and an ask
+                // whose records were among these is spent, as a lent
+                // commit spends it. Left set, the next record would count
+                // its wait from records already committed and go out at
+                // once. Only a commit that took the records does this: one
+                // that gave them back leaves their wait, and the ask, as
+                // they were, so they are still due when they were.
+                state.held_since = None;
+                if state.ask_spent() {
+                    state.commit_asked = None;
+                }
                 report.commits = 1;
                 report.materialized = pending.len();
                 for item in pending {

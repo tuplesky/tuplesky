@@ -984,6 +984,50 @@ fn a_commit_in_doubt_leaves_nothing_due_until_it_is_reconciled() {
     assert!(world.store.lent(A), "lent once reconciled");
 }
 
+/// A commit on the caller's thread that gives its records back leaves
+/// their wait and the ask as they were (task-d86, Codex on #238): the
+/// records are still due when they were, and the ask still lends them at
+/// the next hand-off. Cleared before the commit's outcome was known, a
+/// publication whose commit failed left the records with nothing due and
+/// no ask, held until another record arrived.
+#[test]
+fn a_synchronous_commit_that_gives_its_records_back_keeps_their_wait_and_ask() {
+    let wait = std::time::Duration::from_secs(3600);
+    let (mut world, _handle) = held(hold(100, wait));
+    let before = std::time::Instant::now();
+    journal_and_hand_off(&mut world, 1);
+    assert!(!world.store.lent(A), "one record is held");
+    world.store.request_projection_commit();
+    world
+        .engine()
+        .script_commit(CommitScript::DefinitelyNotCommitted);
+    let pointer = world.pointer();
+    world.store.publish_checkpoint(A, &pointer).unwrap();
+    assert_eq!(
+        world.store.status(A),
+        Some(DomainStatus::MaterializationDeferred)
+    );
+    assert_eq!(
+        world.store.unmaterialized(A),
+        2,
+        "the held record and the pointer's are given back"
+    );
+    let due = world
+        .store
+        .projection_commit_due()
+        .expect("the records given back are still held");
+    assert!(
+        due <= std::time::Instant::now(),
+        "the ask still stands, so they are due now"
+    );
+    assert!(due >= before, "{due:?} before the record arrived");
+    world.store.hand_off().unwrap();
+    assert!(
+        world.store.lent(A),
+        "the ask lends them at the next hand-off, an hour before the wait ends"
+    );
+}
+
 /// A commit made on the caller's thread carries everything held, so the
 /// hold runs again from the next record (task-d86): a checkpoint
 /// published synchronously on a held store commits what was pending, and
