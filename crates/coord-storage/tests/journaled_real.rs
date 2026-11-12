@@ -348,6 +348,81 @@ fn copy_tree(from: &Path, to: &Path) {
     }
 }
 
+/// The command a step takes in.
+fn command(step: u64) -> coord_types::CommandId {
+    coord_types::CommandId(Digest32([step as u8; 32]))
+}
+
+fn dependency(phase: coord_consensus::Phase) -> coord_consensus::CommandRecord {
+    coord_consensus::CommandRecord {
+        phase,
+        deps: Vec::new(),
+        keys: vec![b"k".to_vec()],
+        payload: None,
+        paths: Vec::new(),
+        path: Digest32([0x6; 32]),
+        synced_seq: None,
+    }
+}
+
+/// A step's protocol transition: a row of its own, and the dependency
+/// rows a voter writes (task-d113), which the store keys by intake order:
+/// the step's command taken in with the leader's proposal row, the step
+/// before's rewritten at ACCEPT in place, and every other step the one two
+/// before deleted, as a pulled command's is (task-d08).
+fn protocol_updates(step: u64) -> Vec<StoreUpdate> {
+    use coord_consensus::Phase;
+    use coord_consensus::rows::{dependency_delete, dependency_update, proposal_update};
+    let epoch = ConfigurationEpoch::ZERO;
+    let mut updates = vec![
+        StoreUpdate {
+            collection: Collection::ProtocolV1.id(),
+            key: step.to_be_bytes().to_vec(),
+            value: Some(vec![step as u8; 24]),
+        },
+        dependency_update(epoch, &command(step), &dependency(Phase::PreAccept)).unwrap(),
+        proposal_update(
+            epoch,
+            &command(step),
+            &coord_consensus::ProposalRecordV1 {
+                ballot: ballot(step),
+                seqnum: step,
+                deps: Vec::new(),
+                path: Digest32([0x7; 32]),
+            },
+        )
+        .unwrap(),
+    ];
+    if step > 1 {
+        updates.push(
+            dependency_update(epoch, &command(step - 1), &dependency(Phase::Accept)).unwrap(),
+        );
+    }
+    if step > 2 && step % 2 == 1 {
+        updates.push(dependency_delete(epoch, &command(step - 2)));
+    }
+    updates
+}
+
+/// Dependency and proposal rows a projection's rows hold, keyed by
+/// intake order, and whether any command has two of one kind.
+fn intake_rows(rows: &Rows) -> (usize, bool) {
+    use coord_storage::intake::{ProtocolKey, parse};
+    let mut seen = std::collections::BTreeSet::new();
+    let mut twice = false;
+    let mut count = 0;
+    for (c, key, _) in rows {
+        if *c != Collection::ProtocolV1.id().0 {
+            continue;
+        }
+        if let ProtocolKey::Intake { tag, command, .. } = parse(key) {
+            count += 1;
+            twice |= !seen.insert((tag, command));
+        }
+    }
+    (count, twice)
+}
+
 /// Journal and materialize `steps` protocol transitions and application
 /// outcomes, one flush each, until the first failure.
 fn materialize_steps(store: &mut JournaledStore<RaftEngineJournal, RedbEngine>, steps: u64) {
@@ -370,11 +445,7 @@ fn materialize_range(
             batch: PersistBatch {
                 barrier: barriers.allocate(),
                 base: None,
-                updates: vec![StoreUpdate {
-                    collection: Collection::ProtocolV1.id(),
-                    key: step.to_be_bytes().to_vec(),
-                    value: Some(vec![step as u8; 24]),
-                }],
+                updates: protocol_updates(step),
             },
         });
         let Some(base) = store.application_base(A) else {
@@ -529,6 +600,7 @@ fn crash_matrix(replay: Option<DurableCadence>) {
     }
 
     let mut with_executed = 0;
+    let mut with_intake = 0;
     for k in 1..=workload_ops {
         for tail in [Tail::None, Tail::All, Tail::Seeded(k)] {
             let dir = tempfile::tempdir().unwrap();
@@ -544,6 +616,11 @@ fn crash_matrix(replay: Option<DurableCadence>) {
                 recovered, replayed,
                 "k={k} tail={tail:?}: the recovered projection is the journal's state"
             );
+            // The dependency rows came back under the keys the first
+            // lowering gave them, one a command (task-d113).
+            let (intake, twice) = intake_rows(&recovered);
+            assert!(!twice, "k={k} tail={tail:?}: a command's row twice");
+            with_intake = with_intake.max(intake);
             if recovered
                 .iter()
                 .filter(|(c, ..)| *c == Collection::ExecutedV1.id().0)
@@ -558,6 +635,7 @@ fn crash_matrix(replay: Option<DurableCadence>) {
         with_executed > 0,
         "some crashes left executed rows to recover"
     );
+    assert!(with_intake > 2, "some crashes left dependency rows to recover");
 }
 
 /// task-j06 over redb: `sync_projections` makes every working commit
