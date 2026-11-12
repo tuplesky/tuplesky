@@ -1765,6 +1765,160 @@ Common schema owns stable logical collection IDs, canonical values and reviewed 
 
 Protocol state cannot be reduced to a Raft-like last_applied: application snapshots do not recreate unresolved dependency/vote obligations. Physical placement is adapter-private; logical schema/index maintenance is common.
 
+*Amended by task-d113's design step: the payload, dependency and executed rows keyed by order.* This is a design step; nothing below is built. The table above keeps today's keys until the code step lands.
+
+**Why: the materializer's profile** (#185, [6810986014](https://github.com/tuplesky/tuplesky/pull/185#issuecomment-6810986014); local, the carry at `413fd66a`, five voters, `replay`, tmpfs, 30 and 120 callers).
+- **Measured:**
+  - A follower writes 10.7 to 10.9 rows a command and the leader 11.6 to 11.8, about 2.3 KB.
+  - Yet the materializer writes 38 KB a command to the file at a follower and 46 KB at the leader: about 9.4 and 11.3 fresh 4 KiB pages, the same at both loads.
+  - A commit holds 4.3 and 11.3 commands locally, and 3.25 and 7.55 at the runner's leader.
+  - The thread is 116 to 138 µs a command at the leader and 100 to 120 at a follower.
+- **Why a row costs a page:** the payload, dependency and executed rows are keyed by the command's digest, and the history, current, retry and retry-floor rows by key or by client. So each lands on a leaf no other command in the commit touches. redb copies that page on write, rebuilds it, checksums it at the working commit and writes it at the next durable commit.
+- **The thread's split:** copy-on-write allocation 17 to 19%, the leaf's rebuild 16 to 17%, page lookups 11 to 14%, working-commit checksums 11 to 12%, durable-commit `pwrite` 12 to 15%, freed pages 7 to 9% in all. That is 74 to 86% that follows pages. Reopening the table for every row is another 5 to 6.5%, and it follows rows, not pages.
+
+**What is keyed by what today:**
+
+| Row | Collection and key | Written | Common hash |
+| --- | --- | --- | --- |
+| Executed | `executed_v1`, the command identity (`codecs::executed_key`) | at execution (`retry::executed_update`) | yes |
+| Payload | `payload_v1`, the command identity (`rows::payload_key`) | at intake: a vote, an adoption, the leader's proposal batch, a Sync's installation, a fetched payload, a catch-up install | the executed ones only (`export.rs` keeps a payload only if `executed_v1` holds its command) |
+| Dependency | `protocol_v1`, epoch, tag and command identity (`rows::dependency_key`) | at intake, and again where ACCEPT follows in a later batch | no: `protocol_v1` is node-private |
+
+`execution_v1` (0x0005) is registered and specified in the table above as keyed by established position, and nothing writes it. Two readers already name it as their fix. `executed_order` (`coord-storage/src/protocol.rs`) and `ExecutedOrder` (`coord-daemon/src/catch_up.rs`) each read the whole of `executed_v1` to recover the order of execution, "and a durable position index is what would make it less".
+
+**The layout:**
+
+| Row | Key | Written | Common hash |
+| --- | --- | --- | --- |
+| Executed | `execution_v1`: the execution position, big-endian. The value gains the command identity | at execution | yes, in place of `executed_v1`, which is no longer written |
+| An executed command's payload | `payload_v1`: the execution position | at execution, moved from the pending row in the same transaction | yes |
+| A payload not yet executed | `pending_payload_v1`, a new node-private collection: intake order | at intake; deleted when it moves, or at a Sync's release (task-d24) | no |
+| Dependency, and the leader's proposal row while it is written | `protocol_v1`: epoch, tag and intake order. The value gains the command identity | at intake; a rewrite stays in place | no, as today |
+
+- **Intake order is the journal position of the record that brings the row,** `LocalJournalSeq`, the order replay applies (Section 17.16.4), and the row's ordinal within that record.
+  - It is unique for a projection's life: a missing or empty journal is not permission to create (above), and a voter that starts fresh installs a shared image, which holds no node-private rows.
+  - The code step checks that the sequence never restarts under a live projection, and prefixes the stream's generation if it can.
+- **The store's lowering assigns the keys, not the machine.** The journal's records keep naming these rows by command: the `StoreUpdate`s built in `coord-consensus/src/rows.rs`, used at more than twenty sites, and `retry::executed_update`. So neither the journal's format nor the consensus crate changes.
+  - `lower_update` (`coord-storage/src/lowering.rs`) runs record by record from `project` (`journaled.rs`) and from the worker.
+  - It maps a put or delete by command onto its intake key through the index below. It keys an application outcome's executed row by the record's own position.
+  - Replay lowers the same records at the same journal positions, so it writes the same keys.
+- **The move at execution.** When the lowering lowers an executed row, it moves the command's pending payload to `payload_v1` under that position. A pending row that is written and moved within one commit is never written.
+  - A catch-up install brings its payload and executes in the same turn, so its pending row usually isn't written at all.
+- **A commit's rows share leaves.** A commit's execution positions are consecutive, and so are its records' journal positions. Each ordered region then dirties its right-hand leaf once a commit, plus fresh pages for its bytes. The regions are `execution_v1`, `payload_v1`, the pending table's two ends and the dependency rows.
+
+**1. The index by command.** Under this layout, these readers need it:
+
+| Reader | Today | Under order keys | Index by command? |
+| --- | --- | --- | --- |
+| Boot (`read_protocol`, `read_history`, `coord-storage/src/protocol.rs`) | scans the epoch's dependency rows; reads `payload_v1` and `executed_v1` once per row; scans all of `executed_v1` and sorts it | scans the dependency rows and the pending payloads; scans `execution_v1` in key order, with no sort; reads an executed record's payload at its position | no: it reads every row it joins, and builds the index from them |
+| Catch-up served (`ExecutedOrder`, `page`, `catch_up_entry`, `coord-daemon/src/catch_up.rs`) | all of `executed_v1` into memory at the first ask, then three point reads a command | one range of `execution_v1` and one of `payload_v1` from the requester's frontier | only for the decided record, the dependency row |
+| A campaign's executed rows (`catch_up::executed_rows`, task-d77) | `catch_up_entry` by command | the dependency row through the index | yes |
+| Resolve (`retained_answer`'s `requested()`, `bins/coordd/src/serve.rs`) | `payload_v1` by command | the retry row, read by retry key as now, names the position (`RetryRecordV1::position`); the payload is `payload_v1` at that position | no. A resolve is answered with a result only from a retry row, and only then is the request needed |
+| Settling from the record (`records_for`, `coord-daemon/src/settle.rs`) | retry rows | unchanged | no |
+| Trim (`plan_trim`, `classify`, `executed_within`, `coord-checkpoint/src/trim.rs`; `coordd` doesn't run it yet, task-d27) | scans the protocol rows; reads `executed_v1` by command for each dependency row | scans them in intake order; takes the position from the index | yes |
+| A divergence stop (`catch_up::mismatch`'s `executed_record`; `settle::executed_near`, which scans all of `executed_v1`) | by command; a whole-table scan | a range of `execution_v1` around the two positions; the command's own row through the index, or by one scan at the stop | once, at a stop |
+| The store's own writes: ACCEPT's rewrite, a pulled command's `dependency_delete` (task-d08), `payload_delete` (task-d24), the move | by key | through the index | yes |
+
+So boot, catch-up served and resolve need no index by command here. Boot reads every row it joins, and catch-up and resolve read by position. What does need it is the campaign, trim, a stop and the store's own writes.
+
+**The index lives in memory, in the store.** It maps an 8-byte prefix of each live intake-keyed row's command identity to the row's intake order, and to its execution position once it has one. The row's value carries the whole identity, so a prefix collision is settled by reading the row.
+- **Pages: none.** No durable row is written for it, so it can't put the random leaf back.
+- **Built at open** from the dependency rows boot already reads, and one scan of the pending payloads, which hold only what is not executed.
+- **Kept by the lowering.** Each commit's changes are published with the commit. A reader pins its snapshot first and then asks the index:
+  - a row added after the snapshot reads as absent, which is that snapshot's answer;
+  - a row deleted after the snapshot reads as absent too, which is a later snapshot's answer and what its reader would get next.
+- **Memory (inferred):** about 24 to 32 bytes a live row.
+  - Live rows are the pending payloads and every dependency row the store keeps. In `coordd` today that is every dependency row, since nothing trims (task-d27).
+  - It is the same order as what boot already loads, every dependency row and every executed identity.
+  - `ExecutedOrder`'s 32 bytes an executed command goes.
+- **CPU (inferred):** a map insert or removal for each row lowered: under a microsecond a command a voter, below 0.001 ms an operation.
+- **Not taken:**
+  - a durable index keyed by command, which is the random leaf again;
+  - a durable index batched by order (one row a commit listing its commands). It would let the open read about 40 bytes a command instead of dependency rows, but the open reads those anyway.
+
+**2. Which order: the execution position for executed rows, and intake order before execution.**
+- **Executed rows and executed payloads take the execution position:**
+  - it is replicated: every voter executes the same command at a position, so these rows stay in the common hash and the shared image;
+  - it is known when they are written;
+  - every row lands at the right-hand end: a voter never executes out of position order.
+- **Why nothing executes out of position order.**
+  - The store refuses an application whose base isn't its queued frontier, or whose position isn't above it (`JournaledStore::submit`: `StaleBase`, `PositionNotAfterBase`).
+  - The projection refuses one that doesn't extend it (`project`: "durable record's base does not extend the projection").
+  - Catch-up installs are contiguous from the requester's frontier (`ExecutedOrder::between`, `catch_up::page`), and a Sync's commands execute through the same path.
+  - So the case of a command executed out of position order doesn't arise at a voter. What does differ is the order of intake from the order of execution.
+- **Payload and dependency rows before execution take intake order.** They are written before the command has a position, and each voter writes them at its own journal position, so these keys are node-private. The leader's sequence number isn't used: it is ballot-scoped, and a vote before the proposal, a Sync's installation and a catch-up install have none.
+- **What intake out of execution order does.** A command held across a leader change, installed by a Sync or fetched late executes after commands taken in after it.
+  - Its move then deletes from an older leaf: a page for that command alone.
+  - Its dependency row's rewrite, at ACCEPT after recovery, lands on its old leaf, as every rewrite does today.
+  - So recovery and a late fetch pay a page a command where they are out of order, which is what every command pays today.
+
+**3. The durable format, and how an existing projection moves.**
+- **What changes:**
+  - the projection's layout: four rows' keys and one new node-private collection;
+  - the common hash's membership: `execution_v1` in place of `executed_v1`, and pending payloads out;
+  - the shared image: `payload_v1` and `execution_v1` by position. So `SharedCheckpointV1`'s version is raised, and the scrub reads the new layout (task-d37).
+- **What doesn't change:** the journal's records, the wire, the consensus crate and what a vote rests on.
+- **A domain runs one layout,** as task-d105's design step sets for its own (#208).
+  - Two voters on different layouts would export different roots, and their floors (task-d27) wouldn't count together.
+  - The layout is recorded at initialization and compared at every open. `meta_fields::FORMAT_VERSION` is read by no open today, so the code step builds that check, unless task-d105's code has built it first.
+  - A live store or image of the other layout is refused with the reason (Section 17.7: an unsupported format fails before admission). If both tasks are taken, one layout change carries both.
+- **An existing projection doesn't move in this step.** Nothing is deployed in production, so a store of the old layout is refused and a test domain starts fresh.
+- **`replay` rebuilds from the journal only above its selected local checkpoint** (correcting the order's premise). The journal's prefix is retired at each publication under both profiles (Section 17.16.3, step 4), so below C the rows are only in the local image, in the old layout (Section 17.16.4). Under both profiles a move needs the image converted. They differ in which artifact:
+  - **`replay`:** convert the selected local image offline into a new generation, then replay `(C, J]` onto it. The suffix replays as it is, since its records name rows by command and the new lowering keys them.
+  - **`strict`:** the projection is the durable state at every commit, and a restart replays only above its stamp. So the live projection itself is converted offline as a new generation, selected only once durable, with the old kept until then (Section 17.7's generation replacement).
+  - **The conversion is lossless and mechanical.** It joins `executed_v1` with `payload_v1` by command into `execution_v1` and `payload_v1` by position, and gives every other payload and dependency row an intake order in key order. It is linear in the projection. It isn't built: a local image implies no conversion command (Section 17.16.1), and one is built only if a deployment needs it.
+
+**4. What forgetting, the history sweeps and the checkpoint image read.**
+- **task-d110's sweep and task-d111's forgetting by order** (its cut (d), #221) **read no rows** (correcting the order's premise).
+  - `forget_history`, `forget_in_order`, `forget_one` and `sweep_history` (`coord-consensus/src/follower.rs`, and the leader's `forget_history` in `leader.rs`) drop entries from the machine's maps in memory, and write no row either.
+  - The layout doesn't touch them.
+- **Durable forgetting is task-d27's trim, and `coordd` doesn't run it yet.** No payload, executed, dependency or proposal row is reclaimed today.
+  - Its plan scans the protocol rows through the floor's epoch, and for each dependency row reads `executed_v1` by command to see whether it executed at or below the boundary (`executed_within`).
+  - Under order keys it scans the same range in intake order and takes the position from the index. Its deletes fall in runs of intake order, not one leaf each.
+- **Once a floor forgets executed history,** the prefix of `execution_v1` and `payload_v1` below it is one range delete. Today nothing deletes either, and `executed_v1` is read whole at boot (`read_history`) and at a donor's first catch-up ask.
+- **The shared image** (`export.rs`'s `traverse`, inline on the domain's loop every `FLOOR_INTERVAL`, 4,096 positions, `coord-daemon/src/floor.rs`).
+  - Today it reads `executed_v1` once for every `payload_v1` row, to keep the executed ones.
+  - Under order keys `execution_v1` and `payload_v1` are ranges to the boundary, with no read a row, and pending payloads are in another collection. That is less read work on the loop, not sized here.
+- **The local image** (Section 17.16.1) carries every collection, node-private ones included, so its shape doesn't change. The index is rebuilt at open from it.
+- **KV compaction** (`coord-storage/src/compaction.rs`) reads history and events, which this task doesn't touch.
+
+**5. The history, current, retry and retry-floor rows:**
+
+| Row | Key today | Can it share a leaf? | Whose |
+| --- | --- | --- | --- |
+| Event (`events_v1`) | revision, ordinal | it does already: revisions rise with execution | |
+| History (`kv_history_v1`) | namespace, key, revision | keyed by revision it is the event row, which holds the same entry. task-d105's step (#208) drops the history row for it, with an index by key in memory | task-d105 |
+| Current (`kv_current_v1`) | namespace, key | not by order without an index by key, since reads and guards find it by key. task-d105's second part drops it once that index exists, after its list read's pair | task-d105 |
+| Retry (`retry_v1`) | session, client, sequence | not as a row of its own: admission looks it up by retry key for every command (`retry::admit`), and a commit's commands come from many clients. See the note after the table | task-d104 |
+| Retry deletes | the same | task-d104's window that overwrites in place removes them | task-d104 |
+| Retry floor (`retry_floor_v1`) | session, client | no: one row a client, found by client. task-d104 writes it once every K commands | task-d104 |
+
+**Folding the retry row into the execution row.** The retry record holds the command, position, revision and digest, which are the executed row's fields, plus the response. So it could be the execution row carrying the response, found through an index by retry key in memory, bounded by clients times the window's width. That saves another page a command, about −0.03 ms an operation. But it moves an admission collection's lookups into memory. It is task-d104's to weigh beside its window, and not this task's.
+
+**6. The sizes,** converted by the profile's rule: a local µs a command over five voters is 0.00079 ms an operation at 120 callers and 0.00066 at 30, on the EPYC 9V74.
+- **The cost of a page (inferred).** Page work is 74 to 86% of the thread, so a page costs a voter 7.6 to 9.1 µs at 120 callers and 9.0 to 11.0 at 30: the leader's and a follower's µs a command, over their pages.
+- **A page a command at every voter** is then about −0.03 to −0.036 ms an operation at either load.
+- **If the leaf's rebuild is paid per row rather than per page,** a page is worth about a fifth less, and every figure below shrinks with it.
+
+| Part | Pages a command | ms an operation, 120 callers | ms an operation, 30 callers | Basis |
+| --- | --- | --- | --- | --- |
+| The three rows, gross | −3 at every voter | −0.09 to −0.11 | −0.09 to −0.11 | rows and pages measured; the cost a page inferred |
+| The leader's proposal row | −1 at the leader | −0.006 to −0.007 | −0.006 to −0.007 | counted under task-d103, which stops writing it (#206), not here |
+| What the ordered rows still cost: five right-hand leaves a commit | +5 / commands a commit: +0.66 at the runner's 7.55, +1.54 at its 3.25 | | | inferred; commands a commit measured on the runner |
+| Their bytes, about 0.75 to 1.1 KB: two copies of the payload, the dependency row and the execution row, on half-full to full leaves | +0.2 to +0.55 | | | inferred: the profile doesn't split bytes by table |
+| **Net** | −1.8 to −2.1 a voter at 120 callers, −0.9 to −1.3 at 30 | **−0.05 to −0.08** | **−0.03 to −0.045** | inferred, and a floor: each right-hand leaf is counted as a whole page, though its durable write comes once a durable commit, not once a working commit |
+| Inside the net: the move at execution, against leaving the payload in place behind a node-private locator by position | +0.2 to +0.35 a voter at 120 callers | +0.006 to +0.012 | +0.011 to +0.018 | inferred |
+| With task-d86's cadence at about 30 commands a commit | net −2.3 to −2.6 a voter | −0.07 to −0.095 | toward the same, as far as its time bound fills a commit | inferred |
+| The index | 0 | under 0.001, CPU | under 0.001 | inferred |
+
+**What the sizes say:**
+- **The net is about half to three quarters of the gross at 120 callers, and under half at 30.** A commit of 3.25 commands shares little.
+- **The cadence and this task compound.** task-d86 raises commands a commit, which lifts this task's net toward its gross.
+- **The move at execution costs about 0.01 ms an operation.** It buys three things: executed history read by position with no index (resolve, catch-up, the image), a pending table bounded by what is unexecuted, and a common hash with no node-private key in it.
+- **Not touched here:** the table reopened every row (5 to 6.5%) is lever 3 on #185, and the commit's fixed cost is task-d86's.
+
+**The order (proposed; the lead sets it):** after task-d86's cadence, for the reason above, and inside task-d105's layout change if that is taken, so that a domain changes layout once.
+
 <a id="s17-2"></a>
 ### 17.2 Ordered keys and views
 
