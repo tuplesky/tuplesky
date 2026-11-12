@@ -1087,6 +1087,10 @@ pub struct Domain<P: Persistence> {
     /// loop last looked at its links, and when it last did (task-d115).
     links_moved: bool,
     links_checked: Option<std::time::Instant>,
+    /// Callers answered since the loop's last hand-off to the runtime,
+    /// and when the first was (task-d115, lever 8).
+    answering: Vec<(Responder, Vec<u8>)>,
+    answering_since: Option<std::time::Instant>,
     /// Dials out after the first ones, one task each (task-d03). A dial is
     /// mostly waiting -- an absent voter costs a whole handshake timeout
     /// -- so it runs beside the loop rather than inside it, and ends with
@@ -1465,6 +1469,15 @@ const PAYLOAD_RETRY: std::time::Duration = std::time::Duration::from_millis(50);
 /// some other way. A lost link waits a re-dial floor (250 ms) anyway.
 const REDIAL_CHECK_EVERY: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// The longest the domain loop holds what it owes the runtime -- lane
+/// senders' wake-ups and callers' answers -- before it hands them off
+/// (task-d115, lever 8).
+///
+/// It hands off when no event is waiting, which on a busy leader is
+/// about once a turn, and before every flush. This bounds a loop that
+/// never runs out of events: what it held waits a millisecond at most.
+const HAND_OFF_WITHIN: std::time::Duration = std::time::Duration::from_millis(1);
+
 /// How often a leader sends its voters, again, the proposals they have
 /// not voted on (task-d07). Longer than a round trip on any link this
 /// serves, so a vote on its way is not answered with a second copy, and
@@ -1644,6 +1657,21 @@ fn redial_now(
     moved
         || due.is_some_and(|at| at <= now)
         || checked.is_none_or(|at| now.saturating_duration_since(at) >= REDIAL_CHECK_EVERY)
+}
+
+/// Whether what the domain loop holds for the runtime has waited
+/// [`HAND_OFF_WITHIN`] by `now`: `lanes` is when the oldest lane wake-up
+/// was held and `answers` when the oldest answer was (task-d115, lever 8).
+fn hand_off_due(
+    lanes: Option<std::time::Instant>,
+    answers: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> bool {
+    lanes
+        .into_iter()
+        .chain(answers)
+        .min()
+        .is_some_and(|since| now.saturating_duration_since(since) >= HAND_OFF_WITHIN)
 }
 
 /// Whether the loop lowers before it takes another event: a full journal
@@ -1882,6 +1910,8 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             read_orders: Vec::new(),
             links_moved: false,
             links_checked: None,
+            answering: Vec::new(),
+            answering_since: None,
         }
     }
 
@@ -2417,6 +2447,22 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     /// own turn -- its timers, its peers, its recovery -- so the loop
     /// only waits on a socket once the voter has nothing left to do.
     pub async fn run(&mut self, transport: &mut Transport, clock: impl Fn() -> u64) {
+        // Every lane wake-up this loop's sends make is held for its
+        // hand-offs (task-d115, lever 8). What it still holds when it
+        // stops goes then, as it would have at the next hand-off: the
+        // answers here, and the wake-ups as the hold is dropped.
+        let hold = coord_transport::WakeHold::new();
+        self.serve(transport, clock, &hold).await;
+        self.hand_off(&hold);
+    }
+
+    /// [`Domain::run`]'s passes, under its hold.
+    async fn serve(
+        &mut self,
+        transport: &mut Transport,
+        clock: impl Fn() -> u64,
+        hold: &coord_transport::WakeHold,
+    ) {
         // Reach the other voters. The first dials are the re-dial
         // schedule's, due at once, and go out on the loop's first pass
         // as tasks of their own (task-d03): serving does not wait for
@@ -2452,6 +2498,11 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             };
             let started = std::time::Instant::now();
             self.pacing.pass_started(executed, started);
+            // What the loop held goes once it has waited its bound,
+            // however busy the loop still is (task-d115, lever 8).
+            if self.hand_off_due(hold, started) {
+                self.hand_off(hold);
+            }
             self.report_if_due();
             // The leaf this node presents first, every pass: a node whose
             // leaf has expired serves nothing more on it, however much
@@ -2473,10 +2524,13 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             // kept arriving (task-d47).
             let owed = matches!(&self.backing, Backing::Voting(v) if v.owes_flush());
             let appending = matches!(&self.backing, Backing::Voting(v) if v.appending());
-            if flush_due(self.queued(), appending, owed, self.since_flush)
-                && self.stops_on_flush(transport)
-            {
-                return;
+            if flush_due(self.queued(), appending, owed, self.since_flush) {
+                // What the events so far owe the runtime goes before the
+                // flush, not after it (task-d115, lever 8).
+                self.hand_off(hold);
+                if self.stops_on_flush(transport) {
+                    return;
+                }
             }
             let progressed = match self.turn(transport).await {
                 Ok(p) => p,
@@ -2589,6 +2643,17 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             // share without giving up the ordering that makes the
             // domain progress.
             let api_first = poll_api_first(self.peer_streak);
+            // No event is waiting and the voter has no more to do: the
+            // burst is over, and what it held for the runtime goes in one
+            // hand-off before the loop waits or flushes (task-d115, lever
+            // 8). On a busy leader that is about once a turn.
+            if !progressed
+                && self.holds_hand_off(hold)
+                && !transport.has_event()
+                && !self.plane.as_ref().is_some_and(|p| p.transport.has_event())
+            {
+                self.hand_off(hold);
+            }
             let owes_flush = matches!(&self.backing, Backing::Voting(v) if v.owes_flush());
             let materialized = self.materialized.clone();
             // Waiting from here: the select below returns at once when
@@ -2728,6 +2793,42 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         .flatten()
         .min();
         redial_now(self.links_moved, due, self.links_checked, now)
+    }
+
+    /// Hand the runtime what the loop held since its last hand-off, at
+    /// once (task-d115, lever 8): the wake-ups of the lane senders its
+    /// sends queued frames for, and the callers it answered.
+    ///
+    /// One hand-off is one wake-up of a parked worker, however many
+    /// lanes and answers it carries: the answers go in one task, which
+    /// starts one task an answer from inside the runtime. Each answer is
+    /// still its own task, so a slow reader holds up no other caller and
+    /// not the voter's next turn.
+    fn hand_off(&mut self, hold: &coord_transport::WakeHold) {
+        hold.release();
+        self.answering_since = None;
+        if self.answering.is_empty() {
+            return;
+        }
+        let answers = std::mem::take(&mut self.answering);
+        tokio::spawn(async move {
+            for (responder, frame) in answers {
+                tokio::spawn(async move {
+                    let _ = responder.respond(frame).await;
+                });
+            }
+        });
+    }
+
+    /// Whether the loop holds anything for the runtime.
+    fn holds_hand_off(&self, hold: &coord_transport::WakeHold) -> bool {
+        hold.held_since().is_some() || !self.answering.is_empty()
+    }
+
+    /// Whether the oldest thing the loop holds for the runtime has waited
+    /// [`HAND_OFF_WITHIN`] by `now`.
+    fn hand_off_due(&self, hold: &coord_transport::WakeHold, now: std::time::Instant) -> bool {
+        hand_off_due(hold.held_since(), self.answering_since, now)
     }
 
     /// Keep both planes' links to the other voters up (task-d03).
@@ -4625,12 +4726,11 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             Ok(Held { responder, read }) => {
                 self.frontend.counts.released += 1;
                 self.frontend.answered(&responder, read);
-                // The caller is answered on the stream it asked on, and
-                // the send is not awaited here: a slow reader must not
-                // hold up the voter's next turn.
-                tokio::spawn(async move {
-                    let _ = responder.respond(delivery.frame).await;
-                });
+                // The caller is answered on the stream it asked on, at
+                // the loop's next hand-off (task-d115, lever 8).
+                self.answering_since
+                    .get_or_insert_with(std::time::Instant::now);
+                self.answering.push((responder, delivery.frame));
             }
             Err(_) => {
                 // Nothing is waiting: the caller went away, or resolved
@@ -6389,6 +6489,22 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
         assert!(super::redial_now(true, None, Some(at), soon));
         assert!(super::redial_now(false, Some(soon), Some(at), soon));
         assert!(super::redial_now(false, None, Some(at), at + bound));
+    }
+
+    /// What the loop holds goes once the oldest of it has waited the
+    /// bound, lane wake-ups or answers alike, and not before; nothing
+    /// held is never due (task-d115, lever 8).
+    #[test]
+    fn a_hand_off_is_due_once_the_oldest_held_has_waited_its_bound() {
+        let at = std::time::Instant::now();
+        let bound = super::HAND_OFF_WITHIN;
+        let later = at + bound / 2;
+        assert!(!super::hand_off_due(None, None, at + 10 * bound));
+        assert!(!super::hand_off_due(Some(at), None, at + bound / 2));
+        assert!(super::hand_off_due(Some(at), None, at + bound));
+        assert!(super::hand_off_due(None, Some(at), at + bound));
+        assert!(super::hand_off_due(Some(later), Some(at), at + bound));
+        assert!(!super::hand_off_due(Some(later), Some(later), at + bound));
     }
 
     /// A session this node has not projected yet is "not yet", not a
