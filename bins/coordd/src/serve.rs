@@ -1217,6 +1217,16 @@ unserved_order_above={} unserved_no_snapshot={} unserved_first_row={}",
     }
 }
 
+/// The admission line (task-d26): the frontend's rate, `none` where it
+/// has none, and its refusals by why.
+fn admission_text(per_second: Option<u32>, r: coord_collector::AdmissionRefusals) -> String {
+    let per_second = per_second.map_or_else(|| "none".to_owned(), |n| n.to_string());
+    format!(
+        "admission: per_second={per_second} rate_limited={} session_busy={} other={}",
+        r.rate_limited, r.session_busy, r.other
+    )
+}
+
 /// The stages this daemon has an instrumentation point for (task-61).
 ///
 /// Admission is recorded where the frontend decides a caller's frame;
@@ -2087,6 +2097,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             Ok(rendered) => eprintln!("metrics {rendered}"),
             Err(e) => eprintln!("the metrics snapshot could not be rendered: {e}"),
         }
+        eprintln!("{}", self.admission_line());
         let executed = match &self.backing {
             Backing::Voting(voter) => voter.node().executed,
             Backing::Serving(_) => 0,
@@ -2310,6 +2321,23 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     /// What this loop has seen.
     pub const fn counts(&self) -> Counts {
         self.frontend.counts
+    }
+
+    /// What this frontend's admission gate has refused, by why.
+    pub fn admission_refusals(&self) -> coord_collector::AdmissionRefusals {
+        self.frontend.frontend.dispatcher().admission().refusals()
+    }
+
+    /// The admission line: this frontend's admission rate and what its
+    /// gate refused, by why. Said with every metrics snapshot, so a
+    /// reading carries the bound it was taken under and whether that
+    /// bound refused anything.
+    pub fn admission_line(&self) -> String {
+        let admission = self.frontend.frontend.dispatcher().admission();
+        admission_text(
+            admission.limits().max_admitted_per_second,
+            admission.refusals(),
+        )
     }
 
     /// How this voter's catch-up went, by path, and how it answered its
@@ -4647,6 +4675,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 self.recorder.entered(Stage::Admission);
                 let started = std::time::Instant::now();
                 let now = self.now_millis();
+                let refused_before = self.admission_refusals().total();
                 let ingress = self.frontend.frontend.on_frame(
                     &health,
                     now,
@@ -4666,7 +4695,12 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                     eprintln!("a binding was refused: {reason:?}");
                 }
                 let decided = step(ingress, retry_key);
-                if matches!(decided, Step::Close { .. }) {
+                // Refused at the door: the stream closed, or the gate
+                // answered with a refusal (the admission rate above all,
+                // which the caller sees as `BACKPRESSURE` and retries).
+                if matches!(decided, Step::Close { .. })
+                    || self.admission_refusals().total() > refused_before
+                {
                     self.recorder.refused(Stage::Admission);
                 } else {
                     self.recorder.completed(Stage::Admission, started.elapsed());
@@ -6192,6 +6226,25 @@ impl core::error::Error for TransportError {}
 
 #[cfg(test)]
 mod tests {
+    /// The admission line names the rate and every refusal count, each
+    /// with its own value, and says `none` for a frontend with no rate.
+    #[test]
+    fn the_admission_line_names_the_rate_and_every_refusal() {
+        let refusals = coord_collector::AdmissionRefusals {
+            rate_limited: 7,
+            session_busy: 3,
+            other: 1,
+        };
+        assert_eq!(
+            super::admission_text(Some(1000), refusals),
+            "admission: per_second=1000 rate_limited=7 session_busy=3 other=1"
+        );
+        assert_eq!(
+            super::admission_text(None, coord_collector::AdmissionRefusals::default()),
+            "admission: per_second=none rate_limited=0 session_busy=0 other=0"
+        );
+    }
+
     /// task-d106 step 0: the catch-up paths line names every count, each
     /// with its own value.
     #[test]

@@ -1940,6 +1940,8 @@ The metrics line now carries the table (`table`): its records against its bound,
 
 **Review boundary:** The contract text, the accounting and the bounds it adds. No change to protocol messages or rows. The executed-history set (`CommandTable.history`) and the per-key tombstones in memory are not bounded here: their owner is task-d46, which retires in-memory history above the floor continuously; the durable rows below the floor are task-d27's.
 
+**The admission rate's scope: the owner's decision, for now (2026-11-11).** `limits.max_admitted_per_second` stays a bound for each frontend, and its default stays 1,000 a second. #228 counts its refusals and states it in every bench reading, and changes neither. What this leaves open: the rule above, that the admitted rate stays below the rate a catching-up voter executes, does not hold on the defaults for a domain of several frontends. Three frontends admit up to 3,000 a second and five up to 5,000, against 1,540 to 1,610 a second caught up under load at a page of 64 (#98, 6806617592). The question is revisited against the rate the rejoin PR (a page of 125, one page asked ahead) measures.
+
 <a id="task-d27"></a>
 ### task-d27: Wire quorum-safe forgetting into coordd
 
