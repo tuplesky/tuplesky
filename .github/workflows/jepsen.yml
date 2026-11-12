@@ -114,7 +114,7 @@ on:
         options: ["false", "true", "call-graph"]
         default: "false"
       swiftpaxos:
-        description: "Faults for the SwiftPaxos baseline (pause, partition, packet; kill ends its cluster), none, or skip to not run it; empty for the scenario's"
+        description: "Faults for the SwiftPaxos baseline (pause, partition, packet; kill ends its cluster), none, or skip to not run it; empty for the scenario's; or beside, its register workload without faults in the TupleSky job, on its runner and cluster, after each step's etcd run (or after the one run), into a sweep's tables, instead of in a job of its own; needs nemesis none"
         default: ""
   # A change to the Jepsen harness itself runs it once, on the pull
   # request, with the defaults. Not a required check.
@@ -359,6 +359,20 @@ jobs:
         # the etcd run's bound (scripts/ci/jepsen_etcd.sh deps).
         if: env.ETCD_BESIDE == 'true'
         run: tuplesky/scripts/ci/jepsen_etcd.sh deps
+      - name: Build SwiftPaxos beside TupleSky
+        # swiftpaxos beside: the swiftpaxos-baseline job's build and its
+        # Jepsen project's dependencies, for the runs in the Jepsen step
+        # below, on this runner and cluster.
+        if: env.SWIFTPAXOS_BESIDE == 'true'
+        run: |
+          if [ ! -d jepsen/swiftpaxos ]; then
+            echo "::error::tuplesky/jepsen@$JEPSEN_REF has no swiftpaxos project; dispatch with a jepsen-ref that has it, or another swiftpaxos"
+            exit 1
+          fi
+          go version
+          jepsen/swiftpaxos/build.sh "$RUNNER_TEMP/swiftpaxos-bin" | tee "$RUNNER_TEMP/swiftpaxos-build.txt"
+          echo "SwiftPaxos beside TupleSky: $(tail -n 1 "$RUNNER_TEMP/swiftpaxos-build.txt" | sed 's/.* from //'), at $SWIFTPAXOS_STEPS clients" >> "$GITHUB_STEP_SUMMARY"
+          (cd jepsen/swiftpaxos && lein deps)
       - name: Stand the cluster up
         # With store tmpfs, /opt, which holds each voter's binary and store
         # (/opt/tuplesky), is a tmpfs. Not /opt/tuplesky itself: the test
@@ -553,8 +567,40 @@ jobs:
             python3 "$ci/jepsen_summary.py" "$store" --nodes-file "$RUNNER_TEMP/cluster/nodes" \
               --title "etcd $ETCD_VERSION: $WORKLOAD, $NEMESIS$TITLE_SUFFIX$STORE_SUFFIX: $label" || true
           }
+          # With SwiftPaxos beside TupleSky, its register test once on this
+          # runner and cluster without faults, at $3 clients, its samples in
+          # $1, summarized as the swiftpaxos-baseline job's is and named $2;
+          # its store in swiftpaxos_store.
+          swiftpaxos_previous="" swiftpaxos_store=""
+          swiftpaxos_one() {
+            local dir=$1 label=$2 clients=$3 store
+            mkdir -p "$dir"
+            (cd "$GITHUB_WORKSPACE/jepsen/swiftpaxos" && \
+              unset JEPSEN_LEADER_PROFILE JEPSEN_LEADER_CALLGRAPH && \
+              JEPSEN_CPU_SAMPLES="$dir/cpu-samples.csv" "$ci/jepsen_bounded.sh" \
+                $((TIME_LIMIT + 1200)) "$RUNNER_TEMP/cluster/nodes" -- lein run test \
+                --nodes-file "$RUNNER_TEMP/cluster/nodes" \
+                --ssh-private-key "$RUNNER_TEMP/cluster/id_ed25519" \
+                --username root \
+                --bin-dir "$RUNNER_TEMP/swiftpaxos-bin" \
+                --nemesis none \
+                --rate "$RATE" \
+                --time-limit "$TIME_LIMIT" \
+                --concurrency "$clients") \
+              || echo "::warning::$label: the SwiftPaxos test ended with status $?"
+            store=$(readlink -f "$GITHUB_WORKSPACE/jepsen/swiftpaxos/store/latest" || true)
+            if [ -z "$store" ] || [ "$store" = "$swiftpaxos_previous" ]; then
+              echo "::warning::$label: the SwiftPaxos test left no store"
+              return 1
+            fi
+            swiftpaxos_previous=$store swiftpaxos_store=$store
+            cp "$dir"/cpu-samples* "$store"/ 2>/dev/null || true
+            python3 "$ci/jepsen_summary.py" "$store" --nodes-file "$RUNNER_TEMP/cluster/nodes" \
+              --title "SwiftPaxos: register, none, at $clients clients: $label" || true
+          }
           head_sha=$(git -C "$GITHUB_WORKSPACE/tuplesky" rev-parse --short HEAD)
           beside=""; if [ "$ETCD_BESIDE" = true ]; then beside=", beside etcd $ETCD_VERSION"; fi
+          if [ "$SWIFTPAXOS_BESIDE" = true ]; then beside+=", beside SwiftPaxos"; fi
           if [ -z "$IN_PAIR_BASE" ] && [ -z "$SWEEP" ]; then
             graph=flat; if [ "$IN_LEADER_PROFILE" = call-graph ]; then graph=graph; fi
             rc=0
@@ -566,6 +612,9 @@ jobs:
               python3 "$ci/jepsen_pairs.py" \
                 --title "TupleSky $head_sha$beside on one runner: $WORKLOAD, $NEMESIS$TITLE_SUFFIX$STORE_SUFFIX$PROFILE_SUFFIX$CHECKPOINT_SUFFIX$WORKERS_SUFFIX$TUPLESKY_SUFFIX" \
                 "head=$store" "etcd=$etcd_store" || true
+            fi
+            if [ "$SWIFTPAXOS_BESIDE" = true ]; then
+              swiftpaxos_one "$RUNNER_TEMP/swiftpaxos" "beside TupleSky" "$SWIFTPAXOS_STEPS" || true
             fi
             exit $rc
           fi
@@ -689,6 +738,14 @@ jobs:
               if [ "$ETCD_BESIDE" = true ]; then
                 n=$((n + 1))
                 if etcd_one "$RUNNER_TEMP/run-$n" "step $step"; then runs+=("etcd@$step=$etcd_store"); fi
+              fi
+              # SwiftPaxos at this step's clients, raised as a register
+              # step is (SWIFTPAXOS_STEPS, one a step, in order).
+              if [ "$SWIFTPAXOS_BESIDE" = true ]; then
+                n=$((n + 1))
+                read -ra sp_steps <<< "$SWIFTPAXOS_STEPS"
+                sp=${sp_steps[$((i - 1))]}
+                if swiftpaxos_one "$RUNNER_TEMP/run-$n" "step $step" "$sp"; then runs+=("swiftpaxos@$step=$swiftpaxos_store"); fi
               fi
             done
             python3 "$ci/jepsen_sweep.py" \
@@ -839,6 +896,10 @@ jobs:
           if [ -d etcd-test/store ]; then
             tar czf "$RUNNER_TEMP/jepsen-store-etcd.tgz" -C etcd-test store
           fi
+          # SwiftPaxos's runs beside TupleSky (swiftpaxos beside).
+          if [ -d jepsen/swiftpaxos/store ]; then
+            tar czf "$RUNNER_TEMP/jepsen-store-swiftpaxos.tgz" -C jepsen/swiftpaxos store
+          fi
       - name: Upload the Jepsen store
         if: always() && env.CPU_MISS != 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -847,6 +908,7 @@ jobs:
           path: |
             ${{ runner.temp }}/jepsen-store.tgz
             ${{ runner.temp }}/jepsen-store-etcd.tgz
+            ${{ runner.temp }}/jepsen-store-swiftpaxos.tgz
           retention-days: 14
           if-no-files-found: warn
       - name: Read the nodes' CPU quota again
@@ -976,7 +1038,8 @@ jobs:
     name: SwiftPaxos baseline (docker cluster)
     # The service scenario skips it: SwiftPaxos runs only the register
     # workload.
-    if: ${{ (inputs.swiftpaxos || (inputs.scenario == 'service' && 'skip') || 'pause,partition') != 'skip' }}
+    # swiftpaxos beside runs it in the TupleSky job instead.
+    if: ${{ inputs.swiftpaxos != 'beside' && (inputs.swiftpaxos || (inputs.scenario == 'service' && 'skip') || 'pause,partition') != 'skip' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:

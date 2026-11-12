@@ -808,6 +808,19 @@ same kind of cluster:
 Its store, with the master's and the clients' logs under `control/`, is
 the `jepsen-store-swiftpaxos-<scenario>-register` artifact.
 
+With `swiftpaxos: beside`, the job of its own doesn't run. The TupleSky job
+instead builds SwiftPaxos and runs its register test without faults on its
+own runner and cluster: after the one run, or after each step's etcd run
+in a sweep. Each step's clients are raised to a multiple of the register
+workload's 2n, as a register step is. Each run gets its own summary. A
+sweep's table labels them `swiftpaxos@STEP` and gives their ratio to etcd
+at the step, so all three systems are read on one CPU. It needs `nemesis:
+none`. Its workload is its own, reads and writes half and half a key with no
+compare-and-set, so set the mix against etcd's and TupleSky's when reading
+the ratios. Its master, on the runner, counts among the servers. Its runs
+are packed as `jepsen-store-swiftpaxos.tgz` in the TupleSky job's store
+artifact.
+
 Each test runs under `timeout`, bounded at the time limit plus 20
 minutes. A test whose final phase hangs then fails in that time, instead
 of holding its job until the job's own timeout (90 or 120 minutes). The

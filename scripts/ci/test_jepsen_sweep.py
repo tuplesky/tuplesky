@@ -190,6 +190,7 @@ class SweepTests(unittest.TestCase):
     def test_labels(self):
         self.assertEqual(sw.label("head@30=/s/1"), ("head", "30", "/s/1"))
         self.assertEqual(sw.label("etcd@6n=/s/2"), ("etcd", "6n", "/s/2"))
+        self.assertEqual(sw.label("swiftpaxos@120=/s/3"), ("swiftpaxos", "120", "/s/3"))
         with self.assertRaises(ValueError):
             sw.label("other@30=/s/1")
 
@@ -260,6 +261,19 @@ class SweepTests(unittest.TestCase):
         self.assertIsNone(step.commands_per_op)
         self.assertNotIn("leader_loop", step.cpu)
         self.assertAlmostEqual(step.cpu["servers"], 2400.0)
+
+    def test_swiftpaxos_beside_is_read_as_etcd_is_and_has_its_ratio_to_etcd(self):
+        # A store that happens to hold coordd logs is still not read for
+        # voters: the side says what ran.
+        step = sw.read_step("swiftpaxos", "30", self.store("s", tuplesky=True))
+        self.assertIsNone(step.commands_per_op)
+        self.assertEqual(step.counts, {})
+        self.assertEqual(step.memory, {})
+        self.assertAlmostEqual(step.cpu["servers"], 2400.0)
+        text = sw.render([step, sw.read_step("etcd", "30", self.store("e", tuplesky=False))], "Sweep")
+        self.assertIn("| 30 | swiftpaxos | 1.00× | 1.00× | 1.00× |", text)
+        self.assertIn("SwiftPaxos's on its own register workload", text)
+        self.assertNotIn("| 30 | swiftpaxos | 0 / ", text)
 
     def test_a_run_without_samples(self):
         step = sw.read_step("head", "30", self.store("h", samples=False))

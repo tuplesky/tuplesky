@@ -13,7 +13,10 @@
 #   IN_NEMESIS     their faults; empty for the scenario's. A partition
 #                  may carry TupleSky's partition options,
 #                  partition:TARGETS[:LO-HI[/EVERY]] (see below)
-#   IN_SWIFTPAXOS  SwiftPaxos's faults; empty for the scenario's
+#   IN_SWIFTPAXOS  SwiftPaxos's faults; empty for the scenario's; or
+#                  beside, SwiftPaxos without faults in the TupleSky job,
+#                  on its runner and cluster, after etcd at each step
+#                  (SWIFTPAXOS_BESIDE)
 #   IN_TIME_LIMIT  seconds of workload; empty for the scenario's
 #   IN_CONCURRENCY clients, a number or a multiple of the nodes (5n);
 #                  empty for the scenario's. Comma-separated, a sweep: the
@@ -175,6 +178,8 @@ if [[ ",$nemesis," == *,partition:* ]]; then
   nemesis=$faults
 fi
 swiftpaxos=${IN_SWIFTPAXOS:-$swiftpaxos}
+swiftpaxos_beside=false
+if [ "$swiftpaxos" = beside ]; then swiftpaxos_beside=true; fi
 time_limit=${IN_TIME_LIMIT:-$time_limit}
 concurrency=${IN_CONCURRENCY:-$concurrency}
 # A comma-separated list is a sweep: each count is a step.
@@ -259,6 +264,20 @@ if [ $# -gt 1 ]; then
   fi
   concurrency=${sweep%% *}
   swiftpaxos="skip"
+fi
+# Beside TupleSky, SwiftPaxos runs its register workload without faults,
+# at each step's clients (raised as a register step is), so the job's
+# faults must be none.
+swiftpaxos_steps=""
+if [ "$swiftpaxos_beside" = true ]; then
+  swiftpaxos="skip"
+  for step in ${sweep:-$concurrency}; do
+    swiftpaxos_steps+="${swiftpaxos_steps:+ }$(raise_register "$step")"
+  done
+  if [ "$nemesis" != none ]; then
+    echo "::error::swiftpaxos beside runs without faults; give nemesis none, not $nemesis" >&2
+    exit 1
+  fi
 fi
 # In a sweep with a pair base, the steps the base runs at.
 base_steps=""
@@ -493,6 +512,8 @@ out=${GITHUB_ENV:-/dev/stdout}
   echo "SWEEP_BASE_STEPS=$base_steps"
   echo "REGISTER_MIX=$register_mix"
   echo "SWIFTPAXOS_CONCURRENCY=$swiftpaxos_concurrency"
+  echo "SWIFTPAXOS_BESIDE=$swiftpaxos_beside"
+  echo "SWIFTPAXOS_STEPS=$swiftpaxos_steps"
   echo "WAN=$wan"
   echo "RECOVERY_TIME=$recovery_time"
   echo "TITLE_SUFFIX=$suffix"

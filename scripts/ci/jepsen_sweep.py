@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Tabulate a sweep job: TupleSky's sides and etcd at a series of client
-counts, every run on one runner, so a ratio between them holds within the
+"""Tabulate a sweep job: TupleSky's sides, etcd and SwiftPaxos at a series
+of client counts, every run on one runner, so a ratio between them holds within the
 job.
 
     scripts/ci/jepsen_sweep.py [--title TITLE] SIDE@STEP=STORE [SIDE@STEP=STORE ...]
 
 Each argument is one run's store directory, labelled with its side
-(`head`, `base` or `etcd`) and its step (the clients it ran at, as the
+(`head`, `base`, `etcd` or `swiftpaxos`, the reference beside TupleSky,
+its register workload) and its step (the clients it ran at, as the
 workflow names them: `30`, or `6n`), in the order the job ran them. For
 every run it reads, with `jepsen_summary.py`'s parsers, over the workload (the first invocation to the last completion,
 or the final heal):
@@ -46,7 +47,8 @@ or the final heal):
   marked commands where counted, and the journal groups and projection
   commits.
 
-Then each TupleSky side's ratio to the etcd run at the same step. It writes
+Then each TupleSky side's ratio to the etcd run at the same step, and
+SwiftPaxos's. It writes
 Markdown to `$GITHUB_STEP_SUMMARY` when it is set and to standard output
 either way.
 """
@@ -268,13 +270,17 @@ PARTS = (
     ("busy", "Host busy"),
 )
 KINDS = (":read", ":write", ":cas")
+# The sides that are TupleSky's voters, with their logs, stores and
+# `metrics` lines; etcd and SwiftPaxos are read from the client's history
+# and the sampler alone.
+TUPLESKY = ("head", "base")
 
 
 def label(arg: str) -> tuple[str, str, str]:
     """SIDE@STEP=STORE as its three parts."""
-    m = re.fullmatch(r"(head|base|etcd)@([0-9]+n?)=(.+)", arg)
+    m = re.fullmatch(r"(head|base|etcd|swiftpaxos)@([0-9]+n?)=(.+)", arg)
     if not m:
-        raise ValueError(f"not SIDE@STEP=STORE (SIDE head, base or etcd): {arg}")
+        raise ValueError(f"not SIDE@STEP=STORE (SIDE head, base, etcd or swiftpaxos): {arg}")
     return m[1], m[2], m[3]
 
 
@@ -485,7 +491,7 @@ def read_step(side: str, step_name: str, store: str) -> Step:
     step.window_s = (end - start).total_seconds()
     completed = step.completed
     runner(step, start, end, completed)
-    costs = voter_costs(store) if side != "etcd" else []
+    costs = voter_costs(store) if side in TUPLESKY else []
     if costs and completed:
         leader = lead(costs)
         if leader:
@@ -503,7 +509,7 @@ def read_step(side: str, step_name: str, store: str) -> Step:
                 step.run_queue_p99_ms = tails["run_queue_per_working_pass"]["p99_ms"]
             if "release_round" in tails:
                 step.round_ms = (tails["release_round"]["p50_ms"], tails["release_round"]["p99_ms"])
-    if side != "etcd":
+    if side in TUPLESKY:
         step.pipelines = read_pipelines(store)
         step.counts = read_counts(store)
         step.per_projection_commit = read_per_projection_commit(store)
@@ -566,7 +572,7 @@ def render(steps: list[Step], title: str) -> str:
         "**The runner's CPU per operation** (ms per operation completed, from `cpu_sampler.py` over the samples "
         "around the workload: the voters' loops are the sampled main threads, split between the leader and the "
         "followers as their `metrics` lines' loop CPU is; tokio threads and the other threads by kind are the "
-        "voters' (`--threads` and `--wakeups`); servers in all is `coordd` or `etcd`; everything else is the "
+        "voters' (`--threads` and `--wakeups`); servers in all is `coordd`, `etcd` or `swiftpaxos` (its master, on this runner, too); everything else is the "
         "host's busy time outside every named process, the kernel's packet work most of it; idle and steal in "
         "cores; the materializer's commands a projection commit at each voter, n1 to n5, from its last "
         "`metrics` line since it started, the leader's marked `*`: the line counts the materializer's commits, "
@@ -711,7 +717,8 @@ def render(steps: list[Step], title: str) -> str:
     rows = [s for s in steps if s.side != "etcd" and s.step in etcd]
     if rows:
         out += [
-            "**Against etcd at the same step** (each TupleSky run's value over the etcd run's at its step, on "
+            "**Against etcd at the same step** (each TupleSky run's value, and SwiftPaxos's on its own register "
+            "workload, over the etcd run's at its step, on "
             f"this runner{model_note(steps)}; a ratio read on one CPU model is not comparable with one read on "
             "another without saying so)",
             "",
