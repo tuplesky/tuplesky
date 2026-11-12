@@ -794,19 +794,29 @@ fn reinstall_if_invalid(
     // scan before the attach reads, since that scan starts at the image's
     // stamp. Checked here, before the reinstalled generation becomes the
     // selected one, so a build that can't run it changes nothing.
-    {
+    let admitted = {
         use coord_store_api::engine::{LocalEngine, SnapshotSource};
-        let view = staged.engine().reader().snapshot().map_err(|e| {
-            refused(format!(
+        match staged.engine().reader().snapshot() {
+            Ok(view) => coord_checkpoint::feature::admit(&view)
+                .map(drop)
+                .map_err(|e| {
+                    format!(
+                        "{e}: activated in the local checkpoint at {}; nothing was reinstalled",
+                        pointer.represented.get()
+                    )
+                }),
+            Err(e) => Err(format!(
                 "the reinstalled image's activation record could not be read: {e}"
-            ))
-        })?;
-        coord_checkpoint::feature::admit(&view).map_err(|e| {
-            refused(format!(
-                "{e}: activated in the local checkpoint at {}; nothing was reinstalled",
-                pointer.represented.get()
-            ))
-        })?;
+            )),
+        }
+    };
+    if let Err(reason) = admitted {
+        // Never selected, so removed: a start that keeps refusing must
+        // not leave a staged generation behind each time (#231 review).
+        if let Err(e) = staged.abandon() {
+            eprintln!("the refused reinstall's staged generation could not be removed: {e}");
+        }
+        return Err(refused(reason));
     }
     let generation = staged
         .activate()
@@ -1543,6 +1553,16 @@ namespace = "5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e"
         assert!(represented > 0);
         let selected = selected_generation(&config);
         let rows_were = rows_of(&selected);
+        let root = config.state.root_path(&config.state_directory);
+        let entries = |root: &Path| {
+            let mut names: Vec<_> = std::fs::read_dir(root)
+                .expect("the state root")
+                .map(|e| e.expect("entry").file_name())
+                .collect();
+            names.sort();
+            names
+        };
+        let entries_were = entries(&root);
         for start in 0..2 {
             match serve(&config, 1).and_then(Opened::attach) {
                 Err(StoreError::Refused { reason, .. }) => assert!(
@@ -1562,6 +1582,13 @@ namespace = "5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e"
             assert!(
                 rows_of(&selected) == rows_were,
                 "start {start}: the selected projection's rows changed"
+            );
+            // The staged generation is removed, not left for each start
+            // to add another (#231 review).
+            assert_eq!(
+                entries(&root),
+                entries_were,
+                "start {start}: the refused reinstall left something in the state root"
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
