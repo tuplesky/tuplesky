@@ -21,8 +21,11 @@ spreads it over commands that ran while the history was short.
 commands a voter established on the slow path missed the fast one, the
 pre-acceptances it held that the leader had not ordered, the leader's
 waits from learned to released, the read waits taken apart, the peer
-frames and streams per command, and the journal's and the projection's
-jobs per command, queued, served and completed. A run
+frames and streams per command, what a voter sent while it led (its
+fresh proposals, its proposal frames and its `Committed` frontier
+announcements, task-d102, each a follower, per command), and the
+journal's and the projection's jobs per command, queued, served and
+completed. A run
 in which no voter decided anything fast is printed as a finding.
 
 `table` prints a fourth table (task-d97): the tails of the waits the
@@ -139,6 +142,7 @@ def per_command(node: str, snapshot: dict) -> dict:
         **cpu_of(cost, executed),
         **waits_of(cost, executed),
         **traffic_of(cost, executed),
+        **proposals_of(cost, executed),
         **groups_of(cost, executed, syncs["Observed"]),
         **tails_of(cost),
     }
@@ -296,6 +300,18 @@ def traffic_of(cost: dict, executed: int) -> dict:
     if traffic.get("sent_lost_streams"):
         out["frames_per_lost_stream"] = traffic["sent_lost"] / traffic["sent_lost_streams"]
     return out
+
+
+def proposals_of(cost: dict, executed: int) -> dict:
+    """What a voter sent while it led, per command (task-d102): its fresh
+    proposals, the proposal frames that carried more than one, and its
+    commit frontier announcements (`Committed`), each counted once a
+    follower, with their bytes. Empty for a binary older than the counts
+    and for a voter that never led."""
+    proposals = cost.get("proposals")
+    if not isinstance(proposals, dict) or not any(proposals.values()):
+        return {}
+    return {"proposals_per_command": {k: v / executed for k, v in proposals.items()}}
 
 
 def groups_of(cost: dict, executed: int, syncs: int) -> dict:
@@ -639,14 +655,16 @@ def paths_table(result: dict) -> str:
         "| read ms: confirm/after confirm/after index | reads/round | behind/read "
         "| peer frames/cmd sent/received (streams sent/received) "
         "| peer datagrams/cmd sent/received (send calls, ACKs sent) "
+        "| led, sent/cmd: proposals/frames/Committed "
         "| journal ms/cmd queued/served/completed | projection ms/cmd queued/served/completed |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- "
+        "| --- |",
     ]
     dash = "--"
     for run in result["runs"]:
         for finding in run.get("findings", []):
             lines.append(f"| {run['callers']} | **finding** | {finding} "
-                         "| | | | | | | | | | | |")
+                         "| | | | | | | | | | | | |")
         for v in run["voters"]:
             share = v.get("fast_path_share")
             share = dash if share is None else f"{share:.1%}"
@@ -676,13 +694,16 @@ def paths_table(result: dict) -> str:
             packets = dash if not traffic_cmd or "datagrams_sent" not in traffic_cmd else (
                 f"{traffic_cmd['datagrams_sent']:.2f}/{traffic_cmd['datagrams_received']:.2f} "
                 f"({traffic_cmd['send_calls']:.2f}, {traffic_cmd['acks_sent']:.2f})")
+            sent = v.get("proposals_per_command")
+            sent = dash if sent is None else "/".join(
+                f"{sent[f]:.2f}" for f in ("proposals", "frames", "frontiers"))
             jobs = lambda side: dash if f"{side}_jobs" not in v else "/".join(
                 f"{v[f'{side}_jobs'][f'{t}_ms_per_command']:.3f}"
                 for t in ("queued", "served", "completed"))
             lines.append(
                 f"| {run['callers']} | {v['node']} | {share} | {missed} | {acks} | {held} "
                 f"| {release} | {waits} | {per_round} | {behind} | {traffic} | {packets} "
-                f"| {jobs('appender')} | {jobs('materializer')} |")
+                f"| {sent} | {jobs('appender')} | {jobs('materializer')} |")
     return "\n".join(lines)
 
 
