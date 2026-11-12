@@ -183,6 +183,11 @@ pub struct Counts {
     /// it is established and durable by the quorum rule, not by whether
     /// one submitter heard about it.
     pub unreturnable: u64,
+    /// Hand-offs to the transport that carried `returned` and
+    /// `unreturnable`: one a collector's connection for each round this
+    /// voter carried, whatever it held for that collector (task-d115,
+    /// lever 4). `returned` over this is the frames a hand-off.
+    pub returned_sends: u64,
     /// Watches opened.
     pub watches: u64,
     /// The api plane's frames by kind (task-d88's R3).
@@ -3937,13 +3942,17 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     /// there is no local acknowledgement, and one co-located voter is
     /// one voter's worth of evidence.
     fn carry(&mut self, api: &Transport, out: coord_daemon::Outbound, provenance: PeerProvenance) {
+        // What this round owes each collector in another process goes to
+        // the transport together, one hand-off a collector (task-d115,
+        // lever 4): a flush's releases come out of one round, so a turn's
+        // releases to a collector share the lane's wake-up and its
+        // packets instead of taking one each.
+        let mut returning = Returning::default();
         // A read's answer goes to the collector that sent the read, and
         // to no other (task-d50).
         for (origin, bytes) in out.reads {
             match origin {
-                coord_daemon::voter::Origin::Connection(id) => {
-                    self.return_to_collector(api, id, &bytes);
-                }
+                coord_daemon::voter::Origin::Connection(id) => returning.push(id, bytes),
                 coord_daemon::voter::Origin::Local => match one_frame(&bytes) {
                     Ok(frame) => self.on_frame_from_voter(provenance, &frame),
                     Err(_) => self.frontend.counts.unserved += 1,
@@ -3951,8 +3960,9 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             }
         }
         for frame in out.frontend {
-            self.hand_to_collector(api, provenance, &frame);
+            self.hand_to_collector(provenance, frame, &mut returning);
         }
+        self.return_to_collectors(api, returning);
         let mut turn = Vec::with_capacity(out.peer.len());
         for (to, frame) in out.peer {
             // Which generation of that node may receive it is the
@@ -4162,20 +4172,23 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     /// it to the collector in this process instead loses it, because
     /// that collector has never heard of the command. So it waits for
     /// the submission to say where it goes.
-    fn hand_to_collector(&mut self, api: &Transport, provenance: PeerProvenance, bytes: &[u8]) {
-        let Ok(frame) = one_frame(bytes) else {
+    fn hand_to_collector(
+        &mut self,
+        provenance: PeerProvenance,
+        bytes: Vec<u8>,
+        returning: &mut Returning,
+    ) {
+        let Ok(frame) = one_frame(&bytes) else {
             self.frontend.counts.unserved += 1;
             return;
         };
         match self.owed_to(&frame) {
-            Some(coord_daemon::voter::Origin::Connection(id)) => {
-                self.return_to_collector(api, id, bytes);
-            }
+            Some(coord_daemon::voter::Origin::Connection(id)) => returning.push(id, bytes),
             Some(coord_daemon::voter::Origin::Local) => {
                 self.on_frame_from_voter(provenance, &frame);
             }
             None => match command_of_frame(&frame) {
-                Some(command) => self.park(command, provenance, bytes),
+                Some(command) => self.park(command, provenance, &bytes),
                 // Not about a command at all: nothing can arrive later to
                 // say where it belongs, so this process is where it ends.
                 None => self.on_frame_from_voter(provenance, &frame),
@@ -4183,19 +4196,28 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         }
     }
 
-    /// Send a frame back to the collector on the other end of `id`.
-    fn return_to_collector(&mut self, api: &Transport, id: u64, bytes: &[u8]) {
-        let sent = api.send(
-            coord_transport::Destination::Connection(coord_transport::ConnectionId(id)),
-            self.frontend.membership.domain(),
-            bytes.to_vec(),
-        );
-        match sent {
-            Ok(()) => {
-                self.frontend.counts.returned += 1;
+    /// Send what a round owes collectors in other processes: each
+    /// collector's frames in one hand-off, in the order the round made
+    /// them (task-d115, lever 4). The transport admits each frame on its
+    /// own, as one `send` did, and wakes the connection's sender once.
+    fn return_to_collectors(&mut self, api: &Transport, returning: Returning) {
+        let domain = self.frontend.membership.domain();
+        for (id, frames) in returning.0 {
+            for bytes in &frames {
                 count_returned(&mut self.frontend.counts.api_frames, bytes);
             }
-            Err(_) => self.frontend.counts.unreturnable += 1,
+            let sent = api.send_many(
+                coord_transport::Destination::Connection(coord_transport::ConnectionId(id)),
+                domain,
+                frames,
+            );
+            self.frontend.counts.returned_sends += 1;
+            for result in sent {
+                match result {
+                    Ok(()) => self.frontend.counts.returned += 1,
+                    Err(_) => self.frontend.counts.unreturnable += 1,
+                }
+            }
         }
     }
 
@@ -4347,11 +4369,10 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             }
             self.frontend.counts.unclaimed += routed.unclaimed as u64;
         }
+        let mut returning = Returning::default();
         for (origin, provenance, bytes) in routed.ready {
             match origin {
-                coord_daemon::voter::Origin::Connection(id) => {
-                    self.return_to_collector(api, id, &bytes);
-                }
+                coord_daemon::voter::Origin::Connection(id) => returning.push(id, bytes),
                 coord_daemon::voter::Origin::Local => {
                     if let Ok(frame) = one_frame(&bytes) {
                         self.on_frame_from_voter(provenance, &frame);
@@ -4359,6 +4380,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 }
             }
         }
+        self.return_to_collectors(api, returning);
     }
 
     /// Complete what the collector half holds from this node's own
@@ -5805,7 +5827,22 @@ enum Arrived {
     Peer(TransportEvent),
 }
 
-/// One frame from bytes, through the reader the transport uses.
+/// What one round owes collectors in other processes, by the connection
+/// each submitted on, each connection's frames in the order the round
+/// made them (task-d115, lever 4). A round reaches a handful of collectors,
+/// so a list is searched rather than hashed.
+#[derive(Default)]
+struct Returning(Vec<(u64, Vec<Vec<u8>>)>);
+
+impl Returning {
+    fn push(&mut self, id: u64, frame: Vec<u8>) {
+        match self.0.iter_mut().find(|(at, _)| *at == id) {
+            Some((_, frames)) => frames.push(frame),
+            None => self.0.push((id, vec![frame])),
+        }
+    }
+}
+
 /// Count one frame returned to a collector elsewhere by its kind
 /// (task-d88's R3).
 fn count_returned(counts: &mut coord_daemon::metrics::ApiFrames, bytes: &[u8]) {
@@ -5827,6 +5864,7 @@ fn count_returned(counts: &mut coord_daemon::metrics::ApiFrames, bytes: &[u8]) {
     }
 }
 
+/// One frame from bytes, through the reader the transport uses.
 fn one_frame(bytes: &[u8]) -> Result<Frame, coord_types::wire_v1::WireError> {
     let mut reader = coord_types::wire_v1::FrameReader::new();
     reader.push(bytes)?;
@@ -6303,6 +6341,27 @@ impl core::error::Error for TransportError {}
 
 #[cfg(test)]
 mod tests {
+    /// A round's frames for one collector go to the transport together,
+    /// in the order the round made them, and each collector's apart from
+    /// every other's (task-d115, lever 4): a release that overtook an
+    /// earlier frame to the same collector, or went to another collector's
+    /// connection, would be a different answer.
+    #[test]
+    fn a_rounds_frames_are_grouped_by_collector_in_the_rounds_order() {
+        let mut returning = super::Returning::default();
+        for (id, frame) in [(7, 1u8), (3, 2), (7, 3), (9, 4), (3, 5), (7, 6)] {
+            returning.push(id, vec![frame]);
+        }
+        assert_eq!(
+            returning.0,
+            vec![
+                (7, vec![vec![1], vec![3], vec![6]]),
+                (3, vec![vec![2], vec![5]]),
+                (9, vec![vec![4]]),
+            ]
+        );
+    }
+
     /// A frame the gate (or the collector behind it) refused is refused at
     /// the admission stage though its stream stays open, as a closed
     /// stream is; one that moved no refusal count completed (#228 review:
