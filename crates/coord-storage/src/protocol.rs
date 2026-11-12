@@ -8,7 +8,7 @@ use std::ops::Bound;
 
 use coord_consensus::rows::{
     DEPENDENCY_TAG, PromiseRecordV1, SYNC_TAG, SealRecordV1, decode_dependency, decode_payload,
-    decode_promise, decode_seal, decode_sync, dependency_key, payload_key, promise_key, seal_key,
+    decode_promise, decode_seal, decode_sync, payload_key, promise_key, seal_key,
 };
 use coord_consensus::{CatchUpEntry, CommandRecord, PayloadRecordV1, SyncDecision};
 use coord_store_api::engine::{Direction, EngineError, ErrorClass, OrderedRead, ScanRequest};
@@ -19,6 +19,8 @@ use coord_types::logical_v1::LogicalRequest;
 use coord_types::{CommandId, RetryKey};
 
 use crate::codecs::{self, ExecutedRecordV1};
+use crate::intake::{ProtocolKey, intake_key};
+use crate::view::GatedView;
 use crate::views::ViewBudget;
 
 /// The epoch's durable promise row, if any.
@@ -50,7 +52,7 @@ pub struct RecoveredProtocol {
     /// says this replica has no seal, never that the transition was
     /// cancelled -- that is a quorum's fact, not one replica's.
     pub seal: Option<SealRecordV1>,
-    /// Dependency rows, keyed by command.
+    /// Dependency rows, keyed by command, in command order.
     pub records: Vec<(CommandId, CommandRecord)>,
     /// Bound Sync selections, in key (ballot number, leader) order.
     pub syncs: Vec<(Ballot, SyncDecision)>,
@@ -194,11 +196,20 @@ pub fn read_protocol<V: OrderedRead>(
         )?;
         for row in &page.rows {
             match row.key.get(8) {
-                Some(&DEPENDENCY_TAG) if row.key.len() == 41 => {
-                    let mut id = [0u8; 32];
-                    id.copy_from_slice(&row.key[9..]);
-                    records.push((CommandId(Digest32(id)), decode_dependency(&row.value)?));
-                }
+                // Keyed by intake order (task-d113): the command is the
+                // key's suffix.
+                Some(&DEPENDENCY_TAG) => match crate::intake::parse(&row.key) {
+                    ProtocolKey::Intake { command, .. } => {
+                        records.push((command, decode_dependency(&row.value)?));
+                    }
+                    ProtocolKey::ByCommand { .. } => {
+                        return Err(corrupt(
+                            "a dependency row keyed by command: a store of the layout before \
+                             task-d113",
+                        ));
+                    }
+                    ProtocolKey::Other => {}
+                },
                 Some(&SYNC_TAG) if row.key.len() == 33 => {
                     let decision = decode_sync(&row.value)?.decision;
                     syncs.push((decision.ballot, decision));
@@ -210,6 +221,13 @@ pub fn read_protocol<V: OrderedRead>(
             Some(last) if !page.exhausted => resume = Some(last.key.clone()),
             _ => break,
         }
+    }
+    // In command order, as the rows were when they were keyed by command,
+    // and one row a command: a rewrite stays in place under its intake key,
+    // so a second row of a command is a broken lowering.
+    records.sort_unstable_by_key(|(command, _)| *command);
+    if records.windows(2).any(|w| w[0].0 == w[1].0) {
+        return Err(corrupt("two dependency rows of one command in an epoch"));
     }
     let mut payloads = Vec::with_capacity(records.len());
     let mut executed = Vec::new();
@@ -363,11 +381,18 @@ pub fn executed_order<V: OrderedRead>(
 ///
 /// `None` when the command has no executed row or no payload here: a
 /// donor serves only what it executed and can show.
+///
+/// The dependency row is keyed by intake order (task-d113), and found
+/// through the index by command of the gate `gated` came through. Only for
+/// a command the snapshot shows executed (rule (c)): an executed command's
+/// row is never deleted and written again under a new key, so an index
+/// newer than the snapshot names the row the snapshot holds, or none.
 pub fn catch_up_entry<V: OrderedRead>(
-    view: &V,
+    gated: &GatedView<V>,
     epoch: ConfigurationEpoch,
     command: &CommandId,
 ) -> Result<Option<CatchUpEntry>, EngineError> {
+    let view = gated.view();
     let Some(executed) = view.get(Collection::ExecutedV1.id(), &codecs::executed_key(command))?
     else {
         return Ok(None);
@@ -381,8 +406,7 @@ pub fn catch_up_entry<V: OrderedRead>(
         return Ok(None);
     };
     let payload = decode_payload(&payload)?;
-    let decided = view
-        .get(Collection::ProtocolV1.id(), &dependency_key(epoch, command))?
+    let decided = executed_dependency_row(gated, epoch, command)?
         .map(|bytes| decode_dependency(&bytes))
         .transpose()?;
     Ok(Some(CatchUpEntry {
@@ -393,6 +417,34 @@ pub fn catch_up_entry<V: OrderedRead>(
         revision,
         result_digest,
     }))
+}
+
+/// The dependency row of `command` in `epoch`, which the caller has seen
+/// executed in `gated`'s snapshot (rule (c)), through the index by command.
+fn executed_dependency_row<V: OrderedRead>(
+    gated: &GatedView<V>,
+    epoch: ConfigurationEpoch,
+    command: &CommandId,
+) -> Result<Option<Vec<u8>>, EngineError> {
+    let Some(gate) = gated.gate() else {
+        return Ok(None);
+    };
+    let epoch = epoch.to_be_bytes();
+    let candidates: Vec<_> = gate
+        .index()
+        .candidates(epoch, DEPENDENCY_TAG, command)
+        .collect();
+    for order in candidates {
+        // The key carries the command: a candidate of another command
+        // under the same prefix is not a row of this one.
+        if let Some(bytes) = gated.view().get(
+            Collection::ProtocolV1.id(),
+            &intake_key(epoch, DEPENDENCY_TAG, order, command),
+        )? {
+            return Ok(Some(bytes));
+        }
+    }
+    Ok(None)
 }
 
 /// Every executed identity without a dependency row among `records`,

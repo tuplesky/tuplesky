@@ -727,9 +727,11 @@ impl<P: Persistence> Applier<P> {
             None => Arc::new(CutOverlay::new()),
         };
         let durable = gated.meta().stamp.journal_seq();
-        Ok(GatedView::new(
+        let gate = gated.gate().cloned();
+        Ok(GatedView::with_gate(
             RecoveryCut::new(gated, overlay, durable),
             meta,
+            gate,
         ))
     }
 

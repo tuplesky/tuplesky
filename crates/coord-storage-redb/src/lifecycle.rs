@@ -592,7 +592,7 @@ fn initialize_database(
             let mut meta = txn
                 .open_table(table_definition(Collection::MetaV1))
                 .map_err(|e| OpenError::Corrupt(e.to_string()))?;
-            let rows: [(&[u8], Vec<u8>); 6] = [
+            let rows: [(&[u8], Vec<u8>); 7] = [
                 (meta_fields::CLUSTER_ID, identity.cluster_id.0.to_vec()),
                 (meta_fields::DOMAIN_ID, identity.domain_id.0.to_vec()),
                 (meta_fields::REPLICA_ID, identity.replica_id.0.to_vec()),
@@ -602,6 +602,14 @@ fn initialize_database(
                 ),
                 (meta_fields::ENGINE, ENGINE_NAME.as_bytes().to_vec()),
                 (meta_fields::PROFILE, PROFILE_NAME.as_bytes().to_vec()),
+                // The layout of the rows (task-d113), compared at every
+                // open by the store that lowers into it.
+                (
+                    meta_fields::FORMAT_VERSION,
+                    coord_store_api::registry::STORE_FORMAT_VERSION
+                        .to_be_bytes()
+                        .to_vec(),
+                ),
             ];
             for (k, v) in rows {
                 meta.insert(k, v.as_slice())

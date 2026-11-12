@@ -14,7 +14,11 @@
 //! and implements the ordinary `OrderedRead` contract so the existing
 //! readers ([`crate::protocol::read_protocol`] and friends) run over it
 //! unchanged. No application logic is duplicated: the overlay replays the
-//! same `StoreUpdate` rows the materializer would write.
+//! same `StoreUpdate` rows the materializer would write, under the keys it
+//! would write them: a dependency or proposal row named by command is laid
+//! at its intake key by the same assignment the lowering makes, over the
+//! index at the snapshot's stamp (task-d113, rule (e);
+//! [`CutOverlay::extend_assigned`]).
 //!
 //! The cut is a read of durable facts, never an authorization: a row that
 //! is only journaled is evidence a recovery summary must include, not a
@@ -29,6 +33,7 @@ use coord_store_api::engine::{
 };
 use coord_types::ids::LocalJournalSeq;
 
+use crate::intake::{Assigned, Assigner};
 use crate::view::GatedView;
 
 /// The durable-but-unmaterialized rows of one stream, in journal order
@@ -45,7 +50,11 @@ impl CutOverlay {
         CutOverlay::default()
     }
 
-    /// Apply one record's updates in order.
+    /// Apply one record's updates in order, under their own keys.
+    ///
+    /// For rows no assignment maps: an execution group's application rows
+    /// (the planning view, task-d47). A journal record's updates go through
+    /// [`CutOverlay::extend_assigned`].
     pub fn extend(&mut self, updates: &[StoreUpdate]) {
         for update in updates {
             self.rows.insert(
@@ -53,6 +62,42 @@ impl CutOverlay {
                 update.value.clone(),
             );
         }
+    }
+
+    /// Apply the updates of the record at `seq` in order, each under the
+    /// key materialization will write it at: the assignment `assigner`
+    /// makes over the index at `base`'s stamp, with this overlay's own
+    /// earlier rows laid over `base` (task-d113, rule (e)).
+    ///
+    /// So a dependency row rewritten at ACCEPT and not yet materialized
+    /// replaces its row rather than reading beside it, and a deletion by
+    /// command hides the row it deletes.
+    pub fn extend_assigned<V: OrderedRead>(
+        &mut self,
+        assigner: &mut Assigner<'_>,
+        seq: u64,
+        updates: &[StoreUpdate],
+        base: &V,
+    ) -> Result<(), EngineError> {
+        for (i, update) in updates.iter().enumerate() {
+            let ordinal = u32::try_from(i)
+                .map_err(|_| EngineError::new(ErrorClass::Limit, "a record of too many updates"))?;
+            let rows = &self.rows;
+            let assigned = assigner.assign(seq, ordinal, update, |key| {
+                match rows.get(&(update.collection, key.to_vec())) {
+                    Some(value) => Ok(value.is_some()),
+                    None => Ok(base.get(update.collection, key)?.is_some()),
+                }
+            })?;
+            let key = match assigned {
+                Assigned::AsIs => update.key.clone(),
+                Assigned::Key(key) => key,
+                Assigned::Skip => continue,
+            };
+            self.rows
+                .insert((update.collection, key), update.value.clone());
+        }
+        Ok(())
     }
 
     /// Lay `later`'s rows over these, a key `later` holds winning.

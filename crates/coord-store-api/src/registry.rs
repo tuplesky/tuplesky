@@ -129,6 +129,17 @@ impl Collection {
     }
 }
 
+/// The store format this build writes and reads, recorded in `meta_v1`
+/// under [`meta_fields::FORMAT_VERSION`] (four bytes, big-endian) when an
+/// engine initializes a store, and compared at every open (task-d113).
+///
+/// `2`: the dependency rows, and the leader's proposal rows, of
+/// `protocol_v1` are keyed by epoch, tag, intake order and command. The
+/// format before it keyed them by epoch, tag and command, recorded no
+/// version, and counts as `1`. A store of another format is refused, not
+/// converted.
+pub const STORE_FORMAT_VERSION: u32 = 2;
+
 /// ASCII field names used as keys inside `meta_v1`.
 pub mod meta_fields {
     /// Cluster/restore identity.
@@ -139,7 +150,7 @@ pub mod meta_fields {
     pub const REPLICA_ID: &[u8] = b"replica_id";
     /// Replica incarnation.
     pub const INCARNATION: &[u8] = b"incarnation";
-    /// Store format version.
+    /// Store format version ([`super::STORE_FORMAT_VERSION`]).
     pub const FORMAT_VERSION: &[u8] = b"format_version";
     /// Selected engine name.
     pub const ENGINE: &[u8] = b"engine";

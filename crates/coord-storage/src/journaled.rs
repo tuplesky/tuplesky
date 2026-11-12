@@ -115,7 +115,8 @@ use coord_types::ids::{
 };
 
 use crate::cut::{CutOverlay, RecoveryCut};
-use crate::lowering::{DurableMeta, ExecutionFrontier, batch_bytes, lower_update};
+use crate::intake::{Assigner, IndexDelta, IntakeIndex};
+use crate::lowering::{DurableMeta, ExecutionFrontier, batch_bytes, lower_record};
 use crate::view::{Frontier, GatedReader};
 
 /// Durability profile implemented here (design Section 17.3.4): journal
@@ -657,8 +658,10 @@ struct Domain<E: LocalEngine> {
     /// Durable records waiting for the projection, in journal order.
     pending: Vec<Durable>,
     /// Projection metadata an uncertain materialization would have
-    /// produced, and how many of the front `pending` records it took.
-    pending_meta: Option<(DurableMeta, usize)>,
+    /// produced, how many of the front `pending` records it took, and its
+    /// changes to the index by command, published only if it landed
+    /// (task-d113, rule (d)).
+    pending_meta: Option<(DurableMeta, usize, IndexDelta)>,
     /// How many durable records a [`Materializer`] is committing to the
     /// projection with the lent engine (task-d52). They come before
     /// `pending` in journal order, and the job carries them: its outcome
@@ -1303,6 +1306,13 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
         }
         let frontiers = Frontiers::recovered(durable, applied.materialized, baseline)?;
         let gate = Arc::new(Frontier::default());
+        // The index by command of the intake-keyed rows (task-d113), from
+        // the rows themselves; a store of another layout is refused here,
+        // before anything is replayed into it.
+        gate.install_index(IntakeIndex::build(
+            &reader.snapshot()?,
+            applied.materialized.get(),
+        )?);
         gate.set_completed(meta.stamp.store_seq());
         let mut state = Domain {
             origin,
@@ -3065,12 +3075,20 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                 }
             }
             DomainStatus::MaterializationUncertain => {
-                let (expected, taken) = state.pending_meta.ok_or(JournaledError::Quarantined(
-                    "uncertain materialization without the metadata it wrote",
-                ))?;
+                let (expected, taken) = state
+                    .pending_meta
+                    .as_ref()
+                    .map(|(meta, taken, _)| (*meta, *taken))
+                    .ok_or(JournaledError::Quarantined(
+                        "uncertain materialization without the metadata it wrote",
+                    ))?;
                 let observed = DurableMeta::read(&state.reader.snapshot()?)?;
                 if observed == expected {
                     state.meta = observed;
+                    // The commit landed: its changes to the index are
+                    // published before the gate moves to it.
+                    let (_, _, delta) = state.pending_meta.take().expect("read above");
+                    state.gate.publish_index(delta, observed.stamp.store_seq());
                     state.gate.set_completed(observed.stamp.store_seq());
                     state
                         .frontiers
@@ -3161,10 +3179,53 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
             return Err(CutError::NotReady(state.status));
         }
         let reader = GatedReader::new(state.reader.clone(), state.gate.clone());
-        let snapshot = reader.snapshot().map_err(CutError::View)?;
         let durable = state.frontiers.durable();
+        // The overlay lays the suffix's rows at the keys materialization
+        // will write, over the index at the snapshot's stamp (task-d113,
+        // rule (e)). The materializer may publish a commit between the
+        // snapshot and the index's lock; the cut is then taken again over
+        // the newer snapshot.
+        for _ in 0..CUT_ATTEMPTS {
+            let snapshot = reader.snapshot().map_err(CutError::View)?;
+            let records = self.cut_suffix(state, &snapshot, durable)?;
+            let index = state.gate.index();
+            if index.stamp() != snapshot.meta().stamp.journal_seq().get() {
+                continue;
+            }
+            let mut assigner = Assigner::new(&index);
+            let mut overlay = CutOverlay::new();
+            for record in &records {
+                overlay
+                    .extend_assigned(
+                        &mut assigner,
+                        record.seq().get(),
+                        record.body().updates(),
+                        snapshot.view(),
+                    )
+                    .map_err(|e| CutError::View(crate::view::ViewError::Engine(e)))?;
+            }
+            drop(assigner);
+            drop(index);
+            return Ok(RecoveryCut::new(snapshot, overlay, durable));
+        }
+        Err(CutError::View(crate::view::ViewError::Engine(
+            EngineError::new(
+                coord_store_api::engine::ErrorClass::Busy,
+                "the projection moved on under every attempt at a cut",
+            ),
+        )))
+    }
+
+    /// The records durable through `durable` and past `snapshot`'s stamp,
+    /// verified, in journal order.
+    fn cut_suffix(
+        &self,
+        state: &Domain<E>,
+        snapshot: &crate::view::GatedView<<E::Reader as SnapshotSource>::View>,
+        durable: LocalJournalSeq,
+    ) -> Result<Vec<JournalRecordV1>, CutError> {
         let mut seq = snapshot.meta().stamp.journal_seq();
-        let mut overlay = CutOverlay::new();
+        let mut records = Vec::new();
         if seq < durable {
             let mut expect = RecordExpectation {
                 origin: state.origin,
@@ -3198,12 +3259,12 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                     expect = expect
                         .after(&record)
                         .map_err(|e| CutError::Journal(e.into()))?;
-                    overlay.extend(record.body().updates());
                     seq = record.seq();
+                    records.push(record);
                 }
             }
         }
-        Ok(RecoveryCut::new(snapshot, overlay, durable))
+        Ok(records)
     }
 
     /// Apply one domain's durable records atomically, on this thread.
@@ -3232,6 +3293,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
         // redo would be dropped while the domain stayed ready, and a
         // later record could stamp the projection past it for good.
         let next = state.frontiers.materialized().checked_next().ok();
+        let mut held = None;
         let commit = match project(
             engine,
             &pending,
@@ -3240,6 +3302,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
             &state.gate,
             durable,
             &mut failure,
+            &mut held,
         ) {
             Ok(commit) => commit,
             Err(e) => {
@@ -3282,7 +3345,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
             Err(CommitFailure::Indeterminate(_)) => {
                 let taken = pending.len();
                 state.pending = pending;
-                state.pending_meta = Some((meta, taken));
+                state.pending_meta = Some((meta, taken, held.unwrap_or_default()));
                 state.status = DomainStatus::MaterializationUncertain;
                 report.indeterminate = true;
             }
@@ -3621,7 +3684,7 @@ fn take_back<E: LocalEngine>(
                 state.status = DomainStatus::MaterializationDeferred;
             }
         }
-        Outcome::Indeterminate(meta) => {
+        Outcome::Indeterminate(meta, delta) => {
             let taken = give_back(state, &mut records);
             if !matches!(
                 state.status,
@@ -3630,7 +3693,7 @@ fn take_back<E: LocalEngine>(
                 return Err(state
                     .quarantine("a projection commit in doubt beside another outcome in doubt"));
             }
-            state.pending_meta = Some((meta, taken));
+            state.pending_meta = Some((meta, taken, delta));
             state.status = DomainStatus::MaterializationUncertain;
             report.indeterminate = true;
         }
@@ -3657,6 +3720,13 @@ fn take_back<E: LocalEngine>(
 /// an `Err` means the projection itself failed and the caller still owns
 /// the redo. A commit that returns moves `gate` to its stamp before this
 /// does, whichever thread runs it (task-d52).
+///
+/// The records' dependency and proposal rows are keyed by intake order
+/// through the index by command (task-d113). A commit that returns
+/// publishes its changes to the index before it moves the gate; one whose
+/// outcome is not known leaves them in `held`, for the settling to publish
+/// or drop (rule (d)); any other outcome drops them.
+#[allow(clippy::too_many_arguments)]
 fn project<E: LocalEngine>(
     engine: &mut E,
     pending: &[Durable],
@@ -3665,8 +3735,11 @@ fn project<E: LocalEngine>(
     gate: &Frontier,
     durable: bool,
     failure: &mut Option<&'static str>,
+    held: &mut Option<IndexDelta>,
 ) -> Result<Option<Result<(), CommitFailure>>, JournaledError> {
     let mut tx = engine.begin_write()?;
+    let index = gate.index();
+    let mut assigner = Assigner::new(&index);
     // Guards read the durable accepted state inside this very
     // transaction, never a cached copy.
     match DurableMeta::read(&tx) {
@@ -3696,15 +3769,22 @@ fn project<E: LocalEngine>(
                     execution_position: *position,
                 };
             }
-            for update in record.body().updates() {
-                lower_update(&mut tx, update)?;
-            }
+            // Intake order is the record's journal sequence, the one the
+            // stamp takes below.
+            lower_record(
+                &mut tx,
+                &mut assigner,
+                record.seq().get(),
+                record.body().updates(),
+            )?;
             // The journal sequence is derived from the store sequence
             // by the constructor, never chosen alongside it.
             meta.stamp = AppliedStamp::new(StoreSeq::from_journal(record.seq()), record.digest());
             expect = record.seq().checked_next().ok();
         }
     }
+    let delta = assigner.into_delta();
+    drop(index);
     if failure.is_some() {
         drop(tx);
         return Ok(None);
@@ -3723,8 +3803,13 @@ fn project<E: LocalEngine>(
     } else {
         tx.commit_working()
     };
-    if committed.is_ok() {
-        gate.set_completed(meta.stamp.store_seq());
+    match &committed {
+        Ok(()) => {
+            gate.publish_index(delta, meta.stamp.store_seq());
+            gate.set_completed(meta.stamp.store_seq());
+        }
+        Err(CommitFailure::Indeterminate(_)) => *held = Some(delta),
+        Err(CommitFailure::DefinitelyNotCommitted(_)) => {}
     }
     gate.end_commit();
     Ok(Some(committed))
@@ -3872,6 +3957,7 @@ impl<E: LocalEngine> MaterializeJob<E> {
             durable,
         } = self;
         let mut failure = None;
+        let mut held = None;
         let outcome = match project(
             &mut engine,
             &records,
@@ -3880,12 +3966,15 @@ impl<E: LocalEngine> MaterializeJob<E> {
             &gate,
             durable,
             &mut failure,
+            &mut held,
         ) {
             Err(e) => Outcome::Failed(e),
             Ok(None) => Outcome::Refused(failure.expect("failure set")),
             Ok(Some(Ok(()))) => Outcome::Committed(meta),
             Ok(Some(Err(CommitFailure::DefinitelyNotCommitted(_)))) => Outcome::NotCommitted,
-            Ok(Some(Err(CommitFailure::Indeterminate(_)))) => Outcome::Indeterminate(meta),
+            Ok(Some(Err(CommitFailure::Indeterminate(_)))) => {
+                Outcome::Indeterminate(meta, held.unwrap_or_default())
+            }
         };
         MaterializeDone {
             domain,
@@ -3932,10 +4021,16 @@ impl<E: LocalEngine> MaterializeDone<E> {
 enum Outcome {
     Committed(DurableMeta),
     NotCommitted,
-    Indeterminate(DurableMeta),
+    /// The metadata the commit wrote, and its changes to the index.
+    Indeterminate(DurableMeta, IndexDelta),
     Refused(&'static str),
     Failed(JournaledError),
 }
+
+/// How many times [`JournaledStore::recovery_cut`] pins a snapshot before
+/// it gives up on the materializer publishing between the snapshot and the
+/// index (task-d113). A commit is milliseconds; a cut reads a suffix.
+const CUT_ATTEMPTS: usize = 64;
 
 /// Whether `ballot` is obsolete relative to `promised`.
 fn obsolete(ballot: &Ballot, promised: &Ballot) -> bool {

@@ -465,10 +465,9 @@ impl Cluster {
         order
             .into_iter()
             .map(|(position, command)| {
-                let entry =
-                    coord_storage::protocol::catch_up_entry(gated.view(), epoch(), &command)
-                        .expect("read")
-                        .expect("executed and held");
+                let entry = coord_storage::protocol::catch_up_entry(&gated, epoch(), &command)
+                    .expect("read")
+                    .expect("executed and held");
                 (position.get(), command, entry.result_digest)
             })
             .collect()
@@ -739,7 +738,7 @@ fn a_campaign_is_answered_a_forgotten_commands_row_from_the_store() {
     let applier = cluster.voters[2].node().applier();
     let held = {
         let gated = applier.store().reader().snapshot().expect("snapshot");
-        coord_storage::protocol::catch_up_entry(gated.view(), epoch(), &forgotten)
+        coord_storage::protocol::catch_up_entry(&gated, epoch(), &forgotten)
             .expect("read")
             .expect("executed and held")
             .decided
