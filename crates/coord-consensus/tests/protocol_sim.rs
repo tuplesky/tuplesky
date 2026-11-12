@@ -4689,12 +4689,17 @@ fn one_seed_from_the_environment() {
 /// order under the row's own knobs, so it is replayed under them alone:
 /// a sweep's settings in the environment (answer on release, the relay,
 /// frames) change the schedule, and the seed then reaches nothing.
+///
+/// Seed 231 stopped reaching it when a candidate began asking one
+/// promised voter a batch, not all of them (the takeover gap on #98): the
+/// schedule moved, and the run still passes. Seeds 3 to 7 reach it now,
+/// and the first is kept.
 #[test]
 fn row_21_fails_a_commands_vote_and_adoption_batches_in_order() {
     let knobs = Knobs {
         fail_queue: true,
         ..Knobs::row(21)
     };
-    let stats = run_knobs(3, knobs, 231, Some(true)).unwrap();
+    let stats = run_knobs(3, knobs, 3, Some(true)).unwrap();
     assert!(stats.queue_orders > 0, "{stats:?}");
 }
