@@ -181,6 +181,25 @@ impl Machine {
         }
     }
 
+    /// Announce a leader's commit frontier if it moved since it was last
+    /// announced ([`Leader::announce_advanced`]). A follower has none.
+    pub fn announce_advanced(&mut self) -> Vec<Effect> {
+        match self {
+            Machine::Leader(l) => l.announce_advanced(),
+            Machine::Follower(_) => Vec::new(),
+        }
+    }
+
+    /// Whether a leader's commit frontier moved since it was last
+    /// announced, and waits for the end of the turn
+    /// ([`Leader::set_frontier_at_turn_end`]).
+    pub fn frontier_owed(&self) -> bool {
+        match self {
+            Machine::Leader(l) => l.frontier_owed(),
+            Machine::Follower(_) => false,
+        }
+    }
+
     /// Whether `command` is marked as answered on the release alone.
     pub fn answers_on_release(&self, command: &CommandId) -> bool {
         match self {
@@ -1030,7 +1049,7 @@ impl<P: Persistence> Node<P> {
     /// rest of the group.
     pub fn lower_in_groups(&mut self) {
         self.grouped = true;
-        self.apply_batch_frames();
+        self.apply_turn_settings();
     }
 
     /// Read `Feature::BatchedRound` as active, or not, without the
@@ -1038,7 +1057,7 @@ impl<P: Persistence> Node<P> {
     /// domain activates it, for a test or a local reading's build alone.
     pub fn set_batched_round(&mut self, on: bool) {
         self.batched_round = on;
-        self.apply_batch_frames();
+        self.apply_turn_settings();
     }
 
     /// Whether this node's leaders hold a turn's fresh proposals for one
@@ -1049,10 +1068,16 @@ impl<P: Persistence> Node<P> {
         self.batched_round && self.grouped
     }
 
-    fn apply_batch_frames(&mut self) {
+    /// What a leader holds for the end of the turn: its fresh proposals
+    /// while [`Node::batch_frames`], and its commit frontier while the
+    /// node lowers in groups, since a turn ends where the loop lowers its
+    /// group ([`Leader::set_frontier_at_turn_end`]).
+    fn apply_turn_settings(&mut self) {
         let on = self.batch_frames();
+        let grouped = self.grouped;
         if let Some(Machine::Leader(l)) = self.machine.as_mut() {
             l.set_batch_frames(on);
+            l.set_frontier_at_turn_end(grouped);
         }
     }
 
@@ -1079,11 +1104,32 @@ impl<P: Persistence> Node<P> {
     /// execution group, which materializes anyway. When no command is
     /// ready to execute, the flush materializes it itself, so the
     /// projection never waits on execution that is not coming.
+    ///
+    /// The turn ends here: a leader's commit frontier, if it moved,
+    /// goes to each voter once, after what the flush made durable
+    /// ([`Node::announce_frontier`]).
     pub fn flush(&mut self, ballot: &Ballot) -> Result<Outbound, DriveError> {
         let was = core::mem::replace(&mut self.flushing, true);
         let flushed = self.flush_queued(ballot);
         self.flushing = was;
-        flushed
+        let mut out = flushed?;
+        out.absorb(self.announce_frontier(ballot)?);
+        Ok(out)
+    }
+
+    /// Announce a leader's commit frontier if it moved since it was last
+    /// announced (#242 follow-up). Lowering in groups, the leader holds
+    /// what its steps move for this, once a turn
+    /// ([`Leader::set_frontier_at_turn_end`]): a flush, and the take-back
+    /// of an append ([`Node::settle`]), which is the other place a batch
+    /// turns durable. What a step moves after that is owed a flush
+    /// ([`Machine::frontier_owed`]).
+    fn announce_frontier(&mut self, ballot: &Ballot) -> Result<Outbound, DriveError> {
+        let effects = self.machine_mut().announce_advanced();
+        if effects.is_empty() {
+            return Ok(Outbound::default());
+        }
+        self.carry_out(effects, ballot)
     }
 
     fn flush_queued(&mut self, ballot: &Ballot) -> Result<Outbound, DriveError> {
@@ -1374,6 +1420,7 @@ impl<P: Persistence> Node<P> {
                 leader.set_early_proposal(self.early_proposal);
                 leader.set_early_holders(self.early_holders.clone());
                 leader.set_batch_frames(self.batched_round && self.grouped);
+                leader.set_frontier_at_turn_end(self.grouped);
                 self.won = Some(decision);
                 (Machine::Leader(Box::new(leader)), effects)
             }
@@ -1656,7 +1703,7 @@ impl<P: Persistence> Node<P> {
         self.set_release_at_execution(release);
         self.answer_on_release = answer_on_release;
         self.batched_round = answer_on_release && batched_round;
-        self.apply_batch_frames();
+        self.apply_turn_settings();
     }
 
     /// Whether this node reads `Feature::AnswerOnRelease` active
@@ -2670,6 +2717,7 @@ impl<P: Persistence> Node<P> {
             out.absorb(self.release_through_settled(ballot)?);
             out.absorb(self.release_journaled(ballot)?);
         }
+        out.absorb(self.announce_frontier(ballot)?);
         Ok(out)
     }
 

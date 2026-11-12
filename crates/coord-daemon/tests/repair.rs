@@ -2822,3 +2822,55 @@ fn a_turns_relayed_proposals_leave_in_one_frame_at_the_flush() {
     }
     assert_eq!(w.collector.relay_fallbacks(), 0);
 }
+
+/// A leader lowering in groups announces its commit frontier once a
+/// turn, where it flushes, not in each step that moves it (the follow-up
+/// to #242). Here every command commits inside a flush, as the leader's
+/// own batches are lowered there: announced in each step, one flush sent
+/// the two followers 8 frontiers. Now no peer event sends one, each flush
+/// sends each follower at most one and leaves nothing owed, and a
+/// frontier left owed is owed a flush. The followers learn every command
+/// from those frontiers and execute it.
+#[test]
+fn a_grouped_leader_announces_its_frontier_once_a_turn() {
+    let mut w = Cluster::journaled(256);
+    for sequence in 1..=4 {
+        let submit = w.submit(sequence);
+        for i in 0..3 {
+            w.deliver_submission(i, &submit);
+        }
+    }
+    let frontiers = |w: &Cluster<Journaled>| w.voters[0].node().sent_bytes().frontiers;
+    for _ in 0..16 {
+        if w.executed() == [4, 4, 4] {
+            break;
+        }
+        let before = frontiers(&w);
+        settle_peers(&mut w);
+        assert_eq!(frontiers(&w), before, "a peer event announced the frontier");
+        if w.voters[0].node().machine().frontier_owed() {
+            assert!(w.voters[0].owes_flush(), "an owed frontier is owed a flush");
+        }
+        let before = frontiers(&w);
+        let out = w.voters[0].flush().expect("journaled");
+        w.carry(0, out);
+        assert!(
+            frontiers(&w) - before <= 2,
+            "one flush sent {} frontiers to two followers",
+            frontiers(&w) - before
+        );
+        assert!(
+            !w.voters[0].node().machine().frontier_owed(),
+            "the flush left the frontier unannounced"
+        );
+        let out = w.voters[0].finish().expect("materialized");
+        w.carry(0, out);
+        settle_peers(&mut w);
+        for i in 1..3 {
+            let out = w.voters[i].execute().expect("executed");
+            w.carry(i, out);
+        }
+    }
+    assert_eq!(w.executed(), [4, 4, 4]);
+    assert!(frontiers(&w) > 0, "no frontier was announced");
+}

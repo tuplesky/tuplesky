@@ -572,8 +572,11 @@ pub struct Leader {
     rejections: Vec<Rejection>,
     /// The commit frontier last announced to the other voters (task-d74).
     /// A follower learns only from it, so it goes out in the step that
-    /// moves it.
+    /// moves it, or at the end of that turn while `frontier_at_turn_end`.
     announced: Option<u64>,
+    /// Whether the frontier a step moves waits for the end of the node's
+    /// turn ([`Leader::set_frontier_at_turn_end`]).
+    frontier_at_turn_end: bool,
     /// The command the last admitted request became, once derived
     /// (task-d60, step 3): the voter files where its evidence is owed
     /// under it instead of decoding the request a second time.
@@ -835,6 +838,7 @@ impl Leader {
             speculation: Speculation::new(),
             rejections: Vec::new(),
             announced: None,
+            frontier_at_turn_end: false,
             admitted: None,
             mark_next_admitted: false,
             mark_next_relayed: false,
@@ -944,6 +948,7 @@ impl Leader {
             speculation: Speculation::new(),
             rejections: Vec::new(),
             announced: None,
+            frontier_at_turn_end: false,
             admitted: None,
             mark_next_admitted: false,
             mark_next_relayed: false,
@@ -1870,15 +1875,39 @@ impl Leader {
     /// command it adopted is committed. Announced on the re-send timer
     /// alone, a follower's execution trailed the leader's by up to that
     /// interval; announced in the step that moves it, by one message.
+    ///
+    /// While [`Leader::set_frontier_at_turn_end`] is on, the node calls
+    /// it once at the end of its turn instead, so each voter gets one
+    /// `Committed` frame a turn however many batches turned durable in it.
     pub fn announce_advanced(&mut self) -> Vec<Effect> {
-        if self.boot.is_none() || !self.is_leading() {
-            return Vec::new();
-        }
-        let through = self.commit_frontier();
-        if through.is_none() || through <= self.announced {
+        if !self.frontier_owed() {
             return Vec::new();
         }
         self.announce_committed()
+    }
+
+    /// Whether the commit frontier moved since it was last announced.
+    pub fn frontier_owed(&self) -> bool {
+        if self.boot.is_none() || !self.is_leading() {
+            return false;
+        }
+        let through = self.commit_frontier();
+        through.is_some() && through > self.announced
+    }
+
+    /// Hold the frontier a step moves for the end of the node's turn
+    /// (#242 follow-up): the node then calls [`Leader::announce_advanced`]
+    /// once a turn, where it lowers the turn's group.
+    ///
+    /// Announced in every step that moves it, a new leader's backlog sent
+    /// each voter a `Committed` frame for every re-proposal batch that
+    /// turned durable: at 823 behind, 828 frames a voter in a second,
+    /// past what its control lane takes. Once a turn, a voter gets at most
+    /// one a turn, and still in the turn that moved the frontier. The node
+    /// sets it while it lowers in groups, since that is where its turn
+    /// ends; off, the frontier goes out in the step that moves it.
+    pub fn set_frontier_at_turn_end(&mut self, on: bool) {
+        self.frontier_at_turn_end = on;
     }
 
     /// Tell every other voter this ballot's commit frontier (task-d09).
@@ -4369,10 +4398,12 @@ impl DeterministicMachine for Leader {
             }
             Event::Admitted(request) => self.on_admitted(&request.frame, request.receipt.facts()),
             // What a durable batch or a vote commits is announced in the
-            // same step (task-d74).
+            // same step (task-d74), or at the end of the node's turn.
             Event::Storage(event) => {
                 let mut effects = self.on_storage(&event);
-                effects.extend(self.announce_advanced());
+                if !self.frontier_at_turn_end {
+                    effects.extend(self.announce_advanced());
+                }
                 effects
             }
             Event::Peer(message) => {
@@ -4383,7 +4414,9 @@ impl DeterministicMachine for Leader {
                     incarnation: message.provenance().incarnation(),
                 };
                 let mut effects = self.on_peer(from, message.frame());
-                effects.extend(self.announce_advanced());
+                if !self.frontier_at_turn_end {
+                    effects.extend(self.announce_advanced());
+                }
                 effects
             }
             Event::Timer(_)
