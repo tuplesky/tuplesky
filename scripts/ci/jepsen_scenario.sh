@@ -15,8 +15,9 @@
 #                  partition:TARGETS[:LO-HI[/EVERY]] (see below)
 #   IN_SWIFTPAXOS  SwiftPaxos's faults; empty for the scenario's; or
 #                  beside, SwiftPaxos without faults in the TupleSky job,
-#                  on its runner and cluster, after etcd at each step
-#                  (SWIFTPAXOS_BESIDE)
+#                  on its runner and cluster, after the one run or etcd at
+#                  each sweep step (SWIFTPAXOS_BESIDE); not with pairs
+#   IN_PAIR_BASE   read here only to refuse swiftpaxos beside with pairs
 #   IN_TIME_LIMIT  seconds of workload; empty for the scenario's
 #   IN_CONCURRENCY clients, a number or a multiple of the nodes (5n);
 #                  empty for the scenario's. Comma-separated, a sweep: the
@@ -278,6 +279,12 @@ if [ "$swiftpaxos_beside" = true ]; then
   done
   if [ "$nemesis" != none ]; then
     echo "::error::swiftpaxos beside runs without faults; give nemesis none, not $nemesis" >&2
+    exit 1
+  fi
+  # Beside the one run or each sweep step; a pair job's loop has no place
+  # for it, so refuse it rather than run the pairs without it.
+  if [ -n "${IN_PAIR_BASE:-}" ] && [ -z "$sweep" ]; then
+    echo "::error::swiftpaxos beside runs after the one run or each sweep step, not in pairs; give a sweep (comma-separated concurrency) or no pair-base" >&2
     exit 1
   fi
 fi

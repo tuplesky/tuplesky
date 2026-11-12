@@ -815,7 +815,7 @@ in a sweep. Each step's clients are raised to a multiple of the register
 workload's 2n, as a register step is. Each run gets its own summary. A
 sweep's table labels them `swiftpaxos@STEP` and gives their ratio to etcd
 at the step, so all three systems are read on one CPU. It needs `nemesis:
-none`. Its workload is its own, reads and writes half and half a key with no
+none`, and isn't run in pairs: a pair job without a sweep refuses it. Its workload is its own, reads and writes half and half a key with no
 compare-and-set, so set the mix against etcd's and TupleSky's when reading
 the ratios. Its master, on the runner, counts among the servers. Its runs
 are packed as `jepsen-store-swiftpaxos.tgz` in the TupleSky job's store
