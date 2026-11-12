@@ -3609,6 +3609,35 @@ impl Follower {
         self.held.len() + self.sync_pending.len() + self.table.unexecuted_records()
     }
 
+    /// How much decided work this replica holds and has not executed:
+    /// what a donor could give it (#236 review). The records at COMMIT,
+    /// placeholders whose payload is missing included; the Sync entries
+    /// not installed; and the held proposals within the leader's commit
+    /// frontier, committed there and waiting here for a payload or a
+    /// dependency. Not the proposals and records still undecided: a
+    /// follower at full load holds hundreds of those, and a donor has
+    /// nothing to give for them. A voter refused a promise as behind counts
+    /// as holding without bound, as in [`Self::unexecuted_held`].
+    ///
+    /// One walk of the table and of the held proposals: the catch-up
+    /// pacer reads it once a page of progress and on a turn that may ask,
+    /// not on every pass.
+    pub fn decided_unexecuted_held(&self) -> usize {
+        if self
+            .behind_voters
+            .is_some_and(|needed| self.learner.executed_through() < needed)
+        {
+            return usize::MAX;
+        }
+        let committed_held = self.leader_committed.map_or(0, |through| {
+            self.held
+                .values()
+                .filter(|h| h.proposal.seqnum.is_some_and(|s| s <= through))
+                .count()
+        });
+        committed_held + self.sync_pending.len() + self.table.committed_records()
+    }
+
     /// Ask `donor` for the commands it executed after this replica's own
     /// frontier (task-d08).
     ///
@@ -3888,9 +3917,19 @@ impl Follower {
         // The page answering this replica's own chain says whether more
         // is owed: open until a page reaches its donor's frontier (#226
         // review). A late answer to an earlier ask says nothing of it.
+        //
+        // What it is owed through is the furthest any donor said while
+        // the chain was open, not this page's own donor's: a donor that is
+        // itself behind answers a chain another donor left open with a
+        // page that reaches its own frontier, short of what the first said
+        // (#236 review).
         if !stale || self.catch_up.asked_after == Some(after) {
-            self.catch_up.chain_open = next < through || self.catch_up.continue_from.is_some();
-            self.catch_up.owed_through = Some(through);
+            let owed = match self.catch_up.owed_through {
+                Some(said) if self.catch_up.chain_open => said.max(through),
+                _ => through,
+            };
+            self.catch_up.chain_open = next < owed || self.catch_up.continue_from.is_some();
+            self.catch_up.owed_through = Some(owed);
         }
         if ahead {
             self.catch_up.paths.taken_ahead += 1;
@@ -7020,6 +7059,44 @@ mod tests {
         assert_eq!(follower.table.take_examined(), 1);
         assert!(follower.holds_unexecuted());
         assert_eq!(follower.unexecuted_held(), 2_001);
+    }
+
+    /// What a donor could give a follower (#236 review): of 700 commands
+    /// in flight, undecided, and 5 committed and not executed, only the
+    /// 5. Counted, the 700 made a follower at full load look behind to
+    /// the catch-up pacer.
+    #[test]
+    fn work_in_flight_is_not_what_a_donor_could_give() {
+        let epoch = ConfigurationEpoch::new(1).unwrap();
+        let voters: BTreeSet<ReplicaId> = (0..3).map(r).collect();
+        let genesis = Ballot {
+            epoch,
+            number: 0,
+            leader: r(0),
+        };
+        let config = FollowerConfig {
+            identity: ConfigurationIdentity {
+                cluster: ClusterId([1; 16]),
+                domain: DomainId([2; 16]),
+                epoch,
+                voters: voters.clone(),
+                replica: r(1),
+                incarnation: ReplicaIncarnation::new(1).unwrap(),
+                role: ReplicaRole::Voter,
+            },
+            quorum: BallotConfiguration::c2(epoch, genesis, voters, [r(0), r(1)].into()).unwrap(),
+            genesis,
+            frontend: PeerId {
+                replica: ReplicaId([0xf0; 16]),
+                incarnation: ReplicaIncarnation::ZERO,
+            },
+            capacity: 8,
+        };
+        let rows = crate::commands::tests::in_flight_beside_decided(700, 5);
+        let follower =
+            Follower::recover_with_syncs(config, None, None, rows, [], [], ExecutionPosition::ZERO);
+        assert_eq!(follower.unexecuted_held(), 705);
+        assert_eq!(follower.decided_unexecuted_held(), 5);
     }
 
     /// A voter's configuration and a selection of 2,000 ACCEPT entries it

@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use coord_collector::{Collector, CollectorConfig, MonotonicMillis, Submitted};
 use coord_consensus::{
     BallotConfiguration, ConfigurationIdentity, Follower, FollowerConfig, Leader, LeaderConfig,
-    LearningMode, MAX_CATCH_UP_COMMANDS, ReplicaRole,
+    LearningMode, MAX_CATCH_UP_BYTES, MAX_CATCH_UP_COMMANDS, ReplicaRole,
 };
 use coord_core::capability::{AdmissionReceipt, AttestedAdmission, VerifierToken};
 use coord_core::effect::{BootId, PeerId};
@@ -228,12 +228,12 @@ fn retry_key(sequence: u64) -> RetryKey {
     }
 }
 
-fn logical(sequence: u64) -> LogicalRequest {
+fn logical(sequence: u64, value_len: usize) -> LogicalRequest {
     let mut logical = LogicalRequest::new(
         NS,
         CanonicalOperation::Put(PutOp {
             key: format!("k{sequence}").into_bytes(),
-            value: b"v".to_vec(),
+            value: vec![b'v'; value_len],
             lease: None,
             prev_kv: false,
         }),
@@ -244,8 +244,8 @@ fn logical(sequence: u64) -> LogicalRequest {
 
 /// One admitted client request, as the collector's admission gate
 /// hands it to the collector.
-fn admitted(sequence: u64) -> AdmittedRequest {
-    let request = RequestV1::new(retry_key(sequence), &logical(sequence), 0, 0).unwrap();
+fn admitted(sequence: u64, value_len: usize) -> AdmittedRequest {
+    let request = RequestV1::new(retry_key(sequence), &logical(sequence, value_len), 0, 0).unwrap();
     AdmittedRequest {
         receipt: AdmissionReceipt::submitting(
             VerifierToken::for_boundary(),
@@ -285,6 +285,8 @@ struct Cluster {
     pacers: Vec<Pacer>,
     now: Instant,
     sequence: u64,
+    /// The length of each put's value: 1 unless a test says otherwise.
+    value_len: usize,
     backpressure: Vec<usize>,
     /// The next catch-up ask voter `.0` sends to voter `.1` is lost, or
     /// with `.2`, the next catch-up page.
@@ -315,6 +317,7 @@ impl Cluster {
             pacers: vec![Pacer::default(), Pacer::default(), Pacer::default()],
             now: Instant::now(),
             sequence: 0,
+            value_len: 1,
             backpressure: vec![0; 3],
             lose: None,
             lose_after: 0,
@@ -380,7 +383,10 @@ impl Cluster {
         self.sequence += 1;
         let Submitted::FanOut(fan_out) = self
             .collector
-            .submit(MonotonicMillis::ZERO, &admitted(self.sequence))
+            .submit(
+                MonotonicMillis::ZERO,
+                &admitted(self.sequence, self.value_len),
+            )
             .expect("submitted")
         else {
             panic!("not new work")
@@ -843,5 +849,51 @@ fn a_campaign_is_answered_a_forgotten_commands_row_from_the_store() {
     assert_eq!(
         coord_daemon::catch_up::executed_rows(applier, other, vec![forgotten]),
         vec![(forgotten, None)]
+    );
+}
+
+/// The donor's side of a command past a page's byte bound by itself
+/// (#236 review): a put at the value limit is larger than
+/// `MAX_CATCH_UP_BYTES` on its own, and the donor's one-command exemption
+/// is what puts it in a page at all. Without it, the donor has no page
+/// for it (`FirstRow`), and the voter behind it never gets past it.
+#[test]
+fn a_donor_serves_a_command_past_the_byte_bound_by_itself() {
+    let mut cluster = Cluster::new();
+    cluster.second();
+    cluster.down = vec![2];
+    // Three puts at the value limit, then enough small ones that the
+    // leader's table no longer holds them: r2 can get them only from a
+    // page.
+    cluster.value_len = MAX_CATCH_UP_BYTES;
+    for _ in 0..3 {
+        cluster.submit();
+        cluster.settle();
+    }
+    cluster.value_len = 1;
+    for _ in 0..3 {
+        cluster.second();
+    }
+    let behind = cluster.executed_through(0) - cluster.executed_through(2);
+    assert!(
+        behind > 2 * CAPACITY as u64,
+        "r2 is only {behind} behind: the test shows nothing"
+    );
+    cluster.down.clear();
+    let (pages, _) = cluster.voters[2].node().machine().catch_up_counts();
+    for _ in 0..20 {
+        cluster.tick();
+    }
+    assert_eq!(
+        cluster.executed_through(2),
+        cluster.executed_through(0),
+        "r2 stopped short ({:?})",
+        cluster.voters[2].node().machine().catch_up_paths()
+    );
+    let (taken, _) = cluster.voters[2].node().machine().catch_up_counts();
+    assert!(
+        taken - pages >= 4,
+        "three commands past the bound and the rest: {} pages",
+        taken - pages
     );
 }

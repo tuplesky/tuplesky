@@ -1108,7 +1108,7 @@ impl<P: Persistence> Voter<P> {
         let standing = crate::catch_up::Standing {
             executed: machine.executed_through(),
             holds: machine.holds_unexecuted(),
-            backlog: || machine.unexecuted_held(),
+            backlog: || machine.decided_unexecuted_held(),
             busy: machine.catching_up(),
             chain: machine.catch_up_chain_open(),
             pages: machine.catch_up_counts().0,
