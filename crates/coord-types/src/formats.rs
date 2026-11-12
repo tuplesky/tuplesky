@@ -142,9 +142,11 @@ impl Format {
                 oldest: 1,
                 current: 1,
             },
+            // 2: no `kv_history_v1` rows; below the floor, each key's
+            // newest put at or below it as its event row (task-d105).
             Format::SharedCheckpoint => Window {
-                oldest: 1,
-                current: 1,
+                oldest: 2,
+                current: 2,
             },
             Format::LocalCheckpoint => Window {
                 oldest: 1,

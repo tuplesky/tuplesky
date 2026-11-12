@@ -147,6 +147,8 @@ impl Collection {
                 | Collection::ExecutedV1
                 | Collection::PendingPayloadV1
                 | Collection::DecidedV1
+                // Written by no format since 4 (task-d105).
+                | Collection::KvHistoryV1
         )
     }
 
@@ -171,7 +173,11 @@ impl Collection {
 /// same position in `payload_v1`; a payload not yet executed is in the
 /// node-private `pending_payload_v1` by intake order. `executed_v1` is no
 /// longer written.
-pub const STORE_FORMAT_VERSION: u32 = 3;
+///
+/// `4`: `kv_history_v1` is not written. A key's versions are its event
+/// rows in `events_v1`, found through a key index held in memory
+/// (task-d105). A store holding a history row is of format 3 or before.
+pub const STORE_FORMAT_VERSION: u32 = 4;
 
 /// ASCII field names used as keys inside `meta_v1`.
 pub mod meta_fields {
