@@ -116,7 +116,7 @@ use coord_types::ids::{
 
 use crate::cut::{CutOverlay, RecoveryCut};
 use crate::intake::{Assigner, IndexDelta, IntakeIndex};
-use crate::lowering::{DurableMeta, ExecutionFrontier, batch_bytes, lower_record};
+use crate::lowering::{DurableMeta, ExecutionFrontier, Lowered, batch_bytes};
 use crate::view::{Frontier, GatedReader};
 
 /// Durability profile implemented here (design Section 17.3.4): journal
@@ -4072,6 +4072,7 @@ fn project<E: LocalEngine>(
     let mut tx = engine.begin_write()?;
     let index = gate.index();
     let mut assigner = Assigner::new(&index);
+    let mut lowered = Lowered::new();
     // Guards read the durable accepted state inside this very
     // transaction, never a cached copy.
     match DurableMeta::read(&tx) {
@@ -4103,8 +4104,8 @@ fn project<E: LocalEngine>(
             }
             // Intake order is the record's journal sequence, the one the
             // stamp takes below.
-            lower_record(
-                &mut tx,
+            lowered.lower_record(
+                &tx,
                 &mut assigner,
                 record.seq().get(),
                 record.body().updates(),
@@ -4113,6 +4114,13 @@ fn project<E: LocalEngine>(
             // by the constructor, never chosen alongside it.
             meta.stamp = AppliedStamp::new(StoreSeq::from_journal(record.seq()), record.digest());
             expect = record.seq().checked_next().ok();
+        }
+        // Every record's rows in journal order, as assigned, as one
+        // batch: the engine opens each collection once for the commit
+        // rather than once a row (task-d86). Nothing is written before
+        // the checks above pass, so a commit they refuse writes nothing.
+        if failure.is_none() {
+            tx.apply_updates(lowered.updates())?;
         }
     }
     let delta = assigner.into_delta();

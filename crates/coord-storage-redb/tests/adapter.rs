@@ -645,3 +645,107 @@ fn an_authorized_replacement_adopts_the_state_and_a_stale_one_is_fenced() {
         );
     }
 }
+
+/// One update: a put of `value`, or a delete.
+fn update(c: Collection, key: &[u8], value: Option<&[u8]>) -> coord_core::effect::StoreUpdate {
+    coord_core::effect::StoreUpdate {
+        collection: c.id(),
+        key: key.to_vec(),
+        value: value.map(<[u8]>::to_vec),
+    }
+}
+
+/// Every row of `c` a snapshot of `engine` holds.
+fn rows_of(engine: &RedbEngine, c: Collection) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let view = engine.reader().snapshot().unwrap();
+    view.scan_page(c.id(), &ScanRequest::all(1000, 1 << 20))
+        .unwrap()
+        .rows
+        .into_iter()
+        .map(|row| (row.key, row.value))
+        .collect()
+}
+
+/// A batch of updates opens each table once for the transaction
+/// (task-d86), and leaves what one put or delete each, in order, leaves:
+/// across collections, with a key written twice and a key put then
+/// deleted within the batch, and a delete of a key written before it.
+#[test]
+fn a_batch_of_updates_leaves_what_one_call_each_leaves() {
+    let batch = [
+        update(Collection::KvCurrentV1, b"a", Some(b"1")),
+        update(Collection::KvHistoryV1, b"a@1", Some(b"1")),
+        update(Collection::KvCurrentV1, b"b", Some(b"2")),
+        update(Collection::KvCurrentV1, b"a", Some(b"3")),
+        update(Collection::EventsV1, b"1/0", Some(b"put")),
+        update(Collection::KvCurrentV1, b"c", Some(b"4")),
+        update(Collection::KvCurrentV1, b"c", None),
+        update(Collection::KvCurrentV1, b"old", None),
+        update(Collection::KvHistoryV1, b"a@2", Some(b"3")),
+    ];
+    let collections = [
+        Collection::KvCurrentV1,
+        Collection::KvHistoryV1,
+        Collection::EventsV1,
+    ];
+    let run = |batched: bool| {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = RedbHarness::create(dir.path());
+        {
+            let mut tx = h.engine().begin_write().unwrap();
+            tx.put(Collection::KvCurrentV1.id(), b"old", b"0").unwrap();
+            tx.commit_durable().unwrap();
+        }
+        {
+            let mut tx = h.engine().begin_write().unwrap();
+            if batched {
+                tx.apply_updates(batch.iter()).unwrap();
+            } else {
+                for u in &batch {
+                    match &u.value {
+                        Some(v) => tx.put(u.collection, &u.key, v).unwrap(),
+                        None => tx.delete(u.collection, &u.key).unwrap(),
+                    }
+                }
+            }
+            // Read-your-writes after the batch, with its tables closed.
+            assert_eq!(
+                tx.get(Collection::KvCurrentV1.id(), b"a").unwrap(),
+                Some(b"3".to_vec())
+            );
+            tx.commit_durable().unwrap();
+        }
+        collections
+            .iter()
+            .map(|c| rows_of(h.engine(), *c))
+            .collect::<Vec<_>>()
+    };
+    let one_each = run(false);
+    assert_eq!(
+        one_each[0],
+        vec![
+            (b"a".to_vec(), b"3".to_vec()),
+            (b"b".to_vec(), b"2".to_vec())
+        ]
+    );
+    assert_eq!(run(true), one_each);
+}
+
+/// A batch naming a collection the registry does not know is refused,
+/// as a put to it is.
+#[test]
+fn a_batch_with_an_unregistered_collection_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = RedbHarness::create(dir.path());
+    let mut tx = h.engine().begin_write().unwrap();
+    let unknown = coord_core::effect::StoreUpdate {
+        collection: coord_core::effect::CollectionId(u16::MAX),
+        key: b"k".to_vec(),
+        value: Some(b"v".to_vec()),
+    };
+    let error = tx.apply_updates([&unknown]).unwrap_err();
+    assert_eq!(
+        error.class,
+        coord_store_api::engine::ErrorClass::Unsupported
+    );
+}

@@ -514,6 +514,45 @@ impl WriteTxn for RedbWrite<'_> {
         Ok(())
     }
 
+    /// Each collection's table is opened once for the batch, where a
+    /// put or a delete opens it every call: 5 to 6.5% of the
+    /// materializer's thread at the bar's mix, about eleven rows a
+    /// command (task-d86). The rows go in the order given, so a key
+    /// written twice keeps its last value as it would one call at a time.
+    fn apply_updates<'u>(
+        &mut self,
+        updates: impl IntoIterator<Item = &'u coord_core::effect::StoreUpdate>,
+    ) -> Result<(), EngineError> {
+        let txn = self.txn.as_ref().expect("transaction open");
+        let mut tables: [Option<redb::Table<'_, &'static [u8], &'static [u8]>>;
+            Collection::ALL.len()] = std::array::from_fn(|_| None);
+        for update in updates {
+            let collection = collection(update.collection)?;
+            let slot = Collection::ALL
+                .iter()
+                .position(|known| *known == collection)
+                .expect("a registered collection is in the registry");
+            let table = match &mut tables[slot] {
+                Some(table) => table,
+                empty => empty.insert(
+                    txn.open_table(table_definition(collection))
+                        .map_err(table_error)?,
+                ),
+            };
+            match &update.value {
+                Some(value) => {
+                    table
+                        .insert(update.key.as_slice(), value.as_slice())
+                        .map_err(storage_error)?;
+                }
+                None => {
+                    table.remove(update.key.as_slice()).map_err(storage_error)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn abort(mut self) -> Result<(), EngineError> {
         let txn = self.txn.take().expect("transaction open");
         txn.abort().map_err(storage_error)

@@ -1,7 +1,9 @@
 //! Lowering of immutable batches into engine rows, stamps and digests.
 
-use coord_core::effect::{ApplyBase, PersistBatch, StoreUpdate};
-use coord_store_api::engine::{EngineError, ErrorClass, WriteTxn};
+use std::collections::HashMap;
+
+use coord_core::effect::{ApplyBase, CollectionId, PersistBatch, StoreUpdate};
+use coord_store_api::engine::{EngineError, ErrorClass, OrderedRead, WriteTxn};
 use coord_store_api::envelope::{AppliedStamp, StoreEnvelopeV1};
 use coord_store_api::registry::{Collection, meta_fields};
 use coord_store_api::seq::StoreSeq;
@@ -212,6 +214,81 @@ pub fn lower_record<W: WriteTxn>(
         }
     }
     Ok(())
+}
+
+/// A commit's rows, lowered through the key assignment ahead of writing
+/// them, so the engine can take them as one batch
+/// ([`WriteTxn::apply_updates`]: each table opened once a commit, not once
+/// a row, task-d86) while each update is still assigned against the rows
+/// the updates before it leave (task-d113).
+///
+/// A row this commit has written is read from here; any other from the
+/// transaction, which holds none of this commit's rows yet.
+#[derive(Debug, Default)]
+pub struct Lowered {
+    writes: Vec<StoreUpdate>,
+    at: HashMap<(CollectionId, Vec<u8>), usize>,
+}
+
+impl Lowered {
+    /// Nothing lowered yet.
+    pub fn new() -> Self {
+        Lowered::default()
+    }
+
+    /// Lower the record at `seq` as [`lower_record`] does, reading `base`
+    /// under the rows lowered so far, and keep its rows.
+    pub fn lower_record<R: OrderedRead>(
+        &mut self,
+        base: &R,
+        assigner: &mut Assigner<'_>,
+        seq: u64,
+        updates: &[StoreUpdate],
+    ) -> Result<(), EngineError> {
+        for (i, update) in updates.iter().enumerate() {
+            let ordinal = u32::try_from(i)
+                .map_err(|_| EngineError::new(ErrorClass::Limit, "a record of too many updates"))?;
+            let (writes, at) = (&self.writes, &self.at);
+            // A row this commit has written is read from here, any other
+            // from `base`: the key index's old value (task-d105) and the
+            // assignment's reads alike.
+            let overlay =
+                |collection: CollectionId, key: &[u8]| match at.get(&(collection, key.to_vec())) {
+                    Some(&i) => Ok(writes[i].value.clone()),
+                    None => base.get(collection, key),
+                };
+            assigner.observe_kv(update, |key| overlay(update.collection, key))?;
+            let assigned = assigner.assign(seq, ordinal, update, overlay)?;
+            match assigned {
+                Assigned::AsIs => self.keep(update.clone()),
+                Assigned::Key(key) => self.keep(StoreUpdate {
+                    collection: update.collection,
+                    key,
+                    value: update.value.clone(),
+                }),
+                Assigned::Skip => {}
+                Assigned::Writes(writes) => {
+                    for write in writes {
+                        self.keep(write);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Keep one row; a later row for the same key is the one read.
+    fn keep(&mut self, update: StoreUpdate) {
+        self.at
+            .insert((update.collection, update.key.clone()), self.writes.len());
+        self.writes.push(update);
+    }
+
+    /// The rows, in the order lowered: a key written twice keeps its last
+    /// value when they are applied in order.
+    pub fn updates(&self) -> &[StoreUpdate] {
+        &self.writes
+    }
 }
 
 /// Lower one update into the transaction, under its own key.

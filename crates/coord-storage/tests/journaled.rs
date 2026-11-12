@@ -1905,3 +1905,85 @@ fn an_uncertain_entry_of_several_records_reconciles_all_or_none() {
         );
     }
 }
+
+/// The event row of a put of `key-<step>` at revision `step` (task-d105).
+fn event_row(step: u64) -> StoreUpdate {
+    let at = KvRevision::new(step).unwrap();
+    StoreUpdate {
+        collection: coord_store_api::registry::Collection::EventsV1.id(),
+        key: coord_storage::codecs::event_key(at, 0),
+        value: Some(
+            coord_storage::codecs::encode_event(&coord_storage::codecs::EventRecordV1 {
+                kind: coord_state::KvEventKind::Put,
+                namespace: NamespaceId([0; 16]),
+                key: format!("key-{step}").into_bytes(),
+                entry: Some(coord_state::KvEntry {
+                    value: b"value".to_vec(),
+                    create_revision: at,
+                    mod_revision: at,
+                    version: 1,
+                    lease: None,
+                    lease_generation: None,
+                }),
+                prev: None,
+            })
+            .unwrap(),
+        ),
+    }
+}
+
+/// The commits the journaled store's materializer makes keep the key
+/// index it publishes (task-d105) as the projection has it (#244 review):
+/// each event row lowered is observed, a deleted one through the rows of
+/// its own commit. Steps 2 and 3 go in one commit, and step 3 deletes
+/// step 2's event row, which only that commit holds, and step 1's, which
+/// the store holds. Not observed, the published index stays as the open
+/// built it, without any of them.
+#[test]
+fn the_materializers_commits_keep_the_published_key_index_as_the_projection_has_it() {
+    let mut world = World::new();
+    let events = coord_store_api::registry::Collection::EventsV1.id();
+    let step = |world: &mut World, step: u64, mut updates: Vec<StoreUpdate>| {
+        world.protocol(A, ballot(step), promise(step));
+        updates.extend([
+            StoreUpdate {
+                collection: coord_store_api::registry::Collection::PayloadV1.id(),
+                key: command(step as u8).as_bytes().to_vec(),
+                value: Some(vec![step as u8; 16]),
+            },
+            coord_storage::retry::executed_update(
+                &command(step as u8),
+                position(step),
+                None,
+                coord_types::identity::Digest32([step as u8; 32]),
+            )
+            .unwrap(),
+        ]);
+        world.application(A, step, position(step), updates);
+    };
+    let published = |world: &World| {
+        let view = world.store.reader(A).unwrap().snapshot().unwrap();
+        let live = view
+            .with_kv_index(coord_storage::kv_index::KvIndex::clone)
+            .unwrap();
+        let rebuilt = coord_storage::kv_index::KvIndex::build(view.view()).unwrap();
+        (live, rebuilt)
+    };
+    step(&mut world, 1, vec![event_row(1)]);
+    world.store.flush().unwrap();
+    let (live, rebuilt) = published(&world);
+    assert_eq!(live.versions(), 1, "step 1's event row is in the index");
+    assert_eq!(live, rebuilt);
+
+    step(&mut world, 2, vec![event_row(2)]);
+    let delete = |revision: u64| StoreUpdate {
+        collection: events,
+        key: coord_storage::codecs::event_key(KvRevision::new(revision).unwrap(), 0),
+        value: None,
+    };
+    step(&mut world, 3, vec![event_row(3), delete(2), delete(1)]);
+    world.store.flush().unwrap();
+    let (live, rebuilt) = published(&world);
+    assert_eq!(live.versions(), 1, "only step 3's event row is left");
+    assert_eq!(live, rebuilt);
+}
