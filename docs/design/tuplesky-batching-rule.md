@@ -387,7 +387,13 @@ So this section asks what a voter has to do on the hot path, and what it can do 
   - it lands any agreed batch it holds;
   - then it executes, from its landed frontier to the decided frontier, from the payloads in its journal.
   - New commands can be ordered meanwhile. Their answers wait for the tail.
-- **The tail is bounded by the batch boundary, not by time.** With batches at the floor's boundaries (`FLOOR_INTERVAL`, 4,096 positions), the tail is at most one batch plus what is in flight. At the bar's load that is a boundary about every 1.7 s; at a lower load it is a longer time but no more commands.
+- **The tail is bounded by positions, not by time.** With batches at the floor's boundaries (`FLOOR_INTERVAL`, 4,096 positions), a lazy voter that keeps landing has a tail of at most one batch plus what is in flight. At the bar's load that is a boundary about every 1.7 s; at a lower load it is a longer time but no more commands.
+- **The window is enforced, not assumed** (Codex on #259). Batching alone bounds the tail only while the lazy voter keeps landing. If its batches stall (their delivery, its materializer, or its host), the eager voters pass boundaries without it. So:
+  - **The window:** a lazy voter's lag is its decided frontier minus its landed frontier, in positions. The window is two batches, 8,192 positions: one being landed and one being agreed.
+  - **Past the window, it executes for itself.** It stops waiting for agreement and executes from its landed frontier, as in (a), until it is back within one batch. Its own execution runs at the tail's rate, about 14,000 commands a second on the 7763 (inferred, point 5), against about 2,400 a second at the bar's load, so it gains on the domain. A host that can't keep that pace shows it on the metrics line as a lag that keeps growing.
+  - **Past the window, it doesn't campaign first.** Its campaign waits a second election timeout, so a voter within the window takes over before it. If no voter within the window is up, it campaigns after that wait anyway, so the domain stays live.
+  - **The domain never waits for a lazy voter.** Ordering is unchanged, so a stalled lazy voter costs only its own catch-up.
+  - **So the bound:** while any voter within the window is up, a takeover's tail is at most the window, 8,192 positions, about 0.6 s on the 7763, and at most one batch, about 0.3 s, in steady state. With every voter within it down, the voter that takes over pays its own lag at the tail's rate, and its lag was on the metrics line beforehand.
 - **The new eager follower** (the next voter in the new ballot's order) executes its own tail in the background. Until it catches up, the lazy voters find no agreement and fall back to (a), so their lag stays bounded.
 - **It ends as an eager voter.** From the takeover on, it executes on the hot path.
 
@@ -432,7 +438,7 @@ So this section asks what a voter has to do on the hot path, and what it can do 
 | 1 s | 2,400 | 0.17 s | 1.17 | 1.12 | 1.09 |
 | 3 s | 7,200 | 0.51 s | 1.17 | 1.12 | 1.09 |
 | 10 s | 24,000 | 1.7 s | 1.17 | 1.12 | 1.09 |
-| 4,096 positions (recommended) | 4,096 | at most 0.3 s | 1.17 | 1.12 | 1.09 |
+| 4,096 positions (recommended) | 4,096 | 0.3 s; 0.6 s at the window's edge | 1.17 | 1.12 | 1.09 |
 
 The last three columns are the servers' ms an operation, from 1.19.
 
@@ -453,7 +459,8 @@ The last three columns are the servers' ms an operation, from 1.19.
 - **The batch:** a peer frame with the merged write set and the execution records. The eager follower sends it, so the leader's load doesn't change.
 - **The agreement:** the eager voters' history digests at each boundary, through the floor's existing exchange.
 - **The landing:** a batch lowered as one sorted commit.
-- **The fallbacks:** own execution when there is no agreement within a bound, and on a difference.
+- **The fallbacks:** own execution when there is no agreement within a bound, on a difference, and past the window.
+- **The window:** the lag tracked, and the campaign's second timeout past it.
 - **The takeover:** execute the tail before answering.
 - **The frontend:** forwarding reads, watches and resolves to an eager voter.
 - **The donor rule:** a lazy voter serves executed history only up to its landed frontier.
@@ -472,6 +479,10 @@ The last three columns are the servers' ms an operation, from 1.19.
   - the digests agree at the next boundary.
 - **A difference at one eager voter,** in a build that changes one result: the lazy voters execute the batch, the majority decides, and the loser stops.
 - **The lag under load:** the lazy voters' landed frontier stays within one batch while the leader and eager follower run at the bar's load.
+- **A stalled lazy voter:**
+  - hold one lazy voter's batches back under load until it passes the window;
+  - it executes for itself and comes back within one batch;
+  - kill the eager voters while it is past the window: a lazy voter within the window takes over, within the window's bound.
 
 ## 7. The cost model after each step
 
@@ -551,5 +562,5 @@ So parity needs the leader log and either larger turns or the transport change. 
 **For the owner:**
 - **Option 3 and the leader log,** with Section 6.2's trade and Section 6.3's open arguments.
 - **Or witnesses (Section 6.5):** two voters that journal and vote but keep no projection. They keep the fast path and three independent executions, and give up two projection copies and leadership at the witnesses.
-- **Or lazy voters (Section 6.6):** voters that vote on the hot path and land the eager voters' agreed batches behind, at a lag of one floor interval. Any of them can lead after executing a tail of at most one batch. At one eager follower beside the leader, about −0.10 ms an operation on the 7763.
+- **Or lazy voters (Section 6.6):** voters that vote on the hot path and land the eager voters' agreed batches behind, at a lag of one floor interval. Any of them can lead after executing its tail: one batch in steady state, and at most an enforced window of two while any voter within it is up. At one eager follower beside the leader, about −0.10 ms an operation on the 7763.
 - **Whether the transport moves onto the loop's turn.**
