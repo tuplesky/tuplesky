@@ -7381,8 +7381,9 @@ contract needed and a test for each.
     with three frontends sustain about 1,500 to 1,700 commands a second
     at 120 callers (#224, #225). The busiest frontend admits 630 to 770
     a second at the median and up to 977 in its busiest second. No
-    reading so far was refused (#224's and (e)'s runs counted no refused
-    or unknown operation), but a faster build will be. Catch-up is
+    throughput pair so far was refused (#224's and (e)'s counted no
+    refused or unknown operation), but a faster build's will be. Review's
+    stall runs, with a voter stopped under load, were (#228 review). Catch-up is
     measured now too: about 22 ms a page plus 0.28 ms a command, so a
     voter rejoining at full load with the relay executes about 1,600 a
     second at 64 a page and 2,200 at 125 (#98). That is not the margin
@@ -7391,7 +7392,9 @@ contract needed and a test for each.
   - **What a reading shows.** A refusal counts as refused at the
     admission stage, and an `admission` line with every metrics
     snapshot gives the frontend's rate and its refusals by why
-    (`rate_limited`, `session_busy`, `other`). The bench counts
+    (`rate_limited`, `session_busy`, `other`, and `collection_bound` for
+    a request the gate admitted and the collector's own bound then
+    refused). The bench counts
     `BACKPRESSURE` as a refusal, `backpressure`, not as an unknown
     outcome. Every script in `scripts/bench` sets the rate explicitly
     (`ADMITTED_PER_SECOND`, default 1,000) and states it in its readings'

@@ -209,6 +209,32 @@ pub struct DurableCadence {
     pub records: NonZeroU32,
 }
 
+/// How long a pipelined replay-backed projection holds the records it is
+/// owed before it commits them (task-d86): until `records` are pending,
+/// `wait` has passed since the first of them was, or something asks for
+/// the commit ([`JournaledStore::request_projection_commit`]), whichever
+/// comes first.
+///
+/// A commit costs the pages each random-keyed table copies once a
+/// transaction, besides what its rows cost, so a commit of more records
+/// costs less a record. What a held commit changes is only when the
+/// projection shows a record: the journal has it durable already, and a
+/// crash replays it as it replays any working commit. Whatever reads the
+/// projection and waits for a record asks for the next commit, so the
+/// hold bounds only what nobody waits on.
+///
+/// Only under the replay profile, and only with a materializer: under
+/// `strict` every commit is the record's durability as well
+/// (design Section 17.3.4), and a store that materializes on the
+/// caller's thread commits when the caller lowers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommitHold {
+    /// Pending records at which the commit goes out whatever the time.
+    pub records: NonZeroU32,
+    /// The longest a pending record waits for its commit to go out.
+    pub wait: Duration,
+}
+
 /// What a replay-backed projection has committed since it was last
 /// durable (task-j06).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -363,6 +389,9 @@ pub enum JournaledError {
     /// A checkpoint pointer is already queued for the journal worker and
     /// its outcome has not been taken (task-d66).
     CheckpointQueued,
+    /// A commit hold was asked of a projection under the strict profile,
+    /// where a commit is a record's durability (task-d86).
+    HoldUnderStrict,
 }
 
 impl fmt::Display for JournaledError {
@@ -389,6 +418,9 @@ impl fmt::Display for JournaledError {
             }
             JournaledError::CheckpointQueued => {
                 f.write_str("a checkpoint pointer is already queued for the journal")
+            }
+            JournaledError::HoldUnderStrict => {
+                f.write_str("a projection commit hold under the strict profile")
             }
         }
     }
@@ -681,6 +713,13 @@ struct Domain<E: LocalEngine> {
     /// from [`JournaledStore::queue_checkpoint`] to
     /// [`JournaledStore::take_published`].
     checkpoint: Option<Queued>,
+    /// Since when `pending` has held records no commit has been lent
+    /// (task-d86): what the hold's `wait` is counted from.
+    held_since: Option<Instant>,
+    /// Something reading the projection waits for a record (task-d86):
+    /// the next commit goes out whatever the hold says. Cleared when one
+    /// is lent.
+    commit_asked: bool,
 }
 
 /// A checkpoint pointer on its way through the journal worker (task-d66).
@@ -905,6 +944,12 @@ pub struct JournaledStore<J: JournalEngine, E: LocalEngine> {
     syncs: Option<u64>,
     /// How projections commit (task-j06).
     profile: ProjectionProfile,
+    /// How long a pipelined replay-backed projection holds its records
+    /// for a larger commit (task-d86).
+    hold: Option<CommitHold>,
+    /// Hand-offs that held a domain's records rather than lend them
+    /// (task-d86; diagnostic).
+    holds: u64,
     /// What times a publication's steps on the calling thread (task-d66).
     thread_clock: Option<ThreadClock>,
 }
@@ -1094,6 +1139,8 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
             cost: LoweringCost::default(),
             syncs: journal.syncs(),
             profile: ProjectionProfile::Strict,
+            hold: None,
+            holds: 0,
             thread_clock: None,
             journal: Some(journal),
             appender: None,
@@ -1342,6 +1389,8 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                 took: Duration::ZERO,
             },
             checkpoint: None,
+            held_since: None,
+            commit_asked: false,
         };
         let started = Instant::now();
         Self::replay(
@@ -1739,6 +1788,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                 state.head.complete_durable(barrier)?;
                 state.frontiers.advance_durable(record.seq())?;
                 state.head_digest = record.digest();
+                state.held_since.get_or_insert_with(Instant::now);
                 state.pending.push(Durable {
                     barrier: None,
                     record,
@@ -1851,6 +1901,9 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
             && state.projection_durable < pointer.represented
         {
             state.working.requested = true;
+            // The pointer waits for the projection, so its commit is not
+            // held (task-d86).
+            state.commit_asked = true;
         }
         state.checkpoint = Some(Queued {
             pointer: *pointer,
@@ -2621,6 +2674,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                                 journal_seq: record.seq(),
                             });
                         }
+                        state.held_since.get_or_insert_with(Instant::now);
                         state.pending.push(item);
                     }
                     // The pointer this entry carried is durable, and its
@@ -3048,6 +3102,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                                     journal_seq: item.record.seq(),
                                 });
                             }
+                            state.held_since.get_or_insert_with(Instant::now);
                             state.pending.push(item);
                         }
                         state.status = DomainStatus::Ready;
@@ -3098,6 +3153,9 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                     // ran, and those are still owed.
                     let taken = taken.min(state.pending.len());
                     let applied: Vec<Durable> = state.pending.drain(..taken).collect();
+                    if state.pending.is_empty() {
+                        state.held_since = None;
+                    }
                     report.materialized = applied.len();
                     report.commits = 1;
                     for item in applied {
@@ -3391,6 +3449,81 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
         self.profile
     }
 
+    /// Hold a pipelined projection's records for larger commits from now
+    /// on (task-d86), as `hold` bounds it. It applies under the replay
+    /// profile with a materializer, and nowhere else; refused over the
+    /// strict profile, where a held commit would hold a record's
+    /// durability.
+    pub fn hold_projection_commits(&mut self, hold: CommitHold) -> Result<(), JournaledError> {
+        if matches!(self.profile, ProjectionProfile::Strict) {
+            return Err(JournaledError::HoldUnderStrict);
+        }
+        self.hold = Some(hold);
+        Ok(())
+    }
+
+    /// The commit hold, if one is set (task-d86).
+    pub fn commit_hold(&self) -> Option<CommitHold> {
+        self.hold
+    }
+
+    /// Hand-offs that held a domain's records rather than lend them
+    /// (task-d86; diagnostic).
+    pub fn commit_holds(&self) -> u64 {
+        self.holds
+    }
+
+    /// Ask for every domain's next projection commit to go out at the
+    /// next hand-off, whatever the hold says (task-d86): for a caller
+    /// that waits for the projection to show a record -- a read held at
+    /// the barrier, a release or watch event held for its group's
+    /// commit, a lookup of an execution record. It waits for nothing:
+    /// the caller hands off as it does already, and
+    /// [`JournaledStore::projection_commit_due`] says it is due now.
+    ///
+    /// The ask stands until a commit is lent, so a record that is still
+    /// on its way to the journal when it is made goes out with the
+    /// commit that carries it, not after the hold.
+    pub fn request_projection_commit(&mut self) {
+        if self.hold.is_none() {
+            return;
+        }
+        for state in self.domains.values_mut() {
+            state.commit_asked = true;
+        }
+    }
+
+    /// When the next held projection commit is due to go out
+    /// (task-d86): the earliest of the domains whose records are held,
+    /// at their `wait` or now if one was asked for. `None` when nothing
+    /// is held. A caller that hands off on events alone calls
+    /// [`JournaledStore::hand_off`] at this time too, since nothing
+    /// arrives to say a hold has run out.
+    pub fn projection_commit_due(&self) -> Option<Instant> {
+        let hold = self.held_hold()?;
+        self.domains
+            .values()
+            .filter(|d| d.lent.is_none() && !d.pending.is_empty())
+            .filter_map(|d| {
+                let since = d.held_since?;
+                Some(if d.commit_asked {
+                    since
+                } else {
+                    since + hold.wait
+                })
+            })
+            .min()
+    }
+
+    /// The hold, where it applies: a replay-backed projection with a
+    /// materializer.
+    fn held_hold(&self) -> Option<CommitHold> {
+        match self.profile {
+            ProjectionProfile::Replay(_) if self.materializer.is_some() => self.hold,
+            _ => None,
+        }
+    }
+
     /// Time a publication's steps on the calling thread with `clock` from
     /// now on, as well as by the wall (task-d66): what
     /// [`PublishPhases::thread`] reports.
@@ -3543,6 +3676,11 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
         // left the thread.
         let mut refused = Vec::new();
         let profile = self.profile;
+        let hold = match profile {
+            ProjectionProfile::Replay(_) => self.hold,
+            ProjectionProfile::Strict => None,
+        };
+        let now = Instant::now();
         while let Some(done) = materializer.try_take() {
             let domain = done.domain();
             let result = take_back(&mut self.domains, done);
@@ -3564,6 +3702,13 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
             }
         }
         for (id, state) in &mut self.domains {
+            // The hold runs from when the records arrived, even if a
+            // commit was out then (stamped as they joined `pending`);
+            // records given back by a commit that did not take them wait
+            // from now at the latest.
+            if !state.pending.is_empty() {
+                state.held_since.get_or_insert(now);
+            }
             if state.lent.is_some()
                 || state.pending.is_empty()
                 || refused.contains(id)
@@ -3574,9 +3719,20 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
             {
                 continue;
             }
+            let since = state.held_since.unwrap_or(now);
+            if let Some(hold) = hold
+                && !state.commit_asked
+                && state.pending.len() < hold.records.get() as usize
+                && now.saturating_duration_since(since) < hold.wait
+            {
+                self.holds += 1;
+                continue;
+            }
             let Some(engine) = state.engine.take() else {
                 continue;
             };
+            state.held_since = None;
+            state.commit_asked = false;
             let records = std::mem::take(&mut state.pending);
             state.lent = Some(records.len());
             materializer.submit(MaterializeJob {

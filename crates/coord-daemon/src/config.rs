@@ -418,6 +418,20 @@ pub struct JournalConfig {
     /// the end is synced by its own loop.
     #[serde(default = "projection_durable_ms")]
     pub projection_durable_ms: u64,
+    /// Under [`JOURNAL_REPLAY_PROFILE`], journal records a projection
+    /// commit waits for before it goes out (task-d86): records the
+    /// materializer is owed are held for one larger commit until this
+    /// many are, [`JournalConfig::projection_commit_ms`] has passed, or
+    /// something that reads the projection waits for one of them. Zero
+    /// holds nothing: a commit goes out as soon as the last is back.
+    /// Ignored under the strict profile.
+    #[serde(default = "projection_commit_records")]
+    pub projection_commit_records: u32,
+    /// Under [`JOURNAL_REPLAY_PROFILE`], milliseconds at most a record
+    /// is held for a larger projection commit (task-d86). Zero holds
+    /// nothing. Ignored under the strict profile.
+    #[serde(default = "projection_commit_ms")]
+    pub projection_commit_ms: u64,
 }
 
 impl JournalConfig {
@@ -425,6 +439,29 @@ impl JournalConfig {
     pub fn replays_projection(&self) -> bool {
         self.profile == JOURNAL_REPLAY_PROFILE
     }
+
+    /// The projection commit hold (task-d86): records and the longest
+    /// wait, or `None` where nothing is held (the strict profile, or
+    /// either bound zero).
+    pub fn projection_commit_hold(&self) -> Option<(u32, std::time::Duration)> {
+        (self.replays_projection()
+            && self.projection_commit_records > 0
+            && self.projection_commit_ms > 0)
+            .then(|| {
+                (
+                    self.projection_commit_records,
+                    std::time::Duration::from_millis(self.projection_commit_ms),
+                )
+            })
+    }
+}
+
+fn projection_commit_records() -> u32 {
+    32
+}
+
+fn projection_commit_ms() -> u64 {
+    5
 }
 
 fn projection_durable_commits() -> u32 {
