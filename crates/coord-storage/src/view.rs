@@ -185,6 +185,12 @@ impl<R: SnapshotSource> GatedReader<R> {
         GatedReader { reader, frontier }
     }
 
+    /// Entries the projection's index by command holds (task-d113;
+    /// diagnostic, for the metrics line).
+    pub fn index_len(&self) -> usize {
+        self.frontier.index_len()
+    }
+
     /// Pin a snapshot and verify its stamp against the completed frontier.
     pub fn snapshot(&self) -> Result<GatedView<R::View>, ViewError> {
         if self.frontier.is_quarantined() {

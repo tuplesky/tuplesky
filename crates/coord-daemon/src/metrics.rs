@@ -568,6 +568,24 @@ pub struct Cost {
     /// record (task-d25, #98).
     #[serde(default)]
     pub table: Table,
+    /// The projection's index by command of its intake-keyed rows
+    /// (task-d113): its entries, and the bytes they take.
+    #[serde(default)]
+    pub intake_index: IntakeIndexSize,
+}
+
+/// The size of the projection's index by command of its intake-keyed rows
+/// (task-d113, the lead on #237). Nothing trims it in `coordd` yet
+/// (task-d27), so it grows with every dependency row kept, two a command at
+/// the leader: this is where that growth is read.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntakeIndexSize {
+    /// Entries held: one a live dependency or proposal row.
+    pub entries: u64,
+    /// The bytes they take, at the most review measured an entry to take
+    /// on #237 ([`coord_storage::intake::ENTRY_BYTES`]): an estimate, since
+    /// the ordered set's nodes are not counted one by one.
+    pub bytes: u64,
 }
 
 /// A voter's command table, and what holds back its oldest unexecuted

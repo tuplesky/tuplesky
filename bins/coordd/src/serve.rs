@@ -1964,6 +1964,13 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                         .map(|(_, wait)| coord_daemon::metrics::OldestWait::of(wait)),
                 }
             },
+            intake_index: {
+                let entries = voter.node().applier().store().reader().index_len() as u64;
+                coord_daemon::metrics::IntakeIndexSize {
+                    entries,
+                    bytes: entries.saturating_mul(coord_storage::intake::ENTRY_BYTES),
+                }
+            },
             busy,
             uptime: now.saturating_duration_since(self.started),
             recent,

@@ -527,6 +527,10 @@ fn a_rendered_snapshot_carries_no_secret_or_key_shaped_text() {
                 catch_up_window: 64,
                 oldest_wait: Some(OldestWait::Dependency { phase: None }),
             },
+            intake_index: coord_daemon::metrics::IntakeIndexSize {
+                entries: 7000,
+                bytes: 322_000,
+            },
         }),
     };
     let rendered = serde_json::to_string(&snapshot).expect("a snapshot renders");

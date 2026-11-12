@@ -222,6 +222,11 @@ fn range_of<'a>(
 /// command's prefix, the sequence and the ordinal, 24 bytes.
 type Slot = (u64, u64, u32);
 
+/// The bytes an entry takes, slot and set nodes together, at the most
+/// review measured on #237 (39 to 46): what the metrics line multiplies
+/// the entries by. The design step had inferred 24 to 32.
+pub const ENTRY_BYTES: u64 = 46;
+
 /// The index by command of a projection's intake-keyed rows, in memory
 /// (design Section 17.1, "1. The index by command", its intake part).
 ///

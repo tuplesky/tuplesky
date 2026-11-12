@@ -1065,6 +1065,43 @@ fn catch_up_finds_an_executed_commands_dependency_row_through_the_index() {
     );
 }
 
+/// Two executed commands whose identities share the index's 8-byte prefix
+/// (the lead on #237): catch-up finds each one's own dependency row,
+/// whichever of them is first under the prefix. The index holds both
+/// entries, and the full key, which carries the command, settles whose
+/// each is. Tried with only the first candidate, the second command's
+/// lookup reads a key no row is under and serves it with no decided
+/// record.
+#[test]
+fn catch_up_finds_each_of_two_executed_commands_that_share_a_prefix() {
+    let mut store = Store::journaled();
+    let sharing = |tail: u8| {
+        let mut bytes = [0x3c; 32];
+        bytes[8..].fill(tail);
+        CommandId(Digest32(bytes))
+    };
+    let (first, second) = (sharing(1), sharing(2));
+    let first_row = record(Phase::Commit, &[]);
+    let second_row = record(Phase::Commit, &[first]);
+    for (n, command, row) in [(1, first, &first_row), (2, second, &second_row)] {
+        store.protocol(vec![
+            dependency_update(epoch(), &command, row).unwrap(),
+            payload_update(&command, &payload_of(n)).unwrap(),
+        ]);
+    }
+    store.application(1, vec![executed(&first, 1)]);
+    store.application(2, vec![executed(&second, 2)]);
+    store.materialize();
+    let gated = store.reader().snapshot().unwrap();
+    for (command, row) in [(first, first_row), (second, second_row)] {
+        let entry = catch_up_entry(&gated, epoch(), &command)
+            .unwrap()
+            .expect("executed and held");
+        assert_eq!(entry.command, command);
+        assert_eq!(entry.decided, Some(row), "{command:?}'s own row");
+    }
+}
+
 /// Rule (e)'s timing (review on #233, 6813935632): the materializer moves
 /// the gate as its commit returns, before the store takes the commit back,
 /// so a cut's snapshot can be one commit ahead of the take-back. The
