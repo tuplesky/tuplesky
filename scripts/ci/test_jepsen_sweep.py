@@ -171,7 +171,21 @@ class SweepTests(unittest.TestCase):
         self.assertAlmostEqual(step.counts["proposals"], 4.0)
         self.assertAlmostEqual(step.counts["proposal_frames"], 1.0)
         self.assertNotIn("proposal_bytes", step.counts)
+        self.assertNotIn("relay_not_taken", step.counts)
         self.assertIn("Relayed to the leader alone", sw.render([step], "Sweep"))
+        # #230's follower counts, where a build has them: n2 took 6 frames
+        # with 24 payloads and left 2 untaken.
+        with open(os.path.join(path, "n2", "coordd.log")) as f:
+            line = json.loads(f.read()[len("metrics "):])
+        line["cost"]["Observed"]["relay"].update({"frames_taken": 6, "payloads_taken": 24, "known": 1, "not_taken": 2})
+        with open(os.path.join(path, "n2", "coordd.log"), "w") as f:
+            f.write("metrics " + json.dumps(line) + "\n")
+        step = sw.read_step("head", "30", path)
+        self.assertAlmostEqual(step.counts["relay_frames_taken"], 0.6)
+        self.assertAlmostEqual(step.counts["relay_payloads_taken"], 2.4)
+        self.assertAlmostEqual(step.counts["relay_known"], 0.1)
+        self.assertAlmostEqual(step.counts["relay_not_taken"], 0.2)
+        self.assertIn("Relayed, not taken", sw.render([step], "Sweep"))
 
     def test_labels(self):
         self.assertEqual(sw.label("head@30=/s/1"), ("head", "30", "/s/1"))

@@ -631,7 +631,13 @@ class CheckpointTests(unittest.TestCase):
         line = "metrics " + json.dumps({"stages": [], "cost": {"Observed": cost}}) + "\n"
         text = self.summarize(line)
         self.assertIn("**Leader relay and proposal frames** (task-d102", text)
-        self.assertIn("| n1 | 900 | 12 | 3 | 4000 | 500 (4.0) | 480.0 | 96.0 | 3000 | 60.0 | - | - |", text)
+        self.assertIn("| n1 | 900 | 12 | 3 | - | - | - | - | 4000 | 500 (4.0) | 480.0 | 96.0 | 3000 | 60.0 | - | - |", text)
+        # A build with #230's follower counts.
+        cost["relay"].update({"frames_taken": 700, "payloads_taken": 2800, "known": 40, "not_taken": 5})
+        line = "metrics " + json.dumps({"stages": [], "cost": {"Observed": cost}}) + "\n"
+        self.assertIn("| n1 | 900 | 12 | 3 | 700 | 2800 | 40 | 5 | 4000 |", self.summarize(line))
+        for key in ("frames_taken", "payloads_taken", "known", "not_taken"):
+            del cost["relay"][key]
         # The loop's flushes, task-d73's causes beside task-d102's events.
         cost["flushes"] = {"idle": 50, "events": 10, "queued": 0, "appending": 5,
                            "flushes": 60, "api_events": 120, "peer_events": 300, "by_events": [0] * 9}
@@ -642,7 +648,7 @@ class CheckpointTests(unittest.TestCase):
         cost["proposals"] = {"proposals": 0, "proposal_bytes": 0, "payload_bytes": 0,
                              "frames": 0, "framed": 0, "frontiers": 0, "frontier_bytes": 0}
         line = "metrics " + json.dumps({"stages": [], "cost": {"Observed": cost}}) + "\n"
-        self.assertIn("| n1 | 900 | 12 | 3 | 0 | 0 (-) | 0.0 | 0.0 | 0 | 0.0 | - | - |", self.summarize(line))
+        self.assertIn("| n1 | 900 | 12 | 3 | - | - | - | - | 0 | 0 (-) | 0.0 | 0.0 | 0 | 0.0 | - | - |", self.summarize(line))
 
 
 
