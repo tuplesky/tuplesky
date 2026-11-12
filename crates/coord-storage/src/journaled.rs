@@ -723,6 +723,18 @@ struct Domain<E: LocalEngine> {
     /// Who made the standing ask, for the count of what ended each hold
     /// ([`HoldEnds`]): the latest, since a later ask replaces an earlier.
     ask_cause: AskCause,
+    /// What the commit lent now spent (#238 review): the ask it carried
+    /// out, with its cause, and the hold's start. A commit that gives its
+    /// records back puts them back, as the caller's thread leaves them,
+    /// so the records are due when they were and the ask stands.
+    lent_spent: Option<LentSpent>,
+}
+
+/// The ask and the hold's start a lent commit spent (#238 review).
+#[derive(Clone, Copy, Debug)]
+struct LentSpent {
+    ask: Option<(CommitAsk, AskCause)>,
+    held_since: Option<Instant>,
 }
 
 /// Who asked for a projection commit (task-d86), for the count of what
@@ -1513,6 +1525,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
             checkpoint: None,
             held_since: None,
             commit_asked: None,
+            lent_spent: None,
             ask_cause: AskCause::Other,
         };
         let started = Instant::now();
@@ -3903,10 +3916,15 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                 };
                 *end += 1;
             }
-            state.held_since = None;
-            if state.ask_spent() {
-                state.commit_asked = None;
-            }
+            let spent_ask = if state.ask_spent() {
+                state.commit_asked.take().map(|ask| (ask, state.ask_cause))
+            } else {
+                None
+            };
+            state.lent_spent = Some(LentSpent {
+                ask: spent_ask,
+                held_since: state.held_since.take(),
+            });
             let records = std::mem::take(&mut state.pending);
             state.lent = Some(records.len());
             materializer.submit(MaterializeJob {
@@ -3978,10 +3996,25 @@ fn take_back<E: LocalEngine>(
     state.lent = None;
     // The records go back in front of what was journaled meanwhile,
     // unless the projection conclusively took them.
+    let spent = state.lent_spent.take();
     let give_back = |state: &mut Domain<E>, records: &mut Vec<Durable>| {
         let taken = records.len();
         records.append(&mut state.pending);
         state.pending = std::mem::take(records);
+        // Not committed, so what the lend spent is put back (#238
+        // review): the records' wait from when they were first held, and
+        // the ask, unless a later one, which reaches further, stands.
+        if let Some(spent) = spent {
+            if let Some(since) = spent.held_since {
+                state.held_since = Some(state.held_since.map_or(since, |s| s.min(since)));
+            }
+            if state.commit_asked.is_none()
+                && let Some((ask, cause)) = spent.ask
+            {
+                state.commit_asked = Some(ask);
+                state.ask_cause = cause;
+            }
+        }
         taken
     };
     match outcome {

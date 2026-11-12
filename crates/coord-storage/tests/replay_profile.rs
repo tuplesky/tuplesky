@@ -1077,6 +1077,90 @@ fn a_synchronous_commit_that_gives_its_records_back_keeps_their_wait_and_ask() {
     );
 }
 
+/// A lent commit that comes back not committed spends nothing (#238
+/// review): the ask it carried out stands again and the record is due
+/// from when it was first held, as on the caller's thread, so the
+/// hand-off after the one that takes it back lends it again. Spent at
+/// the lend, the ask was gone and the record's wait ran an hour from the
+/// take-back.
+#[test]
+fn a_lent_commit_given_back_leaves_its_wait_and_ask_standing() {
+    let (mut world, handle) = held(hold(100, std::time::Duration::from_secs(3600)));
+    world
+        .engine()
+        .script_commit(CommitScript::DefinitelyNotCommitted);
+    journal_and_hand_off(&mut world, 1);
+    assert!(!world.store.lent(A), "one record is held");
+    world.store.request_projection_commit();
+    world.store.hand_off().unwrap();
+    assert!(world.store.lent(A), "the ask lends it");
+    assert!(handle.run(), "the commit is refused");
+    world.store.hand_off().unwrap();
+    assert!(
+        !world.store.lent(A),
+        "a refused domain is not lent again in the hand-off that takes it back"
+    );
+    let due = world
+        .store
+        .projection_commit_due()
+        .expect("the record given back is still held");
+    assert!(
+        due <= std::time::Instant::now(),
+        "the ask stands again, so it is due now"
+    );
+    world.store.hand_off().unwrap();
+    assert!(
+        world.store.lent(A),
+        "the next hand-off lends it again on the ask, not an hour later"
+    );
+    assert!(handle.run());
+    world.store.hand_off().unwrap();
+    assert_eq!(
+        world.store.unmaterialized(A),
+        0,
+        "committed the second time"
+    );
+    assert_eq!(world.store.status(A), Some(DomainStatus::Ready));
+}
+
+/// The ask made while its record is queued (task-d86, #238 review): the
+/// record's group is then sealed and lent to the appender, and a
+/// hand-off lends the record held from before while that append is still
+/// out. The ask, turned into the group's sequence at the seal, stands
+/// until the group's record is durable and lent, which is the case
+/// `coordd` runs with the journal pipelined.
+#[test]
+fn an_ask_stands_while_its_records_group_is_out() {
+    let (mut world, handle) = held(hold(100, std::time::Duration::from_secs(3600)));
+    let (appender, appends) = coord_storage::ManualAppender::new();
+    world.store.pipeline_journal(Box::new(appender)).unwrap();
+    // One record journaled and held.
+    world.queue(1);
+    world.store.append().unwrap();
+    assert!(appends.run());
+    world.store.take_back_append().unwrap();
+    world.store.hand_off().unwrap();
+    assert!(!world.store.lent(A), "one record is held");
+    assert_eq!(world.store.unmaterialized(A), 1);
+    // A second is queued and the ask is made; its group goes out.
+    world.queue(1);
+    world.store.request_projection_commit();
+    world.store.append().unwrap();
+    assert!(appends.waiting(), "the second's group is out, not yet run");
+    // The hand-off lends the first while that append is out.
+    world.store.hand_off().unwrap();
+    assert!(world.store.lent(A), "the held record goes out on the ask");
+    // The group turns durable, and the first commit comes back.
+    assert!(appends.run());
+    world.store.take_back_append().unwrap();
+    assert!(handle.run());
+    world.store.hand_off().unwrap();
+    assert!(
+        world.store.lent(A),
+        "the record the ask was made for goes out once durable, not an hour later"
+    );
+}
+
 /// A commit made on the caller's thread carries everything held, so the
 /// hold runs again from the next record (task-d86): a checkpoint
 /// published synchronously on a held store commits what was pending, and

@@ -2749,6 +2749,92 @@ fn a_turns_relayed_proposals_leave_in_one_frame_at_the_flush() {
     assert_eq!(w.collector.relay_fallbacks(), 0);
 }
 
+/// A leader made by an election holds its frontier for the turn's end as
+/// the one the cluster starts with does (#246 review): the role change
+/// is the other place the node sets it (`Node::change_role`).
+/// Voter 1 lowers in groups, voter 0 stops, and voter 1 campaigns and
+/// wins. Under it no peer event sends a `Committed` frame, each flush
+/// sends each follower at most one and leaves nothing owed, and the
+/// follower learns every command from those frontiers.
+#[test]
+fn an_elected_leader_announces_its_frontier_once_a_turn() {
+    let mut voters: Vec<Voter<Journaled>> = (0..3).map(journaled_voter).collect();
+    voters[1].node_mut().lower_in_groups();
+    let mut w = Cluster::of(voters, 256);
+    w.down = Some(0);
+    let (campaigned, out) = w.voters[1]
+        .campaign()
+        .expect("stepped")
+        .expect("a follower campaigns");
+    w.carry(1, out);
+    // Each survivor runs coordd's loop: lowering in groups, the
+    // candidate journals its Sync in a flush and wins there, and the role
+    // changes where the loop follows the machine on its next pass; the
+    // follower's Sync activates once its marker is durable.
+    for _ in 0..16 {
+        w.settle();
+        for i in 1..3 {
+            let out = w.voters[i].flush().expect("journaled");
+            w.carry(i, out);
+            let out = w.voters[i].finish().expect("materialized");
+            w.carry(i, out);
+            let out = w.voters[i].settle().expect("settled");
+            w.carry(i, out);
+            let out = w.voters[i].follow_machine().expect("followed");
+            w.carry(i, out);
+        }
+        if w.voters[1].leads() && w.peers.is_empty() {
+            break;
+        }
+    }
+    assert!(
+        w.voters[1].leads(),
+        "the candidate did not win: {:?}",
+        w.rejections()
+    );
+    w.collector.reconfigure(
+        BallotConfiguration::c2_default(epoch(), campaigned, (0..3).map(r).collect()).unwrap(),
+    );
+    for sequence in 1..=4 {
+        let submit = w.submit(sequence);
+        for i in 1..3 {
+            w.deliver_submission(i, &submit);
+        }
+    }
+    let frontiers = |w: &Cluster<Journaled>| w.voters[1].node().sent_bytes().frontiers;
+    let executed = |w: &Cluster<Journaled>| w.executed()[1..].to_vec();
+    for _ in 0..16 {
+        if executed(&w) == [4, 4] {
+            break;
+        }
+        let before = frontiers(&w);
+        settle_peers(&mut w);
+        assert_eq!(frontiers(&w), before, "a peer event announced the frontier");
+        if w.voters[1].node().machine().frontier_owed() {
+            assert!(w.voters[1].owes_flush(), "an owed frontier is owed a flush");
+        }
+        let before = frontiers(&w);
+        let out = w.voters[1].flush().expect("journaled");
+        w.carry(1, out);
+        assert!(
+            frontiers(&w) - before <= 2,
+            "one flush sent {} frontiers to two followers",
+            frontiers(&w) - before
+        );
+        assert!(
+            !w.voters[1].node().machine().frontier_owed(),
+            "the flush left the frontier unannounced"
+        );
+        let out = w.voters[1].finish().expect("materialized");
+        w.carry(1, out);
+        settle_peers(&mut w);
+        let out = w.voters[2].execute().expect("executed");
+        w.carry(2, out);
+    }
+    assert_eq!(executed(&w), [4, 4]);
+    assert!(frontiers(&w) > 0, "no frontier was announced");
+}
+
 /// A leader lowering in groups announces its commit frontier once a
 /// turn, where it flushes, not in each step that moves it (the follow-up
 /// to #242). Here every command commits inside a flush, as the leader's
