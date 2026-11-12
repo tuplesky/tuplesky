@@ -348,7 +348,7 @@ So this section asks what a voter has to do on the hot path, and what it can do 
 - **On the hot path, a lazy voter does what the protocol needs.** It journals, votes, computes dependencies and learns decisions, as every voter does today. The fast path, any voter's right to propose, and recovery are unchanged.
 - **It neither executes nor materializes on the hot path.** Its projection follows the decided order behind, a batch at a time, at a bounded lag.
 - **Eager voters** execute on the hot path, as today: the leader and `e` followers.
-- **Roles follow the ballot.** The leader and the next `e` voters in the ballot's order are eager; the rest are lazy. A voter that becomes eager first executes its tail (below).
+- **Roles follow the ballot and the leader's word.** The leader is eager. It names the `e` eager followers in its frames, the next voters in the ballot's order by default, and names another when one stops answering (point 3). The rest are lazy. A voter that becomes eager first executes its tail (below).
 
 **1. What a lazy voter must hold.**
 - **To vote and detect conflicts: keys, not state.**
@@ -359,6 +359,12 @@ So this section asks what a voter has to do on the hot path, and what it can do 
   - **Writes** are answered from the release the leader sends (task-d100's relay), as today. The lazy voter's own execution isn't on that path.
   - **Retries** go through consensus as today. A retry's dedup happens at execution (`retry::admit`), so exactly-once state lives in the eager voters' retry windows. The lazy voter's window lags, and nothing reads it above its landed frontier.
   - **Reads, watches and resolves** need current state. A lazy voter's frontend forwards them to an eager voter. That costs a hop and, on the 7763, about +0.003 ms an operation a lazy frontend (the bar's 34% reads, a fifth of them at that frontend, at about 20 µs of tokio a forwarded read). Total read work doesn't change: each read is still answered once.
+  - **Authorization reads this node's own store** (#259's review). `StorePolicySource::barrier` reads the session, the policy and the grants when the frontend admits a request and again on a result's way out, and `retained` reads the retry row when a request arrives. At a lazy voter that state is as old as its last landed batch.
+    - **So a batch ends by time as well as by positions:** at a quarter of the table or 50 ms, whichever comes first. A lazy frontend then authorizes from state at most 50 ms plus one agreement old. Today the bound is the materializer's lag.
+    - **A session opened a moment ago** isn't found there until its batch lands. The frontend's disclosure gate defers rather than refuses, as it does at a lagging replica today.
+    - **A grant revoked a moment ago** still authorizes a result on its way out at a lazy frontend, for up to that bound. That is the owner's to accept.
+    - **The stricter way** sends admission and the result's authorization to an eager voter: a hop for every request at a lazy frontend, not only for reads.
+    - **At the bar's load the time bound ends batches at about 120 positions,** not 250. The merged current rows then save a little less: under +0.002 ms an operation for three lazy voters.
 - **To be a catch-up donor:**
   - the protocol part (order, payloads, decided records) from its journal and task-d117's segments, to any asker;
   - executed history, with each position's result, up to its landed frontier. Above that, an eager voter serves.
@@ -369,12 +375,19 @@ So this section asks what a voter has to do on the hot path, and what it can do 
   - **It saves almost nothing in CPU.** Execution stays per command. What a batch saves is the per-turn and per-commit costs (about 3 µs a command locally), and current rows that a batch writes twice (below).
   - So it is the fallback, not the plan.
 - **(b) The eager voters' batches, agreed, landed behind.**
-  - At each batch's end (point 3 sizes the batch), each eager voter sends the lazy voters its history digest through that position (task-d117, point 3). The eager follower ships each lazy voter the batch: the merged write set and each position's execution record.
-  - A lazy voter lands a batch only once at least two executions agree on its digest. It lands it as one commit, sorted.
+  - At each batch's end (point 3 sizes the batch), each eager voter sends the lazy voters two digests through that position:
+    - **its history digest** (task-d117, point 3): each position's command, revision and result digest;
+    - **its write-set digest:** a digest of the batch's merged write set in a canonical order, by collection and key, each key with its last value or its tombstone (#259's review).
+  - The eager follower ships each lazy voter the batch: the merged write set and each position's execution record.
+  - **A lazy voter lands a batch only once two executions agree on both digests, and only bytes whose write-set digest two voters sent.** It lands it as one commit, sorted.
   - It executes the batch itself, as in (a), when:
     - no agreement comes within a bound (for example, too few eager voters are up);
-    - or the digests differ, in which case its execution counts toward the majority that decides.
-  - **Trust:** the agreement of two independent executions of the same order and payloads, with the lazy voters as tie-breakers. The leader's write set alone isn't trusted. That is the difference from option 3, where followers land the leader's write sets on the hot path (Section 6.3).
+    - the digests differ, in which case its execution counts toward the majority that decides;
+    - or the shipped bytes don't match the agreed write-set digest.
+  - **Why the write set needs its own digest.** The history digest covers results, not rows, and the bytes a lazy voter lands are built and shipped by the eager follower alone. Without the second digest, a write set that is wrong under results that are right would be landed by every lazy voter: a fault in the merge, or state at the eager follower that has diverged and hasn't shown in a result yet. In a later dispute, each lazy voter would execute from those rows, find the eager follower's result, and outvote the correct leader, which would stop.
+  - **With it, two executions are enough** for one faulty execution. What a lazy voter holds through batch N−1 is what two executions agreed on, byte for byte. Its own execution of a disputed batch N is a third, independent one, from agreed state.
+  - **Trust:** the agreement of two independent executions of the same order and payloads, on results and on rows, with the lazy voters as tie-breakers. The leader's write set alone isn't trusted. That is the difference from option 3, where followers land the leader's write sets on the hot path (Section 6.3).
+  - **The leader's share.** It merges and hashes the batch's write set too, about 1 KB a command: about +1.5 µs a command at the leader and +0.5 at the eager follower, which merges the batch already (point 5).
 - **(c) The eager voters' full images, installed every interval.**
   - It costs the application state's size every interval: about 3.5 MB of current rows for the bench's 10,000 keys, and all the event rows retained, which grow until task-d114 collects them.
   - It suits a small state with no history. Otherwise it is (b) with more bytes, so it isn't taken.
@@ -394,6 +407,10 @@ So this section asks what a voter has to do on the hot path, and what it can do 
   - **What goes wrong at the floor's 4,096 positions.** A batch that large would fill the table four times over before its first landing. The lazy voter would then refuse new commands, and at `e = 1` ordering needs a lazy voter's vote.
   - **With the window below at half the table, 500 positions,** a lazy voter's table holds at most 500 positions it hasn't landed, plus what is undecided in flight: under 875.
   - **Landing counts as execution for the table.** It marks a batch's positions executed. They retire once the landing's commit is durable, as an execution group's do today (task-d90, point 2).
+  - **What makes a landing durable** (#259's review). Today an execution is durable once the journal holds its outcome (`executions_durable_through`), and under `replay` the projection is synced on a cadence, not at each commit. A landing isn't in the lazy voter's journal. If its positions retired only at a projection sync, the table would fill between syncs: 875 positions is about 0.4 s at the bar's load. So:
+    - **each landing is a durable projection commit,** under `replay` as under `strict`: one sync a batch, about ten to twenty a second at the bar's load;
+    - **the batch doesn't go through the lazy voter's journal,** so its appender writes the protocol's records only, as today;
+    - **after a crash** the voter boots from its image and journal (task-d117), reads its landed frontier from the projection's stamp, and lands or executes from there.
   - **The table, its reserve and the recovery reports are unchanged.** A smaller configured table gives smaller batches, so a domain with lazy voters keeps the default.
   - **Batches don't need the floor's boundaries.** The history digest (task-d117, point 3) runs over every executed position, so two executions can be compared at any position.
     - Each eager voter sends its digest through each batch's last position: a position and 32 bytes, in a small peer frame to the lazy voters.
@@ -407,6 +424,14 @@ So this section asks what a voter has to do on the hot path, and what it can do 
   - **So the bound:** while any voter within the window is up, a takeover's tail is at most the window, 500 positions, about 0.04 s on the 7763, and at most one batch, about 0.02 s, in steady state. With every voter within it down, the voter that takes over pays its own lag at the tail's rate, and its lag was on the metrics line beforehand.
 - **The new eager follower** (the next voter in the new ballot's order) executes its own tail in the background. Until it catches up, the lazy voters find no agreement and fall back to (a), so their lag stays bounded.
 - **It ends as an eager voter.** From the takeover on, it executes on the hot path.
+- **In time, the larger part is the election, not the tail.**
+  - Losing the leader alone has no tail: the eager follower is eager, and an election prefers it.
+  - Losing both eager voters together costs one more election timeout (a lazy voter's campaign waits), then the tail's 0.02 to 0.04 s.
+- **The tail's rate assumes execution from memory that is warm.** A landing updates proposal 1's in-memory state as it commits: the merged write set is laid over the voter's map in the same step. So a lazy voter's tail runs from warm memory. Without proposal 1, at today's price of execution, the tail is still under 0.1 s.
+- **The eager follower down, with no change of ballot.**
+  - If roles followed the ballot alone, the role wouldn't move: no agreement would come, every lazy voter would execute for itself, and the whole saving would be gone until that voter returned or the ballot changed.
+  - **So the leader names the eager follower.** The role is in the leader's frames, not in the ballot. When the named voter's digests stop arriving for an agreement bound, the leader names the next voter in the ballot's order. That voter executes its tail first, as a new eager follower does after a takeover. Meanwhile the lazy voters fall back to (a).
+  - So one follower down costs the saving only for its tail's time, not until it returns.
 
 **4. How many eager voters, and what that buys for divergence.**
 - **Today** every voter executes. A divergence shows at a held release (task-d06), a late release (task-d12), catch-up (task-d08) and the floor's root (task-d27).
@@ -432,8 +457,10 @@ So this section asks what a voter has to do on the hot path, and what it can do 
 | Followers' loop | −1.8 µs (per-turn execution cost amortized) | −34.5 µs (no execution) |
 | Materializer | −1.3 µs (one commit a batch), and the merged current rows | the merged current rows, +2 µs to decode the batch |
 | Tokio | 0 | +2 µs (the batch's bytes) |
+| The eager follower's tokio: the sender (#259's review) | 0 | +2 µs (about 1 KB a command shipped to each lazy voter) |
 | Forwarded reads (7763) | +0.003 ms an operation | +0.003 ms an operation |
-| **Net, 7763, a lazy voter** | **−0.004 to −0.005 ms an operation** | **−0.033 to −0.035 ms an operation** |
+| **Net, 7763, a lazy voter** | **−0.004 to −0.005 ms an operation** | **−0.030 to −0.032 ms an operation** |
+| The write-set check, once for the domain | 0 | +1.5 µs at the leader, +0.5 at the eager follower: +0.002 ms an operation |
 
 **The merged current rows.**
 - In the bench, half the commands are puts over 10,000 keys and half are contended writes on 16 hot keys. A batch writes each key's current row once.
@@ -446,30 +473,31 @@ So this section asks what a voter has to do on the hot path, and what it can do 
 
 | Lag or batch interval | Batch, commands | Recovery at takeover: the tail | (a), 4 lazy voters | (b), `e = 2` (2 lazy) | (b), `e = 1` (3 lazy) |
 |---|---:|---:|---:|---:|---:|
-| 1 s | 2,400 | 0.17 s | 1.17 | 1.12 | 1.09 |
-| 3 s | 7,200 | 0.51 s | 1.17 | 1.12 | 1.09 |
-| 10 s | 24,000 | 1.7 s | 1.17 | 1.12 | 1.09 |
-| 250 positions, a quarter of the table (recommended) | 250 | 0.02 s; 0.04 s at the window's edge | 1.18 | 1.13 | 1.09 |
+| 1 s | 2,400 | 0.17 s | 1.17 | 1.13 | 1.10 |
+| 3 s | 7,200 | 0.51 s | 1.17 | 1.13 | 1.10 |
+| 10 s | 24,000 | 1.7 s | 1.17 | 1.13 | 1.10 |
+| 250 positions or 50 ms, whichever first (recommended) | 250 | 0.02 s; 0.04 s at the window's edge | 1.18 | 1.13 | 1.10 |
 
-The last three columns are the servers' ms an operation, from 1.19. The rows by time need a batch larger than a quarter of today's largest table. Such a table changes the recovery reports' bound (task-d20), so those rows only show how the CPU moves with the interval.
+The last three columns are the servers' ms an operation, from 1.19. The two right-hand columns count the sender and the write-set check. The rows by time need a batch larger than a quarter of today's largest table. Such a table changes the recovery reports' bound (task-d20), so those rows only show how the CPU moves with the interval.
 
 **What the curve says:**
 - **The CPU is nearly flat in the interval.** A longer batch merges more current rows, but from 250 positions to 24,000 the difference is under 0.01 ms an operation.
 - **Recovery is linear in it.** So the interval should be short.
 - **Batches by positions** bound the tail at any load, and the command table bounds the batch from above: a quarter of it.
-- **The choice that moves the CPU is `e`:** −0.07 at `e = 2` and −0.10 at `e = 1`.
+- **The choice that moves the CPU is `e`:** −0.06 at `e = 2` and −0.09 at `e = 1`, the sender and the write-set check counted.
 - **It adds to proposals 1 to 3 and the levers that need no decision,** and to lever 2's redesign, which takes per-command intake and learning rather than execution.
 - **Every figure is inferred** from the cost table's shares, not from a pair.
 
 **Against the alternatives.**
-- **Option 3 with rotation (Section 7's lever 1):** −0.05 on the 7763, with one execution a command and rotation for detection. (b) at `e = 1` saves more, −0.10, keeps two executions and the lazy voters' tie-break, keeps the fast path, and needs no leader log.
+- **Option 3 with rotation (Section 7's lever 1):** −0.05 on the 7763, with one execution a command and rotation for detection. (b) at `e = 1` saves more, −0.09, keeps two executions and the lazy voters' tie-break, keeps the fast path, and needs no leader log.
 - **Witnesses (Section 6.5):** they can't lead without a rebuild. A lazy voter can, within the tail's bound, which is the owner's condition.
 
 **6. What it costs to build.** About 5 to 7 weeks, after proposals 1 and 2 (task-d117), which it rests on: history digests and segments, and execution from memory.
 - **Roles from the ballot,** and an election that prefers eager voters.
-- **The batch:** a quarter of the table's positions, as a peer frame with the merged write set and the execution records. The eager follower sends it, so the leader's load doesn't change.
-- **The agreement:** each eager voter's history digest through each batch's last position, in a small peer frame to the lazy voters.
-- **The landing:** a batch lowered as one sorted commit.
+- **The batch:** a quarter of the table's positions or 50 ms, as a peer frame with the merged write set and the execution records. The eager follower sends it. The leader's load changes only by merging and hashing the batch's write set.
+- **The agreement:** each eager voter's history digest and write-set digest through each batch's last position, in a small peer frame to the lazy voters.
+- **The landing:** a batch lowered as one sorted, durable commit, of bytes whose write-set digest two voters sent, laid over the in-memory state in the same step.
+- **The eager follower named by the leader,** and named again when it stops answering.
 - **The fallbacks:** own execution when there is no agreement within a bound, on a difference, and past the window.
 - **The window:** the lag tracked, and the campaign's second timeout past it.
 - **The takeover:** execute the tail before answering.
@@ -477,7 +505,11 @@ The last three columns are the servers' ms an operation, from 1.19. The rows by 
 - **The donor rule:** a lazy voter serves executed history only up to its landed frontier.
 - **The metrics line:** lag in positions, tail and takeover times, agreements, fallbacks.
 
-**It changes who executes, so it is the owner's to decide,** beside the parked leader log, option 3 and witnesses. It doesn't change what is decided: votes, dependencies, the fast path and recovery are as today.
+**It changes who executes, so it is the owner's to decide,** beside the parked leader log, option 3 and witnesses. It doesn't change what is decided: votes, dependencies, the fast path and recovery are as today. **What the owner trades** (#259's review):
+- **Two executions check each other, where five do today.** With the write-set digest, they check rows as well as results.
+- **A lazy frontend's authorization is as old as its last batch,** at most 50 ms plus one agreement: a revoked grant can still authorize a result there for that long.
+- **One follower down costs the saving for its tail's time,** while the leader names another.
+- **Half of a lazy voter's table is the window.** At the window's edge it has room for 375 commands in flight, and at `e = 1` ordering needs one lazy voter's vote. The bar's 120 callers put about 80 there.
 
 **7. The fault runs it needs** (testing's, on the runner):
 - **A lazy voter wins an election and serves within the bound:**
@@ -489,6 +521,9 @@ The last three columns are the servers' ms an operation, from 1.19. The rows by 
   - a second lazy voter takes over within the same bound;
   - the digests agree at the next batch's end.
 - **A difference at one eager voter,** in a build that changes one result: the lazy voters execute the batch, the majority decides, and the loser stops.
+- **A wrong write set under right results** at the eager follower, in a build that changes one shipped row: the lazy voters refuse to land it, execute the batch themselves, and the leader isn't stopped.
+- **The eager follower stopped without a change of ballot:** the leader names another, and agreement resumes after that voter's tail.
+- **A revoked grant at a lazy frontend:** the time from the revocation's commit to the first refusal there is under 50 ms plus an agreement.
 - **The lag under load:** the lazy voters' landed frontier stays within one batch while the leader and eager follower run at the bar's load, and their tables stay under the admission limit, with no initialization refused for room.
 - **A stalled lazy voter:**
   - hold one lazy voter's batches back under load until it passes the window;
@@ -573,5 +608,5 @@ So parity needs the leader log and either larger turns or the transport change. 
 **For the owner:**
 - **Option 3 and the leader log,** with Section 6.2's trade and Section 6.3's open arguments.
 - **Or witnesses (Section 6.5):** two voters that journal and vote but keep no projection. They keep the fast path and three independent executions, and give up two projection copies and leadership at the witnesses.
-- **Or lazy voters (Section 6.6):** voters that vote on the hot path and land the eager voters' agreed batches behind, at a lag of one batch, a quarter of the command table. Any of them can lead after executing its tail: one batch in steady state, and at most an enforced window of two while any voter within it is up. At one eager follower beside the leader, about −0.10 ms an operation on the 7763.
+- **Or lazy voters (Section 6.6):** voters that vote on the hot path and land the eager voters' agreed batches behind, at a lag of one batch, a quarter of the command table. Any of them can lead after executing its tail: one batch in steady state, and at most an enforced window of two while any voter within it is up. At one eager follower beside the leader, about −0.09 ms an operation on the 7763.
 - **Whether the transport moves onto the loop's turn.**
