@@ -410,7 +410,12 @@ both activate.
 
 `voter-env` gives every voter of every run one more variable through
 `--voter-env` (such as `COORDD_ACK_FREQUENCY=8,25000`), and the title says
-", with NAME=VALUE". `key-count` sets the keys in play at once in the
+", with NAME=VALUE". `voter-env` `cpu:MODEL[|MODEL...]` sets no variable:
+it is a check of the runner. The job's first step reads the CPU model and,
+unless it holds one of the names (such as `cpu:EPYC 9V74|6975P-C`), ends
+the job before it checks anything out or builds, and the steps that run
+`always()` skip. It's for a reading that counts on some models alone, so a
+miss costs seconds and a dispatch, not a 40-minute sweep. `key-count` sets the keys in play at once in the
 append and wr workloads (Elle's `key-count`, 3 by default; each key retires
 after its share of writes and a fresh one takes its place) through
 `--key-count`, and the title says ", N keys"; with the register workload it

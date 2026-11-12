@@ -85,7 +85,7 @@ on:
         description: "Tokio worker threads per TupleSky voter (TOKIO_WORKER_THREADS, through jepsen.tuplesky's --voter-workers): 2, the job's standard (five voters on a 4-CPU runner), or default for tokio's one per runner core, which each co-located voter takes; BASE/HEAD, such as 2/1, for a pair's two sides (a single run takes HEAD)"
         default: "2"
       voter-env:
-        description: "An environment variable every TupleSky voter starts with in every run, as NAME=VALUE (through jepsen.tuplesky's --voter-env), such as COORDD_ACK_FREQUENCY=8,25000; empty for none"
+        description: "An environment variable every TupleSky voter starts with in every run, as NAME=VALUE (through jepsen.tuplesky's --voter-env), such as COORDD_ACK_FREQUENCY=8,25000; or cpu:MODEL[|MODEL...], no variable, to end the job in its first seconds unless the runner's CPU model holds one of them, such as cpu:EPYC 9V74|6975P-C, for a reading that counts on those models alone; empty for none"
         default: ""
       key-count:
         description: "Keys in play at once in the append or wr workload, TupleSky's (through jepsen.tuplesky's --key-count) and etcd's (the job sets its workload's key-count); empty for the scenario's: the harnesses' 3, or 1000 for service"
@@ -202,6 +202,22 @@ jobs:
       # inside the allocator.
       CFLAGS: ${{ inputs.leader-profile == 'call-graph' && '-fno-omit-frame-pointer' || '' }}
     steps:
+      - name: Check the runner's CPU model
+        # voter-env cpu:MODEL[|MODEL...]: a reading that counts on some CPU
+        # models alone ends here, before the 40 minutes of a sweep, on any
+        # other; the steps that run always() skip, as there is nothing to
+        # read, pack or take down.
+        if: startsWith(inputs.voter-env, 'cpu:')
+        run: |
+          model=$(sed -n 's/^model name[[:space:]]*: //p' /proc/cpuinfo | head -1)
+          echo "CPU model: $model"
+          IFS='|' read -ra wanted <<< "${IN_VOTER_ENV#cpu:}"
+          for want in "${wanted[@]}"; do
+            if [ -n "$want" ] && [[ "$model" == *"$want"* ]]; then exit 0; fi
+          done
+          echo "CPU_MISS=true" >> "$GITHUB_ENV"
+          echo "::error::This runner's CPU is $model, not one of ${IN_VOTER_ENV#cpu:}; dispatch again"
+          exit 1
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           path: tuplesky
@@ -704,7 +720,7 @@ jobs:
             ${runs[@]+"${runs[@]}"} || true
           exit $rc
       - name: Read how far each voter executed
-        if: always() && env.IN_PAIR_BASE == '' && env.SWEEP == ''
+        if: always() && env.CPU_MISS != 'true' && env.IN_PAIR_BASE == '' && env.SWEEP == ''
         # Each voter's highest executed position at the end, from its store
         # (a crash image, jepsen.tuplesky.db's log-files kills coordd first),
         # for the summary's "Executed at end" column: a voter left behind
@@ -721,7 +737,7 @@ jobs:
             echo "$node: $(head -c 200 "$dir/executed-at-end")"
           done
       - name: Summarize the run
-        if: always() && env.IN_PAIR_BASE == '' && env.SWEEP == ''
+        if: always() && env.CPU_MISS != 'true' && env.IN_PAIR_BASE == '' && env.SWEEP == ''
         # The verdict, counts, final reads per node, faults and one row per
         # voter, in the job summary; each voter's last 400 lines follow here.
         run: |
@@ -737,7 +753,7 @@ jobs:
         # Not for a paired job: the API returns only a log's last 5000
         # lines, which the runs' summaries and the pair table need; every
         # run's voter logs are in the uploaded store.
-        if: always() && env.IN_PAIR_BASE == '' && env.SWEEP == ''
+        if: always() && env.CPU_MISS != 'true' && env.IN_PAIR_BASE == '' && env.SWEEP == ''
         # Jepsen copies each voter's coordd.log into the test's store before
         # tearing the cluster down. Printed here, without the periodic
         # metrics lines, so a run can be read from its job log alone.
@@ -758,7 +774,7 @@ jobs:
           done
           echo "::endgroup::"
       - name: Show every voter's execution order around a stop
-        if: always()
+        if: always() && env.CPU_MISS != 'true'
         # A voter that stops on a command, a release contradicting its own
         # execution or two decisions of one command, names it by an id
         # prefix. Each voter's store comes with its log (jepsen.tuplesky.db's
@@ -790,7 +806,7 @@ jobs:
             done
           done
       - name: Fail on a divergence stop
-        if: always()
+        if: always() && env.CPU_MISS != 'true'
         # A voter that stops because the domain's commands diverged, or
         # because recovery selected a dependency cycle no quorum's order
         # can produce, is a safety tripwire firing, whatever Elle concludes
@@ -807,7 +823,7 @@ jobs:
             exit 1
           fi
       - name: Pack the Jepsen store
-        if: always()
+        if: always() && env.CPU_MISS != 'true'
         # Jepsen names each run's directory by its start time, and
         # upload-artifact refuses a path with a colon in it, so the store
         # travels as one archive. Not the provisioned run directory: it
@@ -824,7 +840,7 @@ jobs:
             tar czf "$RUNNER_TEMP/jepsen-store-etcd.tgz" -C etcd-test store
           fi
       - name: Upload the Jepsen store
-        if: always()
+        if: always() && env.CPU_MISS != 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: jepsen-store-${{ env.SCENARIO }}-${{ env.WORKLOAD }}
@@ -834,10 +850,10 @@ jobs:
           retention-days: 14
           if-no-files-found: warn
       - name: Read the nodes' CPU quota again
-        if: always()
+        if: always() && env.CPU_MISS != 'true'
         run: tuplesky/scripts/ci/jepsen_cpu_quota.sh "$RUNNER_TEMP/cluster/nodes" "after the runs" || true
       - name: Take the cluster down
-        if: always()
+        if: always() && env.CPU_MISS != 'true'
         run: jepsen/tuplesky/docker/down.sh --dir "$RUNNER_TEMP/cluster"
 
   etcd-baseline:

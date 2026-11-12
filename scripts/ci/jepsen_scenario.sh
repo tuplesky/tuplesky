@@ -63,7 +63,8 @@
 #                  HEAD), each a number or
 #                  default (or empty) for tokio's one per runner core
 #   IN_VOTER_ENV   NAME=VALUE every TupleSky voter starts with; empty for
-#                  none
+#                  none, or cpu:MODEL[|MODEL...], the job's check of its
+#                  runner's CPU model and no variable
 #   IN_KEY_COUNT   keys in play at once in the append or wr workload,
 #                  TupleSky's and etcd's; empty for the scenario's (the
 #                  harnesses' 3, or 1000 for service)
@@ -370,6 +371,8 @@ done
 
 tuplesky_suffix=""
 voter_env=${IN_VOTER_ENV:-}
+# cpu:MODEL[|MODEL...] is the job's check of its runner, not a variable.
+case $voter_env in cpu:*) voter_env="" ;; esac
 if [ -n "$voter_env" ]; then
   case $voter_env in
     [A-Za-z_]*=*) ;;
