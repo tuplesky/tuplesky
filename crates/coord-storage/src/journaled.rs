@@ -756,6 +756,18 @@ pub struct Replayed {
     pub through: LocalJournalSeq,
     /// How long the replay took.
     pub took: Duration,
+    /// How long the index by command of the intake-keyed rows took to
+    /// build from the rows, before the replay (task-d113). It grows with
+    /// the live intake-keyed rows.
+    pub intake_index: Duration,
+    /// Entries in the intake index.
+    pub intake_entries: usize,
+    /// How long the key index of the retained event rows took to build,
+    /// before the replay (task-d105). It grows with the event rows
+    /// retained.
+    pub key_index: Duration,
+    /// Versions in the key index.
+    pub key_versions: usize,
 }
 
 impl Replayed {
@@ -1357,10 +1369,18 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
         // the rows themselves; a store of another layout is refused here,
         // before anything is replayed into it.
         let snapshot = reader.snapshot()?;
-        gate.install_index(IntakeIndex::build(&snapshot, applied.materialized.get())?);
+        let building = Instant::now();
+        let intake = IntakeIndex::build(&snapshot, applied.materialized.get())?;
+        let intake_entries = intake.len();
+        gate.install_index(intake);
+        let intake_index = building.elapsed();
         // The key index of the retained event rows (task-d105), from the
         // same snapshot, before the replay lowers into it.
-        gate.install_kv_index(crate::kv_index::KvIndex::build(&snapshot)?);
+        let building = Instant::now();
+        let keys = crate::kv_index::KvIndex::build(&snapshot)?;
+        let key_versions = keys.versions();
+        gate.install_kv_index(keys);
+        let key_index = building.elapsed();
         drop(snapshot);
         gate.set_completed(meta.stamp.store_seq());
         let mut state = Domain {
@@ -1389,6 +1409,10 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                 from: applied.materialized,
                 through: applied.materialized,
                 took: Duration::ZERO,
+                intake_index,
+                intake_entries,
+                key_index,
+                key_versions,
             },
             checkpoint: None,
             held_since: None,

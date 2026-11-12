@@ -51,10 +51,16 @@ impl Version {
     }
 }
 
-/// Bytes an entry is charged on top of its key: a version's revision and
-/// ordinal and the map's own share, as the design step sizes it (about
-/// 16 bytes a retained version), not measured.
-pub const VERSION_BYTES: usize = 16;
+/// Bytes a key is charged on top of its own bytes: the map's node share,
+/// the key's and the versions' allocations and their headers. Review
+/// measured 210 bytes for a key of 24 bytes with one version (#245), so
+/// 210 less the key and one [`VERSION_BYTES`].
+pub const KEY_ENTRY_BYTES: usize = 210 - 24 - VERSION_BYTES;
+
+/// Bytes a retained version is charged: its revision and ordinal, and the
+/// spare capacity its vector grows by. Review measured 17 to 21 bytes a
+/// further version (#245); the charge is the top of that.
+pub const VERSION_BYTES: usize = 21;
 
 /// The index by key of the retained event rows.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -113,18 +119,40 @@ impl KvIndex {
     }
 
     /// Apply a commit's changes.
+    ///
+    /// A key's removals are applied together, once a key: compaction
+    /// removes a hot key's oldest versions, and taking them one at a time
+    /// from the front of its vector moved every later version each time,
+    /// quadratic in the removals (review on #245: 1,024 removals from a key
+    /// of 1,000,000 versions took 519 ms under the index's write lock).
     pub fn publish(&mut self, delta: KvDelta) {
+        let mut removed: BTreeMap<(NamespaceId, Vec<u8>), Vec<Version>> = BTreeMap::new();
         for (namespace, key, version) in delta.removed {
-            let slot = (namespace, key);
-            if let Some(versions) = self.keys.get_mut(&slot)
-                && let Ok(at) = versions.binary_search(&version)
-            {
-                versions.remove(at);
-                self.versions -= 1;
-                if versions.is_empty() {
-                    self.key_bytes -= slot.1.len();
-                    self.keys.remove(&slot);
-                }
+            removed.entry((namespace, key)).or_default().push(version);
+        }
+        for (slot, mut gone) in removed {
+            let Some(versions) = self.keys.get_mut(&slot) else {
+                continue;
+            };
+            gone.sort_unstable();
+            gone.dedup();
+            let before = versions.len();
+            // The oldest versions are the usual case: one drain of the
+            // front. Anything else is one pass over the key's versions.
+            let front = versions
+                .iter()
+                .zip(&gone)
+                .take_while(|(have, drop)| have == drop)
+                .count();
+            if front == gone.len() {
+                versions.drain(..front);
+            } else {
+                versions.retain(|v| gone.binary_search(v).is_err());
+            }
+            self.versions -= before - versions.len();
+            if versions.is_empty() {
+                self.key_bytes -= slot.1.len();
+                self.keys.remove(&slot);
             }
         }
         for (namespace, key, version) in delta.added {
@@ -176,10 +204,10 @@ impl KvIndex {
         self.key_bytes
     }
 
-    /// Bytes the index is charged: its keys and [`VERSION_BYTES`] a
-    /// version.
+    /// Bytes the index is charged: its keys' bytes, [`KEY_ENTRY_BYTES`] a
+    /// key and [`VERSION_BYTES`] a version.
     pub fn bytes(&self) -> usize {
-        self.key_bytes + self.versions * VERSION_BYTES
+        self.key_bytes + self.keys.len() * KEY_ENTRY_BYTES + self.versions * VERSION_BYTES
     }
 
     /// Each key of `namespace` in `[lower, upper)` with its newest version
@@ -323,10 +351,14 @@ impl KvDelta {
 
     /// Lay `later` over this delta, as the two commits apply in order.
     pub fn absorb(&mut self, later: KvDelta) {
-        for removed in later.removed {
-            self.added.retain(|a| *a != removed);
-            self.removed.push(removed);
+        // One pass over what this delta added, not one a removal: a
+        // compaction's commit removes many versions at once (#245 review).
+        if !later.removed.is_empty() {
+            let gone: std::collections::BTreeSet<&(NamespaceId, Vec<u8>, Version)> =
+                later.removed.iter().collect();
+            self.added.retain(|a| !gone.contains(a));
         }
+        self.removed.extend(later.removed);
         self.added.extend(later.added);
         if let Some(t) = later.through {
             self.through = Some(self.through.map_or(t, |s| s.max(t)));
@@ -502,5 +534,119 @@ fn entry_of(kind: KvEventKind, entry: Option<coord_state::KvEntry>) -> Chosen {
     match kind {
         KvEventKind::Put => entry,
         KvEventKind::Delete => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn version(n: u64) -> Version {
+        Version {
+            revision: KvRevision::new(n).expect("positive"),
+            ordinal: 0,
+        }
+    }
+
+    fn one_key(namespace: NamespaceId, key: &[u8], versions: impl Iterator<Item = u64>) -> KvDelta {
+        KvDelta {
+            added: versions
+                .map(|n| (namespace, key.to_vec(), version(n)))
+                .collect(),
+            ..KvDelta::default()
+        }
+    }
+
+    /// Compaction removes a hot key's oldest versions in one commit. They
+    /// are taken from the front once, not one at a time: one at a time
+    /// moved every later version for each removal (review on #245: 1,024
+    /// removals from a key of 1,000,000 versions, 519 ms).
+    #[test]
+    fn a_hot_keys_oldest_versions_are_removed_in_one_pass() {
+        let namespace = NamespaceId([7; 16]);
+        let key = b"hot".as_slice();
+        let held = 400_000u64;
+        let mut index = KvIndex::default();
+        index.publish(one_key(namespace, key, 1..=held));
+        assert_eq!(index.versions(), held as usize);
+
+        let removed = KvDelta {
+            removed: (1..=1_024)
+                .map(|n| (namespace, key.to_vec(), version(n)))
+                .collect(),
+            ..KvDelta::default()
+        };
+        let started = std::time::Instant::now();
+        index.publish(removed);
+        let took = started.elapsed();
+        assert_eq!(index.versions(), held as usize - 1_024);
+        let versions = index.versions_of(namespace, key);
+        assert_eq!(versions.first(), Some(&version(1_025)));
+        assert_eq!(versions.last(), Some(&version(held)));
+        // One drain of 400,000 versions is well under a millisecond; one
+        // removal at a time moved about 400 million, seconds unoptimized.
+        assert!(took < std::time::Duration::from_millis(200), "{took:?}");
+    }
+
+    /// Removals that are not the oldest, and one the index never held,
+    /// leave exactly the rest; a key with none left is gone with its bytes.
+    #[test]
+    fn removals_anywhere_in_a_key_leave_exactly_the_rest() {
+        let namespace = NamespaceId([1; 16]);
+        let mut index = KvIndex::default();
+        index.publish(one_key(namespace, b"a", 1..=10));
+        index.publish(one_key(namespace, b"b", 1..=2));
+        index.publish(KvDelta {
+            removed: [3, 5, 5, 9, 42]
+                .into_iter()
+                .map(|n| (namespace, b"a".to_vec(), version(n)))
+                .chain([1, 2].map(|n| (namespace, b"b".to_vec(), version(n))))
+                .collect(),
+            ..KvDelta::default()
+        });
+        let left: Vec<u64> = index
+            .versions_of(namespace, b"a")
+            .iter()
+            .map(|v| v.revision.get())
+            .collect();
+        assert_eq!(left, vec![1, 2, 4, 6, 7, 8, 10]);
+        assert_eq!(index.versions(), 7);
+        assert_eq!(index.keys(), 1);
+        assert_eq!(index.key_bytes(), 1);
+    }
+
+    /// The charge is what review measured (#245): 210 bytes for a key of
+    /// 24 bytes with one version, and the top of 17 to 21 a further one.
+    #[test]
+    fn the_charge_is_what_review_measured() {
+        let namespace = NamespaceId([2; 16]);
+        let key = [b'k'; 24];
+        let mut index = KvIndex::default();
+        index.publish(one_key(namespace, &key, 1..=1));
+        assert_eq!(index.bytes(), 210);
+        index.publish(one_key(namespace, &key, 2..=11));
+        assert_eq!(index.bytes(), 210 + 10 * 21);
+    }
+
+    /// A later commit's removals take back what an earlier one in the
+    /// same delta added, in one pass.
+    #[test]
+    fn absorbing_removals_takes_back_the_versions_added_before() {
+        let namespace = NamespaceId([3; 16]);
+        let mut delta = one_key(namespace, b"k", 1..=5);
+        delta.absorb(KvDelta {
+            removed: [2, 4]
+                .map(|n| (namespace, b"k".to_vec(), version(n)))
+                .to_vec(),
+            ..KvDelta::default()
+        });
+        let mut index = KvIndex::default();
+        index.publish(delta);
+        let left: Vec<u64> = index
+            .versions_of(namespace, b"k")
+            .iter()
+            .map(|v| v.revision.get())
+            .collect();
+        assert_eq!(left, vec![1, 3, 5]);
     }
 }

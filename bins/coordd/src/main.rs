@@ -988,6 +988,7 @@ fn main() -> ExitCode {
     // The store is opened before a listener exists. A process that bound
     // first would accept connections it could not serve, and a caller
     // cannot tell that from one it is merely slow to answer.
+    let booting = std::time::Instant::now();
     let mut opened = match store::open_storage(
         &config,
         store::Intent::Serve,
@@ -1079,6 +1080,7 @@ fn main() -> ExitCode {
     // problem and is the most expensive kind of misconfiguration to
     // find. This is the order that makes `live` mean it.
     let boot = storage.boot;
+    let phases = storage.phases;
     let checkpoints = storage.checkpoints;
     let early_proposal = early_proposal(&storage.active);
     let applier = match coord_storage::Applier::new(
@@ -1102,6 +1104,7 @@ fn main() -> ExitCode {
     let materialized = std::sync::Arc::new(tokio::sync::Notify::new());
     // Where the loop's waits on those two threads are counted.
     let mut waits = None;
+    let building = std::time::Instant::now();
     let backing = if roles.votes() {
         match voter(
             &placed,
@@ -1122,6 +1125,15 @@ fn main() -> ExitCode {
     } else {
         serve::Backing::Serving(Box::new(applier))
     };
+    println!(
+        "{}",
+        boot_line(
+            &phases,
+            replayed.as_ref(),
+            building.elapsed(),
+            booting.elapsed()
+        )
+    );
     // The local route is the voter's to hand over, and it exists only
     // because a voter is running here. A frontend-only process gets
     // `None` and reaches every voter over the wire.
@@ -1870,4 +1882,39 @@ fn now_seconds() -> u64 {
 /// an identity, not a secret, and the full value is in the certificate.
 fn short(bytes: &[u8; 16]) -> String {
     bytes[..4].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The startup report's `boot` line: how long each step before the
+/// runtime starts took, in milliseconds, with the sizes of what the
+/// attach indexed (#245; the lead on #185 asked what grows with history
+/// there). `voter_ms` is building the voter over the attached store;
+/// `total_ms` runs from the journal's open to the voter built.
+fn boot_line(
+    phases: &store::BootPhases,
+    replayed: Option<&coord_storage::Replayed>,
+    voter: std::time::Duration,
+    total: std::time::Duration,
+) -> String {
+    let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+    let (intake, entries, keys, versions, replay) = replayed.map_or((0.0, 0, 0.0, 0, 0.0), |r| {
+        (
+            ms(r.intake_index),
+            r.intake_entries,
+            ms(r.key_index),
+            r.key_versions,
+            ms(r.took),
+        )
+    });
+    format!(
+        "boot journal_open_ms={:.1} projection_open_ms={:.1} baseline_ms={:.1} guard_scan_ms={:.1} \
+attach_ms={:.1} intake_index_ms={intake:.1} intake_entries={entries} key_index_ms={keys:.1} \
+key_versions={versions} replay_ms={replay:.1} voter_ms={:.1} total_ms={:.1}",
+        ms(phases.journal_open),
+        ms(phases.projection_open),
+        ms(phases.baseline),
+        ms(phases.guard_scan),
+        ms(phases.attach),
+        ms(voter),
+        ms(total),
+    )
 }

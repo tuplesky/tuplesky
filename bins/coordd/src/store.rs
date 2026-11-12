@@ -263,6 +263,28 @@ pub struct Storage {
     /// them at start (task-60): each one this build supports, or the
     /// store was refused.
     pub active: std::collections::BTreeSet<coord_types::formats::Feature>,
+    /// How long opening and attaching took, step by step.
+    pub phases: BootPhases,
+}
+
+/// How long each step of opening the storage took before the runtime
+/// starts, for the startup report's `boot` line (#245; the lead on #185
+/// asked what grows with history there). The index builds and the replay
+/// inside the attach are on the store's [`coord_storage::Replayed`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BootPhases {
+    /// Opening the journal: raft-engine reads its files, and every
+    /// retained record is decoded and checked.
+    pub journal_open: std::time::Duration,
+    /// Opening the projection's generation.
+    pub projection_open: std::time::Duration,
+    /// Reading the recovery baseline from the journal's retained records
+    /// and loading the image it names.
+    pub baseline: std::time::Duration,
+    /// The activation guard's scan of what the attach will replay.
+    pub guard_scan: std::time::Duration,
+    /// The attach in all: the index builds, the replay and the checks.
+    pub attach: std::time::Duration,
 }
 
 /// The journal and the projection, open and not yet attached.
@@ -290,6 +312,8 @@ pub struct Opened {
     /// How the projection's generation is opened, for a reinstall
     /// (task-j06).
     options: OpenOptions,
+    /// The open's steps, timed so far.
+    phases: BootPhases,
 }
 
 /// An authorized replacement this start comes back on (task-58), found
@@ -373,6 +397,7 @@ pub fn open_storage_with(
         },
     };
 
+    let mut phases = BootPhases::default();
     let (generation, pending, journal) = match intent {
         Intent::Initialize => {
             // Refused before anything is written if the journal is already
@@ -433,10 +458,14 @@ pub fn open_storage_with(
             (generation, None, journal)
         }
         Intent::Serve => {
+            let opening = std::time::Instant::now();
             let journal = RaftEngineJournal::open_existing(&journal_root, identity, &options)
                 .map_err(journal_error)?;
+            phases.journal_open = opening.elapsed();
+            let opening = std::time::Instant::now();
             let (mut generation, pending) =
                 open(config, intent, cluster, domain_id, replica, incarnation)?;
+            phases.projection_open = opening.elapsed();
             before_attach(generation.engine())?;
             (generation, pending, journal)
         }
@@ -515,6 +544,7 @@ pub fn open_storage_with(
         options: OpenOptions {
             cache_bytes: config.state.cache_bytes,
         },
+        phases,
     })
 }
 
@@ -547,6 +577,7 @@ impl Opened {
             checkpoint_root,
             adoption,
             options,
+            mut phases,
         } = self;
         let mut generation = generation;
         let active;
@@ -591,6 +622,7 @@ impl Opened {
         // baseline is a fact of the stream, not of the projection, and an
         // image that no longer loads has to stop the node here rather than
         // when a recovery needs it.
+        let reading = std::time::Instant::now();
         let checkpoints =
             coord_checkpoint::LocalCheckpointStore::open(&checkpoint_root).map_err(|e| {
                 StoreError::Refused {
@@ -612,6 +644,7 @@ impl Opened {
             None => None,
         };
         let represented = baseline.map_or(LocalJournalSeq::ZERO, |pointer| pointer.represented);
+        phases.baseline = reading.elapsed();
         let mut generation = if store.projection_profile() == ProjectionProfile::Strict {
             generation
         } else {
@@ -625,6 +658,7 @@ impl Opened {
             )?
         };
         let directory = generation.directory().to_path_buf();
+        let scanning = std::time::Instant::now();
         // The rollback guard over what the attach is about to replay (Codex
         // on #98; #212 has the same). An activation is a journaled
         // transition like any other, and the replay applies its rows
@@ -669,6 +703,7 @@ impl Opened {
             }
         }
         let (engine, _lock, _manifest) = generation.into_parts();
+        phases.guard_scan = scanning.elapsed();
 
         // Shard 0 for the single-domain preview; task-j07 is where a node
         // spreads domains over a shard set.
@@ -677,12 +712,14 @@ impl Opened {
         // would count the whole retained stream as unreclaimed, and the
         // housekeeping that watches that number would publish a full image
         // on every restart of a node that had once crossed its threshold.
+        let attaching = std::time::Instant::now();
         store
             .attach_with_baseline(domain_id, shard, engine, represented)
             .map_err(|e| StoreError::Refused {
                 root: show(&directory),
                 reason: format!("the projection could not be attached to the journal: {e:?}"),
             })?;
+        phases.attach = attaching.elapsed();
         // The guard again, over what the attach's replay applied: the
         // features the store has active now, which the scan above has
         // admitted record by record. This is the set the node runs with,
@@ -728,6 +765,7 @@ impl Opened {
             generation: directory,
             boot,
             active,
+            phases,
         })
     }
 }
