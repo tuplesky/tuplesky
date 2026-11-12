@@ -2019,13 +2019,15 @@ So task-d103 stops writing the proposal row and removes that comment. That is on
 | The floor's rewrite, at `K = 16` (task-d104) | about 9 |
 
 - **task-d104 batches the retry deletes; it doesn't remove them.** K deletes every K commands is still one a command, so its step is under one row.
-- **Nine rows is about 0.27 to 0.36 ms an operation,** at −0.03 to −0.04 ms a row, against a parity budget of 0.18 for the whole materializer block. The three steps together stop well short of it.
+- **The price is a page, not a row** (review on #185, 6812429771, from task-d86's profile). A row that lands on a leaf no other row of its commit touches costs a fresh 4 KiB page: copied on write, rebuilt, checksummed at the working commit and written at the durable one. A row rewritten on a page its commit has already copied costs a few µs. At the sweep's fit, about 9.2 µs a page a voter, a page a command at every voter is about −0.036 to −0.040 ms an operation on the EPYC 9V74.
+  - **So the table counts rows, but the cost follows pages.** A follower writes about 10.8 rows and 9.4 fresh pages a command today. The meta rows and the retry deletes mostly land on pages already copied.
+  - **The three steps together stop well short of the parity budget** for the whole materializer block (0.18 then, restated on the 9V74 in task-d72's record): each takes at most one page a command, and task-d104's first part takes almost none at the bar (its own step).
 - **What's left to cut, each raised on its own step:**
   - the current row, once task-d105's index exists (task-d105's step);
   - the retry delete, with a window that overwrites in place (task-d104's step);
   - the meta row once a commit rather than once a command, with the commit cadence (task-d86, task-d101's option 1).
 
-  With those, a follower writes about five rows a command: payload, dependency, executed, event and retry.
+  With those, a follower writes about five rows a command: payload, dependency, executed, event and retry. Three of them, the payload, dependency and executed rows, are keyed by the command's digest and pay a page each. Keying them by order, so that a commit's rows share leaves, is task-d113's step (#233), the largest single cut on the materializers.
 
 **The retry window retired in batches (task-d104).** In steady state a command writes four retry rows at every voter:
 - its retained result (`RetryV1`) and its executed row (`ExecutedV1`), both put;
@@ -2043,7 +2045,10 @@ A client acknowledges on every request (`ack_through`), so `retirement()` (`retr
 - **An acknowledged sequence still retained answers with its result,** not `Retired`. Both are correct answers to a retry of a request whose result the client already holds. A client's retry of its own acknowledged sequence is outside its contract, and nothing compares the two answers.
 - **The window's bound grows by `K` retained results a client,** at most. Under task-d26's resource contract, the session's retained bytes are bounded by `width + K` results, not `width`.
 
-**What it moves.** The floor row is written once every `K` commands a client instead of every command: about −(1 − 1/K) rows a command at every voter, about −0.03 to −0.04 ms an operation at `K = 16`. The `K` deletes land together on consecutive keys of one client, which redb writes as one region of its tree. Whether that is cheaper than `K` scattered deletes is read in the pair, not assumed. `ExecutedV1` stays: it is the index by command that catch-up, campaigns and boot read, and `RetryV1` is keyed by the retry key.
+**What it moves.** The floor row is written once every `K` commands a client instead of every command: about −(1 − 1/K) rows a command at every voter. That was first priced at about −0.03 to −0.04 ms an operation at `K = 16`, a row at a page's price, and at the bar it doesn't hold (review on #185, 6812429771).
+- **At the materializer, task-d86's profile reads only the retry deletes,** 2.1 to 2.3% of the thread, about −0.009 ms an operation at 120 callers on the EPYC 9V74. A delete lands on a leaf the command's own retry row has already copied.
+- **It reads nothing for the floor's rewrite.** With the bench's 30 to 240 clients the floor rows sit on a few leaves that every commit copies anyway. A domain with thousands of clients would pay a page for each rewrite, and this step would then save about a page a command. That isn't measured.
+- **So at the bar this step is sized at about −0.009 at the materializer.** Its share of the domain loop (`retirement()` and the reads it makes) is read on the CPU clock before it is built, and the step is kept or dropped on that reading with the materializer's. The `K` deletes land together on consecutive keys of one client, which redb writes as one region of its tree. Whether that is cheaper than `K` scattered deletes is read in the pair, not assumed. `ExecutedV1` stays: it is the index by command that catch-up, campaigns and boot read, and `RetryV1` is keyed by the retry key.
 
 **How the rule is introduced** (#207 review). The retirement rule is part of deterministic execution: `RetryV1` and `RetryFloorV1` are in the common hash. Two builds with different rules reach different common states at the same position. Their floor roots would disagree (task-d27), and they would answer the same retry differently at different voters. So the rule is a change to the replicated state, and a domain changes it at one position on every voter:
 - **It is a replicated feature, `Feature::BatchedRetirement`, activated through task-d99's path.** It is gated like `EarlyProposal`: a prepare marker in each voter's `ActiveFeaturesV1`, then activation at a position. Below the activation position every voter retires one sequence a command, as today; from it, every voter retires in batches. Both rules stay in the code.
@@ -2068,7 +2073,7 @@ What it has to answer before its code:
 - **Resolve and `records_for`** read a slot and compare its sequence; nothing else reads `RetryV1` by range.
 - **It changes `RetryV1`'s layout,** a collection in the common hash. So, unlike this step's rule, it takes task-d105's route: one layout a domain, with a store or image of the other refused with the reason.
 
-**Its size, with this step:** the retry state falls to one put and `1/K` of a floor row a command, about −0.06 to −0.08 ms an operation together, against this step's −0.03 to −0.04 alone. It composes with this step and doesn't replace it. It is task-d104's second part, sized after the first part's pair, before its code.
+**Its size, with this step:** the retry state falls to one put and `1/K` of a floor row a command. That was priced at about −0.06 to −0.08 ms an operation together, counting each row at a page, and doesn't hold at the bar either: the deletes it takes are the profile's 2.1 to 2.3%, rewritten on a page already copied. It composes with this step and doesn't replace it. It is task-d104's second part, sized from the first part's pair and its loop share on the CPU clock, before its code.
 
 **One version row a revision (task-d105).** A put writes three rows for its key: the current entry (`KvCurrentV1`), a history row (`KvHistoryV1`, keyed by namespace, key and revision, holding the entry) and an event row (`EventsV1`, keyed by revision and ordinal, holding kind, namespace, key, entry and the previous entry). The event row holds everything the history row holds. They differ in their keys and their retention:
 - reads at a past revision (`scan_history`) need the newest version of a key at or below a revision, in key order;
