@@ -591,12 +591,25 @@ fn under_load(mut store: Store, seed: u64, steps: usize) {
         "after the last restart"
     );
     // One row a command: a rewrite stays in place, and a released
-    // command's row is gone before its new one comes.
+    // command's row is gone before its new one comes. An executed
+    // command's moved to `decided_v1` at its execution (task-d113, step 2,
+    // the bound), so the intake part holds only the others.
     let dependency_rows = intake_rows(&store.raw())
         .into_iter()
         .filter(|(k, _)| k.get(8) == Some(&DEPENDENCY_TAG))
         .count();
-    assert_eq!(dependency_rows, model.deps.len());
+    let executed_records = model
+        .deps
+        .keys()
+        .filter(|c| model.executed.contains_key(c))
+        .count();
+    assert_eq!(dependency_rows, model.deps.len() - executed_records);
+    let decided = rows(&store.raw().snapshot().unwrap(), Collection::DecidedV1).len();
+    assert_eq!(decided, executed_records, "each executed record moved once");
+    assert!(
+        executed_records > 0,
+        "the run executed commands with records"
+    );
     store.assert_index_is_the_rows("after the run");
     assert!(seen.len() > 3, "the run held rows");
 }

@@ -437,6 +437,27 @@ pub fn position_of(key: &[u8]) -> Result<ExecutionPosition, EngineError> {
         .map_err(|_| EngineError::new(ErrorClass::Corrupt, "a position key of the wrong length"))
 }
 
+/// A `decided_v1` value (task-d113, step 2): the configuration epoch the
+/// record was decided in, big-endian, then the dependency row's bytes as
+/// `protocol_v1` held them. Its key is the command's execution position.
+pub fn decided_value(epoch: [u8; 8], record: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8 + record.len());
+    out.extend_from_slice(&epoch);
+    out.extend_from_slice(record);
+    out
+}
+
+/// The epoch and the dependency row's bytes a `decided_v1` value holds.
+pub fn split_decided(bytes: &[u8]) -> Result<([u8; 8], &[u8]), EngineError> {
+    match bytes.split_first_chunk::<8>() {
+        Some((epoch, record)) => Ok((*epoch, record)),
+        None => Err(EngineError::new(
+            ErrorClass::Corrupt,
+            "a decided record shorter than its epoch",
+        )),
+    }
+}
+
 /// `session_v1` key: the session identity bytes.
 pub fn session_key(session: &SessionId) -> Vec<u8> {
     session.as_bytes().to_vec()

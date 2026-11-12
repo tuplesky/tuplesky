@@ -620,25 +620,30 @@ pub fn trim_backpressure<V: OrderedRead>(
 ) -> Result<TrimBackpressure, TrimError> {
     limits.validate()?;
     let mut rows = 0u32;
-    let mut resume: Option<Vec<u8>> = None;
-    while rows < limits.max_protocol_rows {
-        let page = view.scan_page(
-            Collection::ProtocolV1.id(),
-            &ScanRequest {
-                lower: Bound::Unbounded,
-                upper: Bound::Unbounded,
-                direction: Direction::Forward,
-                resume_after: resume.clone(),
-                max_rows: limits.page_rows(),
-                max_bytes: limits.page_bytes(),
-            },
-        )?;
-        rows = rows
-            .saturating_add(page.rows.len() as u32)
-            .min(limits.max_protocol_rows);
-        match page.rows.last() {
-            Some(last) if !page.exhausted => resume = Some(last.key.clone()),
-            _ => break,
+    // An executed command's decided record, moved at its execution to
+    // `decided_v1` (task-d113, step 2), is the row its dependency row was:
+    // what a missing voter's acknowledgement keeps from being trimmed.
+    for collection in [Collection::ProtocolV1, Collection::DecidedV1] {
+        let mut resume: Option<Vec<u8>> = None;
+        while rows < limits.max_protocol_rows {
+            let page = view.scan_page(
+                collection.id(),
+                &ScanRequest {
+                    lower: Bound::Unbounded,
+                    upper: Bound::Unbounded,
+                    direction: Direction::Forward,
+                    resume_after: resume.clone(),
+                    max_rows: limits.page_rows(),
+                    max_bytes: limits.page_bytes(),
+                },
+            )?;
+            rows = rows
+                .saturating_add(page.rows.len() as u32)
+                .min(limits.max_protocol_rows);
+            match page.rows.last() {
+                Some(last) if !page.exhausted => resume = Some(last.key.clone()),
+                _ => break,
+            }
         }
     }
     let mut missing: Vec<ReplicaId> = missing.to_vec();
@@ -655,7 +660,8 @@ pub fn trim_backpressure<V: OrderedRead>(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TrimPlan {
     /// Deletions to apply as one durable batch. Every entry targets
-    /// `protocol_v1` and carries no value.
+    /// `protocol_v1`, or `decided_v1` for a decided record moved at its
+    /// command's execution (task-d113, step 2), and carries no value.
     pub updates: Vec<StoreUpdate>,
     /// Protocol rows examined.
     pub examined: u32,
@@ -700,14 +706,20 @@ pub fn plan_trim<V: OrderedRead>(
     check_floor_durable(view, floor)?;
     let boundary = floor.boundary.execution_position;
     // What executed at or below the boundary, read once: what decides each
-    // row below.
-    let executed = executed_below(view, boundary)?;
+    // row below, and which command a decided record by position is.
+    let executed_rows = coord_storage::protocol::executed_through(
+        view,
+        boundary,
+        coord_storage::views::ViewBudget::default(),
+    )?;
+    let executed: BTreeSet<CommandId> = executed_rows.iter().map(|(_, c)| *c).collect();
+    let at_position: BTreeMap<ExecutionPosition, CommandId> = executed_rows.into_iter().collect();
     // Every epoch at or below the floor's, through its Sync rows; epochs
     // above the floor are outside the acknowledged history entirely.
     let mut upper = floor.configuration.to_be_bytes().to_vec();
     upper.push(SYNC_TAG + 1);
 
-    let mut candidates: Vec<(Vec<u8>, CommandId)> = Vec::new();
+    let mut candidates: Vec<(Collection, Vec<u8>, CommandId)> = Vec::new();
     let mut pins: BTreeSet<CommandId> = BTreeSet::new();
     // Dependencies of every command seen, so a pin can be closed over
     // them. Pinning only the direct dependencies of retained commands
@@ -748,9 +760,53 @@ pub fn plan_trim<V: OrderedRead>(
                     // though it is a candidate: a command pinned later may
                     // depend on it, and closure has to continue through it.
                     deps_of.entry(command).or_insert(deps);
-                    candidates.push((row.key.clone(), command));
+                    candidates.push((Collection::ProtocolV1, row.key.clone(), command));
                 }
             }
+        }
+        match page.rows.last() {
+            Some(last) if !page.exhausted => resume = Some(last.key.clone()),
+            _ => break,
+        }
+    }
+    // An executed command's decided record moved at its execution to
+    // `decided_v1`, under its position (task-d113, step 2, the bound): those
+    // at or below the boundary, of an epoch at or below the floor's, are
+    // eligible as their dependency rows were, and the same pins hold them.
+    let floor_epoch = floor.configuration.to_be_bytes();
+    let mut resume: Option<Vec<u8>> = None;
+    loop {
+        let page = view.scan_page(
+            Collection::DecidedV1.id(),
+            &ScanRequest {
+                lower: Bound::Unbounded,
+                upper: Bound::Included(coord_storage::codecs::position_key(boundary).to_vec()),
+                direction: Direction::Forward,
+                resume_after: resume.clone(),
+                max_rows: limits.page_rows(),
+                max_bytes: limits.page_bytes(),
+            },
+        )?;
+        for row in &page.rows {
+            let position = coord_storage::codecs::position_of(&row.key)?;
+            let (epoch, record) = coord_storage::codecs::split_decided(&row.value)?;
+            if epoch > floor_epoch {
+                // Outside the acknowledged history, as a later epoch's
+                // rows are outside the survey above.
+                continue;
+            }
+            examined += 1;
+            if examined > limits.max_examined_rows {
+                return Err(TrimError::ExaminationBudget {
+                    limit: limits.max_examined_rows,
+                });
+            }
+            let command = *at_position
+                .get(&position)
+                .ok_or_else(|| corrupt("a decided record at a position with no executed row"))?;
+            let deps = decode_dependency(record)?.deps;
+            deps_of.entry(command).or_insert(deps);
+            candidates.push((Collection::DecidedV1, row.key.clone(), command));
         }
         match page.rows.last() {
             Some(last) if !page.exhausted => resume = Some(last.key.clone()),
@@ -775,7 +831,7 @@ pub fn plan_trim<V: OrderedRead>(
     let mut updates = Vec::new();
     let mut eligible = 0u32;
     let mut pinned = 0u32;
-    for (key, command) in candidates {
+    for (collection, key, command) in candidates {
         if pins.contains(&command) {
             pinned += 1;
             retained += 1;
@@ -786,7 +842,7 @@ pub fn plan_trim<V: OrderedRead>(
             continue;
         }
         updates.push(StoreUpdate {
-            collection: Collection::ProtocolV1.id(),
+            collection: collection.id(),
             key,
             value: None,
         });

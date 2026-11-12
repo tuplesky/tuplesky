@@ -58,6 +58,16 @@
 //!   nothing, since its payload has moved;
 //! * rule (b): an executed row with no pending payload to move is refused,
 //!   so `payload_v1` has no hole at a position.
+//!
+//! **The bound** (the lead on #237, #240's proposal): the same transaction
+//! deletes the command's dependency rows, and the leader's proposal rows,
+//! and writes the decided record, the dependency row of the latest epoch
+//! that holds one, to the node-private `decided_v1` under the position,
+//! with that epoch ([`crate::codecs::decided_value`]). The intake part
+//! then holds only rows of commands not yet executed, whatever the
+//! history. A later dependency row put or deleted by command for an
+//! executed command follows its record to `decided_v1`, and a later
+//! proposal row is dropped: the proposal is settled.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
@@ -71,8 +81,8 @@ use coord_types::identity::Digest32;
 use coord_types::ids::ExecutionPosition;
 
 use crate::codecs::{
-    ExecutionRecordV1, decode_executed, decode_execution, encode_execution, position_key,
-    position_of,
+    ExecutionRecordV1, decided_value, decode_executed, decode_execution, encode_execution,
+    position_key, position_of, split_decided,
 };
 
 /// Length of a by-command key: epoch, tag, command.
@@ -284,6 +294,12 @@ type Slot = (u64, u64, u32);
 /// review measured on #237 (39 to 46): what the metrics line multiplies
 /// the entries by. The design step had inferred 24 to 32.
 pub const ENTRY_BYTES: u64 = 46;
+
+/// The bytes an executed part's entry takes, at most: the 16-byte pair and
+/// its share of the ordered set's nodes. Inferred, as the design step's
+/// 16 to 24 was, and not measured: the metrics line multiplies the
+/// executed entries by it.
+pub const EXECUTED_ENTRY_BYTES: u64 = 24;
 
 /// The index by command of a projection's intake-keyed rows, in memory
 /// (design Section 17.1, "1. The index by command", its intake part).
@@ -700,6 +716,134 @@ impl<'a> Assigner<'a> {
         Ok(None)
     }
 
+    /// The epochs the index holds rows of `tag` in, this assignment's own
+    /// additions included, oldest first.
+    fn epochs(&self, tag: u8) -> BTreeSet<u64> {
+        let mut out: BTreeSet<u64> = self
+            .base
+            .regions
+            .keys()
+            .filter(|(_, t)| *t == tag)
+            .map(|(e, _)| *e)
+            .collect();
+        out.extend(
+            self.delta
+                .added
+                .iter()
+                .filter(|(_, t, _, _)| *t == tag)
+                .map(|(e, _, _, _)| *e),
+        );
+        out
+    }
+
+    /// `command`'s rows of `tag` in every epoch, oldest epoch first: the
+    /// epoch, the intake order and the row's bytes.
+    #[allow(clippy::type_complexity)]
+    fn rows_of(
+        &self,
+        tag: u8,
+        command: &CommandId,
+        read: &mut impl FnMut(CollectionId, &[u8]) -> Result<Option<Vec<u8>>, EngineError>,
+    ) -> Result<Vec<([u8; 8], IntakeOrder, Vec<u8>)>, EngineError> {
+        let mut out = Vec::new();
+        for epoch in self.epochs(tag) {
+            let epoch = epoch.to_be_bytes();
+            for order in self.live(epoch, tag, command) {
+                if let Some(value) = read(
+                    Collection::ProtocolV1.id(),
+                    &intake_key(epoch, tag, order, command),
+                )? {
+                    out.push((epoch, order, value));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// At `command`'s execution at `position` (the bound): delete its
+    /// dependency and proposal rows, and write the latest epoch's
+    /// dependency row to `decided_v1` under the position.
+    fn move_decided(
+        &mut self,
+        command: &CommandId,
+        position: ExecutionPosition,
+        read: &mut impl FnMut(CollectionId, &[u8]) -> Result<Option<Vec<u8>>, EngineError>,
+    ) -> Result<Vec<StoreUpdate>, EngineError> {
+        let protocol = Collection::ProtocolV1.id();
+        let mut out = Vec::new();
+        let mut decided = None;
+        for (epoch, order, value) in self.rows_of(DEPENDENCY_TAG, command, read)? {
+            self.delta
+                .remove(entry(epoch, DEPENDENCY_TAG, order, command));
+            out.push(StoreUpdate {
+                collection: protocol,
+                key: intake_key(epoch, DEPENDENCY_TAG, order, command),
+                value: None,
+            });
+            decided = Some(decided_value(epoch, &value));
+        }
+        for (epoch, order, _) in self.rows_of(PROPOSAL_TAG, command, read)? {
+            self.delta
+                .remove(entry(epoch, PROPOSAL_TAG, order, command));
+            out.push(StoreUpdate {
+                collection: protocol,
+                key: intake_key(epoch, PROPOSAL_TAG, order, command),
+                value: None,
+            });
+        }
+        if let Some(value) = decided {
+            out.push(StoreUpdate {
+                collection: Collection::DecidedV1.id(),
+                key: position_key(position).to_vec(),
+                value: Some(value),
+            });
+        }
+        Ok(out)
+    }
+
+    /// A by-command update of a dependency or proposal row of `command`
+    /// with no row of its own here: if the command has executed, its rows
+    /// moved at execution. A dependency row follows its record to
+    /// `decided_v1`, unless the record there is of a later epoch, and is
+    /// deleted there only in its own epoch. A proposal row writes nothing.
+    fn after_execution(
+        &self,
+        epoch: [u8; 8],
+        tag: u8,
+        command: &CommandId,
+        value: Option<&[u8]>,
+        read: &mut impl FnMut(CollectionId, &[u8]) -> Result<Option<Vec<u8>>, EngineError>,
+    ) -> Result<Option<Assigned>, EngineError> {
+        let Some(position) = self.executed_at(command, read)? else {
+            return Ok(None);
+        };
+        if tag != DEPENDENCY_TAG {
+            return Ok(Some(Assigned::Skip));
+        }
+        let decided = Collection::DecidedV1.id();
+        let key = position_key(position).to_vec();
+        let held = match read(decided, &key)? {
+            Some(bytes) => Some(u64::from_be_bytes(split_decided(&bytes)?.0)),
+            None => None,
+        };
+        let this = u64::from_be_bytes(epoch);
+        Ok(Some(match value {
+            Some(value) if held.is_none_or(|held| held <= this) => {
+                Assigned::Writes(vec![StoreUpdate {
+                    collection: decided,
+                    key,
+                    value: Some(decided_value(epoch, value)),
+                }])
+            }
+            None if held == Some(this) => Assigned::Writes(vec![StoreUpdate {
+                collection: decided,
+                key,
+                value: None,
+            }]),
+            _ => Assigned::Skip,
+        }))
+    }
+
     /// Assign `update`, the `ordinal`th of the record at `seq`. `read`
     /// reads a row at the state the record's earlier updates have left.
     pub fn assign(
@@ -760,7 +904,12 @@ impl<'a> Assigner<'a> {
                     (Some(_), Some(order)) => {
                         Ok(Assigned::Key(intake_key(epoch, tag, order, &command)))
                     }
-                    (Some(_), None) => {
+                    (Some(value), None) => {
+                        if let Some(moved) =
+                            self.after_execution(epoch, tag, &command, Some(value), &mut read)?
+                        {
+                            return Ok(moved);
+                        }
                         let order = IntakeOrder { seq, ordinal };
                         self.delta.add(entry(epoch, tag, order, &command));
                         Ok(Assigned::Key(intake_key(epoch, tag, order, &command)))
@@ -769,7 +918,9 @@ impl<'a> Assigner<'a> {
                         self.delta.remove(entry(epoch, tag, order, &command));
                         Ok(Assigned::Key(intake_key(epoch, tag, order, &command)))
                     }
-                    (None, None) => Ok(Assigned::Skip),
+                    (None, None) => Ok(self
+                        .after_execution(epoch, tag, &command, None, &mut read)?
+                        .unwrap_or(Assigned::Skip)),
                 }
             }
         }
@@ -827,8 +978,9 @@ impl<'a> Assigner<'a> {
 
     /// An executed row named by command (step 2): written to `execution_v1`
     /// under its position, with the command's pending payload moved to
-    /// `payload_v1` under the same position. With no pending payload to
-    /// move, it is refused (rule (b)).
+    /// `payload_v1` under the same position, and its decided record moved
+    /// to `decided_v1` (the bound). With no pending payload to move, it is
+    /// refused (rule (b)).
     fn assign_executed(
         &mut self,
         update: &StoreUpdate,
@@ -855,6 +1007,11 @@ impl<'a> Assigner<'a> {
                 },
                 StoreUpdate {
                     collection: payloads,
+                    key: key.clone(),
+                    value: None,
+                },
+                StoreUpdate {
+                    collection: Collection::DecidedV1.id(),
                     key,
                     value: None,
                 },
@@ -885,7 +1042,7 @@ impl<'a> Assigner<'a> {
         let (epoch, tag) = PENDING_REGION;
         self.delta.remove(entry(epoch, tag, order, &command));
         self.delta.execute((prefix(&command), position.get()));
-        Ok(Assigned::Writes(vec![
+        let mut writes = vec![
             row,
             StoreUpdate {
                 collection: Collection::PendingPayloadV1.id(),
@@ -897,7 +1054,9 @@ impl<'a> Assigner<'a> {
                 key,
                 value: Some(payload),
             },
-        ]))
+        ];
+        writes.extend(self.move_decided(&command, position, read)?);
+        Ok(Assigned::Writes(writes))
     }
 }
 
@@ -1191,5 +1350,166 @@ mod tests {
             rows.assign(&mut assigner, 4, 1, gone).unwrap(),
             Assigned::Skip
         );
+    }
+
+    fn protocol_row(tag: u8, epoch: u64, command: &CommandId, value: Option<u8>) -> StoreUpdate {
+        let epoch = coord_types::ids::ConfigurationEpoch::new(epoch).unwrap();
+        StoreUpdate {
+            collection: Collection::ProtocolV1.id(),
+            key: if tag == DEPENDENCY_TAG {
+                coord_consensus::rows::dependency_key(epoch, command)
+            } else {
+                coord_consensus::rows::proposal_key(epoch, command)
+            },
+            value: value.map(|v| vec![v]),
+        }
+    }
+
+    /// The bound: an execution deletes the command's dependency rows, in
+    /// every epoch, and its proposal rows, and writes the latest epoch's
+    /// record to `decided_v1` under the position, with that epoch. The
+    /// intake part keeps no entry of the command. A later dependency row
+    /// follows its record there, and a later proposal row writes nothing.
+    #[test]
+    fn an_execution_moves_the_decided_record_to_its_position() {
+        let c = cmd(6);
+        let other = cmd(7);
+        // Its rows, brought by earlier commits and published: the index the
+        // execution's assignment reads them through is the base.
+        let mut base = IntakeIndex::default();
+        let mut rows = Rows::default();
+        {
+            let mut assigner = Assigner::new(&base);
+            rows.assign(&mut assigner, 1, 0, payload(&c, Some(1)))
+                .unwrap();
+            rows.assign(
+                &mut assigner,
+                1,
+                1,
+                protocol_row(DEPENDENCY_TAG, 1, &c, Some(10)),
+            )
+            .unwrap();
+            rows.assign(
+                &mut assigner,
+                1,
+                2,
+                protocol_row(PROPOSAL_TAG, 1, &c, Some(20)),
+            )
+            .unwrap();
+            rows.assign(
+                &mut assigner,
+                2,
+                0,
+                protocol_row(DEPENDENCY_TAG, 2, &c, Some(11)),
+            )
+            .unwrap();
+            rows.assign(
+                &mut assigner,
+                2,
+                1,
+                protocol_row(DEPENDENCY_TAG, 2, &other, Some(12)),
+            )
+            .unwrap();
+            let delta = assigner.into_delta();
+            base.publish(delta, 2);
+        }
+        assert_eq!(base.len(), 5, "{base:?}");
+        assert_eq!(rows.of(Collection::ProtocolV1), 4);
+
+        let mut assigner = Assigner::new(&base);
+        rows.assign(&mut assigner, 3, 0, executed(&c, 9)).unwrap();
+        let at = position_key(ExecutionPosition::new(9).unwrap());
+        assert_eq!(
+            rows.of(Collection::ProtocolV1),
+            1,
+            "only the other command's row is left"
+        );
+        assert_eq!(
+            rows.get(Collection::DecidedV1.id(), &at),
+            Some(decided_value(2u64.to_be_bytes(), &[11])),
+            "the latest epoch's record, with its epoch"
+        );
+        assert_eq!(rows.of(Collection::DecidedV1), 1);
+
+        // A rewrite of the record by command, in its epoch, follows it.
+        assert!(matches!(
+            rows.assign(
+                &mut assigner,
+                4,
+                0,
+                protocol_row(DEPENDENCY_TAG, 2, &c, Some(13))
+            )
+            .unwrap(),
+            Assigned::Writes(_)
+        ));
+        assert_eq!(
+            rows.get(Collection::DecidedV1.id(), &at),
+            Some(decided_value(2u64.to_be_bytes(), &[13]))
+        );
+        // An earlier epoch's does not replace it, nor delete it.
+        for value in [Some(14), None] {
+            assert_eq!(
+                rows.assign(
+                    &mut assigner,
+                    4,
+                    1,
+                    protocol_row(DEPENDENCY_TAG, 1, &c, value)
+                )
+                .unwrap(),
+                Assigned::Skip
+            );
+        }
+        // A proposal row of a settled proposal writes nothing.
+        assert_eq!(
+            rows.assign(
+                &mut assigner,
+                4,
+                2,
+                protocol_row(PROPOSAL_TAG, 2, &c, Some(21))
+            )
+            .unwrap(),
+            Assigned::Skip
+        );
+        assert_eq!(rows.of(Collection::ProtocolV1), 1);
+
+        let delta = assigner.into_delta();
+        base.publish(delta, 4);
+        assert_eq!(
+            base.len(),
+            1,
+            "the intake part holds only the other command"
+        );
+        assert_eq!(base.executed_len(), 1);
+
+        // A delete in its epoch takes it; the executed row's delete would too.
+        let mut assigner = Assigner::new(&base);
+        rows.assign(
+            &mut assigner,
+            5,
+            0,
+            protocol_row(DEPENDENCY_TAG, 2, &c, None),
+        )
+        .unwrap();
+        assert_eq!(rows.of(Collection::DecidedV1), 0);
+        rows.assign(
+            &mut assigner,
+            5,
+            1,
+            protocol_row(DEPENDENCY_TAG, 2, &c, Some(15)),
+        )
+        .unwrap();
+        assert_eq!(rows.of(Collection::DecidedV1), 1);
+        rows.assign(
+            &mut assigner,
+            6,
+            0,
+            StoreUpdate {
+                value: None,
+                ..executed(&c, 9)
+            },
+        )
+        .unwrap();
+        assert_eq!(rows.of(Collection::DecidedV1), 0);
+        assert_eq!(rows.of(Collection::ExecutionV1), 0);
     }
 }

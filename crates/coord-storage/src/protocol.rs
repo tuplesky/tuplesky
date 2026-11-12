@@ -18,7 +18,7 @@ use coord_types::logical_v1::LogicalRequest;
 use coord_types::{CommandId, RetryKey};
 
 use crate::codecs::{self, ExecutedRecordV1, ExecutionRecordV1, position_key};
-use crate::intake::{ProtocolKey, intake_key};
+use crate::intake::ProtocolKey;
 use crate::view::GatedView;
 use crate::views::ViewBudget;
 
@@ -221,19 +221,14 @@ pub fn read_protocol<V: OrderedRead>(
             _ => break,
         }
     }
-    // In command order, as the rows were when they were keyed by command,
-    // and one row a command: a rewrite stays in place under its intake key,
-    // so a second row of a command is a broken lowering.
-    records.sort_unstable_by_key(|(command, _)| *command);
-    if records.windows(2).any(|w| w[0].0 == w[1].0) {
-        return Err(corrupt("two dependency rows of one command in an epoch"));
-    }
     // Every executed row, in the order executed (task-d113, step 2: keyed
-    // by position, so no sort). The commands with a dependency row here
-    // are the machine's executed answers; the rest are its history.
+    // by position, so no sort). The commands with a decided record of this
+    // epoch are the machine's executed answers; the rest are its history.
     let mut executions: std::collections::BTreeMap<CommandId, ExecutionPosition> =
         std::collections::BTreeMap::new();
     let mut in_order: Vec<CommandId> = Vec::new();
+    let mut by_position: std::collections::BTreeMap<ExecutionPosition, CommandId> =
+        std::collections::BTreeMap::new();
     scan_executions(
         view,
         Bound::Unbounded,
@@ -244,10 +239,38 @@ pub fn read_protocol<V: OrderedRead>(
                 return Err(corrupt("an executed row under another position's key"));
             }
             executions.insert(row.command, position);
+            by_position.insert(position, row.command);
             in_order.push(row.command);
             Ok(())
         },
     )?;
+    // An executed command's decided record moved at its execution to
+    // `decided_v1`, under its position (task-d113, step 2, the bound). Those
+    // of this epoch are restored as its dependency row was before the move,
+    // so each key's latest command, which a key keeps naming after the
+    // command executes, comes back with its paths.
+    let epoch_bytes = epoch.to_be_bytes();
+    scan_rows(view, Collection::DecidedV1, budget, |key, value| {
+        let position = codecs::position_of(key)?;
+        let (decided_in, record) = codecs::split_decided(value)?;
+        if decided_in != epoch_bytes {
+            return Ok(());
+        }
+        let command = by_position
+            .get(&position)
+            .copied()
+            .ok_or_else(|| corrupt("a decided record at a position with no executed row"))?;
+        records.push((command, decode_dependency(record)?));
+        Ok(())
+    })?;
+    // In command order, as the rows were when they were keyed by command,
+    // and one row a command: a rewrite stays in place under its intake key,
+    // and a command's record moves once, so a second row of a command is a
+    // broken lowering.
+    records.sort_unstable_by_key(|(command, _)| *command);
+    if records.windows(2).any(|w| w[0].0 == w[1].0) {
+        return Err(corrupt("two dependency rows of one command in an epoch"));
+    }
     // A payload not yet executed is pending, by intake order: read them
     // all, which the table's capacity bounds.
     let mut pending: std::collections::BTreeMap<CommandId, Vec<u8>> =
@@ -533,17 +556,17 @@ fn scan_rows<V: OrderedRead>(
 /// What a donor sends a lagging voter of one command it executed
 /// (task-d08), read from its durable rows: the execution from
 /// `execution_v1` and the payload from `payload_v1`, both at the command's
-/// position (task-d113, step 2), and the decided record from the epoch's
-/// dependency row in `protocol_v1`, if it keeps one.
+/// position (task-d113, step 2), and the decided record from `decided_v1`
+/// at the same position, if it keeps one of the asker's epoch.
 ///
 /// `None` when the command has no executed row or no payload here: a
 /// donor serves only what it executed and can show.
 ///
-/// The dependency row is keyed by intake order (task-d113), and found
-/// through the index by command of the gate `gated` came through. Only for
-/// a command the snapshot shows executed (rule (c)): an executed command's
-/// row is never deleted and written again under a new key, so an index
-/// newer than the snapshot names the row the snapshot holds, or none.
+/// The position is found through the index's executed part of the gate
+/// `gated` came through, and the row there, which names its command,
+/// settles it (rule (c)). The decided record moved there from the
+/// command's dependency row at its execution (the bound), so no lookup of
+/// the intake part is needed.
 pub fn catch_up_entry<V: OrderedRead>(
     gated: &GatedView<V>,
     epoch: ConfigurationEpoch,
@@ -573,9 +596,20 @@ pub fn catch_up_entry_at<V: OrderedRead>(
         return Ok(None);
     };
     let payload = decode_payload(&payload)?;
-    let decided = executed_dependency_row(gated, epoch, command)?
-        .map(|bytes| decode_dependency(&bytes))
-        .transpose()?;
+    // The decided record moved to `decided_v1` at the command's execution
+    // (the bound), under the same position: served only in its own epoch,
+    // as the epoch's dependency row was.
+    let decided = match view.get(Collection::DecidedV1.id(), &position_key(position))? {
+        Some(bytes) => {
+            let (decided_in, record) = codecs::split_decided(&bytes)?;
+            if decided_in == epoch.to_be_bytes() {
+                Some(decode_dependency(record)?)
+            } else {
+                None
+            }
+        }
+        None => None,
+    };
     Ok(Some(CatchUpEntry {
         command: *command,
         payload,
@@ -584,32 +618,4 @@ pub fn catch_up_entry_at<V: OrderedRead>(
         revision,
         result_digest,
     }))
-}
-
-/// The dependency row of `command` in `epoch`, which the caller has seen
-/// executed in `gated`'s snapshot (rule (c)), through the index by command.
-fn executed_dependency_row<V: OrderedRead>(
-    gated: &GatedView<V>,
-    epoch: ConfigurationEpoch,
-    command: &CommandId,
-) -> Result<Option<Vec<u8>>, EngineError> {
-    let Some(gate) = gated.gate() else {
-        return Ok(None);
-    };
-    let epoch = epoch.to_be_bytes();
-    let candidates: Vec<_> = gate
-        .index()
-        .candidates(epoch, DEPENDENCY_TAG, command)
-        .collect();
-    for order in candidates {
-        // The key carries the command: a candidate of another command
-        // under the same prefix is not a row of this one.
-        if let Some(bytes) = gated.view().get(
-            Collection::ProtocolV1.id(),
-            &intake_key(epoch, DEPENDENCY_TAG, order, command),
-        )? {
-            return Ok(Some(bytes));
-        }
-    }
-    Ok(None)
 }

@@ -1965,10 +1965,15 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 }
             },
             intake_index: {
-                let entries = voter.node().applier().store().reader().index_len() as u64;
+                let reader = voter.node().applier().store().reader();
+                let entries = reader.index_len() as u64;
+                let executed = reader.index_executed_len() as u64;
                 coord_daemon::metrics::IntakeIndexSize {
                     entries,
                     bytes: entries.saturating_mul(coord_storage::intake::ENTRY_BYTES),
+                    executed,
+                    executed_bytes: executed
+                        .saturating_mul(coord_storage::intake::EXECUTED_ENTRY_BYTES),
                 }
             },
             busy,

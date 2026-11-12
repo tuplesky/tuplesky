@@ -530,6 +530,8 @@ fn a_rendered_snapshot_carries_no_secret_or_key_shaped_text() {
             intake_index: coord_daemon::metrics::IntakeIndexSize {
                 entries: 7000,
                 bytes: 322_000,
+                executed: 90_000,
+                executed_bytes: 2_160_000,
             },
         }),
     };

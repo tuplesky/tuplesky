@@ -113,6 +113,11 @@ impl Frontier {
         self.index().len()
     }
 
+    /// Entries the index's executed part holds (diagnostic).
+    pub fn index_executed_len(&self) -> usize {
+        self.index().executed_len()
+    }
+
     /// Completed sequence.
     pub fn completed(&self) -> u64 {
         self.completed.load(Ordering::Acquire)
@@ -189,6 +194,12 @@ impl<R: SnapshotSource> GatedReader<R> {
     /// diagnostic, for the metrics line).
     pub fn index_len(&self) -> usize {
         self.frontier.index_len()
+    }
+
+    /// Entries the index's executed part holds (task-d113, step 2;
+    /// diagnostic, for the metrics line).
+    pub fn index_executed_len(&self) -> usize {
+        self.frontier.index_executed_len()
     }
 
     /// Pin a snapshot and verify its stamp against the completed frontier.

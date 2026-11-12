@@ -90,6 +90,11 @@
       "pending_payload_v1",
       18,
       false
+    ],
+    [
+      "decided_v1",
+      19,
+      false
     ]
   ],
   "meta_fields": [

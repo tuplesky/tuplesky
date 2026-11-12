@@ -51,11 +51,16 @@ pub enum Collection {
     /// [`Collection::PayloadV1`] when its command executes (task-d113,
     /// step 2).
     PendingPayloadV1,
+    /// An executed command's decided record, by execution position, with
+    /// the configuration epoch it was decided in: node-private, moved from
+    /// its dependency row in [`Collection::ProtocolV1`] when the command
+    /// executes (task-d113, step 2, the index's bound).
+    DecidedV1,
 }
 
 impl Collection {
     /// Every registered collection, in identifier order.
-    pub const ALL: [Collection; 18] = [
+    pub const ALL: [Collection; 19] = [
         Collection::MetaV1,
         Collection::ConfigV1,
         Collection::PayloadV1,
@@ -74,6 +79,7 @@ impl Collection {
         Collection::RetryFloorV1,
         Collection::CheckpointV1,
         Collection::PendingPayloadV1,
+        Collection::DecidedV1,
     ];
 
     /// Frozen identifier.
@@ -97,6 +103,7 @@ impl Collection {
             Collection::RetryFloorV1 => 0x0010,
             Collection::CheckpointV1 => 0x0011,
             Collection::PendingPayloadV1 => 0x0012,
+            Collection::DecidedV1 => 0x0013,
         })
     }
 
@@ -121,6 +128,7 @@ impl Collection {
             Collection::RetryFloorV1 => "retry_floor_v1",
             Collection::CheckpointV1 => "checkpoint_v1",
             Collection::PendingPayloadV1 => "pending_payload_v1",
+            Collection::DecidedV1 => "decided_v1",
         }
     }
 
@@ -138,6 +146,7 @@ impl Collection {
                 | Collection::CheckpointV1
                 | Collection::ExecutedV1
                 | Collection::PendingPayloadV1
+                | Collection::DecidedV1
         )
     }
 
@@ -209,7 +218,7 @@ mod tests {
             assert_eq!(Collection::from_id(c.id()), Some(*c));
         }
         assert_eq!(Collection::from_id(CollectionId(0)), None);
-        assert_eq!(Collection::from_id(CollectionId(0x0013)), None);
+        assert_eq!(Collection::from_id(CollectionId(0x0014)), None);
         assert!(!Collection::MetaV1.in_common_hash());
         assert!(Collection::KvCurrentV1.in_common_hash());
         // Rows by position (task-d113, step 2): the executed rows and the
@@ -219,5 +228,6 @@ mod tests {
         assert!(Collection::PayloadV1.in_common_hash());
         assert!(!Collection::PendingPayloadV1.in_common_hash());
         assert!(!Collection::ExecutedV1.in_common_hash());
+        assert!(!Collection::DecidedV1.in_common_hash());
     }
 }

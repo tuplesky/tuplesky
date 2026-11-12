@@ -84,7 +84,7 @@ fn a_trial_records_everything_a_comparison_depends_on() {
         EngineKind::Fjall.durability_profile()
     );
     assert_eq!(m.engine.layout, EngineKind::Fjall.layout());
-    assert_eq!(m.engine.collections, 18);
+    assert_eq!(m.engine.collections, 19);
     assert_eq!(m.engine.cache_bytes, spec.cache_bytes);
     assert_eq!(m.workload_digest, spec.workload.digest());
     assert_eq!(m.limits, spec.limits());

@@ -749,10 +749,12 @@ fn check_target<V: OrderedRead>(view: &V, plan: &RestorePlan) -> Result<(), Rest
     }
     for collection in Collection::ALL {
         // Protocol rows and payloads pending execution are this node's
-        // obligations (task-d113, step 2), outside the common hash.
+        // obligations, and decided records moved at execution its history
+        // (task-d113, step 2), outside the common hash.
         if (collection.in_common_hash()
             || collection == Collection::ProtocolV1
-            || collection == Collection::PendingPayloadV1)
+            || collection == Collection::PendingPayloadV1
+            || collection == Collection::DecidedV1)
             && !empty(view, collection)?
         {
             return Err(RestoreError::TargetNotEmpty {

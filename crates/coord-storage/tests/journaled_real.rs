@@ -425,6 +425,12 @@ fn intake_rows(rows: &Rows) -> (usize, bool) {
     let mut twice = false;
     let mut count = 0;
     for (c, key, _) in rows {
+        // A decided record moved at its command's execution (task-d113,
+        // step 2) is that command's dependency row, by position.
+        if *c == Collection::DecidedV1.id().0 {
+            count += 1;
+            continue;
+        }
         if *c != Collection::ProtocolV1.id().0 {
             continue;
         }

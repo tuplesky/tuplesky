@@ -350,10 +350,13 @@ fn protocol_rows() -> Vec<Row> {
         dependency_key(e, &command(6)),
         encode_dependency(&record(Phase::Commit, &[])).unwrap(),
     );
-    // A settled command of a configuration above the floor's: outside the
-    // acknowledged history entirely.
+    // A command of a configuration above the floor's: outside the
+    // acknowledged history entirely. Not executed here: an executed
+    // command's record of a later epoch replaces its earlier one in
+    // `decided_v1` (task-d113, step 2), which
+    // `a_decided_record_of_an_epoch_above_the_floors_is_kept` covers.
     put(
-        dependency_key(epoch(EPOCH + 1), &command(1)),
+        dependency_key(epoch(EPOCH + 1), &command(9)),
         encode_dependency(&record(Phase::Accept, &[])).unwrap(),
     );
     rows
@@ -475,10 +478,56 @@ fn logical(key: &[u8]) -> Vec<u8> {
     intake::command_key_of(key).unwrap_or_else(|| key.to_vec())
 }
 
+/// The dependency key a `decided_v1` row stands for: its command's, in
+/// the epoch it holds. A decided record moved to `decided_v1` under its
+/// command's position at the execution (task-d113, step 2, the bound).
+/// A row it cannot read so (a corrupt record's) stands for its raw key.
+fn decided_logical<E: LocalEngine>(engine: &E, key: &[u8], value: &[u8]) -> Vec<u8> {
+    let command = engine
+        .reader()
+        .snapshot()
+        .unwrap()
+        .get(Collection::ExecutionV1.id(), key)
+        .unwrap()
+        .and_then(|row| coord_storage::codecs::decode_execution(&row).ok())
+        .map(|row| row.command);
+    match (coord_storage::codecs::split_decided(value), command) {
+        (Ok((epoch, _)), Some(command)) => dependency_key(
+            ConfigurationEpoch::new(u64::from_be_bytes(epoch)).unwrap(),
+            &command,
+        ),
+        _ => [b"decided_v1:".as_slice(), key].concat(),
+    }
+}
+
+/// Every protocol row by the key the machine names it, with each decided
+/// record moved at execution as its dependency row.
 fn protocol_keys<E: LocalEngine>(engine: &E) -> BTreeSet<Vec<u8>> {
     rows_of(engine, Collection::ProtocolV1)
         .into_iter()
         .map(|(k, _)| logical(&k))
+        .chain(
+            rows_of(engine, Collection::DecidedV1)
+                .into_iter()
+                .map(|(k, v)| decided_logical(engine, &k, &v)),
+        )
+        .collect()
+}
+
+/// The keys a trim plan deletes, by the key the machine names each row,
+/// read against `engine` before the plan is applied.
+fn deleted_keys<E: LocalEngine>(engine: &E, plan: &TrimPlan) -> BTreeSet<Vec<u8>> {
+    let view = engine.reader().snapshot().unwrap();
+    plan.updates
+        .iter()
+        .map(|u| {
+            if u.collection == Collection::DecidedV1.id() {
+                let value = view.get(u.collection, &u.key).unwrap().unwrap();
+                decided_logical(engine, &u.key, &value)
+            } else {
+                logical(&u.key)
+            }
+        })
         .collect()
 }
 
@@ -706,8 +755,10 @@ fn trimming_deletes_only_settled_below_floor_protocol_rows_and_keeps_every_oblig
     assert!(
         plan.updates
             .iter()
-            .all(|u| u.collection == Collection::ProtocolV1.id() && u.value.is_none()),
-        "a trim emits only protocol deletions"
+            .all(|u| (u.collection == Collection::ProtocolV1.id()
+                || u.collection == Collection::DecidedV1.id())
+                && u.value.is_none()),
+        "a trim emits only protocol deletions, a decided record moved at execution's among them"
     );
     apply(&mut engine, &plan.updates);
     let after = protocol_keys(&engine);
@@ -727,20 +778,22 @@ fn trimming_deletes_only_settled_below_floor_protocol_rows_and_keeps_every_oblig
     // unexecuted command, the settled commands it can reach through the
     // chain, the command committed but not executed, the command executed
     // beyond the boundary, and a command of an epoch above the floor's.
+    // An executed command's proposal row went at its execution (task-d113,
+    // step 2), before any trim.
+    for n in [1u8, 2, 3, 5, 7, 8] {
+        assert!(!before.contains(&proposal_key(e, &command(n))));
+    }
     for retained in [
         promise_key(e),
         sync_key(e, &ballot(3)),
         dependency_key(e, &command(1)),
-        proposal_key(e, &command(1)),
         dependency_key(e, &command(2)),
-        proposal_key(e, &command(2)),
         dependency_key(e, &command(3)),
-        proposal_key(e, &command(3)),
         dependency_key(e, &command(4)),
         proposal_key(e, &command(4)),
         dependency_key(e, &command(5)),
         dependency_key(e, &command(6)),
-        dependency_key(epoch(EPOCH + 1), &command(1)),
+        dependency_key(epoch(EPOCH + 1), &command(9)),
     ] {
         assert!(
             after.contains(&retained),
@@ -769,11 +822,10 @@ fn a_retained_command_pins_the_protocol_rows_of_the_dependencies_it_names() {
     // 2 -> 1, and a deleted link stops it at a command it cannot resolve.
     // Being settled below the floor is not on its own a reason to drop a
     // row something unresolved still has to reach.
-    assert_eq!(
-        plan.pinned, 6,
-        "the dependency and proposal rows of commands 1, 2 and 3"
-    );
-    let deleted: BTreeSet<Vec<u8>> = plan.updates.iter().map(|u| logical(&u.key)).collect();
+    // Their proposal rows went at their execution, and their records moved
+    // to `decided_v1` (task-d113, step 2): the pins hold the records.
+    assert_eq!(plan.pinned, 3, "the decided records of commands 1, 2 and 3");
+    let deleted = deleted_keys(&engine, &plan);
     for n in [1u8, 2, 3] {
         assert!(
             !deleted.contains(&dependency_key(e, &command(n))),
@@ -812,10 +864,9 @@ fn a_retained_command_pins_the_protocol_rows_of_the_dependencies_it_names() {
     seed(&mut settled, rows);
     publish(&mut settled);
     let plan = step(&settled, &TrimLimits::default());
-    let deleted: BTreeSet<Vec<u8>> = plan.updates.iter().map(|u| logical(&u.key)).collect();
+    let deleted = deleted_keys(&settled, &plan);
     assert_eq!(plan.pinned, 0);
     assert!(deleted.contains(&dependency_key(e, &command(3))));
-    assert!(deleted.contains(&proposal_key(e, &command(3))));
     assert!(deleted.contains(&dependency_key(e, &command(4))));
 }
 
@@ -969,9 +1020,10 @@ fn the_published_floor_never_moves_backwards_under_a_late_acknowledgement() {
 #[test]
 fn trimming_leaves_public_mvcc_common_state_and_the_local_journal_stamp_untouched() {
     let mut engine = trimmable_store();
+    // `decided_v1` is protocol state moved at execution (task-d113, step 2).
     let common: Vec<Vec<(Vec<u8>, Vec<u8>)>> = Collection::ALL
         .iter()
-        .filter(|c| **c != Collection::ProtocolV1)
+        .filter(|c| **c != Collection::ProtocolV1 && **c != Collection::DecidedV1)
         .map(|c| rows_of(&engine, *c))
         .collect();
     let exported = export_shared(
@@ -988,7 +1040,7 @@ fn trimming_leaves_public_mvcc_common_state_and_the_local_journal_stamp_untouche
 
     let after: Vec<Vec<(Vec<u8>, Vec<u8>)>> = Collection::ALL
         .iter()
-        .filter(|c| **c != Collection::ProtocolV1)
+        .filter(|c| **c != Collection::ProtocolV1 && **c != Collection::DecidedV1)
         .map(|c| rows_of(&engine, *c))
         .collect();
     assert_eq!(
@@ -1036,7 +1088,8 @@ fn mvcc_collection_and_protocol_trimming_decide_different_retention() {
     assert!(
         gc.updates
             .iter()
-            .all(|u| u.collection != Collection::ProtocolV1.id()),
+            .all(|u| u.collection != Collection::ProtocolV1.id()
+                && u.collection != Collection::DecidedV1.id()),
         "MVCC collection never forgets protocol state"
     );
     apply(&mut engine, &gc.updates);
@@ -1047,7 +1100,8 @@ fn mvcc_collection_and_protocol_trimming_decide_different_retention() {
     assert!(
         plan.updates
             .iter()
-            .all(|u| u.collection == Collection::ProtocolV1.id())
+            .all(|u| u.collection == Collection::ProtocolV1.id()
+                || u.collection == Collection::DecidedV1.id())
     );
     apply(&mut engine, &plan.updates);
     assert_eq!(rows_of(&engine, Collection::KvHistoryV1), history_before);
@@ -1085,13 +1139,46 @@ fn an_unrecognized_protocol_row_is_retained_rather_than_deleted() {
     publish(&mut engine);
 
     let plan = step(&engine, &TrimLimits::default());
-    let deleted: BTreeSet<Vec<u8>> = plan.updates.iter().map(|u| logical(&u.key)).collect();
+    let deleted = deleted_keys(&engine, &plan);
     assert!(!deleted.contains(&unknown_tag));
     assert!(!deleted.contains(&short_key));
     assert!(plan.retained >= 2);
     apply(&mut engine, &plan.updates);
     let after = protocol_keys(&engine);
     assert!(after.contains(&unknown_tag) && after.contains(&short_key));
+}
+
+/// An executed command's record of a later epoch replaces its earlier one
+/// in `decided_v1` (task-d113, step 2): below the boundary, but of an epoch
+/// above the floor's, it is outside the acknowledged history and stays, as
+/// that epoch's dependency row would have.
+#[test]
+fn a_decided_record_of_an_epoch_above_the_floors_is_kept() {
+    let e = epoch(EPOCH);
+    let later = epoch(EPOCH + 1);
+    let mut engine = ModelEngine::new();
+    let mut rows: Vec<Row> = common_rows()
+        .into_iter()
+        .chain(protocol_rows())
+        .chain(identity_rows())
+        .collect();
+    rows.push((
+        Collection::ProtocolV1,
+        dependency_key(later, &command(7)),
+        encode_dependency(&record(Phase::Accept, &[])).unwrap(),
+    ));
+    seed(&mut engine, rows);
+    publish(&mut engine);
+    let before = protocol_keys(&engine);
+    assert!(before.contains(&dependency_key(later, &command(7))));
+    assert!(!before.contains(&dependency_key(e, &command(7))));
+
+    let deleted = deleted_keys(&engine, &step(&engine, &TrimLimits::default()));
+    assert!(
+        deleted.contains(&dependency_key(e, &command(8))),
+        "the floor's epoch's record still goes"
+    );
+    assert!(!deleted.contains(&dependency_key(later, &command(7))));
 }
 
 #[test]
