@@ -378,8 +378,9 @@ swiftpaxos_suffix=$(load_suffix "$swiftpaxos_concurrency" "$swiftpaxos_raised")
 store=${IN_STORE:-disk}
 case $store in
   disk) store_suffix="" ;;
+  disk-barrier) store_suffix=", stores on disk with write barriers on" ;;
   tmpfs) store_suffix=", stores on tmpfs" ;;
-  *) echo "store must be disk or tmpfs, not $store" >&2; exit 2 ;;
+  *) echo "store must be disk, disk-barrier or tmpfs, not $store" >&2; exit 2 ;;
 esac
 
 profile=${IN_PROFILE:-strict}

@@ -69,6 +69,16 @@ def main():
     args = p.parse_args()
     os.makedirs(args.dir, exist_ok=True)
 
+    model = "?"
+    try:
+        with open("/proc/cpuinfo") as f:
+            for line in f:
+                if line.startswith("model name"):
+                    model = line.split(":", 1)[1].strip()
+                    break
+    except OSError:
+        pass
+    print(f"CPU model: {model}")
     fs = run("findmnt", "-no", "SOURCE,FSTYPE,OPTIONS", "-T", args.dir)
     print(f"Filesystem under {args.dir}: {fs or '?'}")
     source = fs.split()[0] if fs else ""

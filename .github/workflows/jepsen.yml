@@ -69,9 +69,9 @@ on:
         description: "Replicated features TupleSky's voters activate once every voter is submittable, before the nemesis and the workload (jepsen.tuplesky's --activate, task-d99), comma-separated in order, such as early-proposal,release-at-execution; NAME@SECS activates one under load, SECS into the workload (--activate-after), such as early-proposal,answer-on-release@60; a build without an admin socket (a pair's base before task-d99) is left as it is; empty for none; BASE/HEAD gives a pair's two sides their own lists (either may be empty)"
         default: ""
       store:
-        description: "Where TupleSky's voters and etcd keep their stores: disk, or tmpfs to measure without the runner's disk"
+        description: "Where TupleSky's voters and etcd keep their stores: disk (the runner's ext4 as mounted, nobarrier, so an fsync reaches the device's cache only), disk-barrier (the same with ext4's write barriers turned on, so an fsync sends the device a cache flush; scripts/ci/disk_barrier.sh), or tmpfs to measure without the runner's disk"
         type: choice
-        options: [disk, tmpfs]
+        options: [disk, disk-barrier, tmpfs]
         default: disk
       profile:
         description: "TupleSky's journal profile: strict, or replay (task-j06: projection commits made durable on a cadence and replayed after a crash; not a default)"
@@ -374,6 +374,11 @@ jobs:
           jepsen/swiftpaxos/build.sh "$RUNNER_TEMP/swiftpaxos-bin" | tee "$RUNNER_TEMP/swiftpaxos-build.txt"
           echo "SwiftPaxos beside TupleSky: $(tail -n 1 "$RUNNER_TEMP/swiftpaxos-build.txt" | sed 's/.* from //'), at $SWIFTPAXOS_STEPS clients" >> "$GITHUB_STEP_SUMMARY"
           (cd jepsen/swiftpaxos && lein deps)
+      - name: Turn the disk's write barriers on
+        # store disk-barrier: before the probe, so it times the fdatasync
+        # the stores will get (scripts/ci/disk_barrier.sh).
+        if: env.STORE == 'disk-barrier'
+        run: tuplesky/scripts/ci/disk_barrier.sh
       - name: Describe the runner's disk
         # With store disk, both systems' stores sit in the containers'
         # writable layers, under Docker's data root: its filesystem, the
@@ -1122,6 +1127,9 @@ jobs:
         run: tuplesky/scripts/ci/jepsen_etcd.sh prepare
       - name: Fetch the etcd test's dependencies
         run: tuplesky/scripts/ci/jepsen_etcd.sh deps
+      - name: Turn the disk's write barriers on
+        if: env.STORE == 'disk-barrier'
+        run: tuplesky/scripts/ci/disk_barrier.sh
       - name: Stand the cluster up
         # With store tmpfs, /opt, which holds etcd's binary and data
         # directory (/opt/etcd), is a tmpfs.
