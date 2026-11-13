@@ -42,7 +42,7 @@ on:
         options: [faults, throughput, wan, wan-throughput, service]
         default: faults
       workload:
-        description: "append, wr, register, register-etcd-mix (register drawn as etcd's register test draws its own: on each key, n readers reserved over a mix of write and cas, 100 operations a key; with a jepsen-ref from 50b71de2), register-etcd-mix:QUIRKS (the same with some of that mix's first generator's differences put back: on-threads, process-limit, jitter, comma-separated, or first for all three), or register-swiftpaxos-mix (register with TupleSky's and etcd's operations drawn as SwiftPaxos's register test draws its own: n readers in each key's group of 2n, the rest writing, no cas); empty for the scenario's"
+        description: "append, wr, register, register-etcd-mix (register drawn as etcd's register test's runs draw their own: the first n threads read, every other mixes write and cas, 100 operations a key; the default from jepsen-ref 50b71de2's successor), register-etcd-mix:QUIRKS (drawn with these of that mix's first generator's differences from etcd's expression: on-threads, process-limit, jitter, comma-separated, or first for all three; none for etcd's literal expression, gen/reserve, whose reader split here depends on timing), or register-swiftpaxos-mix (register with TupleSky's and etcd's operations drawn as SwiftPaxos's register test draws its own: n readers in each key's group of 2n, the rest writing, no cas); empty for the scenario's"
         default: ""
       nemesis:
         description: "Comma-separated faults (kill, pause, partition, packet), or none; empty for the scenario's. Not clock: the containers share this runner's clock. TupleSky's partitions can be partition:TARGETS[:LO-HI[/EVERY]], TARGETS any, one or follower (a voter not leading), such as partition:follower:5-10/60; etcd and SwiftPaxos get plain partitions."
@@ -126,6 +126,7 @@ on:
       - scripts/ci/jepsen_bounded.sh
       - scripts/ci/jepsen_cpu_quota.sh
       - scripts/ci/jepsen_etcd.sh
+      - scripts/ci/jepsen_key_groups.py
       - scripts/ci/jepsen_pairs.py
       - scripts/ci/jepsen_sweep.py
       - scripts/ci/leader_profile.py
@@ -881,6 +882,12 @@ jobs:
               ${ETCD_HEADLINE:+--baseline "etcd-${ETCD_HEADLINE//+/}"} \
               --title "TupleSky sweep: $head_sha (head)${base_name:+ and $base_name (base)}$beside, $WORKLOAD, $NEMESIS$TITLE_SUFFIX$STORE_SUFFIX$PROFILE_SUFFIX$CHECKPOINT_SUFFIX$WORKERS_SUFFIX$TUPLESKY_SUFFIX" \
               ${runs[@]+"${runs[@]}"} || true
+            # Every key on its whole group of threads, and no thread
+            # stopped early: a run that isn't fails the job.
+            if ! python3 "$ci/jepsen_key_groups.py" ${runs[@]+"${runs[@]}"}; then
+              echo "::error::a run's load generator left threads out of its keys or stopped some (Key groups in the summary)"
+              rc=1
+            fi
             exit $rc
           fi
           # Paired: base and head in turn, the order alternating from pair
@@ -905,6 +912,10 @@ jobs:
           python3 "$ci/jepsen_pairs.py" \
             --title "TupleSky pairs: $head_sha (head) against $base_name (base)$beside, $WORKLOAD, $NEMESIS$TITLE_SUFFIX$STORE_SUFFIX$PROFILE_SUFFIX$CHECKPOINT_SUFFIX$WORKERS_SUFFIX$TUPLESKY_SUFFIX" \
             ${runs[@]+"${runs[@]}"} || true
+          if ! python3 "$ci/jepsen_key_groups.py" ${runs[@]+"${runs[@]}"}; then
+            echo "::error::a run's load generator left threads out of its keys or stopped some (Key groups in the summary)"
+            rc=1
+          fi
           exit $rc
       - name: Read how far each voter executed
         if: always() && env.CPU_MISS != 'true' && env.IN_PAIR_BASE == '' && env.SWEEP == ''

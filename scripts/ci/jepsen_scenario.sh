@@ -7,14 +7,17 @@
 #                  service
 #   IN_WORKLOAD    TupleSky's and etcd's workload; empty for the scenario's.
 #                  register-etcd-mix is the register workload drawn as
-#                  etcd's register test draws its own (jepsen.tuplesky's
-#                  --register-mix etcd: on each key, gen/reserve n readers
-#                  over gen/mix of write and cas, limited to 100 a key);
-#                  register-etcd-mix:QUIRKS puts back some of that mix's
+#                  etcd's register test's runs draw their own (jepsen.tuplesky's
+#                  --register-mix etcd; with a jepsen-ref from 50b71de2's
+#                  successor, its default on-threads: the first n threads
+#                  read, every other mixes write and cas, 100 a key);
+#                  register-etcd-mix:QUIRKS draws it with these of the
 #                  first generator's differences from etcd's expression
 #                  (--etcd-register-quirks: on-threads, process-limit,
 #                  jitter, comma-separated; first for all three, the
-#                  generator through jepsen 2057754)
+#                  generator through jepsen 2057754; none for etcd's
+#                  literal expression, gen/reserve, whose reader split on
+#                  this Jepsen depends on timing)
 #   IN_NEMESIS     their faults; empty for the scenario's. A partition
 #                  may carry TupleSky's partition options,
 #                  partition:TARGETS[:LO-HI[/EVERY]] (see below)
@@ -161,12 +164,13 @@ elif [[ $workload == register-etcd-mix:* ]]; then
   if [ "$register_quirks" = first ]; then register_quirks=on-threads,process-limit,jitter; fi
   IFS=, read -ra quirk_list <<< "$register_quirks"
   if [ ${#quirk_list[@]} -eq 0 ]; then
-    echo "::error::register-etcd-mix:QUIRKS needs at least one of on-threads, process-limit, jitter, or first" >&2; exit 1
+    echo "::error::register-etcd-mix:QUIRKS needs at least one of on-threads, process-limit, jitter, or first, or none" >&2; exit 1
   fi
-  for quirk in "${quirk_list[@]}"; do
+  if [ "$register_quirks" = none ]; then quirk_list=(); fi
+  for quirk in ${quirk_list[@]+"${quirk_list[@]}"}; do
     case $quirk in
       on-threads|process-limit|jitter) ;;
-      *) echo "::error::not an etcd-mix quirk: '$quirk' in $IN_WORKLOAD (on-threads, process-limit, jitter, or first)" >&2; exit 1 ;;
+      *) echo "::error::not an etcd-mix quirk: '$quirk' in $IN_WORKLOAD (on-threads, process-limit, jitter, or first, or none alone)" >&2; exit 1 ;;
     esac
   done
 elif [ "$workload" = register-swiftpaxos-mix ]; then
@@ -390,7 +394,11 @@ steps_title=${sweep// /, }
 suffix=$(load_suffix "${steps_title:-$concurrency}" "$raised")
 case $register_mix in
   etcd) suffix+=", etcd's register mix"
-    if [ -n "$register_quirks" ]; then suffix+=" with the first generator's ${register_quirks//,/, }"; fi ;;
+    case $register_quirks in
+      "") ;;
+      none) suffix+=" as its literal expression (gen/reserve)" ;;
+      *) suffix+=" with ${register_quirks//,/, }" ;;
+    esac ;;
   swiftpaxos) suffix+=", SwiftPaxos's register mix (reads and writes, no cas)" ;;
 esac
 swiftpaxos_suffix=$(load_suffix "$swiftpaxos_concurrency" "$swiftpaxos_raised")
