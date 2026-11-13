@@ -534,8 +534,30 @@ impl JournalRecordV1 {
         self.digest
     }
 
-    /// Verify the record against what the stream expects: origin fields,
-    /// index, predecessor chain and re-derived digest.
+    /// Verify the record against what the stream expects: its format,
+    /// origin fields, index and predecessor chain.
+    ///
+    /// The body's bounds and guards and the digest over the whole record
+    /// are not checked again here (#185, lead 17:43): they hold of every
+    /// value of this type.
+    /// - **A record is made two ways:** [`JournalRecordV1::seal`] checks
+    ///   the body and derives the digest from its encoding, and
+    ///   [`JournalRecordV1::decode`] checks the body and re-derives the
+    ///   digest from the bytes it read, refusing a mismatch.
+    /// - **Nothing changes it after that:** the fields are private and the
+    ///   body is shared immutably.
+    /// - **What that check protected against,** then, is only a record
+    ///   corrupted in this process's memory between its making and its
+    ///   append. Bytes corrupted after the append, on the way to the
+    ///   disk or on it, are what [`JournalRecordV1::decode`] refuses when
+    ///   they are read back, and a record received from elsewhere is
+    ///   decoded before it is a record.
+    ///
+    /// The append verifies every record a moment after this process
+    /// sealed it, and the body's encoding and digest again were 40% of
+    /// the appender's thread in testing's profile on the 9V45 runner
+    /// (#98). Debug builds still derive the digest again here, and stop
+    /// on a difference.
     pub fn verify(&self, expect: &RecordExpectation) -> Result<(), RecordError> {
         if self.format != JOURNAL_RECORD_FORMAT_V1 {
             return Err(RecordError::UnsupportedFormat { found: self.format });
@@ -564,19 +586,29 @@ impl JournalRecordV1 {
         if self.predecessor != expect.predecessor {
             return Err(RecordError::PredecessorMismatch);
         }
+        #[cfg(debug_assertions)]
+        assert_eq!(
+            self.derived(),
+            Ok(self.digest),
+            "a record's digest no longer matches its body"
+        );
+        Ok(())
+    }
+
+    /// The body checked and the digest derived again from the record's
+    /// fields: what [`JournalRecordV1::seal`] and
+    /// [`JournalRecordV1::decode`] establish, for a debug build to check.
+    #[cfg(debug_assertions)]
+    fn derived(&self) -> Result<Digest32, RecordError> {
         check_body(&self.origin, self.seq, &self.predecessor, &self.body)?;
         let body_bytes = encode_body(&self.body)?;
-        let derived = digest_of(
+        Ok(digest_of(
             self.format,
             &self.origin,
             self.seq,
             &self.predecessor,
             &body_bytes,
-        );
-        if derived != self.digest {
-            return Err(RecordError::DigestMismatch);
-        }
-        Ok(())
+        ))
     }
 
     fn wire(&self) -> RecordWireRefV1<'_> {
