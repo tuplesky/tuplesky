@@ -568,7 +568,13 @@ impl BoundFrontend {
     ) -> Delivery {
         // SCRATCH (ceilings): no store read at the disclosure gate.
         static NO_GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *NO_GATE.get_or_init(|| std::env::var("COORDD_X_NO_GATE").is_ok_and(|v| v == "1")) {
+        if *NO_GATE.get_or_init(|| {
+            let on = coord_storage::scratch::x_var("COORDD_X_NO_GATE").is_some_and(|v| v == "1");
+            if on {
+                eprintln!("SCRATCH no-gate on");
+            }
+            on
+        }) {
             return delivery;
         }
         let response = match decode_stream(&delivery.frame).as_deref() {

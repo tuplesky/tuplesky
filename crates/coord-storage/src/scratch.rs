@@ -51,15 +51,45 @@ pub fn set_stale_reads(on: bool) {
     }
 }
 
+/// A switch's value: its own variable if set, or else what the preset
+/// `COORDD_X_BUILD` gives it, so a harness that passes one variable can
+/// pick a whole build:
+/// - `1`: storage off at every voter (`MEM_EXEC=1`, `STORE_OFF_AFTER=10000`,
+///   `NO_GATE=1`);
+/// - `2`: followers journal and vote only (`FOLLOWERS_IDLE_AFTER=10000`);
+/// - `3`: the leader's hold (`HOLD_N=32`, `HOLD_US=2000`);
+/// - `5`: builds 1 and 3 together.
+pub fn x_var(name: &str) -> Option<String> {
+    if let Ok(v) = std::env::var(name) {
+        return Some(v);
+    }
+    let build = std::env::var("COORDD_X_BUILD").ok()?;
+    let storage_off = matches!(build.as_str(), "1" | "5");
+    let hold = matches!(build.as_str(), "3" | "5");
+    let v = match name {
+        "COORDD_X_MEM_EXEC" | "COORDD_X_NO_GATE" if storage_off => "1",
+        "COORDD_X_STORE_OFF_AFTER" if storage_off => "10000",
+        "COORDD_X_FOLLOWERS_IDLE_AFTER" if build == "2" => "10000",
+        "COORDD_X_HOLD_N" if hold => "32",
+        "COORDD_X_HOLD_US" if hold => "2000",
+        _ => return None,
+    };
+    Some(v.to_owned())
+}
+
 fn env_u64(name: &str) -> Option<u64> {
-    std::env::var(name).ok()?.parse().ok()
+    let v = x_var(name)?.parse().ok();
+    if let Some(v) = v {
+        eprintln!("SCRATCH {name}={v}");
+    }
+    v
 }
 
 /// `COORDD_X_MEM_EXEC=1`.
 pub fn mem_exec() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| {
-        let on = std::env::var("COORDD_X_MEM_EXEC").is_ok_and(|v| v == "1");
+        let on = x_var("COORDD_X_MEM_EXEC").is_some_and(|v| v == "1");
         if on {
             eprintln!("SCRATCH mem-exec on");
         }

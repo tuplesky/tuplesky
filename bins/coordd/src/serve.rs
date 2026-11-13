@@ -1718,12 +1718,10 @@ enum Hold {
 
 /// SCRATCH (ceilings): `COORDD_X_HOLD_N` batches, `COORDD_X_HOLD_US` µs.
 fn scratch_hold() -> Option<(usize, std::time::Duration)> {
-    let n = std::env::var("COORDD_X_HOLD_N")
-        .ok()?
+    let n = coord_storage::scratch::x_var("COORDD_X_HOLD_N")?
         .parse::<usize>()
         .ok()?;
-    let us = std::env::var("COORDD_X_HOLD_US")
-        .ok()
+    let us = coord_storage::scratch::x_var("COORDD_X_HOLD_US")
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(2000);
     eprintln!("SCRATCH hold: leader flush held to {n} batches or {us} us");
