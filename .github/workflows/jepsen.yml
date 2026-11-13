@@ -106,7 +106,7 @@ on:
         description: "Run TupleSky in pairs on one runner against this base: a tuplesky ref (a branch, a tag or a full commit SHA, which actions/checkout needs whole) built beside the head, env:NAME=VALUE for the head's own build with that variable on every voter, harness:COORD_HARNESS_NAME=VALUE for the head's own build with that variable where the harness provisions it (a setting the harness writes into every voter's coordd.toml, such as COORD_HARNESS_PROJECTION_COMMIT_RECORDS=0), profile:strict or profile:replay for the head's own build on that journal profile (the profile input is the head's), or same for the head's own build (voter-workers BASE/HEAD then sets the sides apart); empty for one run"
         default: ""
       pairs:
-        description: "How many base and head pairs, when pair-base is set (the order alternates from pair to pair; empty for 3); in a sweep, the steps the base runs at, comma-separated (empty for every step)"
+        description: "How many base and head pairs, when pair-base is set (the order alternates from pair to pair; empty for 3); in a sweep, the steps the base runs at, comma-separated (empty for every step), where base and head each run twice in both orders, base, head, head, base"
         default: ""
       leader-profile:
         description: "Profile the TupleSky leader's domain thread with perf for 20 s in each run's workload, into its summary: true (flat), call-graph (call graphs by frame pointer, on the first pair's runs in a paired job, with every build in the job made with frame pointers; also the busiest follower, the leader's and that follower's tokio threads and their threads' system calls), or false. Under faults, the first window labels the busiest loops leader and follower whatever their roles, and every voter whose loop stays pegged is profiled while it is (leader_profile.py --watch-pegged)"
@@ -724,16 +724,25 @@ jobs:
             runs+=("$label=$store")
           }
           if [ -n "$SWEEP" ]; then
-            # Each step in turn: TupleSky (the head, and the base where it
-            # runs at this step, the two in an order alternating from step
-            # to step) and etcd, TupleSky first at odd steps and etcd first
-            # at even ones, so neither system always runs on the runner the
-            # other just warmed or heated; then SwiftPaxos.
+            # Each step in turn: TupleSky (the head, and where the base
+            # runs at this step, both twice, in both orders: base, head,
+            # head, base at odd steps and head, base, base, head at even
+            # ones, so a drift of the runner over the step cancels out of
+            # the head against the base) and etcd, TupleSky first at odd
+            # steps and etcd first at even ones, so neither system always
+            # runs on the runner the other just warmed or heated; then
+            # SwiftPaxos. A side's second run at a step is labelled #2.
             i=0
             tuplesky_step() {
-              local side
+              local side runs_head=0 runs_base=0 nth
               for side in $sides; do
-                one_side "$side" "$graph" "step $step" "$side@$step"
+                if [ "$side" = head ]; then runs_head=$((runs_head + 1)); nth=$runs_head
+                else runs_base=$((runs_base + 1)); nth=$runs_base; fi
+                if [ "$nth" = 1 ]; then
+                  one_side "$side" "$graph" "step $step" "$side@$step"
+                else
+                  one_side "$side" "$graph" "step $step, run $nth" "$side@$step#$nth"
+                fi
               done
             }
             etcd_step() {
@@ -760,7 +769,7 @@ jobs:
               CONCURRENCY=$step
               sides=head
               if [ -n "$IN_PAIR_BASE" ] && [[ " $SWEEP_BASE_STEPS " == *" $step "* ]]; then
-                if [ $((i % 2)) = 1 ]; then sides="head base"; else sides="base head"; fi
+                if [ $((i % 2)) = 1 ]; then sides="base head head base"; else sides="head base base head"; fi
               fi
               graph=flat; if [ "$IN_LEADER_PROFILE" = call-graph ] && [ "$i" = 1 ]; then graph=graph; fi
               if [ $((i % 2)) = 1 ]; then

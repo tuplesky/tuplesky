@@ -681,9 +681,10 @@ the etcd test itself instead, on its own runner and cluster, and the
 **A sweep.** A `concurrency` of several counts, comma-separated
 (`30,60,120`), runs the TupleSky job at each in turn on one runner: the
 head at each step; the base too, where `pair-base` is set, at the steps
-`pairs` lists (comma-separated; empty for every step), the order of the two
-alternating from step to step; and with `etcd-version: beside`, etcd after
-each step at the same clients. A register sweep's steps are raised to
+`pairs` lists (comma-separated; empty for every step), each twice in both
+orders, base, head, head, base at odd steps and head, base, base, head at
+even ones; and with `etcd-version: beside`, etcd after each step at the
+same clients. A register sweep's steps are raised to
 multiples of 2n as one count is. `pair-base: same` makes the base the
 head's own build, so `voter-workers: 2/1` sweeps the head at one worker
 against itself at two, with the same `features` on both; `pair-base:
@@ -862,6 +863,15 @@ the secured run is a row beside it.
 In a sweep, TupleSky runs first at odd steps and etcd runs first at even
 steps. That way neither system always runs on a runner the other has
 just warmed. SwiftPaxos runs after both.
+
+A step that runs the base runs it and the head twice each, in both orders.
+In the #253 pair (43329322354), which ran each once, the side that ran
+first won by 6–7% at both steps, the head at one and the base at the
+other: the runner drifts over a step by about as much as a lever moves.
+The sweep's summary labels a side's second run `#2` and gives the head
+against the base pair by pair and as the mean of each side's two runs,
+which cancels that drift. A change under about 10% is read from the mean,
+not from one pair.
 
 Each test runs under `timeout`, bounded at the time limit plus 20
 minutes. A test whose final phase hangs then fails in that time, instead

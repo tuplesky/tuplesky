@@ -3,7 +3,7 @@
 of client counts, every run on one runner, so a ratio between them holds within the
 job.
 
-    scripts/ci/jepsen_sweep.py [--title TITLE] SIDE@STEP=STORE [SIDE@STEP=STORE ...]
+    scripts/ci/jepsen_sweep.py [--title TITLE] SIDE@STEP[#N]=STORE [SIDE@STEP[#N]=STORE ...]
 
 Each argument is one run's store directory, labelled with its side
 (`head`, `base`, `etcd` at its default snapshot count, `etcd-snapCOUNT` at
@@ -11,7 +11,9 @@ Each argument is one run's store directory, labelled with its side
 (TLS with client certificates, and auth checked on every request), or
 `swiftpaxos`, the reference beside TupleSky)
 and its step (the clients it ran at, as the
-workflow names them: `30`, or `6n`), in the order the job ran them. For
+workflow names them: `30`, or `6n`), in the order the job ran them, and
+`#N` for a side's Nth run at that step (a step that runs the base and the
+head twice, in both orders: base, head, head, base). For
 every run it reads, with `jepsen_summary.py`'s parsers, over the workload (the first invocation to the last completion,
 or the final heal):
 
@@ -50,8 +52,11 @@ or the final heal):
   marked commands where counted, and the journal groups and projection
   commits.
 
-Then each TupleSky side's ratio to the etcd run at the same step, and
-SwiftPaxos's. It writes
+Then, at each step that ran both, the head against the base: each
+adjacent base and head (a pair, in the order they ran) and the means over
+the step's runs, so a step run in both orders cancels the runner's drift
+over the step; and each TupleSky side's ratio to the etcd run at the same
+step, and SwiftPaxos's. It writes
 Markdown to `$GITHUB_STEP_SUMMARY` when it is set and to standard output
 either way.
 """
@@ -72,6 +77,8 @@ class Step:
     side: str
     step: str
     store: str
+    # The side's Nth run at this step (`#N` in its label), 1 for the first.
+    rep: int = 1
     ok_per_s: float | None = None
     completed_per_s: float | None = None
     completed: int = 0
@@ -282,14 +289,18 @@ KINDS = (":read", ":write", ":cas")
 TUPLESKY = ("head", "base")
 
 
-def label(arg: str) -> tuple[str, str, str]:
-    """SIDE@STEP=STORE as its three parts."""
-    m = re.fullmatch(r"(head|base|etcd|etcd-snap[0-9]+|etcd-tls|etcd-tlsauth|swiftpaxos)@([0-9]+n?)=(.+)", arg)
+def label(arg: str) -> tuple[str, str, int, str]:
+    """SIDE@STEP[#N]=STORE as its parts: the side, the step, which of the
+    side's runs at that step it is (1 without `#N`), and the store."""
+    m = re.fullmatch(
+        r"(head|base|etcd|etcd-snap[0-9]+|etcd-tls|etcd-tlsauth|swiftpaxos)@([0-9]+n?)(?:#([1-9][0-9]*))?=(.+)", arg
+    )
     if not m:
         raise ValueError(
-            f"not SIDE@STEP=STORE (SIDE head, base, etcd, etcd-snapCOUNT, etcd-tls, etcd-tlsauth or swiftpaxos): {arg}"
+            "not SIDE@STEP[#N]=STORE (SIDE head, base, etcd, etcd-snapCOUNT, etcd-tls, etcd-tlsauth or "
+            f"swiftpaxos): {arg}"
         )
-    return m[1], m[2], m[3]
+    return m[1], m[2], int(m[3] or 1), m[4]
 
 
 def window(client: list) -> tuple:
@@ -499,8 +510,8 @@ def memory_of(store: str) -> dict:
     }
 
 
-def read_step(side: str, step_name: str, store: str) -> Step:
-    step = Step(side, step_name, store)
+def read_step(side: str, step_name: str, store: str, rep: int = 1) -> Step:
+    step = Step(side, step_name, store, rep)
     log = os.path.join(store, "jepsen.log")
     if not os.path.exists(log):
         return step
@@ -550,7 +561,65 @@ def cell(value, fmt: str) -> str:
 
 
 def name(step: Step) -> str:
-    return f"{step.step} | {step.side}"
+    return f"{step.step} | {step.side}{f' #{step.rep}' if step.rep > 1 else ''}"
+
+
+def head_against_base(steps: list[Step]) -> list[str]:
+    """At each step that ran both, the head against the base: each
+    adjacent base and head in the order they ran (a pair), and the means
+    over all the step's runs of each, as the head's difference from the
+    base; [] without a step that ran both."""
+    measures = (
+        ("Completed/s", lambda s: s.completed_per_s),
+        ("Servers' CPU per operation", lambda s: s.cpu.get("servers")),
+        ("Host busy per operation", lambda s: s.cpu.get("busy")),
+    )
+    out = []
+    order = []
+    for s in steps:
+        if s.step not in order:
+            order.append(s.step)
+    for step in order:
+        runs = [s for s in steps if s.step == step and s.side in TUPLESKY]
+        if not {"base", "head"} <= {s.side for s in runs}:
+            continue
+        pairs = []
+        rest = list(runs)
+        while len(rest) >= 2:
+            a, b = rest[0], rest[1]
+            if a.side != b.side:
+                pairs.append((a, b) if a.side == "base" else (b, a))
+                rest = rest[2:]
+            else:
+                rest = rest[1:]
+
+        def diff(head, base):
+            return f"{(head / base - 1) * 100:+.1f}%" if (head is not None and base) else "-"
+
+        def mean(side, get):
+            values = [get(s) for s in runs if s.side == side and get(s) is not None]
+            return sum(values) / len(values) if values else None
+
+        if not out:
+            out += [
+                "**Head against base** (at each step that ran both: each pair, a base and a head run next to each "
+                "other in the order shown, and the mean of each side's runs at the step; the head's difference from "
+                "the base. A step run in both orders, base, head, head, base, cancels a drift of the runner over "
+                "the step, which one order alone reads as the change)",
+                "",
+                "| Step | Pair | Order | " + " | ".join(m for m, _ in measures) + " |",
+                "| --- | --- | --- | " + "--- | " * len(measures),
+            ]
+        for i, (base, head) in enumerate(pairs, 1):
+            first = "base, head" if runs.index(base) < runs.index(head) else "head, base"
+            out.append(f"| {step} | {i} | {first} | " + " | ".join(diff(get(head), get(base)) for _, get in measures) + " |")
+        if len(pairs) > 1:
+            out.append(
+                f"| {step} | mean | both | "
+                + " | ".join(diff(mean("head", get), mean("base", get)) for _, get in measures)
+                + " |"
+            )
+    return out + [""] if out else []
 
 
 def per_commit_cell(readings: dict) -> str:
@@ -764,6 +833,8 @@ def render(steps: list[Step], title: str) -> str:
             out.append(f"| {name(s)} | " + " | ".join(cells) + " |")
         out += ["", "(each cell: resident at the end / high-water mark)", ""]
 
+    out += head_against_base(steps)
+
     etcd = {s.step: s for s in steps if s.side == "etcd"}
     rows = [s for s in steps if s.side != "etcd" and s.step in etcd]
     if rows:
@@ -796,12 +867,12 @@ def render(steps: list[Step], title: str) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--title", default="TupleSky sweep")
-    parser.add_argument("runs", nargs="+", metavar="SIDE@STEP=STORE")
+    parser.add_argument("runs", nargs="+", metavar="SIDE@STEP[#N]=STORE")
     args = parser.parse_args()
     steps = []
     for arg in args.runs:
-        side, step, store = label(arg)
-        steps.append(read_step(side, step, store))
+        side, step, rep, store = label(arg)
+        steps.append(read_step(side, step, store, rep))
     text = render(steps, args.title)
     print(text)
     summary = os.environ.get("GITHUB_STEP_SUMMARY")

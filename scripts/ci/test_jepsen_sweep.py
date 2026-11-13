@@ -188,12 +188,15 @@ class SweepTests(unittest.TestCase):
         self.assertIn("Relayed, not taken", sw.render([step], "Sweep"))
 
     def test_labels(self):
-        self.assertEqual(sw.label("head@30=/s/1"), ("head", "30", "/s/1"))
-        self.assertEqual(sw.label("etcd@6n=/s/2"), ("etcd", "6n", "/s/2"))
-        self.assertEqual(sw.label("swiftpaxos@120=/s/3"), ("swiftpaxos", "120", "/s/3"))
-        self.assertEqual(sw.label("etcd-snap100@30=/s/4"), ("etcd-snap100", "30", "/s/4"))
-        self.assertEqual(sw.label("etcd-tls@30=/s/5"), ("etcd-tls", "30", "/s/5"))
-        self.assertEqual(sw.label("etcd-tlsauth@120=/s/6"), ("etcd-tlsauth", "120", "/s/6"))
+        self.assertEqual(sw.label("head@30=/s/1"), ("head", "30", 1, "/s/1"))
+        self.assertEqual(sw.label("etcd@6n=/s/2"), ("etcd", "6n", 1, "/s/2"))
+        self.assertEqual(sw.label("swiftpaxos@120=/s/3"), ("swiftpaxos", "120", 1, "/s/3"))
+        self.assertEqual(sw.label("etcd-snap100@30=/s/4"), ("etcd-snap100", "30", 1, "/s/4"))
+        self.assertEqual(sw.label("etcd-tls@30=/s/5"), ("etcd-tls", "30", 1, "/s/5"))
+        self.assertEqual(sw.label("etcd-tlsauth@120=/s/6"), ("etcd-tlsauth", "120", 1, "/s/6"))
+        self.assertEqual(sw.label("head@30#2=/s/8"), ("head", "30", 2, "/s/8"))
+        with self.assertRaises(ValueError):
+            sw.label("head@30#0=/s/9")
         with self.assertRaises(ValueError):
             sw.label("etcd-auth@30=/s/7")
         with self.assertRaises(ValueError):
@@ -375,6 +378,38 @@ class SweepTests(unittest.TestCase):
         self.assertIn("| 30 | head | 150 / 200* | 40 / 300 |", text)
         section = text[text.index("**The voters' memory**"):text.index("**Against etcd")]
         self.assertNotIn("| 30 | etcd |", section)
+
+
+class HeadAgainstBaseTests(unittest.TestCase):
+    """A step that runs base, head, head, base: each pair and the means."""
+
+    @staticmethod
+    def made(side, rep, completed, servers, busy):
+        step = sw.Step(side, "30", "/s", rep)
+        step.completed_per_s = completed
+        step.cpu = {"servers": servers, "busy": busy}
+        return step
+
+    def test_each_pair_and_the_mean_over_both_orders(self):
+        steps = [
+            self.made("base", 1, 1000.0, 1.0, 2.0),
+            self.made("head", 1, 1100.0, 0.9, 1.8),
+            self.made("head", 2, 950.0, 1.05, 2.1),
+            self.made("base", 2, 1000.0, 1.0, 2.0),
+        ]
+        rows = [line for line in sw.render(steps, "Sweep").splitlines() if line.startswith("| 30 | ")]
+        self.assertIn("| 30 | 1 | base, head | +10.0% | -10.0% | -10.0% |", rows)
+        self.assertIn("| 30 | 2 | head, base | -5.0% | +5.0% | +5.0% |", rows)
+        self.assertIn("| 30 | mean | both | +2.5% | -2.5% | -2.5% |", rows)
+        # The second runs are named as such in the other tables.
+        self.assertIn("| 30 | head #2 |", sw.render(steps, "Sweep"))
+
+    def test_one_pair_has_no_mean_and_a_lone_side_no_table(self):
+        one = [self.made("head", 1, 1100.0, 0.9, 1.8), self.made("base", 1, 1000.0, 1.0, 2.0)]
+        text = sw.render(one, "Sweep")
+        self.assertIn("| 30 | 1 | head, base | +10.0% |", text)
+        self.assertNotIn("| 30 | mean |", text)
+        self.assertNotIn("**Head against base**", sw.render([self.made("head", 1, 1.0, 1.0, 1.0)], "Sweep"))
 
 
 if __name__ == "__main__":
