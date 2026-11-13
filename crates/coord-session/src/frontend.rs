@@ -504,6 +504,10 @@ impl BoundFrontend {
             debug_assert_eq!(existing.command, command, "identity decides the metadata");
             return;
         }
+        // Room first: the record being added is never the one forgotten,
+        // since its result may be gated as soon as it is recorded (a
+        // retained answer to a retry).
+        self.forget_settled();
         let info = RequestInfo {
             command,
             namespace: logical.namespace,
@@ -512,7 +516,6 @@ impl BoundFrontend {
         };
         self.requests.insert(key, info);
         self.order.push_back(key);
-        self.forget_settled();
     }
 
     /// Forget the oldest records past `max_requests`, but never one whose
@@ -525,21 +528,23 @@ impl BoundFrontend {
     /// load a read slower than the node's last `max_requests` arrivals
     /// lost its record.
     ///
-    /// Past the bound, a record added looks at the oldest records in
-    /// turn: it forgets each one the dispatcher no longer holds, and
-    /// moves at most [`HELD_LOOKS`] that it still holds to the back. So
+    /// At the bound, a record about to be added looks at the oldest
+    /// records in turn: it forgets each one the dispatcher no longer
+    /// holds, and moves at most [`HELD_LOOKS`] that it still holds to the
+    /// back. It looks before it is added, so it is never among them. So
     /// the work is constant for each record added, however much the
     /// dispatcher holds (its retained results alone can outnumber the
     /// bound on a busy node), and every record is looked at again within
     /// a pass of no more than half as many additions as there are
     /// records. A record forgotten is one the dispatcher let go before
     /// that pass reached it, which bounds the records by the larger of
-    /// `max_requests` and four times what the dispatcher holds: its
+    /// `max_requests` and four times what the dispatcher holds, plus the
+    /// record being added: its
     /// commands pending or retained for resolution, and its reads
     /// waiting on a leader.
     fn forget_settled(&mut self) {
         let mut held = 0;
-        while self.order.len() > self.max_requests && held < HELD_LOOKS {
+        while self.order.len() >= self.max_requests && held < HELD_LOOKS {
             let Some(old) = self.order.pop_front() else {
                 break;
             };

@@ -1412,6 +1412,90 @@ fn a_read_still_outstanding_when_the_request_memory_turns_over_is_still_disclose
 }
 
 #[test]
+fn a_read_waiting_on_its_leader_keeps_its_record_past_the_bound() {
+    // The half of what the dispatcher holds that isn't a command: a
+    // current read sent to the leader's barrier waits outside the
+    // collector, and its record is kept while it waits.
+    let ring = ring();
+    let domain = Domain::new();
+    let hub = WatchHub::new(KvRevision::ZERO, KvRevision::ZERO);
+    let mut f = frontend_remembering(&ring, 4);
+    f.dispatcher_mut().set_leader_reads(true);
+    let bind = frame_of(&bind_frame(&token(&ring, SESSION, NOW + 100)).unwrap());
+    let Ingress::Bound(_) = f.on_frame(&clock(NOW), at(NOW), 1, &bind, &hub, &domain.policy())
+    else {
+        panic!()
+    };
+    let (read, req) = request(1, range(b"secret"));
+    assert!(matches!(
+        f.on_frame(&clock(NOW), at(NOW), 1, &req, &hub, &domain.policy()),
+        Ingress::Action(Action::Read(_))
+    ));
+    assert_eq!(f.dispatcher().reads_waiting(), 1);
+    for seq in 2..=11 {
+        let mut logical = LogicalRequest::new(NS, range(b"secret"));
+        logical.canonicalize();
+        let command = CommandId::derive(&retry_key(seq), &logical).unwrap();
+        f.deliver_retained(
+            delivery(1, seq, command, range_outcome(b"secret")),
+            command,
+            &logical,
+            &domain.policy(),
+        );
+    }
+    assert!(f.remembered() <= 5, "{} remembered", f.remembered());
+    let answered = f
+        .deliver(
+            delivery(1, 1, read, range_outcome(b"secret")),
+            &domain.policy(),
+        )
+        .answered();
+    assert!(!is_denied(&answered), "{:?}", outcome_of(&answered));
+}
+
+#[test]
+fn a_result_gated_as_it_is_recorded_keeps_its_record_at_a_bound_of_one() {
+    // At a bound of one, with one record held, the record of a retained
+    // answer is added and gated at once: making room never forgets the
+    // record being added.
+    let ring = ring();
+    let domain = Domain::new();
+    let hub = WatchHub::new(KvRevision::ZERO, KvRevision::ZERO);
+    let mut f = frontend_remembering(&ring, 1);
+    let bind = frame_of(&bind_frame(&token(&ring, SESSION, NOW + 100)).unwrap());
+    let Ingress::Bound(_) = f.on_frame(&clock(NOW), at(NOW), 1, &bind, &hub, &domain.policy())
+    else {
+        panic!()
+    };
+    let (read, req) = request(1, range(b"secret"));
+    assert!(matches!(
+        f.on_frame(&clock(NOW), at(NOW), 1, &req, &hub, &domain.policy()),
+        Ingress::Action(Action::FanOut(_))
+    ));
+    for seq in 2..=4 {
+        let mut logical = LogicalRequest::new(NS, range(b"secret"));
+        logical.canonicalize();
+        let command = CommandId::derive(&retry_key(seq), &logical).unwrap();
+        let answered = f
+            .deliver_retained(
+                delivery(1, seq, command, range_outcome(b"secret")),
+                command,
+                &logical,
+                &domain.policy(),
+            )
+            .answered();
+        assert!(!is_denied(&answered), "{:?}", outcome_of(&answered));
+    }
+    let answered = f
+        .deliver(
+            delivery(1, 1, read, range_outcome(b"secret")),
+            &domain.policy(),
+        )
+        .answered();
+    assert!(!is_denied(&answered), "{:?}", outcome_of(&answered));
+}
+
+#[test]
 fn the_gate_keeps_what_the_dispatcher_holds_within_four_times_it() {
     // More is held than the bound: each record added past it looks at a
     // constant number of records, and the records stay within four times
