@@ -2915,7 +2915,11 @@ async fn a_turns_frames_to_one_peer_share_a_stream_in_order() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
+// One thread: the lane's sender runs only when this test yields, so it has
+// parked by the time `b` reads a batch, and a frame queued under the hold
+// can only leave at the release. On several threads, a sender still
+// finishing the last batch drains the held frames, which the hold allows.
+#[tokio::test]
 async fn a_held_wake_up_leaves_the_frames_queued_until_it_is_released() {
     // task-d115, lever 8: under a hold, a send admits and queues as
     // before and its sender is woken only at the release -- once for
