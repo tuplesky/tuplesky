@@ -2165,7 +2165,10 @@ fn an_admitted_request_is_taken_only_as_its_canonical_encoding() {
         !effects.iter().any(|e| matches!(e, Effect::Persist(_))),
         "nothing written"
     );
-    assert_eq!(f.take_rejections(), vec![FollowerRejection::MalformedRequest]);
+    assert_eq!(
+        f.take_rejections(),
+        vec![FollowerRejection::MalformedRequest]
+    );
     assert_eq!(f.admitted(), None);
 
     // The canonical bytes are taken, and written.
