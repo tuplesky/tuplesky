@@ -65,6 +65,8 @@ either way.
 from __future__ import annotations
 
 import argparse
+import collections
+import datetime
 import os
 import re
 import sys
@@ -105,6 +107,13 @@ class Step:
     per_commit: float | None = None
     run_queue_per_cmd_ms: float | None = None
     run_queue_p99_ms: float | None = None
+    # server_profile.py's counts over its window (key -> value), with
+    # `ops`, the operations completed in that window.
+    servers: dict = field(default_factory=dict)
+    # etcd by call graph: role (leader, follower) -> (samples, leaf kind ->
+    # share in percent, component -> share of the samples whose stack
+    # holds it, in percent).
+    etcd_profile: dict = field(default_factory=dict)
     # The leader's round, submitted to learned (task-d97), p50 and p99 in ms.
     round_ms: tuple | None = None
     # The workload's length in seconds.
@@ -576,6 +585,106 @@ def memory_of(store: str) -> dict:
     }
 
 
+# etcd's samples by kind of work: the leaf's kind, the first that matches
+# (each a name a symbol holds), and the components a stack passes through.
+# The kernel's frames are marked [k] by server_profile.py.
+ETCD_LEAF_KINDS = (
+    ("kernel", ("[k]",)),
+    ("allocator", ("runtime.mallocgc", "runtime.(*mcache)", "runtime.(*mcentral)", "runtime.(*mheap)",
+                   "runtime.newobject", "runtime.makeslice", "runtime.growslice", "runtime.nextFreeFast",
+                   "runtime.(*mspan)", "runtime.memclrNoHeapPointers", "runtime.heapBitsSetType",
+                   "runtime.makemap", "runtime.newarray", "runtime.rawstring", "runtime.slicebytetostring")),
+    ("garbage collector", ("runtime.gcBgMarkWorker", "runtime.scanobject", "runtime.greyobject", "runtime.gcDrain",
+                           "runtime.findObject", "runtime.markBits", "runtime.scanblock", "runtime.wbBuf",
+                           "runtime.bulkBarrier", "runtime.sweepone", "runtime.(*gcWork)", "runtime.typePointers",
+                           "runtime.gcmarknewobject", "runtime.scanstack", "runtime.markroot")),
+    ("B-tree search", ("go.etcd.io/bbolt", "github.com/google/btree", "/btree.")),
+    ("memcpy, memcmp", ("runtime.memmove", "runtime.memequal", "runtime.memeqbody", "runtime.cmpbody",
+                        "internal/bytealg", "bytes.Equal", "bytes.Compare")),
+    ("hashing, maps", ("runtime.mapaccess", "runtime.mapassign", "runtime.mapdelete", "runtime.aeshash",
+                       "runtime.memhash", "runtime.strhash", "internal/runtime/maps", "hash/")),
+    ("crypto", ("crypto/", "golang.org/x/crypto")),
+    ("scheduler", ("runtime.schedule", "runtime.findRunnable", "runtime.runqget", "runtime.stealWork",
+                   "runtime.netpoll", "runtime.futex", "runtime.park_m", "runtime.mcall", "runtime.gopark",
+                   "runtime.goready", "runtime.ready", "runtime.wakep", "runtime.notesleep", "runtime.notewakeup",
+                   "runtime.lock", "runtime.unlock", "runtime.usleep", "runtime.osyield", "runtime.casgstatus",
+                   "runtime.selectgo", "runtime.chansend", "runtime.chanrecv", "runtime.semacquire",
+                   "runtime.semrelease", "sync.")),
+    ("the rest", ("",)),
+)
+ETCD_COMPONENTS = (
+    ("raft", ("go.etcd.io/raft",)),
+    ("WAL", ("storage/wal", "/wal.")),
+    ("bbolt", ("go.etcd.io/bbolt",)),
+    ("MVCC and apply", ("storage/mvcc", "storage/backend", "etcdserver/apply", "etcdserver.(*EtcdServer).apply",
+                        "server/v3/etcdserver/txn")),
+    ("gRPC", ("google.golang.org/grpc",)),
+    ("HTTP/2", ("golang.org/x/net/http2", "net/http.")),
+    ("TLS", ("crypto/tls",)),
+    ("protobuf", ("protobuf", "gogo", ".Marshal", ".Unmarshal")),
+    ("garbage collector", ("runtime.gcBgMarkWorker", "runtime.gcDrain", "runtime.markroot", "runtime.bgsweep",
+                           "runtime.gcAssistAlloc")),
+    ("logging", ("go.uber.org/zap",)),
+    ("system calls", ("syscall.", "internal/poll", "golang.org/x/sys", "runtime.write1", "runtime.read")),
+)
+
+
+def etcd_kind(stack: list[str], table) -> str:
+    """The first kind in TABLE whose names the leaf holds."""
+    leaf = stack[0] if stack else ""
+    for kind, names in table:
+        if any(n in leaf for n in names):
+            return kind
+    return table[-1][0]
+
+
+def read_etcd_profile(path: str):
+    """A -etcd-ROLE file's samples (one folded stack a line, leaf first):
+    their count, leaf kinds and components, in percent. None without it."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            stacks = [line.rstrip("\n").split(";") for line in f if line.strip()]
+    except OSError:
+        return None
+    if not stacks:
+        return None
+    n = len(stacks)
+    kinds = collections.Counter(etcd_kind(st, ETCD_LEAF_KINDS) for st in stacks)
+    parts = collections.Counter()
+    unknown = 0
+    for st in stacks:
+        if all(f in ("[unknown]", "[k][unknown]") or f.startswith("0x") for f in st):
+            unknown += 1
+        for comp, names in ETCD_COMPONENTS:
+            if any(any(nm in f for nm in names) for f in st):
+                parts[comp] += 1
+    return (n, {k: v * 100 / n for k, v in kinds.items()}, {k: v * 100 / n for k, v in parts.items()},
+            unknown * 100 / n)
+
+
+def server_counts(step: Step, client: list) -> None:
+    """server_profile.py's counts and etcd profile, with the operations
+    completed in its window."""
+    path = os.path.join(step.store, "cpu-samples-servers.txt")
+    try:
+        with open(path) as f:
+            kv = dict(line.rstrip("\n").split("=", 1) for line in f if "=" in line)
+    except OSError:
+        return
+    step.servers = kv
+    try:
+        a = datetime.datetime.fromtimestamp(float(kv["window_start"]), tz=datetime.timezone.utc).replace(tzinfo=None)
+        b = datetime.datetime.fromtimestamp(float(kv["window_end"]), tz=datetime.timezone.utc).replace(tzinfo=None)
+    except (KeyError, ValueError):
+        return
+    kv["ops"] = sum(1 for o in client if o.type != "invoke" and a <= o.at <= b)
+    kv["seconds"] = (b - a).total_seconds()
+    for role in ("leader", "follower"):
+        got = read_etcd_profile(os.path.join(step.store, f"cpu-samples-servers-etcd-{role}.txt"))
+        if got:
+            step.etcd_profile[role] = got
+
+
 def read_step(side: str, step_name: str, store: str, rep: int = 1) -> Step:
     step = Step(side, step_name, store, rep)
     log = os.path.join(store, "jepsen.log")
@@ -591,6 +700,7 @@ def read_step(side: str, step_name: str, store: str, rep: int = 1) -> Step:
     if nemesis:
         end = nemesis[-1].at
     clients_and_mix(step, client, start, end)
+    server_counts(step, client)
     step.window_s = (end - start).total_seconds()
     completed = step.completed
     runner(step, start, end, completed)
@@ -705,6 +815,77 @@ def model_note(steps: list[Step]) -> str:
     return f", {' and '.join(models)}" if models else ""
 
 
+def servers_table(steps: list[Step]) -> list[str]:
+    """server_profile.py's counts an operation, for every run that has
+    them; [] for none."""
+    rows = [s for s in steps if s.servers]
+    if not rows:
+        return []
+    out = [
+        "**The servers' system calls, context switches and packets an operation** (`server_profile.py`, over a "
+        "window of the workload after it settled: every server process's system calls (`raw_syscalls:sys_enter`), "
+        "context switches and CPU by `perf stat`, summed over the five, and the packets the containers sent and "
+        "received on the cluster's network (the host side of their `veth` interfaces: the clients' traffic to the "
+        "servers and the servers' to each other), each over the operations completed in the window)",
+        "",
+        "| Step | Side | Window (s) | Operations | System calls | Context switches | Packets sent | Packets received "
+        "| Servers' CPU (ms) |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+    ]
+    for s in rows:
+        kv = s.servers
+        if "error" in kv and "syscalls" not in kv:
+            out.append(f"| {name(s)} | - | - | {kv['error'][:120]} | - | - | - | - |")
+            continue
+        ops = kv.get("ops") or 0
+
+        def per(key, fmt=".2f"):
+            try:
+                return format(float(kv[key].replace(",", "")) / ops, fmt) if ops else "-"
+            except (KeyError, ValueError):
+                return "-"
+        out.append(
+            f"| {name(s)} | {cell(kv.get('seconds'), '.1f')} | {ops} | {per('syscalls')} | "
+            f"{per('context_switches')} | {per('packets_sent')} | {per('packets_received')} | "
+            f"{per('task_clock_ms', '.3f')} |"
+        )
+    out.append("")
+    return out
+
+
+def etcd_profile_table(steps: list[Step]) -> list[str]:
+    """etcd's leader and a follower by kind of work, for each run with a
+    profile; [] for none."""
+    rows = [s for s in steps if s.etcd_profile]
+    if not rows:
+        return []
+    kinds = [k for k, _ in ETCD_LEAF_KINDS]
+    comps = [c for c, _ in ETCD_COMPONENTS]
+    out = [
+        "**etcd by call graph** (`server_profile.py --call-graph`: the busiest member, the leader, and the next, a "
+        "follower, sampled at 499 Hz with call graphs by frame pointer over the counts' window; by the leaf's kind, "
+        "in percent of the member's samples, as the TupleSky loops' table names them where the two match, then by "
+        "component, the share of the samples whose stack passes through it, so components overlap; unresolved is "
+        "the share of samples with no symbol at all, high for a stripped binary)",
+        "",
+        "| Step | Side | Member | Samples | Unresolved | " + " | ".join(kinds) + " | " + " | ".join(comps) + " |",
+        "| --- | --- | --- | --- | --- | " + " | ".join("---" for _ in kinds + comps) + " |",
+    ]
+    for s in rows:
+        for role in ("leader", "follower"):
+            got = s.etcd_profile.get(role)
+            if not got:
+                continue
+            n, leaf, parts, unknown = got
+            out.append(
+                f"| {name(s)} | {role} | {n} | {unknown:.0f}% | "
+                + " | ".join(f"{leaf.get(k, 0.0):.1f}%" for k in kinds) + " | "
+                + " | ".join(f"{parts.get(c, 0.0):.1f}%" for c in comps) + " |"
+            )
+    out.append("")
+    return out
+
+
 def render(steps: list[Step], title: str, baseline: str = "etcd") -> str:
     out = [f"## {title}", ""]
     models = sorted({f"{s.model} ({s.cpus} CPUs)" for s in steps if s.model})
@@ -808,6 +989,9 @@ def render(steps: list[Step], title: str, baseline: str = "etcd") -> str:
                 f"{cell(mean, '.2f')} |"
             )
         out.append("")
+
+    out += servers_table(steps)
+    out += etcd_profile_table(steps)
 
     rows = [s for s in steps if s.pipelines]
     if rows:

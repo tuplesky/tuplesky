@@ -71,8 +71,25 @@ if [ -n "${JEPSEN_LEADER_PROFILE:-}" ]; then
   profiler=$!
 fi
 
+# With JEPSEN_SERVER_PROFILE (counts or call-graph) and JEPSEN_CPU_SAMPLES,
+# server_profile.py counts the servers' system calls, context switches and
+# the containers' packets over a window of the workload, into the samples'
+# path with -servers.txt for .csv, and with call-graph profiles etcd's
+# leader and a follower by call graph beside it.
+servers=
+if [ -n "${JEPSEN_SERVER_PROFILE:-}" ] && [ -n "${JEPSEN_CPU_SAMPLES:-}" ]; then
+  graph=(); if [ "$JEPSEN_SERVER_PROFILE" = call-graph ]; then graph=(--call-graph); fi
+  python3 "$(dirname "$0")/server_profile.py" --out "${JEPSEN_CPU_SAMPLES%.csv}-servers.txt" ${graph[@]+"${graph[@]}"} &
+  servers=$!
+fi
+
 rc=0
 timeout -k 60 "$bound" "$@" || rc=$?
+
+if [ -n "$servers" ]; then
+  kill "$servers" 2>/dev/null || true
+  wait "$servers" 2>/dev/null || true
+fi
 
 if [ -n "$profiler" ]; then
   kill "$profiler" 2>/dev/null || true

@@ -381,6 +381,51 @@ class SweepTests(unittest.TestCase):
         self.assertNotIn("| 30 | etcd |", section)
 
 
+class ServerProfileTests(unittest.TestCase):
+    """server_profile.py's counts an operation, and etcd by kind of work."""
+
+    setUp, tearDown, store = SweepTests.setUp, SweepTests.tearDown, SweepTests.store
+
+    def test_the_servers_counts_and_etcd_by_kind(self):
+        path = self.store("e", tuplesky=False)
+        import datetime
+        at = lambda s: datetime.datetime(2026, 9, 27, 10, 0, s, tzinfo=datetime.timezone.utc).timestamp()
+        # 10:00:01 to 10:00:05: a write, a read and a failed cas completed.
+        with open(os.path.join(path, "cpu-samples-servers.txt"), "w") as f:
+            f.write(f"comm=etcd\npids=1 2 3 4 5\nwindow_start={at(1)}\nwindow_end={at(5)}\ninterfaces=5\n"
+                    "packets_sent=30\npackets_received=36\nsyscalls=1,200\ncontext_switches=90\n"
+                    "task_clock_ms=6.0\nleader_pid=1\nfollower_pid=2\n")
+        with open(os.path.join(path, "cpu-samples-servers-etcd-leader.txt"), "w") as f:
+            f.write("runtime.mallocgc;go.etcd.io/raft/v3.(*raft).Step;main\n"
+                    "[k]__x64_sys_futex;runtime.futex;google.golang.org/grpc.(*Server).serve\n"
+                    "crypto/aes.gcmAesEnc;crypto/tls.(*Conn).Write;google.golang.org/grpc.(*Server).serve\n"
+                    "go.etcd.io/bbolt.(*Cursor).search;go.etcd.io/etcd/server/v3/storage/backend.(*readTx).UnsafeRange\n")
+        with open(os.path.join(path, "cpu-samples-servers-etcd-follower.txt"), "w") as f:
+            f.write("[unknown]\n0x1234\n")
+        step = sw.read_step("etcd", "30", path)
+        self.assertEqual(step.servers["ops"], 3)
+        leader = step.etcd_profile["leader"]
+        self.assertEqual(leader[0], 4)
+        self.assertEqual(leader[1], {"allocator": 25.0, "kernel": 25.0, "crypto": 25.0, "B-tree search": 25.0})
+        self.assertEqual(leader[2]["gRPC"], 50.0)
+        self.assertEqual(leader[2]["TLS"], 25.0)
+        self.assertEqual(leader[2]["raft"], 25.0)
+        self.assertEqual(leader[2]["MVCC and apply"], 25.0)
+        self.assertEqual(leader[3], 0.0)
+        self.assertEqual(step.etcd_profile["follower"][3], 100.0)
+        text = sw.render([step], "Sweep")
+        self.assertIn("**The servers' system calls, context switches and packets an operation**", text)
+        self.assertIn("| 30 | etcd | 4.0 | 3 | 400.00 | 30.00 | 10.00 | 12.00 | 2.000 |", text)
+        self.assertIn("**etcd by call graph**", text)
+        self.assertIn("| 30 | etcd | leader | 4 | 0% | 25.0% | 25.0% | 0.0% | 25.0% |", text)
+        self.assertIn("| 30 | etcd | follower | 2 | 100% |", text)
+
+    def test_no_counts_no_table(self):
+        step = sw.read_step("etcd", "30", self.store("e", tuplesky=False))
+        self.assertEqual(step.servers, {})
+        self.assertNotIn("system calls, context switches", sw.render([step], "Sweep"))
+
+
 class HeadAgainstBaseTests(unittest.TestCase):
     """A step that runs base, head, head, base: each pair and the means."""
 

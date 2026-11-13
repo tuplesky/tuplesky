@@ -109,7 +109,7 @@ on:
         description: "How many base and head pairs, when pair-base is set (the order alternates from pair to pair; empty for 3); in a sweep, the steps the base runs at, comma-separated (empty for every step), where base and head each run twice in both orders, base, head, head, base"
         default: ""
       leader-profile:
-        description: "Profile the TupleSky leader's domain thread with perf for 20 s in each run's workload, into its summary: true (flat), call-graph (call graphs by frame pointer, on the first pair's runs in a paired job, with every build in the job made with frame pointers; also the busiest follower, the leader's and that follower's tokio threads and their threads' system calls), or false. Under faults, the first window labels the busiest loops leader and follower whatever their roles, and every voter whose loop stays pegged is profiled while it is (leader_profile.py --watch-pegged)"
+        description: "Profile the TupleSky leader's domain thread with perf for 20 s in each run's workload, into its summary: true (flat), call-graph (call graphs by frame pointer, on the first pair's runs in a paired job, with every build in the job made with frame pointers; also the busiest follower, the leader's and that follower's tokio threads and their threads' system calls; and for TupleSky and etcd alike, every server's system calls, context switches and the cluster's packets an operation, and etcd's leader and a follower by call graph, scripts/ci/server_profile.py), or false. Under faults, the first window labels the busiest loops leader and follower whatever their roles, and every voter whose loop stays pegged is profiled while it is (leader_profile.py --watch-pegged)"
         type: choice
         options: ["false", "true", "call-graph"]
         default: "false"
@@ -129,6 +129,7 @@ on:
       - scripts/ci/jepsen_pairs.py
       - scripts/ci/jepsen_sweep.py
       - scripts/ci/leader_profile.py
+      - scripts/ci/server_profile.py
       - scripts/ci/jepsen_scenario.sh
       - scripts/ci/jepsen_summary.py
   schedule:
@@ -535,6 +536,11 @@ jobs:
             ${wan[@]+"${wan[@]}"}
             ${voter[@]+"${voter[@]}"})
           ci="$GITHUB_WORKSPACE/tuplesky/scripts/ci"
+          # With call graphs, every server's system calls, context switches
+          # and the cluster's packets over a window of each run, TupleSky's
+          # and etcd's alike, and etcd's leader and a follower by call graph
+          # (scripts/ci/server_profile.py, through jepsen_bounded.sh).
+          if [ "$IN_LEADER_PROFILE" = call-graph ]; then export JEPSEN_SERVER_PROFILE=call-graph; fi
           # One test with the binaries in $1, its samples and profile in $2,
           # a call graph when $3 is "graph", at $CONCURRENCY clients (a
           # sweep's step sets it, and the etcd test reads it too).

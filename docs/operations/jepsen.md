@@ -887,6 +887,18 @@ A job with one step and no pair runs TupleSky once, then the baseline
 once: etcd with TLS for `beside+tls` and `beside+tls+auth`, without the
 side rows, which need a sweep.
 
+With `leader-profile: call-graph`, `scripts/ci/server_profile.py` also
+runs beside every TupleSky and etcd run. Over 20 s of the settled
+workload it counts every server process's system calls, context switches
+and CPU with `perf stat`, and the packets the containers send and receive
+on the cluster's network. The sweep turns them into counts an operation
+over the operations completed in that window. For etcd it also samples
+the busiest member (the leader) and the next (a follower) by call graph
+at 499 Hz, and the sweep splits their samples by leaf kind (allocator,
+garbage collector, B-tree search, memcpy and memcmp, hashing, crypto,
+scheduler, kernel) and by the components a stack passes through (raft,
+the WAL, bbolt, MVCC and apply, gRPC, HTTP/2, TLS, protobuf, logging).
+
 A sweep's step can offer a fixed load instead of running its clients
 flat out. `CLIENTS@RATE` (`480@2000`) offers 2,000 operations a second
 to 480 clients, through each test's own `--rate`, for both systems
