@@ -319,6 +319,27 @@ def crowded(s: Step) -> bool:
     return bool(rate and clients and s.busy_clients is not None and s.busy_clients >= 0.8 * clients)
 
 
+def starved(s: Step, steps: list[Step], baseline: str) -> bool:
+    """A TupleSky run whose clients were busy less than 80% as much as the
+    baseline's at the same step: its load generator left clients idle, so
+    its latency and completions aren't at the same offered load (#98, the
+    etcd mix's first generator)."""
+    if s.side not in TUPLESKY or s.busy_clients is None:
+        return False
+    theirs = [b.busy_clients for b in steps if b.side == baseline and b.step == s.step and b.busy_clients]
+    return bool(theirs) and s.busy_clients < 0.8 * sum(theirs) / len(theirs)
+
+
+def busy_cell(s: Step, steps: list[Step], baseline: str) -> str:
+    """The clients busy on average, of the step's clients where they are a
+    count, with ⚠ for a crowded run and ⚑ for a starved one."""
+    clients, _ = offered(s.step)
+    text = cell(s.busy_clients, ".1f")
+    if s.busy_clients is not None and clients:
+        text += f" of {clients}"
+    return text + (" ⚠" if crowded(s) else "") + (" ⚑" if starved(s, steps, baseline) else "")
+
+
 def withheld(s: Step) -> int:
     """A run's reads answered with their output withheld: a permitted read
     the frontend's output gate didn't show."""
@@ -923,7 +944,8 @@ def render(steps: list[Step], title: str, baseline: str = "etcd") -> str:
         "mix is each kind's share of the operations completed, with the clients that invoked it; latency is of `ok`s, p50 / p99 in ms; "
         "a step CLIENTS@RATE offered RATE operations a second to its clients, both systems alike, and ⚠ marks a run "
         "whose clients were busy 80% of the time or more, where operations waited for a free client and its latency "
-        "leaves that wait out)",
+        "leaves that wait out; ⚑ marks a TupleSky run whose clients were busy less than 80% as much as the "
+        f"baseline's ({baseline}) at the same step, a load generator leaving clients idle, so not the same offered load)",
         "",
         "| Step | Side | `ok`/s | Completed/s | Busy clients | Reads / writes / cas | Read p50 / p99 | "
         "Write p50 / p99 | Cas p50 / p99 |",
@@ -936,7 +958,7 @@ def render(steps: list[Step], title: str, baseline: str = "etcd") -> str:
         ]
         out.append(
             f"| {name(s)} | {cell(s.ok_per_s, '.1f')} | {cell(s.completed_per_s, '.1f')} | "
-            f"{cell(s.busy_clients, '.1f')}{' ⚠' if crowded(s) else ''} | {mix} | " + " | ".join(lat) + " |"
+            f"{busy_cell(s, steps, baseline)} | {mix} | " + " | ".join(lat) + " |"
         )
     out.append("")
     out += not_ok_table(steps)

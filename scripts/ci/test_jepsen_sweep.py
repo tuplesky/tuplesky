@@ -327,8 +327,8 @@ class SweepTests(unittest.TestCase):
         text = sw.render(steps, "Sweep")
         self.assertIn("## Sweep", text)
         self.assertIn("**Runner:** Some CPU (4 CPUs)", text)
-        self.assertIn("| 30 | head | 0.4 | 0.5 | 0.4 | 60% (1) / 20% (1) / 20% (2) | 100.0 / 300.0 | 1000.0 / 1000.0 | - |", text)
-        self.assertIn("| 30 | etcd | 0.4 | 0.5 | 0.4 |", text)
+        self.assertIn("| 30 | head | 0.4 | 0.5 | 0.4 of 30 | 60% (1) / 20% (1) / 20% (2) | 100.0 / 300.0 | 1000.0 / 1000.0 | - |", text)
+        self.assertIn("| 30 | etcd | 0.4 | 0.5 | 0.4 of 30 |", text)
         # Per command: 2400 / 2 commands an operation; per write: 2400 / 0.4.
         self.assertIn("| 30 | head | 2.000 | 1200.000 | 200.000 | 400.000 | 6000.000 | 2.50 | 2.00 | 2.000 | - |", text)
         self.assertIn("| 30 | etcd | - | - | - | - | 6000.000 | - | - | - | - |", text)
@@ -524,6 +524,20 @@ class OfferedRateTests(unittest.TestCase):
         self.assertFalse(sw.crowded(free))
         self.assertTrue(sw.crowded(crowded))
         self.assertFalse(sw.crowded(unthrottled))
+
+    def test_busy_clients_of_the_step_and_a_starved_run_flagged(self):
+        # etcd-tls busy 26 and 25 of 30 (25.5); a head at 19.5 is under 80%
+        # of that and flagged, one at 22 is not; etcd's own rows never are.
+        steps = [self.made("etcd-tls", "30", 2500.0, 26.0), self.made("etcd-tls", "30", 2500.0, 25.0),
+                 self.made("head", "30", 2000.0, 19.5), self.made("head", "30", 2000.0, 22.0),
+                 self.made("base", "120", 2000.0, 45.0)]
+        self.assertTrue(sw.starved(steps[2], steps, "etcd-tls"))
+        self.assertFalse(sw.starved(steps[3], steps, "etcd-tls"))
+        self.assertFalse(sw.starved(steps[0], steps, "etcd-tls"))
+        self.assertFalse(sw.starved(steps[4], steps, "etcd-tls"))  # no baseline at its step
+        self.assertEqual(sw.busy_cell(steps[2], steps, "etcd-tls"), "19.5 of 30 ⚑")
+        self.assertEqual(sw.busy_cell(steps[3], steps, "etcd-tls"), "22.0 of 30")
+        self.assertEqual(sw.busy_cell(self.made("head", "48n", 1.0, 3.0), steps, "etcd-tls"), "3.0")
 
 
 class NotOkTests(unittest.TestCase):

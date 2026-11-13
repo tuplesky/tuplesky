@@ -42,7 +42,7 @@ on:
         options: [faults, throughput, wan, wan-throughput, service]
         default: faults
       workload:
-        description: "append, wr, register, register-etcd-mix (register with TupleSky's client threads split as etcd's register test splits its own: n readers in all, the rest mixing write and cas), or register-swiftpaxos-mix (register with TupleSky's and etcd's operations drawn as SwiftPaxos's register test draws its own: n readers in each key's group of 2n, the rest writing, no cas); empty for the scenario's"
+        description: "append, wr, register, register-etcd-mix (register drawn as etcd's register test draws its own: on each key, n readers reserved over a mix of write and cas, 100 operations a key; with a jepsen-ref from 50b71de2), register-etcd-mix:QUIRKS (the same with some of that mix's first generator's differences put back: on-threads, process-limit, jitter, comma-separated, or first for all three), or register-swiftpaxos-mix (register with TupleSky's and etcd's operations drawn as SwiftPaxos's register test draws its own: n readers in each key's group of 2n, the rest writing, no cas); empty for the scenario's"
         default: ""
       nemesis:
         description: "Comma-separated faults (kill, pause, partition, packet), or none; empty for the scenario's. Not clock: the containers share this runner's clock. TupleSky's partitions can be partition:TARGETS[:LO-HI[/EVERY]], TARGETS any, one or follower (a voter not leading), such as partition:follower:5-10/60; etcd and SwiftPaxos get plain partitions."
@@ -533,6 +533,13 @@ jobs:
               exit 1
             fi
             voter+=(--register-mix "$REGISTER_MIX")
+          fi
+          if [ -n "$REGISTER_QUIRKS" ]; then
+            if ! grep -q -- '--etcd-register-quirks' src/jepsen/tuplesky.clj; then
+              echo "::error::tuplesky/jepsen@$JEPSEN_REF has no --etcd-register-quirks; dispatch with a jepsen-ref that has it (50b71de2 or later), or the plain register-etcd-mix"
+              exit 1
+            fi
+            voter+=(--etcd-register-quirks "$REGISTER_QUIRKS")
           fi
           if [ -n "$HOLD_PEER_LINKS" ]; then
             if ! grep -q -- '--hold-peer-links' src/jepsen/tuplesky.clj; then
