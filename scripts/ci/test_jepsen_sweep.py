@@ -280,7 +280,7 @@ class SweepTests(unittest.TestCase):
         self.assertAlmostEqual(step.cpu["servers"], 2400.0)
         text = sw.render([step, sw.read_step("etcd", "30", self.store("e", tuplesky=False))], "Sweep")
         self.assertIn("| 30 | swiftpaxos | 1.00× | 1.00× | 1.00× |", text)
-        self.assertIn("SwiftPaxos's, and etcd's at another snapshot count or secured", text)
+        self.assertIn("SwiftPaxos's, and every other etcd row's", text)
         snap = sw.read_step("etcd-snap100", "30", self.store("e100", tuplesky=False))
         self.assertIsNone(snap.commands_per_op)
         text = sw.render([snap, sw.read_step("etcd", "30", self.store("e2", tuplesky=False))], "Sweep")
@@ -410,6 +410,53 @@ class HeadAgainstBaseTests(unittest.TestCase):
         self.assertIn("| 30 | 1 | head, base | +10.0% |", text)
         self.assertNotIn("| 30 | mean |", text)
         self.assertNotIn("**Head against base**", sw.render([self.made("head", 1, 1.0, 1.0, 1.0)], "Sweep"))
+
+    def test_a_missing_run_drops_its_own_pair_and_no_other(self):
+        # base, head, head #2, base #2 with the first head missing: the second
+        # pair stands alone and the first base is in no pair.
+        steps = [
+            self.made("base", 1, 500.0, 2.0, 4.0),
+            self.made("head", 2, 1100.0, 0.9, 1.8),
+            self.made("base", 2, 1000.0, 1.0, 2.0),
+        ]
+        rows = [line for line in sw.render(steps, "Sweep").splitlines() if line.startswith("| 30 | ")]
+        self.assertIn("| 30 | 1 | head, base | +10.0% | -10.0% | -10.0% |", rows)
+        self.assertFalse([r for r in rows if r.startswith("| 30 | 2 | ") or r.startswith("| 30 | mean | ")])
+
+
+class BaselineTests(unittest.TestCase):
+    """--baseline etcd-tls: ratios over etcd with TLS, the mean of its runs."""
+
+    @staticmethod
+    def made(side, rep, completed, servers):
+        step = sw.Step(side, "30", "/s", rep)
+        step.completed_per_s = completed
+        step.cpu = {"servers": servers}
+        return step
+
+    def test_ratios_over_the_tls_baseline_mean_with_plain_etcd_beside(self):
+        steps = [
+            self.made("head", 1, 1000.0, 1.0),
+            self.made("etcd-tls", 1, 2100.0, 0.55),
+            self.made("etcd", 1, 2400.0, 0.5),
+            self.made("etcd-tls", 2, 1900.0, 0.45),
+            self.made("head", 2, 1200.0, 1.2),
+        ]
+        text = sw.render(steps, "Sweep", "etcd-tls")
+        rows = [line for line in text.split("**Against etcd at the same step**")[1].splitlines()
+                if line.startswith("| 30 | ")]
+        # etcd-tls's mean: 2000/s at 0.5 ms an operation.
+        self.assertEqual(rows, [
+            "| 30 | head | - | 0.50× | 2.00× | - | - | - | - |",
+            "| 30 | etcd | - | 1.20× | 1.00× | - | - | - | - |",
+            "| 30 | head #2 | - | 0.60× | 2.40× | - | - | - | - |",
+            "| 30 | head mean | - | 0.55× | 2.20× | - | - | - | - |",
+        ])
+        self.assertIn("etcd's with TLS on both planes", text)
+
+    def test_without_the_baseline_at_a_step_no_ratio(self):
+        text = sw.render([self.made("head", 1, 1000.0, 1.0), self.made("etcd", 1, 2000.0, 0.5)], "Sweep", "etcd-tls")
+        self.assertNotIn("**Against etcd at the same step**", text)
 
 
 if __name__ == "__main__":

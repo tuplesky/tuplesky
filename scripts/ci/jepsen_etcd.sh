@@ -34,17 +34,23 @@ prepare() {
   fi
   echo "ETCD_SNAPSHOT_EXTRA=$extra" >> "${GITHUB_ENV:-/dev/null}"
   # VERSION+tls or VERSION+tls+auth (beside+tls, beside+tls+auth/100): in
-  # a TupleSky sweep, etcd again at each step secured as TupleSky is
-  # (ETCD_SECURE_EXTRA): TLS with client certificates on both planes, and
-  # with +auth a user whose role grants the test's keys, so every request
-  # carries a token and is checked against that grant. etcd plain stays the
-  # row every ratio is over; the secured run is a row beside it.
+  # a TupleSky sweep, etcd with TLS is the baseline every ratio is over
+  # (ETCD_HEADLINE=tls), because TupleSky's transport is always encrypted:
+  # TLS with client certificates on both planes. etcd plain is a row
+  # beside it, and with +auth etcd with TLS and auth too, a user whose role
+  # grants the test's keys, so every request carries a token and is checked
+  # against that grant (ETCD_SIDE_ROWS). Without either, plain etcd is the
+  # baseline and there is no side row.
+  local headline="" sides=""
   case $ETCD_VERSION in
-    *+tls+auth) secure=tls+auth ETCD_VERSION=${ETCD_VERSION%+tls+auth} ;;
-    *+tls) secure=tls ETCD_VERSION=${ETCD_VERSION%+tls} ;;
+    *+tls+auth) secure=tls+auth headline=tls sides="plain tls+auth" ETCD_VERSION=${ETCD_VERSION%+tls+auth} ;;
+    *+tls) secure=tls headline=tls sides=plain ETCD_VERSION=${ETCD_VERSION%+tls} ;;
     *+*) echo "::error::not an etcd security setting: '${ETCD_VERSION#*+}' (etcd-version VERSION+tls or VERSION+tls+auth)"; exit 1 ;;
   esac
-  echo "ETCD_SECURE_EXTRA=$secure" >> "${GITHUB_ENV:-/dev/null}"
+  {
+    echo "ETCD_HEADLINE=$headline"
+    echo "ETCD_SIDE_ROWS=$sides"
+  } >> "${GITHUB_ENV:-/dev/null}"
   # `beside` or `beside:VERSION` (etcd in the TupleSky job) names the
   # version after it, `latest` without one.
   case $ETCD_VERSION in
@@ -148,7 +154,7 @@ open(path, "w").write(src)
 PY
   grep -n 'cu/signal!' "$test_dir/src/jepsen/etcd/db.clj"
 
-  # The secured runs (ETCD_SECURE_EXTRA): the test reads the certificates'
+  # The secured runs (ETCD_HEADLINE, ETCD_SIDE_ROWS): the test reads the certificates'
   # directory from JEPSEN_ETCD_TLS and JEPSEN_ETCD_AUTH for auth, which
   # `run` sets for those runs alone, so a plain run on the same edits is
   # the test as it was.

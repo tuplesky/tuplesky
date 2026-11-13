@@ -857,12 +857,31 @@ runs etcd secured at each sweep step, labelled `etcd-tls`:
 `jepsen_etcd_secure.py` makes these edits to the etcd test. They do
 nothing in the plain runs. The clients the etcd test opens with no test
 map, for its nemeses' membership calls, send no credentials, so a
-secured run takes no faults. Every ratio stays over the plain run, and
-the secured run is a row beside it.
+secured run takes no faults.
+
+With `+tls`, etcd with TLS is the baseline: every ratio in the sweep's
+summary is over it (`--baseline etcd-tls`), and the job's title names it.
+TupleSky's transport is QUIC, which is always encrypted and has no
+plaintext mode, so the like-for-like etcd is one with TLS on both planes.
+Plain etcd is a side row, with its own ratios, and `+tls+auth` adds the
+`etcd-tlsauth` side row. Both TLS stacks run TLS 1.3 with mutual
+certificates on ECDSA P-256 keys: etcd's Go `crypto/tls` from etcd's flags
+above, and ours rustls with the aws-lc-rs provider, restricted to TLS 1.3
+in `coord-transport`. One difference remains: etcd's Go server picks
+AES-128-GCM on hardware with AES instructions, while rustls follows the
+client's order, which puts AES-256-GCM first, so our records are sealed
+with AES-256-GCM. A local etcd 3.7.3 with the job's flags negotiated
+TLS 1.3 and `TLS_AES_128_GCM_SHA256` on both planes, and refused a client
+without a certificate.
 
 In a sweep, TupleSky runs first at odd steps and etcd runs first at even
 steps. That way neither system always runs on a runner the other has
-just warmed. SwiftPaxos runs after both.
+just warmed. A step without a pair runs TupleSky and the baseline twice
+each, in both orders (TupleSky, baseline, side rows, baseline, TupleSky at
+odd steps, and the reverse at even ones), labelled `#2` the second time.
+The summary's ratios are over the baseline's mean at the step, with a row
+for each run and a `mean` row for each side that ran twice. SwiftPaxos
+runs after both.
 
 A step that runs the base runs it and the head twice each, in both orders.
 In the #253 pair (43329322354), which ran each once, the side that ran

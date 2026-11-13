@@ -63,7 +63,7 @@ on:
         description: Voters (containers), 3 or 5
         default: "5"
       etcd-version:
-        description: "etcd for the baseline: a version such as 3.7.2, latest (the newest stable release), or none to skip it; beside, or beside:VERSION, runs it in the TupleSky job, on its runner and cluster, after each pair (or after the one run), with each TupleSky run's ratio to it, instead of in a job of its own on another runner. etcd runs at its own default snapshot count; /COUNT after any of them (beside/100) also runs it at --snapshot-count COUNT at each sweep step, labelled etcd-snapCOUNT; +tls or +tls+auth before it (beside+tls, beside+tls+auth/100) also runs it secured at each sweep step, TLS with client certificates on both planes and with +auth a non-root user checked against a role's grant, labelled etcd-tls or etcd-tlsauth; in a sweep TupleSky runs first at odd steps and etcd at even ones"
+        description: "etcd for the baseline: a version such as 3.7.2, latest (the newest stable release), or none to skip it; beside, or beside:VERSION, runs it in the TupleSky job, on its runner and cluster, after each pair (or after the one run), with each TupleSky run's ratio to it, instead of in a job of its own on another runner. etcd runs at its own default snapshot count; /COUNT after any of them (beside/100) also runs it at --snapshot-count COUNT at each sweep step, labelled etcd-snapCOUNT; +tls before it (beside+tls, beside+tls+auth/100) makes etcd with TLS, client certificates required on both planes, the baseline every ratio is over, labelled etcd-tls, since TupleSky's QUIC is always encrypted, with plain etcd (etcd) as a side row, and +tls+auth adds a side row with a non-root user checked against a role's grant (etcd-tlsauth); in a sweep TupleSky runs first at odd steps and etcd at even ones, and without a pair TupleSky and the baseline run twice a step, in both orders"
         default: latest
       features:
         description: "Replicated features TupleSky's voters activate once every voter is submittable, before the nemesis and the workload (jepsen.tuplesky's --activate, task-d99), comma-separated in order, such as early-proposal,release-at-execution; NAME@SECS activates one under load, SECS into the workload (--activate-after), such as early-proposal,answer-on-release@60; a build without an admin socket (a pair's base before task-d99) is left as it is; empty for none; BASE/HEAD gives a pair's two sides their own lists (either may be empty)"
@@ -602,7 +602,7 @@ jobs:
               --title "SwiftPaxos: register, none, at $clients clients: $label" || true
           }
           head_sha=$(git -C "$GITHUB_WORKSPACE/tuplesky" rev-parse --short HEAD)
-          beside=""; if [ "$ETCD_BESIDE" = true ]; then beside=", beside etcd $ETCD_VERSION${ETCD_SECURE_EXTRA:+ (and with $ETCD_SECURE_EXTRA)}"; fi
+          beside=""; if [ "$ETCD_BESIDE" = true ]; then beside=", beside etcd $ETCD_VERSION${ETCD_HEADLINE:+ with $ETCD_HEADLINE}${ETCD_SIDE_ROWS:+ (and ${ETCD_SIDE_ROWS// / and })}"; fi
           if [ "$SWIFTPAXOS_BESIDE" = true ]; then beside+=", beside SwiftPaxos"; fi
           if [ -z "$IN_PAIR_BASE" ] && [ -z "$SWEEP" ]; then
             graph=flat; if [ "$IN_LEADER_PROFILE" = call-graph ]; then graph=graph; fi
@@ -732,9 +732,16 @@ jobs:
             # steps and etcd first at even ones, so neither system always
             # runs on the runner the other just warmed or heated; then
             # SwiftPaxos. A side's second run at a step is labelled #2.
+            # The etcd baseline (with TLS, ETCD_HEADLINE=tls, or plain) and
+            # then its side rows (ETCD_SIDE_ROWS). At a step without the
+            # base, TupleSky and the baseline each run twice in both orders
+            # too: TupleSky, baseline, side rows, baseline, TupleSky at odd
+            # steps, the mirror at even ones.
             i=0
+            # $1: which round of the step this is, 1 or 2, so the runs'
+            # labels go on from the first round's.
             tuplesky_step() {
-              local side runs_head=0 runs_base=0 nth
+              local side runs_head=$(( ${1:-1} - 1 )) runs_base=$(( ${1:-1} - 1 )) nth
               for side in $sides; do
                 if [ "$side" = head ]; then runs_head=$((runs_head + 1)); nth=$runs_head
                 else runs_base=$((runs_base + 1)); nth=$runs_base; fi
@@ -745,37 +752,58 @@ jobs:
                 fi
               done
             }
-            etcd_step() {
+            # The baseline once; $1 its round at the step.
+            etcd_headline() {
               [ "$ETCD_BESIDE" = true ] || return 0
+              local round=${1:-1} label=etcd mark=""
+              if [ -n "${ETCD_HEADLINE:-}" ]; then label="etcd-${ETCD_HEADLINE//+/}"; fi
+              if [ "$round" != 1 ]; then mark="#$round"; fi
               n=$((n + 1))
-              if etcd_one "$RUNNER_TEMP/run-$n" "step $step"; then runs+=("etcd@$step=$etcd_store"); fi
+              if etcd_one "$RUNNER_TEMP/run-$n" "step $step${mark:+, run $round}${ETCD_HEADLINE:+, $ETCD_HEADLINE}" "" "${ETCD_HEADLINE:-}"; then
+                runs+=("$label@$step$mark=$etcd_store")
+              fi
+            }
+            # The rows beside the baseline, once a step.
+            etcd_sides() {
+              [ "$ETCD_BESIDE" = true ] || return 0
               # etcd-version .../COUNT: etcd again at that snapshot count.
               if [ -n "${ETCD_SNAPSHOT_EXTRA:-}" ]; then
                 n=$((n + 1))
-                if etcd_one "$RUNNER_TEMP/run-$n" "step $step, --snapshot-count $ETCD_SNAPSHOT_EXTRA" "$ETCD_SNAPSHOT_EXTRA"; then
+                if etcd_one "$RUNNER_TEMP/run-$n" "step $step, --snapshot-count $ETCD_SNAPSHOT_EXTRA" "$ETCD_SNAPSHOT_EXTRA" "${ETCD_HEADLINE:-}"; then
                   runs+=("etcd-snap$ETCD_SNAPSHOT_EXTRA@$step=$etcd_store")
                 fi
               fi
-              # etcd-version VERSION+tls or +tls+auth: etcd again, secured.
-              if [ -n "${ETCD_SECURE_EXTRA:-}" ]; then
+              # etcd-version VERSION+tls or +tls+auth: plain etcd, and etcd
+              # with TLS and auth, beside the baseline with TLS.
+              local row
+              for row in ${ETCD_SIDE_ROWS:-}; do
                 n=$((n + 1))
-                if etcd_one "$RUNNER_TEMP/run-$n" "step $step, $ETCD_SECURE_EXTRA" "" "$ETCD_SECURE_EXTRA"; then
-                  runs+=("etcd-${ETCD_SECURE_EXTRA//+/}@$step=$etcd_store")
+                if [ "$row" = plain ]; then
+                  if etcd_one "$RUNNER_TEMP/run-$n" "step $step, plain"; then runs+=("etcd@$step=$etcd_store"); fi
+                elif etcd_one "$RUNNER_TEMP/run-$n" "step $step, $row" "" "$row"; then
+                  runs+=("etcd-${row//+/}@$step=$etcd_store")
                 fi
-              fi
+              done
             }
             for step in $SWEEP; do
               i=$((i + 1))
               CONCURRENCY=$step
-              sides=head
+              sides=head paired=false
               if [ -n "$IN_PAIR_BASE" ] && [[ " $SWEEP_BASE_STEPS " == *" $step "* ]]; then
+                paired=true
                 if [ $((i % 2)) = 1 ]; then sides="base head head base"; else sides="head base base head"; fi
               fi
               graph=flat; if [ "$IN_LEADER_PROFILE" = call-graph ] && [ "$i" = 1 ]; then graph=graph; fi
-              if [ $((i % 2)) = 1 ]; then
-                tuplesky_step; etcd_step
+              if [ "$paired" = true ] || [ "$ETCD_BESIDE" != true ]; then
+                if [ $((i % 2)) = 1 ]; then
+                  tuplesky_step; etcd_headline; etcd_sides
+                else
+                  etcd_headline; etcd_sides; tuplesky_step
+                fi
+              elif [ $((i % 2)) = 1 ]; then
+                tuplesky_step 1; etcd_headline 1; etcd_sides; etcd_headline 2; tuplesky_step 2
               else
-                etcd_step; tuplesky_step
+                etcd_headline 1; tuplesky_step 1; etcd_sides; tuplesky_step 2; etcd_headline 2
               fi
               # SwiftPaxos at this step's clients, raised as a register
               # step is (SWIFTPAXOS_STEPS, one a step, in order).
@@ -787,6 +815,7 @@ jobs:
               fi
             done
             python3 "$ci/jepsen_sweep.py" \
+              ${ETCD_HEADLINE:+--baseline "etcd-${ETCD_HEADLINE//+/}"} \
               --title "TupleSky sweep: $head_sha (head)${base_name:+ and $base_name (base)}$beside, $WORKLOAD, $NEMESIS$TITLE_SUFFIX$STORE_SUFFIX$PROFILE_SUFFIX$CHECKPOINT_SUFFIX$WORKERS_SUFFIX$TUPLESKY_SUFFIX" \
               ${runs[@]+"${runs[@]}"} || true
             exit $rc
@@ -807,7 +836,7 @@ jobs:
             # etcd after the pair, so each pair has its own on this runner.
             if [ "$ETCD_BESIDE" = true ]; then
               n=$((n + 1))
-              if etcd_one "$RUNNER_TEMP/run-$n" "pair $i"; then runs+=("etcd#$i=$etcd_store"); fi
+              if etcd_one "$RUNNER_TEMP/run-$n" "pair $i${ETCD_HEADLINE:+, $ETCD_HEADLINE}" "" "${ETCD_HEADLINE:-}"; then runs+=("etcd#$i=$etcd_store"); fi
             fi
           done
           python3 "$ci/jepsen_pairs.py" \

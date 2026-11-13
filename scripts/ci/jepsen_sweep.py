@@ -52,7 +52,9 @@ or the final heal):
   marked commands where counted, and the journal groups and projection
   commits.
 
-Then, at each step that ran both, the head against the base: each
+`--baseline etcd-tls` makes etcd with TLS the row every ratio is over,
+as the workflow does with `etcd-version: beside+tls`; plain etcd is then a
+row beside it. Then, at each step that ran both, the head against the base: each
 adjacent base and head (a pair, in the order they ran) and the means over
 the step's runs, so a step run in both orders cancels the runner's drift
 over the step; and each TupleSky side's ratio to the etcd run at the same
@@ -566,9 +568,9 @@ def name(step: Step) -> str:
 
 def head_against_base(steps: list[Step]) -> list[str]:
     """At each step that ran both, the head against the base: each
-    adjacent base and head in the order they ran (a pair), and the means
-    over all the step's runs of each, as the head's difference from the
-    base; [] without a step that ran both."""
+    repetition's base and head (a pair), in the order they ran, and the
+    means over the step's complete pairs of each, as the head's difference
+    from the base; [] without a step that ran both."""
     measures = (
         ("Completed/s", lambda s: s.completed_per_s),
         ("Servers' CPU per operation", lambda s: s.cpu.get("servers")),
@@ -583,27 +585,29 @@ def head_against_base(steps: list[Step]) -> list[str]:
         runs = [s for s in steps if s.step == step and s.side in TUPLESKY]
         if not {"base", "head"} <= {s.side for s in runs}:
             continue
+        # A pair is the base and head of one repetition, so a run that left
+        # no store drops its own pair and never shifts the others.
         pairs = []
-        rest = list(runs)
-        while len(rest) >= 2:
-            a, b = rest[0], rest[1]
-            if a.side != b.side:
-                pairs.append((a, b) if a.side == "base" else (b, a))
-                rest = rest[2:]
-            else:
-                rest = rest[1:]
+        for rep in sorted({s.rep for s in runs}):
+            base = [s for s in runs if s.side == "base" and s.rep == rep]
+            head = [s for s in runs if s.side == "head" and s.rep == rep]
+            if base and head:
+                pairs.append((base[0], head[0]))
+        if not pairs:
+            continue
 
         def diff(head, base):
             return f"{(head / base - 1) * 100:+.1f}%" if (head is not None and base) else "-"
 
         def mean(side, get):
-            values = [get(s) for s in runs if s.side == side and get(s) is not None]
+            values = [get(p[side == "head"]) for p in pairs]
+            values = [v for v in values if v is not None]
             return sum(values) / len(values) if values else None
 
         if not out:
             out += [
-                "**Head against base** (at each step that ran both: each pair, a base and a head run next to each "
-                "other in the order shown, and the mean of each side's runs at the step; the head's difference from "
+                "**Head against base** (at each step that ran both: each pair, the base and head runs of one "
+                "repetition in the order shown, and the mean of each side's runs in complete pairs; the head's difference from "
                 "the base. A step run in both orders, base, head, head, base, cancels a drift of the runner over "
                 "the step, which one order alone reads as the change)",
                 "",
@@ -637,7 +641,7 @@ def model_note(steps: list[Step]) -> str:
     return f", {' and '.join(models)}" if models else ""
 
 
-def render(steps: list[Step], title: str) -> str:
+def render(steps: list[Step], title: str, baseline: str = "etcd") -> str:
     out = [f"## {title}", ""]
     models = sorted({f"{s.model} ({s.cpus} CPUs)" for s in steps if s.model})
     if models:
@@ -835,31 +839,50 @@ def render(steps: list[Step], title: str) -> str:
 
     out += head_against_base(steps)
 
-    etcd = {s.step: s for s in steps if s.side == "etcd"}
-    rows = [s for s in steps if s.side != "etcd" and s.step in etcd]
+    by_step: dict = {}
+    for s in steps:
+        if s.side == baseline:
+            by_step.setdefault(s.step, []).append(s)
+    rows = [s for s in steps if s.side != baseline and s.step in by_step]
     if rows:
+        what = {
+            "etcd": "the plain etcd run's at its default snapshot count",
+            "etcd-tls": "etcd's with TLS on both planes (client certificates, peer TLS) at its default snapshot count, "
+            "the baseline because TupleSky's transport is always encrypted",
+        }.get(baseline, f"the {baseline} run's")
         out += [
-            "**Against etcd at the same step** (each TupleSky run's value, SwiftPaxos's, and etcd's at another "
-            "snapshot count or secured, over the plain etcd run's at its default snapshot count at its step, on "
-            f"this runner{model_note(steps)}; a ratio read on one CPU model is not comparable with one read on "
-            "another without saying so)",
+            "**Against etcd at the same step** (each TupleSky run's value, SwiftPaxos's, and every other etcd row's, "
+            f"over {what} at its step, the mean of its runs there where it ran more than once; a side's mean over "
+            f"its runs at a step is the row marked mean; on this runner{model_note(steps)}; a ratio read on one CPU "
+            "model is not comparable with one read on another without saying so)",
             "",
             "| Step | Side | `ok`/s | Completed/s | Servers' CPU per operation | Servers' CPU per write | "
             "Read p99 | Write p99 | Cas p99 |",
             "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
         ]
+
+        def r(a, b):
+            return f"{a / b:.2f}×" if (a is not None and b) else "-"
+
+        def pw(x):
+            return x.cpu["servers"] / x.writes_per_op if (x.cpu.get("servers") is not None and x.writes_per_op) else None
+
+        def mean(runs, get):
+            values = [get(x) for x in runs if get(x) is not None]
+            return sum(values) / len(values) if values else None
+
+        gets = [lambda x: x.ok_per_s, lambda x: x.completed_per_s, lambda x: x.cpu.get("servers"), pw] + [
+            (lambda k: lambda x: x.latency.get(k, (None, None))[1])(k) for k in KINDS
+        ]
+
+        def row(label, runs, base):
+            return f"| {label} | " + " | ".join(r(mean(runs, g), mean(base, g)) for g in gets) + " |"
+
         for s in rows:
-            e = etcd[s.step]
-
-            def r(a, b):
-                return f"{a / b:.2f}×" if (a is not None and b) else "-"
-
-            pw = lambda x: x.cpu["servers"] / x.writes_per_op if (x.cpu.get("servers") is not None and x.writes_per_op) else None  # noqa: E731,E501
-            p99 = [r(s.latency.get(k, (None, None))[1], e.latency.get(k, (None, None))[1]) for k in KINDS]
-            out.append(
-                f"| {name(s)} | {r(s.ok_per_s, e.ok_per_s)} | {r(s.completed_per_s, e.completed_per_s)} | "
-                f"{r(s.cpu.get('servers'), e.cpu.get('servers'))} | {r(pw(s), pw(e))} | " + " | ".join(p99) + " |"
-            )
+            out.append(row(name(s), [s], by_step[s.step]))
+            same = [x for x in rows if x.step == s.step and x.side == s.side]
+            if len(same) > 1 and s is same[-1]:
+                out.append(row(f"{s.step} | {s.side} mean", same, by_step[s.step]))
         out.append("")
     return "\n".join(out) + "\n"
 
@@ -867,13 +890,17 @@ def render(steps: list[Step], title: str) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--title", default="TupleSky sweep")
+    parser.add_argument(
+        "--baseline", default="etcd",
+        help="the etcd row every ratio is over: etcd (plain) or etcd-tls (with TLS, the workflow's headline)",
+    )
     parser.add_argument("runs", nargs="+", metavar="SIDE@STEP[#N]=STORE")
     args = parser.parse_args()
     steps = []
     for arg in args.runs:
         side, step, rep, store = label(arg)
         steps.append(read_step(side, step, store, rep))
-    text = render(steps, args.title)
+    text = render(steps, args.title, args.baseline)
     print(text)
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary:
