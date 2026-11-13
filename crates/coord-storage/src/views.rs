@@ -333,6 +333,18 @@ pub fn build_authorized_view<V: OrderedRead>(
     budget: ViewBudget,
 ) -> Result<ReadView, ViewBuildError> {
     let authorization = load_authorization(gated.view(), namespace, session, budget)?;
+    build_view_under(gated, namespace, authorization, request, budget)
+}
+
+/// [`build_authorized_view`] with the authorization context already
+/// loaded, from this view or one that reads the same rows.
+pub fn build_view_under<V: OrderedRead>(
+    gated: &GatedView<V>,
+    namespace: NamespaceId,
+    authorization: Authorization,
+    request: &LogicalRequest,
+    budget: ViewBudget,
+) -> Result<ReadView, ViewBuildError> {
     let principal = authorization
         .session
         .as_ref()
