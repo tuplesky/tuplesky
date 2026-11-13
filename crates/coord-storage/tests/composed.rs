@@ -1243,10 +1243,6 @@ fn a_group_of_commands_lowers_once_and_matches_applying_them_one_at_a_time() {
     assert_eq!(grouped.store().unmaterialized(), 0);
 }
 
-/// A group's commands are planned over one snapshot of the projection,
-/// pinned by the first of them, where a command outside a group pins one
-/// of its own (task-d115): one read view a batch. The outcomes are the
-/// ones each gets applied alone.
 /// A lost group is the applier's last (#185, review 6861674000). Its
 /// commands were reported applied, at positions and revisions no batch
 /// of this replica's will hold, so the next command is refused rather
@@ -1291,6 +1287,10 @@ fn an_applier_that_lost_a_group_refuses_to_be_used() {
     refused(applier.apply(*command, record).map(drop));
 }
 
+/// A group's commands are planned over one snapshot of the projection,
+/// pinned by the first of them, where a command outside a group pins one
+/// of its own (task-d115): one read view a batch. The outcomes are the
+/// ones each gets applied alone.
 #[test]
 fn a_group_plans_every_command_over_one_snapshot() {
     let snapshots = |applier: &Applier<JournaledDomain<ModelJournal, ModelEngine>>| {

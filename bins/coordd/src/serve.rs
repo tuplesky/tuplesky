@@ -8211,6 +8211,16 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
             wait: Duration,
             voters: std::collections::BTreeSet<ReplicaId>,
         ) -> (Voter<Journaled>, ManualHandle<ModelEngine>) {
+            held_voter_within(replica, wait, voters, JournalLimits::default())
+        }
+
+        /// [`held_voter`], its store's queue bounded by `limits`.
+        fn held_voter_within(
+            replica: ReplicaId,
+            wait: Duration,
+            voters: std::collections::BTreeSet<ReplicaId>,
+            limits: JournalLimits,
+        ) -> (Voter<Journaled>, ManualHandle<ModelEngine>) {
             let boot = BootId([replica.0[0]; 16]);
             let incarnation = incarnation_of(replica);
             let mut store = JournaledStore::open(
@@ -8219,7 +8229,7 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
                 replica,
                 incarnation,
                 boot,
-                JournalLimits::default(),
+                limits,
             )
             .unwrap();
             store
@@ -8859,6 +8869,200 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
                 applier.settle(),
                 Err(coord_storage::ApplyError::AfterGroupLost)
             ));
+        }
+
+        /// A lone leader that has executed a command and holds its group
+        /// open. The group's batch is the one batch its store queues, at a
+        /// bound of one, and the model journal refuses the next append. A
+        /// step that queues another batch makes room by journaling what is
+        /// queued, so the group is lost on that step's path, as on a
+        /// peer's frame above. With the collector that made the command,
+        /// for the next.
+        fn leader_at_a_full_queue() -> (Voter<Journaled>, ManualHandle<ModelEngine>, Collector) {
+            use coord_store_testkit::journal::AppendScript;
+
+            let limits = JournalLimits {
+                max_queued_per_domain: 1,
+                ..JournalLimits::default()
+            };
+            let (mut leader, commits) = held_voter_within(
+                me(),
+                Duration::from_secs(3600),
+                [me()].into_iter().collect(),
+                limits,
+            );
+            let mut collector = collector();
+            let Submitted::FanOut(fan_out) = collector
+                .submit(MonotonicMillis::ZERO, &admitted(1))
+                .expect("submitted")
+            else {
+                panic!("not new work")
+            };
+            leader
+                .on_submission(
+                    PeerRole::Frontend,
+                    &frame(&fan_out.frame),
+                    Origin::Connection(7),
+                )
+                .expect("driven")
+                .expect("admitted");
+            // The flush in its two steps, as above, until the command has
+            // executed: staged, its group open, its batch queued.
+            let executed = leader.node().executed;
+            let at = leader.ballot();
+            for _ in 0..32 {
+                leader.node_mut().stage(&at).expect("staged");
+                if leader.node().executed > executed {
+                    break;
+                }
+                leader.node_mut().flush(&at).expect("journaled");
+            }
+            assert_eq!(leader.node().executed, executed + 1);
+            assert!(
+                leader.node().applier().grouped() > 0,
+                "the command's group is open"
+            );
+            assert_eq!(
+                leader.node().applier().store().queued(),
+                1,
+                "the group's batch fills the queue"
+            );
+            leader
+                .node_mut()
+                .applier_mut()
+                .store_mut()
+                .store_mut()
+                .journal_mut()
+                .expect("the model journal")
+                .script_append(AppendScript::DefinitelyNotCommitted);
+            (leader, commits, collector)
+        }
+
+        /// A failure on a collector's submission stops the voter (#280
+        /// review 6863462741). The submission's batch meets the full queue,
+        /// and the room is made by journaling the group, which the journal
+        /// refuses.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_failure_on_a_collectors_submission_stops_the_voter() {
+            use coord_transport::ConnectionId;
+
+            let (leader, _commits, mut collector) = leader_at_a_full_queue();
+            let Submitted::FanOut(next) = collector
+                .submit(MonotonicMillis::ZERO, &admitted(2))
+                .expect("submitted")
+            else {
+                panic!("not new work")
+            };
+            let mut domain = domain(leader, collector);
+            let api = transport();
+            domain.on_remote_submission(
+                &api,
+                PeerRole::Frontend,
+                &frame(&next.frame),
+                ConnectionId(8),
+            );
+            match &domain.stopping {
+                Some(super::super::Stopping::Failed(said)) => {
+                    assert!(said.contains("cannot carry out a submission"), "{said}");
+                    assert!(said.contains("not journaled"), "{said}");
+                }
+                other => panic!("the voter does not stop: {other:?}"),
+            }
+            assert!(voter(&mut domain).node().applier().lost());
+        }
+
+        /// A failure activating a feature stops the voter (#280 review
+        /// 6863462741). The leader's own prepared row meets the full queue,
+        /// as the submission above does, and the operator is told the
+        /// voter stops.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_failure_activating_a_feature_stops_the_voter() {
+            use coord_types::formats::Feature;
+
+            let (mut leader, _commits, collector) = leader_at_a_full_queue();
+            let features = {
+                let gated = leader
+                    .node()
+                    .applier()
+                    .store()
+                    .reader()
+                    .snapshot()
+                    .expect("a snapshot");
+                coord_daemon::feature::Features::open(
+                    CLUSTER,
+                    DOMAIN,
+                    me(),
+                    coord_consensus::EpochVoters::new(epoch(), [me()].into_iter().collect())
+                        .expect("voters"),
+                    gated.view(),
+                    incarnation_of(me()),
+                    BootId([me().0[0]; 16]),
+                )
+                .expect("the feature rows")
+            };
+            leader.node_mut().keep_features(features);
+            let mut domain = domain(leader, collector);
+            let api = transport();
+            let (reply, answer) = tokio::sync::oneshot::channel();
+            domain.on_admin(
+                &api,
+                super::super::AdminRequest {
+                    line: format!("feature activate {}", Feature::AnswerOnRelease.name()),
+                    reply,
+                },
+            );
+            let said = answer.await.expect("answered");
+            assert!(
+                said.starts_with("refused: ") && said.contains("this voter stops"),
+                "{said}"
+            );
+            match &domain.stopping {
+                Some(super::super::Stopping::Failed(said)) => {
+                    assert!(said.contains("cannot activate a feature"), "{said}");
+                    assert!(said.contains("not journaled"), "{said}");
+                }
+                other => panic!("the voter does not stop: {other:?}"),
+            }
+        }
+
+        /// A stop a path recorded ends the loop at the top of its next
+        /// pass, before it takes another event (#280 review 6863462741).
+        /// An operator's request waiting is not answered, and the loop
+        /// returns.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_recorded_stop_ends_the_loop_before_it_takes_another_event() {
+            let (leader, _commits) = held_leader(Duration::from_secs(3600));
+            let (requests, admin) = tokio::sync::mpsc::channel(1);
+            let mut domain = domain(leader, collector()).with_admin(admin);
+            let (reply, mut answer) = tokio::sync::oneshot::channel();
+            requests
+                .send(super::super::AdminRequest {
+                    line: "feature status".into(),
+                    reply,
+                })
+                .await
+                .expect("queued");
+            domain.stopping = Some(super::super::Stopping::Failed(
+                "this voter cannot carry out a submission: a test's failure; this voter stops"
+                    .into(),
+            ));
+            let mut api = transport();
+            let clock = || {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs())
+            };
+            tokio::time::timeout(Duration::from_secs(30), domain.run(&mut api, clock))
+                .await
+                .expect("the loop ends");
+            assert!(domain.stopping.is_none(), "the loop took the stop");
+            assert!(
+                matches!(
+                    answer.try_recv(),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                ),
+                "the operator's request was not taken"
+            );
         }
 
         /// coordd's own guards on a non-voter's link (#272 review,
