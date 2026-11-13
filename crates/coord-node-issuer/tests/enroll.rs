@@ -305,27 +305,31 @@ fn a_request_that_names_its_role_is_answered_by_that_rule_of_the_workload() {
 
 /// One workload, a node in each of two domains of the cluster: a rule
 /// for each. A request that names its domain is answered by that rule;
-/// one that names none keeps the first-match rule; and a domain the
-/// workload holds no rule for is refused as having no rule, never
-/// granted. The certificate's domain is always the rule's.
+/// one that names none is refused, since which domain it got would be
+/// the order the rules are listed in; and a domain the workload holds no
+/// rule for is refused as having no rule, never granted. The
+/// certificate's domain is always the rule's.
 #[test]
 fn a_request_that_names_its_domain_is_answered_by_that_rule_of_the_workload() {
     let provider = idp();
     let (cert, key) = ca(NOW, 86_400);
-    let ca = Ca::load(&cert, &key, NOW).unwrap();
+    let authority = Ca::load(&cert, &key, NOW).unwrap();
     let sibling = RolePolicy {
         domain: SIBLING,
         ..policy()
     };
-    let mut issuer = NodeIssuer::new(verifier(&provider), ca, vec![policy(), sibling]);
+    let mut issuer = NodeIssuer::new(verifier(&provider), authority, vec![policy(), sibling]);
     let domain_of =
         |issued: coord_node_issuer::Issued| parse_node_uri(&issued.node_uri).unwrap().domain;
 
     let (csr_der, _) = csr(vec![KeyUsagePurpose::DigitalSignature], IsCa::NoCa);
-    let first = issuer
-        .enroll(&request(&provider, csr_der.clone(), 1, 2, 300), &clock(NOW))
-        .unwrap();
-    assert_eq!(domain_of(first), DOMAIN, "no domain named: the first rule");
+    assert_eq!(
+        issuer
+            .enroll(&request(&provider, csr_der.clone(), 1, 2, 300), &clock(NOW))
+            .map(|_| ()),
+        Err(IssueError::Policy(PolicyError::DomainNotNamed)),
+        "no domain named, with rules for two: refused, not the first rule"
+    );
 
     for domain in [DOMAIN, SIBLING] {
         let named = NodeRequest {
@@ -341,11 +345,44 @@ fn a_request_that_names_its_domain_is_answered_by_that_rule_of_the_workload() {
     // Naming a domain is choosing among the workload's rules, not a grant.
     let other = NodeRequest {
         domain: Some([4; 16]),
-        ..request(&provider, csr_der, 1, 2, 300)
+        ..request(&provider, csr_der.clone(), 1, 2, 300)
     };
     assert_eq!(
         issuer.enroll(&other, &clock(NOW)).map(|_| ()),
         Err(IssueError::Policy(PolicyError::NoRule))
+    );
+
+    // What counts is the rules that could answer: a named role whose
+    // rules reach one domain needs no domain named, even when the
+    // workload's other role is in another.
+    let (cert, key) = ca(NOW, 86_400);
+    let authority = Ca::load(&cert, &key, NOW).unwrap();
+    let sibling_frontend = RolePolicy {
+        domain: SIBLING,
+        role: PeerRole::Frontend,
+        ..policy()
+    };
+    let mut issuer = NodeIssuer::new(
+        verifier(&provider),
+        authority,
+        vec![policy(), sibling_frontend],
+    );
+    for (role, domain) in [(PeerRole::Voter, DOMAIN), (PeerRole::Frontend, SIBLING)] {
+        let named = NodeRequest {
+            role: Some(role),
+            ..request(&provider, csr_der.clone(), 1, 2, 300)
+        };
+        assert_eq!(
+            domain_of(issuer.enroll(&named, &clock(NOW)).unwrap()),
+            domain
+        );
+    }
+    assert_eq!(
+        issuer
+            .enroll(&request(&provider, csr_der, 1, 2, 300), &clock(NOW))
+            .map(|_| ()),
+        Err(IssueError::Policy(PolicyError::DomainNotNamed)),
+        "neither named: two domains could answer"
     );
 }
 

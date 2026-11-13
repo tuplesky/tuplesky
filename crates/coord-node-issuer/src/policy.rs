@@ -21,6 +21,9 @@ pub enum PolicyError {
     IncarnationTooOld,
     /// The lifetime exceeds the rule's maximum.
     LifetimeTooLong,
+    /// The request names no domain, and the workload's rules reach more
+    /// than one: which domain it got would be the rules' order.
+    DomainNotNamed,
 }
 
 /// One node role policy.
@@ -97,7 +100,10 @@ pub struct Choice {
 /// granting what `choice` names, where the request names anything.
 ///
 /// The certificate's cluster, domain and role are the rule's, never the
-/// request's.
+/// request's. A request that names no domain is refused when the
+/// workload's rules (of the role it names, if it names one) reach more
+/// than one domain: the domain a certificate reaches is never decided by
+/// the order the rules are listed in.
 pub fn authorize(
     rules: &[RolePolicy],
     identity: &VerifiedIdentity,
@@ -107,13 +113,21 @@ pub fn authorize(
     lifetime_secs: u64,
 ) -> Result<NodePolicy, PolicyError> {
     let attrs = coord_authn::receipt::attributes(identity);
+    let workload = |r: &&RolePolicy| {
+        matches(r, identity, &attrs) && choice.role.is_none_or(|role| r.role == role)
+    };
+    if choice.domain.is_none() {
+        let mut domains = rules.iter().filter(workload).map(|r| r.domain);
+        if let Some(first) = domains.next()
+            && domains.any(|domain| domain != first)
+        {
+            return Err(PolicyError::DomainNotNamed);
+        }
+    }
     let rule = rules
         .iter()
-        .find(|r| {
-            matches(r, identity, &attrs)
-                && choice.role.is_none_or(|role| r.role == role)
-                && choice.domain.is_none_or(|domain| r.domain == domain)
-        })
+        .filter(workload)
+        .find(|r| choice.domain.is_none_or(|domain| r.domain == domain))
         .ok_or(PolicyError::NoRule)?;
     if !rule.nodes.contains(&node) {
         return Err(PolicyError::NodeNotAuthorized);

@@ -999,6 +999,23 @@ fn a_certificate_of_another_domain_never_reaches_this_domains_store() {
         !dir.join("state").exists(),
         "a node of another domain initialized this domain's store"
     );
+
+    // And `inspect`, which reports a credential `place` would refuse,
+    // says which mismatch it is rather than reading it as this domain's.
+    let inspected = run(&path, &["inspect"]);
+    assert_eq!(
+        inspected.code,
+        Some(2),
+        "{}{}",
+        inspected.out,
+        inspected.err
+    );
+    assert!(
+        inspected.err.contains("another domain"),
+        "inspect did not name the mismatch: {}{}",
+        inspected.out,
+        inspected.err
+    );
 }
 
 /// Present `certificate` and `key` on `daemon`'s API plane with a
@@ -1079,6 +1096,7 @@ async fn hello_on_api(
 /// here as a frontend -- the role that submits on callers' behalf and
 /// establishes their sessions -- by naming this domain in its `Hello`.
 /// The handshake now refuses it; this domain's own frontend still binds.
+/// The same holds for a Kine collector's certificate.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_frontend_certificate_of_another_domain_is_refused_at_the_handshake() {
     use coord_types::wire_v1::{MessageV1, PeerRole};
@@ -1098,33 +1116,24 @@ async fn a_frontend_certificate_of_another_domain_is_refused_at_the_handshake() 
     assert_eq!(run(&path, &["init"]).code, Some(0));
     let daemon = start(&path);
 
-    let (mine, mine_key) = ca.issue_in(
-        "frontend.coordd.test",
-        CLUSTER,
-        DOMAIN,
-        0x0f,
-        PeerRole::Frontend,
-        1,
-    );
-    let answer = hello_on_api(&daemon, &ca, &mine, &mine_key, PeerRole::Frontend).await;
-    assert!(
-        matches!(answer, Some(MessageV1::HelloAck(_))),
-        "this domain's frontend binds: {answer:?}"
-    );
+    // Both collector roles: the frontend, and the Kine collector, the
+    // role the code calls "for one domain", which submits too.
+    for role in [PeerRole::Frontend, PeerRole::KineCollector] {
+        let (mine, mine_key) = ca.issue_in("frontend.coordd.test", CLUSTER, DOMAIN, 0x0f, role, 1);
+        let answer = hello_on_api(&daemon, &ca, &mine, &mine_key, role).await;
+        assert!(
+            matches!(answer, Some(MessageV1::HelloAck(_))),
+            "this domain's {role:?} binds: {answer:?}"
+        );
 
-    let (theirs, theirs_key) = ca.issue_in(
-        "frontend.coordd.test",
-        CLUSTER,
-        [0x33; 16],
-        0x0f,
-        PeerRole::Frontend,
-        1,
-    );
-    let answer = hello_on_api(&daemon, &ca, &theirs, &theirs_key, PeerRole::Frontend).await;
-    assert!(
-        !matches!(answer, Some(MessageV1::HelloAck(_))),
-        "a sibling domain's frontend bound here: {answer:?}"
-    );
+        let (theirs, theirs_key) =
+            ca.issue_in("frontend.coordd.test", CLUSTER, [0x33; 16], 0x0f, role, 1);
+        let answer = hello_on_api(&daemon, &ca, &theirs, &theirs_key, role).await;
+        assert!(
+            !matches!(answer, Some(MessageV1::HelloAck(_))),
+            "a sibling domain's {role:?} bound here: {answer:?}"
+        );
+    }
 }
 
 /// Start `coordd` and read its startup report, then stop it.
