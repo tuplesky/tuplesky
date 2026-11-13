@@ -942,9 +942,10 @@ pub struct Traffic {
     #[serde(default)]
     pub api: Datagrams,
     /// Handshakes refused because an observer's or learner's certificate
-    /// named a committed voter's node (design Section 20.4). Never a
-    /// legitimate peer: above zero, an issuer signed what it never
-    /// should, and an operator has a certificate to revoke.
+    /// named a committed voter's node (design Section 20.4). No legitimate
+    /// peer today: until a prepared transition names a staged learner's
+    /// incarnation (task-d39), above zero means an issuer signed what it
+    /// never should, and an operator has a certificate to revoke.
     #[serde(default)]
     pub refused_voter_names: u64,
 }

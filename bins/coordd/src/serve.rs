@@ -4733,11 +4733,10 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             KIND_READ_ANSWER => {
                 let now = self.now_millis();
                 let resolved = decode_read_answer(frame).ok().and_then(|answer| {
-                    self.frontend.frontend.dispatcher_mut().on_read_answer(
-                        now,
-                        provenance.from(),
-                        answer,
-                    )
+                    self.frontend
+                        .frontend
+                        .dispatcher_mut()
+                        .on_read_answer(now, provenance, answer)
                 });
                 match resolved {
                     Some(coord_collector::ReadResolution::Answer(delivery)) => Some(delivery),
@@ -5071,8 +5070,8 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 }
                 // Only a voter's link: an observer or learner holds a
                 // link of its own, and what it says is no voter's.
-                if let (coord_types::wire_v1::PeerRole::Voter, Some(peer), Backing::Voting(voter)) =
-                    (identity.role, identity.replica, &mut self.backing)
+                if let (Some(peer), Backing::Voting(voter)) =
+                    (linked_voter(&identity), &mut self.backing)
                 {
                     match voter.peer_linked(peer) {
                         Ok(out) => {
@@ -6492,8 +6491,48 @@ fn resolve_retained<V: coord_store_api::OrderedRead>(
 
 impl core::error::Error for TransportError {}
 
+/// The voter a new link is with, if it is a voter's: a connection bound
+/// as a voter, and nothing else. An observer's or learner's link under a
+/// voter's replica is a link of its own (design Section 10.1), so it
+/// neither resets that voter's feature state nor draws this voter's
+/// features (task-d99).
+fn linked_voter(identity: &coord_transport::BoundIdentity) -> Option<ReplicaId> {
+    match identity.role {
+        coord_types::wire_v1::PeerRole::Voter => identity.replica,
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// Only a link bound as a voter is a voter's new link (#272 review):
+    /// one bound as anything else names no voter, whatever replica its
+    /// certificate carries.
+    #[test]
+    fn only_a_link_bound_as_a_voter_is_a_voters_new_link() {
+        use coord_types::ids::{ReplicaId, ReplicaIncarnation};
+        use coord_types::wire_v1::PeerRole;
+        let bound = |role| coord_transport::BoundIdentity {
+            role,
+            replica: Some(ReplicaId([1; 16])),
+            incarnation: Some(ReplicaIncarnation::new(1).unwrap()),
+            capabilities: Vec::new(),
+        };
+        assert_eq!(
+            super::linked_voter(&bound(PeerRole::Voter)),
+            Some(ReplicaId([1; 16]))
+        );
+        for role in [
+            PeerRole::Observer,
+            PeerRole::Learner,
+            PeerRole::Frontend,
+            PeerRole::KineCollector,
+            PeerRole::Client,
+        ] {
+            assert_eq!(super::linked_voter(&bound(role)), None, "{role:?}");
+        }
+    }
+
     /// A round's frames for one collector go to the transport together,
     /// in the order the round made them, and each collector's apart from
     /// every other's (task-d115, lever 4): a release that overtook an
@@ -8596,6 +8635,76 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
             heard.sort_by_key(key);
             owed_open.sort_by_key(key);
             assert_eq!(heard, owed_open);
+        }
+
+        /// coordd's own guards on a non-voter's link (#272 review,
+        /// 6849212225). A peer frame, and an api delivery of each kind a
+        /// voter sends a collector -- evidence, a release, a read answer
+        /// -- on a link bound as an observer or a learner is counted
+        /// unserved here and handed to nothing, though the replica it
+        /// names is a voter's. The voter's ballot does not move.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_non_voters_frames_are_counted_unserved_and_reach_nothing() {
+            use coord_collector::wire::{KIND_EVIDENCE, KIND_READ_ANSWER, KIND_RELEASE};
+            use coord_transport::{BoundIdentity, ConnectionId, Lane, TransportEvent};
+            use coord_transport_testkit::bound_provenance;
+
+            let (leader, _handle) = held_leader(Duration::from_secs(3600));
+            let mut domain = domain(leader, collector());
+            let mut api = transport();
+            let ballot = voter(&mut domain).ballot();
+            let named = ReplicaId([2; 16]);
+            for role in [PeerRole::Observer, PeerRole::Learner] {
+                let provenance = bound_provenance(named, inc(), role, 7);
+                let unserved = domain.frontend.counts.unserved;
+                domain.on_peer_plane(
+                    &api,
+                    TransportEvent::PeerFrame {
+                        connection: ConnectionId(7),
+                        lane: Lane::Control,
+                        provenance,
+                        kind: coord_transport::KIND_PEER_EVIDENCE,
+                        version: coord_transport::frames::PEER_EVIDENCE_VERSION,
+                        payload: b"never read".to_vec(),
+                    },
+                );
+                assert_eq!(
+                    domain.frontend.counts.unserved,
+                    unserved + 1,
+                    "a peer frame on a {role:?} link"
+                );
+                for kind in [KIND_EVIDENCE, KIND_RELEASE, KIND_READ_ANSWER] {
+                    let unserved = domain.frontend.counts.unserved;
+                    domain
+                        .on_transport(
+                            &mut api,
+                            TransportEvent::ApiDelivery {
+                                connection: ConnectionId(8),
+                                lane: Lane::Unary,
+                                identity: BoundIdentity {
+                                    role,
+                                    replica: Some(named),
+                                    incarnation: Some(inc()),
+                                    capabilities: Vec::new(),
+                                },
+                                provenance: Some(provenance),
+                                frame: coord_types::wire_v1::Frame {
+                                    kind,
+                                    version: 1,
+                                    payload: b"never read".to_vec(),
+                                },
+                            },
+                            &|| 0,
+                        )
+                        .await;
+                    assert_eq!(
+                        domain.frontend.counts.unserved,
+                        unserved + 1,
+                        "a delivery of kind {kind:#06x} on a {role:?} link"
+                    );
+                }
+            }
+            assert_eq!(voter(&mut domain).ballot(), ballot);
         }
 
         /// The loop wakes when a held projection commit is due, and the
