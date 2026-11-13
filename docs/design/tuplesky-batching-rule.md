@@ -1275,7 +1275,7 @@ Each step has its own PRs and pair.
 | 1. One application record and one durability event a group | None: local format | B0 | Half of B0, in the appender and the materializer |
 | 2. A follower takes a frame in one pass: its adoptions in a few batches, split at the store's bounds | None | B1; −15 to −21 µs a follower inferred (6.7) | Half of B1, in a follower's loop |
 | 3. The frame log's kinds, read only, and the frame fetch | None: nothing writes or sends them | 0 | A null step |
-| 4. Frame records written in order beside the per-command ones; recovery selects both ways and checks they agree | `FrameLog`, dark | B2's dual-write variant: the cost added | Inactive, a null step. Active, no more than its bound, and no disagreement |
+| 4. Frame records written in order beside the per-command ones; recovery selects both ways and checks they agree | `FrameLog`, dark | B1W against B1, one pair: the cost added | Inactive, a null step. Active, no more than its bound, and no disagreement |
 | 5. The frame decides above a boundary position | `FrameDecision` | B2 − B1, one pair; −0.26 [−0.38] an upper bound | The go/no-go above, then half of B2 − B1; then the runner's pair |
 | 6. Learning by frame position, forgetting by range | With `FrameDecision` | −4 to −6 µs a follower, inferred (6.7) | Half of its profiled share |
 | 7. The leader's own per-command records go | `FrameDecision` | About −0.06 [7763], inferred: B3 | Half of B3, in the leader's loop |
@@ -1283,10 +1283,14 @@ Each step has its own PRs and pair.
 **Step 0: the bounds.** No PR. Each bound is a scratch build measured as one pair: against the carry, or against another bound where the step's saving is their difference.
 - **B0: one application record a group.** Consecutive application outcomes are sealed as one journal record with one durability event, nothing else changed. It bounds step 1.
 - **B1: a follower takes a frame in one pass.** It writes every per-command record as today, with one batch, one barrier and one storage event a frame (cut at 64 adoptions), and its votes in one hand-off. It bounds step 2.
+- **B1W: B1 with step 4's writes, on B1's branch.** Decisions stay per command, as at step 4.
+  - The leader and every follower also journal each frame record, by step 4's rule: once its entries are adopted and its predecessor's record written, in a batch of its own.
+  - Every payload is in the frame.
+  - It is measured as one pair against B1, and bounds step 4's cost: what `FrameLog` adds to step 2, which step 4 is built on. Measured against B2, it would read the cost of putting per-command records back beside frame decisions instead.
+  - Recovery's second selection runs only at a Sync, so a pair without an election reads the records and the payloads. Its cost at a Sync is read in step 4's takeover rows.
 - **B2: the frame decides, on B1's branch,** so that B2 − B1 is the decision alone.
   - It is build 6's follower that takes the frame as a unit, with execution and materialization put back: build 6's followers neither execute nor decode, so its floor holds the lazy voters' saving, which the owner deferred.
   - It is measured as one pair against B1 (R13).
-  - **Its dual-write variant** writes the frame record beside every per-command record, with every payload in the frame. It is measured against B2 as its own pair, and bounds step 4's cost.
 - **B3: the leader proposes by range,** without per-command dependency rows or records. It bounds step 7.
 - **What every pair reports:**
   - CPU a command by part;
@@ -1294,7 +1298,7 @@ Each step has its own PRs and pair.
   - commands a frame;
   - p50 and p99 at 1, 5 and 30 callers.
 - **The 30-caller floor again.** The pair of build 1 against build 6 at 30 callers ran, but its run directories were deleted for disk before its CPU was read. Only operations a second are left: build 6 at +42% over build 1, each run read against the base runs on either side of it (+28 to +50% by run; 2,766 a second against 3,871 on the means). B2's pair at 30 replaces it.
-- **Where it stands:** B0 and B1 are written, on a local scratch branch off the carry at `ba947188`. Their pairs are queued at 120, 30, 5 and 1 callers. B2 and B3 come after.
+- **Where it stands:** B0 and B1 are written, on a local scratch branch off the carry at `ba947188`. Their pairs are queued at 120, 30, 5 and 1 callers. B1W, B2 and B3 come after.
 - Under a week. Steps 1 and 2 need only B0 and B1.
 
 **Step 1: one application record and one durability event a group.** This is the application half of 10.5's step 2 without the frame record, and the fifth item of 10.8.
@@ -1358,7 +1362,7 @@ Each step has its own PRs and pair.
 - **Every frame carries every payload from 4a (R4).** Today a frame carries a payload only for a relayed command.
   - Under `FrameLog`, a fast command's payload also crosses the wire in the frame, a second time, below the relay's threshold.
   - So the records step 4 writes are the ones step 5 reads, and step 4's check speaks for step 5.
-  - B2's dual-write variant counts the second crossing, at 1 and 5 callers, where it falls.
+  - B1W counts the second crossing, at 1 and 5 callers, where it falls.
 - **When a follower writes a frame record (R2).** It writes frame f's record once it has adopted every entry of f and written f − 1's.
   - So a voter's frame records are in position order with no gap, and its report's frames are a prefix, as 10.3 needs.
   - It still adopts entries out of order, as today. Frame f + 1's entries are adopted while f is missing, and f + 1's record waits for f's.
@@ -1384,7 +1388,7 @@ Each step has its own PRs and pair.
     - after both, replay ends with b2's frame at p;
     - between them, it ends with b0's, and b2's leader re-sends.
   - the lone 2 MiB request under `FrameLog`: its adoption batch and its frame record each under the record's bounds (R1).
-- **Bound:** B2's dual-write variant, the cost `FrameLog` adds.
+- **Bound:** B1W against B1, one pair: the cost `FrameLog` adds.
 - **Checkpoint:** inactive, a null step. Active, no more than that bound, and no disagreement in the rows above. Then the drift pair against the carry before step 1.
 
 **Step 5: the frame decides.** `FrameDecision`, which requires `FrameLog`. Each PR lands dark, and the build knows the feature only from 5c. It starts only past the go/no-go above.
