@@ -46,6 +46,20 @@ pub const MAX_RECORD_KEY_BYTES: usize = 16 * 1024;
 pub const MAX_RECORD_VALUE_BYTES: usize = MAX_ENVELOPE_PAYLOAD + 16;
 /// Predecessor digest of the first record of a stream.
 pub const GENESIS_PREDECESSOR: Digest32 = Digest32([0; 32]);
+/// The first record format whose records may hold a group's application
+/// outcomes ([`RecordBody::ApplicationGroup`]). This build reads it and
+/// writes [`JOURNAL_RECORD_FORMAT_V1`]: the writer of groups is its
+/// successor (the batching-rule doc's 10.7, steps 1a and 1b), and a voter
+/// can go back from that successor to this build.
+pub const JOURNAL_RECORD_FORMAT_GROUPS: u16 = 2;
+const _: () = assert!(
+    coord_types::formats::Format::JournalRecord.supports(JOURNAL_RECORD_FORMAT_GROUPS as u32)
+);
+
+/// Whether this build reads records of `format`.
+fn readable(format: u16) -> bool {
+    coord_types::formats::Format::JournalRecord.supports(format as u32)
+}
 
 /// Where a record comes from: the local identity and stream that wrote it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -135,6 +149,45 @@ pub enum RecordBody {
     PublishLocalCheckpoint(CheckpointPointerV1),
     /// Lifecycle metadata.
     Lifecycle(LifecycleRecordV1),
+    /// The application outcomes of a run of established commands, in
+    /// execution order: the same facts as one
+    /// [`RecordBody::ApplicationOutcome`] each, in one record (the
+    /// batching-rule doc's 10.7, step 1). Only in records of
+    /// [`JOURNAL_RECORD_FORMAT_GROUPS`] and later.
+    ///
+    /// The first outcome extends `base`, and each later one the position
+    /// before it. The updates are every outcome's, in order, so the
+    /// record's updates read as the per-command records' would one after
+    /// another.
+    ApplicationGroup {
+        /// Effect context, the same for every outcome.
+        context: TransitionContext,
+        /// Base the first outcome's plan was computed against.
+        base: ApplyBase,
+        /// Each command's outcome, in execution order.
+        outcomes: Vec<GroupOutcomeV1>,
+        /// Every outcome's complete immutable updates, in order.
+        updates: Vec<StoreUpdate>,
+    },
+}
+
+/// One command's application outcome in a
+/// [`RecordBody::ApplicationGroup`]: what a
+/// [`RecordBody::ApplicationOutcome`] carries but its context, its base
+/// and its updates, which the group holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct GroupOutcomeV1 {
+    /// Execution position assigned: the one after the outcome before it,
+    /// or after the group's base for the first.
+    pub position: ExecutionPosition,
+    /// KV revision produced, if the command mutated KV.
+    pub revision: Option<KvRevision>,
+    /// Digest of the exact result.
+    pub result_digest: Digest32,
+    /// How many of the group's updates are this one's, taken in order
+    /// after those of the outcomes before it. A command that changed no
+    /// rows has none, and still took its position.
+    pub updates: u32,
 }
 
 impl RecordBody {
@@ -143,8 +196,36 @@ impl RecordBody {
     pub fn updates(&self) -> &[StoreUpdate] {
         match self {
             RecordBody::ProtocolTransition { updates, .. }
-            | RecordBody::ApplicationOutcome { updates, .. } => updates,
+            | RecordBody::ApplicationOutcome { updates, .. }
+            | RecordBody::ApplicationGroup { updates, .. } => updates,
             RecordBody::PublishLocalCheckpoint(_) | RecordBody::Lifecycle(_) => &[],
+        }
+    }
+
+    /// How the record moves the execution frontier: the base its first
+    /// application outcome extends, and the position its last takes.
+    /// `None` for a record that holds no application outcome.
+    pub fn execution(&self) -> Option<(ApplyBase, ExecutionPosition)> {
+        match self {
+            RecordBody::ApplicationOutcome { base, position, .. } => Some((*base, *position)),
+            RecordBody::ApplicationGroup { base, outcomes, .. } => {
+                outcomes.last().map(|last| (*base, last.position))
+            }
+            RecordBody::ProtocolTransition { .. }
+            | RecordBody::PublishLocalCheckpoint(_)
+            | RecordBody::Lifecycle(_) => None,
+        }
+    }
+
+    /// How many established commands' application outcomes the record
+    /// holds.
+    pub fn application_outcomes(&self) -> usize {
+        match self {
+            RecordBody::ApplicationOutcome { .. } => 1,
+            RecordBody::ApplicationGroup { outcomes, .. } => outcomes.len(),
+            RecordBody::ProtocolTransition { .. }
+            | RecordBody::PublishLocalCheckpoint(_)
+            | RecordBody::Lifecycle(_) => 0,
         }
     }
 }
@@ -211,6 +292,13 @@ pub enum RecordError {
     TrailingBytes,
     /// Encoding is not a valid record.
     Malformed,
+    /// A group of application outcomes in a record of a format before
+    /// [`JOURNAL_RECORD_FORMAT_GROUPS`].
+    GroupBeforeItsFormat,
+    /// A group of no application outcomes.
+    EmptyGroup,
+    /// A group's outcomes don't account for exactly its updates.
+    GroupUpdatesMismatch,
     /// The bytes decode to a valid record but are not its encoding: a
     /// varint written longer than it needs, which decodes to the same
     /// value. No encoder of this format writes one.
@@ -405,6 +493,7 @@ fn check_updates(updates: &[StoreUpdate]) -> Result<(), RecordError> {
 }
 
 fn check_body(
+    format: u16,
     origin: &RecordOrigin,
     seq: LocalJournalSeq,
     predecessor: &Digest32,
@@ -459,6 +548,46 @@ fn check_body(
             }
             check_update_sizes(updates)
         }
+        RecordBody::ApplicationGroup {
+            context,
+            base,
+            outcomes,
+            updates,
+        } => {
+            if format < JOURNAL_RECORD_FORMAT_GROUPS {
+                return Err(RecordError::GroupBeforeItsFormat);
+            }
+            if context.ballot.epoch != context.configuration
+                || base.configuration != context.configuration
+            {
+                return Err(RecordError::EpochMismatch);
+            }
+            // A record of nothing: no position taken, no row written.
+            if outcomes.is_empty() {
+                return Err(RecordError::EmptyGroup);
+            }
+            // Contiguous, as each per-command outcome is with its base:
+            // the first takes the position after the group's base, and
+            // each later one the position after the one before it.
+            let mut before = base.execution_position;
+            let mut counted = 0usize;
+            for outcome in outcomes {
+                let next = before
+                    .checked_next()
+                    .map_err(|_| RecordError::PositionNotAfterBase)?;
+                if outcome.position != next {
+                    return Err(RecordError::PositionNotAfterBase);
+                }
+                before = next;
+                counted = counted
+                    .checked_add(outcome.updates as usize)
+                    .ok_or(RecordError::GroupUpdatesMismatch)?;
+            }
+            if counted != updates.len() {
+                return Err(RecordError::GroupUpdatesMismatch);
+            }
+            check_update_sizes(updates)
+        }
         RecordBody::PublishLocalCheckpoint(pointer) => {
             // Any format a pointer has named decodes: the record's layout
             // didn't change with the image's, and a journal that retains a
@@ -478,7 +607,7 @@ fn check_body(
             Ok(())
         }
         RecordBody::Lifecycle(LifecycleRecordV1::Genesis { format }) => {
-            if *format != JOURNAL_RECORD_FORMAT_V1 {
+            if !readable(*format) {
                 return Err(RecordError::UnsupportedFormat { found: *format });
             }
             Ok(())
@@ -492,19 +621,37 @@ fn encode_body(body: &RecordBody) -> Result<Vec<u8>, RecordError> {
 }
 
 impl JournalRecordV1 {
-    /// Seal a draft: validate bounds and guards, derive the digest.
+    /// Seal a draft at the format this build writes: validate bounds and
+    /// guards, derive the digest.
     pub fn seal(draft: RecordDraft) -> Result<Self, RecordError> {
-        check_body(&draft.origin, draft.seq, &draft.predecessor, &draft.body)?;
+        Self::seal_as(JOURNAL_RECORD_FORMAT_V1, draft)
+    }
+
+    /// Seal a draft at `format`, one this build reads. A stream's writer
+    /// seals at the format it writes ([`Self::seal`]). This is for a
+    /// reader's fixtures: the records of a format its successor writes,
+    /// such as [`JOURNAL_RECORD_FORMAT_GROUPS`].
+    pub fn seal_as(format: u16, draft: RecordDraft) -> Result<Self, RecordError> {
+        if !readable(format) {
+            return Err(RecordError::UnsupportedFormat { found: format });
+        }
+        check_body(
+            format,
+            &draft.origin,
+            draft.seq,
+            &draft.predecessor,
+            &draft.body,
+        )?;
         let body_bytes = encode_body(&draft.body)?;
         let digest = digest_of(
-            JOURNAL_RECORD_FORMAT_V1,
+            format,
             &draft.origin,
             draft.seq,
             &draft.predecessor,
             &body_bytes,
         );
         let mut record = JournalRecordV1 {
-            format: JOURNAL_RECORD_FORMAT_V1,
+            format,
             origin: draft.origin,
             seq: draft.seq,
             predecessor: draft.predecessor,
@@ -570,7 +717,7 @@ impl JournalRecordV1 {
     /// (#98). Debug builds still derive the digest again here, and stop
     /// on a difference.
     pub fn verify(&self, expect: &RecordExpectation) -> Result<(), RecordError> {
-        if self.format != JOURNAL_RECORD_FORMAT_V1 {
+        if !readable(self.format) {
             return Err(RecordError::UnsupportedFormat { found: self.format });
         }
         if self.origin.cluster != expect.origin.cluster {
@@ -611,7 +758,13 @@ impl JournalRecordV1 {
     /// [`JournalRecordV1::decode`] establish, for a debug build to check.
     #[cfg(debug_assertions)]
     fn derived(&self) -> Result<Digest32, RecordError> {
-        check_body(&self.origin, self.seq, &self.predecessor, &self.body)?;
+        check_body(
+            self.format,
+            &self.origin,
+            self.seq,
+            &self.predecessor,
+            &self.body,
+        )?;
         let body_bytes = encode_body(&self.body)?;
         Ok(digest_of(
             self.format,
@@ -685,10 +838,16 @@ impl JournalRecordV1 {
         if !rest.is_empty() {
             return Err(RecordError::TrailingBytes);
         }
-        if wire.format != JOURNAL_RECORD_FORMAT_V1 {
+        if !readable(wire.format) {
             return Err(RecordError::UnsupportedFormat { found: wire.format });
         }
-        check_body(&wire.origin, wire.seq, &wire.predecessor, &wire.body)?;
+        check_body(
+            wire.format,
+            &wire.origin,
+            wire.seq,
+            &wire.predecessor,
+            &wire.body,
+        )?;
         let body_bytes = encode_body(&wire.body)?;
         let derived = digest_of(
             wire.format,
