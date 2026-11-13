@@ -641,23 +641,34 @@ impl BoundFrontend {
     /// within that figure (1.3 to 1.4 times what is held, at 120 and 480
     /// callers), and it does not run.
     fn forget_settled(&mut self) {
+        // A disclosure the gate holds for the projection (task-d93) is
+        // gated again from its record when it is released: the dispatcher
+        // let it go when it was answered, so it counts as held here, or
+        // request churn while the projection lags would forget its record
+        // and turn a permitted read into a final `OUTPUT_WITHHELD`.
+        let gated: std::collections::HashSet<RetryKey> =
+            self.held.iter().map(|h| h.delivery.retry_key).collect();
         let mut held = 0;
         while self.order.len() >= self.max_requests && held < HELD_LOOKS {
             let Some(old) = self.order.pop_front() else {
                 break;
             };
-            if self.dispatcher.holds(&old) {
+            if self.dispatcher.holds(&old) || gated.contains(&old) {
                 self.order.push_back(old);
                 held += 1;
             } else {
                 self.requests.remove(&old);
             }
         }
-        if self.order.len() > self.max_requests.max(4 * self.dispatcher.held()) {
+        if self.order.len()
+            > self
+                .max_requests
+                .max(4 * (self.dispatcher.held() + gated.len()))
+        {
             let dispatcher = &self.dispatcher;
             let requests = &mut self.requests;
             self.order.retain(|key| {
-                let keep = dispatcher.holds(key);
+                let keep = dispatcher.holds(key) || gated.contains(key);
                 if !keep {
                     requests.remove(key);
                 }
