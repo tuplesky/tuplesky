@@ -811,15 +811,24 @@ pub struct Follower {
     /// no room. Each such command's payload is fetched, if it is wanted
     /// (#224 review).
     relayed_not_taken: u64,
-    /// While a proposal frame's entries are taken, once the frame has
-    /// made a full learning pass: the commands an entry has since given a
-    /// vote or adopted. `None` makes the next pass a full one, as it is
-    /// outside a frame. See [`Follower::learn`] (lever 2, step 1).
+    /// While a proposal frame's entries or a step of storage events are
+    /// taken, once a full learning pass was made in it: the commands an
+    /// entry or event has since given a vote, adopted, or whose adoption
+    /// it made durable. `None` makes the next pass a full one, as it is
+    /// outside a frame or a step. See [`Follower::learn`] (lever 2, step
+    /// 1).
     learn_touched: Option<Vec<CommandId>>,
-    /// Whether a proposal frame's entries are being taken.
-    taking_frame: bool,
+    /// Whether a proposal frame's entries or a step of storage events
+    /// ([`Follower::step_storage`]) are being taken.
+    learn_scope: Option<LearnScope>,
     /// Learning passes made and passed over (lever 2, step 1).
     learn_passes: LearnPasses,
+    /// Durable adoptions with a sequence number of their ballot, by that
+    /// number: what [`Follower::commit_through_leader`] reads instead of
+    /// every accepted command (lever 2, step 1). An entry is dropped once
+    /// its command commits, and lazily once its adoption is no longer the
+    /// one it names; one whose command is below ACCEPT stays.
+    frontier_ready: BTreeSet<(u64, CommandId)>,
 }
 
 /// What a follower did with the payloads relayed proposals carried
@@ -848,15 +857,28 @@ impl RelayTaken {
 }
 
 /// A follower's learning passes (lever 2, step 1): the passes made over
-/// every accepted command, and the ones a proposal frame passed over
-/// because no entry since the frame's last pass gave a vote or adopted a
-/// command that pass could commit.
+/// every accepted command, and the ones a proposal frame or a step of
+/// storage events passed over because nothing since its last pass gave a
+/// vote, adopted or made an adoption durable for a command that pass
+/// could commit.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LearnPasses {
     /// Passes made over every accepted command.
     pub full: u64,
     /// Passes a frame passed over.
     pub skipped: u64,
+    /// Passes a step of storage events passed over.
+    pub skipped_storage: u64,
+}
+
+/// What a follower is taking while it learns once for many inputs
+/// (lever 2, step 1; see [`Follower::learn`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LearnScope {
+    /// A proposal frame's entries.
+    Frame,
+    /// A step of storage events ([`Follower::step_storage`]).
+    Storage,
 }
 
 /// The retry-key bindings a restart restores from the payload rows
@@ -993,8 +1015,9 @@ impl Follower {
             relayed_known: 0,
             relayed_not_taken: 0,
             learn_touched: None,
-            taking_frame: false,
+            learn_scope: None,
             learn_passes: LearnPasses::default(),
+            frontier_ready: BTreeSet::new(),
             catch_up: CatchUp::default(),
             diverged: None,
             config,
@@ -1308,8 +1331,9 @@ impl Follower {
             relayed_known: 0,
             relayed_not_taken: 0,
             learn_touched: None,
-            taking_frame: false,
+            learn_scope: None,
             learn_passes: LearnPasses::default(),
+            frontier_ready: BTreeSet::new(),
             catch_up: CatchUp::default(),
             diverged: None,
         }
@@ -1862,7 +1886,7 @@ impl Follower {
         // Learning once a frame (lever 2, step 1): see `learn`. The
         // frame's first pass is a full one.
         self.learn_touched = None;
-        self.taking_frame = true;
+        self.learn_scope = Some(LearnScope::Frame);
         for entry in proposals {
             let (vote, payload) = entry.into_vote(replica, ballot);
             effects.extend(match payload {
@@ -1870,9 +1894,75 @@ impl Follower {
                 None => self.on_proposal(from, vote),
             });
         }
-        self.taking_frame = false;
+        self.learn_scope = None;
         self.learn_touched = None;
         effects
+    }
+
+    /// Take a step of storage events in order, each as
+    /// [`DeterministicMachine::step`] takes it, learning once the step
+    /// rather than once an event where an event changes nothing a pass
+    /// would commit (lever 2, step 1).
+    ///
+    /// A node hands over at once what one journal group made durable:
+    /// about one vote or adoption batch a command, each event ending in a
+    /// learning pass. Within the step, once a full pass was made, an
+    /// event that only makes a vote or adoption batch durable
+    /// ([`Follower::storage_touches_only`]) touches the command whose
+    /// vote or adoption it made a fact, and the pass it ends in is made
+    /// only if that command is one it would commit. Any other event makes
+    /// its own pass, and the next one, full. See [`Follower::learn`].
+    pub fn step_storage(&mut self, events: Vec<StorageEvent>) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        self.learn_touched = None;
+        self.learn_scope = Some(LearnScope::Storage);
+        for event in events {
+            let touches_only = self.storage_touches_only(&event);
+            if !touches_only {
+                self.learn_touched = None;
+            }
+            effects.extend(self.step(Event::Storage(event)));
+            if !touches_only {
+                self.learn_touched = None;
+            }
+        }
+        self.learn_scope = None;
+        self.learn_touched = None;
+        effects
+    }
+
+    /// Whether a storage event changes what a learning pass reads only
+    /// for the command its batch carried (lever 2, step 1): a vote or
+    /// adoption batch made durable, at a follower with nothing else
+    /// waiting on a storage event.
+    ///
+    /// Such an event marks the command's adoption durable or adds its
+    /// deferred vote, and moves the ledger and the payloads served, which
+    /// a pass doesn't read. It commits nothing, so no other command's
+    /// dependencies become committed. Everything else a storage event
+    /// can set off is ruled out here: the Sync's own row, a catch-up
+    /// window, a campaign, a report due, a Sync held behind rows or a
+    /// promise, a reinstall owed, and rows to write again after a
+    /// failure.
+    fn storage_touches_only(&self, event: &StorageEvent) -> bool {
+        let (StorageEvent::JournalDurable { .. }, Some(barrier)) = (event, event.barrier()) else {
+            return false;
+        };
+        self.pending.contains_key(&barrier)
+            && self
+                .sync_barrier
+                .as_ref()
+                .is_none_or(|(b, _)| *b != barrier)
+            && !self.catch_up.running.iter().any(|r| r.barrier == barrier)
+            && self.campaign.is_none()
+            && self.report_due.is_none()
+            && self.sync_behind_rows.is_none()
+            && self.early_sync.is_none()
+            && self.sync_behind_promise.is_none()
+            && !self.sync_reinstall
+            && !self.catch_up_reinstall
+            && self.unwritten.is_empty()
+            && self.payload_unwritten.is_empty()
     }
 
     /// This follower's learning passes (lever 2, step 1).
@@ -2239,6 +2329,7 @@ impl Follower {
         self.held_check.clear();
         self.held_waiters.clear();
         self.adopted.clear();
+        self.frontier_ready.clear();
         self.adopted_lacking.clear();
         self.leader_committed = None;
         self.named_facts = named_facts(&decision);
@@ -4724,7 +4815,9 @@ impl Follower {
     /// until neither commits more.
     ///
     /// Each entry of a proposal frame ends in a pass, and a pass walks
-    /// every accepted command twice. Within a frame, once the frame has
+    /// every accepted command (`commit_learned`) and the durable
+    /// adoptions at or below the leader's frontier
+    /// (`commit_through_leader`). Within a frame, once the frame has
     /// made one full pass, a pass is made only if a command an entry has
     /// since given a vote or adopted is one it would commit now
     /// ([`Follower::learnable`]); otherwise it is passed over, as one
@@ -4741,8 +4834,18 @@ impl Follower {
     ///
     /// So a pass passed over would have committed nothing, and every
     /// state the frame passes through is the one taking each entry with
-    /// a full pass leaves. Debug builds check each pass passed over
-    /// against every accepted command.
+    /// a full pass leaves.
+    ///
+    /// A step of storage events is taken the same way
+    /// ([`Follower::step_storage`]): each event ends in a pass, and the
+    /// common one, a vote or adoption batch made durable
+    /// ([`Follower::storage_touches_only`]), changes what a pass reads
+    /// only for the command whose adoption it marks durable or whose
+    /// deferred vote it adds. Any other event makes its own pass and the
+    /// next one full.
+    ///
+    /// Debug builds check each pass passed over against every accepted
+    /// command.
     fn learn(&mut self) {
         if let Some(mut touched) = self.learn_touched.take()
             && !touched.iter().any(|c| self.learnable(c))
@@ -4751,7 +4854,12 @@ impl Follower {
                 !self.table.in_accept().iter().any(|c| self.learnable(c)),
                 "a learning pass passed over would have committed"
             );
-            self.learn_passes.skipped = self.learn_passes.skipped.saturating_add(1);
+            if self.learn_scope == Some(LearnScope::Storage) {
+                self.learn_passes.skipped_storage =
+                    self.learn_passes.skipped_storage.saturating_add(1);
+            } else {
+                self.learn_passes.skipped = self.learn_passes.skipped.saturating_add(1);
+            }
             touched.clear();
             self.learn_touched = Some(touched);
             return;
@@ -4765,7 +4873,7 @@ impl Follower {
                 break;
             }
         }
-        if self.taking_frame {
+        if self.learn_scope.is_some() {
             self.learn_touched = Some(Vec::new());
         }
     }
@@ -4795,8 +4903,9 @@ impl Follower {
             && crate::phase::guard_commit(&record.deps, |d| self.table.phase_of(d)).is_ok()
     }
 
-    /// Note that `command` was given a vote or adopted, for a frame's
-    /// next learning pass (see [`Follower::learn`]).
+    /// Note that `command` was given a vote, adopted, or its adoption
+    /// made durable, for the next learning pass of a frame or a step of
+    /// storage events (see [`Follower::learn`]).
     fn touch_learning(&mut self, command: CommandId) {
         if let Some(touched) = self.learn_touched.as_mut() {
             touched.push(command);
@@ -4816,25 +4925,64 @@ impl Follower {
     /// ballot, so it waits for the re-sent proposal to be adopted again.
     /// Sequence order, because a dependency needs to be committed first
     /// and was proposed first.
+    ///
+    /// The candidates come from the durable adoptions by sequence number
+    /// at or below the frontier (`frontier_ready`), not a walk of every
+    /// accepted command (lever 2, step 1): the same commands, those at
+    /// ACCEPT whose adoption is durable at or below the frontier, in the
+    /// same order. An adoption with no sequence number of its ballot
+    /// (`u64::MAX`, restored) is never at or below a frontier, so it isn't
+    /// indexed. Debug builds check the candidates against the walk.
     fn commit_through_leader(&mut self) -> bool {
         let Some(through) = self.leader_committed else {
             return false;
         };
-        // From the commands at ACCEPT rather than every adoption, which
-        // keeps executed ones until the history sweep (task-d46).
-        let mut ready: Vec<(u64, CommandId)> = self
-            .table
-            .in_accept()
-            .into_iter()
-            .filter_map(|c| match self.adopted.get(&c) {
-                Some((seqnum, true)) if *seqnum <= through => Some((*seqnum, c)),
-                _ => None,
-            })
-            .collect();
-        ready.sort_unstable();
+        let mut ready: Vec<(u64, CommandId)> = Vec::new();
+        let mut dropped: Vec<(u64, CommandId)> = Vec::new();
+        for &(seqnum, c) in self
+            .frontier_ready
+            .iter()
+            .take_while(|(seqnum, _)| *seqnum <= through)
+        {
+            match (self.adopted.get(&c), self.table.phase_of(&c)) {
+                (Some(&(s, true)), Some(phase)) if s == seqnum => match phase {
+                    Phase::Accept => ready.push((seqnum, c)),
+                    // Committed: a commit is final.
+                    p if p > Phase::Accept => dropped.push((seqnum, c)),
+                    // Below ACCEPT (demoted, released): it may be
+                    // raised again under the same adoption.
+                    _ => {}
+                },
+                // Forgotten, or adopted again since.
+                _ => dropped.push((seqnum, c)),
+            }
+        }
+        #[cfg(debug_assertions)]
+        {
+            let mut walked: Vec<(u64, CommandId)> = self
+                .table
+                .in_accept()
+                .into_iter()
+                .filter_map(|c| match self.adopted.get(&c) {
+                    Some((seqnum, true)) if *seqnum <= through => Some((*seqnum, c)),
+                    _ => None,
+                })
+                .collect();
+            walked.sort_unstable();
+            debug_assert_eq!(
+                ready, walked,
+                "the commit frontier's index and the walk it replaces"
+            );
+        }
+        for key in &dropped {
+            self.frontier_ready.remove(key);
+        }
         let mut progressed = false;
-        for (_, command) in ready {
-            progressed |= self.table.commit_accepted(command);
+        for key in ready {
+            if self.table.commit_accepted(key.1) {
+                self.frontier_ready.remove(&key);
+                progressed = true;
+            }
         }
         progressed
     }
@@ -6572,6 +6720,10 @@ impl Follower {
                         && let Some(entry) = self.adopted.get_mut(&c)
                     {
                         entry.1 = true;
+                        if entry.0 != u64::MAX {
+                            self.frontier_ready.insert((entry.0, c));
+                        }
+                        self.touch_learning(c);
                     }
                     // A window is one batch: every command of it is
                     // decided here now, and its payload is on disk.
@@ -6586,6 +6738,7 @@ impl Follower {
                         && let Some(set) = self.votes.get_mut(&deferred.command)
                     {
                         let _ = set.add(deferred.vote);
+                        self.touch_learning(deferred.command);
                     }
                 }
                 StorageEvent::Failed { .. } => {

@@ -2336,6 +2336,165 @@ fn a_frame_commits_what_an_entry_decides_before_its_next_entry() {
     assert_eq!(f.take_rejections(), g.take_rejections());
 }
 
+/// The storage events of `events`, as a node hands a step of them over.
+fn storage_of(events: Vec<Event>) -> Vec<StorageEvent> {
+    events
+        .into_iter()
+        .map(|e| match e {
+            Event::Storage(s) => s,
+            other => panic!("not a storage event: {other:?}"),
+        })
+        .collect()
+}
+
+/// The leader's commit frontier at ballot 0, through `through`.
+fn committed_through(through: u64) -> Event {
+    peer(
+        0,
+        ProtocolMessage::Committed {
+            ballot: ballot(0, 0),
+            through,
+        },
+    )
+}
+
+/// Two followers that took the same frame of a relayed chain, and the
+/// storage events of the batches it wrote.
+fn took_chain(seqs: &[u64]) -> (Follower, Follower, Vec<StorageEvent>, Vec<CommandId>) {
+    let (entries, commands) = relayed_chain(seqs);
+    let mut f = booted(1);
+    let mut g = booted(1);
+    let adopted = f.step(peer(0, framed(entries.clone())));
+    assert_eq!(g.step(peer(0, framed(entries))), adopted);
+    let events = storage_of(durable_of(&adopted, 1));
+    assert!(events.len() >= commands.len(), "a batch a command at least");
+    (f, g, events, commands)
+}
+
+/// Lever 2, step 1: a step of storage events shares its learning passes.
+/// The frame's adoptions made durable in one step make one full pass, at
+/// the first event, and pass the others over, as none commits anything
+/// before the leader's frontier; one event at a time, each makes its
+/// own. Either way the same effects and records, and once the frontier
+/// comes, the same commits.
+#[test]
+fn a_step_of_storage_events_makes_one_full_learning_pass() {
+    let (mut f, mut g, events, commands) = took_chain(&[1, 2, 3, 4, 5, 6, 7, 8]);
+    let n = events.len() as u64;
+    let before = f.learn_passes();
+    let stepped = f.step_storage(events.clone());
+    let after = f.learn_passes();
+    let g_before = g.learn_passes();
+    let mut one_at_a_time = Vec::new();
+    for event in events {
+        one_at_a_time.extend(g.step(Event::Storage(event)));
+    }
+    let g_after = g.learn_passes();
+    assert_eq!(
+        (
+            after.full - before.full,
+            after.skipped_storage - before.skipped_storage
+        ),
+        (1, n - 1),
+        "one full pass for the step, the others passed over"
+    );
+    assert_eq!(
+        (
+            g_after.full - g_before.full,
+            g_after.skipped_storage - g_before.skipped_storage
+        ),
+        (n, 0),
+        "one full pass an event"
+    );
+    assert_eq!(stepped, one_at_a_time, "the same effects, in order");
+    for c in &commands {
+        assert_eq!(f.table().record(c), g.table().record(c));
+        assert_eq!(f.table().phase_of(c), Some(Phase::Accept));
+    }
+    let through = commands.len() as u64 - 1;
+    assert_eq!(
+        f.step(committed_through(through)),
+        g.step(committed_through(through))
+    );
+    for c in &commands {
+        assert_eq!(f.table().phase_of(c), Some(Phase::Commit));
+        assert_eq!(g.table().phase_of(c), Some(Phase::Commit));
+    }
+    assert_eq!(f.take_rejections(), g.take_rejections());
+}
+
+/// Lever 2, step 1: a pass a storage event needs is made. With the
+/// leader's frontier already past the chain, each adoption made durable
+/// commits its command, which the next one depends on: no pass is passed
+/// over, and the step commits the chain as one event at a time does.
+#[test]
+fn a_step_of_storage_events_commits_what_each_event_makes_learnable() {
+    let (mut f, mut g, events, commands) = took_chain(&[1, 2, 3, 4]);
+    let through = commands.len() as u64 - 1;
+    assert_eq!(
+        f.step(committed_through(through)),
+        g.step(committed_through(through))
+    );
+    for c in &commands {
+        assert_eq!(
+            f.table().phase_of(c),
+            Some(Phase::Accept),
+            "not durable yet"
+        );
+    }
+    let before = f.learn_passes();
+    let stepped = f.step_storage(events.clone());
+    let after = f.learn_passes();
+    let mut one_at_a_time = Vec::new();
+    for event in events {
+        one_at_a_time.extend(g.step(Event::Storage(event)));
+    }
+    assert_eq!(
+        after.skipped_storage, before.skipped_storage,
+        "none passed over"
+    );
+    assert_eq!(stepped, one_at_a_time, "the same effects, in order");
+    for c in &commands {
+        assert_eq!(f.table().phase_of(c), Some(Phase::Commit));
+        assert_eq!(f.table().record(c), g.table().record(c));
+    }
+    assert_eq!(f.take_rejections(), g.take_rejections());
+}
+
+/// Lever 2, step 1: a storage event other than a vote or adoption batch
+/// made durable -- here the second batch failing -- makes its own pass
+/// and the next one full. The step leaves the same effects, records and
+/// refusals as one event at a time.
+#[test]
+fn a_failure_in_a_step_of_storage_events_makes_the_passes_around_it_full() {
+    let (mut f, mut g, mut events, commands) = took_chain(&[1, 2, 3, 4]);
+    let failed = events[1].barrier().expect("a batch");
+    events[1] = StorageEvent::Failed {
+        barrier_id: failed,
+        error: StorageError::NoSpace,
+    };
+    let n = events.len() as u64;
+    let before = f.learn_passes();
+    let stepped = f.step_storage(events.clone());
+    let after = f.learn_passes();
+    let mut one_at_a_time = Vec::new();
+    for event in events {
+        one_at_a_time.extend(g.step(Event::Storage(event)));
+    }
+    let full = after.full - before.full;
+    let skipped = after.skipped_storage - before.skipped_storage;
+    assert_eq!(full + skipped, n, "a pass an event");
+    assert!(
+        full >= 3,
+        "the first, the failure's and the next are full: {full}"
+    );
+    assert_eq!(stepped, one_at_a_time, "the same effects, in order");
+    for c in &commands {
+        assert_eq!(f.table().record(c), g.table().record(c));
+    }
+    assert_eq!(f.take_rejections(), g.take_rejections());
+}
+
 /// task-d102: a proposal held for want of its payload -- a plain copy
 /// arrived first -- is adopted when a relayed copy brings the payload,
 /// though that copy is a duplicate of one held. Found by the frames sweep

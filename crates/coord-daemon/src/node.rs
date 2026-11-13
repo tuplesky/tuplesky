@@ -80,6 +80,20 @@ impl Machine {
         }
     }
 
+    /// Feed a step of storage events, in order, and take the effects
+    /// they produced: what one journal group, or one apply, made known.
+    /// A follower learns once the step where an event changes nothing a
+    /// learning pass would commit (lever 2, step 1).
+    pub fn step_storage(&mut self, events: Vec<StorageEvent>) -> Vec<Effect> {
+        match self {
+            Machine::Leader(m) => events
+                .into_iter()
+                .flat_map(|event| m.step(Event::Storage(event)))
+                .collect(),
+            Machine::Follower(m) => m.step_storage(events),
+        }
+    }
+
     /// Take what this machine refused since the last call, rendered.
     ///
     /// A machine records a refusal and carries on; nothing in the
@@ -2320,6 +2334,9 @@ impl<P: Persistence> Node<P> {
             outcome.events.extend(settled.events);
             outcome.indeterminate = settled.indeterminate;
         }
+        // The machine takes the group's protocol events as one step, in
+        // order, so a follower learns once the step (lever 2, step 1).
+        let mut protocol = Vec::with_capacity(outcome.events.len());
         for event in outcome.events {
             // A staged execution group's batches are journaled with the
             // protocol's (task-d47); they are the applier's to complete,
@@ -2339,6 +2356,7 @@ impl<P: Persistence> Node<P> {
                         ..
                     }
                 ) {
+                    next.extend(self.machine_mut().step_storage(protocol));
                     return Err(DriveError::Engine(
                         "an execution group was definitely not journaled".into(),
                     ));
@@ -2346,7 +2364,10 @@ impl<P: Persistence> Node<P> {
                 continue;
             }
             self.outbox.observe(&event);
-            next.extend(self.machine_mut().step(Event::Storage(event)));
+            protocol.push(event);
+        }
+        if !protocol.is_empty() {
+            next.extend(self.machine_mut().step_storage(protocol));
         }
         // Still unknown after a reconcile: an engine failure, so it
         // cannot be mistaken for a clean round.
@@ -2365,11 +2386,15 @@ impl<P: Persistence> Node<P> {
     /// this node's to deliver, and the sends they release go out with
     /// the next round.
     fn absorb_foreign(&mut self, next: &mut Vec<Effect>) {
-        for event in self.applier.take_foreign() {
-            self.unreleased = true;
-            self.outbox.observe(&event);
-            next.extend(self.machine_mut().step(Event::Storage(event)));
+        let foreign = self.applier.take_foreign();
+        if foreign.is_empty() {
+            return;
         }
+        self.unreleased = true;
+        for event in &foreign {
+            self.outbox.observe(event);
+        }
+        next.extend(self.machine_mut().step_storage(foreign));
     }
 
     /// Lower what is queued until the store has room for `batch`.

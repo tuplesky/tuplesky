@@ -251,6 +251,12 @@ struct Knobs {
     /// cut where its loop lowers a group. Off, a proposal leaves as it is
     /// made.
     frames: u32,
+    /// A follower's journal completes a run of its queued vote and
+    /// adoption batches at once, handed to it as one step of storage
+    /// events ([`Follower::step_storage`]), as `coordd`'s node hands it
+    /// what a journal group made durable (lever 2, step 1). Off, each
+    /// batch completes on its own.
+    storage_steps: bool,
     /// An execution's group reaches the journal after its outcome is
     /// taken, in journal order with the protocol batches, as `coordd`'s
     /// does, and the machines count an execution durable only once its
@@ -374,6 +380,7 @@ impl Knobs {
         answer_on_release: 0,
         relay: 0,
         frames: 0,
+        storage_steps: false,
         late_execution: false,
         execution_lag: 0,
         total_crash: 0,
@@ -661,6 +668,13 @@ const RULES: coord_consensus::SelectionRules = coord_consensus::SelectionRules {
     leave_out_unheld: true,
 };
 
+/// What a node is handed in one step: an event, or a step of storage
+/// events ([`Knobs::storage_steps`]).
+enum Input {
+    Event(Event),
+    Storage(Vec<StorageEvent>),
+}
+
 impl Node {
     fn alive(&self) -> bool {
         self.role.is_some()
@@ -676,10 +690,23 @@ impl Node {
     }
 
     fn step(&mut self, e: Event) -> Vec<Effect> {
+        self.step_input(Input::Event(e))
+    }
+
+    fn step_input(&mut self, input: Input) -> Vec<Effect> {
         match self.role.as_mut().expect("alive") {
-            Role::Leader(m) => m.step(e),
+            Role::Leader(m) => match input {
+                Input::Event(e) => m.step(e),
+                Input::Storage(events) => events
+                    .into_iter()
+                    .flat_map(|e| m.step(Event::Storage(e)))
+                    .collect(),
+            },
             Role::Follower(m) => {
-                let mut effects = m.step(e);
+                let mut effects = match input {
+                    Input::Event(e) => m.step(e),
+                    Input::Storage(events) => m.step_storage(events),
+                };
                 // A campaign waiting on the rows of commands this node
                 // executed and forgot is answered by its runtime from its
                 // durable rows, as `coordd`'s is (task-d77).
@@ -983,6 +1010,9 @@ struct Stats {
     /// (task-d25), likewise.
     asked_ahead: u64,
     taken_ahead: u64,
+    /// Learning passes a step of storage events passed over, at every
+    /// follower (lever 2, step 1).
+    storage_passes_skipped: u64,
 }
 
 /// FNV-1a over `bytes`, continuing from `hash`.
@@ -1524,6 +1554,7 @@ impl Sim {
                 self.stats.stopped_stale += paths.stopped_stale;
                 self.stats.asked_ahead += paths.asked_ahead;
                 self.stats.taken_ahead += paths.taken_ahead;
+                self.stats.storage_passes_skipped += f.learn_passes().skipped_storage;
                 let q = f.quorum().clone();
                 let (mut l, effects) = Leader::from_recovered(f.into_recovered(), q, &decision);
                 l.set_learning(LearningMode::Full);
@@ -1551,6 +1582,10 @@ impl Sim {
     }
 
     fn step_node(&mut self, i: u8, event: Event) {
+        self.step_node_input(i, Input::Event(event));
+    }
+
+    fn step_node_input(&mut self, i: u8, input: Input) {
         let decided_before = match &self.nodes[usize::from(i)].role {
             Some(Role::Follower(f)) => f.campaign_state().and_then(|c| c.decision()).is_some(),
             _ => true,
@@ -1578,15 +1613,15 @@ impl Sim {
                     };
                     Some((c, self.phase(i, &c), deps.unwrap_or_default()))
                 });
-        let acked = match &event {
-            Event::Peer(m) => match ProtocolMessage::decode(m.frame()) {
+        let acked = match &input {
+            Input::Event(Event::Peer(m)) => match ProtocolMessage::decode(m.frame()) {
                 Ok(ProtocolMessage::FastAck(a)) => Some(a.command),
                 Ok(ProtocolMessage::SlowAck(a)) => Some(a.command),
                 _ => None,
             },
             _ => None,
         };
-        let effects = self.nodes[usize::from(i)].step(event);
+        let effects = self.nodes[usize::from(i)].step_input(input);
         match &mut self.nodes[usize::from(i)].role {
             Some(Role::Leader(l)) => self.counted.extend(l.take_learned()),
             Some(Role::Follower(f)) => {
@@ -2152,25 +2187,50 @@ impl Sim {
                 return;
             }
         };
-        let seq = self.nodes[usize::from(i)]
-            .storage
-            .complete(barrier)
-            .expect("volatile");
+        // A follower's run of queued batches completes at once, as one
+        // journal group does (`Knobs::storage_steps`): up to eight more,
+        // stopping at an execution group or a batch the run may fail.
+        let mut barriers = vec![barrier];
+        if self.knobs.storage_steps
+            && matches!(self.nodes[usize::from(i)].role, Some(Role::Follower(_)))
+        {
+            let more = self.below("storage-step", 9);
+            while barriers.len() <= more {
+                let node = &mut self.nodes[usize::from(i)];
+                match node.journal.front() {
+                    Some(Entry::Batch(next)) if !node.failable.contains(next) => {
+                        barriers.push(*next);
+                        node.journal.pop_front();
+                    }
+                    _ => break,
+                }
+            }
+        }
+        let mut events = Vec::with_capacity(barriers.len());
+        for barrier in &barriers {
+            let seq = self.nodes[usize::from(i)]
+                .storage
+                .complete(*barrier)
+                .expect("volatile");
+            self.note(|| format!("durable node {i} {barrier:?}"));
+            events.push(StorageEvent::JournalDurable {
+                barrier_id: *barrier,
+                journal_seq: seq,
+            });
+        }
         if self.nodes[usize::from(i)].journal.is_empty() {
             self.window[usize::from(i)] = false;
-        }
-        self.note(|| format!("durable node {i} {barrier:?}"));
-        if self.nodes[usize::from(i)].journal.is_empty() {
             self.nodes[usize::from(i)].payload_window.clear();
         }
-        self.step_node(
-            i,
-            Event::Storage(StorageEvent::JournalDurable {
-                barrier_id: barrier,
-                journal_seq: seq,
-            }),
-        );
-        self.check_leader_vote(i, barrier);
+        if events.len() == 1 {
+            let event = events.pop().expect("one");
+            self.step_node(i, Event::Storage(event));
+        } else {
+            self.step_node_input(i, Input::Storage(events));
+        }
+        for barrier in barriers {
+            self.check_leader_vote(i, barrier);
+        }
         self.check_promise(i);
     }
 
@@ -2805,6 +2865,7 @@ impl Sim {
             self.stats.stopped_stale += paths.stopped_stale;
             self.stats.asked_ahead += paths.asked_ahead;
             self.stats.taken_ahead += paths.taken_ahead;
+            self.stats.storage_passes_skipped += f.learn_passes().skipped_storage;
         }
     }
 
@@ -4403,6 +4464,37 @@ fn rows_with_pages_of_three_ask_ahead() {
         asked > 0 && taken > 0,
         "no page asked ahead ({asked}) or taken ahead ({taken}) of {pages}"
     );
+}
+
+/// Lever 2, step 1: followers' journals complete runs of batches at
+/// once, each run handed over as one step of storage events, under rows
+/// that crash leaders, repeat elections, fail payload batches with the
+/// queue behind them, and execute late, with leaders sending frames.
+/// Every row's checks hold, debug builds check each learning pass passed
+/// over against every accepted command, and the steps pass some over.
+#[test]
+fn rows_with_storage_steps_learn_once_a_step() {
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let mut failures = Vec::new();
+    let mut skipped = 0u64;
+    for row in [1u8, 9, 21, 23] {
+        let mut knobs = row_knobs(row);
+        knobs.storage_steps = true;
+        knobs.frames = 500_000;
+        for n in [3u8, 5] {
+            for seed in 0..seeds() {
+                match run_knobs(n, knobs, seed, None) {
+                    Ok(stats) => skipped += stats.storage_passes_skipped,
+                    Err(e) => failures.push(e),
+                }
+            }
+        }
+    }
+    std::panic::set_hook(hook);
+    println!("storage steps: {skipped} learning passes passed over");
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    assert!(skipped > 0, "no step of storage events passed a pass over");
 }
 
 #[test]
