@@ -8,8 +8,8 @@
 //!   own earlier command established.
 //! * A session executes in each namespace under that namespace's rules
 //!   (#279's review, debt 1).
-//! * A group the journal refuses empties the cache (#279's review, debt
-//!   2).
+//! * A group the journal refuses, or a reconcile, empties the cache
+//!   (#279's review, debt 2).
 //! * Debug builds check every cached context against the view, so a
 //!   write that goes around the applier is caught at the next command
 //!   that uses the context, and `forget_authorizations` is what such a
@@ -30,7 +30,7 @@ use coord_storage::journaled::{JournalLimits, JournaledStore, TransitionKind};
 use coord_storage::policy::{bootstrap_session, bootstrap_trust_rule, rule_update};
 use coord_storage::{Applier, ApplyError, GroupLimits, JournaledDomain, Persistence, StoreWorker};
 use coord_store_testkit::journal::{AppendScript, ModelJournal};
-use coord_store_testkit::model::ModelEngine;
+use coord_store_testkit::model::{CommitScript, ModelEngine};
 use coord_types::identity::Digest32;
 use coord_types::ids::*;
 use coord_types::logical_v1::*;
@@ -366,6 +366,28 @@ fn a_lost_group_empties_the_cache() {
     assert_eq!((before.loads, before.cleared), (1, 0));
     assert!(matches!(applier.finish_group(), Err(ApplyError::GroupLost)));
     assert_eq!(applier.authorization_cache().cleared, 1);
+}
+
+/// A commit whose outcome is unknown is settled by a reconcile, which
+/// empties the cache: what the store settles may hold rows a context was
+/// read over (#279's review, debt 2).
+#[test]
+fn a_reconcile_empties_the_cache() {
+    let mut applier = worker();
+    let (id, payload) = command(SESSION, 1, b"a");
+    written(&applier.apply_staged(id, &payload).unwrap());
+    assert_eq!(applier.authorization_cache().loads, 1);
+    applier
+        .store_mut()
+        .engine_mut()
+        .script_commit(CommitScript::Indeterminate { applied: true });
+    let (id, payload) = command(SESSION, 2, b"b");
+    written(&applier.apply_staged(id, &payload).unwrap());
+    let stats = applier.authorization_cache();
+    assert_eq!((stats.hits, stats.cleared), (1, 1));
+    let (id, payload) = command(SESSION, 3, b"c");
+    written(&applier.apply_staged(id, &payload).unwrap());
+    assert_eq!(applier.authorization_cache().loads, 2);
 }
 
 /// A rule written around the applier, as a test's bootstrap or a tool

@@ -720,30 +720,35 @@ mod tests {
 
     /// The bound is in bytes: a cache that would pass it is emptied
     /// before the context is kept, and a context larger than it alone is
-    /// never kept (#279's review, debt 3).
+    /// never kept (#279's review, debt 3). A row is at most about 2 MiB
+    /// (the store's envelope), so a large context is one of many rules.
     #[test]
     fn the_cache_is_bounded_in_bytes() {
-        let mut rows = Rows::default();
-        let mut cache = AuthorizationCache::default();
-        // A context of ALICE's sessions whose rules take half the bound and
-        // a little.
-        let half = CAPACITY_BYTES / 2 + 1;
-        let lower = vec![b'k'; half];
-        rows.write(&Mutation::PolicyRuleWrite {
+        const MIB: usize = 1 << 20;
+        let big = |id: u8| Mutation::PolicyRuleWrite {
             principal: ALICE,
-            rule: PolicyRuleId([1; 16]),
+            rule: PolicyRuleId([id; 16]),
             record: Some(PolicyRule {
                 principal: ALICE,
                 action: Action::Read,
                 namespace: NS,
-                interval: KeyInterval { lower, upper: None },
+                interval: KeyInterval {
+                    lower: vec![id; MIB],
+                    upper: None,
+                },
             }),
-        });
+        };
+        let mut rows = Rows::default();
+        let mut cache = AuthorizationCache::default();
+        // ALICE's rules in NS: three of a mebibyte each, so a context in
+        // NS takes more than half the bound.
+        for id in 1..=3 {
+            rows.write(&big(id));
+        }
         let sessions: Vec<SessionId> = (0x40..0x44).map(|b| SessionId([b; 16])).collect();
         for session in &sessions {
             rows.write(&session_write(*session));
         }
-        // Each session's context in NS reads the same large rule.
         cache.load(&rows, NS, &sessions[0]).unwrap();
         assert!(cache.bytes > CAPACITY_BYTES / 2 && cache.bytes <= CAPACITY_BYTES);
         assert_eq!(keys(&cache), vec![(sessions[0], NS)]);
@@ -758,23 +763,14 @@ mod tests {
         assert_eq!(keys(&cache).len(), 1 + sessions.len());
         assert!(cache.bytes <= CAPACITY_BYTES);
         assert_eq!(cache.stats.overflowed, 1);
-        // A context larger than the bound alone is loaded, not kept.
-        rows.write(&Mutation::PolicyRuleWrite {
-            principal: ALICE,
-            rule: PolicyRuleId([2; 16]),
-            record: Some(PolicyRule {
-                principal: ALICE,
-                action: Action::Write,
-                namespace: NS,
-                interval: KeyInterval {
-                    lower: vec![b'k'; CAPACITY_BYTES],
-                    upper: None,
-                },
-            }),
-        });
+        // Five rules: a context larger than the bound alone is loaded,
+        // and not kept.
+        for id in 4..=5 {
+            rows.write(&big(id));
+        }
         cache.clear();
         let context = cache.load(&rows, NS, &sessions[2]).unwrap();
-        assert_eq!(context.rules.len(), 2);
+        assert_eq!(context.rules.len(), 5);
         assert!(keys(&cache).is_empty());
         assert_eq!((cache.stats.too_large, cache.bytes), (1, 0));
     }
