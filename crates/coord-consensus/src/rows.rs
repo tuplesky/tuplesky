@@ -170,6 +170,7 @@ pub struct PayloadRecordV1 {
     /// Stable invocation identity.
     pub retry_key: RetryKey,
     /// Canonical `LogicalRequest` encoding.
+    #[serde(with = "coord_core::effect::scratch_bytes::vec")]
     pub logical: Vec<u8>,
     /// What the admitting verifier attested, as part of what this
     /// command durably *is*.

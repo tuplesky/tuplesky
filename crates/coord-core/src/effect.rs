@@ -43,9 +43,100 @@ pub struct StoreUpdate {
     /// Target collection.
     pub collection: CollectionId,
     /// Ordered key bytes.
+    #[serde(with = "scratch_bytes::vec")]
     pub key: Vec<u8>,
     /// New value, or `None` for a tombstone/delete.
+    #[serde(with = "scratch_bytes::opt")]
     pub value: Option<Vec<u8>>,
+}
+
+/// SCRATCH (structural floors, the appender): byte fields through serde's
+/// bytes path, not one `u8` element at a time. Postcard writes a sequence
+/// of `u8` as its length and then each byte raw, which is exactly what it
+/// writes for bytes, so the encoding is unchanged; reading accepts either.
+pub mod scratch_bytes {
+    use alloc::vec::Vec;
+    use core::fmt;
+
+    use serde::de::{self, SeqAccess, Visitor};
+    use serde::{Deserializer, Serializer};
+
+    struct BytesVisitor;
+
+    impl<'de> Visitor<'de> for BytesVisitor {
+        type Value = Vec<u8>;
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("bytes")
+        }
+        fn visit_bytes<E: de::Error>(self, v: &[u8]) -> Result<Vec<u8>, E> {
+            Ok(v.to_vec())
+        }
+        fn visit_borrowed_bytes<E: de::Error>(self, v: &'de [u8]) -> Result<Vec<u8>, E> {
+            Ok(v.to_vec())
+        }
+        fn visit_byte_buf<E: de::Error>(self, v: Vec<u8>) -> Result<Vec<u8>, E> {
+            Ok(v)
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<u8>, A::Error> {
+            let mut out = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(4096));
+            while let Some(b) = seq.next_element::<u8>()? {
+                out.push(b);
+            }
+            Ok(out)
+        }
+    }
+
+    /// `Vec<u8>` as bytes.
+    pub mod vec {
+        use super::*;
+        /// Serialize as bytes.
+        pub fn serialize<S: Serializer>(v: &[u8], s: S) -> Result<S::Ok, S::Error> {
+            s.serialize_bytes(v)
+        }
+        /// Deserialize from bytes (or a sequence of `u8`).
+        pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+            d.deserialize_byte_buf(BytesVisitor)
+        }
+    }
+
+    /// `Option<Vec<u8>>` as an option of bytes.
+    pub mod opt {
+        use super::*;
+
+        struct AsBytes<'a>(&'a [u8]);
+        impl serde::Serialize for AsBytes<'_> {
+            fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                s.serialize_bytes(self.0)
+            }
+        }
+
+        struct OptVisitor;
+        impl<'de> Visitor<'de> for OptVisitor {
+            type Value = Option<Vec<u8>>;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("optional bytes")
+            }
+            fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+                Ok(None)
+            }
+            fn visit_some<D: Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+                d.deserialize_byte_buf(BytesVisitor).map(Some)
+            }
+        }
+
+        /// Serialize as an option of bytes.
+        #[allow(clippy::ref_option)]
+        pub fn serialize<S: Serializer>(v: &Option<Vec<u8>>, s: S) -> Result<S::Ok, S::Error> {
+            match v {
+                Some(b) => s.serialize_some(&AsBytes(b)),
+                None => s.serialize_none(),
+            }
+        }
+        /// Deserialize an option of bytes.
+        pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<u8>>, D::Error> {
+            d.deserialize_option(OptVisitor)
+        }
+    }
 }
 
 /// The application base a batch was computed against (design Section 18.1).
