@@ -1243,6 +1243,61 @@ fn a_group_of_commands_lowers_once_and_matches_applying_them_one_at_a_time() {
     assert_eq!(grouped.store().unmaterialized(), 0);
 }
 
+/// A group's commands are planned over one snapshot of the projection,
+/// pinned by the first of them, where a command outside a group pins one
+/// of its own (task-d115): one read view a batch. The outcomes are the
+/// ones each gets applied alone.
+#[test]
+fn a_group_plans_every_command_over_one_snapshot() {
+    let snapshots = |applier: &Applier<JournaledDomain<ModelJournal, ModelEngine>>| {
+        applier
+            .store()
+            .store()
+            .projection(DOMAIN)
+            .expect("attached")
+            .snapshots()
+    };
+    let workload = group_workload();
+
+    let mut alone = journaled();
+    support::stage_all(alone.store_mut(), &workload);
+    let mut one_at_a_time = Vec::new();
+    for (command, record) in &workload {
+        let before = snapshots(&alone);
+        one_at_a_time.push(alone.apply(*command, record).expect("applied"));
+        assert!(snapshots(&alone) > before, "a command alone pins its own");
+    }
+
+    let mut grouped = journaled();
+    support::stage_all(grouped.store_mut(), &workload);
+    assert!(grouped.begin_group());
+    let before = snapshots(&grouped);
+    let together: Vec<_> = workload
+        .iter()
+        .map(|(command, record)| grouped.apply(*command, record).expect("applied"))
+        .collect();
+    assert_eq!(
+        snapshots(&grouped) - before,
+        1,
+        "{} commands, one snapshot",
+        workload.len()
+    );
+    grouped.finish_group().expect("the group materializes");
+    assert_eq!(together, one_at_a_time);
+    assert_eq!(grouped.kv_revision().unwrap(), alone.kv_revision().unwrap());
+
+    // The next group pins a snapshot of its own, which holds the first.
+    let next = payload(11, &put(b"k1", b"w"));
+    support::stage_all(grouped.store_mut(), std::slice::from_ref(&next));
+    assert!(grouped.begin_group());
+    let before = snapshots(&grouped);
+    let outcome = grouped.apply(next.0, &next.1).expect("applied");
+    assert_eq!(snapshots(&grouped) - before, 1);
+    grouped.finish_group().expect("the group materializes");
+    let expected = alone.apply_staged(next.0, &next.1).expect("applied");
+    assert_eq!(outcome, expected);
+}
+
 /// A group whose records reached the journal and whose projection commit
 /// never happened is recovered whole from the journal by the next boot:
 /// each command executed once, at the position it took (task-d47).

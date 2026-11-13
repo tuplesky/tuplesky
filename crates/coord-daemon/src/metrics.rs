@@ -1142,10 +1142,10 @@ pub struct Scheduling {
     /// Times the scheduler took the CPU from it.
     pub involuntary: u64,
     /// The domain loop's run-queue time a pass, distributed over a
-    /// sample of its passes (task-d97): one pass in
-    /// [`RUN_QUEUE_SAMPLE_EVERY`], from its start to the next pass's
-    /// start. That is the pass's own preemptions and the wait to run
-    /// once something woke it again.
+    /// sample of its passes (task-d97): the first pass to start
+    /// [`RUN_QUEUE_SAMPLE_PERIOD`] or more after the last sampled one,
+    /// from its start to the next pass's start. That is the pass's own
+    /// preemptions and the wait to run once something woke it again.
     #[serde(default)]
     pub run_queue_per_pass: Distribution,
     /// The same, over the sampled passes in which the loop executed at
@@ -1155,9 +1155,14 @@ pub struct Scheduling {
     pub run_queue_per_working_pass: Distribution,
 }
 
-/// One domain-loop pass in this many has its run-queue time sampled
-/// (task-d97): two reads of the thread's `schedstat` a sample.
-pub const RUN_QUEUE_SAMPLE_EVERY: u64 = 16;
+/// How far apart the domain loop's sampled passes start (task-d97): two
+/// reads of the thread's `schedstat` a sample.
+///
+/// By time, not one pass in a count (task-d115): a busy leader's loop
+/// takes some sixty passes a turn, and one in sixteen made the sample's
+/// reads 35 of its 55 system calls a turn. A hundred samples a second
+/// still fill the distribution.
+pub const RUN_QUEUE_SAMPLE_PERIOD: Duration = Duration::from_millis(10);
 
 fn not_instrumented<T>() -> Measure<T> {
     Measure::Unavailable(Unavailable::NotInstrumented)

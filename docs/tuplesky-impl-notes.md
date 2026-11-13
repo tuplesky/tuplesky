@@ -11323,11 +11323,14 @@ Three waits now also go out as distributions:
 - **The read barrier's wait,** arrival to answer (`cost.reads.waited`),
   at the barrier's millisecond resolution.
 - **The domain loop's run-queue time a pass**
-  (`cost.cpu.domain_scheduling.run_queue_per_pass`): one pass in 16
-  reads the thread's `schedstat` at its start and again at the next
-  pass's start, so a sample is the pass's own preemptions and the wait
-  to run once something woke it. Two reads of a `/proc` file in 16
-  passes; the total run-queue time beside it is unchanged. Idle passes
+  (`cost.cpu.domain_scheduling.run_queue_per_pass`): the first pass to
+  start 10 ms or more after the last sampled one reads the thread's
+  `schedstat` at its start and again at the next pass's start, so a
+  sample is the pass's own preemptions and the wait to run once
+  something woke it. Two reads of a `/proc` file every 10 ms; the total
+  run-queue time beside it is unchanged. (It was one pass in 16 until
+  task-d115: on a busy leader that was 35 of its loop's 55 system calls
+  a turn.) Idle passes
   outnumber working ones many times over, so the samples whose pass
   executed a command also go into `run_queue_per_working_pass`, which
   compares with the commands' own tails.

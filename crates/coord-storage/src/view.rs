@@ -188,6 +188,11 @@ impl<V: OrderedRead> GatedView<V> {
         self.gate.as_ref()
     }
 
+    /// The snapshot, the metadata it proves and its gate, apart.
+    pub(crate) fn into_parts(self) -> (V, DurableMeta, Option<Arc<Frontier>>) {
+        (self.view, self.meta, self.gate)
+    }
+
     /// The snapshot.
     pub fn view(&self) -> &V {
         &self.view

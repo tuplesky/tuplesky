@@ -1,7 +1,9 @@
 //! The endpoint: TLS lifecycle, accept and connect, negotiation, lanes,
 //! links with fair queues and budgets, stream readers and owned dispatch.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -648,6 +650,127 @@ impl Link {
             ],
             notify: [Notify::new(), Notify::new(), Notify::new(), Notify::new()],
         }
+    }
+}
+
+/// The lane senders' wake-ups a thread is holding back, and since when
+/// (see [`WakeHold`]).
+struct Held {
+    /// How many [`WakeHold`]s this thread has open: it holds while any is.
+    holds: u32,
+    /// When the first wake-up held since the last release was held.
+    since: Option<Instant>,
+    /// Each lane whose sender is owed a wake-up, once however many frames
+    /// were queued for it.
+    lanes: Vec<(Arc<Link>, usize)>,
+}
+
+thread_local! {
+    static HELD: RefCell<Held> = const {
+        RefCell::new(Held {
+            holds: 0,
+            since: None,
+            lanes: Vec::new(),
+        })
+    };
+}
+
+/// Holds back, on the thread that made it, the wake-ups of the lane
+/// senders its sends queue frames for, until [`WakeHold::release`]
+/// (task-d115, lever 8).
+///
+/// A domain loop queues frames all through a turn, and every send woke
+/// its lane's sender at once. On a runtime with one worker, each was a
+/// wake-up of that worker whenever it had parked between two sends: the
+/// audit counted ten a turn at a leader, where one would carry the
+/// turn's frames. Under a hold a send is what it was -- the frame is
+/// admitted, queued or refused, and its result returned at once -- and
+/// only the wake-up waits for the thread to say its batch is done. A
+/// sender already awake finds the frames anyway: it drains its queue.
+///
+/// The thread releases at the points it chooses, and dropping the hold
+/// releases what it still holds. Other threads are untouched: a hold is
+/// the thread's own, and is neither `Send` nor `Sync`.
+pub struct WakeHold {
+    _thread: PhantomData<*const ()>,
+}
+
+impl WakeHold {
+    /// Start holding this thread's lane wake-ups back. Holds nest: the
+    /// thread holds until the last is dropped.
+    #[must_use]
+    pub fn new() -> Self {
+        HELD.with(|held| held.borrow_mut().holds += 1);
+        WakeHold {
+            _thread: PhantomData,
+        }
+    }
+
+    /// When the oldest wake-up held since the last release was held, or
+    /// `None` when nothing is held.
+    pub fn held_since(&self) -> Option<Instant> {
+        HELD.with(|held| held.borrow().since)
+    }
+
+    /// Wake each lane sender held since the last release, once, and go on
+    /// holding. Returns how many were woken.
+    pub fn release(&self) -> usize {
+        release_held()
+    }
+
+    /// [`WakeHold::release`] for code that has no hold at hand. A hold is
+    /// the thread's, not the value's, so this releases what the calling
+    /// thread holds, and is a no-op on a thread that holds nothing.
+    pub fn release_this_thread() -> usize {
+        release_held()
+    }
+}
+
+impl Default for WakeHold {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for WakeHold {
+    fn drop(&mut self) {
+        release_held();
+        HELD.with(|held| held.borrow_mut().holds -= 1);
+    }
+}
+
+fn release_held() -> usize {
+    let lanes = HELD.with(|held| {
+        let mut held = held.borrow_mut();
+        held.since = None;
+        std::mem::take(&mut held.lanes)
+    });
+    for (link, lane) in &lanes {
+        link.notify[*lane].notify_one();
+    }
+    lanes.len()
+}
+
+/// Wake `lane`'s sender on `link`, or owe it the wake-up where this
+/// thread holds them back (see [`WakeHold`]).
+fn wake(link: &Arc<Link>, lane: usize) {
+    let held = HELD.with(|held| {
+        let mut held = held.borrow_mut();
+        if held.holds == 0 {
+            return false;
+        }
+        if !held
+            .lanes
+            .iter()
+            .any(|(l, i)| *i == lane && Arc::ptr_eq(l, link))
+        {
+            held.lanes.push((link.clone(), lane));
+        }
+        held.since.get_or_insert_with(Instant::now);
+        true
+    });
+    if !held {
+        link.notify[lane].notify_one();
     }
 }
 
@@ -1465,6 +1588,13 @@ impl Transport {
         }
     }
 
+    /// Whether an event is waiting to be taken (task-d115, lever 8). A
+    /// loop holding work for the runtime hands it off once none is,
+    /// rather than taking another pass to find out.
+    pub fn has_event(&self) -> bool {
+        self.events.iter().any(|events| !events.is_empty())
+    }
+
     /// The next event of one lane only; other lanes are left untouched.
     pub async fn next_event_in(&mut self, lane: Lane) -> Option<TransportEvent> {
         self.events[lane.index()].recv().await
@@ -1519,6 +1649,8 @@ impl Transport {
     /// [`Self::send`] admits one, and has its own result; the lane's
     /// sender is woken once, after the last, so a link that carries
     /// several frames a stream takes what this turn queued together.
+    /// Where the calling thread holds a [`WakeHold`], that wake-up waits
+    /// for the hold's release.
     pub fn send_many(
         &self,
         to: Destination,
@@ -1583,7 +1715,7 @@ impl Transport {
         state.stats.queued = state.queue.len();
         drop(state);
         if queued {
-            link.notify[lane.index()].notify_one();
+            wake(&link, lane.index());
         }
         results
     }

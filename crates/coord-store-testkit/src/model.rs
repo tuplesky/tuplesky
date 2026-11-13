@@ -101,6 +101,8 @@ struct Shared {
     /// Writes seen since the current transaction opened.
     writes_in_txn: usize,
     txn_counter: u64,
+    /// Snapshots handed out, for a test that counts a reader's views.
+    snapshots: u64,
 }
 
 /// The model engine.
@@ -129,6 +131,11 @@ impl ModelEngine {
         let engine = ModelEngine::new();
         engine.shared.lock().unwrap().misbehaviors = misbehaviors.iter().copied().collect();
         engine
+    }
+
+    /// Snapshots its readers have handed out so far.
+    pub fn snapshots(&self) -> u64 {
+        self.shared.lock().unwrap().snapshots
     }
 
     /// Script the outcome of upcoming commits (consumed in order).
@@ -331,7 +338,8 @@ impl SnapshotSource for ModelReader {
     type View = ModelView;
 
     fn snapshot(&self) -> Result<ModelView, EngineError> {
-        let s = self.0.lock().unwrap();
+        let mut s = self.0.lock().unwrap();
+        s.snapshots += 1;
         if s.misbehaviors.contains(&Misbehavior::MixedSnapshots) {
             return Ok(ModelView {
                 pinned: None,

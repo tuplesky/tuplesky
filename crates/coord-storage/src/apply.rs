@@ -31,7 +31,7 @@ use std::sync::Arc;
 use coord_core::effect::BarrierId;
 use coord_core::event::{StorageError, StorageEvent};
 use coord_state::KvEvent;
-use coord_store_api::engine::SnapshotSource;
+use coord_store_api::engine::{CollectionId, OrderedRead, RowPage, ScanRequest, SnapshotSource};
 
 use crate::cut::{CutOverlay, RecoveryCut};
 use crate::lowering::ExecutionFrontier;
@@ -174,7 +174,7 @@ pub struct Applier<P: Persistence> {
     sharing: bool,
     /// The commands applied since [`Applier::begin_group`] whose batches
     /// have not materialized yet (task-d47).
-    group: Option<Group>,
+    group: Option<Group<Snapshot<P>>>,
     /// Groups handed to a pipelined store and not yet known to have
     /// materialized (task-d52), oldest first.
     inflight: VecDeque<InFlight>,
@@ -204,8 +204,7 @@ struct InFlight {
 
 /// Commands applied as one group: planned one after another, each over
 /// what the ones before it wrote, and lowered together (task-d47).
-#[derive(Default)]
-struct Group {
+struct Group<V> {
     /// Every row the group's batches write, in order, a later write of a
     /// key winning: what a command planned after them reads through. On
     /// a pipelined store it starts from the rows of the groups still in
@@ -225,6 +224,32 @@ struct Group {
     last: Option<Pending>,
     /// Watch publications owed once the group has materialized, in order.
     publications: Vec<Publication>,
+    /// The projection's snapshot every command of the group is planned
+    /// over, pinned by the first plan (task-d115): one read view a group,
+    /// each table opened once in it, not one a command.
+    ///
+    /// A later snapshot would read the same. A plan reads only what
+    /// applications write. While the group is open, those are its own
+    /// batches and the groups in flight when it began, and `overlay`
+    /// holds both. The groups in flight may commit meanwhile; a snapshot
+    /// that holds them reads the same, as at [`Applier::begin_group`].
+    /// Nothing else applies a command until the group is lowered or
+    /// handed off, and that drops the snapshot.
+    snapshot: std::cell::OnceCell<GatedView<V>>,
+}
+
+impl<V> Default for Group<V> {
+    fn default() -> Self {
+        Group {
+            overlay: Arc::default(),
+            own: Arc::default(),
+            barriers: BTreeSet::new(),
+            unjournaled: BTreeSet::new(),
+            last: None,
+            publications: Vec::new(),
+            snapshot: std::cell::OnceCell::new(),
+        }
+    }
 }
 
 /// A watch publication held until its revision has materialized.
@@ -239,10 +264,43 @@ enum Publication {
     Through(KvRevision),
 }
 
+/// A snapshot of the projection `P` keeps.
+type Snapshot<P> = <<P as Persistence>::Reader as SnapshotSource>::View;
+
 /// What a command is planned against: the projection's snapshot, with a
 /// group's own unmaterialized writes over it.
-type PlanningView<P> =
-    GatedView<RecoveryCut<<<P as Persistence>::Reader as SnapshotSource>::View, Arc<CutOverlay>>>;
+type PlanningView<'a, P> =
+    GatedView<RecoveryCut<PlanningSnapshot<'a, Snapshot<P>>, Arc<CutOverlay>>>;
+
+/// The snapshot under a command's plan: its own outside a group, or the
+/// one its group pinned (task-d115).
+enum PlanningSnapshot<'a, V> {
+    Own(V),
+    Group(&'a V),
+}
+
+impl<V> PlanningSnapshot<'_, V> {
+    const fn view(&self) -> &V {
+        match self {
+            PlanningSnapshot::Own(view) => view,
+            PlanningSnapshot::Group(view) => view,
+        }
+    }
+}
+
+impl<V: OrderedRead> OrderedRead for PlanningSnapshot<'_, V> {
+    fn get(&self, collection: CollectionId, key: &[u8]) -> Result<Option<Vec<u8>>, EngineError> {
+        self.view().get(collection, key)
+    }
+
+    fn scan_page(
+        &self,
+        collection: CollectionId,
+        request: &ScanRequest,
+    ) -> Result<RowPage, EngineError> {
+        self.view().scan_page(collection, request)
+    }
+}
 
 /// Whether `event` says one of `barriers` will never be journaled.
 fn lost(event: &StorageEvent, barriers: &BTreeSet<BarrierId>) -> bool {
@@ -386,9 +444,12 @@ impl<P: Persistence> Applier<P> {
     /// cannot be planned again here. A batch journaled whose projection
     /// is still owed is not a failure; lowering goes on.
     pub fn finish_group(&mut self) -> Result<(), ApplyError> {
-        let Some(group) = self.group.take() else {
+        let Some(mut group) = self.group.take() else {
             return Ok(());
         };
+        // Nothing is planned over it any more, and the lowering below
+        // moves the projection past it.
+        group.snapshot.take();
         if let Some(last) = group.last {
             let mut materialized = false;
             for _ in 0..GROUP_LOWERINGS {
@@ -489,7 +550,8 @@ impl<P: Persistence> Applier<P> {
             return Ok(None);
         };
         let Some(position) = open.last.as_ref().map(|last| last.position) else {
-            let group = self.group.take().expect("open");
+            let mut group = self.group.take().expect("open");
+            group.snapshot.take();
             // Nothing of its own to materialize; what it publishes may
             // still name a revision a group in flight wrote.
             if let Some(flight) = self.inflight.back_mut() {
@@ -530,7 +592,10 @@ impl<P: Persistence> Applier<P> {
             }
             attempts -= 1;
         }
-        let group = self.group.take().expect("open");
+        let mut group = self.group.take().expect("open");
+        // Nothing is planned over its snapshot any more; the materializer
+        // commits past it.
+        group.snapshot.take();
         // A watch's events wait for their group's commit, so a group that
         // has some for an open watch is not held for a larger one
         // (task-d86).
@@ -731,28 +796,46 @@ impl<P: Persistence> Applier<P> {
             .execution_position)
     }
 
-    /// The view a command is planned against. Outside a group, the
-    /// projection's snapshot. Within one, the same snapshot with the
-    /// group's writes over it, at the frontier the group has reached, so
-    /// the plan's base is the queued frontier the store will check.
-    fn planning_view(&self) -> Result<PlanningView<P>, ApplyError> {
-        let gated = self.store.reader().snapshot()?;
-        let mut meta = *gated.meta();
-        let overlay = match &self.group {
-            Some(group) => {
-                let base = self.store.application_base();
-                meta.frontier = ExecutionFrontier {
-                    configuration: base.configuration,
-                    execution_position: base.execution_position,
-                };
-                group.overlay.clone()
-            }
-            None => Arc::new(CutOverlay::new()),
+    /// The view a command is planned against. Outside a group, a
+    /// snapshot of the projection of its own. Within one, the snapshot the
+    /// group pinned with the group's writes over it, at the frontier the
+    /// group has reached, so the plan's base is the queued frontier the
+    /// store will check.
+    fn planning_view(&self) -> Result<PlanningView<'_, P>, ApplyError> {
+        let Some(group) = &self.group else {
+            let (view, meta, gate) = self.store.reader().snapshot()?.into_parts();
+            let durable = meta.stamp.journal_seq();
+            let snapshot = GatedView::with_gate(PlanningSnapshot::Own(view), meta, gate.clone());
+            return Ok(GatedView::with_gate(
+                RecoveryCut::new(snapshot, Arc::new(CutOverlay::new()), durable),
+                meta,
+                gate,
+            ));
         };
-        let durable = gated.meta().stamp.journal_seq();
-        let gate = gated.gate().cloned();
+        if group.snapshot.get().is_none() {
+            let pinned = self.store.reader().snapshot()?;
+            let _ = group.snapshot.set(pinned);
+        }
+        let pinned = group.snapshot.get().expect("pinned above");
+        let snapshot_meta = *pinned.meta();
+        let gate = pinned.gate().cloned();
+        let mut meta = snapshot_meta;
+        let base = self.store.application_base();
+        meta.frontier = ExecutionFrontier {
+            configuration: base.configuration,
+            execution_position: base.execution_position,
+        };
+        let snapshot = GatedView::with_gate(
+            PlanningSnapshot::Group(pinned.view()),
+            snapshot_meta,
+            gate.clone(),
+        );
         Ok(GatedView::with_gate(
-            RecoveryCut::new(gated, overlay, durable),
+            RecoveryCut::new(
+                snapshot,
+                group.overlay.clone(),
+                snapshot_meta.stamp.journal_seq(),
+            ),
             meta,
             gate,
         ))
@@ -1066,6 +1149,7 @@ impl<P: Persistence> Applier<P> {
             let gated = self.planning_view()?;
             match retry::lookup(gated.view(), &binding.retry_key)? {
                 Some(record) if record.command_id == binding.command_id => {
+                    drop(gated);
                     if let Some(revision) = record.revision {
                         self.publish_through(revision)?;
                     }
@@ -1218,6 +1302,7 @@ impl<P: Persistence> Applier<P> {
             match retry::admit(gated.view(), binding, authorized)? {
                 Admission::New => {}
                 Admission::Retry(record) => {
+                    drop(gated);
                     // The command already executed: either earlier, or by
                     // the commit that reconciliation established after an
                     // indeterminate acknowledgement. Its revision is
