@@ -2831,6 +2831,9 @@ impl<P: Persistence> Node<P> {
             coord_storage::ApplyError::GroupLost => {
                 DriveError::Engine("an execution group was definitely not journaled".into())
             }
+            coord_storage::ApplyError::AfterGroupLost => {
+                DriveError::Engine("the applier was used after an execution group was lost".into())
+            }
             other => DriveError::Engine(format!("{other:?}")),
         }
     }
