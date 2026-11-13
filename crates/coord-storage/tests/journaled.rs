@@ -1987,3 +1987,146 @@ fn the_materializers_commits_keep_the_published_key_index_as_the_projection_has_
     assert_eq!(live.versions(), 1, "only step 3's event row is left");
     assert_eq!(live, rebuilt);
 }
+
+/// Each `meta_v1` key is written once a commit, with the value its last
+/// command put, not once a command (task-d117 step 1, design Section
+/// 17.17 point 5). Three commands put the key revision, two the retention
+/// floor and two the lease authority. Taken in one commit, the projection
+/// holds what one commit a command leaves, and so does a projection the
+/// attach rebuilds from the journal alone after a crash that loses every
+/// commit. The key index the store publishes after the restart is the one
+/// the projection builds.
+#[test]
+fn a_commit_writes_each_meta_key_once_with_its_last_value() {
+    use coord_store_api::registry::{Collection, meta_fields};
+    let meta = Collection::MetaV1.id();
+    let counter = |n: u64| coord_storage::codecs::encode_counter(n).unwrap();
+    let meta_row = |key: &[u8], n: u64| StoreUpdate {
+        collection: meta,
+        key: key.to_vec(),
+        value: Some(counter(n)),
+    };
+    let step = |world: &mut World, step: u64| {
+        world.protocol(A, ballot(step), promise(step));
+        let mut updates = vec![
+            kv_update(format!("key-{step}").as_bytes(), b"value"),
+            event_row(step),
+            StoreUpdate {
+                collection: Collection::PayloadV1.id(),
+                key: command(step as u8).as_bytes().to_vec(),
+                value: Some(vec![step as u8; 16]),
+            },
+            coord_storage::retry::executed_update(
+                &command(step as u8),
+                position(step),
+                None,
+                Digest32([step as u8; 32]),
+            )
+            .unwrap(),
+            meta_row(meta_fields::KV_REVISION, step),
+        ];
+        if step >= 2 {
+            updates.push(meta_row(meta_fields::RETENTION_FLOOR, step - 1));
+            updates.push(meta_row(meta_fields::LEASE_AUTHORITY, 10 + step));
+        }
+        world.application(A, step, position(step), updates);
+    };
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Run {
+        CommitEach,
+        OneCommit,
+        Replayed,
+    }
+    let run = |how: Run| {
+        let mut world = World::new();
+        for s in 1..=3 {
+            step(&mut world, s);
+            match how {
+                Run::CommitEach => {
+                    world.store.flush().unwrap();
+                }
+                Run::OneCommit => {}
+                Run::Replayed => {
+                    world.store.append_pending().unwrap();
+                }
+            }
+        }
+        let before = world.store.projection(A).unwrap().writes_to(meta);
+        match how {
+            Run::CommitEach => {}
+            Run::OneCommit => {
+                world.store.flush().unwrap();
+            }
+            Run::Replayed => {
+                let frontiers = world.store.frontiers(A).unwrap();
+                assert!(frontiers.materialized() < frontiers.durable());
+            }
+        }
+        let one_commit = world.store.projection(A).unwrap().writes_to(meta) - before;
+        if how != Run::Replayed {
+            // The key index the commits kept is the one their rows build:
+            // it saw every revision and floor the meta rows carried.
+            let view = world.store.reader(A).unwrap().snapshot().unwrap();
+            let live = view
+                .with_kv_index(coord_storage::kv_index::KvIndex::clone)
+                .unwrap();
+            assert_eq!(
+                live,
+                coord_storage::kv_index::KvIndex::build(view.view()).unwrap(),
+                "{how:?}, before the restart"
+            );
+        }
+        // The boot ends, so every run's journal holds the same records. The
+        // replayed one's projection loses every commit to a crash, and the
+        // attach rebuilds it from the journal.
+        let (journal, mut engines) = world.store.into_parts();
+        let mut engine = engines.pop().expect("one domain").1;
+        if how == Run::Replayed {
+            engine.crash_and_reopen();
+        }
+        let mut store = JournaledStore::open(
+            journal,
+            CLUSTER,
+            REPLICA,
+            inc(),
+            BootId([0x89; 16]),
+            JournalLimits::default(),
+        )
+        .unwrap();
+        store.attach(A, shard(), engine).unwrap();
+        let frontiers = store.frontiers(A).unwrap();
+        assert_eq!(frontiers.materialized(), frontiers.durable(), "{how:?}");
+        let view = store.reader(A).unwrap().snapshot().unwrap();
+        let live = view
+            .with_kv_index(coord_storage::kv_index::KvIndex::clone)
+            .unwrap();
+        assert_eq!(
+            live,
+            coord_storage::kv_index::KvIndex::build(view.view()).unwrap(),
+            "{how:?}"
+        );
+        drop(view);
+        (store.projection(A).unwrap().durable_rows(), one_commit)
+    };
+    let (each, _) = run(Run::CommitEach);
+    let (one, meta_writes) = run(Run::OneCommit);
+    let (replayed, _) = run(Run::Replayed);
+    let value_of = |rows: &[(u16, Vec<u8>, Vec<u8>)], key: &[u8]| {
+        rows.iter()
+            .find(|(c, k, _)| *c == meta.0 && k.as_slice() == key)
+            .map(|(.., v)| v.clone())
+    };
+    assert_eq!(value_of(&each, meta_fields::KV_REVISION), Some(counter(3)));
+    assert_eq!(
+        value_of(&each, meta_fields::RETENTION_FLOOR),
+        Some(counter(2))
+    );
+    assert_eq!(
+        value_of(&each, meta_fields::LEASE_AUTHORITY),
+        Some(counter(13))
+    );
+    assert_eq!(one, each, "one commit leaves what a commit a command does");
+    assert_eq!(replayed, each, "replay leaves what a commit a command does");
+    // The three keys once each, and the stamp and the frontier.
+    assert_eq!(meta_writes, 3 + 2, "meta rows written by the one commit");
+}
