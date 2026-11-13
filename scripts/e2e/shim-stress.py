@@ -34,7 +34,10 @@ full Elle run:
 * an append reported `ok` is in every read that began after it ended;
 * a read that began after another read ended is not shorter;
 * no two ok transactions read the same value of a key and then both
-  append to it (a lost update).
+  append to it (a lost update);
+* a transaction's appends to one key are read together, adjacent and in
+  the transaction's order, by any other transaction's read (or the final
+  read) that holds one of them.
 
 Exit status: 0 clean, 1 an anomaly, 2 the domain did not serve the final
 read, or no workload operation completed `ok`, so the faults exercised
@@ -381,17 +384,17 @@ def check(ops, final):
         if answer["type"] == "ok":
             for m in answer["value"]:
                 if m[0] == "r":
-                    reads.setdefault(m[1], []).append((m[2] or [], t0, t1))
+                    reads.setdefault(m[1], []).append((m[2] or [], t0, t1, id(mops)))
     # The final read is a read like the others, begun after everything
     # else ended: a value an earlier read saw must still be in it.
     if final is not None:
         for k, lst in final.items():
-            reads.setdefault(k, []).append((lst, float("inf"), float("inf")))
+            reads.setdefault(k, []).append((lst, float("inf"), float("inf"), None))
     for k, rs in reads.items():
-        longest = max((r for r, _, _ in rs), key=len)
+        longest = max((r for r, _, _, _ in rs), key=len)
         if final is not None:
             longest = final[k] if len(final[k]) >= len(longest) else longest
-        for r, s, e in rs:
+        for r, s, e, _ in rs:
             if r != longest[:len(r)]:
                 problems.append(f"key {k}: read {r} is not a prefix of {longest}")
             if len(set(r)) != len(r):
@@ -400,7 +403,30 @@ def check(ops, final):
             problems += [f"key {k}: read {r} holds {v}, which no append invoked before the read ended"
                          for v in r if not invoked.get((k, v), float("inf")) < e]
             problems += [f"key {k}: read {r2} began after read {r} ended and is shorter"
-                         for r2, s2, _ in rs if s2 > e and len(r2) < len(r)]
+                         for r2, s2, _, _ in rs if s2 > e and len(r2) < len(r)]
+    # A transaction's appends to one key take effect together and in its
+    # order, so another transaction's read that holds any of them holds
+    # them all, one after another. Each element is checked on its own
+    # above; this checks their order and that none was read without the
+    # others. A transaction's own reads see only its earlier appends, so
+    # they are left out.
+    for _, _, mops, answer, _, _ in ops:
+        if answer["type"] == "fail":
+            continue
+        by_key = {}
+        for m in mops:
+            if m[0] == "append":
+                by_key.setdefault(m[1], []).append(m[2])
+        for k, vs in by_key.items():
+            if len(vs) < 2:
+                continue
+            for r, _, _, txn in reads.get(k, []):
+                if txn == id(mops) or not any(v in r for v in vs):
+                    continue
+                at = r.index(vs[0]) if vs[0] in r else -1
+                if at < 0 or r[at:at + len(vs)] != vs:
+                    problems.append(f"key {k}: read {r} does not hold one transaction's appends {vs} "
+                                    "together and in order")
     # Two ok transactions that read the same value of a key and then both
     # appended to it: one append was lost (or the guard did not hold).
     seen = {}
@@ -420,7 +446,7 @@ def check(ops, final):
         if answer["type"] != "ok":
             continue
         for m in (m for m in mops if m[0] == "append"):
-            for r, s, _ in reads.get(m[1], []):
+            for r, s, _, _ in reads.get(m[1], []):
                 if s > t1 and m[2] not in r:
                     problems.append(f"key {m[1]}: ok append {m[2]} missing from a later read")
             if final is not None and final[m[1]].count(m[2]) != 1:
