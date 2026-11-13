@@ -156,7 +156,7 @@ pub struct PayloadRecordV1 {
     /// Stable invocation identity.
     pub retry_key: RetryKey,
     /// Canonical `LogicalRequest` encoding.
-    #[serde(with = "byte_string")]
+    #[serde(with = "coord_core::byte_string")]
     pub logical: Vec<u8>,
     /// What the admitting verifier attested, as part of what this
     /// command durably *is*.
@@ -199,55 +199,6 @@ pub struct PayloadRecordV1 {
     /// record written before this field existed.
     #[serde(default)]
     pub ack_through: u64,
-}
-
-/// A byte string field encoded as one -- its length, then its bytes,
-/// copied once -- rather than as the sequence of `u8`s a `Vec<u8>` is to
-/// serde, each pushed on its own. Postcard lays the two out the same way,
-/// so what a field encodes to, and every row already written, is
-/// unchanged (`a_byte_string_is_encoded_as_the_sequence_was`).
-mod byte_string {
-    use alloc::vec::Vec;
-    use core::fmt;
-
-    use serde::de::{SeqAccess, Visitor};
-    use serde::{Deserializer, Serializer};
-
-    pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_bytes(bytes)
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
-        deserializer.deserialize_byte_buf(Bytes)
-    }
-
-    struct Bytes;
-
-    impl<'de> Visitor<'de> for Bytes {
-        type Value = Vec<u8>;
-
-        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.write_str("a byte string")
-        }
-
-        fn visit_bytes<E: serde::de::Error>(self, v: &[u8]) -> Result<Vec<u8>, E> {
-            Ok(v.to_vec())
-        }
-
-        fn visit_byte_buf<E: serde::de::Error>(self, v: Vec<u8>) -> Result<Vec<u8>, E> {
-            Ok(v)
-        }
-
-        // A format without byte strings hands over the sequence the field
-        // always was.
-        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<u8>, A::Error> {
-            let mut out = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(4096));
-            while let Some(byte) = seq.next_element::<u8>()? {
-                out.push(byte);
-            }
-            Ok(out)
-        }
-    }
 }
 
 impl PayloadRecordV1 {
