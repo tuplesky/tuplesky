@@ -211,6 +211,10 @@ pub enum RecordError {
     TrailingBytes,
     /// Encoding is not a valid record.
     Malformed,
+    /// The bytes decode to a valid record but are not its encoding: a
+    /// varint written longer than it needs, which decodes to the same
+    /// value. No encoder of this format writes one.
+    NonCanonical,
 }
 
 impl fmt::Display for RecordError {
@@ -335,6 +339,10 @@ pub struct JournalRecordV1 {
     predecessor: Digest32,
     body: Arc<RecordBody>,
     digest: Digest32,
+    /// The encoding's length, counted once where the record is made: at
+    /// [`Self::seal`], and at [`Self::decode`] as the bytes decoded. A
+    /// function of the fields above, so it never disagrees with them.
+    encoded_len: usize,
 }
 
 fn digest_of(
@@ -495,15 +503,18 @@ impl JournalRecordV1 {
             &draft.predecessor,
             &body_bytes,
         );
-        let record = JournalRecordV1 {
+        let mut record = JournalRecordV1 {
             format: JOURNAL_RECORD_FORMAT_V1,
             origin: draft.origin,
             seq: draft.seq,
             predecessor: draft.predecessor,
             body: Arc::new(draft.body),
             digest,
+            encoded_len: 0,
         };
-        if record.encoded_len()? > MAX_RECORD_BYTES {
+        record.encoded_len = postcard::experimental::serialized_size(&record.wire())
+            .map_err(|_| RecordError::TooLarge)?;
+        if record.encoded_len > MAX_RECORD_BYTES {
             return Err(RecordError::TooLarge);
         }
         Ok(record)
@@ -534,8 +545,30 @@ impl JournalRecordV1 {
         self.digest
     }
 
-    /// Verify the record against what the stream expects: origin fields,
-    /// index, predecessor chain and re-derived digest.
+    /// Verify the record against what the stream expects: its format,
+    /// origin fields, index and predecessor chain.
+    ///
+    /// The body's bounds and guards and the digest over the whole record
+    /// are not checked again here (#185, lead 17:43): they hold of every
+    /// value of this type.
+    /// - **A record is made two ways:** [`JournalRecordV1::seal`] checks
+    ///   the body and derives the digest from its encoding, and
+    ///   [`JournalRecordV1::decode`] checks the body and re-derives the
+    ///   digest from the bytes it read, refusing a mismatch.
+    /// - **Nothing changes it after that:** the fields are private and the
+    ///   body is shared immutably.
+    /// - **What that check protected against,** then, is only a record
+    ///   corrupted in this process's memory between its making and its
+    ///   append. Bytes corrupted after the append, on the way to the
+    ///   disk or on it, are what [`JournalRecordV1::decode`] refuses when
+    ///   they are read back, and a record received from elsewhere is
+    ///   decoded before it is a record.
+    ///
+    /// The append verifies every record a moment after this process
+    /// sealed it, and the body's encoding and digest again were 40% of
+    /// the appender's thread in testing's profile on the 9V45 runner
+    /// (#98). Debug builds still derive the digest again here, and stop
+    /// on a difference.
     pub fn verify(&self, expect: &RecordExpectation) -> Result<(), RecordError> {
         if self.format != JOURNAL_RECORD_FORMAT_V1 {
             return Err(RecordError::UnsupportedFormat { found: self.format });
@@ -564,19 +597,29 @@ impl JournalRecordV1 {
         if self.predecessor != expect.predecessor {
             return Err(RecordError::PredecessorMismatch);
         }
+        #[cfg(debug_assertions)]
+        assert_eq!(
+            self.derived(),
+            Ok(self.digest),
+            "a record's digest no longer matches its body"
+        );
+        Ok(())
+    }
+
+    /// The body checked and the digest derived again from the record's
+    /// fields: what [`JournalRecordV1::seal`] and
+    /// [`JournalRecordV1::decode`] establish, for a debug build to check.
+    #[cfg(debug_assertions)]
+    fn derived(&self) -> Result<Digest32, RecordError> {
         check_body(&self.origin, self.seq, &self.predecessor, &self.body)?;
         let body_bytes = encode_body(&self.body)?;
-        let derived = digest_of(
+        Ok(digest_of(
             self.format,
             &self.origin,
             self.seq,
             &self.predecessor,
             &body_bytes,
-        );
-        if derived != self.digest {
-            return Err(RecordError::DigestMismatch);
-        }
-        Ok(())
+        ))
     }
 
     fn wire(&self) -> RecordWireRefV1<'_> {
@@ -590,29 +633,46 @@ impl JournalRecordV1 {
         }
     }
 
-    /// Encoded length in bytes, counted without encoding.
+    /// Encoded length in bytes, counted once when the record was sealed
+    /// or decoded.
     pub fn encoded_len(&self) -> Result<usize, RecordError> {
-        postcard::experimental::serialized_size(&self.wire()).map_err(|_| RecordError::TooLarge)
+        Ok(self.encoded_len)
     }
 
-    /// Durable encoding.
+    /// Durable encoding, into a buffer sized once.
     pub fn encode(&self) -> Result<Vec<u8>, RecordError> {
-        postcard::to_allocvec(&self.wire()).map_err(|_| RecordError::TooLarge)
+        let mut buf = Vec::with_capacity(self.encoded_len);
+        self.encode_into(&mut buf)?;
+        Ok(buf)
     }
 
     /// Append the durable encoding to `buf`, the bytes [`Self::encode`]
-    /// returns. On an error `buf` is left as it was.
+    /// returns. The room is reserved once, from the length counted when
+    /// the record was made, rather than grown a field at a time. On an
+    /// error `buf` is left as it was.
     pub fn encode_into(&self, buf: &mut Vec<u8>) -> Result<(), RecordError> {
         let start = buf.len();
+        buf.reserve(self.encoded_len);
         postcard::serialize_with_flavor(&self.wire(), Append(buf)).map_err(|_| {
             buf.truncate(start);
             RecordError::TooLarge
-        })
+        })?;
+        debug_assert_eq!(buf.len() - start, self.encoded_len);
+        Ok(())
     }
 
     /// Decode exactly: bounds are checked before nested allocation is
     /// trusted, the digest is re-derived, trailing bytes are rejected, and
     /// a decode error is never end of data.
+    ///
+    /// Only the record's own encoding is taken. A varint written longer
+    /// than it needs decodes to the same value, and the digest is derived
+    /// from the decoded fields and the body encoded again, so such bytes
+    /// would pass every other check while being longer than the record's
+    /// encoding (#284, Codex). They are refused, so a decoded record
+    /// encodes to exactly the bytes it was read from, and its stored
+    /// length is theirs. Every field encodes to at least its canonical
+    /// length, so equal lengths mean equal bytes.
     pub fn decode(bytes: &[u8]) -> Result<Self, RecordError> {
         if bytes.len() > MAX_RECORD_BYTES {
             return Err(RecordError::TooLarge);
@@ -640,13 +700,20 @@ impl JournalRecordV1 {
         if derived != wire.digest {
             return Err(RecordError::DigestMismatch);
         }
-        Ok(JournalRecordV1 {
+        let record = JournalRecordV1 {
             format: wire.format,
             origin: wire.origin,
             seq: wire.seq,
             predecessor: wire.predecessor,
             body: Arc::new(wire.body),
             digest: wire.digest,
-        })
+            encoded_len: bytes.len(),
+        };
+        let canonical = postcard::experimental::serialized_size(&record.wire())
+            .map_err(|_| RecordError::TooLarge)?;
+        if canonical != bytes.len() {
+            return Err(RecordError::NonCanonical);
+        }
+        Ok(record)
     }
 }

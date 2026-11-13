@@ -23,7 +23,7 @@ use coord_store_api::registry::Collection;
 use coord_types::identity::Digest32;
 use coord_types::ids::*;
 use coord_types::logical_v1::{CanonicalOperation, LogicalRequest, PutOp};
-use coord_types::wire_v1::{MessageV1, RequestV1};
+use coord_types::wire_v1::{BoundedBytes, MessageV1, RequestV1};
 use coord_types::{CommandId, RetryKey};
 
 fn r(i: u8) -> ReplicaId {
@@ -2075,6 +2075,106 @@ fn a_relayed_payload_that_does_not_match_its_proposal_is_not_taken() {
         f.take_rejections()
             .contains(&FollowerRejection::PayloadIdentityMismatch(c1))
     );
+}
+
+/// Cost pass row 16: a relayed payload's identity is the digest of its
+/// logical bytes as they came. Bytes that decode to the command's request
+/// but aren't the encoding its identity was derived from (here, one byte
+/// more) are refused. The check this replaces decoded them, encoded the
+/// request again and took them.
+#[test]
+fn a_relayed_payload_is_taken_only_as_the_bytes_its_command_names() {
+    let mut f = booted(1);
+    let (mut payload, c1) = relayed_payload(1, 1, 1);
+    payload.logical.push(0);
+    assert_eq!(
+        postcard::from_bytes::<LogicalRequest>(&payload.logical)
+            .ok()
+            .and_then(|r| CommandId::derive(&payload.retry_key, &r).ok()),
+        Some(c1),
+        "a decode and an encoding made again find the command in these bytes"
+    );
+    let mut leader_view = coord_consensus::CommandTable::new();
+    let l1 = leader_view
+        .initialize(c1, c1.0, vec![CONSERVATIVE_KEY.to_vec()])
+        .unwrap();
+    let effects = f.step(peer(
+        0,
+        relayed(proposal(c1, vec![], 0, l1.paths.clone(), l1.path), payload),
+    ));
+    assert_eq!(f.relayed_taken(), 0);
+    assert!(
+        !effects.iter().any(|e| matches!(e, Effect::Persist(_))),
+        "nothing written"
+    );
+    assert_eq!(f.held().len(), 1, "held for its payload");
+    assert!(
+        f.take_rejections()
+            .contains(&FollowerRejection::PayloadIdentityMismatch(c1))
+    );
+
+    // The bytes the command was derived from are taken.
+    let mut f = booted(1);
+    let (payload, c1) = relayed_payload(1, 1, 1);
+    f.step(peer(
+        0,
+        relayed(proposal(c1, vec![], 0, l1.paths, l1.path), payload),
+    ));
+    assert_eq!(f.relayed_taken(), 1);
+}
+
+/// Review on #277: a follower's own intake takes a request's logical
+/// bytes only as the canonical encoding of the request they decode to, as
+/// the leader's `propose` does. Bytes that decode to the request with
+/// nothing left over but aren't its encoding (here, the schema version's
+/// varint written in two bytes) are refused, with nothing written, bound
+/// or sent. Taken, they would be held and, if this replica led, relayed
+/// as bytes that the identity check above refuses.
+#[test]
+fn an_admitted_request_is_taken_only_as_its_canonical_encoding() {
+    let (event, c1) = admitted(1, 1, 1);
+    let request = LogicalRequest::new(
+        NamespaceId([5; 16]),
+        CanonicalOperation::Put(PutOp {
+            key: vec![1],
+            value: vec![1],
+            lease: None,
+            prev_kv: false,
+        }),
+    );
+    let canonical = request.canonical_bytes().unwrap();
+    assert!(canonical[0] < 0x80, "the schema version is one byte");
+    let mut long = vec![canonical[0] | 0x80, 0];
+    long.extend_from_slice(&canonical[1..]);
+    // What the intake checked before: a decode with nothing left over,
+    // and the command derived from the request decoded.
+    let (decoded, rest) = postcard::take_from_bytes::<LogicalRequest>(&long).unwrap();
+    assert!(rest.is_empty());
+    assert_eq!(CommandId::derive(&retry_key(1), &decoded).unwrap(), c1);
+    let mut wire = RequestV1::new(retry_key(1), &request, 0, 0).unwrap();
+    wire.logical = BoundedBytes::new(long).unwrap();
+    assert!(wire.logical().is_err(), "the bytes are not canonical");
+    let Event::Admitted(mut long_form) = event.clone() else {
+        unreachable!("an admitted request")
+    };
+    long_form.frame = MessageV1::Request(wire).encode().unwrap();
+
+    let mut f = booted(1);
+    let effects = f.step(Event::Admitted(long_form));
+    assert!(
+        !effects.iter().any(|e| matches!(e, Effect::Persist(_))),
+        "nothing written"
+    );
+    assert_eq!(
+        f.take_rejections(),
+        vec![FollowerRejection::MalformedRequest]
+    );
+    assert_eq!(f.admitted(), None);
+
+    // The canonical bytes are taken, and written.
+    let effects = f.step(event);
+    assert!(effects.iter().any(|e| matches!(e, Effect::Persist(_))));
+    assert_eq!(f.admitted(), Some(c1));
 }
 
 /// task-d102: a follower that already took the submission keeps what it

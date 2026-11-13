@@ -24,7 +24,7 @@ use coord_store_api::registry::Collection;
 use coord_types::identity::Digest32;
 use coord_types::ids::*;
 use coord_types::logical_v1::{CanonicalOperation, LogicalRequest, PutOp};
-use coord_types::wire_v1::{MessageV1, RequestV1};
+use coord_types::wire_v1::{BoundedBytes, MessageV1, RequestV1};
 use coord_types::{CommandId, RetryKey};
 use serde::Serialize;
 
@@ -466,6 +466,60 @@ fn reordered_and_duplicate_requests_cannot_bind_conflicting_payload() {
     assert!(small.step(admitted(2, 2, 2).0).is_empty());
     assert_eq!(small.take_rejections(), vec![Rejection::Backpressure]);
     assert!(small.proposal(&admitted(1, 1, 1).1).is_some());
+}
+
+/// `event` with its frame replaced by `frame`.
+fn with_frame(event: Event, frame: Vec<u8>) -> Event {
+    let Event::Admitted(mut admitted) = event else {
+        unreachable!("an admitted request")
+    };
+    admitted.frame = frame;
+    Event::Admitted(admitted)
+}
+
+/// The leader proposes a frame only as exactly one request whose logical
+/// bytes are the canonical encoding of the request they decode to (row
+/// (c), #274). It derives the identity from those bytes as they are, so
+/// without the canonical check a frame whose bytes decode to the same
+/// request would be proposed under another identity, and without the
+/// one-message check a frame of two requests would be proposed as its
+/// last. Either is refused, with nothing proposed, bound or numbered.
+#[test]
+fn a_request_frame_is_proposed_only_as_one_canonical_request() {
+    let mut leader = booted();
+    let request =
+        |seq: u64, key: u8| RequestV1::new(retry_key(seq), &logical(key, key), 0, 0).unwrap();
+    let frame_of = |requests: Vec<RequestV1>| -> Vec<u8> {
+        requests
+            .into_iter()
+            .flat_map(|r| MessageV1::Request(r).encode().unwrap())
+            .collect()
+    };
+    let (event, command) = admitted(1, 1, 1);
+
+    // Two requests in one frame.
+    let two = with_frame(event.clone(), frame_of(vec![request(1, 1), request(2, 2)]));
+    assert!(leader.step(two).is_empty());
+    assert_eq!(leader.take_rejections(), vec![Rejection::MalformedRequest]);
+
+    // One request, its logical bytes the canonical encoding and one byte
+    // more: they decode to the same request, but they are not its
+    // canonical encoding.
+    let mut trailing = request(1, 1);
+    let mut bytes = trailing.logical.as_slice().to_vec();
+    bytes.push(0);
+    trailing.logical = BoundedBytes::new(bytes).unwrap();
+    assert!(trailing.logical().is_err(), "the bytes are not canonical");
+    let non_canonical = with_frame(event.clone(), frame_of(vec![trailing]));
+    assert!(leader.step(non_canonical).is_empty());
+    assert_eq!(leader.take_rejections(), vec![Rejection::MalformedRequest]);
+
+    // Neither bound the retry key or took a sequence number: the request
+    // itself, alone and canonical, is proposed first.
+    assert_eq!(leader.step(event).len(), 1);
+    assert!(leader.take_rejections().is_empty());
+    assert_eq!(leader.proposal(&command).unwrap().seqnum, 0);
+    assert!(leader.proposal(&admitted(2, 2, 2).1).is_none());
 }
 
 #[test]
