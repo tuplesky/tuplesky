@@ -360,7 +360,12 @@ So this section asks what a voter has to do on the hot path, and what it can do 
   - **Retries** go through consensus as today. A retry's dedup happens at execution (`retry::admit`), so exactly-once state lives in the eager voters' retry windows. The lazy voter's window lags, and nothing reads it above its landed frontier.
   - **Reads, watches and resolves** need current state. A lazy voter's frontend forwards them to an eager voter. That costs a hop and, on the 7763, about +0.003 ms an operation a lazy frontend (the bar's 34% reads, a fifth of them at that frontend, at about 20 µs of tokio a forwarded read). Total read work doesn't change: each read is still answered once.
   - **Authorization reads this node's own store** (#259's review). `StorePolicySource::barrier` reads the session, the policy and the grants when the frontend admits a request and again on a result's way out, and `retained` reads the retry row when a request arrives. At a lazy voter that state is as old as its last landed batch.
-    - **So a batch ends by time as well as by positions:** at a quarter of the table or 50 ms, whichever comes first. A lazy frontend then authorizes from state at most 50 ms plus one agreement old. Today the bound is the materializer's lag.
+    - **So a batch ends by time as well as by positions:** at a quarter of the table or 50 ms, whichever comes first. Today the bound is the materializer's lag.
+    - **Ending batches by time doesn't bound the age by itself; a check before authorizing does** (Codex on #259). A landing can stall while the frontend still answers.
+      - **The age:** the voter keeps the time it learned the decision of its first position not yet landed. The age is the time since then, or 0 when every decided position has landed.
+      - **Under 100 ms** (the 50 ms batch and a landing's allowance), the frontend authorizes from its own store.
+      - **Over it, it fails closed:** admission and the result's authorization go to an eager voter (the stricter way, below). If none answers, the request is deferred, as the disclosure gate defers today.
+      - So a stalled landing costs hops, not a longer exposure. A lazy frontend authorizes from state at most 100 ms old, at any traffic.
     - **A session opened a moment ago** isn't found there until its batch lands. The frontend's disclosure gate defers rather than refuses, as it does at a lagging replica today.
     - **A grant revoked a moment ago** still authorizes a result on its way out at a lazy frontend, for up to that bound. That is the owner's to accept.
     - **The stricter way** sends admission and the result's authorization to an eager voter: a hop for every request at a lazy frontend, not only for reads.
@@ -507,7 +512,7 @@ The last three columns are the servers' ms an operation, from 1.19. The two righ
 
 **It changes who executes, so it is the owner's to decide,** beside the parked leader log, option 3 and witnesses. It doesn't change what is decided: votes, dependencies, the fast path and recovery are as today. **What the owner trades** (#259's review):
 - **Two executions check each other, where five do today.** With the write-set digest, they check rows as well as results.
-- **A lazy frontend's authorization is as old as its last batch,** at most 50 ms plus one agreement: a revoked grant can still authorize a result there for that long.
+- **A lazy frontend's authorization is as old as its last landed batch,** at most 100 ms, checked before each authorization (point 1): a revoked grant can still authorize a result there for that long. Past it, the frontend asks an eager voter or defers.
 - **One follower down costs the saving for its tail's time,** while the leader names another.
 - **Half of a lazy voter's table is the window.** At the window's edge it has room for 375 commands in flight, and at `e = 1` ordering needs one lazy voter's vote. The bar's 120 callers put about 80 there.
 
@@ -523,7 +528,7 @@ The last three columns are the servers' ms an operation, from 1.19. The two righ
 - **A difference at one eager voter,** in a build that changes one result: the lazy voters execute the batch, the majority decides, and the loser stops.
 - **A wrong write set under right results** at the eager follower, in a build that changes one shipped row: the lazy voters refuse to land it, execute the batch themselves, and the leader isn't stopped.
 - **The eager follower stopped without a change of ballot:** the leader names another, and agreement resumes after that voter's tail.
-- **A revoked grant at a lazy frontend:** the time from the revocation's commit to the first refusal there is under 50 ms plus an agreement.
+- **A revoked grant at a lazy frontend:** the time from the revocation's commit to the first refusal there is under 100 ms, and stays under it with that voter's landing stalled (a build that holds its landings): the frontend fails closed to an eager voter, or defers.
 - **The lag under load:** the lazy voters' landed frontier stays within one batch while the leader and eager follower run at the bar's load, and their tables stay under the admission limit, with no initialization refused for room.
 - **A stalled lazy voter:**
   - hold one lazy voter's batches back under load until it passes the window;
