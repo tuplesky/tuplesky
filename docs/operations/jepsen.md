@@ -1103,7 +1103,11 @@ kills `coordd` and then fetches the newest `gen-*/domain.redb`, before the
 teardown removes it, so it is in the test's store and the artifact. A
 copy taken while `coordd` commits could read one commit's header and pages
 a later commit reused; a killed store is a crash image, which `redb`
-recovers to its last commit.
+recovers to its last commit. A job without faults (`throughput` or
+`wan-throughput`) leaves the voters' stores out of its artifact unless a
+voter stopped on a divergence: they are most of an archive's gigabytes,
+and only a divergence is read from them. The artifacts are kept three
+days.
 
 When a voter stops on a command (`release-record-mismatch(..)`,
 `incompatible-admission(..)` or `recovery-cycle(..)`):
