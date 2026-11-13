@@ -211,6 +211,10 @@ pub enum RecordError {
     TrailingBytes,
     /// Encoding is not a valid record.
     Malformed,
+    /// The bytes decode to a valid record but are not its encoding: a
+    /// varint written longer than it needs, which decodes to the same
+    /// value. No encoder of this format writes one.
+    NonCanonical,
 }
 
 impl fmt::Display for RecordError {
@@ -660,6 +664,15 @@ impl JournalRecordV1 {
     /// Decode exactly: bounds are checked before nested allocation is
     /// trusted, the digest is re-derived, trailing bytes are rejected, and
     /// a decode error is never end of data.
+    ///
+    /// Only the record's own encoding is taken. A varint written longer
+    /// than it needs decodes to the same value, and the digest is derived
+    /// from the decoded fields and the body encoded again, so such bytes
+    /// would pass every other check while being longer than the record's
+    /// encoding (#284, Codex). They are refused, so a decoded record
+    /// encodes to exactly the bytes it was read from, and its stored
+    /// length is theirs. Every field encodes to at least its canonical
+    /// length, so equal lengths mean equal bytes.
     pub fn decode(bytes: &[u8]) -> Result<Self, RecordError> {
         if bytes.len() > MAX_RECORD_BYTES {
             return Err(RecordError::TooLarge);
@@ -687,7 +700,7 @@ impl JournalRecordV1 {
         if derived != wire.digest {
             return Err(RecordError::DigestMismatch);
         }
-        Ok(JournalRecordV1 {
+        let record = JournalRecordV1 {
             format: wire.format,
             origin: wire.origin,
             seq: wire.seq,
@@ -695,6 +708,12 @@ impl JournalRecordV1 {
             body: Arc::new(wire.body),
             digest: wire.digest,
             encoded_len: bytes.len(),
-        })
+        };
+        let canonical = postcard::experimental::serialized_size(&record.wire())
+            .map_err(|_| RecordError::TooLarge)?;
+        if canonical != bytes.len() {
+            return Err(RecordError::NonCanonical);
+        }
+        Ok(record)
     }
 }

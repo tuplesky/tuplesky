@@ -326,6 +326,38 @@ fn decode_rejects_tampering_truncation_trailing_bytes_and_formats() {
     assert_eq!(JournalRecordV1::decode(&[]), Err(RecordError::Truncated));
 }
 
+/// Only a record's own encoding decodes (#284, Codex). A varint written
+/// longer than it needs decodes to the same value and passes the digest,
+/// which is derived from the decoded fields and the body encoded again;
+/// taken, the record would carry the longer length and encode to other
+/// bytes than it was read from. Refused, wherever the varint is: the
+/// record's format in its header, and the genesis format in its body.
+#[test]
+fn decode_takes_only_the_canonical_encoding() {
+    let genesis = genesis();
+    let bytes = genesis.encode().unwrap();
+    // The record's format leads; the genesis record's own format is the
+    // body's last byte, before the 32 bytes of the digest.
+    assert_eq!(bytes[0], JOURNAL_RECORD_FORMAT_V1 as u8);
+    let tail = bytes.len() - 33;
+    assert_eq!(bytes[tail], JOURNAL_RECORD_FORMAT_V1 as u8);
+    for at in [0, tail] {
+        // The same value, as a two-byte varint: the low seven bits with
+        // the continuation bit, then a zero.
+        let mut longer = bytes[..at].to_vec();
+        longer.extend_from_slice(&[0x80 | bytes[at], 0x00]);
+        longer.extend_from_slice(&bytes[at + 1..]);
+        assert_eq!(
+            JournalRecordV1::decode(&longer),
+            Err(RecordError::NonCanonical),
+            "an overlong varint at byte {at} was taken"
+        );
+    }
+    let decoded = JournalRecordV1::decode(&bytes).unwrap();
+    assert_eq!(decoded.encoded_len().unwrap(), bytes.len());
+    assert_eq!(decoded.encode().unwrap(), bytes);
+}
+
 type SealCase = (LocalJournalSeq, Digest32, RecordBody, RecordError);
 
 #[test]
