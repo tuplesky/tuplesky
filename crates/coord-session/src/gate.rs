@@ -6,9 +6,10 @@
 use coord_state::Response;
 use coord_state::plan::Outcome;
 use coord_state::policy::{Action, Authorization, KeyInterval};
-use coord_storage::Persistence;
 use coord_storage::WatchBatch;
 use coord_storage::views::{ViewBudget, load_authorization};
+use coord_storage::{GatedView, Persistence};
+use coord_store_api::OrderedRead;
 use coord_types::ids::{ExecutionPosition, NamespaceId, SessionId};
 
 /// Policy as of one ordered position, for one session in one namespace.
@@ -190,9 +191,40 @@ impl<P: Persistence> PolicySource for StorePolicySource<'_, P> {
             .reader()
             .snapshot()
             .map_err(|_| PolicyError::Unavailable)?;
-        let authorization = load_authorization(gated.view(), namespace, session, self.budget)
+        ViewPolicySource {
+            view: &gated,
+            budget: self.budget,
+        }
+        .barrier(namespace, session)
+    }
+}
+
+/// Barriers read from a view the caller already holds.
+///
+/// A read is served over a view that can be ahead of the store's
+/// committed snapshot: the snapshot with the journaled groups the
+/// projection hasn't committed laid over it. Its output is reauthorized
+/// against that same view, so the barrier is at a position no older than
+/// the one the output was read at. Read from the committed snapshot
+/// instead, a session created in a group still in flight is one this
+/// node has never seen, and its first read is held as pending; and a
+/// grant revoked in such a group isn't seen by the barrier either.
+pub struct ViewPolicySource<'a, V> {
+    /// The view the barrier reads.
+    pub view: &'a GatedView<V>,
+    /// Row and byte budget of one read.
+    pub budget: ViewBudget,
+}
+
+impl<V: OrderedRead> PolicySource for ViewPolicySource<'_, V> {
+    fn barrier(
+        &self,
+        namespace: NamespaceId,
+        session: &SessionId,
+    ) -> Result<AuthorizationBarrier, PolicyError> {
+        let authorization = load_authorization(self.view.view(), namespace, session, self.budget)
             .map_err(|_| PolicyError::Unavailable)?;
-        let position = gated.meta().frontier.as_base().execution_position;
+        let position = self.view.meta().frontier.as_base().execution_position;
         Ok(AuthorizationBarrier::new(
             position,
             namespace,

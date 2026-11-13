@@ -1249,6 +1249,10 @@ fn a_group_of_commands_lowers_once_and_matches_applying_them_one_at_a_time() {
 /// than planned at the lost group's first position again, as is every
 /// lowering and the lost command presented again; the replica restarts
 /// from its journal.
+///
+/// So is a read view (#281): one taken after the loss would lay the
+/// groups still in flight over the snapshot, behind a group that will
+/// never be journaled, and the gate's barrier is read from it.
 #[test]
 fn an_applier_that_lost_a_group_refuses_to_be_used() {
     let commands = group_workload();
@@ -1265,6 +1269,7 @@ fn an_applier_that_lost_a_group_refuses_to_be_used() {
         .unwrap()
         .script_append(AppendScript::DefinitelyNotCommitted);
     assert!(!applier.lost());
+    assert!(applier.read_view().is_ok(), "readable before the loss");
     assert!(matches!(
         applier.finish_group(),
         Err(coord_storage::ApplyError::GroupLost)
@@ -1283,6 +1288,7 @@ fn an_applier_that_lost_a_group_refuses_to_be_used() {
     refused(applier.hand_off_group().map(drop));
     refused(applier.settle().map(drop));
     refused(applier.drain().map(drop));
+    refused(applier.read_view().map(drop));
     let (command, record) = &commands[0];
     refused(applier.apply(*command, record).map(drop));
 }
