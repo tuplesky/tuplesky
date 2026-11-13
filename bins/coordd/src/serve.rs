@@ -1069,6 +1069,9 @@ pub struct Domain<P: Persistence> {
     /// Why the loop flushed (task-d73), and how many events it took
     /// between its flushes (task-d102).
     flushes: coord_daemon::metrics::Flushes,
+    /// The loop's hand-offs to the runtime, by what made each (#256
+    /// review).
+    hand_offs: coord_daemon::metrics::HandOffs,
     budgets: Budgets,
     /// This run's stage accounting (task-61), shared with the voter's
     /// node so the journal and materialization points record into the
@@ -1390,6 +1393,8 @@ struct Pacing {
     )>,
     /// When the last sampled pass started (task-d97).
     sampled_at: Option<std::time::Instant>,
+    /// Passes started since the last sampled one (#254 review).
+    passes_since_sample: u32,
     /// The run-queue time and the commands executed, read at the start
     /// of a sampled pass, until the next pass starts.
     sampled_from: Option<(std::time::Duration, u64)>,
@@ -1417,14 +1422,17 @@ impl Pacing {
     /// of the loop, and nowhere else. [`woke`] is also called after the
     /// event select, so a pass can call it more than once.
     ///
-    /// The first pass to start [`RUN_QUEUE_SAMPLE_PERIOD`] or more after
-    /// the last sampled one has its run-queue time read from here to the
-    /// next pass's start (task-d97): its own preemptions, and the wait to
-    /// run once something woke it, which the snapshot's run-queue total
-    /// only gives as a sum.
+    /// The first pass to start both [`RUN_QUEUE_SAMPLE_PERIOD`] and
+    /// [`RUN_QUEUE_SAMPLE_PASSES`] passes or more after the last sampled
+    /// one has its run-queue time read from here to the next pass's start
+    /// (task-d97): its own preemptions, and the wait to run once something
+    /// woke it, which the snapshot's run-queue total only gives as a sum.
+    /// The period bounds a busy loop's reads and the count an idle one's
+    /// (task-d115; #254 review).
     ///
     /// [`woke`]: Pacing::woke
     /// [`RUN_QUEUE_SAMPLE_PERIOD`]: coord_daemon::metrics::RUN_QUEUE_SAMPLE_PERIOD
+    /// [`RUN_QUEUE_SAMPLE_PASSES`]: coord_daemon::metrics::RUN_QUEUE_SAMPLE_PASSES
     ///
     /// `executed` is the commands the loop has executed so far: a sample
     /// whose pass executed one also goes into the working passes'
@@ -1449,10 +1457,15 @@ impl Pacing {
                 self.run_queue_per_working_pass.record(waited);
             }
         }
+        self.passes_since_sample = self.passes_since_sample.saturating_add(1);
+        let passes = self.passes_since_sample;
         if self.sampled_at.is_none_or(|at| {
-            now.saturating_duration_since(at) >= coord_daemon::metrics::RUN_QUEUE_SAMPLE_PERIOD
+            passes >= coord_daemon::metrics::RUN_QUEUE_SAMPLE_PASSES
+                && now.saturating_duration_since(at)
+                    >= coord_daemon::metrics::RUN_QUEUE_SAMPLE_PERIOD
         }) {
             self.sampled_at = Some(now);
+            self.passes_since_sample = 0;
             self.sampled_from = read().map(|run_queue| (run_queue, executed));
         }
     }
@@ -1941,6 +1954,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             since_flush: 0,
             since_flush_api: 0,
             flushes: coord_daemon::metrics::Flushes::default(),
+            hand_offs: coord_daemon::metrics::HandOffs::default(),
             budgets,
             recorder,
             pacing: Pacing::default(),
@@ -2111,6 +2125,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 .dispatcher()
                 .collector()
                 .early_solicits(),
+            hand_offs: self.hand_offs,
             proposals: {
                 let sent = voter.node().sent_bytes();
                 coord_daemon::metrics::ProposalBytes {
@@ -2541,9 +2556,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             self.pacing.pass_started(executed, started);
             // What the loop held goes once it has waited its bound,
             // however busy the loop still is (task-d115, lever 8).
-            if self.hand_off_due(hold, started) {
-                self.hand_off();
-            }
+            self.hand_off_if_due(hold, started);
             self.report_if_due();
             // The leaf this node presents first, every pass: a node whose
             // leaf has expired serves nothing more on it, however much
@@ -2568,7 +2581,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             if flush_due(self.queued(), appending, owed, self.since_flush) {
                 // What the events so far owe the runtime goes before the
                 // flush, not after it (task-d115, lever 8).
-                self.hand_off();
+                self.hand_off_for(coord_daemon::metrics::HandOff::Flush);
                 let cause = if self.queued() >= FLUSH_QUEUED && !appending {
                     Flush::Queued
                 } else {
@@ -2692,14 +2705,10 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             // No event is waiting and the voter has no more to do: the
             // burst is over, and what it held for the runtime goes in one
             // hand-off before the loop waits or flushes (task-d115, lever
-            // 8). On a busy leader that is about once a turn.
-            if !progressed
-                && self.holds_hand_off(hold)
-                && !transport.has_event()
-                && !self.plane.as_ref().is_some_and(|p| p.transport.has_event())
-            {
-                self.hand_off();
-            }
+            // 8). A follower's turn has about one such gap. A leader's
+            // has several: before and after its flush, after each burst
+            // of votes and after each commit's results (#256 review).
+            self.hand_off_before_waiting(hold, progressed, transport);
             let owes_flush = matches!(&self.backing, Backing::Voting(v) if v.owes_flush());
             let materialized = self.materialized.clone();
             // Waiting from here: the select below returns at once when
@@ -2849,12 +2858,12 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     /// lanes and answers it carries: the answers go in one task, which
     /// starts one task an answer from inside the runtime. Each answer is
     /// still its own task, so a slow reader holds up no other caller and
-    /// not the voter's next turn.
-    fn hand_off(&mut self) {
-        coord_transport::WakeHold::release_this_thread();
+    /// not the voter's next turn. Whether it carried anything.
+    fn hand_off(&mut self) -> bool {
+        let woken = coord_transport::WakeHold::release_this_thread();
         self.answering_since = None;
         if self.answering.is_empty() {
-            return;
+            return woken > 0;
         }
         let answers = std::mem::take(&mut self.answering);
         tokio::spawn(async move {
@@ -2864,6 +2873,15 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 });
             }
         });
+        true
+    }
+
+    /// [`Domain::hand_off`], counted under `cause` when it carried
+    /// anything (#256 review).
+    fn hand_off_for(&mut self, cause: coord_daemon::metrics::HandOff) {
+        if self.hand_off() {
+            self.hand_offs.count(cause);
+        }
     }
 
     /// Answer a caller from inside a pass, handing off what the loop holds
@@ -2875,7 +2893,10 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     /// answer the loop holds, which before lever 8 went out on their own.
     /// An answer that goes at once hands off nothing.
     async fn respond_inline(&mut self, responder: Responder, frame: Vec<u8>) {
-        let _ = unless_ready(responder.respond(frame), || self.hand_off()).await;
+        let _ = unless_ready(responder.respond(frame), || {
+            self.hand_off_for(coord_daemon::metrics::HandOff::Answer);
+        })
+        .await;
     }
 
     /// Whether the loop holds anything for the runtime.
@@ -2887,6 +2908,43 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     /// [`HAND_OFF_WITHIN`] by `now`.
     fn hand_off_due(&self, hold: &coord_transport::WakeHold, now: std::time::Instant) -> bool {
         hand_off_due(hold.held_since(), self.answering_since, now)
+    }
+
+    /// The bound's hand-off, at a pass's start (task-d115, lever 8): what
+    /// the loop holds goes once its oldest has waited [`HAND_OFF_WITHIN`],
+    /// whatever else is waiting. On a loop that never runs out of events
+    /// it is the only release. Whether it handed off.
+    fn hand_off_if_due(
+        &mut self,
+        hold: &coord_transport::WakeHold,
+        now: std::time::Instant,
+    ) -> bool {
+        let due = self.hand_off_due(hold, now);
+        if due {
+            self.hand_off_for(coord_daemon::metrics::HandOff::Bound);
+        }
+        due
+    }
+
+    /// The idle hand-off, just before the loop waits (task-d115, lever 8):
+    /// with no event waiting on either plane and nothing more the voter
+    /// can do, the burst is over, and what it held goes in one hand-off.
+    /// The loop never waits with anything held, so a frame or an answer
+    /// never waits on the loop's timers. Whether it handed off.
+    fn hand_off_before_waiting(
+        &mut self,
+        hold: &coord_transport::WakeHold,
+        progressed: bool,
+        api: &Transport,
+    ) -> bool {
+        let idle = !progressed
+            && self.holds_hand_off(hold)
+            && !api.has_event()
+            && !self.plane.as_ref().is_some_and(|p| p.transport.has_event());
+        if idle {
+            self.hand_off_for(coord_daemon::metrics::HandOff::Idle);
+        }
+        idle
     }
 
     /// Keep both planes' links to the other voters up (task-d03).
@@ -5236,7 +5294,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 self.frontend.counts.watches += 1;
                 // Opening may write to the stream and wait on it; what the
                 // loop holds goes first (#256 review).
-                self.hand_off();
+                self.hand_off_for(coord_daemon::metrics::HandOff::Watch);
                 self.open_watch(connection.0, watch_id, registration, responder)
                     .await;
             }
@@ -5396,7 +5454,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 // A push waits on the consumer's flow control, for up to the
                 // responder's deadline: what the loop holds goes first
                 // (#256 review).
-                self.hand_off();
+                self.hand_off_for(coord_daemon::metrics::HandOff::Watch);
                 let Some(responder) = self.frontend.watches.get_mut(&(connection, watch_id)) else {
                     break;
                 };
@@ -6660,31 +6718,45 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
         poll_api_first,
     };
 
-    /// The first pass to start a period or more after the last sampled
-    /// one is sampled, and only passes start or end a sample: the event
-    /// paths' extra `woke` calls neither (task-d97, #191 review). By
-    /// time, not one pass in sixteen (task-d115).
+    /// A pass is sampled once a period and sixteen passes have both gone
+    /// by since the last sampled one, and only passes start or end a
+    /// sample: the event paths' extra `woke` calls neither (task-d97,
+    /// #191 review). The period bounds a busy loop's reads (task-d115) and
+    /// the count an idle one's (#254 review).
     #[test]
-    fn the_run_queue_is_sampled_once_a_period() {
+    fn the_run_queue_is_sampled_once_a_period_and_sixteen_passes() {
         let period = coord_daemon::metrics::RUN_QUEUE_SAMPLE_PERIOD;
+        assert_eq!(coord_daemon::metrics::RUN_QUEUE_SAMPLE_PASSES, 16);
         let start = std::time::Instant::now();
+        // Busy: a hundred passes a period, for two and a half periods.
         let mut pacing = super::Pacing::default();
-        // A pass every tenth of a period, for two and a half periods.
-        for pass in 0..25u32 {
+        for pass in 0..250u32 {
             pacing.woke();
-            // A command executed in every pass but pass 10.
-            let executed = u64::from(pass - u32::from(pass > 10));
-            pacing.pass_started_with(executed, start + period * pass / 10, || {
+            // A command executed in every pass but pass 101.
+            let executed = u64::from(pass - u32::from(pass > 100));
+            pacing.pass_started_with(executed, start + period * pass / 100, || {
                 Some(std::time::Duration::ZERO)
             });
             pacing.woke();
             pacing.woke();
         }
-        // Passes 0, 10 and 20 start a sample; 1, 11 and 21 end them.
+        // The period binds: passes 0, 100 and 200 start a sample, and 1,
+        // 101 and 201 end them.
         assert_eq!(pacing.run_queue_per_pass.count(), 3);
         assert!(pacing.sampled_from.is_none());
-        // Pass 10 executed nothing, so two samples worked.
+        // Pass 101 executed nothing, so two samples worked.
         assert_eq!(pacing.run_queue_per_working_pass.count(), 2);
+
+        // Idle: a pass every half period, for twenty periods. The count
+        // binds: passes 0, 16 and 32 start a sample, where the period
+        // alone would sample every other pass, twenty in all.
+        let mut pacing = super::Pacing::default();
+        for pass in 0..40u32 {
+            pacing.pass_started_with(0, start + period * pass / 2, || {
+                Some(std::time::Duration::ZERO)
+            });
+        }
+        assert_eq!(pacing.run_queue_per_pass.count(), 3);
     }
 
     /// The loop looks at its links when something said they moved, when a
@@ -8383,24 +8455,18 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
             .unwrap()
         }
 
-        /// Every frame a round owes a collector in another process reaches
-        /// that collector, in one hand-off a collector (task-d115, lever 4;
-        /// review on #253). A collector re-offers what it has not heard
-        /// back about, and the re-offer is answered, so a hand-off that
-        /// carried only a collector's first frame still completed every
-        /// command of every other test. Here nothing re-offers: a frame is
-        /// what reaches the collector's end of the link, or nothing does.
-        ///
-        /// Three commands are submitted on a collector's connection and a
-        /// fourth on a connection that has gone, and their frames are
-        /// carried as one round.
-        #[tokio::test(flavor = "multi_thread")]
-        async fn every_frame_a_round_owes_a_collector_reaches_it_in_one_hand_off() {
+        /// This voter's api plane, and a collector's endpoint in another
+        /// process that dialled it as a collector link does: the plane,
+        /// the endpoint, and the link's connection at each end.
+        async fn collector_link() -> (
+            coord_transport::Transport,
+            coord_transport::Transport,
+            coord_transport::ConnectionId,
+            coord_transport::ConnectionId,
+        ) {
             use coord_transport::{Class, Lane, Limits, Transport, TransportEvent};
             use coord_transport_testkit::{TestBinder, TestCa};
 
-            // This voter's api plane, and a collector's endpoint that
-            // dialled it as a collector link does.
             let ca = TestCa::new();
             let node = ca.issue("node-1", me(), inc(), PeerRole::Voter);
             let other = ca.issue(
@@ -8418,23 +8484,24 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
             let address = "127.0.0.1:0".parse().unwrap();
             let mut api = Transport::bind(address, local, binder.clone(), Limits::default())
                 .expect("the api plane");
-            let mut far = Transport::bind(
+            let far = Transport::bind(
                 address,
                 other.local(&ca, CLUSTER, DOMAIN, vec![1, 2]),
                 binder,
                 Limits::default(),
             )
             .expect("the collector's endpoint");
-            far.connect(
-                api.local_addr().unwrap(),
-                &node.name,
-                PeerRole::Frontend,
-                None,
-                Lane::Unary,
-                node.expected(),
-            )
-            .await
-            .expect("the collector dialled");
+            let dialled = far
+                .connect(
+                    api.local_addr().unwrap(),
+                    &node.name,
+                    PeerRole::Frontend,
+                    None,
+                    Lane::Unary,
+                    node.expected(),
+                )
+                .await
+                .expect("the collector dialled");
             let accepted = loop {
                 let event = tokio::time::timeout(Duration::from_secs(5), api.next_event())
                     .await
@@ -8444,6 +8511,84 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
                     break connection;
                 }
             };
+            (api, far, accepted, dialled)
+        }
+
+        /// What `far` hears from this voter until `enough` says it has
+        /// heard enough.
+        async fn hear_until(
+            far: &mut coord_transport::Transport,
+            enough: impl Fn(&[coord_types::wire_v1::Frame]) -> bool,
+        ) -> Vec<coord_types::wire_v1::Frame> {
+            let mut heard = Vec::new();
+            while !enough(&heard) {
+                match far.next_event().await {
+                    Some(coord_transport::TransportEvent::ApiDelivery { frame, .. }) => {
+                        heard.push(frame);
+                    }
+                    Some(_) => {}
+                    None => panic!("the collector's endpoint closed"),
+                }
+            }
+            heard
+        }
+
+        /// Drive `domain`'s loop on this thread, under `hold`, until
+        /// `until` is ready (task-d115, lever 8; #256 review); and how
+        /// many times the loop waited meanwhile. Every time it waits, it
+        /// holds no lane sender's wake-up: a frame it held then would go
+        /// only on its next pass, at whatever time its timers or another
+        /// event set.
+        async fn serve_until<T>(
+            domain: &mut super::super::Domain<Journaled>,
+            api: &mut coord_transport::Transport,
+            hold: &coord_transport::WakeHold,
+            until: impl std::future::Future<Output = T>,
+        ) -> (T, u32) {
+            use std::task::Poll;
+            let clock = || {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs())
+            };
+            let mut serving = std::pin::pin!(domain.serve(api, clock, hold));
+            let mut until = std::pin::pin!(until);
+            let mut waits = 0;
+            let done = std::future::poll_fn(|cx| {
+                if let Poll::Ready(done) = until.as_mut().poll(cx) {
+                    return Poll::Ready(done);
+                }
+                assert!(serving.as_mut().poll(cx).is_pending(), "the loop stopped");
+                waits += 1;
+                assert_eq!(
+                    hold.held_since(),
+                    None,
+                    "the loop waits holding a lane sender's wake-up"
+                );
+                until.as_mut().poll(cx)
+            });
+            let done = tokio::time::timeout(Duration::from_secs(10), done)
+                .await
+                .expect("heard in time");
+            (done, waits)
+        }
+
+        /// Every frame a round owes a collector in another process reaches
+        /// that collector, in one hand-off a collector (task-d115, lever 4;
+        /// review on #253). A collector re-offers what it has not heard
+        /// back about, and the re-offer is answered, so a hand-off that
+        /// carried only a collector's first frame still completed every
+        /// command of every other test. Here nothing re-offers: a frame is
+        /// what reaches the collector's end of the link, or nothing does.
+        ///
+        /// Three commands are submitted on a collector's connection and a
+        /// fourth on a connection that has gone, and their frames are
+        /// carried as one round.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn every_frame_a_round_owes_a_collector_reaches_it_in_one_hand_off() {
+            use coord_transport::TransportEvent;
+
+            let (api, mut far, accepted, _) = collector_link().await;
             let open = Origin::Connection(accepted.0);
             let gone = Origin::Connection(accepted.0 + 1000);
 
@@ -8613,6 +8758,201 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
                     .dispatcher()
                     .half_established()
                     .is_empty()
+            );
+        }
+
+        /// A collector's submission, as its link carries it.
+        fn submission(collector: &mut Collector, sequence: u64) -> Vec<u8> {
+            let Submitted::FanOut(fan_out) = collector
+                .submit(MonotonicMillis::ZERO, &admitted(sequence))
+                .expect("submitted")
+            else {
+                panic!("not new work")
+            };
+            fan_out.frame.to_vec()
+        }
+
+        /// The loop never waits holding a frame (task-d115, lever 8; #256
+        /// review), the rule lever 8's safety rests on: a frame held when
+        /// the loop waits goes on its next pass, and with nothing arriving
+        /// that pass waits on the loop's timers. With the idle hand-off
+        /// taken out, every other test still passed, only slower.
+        ///
+        /// A collector in another process submits a command on its link.
+        /// The loop takes it, its lone leader executes it, and the
+        /// collector hears the release. The loop is polled by hand, and
+        /// each time it waits, nothing is held.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn the_loop_never_waits_holding_a_frame() {
+            let (mut api, mut far, _, link) = collector_link().await;
+            let (leader, _handle) = held_leader(Duration::from_secs(3600));
+            let mut domain = domain(leader, collector());
+            // Sent before this thread holds anything back.
+            far.send(
+                coord_transport::Destination::Connection(link),
+                DOMAIN,
+                submission(&mut collector(), 1),
+            )
+            .expect("the collector's submission");
+            let hold = coord_transport::WakeHold::new();
+            let released = |heard: &[coord_types::wire_v1::Frame]| {
+                heard
+                    .iter()
+                    .any(|f| coord_collector::wire::decode_release(f).is_ok())
+            };
+            let (_, waits) =
+                serve_until(&mut domain, &mut api, &hold, hear_until(&mut far, released)).await;
+            assert!(waits > 0, "the loop waited");
+            assert!(domain.frontend.counts.returned > 0);
+            assert!(domain.hand_offs.total() > 0, "{:?}", domain.hand_offs);
+        }
+
+        /// What the loop holds goes once its oldest has waited the bound,
+        /// at the next pass's start, whatever else is waiting (task-d115,
+        /// lever 8; #256 review): on a loop that never runs out of events
+        /// it is the only release. With it taken out, every test still
+        /// passed.
+        ///
+        /// A round's frames for a collector in another process are held
+        /// past the bound before the loop's first pass starts. That pass
+        /// hands them off as the bound's, and the collector hears them.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn what_the_loop_holds_goes_at_its_bound() {
+            let (mut api, mut far, accepted, _) = collector_link().await;
+            let (mut leader, _handle) = held_leader(Duration::from_secs(3600));
+            let mut collector = collector();
+            let frames = execute_from(
+                &mut leader,
+                &mut collector,
+                1,
+                Origin::Connection(accepted.0),
+            );
+            let provenance = leader.provenance();
+            let mut domain = domain(leader, collector);
+            let hold = coord_transport::WakeHold::new();
+            domain.carry(
+                &api,
+                coord_daemon::Outbound {
+                    frontend: frames.clone(),
+                    ..Default::default()
+                },
+                provenance,
+            );
+            assert_eq!(domain.frontend.counts.returned, frames.len() as u64);
+            let held = hold.held_since().expect("the round's frames are held");
+            tokio::time::sleep(2 * super::super::HAND_OFF_WITHIN).await;
+            assert_eq!(hold.held_since(), Some(held), "nothing let them go");
+            let (mut heard, _) = serve_until(
+                &mut domain,
+                &mut api,
+                &hold,
+                hear_until(&mut far, |heard| heard.len() >= frames.len()),
+            )
+            .await;
+            assert_eq!(domain.hand_offs.bound, 1, "{:?}", domain.hand_offs);
+            let key = |f: &coord_types::wire_v1::Frame| (f.kind, f.version, f.payload.clone());
+            let mut sent: Vec<_> = frames.iter().map(|bytes| frame(bytes)).collect();
+            heard.sort_by_key(key);
+            sent.sort_by_key(key);
+            assert_eq!(heard, sent);
+        }
+
+        /// Evidence routed out of the parked set reaches the collector it
+        /// belongs to (#262 review). A voter holds evidence for a command
+        /// whose submitter it does not know yet, and routes it once a
+        /// submission names one, back on that collector's link with the
+        /// rest of a round. Dropped there, or never handed off, it failed
+        /// no test: a collector's re-offer is answered again.
+        ///
+        /// A command's frames, made for a collector in another process,
+        /// are parked as if the voter had made them before its submission
+        /// arrived. The loop's turn routes them, and the collector hears
+        /// every one.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn evidence_routed_out_of_the_parked_set_reaches_its_collector() {
+            let (mut api, mut far, accepted, _) = collector_link().await;
+            let (mut leader, _handle) = held_leader(Duration::from_secs(3600));
+            let mut collector = collector();
+            let frames = execute_from(
+                &mut leader,
+                &mut collector,
+                1,
+                Origin::Connection(accepted.0),
+            );
+            let provenance = leader.provenance();
+            let mut domain = domain(leader, collector);
+            for bytes in &frames {
+                let command = super::super::command_of_frame(&frame(bytes)).expect("a command's");
+                domain.park(command, provenance, bytes);
+            }
+            assert_eq!(domain.frontend.counts.parked, frames.len() as u64);
+            let hold = coord_transport::WakeHold::new();
+            let (mut heard, _) = serve_until(
+                &mut domain,
+                &mut api,
+                &hold,
+                hear_until(&mut far, |heard| heard.len() >= frames.len()),
+            )
+            .await;
+            assert!(domain.parked.is_empty());
+            assert_eq!(domain.frontend.counts.returned, frames.len() as u64);
+            let key = |f: &coord_types::wire_v1::Frame| (f.kind, f.version, f.payload.clone());
+            let mut parked: Vec<_> = frames.iter().map(|bytes| frame(bytes)).collect();
+            heard.sort_by_key(key);
+            parked.sort_by_key(key);
+            assert_eq!(heard, parked);
+        }
+
+        /// A current read a collector in another process sends this voter
+        /// is answered on that collector's link (task-d50; #262 review).
+        /// Dropped, it failed no test: a collector whose read goes
+        /// unanswered sends it the ordered way.
+        ///
+        /// The leader has proposed nothing in its ballot, so it refuses
+        /// the read at once. A refusal is an answer like any other: it
+        /// takes the same way back as a served read, and the collector
+        /// that hears it orders the read instead.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_collectors_read_is_answered_on_its_link() {
+            let (mut api, mut far, _, link) = collector_link().await;
+            let (leader, _handle) = held_leader(Duration::from_secs(3600));
+            let mut domain = domain(leader, collector());
+            let mut logical = LogicalRequest::new(
+                NS,
+                CanonicalOperation::Range(coord_types::logical_v1::RangeOp {
+                    range: coord_types::logical_v1::KeyRange {
+                        key: b"k".to_vec(),
+                        range_end: None,
+                    },
+                    revision: None,
+                    limit: 1,
+                    keys_only: false,
+                    count_only: false,
+                }),
+            );
+            logical.canonicalize();
+            let read = coord_collector::wire::read_frame(&coord_collector::wire::ReadV1 {
+                ballot: ballot(),
+                request: RequestV1::new(retry_key(1), &logical, 0, 0).unwrap(),
+            })
+            .expect("a read");
+            far.send(coord_transport::Destination::Connection(link), DOMAIN, read)
+                .expect("the collector's read");
+            let hold = coord_transport::WakeHold::new();
+            let (heard, _) = serve_until(
+                &mut domain,
+                &mut api,
+                &hold,
+                hear_until(&mut far, |heard| !heard.is_empty()),
+            )
+            .await;
+            let answer = coord_collector::wire::decode_read_answer(&heard[0]).expect("an answer");
+            assert_eq!(answer.retry_key, retry_key(1));
+            assert_eq!(
+                answer.outcome,
+                coord_collector::ReadOutcomeV1::Refused {
+                    reason: coord_collector::wire::ReadRefusal::NothingProposed,
+                }
             );
         }
     }

@@ -4529,7 +4529,7 @@ Nearly all of the step is history the follower reads, builds and then forgets in
    An executed command beyond that comes back as its identity in execution order, from `execution_v1`, with no record and no payload.
 3. **Decided records: only each key's latest,** decided in task-d117's terms (review on #255, [6839439954](https://github.com/tuplesky/tuplesky/pull/255#issuecomment-6839439954)). A key keeps naming its latest command after that command executes, so the chain needs that record and its paths.
    - **Neither index can find them.** The key index holds a key's versions, and a refused conditional write names its key and becomes its latest command without writing a version; an event row holds no command or position. The intake index is by command, so it doesn't lead from a key.
-   - **So a key's latest decided record is live protocol state:** it stays in task-d117's recovery map for as long as the table keeps it, and goes to history only once every key it names has a later command.
+   - **So a key's latest decided record is live protocol state:** it stays in task-d117's recovery map, under its keys, and goes to history only once every key it names has a later command. That part of the map grows with the keys the domain has named, about 200 bytes a key, not with history (design [Section 17.17](tuplesky-design.md#s17-17), point 2; Codex on #260).
    - **Boot then reads records from the image and the journal above it,** and reads history for identities alone. `decided_v1` leaves the projection in task-d117's step 4, so deleting superseded rows from it isn't taken.
 4. **No copies.** The records and payloads move into the follower, and `restore_payloads` reads the follower's own map.
 5. **What stays a command, until task-d27's trim:** the table's executed set and the intake index's executed part (27 bytes an entry, task-d27's note).
@@ -4570,7 +4570,7 @@ Proposal 2 of [the batching rule](tuplesky-batching-rule.md#41-proposal-2-protoc
 - **Not taken:** history from the journal by position (retention would follow the slowest voter, and boot reads every retained record), one history row a commit in the projection, and history in memory.
 
 **The code, in four steps, one PR each:**
-1. **`meta_v1` once a commit.** No format change. It can go now.
+1. **`meta_v1` once a commit.** No format change. Built: `Lowered::keep` writes each `meta_v1` key once a commit, with its last value.
 2. **Live protocol state in the recovery map,** the image's recovery section and the recovery replay. Node-private only. It waits for task-j05's composed matrix (#212) on the carry.
 3. **The retry window in memory,** with the request beside each result. It changes `retry_v1` in the common hash and both images.
 4. **Executed history in segments,** with the history digest in the floor's root in place of `payload_v1` and `execution_v1`.

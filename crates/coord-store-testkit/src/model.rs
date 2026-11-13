@@ -100,6 +100,8 @@ struct Shared {
     fail_write_at: Option<usize>,
     /// Writes seen since the current transaction opened.
     writes_in_txn: usize,
+    /// Puts and deletes taken by collection since the engine was made.
+    writes_by_collection: BTreeMap<u16, usize>,
     txn_counter: u64,
     /// Snapshots handed out, for a test that counts a reader's views.
     snapshots: u64,
@@ -182,6 +184,19 @@ impl ModelEngine {
         s.open_pending = None;
         s.events.push(ModelEvent::Reopened { lost });
         self.writer_open = false;
+    }
+
+    /// Puts and deletes write transactions have taken under `collection`
+    /// since the engine was made, committed or not: what a lowering
+    /// writes, row by row.
+    pub fn writes_to(&self, collection: CollectionId) -> usize {
+        self.shared
+            .lock()
+            .unwrap()
+            .writes_by_collection
+            .get(&collection.0)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Recorded events.
@@ -377,8 +392,9 @@ pub struct ModelWrite<'a> {
 
 impl ModelWrite<'_> {
     /// Whether this write is the one a test asked to fail.
-    fn injected_write_failure(&self) -> Result<(), EngineError> {
+    fn injected_write_failure(&self, collection: CollectionId) -> Result<(), EngineError> {
         let mut s = self.engine.shared.lock().unwrap();
+        *s.writes_by_collection.entry(collection.0).or_default() += 1;
         s.writes_in_txn += 1;
         if s.fail_write_at == Some(s.writes_in_txn) {
             s.fail_write_at = None;
@@ -435,7 +451,7 @@ impl WriteTxn for ModelWrite<'_> {
         key: &[u8],
         value: &[u8],
     ) -> Result<(), EngineError> {
-        self.injected_write_failure()?;
+        self.injected_write_failure(collection)?;
         self.pending
             .insert((collection.0, key.to_vec()), Some(value.to_vec()));
         self.sync_pending();
@@ -443,7 +459,7 @@ impl WriteTxn for ModelWrite<'_> {
     }
 
     fn delete(&mut self, collection: CollectionId, key: &[u8]) -> Result<(), EngineError> {
-        self.injected_write_failure()?;
+        self.injected_write_failure(collection)?;
         self.pending.insert((collection.0, key.to_vec()), None);
         self.sync_pending();
         Ok(())

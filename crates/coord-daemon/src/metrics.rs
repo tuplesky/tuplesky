@@ -563,6 +563,10 @@ pub struct Cost {
     /// history sweep forgets (task-d110).
     #[serde(default)]
     pub history: History,
+    /// The domain loop's hand-offs to the runtime, by what made each
+    /// (task-d115, lever 8; #256 review).
+    #[serde(default)]
+    pub hand_offs: HandOffs,
     /// What this voter's leaders sent of their fresh proposals and their
     /// frontier, by kind (task-d102). Zero for a voter that never led.
     #[serde(default)]
@@ -741,6 +745,67 @@ impl Flushes {
             _ => 8,
         };
         self.by_events[bucket] += 1;
+    }
+}
+
+/// The domain loop's hand-offs to the runtime (task-d115, lever 8), by
+/// what made each, cumulative (#256 review). A hand-off wakes the lane
+/// senders the loop's sends queued frames for, and answers the callers it
+/// answered: one wake-up of a parked worker, however much it carries. Only
+/// a hand-off that carried something is counted.
+///
+/// A follower's turn has about one, the idle one after its batch of votes.
+/// A leader's has several: before and after its flush, after each burst of
+/// votes, after each commit's results. These say which.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HandOffs {
+    /// At a pass's start, once the oldest thing held had waited the
+    /// loop's bound (1 ms): on a loop that never runs out of events, the
+    /// only release.
+    pub bound: u64,
+    /// Before a flush, so that what the events so far queued does not
+    /// wait the flush out.
+    pub flush: u64,
+    /// Before the loop waits: no event waiting on either plane and nothing
+    /// more the voter can do.
+    pub idle: u64,
+    /// Before a caller's answer waits for room on its stream.
+    pub answer: u64,
+    /// Before a watch's stream is opened or written to.
+    pub watch: u64,
+}
+
+/// What made one of the domain loop's hand-offs (see [`HandOffs`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HandOff {
+    /// [`HandOffs::bound`].
+    Bound,
+    /// [`HandOffs::flush`].
+    Flush,
+    /// [`HandOffs::idle`].
+    Idle,
+    /// [`HandOffs::answer`].
+    Answer,
+    /// [`HandOffs::watch`].
+    Watch,
+}
+
+impl HandOffs {
+    /// Count one hand-off `cause` made.
+    pub fn count(&mut self, cause: HandOff) {
+        let n = match cause {
+            HandOff::Bound => &mut self.bound,
+            HandOff::Flush => &mut self.flush,
+            HandOff::Idle => &mut self.idle,
+            HandOff::Answer => &mut self.answer,
+            HandOff::Watch => &mut self.watch,
+        };
+        *n += 1;
+    }
+
+    /// Every hand-off counted.
+    pub const fn total(&self) -> u64 {
+        self.bound + self.flush + self.idle + self.answer + self.watch
     }
 }
 
@@ -1142,10 +1207,11 @@ pub struct Scheduling {
     /// Times the scheduler took the CPU from it.
     pub involuntary: u64,
     /// The domain loop's run-queue time a pass, distributed over a
-    /// sample of its passes (task-d97): the first pass to start
-    /// [`RUN_QUEUE_SAMPLE_PERIOD`] or more after the last sampled one,
-    /// from its start to the next pass's start. That is the pass's own
-    /// preemptions and the wait to run once something woke it again.
+    /// sample of its passes (task-d97): the first pass to start both
+    /// [`RUN_QUEUE_SAMPLE_PERIOD`] and [`RUN_QUEUE_SAMPLE_PASSES`] passes
+    /// or more after the last sampled one, from its start to the next
+    /// pass's start. That is the pass's own preemptions and the wait to
+    /// run once something woke it again.
     #[serde(default)]
     pub run_queue_per_pass: Distribution,
     /// The same, over the sampled passes in which the loop executed at
@@ -1156,13 +1222,22 @@ pub struct Scheduling {
 }
 
 /// How far apart the domain loop's sampled passes start (task-d97): two
-/// reads of the thread's `schedstat` a sample.
+/// reads of the thread's `schedstat` a sample, at most one sample a
+/// period and one in [`RUN_QUEUE_SAMPLE_PASSES`] passes, whichever is
+/// rarer.
 ///
-/// By time, not one pass in a count (task-d115): a busy leader's loop
-/// takes some sixty passes a turn, and one in sixteen made the sample's
-/// reads 35 of its 55 system calls a turn. A hundred samples a second
-/// still fill the distribution.
+/// The period bounds a busy loop (task-d115): a busy leader's loop takes
+/// some sixty passes a turn, and one in sixteen made the sample's reads 35
+/// of its 55 system calls a turn. A hundred samples a second still fill
+/// the distribution.
 pub const RUN_QUEUE_SAMPLE_PERIOD: Duration = Duration::from_millis(10);
+
+/// The fewest passes between two sampled ones: the count bounds an idle
+/// loop (#254 review). An idle loop passes 10 to 16 times a second, more
+/// than a period apart, so the period alone samples nearly every pass:
+/// 60 to 100 reads a second a voter where one in sixteen made about 10,
+/// and a host's idle domains multiply it.
+pub const RUN_QUEUE_SAMPLE_PASSES: u32 = 16;
 
 fn not_instrumented<T>() -> Measure<T> {
     Measure::Unavailable(Unavailable::NotInstrumented)

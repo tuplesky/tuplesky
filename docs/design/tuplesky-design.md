@@ -1767,7 +1767,7 @@ Common schema owns stable logical collection IDs, canonical values and reviewed 
 
 Protocol state cannot be reduced to a Raft-like last_applied: application snapshots do not recreate unresolved dependency/vote obligations. Physical placement is adapter-private; logical schema/index maintenance is common.
 
-*Proposed by task-d117's design step ([Section 17.17](#s17-17)), not built:* the per-command protocol rows (`protocol_v1`'s dependency and proposal rows, `pending_payload_v1`), the retry rows (`retry_v1`, `retry_floor_v1`) and executed history (`execution_v1`, `payload_v1`, `decided_v1`) leave the projection, and `meta_v1` is written once a commit. Each of its code steps amends this table as it lands.
+*Proposed by task-d117's design step ([Section 17.17](#s17-17)), not built:* the per-command protocol rows (`protocol_v1`'s dependency and proposal rows, `pending_payload_v1`), the retry rows (`retry_v1`, `retry_floor_v1`) and executed history (`execution_v1`, `payload_v1`, `decided_v1`) leave the projection Its first code step is built: `meta_v1` is written once a commit (point 5). Each of its code steps amends this table as it lands.
 
 *Amended by task-d113's design step: the payload, dependency and executed rows keyed by order.* This is a design step; nothing below is built. The table above keeps today's keys until the code step lands.
 
@@ -2449,14 +2449,24 @@ About 11.8 of a follower's 13.9 rows a command leave, 85%. What stays is 2 appli
     - The image carries the same two. A store of today's layout is refused (point 1), so none has to be dropped from one.
     - At most about 4 MB.
   - At execution the lowering moves the command's payload and dependency row out, as it does today (`assign_executed`, `move_decided`): to the history buffer (point 3), and the payload to the retry window too (point 4). A released command's rows go at the Sync's release, and a pulled command's at its install, as today.
-  - So the map is bounded by the table and two Syncs, not by history or leader changes: about 2 MB of commands, 4 MB of Syncs and the decided overlay (point 3), about 6 MB at the largest, against today's rows, which nothing trims.
+  - **Each key's latest decided command stays as well** (task-d116, point 3; Codex on #260).
+    - A key keeps naming its latest command after that command executes, and the key's chain needs that record and its paths. Neither the key index nor the intake index leads from a key to it (task-d116).
+    - So the map also keeps, under each key, the decided record of the key's latest command: one copy however many keys name it.
+    - The record goes once every key it names has a later command. A later change to it (point 3) is written there.
+    - The image carries it with the rest of the map, and boot reads it there.
+    - It costs about one more map update a key a command names.
+    - **This part grows with the keys the domain has named, not with history,** as task-d105's key index does. A dependency row is about 200 bytes, the 1 KB above less the payload, so this part is about 200 bytes a key at most, less where one command is the latest for several keys. A domain whose commands have named a million distinct keys holds up to about 200 MB here; today `decided_v1` holds a record for every command.
+  - So the map is bounded by the table, two Syncs and the domain's keys, not by history or leader changes. That is about 2 MB of commands, 4 MB of Syncs and the decided overlay (point 3), about 6 MB, plus about 200 bytes a key named. Today's rows are bounded by nothing, since nothing trims them.
+  - **Not taken: a key's latest command kept as a position, its record read back from history.**
+    - It would be about 40 bytes a key.
+    - But trim (task-d27) would then have to keep every segment holding some key's latest record, which is the history the floor exists to drop.
 - **Who reads it.**
   - The lowering, on the materializer's thread, for the store's own writes and the move.
   - Boot's `read_protocol`, after the attach, when nothing else runs.
   - The export, which takes the version published with the commit it pins (point 6).
   - Nothing on the loop reads it while the domain runs: a campaign's report comes from the machine's ledger, which reads no rows (task-d77).
 - **CPU (inferred):** an insert or removal in a persistent map for each protocol update, about 0.3 to 0.5 µs, at about 8 updates a command: 2 to 4 µs a command a voter, against the redb rows' share of the materializer.
-- **Not taken:** a plain map copied at each pin. It would cost a copy of up to about 6 MB a publication on the materializer's thread, and the pin would have to wait for the materializer to reach a commit boundary.
+- **Not taken:** a plain map copied at each pin. It would cost a copy of the whole map, 6 MB and up, a publication on the materializer's thread, and the pin would have to wait for the materializer to reach a commit boundary.
 
 **3. Executed history: a buffer, then segments.**
 - **What executed history is:** for each position, the execution record (command, revision, result digest), the payload, and this node's decided record (the dependency row moved at execution, node-private, with its epoch). Today they are `execution_v1`, `payload_v1` and `decided_v1`.
@@ -2503,6 +2513,7 @@ About 11.8 of a follower's 13.9 rows a command leave, 85%. What stays is 2 appli
 - Today application batches put `kv_revision`, `retention_floor` and `lease_authority` as ordinary updates (`materialize.rs`): about one meta row a command in the audit. The stamp and the execution frontier are already written once a commit (`DurableMeta::write`).
 - The lowering keeps the last put of each `meta_v1` key in a commit and writes it once. Nothing reads the values in between from the projection: the planning view's overlay holds the group's own, and the recovery cut lays the journal's updates over its snapshot as they are.
 - It needs no format change, and it is its own small PR, first.
+- **Built** by the first code step. `Lowered::keep` (`lowering.rs`) gives a `meta_v1` key the commit has already written the later value in its row's place, so the commit writes each key once. The key index still sees every update, as it is assigned and before the row is kept.
 
 **6. The images, and what journal retention depends on.**
 - **The local image at `C`** holds:
@@ -2613,7 +2624,7 @@ About 11.8 of a follower's 13.9 rows a command leave, 85%. What stays is 2 appli
 - **Not counted:** the retry and planning reads served from memory (proposal 1's), the image's smaller export, and the floor's export reading no history. None of them shows in a 25 s pair.
 
 **10. The order of the code steps.** One PR each, each with its own pair (the counting build's bytes by table, and the materializer's µs a command at each voter) and its crash tests:
-1. **`meta_v1` once a commit.** No format change. It can go now.
+1. **`meta_v1` once a commit.** No format change. Built.
 2. **Live protocol state in the recovery map,** with the image's recovery section and the recovery replay. Node-private only: no image shared, no common hash changed. It needs task-j05's composed matrix on the carry first.
 3. **The retry window,** with the request beside each result. It changes the common hash's `retry_v1` and both images. It goes before step 4, so that step 4 owes resolve nothing.
 4. **Executed history in segments,** with the history digest in the floor's root.
