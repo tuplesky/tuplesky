@@ -291,16 +291,41 @@ KINDS = (":read", ":write", ":cas")
 TUPLESKY = ("head", "base")
 
 
+def offered(step: str) -> tuple[int | None, int | None]:
+    """A step's clients, where they are a plain count, and the operations
+    a second it offered them (None for an unthrottled step)."""
+    clients, _, rate = step.partition("@")
+    return (int(clients) if clients.isdigit() else None), (int(rate) if rate else None)
+
+
+def crowded(s: Step) -> bool:
+    """A run at an offered rate whose clients were busy 80% of the time or
+    more: operations then waited for a free client, a wait its latency
+    leaves out, so the step's offered load wasn't an open loop."""
+    clients, rate = offered(s.step)
+    return bool(rate and clients and s.busy_clients is not None and s.busy_clients >= 0.8 * clients)
+
+
+def capacity(steps: list[Step], step: str) -> float | None:
+    """The head's completions a second at a step, the mean of its runs
+    there: what a later step's share of the capacity is a share of."""
+    values = [s.completed_per_s for s in steps if s.step == step and s.side == "head" and s.completed_per_s]
+    return sum(values) / len(values) if values else None
+
+
 def label(arg: str) -> tuple[str, str, int, str]:
     """SIDE@STEP[#N]=STORE as its parts: the side, the step, which of the
-    side's runs at that step it is (1 without `#N`), and the store."""
+    side's runs at that step it is (1 without `#N`), and the store. A step
+    is the clients, with `@RATE` after them when the step offered RATE
+    operations a second."""
     m = re.fullmatch(
-        r"(head|base|etcd|etcd-snap[0-9]+|etcd-tls|etcd-tlsauth|swiftpaxos)@([0-9]+n?)(?:#([1-9][0-9]*))?=(.+)", arg
+        r"(head|base|etcd|etcd-snap[0-9]+|etcd-tls|etcd-tlsauth|swiftpaxos)@([0-9]+n?(?:@[1-9][0-9]*)?)(?:#([1-9][0-9]*))?=(.+)",
+        arg,
     )
     if not m:
         raise ValueError(
             "not SIDE@STEP[#N]=STORE (SIDE head, base, etcd, etcd-snapCOUNT, etcd-tls, etcd-tlsauth or "
-            f"swiftpaxos): {arg}"
+            f"swiftpaxos; STEP CLIENTS or CLIENTS@RATE): {arg}"
         )
     return m[1], m[2], int(m[3] or 1), m[4]
 
@@ -651,7 +676,10 @@ def render(steps: list[Step], title: str, baseline: str = "etcd") -> str:
         "**Throughput and latency** (each run in the order the job ran them; over the workload, the first "
         "invocation to the last completion; completed is `ok`, `fail` and `info`; busy clients is the clients' "
         "time between an invocation and its completion over the window, so the clients' mean concurrency; the "
-        "mix is each kind's share of the operations completed, with the clients that invoked it; latency is of `ok`s, p50 / p99 in ms)",
+        "mix is each kind's share of the operations completed, with the clients that invoked it; latency is of `ok`s, p50 / p99 in ms; "
+        "a step CLIENTS@RATE offered RATE operations a second to its clients, both systems alike, and ⚠ marks a run "
+        "whose clients were busy 80% of the time or more, where operations waited for a free client and its latency "
+        "leaves that wait out)",
         "",
         "| Step | Side | `ok`/s | Completed/s | Busy clients | Reads / writes / cas | Read p50 / p99 | "
         "Write p50 / p99 | Cas p50 / p99 |",
@@ -664,7 +692,7 @@ def render(steps: list[Step], title: str, baseline: str = "etcd") -> str:
         ]
         out.append(
             f"| {name(s)} | {cell(s.ok_per_s, '.1f')} | {cell(s.completed_per_s, '.1f')} | "
-            f"{cell(s.busy_clients, '.1f')} | {mix} | " + " | ".join(lat) + " |"
+            f"{cell(s.busy_clients, '.1f')}{' ⚠' if crowded(s) else ''} | {mix} | " + " | ".join(lat) + " |"
         )
     out.append("")
 
@@ -894,12 +922,25 @@ def main() -> int:
         "--baseline", default="etcd",
         help="the etcd row every ratio is over: etcd (plain) or etcd-tls (with TLS, the workflow's headline)",
     )
-    parser.add_argument("runs", nargs="+", metavar="SIDE@STEP[#N]=STORE")
+    parser.add_argument(
+        "--capacity", metavar="STEP",
+        help="print only the head's completions a second at STEP, the mean of its runs (nothing without one)",
+    )
+    parser.add_argument("runs", nargs="*", metavar="SIDE@STEP[#N]=STORE")
     args = parser.parse_args()
     steps = []
     for arg in args.runs:
         side, step, rep, store = label(arg)
+        if args.capacity and (side != "head" or step != args.capacity):
+            continue
         steps.append(read_step(side, step, store, rep))
+    if args.capacity:
+        value = capacity(steps, args.capacity)
+        if value:
+            print(f"{value:.0f}")
+        return 0
+    if not steps:
+        parser.error("no runs")
     text = render(steps, args.title, args.baseline)
     print(text)
     summary = os.environ.get("GITHUB_STEP_SUMMARY")

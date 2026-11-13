@@ -424,6 +424,43 @@ class HeadAgainstBaseTests(unittest.TestCase):
         self.assertFalse([r for r in rows if r.startswith("| 30 | 2 | ") or r.startswith("| 30 | mean | ")])
 
 
+class OfferedRateTests(unittest.TestCase):
+    """CLIENTS@RATE steps: the label, the capacity and the crowded mark."""
+
+    @staticmethod
+    def made(side, step, completed, busy):
+        s = sw.Step(side, step, "/s", 1)
+        s.completed_per_s = completed
+        s.busy_clients = busy
+        return s
+
+    def test_a_label_with_an_offered_rate(self):
+        self.assertEqual(sw.label("head@480@2000#2=/s"), ("head", "480@2000", 2, "/s"))
+        self.assertEqual(sw.offered("480@2000"), (480, 2000))
+        self.assertEqual(sw.offered("120"), (120, None))
+        self.assertEqual(sw.offered("48n@900"), (None, 900))
+        with self.assertRaises(ValueError):
+            sw.label("head@480@0.5=/s")
+
+    def test_capacity_is_the_heads_mean_at_the_step(self):
+        steps = [
+            self.made("head", "120", 2000.0, 40.0),
+            self.made("etcd", "120", 5000.0, 40.0),
+            self.made("head", "120", 2200.0, 40.0),
+            self.made("head", "30", 1000.0, 18.0),
+        ]
+        self.assertEqual(sw.capacity(steps, "120"), 2100.0)
+        self.assertIsNone(sw.capacity(steps, "240"))
+
+    def test_a_crowded_offered_step_is_marked(self):
+        free = self.made("head", "480@2000", 2000.0, 100.0)
+        crowded = self.made("head", "480@4000", 3000.0, 400.0)
+        unthrottled = self.made("head", "120", 2000.0, 119.0)
+        self.assertFalse(sw.crowded(free))
+        self.assertTrue(sw.crowded(crowded))
+        self.assertFalse(sw.crowded(unthrottled))
+
+
 class BaselineTests(unittest.TestCase):
     """--baseline etcd-tls: ratios over etcd with TLS, the mean of its runs."""
 

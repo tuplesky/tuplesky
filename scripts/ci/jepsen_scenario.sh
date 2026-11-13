@@ -22,7 +22,10 @@
 #   IN_CONCURRENCY clients, a number or a multiple of the nodes (5n);
 #                  empty for the scenario's. Comma-separated, a sweep: the
 #                  job runs every side at each count in turn (SWEEP), and
-#                  CONCURRENCY is the first
+#                  CONCURRENCY is the first. A sweep's step may be
+#                  CLIENTS@RATE (operations a second offered) or
+#                  CLIENTS@SHARE (0.5: that share of the capacity the
+#                  job measured at the last step without @), with rate 0
 #   IN_PAIRS_GIVEN in a sweep with a pair base, the steps the base runs
 #                  at, comma-separated; empty for every step
 #   IN_RATE        operations a second over all clients, 0 for
@@ -185,13 +188,35 @@ swiftpaxos_beside=false
 if [ "$swiftpaxos" = beside ]; then swiftpaxos_beside=true; fi
 time_limit=${IN_TIME_LIMIT:-$time_limit}
 concurrency=${IN_CONCURRENCY:-$concurrency}
-# A comma-separated list is a sweep: each count is a step.
+# A comma-separated list is a sweep: each count is a step. A sweep's step
+# CLIENTS@RATE offers RATE operations a second to that many clients, an
+# open loop while most of them are free: a whole RATE is operations a
+# second, and a decimal (0.5) is that share of the head's completions a
+# second at the last step before it without a rate, measured in the job.
 steps_in=${concurrency//,/ }
+offered_steps=false measured=false
 for step in $steps_in; do
-  case $step in
+  case ${step%%@*} in
     *[!0-9n]* | "" | n* | *n?*)
-      echo "::error::concurrency '$step' is not a number or a multiple of the nodes (5n)" >&2
+      echo "::error::concurrency '$step' is not a number or a multiple of the nodes (5n), with @RATE or @SHARE after it in a sweep" >&2
       exit 1 ;;
+  esac
+  case $step in
+    *@*)
+      offered=${step#*@}
+      if [[ $offered =~ ^[1-9][0-9]*$ ]]; then
+        :
+      elif [[ $offered =~ ^(0?\.[0-9]*[1-9][0-9]*|1\.0*)$ ]]; then
+        if [ "$measured" = false ]; then
+          echo "::error::concurrency step $step offers a share of a capacity no earlier step measures; put a step without @ before it" >&2
+          exit 1
+        fi
+      else
+        echo "::error::concurrency step $step: after @ give operations a second (2000) or a share of the measured capacity (0.5)" >&2
+        exit 1
+      fi
+      offered_steps=true ;;
+    *) measured=true ;;
   esac
 done
 if [ -z "$steps_in" ]; then
@@ -199,7 +224,11 @@ if [ -z "$steps_in" ]; then
   exit 1
 fi
 set -- $steps_in
-concurrency=$1
+if [ "$offered_steps" = true ] && [ $# -lt 2 ]; then
+  echo "::error::concurrency '$concurrency': a step with @ is a sweep's, after a step without it" >&2
+  exit 1
+fi
+concurrency=${1%%@*}
 wan=${IN_WAN:-$wan}
 # A scenario's keys and read ratio are for the workloads they apply to; a
 # workload input of another drops them.
@@ -212,6 +241,10 @@ rate=${IN_RATE:-$rate}
 case $rate in
   "" | *[!0-9]*) echo "::error::rate '$rate' is not a whole number of operations a second (0 for unthrottled)" >&2; exit 1 ;;
 esac
+if [ "$offered_steps" = true ] && [ "$rate" != 0 ]; then
+  echo "::error::a sweep with @ steps measures capacity at its steps without one, so its rate must be 0, not $rate" >&2
+  exit 1
+fi
 
 # The etcd test's --rate must be positive; 100000 a second staggers its
 # clients by 10 microseconds on average, which is unthrottled at any
@@ -255,7 +288,11 @@ fi
 sweep=""
 if [ $# -gt 1 ]; then
   for step in "$@"; do
-    if [ "$workload" = register ]; then step=$(raise_register "$step"); fi
+    if [ "$workload" = register ]; then
+      offered=""
+      case $step in *@*) offered=@${step#*@} ;; esac
+      step=$(raise_register "${step%%@*}")$offered
+    fi
     case " $sweep " in
       *" $step "*) echo "::error::concurrency '$IN_CONCURRENCY' names the step $step twice" >&2; exit 1 ;;
     esac
@@ -266,6 +303,7 @@ if [ $# -gt 1 ]; then
     raised=" (raised from ${steps_in// /, } to multiples of the register workload's 2n)"
   fi
   concurrency=${sweep%% *}
+  concurrency=${concurrency%%@*}
   swiftpaxos="skip"
 fi
 # Beside TupleSky, SwiftPaxos runs its register workload without faults,
@@ -273,6 +311,10 @@ fi
 # faults must be none.
 swiftpaxos_steps=""
 if [ "$swiftpaxos_beside" = true ]; then
+  if [ "$offered_steps" = true ]; then
+    echo "::error::swiftpaxos beside runs each step unthrottled; give no @ steps with it" >&2
+    exit 1
+  fi
   swiftpaxos="skip"
   for step in ${sweep:-$concurrency}; do
     swiftpaxos_steps+="${swiftpaxos_steps:+ }$(raise_register "$step")"
@@ -292,7 +334,11 @@ fi
 base_steps=""
 if [ -n "$sweep" ] && [ -n "${IN_PAIRS_GIVEN:-}" ]; then
   for step in ${IN_PAIRS_GIVEN//,/ }; do
-    if [ "$workload" = register ]; then step=$(raise_register "$step"); fi
+    if [ "$workload" = register ]; then
+      offered=""
+      case $step in *@*) offered=@${step#*@} ;; esac
+      step=$(raise_register "${step%%@*}")$offered
+    fi
     case " $sweep " in
       *" $step "*) base_steps+="${base_steps:+ }$step" ;;
       *) echo "::error::pairs '$IN_PAIRS_GIVEN' in a sweep names the step $step, which concurrency '$IN_CONCURRENCY' does not" >&2; exit 1 ;;

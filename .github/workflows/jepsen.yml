@@ -54,7 +54,7 @@ on:
         description: "Seconds of workload before healing; empty for the scenario's (300, or 120 for throughput)"
         default: ""
       concurrency:
-        description: "Clients, as a number or a multiple of the nodes such as 5n; empty for the scenario's (2n, 10n for throughput, 4 for service); comma-separated, a sweep: every side in turn at each count, etcd-beside after each step, one table of the steps at the end"
+        description: "Clients, as a number or a multiple of the nodes such as 5n; empty for the scenario's (2n, 10n for throughput, 4 for service); comma-separated, a sweep: every side in turn at each count, etcd-beside after each step, one table of the steps at the end; a sweep's step CLIENTS@RATE offers RATE operations a second to that many clients for both systems (an open loop while most are free), and CLIENTS@SHARE such as 480@0.5 offers that share of the head's completions a second at the last step without @, measured in the job (rate 0)"
         default: ""
       rate:
         description: "Operations a second over all clients, for every system (0 for unthrottled); empty for the scenario's (20, 0 for throughput, 300 for service)"
@@ -547,7 +547,7 @@ jobs:
             if [ "$IN_LEADER_PROFILE" != false ]; then export JEPSEN_LEADER_PROFILE="$dir/leader-profile.txt"; fi
             if [ "$IN_LEADER_PROFILE" != false ] && [ "$graph" = graph ]; then export JEPSEN_LEADER_CALLGRAPH=1; fi
             "$ci/jepsen_bounded.sh" $((TIME_LIMIT + 1200)) "$RUNNER_TEMP/cluster/nodes" -- \
-              "${common[@]}" --concurrency "$CONCURRENCY" --bin-dir "$bin" "$@"
+              "${common[@]}" --concurrency "$CONCURRENCY" ${STEP_RATE:+--rate "$STEP_RATE"} --bin-dir "$bin" "$@"
           }
           # With etcd beside TupleSky, the etcd test once on this runner and cluster,
           # its samples in $1, summarized as the etcd-baseline job's is and
@@ -558,7 +558,7 @@ jobs:
             mkdir -p "$dir"
             # $3: a snapshot count for this run; etcd's own default without.
             # $4: tls or tls+auth, this run secured (etcd-version VERSION+tls).
-            (cd "$GITHUB_WORKSPACE" && ETCD_SNAPSHOT_COUNT=$snapshots ETCD_SECURE=$secure "$ci/jepsen_etcd.sh" run "$dir/cpu-samples.csv") \
+            (cd "$GITHUB_WORKSPACE" && ETCD_SNAPSHOT_COUNT=$snapshots ETCD_SECURE=$secure ETCD_RATE=${STEP_RATE:-$ETCD_RATE} "$ci/jepsen_etcd.sh" run "$dir/cpu-samples.csv") \
               || echo "::warning::$label: the etcd test ended with status $?"
             store=$(readlink -f "$GITHUB_WORKSPACE/etcd-test/store/latest" || true)
             if [ -z "$store" ] || [ "$store" = "$etcd_previous" ]; then
@@ -785,13 +785,35 @@ jobs:
                 fi
               done
             }
+            # A step CLIENTS@RATE offers RATE operations a second to its
+            # clients, both systems alike; CLIENTS@SHARE offers that share
+            # of the head's completions a second at the last step without
+            # @ (capacity). Its runs are labelled CLIENTS@RATE as offered.
+            capacity="" offered_labels=" "
             for step in $SWEEP; do
               i=$((i + 1))
-              CONCURRENCY=$step
+              CONCURRENCY=${step%%@*} STEP_RATE=""
               sides=head paired=false
               if [ -n "$IN_PAIR_BASE" ] && [[ " $SWEEP_BASE_STEPS " == *" $step "* ]]; then
                 paired=true
                 if [ $((i % 2)) = 1 ]; then sides="base head head base"; else sides="head base base head"; fi
+              fi
+              case $step in
+                *@*.*)
+                  if [ -z "$capacity" ]; then
+                    echo "::error::step $step: no capacity was measured before it (the step before ran no head that completed); skipped"
+                    rc=1; continue
+                  fi
+                  STEP_RATE=$(awk -v s="${step#*@}" -v c="$capacity" 'BEGIN { r = int(s * c + 0.5); print (r < 1 ? 1 : r) }') ;;
+                *@*) STEP_RATE=${step#*@} ;;
+              esac
+              if [ -n "$STEP_RATE" ]; then
+                # Two steps that come to one rate get apart by a unit, so
+                # their runs keep their own labels.
+                while [[ $offered_labels == *" $CONCURRENCY@$STEP_RATE "* ]]; do STEP_RATE=$((STEP_RATE + 1)); done
+                offered_labels+="$CONCURRENCY@$STEP_RATE "
+                echo "step $step: $CONCURRENCY clients offered $STEP_RATE operations a second${capacity:+ (capacity $capacity/s)}"
+                step=$CONCURRENCY@$STEP_RATE
               fi
               graph=flat; if [ "$IN_LEADER_PROFILE" = call-graph ] && [ "$i" = 1 ]; then graph=graph; fi
               if [ "$paired" = true ] || [ "$ETCD_BESIDE" != true ]; then
@@ -812,6 +834,11 @@ jobs:
                 read -ra sp_steps <<< "$SWIFTPAXOS_STEPS"
                 sp=${sp_steps[$((i - 1))]}
                 if swiftpaxos_one "$RUNNER_TEMP/run-$n" "step $step" "$sp"; then runs+=("swiftpaxos@$step=$swiftpaxos_store"); fi
+              fi
+              # The capacity a later @SHARE step offers its share of.
+              if [ -z "$STEP_RATE" ]; then
+                capacity=$(python3 "$ci/jepsen_sweep.py" --capacity "$step" ${runs[@]+"${runs[@]}"} 2>/dev/null || true)
+                if [ -n "$capacity" ]; then echo "capacity at step $step: the head completed $capacity operations a second"; fi
               fi
             done
             python3 "$ci/jepsen_sweep.py" \

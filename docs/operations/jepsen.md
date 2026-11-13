@@ -883,6 +883,32 @@ The summary's ratios are over the baseline's mean at the step, with a row
 for each run and a `mean` row for each side that ran twice. SwiftPaxos
 runs after both.
 
+A sweep's step can offer a fixed load instead of running its clients
+flat out. `CLIENTS@RATE` (`480@2000`) offers 2,000 operations a second
+to 480 clients, through each test's own `--rate`, for both systems
+alike. `CLIENTS@SHARE` (`480@0.5`) offers that share of the head's
+completions a second at the last step without `@` in the same job, so
+the load suits whatever CPU model the job lands on: `120,480@0.5,480@0.8`
+measures the head's capacity at 120 clients, then offers half of it and
+four fifths of it to 480. The runs are labelled with the rate offered
+(`head@480@1234`).
+- Jepsen's stagger hands each operation, when it falls due, to whichever
+  client is free. With many more clients than rate × latency, operations
+  arrive at the rate offered whatever their latency, an open loop, and a
+  change that trades latency for throughput shows in p50 and p99 rather
+  than in fewer completions.
+- An open loop at a fixed rate is what a buffer of commands needs to
+  fill. A closed loop on four CPUs can't push more operations in flight:
+  in the two-worker sweep (43328369031) the busy clients went from 42.6
+  to 47.7 for TupleSky and from 44.6 to 37.9 for etcd between 120 and 240
+  clients, and completions fell.
+- When every client is busy, an operation that falls due waits for one,
+  and that wait is in no latency. The throughput table marks with ⚠ a run
+  whose clients were busy 80% of the time or more: its rate was more than
+  the step's clients could offer as an open loop.
+- Such a sweep runs at `rate` 0, and a share needs a step without `@`
+  before it. SwiftPaxos isn't run beside one.
+
 A step that runs the base runs it and the head twice each, in both orders.
 In the #253 pair (43329322354), which ran each once, the side that ran
 first won by 6–7% at both steps, the head at one and the base at the
