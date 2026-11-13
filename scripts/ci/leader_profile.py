@@ -51,7 +51,11 @@ profiled the same way over the same window, into the transport profile's
 name with -follower before its extension (transport-profile-follower.txt,
 its -inclusive and -chains beside it), and its threads counted into the
 follower profile's name with -syscalls (follower-profile-syscalls.txt), so
-the summary sets a follower's transport beside the leader's.
+the summary sets a follower's transport beside the leader's. The same two
+whole-process samples are reported for each voter's store threads as well,
+its materializer and its appender, into materializer-profile.txt and
+appender-profile.txt (and -follower beside each, with -inclusive and -chains),
+so the projection's commits are profiled on the runner beside the loop.
 
 With --loops-hz HZ, `perf record -a` samples every CPU from the start to
 SIGTERM at that rate, with call graphs by frame pointer, and each coordd
@@ -83,6 +87,12 @@ ALLOC_SECONDS = 10
 # What tokio names its threads, its workers and its blocking pool's alike
 # (`comm` is cut at 15 characters), as cpu_sampler.py reads them.
 TOKIO_THREADS = ("tokio-rt-worker", "tokio-runtime-w")
+
+# The store's pipeline threads (coord-storage's pipeline.rs names them),
+# reported from the transport's whole-process sample of the same voter: the
+# materializer's projection commits (redb) and the appender's journal
+# writes, into <name>-profile.txt beside the transport's.
+PIPELINE_THREADS = (("materializer", ("materializer",)), ("appender", ("appender",)))
 
 # The system calls counted per thread beside the transport's profile.
 SYSCALLS = ("futex", "sendmsg", "sendmmsg", "sendto", "recvmsg", "recvmmsg", "recvfrom", "epoll_wait", "epoll_pwait", "write")
@@ -223,7 +233,7 @@ def profile(args) -> int:
         return [line for line in lines if line.strip() and not line.startswith("#")], samples.lstrip("# ").strip()
 
     def write_profile(out: str, role: str, tid: int, used: float | None, data: str, started: str, ended: str,
-                      comms: tuple[str, ...] = (), node: str | None = None) -> None:
+                      comms: tuple[str, ...] = (), node: str | None = None, label: str = "tokio") -> None:
         symbols, samples = report(data, "overhead,dso,sym", "0.2", comms=comms)
         if comms:
             # perf's object report ignores relative percentages; sum the
@@ -242,7 +252,7 @@ def profile(args) -> int:
             f"{role} thread {tid}{f' ({node})' if node else ''}, {used / span:.2f} of a core over "
             f"the {span} s before"
             if used is not None
-            else f"{role}: the tokio threads ({', '.join(comms)}) of the "
+            else f"{role}: the {label} threads ({', '.join(comms)}) of the "
             f"{'follower' if role.startswith('follower') else 'leader'}'s process {tid}{f' ({node})' if node else ''}, pooled"
         )
         header = (
@@ -311,6 +321,14 @@ def profile(args) -> int:
         if proc.returncode == 0:
             write_profile(out, role, tid, u, data, started, ended,
                           comms=TOKIO_THREADS if role.endswith("transport") else (), node=nodes[tid])
+            # The same whole-process sample holds the voter's store threads.
+            if role.endswith("transport"):
+                for name, comms in PIPELINE_THREADS:
+                    path = role_path(args.out, name)
+                    if role.startswith("follower"):
+                        path = suffixed(path, "follower")
+                    write_profile(path, role.replace("transport", name), tid, None, data, started, ended,
+                                  comms=comms, node=nodes[tid], label=name)
         subprocess.run(["sudo", "-n", "rm", "-f", data], capture_output=True)
     for role, target, counts, proc in counting:
         _, err = proc.communicate()
