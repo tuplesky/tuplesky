@@ -298,6 +298,15 @@ impl Lowered {
     }
 
     /// Keep one row; a later row for the same key is the one read.
+    ///
+    /// A `meta_v1` row this commit has already written takes the later
+    /// value in its place, so each meta key is written once a commit, not
+    /// once a command (task-d117 step 1, design Section 17.17 point 5).
+    /// Application puts `kv_revision`, `retention_floor` and
+    /// `lease_authority` as ordinary updates, about one meta row a command.
+    /// Rows under other keys never depend on where a meta row stands, so
+    /// the commit leaves the same rows; the key index saw every one of
+    /// them as it was assigned, before it got here.
     fn keep(&mut self, update: StoreUpdate) {
         let place = self.writes.len();
         let rows = match self.at.iter().position(|(c, _)| *c == update.collection) {
@@ -308,12 +317,19 @@ impl Lowered {
                 &mut self.at.last_mut().expect("just pushed").1
             }
         };
+        if update.collection == Collection::MetaV1.id()
+            && let Some(&earlier) = rows.get(&update.key)
+        {
+            self.writes[earlier].value = update.value;
+            return;
+        }
         rows.insert(update.key.clone(), place);
         self.writes.push(update);
     }
 
     /// The rows, in the order lowered: a key written twice keeps its last
-    /// value when they are applied in order.
+    /// value when they are applied in order, and a `meta_v1` key is here
+    /// once, with its last value, where it was first written.
     pub fn updates(&self) -> &[StoreUpdate] {
         &self.writes
     }
@@ -355,19 +371,55 @@ mod tests {
     #[test]
     fn a_commit_finds_its_own_rows_by_collection_and_key() {
         let mut lowered = Lowered::new();
-        lowered.keep(row(1, b"k", Some(b"one")));
-        lowered.keep(row(2, b"k", Some(b"two")));
-        lowered.keep(row(1, b"other", Some(b"three")));
-        lowered.keep(row(1, b"k", None));
+        lowered.keep(row(7, b"k", Some(b"one")));
+        lowered.keep(row(8, b"k", Some(b"two")));
+        lowered.keep(row(7, b"other", Some(b"three")));
+        lowered.keep(row(7, b"k", None));
         let at = &lowered.at;
-        assert_eq!(written(at, CollectionId(1), b"k"), Some(3));
+        assert_eq!(written(at, CollectionId(7), b"k"), Some(3));
         assert_eq!(lowered.updates()[3].value, None);
-        assert_eq!(written(at, CollectionId(2), b"k"), Some(1));
-        assert_eq!(written(at, CollectionId(1), b"other"), Some(2));
-        assert_eq!(written(at, CollectionId(2), b"other"), None);
-        assert_eq!(written(at, CollectionId(3), b"k"), None);
+        assert_eq!(written(at, CollectionId(8), b"k"), Some(1));
+        assert_eq!(written(at, CollectionId(7), b"other"), Some(2));
+        assert_eq!(written(at, CollectionId(8), b"other"), None);
+        assert_eq!(written(at, CollectionId(9), b"k"), None);
         // Every row stays in `writes`, in the order lowered.
         assert_eq!(lowered.updates().len(), 4);
+    }
+
+    /// A `meta_v1` key written by every command of a commit is one row,
+    /// where it was first written, with the last value, a delete included;
+    /// the overlay reads that value. Any other collection keeps every row.
+    #[test]
+    fn a_meta_key_is_one_row_a_commit_with_its_last_value() {
+        let meta = Collection::MetaV1.id().0;
+        let revision = meta_fields::KV_REVISION;
+        let floor = meta_fields::RETENTION_FLOOR;
+        let mut lowered = Lowered::new();
+        lowered.keep(row(meta, revision, Some(b"1")));
+        lowered.keep(row(7, b"k", Some(b"one")));
+        lowered.keep(row(meta, revision, Some(b"2")));
+        lowered.keep(row(meta, floor, Some(b"f")));
+        lowered.keep(row(7, b"k", Some(b"two")));
+        lowered.keep(row(meta, revision, Some(b"3")));
+        lowered.keep(row(meta, floor, None));
+        let rows: Vec<_> = lowered
+            .updates()
+            .iter()
+            .map(|u| (u.collection.0, u.key.as_slice(), u.value.as_deref()))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (meta, revision, Some(&b"3"[..])),
+                (7, &b"k"[..], Some(&b"one"[..])),
+                (meta, floor, None),
+                (7, &b"k"[..], Some(&b"two"[..])),
+            ]
+        );
+        let at = &lowered.at;
+        assert_eq!(written(at, CollectionId(meta), revision), Some(0));
+        assert_eq!(written(at, CollectionId(meta), floor), Some(2));
+        assert_eq!(written(at, CollectionId(7), b"k"), Some(3));
     }
 
     /// More rows than an index is sized for: it grows and still finds

@@ -4524,7 +4524,7 @@ Proposal 2 of [the batching rule](tuplesky-batching-rule.md#41-proposal-2-protoc
 - **Not taken:** history from the journal by position (retention would follow the slowest voter, and boot reads every retained record), one history row a commit in the projection, and history in memory.
 
 **The code, in four steps, one PR each:**
-1. **`meta_v1` once a commit.** No format change. It can go now.
+1. **`meta_v1` once a commit.** No format change. Built: `Lowered::keep` writes each `meta_v1` key once a commit, with its last value.
 2. **Live protocol state in the recovery map,** the image's recovery section and the recovery replay. Node-private only. It waits for task-j05's composed matrix (#212) on the carry.
 3. **The retry window in memory,** with the request beside each result. It changes `retry_v1` in the common hash and both images.
 4. **Executed history in segments,** with the history digest in the floor's root in place of `payload_v1` and `execution_v1`.

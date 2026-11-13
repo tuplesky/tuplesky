@@ -1767,7 +1767,7 @@ Common schema owns stable logical collection IDs, canonical values and reviewed 
 
 Protocol state cannot be reduced to a Raft-like last_applied: application snapshots do not recreate unresolved dependency/vote obligations. Physical placement is adapter-private; logical schema/index maintenance is common.
 
-*Proposed by task-d117's design step ([Section 17.17](#s17-17)), not built:* the per-command protocol rows (`protocol_v1`'s dependency and proposal rows, `pending_payload_v1`), the retry rows (`retry_v1`, `retry_floor_v1`) and executed history (`execution_v1`, `payload_v1`, `decided_v1`) leave the projection, and `meta_v1` is written once a commit. Each of its code steps amends this table as it lands.
+*Proposed by task-d117's design step ([Section 17.17](#s17-17)), not built:* the per-command protocol rows (`protocol_v1`'s dependency and proposal rows, `pending_payload_v1`), the retry rows (`retry_v1`, `retry_floor_v1`) and executed history (`execution_v1`, `payload_v1`, `decided_v1`) leave the projection Its first code step is built: `meta_v1` is written once a commit (point 5). Each of its code steps amends this table as it lands.
 
 *Amended by task-d113's design step: the payload, dependency and executed rows keyed by order.* This is a design step; nothing below is built. The table above keeps today's keys until the code step lands.
 
@@ -2503,6 +2503,7 @@ About 11.8 of a follower's 13.9 rows a command leave, 85%. What stays is 2 appli
 - Today application batches put `kv_revision`, `retention_floor` and `lease_authority` as ordinary updates (`materialize.rs`): about one meta row a command in the audit. The stamp and the execution frontier are already written once a commit (`DurableMeta::write`).
 - The lowering keeps the last put of each `meta_v1` key in a commit and writes it once. Nothing reads the values in between from the projection: the planning view's overlay holds the group's own, and the recovery cut lays the journal's updates over its snapshot as they are.
 - It needs no format change, and it is its own small PR, first.
+- **Built** by the first code step. `Lowered::keep` (`lowering.rs`) gives a `meta_v1` key the commit has already written the later value in its row's place, so the commit writes each key once. The key index still sees every update, as it is assigned and before the row is kept.
 
 **6. The images, and what journal retention depends on.**
 - **The local image at `C`** holds:
@@ -2613,7 +2614,7 @@ About 11.8 of a follower's 13.9 rows a command leave, 85%. What stays is 2 appli
 - **Not counted:** the retry and planning reads served from memory (proposal 1's), the image's smaller export, and the floor's export reading no history. None of them shows in a 25 s pair.
 
 **10. The order of the code steps.** One PR each, each with its own pair (the counting build's bytes by table, and the materializer's µs a command at each voter) and its crash tests:
-1. **`meta_v1` once a commit.** No format change. It can go now.
+1. **`meta_v1` once a commit.** No format change. Built.
 2. **Live protocol state in the recovery map,** with the image's recovery section and the recovery replay. Node-private only: no image shared, no common hash changed. It needs task-j05's composed matrix on the carry first.
 3. **The retry window,** with the request beside each result. It changes the common hash's `retry_v1` and both images. It goes before step 4, so that step 4 owes resolve nothing.
 4. **Executed history in segments,** with the history digest in the floor's root.
