@@ -519,6 +519,7 @@ struct Traffic {
     received_frames: AtomicU64,
     received_bytes: AtomicU64,
     received_streams: AtomicU64,
+    refused_voter_names: AtomicU64,
     /// QUIC's own counts of the connections already closed (task-d61,
     /// task-d70); those still open are read from the connections
     /// themselves.
@@ -601,6 +602,7 @@ impl Traffic {
             received_frames: load(&self.received_frames),
             received_bytes: load(&self.received_bytes),
             received_streams: load(&self.received_streams),
+            refused_voter_names: load(&self.refused_voter_names),
         }
     }
 }
@@ -860,9 +862,22 @@ impl Shared {
         let _ = self.events[event.lane().index()].send(event).await;
     }
 
+    /// Which link a connection belongs to.
+    ///
+    /// Only a voter's connection is keyed by its replica. The replica's
+    /// link is the one frames to that voter go out on and the one whose
+    /// lane slot `register` lets a newcomer from the same identity take.
+    /// An observer's or learner's certificate naming the same replica
+    /// would otherwise displace the voter's connection from it. So any
+    /// other role gets a link of its own, keyed by its connection, which
+    /// nothing sends to by replica and nothing else contends for.
     fn link_key(peer: &Peer) -> LinkKey {
-        match (peer.identity.replica, peer.identity.incarnation) {
-            (Some(r), Some(i)) => LinkKey::Replica(r, i),
+        match (
+            peer.identity.role,
+            peer.identity.replica,
+            peer.identity.incarnation,
+        ) {
+            (PeerRole::Voter, Some(r), Some(i)) => LinkKey::Replica(r, i),
             _ => LinkKey::Connection(peer.id),
         }
     }
@@ -953,8 +968,8 @@ impl Shared {
     /// its own connection, and a rule that refused would leave the link
     /// held by a connection that no longer carries anything. That is
     /// also what happens where either identity is absent -- an endpoint
-    /// with no replica of its own, or an API-class peer, whose links are
-    /// per-connection and never collide.
+    /// with no replica of its own, or an API-class or non-voter peer,
+    /// whose links are per-connection and never collide.
     fn survivor(&self, held: &Peer, newcomer: &Peer) -> bool {
         let dialler = |peer: &Peer| {
             if peer.accepted {
@@ -2289,7 +2304,16 @@ async fn negotiate_incoming(
     let bound = match &certs {
         Some(certs) => match shared.binder.bind(certs, &hello) {
             Ok(b) => b,
-            Err(e) => return Err((CloseReason::Rejected(format!("{e:?}")), Some(send))),
+            Err(e) => {
+                // Counted here, on the node that refused it: the peer
+                // learns only the refusal, and until a prepared transition
+                // names a staged learner (task-d39) this one means an
+                // issuer signed what it never should.
+                if e == crate::BindError::NonVoterNamesVoter {
+                    Traffic::add(&shared.traffic.refused_voter_names, 1);
+                }
+                return Err((CloseReason::Rejected(format!("{e:?}")), Some(send)));
+            }
         },
         // Without a certificate only `Client` is admissible: a frontend
         // or Kine collector acts for other principals and must prove
@@ -2546,7 +2570,12 @@ async fn deliver_peer_frame(
         .emit(TransportEvent::PeerFrame {
             connection: peer.id,
             lane: peer.lane,
-            provenance: PeerProvenance::from_transport(replica, incarnation, peer.id.0),
+            provenance: PeerProvenance::from_transport(
+                replica,
+                incarnation,
+                peer.identity.role,
+                peer.id.0,
+            ),
             kind: frame.kind,
             version: frame.version,
             payload: frame.payload,
@@ -2655,7 +2684,12 @@ async fn read_delivery(
                     // under, not anything the frame says.
                     provenance: peer.identity.replica.and_then(|replica| {
                         peer.identity.incarnation.map(|incarnation| {
-                            PeerProvenance::from_transport(replica, incarnation, peer.id.0)
+                            PeerProvenance::from_transport(
+                                replica,
+                                incarnation,
+                                peer.identity.role,
+                                peer.id.0,
+                            )
                         })
                     }),
                     identity: peer.identity.clone(),

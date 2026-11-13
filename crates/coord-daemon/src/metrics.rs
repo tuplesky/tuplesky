@@ -535,6 +535,11 @@ pub struct Cost {
     /// answer, writes and reads apart (task-d97, #191 review).
     #[serde(default)]
     pub answered: Answered,
+    /// What this node's frontend's output gate refused and held, and the
+    /// request records it keeps to authorize what it lets through (#185,
+    /// the withheld gets).
+    #[serde(default)]
+    pub gate: Gate,
     /// Evidence frames this node's collector took for commands it
     /// submitted as answered on the release alone (task-d100, step A;
     /// #204 review): from voters that learned them from the leader's
@@ -936,6 +941,13 @@ pub struct Traffic {
     /// collectors' (task-d70), so its datagrams split into its two planes.
     #[serde(default)]
     pub api: Datagrams,
+    /// Handshakes refused because an observer's or learner's certificate
+    /// named a committed voter's node (design Section 20.4). No legitimate
+    /// peer today: until a prepared transition names a staged learner's
+    /// incarnation (task-d39), above zero means an issuer signed what it
+    /// never should, and an operator has a certificate to revoke.
+    #[serde(default)]
+    pub refused_voter_names: u64,
 }
 
 /// What QUIC sent and received on one class of connections (task-d70).
@@ -1071,6 +1083,24 @@ pub struct Answered {
     /// Current reads.
     #[serde(default)]
     pub reads: Distribution,
+}
+
+/// What a frontend's output gate did with the results it was asked to
+/// disclose (#185), cumulative except where said.
+///
+/// A refusal here is `OUTPUT_WITHHELD`, which a client takes as final: an
+/// executed command whose result its session may not see. Counted on the
+/// node, a run shows refusals without a client to report them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Gate {
+    /// Results withheld: the barrier didn't permit them, or the gate had no
+    /// record of what the request asked.
+    pub denied: u64,
+    /// Results held because this node hadn't yet projected the session
+    /// they were for; the caller is told to ask again.
+    pub deferred: u64,
+    /// Request records the gate kept, as the snapshot found them.
+    pub remembered: u64,
 }
 
 /// The distributions of a command's waits from learned to released on

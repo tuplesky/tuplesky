@@ -4,6 +4,7 @@ use alloc::vec::Vec;
 
 use coord_types::identity::Digest32;
 use coord_types::ids::{LocalJournalSeq, ReplicaId, ReplicaIncarnation};
+use coord_types::wire_v1::PeerRole;
 use serde::{Deserialize, Serialize};
 
 use crate::capability::AdmissionReceipt;
@@ -70,10 +71,16 @@ impl StorageEvent {
 
 /// Transport-issued proof that a frame arrived on an authenticated,
 /// role-bound connection. Only the transport constructs it.
+///
+/// The role is the one the connection was bound in. A replica identity
+/// alone does not say a frame is a voter's: an observer's or a learner's
+/// certificate names a node too, and only a frame bound as a `Voter` is
+/// evidence consensus may count.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PeerProvenance {
     from: ReplicaId,
     incarnation: ReplicaIncarnation,
+    role: PeerRole,
     connection: u64,
 }
 
@@ -86,11 +93,13 @@ impl PeerProvenance {
     pub const fn from_transport(
         from: ReplicaId,
         incarnation: ReplicaIncarnation,
+        role: PeerRole,
         connection: u64,
     ) -> Self {
         PeerProvenance {
             from,
             incarnation,
+            role,
             connection,
         }
     }
@@ -111,6 +120,7 @@ impl PeerProvenance {
         PeerProvenance {
             from,
             incarnation,
+            role: PeerRole::Voter,
             // No connection carried it. Diagnostic only: every rule that
             // matters -- deduplication, quorum counting -- is by voter
             // identity, which is why local evidence can enter the same
@@ -125,6 +135,15 @@ impl PeerProvenance {
     /// Sender incarnation.
     pub const fn incarnation(&self) -> ReplicaIncarnation {
         self.incarnation
+    }
+    /// The role the sender's connection was bound in.
+    pub const fn role(&self) -> PeerRole {
+        self.role
+    }
+    /// Whether the sender was bound as a voter: the one role whose frames
+    /// are evidence.
+    pub const fn is_voter(&self) -> bool {
+        matches!(self.role, PeerRole::Voter)
     }
     /// Connection identity (diagnostic).
     pub const fn connection(&self) -> u64 {

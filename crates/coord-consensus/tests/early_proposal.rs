@@ -312,7 +312,12 @@ fn adopt(leader: &mut Leader, command: CommandId, followers: &[u8]) {
         .expect("initialized");
     for follower in followers {
         leader.step(Event::Peer(AuthenticatedPeerMessage::new(
-            PeerProvenance::from_transport(r(*follower), ReplicaIncarnation::new(1).unwrap(), 1),
+            PeerProvenance::from_transport(
+                r(*follower),
+                ReplicaIncarnation::new(1).unwrap(),
+                coord_types::wire_v1::PeerRole::Voter,
+                1,
+            ),
             ProtocolMessage::SlowAck(SlowAck {
                 replica: r(*follower),
                 ballot: genesis(),

@@ -3,12 +3,20 @@
 //! node-identity URI SAN from the peer's certificate and binds it to the
 //! declared role, subject to committed membership.
 //!
+//! A certificate reaches only the domain it names. A cluster's domains
+//! share its issuer, so the cluster alone doesn't confine one; the
+//! domain is taken from the certificate, and the caller's `Hello` must
+//! name the same one (design Section 11.1).
+//!
 //! Peer access is never voting access. The binder accepts a well-formed
 //! node certificate of the right cluster and domain for any peer role,
 //! but a `Voter` declaration is bound only when the certificate's node
 //! and incarnation are the *current* committed voter: a stale generation,
 //! an unknown node, or a frontend, observer or learner certificate
-//! claiming a voter slot is refused. What ultimately counts a vote is
+//! claiming a voter slot is refused. Nor does a non-voter peer get a
+//! voter's name: an observer or learner certificate whose node is a
+//! committed voter's is refused at any generation, since a peer is known
+//! downstream by its replica identity. What ultimately counts a vote is
 //! consensus over the committed configuration; the binder only ensures a
 //! frame's provenance is an exact, current identity, and a cloned
 //! identity carries the same incarnation so it is deduplicated, never
@@ -106,12 +114,15 @@ impl IdentityBinder for PeerBinder {
     ) -> Result<BoundIdentity, BindError> {
         let leaf = certs.first().ok_or(BindError::NoCertificate)?;
         let identity = node_uri_of(leaf).ok_or(BindError::UnknownCertificate)?;
-        // The certificate's own bindings decide cluster, role and
+        // The certificate's own bindings decide cluster, domain, role and
         // incarnation; the Hello must not claim anything else.
         if identity.cluster != self.cluster || hello.cluster_id != self.cluster {
             return Err(BindError::ClusterMismatch);
         }
-        if hello.domain_id != self.domain {
+        // The domain is the certificate's. A Hello's is only what the
+        // caller says, and a certificate for a sibling domain under the
+        // same issuer would otherwise reach this one by saying it.
+        if identity.domain != self.domain || hello.domain_id != self.domain {
             return Err(BindError::DomainMismatch);
         }
         if hello.role != identity.role {
@@ -144,6 +155,20 @@ impl IdentityBinder for PeerBinder {
             {
                 return Err(BindError::IncarnationMismatch);
             }
+        } else if self
+            .membership
+            .read()
+            .expect("membership lock")
+            .non_voter_names_voter(&identity.node, identity.role)
+        {
+            // An observer or learner is bound by its replica identity too,
+            // and a committed voter's is not one it may hold, at any
+            // generation. Everything downstream that knows a peer by its
+            // replica -- the transport's link to it, the provenance of
+            // its frames -- would otherwise take it for that voter. Its
+            // own reason, since it means the issuer signed what it never
+            // should: the transport counts it where it is refused.
+            return Err(BindError::NonVoterNamesVoter);
         }
         Ok(BoundIdentity {
             role: identity.role,

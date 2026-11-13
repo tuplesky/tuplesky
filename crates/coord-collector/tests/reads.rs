@@ -14,10 +14,11 @@ use coord_collector::{
     MonotonicMillis, ReadAnswerV1, ReadOutcomeV1, ReadRefusal, ReadResolution, codes,
 };
 use coord_consensus::BallotConfiguration;
+use coord_core::event::PeerProvenance;
 use coord_storage::WatchHub;
 use coord_types::ids::{
     Ballot, ClientInstanceId, ClusterId, ConfigurationEpoch, DomainId, KvRevision, NamespaceId,
-    ReplicaId, RequestSequence, SessionId,
+    ReplicaId, ReplicaIncarnation, RequestSequence, SessionId,
 };
 use coord_types::logical_v1::{CanonicalOperation, KeyRange, LogicalRequest, PutOp, RangeOp};
 use coord_types::wire_v1::{
@@ -35,6 +36,16 @@ const WALL: u64 = 1_700_000_000;
 
 fn r(i: u8) -> ReplicaId {
     ReplicaId([i; 16])
+}
+
+/// Replica `i`'s link, bound as `role`.
+fn link(i: u8, role: PeerRole) -> PeerProvenance {
+    PeerProvenance::from_transport(r(i), ReplicaIncarnation::new(1).unwrap(), role, 1)
+}
+
+/// Replica `i`'s voter link.
+fn voter(i: u8) -> PeerProvenance {
+    link(i, PeerRole::Voter)
 }
 
 fn quorum() -> BallotConfiguration {
@@ -201,7 +212,7 @@ fn a_current_read_goes_to_the_leader_and_its_answer_is_delivered() {
         connection, frame, ..
     })) = d.on_read_answer(
         ms(3),
-        r(0),
+        voter(0),
         answer(
             1,
             ReadOutcomeV1::Served {
@@ -222,6 +233,58 @@ fn a_current_read_goes_to_the_leader_and_its_answer_is_delivered() {
     assert_eq!(d.reads_waiting(), 0);
 }
 
+/// A read answer counts only on the leader's voter link (#272 review).
+/// An observer's or learner's link bound under the leader's replica
+/// answers nothing: neither a served result nor a refusal resolves the
+/// read, and it keeps waiting for the leader, whose answer still counts.
+#[test]
+fn a_read_answer_on_a_non_voter_link_answers_nothing() {
+    let mut d = dispatcher();
+    let (command, read) = get(1, "a", 0);
+    let Action::Read(plan) = present(&mut d, 0, 1, &read) else {
+        panic!("not sent to the leader");
+    };
+    assert_eq!(plan.leader, r(0));
+    let forged = || {
+        answer(
+            1,
+            ReadOutcomeV1::Served {
+                response: b"forged".to_vec(),
+            },
+        )
+    };
+    for role in [PeerRole::Observer, PeerRole::Learner] {
+        assert!(
+            d.on_read_answer(ms(1), link(0, role), forged()).is_none(),
+            "a served answer on the leader's {role:?} link counted"
+        );
+        assert!(
+            d.on_read_answer(ms(1), link(0, role), refused(1)).is_none(),
+            "a refusal on the leader's {role:?} link ordered the read"
+        );
+        assert_eq!(d.reads_waiting(), 1);
+        assert!(!d.collector().is_pending(&command));
+    }
+
+    let Some(ReadResolution::Answer(Delivery { frame, .. })) = d.on_read_answer(
+        ms(2),
+        voter(0),
+        answer(
+            1,
+            ReadOutcomeV1::Served {
+                response: b"rows".to_vec(),
+            },
+        ),
+    ) else {
+        panic!("the leader's own answer did not count");
+    };
+    let OutcomeV1::Ok { result, .. } = response(&frame).outcome else {
+        panic!("not served");
+    };
+    assert_eq!(result.as_slice(), b"rows");
+    assert_eq!(d.reads_waiting(), 0);
+}
+
 /// A read that fell back to the ordered path is a command the collector
 /// holds, whether or not a caller is still attached to it. Its caller's
 /// connection closes; the retry, on another connection, attaches to that
@@ -236,7 +299,7 @@ fn a_retry_of_a_read_ordered_and_then_abandoned_attaches_to_the_command() {
         panic!("not sent to the leader");
     };
     let Some(ReadResolution::Ordered(Action::FanOut(_))) =
-        d.on_read_answer(ms(2), r(0), refused(1))
+        d.on_read_answer(ms(2), voter(0), refused(1))
     else {
         panic!("a refusal did not order the read");
     };
@@ -313,7 +376,7 @@ fn another_payload_under_a_waiting_reads_retry_key_is_a_conflict() {
     assert!(!d.collector().is_pending(&command));
     let Some(ReadResolution::Answer(Delivery { connection, .. })) = d.on_read_answer(
         ms(3),
-        r(0),
+        voter(0),
         answer(
             1,
             ReadOutcomeV1::Served {

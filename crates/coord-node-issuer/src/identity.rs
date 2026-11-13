@@ -1,7 +1,8 @@
 //! The node identity a certificate binds, encoded as a `tuplesky:` URI
-//! SAN the transport binder reads (design Sections 10.1, 10.5.1, 20.4).
+//! SAN the transport binder reads (design Sections 10.1, 10.5.1, 11.1,
+//! 20.4).
 
-use coord_types::ids::{ClusterId, ReplicaId, ReplicaIncarnation};
+use coord_types::ids::{ClusterId, DomainId, ReplicaId, ReplicaIncarnation};
 use coord_types::wire_v1::PeerRole;
 
 /// A node's committed identity.
@@ -9,6 +10,13 @@ use coord_types::wire_v1::PeerRole;
 pub struct NodeIdentity {
     /// Cluster.
     pub cluster: ClusterId,
+    /// The one domain the certificate may reach.
+    ///
+    /// A cluster hosts many domains under one issuer, so the cluster
+    /// alone doesn't say which domain's listeners a certificate is for.
+    /// The binder takes the domain from here, never from the caller's
+    /// `Hello` (design Section 11.1).
+    pub domain: DomainId,
     /// Node (replica) identity.
     pub node: ReplicaId,
     /// Key generation / incarnation.
@@ -60,8 +68,9 @@ pub fn role_of(s: &str) -> Option<PeerRole> {
 /// The URI SAN encoding of a node identity.
 pub fn node_uri(identity: &NodeIdentity) -> String {
     format!(
-        "tuplesky://cluster/{}/node/{}/incarnation/{}/role/{}",
+        "tuplesky://cluster/{}/domain/{}/node/{}/incarnation/{}/role/{}",
         hex(&identity.cluster.0),
+        hex(&identity.domain.0),
         hex(&identity.node.0),
         identity.incarnation.get(),
         role_str(identity.role),
@@ -69,21 +78,26 @@ pub fn node_uri(identity: &NodeIdentity) -> String {
 }
 
 /// Parse a node identity URI SAN.
+///
+/// A URI without a domain is not an identity: such a certificate names
+/// no domain it may reach, so it reaches none.
 pub fn parse_node_uri(uri: &str) -> Option<NodeIdentity> {
     let rest = uri.strip_prefix("tuplesky://")?;
     let parts: Vec<&str> = rest.split('/').collect();
-    if parts.len() != 8
+    if parts.len() != 10
         || parts[0] != "cluster"
-        || parts[2] != "node"
-        || parts[4] != "incarnation"
-        || parts[6] != "role"
+        || parts[2] != "domain"
+        || parts[4] != "node"
+        || parts[6] != "incarnation"
+        || parts[8] != "role"
     {
         return None;
     }
     Some(NodeIdentity {
         cluster: ClusterId(unhex(parts[1])?),
-        node: ReplicaId(unhex(parts[3])?),
-        incarnation: ReplicaIncarnation::new(parts[5].parse().ok()?).ok()?,
-        role: role_of(parts[7])?,
+        domain: DomainId(unhex(parts[3])?),
+        node: ReplicaId(unhex(parts[5])?),
+        incarnation: ReplicaIncarnation::new(parts[7].parse().ok()?).ok()?,
+        role: role_of(parts[9])?,
     })
 }

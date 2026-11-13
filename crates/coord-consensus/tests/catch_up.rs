@@ -300,7 +300,12 @@ impl Cluster {
 
     fn deliver(&mut self, to: usize, from: ReplicaId, frame: Vec<u8>) {
         let event = Event::Peer(AuthenticatedPeerMessage::new(
-            PeerProvenance::from_transport(from, ReplicaIncarnation::new(1).unwrap(), 1),
+            PeerProvenance::from_transport(
+                from,
+                ReplicaIncarnation::new(1).unwrap(),
+                coord_types::wire_v1::PeerRole::Voter,
+                1,
+            ),
             frame,
         ));
         let effects = self.nodes[to].step(event);

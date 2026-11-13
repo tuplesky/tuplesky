@@ -2094,6 +2094,11 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             unordered: self.unordered,
             release: release(&voter.node().release_split()),
             answered: self.frontend.answered,
+            gate: coord_daemon::metrics::Gate {
+                denied: self.frontend.frontend.denied,
+                deferred: self.frontend.frontend.deferred,
+                remembered: u64::try_from(self.frontend.frontend.remembered()).unwrap_or(u64::MAX),
+            },
             evidence_for_marked: self
                 .frontend
                 .frontend
@@ -2156,6 +2161,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                         received_frames: t.received_frames,
                         received_bytes: t.received_bytes,
                         received_streams: t.received_streams,
+                        refused_voter_names: t.refused_voter_names,
                         api: coord_daemon::metrics::Datagrams {
                             datagrams_sent: api.datagrams_sent,
                             datagrams_received: api.datagrams_received,
@@ -4727,11 +4733,10 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             KIND_READ_ANSWER => {
                 let now = self.now_millis();
                 let resolved = decode_read_answer(frame).ok().and_then(|answer| {
-                    self.frontend.frontend.dispatcher_mut().on_read_answer(
-                        now,
-                        provenance.from(),
-                        answer,
-                    )
+                    self.frontend
+                        .frontend
+                        .dispatcher_mut()
+                        .on_read_answer(now, provenance, answer)
                 });
                 match resolved {
                     Some(coord_collector::ReadResolution::Answer(delivery)) => Some(delivery),
@@ -4967,13 +4972,14 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             TransportEvent::ApiDelivery {
                 provenance, frame, ..
             } => match provenance {
-                Some(provenance) => {
+                Some(provenance) if provenance.is_voter() => {
                     self.on_frame_from_voter(provenance, &frame);
                     self.send_read_orders(transport);
                 }
                 // A peer holding no replica identity is not a voter, so
-                // what it delivered is not evidence of anything.
-                None => self.frontend.counts.unserved += 1,
+                // what it delivered is not evidence of anything; nor is
+                // an observer's or learner's, whose replica may be any.
+                _ => self.frontend.counts.unserved += 1,
             },
             // A caller's plane carries no protocol traffic.
             TransportEvent::PeerFrame { .. } => {
@@ -5003,6 +5009,14 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                     self.frontend.counts.unserved += 1;
                     return;
                 };
+                // Peer access is never a vote (design Section 10.1): an
+                // observer's or learner's frame is counted and dropped
+                // here, as `Voter::on_peer` would drop it, never read as
+                // the voter its replica names.
+                if !provenance.is_voter() {
+                    self.frontend.counts.unserved += 1;
+                    return;
+                }
                 // The payload as it arrived, not re-framed. A machine
                 // consumes the consensus message itself; the frame
                 // around it is the transport's, and the transport has
@@ -5054,7 +5068,10 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 if let Some(plane) = &mut self.plane {
                     plane.report();
                 }
-                if let (Some(peer), Backing::Voting(voter)) = (identity.replica, &mut self.backing)
+                // Only a voter's link: an observer or learner holds a
+                // link of its own, and what it says is no voter's.
+                if let (Some(peer), Backing::Voting(voter)) =
+                    (linked_voter(&identity), &mut self.backing)
                 {
                     match voter.peer_linked(peer) {
                         Ok(out) => {
@@ -6474,8 +6491,48 @@ fn resolve_retained<V: coord_store_api::OrderedRead>(
 
 impl core::error::Error for TransportError {}
 
+/// The voter a new link is with, if it is a voter's: a connection bound
+/// as a voter, and nothing else. An observer's or learner's link under a
+/// voter's replica is a link of its own (design Section 10.1), so it
+/// neither resets that voter's feature state nor draws this voter's
+/// features (task-d99).
+fn linked_voter(identity: &coord_transport::BoundIdentity) -> Option<ReplicaId> {
+    match identity.role {
+        coord_types::wire_v1::PeerRole::Voter => identity.replica,
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// Only a link bound as a voter is a voter's new link (#272 review):
+    /// one bound as anything else names no voter, whatever replica its
+    /// certificate carries.
+    #[test]
+    fn only_a_link_bound_as_a_voter_is_a_voters_new_link() {
+        use coord_types::ids::{ReplicaId, ReplicaIncarnation};
+        use coord_types::wire_v1::PeerRole;
+        let bound = |role| coord_transport::BoundIdentity {
+            role,
+            replica: Some(ReplicaId([1; 16])),
+            incarnation: Some(ReplicaIncarnation::new(1).unwrap()),
+            capabilities: Vec::new(),
+        };
+        assert_eq!(
+            super::linked_voter(&bound(PeerRole::Voter)),
+            Some(ReplicaId([1; 16]))
+        );
+        for role in [
+            PeerRole::Observer,
+            PeerRole::Learner,
+            PeerRole::Frontend,
+            PeerRole::KineCollector,
+            PeerRole::Client,
+        ] {
+            assert_eq!(super::linked_voter(&bound(role)), None, "{role:?}");
+        }
+    }
+
     /// A round's frames for one collector go to the transport together,
     /// in the order the round made them, and each collector's apart from
     /// every other's (task-d115, lever 4): a release that overtook an
@@ -8344,54 +8401,91 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
             coord_transport::ConnectionId,
             coord_transport::ConnectionId,
         ) {
+            let (api, mut links) = collector_links(1).await;
+            let (far, accepted, dialled) = links.remove(0);
+            (api, far, accepted, dialled)
+        }
+
+        /// This voter's api plane, and `count` collectors' endpoints in
+        /// other processes, each a replica of its own that dialled it as a
+        /// collector link does: the plane, and for each collector its
+        /// endpoint and the link's connection at each end. The first is
+        /// [`FRONTEND`].
+        async fn collector_links(
+            count: u8,
+        ) -> (
+            coord_transport::Transport,
+            Vec<(
+                coord_transport::Transport,
+                coord_transport::ConnectionId,
+                coord_transport::ConnectionId,
+            )>,
+        ) {
             use coord_transport::{Class, Lane, Limits, Transport, TransportEvent};
             use coord_transport_testkit::{TestBinder, TestCa};
 
             let ca = TestCa::new();
             let node = ca.issue("node-1", me(), inc(), PeerRole::Voter);
-            let other = ca.issue(
-                "collector-1",
-                FRONTEND.replica,
-                ReplicaIncarnation::new(1).unwrap(),
-                PeerRole::Frontend,
-            );
+            let others: Vec<_> = (0..count)
+                .map(|n| {
+                    let replica = if n == 0 {
+                        FRONTEND.replica
+                    } else {
+                        let mut id = [0xe0; 16];
+                        id[15] = n;
+                        ReplicaId(id)
+                    };
+                    ca.issue(
+                        &format!("collector-{}", n + 1),
+                        replica,
+                        ReplicaIncarnation::new(1).unwrap(),
+                        PeerRole::Frontend,
+                    )
+                })
+                .collect();
             let mut binder = TestBinder::new(CLUSTER, DOMAIN);
             binder.register(&node);
-            binder.register(&other);
+            for other in &others {
+                binder.register(other);
+            }
             let binder = std::sync::Arc::new(binder);
             let mut local = node.local(&ca, CLUSTER, DOMAIN, vec![1, 2]);
             local.serves = Some(Class::Api);
             let address = "127.0.0.1:0".parse().unwrap();
             let mut api = Transport::bind(address, local, binder.clone(), Limits::default())
                 .expect("the api plane");
-            let far = Transport::bind(
-                address,
-                other.local(&ca, CLUSTER, DOMAIN, vec![1, 2]),
-                binder,
-                Limits::default(),
-            )
-            .expect("the collector's endpoint");
-            let dialled = far
-                .connect(
-                    api.local_addr().unwrap(),
-                    &node.name,
-                    PeerRole::Frontend,
-                    None,
-                    Lane::Unary,
-                    node.expected(),
+            let mut links = Vec::new();
+            for other in &others {
+                let far = Transport::bind(
+                    address,
+                    other.local(&ca, CLUSTER, DOMAIN, vec![1, 2]),
+                    binder.clone(),
+                    Limits::default(),
                 )
-                .await
-                .expect("the collector dialled");
-            let accepted = loop {
-                let event = tokio::time::timeout(Duration::from_secs(5), api.next_event())
+                .expect("the collector's endpoint");
+                let dialled = far
+                    .connect(
+                        api.local_addr().unwrap(),
+                        &node.name,
+                        PeerRole::Frontend,
+                        None,
+                        Lane::Unary,
+                        node.expected(),
+                    )
                     .await
-                    .expect("the dial arrives")
-                    .expect("the api plane is open");
-                if let TransportEvent::Connected { connection, .. } = event {
-                    break connection;
-                }
-            };
-            (api, far, accepted, dialled)
+                    .expect("the collector dialled");
+                let accepted = loop {
+                    let event = tokio::time::timeout(Duration::from_secs(5), api.next_event())
+                        .await
+                        .expect("the dial arrives")
+                        .expect("the api plane is open");
+                    if let TransportEvent::Connected { connection, .. } = event {
+                        break connection;
+                    }
+                };
+                links.push((far, accepted, dialled));
+            }
+            (api, links)
         }
 
         /// What `far` hears from this voter until `enough` says it has
@@ -8543,6 +8637,76 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
             assert_eq!(heard, owed_open);
         }
 
+        /// coordd's own guards on a non-voter's link (#272 review,
+        /// 6849212225). A peer frame, and an api delivery of each kind a
+        /// voter sends a collector -- evidence, a release, a read answer
+        /// -- on a link bound as an observer or a learner is counted
+        /// unserved here and handed to nothing, though the replica it
+        /// names is a voter's. The voter's ballot does not move.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_non_voters_frames_are_counted_unserved_and_reach_nothing() {
+            use coord_collector::wire::{KIND_EVIDENCE, KIND_READ_ANSWER, KIND_RELEASE};
+            use coord_transport::{BoundIdentity, ConnectionId, Lane, TransportEvent};
+            use coord_transport_testkit::bound_provenance;
+
+            let (leader, _handle) = held_leader(Duration::from_secs(3600));
+            let mut domain = domain(leader, collector());
+            let mut api = transport();
+            let ballot = voter(&mut domain).ballot();
+            let named = ReplicaId([2; 16]);
+            for role in [PeerRole::Observer, PeerRole::Learner] {
+                let provenance = bound_provenance(named, inc(), role, 7);
+                let unserved = domain.frontend.counts.unserved;
+                domain.on_peer_plane(
+                    &api,
+                    TransportEvent::PeerFrame {
+                        connection: ConnectionId(7),
+                        lane: Lane::Control,
+                        provenance,
+                        kind: coord_transport::KIND_PEER_EVIDENCE,
+                        version: coord_transport::frames::PEER_EVIDENCE_VERSION,
+                        payload: b"never read".to_vec(),
+                    },
+                );
+                assert_eq!(
+                    domain.frontend.counts.unserved,
+                    unserved + 1,
+                    "a peer frame on a {role:?} link"
+                );
+                for kind in [KIND_EVIDENCE, KIND_RELEASE, KIND_READ_ANSWER] {
+                    let unserved = domain.frontend.counts.unserved;
+                    domain
+                        .on_transport(
+                            &mut api,
+                            TransportEvent::ApiDelivery {
+                                connection: ConnectionId(8),
+                                lane: Lane::Unary,
+                                identity: BoundIdentity {
+                                    role,
+                                    replica: Some(named),
+                                    incarnation: Some(inc()),
+                                    capabilities: Vec::new(),
+                                },
+                                provenance: Some(provenance),
+                                frame: coord_types::wire_v1::Frame {
+                                    kind,
+                                    version: 1,
+                                    payload: b"never read".to_vec(),
+                                },
+                            },
+                            &|| 0,
+                        )
+                        .await;
+                    assert_eq!(
+                        domain.frontend.counts.unserved,
+                        unserved + 1,
+                        "a delivery of kind {kind:#06x} on a {role:?} link"
+                    );
+                }
+            }
+            assert_eq!(voter(&mut domain).ballot(), ballot);
+        }
+
         /// The loop wakes when a held projection commit is due, and the
         /// turn it takes then lends it (task-d86): on a quiet domain
         /// nothing else arrives, so these two are what bound a record's
@@ -8641,6 +8805,29 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
             );
         }
 
+        /// A current read of `k` a collector sends on its link (task-d50).
+        fn current_read(sequence: u64) -> Vec<u8> {
+            let mut logical = LogicalRequest::new(
+                NS,
+                CanonicalOperation::Range(coord_types::logical_v1::RangeOp {
+                    range: coord_types::logical_v1::KeyRange {
+                        key: b"k".to_vec(),
+                        range_end: None,
+                    },
+                    revision: None,
+                    limit: 1,
+                    keys_only: false,
+                    count_only: false,
+                }),
+            );
+            logical.canonicalize();
+            coord_collector::wire::read_frame(&coord_collector::wire::ReadV1 {
+                ballot: ballot(),
+                request: RequestV1::new(retry_key(sequence), &logical, 0, 0).unwrap(),
+            })
+            .expect("a read")
+        }
+
         /// A collector's submission, as its link carries it.
         fn submission(collector: &mut Collector, sequence: u64) -> Vec<u8> {
             let Submitted::FanOut(fan_out) = collector
@@ -8737,6 +8924,98 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
             assert_eq!(heard, sent);
         }
 
+        /// What the loop holds goes at its bound on a loop that never runs
+        /// out of events (#265 review). There the idle hand-off never
+        /// fires, and the bound is the only release. The test above holds
+        /// the bound's count: with the bound taken out, that pass's idle
+        /// hand-off still delivers. Here nothing else would until the loop
+        /// ran dry.
+        ///
+        /// Fifteen collectors in other processes queue reads on their
+        /// links, far more than the loop takes within the bound. A round's
+        /// frames for another collector are held past the bound, and the
+        /// loop runs. The collector
+        /// hears every frame while reads are still waiting, and the loop
+        /// never once ran out of events.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn what_the_loop_holds_goes_at_its_bound_while_events_keep_arriving() {
+            // A collector link keeps at most 64 requests in flight (its
+            // lane's streams), so the reads come from fifteen collectors:
+            // 960 in all, under the api plane's event queue (1,024 a lane),
+            // so every one waits there before the loop starts.
+            const SENDERS: u8 = 15;
+            const READS: u64 = 64;
+            let (mut api, mut links) = collector_links(1 + SENDERS).await;
+            let (mut far, accepted, _) = links.remove(0);
+            let (mut leader, _handle) = held_leader(Duration::from_secs(3600));
+            let mut collector = collector();
+            let frames = execute_from(
+                &mut leader,
+                &mut collector,
+                1,
+                Origin::Connection(accepted.0),
+            );
+            let provenance = leader.provenance();
+            let mut domain = domain(leader, collector);
+            // Sent before this thread holds anything back.
+            for (n, (sender, _, link)) in links.iter().enumerate() {
+                for sequence in 0..READS {
+                    sender
+                        .send(
+                            coord_transport::Destination::Connection(*link),
+                            DOMAIN,
+                            current_read(1_000 * (n as u64 + 1) + sequence),
+                        )
+                        .expect("a collector's read");
+                }
+            }
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !api.has_event() {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("the reads arrive");
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let hold = coord_transport::WakeHold::new();
+            domain.carry(
+                &api,
+                coord_daemon::Outbound {
+                    frontend: frames.clone(),
+                    ..Default::default()
+                },
+                provenance,
+            );
+            let held = hold.held_since().expect("the round's frames are held");
+            tokio::time::sleep(2 * super::super::HAND_OFF_WITHIN).await;
+            assert_eq!(hold.held_since(), Some(held), "nothing let them go");
+            let sent: Vec<_> = frames.iter().map(|bytes| frame(bytes)).collect();
+            let clock = || {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs())
+            };
+            // The loop's future is not checked at each pending here: a loop
+            // that never runs out of events yields only to tokio's budget,
+            // and may hold work then, for at most the bound.
+            let heard = tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::select! {
+                    biased;
+                    heard = hear_until(&mut far, |heard| sent.iter().all(|f| heard.contains(f))) => heard,
+                    () = domain.serve(&mut api, clock, &hold) => panic!("the loop stopped"),
+                }
+            })
+            .await
+            .expect("heard in time");
+            assert!(
+                api.has_event(),
+                "the collector heard the frames only once the reads ran out"
+            );
+            assert_eq!(domain.hand_offs.idle, 0, "{:?}", domain.hand_offs);
+            assert!(domain.hand_offs.bound > 0, "{:?}", domain.hand_offs);
+            assert!(sent.iter().all(|f| heard.contains(f)));
+        }
+
         /// Evidence routed out of the parked set reaches the collector it
         /// belongs to (#262 review). A voter holds evidence for a command
         /// whose submitter it does not know yet, and routes it once a
@@ -8797,27 +9076,12 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
             let (mut api, mut far, _, link) = collector_link().await;
             let (leader, _handle) = held_leader(Duration::from_secs(3600));
             let mut domain = domain(leader, collector());
-            let mut logical = LogicalRequest::new(
-                NS,
-                CanonicalOperation::Range(coord_types::logical_v1::RangeOp {
-                    range: coord_types::logical_v1::KeyRange {
-                        key: b"k".to_vec(),
-                        range_end: None,
-                    },
-                    revision: None,
-                    limit: 1,
-                    keys_only: false,
-                    count_only: false,
-                }),
-            );
-            logical.canonicalize();
-            let read = coord_collector::wire::read_frame(&coord_collector::wire::ReadV1 {
-                ballot: ballot(),
-                request: RequestV1::new(retry_key(1), &logical, 0, 0).unwrap(),
-            })
-            .expect("a read");
-            far.send(coord_transport::Destination::Connection(link), DOMAIN, read)
-                .expect("the collector's read");
+            far.send(
+                coord_transport::Destination::Connection(link),
+                DOMAIN,
+                current_read(1),
+            )
+            .expect("the collector's read");
             let hold = coord_transport::WakeHold::new();
             let (heard, _) = serve_until(
                 &mut domain,

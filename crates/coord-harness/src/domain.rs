@@ -704,8 +704,16 @@ pub fn provision(plan: &Plan) -> std::io::Result<Provisioned> {
         // it dials the others. One key per certificate, issued once, so
         // the key the genesis below commits is the key this leaf holds.
         let issue = |role| match voter_reach.get(usize::from(n) - 1) {
-            None => ca.issue_node(SERVER_NAME, cluster, node, incarnation, role),
-            Some(at) => ca.issue_node_at(SERVER_NAME, cluster, node, incarnation, role, at.clone()),
+            None => ca.issue_node(SERVER_NAME, cluster, domain, node, incarnation, role),
+            Some(at) => ca.issue_node_at(
+                SERVER_NAME,
+                cluster,
+                domain,
+                node,
+                incarnation,
+                role,
+                at.clone(),
+            ),
         };
         let issued = issue(PeerRole::Voter);
         voter_keys.push(issued.spki());
@@ -855,7 +863,7 @@ pub fn provision(plan: &Plan) -> std::io::Result<Provisioned> {
     // if the authority outlives provisioning.
     let caller_certificate = dir.join("caller.pem");
     let caller_key = dir.join("caller.key");
-    issue_caller(&ca, cluster, 0).write(&caller_certificate, &caller_key)?;
+    issue_caller(&ca, cluster, domain, 0).write(&caller_certificate, &caller_key)?;
     let authority_key = dir.join("domain-ca.key");
     std::fs::write(&authority_key, coord_sts::keys::b64url(&ca.signing_key()))?;
     restrict(&authority_key)?;
@@ -901,14 +909,16 @@ pub fn provision(plan: &Plan) -> std::io::Result<Provisioned> {
     Ok(provisioned)
 }
 
-/// One caller credential. `ordinal` distinguishes concurrent callers:
-/// each is a different client identity, as separate processes would be.
-pub fn issue_caller(ca: &Ca, cluster: ClusterId, ordinal: u16) -> Issued {
+/// One caller credential for `domain`. `ordinal` distinguishes concurrent
+/// callers: each is a different client identity, as separate processes
+/// would be.
+pub fn issue_caller(ca: &Ca, cluster: ClusterId, domain: DomainId, ordinal: u16) -> Issued {
     let mut node = [0x0c; 16];
     node[14..].copy_from_slice(&ordinal.to_be_bytes());
     ca.issue_node(
         "caller.tuplesky.harness",
         cluster,
+        domain,
         ReplicaId(node),
         ReplicaIncarnation::new(1).expect("one is positive"),
         PeerRole::Client,

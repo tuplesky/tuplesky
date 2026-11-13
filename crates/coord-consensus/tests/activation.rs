@@ -561,7 +561,12 @@ impl Cluster {
             out.remove(&command);
         }
         let event = Event::Peer(AuthenticatedPeerMessage::new(
-            PeerProvenance::from_transport(from, ReplicaIncarnation::new(1).unwrap(), 1),
+            PeerProvenance::from_transport(
+                from,
+                ReplicaIncarnation::new(1).unwrap(),
+                coord_types::wire_v1::PeerRole::Voter,
+                1,
+            ),
             frame,
         ));
         let effects = self.nodes[to].step(event);
@@ -2634,7 +2639,12 @@ fn payload_rows(
 /// An authenticated peer message.
 fn peer_event(from: ReplicaId, message: ProtocolMessage) -> Event {
     Event::Peer(AuthenticatedPeerMessage::new(
-        PeerProvenance::from_transport(from, ReplicaIncarnation::new(1).unwrap(), 1),
+        PeerProvenance::from_transport(
+            from,
+            ReplicaIncarnation::new(1).unwrap(),
+            coord_types::wire_v1::PeerRole::Voter,
+            1,
+        ),
         message.encode(),
     ))
 }
