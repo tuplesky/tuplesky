@@ -811,6 +811,15 @@ pub struct Follower {
     /// no room. Each such command's payload is fetched, if it is wanted
     /// (#224 review).
     relayed_not_taken: u64,
+    /// While a proposal frame's entries are taken, once the frame has
+    /// made a full learning pass: the commands an entry has since given a
+    /// vote or adopted. `None` makes the next pass a full one, as it is
+    /// outside a frame. See [`Follower::learn`] (lever 2, step 1).
+    learn_touched: Option<Vec<CommandId>>,
+    /// Whether a proposal frame's entries are being taken.
+    taking_frame: bool,
+    /// Learning passes made and passed over (lever 2, step 1).
+    learn_passes: LearnPasses,
 }
 
 /// What a follower did with the payloads relayed proposals carried
@@ -836,6 +845,18 @@ impl RelayTaken {
         self.known = self.known.saturating_add(other.known);
         self.not_taken = self.not_taken.saturating_add(other.not_taken);
     }
+}
+
+/// A follower's learning passes (lever 2, step 1): the passes made over
+/// every accepted command, and the ones a proposal frame passed over
+/// because no entry since the frame's last pass gave a vote or adopted a
+/// command that pass could commit.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LearnPasses {
+    /// Passes made over every accepted command.
+    pub full: u64,
+    /// Passes a frame passed over.
+    pub skipped: u64,
 }
 
 /// The retry-key bindings a restart restores from the payload rows
@@ -971,6 +992,9 @@ impl Follower {
             frames_taken: 0,
             relayed_known: 0,
             relayed_not_taken: 0,
+            learn_touched: None,
+            taking_frame: false,
+            learn_passes: LearnPasses::default(),
             catch_up: CatchUp::default(),
             diverged: None,
             config,
@@ -1283,6 +1307,9 @@ impl Follower {
             frames_taken: 0,
             relayed_known: 0,
             relayed_not_taken: 0,
+            learn_touched: None,
+            taking_frame: false,
+            learn_passes: LearnPasses::default(),
             catch_up: CatchUp::default(),
             diverged: None,
         }
@@ -1832,6 +1859,10 @@ impl Follower {
     ) -> Vec<Effect> {
         self.frames_taken = self.frames_taken.saturating_add(1);
         let mut effects = Vec::new();
+        // Learning once a frame (lever 2, step 1): see `learn`. The
+        // frame's first pass is a full one.
+        self.learn_touched = None;
+        self.taking_frame = true;
         for entry in proposals {
             let (vote, payload) = entry.into_vote(replica, ballot);
             effects.extend(match payload {
@@ -1839,7 +1870,14 @@ impl Follower {
                 None => self.on_proposal(from, vote),
             });
         }
+        self.taking_frame = false;
+        self.learn_touched = None;
         effects
+    }
+
+    /// This follower's learning passes (lever 2, step 1).
+    pub const fn learn_passes(&self) -> LearnPasses {
+        self.learn_passes
     }
 
     /// Proposal frames this follower took (task-d102).
@@ -4680,14 +4718,88 @@ impl Follower {
             .chain(self.rebinds.iter().filter(|c| self.awaits_rebind(c)))
     }
 
+    /// Commit what this replica has learned: what its votes decide
+    /// ([`Learner::commit_learned`]) and what it adopted up to the
+    /// leader's commit frontier ([`Follower::commit_through_leader`]),
+    /// until neither commits more.
+    ///
+    /// Each entry of a proposal frame ends in a pass, and a pass walks
+    /// every accepted command twice. Within a frame, once the frame has
+    /// made one full pass, a pass is made only if a command an entry has
+    /// since given a vote or adopted is one it would commit now
+    /// ([`Follower::learnable`]); otherwise it is passed over, as one
+    /// that would commit nothing (lever 2, step 1). That holds because
+    /// the full pass left no accepted command it could commit, and an
+    /// entry changes what a pass reads only for those commands:
+    /// - it adds the leader's proposal to its command's votes, and adopts
+    ///   held proposals, at ACCEPT, with an adoption not yet durable;
+    /// - it commits nothing, marks no adoption durable and moves no
+    ///   frontier, so no other command's dependencies become committed,
+    ///   and an adoption at ACCEPT doesn't let a dependent commit;
+    /// - the rest it changes (holds, placeholders, payloads taken, paths)
+    ///   is below ACCEPT or not read by a pass.
+    ///
+    /// So a pass passed over would have committed nothing, and every
+    /// state the frame passes through is the one taking each entry with
+    /// a full pass leaves. Debug builds check each pass passed over
+    /// against every accepted command.
     fn learn(&mut self) {
+        if let Some(mut touched) = self.learn_touched.take()
+            && !touched.iter().any(|c| self.learnable(c))
+        {
+            debug_assert!(
+                !self.table.in_accept().iter().any(|c| self.learnable(c)),
+                "a learning pass passed over would have committed"
+            );
+            self.learn_passes.skipped = self.learn_passes.skipped.saturating_add(1);
+            touched.clear();
+            self.learn_touched = Some(touched);
+            return;
+        }
+        self.learn_passes.full = self.learn_passes.full.saturating_add(1);
         loop {
             let learned = self
                 .learner
                 .commit_learned(&mut self.table, |c| self.votes.get(c));
             if !self.commit_through_leader() && learned.is_empty() {
-                return;
+                break;
             }
+        }
+        if self.taking_frame {
+            self.learn_touched = Some(Vec::new());
+        }
+    }
+
+    /// Whether a learning pass would commit `command` now, on its first
+    /// walk: at ACCEPT, every dependency committed, and decided by its
+    /// votes or adopted durably at or below the leader's commit frontier
+    /// (lever 2, step 1).
+    fn learnable(&self, command: &CommandId) -> bool {
+        let Some(record) = self.table.record(command) else {
+            return false;
+        };
+        if record.phase != Phase::Accept {
+            return false;
+        }
+        let by_votes = self
+            .votes
+            .get(command)
+            .is_some_and(|v| match self.learner.mode() {
+                LearningMode::Full => v.learned_by().is_some(),
+                LearningMode::SlowOnly => v.learned_slow_by().is_some(),
+            });
+        let by_frontier = self.leader_committed.is_some_and(|through| {
+            matches!(self.adopted.get(command), Some((seqnum, true)) if *seqnum <= through)
+        });
+        (by_votes || by_frontier)
+            && crate::phase::guard_commit(&record.deps, |d| self.table.phase_of(d)).is_ok()
+    }
+
+    /// Note that `command` was given a vote or adopted, for a frame's
+    /// next learning pass (see [`Follower::learn`]).
+    fn touch_learning(&mut self, command: CommandId) {
+        if let Some(touched) = self.learn_touched.as_mut() {
+            touched.push(command);
         }
     }
 
@@ -5785,6 +5897,7 @@ impl Follower {
                 let _ = set.add(Vote::Fast(proposal.clone()));
                 self.votes.insert(command, set);
             }
+            self.touch_learning(command);
         }
         self.held.insert(command, HeldProposal { proposal });
         // Nothing is held before this, so nothing waits on a change the
@@ -6171,6 +6284,7 @@ impl Follower {
                 self.sync_demoted.retain(|c| *c != command);
                 self.adopted
                     .insert(command, (held.proposal.seqnum.unwrap_or(u64::MAX), false));
+                self.touch_learning(command);
                 self.note_lacking(command);
                 let epoch = self.config.identity.epoch;
                 let record = self.table.record(&command).expect("adopted").clone();

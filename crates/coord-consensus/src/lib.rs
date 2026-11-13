@@ -156,7 +156,7 @@ pub use floor::{
 };
 pub use follower::{
     COMMIT_ROWS_BATCH_BYTES, COMMIT_ROWS_BATCH_UPDATES, Follower, FollowerConfig,
-    FollowerRejection, HELD_PROPOSAL_SLACK, HeldProposal, RelayTaken,
+    FollowerRejection, HELD_PROPOSAL_SLACK, HeldProposal, LearnPasses, RelayTaken,
 };
 pub use graph::{
     Closure, ClosureCursor, ClosureProgress, PathLog, Position, anchored_path, chain,

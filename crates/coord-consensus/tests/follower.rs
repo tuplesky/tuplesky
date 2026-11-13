@@ -2215,6 +2215,122 @@ fn a_refused_entry_leaves_the_frames_others_as_they_are() {
     assert_eq!(f.table().phase_of(&c2), Some(Phase::Accept));
 }
 
+/// A chain of relayed proposals for `seqs`, each depending on the one
+/// before it, as a leader whose table saw them in that order proposes
+/// them.
+fn relayed_chain(seqs: &[u64]) -> (Vec<ProtocolMessage>, Vec<CommandId>) {
+    let mut leader_view = coord_consensus::CommandTable::new();
+    let mut entries = Vec::new();
+    let mut commands: Vec<CommandId> = Vec::new();
+    for (i, seq) in seqs.iter().enumerate() {
+        let (payload, c) = relayed_payload(*seq, *seq as u8, *seq as u8);
+        let l = leader_view
+            .initialize(c, c.0, vec![CONSERVATIVE_KEY.to_vec()])
+            .unwrap();
+        let deps = commands.last().copied().into_iter().collect();
+        entries.push(relayed(
+            proposal(c, deps, i as u64, l.paths, l.path),
+            payload,
+        ));
+        commands.push(c);
+    }
+    (entries, commands)
+}
+
+/// Lever 2, step 1: a frame's entries share its learning passes. The
+/// frame makes one full pass, at its first entry, and passes over the
+/// others, after which nothing could be committed; taken one at a time,
+/// each entry makes its own. The frame leaves the same table and the same
+/// effects either way.
+#[test]
+fn a_frame_makes_one_full_learning_pass() {
+    let (entries, commands) = relayed_chain(&[1, 2, 3, 4, 5, 6, 7, 8]);
+    let n = entries.len() as u64;
+    let mut f = booted(1);
+    let before = f.learn_passes();
+    let framed_effects = f.step(peer(0, framed(entries.clone())));
+    let after = f.learn_passes();
+    let mut g = booted(1);
+    let g_before = g.learn_passes();
+    let mut one_at_a_time = Vec::new();
+    for entry in entries {
+        one_at_a_time.extend(g.step(peer(0, entry)));
+    }
+    let g_after = g.learn_passes();
+    assert_eq!(after.full - before.full, 1, "one full pass for the frame");
+    assert_eq!(
+        after.skipped - before.skipped,
+        n - 1,
+        "the others passed over"
+    );
+    assert_eq!(g_after.full - g_before.full, n, "one full pass an entry");
+    assert_eq!(g_after.skipped, g_before.skipped);
+    assert_eq!(framed_effects, one_at_a_time, "the same batches, in order");
+    for c in &commands {
+        assert_eq!(f.table().record(c), g.table().record(c));
+        assert_eq!(f.table().phase_of(c), Some(Phase::Accept));
+    }
+    assert_eq!(f.take_rejections(), g.take_rejections());
+}
+
+/// Lever 2, step 1: a pass a frame's entry needs is made. The follower
+/// took c1's submission and its own fast vote is durable, so the leader's
+/// proposal of c1 decides it here: the entry's pass commits it, before
+/// the next entry, which depends on it, is taken -- as taking the entries
+/// one at a time does. The entry after it can commit nothing, and its
+/// pass is passed over.
+#[test]
+fn a_frame_commits_what_an_entry_decides_before_its_next_entry() {
+    let (e1, c1) = admitted(1, 1, 1);
+    let mut leader_view = coord_consensus::CommandTable::new();
+    let l1 = leader_view
+        .initialize(c1, c1.0, vec![CONSERVATIVE_KEY.to_vec()])
+        .unwrap();
+    let (p0, c0) = relayed_payload(2, 2, 2);
+    let l0 = leader_view
+        .initialize(c0, c0.0, vec![CONSERVATIVE_KEY.to_vec()])
+        .unwrap();
+    let (p2, c2) = relayed_payload(3, 3, 3);
+    let l2 = leader_view
+        .initialize(c2, c2.0, vec![CONSERVATIVE_KEY.to_vec()])
+        .unwrap();
+    let (p1, same) = relayed_payload(1, 1, 1);
+    assert_eq!(same, c1);
+    let entries = vec![
+        relayed(proposal(c0, vec![], 0, l0.paths, l0.path), p0),
+        relayed(proposal(c1, vec![], 1, l1.paths, l1.path), p1),
+        relayed(proposal(c2, vec![c1], 2, l2.paths, l2.path), p2),
+    ];
+    let mut f = booted(1);
+    let mut g = booted(1);
+    for m in [&mut f, &mut g] {
+        let votes = m.step(e1.clone());
+        for event in durable_of(&votes, 1) {
+            m.step(event);
+        }
+    }
+    let before = f.learn_passes();
+    let framed_effects = f.step(peer(0, framed(entries.clone())));
+    let after = f.learn_passes();
+    let mut one_at_a_time = Vec::new();
+    for entry in entries {
+        one_at_a_time.extend(g.step(peer(0, entry)));
+    }
+    assert_eq!(f.table().phase_of(&c1), Some(Phase::Commit), "decided here");
+    assert_eq!(f.table().phase_of(&c0), Some(Phase::Accept));
+    assert_eq!(f.table().phase_of(&c2), Some(Phase::Accept));
+    assert_eq!(
+        (after.full - before.full, after.skipped - before.skipped),
+        (2, 1),
+        "the frame's first pass, c1's, and c2's passed over"
+    );
+    assert_eq!(framed_effects, one_at_a_time, "the same batches, in order");
+    for c in [c0, c1, c2] {
+        assert_eq!(f.table().record(&c), g.table().record(&c));
+    }
+    assert_eq!(f.take_rejections(), g.take_rejections());
+}
+
 /// task-d102: a proposal held for want of its payload -- a plain copy
 /// arrived first -- is adopted when a relayed copy brings the payload,
 /// though that copy is a duplicate of one held. Found by the frames sweep
