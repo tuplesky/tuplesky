@@ -33,7 +33,7 @@ use coord_core::event::{StorageError, StorageEvent};
 use coord_state::KvEvent;
 use coord_store_api::engine::{CollectionId, OrderedRead, RowPage, ScanRequest, SnapshotSource};
 
-use crate::cut::{CutOverlay, RecoveryCut};
+use crate::cut::{CutOverlay, LayeredOverlay, RecoveryCut};
 use crate::lowering::ExecutionFrontier;
 use crate::materialize::{
     ApplyOutcome, Pending, Submitted, apply_plan_sharing, apply_refused_plan_sharing, prepare,
@@ -205,13 +205,13 @@ struct InFlight {
 /// Commands applied as one group: planned one after another, each over
 /// what the ones before it wrote, and lowered together (task-d47).
 struct Group<V> {
-    /// Every row the group's batches write, in order, a later write of a
-    /// key winning: what a command planned after them reads through. On
-    /// a pipelined store it starts from the rows of the groups still in
-    /// flight (task-d52).
-    overlay: Arc<CutOverlay>,
-    /// The rows the group's own batches write, without those of the
-    /// groups in flight before it (task-d52).
+    /// On a pipelined store, the rows of the groups still in flight when
+    /// it began, each group's own, oldest first (task-d52). A command
+    /// planned in the group reads through them and then `own`, as layers:
+    /// none is copied into another (#185, lead 17:43, the commit cadence).
+    below: Vec<Arc<CutOverlay>>,
+    /// Every row the group's own batches write, in order, a later write of
+    /// a key winning (task-d52).
     own: Arc<CutOverlay>,
     /// Barriers of the group's batches.
     barriers: BTreeSet<BarrierId>,
@@ -230,8 +230,8 @@ struct Group<V> {
     ///
     /// A later snapshot would read the same. A plan reads only what
     /// applications write. While the group is open, those are its own
-    /// batches and the groups in flight when it began, and `overlay`
-    /// holds both. The groups in flight may commit meanwhile; a snapshot
+    /// batches and the groups in flight when it began, and `below` and
+    /// `own` hold both. The groups in flight may commit meanwhile; a snapshot
     /// that holds them reads the same, as at [`Applier::begin_group`].
     /// Nothing else applies a command until the group is lowered or
     /// handed off, and that drops the snapshot.
@@ -241,7 +241,7 @@ struct Group<V> {
 impl<V> Default for Group<V> {
     fn default() -> Self {
         Group {
-            overlay: Arc::default(),
+            below: Vec::new(),
             own: Arc::default(),
             barriers: BTreeSet::new(),
             unjournaled: BTreeSet::new(),
@@ -270,12 +270,12 @@ type Snapshot<P> = <<P as Persistence>::Reader as SnapshotSource>::View;
 /// What a command is planned against: the projection's snapshot, with a
 /// group's own unmaterialized writes over it.
 type PlanningView<'a, P> =
-    GatedView<RecoveryCut<PlanningSnapshot<'a, Snapshot<P>>, Arc<CutOverlay>>>;
+    GatedView<RecoveryCut<PlanningSnapshot<'a, Snapshot<P>>, LayeredOverlay>>;
 
 /// What a read held at the barrier is planned against
 /// ([`Applier::read_view`]): the projection's snapshot, with the rows of
 /// the journaled groups in flight above it laid over it.
-pub type ReadView<P> = GatedView<RecoveryCut<Snapshot<P>, Arc<CutOverlay>>>;
+pub type ReadView<P> = GatedView<RecoveryCut<Snapshot<P>, LayeredOverlay>>;
 
 /// The snapshot under a command's plan: its own outside a group, or the
 /// one its group pinned (task-d115).
@@ -418,14 +418,13 @@ impl<P: Persistence> Applier<P> {
             // so a command planned now reads through their rows as well,
             // oldest first. A snapshot that already holds some of them
             // reads the same: those rows are the ones it holds, and every
-            // later write is laid over them again.
-            if !self.inflight.is_empty() {
-                let mut overlay = CutOverlay::new();
-                for flight in &self.inflight {
-                    overlay.absorb(&flight.own);
-                }
-                group.overlay = Arc::new(overlay);
-            }
+            // later write is laid over them again. Each group's rows are
+            // laid as they are, shared, not copied into one overlay.
+            group.below = self
+                .inflight
+                .iter()
+                .map(|flight| Arc::clone(&flight.own))
+                .collect();
             self.group = Some(group);
         }
         self.group.is_some()
@@ -750,25 +749,14 @@ impl<P: Persistence> Applier<P> {
         let (view, meta, gate) = self.store.reader().snapshot()?.into_parts();
         let committed = meta.frontier.execution_position;
         let mut through = committed;
-        let mut laid: Vec<&Arc<CutOverlay>> = Vec::new();
+        let mut overlay = LayeredOverlay::default();
         for flight in self.inflight.iter().filter(|f| f.position > committed) {
             if !flight.unjournaled.is_empty() {
                 break;
             }
-            laid.push(&flight.own);
+            overlay.push(Arc::clone(&flight.own));
             through = flight.position;
         }
-        let overlay = match laid.as_slice() {
-            [] => Arc::new(CutOverlay::new()),
-            [one] => Arc::clone(one),
-            many => {
-                let mut overlay = CutOverlay::new();
-                for own in many {
-                    overlay.absorb(own);
-                }
-                Arc::new(overlay)
-            }
-        };
         let mut reaches = meta;
         reaches.frontier.execution_position = through;
         let snapshot = GatedView::with_gate(view, meta, gate.clone());
@@ -870,7 +858,7 @@ impl<P: Persistence> Applier<P> {
             let durable = meta.stamp.journal_seq();
             let snapshot = GatedView::with_gate(PlanningSnapshot::Own(view), meta, gate.clone());
             return Ok(GatedView::with_gate(
-                RecoveryCut::new(snapshot, Arc::new(CutOverlay::new()), durable),
+                RecoveryCut::new(snapshot, LayeredOverlay::default(), durable),
                 meta,
                 gate,
             ));
@@ -896,7 +884,13 @@ impl<P: Persistence> Applier<P> {
         Ok(GatedView::with_gate(
             RecoveryCut::new(
                 snapshot,
-                group.overlay.clone(),
+                LayeredOverlay::new(
+                    group
+                        .below
+                        .iter()
+                        .cloned()
+                        .chain(std::iter::once(Arc::clone(&group.own))),
+                ),
                 snapshot_meta.stamp.journal_seq(),
             ),
             meta,
@@ -955,7 +949,6 @@ impl<P: Persistence> Applier<P> {
         match crate::materialize::submit(&mut self.store, batch, kind)? {
             Submitted::Accepted => {
                 let group = self.group.as_mut().expect("checked above");
-                Arc::make_mut(&mut group.overlay).extend(&updates);
                 Arc::make_mut(&mut group.own).extend(&updates);
                 group.barriers.insert(barrier);
                 group.unjournaled.insert(barrier);
