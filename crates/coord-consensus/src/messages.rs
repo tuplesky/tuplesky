@@ -605,7 +605,25 @@ impl ProtocolMessage {
         }
         Ok(m)
     }
+
+    /// Whether `bytes` would decode as a [`ProtocolMessage::ProposalFrame`]
+    /// if it decodes at all, read from its first byte without decoding it
+    /// (cost pass row 11).
+    ///
+    /// Postcard writes the variant index first, as a varint, and an index
+    /// below 128 is that one byte. So bytes that start with the frame's
+    /// index decode as a frame or not at all, and bytes that start with
+    /// any other byte never decode as one. A runtime that acts on some
+    /// kinds itself before its machine does can leave a frame undecoded
+    /// for the machine, which decodes it once.
+    pub fn is_proposal_frame(bytes: &[u8]) -> bool {
+        bytes.first() == Some(&PROPOSAL_FRAME_INDEX)
+    }
 }
+
+/// [`ProtocolMessage::ProposalFrame`]'s variant index, which is its
+/// encoding's first byte. The variants are only ever appended, so it stays.
+const PROPOSAL_FRAME_INDEX: u8 = 28;
 
 #[cfg(test)]
 mod tests {
@@ -756,6 +774,15 @@ mod tests {
         assert_eq!(ProtocolMessage::decode(&framed).as_ref(), Ok(&frame));
         assert_eq!(frame.command(), None, "a frame is about more than one");
         assert!(ProtocolMessage::decode(&[held[0] + 3]).is_err());
+
+        // A frame is told from its first byte (cost pass row 11), and
+        // nothing that starts with another byte is one.
+        assert_eq!(framed[0], PROPOSAL_FRAME_INDEX);
+        assert!(ProtocolMessage::is_proposal_frame(&framed));
+        for other in [&bytes, &proposal, &held] {
+            assert!(!ProtocolMessage::is_proposal_frame(other));
+        }
+        assert!(!ProtocolMessage::is_proposal_frame(&[]));
     }
 
     /// A frame's entry is the proposal it stands for: back from the

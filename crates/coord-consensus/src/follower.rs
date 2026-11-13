@@ -5292,10 +5292,18 @@ impl Follower {
             self.rejections.push(FollowerRejection::MalformedRequest);
             return Vec::new();
         }
-        let Ok(command) = CommandId::derive(&retry_key, &request) else {
+        // The bytes are taken only as the canonical encoding of the request
+        // they decode to, as the frontend and the leader's `propose` take
+        // them (`RequestV1::logical`). A decode alone takes more: a varint
+        // written long decodes to the same request. The payload is held as
+        // these bytes, and relayed as them if this replica leads, and a
+        // follower takes relayed bytes only as the digest of the encoding
+        // its command names (`take_relayed_payload`).
+        if request.canonical_bytes().ok().as_deref() != Some(logical.as_slice()) {
             self.rejections.push(FollowerRejection::MalformedRequest);
             return Vec::new();
-        };
+        }
+        let command = CommandId::from_canonical(&retry_key, &logical);
         self.admitted = Some(command);
         if self.mark_next_admitted {
             self.answer_on_release.insert(command);
@@ -5584,11 +5592,26 @@ impl Follower {
     /// `on_relayed_proposal`). Returns whether it took it.
     fn take_relayed_payload(&mut self, proposal: &FastAck, payload: PayloadRecordV1) -> bool {
         let command = proposal.command;
-        let identity =
-            postcard::from_bytes::<coord_types::logical_v1::LogicalRequest>(&payload.logical)
+        // The payload's identity is the digest of its retry key and its
+        // logical bytes as they came, not of a decode encoded again (cost
+        // pass row 16). Every command's identity is derived from bytes
+        // checked to be a valid request's canonical encoding where it was
+        // derived (`RequestV1::logical`, `CommandId::derive`). So, under
+        // the digest's collision resistance, bytes that hash to this
+        // proposal's command are those bytes, and a decode here would
+        // find nothing more. Bytes that aren't canonical never match.
+        let identity = CommandId::from_canonical(&payload.retry_key, &payload.logical);
+        debug_assert!(
+            identity != command
+                || postcard::from_bytes::<coord_types::logical_v1::LogicalRequest>(
+                    &payload.logical
+                )
                 .ok()
-                .and_then(|r| CommandId::derive(&payload.retry_key, &r).ok());
-        if identity != Some(command) || payload.admission_digest() != proposal.admission {
+                .and_then(|r| CommandId::derive(&payload.retry_key, &r).ok())
+                    == Some(command),
+            "a relayed payload that hashes to its command decodes to it"
+        );
+        if identity != command || payload.admission_digest() != proposal.admission {
             self.rejections
                 .push(FollowerRejection::PayloadIdentityMismatch(command));
             self.relayed_not_taken = self.relayed_not_taken.saturating_add(1);
