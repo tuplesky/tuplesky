@@ -827,7 +827,13 @@ impl<P: Persistence> Applier<P> {
     ///
     /// Without a pipelined store nothing is ever in flight, and this is
     /// the projection's snapshot as it is.
+    ///
+    /// **Refused once a group was lost** ([`ApplyError::AfterGroupLost`]):
+    /// the groups in flight behind it will never be journaled, so none of
+    /// them may be read, and neither may a barrier the gate reads from
+    /// this view.
     pub fn read_view(&self) -> Result<ReadView<P>, ApplyError> {
+        self.usable()?;
         let (view, meta, gate) = self.store.reader().snapshot()?.into_parts();
         let committed = meta.frontier.execution_position;
         let mut through = committed;
