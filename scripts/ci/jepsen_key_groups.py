@@ -14,7 +14,11 @@ some keys two threads and others none). So, from each run's `jepsen.log`:
   never invoked can't be seen);
 - a key is finished when its group went on to another key, and every
   finished key of at least five operations a thread must have been invoked
-  on by every thread of its group (fewer can miss a thread by chance);
+  on by every thread of its group (fewer can miss a thread by chance),
+  except a thread that couldn't take its operations: one that hadn't yet
+  invoked anything (its client still opening), or one whose own operation
+  was open from the key's first invocation to its last; keys begun in the
+  run's first 10 s (the warm-up) are reported, not held to it;
 - every thread must invoke within the run's last 5 s;
 - the threads that read are listed by group (reported, not checked).
 
@@ -25,6 +29,7 @@ appending them to the step summary)."""
 from __future__ import annotations
 
 import argparse
+import bisect
 import os
 import re
 import sys
@@ -39,6 +44,12 @@ TAIL_S = 5.0
 # A finished key is held to its whole group only with at least this many
 # operations a thread of the group.
 OPS_A_THREAD = 5
+# Keys begun this many seconds into the run are reported but not held to
+# their whole group: while clients connect and the JVM warms, the generator
+# hands a free group work faster than it's taken, and can leave one thread
+# of a group without an operation for a key (43527949820: 3 keys of 2245,
+# each one thread short, at 4.7-5.7 s; none after).
+WARMUP_S = 10.0
 
 
 @dataclass
@@ -53,6 +64,11 @@ class Groups:
     short: list = field(default_factory=list)
     # Finished keys under that size on fewer threads (not a failure).
     short_small: int = 0
+    # Finished keys begun in the warm-up on fewer threads (not a failure).
+    short_warmup: int = 0
+    # Finished keys a thread of the group missed only while it couldn't
+    # take work (not a failure; see occupied).
+    excused: int = 0
     # Threads whose last invocation came more than TAIL_S before the end:
     # (thread, seconds before the end).
     stopped: list = field(default_factory=list)
@@ -65,20 +81,41 @@ class Groups:
         return bool(self.short or self.stopped)
 
 
+def occupied(spans: list, start, end) -> bool:
+    """Whether a thread couldn't have taken any of a key's operations,
+    invoked from `start` to `end`: it hadn't invoked anything yet by the
+    key's last invocation (its client was still opening), or one operation
+    of its own was open the whole time (invoked by `start` and completed at
+    `end` or later, or never). A thread missing from a key otherwise was
+    free and not handed work."""
+    if not spans or spans[0][0] > end:
+        return True
+    i = bisect.bisect_right([s[0] for s in spans], start) - 1
+    return i >= 0 and (spans[i][1] is None or spans[i][1] >= end)
+
+
 def check(label: str, ops: list) -> Groups:
     g = Groups(label)
     invokes = []
+    # Each thread's operations as [invoked, completed or None], in order.
+    spans = {}
     for o in ops:
-        if o.type != "invoke" or o.process.startswith(":"):
+        if o.process.startswith(":"):
             continue
         w = js.WORKER.match(o.thread)
-        k = KEY.match(o.value)
         if not w:
             continue
+        t = int(w[1])
+        if o.type != "invoke":
+            if spans.get(t) and spans[t][-1][1] is None:
+                spans[t][-1][1] = o.at
+            continue
+        k = KEY.match(o.value)
         if not k:
             g.note = "not keyed"
             return g
-        invokes.append((o.at, int(w[1]), int(k[1]), o.f))
+        invokes.append((o.at, t, int(k[1]), o.f))
+        spans.setdefault(t, []).append([o.at, None])
     if not invokes:
         g.note = "no invocations"
         return g
@@ -87,9 +124,11 @@ def check(label: str, ops: list) -> Groups:
     first = {}
     last_of = {}
     count = {}
+    last = {}
     for at, t, k, f in invokes:
         on.setdefault(k, set()).add(t)
         first.setdefault(k, at)
+        last[k] = at
         last_of[t] = at
         count[k] = count.get(k, 0) + 1
     g.keys = len(on)
@@ -101,6 +140,7 @@ def check(label: str, ops: list) -> Groups:
     g.size = size
     # Threads above the last that invoked, up to its group's end, never did.
     g.threads = -(-g.threads // size) * size
+    start = invokes[0][0]
     by_group = {}
     for k, ts in on.items():
         grp = min(ts) // size
@@ -110,10 +150,15 @@ def check(label: str, ops: list) -> Groups:
         keys.sort(key=lambda k: first[k])
         for k in keys[:-1]:
             g.finished += 1
-            if whole <= on[k]:
+            missing = {t for t in whole - on[k] if not occupied(spans.get(t, []), first[k], last[k])}
+            if len(missing) < len(whole - on[k]):
+                g.excused += 1
+            if not missing:
                 continue
-            if count[k] >= OPS_A_THREAD * size:
-                g.short.append((k, grp, len(on[k] & whole)))
+            if (first[k] - start).total_seconds() < WARMUP_S:
+                g.short_warmup += 1
+            elif count[k] >= OPS_A_THREAD * size:
+                g.short.append((k, grp, size - len(missing)))
             else:
                 g.short_small += 1
     end = invokes[-1][0]
@@ -147,6 +192,10 @@ def line(g: Groups) -> str:
         short += f", and {len(g.short) - 6} more"
     if g.short_small:
         short += ("; " if short else "") + f"{g.short_small} under {OPS_A_THREAD} a thread on fewer (not counted)"
+    if g.short_warmup:
+        short += ("; " if short else "") + f"{g.short_warmup} begun in the first {WARMUP_S:.0f} s on fewer (not counted)"
+    if g.excused:
+        short += ("; " if short else "") + f"{g.excused} missing a thread that was busy or not yet started (not counted)"
     stopped = ", ".join(
         f"{t} ({'never' if s is None else f'{s:.0f} s before the end'})" for t, s in g.stopped[:8]
     )
@@ -164,9 +213,9 @@ def render(groups: list[Groups]) -> str:
     out = [
         "### Key groups",
         "",
-        "Every finished key should be invoked on by every thread of its group, and every thread should invoke "
-        f"within the run's last {TAIL_S:.0f} s; a run that doesn't fails the job (the load generator ran it at "
-        "fewer clients than it says).",
+        "Every finished key should be invoked on by every thread of its group that was free to take it (after "
+        f"the first {WARMUP_S:.0f} s), and every thread should invoke within the run's last {TAIL_S:.0f} s; a run "
+        "that doesn't fails the job (the load generator ran it at fewer clients than it says).",
         "",
         "| Run | Threads | Group size × groups | Keys finished | Keys short of their group | Threads stopped early | Threads that read | |",
         "| --- | --- | --- | --- | --- | --- | --- | --- |",

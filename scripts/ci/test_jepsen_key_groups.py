@@ -13,8 +13,12 @@ import jepsen_summary as js  # noqa: E402
 T0 = datetime.datetime(2026, 11, 13, 10, 0, 0)
 
 
-def invoke(ms, thread, key, f=":write"):
-    return js.Op(T0 + datetime.timedelta(milliseconds=ms), f"jepsen worker {thread}", str(thread), "invoke", f, f"[{key} 1]", "")
+def invoke(ms, thread, key, f=":write", kind="invoke"):
+    return js.Op(T0 + datetime.timedelta(milliseconds=ms), f"jepsen worker {thread}", str(thread), kind, f, f"[{key} 1]", "")
+
+
+def ok(ms, thread, key, f=":write"):
+    return invoke(ms, thread, key, f, "ok")
 
 
 def run(groups, size, keys_a_group, ops_a_key, last_ms=60_000, drop=None, stop=None):
@@ -36,8 +40,10 @@ def run(groups, size, keys_a_group, ops_a_key, last_ms=60_000, drop=None, stop=N
                 t = mine[j % len(mine)]
                 if stop and t in stop and ms > stop[t]:
                     continue
-                ops.append(invoke(ms, t, key, ":read" if t < 5 else ":write"))
-    ops.sort(key=lambda o: o.at)
+                f = ":read" if t < 5 else ":write"
+                ops.append(invoke(ms, t, key, f))
+                ops.append(ok(ms + 1, t, key, f))
+    ops.sort(key=lambda o: (o.at, o.type != "ok"))
     return ops
 
 
@@ -57,6 +63,32 @@ class KeyGroupTests(unittest.TestCase):
         self.assertEqual(g.short, [(14, 2, 2)])
         self.assertIn("key 14 (group 2) on 2 of 10", kg.line(g))
         self.assertIn("**fails**", kg.line(g))
+
+    def test_a_thread_not_yet_started_or_busy_is_excused(self):
+        ops = run(3, 10, 20, 100, drop=lambda grp, i: {29} if (grp, i) <= (2, 3) and grp == 2 else set())
+        # Thread 29 starts after group 2's fourth key ends, at 12 s: its
+        # client was still opening.
+        late = [o for o in ops if o.thread != "jepsen worker 29" or o.at > T0 + datetime.timedelta(seconds=12)]
+        g = kg.check("head@120", late)
+        self.assertFalse(g.failed, kg.line(g))
+        self.assertEqual(g.excused, 4)
+        self.assertIn("4 missing a thread that was busy or not yet started (not counted)", kg.line(g))
+        # Thread 25 holds one operation open across group 2's fifth key.
+        ops = run(3, 10, 20, 100, drop=lambda grp, i: {25} if (grp, i) == (2, 4) else set())
+        k4 = [o.at for o in ops if o.value == "[14 1]" and o.type == "invoke"]
+        held = [o for o in ops if not (o.thread == "jepsen worker 25" and k4[0] - datetime.timedelta(milliseconds=200) <= o.at <= k4[-1] + datetime.timedelta(milliseconds=200))]
+        held += [invoke((k4[0] - T0).total_seconds() * 1000 - 100, 25, 11), ok((k4[-1] - T0).total_seconds() * 1000 + 100, 25, 11)]
+        held.sort(key=lambda o: (o.at, o.type != "ok"))
+        g = kg.check("head@120", held)
+        self.assertEqual(g.short, [], kg.line(g))
+        self.assertGreaterEqual(g.excused, 1)
+
+    def test_a_short_key_in_the_warmup_is_reported_not_failed(self):
+        # 20 keys over 60 s: key 5 (group 2's second) begins at 3 s.
+        g = kg.check("head@120", run(3, 10, 20, 100, drop=lambda grp, i: set(range(20, 28)) if (grp, i) == (2, 1) else set()))
+        self.assertFalse(g.failed, kg.line(g))
+        self.assertEqual(g.short_warmup, 1)
+        self.assertIn("1 begun in the first 10 s on fewer (not counted)", kg.line(g))
 
     def test_a_small_key_short_is_reported_not_failed(self):
         g = kg.check("swiftpaxos@30", run(3, 10, 20, 20, drop=lambda grp, i: {29} if (grp, i) == (2, 4) else set()))
