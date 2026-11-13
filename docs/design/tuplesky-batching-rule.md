@@ -413,7 +413,7 @@ So this section asks what a voter has to do on the hot path, and what it can do 
   - So it is the fallback, not the plan.
 - **(b) The eager voters' batches, agreed, landed behind.**
   - At each batch's end (point 3 sizes the batch), each eager voter sends the lazy voters two digests through that position:
-    - **its history digest** (task-d117, point 3): each position's command, revision and result digest;
+    - **its history digest** (task-d117, point 3): each position's command, admission digest, revision and result digest;
     - **its write-set digest:** a digest of the batch's merged write set in a canonical order, by collection and key, each key with its last value or its tombstone (#259's review).
   - The eager follower ships each lazy voter the batch: the merged write set and each position's execution record.
   - **A lazy voter lands a batch only once two executions agree on both digests, and only bytes whose write-set digest two voters sent.** It lands it as one commit, sorted.
