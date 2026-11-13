@@ -2100,10 +2100,7 @@ fn a_relayed_payload_is_taken_only_as_the_bytes_its_command_names() {
         .unwrap();
     let effects = f.step(peer(
         0,
-        relayed(
-            proposal(c1, vec![], 0, l1.paths.clone(), l1.path),
-            payload,
-        ),
+        relayed(proposal(c1, vec![], 0, l1.paths.clone(), l1.path), payload),
     ));
     assert_eq!(f.relayed_taken(), 0);
     assert!(
