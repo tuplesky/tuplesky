@@ -5292,10 +5292,18 @@ impl Follower {
             self.rejections.push(FollowerRejection::MalformedRequest);
             return Vec::new();
         }
-        let Ok(command) = CommandId::derive(&retry_key, &request) else {
+        // The bytes are taken only as the canonical encoding of the request
+        // they decode to, as the frontend and the leader's `propose` take
+        // them (`RequestV1::logical`). A decode alone takes more: a varint
+        // written long decodes to the same request. The payload is held as
+        // these bytes, and relayed as them if this replica leads, and a
+        // follower takes relayed bytes only as the digest of the encoding
+        // its command names (`take_relayed_payload`).
+        if request.canonical_bytes().ok().as_deref() != Some(logical.as_slice()) {
             self.rejections.push(FollowerRejection::MalformedRequest);
             return Vec::new();
-        };
+        }
+        let command = CommandId::from_canonical(&retry_key, &logical);
         self.admitted = Some(command);
         if self.mark_next_admitted {
             self.answer_on_release.insert(command);
