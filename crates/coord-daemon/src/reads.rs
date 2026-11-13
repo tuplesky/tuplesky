@@ -431,7 +431,10 @@ pub fn evaluate<V: OrderedRead>(gated: &GatedView<V>, held: &Held) -> Evaluated 
     let Some(required) = held.required else {
         return Evaluated::NotYet;
     };
-    if gated.meta().frontier.execution_position < required {
+    // SCRATCH (ceilings): a follower that no longer executes serves its
+    // stale projection.
+    let stale = coord_storage::scratch::stale_reads();
+    if gated.meta().frontier.execution_position < required && !stale {
         return Evaluated::NotYet;
     }
     let request = &held.read.request;
@@ -464,6 +467,7 @@ pub fn evaluate<V: OrderedRead>(gated: &GatedView<V>, held: &Held) -> Evaluated 
     let sequence = request.retry_key.request_sequence.get();
     match retry::session_floor(gated.view(), &request.retry_key) {
         Ok(Some(floor)) if sequence - floor.floor.get() <= u64::from(floor.width / 2) => {}
+        Ok(Some(_)) if stale => {}
         _ => return Evaluated::NotServable,
     }
     let session = request.retry_key.session_id;

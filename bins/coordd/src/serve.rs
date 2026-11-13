@@ -1063,6 +1063,10 @@ pub struct Domain<P: Persistence> {
     since_flush_api: u32,
     /// How many events the loop took between its flushes (task-d102).
     flushes: coord_daemon::metrics::Flushes,
+    /// SCRATCH (ceilings): hold the leader's flush until this many
+    /// batches are queued or `hold_us` has passed since it was first owed.
+    hold: Option<(usize, std::time::Duration)>,
+    hold_since: Option<std::time::Instant>,
     budgets: Budgets,
     /// This run's stage accounting (task-61), shared with the voter's
     /// node so the journal and materialization points record into the
@@ -1704,6 +1708,28 @@ async fn unless_ready<F: std::future::Future>(work: F, before_waiting: impl FnOn
 /// reason to flush: the flush would move nothing, and with events still
 /// arriving it would run after every one of them. The appender's wake
 /// takes the append back, and the flush after it lends the group.
+/// SCRATCH (ceilings): where the leader's hold stands this pass.
+#[derive(Clone, Copy)]
+enum Hold {
+    Off,
+    Held(std::time::Instant),
+    Due,
+}
+
+/// SCRATCH (ceilings): `COORDD_X_HOLD_N` batches, `COORDD_X_HOLD_US` µs.
+fn scratch_hold() -> Option<(usize, std::time::Duration)> {
+    let n = std::env::var("COORDD_X_HOLD_N")
+        .ok()?
+        .parse::<usize>()
+        .ok()?;
+    let us = std::env::var("COORDD_X_HOLD_US")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(2000);
+    eprintln!("SCRATCH hold: leader flush held to {n} batches or {us} us");
+    Some((n, std::time::Duration::from_micros(us)))
+}
+
 const fn flush_due(queued: usize, appending: bool, owed: bool, since_flush: u32) -> bool {
     (queued >= FLUSH_QUEUED && !appending) || (owed && since_flush >= FLUSH_EVENTS)
 }
@@ -1922,6 +1948,8 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             peer_streak: 0,
             since_flush: 0,
             since_flush_api: 0,
+            hold: scratch_hold(),
+            hold_since: None,
             flushes: coord_daemon::metrics::Flushes::default(),
             budgets,
             recorder,
@@ -2546,7 +2574,13 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             // kept arriving (task-d47).
             let owed = matches!(&self.backing, Backing::Voting(v) if v.owes_flush());
             let appending = matches!(&self.backing, Backing::Voting(v) if v.appending());
-            if flush_due(self.queued(), appending, owed, self.since_flush) {
+            let turn_hold = self.hold_state();
+            let flush_now = match turn_hold {
+                Hold::Off => flush_due(self.queued(), appending, owed, self.since_flush),
+                Hold::Held(_) => false,
+                Hold::Due => !appending || self.queued() >= FLUSH_QUEUED,
+            };
+            if flush_now {
                 // What the events so far owe the runtime goes before the
                 // flush, not after it (task-d115, lever 8).
                 self.hand_off();
@@ -2676,7 +2710,12 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             {
                 self.hand_off();
             }
-            let owes_flush = matches!(&self.backing, Backing::Voting(v) if v.owes_flush());
+            let hold_until = self.held();
+            let owes_flush = hold_until.is_none()
+                && matches!(&self.backing, Backing::Voting(v) if v.owes_flush());
+            let hold_sleep = tokio::time::sleep_until(tokio::time::Instant::from_std(
+                hold_until.unwrap_or_else(std::time::Instant::now),
+            ));
             let materialized = self.materialized.clone();
             // Waiting from here: the select below returns at once when
             // there is work, and otherwise this is the loop's idle time.
@@ -2730,6 +2769,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                         continue;
                     }
                     () = sleep, if wake.is_some() => continue,
+                    () = hold_sleep, if hold_until.is_some() => continue,
                 }
             } else {
                 tokio::select! {
@@ -2773,6 +2813,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                         continue;
                     }
                     () = sleep, if wake.is_some() => continue,
+                    () = hold_sleep, if hold_until.is_some() => continue,
                 }
             };
             self.pacing.woke();
@@ -3344,6 +3385,39 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             .map_or((0, 0, 0), |e| (e.done.0, e.done.1, e.armed()))
     }
 
+    /// SCRATCH (ceilings): whether the leader's flush is being held, and
+    /// until when. `None` when no hold applies (follower, no knob, or the
+    /// hold has reached its count or its time).
+    fn held(&mut self) -> Option<std::time::Instant> {
+        match self.hold_state() {
+            Hold::Held(until) => Some(until),
+            _ => None,
+        }
+    }
+
+    /// SCRATCH (ceilings): the leader's hold, if the knob is set.
+    fn hold_state(&mut self) -> Hold {
+        let Some((n, t)) = self.hold else {
+            return Hold::Off;
+        };
+        let Backing::Voting(voter) = &self.backing else {
+            return Hold::Off;
+        };
+        if !voter.leads() || !voter.owes_flush() {
+            return Hold::Off;
+        }
+        if voter.queued() >= n {
+            return Hold::Due;
+        }
+        let since = *self.hold_since.get_or_insert_with(std::time::Instant::now);
+        let until = since + t;
+        if std::time::Instant::now() < until {
+            Hold::Held(until)
+        } else {
+            Hold::Due
+        }
+    }
+
     /// Batches the voter's rounds left queued for a flush (task-d47).
     fn queued(&self) -> usize {
         match &self.backing {
@@ -3361,6 +3435,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         self.flushes.count(from_api, taken.saturating_sub(from_api));
         self.since_flush = 0;
         self.since_flush_api = 0;
+        self.hold_since = None;
         let Backing::Voting(voter) = &mut self.backing else {
             return false;
         };

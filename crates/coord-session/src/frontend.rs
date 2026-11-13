@@ -566,6 +566,11 @@ impl BoundFrontend {
         scope: u32,
         policy: &dyn PolicySource,
     ) -> Delivery {
+        // SCRATCH (ceilings): no store read at the disclosure gate.
+        static NO_GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *NO_GATE.get_or_init(|| std::env::var("COORDD_X_NO_GATE").is_ok_and(|v| v == "1")) {
+            return delivery;
+        }
         let response = match decode_stream(&delivery.frame).as_deref() {
             Ok([MessageV1::Response(r)]) => r.clone(),
             _ => return delivery,

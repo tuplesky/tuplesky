@@ -181,6 +181,11 @@ pub struct Applier<P: Persistence> {
     /// The position the projection was last seen committed through, by
     /// [`Applier::settle`] or a drain (task-d63).
     committed: Option<coord_types::ids::ExecutionPosition>,
+    /// SCRATCH (ceilings): the application rows in memory, and the boot's
+    /// metadata the planning view carries (`COORDD_X_MEM_EXEC`).
+    shadow: Option<crate::scratch::ShadowRef>,
+    boot_meta: crate::lowering::DurableMeta,
+    empty: Arc<CutOverlay>,
 }
 
 /// A group handed off to a pipelined store's materializer (task-d52).
@@ -269,13 +274,15 @@ type Snapshot<P> = <<P as Persistence>::Reader as SnapshotSource>::View;
 
 /// What a command is planned against: the projection's snapshot, with a
 /// group's own unmaterialized writes over it.
-type PlanningView<'a, P> =
+pub type PlanningView<'a, P> =
     GatedView<RecoveryCut<PlanningSnapshot<'a, Snapshot<P>>, Arc<CutOverlay>>>;
 
 /// The snapshot under a command's plan: its own outside a group, or the
 /// one its group pinned (task-d115).
-enum PlanningSnapshot<'a, V> {
+pub enum PlanningSnapshot<'a, V> {
+    /// A command's own snapshot, outside a group.
     Own(V),
+    /// The snapshot the command's group pinned.
     Group(&'a V),
 }
 
@@ -326,13 +333,20 @@ impl<P: Persistence> Applier<P> {
     /// of this applier's is also one of the protocol machine's that
     /// shares its store and its boot.
     pub fn new(store: P, alloc: BarrierAllocator) -> Result<Self, EngineError> {
-        let (published, floor) = {
+        let (published, floor, shadow, boot_meta) = {
             let gated = store.reader().snapshot().map_err(|_| {
                 EngineError::new(coord_store_api::engine::ErrorClass::Busy, "no durable view")
             })?;
+            let shadow = if crate::scratch::mem_exec() {
+                Some(Arc::new(crate::scratch::Shadow::seed(gated.view())?))
+            } else {
+                None
+            };
             (
                 crate::codecs::read_kv_revision(gated.view())?,
                 crate::codecs::read_retention_floor(gated.view())?,
+                shadow,
+                *gated.meta(),
             )
         };
         Ok(Applier {
@@ -344,7 +358,31 @@ impl<P: Persistence> Applier<P> {
             group: None,
             inflight: VecDeque::new(),
             committed: None,
+            shadow,
+            boot_meta,
+            empty: Arc::new(CutOverlay::new()),
         })
+    }
+
+    /// SCRATCH (ceilings): the view the read fast path evaluates over when
+    /// execution runs against the in-memory rows.
+    pub fn scratch_read_view(&self) -> Option<PlanningView<'_, P>> {
+        self.shadow.as_ref().map(|_| self.shadow_view())
+    }
+
+    fn shadow_view(&self) -> PlanningView<'_, P> {
+        let shadow = self.shadow.clone().expect("shadow");
+        let mut meta = self.boot_meta;
+        let base = self.store.application_base();
+        meta.frontier = ExecutionFrontier {
+            configuration: base.configuration,
+            execution_position: base.execution_position,
+        };
+        GatedView::with_gate(
+            RecoveryCut::shadow_only(shadow, self.empty.clone(), meta.stamp.journal_seq()),
+            meta,
+            None,
+        )
     }
 
     /// Keep the storage facts about other batches for
@@ -414,7 +452,7 @@ impl<P: Persistence> Applier<P> {
             // oldest first. A snapshot that already holds some of them
             // reads the same: those rows are the ones it holds, and every
             // later write is laid over them again.
-            if !self.inflight.is_empty() {
+            if !self.inflight.is_empty() && self.shadow.is_none() {
                 let mut overlay = CutOverlay::new();
                 for flight in &self.inflight {
                     overlay.absorb(&flight.own);
@@ -802,6 +840,9 @@ impl<P: Persistence> Applier<P> {
     /// group has reached, so the plan's base is the queued frontier the
     /// store will check.
     fn planning_view(&self) -> Result<PlanningView<'_, P>, ApplyError> {
+        if self.shadow.is_some() {
+            return Ok(self.shadow_view());
+        }
         let Some(group) = &self.group else {
             let (view, meta, gate) = self.store.reader().snapshot()?.into_parts();
             let durable = meta.stamp.journal_seq();
@@ -853,6 +894,18 @@ impl<P: Persistence> Applier<P> {
         refused: Option<&CommandId>,
     ) -> Result<ApplyOutcome, ApplyError> {
         if self.group.is_none() {
+            if let Some(shadow) = &self.shadow {
+                let (mut batch, _, pending) = prepare(barrier, namespace, plan, binding)?;
+                if let Some(command) = refused {
+                    batch.updates.push(crate::retry::executed_update(
+                        command,
+                        plan.position,
+                        plan.revision,
+                        pending.result_digest,
+                    )?);
+                }
+                shadow.extend(&batch.updates);
+            }
             let others = self.sharing.then_some(&mut self.foreign);
             return Ok(match refused {
                 Some(command) => apply_refused_plan_sharing(
@@ -892,8 +945,12 @@ impl<P: Persistence> Applier<P> {
         match crate::materialize::submit(&mut self.store, batch, kind)? {
             Submitted::Accepted => {
                 let group = self.group.as_mut().expect("checked above");
-                Arc::make_mut(&mut group.overlay).extend(&updates);
-                Arc::make_mut(&mut group.own).extend(&updates);
+                if let Some(shadow) = &self.shadow {
+                    shadow.extend(&updates);
+                } else {
+                    Arc::make_mut(&mut group.overlay).extend(&updates);
+                    Arc::make_mut(&mut group.own).extend(&updates);
+                }
                 group.barriers.insert(barrier);
                 group.unjournaled.insert(barrier);
                 group.last = Some(pending);

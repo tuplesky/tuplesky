@@ -926,7 +926,16 @@ impl<P: Persistence> Voter<P> {
         // snapshot is pinned.
         let reader = self.node.applier().store().reader();
         let completed = reader.completed();
-        let gated = if due.is_empty() || self.reads_behind_at == Some(completed) {
+        // SCRATCH (ceilings): reads evaluate over the in-memory rows.
+        let shadow = if due.is_empty() {
+            None
+        } else {
+            self.node.applier().scratch_read_view()
+        };
+        let gated = if shadow.is_some()
+            || due.is_empty()
+            || (self.reads_behind_at == Some(completed) && !coord_storage::scratch::stale_reads())
+        {
             None
         } else {
             reader.snapshot().ok()
@@ -935,9 +944,12 @@ impl<P: Persistence> Voter<P> {
         for held in due {
             let retry_key = held.read.request.retry_key;
             let ballot = held.read.ballot;
-            let evaluated = gated
-                .as_ref()
-                .map_or(Evaluated::NotYet, |gated| evaluate(gated, &held));
+            let evaluated = match &shadow {
+                Some(view) => evaluate(view, &held),
+                None => gated
+                    .as_ref()
+                    .map_or(Evaluated::NotYet, |gated| evaluate(gated, &held)),
+            };
             match evaluated {
                 Evaluated::Served(response) => {
                     self.reads.served(&held, now);

@@ -112,6 +112,7 @@ pub mod pipeline;
 pub mod policy;
 pub mod protocol;
 pub mod retry;
+pub mod scratch;
 pub mod speculate;
 pub mod sync;
 pub mod view;

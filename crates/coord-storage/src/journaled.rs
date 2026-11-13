@@ -3475,6 +3475,10 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
         if state.pending.is_empty() {
             return Ok(report);
         }
+        if crate::scratch::no_mat() && state.engine.is_some() {
+            scratch_pretend_commit(state, &mut report)?;
+            return Ok(report);
+        }
         let durable = state.commit_durably(profile, state.pending.len());
         let Some(engine) = state.engine.as_mut() else {
             // Every caller takes a lent engine back first.
@@ -3887,6 +3891,13 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                     DomainStatus::Quarantined | DomainStatus::MaterializationUncertain
                 )
             {
+                continue;
+            }
+            if crate::scratch::no_mat() {
+                if let Err(e) = scratch_pretend_commit(state, &mut report) {
+                    self.cost.charge(&report);
+                    return Err(e);
+                }
                 continue;
             }
             let since = state.held_since.unwrap_or(now);
@@ -4427,6 +4438,50 @@ fn frontier_after(frontier: ExecutionFrontier, record: &JournalRecordV1) -> Exec
         | RecordBody::PublishLocalCheckpoint(_)
         | RecordBody::Lifecycle(_) => frontier,
     }
+}
+
+/// SCRATCH (ceilings): pretend a projection commit of everything pending.
+/// The stamp, the frontier, the gate and the durable mark move as a commit
+/// would move them; nothing is written.
+fn scratch_pretend_commit<E: LocalEngine>(
+    state: &mut Domain<E>,
+    report: &mut FlushReport,
+) -> Result<(), JournaledError> {
+    if state.pending.is_empty() {
+        return Ok(());
+    }
+    let pending = std::mem::take(&mut state.pending);
+    let mut meta = state.meta;
+    for item in &pending {
+        meta.frontier = frontier_after(meta.frontier, &item.record);
+        meta.stamp = AppliedStamp::new(
+            StoreSeq::from_journal(item.record.seq()),
+            item.record.digest(),
+        );
+    }
+    state.gate.set_completed(meta.stamp.store_seq());
+    state.meta = meta;
+    state
+        .frontiers
+        .advance_materialized(meta.stamp.journal_seq())?;
+    state.projection_durable = meta.stamp.journal_seq();
+    state.pending_meta = None;
+    state.held_since = None;
+    state.commit_asked = None;
+    if state.status == DomainStatus::MaterializationDeferred {
+        state.status = DomainStatus::Ready;
+    }
+    report.commits += 1;
+    report.materialized += pending.len();
+    for item in pending {
+        if let Some(barrier) = item.barrier {
+            report.events.push(StorageEvent::Materialized {
+                barrier_id: barrier,
+                journal_seq: item.record.seq(),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// The record bounds that do not depend on the stream position, checked at

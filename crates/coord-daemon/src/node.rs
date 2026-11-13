@@ -2491,6 +2491,38 @@ impl<P: Persistence> Node<P> {
                 return Ok(out);
             };
             self.awaiting = None;
+            // SCRATCH (ceilings): storage off past a count of executions,
+            // at every voter or at followers only, which then stop
+            // executing too.
+            let executed_through = self.machine().executed_through().get();
+            if let Some(after) = coord_storage::scratch::store_off_after() {
+                coord_storage::scratch::set_no_mat(executed_through >= after);
+            }
+            if let Some(after) = coord_storage::scratch::followers_idle_after() {
+                let idle = !self.machine().leads() && executed_through >= after;
+                coord_storage::scratch::set_no_mat(idle);
+                coord_storage::scratch::set_stale_reads(idle);
+                if idle {
+                    if self.applier.in_group() {
+                        out.absorb(self.close_group(&mut held, ballot)?);
+                    }
+                    let position = self
+                        .machine()
+                        .executed_through()
+                        .checked_next()
+                        .map_err(|_| DriveError::Encode("scratch: position overflow".into()))?;
+                    let outcome = coord_consensus::AppliedOutcome {
+                        position,
+                        revision: None,
+                        result_digest: coord_types::identity::Digest32([0; 32]),
+                        response: Vec::new(),
+                    };
+                    let effects = self.machine_mut().applied(command, &outcome)?;
+                    self.executed += 1;
+                    out.absorb(self.carry_out(effects, ballot)?);
+                    continue;
+                }
+            }
             if self.applier.grouped() >= GROUP_COMMANDS {
                 out.absorb(self.close_group(&mut held, ballot)?);
             }

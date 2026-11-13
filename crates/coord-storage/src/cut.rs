@@ -159,7 +159,9 @@ impl CutOverlay {
 /// the group has not materialized yet (task-d47) -- shares it rather than
 /// copying it for each.
 pub struct RecoveryCut<V, O = CutOverlay> {
-    snapshot: GatedView<V>,
+    snapshot: Option<GatedView<V>>,
+    /// SCRATCH (ceilings): the in-memory rows read in place of a snapshot.
+    shadow: Option<crate::scratch::ShadowRef>,
     overlay: O,
     durable: LocalJournalSeq,
 }
@@ -169,10 +171,31 @@ impl<V: OrderedRead, O: Borrow<CutOverlay>> RecoveryCut<V, O> {
     /// `durable` but not represented by the snapshot's stamp.
     pub const fn new(snapshot: GatedView<V>, overlay: O, durable: LocalJournalSeq) -> Self {
         RecoveryCut {
-            snapshot,
+            snapshot: Some(snapshot),
+            shadow: None,
             overlay,
             durable,
         }
+    }
+
+    /// SCRATCH (ceilings): a cut over the in-memory rows alone.
+    pub const fn shadow_only(
+        shadow: crate::scratch::ShadowRef,
+        overlay: O,
+        durable: LocalJournalSeq,
+    ) -> Self {
+        RecoveryCut {
+            snapshot: None,
+            shadow: Some(shadow),
+            overlay,
+            durable,
+        }
+    }
+
+    fn snap(&self) -> &GatedView<V> {
+        self.snapshot
+            .as_ref()
+            .expect("a cut without a shadow has a snapshot")
     }
 
     /// The journal sequence the cut is defined at (`J`).
@@ -182,7 +205,9 @@ impl<V: OrderedRead, O: Borrow<CutOverlay>> RecoveryCut<V, O> {
 
     /// The materialized sequence the underlying snapshot proves (`M`).
     pub fn materialized(&self) -> LocalJournalSeq {
-        self.snapshot.meta().stamp.journal_seq()
+        self.snapshot
+            .as_ref()
+            .map_or(self.durable, |s| s.meta().stamp.journal_seq())
     }
 
     /// The overlay the cut adds over the snapshot.
@@ -202,12 +227,18 @@ enum Side {
 
 impl<V: OrderedRead, O: Borrow<CutOverlay>> OrderedRead for RecoveryCut<V, O> {
     fn get(&self, collection: CollectionId, key: &[u8]) -> Result<Option<Vec<u8>>, EngineError> {
+        if let Some(shadow) = &self.shadow {
+            return Ok(match self.overlay().rows.get(&(collection, key.to_vec())) {
+                Some(value) => value.clone(),
+                None => shadow.get(collection, key),
+            });
+        }
         if self.overlay().is_empty() {
-            return self.snapshot.view().get(collection, key);
+            return self.snap().view().get(collection, key);
         }
         match self.overlay().rows.get(&(collection, key.to_vec())) {
             Some(value) => Ok(value.clone()),
-            None => self.snapshot.view().get(collection, key),
+            None => self.snap().view().get(collection, key),
         }
     }
 
@@ -216,8 +247,12 @@ impl<V: OrderedRead, O: Borrow<CutOverlay>> OrderedRead for RecoveryCut<V, O> {
         collection: CollectionId,
         request: &ScanRequest,
     ) -> Result<RowPage, EngineError> {
+        if let Some(shadow) = &self.shadow {
+            debug_assert!(self.overlay().is_empty(), "a shadow cut carries no overlay");
+            return shadow.scan_page(collection, request);
+        }
         if self.overlay().is_empty() {
-            return self.snapshot.view().scan_page(collection, request);
+            return self.snap().view().scan_page(collection, request);
         }
         let mut overlay = self.overlay().in_scan_order(collection, request);
         let mut base: VecDeque<Row> = VecDeque::new();
@@ -227,7 +262,7 @@ impl<V: OrderedRead, O: Borrow<CutOverlay>> OrderedRead for RecoveryCut<V, O> {
         let mut bytes = 0usize;
         loop {
             if base.is_empty() && !base_exhausted {
-                let page = self.snapshot.view().scan_page(
+                let page = self.snap().view().scan_page(
                     collection,
                     &ScanRequest {
                         resume_after: base_cursor.clone(),
