@@ -121,8 +121,10 @@ impl Frontier {
 
     /// The index as published.
     pub(crate) fn index(&self) -> RwLockReadGuard<'_, IntakeIndex> {
-        // A panic while the index was written leaves it as it was then;
-        // its readers settle every answer against the rows.
+        // Nothing that writes the index panics short of an allocation
+        // failure, which aborts: publishing is map inserts and removes. The
+        // executed part's readers settle each answer against the rows; the
+        // intake part's answers are the command's own (#185, lead 17:43).
         self.index
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
