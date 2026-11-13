@@ -22,8 +22,7 @@ const USER_HZ: u64 = 100;
 
 /// CPU time the calling thread has used since it started.
 pub fn this_thread() -> Option<Duration> {
-    let schedstat = std::fs::read_to_string("/proc/thread-self/schedstat").ok()?;
-    schedstat_times(&schedstat).map(|(on_cpu, _)| on_cpu)
+    this_thread_schedstat().map(|(on_cpu, _)| on_cpu)
 }
 
 /// The calling thread's time on a CPU and waiting for one since it
@@ -36,8 +35,7 @@ pub fn this_thread() -> Option<Duration> {
 /// `schedstat`'s, settled each time the thread is put back on a CPU, so
 /// a reading the thread takes itself is never short of a wait.
 pub fn this_thread_time() -> Option<coord_storage::ThreadTime> {
-    let schedstat = std::fs::read_to_string("/proc/thread-self/schedstat").ok()?;
-    let (_, run_queue) = schedstat_times(&schedstat)?;
+    let (_, run_queue) = this_thread_schedstat()?;
     let on_cpu = rustix::time::clock_gettime(rustix::time::ClockId::ThreadCPUTime);
     let on_cpu = Duration::new(
         u64::try_from(on_cpu.tv_sec).ok()?,
@@ -66,8 +64,7 @@ pub struct Scheduling {
 /// time says which, and a runner with more runnable threads than cores
 /// shows it here before anywhere else.
 pub fn this_thread_scheduling() -> Option<Scheduling> {
-    let schedstat = std::fs::read_to_string("/proc/thread-self/schedstat").ok()?;
-    let (_, run_queue) = schedstat_times(&schedstat)?;
+    let (_, run_queue) = this_thread_schedstat()?;
     let status = std::fs::read_to_string("/proc/thread-self/status").ok()?;
     let (voluntary, involuntary) = switches(&status)?;
     Some(Scheduling {
@@ -81,8 +78,45 @@ pub fn this_thread_scheduling() -> Option<Scheduling> {
 /// from `schedstat` alone: what the domain loop reads on a sampled pass
 /// (task-d97), one read rather than [`this_thread_scheduling`]'s two.
 pub fn this_thread_run_queue() -> Option<Duration> {
-    let schedstat = std::fs::read_to_string("/proc/thread-self/schedstat").ok()?;
-    schedstat_times(&schedstat).map(|(_, run_queue)| run_queue)
+    this_thread_schedstat().map(|(_, run_queue)| run_queue)
+}
+
+/// The calling thread's `schedstat` line, read through a descriptor the
+/// thread opened once (#185, lead 15:27).
+///
+/// Opening `/proc/thread-self/schedstat` walks the path to the thread's
+/// directory and allocates the file's buffer, and closing frees both, on
+/// every read: about 1% of a loop's time even once a sampled pass
+/// (task-d115). The file prints its line again from offset 0, so a held
+/// descriptor costs one `pread` a read. It names the thread that opened
+/// it, so each thread keeps its own. A failed open is not kept, and the
+/// next read tries again.
+#[cfg(unix)]
+fn this_thread_schedstat() -> Option<(Duration, Duration)> {
+    use std::os::unix::fs::FileExt;
+    thread_local! {
+        static SCHEDSTAT: std::cell::RefCell<Option<std::fs::File>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    SCHEDSTAT.with_borrow_mut(|held| {
+        if held.is_none() {
+            *held = std::fs::File::open("/proc/thread-self/schedstat").ok();
+        }
+        // The line is three decimal numbers and a newline, at most 63 bytes.
+        let mut line = [0u8; 128];
+        let read = held.as_ref()?.read_at(&mut line, 0).ok()?;
+        // A read that fills the buffer may have cut the line short.
+        if read == line.len() {
+            return None;
+        }
+        schedstat_times(std::str::from_utf8(&line[..read]).ok()?)
+    })
+}
+
+/// No `/proc` elsewhere, so no reading.
+#[cfg(not(unix))]
+fn this_thread_schedstat() -> Option<(Duration, Duration)> {
+    None
 }
 
 /// Time on a CPU and time waiting on a run queue, the first two fields of
@@ -158,6 +192,31 @@ mod tests {
         let after = this_thread_scheduling().expect("linux has schedstat and status");
         assert!(after.voluntary >= before.voluntary + 3);
         assert!(after.run_queue >= before.run_queue);
+    }
+
+    /// The descriptor a thread holds reads the line as it is now, not
+    /// as it was when the thread first read it, and it is the thread's
+    /// own: another thread's reading is of that thread.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_held_schedstat_reads_the_calling_thread_now() {
+        let before = this_thread().expect("linux has schedstat");
+        let mut x = 0u64;
+        for i in 0..20_000_000u64 {
+            x = x.wrapping_mul(31).wrapping_add(i);
+        }
+        std::hint::black_box(x);
+        let after = this_thread().expect("linux has schedstat");
+        assert!(after > before);
+        let fresh = std::fs::read_to_string("/proc/thread-self/schedstat").unwrap();
+        let (on_cpu, _) = schedstat_times(&fresh).unwrap();
+        assert!(on_cpu >= after);
+        // A new thread starts from nothing, not from this one's time.
+        let other = std::thread::spawn(this_thread)
+            .join()
+            .unwrap()
+            .expect("linux has schedstat");
+        assert!(other < after);
     }
 
     /// The CPU clock moves with work that `schedstat` may not have
