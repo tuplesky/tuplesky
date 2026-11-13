@@ -1272,7 +1272,7 @@ Each step has its own PRs and pair.
 | Step | Activation | Bound | Checkpoint |
 | --- | --- | --- | --- |
 | 0. The bounds | — | — | — |
-| 1. One application record and one durability event a group | None: local format | B0 | Half of B0, in the appender and the materializer |
+| 1. One application record and one durability event a group, split at the store's bounds | None: local format | B0 | Half of B0, in the appender and the materializer |
 | 2. A follower takes a frame in one pass: its adoptions in a few batches, split at the store's bounds | None | B1; −15 to −21 µs a follower inferred (6.7) | Half of B1, in a follower's loop |
 | 3. The frame log's kinds, read only, and the frame fetch | None: nothing writes or sends them | 0 | A null step |
 | 4. Frame records written in order beside the per-command ones; recovery selects both ways and checks they agree | `FrameLog`, dark | B1W against B1, one pair: the cost added | Inactive, a null step. Active, no more than its bound, and no disagreement |
@@ -1309,10 +1309,20 @@ Each step has its own PRs and pair.
 - **PRs:**
   - 1a: the journal's reader and replay take a group's application record, and nothing writes one;
   - 1b: the applier writes one application record a group in place of one a command, and waits on one durability event for it.
+- **How a group's record is bounded (Codex).** An execution group holds up to 32 commands (`GROUP_COMMANDS`), and the applier's queue is bounded at 16 MiB, not at the record's 4 MiB and 4,096 updates. Each outcome is under the record's bounds today, but 32 together needn't be. Since #280 a record the store refuses stops the voter.
+  - **The rule:** the same as step 2's. A group's outcomes go in records cut in execution order. A record closes before an outcome that would take it past 1,024 updates or 1 MiB of rows.
+  - **An outcome over either bound goes alone,** in a record of its own, as every outcome does today.
+  - **One durability event a record.** The group's answers wait on its last record, since the journal keeps records in order.
+  - At the bench's sizes a group is one record. Groups of large outcomes take a few.
+  - B0 cuts a run at half the journal group's byte limit and at the record's update bound. At the bench's sizes neither binds, so it bounds step 1 as written.
 - **What recovery reads:** replay reads a group record as the application outcome of each command it names. Those are the same facts, in one record. The decision's records are untouched.
 - **Mixed versions:** the format is local, since only this voter reads its journal. 1b raises the local image version, which 1a's release reads and an older release refuses to open. So a voter goes back at most to 1a's release.
 - **Pinned by:**
-  - the crash matrix's cuts at the group record: torn, and durable but not acknowledged;
+  - a group of 32 outcomes near 1 MiB each, cut into records under the bounds;
+  - a lone outcome over 1 MiB, in a record of its own;
+  - a group past 1,024 updates;
+  - a compile-time check of the bounds against the record's, like `journaled.rs`'s for the commit rows;
+  - the crash matrix's cuts at the group record: torn, durable but not acknowledged, and between two records of one group;
   - a journal holding both forms replays to the same state as either alone;
   - a fixture: 1a's release opens 1b's journal.
 - **Bound:** B0. **Checkpoint:** half of B0, in the appender and the materializer, as µs a command. Application records a command at every voter fall from one to one a group.
