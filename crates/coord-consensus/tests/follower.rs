@@ -2077,6 +2077,55 @@ fn a_relayed_payload_that_does_not_match_its_proposal_is_not_taken() {
     );
 }
 
+/// Cost pass row 16: a relayed payload's identity is the digest of its
+/// logical bytes as they came. Bytes that decode to the command's request
+/// but aren't the encoding its identity was derived from (here, one byte
+/// more) are refused. The check this replaces decoded them, encoded the
+/// request again and took them.
+#[test]
+fn a_relayed_payload_is_taken_only_as_the_bytes_its_command_names() {
+    let mut f = booted(1);
+    let (mut payload, c1) = relayed_payload(1, 1, 1);
+    payload.logical.push(0);
+    assert_eq!(
+        postcard::from_bytes::<LogicalRequest>(&payload.logical)
+            .ok()
+            .and_then(|r| CommandId::derive(&payload.retry_key, &r).ok()),
+        Some(c1),
+        "a decode and an encoding made again find the command in these bytes"
+    );
+    let mut leader_view = coord_consensus::CommandTable::new();
+    let l1 = leader_view
+        .initialize(c1, c1.0, vec![CONSERVATIVE_KEY.to_vec()])
+        .unwrap();
+    let effects = f.step(peer(
+        0,
+        relayed(
+            proposal(c1, vec![], 0, l1.paths.clone(), l1.path),
+            payload,
+        ),
+    ));
+    assert_eq!(f.relayed_taken(), 0);
+    assert!(
+        !effects.iter().any(|e| matches!(e, Effect::Persist(_))),
+        "nothing written"
+    );
+    assert_eq!(f.held().len(), 1, "held for its payload");
+    assert!(
+        f.take_rejections()
+            .contains(&FollowerRejection::PayloadIdentityMismatch(c1))
+    );
+
+    // The bytes the command was derived from are taken.
+    let mut f = booted(1);
+    let (payload, c1) = relayed_payload(1, 1, 1);
+    f.step(peer(
+        0,
+        relayed(proposal(c1, vec![], 0, l1.paths, l1.path), payload),
+    ));
+    assert_eq!(f.relayed_taken(), 1);
+}
+
 /// task-d102: a follower that already took the submission keeps what it
 /// accepted; the payload a relayed proposal carries is left aside and the
 /// proposal is adopted as any.
