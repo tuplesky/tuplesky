@@ -187,7 +187,8 @@ pub fn roots_of(cas: &[&TestCa]) -> Arc<rustls::RootCertStore> {
 pub struct TestBinder {
     cluster: ClusterId,
     domain: DomainId,
-    known: HashMap<Vec<u8>, (ReplicaId, ReplicaIncarnation, PeerRole)>,
+    /// Each issued leaf's identity, with the domain it was issued for.
+    known: HashMap<Vec<u8>, (ReplicaId, ReplicaIncarnation, PeerRole, DomainId)>,
     /// When the credentials this binder admits stop being valid, in
     /// unix seconds (task-58). `None` leaves the connection bounded by
     /// the age cap alone, which is what every test that is not about
@@ -231,11 +232,22 @@ impl TestBinder {
         self.ends.insert(identity.chain[0].as_ref().to_vec(), until);
     }
 
-    /// Register an issued identity.
+    /// Register an issued identity, issued for this binder's domain.
     pub fn register(&mut self, identity: &TestIdentity) {
+        self.register_in(identity, self.domain);
+    }
+
+    /// Register an identity issued for `domain`: a sibling domain's,
+    /// under the same authority, when `domain` is not this binder's.
+    pub fn register_in(&mut self, identity: &TestIdentity, domain: DomainId) {
         self.known.insert(
             identity.chain[0].as_ref().to_vec(),
-            (identity.replica, identity.incarnation, identity.role),
+            (
+                identity.replica,
+                identity.incarnation,
+                identity.role,
+                domain,
+            ),
         );
     }
 }
@@ -247,7 +259,7 @@ impl IdentityBinder for TestBinder {
         hello: &HelloV1,
     ) -> Result<BoundIdentity, BindError> {
         let leaf = certs.first().ok_or(BindError::NoCertificate)?;
-        let (replica, incarnation, role) = self
+        let (replica, incarnation, role, issued_for) = self
             .known
             .get(leaf.as_ref())
             .ok_or(BindError::UnknownCertificate)?;
@@ -257,12 +269,25 @@ impl IdentityBinder for TestBinder {
         if hello.cluster_id != self.cluster {
             return Err(BindError::ClusterMismatch);
         }
-        if hello.domain_id != self.domain {
+        // The domain is the credential's, as the production binder takes
+        // it from the certificate; the Hello must name the same one.
+        if *issued_for != self.domain || hello.domain_id != self.domain {
             return Err(BindError::DomainMismatch);
         }
         let peer = role_class(*role) == Class::Peer;
         if peer && hello.incarnation != Some(*incarnation) {
             return Err(BindError::IncarnationMismatch);
+        }
+        // A non-voter peer never holds a voter's replica identity, as the
+        // production binder refuses one naming a committed voter: here,
+        // a voter registered with this binder.
+        if peer
+            && *role != PeerRole::Voter
+            && self.known.values().any(|(voter, _, known, domain)| {
+                *known == PeerRole::Voter && voter == replica && *domain == self.domain
+            })
+        {
+            return Err(BindError::NonVoterNamesVoter);
         }
         Ok(BoundIdentity {
             role: *role,

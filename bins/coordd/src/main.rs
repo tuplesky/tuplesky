@@ -633,7 +633,13 @@ fn main() -> ExitCode {
                     short(&report.replica.0),
                     report.incarnation.get(),
                     report.role,
-                    credential_state(&report.credential),
+                    // A non-voter naming a voter is refused for its role,
+                    // whatever its generation and key say.
+                    if report.names_a_voter {
+                        "names-a-committed-voter".to_owned()
+                    } else {
+                        credential_state(&report.credential)
+                    },
                 );
                 println!(
                     "leaf issued_at={} expires_at={} renewal={} driver={}",
@@ -937,6 +943,7 @@ fn main() -> ExitCode {
             && let Err(why) = enroll::collector_for(
                 &credential,
                 placed.membership.cluster(),
+                placed.membership.domain(),
                 placed.replica,
                 placed.incarnation,
             )

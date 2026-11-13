@@ -111,8 +111,9 @@ fn every_caller_gets_its_own_identity() {
         coord_harness::pki::Ca::reopen(&b64url_decode(&encoded).expect("base64url")).expect("ca");
     let cluster =
         coord_types::ids::ClusterId(parse_id(&out.cluster).expect("a cluster identifier"));
-    let first = coord_harness::domain::issue_caller(&authority, cluster, 0);
-    let second = coord_harness::domain::issue_caller(&authority, cluster, 1);
+    let domain = coord_types::ids::DomainId(parse_id(&out.domain).expect("a domain identifier"));
+    let first = coord_harness::domain::issue_caller(&authority, cluster, domain, 0);
+    let second = coord_harness::domain::issue_caller(&authority, cluster, domain, 1);
     assert_ne!(
         first.certificate.der().as_ref(),
         second.certificate.der().as_ref()

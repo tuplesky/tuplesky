@@ -199,6 +199,11 @@ pub struct PeerTraffic {
     /// The same QUIC counts on api connections, callers' and collectors'
     /// (task-d70), so a node's datagrams split into its two planes.
     pub api: Datagrams,
+    /// Handshakes this node refused because an observer's or learner's
+    /// certificate named a committed voter's node
+    /// ([`crate::BindError::NonVoterNamesVoter`]). Never a legitimate
+    /// peer: above zero, an issuer signed what it never should.
+    pub refused_voter_names: u64,
 }
 
 /// What QUIC sent and received on one class of connections (task-d70).

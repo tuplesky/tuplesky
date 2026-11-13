@@ -9,9 +9,10 @@ use coord_authn::{
     ClockHealth, IssuerConfig, JwksLimits, KubernetesMode, Registry, WifVerifier, WorkloadKind,
 };
 use coord_node_issuer::{
-    Ca, CaError, IssueError, NodeIssuer, NodeRequest, PolicyError, RolePolicy, parse_node_uri,
+    Ca, CaError, IssueError, NodeIdentity, NodeIssuer, NodeRequest, PolicyError, RolePolicy,
+    node_uri, parse_node_uri,
 };
-use coord_types::ids::{ClusterId, ReplicaId, ReplicaIncarnation};
+use coord_types::ids::{ClusterId, DomainId, ReplicaId, ReplicaIncarnation};
 use coord_types::wire_v1::PeerRole;
 use rcgen::PublicKeyData;
 use rcgen::string::Ia5String;
@@ -24,6 +25,9 @@ use time::OffsetDateTime;
 const AUD: &str = "node-enrollment";
 const K8S_ISS: &str = "https://kubernetes.default.svc";
 const CLUSTER: ClusterId = ClusterId([1; 16]);
+const DOMAIN: DomainId = DomainId([2; 16]);
+/// A sibling domain of the same cluster, under the same issuer.
+const SIBLING: DomainId = DomainId([3; 16]);
 const NOW: u64 = 1_700_000_000;
 
 fn b64url(bytes: &[u8]) -> String {
@@ -117,6 +121,7 @@ fn policy() -> RolePolicy {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect(),
         cluster: CLUSTER,
+        domain: DOMAIN,
         nodes: vec![node(1)],
         role: PeerRole::Voter,
         min_incarnation: 2,
@@ -134,11 +139,19 @@ fn csr(usages: Vec<KeyUsagePurpose>, is_ca: IsCa) -> (Vec<u8>, KeyPair) {
         .push(DnType::CommonName, "requested-by-node");
     params.key_usages = usages;
     params.is_ca = is_ca;
-    // A node may request its own DNS SAN; the issuer ignores it and uses
-    // the policy's names.
-    params.subject_alt_names = vec![SanType::DnsName(
-        Ia5String::try_from("attacker.example").unwrap(),
-    )];
+    // A node may request its own DNS SAN, and its own identity URI for
+    // another domain; the issuer ignores both and uses the policy's.
+    let claimed = node_uri(&NodeIdentity {
+        cluster: CLUSTER,
+        domain: SIBLING,
+        node: node(1),
+        incarnation: ReplicaIncarnation::new(2).unwrap(),
+        role: PeerRole::Voter,
+    });
+    params.subject_alt_names = vec![
+        SanType::DnsName(Ia5String::try_from("attacker.example").unwrap()),
+        SanType::URI(Ia5String::try_from(claimed).unwrap()),
+    ];
     let csr = params.serialize_request(&key).unwrap();
     (csr.der().to_vec(), key)
 }
@@ -162,6 +175,7 @@ fn request(idp: &Idp, csr_der: Vec<u8>, node: u8, incarnation: u64, lifetime: u6
         incarnation,
         lifetime_secs: lifetime,
         role: None,
+        domain: None,
     }
 }
 
@@ -183,6 +197,7 @@ fn cold_enrollment_works_before_any_voter_and_binds_the_node_identity() {
     assert_eq!(issued.expires_at, NOW + 295);
     let identity = parse_node_uri(&issued.node_uri).unwrap();
     assert_eq!(identity.cluster, CLUSTER);
+    assert_eq!(identity.domain, DOMAIN);
     assert_eq!(identity.node, node(1));
     assert_eq!(identity.incarnation, ReplicaIncarnation::new(2).unwrap());
     assert_eq!(identity.role, PeerRole::Voter);
@@ -222,6 +237,13 @@ fn cold_enrollment_works_before_any_voter_and_binds_the_node_identity() {
     assert!(
         !sans.iter().any(|s| s.contains("attacker.example")),
         "CSR SAN not copied"
+    );
+    // One identity URI, the policy's: the CSR's own, for a sibling
+    // domain, is not copied.
+    assert_eq!(
+        sans.iter().filter(|s| s.contains("tuplesky://")).count(),
+        1,
+        "{sans:?}"
     );
     // The certificate's public key is the node's, proving possession bound.
     assert_eq!(
@@ -279,6 +301,110 @@ fn a_request_that_names_its_role_is_answered_by_that_rule_of_the_workload() {
         issuer.enroll(&observer, &clock(NOW)).map(|_| ()),
         Err(IssueError::Policy(PolicyError::NoRule))
     );
+}
+
+/// One workload, a node in each of two domains of the cluster: a rule
+/// for each. A request that names its domain is answered by that rule;
+/// one that names none is refused, since which domain it got would be
+/// the order the rules are listed in; and a domain the workload holds no
+/// rule for is refused as having no rule, never granted. The
+/// certificate's domain is always the rule's.
+#[test]
+fn a_request_that_names_its_domain_is_answered_by_that_rule_of_the_workload() {
+    let provider = idp();
+    let (cert, key) = ca(NOW, 86_400);
+    let authority = Ca::load(&cert, &key, NOW).unwrap();
+    let sibling = RolePolicy {
+        domain: SIBLING,
+        ..policy()
+    };
+    let mut issuer = NodeIssuer::new(verifier(&provider), authority, vec![policy(), sibling]);
+    let domain_of =
+        |issued: coord_node_issuer::Issued| parse_node_uri(&issued.node_uri).unwrap().domain;
+
+    let (csr_der, _) = csr(vec![KeyUsagePurpose::DigitalSignature], IsCa::NoCa);
+    assert_eq!(
+        issuer
+            .enroll(&request(&provider, csr_der.clone(), 1, 2, 300), &clock(NOW))
+            .map(|_| ()),
+        Err(IssueError::Policy(PolicyError::DomainNotNamed)),
+        "no domain named, with rules for two: refused, not the first rule"
+    );
+
+    for domain in [DOMAIN, SIBLING] {
+        let named = NodeRequest {
+            domain: Some(domain.0),
+            ..request(&provider, csr_der.clone(), 1, 2, 300)
+        };
+        assert_eq!(
+            domain_of(issuer.enroll(&named, &clock(NOW)).unwrap()),
+            domain
+        );
+    }
+
+    // Naming a domain is choosing among the workload's rules, not a grant.
+    let other = NodeRequest {
+        domain: Some([4; 16]),
+        ..request(&provider, csr_der.clone(), 1, 2, 300)
+    };
+    assert_eq!(
+        issuer.enroll(&other, &clock(NOW)).map(|_| ()),
+        Err(IssueError::Policy(PolicyError::NoRule))
+    );
+
+    // What counts is the rules that could answer: a named role whose
+    // rules reach one domain needs no domain named, even when the
+    // workload's other role is in another.
+    let (cert, key) = ca(NOW, 86_400);
+    let authority = Ca::load(&cert, &key, NOW).unwrap();
+    let sibling_frontend = RolePolicy {
+        domain: SIBLING,
+        role: PeerRole::Frontend,
+        ..policy()
+    };
+    let mut issuer = NodeIssuer::new(
+        verifier(&provider),
+        authority,
+        vec![policy(), sibling_frontend],
+    );
+    for (role, domain) in [(PeerRole::Voter, DOMAIN), (PeerRole::Frontend, SIBLING)] {
+        let named = NodeRequest {
+            role: Some(role),
+            ..request(&provider, csr_der.clone(), 1, 2, 300)
+        };
+        assert_eq!(
+            domain_of(issuer.enroll(&named, &clock(NOW)).unwrap()),
+            domain
+        );
+    }
+    assert_eq!(
+        issuer
+            .enroll(&request(&provider, csr_der, 1, 2, 300), &clock(NOW))
+            .map(|_| ()),
+        Err(IssueError::Policy(PolicyError::DomainNotNamed)),
+        "neither named: two domains could answer"
+    );
+}
+
+/// A URI without a domain, as every certificate before the domain was
+/// bound carried, is not an identity: it names no domain it may reach.
+#[test]
+fn a_node_uri_without_a_domain_is_not_an_identity() {
+    let identity = NodeIdentity {
+        cluster: CLUSTER,
+        domain: DOMAIN,
+        node: node(1),
+        incarnation: ReplicaIncarnation::new(2).unwrap(),
+        role: PeerRole::Frontend,
+    };
+    let uri = node_uri(&identity);
+    assert_eq!(parse_node_uri(&uri), Some(identity));
+    let undomained = format!(
+        "tuplesky://cluster/{}/node/{}/incarnation/2/role/frontend",
+        "01".repeat(16),
+        "01".repeat(16)
+    );
+    assert_eq!(parse_node_uri(&undomained), None);
 }
 
 #[test]

@@ -2179,6 +2179,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                         received_frames: t.received_frames,
                         received_bytes: t.received_bytes,
                         received_streams: t.received_streams,
+                        refused_voter_names: t.refused_voter_names,
                         api: coord_daemon::metrics::Datagrams {
                             datagrams_sent: api.datagrams_sent,
                             datagrams_received: api.datagrams_received,
@@ -5070,13 +5071,14 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             TransportEvent::ApiDelivery {
                 provenance, frame, ..
             } => match provenance {
-                Some(provenance) => {
+                Some(provenance) if provenance.is_voter() => {
                     self.on_frame_from_voter(provenance, &frame);
                     self.send_read_orders(transport);
                 }
                 // A peer holding no replica identity is not a voter, so
-                // what it delivered is not evidence of anything.
-                None => self.frontend.counts.unserved += 1,
+                // what it delivered is not evidence of anything; nor is
+                // an observer's or learner's, whose replica may be any.
+                _ => self.frontend.counts.unserved += 1,
             },
             // A caller's plane carries no protocol traffic.
             TransportEvent::PeerFrame { .. } => {
@@ -5106,6 +5108,14 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                     self.frontend.counts.unserved += 1;
                     return;
                 };
+                // Peer access is never a vote (design Section 10.1): an
+                // observer's or learner's frame is counted and dropped
+                // here, as `Voter::on_peer` would drop it, never read as
+                // the voter its replica names.
+                if !provenance.is_voter() {
+                    self.frontend.counts.unserved += 1;
+                    return;
+                }
                 // The payload as it arrived, not re-framed. A machine
                 // consumes the consensus message itself; the frame
                 // around it is the transport's, and the transport has
@@ -5157,7 +5167,10 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 if let Some(plane) = &mut self.plane {
                     plane.report();
                 }
-                if let (Some(peer), Backing::Voting(voter)) = (identity.replica, &mut self.backing)
+                // Only a voter's link: an observer or learner holds a
+                // link of its own, and what it says is no voter's.
+                if let (coord_types::wire_v1::PeerRole::Voter, Some(peer), Backing::Voting(voter)) =
+                    (identity.role, identity.replica, &mut self.backing)
                 {
                     match voter.peer_linked(peer) {
                         Ok(out) => {

@@ -172,8 +172,12 @@ impl Session {
             replica: ReplicaId(parse_id(&node.node)?),
         };
 
-        let issued =
-            coord_harness::domain::issue_caller(&authority(provisioned)?, cluster, instance);
+        let issued = coord_harness::domain::issue_caller(
+            &authority(provisioned)?,
+            cluster,
+            domain,
+            instance,
+        );
         let chain = vec![rustls_pki_types::CertificateDer::from(
             issued.certificate.der().to_vec(),
         )];

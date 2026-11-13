@@ -45,6 +45,15 @@ pub enum BindError {
     UnknownCertificate,
     /// The certificate is not entitled to the declared role.
     RoleNotAuthorized,
+    /// An observer's or learner's certificate names a committed voter's
+    /// node (design Section 10.1).
+    ///
+    /// Apart from every other refusal because no issuer that follows its
+    /// policy signs one: the node is a voter's, and a non-voter role for
+    /// it means an issuer signed what it never should. The accepting
+    /// node counts it ([`crate::PeerTraffic::refused_voter_names`]) for
+    /// an operator to see; the peer learns only that it was refused.
+    NonVoterNamesVoter,
     /// The declared cluster is not the certificate's.
     ClusterMismatch,
     /// The declared domain is not one the certificate may reach.
