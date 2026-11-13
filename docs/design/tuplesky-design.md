@@ -2449,14 +2449,24 @@ About 11.8 of a follower's 13.9 rows a command leave, 85%. What stays is 2 appli
     - The image carries the same two. A store of today's layout is refused (point 1), so none has to be dropped from one.
     - At most about 4 MB.
   - At execution the lowering moves the command's payload and dependency row out, as it does today (`assign_executed`, `move_decided`): to the history buffer (point 3), and the payload to the retry window too (point 4). A released command's rows go at the Sync's release, and a pulled command's at its install, as today.
-  - So the map is bounded by the table and two Syncs, not by history or leader changes: about 2 MB of commands, 4 MB of Syncs and the decided overlay (point 3), about 6 MB at the largest, against today's rows, which nothing trims.
+  - **Each key's latest decided command stays as well** (task-d116, point 3; Codex on #260).
+    - A key keeps naming its latest command after that command executes, and the key's chain needs that record and its paths. Neither the key index nor the intake index leads from a key to it (task-d116).
+    - So the map also keeps, under each key, the decided record of the key's latest command: one copy however many keys name it.
+    - The record goes once every key it names has a later command. A later change to it (point 3) is written there.
+    - The image carries it with the rest of the map, and boot reads it there.
+    - It costs about one more map update a key a command names.
+    - **This part grows with the keys the domain has named, not with history,** as task-d105's key index does. A dependency row is about 200 bytes, the 1 KB above less the payload, so this part is about 200 bytes a key at most, less where one command is the latest for several keys. A domain whose commands have named a million distinct keys holds up to about 200 MB here; today `decided_v1` holds a record for every command.
+  - So the map is bounded by the table, two Syncs and the domain's keys, not by history or leader changes. That is about 2 MB of commands, 4 MB of Syncs and the decided overlay (point 3), about 6 MB, plus about 200 bytes a key named. Today's rows are bounded by nothing, since nothing trims them.
+  - **Not taken: a key's latest command kept as a position, its record read back from history.**
+    - It would be about 40 bytes a key.
+    - But trim (task-d27) would then have to keep every segment holding some key's latest record, which is the history the floor exists to drop.
 - **Who reads it.**
   - The lowering, on the materializer's thread, for the store's own writes and the move.
   - Boot's `read_protocol`, after the attach, when nothing else runs.
   - The export, which takes the version published with the commit it pins (point 6).
   - Nothing on the loop reads it while the domain runs: a campaign's report comes from the machine's ledger, which reads no rows (task-d77).
 - **CPU (inferred):** an insert or removal in a persistent map for each protocol update, about 0.3 to 0.5 µs, at about 8 updates a command: 2 to 4 µs a command a voter, against the redb rows' share of the materializer.
-- **Not taken:** a plain map copied at each pin. It would cost a copy of up to about 6 MB a publication on the materializer's thread, and the pin would have to wait for the materializer to reach a commit boundary.
+- **Not taken:** a plain map copied at each pin. It would cost a copy of the whole map, 6 MB and up, a publication on the materializer's thread, and the pin would have to wait for the materializer to reach a commit boundary.
 
 **3. Executed history: a buffer, then segments.**
 - **What executed history is:** for each position, the execution record (command, revision, result digest), the payload, and this node's decided record (the dependency row moved at execution, node-private, with its epoch). Today they are `execution_v1`, `payload_v1` and `decided_v1`.
