@@ -132,10 +132,12 @@ class Step:
     # last `metrics` line since it started: node -> (commands a commit,
     # whether it is the leader).
     per_projection_commit: dict = field(default_factory=dict)
-    # Each voter's memory (see memory_of): node -> (resident set at its
-    # last boot's last sample, the largest high-water mark of its boots),
-    # in MiB.
+    # Each voter's or etcd member's memory (see memory_of): node ->
+    # (resident set at its last boot's last sample, the largest high-water
+    # mark of its boots), in MiB.
     memory: dict = field(default_factory=dict)
+    # The etcd member that led (see etcd_leader_of), for an etcd run.
+    etcd_leader: str | None = None
     # The batch depth (see batch_of): commands a proposal frame and a
     # leader turn, from the leader's last `metrics` line.
     batch: dict = field(default_factory=dict)
@@ -569,10 +571,10 @@ def read_per_projection_commit(store: str) -> dict:
 
 
 def memory_of(store: str) -> dict:
-    """Each voter's memory from `cpu_sampler.py --memory`, named by its
-    `--nodes` file: node -> (its resident set at the last sample of its
-    last boot, the largest high-water mark, `VmHWM`, of its boots), in
-    MiB; {} without both files."""
+    """Each voter's or etcd member's memory from `cpu_sampler.py
+    --memory`, named by its `--nodes` file: node -> (its resident set at
+    the last sample of its last boot, the largest high-water mark,
+    `VmHWM`, of its boots), in MiB; {} without both files."""
     samples = js.read_memory(os.path.join(store, "cpu-samples-memory.csv"))
     named = js.read_node_map(os.path.join(store, "cpu-samples-nodes.csv"))
     boots: dict = {}
@@ -583,6 +585,26 @@ def memory_of(store: str) -> dict:
         node: (max(runs, key=lambda r: r[-1][0])[-1][1], max(r[-1][2] for r in runs))
         for node, runs in sorted(boots.items())
     }
+
+
+BECAME_LEADER = re.compile(r"became leader at term (\d+)")
+
+
+def etcd_leader_of(store: str) -> str | None:
+    """The etcd member that led last: the node whose `etcd.log`, which
+    Jepsen keeps in the node's directory of the store, says raft's `became
+    leader at term N` with the largest N; None without one."""
+    best = None
+    for node in sorted(os.listdir(store)):
+        try:
+            with open(os.path.join(store, node, "etcd.log"), encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    m = BECAME_LEADER.search(line)
+                    if m and (best is None or int(m.group(1)) > best[0]):
+                        best = (int(m.group(1)), node)
+        except OSError:
+            continue
+    return best[1] if best else None
 
 
 # etcd's samples by kind of work: the leaf's kind, the first that matches
@@ -728,7 +750,9 @@ def read_step(side: str, step_name: str, store: str, rep: int = 1) -> Step:
         step.counts = read_counts(store)
         step.per_projection_commit = read_per_projection_commit(store)
         step.behind = behind_of(store)
-        step.memory = memory_of(store)
+    else:
+        step.etcd_leader = etcd_leader_of(store)
+    step.memory = memory_of(store)
     return step
 
 
@@ -1073,9 +1097,10 @@ def render(steps: list[Step], title: str, baseline: str = "etcd") -> str:
     if rows:
         nodes = sorted({n for s in rows for n in s.memory})
         out += [
-            "**The voters' memory** (each TupleSky run, each voter, from `cpu_sampler.py --memory` once a second: "
-            "its resident set at its last sample and its high-water mark, `VmHWM`, the largest over its boots; MiB; "
-            "the leader, by its commands a projection commit's reading, starred)",
+            "**The servers' memory** (each run, each voter or etcd member, from `cpu_sampler.py --memory` once a "
+            "second: its resident set at its last sample and its high-water mark, `VmHWM`, the largest over its "
+            "boots; MiB; the leader starred: TupleSky's by its commands a projection commit's reading, etcd's the "
+            "member whose `etcd.log` last says it became leader)",
             "",
             "| Step | Side | " + " | ".join(nodes) + " |",
             "| --- | --- " + "| --- " * len(nodes) + "|",
@@ -1084,7 +1109,10 @@ def render(steps: list[Step], title: str, baseline: str = "etcd") -> str:
             cells = []
             for n in nodes:
                 end, peak = s.memory.get(n, (None, None))
-                star = "*" if s.per_projection_commit.get(n, (None, False))[1] else ""
+                if s.side in TUPLESKY:
+                    star = "*" if s.per_projection_commit.get(n, (None, False))[1] else ""
+                else:
+                    star = "*" if n == s.etcd_leader else ""
                 cells.append(f"{cell(end, '.0f')} / {cell(peak, '.0f')}{star}")
             out.append(f"| {name(s)} | " + " | ".join(cells) + " |")
         out += ["", "(each cell: resident at the end / high-water mark)", ""]

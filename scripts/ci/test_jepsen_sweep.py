@@ -374,11 +374,30 @@ class SweepTests(unittest.TestCase):
             f.write("pid,start,node\n1,1,n1\n2,1,n2\n3,9,n2\n")
         step = sw.read_step("head", "30", path)
         self.assertEqual(step.memory, {"n1": (150.0, 200.0), "n2": (40.0, 300.0)})
-        text = sw.render([step, sw.read_step("etcd", "30", self.store("e", tuplesky=False))], "Sweep")
-        self.assertIn("**The voters' memory**", text)
+        # etcd's members: n1 led at term 2, then n2 at term 3, so n2 is
+        # starred; an etcd run without samples has no row.
+        epath = self.store("e", tuplesky=False)
+        with open(os.path.join(epath, "cpu-samples-memory.csv"), "w") as f:
+            f.write("time,pid,start,rss_kib,hwm_kib\n"
+                    "2026-09-27 10:00:10.000000,7,1,81920,92160\n"
+                    "2026-09-27 10:00:10.000000,8,1,71680,102400\n")
+        with open(os.path.join(epath, "cpu-samples-nodes.csv"), "w") as f:
+            f.write("pid,start,node\n7,1,n1\n8,1,n2\n")
+        for node, lines in (("n1", ['{"msg":"8e9e05c52164694d became leader at term 2"}']),
+                            ("n2", ['{"msg":"91bc3c398fb3c146 became follower at term 2"}',
+                                    '{"msg":"91bc3c398fb3c146 became leader at term 3"}'])):
+            os.makedirs(os.path.join(epath, node))
+            with open(os.path.join(epath, node, "etcd.log"), "w") as f:
+                f.write("\n".join(lines) + "\n")
+        estep = sw.read_step("etcd", "30", epath)
+        self.assertEqual(estep.etcd_leader, "n2")
+        self.assertEqual(estep.memory, {"n1": (80.0, 90.0), "n2": (70.0, 100.0)})
+        text = sw.render([step, estep, sw.read_step("etcd", "30", self.store("e2", tuplesky=False))], "Sweep")
+        self.assertIn("**The servers' memory**", text)
         self.assertIn("| 30 | head | 150 / 200* | 40 / 300 |", text)
-        section = text[text.index("**The voters' memory**"):text.index("**Against etcd")]
-        self.assertNotIn("| 30 | etcd |", section)
+        self.assertIn("| 30 | etcd | 80 / 90 | 70 / 100* |", text)
+        section = text[text.index("**The servers' memory**"):text.index("**Against etcd")]
+        self.assertEqual(section.count("| 30 | etcd"), 1)
 
 
 class ServerProfileTests(unittest.TestCase):

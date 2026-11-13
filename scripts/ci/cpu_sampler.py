@@ -31,10 +31,11 @@ count. These are cumulative from the process's
 start, so the summary takes differences; a run queue is time a thread was
 ready to run and waiting for a CPU.
 
-With --memory, each row also appends one row per `coordd` to that file:
-the time, its pid and start time, and its resident set (`VmRSS`) and the
-resident set's high-water mark (`VmHWM`) from `/proc/<pid>/status`, in KiB,
-so a run reads each voter's memory at its end and at its peak.
+With --memory, each row also appends one row per server, each `coordd`
+and each `etcd`, to that file: the time, its pid and start time, and its
+resident set (`VmRSS`) and the resident set's high-water mark (`VmHWM`)
+from `/proc/<pid>/status`, in KiB, so a run reads each voter's or etcd
+member's memory at its end and at its peak.
 
 With --wakeups, each row also appends one row per `coordd` and kind of
 thread to that file (task-d91's R4): the time, its pid and start time, the
@@ -49,8 +50,8 @@ switch is the thread giving up its CPU to wait, so it counts its parks. A thread
 reading in the sums, so they stay cumulative while short-lived threads (a
 publication's) come and go.
 
-With --nodes, the first row that sees a `coordd` also appends one row for
-it to that file: its pid and start time and the node it runs on, its
+With --nodes, the first row that sees a `coordd` or an `etcd` also
+appends one row for it to that file: its pid and start time and the node it runs on, its
 container's hostname (each Jepsen node is a container named and
 hostnamed after the node, as leader_profile.py reads it), so the summary
 can say whose loop a row of --threads is. One whose node cannot be read
@@ -232,7 +233,7 @@ def loops(pids) -> list[str]:
 
 
 def memory(pids) -> list[str]:
-    """One `--memory` row's cells after the time for each coordd in `pids`
+    """One `--memory` row's cells after the time for each server in `pids`
     (pid, start): its resident set and its high-water mark, in KiB."""
     out = []
     for pid, start in pids:
@@ -269,7 +270,7 @@ def processes():
 
 
 def node_of(pid: int) -> str | None:
-    """The node a coordd runs on, its container's hostname; None where it
+    """The node a coordd or etcd runs on, its container's hostname; None where it
     cannot be read (the runner's user reads a container's root through
     sudo, as leader_profile.py does)."""
     path = f"/proc/{pid}/root/etc/hostname"
@@ -331,6 +332,7 @@ def main() -> int:
             now = datetime.datetime.now(datetime.timezone.utc)
             busy, total, steal = host()
             coordd = []
+            servers = []  # coordd and etcd: --memory and --nodes
             for pid, start, comm, ticks in processes():
                 key = (pid, start)
                 if first:
@@ -338,6 +340,8 @@ def main() -> int:
                 last[key] = (GROUP_OF.get(comm), ticks)
                 if comm == "coordd":
                     coordd.append(key)
+                if comm in ("coordd", "etcd"):
+                    servers.append(key)
             sums = dict.fromkeys(NAMES, 0)
             for key, (group, ticks) in last.items():
                 if group:
@@ -353,7 +357,7 @@ def main() -> int:
                     threads.write(f"{now:%Y-%m-%d %H:%M:%S.%f},{cells}\n")
                 threads.flush()
             if mem:
-                for cells in memory(coordd):
+                for cells in memory(servers):
                     mem.write(f"{now:%Y-%m-%d %H:%M:%S.%f},{cells}\n")
                 mem.flush()
             if wake:
@@ -361,7 +365,7 @@ def main() -> int:
                     wake.write(f"{now:%Y-%m-%d %H:%M:%S.%f},{cells}\n")
                 wake.flush()
             if named:
-                for pid, start in coordd:
+                for pid, start in servers:
                     if (pid, start) not in known and (node := node_of(pid)):
                         known.add((pid, start))
                         named.write(f"{pid},{start},{node}\n")
