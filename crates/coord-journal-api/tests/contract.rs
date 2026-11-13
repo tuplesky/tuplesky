@@ -199,9 +199,11 @@ fn chained_records_verify_and_round_trip_exactly() {
 }
 
 /// The three ways to encode a record agree (task-d60): `encoded_len`
-/// counts without encoding and `encode_into` appends after what a buffer
-/// already holds, and both give exactly what `encode` gives, which the
-/// frozen fixture pins.
+/// is the length counted when the record was sealed or decoded,
+/// `encode_into` appends after what a buffer already holds, and both give
+/// exactly what `encode` gives, which the frozen fixture pins. A record
+/// decoded from those bytes carries the same length and encodes to the
+/// same bytes.
 #[test]
 fn encoded_len_and_encode_into_agree_with_encode() {
     let mut buf = vec![0xee; 3];
@@ -212,6 +214,10 @@ fn encoded_len_and_encode_into_agree_with_encode() {
         r.encode_into(&mut buf).unwrap();
         expect.extend_from_slice(&bytes);
         assert_eq!(buf, expect);
+        let decoded = JournalRecordV1::decode(&bytes).unwrap();
+        assert_eq!(decoded.encoded_len().unwrap(), bytes.len());
+        assert_eq!(decoded.encode().unwrap(), bytes);
+        assert_eq!(&decoded, r);
         // A clone shares the body rather than copying its updates.
         let clone = r.clone();
         assert!(std::ptr::eq(clone.body(), r.body()));

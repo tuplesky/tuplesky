@@ -335,6 +335,10 @@ pub struct JournalRecordV1 {
     predecessor: Digest32,
     body: Arc<RecordBody>,
     digest: Digest32,
+    /// The encoding's length, counted once where the record is made: at
+    /// [`Self::seal`], and at [`Self::decode`] as the bytes decoded. A
+    /// function of the fields above, so it never disagrees with them.
+    encoded_len: usize,
 }
 
 fn digest_of(
@@ -495,15 +499,18 @@ impl JournalRecordV1 {
             &draft.predecessor,
             &body_bytes,
         );
-        let record = JournalRecordV1 {
+        let mut record = JournalRecordV1 {
             format: JOURNAL_RECORD_FORMAT_V1,
             origin: draft.origin,
             seq: draft.seq,
             predecessor: draft.predecessor,
             body: Arc::new(draft.body),
             digest,
+            encoded_len: 0,
         };
-        if record.encoded_len()? > MAX_RECORD_BYTES {
+        record.encoded_len = postcard::experimental::serialized_size(&record.wire())
+            .map_err(|_| RecordError::TooLarge)?;
+        if record.encoded_len > MAX_RECORD_BYTES {
             return Err(RecordError::TooLarge);
         }
         Ok(record)
@@ -622,24 +629,32 @@ impl JournalRecordV1 {
         }
     }
 
-    /// Encoded length in bytes, counted without encoding.
+    /// Encoded length in bytes, counted once when the record was sealed
+    /// or decoded.
     pub fn encoded_len(&self) -> Result<usize, RecordError> {
-        postcard::experimental::serialized_size(&self.wire()).map_err(|_| RecordError::TooLarge)
+        Ok(self.encoded_len)
     }
 
-    /// Durable encoding.
+    /// Durable encoding, into a buffer sized once.
     pub fn encode(&self) -> Result<Vec<u8>, RecordError> {
-        postcard::to_allocvec(&self.wire()).map_err(|_| RecordError::TooLarge)
+        let mut buf = Vec::with_capacity(self.encoded_len);
+        self.encode_into(&mut buf)?;
+        Ok(buf)
     }
 
     /// Append the durable encoding to `buf`, the bytes [`Self::encode`]
-    /// returns. On an error `buf` is left as it was.
+    /// returns. The room is reserved once, from the length counted when
+    /// the record was made, rather than grown a field at a time. On an
+    /// error `buf` is left as it was.
     pub fn encode_into(&self, buf: &mut Vec<u8>) -> Result<(), RecordError> {
         let start = buf.len();
+        buf.reserve(self.encoded_len);
         postcard::serialize_with_flavor(&self.wire(), Append(buf)).map_err(|_| {
             buf.truncate(start);
             RecordError::TooLarge
-        })
+        })?;
+        debug_assert_eq!(buf.len() - start, self.encoded_len);
+        Ok(())
     }
 
     /// Decode exactly: bounds are checked before nested allocation is
@@ -679,6 +694,7 @@ impl JournalRecordV1 {
             predecessor: wire.predecessor,
             body: Arc::new(wire.body),
             digest: wire.digest,
+            encoded_len: bytes.len(),
         })
     }
 }
