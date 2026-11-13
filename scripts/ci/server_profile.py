@@ -32,7 +32,9 @@ says so.
 
 Exits 0 whatever happens: counts that cannot be taken (no `perf`, no
 permission, no load before SIGTERM) leave FILE saying why, and the test is
-never failed by it.
+never failed by it. `perf` runs under `sudo -n`, as `leader_profile.py`'s
+does: the runner's kernel lets only root read tracepoints such as
+`raw_syscalls:sys_enter` or sample another user's processes.
 """
 from __future__ import annotations
 
@@ -105,7 +107,7 @@ def folded(data: str, out: str) -> str | None:
     """`perf script` on DATA, each sample's stack folded leaf first into
     OUT, a sample a line. None, or why not."""
     proc = subprocess.run(
-        ["perf", "script", "-i", data, "-F", "ip,sym"],
+        ["sudo", "-n", "perf", "script", "-i", data, "-F", "ip,sym"],
         capture_output=True, text=True, errors="replace",
     )
     if proc.returncode != 0:
@@ -193,7 +195,7 @@ def main() -> int:
 
     runs = []
     stat = subprocess.Popen(
-        ["perf", "stat", "-x,", "-e", "raw_syscalls:sys_enter,context-switches,task-clock",
+        ["sudo", "-n", "perf", "stat", "-x,", "-e", "raw_syscalls:sys_enter,context-switches,task-clock",
          "-p", ",".join(map(str, pids)), "--", "sleep", str(args.seconds)],
         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
     )
@@ -202,7 +204,7 @@ def main() -> int:
         for role, pid in zip(("leader", "follower"), by_load[:2]):
             data = sibling(args.out, f"-etcd-{role}") + ".data"
             graphs[role] = (pid, data, subprocess.Popen(
-                ["perf", "record", "-F", "499", "--call-graph", "fp", "-p", str(pid), "-o", data,
+                ["sudo", "-n", "perf", "record", "-F", "499", "--call-graph", "fp", "-p", str(pid), "-o", data,
                  "--", "sleep", str(args.seconds)],
                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
             ))
@@ -235,10 +237,7 @@ def main() -> int:
         why = folded(data, sibling(args.out, f"-etcd-{role}"))
         if why:
             lines.append(f"{role}_error={why}")
-        try:
-            os.remove(data)
-        except OSError:
-            pass
+        subprocess.run(["sudo", "-n", "rm", "-f", data], capture_output=True)
     write(args.out, lines)
     return 0
 
