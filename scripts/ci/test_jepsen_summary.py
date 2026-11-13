@@ -1223,6 +1223,33 @@ class ResendAndFollowerTests(unittest.TestCase):
         self.assertIn("| `coord_daemon::voter::Voter<P>::pump_reads` | 80.0 |", text)
 
 
+    def test_the_loops_by_leaf_kind(self):
+        run = "main;coordd::serve::Domain<P>::run::{{closure}}"
+        lead = js.read_chains_from_lines([
+            "header",
+            "    40.00%  coordd  [.] mi_malloc",
+            f"40.00% {run};coord_daemon::node::Node<P>::settle;mi_malloc",
+            "    20.00%  libc.so.6  [.] __memcmp_avx2_movbe",
+            f"20.00% {run};coord_consensus::leader::Leader::propose;alloc::collections::btree::search::search_tree (inlined);__memcmp_avx2_movbe",
+            "    10.00%  libc.so.6  [.] __memmove_avx_unaligned_erms",
+            f"10.00% {run};coord_journal_api::record::JournalRecordV1::encode;__memmove_avx_unaligned_erms",
+            "    30.00%  coordd  [.] coord_daemon::node::Node<P>::settle",
+            f"30.00% {run};coord_daemon::node::Node<P>::settle",
+        ])
+        follow = js.read_chains_from_lines([
+            "header",
+            "    100.00%  coordd  [.] aws_lc_0_32_aes_gcm_encrypt",
+            f"100.00% {run};coord_transport::send;aws_lc_0_32_aes_gcm_encrypt",
+        ])
+        text = "\n".join(js.leaf_kinds_table(lead, follow, 500.0, 200.0, "n3"))
+        self.assertIn("| allocator | 200.0 (40.0%) | 0.0 (0.0%) |", text)
+        self.assertIn("| B-tree search | 100.0 (20.0%) | 0.0 (0.0%) |", text)
+        self.assertIn("| memcpy, memmove | 50.0 (10.0%) | 0.0 (0.0%) |", text)
+        self.assertIn("| crypto | 0.0 (0.0%) | 200.0 (100.0%) |", text)
+        self.assertIn("| the rest | 150.0 (30.0%) | 0.0 (0.0%) |", text)
+        self.assertIn("| **all** | 500.0 | 200.0 |", text)
+        self.assertEqual(js.leaf_kinds_table([], [], None, None), [])
+
     def test_the_sampled_follower_is_costed_at_its_own_loop(self):
         # n3 is slower than n2: the profile sampled n3, so its phases are
         # costed at its 900 µs, not the followers' mean of 750.

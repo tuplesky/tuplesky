@@ -1376,6 +1376,79 @@ def phase_children(chains: list, phase: str) -> collections.Counter:
     return out
 
 
+# What a sample's leaf is, for the load-bound work a faster core may not
+# shorten (#185's hypothesis): the allocator, a B-tree's key search (its
+# memcmp too), other comparing and copying, hashing and the transport's
+# crypto, with the kernel and everything else.
+LEAF_KINDS = (
+    "allocator", "B-tree search", "other memcmp", "memcpy, memmove", "hashing", "crypto", "kernel", "the rest",
+)
+CRYPTO = ("aws_lc", "aes_", "aes_gcm", "gcm_", "ghash", "chacha", "poly1305", "ring_core")
+KERNEL = ("entry_SYSCALL", "do_syscall_64", "__x64_sys_", "asm_sysvec", "asm_exc", "syscall_exit", "__schedule")
+
+
+def leaf_kind(leaf: str, frames: list[str]) -> str:
+    """One sample's leaf as one of LEAF_KINDS."""
+    name = bare(leaf)
+    if allocating(leaf, frames):
+        return "allocator"
+    near = frames[-4:]
+    if "btree" in name or (name.startswith(COMPARE) and any("btree" in f for f in near)):
+        return "B-tree search"
+    if name.startswith(COMPARE):
+        return "other memcmp"
+    if name.startswith(COPY):
+        return "memcpy, memmove"
+    low = name.lower()
+    if "hash" in low or "siphash" in low or "hasher" in low:
+        return "hashing"
+    if any(c in low for c in CRYPTO):
+        return "crypto"
+    if any(f.startswith(KERNEL) for f in frames):
+        return "kernel"
+    return "the rest"
+
+
+def leaf_kinds(chains: list) -> collections.Counter:
+    """Each kind's share of a thread's samples, in percent."""
+    out = collections.Counter()
+    for leaf, share, frames in chains:
+        out[leaf_kind(leaf, frames)] += share
+    return out
+
+
+def leaf_kinds_table(lead: list, follow: list, leader_us: float | None, follower_us: float | None,
+                     follower: str | None = None) -> list[str]:
+    """The leader's and a follower's loops by what each sample's leaf is,
+    in microseconds per command where the loop's cost is known, else in
+    percent; [] without either profile."""
+    if not (lead or follow):
+        return []
+    a, b = leaf_kinds(lead), leaf_kinds(follow)
+    scaled = bool(leader_us and follower_us)
+
+    def cell(counter, us, kind):
+        share = counter.get(kind, 0.0)
+        return f"{share * us / 100:.1f} ({share:.1f}%)" if scaled else f"{share:.1f}%"
+
+    whose = f"the sampled follower, {follower}" if follower else "a follower"
+    out = [
+        f"**The leader's loop and {whose}'s, by what each sample's leaf is** (the call graph's samples; "
+        f"{'µs per command, each kind’s share times its loop’s CPU per command, with the share' if scaled else 'percent of the samples'}; "
+        "the allocator is `malloc`, `free` and kin or anything under Rust's allocator calls; a B-tree search is a "
+        "leaf in `alloc::collections::btree` or a `memcmp` it called; crypto is aws-lc's, the transport's)",
+        "",
+        "| Leaf | Leader | Follower |",
+        "| --- | --- | --- |",
+    ]
+    for kind in LEAF_KINDS:
+        out.append(f"| {kind} | {cell(a, leader_us, kind)} | {cell(b, follower_us, kind)} |")
+    if scaled:
+        out.append(f"| **all** | {sum(a.values()) * leader_us / 100:.1f} | {sum(b.values()) * follower_us / 100:.1f} |")
+    out.append("")
+    return out
+
+
 def copies_table(chains: list, scale: float | None, top: int = 15) -> list[str]:
     """memcmp and memmove by caller, in µs per command where `scale` (the
     loop's µs per command over 100) is known, else percent."""
@@ -2393,6 +2466,7 @@ def leader_and_follower(store: str, voters: dict, top: int = 20) -> list[str]:
     lead = read_chains(os.path.join(store, "leader-profile-chains.txt"))
     follow = read_chains(os.path.join(store, "follower-profile-chains.txt"))
     out = phase_comparison(lead, follow, leader_us, follower_us, top, sampled)
+    out.extend(leaf_kinds_table(lead, follow, leader_us, follower_us, sampled))
     out.extend(copies_table(lead, leader_us / 100 if leader_us else None))
     out.extend(children_table(follow, follower_us / 100 if follower_us else None, "follower"))
     alloc_path = os.path.join(store, "leader-profile-alloc-chains.txt")
