@@ -432,6 +432,12 @@ mod tests {
             format!("{}\n", child.id()),
         )
         .expect("write");
+        // Until the child has exec'd `sh`, its command line is still this
+        // test's: wait for the exec, not for a guess at how long it takes.
+        let by = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while replacement(dir.path(), &config).is_none() && std::time::Instant::now() < by {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         assert_eq!(replacement(dir.path(), &config), Some(child.id()));
         assert_eq!(
             replacement(dir.path(), &dir.path().join("other.toml")),

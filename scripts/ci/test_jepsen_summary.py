@@ -877,6 +877,18 @@ class CheckpointTests(unittest.TestCase):
         self.assertIn("**Gate** (#268", text)
         self.assertIn("| n1 | 3 | 41 | 7 |", text)
 
+    def test_the_refused_voter_names(self):
+        cost = {"executed": 1000, "busy": {"secs": 1, "nanos": 0}, "uptime": {"secs": 60, "nanos": 0},
+                "recent": {"Unavailable": "NotInstrumented"}, "reads": {"served": 0},
+                "traffic": {"Observed": {"sent_frames": 1}}}
+        line = lambda: "metrics " + json.dumps({"stages": [], "cost": {"Observed": cost}}) + "\n"
+        self.assertNotIn("**Refused voter names**", self.summarize(line()))
+        cost["traffic"]["Observed"]["refused_voter_names"] = 0
+        self.assertIn("**Refused voter names** (#272", self.summarize(line()))
+        self.assertIn("0 at every voter (1)", self.summarize(line()))
+        cost["traffic"]["Observed"]["refused_voter_names"] = 2
+        self.assertIn("NOT ZERO: n1 2.", self.summarize(line()))
+
 
 
 class CarryReadingTests(unittest.TestCase):

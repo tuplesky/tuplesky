@@ -2364,6 +2364,26 @@ def gate_table(voters: dict) -> list[str]:
     return out
 
 
+def refused_voter_names_line(voters: dict) -> list[str]:
+    """#272's `traffic.refused_voter_names`, each voter's last `metrics`
+    line: handshakes refused because a non-voter's certificate named a
+    committed voter. Zero in every healthy run, so one line says so, or
+    names each voter's count when any is not. [] from a build without it."""
+    counts = []
+    for node, v in voters.items():
+        raw = (v.cost.raw or {}) if v.cost else {}
+        t = raw.get("traffic")
+        t = t.get("Observed") if isinstance(t, dict) and "Observed" in t else t
+        if isinstance(t, dict) and isinstance(t.get("refused_voter_names"), int):
+            counts.append((node, t["refused_voter_names"]))
+    if not counts:
+        return []
+    head = "**Refused voter names** (#272, each voter's last `metrics` line, cumulative since it started):"
+    if all(n == 0 for _, n in counts):
+        return [f"{head} 0 at every voter ({len(counts)}).", ""]
+    return [f"{head} NOT ZERO: " + ", ".join(f"{node} {n}" for node, n in counts) + ".", ""]
+
+
 def loop_per_command(voters: dict, follower: str | None = None, leader: str | None = None,
                      sampled: dict | None = None) -> tuple[float | None, float | None]:
     """The leader's loop CPU per command and a follower's, in
@@ -3544,6 +3564,7 @@ def summarize(store: str, nodes: list[str], title: str, profile: str | None = No
             out.extend(relay_table(voters))
             out.extend(hand_offs_table(voters))
             out.extend(gate_table(voters))
+            out.extend(refused_voter_names_line(voters))
             out.extend(leader_and_follower(store, voters))
             out.extend(transport_tables(store, voters))
     return "\n".join(out) + "\n"
