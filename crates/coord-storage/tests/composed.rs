@@ -28,7 +28,7 @@ use coord_storage::policy::{bootstrap_session, rule_update};
 use coord_storage::{
     Applier, ApplyOutcome, GroupLimits, JournaledDomain, Persistence, StoreWorker, complete, submit,
 };
-use coord_store_testkit::journal::ModelJournal;
+use coord_store_testkit::journal::{AppendScript, ModelJournal};
 use coord_store_testkit::model::{CommitScript, ModelEngine};
 use coord_types::ids::*;
 use coord_types::logical_v1::*;
@@ -1241,6 +1241,50 @@ fn a_group_of_commands_lowers_once_and_matches_applying_them_one_at_a_time() {
     assert_eq!(grouped.kv_revision().unwrap(), alone.kv_revision().unwrap());
     assert_eq!(grouped.hub().published(), alone.hub().published());
     assert_eq!(grouped.store().unmaterialized(), 0);
+}
+
+/// A lost group is the applier's last (#185, review 6861674000). Its
+/// commands were reported applied, at positions and revisions no batch
+/// of this replica's will hold, so the next command is refused rather
+/// than planned at the lost group's first position again, as is every
+/// lowering and the lost command presented again; the replica restarts
+/// from its journal.
+#[test]
+fn an_applier_that_lost_a_group_refuses_to_be_used() {
+    let commands = group_workload();
+    let mut applier = journaled();
+    support::stage_all(applier.store_mut(), &commands);
+    assert!(applier.begin_group());
+    for (command, record) in &commands[..2] {
+        applier.apply(*command, record).expect("applied");
+    }
+    applier
+        .store_mut()
+        .store_mut()
+        .journal_mut()
+        .unwrap()
+        .script_append(AppendScript::DefinitelyNotCommitted);
+    assert!(!applier.lost());
+    assert!(matches!(
+        applier.finish_group(),
+        Err(coord_storage::ApplyError::GroupLost)
+    ));
+    assert!(applier.lost());
+    let refused = |r: Result<(), coord_storage::ApplyError>| {
+        assert!(
+            matches!(r, Err(coord_storage::ApplyError::AfterGroupLost)),
+            "{r:?}"
+        );
+    };
+    applier.begin_group();
+    let (command, record) = &commands[2];
+    refused(applier.apply(*command, record).map(drop));
+    refused(applier.finish_group());
+    refused(applier.hand_off_group().map(drop));
+    refused(applier.settle().map(drop));
+    refused(applier.drain().map(drop));
+    let (command, record) = &commands[0];
+    refused(applier.apply(*command, record).map(drop));
 }
 
 /// A group's commands are planned over one snapshot of the projection,
