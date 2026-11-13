@@ -33,6 +33,7 @@ use coord_core::event::{StorageError, StorageEvent};
 use coord_state::KvEvent;
 use coord_store_api::engine::{CollectionId, OrderedRead, RowPage, ScanRequest, SnapshotSource};
 
+use crate::authorizations::{AuthorizationCache, AuthorizationCacheStats};
 use crate::cut::{CutOverlay, RecoveryCut};
 use crate::lowering::ExecutionFrontier;
 use crate::materialize::{
@@ -42,7 +43,7 @@ use crate::persistence::Persistence;
 use crate::retry::{self, Admission, RetryBinding};
 use crate::view::{GatedView, ViewError};
 use crate::views::{
-    ViewBudget, ViewBuildError, build_authorized_view, build_internal_view, load_authorization,
+    ViewBudget, ViewBuildError, build_internal_view, build_view_under, load_authorization,
 };
 use crate::watch::{PublishError, WatchHub};
 
@@ -178,6 +179,11 @@ pub struct Applier<P: Persistence> {
     /// Groups handed to a pipelined store and not yet known to have
     /// materialized (task-d52), oldest first.
     inflight: VecDeque<InFlight>,
+    /// The authorization contexts commands executed under, kept until a
+    /// landing writes a row they read ([`crate::authorizations`]). In a
+    /// cell because a command reads it while its planning view borrows
+    /// the applier.
+    authorizations: std::cell::RefCell<AuthorizationCache>,
     /// The position the projection was last seen committed through, by
     /// [`Applier::settle`] or a drain (task-d63).
     committed: Option<coord_types::ids::ExecutionPosition>,
@@ -344,6 +350,7 @@ impl<P: Persistence> Applier<P> {
             group: None,
             inflight: VecDeque::new(),
             committed: None,
+            authorizations: std::cell::RefCell::default(),
         })
     }
 
@@ -379,6 +386,11 @@ impl<P: Persistence> Applier<P> {
     /// Within a group, a batch of the group found definitely not journaled
     /// ends it: the commands it holds were already reported applied.
     fn reconcile(&mut self) -> Result<(), ApplyError> {
+        // What the store settles can take back writes a context was read
+        // over; none of the authorization's rows is among them unless a
+        // group is lost, which stops the node, but nothing is kept past
+        // an outcome that was unknown.
+        self.authorizations.get_mut().clear();
         let settled = self.store.reconcile()?;
         self.note_all(&settled.events);
         let group_lost = self
@@ -852,6 +864,9 @@ impl<P: Persistence> Applier<P> {
         binding: Option<&RetryBinding>,
         refused: Option<&CommandId>,
     ) -> Result<ApplyOutcome, ApplyError> {
+        // Before the plan lands, so that whatever its outcome no context
+        // read before a write of its rows is used after it.
+        self.authorizations.get_mut().landing(&plan.mutations);
         if self.group.is_none() {
             let others = self.sharing.then_some(&mut self.foreign);
             return Ok(match refused {
@@ -948,6 +963,20 @@ impl<P: Persistence> Applier<P> {
         }
     }
 
+    /// How the authorization contexts kept between commands have been
+    /// used ([`crate::authorizations`]).
+    pub fn authorization_cache(&self) -> AuthorizationCacheStats {
+        self.authorizations.borrow().stats()
+    }
+
+    /// Drop the authorization contexts kept between commands: what a
+    /// write of a session or policy row around the applier, through
+    /// [`Applier::store_mut`], calls before the next command. The
+    /// applier's own landings need not.
+    pub fn forget_authorizations(&mut self) {
+        self.authorizations.get_mut().clear();
+    }
+
     /// The watch hub fed by this applier.
     pub const fn hub(&self) -> &WatchHub {
         &self.hub
@@ -958,7 +987,9 @@ impl<P: Persistence> Applier<P> {
         &self.store
     }
 
-    /// The same, mutably (administration batches).
+    /// The same, mutably (administration batches). A batch written
+    /// through it that writes a session or policy row is followed by
+    /// [`Applier::forget_authorizations`] before the next command.
     pub const fn store_mut(&mut self) -> &mut P {
         &mut self.store
     }
@@ -1365,8 +1396,19 @@ impl<P: Persistence> Applier<P> {
             // never a local setting: a command that overruns it overruns
             // it everywhere, so the rejection below is a replicated result
             // and not this node's resource limit leaking into the history.
-            let built =
-                build_authorized_view(&gated, namespace, &session, request, ViewBudget::SCHEMA);
+            let built = self
+                .authorizations
+                .borrow_mut()
+                .load(gated.view(), namespace, &session)
+                .and_then(|authorization| {
+                    build_view_under(
+                        &gated,
+                        namespace,
+                        authorization,
+                        request,
+                        ViewBudget::SCHEMA,
+                    )
+                });
             let planned = match built {
                 Ok(view) => match plan(request, &view, &PlanLimits::default()) {
                     Ok(planned) => planned,
