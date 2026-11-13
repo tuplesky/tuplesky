@@ -8755,7 +8755,11 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
                     };
                     let sender = voter.provenance();
                     let out = voter.on_peer(from, bytes).expect("stepped");
-                    queue.extend(out.peer.into_iter().map(|(next, f)| (sender, next.replica, f)));
+                    queue.extend(
+                        out.peer
+                            .into_iter()
+                            .map(|(next, f)| (sender, next.replica, f)),
+                    );
                 }
                 // The leader's flush in its two steps: what is ready is
                 // staged, then the queue is journaled. The loop stops
