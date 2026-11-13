@@ -8703,13 +8703,12 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
         /// with the protocol's is out on the appender's thread, not yet
         /// run, when voter 2's `NewLeader` for a higher ballot arrives.
         /// Taking the frame waits for that append, which the model journal
-        /// refuses, so the group is lost on the frame's path. The path records the stop, and the loop ends at the top
-        /// of its next pass, before it takes another event. The applier
-        /// refuses to be used again, so nothing is planned at the lost
-        /// group's positions.
+        /// refuses, so the group is lost on the frame's path. The path
+        /// records the stop, and the loop ends at the top of its next pass,
+        /// before it takes another event. The applier refuses to be used
+        /// again, so nothing is planned at the lost group's positions.
         #[tokio::test(flavor = "multi_thread")]
         async fn a_group_lost_on_a_peers_frame_that_changes_the_ballot_stops_the_voter() {
-            use coord_core::event::PeerProvenance;
             use coord_store_testkit::journal::AppendScript;
             use coord_transport::{ConnectionId, Lane, TransportEvent};
             use coord_transport_testkit::bound_provenance;
@@ -8728,9 +8727,11 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
                 panic!("not new work")
             };
             // The fan-out reaches voters 1 and 2; voter 3 is down. Their
-            // frames go between them until the leader has executed.
+            // frames go between them, each under its sender's own
+            // provenance, until the leader has executed.
+            let (from_leader, from_follower) = (leader.provenance(), follower.provenance());
             let mut queue = std::collections::VecDeque::new();
-            for (from, voter) in [(me(), &mut leader), (two, &mut follower)] {
+            for (from, voter) in [(from_leader, &mut leader), (from_follower, &mut follower)] {
                 let out = voter
                     .on_submission(
                         PeerRole::Frontend,
@@ -8752,13 +8753,9 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
                     } else {
                         continue;
                     };
-                    let out = voter
-                        .on_peer(
-                            PeerProvenance::from_local_voter(from, incarnation_of(from)),
-                            bytes,
-                        )
-                        .expect("stepped");
-                    queue.extend(out.peer.into_iter().map(|(next, f)| (to, next.replica, f)));
+                    let sender = voter.provenance();
+                    let out = voter.on_peer(from, bytes).expect("stepped");
+                    queue.extend(out.peer.into_iter().map(|(next, f)| (sender, next.replica, f)));
                 }
                 // The leader's flush in its two steps: what is ready is
                 // staged, then the queue is journaled. The loop stops
@@ -8768,7 +8765,7 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
                 queue.extend(
                     out.peer
                         .into_iter()
-                        .map(|(next, f)| (me(), next.replica, f)),
+                        .map(|(next, f)| (from_leader, next.replica, f)),
                 );
                 if leader.node().executed > executed {
                     break;
@@ -8777,10 +8774,14 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
                 queue.extend(
                     out.peer
                         .into_iter()
-                        .map(|(next, f)| (me(), next.replica, f)),
+                        .map(|(next, f)| (from_leader, next.replica, f)),
                 );
                 let out = follower.flush().expect("journaled");
-                queue.extend(out.peer.into_iter().map(|(next, f)| (two, next.replica, f)));
+                queue.extend(
+                    out.peer
+                        .into_iter()
+                        .map(|(next, f)| (from_follower, next.replica, f)),
+                );
             }
             assert_eq!(leader.node().executed, executed + 1);
             assert!(
