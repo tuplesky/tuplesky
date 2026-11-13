@@ -1358,6 +1358,8 @@ Each step has its own PRs and pair.
 **Step 4: frame records written, and recovery checked against them.** Dark, behind `FrameLog`.
 - **PRs:**
   - 4a: with `FrameLog` active, the leader gives each frame the next position in the domain's frame log, durable across ballots, and its predecessor's digest, and journals it. A follower journals the frame record: its bytes as received, its ballot and its position.
+    - **When the frame log starts (Codex).** task-d99's activation doesn't reach the order: each voter's own durable record turns a feature on, and the leader learns who holds it from `FeatureHeld` (`feature.rs`). So the leader starts giving frames positions once its own record holds `FrameLog` and every configured voter is in its holders set (`Features::holders`).
+    - A frame carries its position, so a follower journals the frame record by what the frame says, not by when its own record became durable.
   - 4b: a recovery report adds each accepted frame above the voter's commit frontier as (position, ballot, digest), the leader's own included, and a Sync names frames the same way. Recovery selects both ways, by 4.9's rules over the per-command records and by 10.3's source rule over the frames, and checks they agree.
 - **Every frame carries every payload from 4a (R4).** Today a frame carries a payload only for a relayed command.
   - Under `FrameLog`, a fast command's payload also crosses the wire in the frame, a second time, below the relay's threshold.
@@ -1392,12 +1394,14 @@ Each step has its own PRs and pair.
 - **Checkpoint:** inactive, a null step. Active, no more than that bound, and no disagreement in the rows above. Then the drift pair against the carry before step 1.
 
 **Step 5: the frame decides.** `FrameDecision`, which requires `FrameLog`. Each PR lands dark, and the build knows the feature only from 5c. It starts only past the go/no-go above.
-- **The boundary is a frame position (R6).** A voter learns the activation when it executes it, and voters execute at different times, so a frame's rule can't depend on that.
-  - The frame that holds `FrameDecision`'s activation record is at position a. Every frame above a is decided as a frame, and every frame at or below a per command.
-  - **Each frame says which it is:** a bit under its digest, which the leader sets on every frame it cuts after a's. A follower needn't have executed the activation, or even hold frame a, to know a frame's rule.
+- **The boundary is a frame position the leader chooses (R6; Codex).** task-d99's activation doesn't reach the order: each voter's own durable record turns a feature on, at its own time, and the leader learns who holds it from `FeatureHeld`. So no frame holds the activation, and a frame's rule can't depend on when a voter's record became durable.
+  - **Each frame says which it is:** a bit under its digest. The leader sets it on every frame it cuts once its own record holds `FrameDecision` and every configured voter is in its holders set. The first flagged frame in the chain is at position a. Every frame from a on is decided as a frame, and every frame below a per command.
+  - **So the chain records the boundary.** Every voter that holds a frame holds its rule, durably. A follower needn't know when anyone's activation became durable, or hold frame a itself, to know a frame's rule.
   - **A follower takes a flagged frame whole and in order,** and an unflagged one entry by entry, as at step 4.
-  - **The bit is set exactly on the frames above a in the chain.** Recovery and the oracle check it, and a frame that breaks it is refused.
-  - **A selection is a prefix of frames,** so a takeover that doesn't select a selects nothing above it. The activation then comes back through its retry, in a later frame, and the boundary moves with it.
+  - **Flagged frames are a suffix of the chain:** a frame whose predecessor is flagged is flagged. Recovery and the oracle check it, and a frame that breaks it is refused.
+  - **A new leader** whose selected chain ends in a flagged frame flags every frame it cuts. One whose chain ends unflagged flags again by the rule above.
+  - **A selection is a prefix of frames,** so a takeover that doesn't select a selects nothing above it, and the boundary moves to a later frame.
+  - **A voter whose own record doesn't hold `FrameDecision` doesn't vote on a flagged frame,** as for a frame it can't take, until the re-send activates it. The leader flags only with every configured voter holding the feature, so this is a voter added after the activation.
 - **PRs:**
   - 5a: recovery and Sync select frame commands by frames, under the source rule with frames as its entries (10.3).
     - A new leader fetches any selected frame it lacks (step 3), then re-proposes the selected frames whole, at its ballot and in order, before new ones.
@@ -1410,14 +1414,16 @@ Each step has its own PRs and pair.
 - **What recovery reads:**
   - for a frame command, frames, from every reporter;
   - for a fast command, its records, as today;
-  - for a command at or below the boundary, its per-command records. Reports carry them beside frames until the voter's commit frontier passes a.
-- **Mixed versions:** it activates through task-d99, once every voter runs 5c's release, and never goes back. The rows above apply.
+  - for a command in a frame below a, its per-command records. Reports carry them beside frames until the voter's commit frontier reaches a.
+- **Mixed versions:** it activates through task-d99, once every voter runs 5c's release, and never goes back. The boundary then follows by the leader's rule above. The rows above apply.
 - **Pinned by:**
   - step 4's rows with `FrameDecision` active, the oracle one order everywhere;
   - **the boundary (R6):**
-    - the activation in a running domain over old records;
+    - the activation in a running domain over old records, with frame a cut only once every voter holds it;
     - the leader ahead of a follower across it, the follower at a − 3 when the leader cuts a + 2;
     - a takeover that doesn't select frame a;
+    - a new leader whose selected chain ends flagged, which keeps flagging;
+    - a voter added after the activation, which votes on no flagged frame until the re-send activates it;
   - conflicting fast and frame commands;
   - a follower frames behind, waiting for the re-send;
   - **a voter that rejoins across the boundary (R7),** its execution frontier below a and its donor's above:
