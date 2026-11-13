@@ -592,6 +592,13 @@ pub struct Leader {
     /// voter beside `mark_next_admitted`, so a leader proposes the
     /// command with its payload and a voter that isn't leading says so.
     mark_next_relayed: bool,
+    /// Whether this leader's configuration lets it lead at all: a voter,
+    /// in its quorum's epoch and voter set, and the leader its quorum's
+    /// ballot names (#185, lead 17:43). The configuration is fixed for
+    /// a leader's life (a reconfiguration makes a new one), so this is
+    /// read once at construction, not compared on every
+    /// [`Leader::is_leading`], which compared the voter sets each time.
+    configured_to_lead: bool,
     fenced: Option<FenceReason>,
     /// Entries of the selection this leader was handed that no order
     /// keeps: a dependency cycle, which is an invariant violation
@@ -752,6 +759,18 @@ fn ready_tails(decision: &SyncDecision, last: &[CommandId], ready: &[CommandId])
     tails
 }
 
+/// Whether `config` lets its leader lead at all, whatever its ballots
+/// say: what [`Leader::is_leading`] reads of the configuration.
+fn configured_to_lead(config: &LeaderConfig) -> bool {
+    let identity = &config.identity;
+    let quorum = &config.quorum;
+    identity.role == ReplicaRole::Voter
+        && identity.epoch == quorum.epoch()
+        && identity.voters == *quorum.voters()
+        && quorum.is_voter(&identity.replica)
+        && quorum.ballot().leader == identity.replica
+}
+
 impl Leader {
     /// A leader from its configuration, the recovered promise row and the
     /// application's durable execution position. The learner resumes from
@@ -786,6 +805,7 @@ impl Leader {
         );
         let table = CommandTable::with_capacity(config.capacity);
         Leader {
+            configured_to_lead: configured_to_lead(&config),
             replay: crate::replay::EvidenceStore::new(config.capacity),
             selection: None,
             // Every voter of the genesis ballot is in it from the start.
@@ -910,14 +930,16 @@ impl Leader {
         decision: &SyncDecision,
     ) -> (Self, Vec<Effect>) {
         let identity = state.identity.clone();
+        let config = LeaderConfig {
+            identity: state.identity,
+            genesis: quorum.ballot(),
+            quorum,
+            frontend: state.frontend,
+            capacity: state.capacity,
+        };
         let mut leader = Leader {
-            config: LeaderConfig {
-                identity: state.identity,
-                genesis: quorum.ballot(),
-                quorum,
-                frontend: state.frontend,
-                capacity: state.capacity,
-            },
+            configured_to_lead: configured_to_lead(&config),
+            config,
             boot: state.boot,
             alloc: state.alloc,
             outbox: state.outbox,
@@ -2753,17 +2775,12 @@ impl Leader {
     /// recovered from a durable seal row is fenced from its first step
     /// and a leader whose seal row failed is not (task-55).
     pub fn is_leading(&self) -> bool {
-        let identity = &self.config.identity;
-        let quorum = &self.config.quorum;
+        debug_assert_eq!(self.configured_to_lead, configured_to_lead(&self.config));
         self.fenced.is_none()
             && self.recovery_cycle.is_none()
             && !self.ballots.is_fenced()
-            && identity.role == ReplicaRole::Voter
-            && identity.epoch == quorum.epoch()
-            && identity.voters == *quorum.voters()
-            && quorum.is_voter(&identity.replica)
-            && self.ballots.promised() == quorum.ballot()
-            && quorum.ballot().leader == identity.replica
+            && self.configured_to_lead
+            && self.ballots.promised() == self.config.quorum.ballot()
             && self.ballots.in_flight().is_none()
     }
 
