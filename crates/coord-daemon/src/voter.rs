@@ -1203,7 +1203,11 @@ impl<P: Persistence> Voter<P> {
             || self.node.can_execute()
             || self.node.machine().frames_queued()
             || self.node.machine().frontier_owed()
-            || coord_consensus::scratch::learn_owed()
+    }
+
+    /// SCRATCH (L2): take a follower's learn put off, at the loop's idle.
+    pub fn scratch_turn_end(&mut self) {
+        self.node.scratch_turn_end();
     }
 
     /// Whether a journal append is out on the appender's thread, its

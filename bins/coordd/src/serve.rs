@@ -2751,6 +2751,16 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             // has several: before and after its flush, after each burst
             // of votes and after each commit's results (#256 review).
             self.hand_off_before_waiting(hold, progressed, transport);
+            // SCRATCH (L2): a learn put off is taken when the loop runs out
+            // of events, as at a flush, without forcing one.
+            if coord_consensus::scratch::learn_owed()
+                && !progressed
+                && !transport.has_event()
+                && !self.plane.as_ref().is_some_and(|p| p.transport.has_event())
+                && let Backing::Voting(v) = &mut self.backing
+            {
+                v.scratch_turn_end();
+            }
             let hold_until = self.held();
             let owes_flush = hold_until.is_none()
                 && matches!(&self.backing, Backing::Voting(v) if v.owes_flush());

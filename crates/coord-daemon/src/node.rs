@@ -1111,15 +1111,11 @@ impl<P: Persistence> Node<P> {
     pub fn flush(&mut self, ballot: &Ballot) -> Result<Outbound, DriveError> {
         // SCRATCH (L2): a learn put off is taken at the turn's end, before
         // its executions and after them.
-        if let Machine::Follower(f) = self.machine_mut() {
-            f.scratch_turn_end();
-        }
+        self.scratch_turn_end();
         let was = core::mem::replace(&mut self.flushing, true);
         let flushed = self.flush_queued(ballot);
         self.flushing = was;
-        if let Machine::Follower(f) = self.machine_mut() {
-            f.scratch_turn_end();
-        }
+        self.scratch_turn_end();
         let mut out = flushed?;
         out.absorb(self.announce_frontier(ballot)?);
         Ok(out)
@@ -1132,6 +1128,13 @@ impl<P: Persistence> Node<P> {
     /// of an append ([`Node::settle`]), which is the other place a batch
     /// turns durable. What a step moves after that is owed a flush
     /// ([`Machine::frontier_owed`]).
+    /// SCRATCH (L2): a follower's learn put off is taken.
+    pub fn scratch_turn_end(&mut self) {
+        if let Machine::Follower(f) = self.machine_mut() {
+            f.scratch_turn_end();
+        }
+    }
+
     fn announce_frontier(&mut self, ballot: &Ballot) -> Result<Outbound, DriveError> {
         let effects = self.machine_mut().announce_advanced();
         if effects.is_empty() {
