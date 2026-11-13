@@ -194,6 +194,7 @@ async fn voters_negotiate_roles_and_exchange_frames_with_bound_provenance() {
         } => {
             assert_eq!(provenance.from(), r(0));
             assert_eq!(provenance.incarnation(), inc(1));
+            assert_eq!(provenance.role(), PeerRole::Voter);
             assert_eq!(lane, Lane::Control);
             assert_eq!(kind, coord_transport::KIND_PEER_EVIDENCE);
             assert_eq!(payload, b"vote-from-a");
@@ -1846,6 +1847,30 @@ async fn a_non_voter_naming_a_voters_replica_does_not_take_its_link() {
         "voter 1's link moved"
     );
     assert_eq!(a.connections(), 2);
+
+    // The transport reports the role it bound, not the replica's: what
+    // the observer sends reaches `a` as an observer's, under voter 1's
+    // replica, and nothing downstream takes it for voter 1's.
+    observer
+        .send(
+            dest(0, Lane::Control),
+            DOMAIN,
+            evidence_frame(b"from-the-observer").unwrap(),
+        )
+        .unwrap();
+    match event(&mut a).await {
+        TransportEvent::PeerFrame {
+            provenance,
+            payload,
+            ..
+        } => {
+            assert_eq!(payload, b"from-the-observer");
+            assert_eq!(provenance.from(), r(1));
+            assert_eq!(provenance.role(), PeerRole::Observer);
+            assert!(!provenance.is_voter());
+        }
+        other => panic!("{other:?}"),
+    }
 
     // What is sent to voter 1 reaches voter 1, and never the observer.
     a.send(

@@ -210,7 +210,8 @@ impl Membership {
 
     /// Whether a certificate for `role` naming `node` is an observer's
     /// or a learner's naming a committed voter's node, at any generation
-    /// (design Section 10.1).
+    /// (design Section 10.1). task-d39 narrows it: a successor staged as
+    /// a learner binds at the incarnation a prepared transition names.
     ///
     /// A peer is known downstream by its replica identity, and a voter's
     /// is not one a non-voter may hold. The binder refuses such a

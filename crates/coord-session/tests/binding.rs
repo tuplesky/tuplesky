@@ -1680,7 +1680,12 @@ fn answered_reads_presented_again_keep_the_records_within_the_bound() {
         for s in waiting {
             let resolution = f.dispatcher_mut().on_read_answer(
                 at(NOW),
-                r(0),
+                PeerProvenance::from_transport(
+                    r(0),
+                    ReplicaIncarnation::new(1).unwrap(),
+                    coord_types::wire_v1::PeerRole::Voter,
+                    1,
+                ),
                 coord_collector::ReadAnswerV1 {
                     retry_key: retry_key(s),
                     ballot,

@@ -49,8 +49,9 @@ pub enum BindError {
     /// node (design Section 10.1).
     ///
     /// Apart from every other refusal because no issuer that follows its
-    /// policy signs one: the node is a voter's, and a non-voter role for
-    /// it means an issuer signed what it never should. The accepting
+    /// policy signs one: the node is a voter's, and until a prepared
+    /// transition names a staged learner's incarnation (task-d39), a
+    /// non-voter role for it means an issuer signed what it never should. The accepting
     /// node counts it ([`crate::PeerTraffic::refused_voter_names`]) for
     /// an operator to see; the peer learns only that it was refused.
     NonVoterNamesVoter,

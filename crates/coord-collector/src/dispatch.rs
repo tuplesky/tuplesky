@@ -880,17 +880,25 @@ impl Dispatcher {
         })
     }
 
-    /// The leader `from`'s answer to a read (task-d50).
+    /// The leader's answer to a read (task-d50), by the provenance the
+    /// transport bound its link to.
     ///
-    /// Only the voter the read was sent to answers it. A served result is
-    /// the caller's, still to pass the frontend's output gate; a refusal
-    /// orders the read instead.
+    /// Only the voter the read was sent to answers it, and only on a
+    /// voter's link: an observer's or learner's, bound under the leader's
+    /// replica, answers nothing, and the read keeps waiting for the
+    /// leader (design Section 10.1). A served result is the caller's,
+    /// still to pass the frontend's output gate; a refusal orders the
+    /// read instead.
     pub fn on_read_answer(
         &mut self,
         now: MonotonicMillis,
-        from: ReplicaId,
+        from: PeerProvenance,
         answer: ReadAnswerV1,
     ) -> Option<ReadResolution> {
+        if !from.is_voter() {
+            return None;
+        }
+        let from = from.from();
         let key = answer.retry_key;
         if self.reads.get(&key)?.leader != from {
             return None;

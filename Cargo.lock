@@ -1050,6 +1050,7 @@ dependencies = [
 name = "coord-transport-testkit"
 version = "0.1.0"
 dependencies = [
+ "coord-core",
  "coord-transport",
  "coord-types",
  "rcgen",
