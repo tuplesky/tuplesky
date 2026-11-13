@@ -119,7 +119,7 @@ pub mod views;
 pub mod watch;
 pub mod worker;
 
-pub use apply::{AppliedOutcomeParts, Applier, ApplyError};
+pub use apply::{AppliedOutcomeParts, Applier, ApplyError, ReadView};
 pub use compaction::{GcBudget, GcPlan, HoldGuard, RetentionHolds, plan_gc};
 pub use cut::{CutOverlay, RecoveryCut};
 pub use journaled::{

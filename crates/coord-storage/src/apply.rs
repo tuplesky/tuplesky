@@ -272,6 +272,11 @@ type Snapshot<P> = <<P as Persistence>::Reader as SnapshotSource>::View;
 type PlanningView<'a, P> =
     GatedView<RecoveryCut<PlanningSnapshot<'a, Snapshot<P>>, Arc<CutOverlay>>>;
 
+/// What a read held at the barrier is planned against
+/// ([`Applier::read_view`]): the projection's snapshot, with the rows of
+/// the journaled groups in flight above it laid over it.
+pub type ReadView<P> = GatedView<RecoveryCut<Snapshot<P>, Arc<CutOverlay>>>;
+
 /// The snapshot under a command's plan: its own outside a group, or the
 /// one its group pinned (task-d115).
 enum PlanningSnapshot<'a, V> {
@@ -714,6 +719,64 @@ impl<P: Persistence> Applier<P> {
             through = Some(through.map_or(flight.position, |seen| seen.max(flight.position)));
         }
         through
+    }
+
+    /// The view a read held at the barrier is planned against (#185,
+    /// lead 17:43), at the execution position it reaches: the
+    /// projection's snapshot, with the rows of the groups in flight above
+    /// its frontier laid over it, oldest first, as far as every batch of
+    /// theirs is in the journal.
+    ///
+    /// - **What it shows** is what [`Applier::journaled_through`] already
+    ///   lets a group's results go out at (design Section 4.5): executed,
+    ///   decided commands whose outcome is in the journal. A read served
+    ///   over it discloses nothing a release has not.
+    /// - **What it reads** is what a command planned at that position
+    ///   reads: the same snapshot and the same rows laid over it, as
+    ///   [`Applier::begin_group`] lays them. So the read is answered as
+    ///   the ordered path would answer it there, without waiting for the
+    ///   projection to commit those groups, and without asking it to.
+    /// - **Only groups above the snapshot's frontier are laid.** One the
+    ///   snapshot holds is read from it; laying it again under a later
+    ///   group the snapshot holds too would hide that group's rows. A
+    ///   group the snapshot holds in part is laid whole, and its rows
+    ///   are a superset of that part.
+    /// - **The open group is never laid:** it is not in flight until it
+    ///   is handed off, so a read whose index falls in it waits for that.
+    ///
+    /// Without a pipelined store nothing is ever in flight, and this is
+    /// the projection's snapshot as it is.
+    pub fn read_view(&self) -> Result<ReadView<P>, ApplyError> {
+        let (view, meta, gate) = self.store.reader().snapshot()?.into_parts();
+        let committed = meta.frontier.execution_position;
+        let mut through = committed;
+        let mut laid: Vec<&Arc<CutOverlay>> = Vec::new();
+        for flight in self.inflight.iter().filter(|f| f.position > committed) {
+            if !flight.unjournaled.is_empty() {
+                break;
+            }
+            laid.push(&flight.own);
+            through = flight.position;
+        }
+        let overlay = match laid.as_slice() {
+            [] => Arc::new(CutOverlay::new()),
+            [one] => Arc::clone(one),
+            many => {
+                let mut overlay = CutOverlay::new();
+                for own in many {
+                    overlay.absorb(own);
+                }
+                Arc::new(overlay)
+            }
+        };
+        let mut reaches = meta;
+        reaches.frontier.execution_position = through;
+        let snapshot = GatedView::with_gate(view, meta, gate.clone());
+        Ok(GatedView::with_gate(
+            RecoveryCut::new(snapshot, overlay, meta.stamp.journal_seq()),
+            reaches,
+            gate,
+        ))
     }
 
     /// The barriers of every group handed off and not yet materialized.
