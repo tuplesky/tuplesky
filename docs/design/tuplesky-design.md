@@ -1767,7 +1767,7 @@ Common schema owns stable logical collection IDs, canonical values and reviewed 
 
 Protocol state cannot be reduced to a Raft-like last_applied: application snapshots do not recreate unresolved dependency/vote obligations. Physical placement is adapter-private; logical schema/index maintenance is common.
 
-*Proposed by task-d117's design step ([Section 17.17](#s17-17)), not built:* the per-command protocol rows (`protocol_v1`'s dependency and proposal rows, `pending_payload_v1`), the retry rows (`retry_v1`, `retry_floor_v1`) and executed history (`execution_v1`, `payload_v1`, `decided_v1`) leave the projection Its first code step is built: `meta_v1` is written once a commit (point 5). Each of its code steps amends this table as it lands.
+*Proposed by task-d117's design step ([Section 17.17](#s17-17)), not built:* the per-command protocol rows (`protocol_v1`'s dependency and proposal rows, `pending_payload_v1`), the retry rows (`retry_v1`, `retry_floor_v1`) and executed history (`execution_v1`, `payload_v1`, `decided_v1`) leave the projection. Its first code step is built: `meta_v1` is written once a commit (point 5). Each of its code steps amends this table as it lands.
 
 *Amended by task-d113's design step: the payload, dependency and executed rows keyed by order.* This is a design step; nothing below is built. The table above keeps today's keys until the code step lands.
 
