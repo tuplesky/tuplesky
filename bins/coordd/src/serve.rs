@@ -1120,12 +1120,24 @@ pub struct Domain<P: Persistence> {
     fenced_said: u64,
     /// The floor's counts last reported (task-d27).
     floor_said: coord_daemon::floor::FloorCounts,
-    /// What a peer's frame or a collector's submission was refused by
-    /// this voter's own fence for, where the refusal stops the voter
-    /// (`DriveError::Fenced`). Those paths only log a `DriveError`, so the
-    /// stop is recorded here and the loop ends on its next pass, as it
-    /// does for the same refusal on a turn.
-    fenced_stop: Option<String>,
+    /// Why the voter stops, met on a path that answers a peer, a
+    /// collector or an operator rather than ending the loop itself: a
+    /// peer's frame, a collector's submission, a new link, a feature
+    /// activation. Any `DriveError` there stops the voter, as on a turn:
+    /// the stop is recorded here and the loop ends at the top of its next
+    /// pass, before it takes another event (#185, review 6861674000).
+    stopping: Option<Stopping>,
+}
+
+/// Why a voter stops, recorded by a path that cannot end the loop itself.
+#[derive(Debug)]
+enum Stopping {
+    /// Refused by this voter's own fence (`DriveError::Fenced`).
+    Fenced(String),
+    /// Any other failure to carry out a step: an engine failure, or a
+    /// lost execution group, whose commands took positions this replica
+    /// will not journal. What is said, whole.
+    Failed(String),
 }
 
 /// The two planes a voter is dialled on.
@@ -1931,7 +1943,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             role_said: None,
             fenced_said: 0,
             floor_said: coord_daemon::floor::FloorCounts::default(),
-            fenced_stop: None,
+            stopping: None,
             peer_streak: 0,
             since_flush: 0,
             since_flush_api: 0,
@@ -2412,10 +2424,14 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                         Ok(Err(refusal)) => format!("refused: {refusal}\n"),
                         Err(DriveError::Fenced(what)) => {
                             let said = format!("refused: this voter is fenced: {what}\n");
-                            self.fenced_stop = Some(what);
+                            self.stop_on(DriveError::Fenced(what), "");
                             said
                         }
-                        Err(e) => format!("refused: {e}\n"),
+                        Err(e) => {
+                            let said = format!("refused: {e}; this voter stops\n");
+                            self.stop_on(e, "this voter cannot activate a feature");
+                            said
+                        }
                     },
                 }
             }
@@ -2551,10 +2567,13 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             if self.renew() {
                 return;
             }
-            // A fenced refusal the event paths met since the last pass
-            // stops the voter here, as one met on a turn does below.
-            if let Some(what) = self.fenced_stop.take() {
-                say_fenced_stop(&what);
+            // A failure the event paths met since the last pass stops the
+            // voter here, as one met on a turn does below.
+            if let Some(stopping) = self.stopping.take() {
+                match stopping {
+                    Stopping::Fenced(what) => say_fenced_stop(&what),
+                    Stopping::Failed(said) => eprintln!("{said}"),
+                }
                 return;
             }
             // A full journal group's worth queued is lowered now, whatever
@@ -5042,8 +5061,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                         );
                         self.carry(api, out, provenance);
                     }
-                    Err(DriveError::Fenced(what)) => self.fenced_stop = Some(what),
-                    Err(e) => eprintln!("this voter cannot carry out a peer's frame: {e}"),
+                    Err(e) => self.stop_on(e, "this voter cannot carry out a peer's frame"),
                 }
             }
             // A connection ended. Nothing is remembered about which one:
@@ -5078,8 +5096,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                             let provenance = voter.provenance();
                             self.carry(api, out, provenance);
                         }
-                        Err(DriveError::Fenced(what)) => self.fenced_stop = Some(what),
-                        Err(e) => eprintln!("this voter cannot answer a new link: {e}"),
+                        Err(e) => self.stop_on(e, "this voter cannot answer a new link"),
                     }
                 }
             }
@@ -5094,6 +5111,19 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 self.frontend.counts.unserved += 1;
             }
         }
+    }
+
+    /// Record that the voter stops on `error`, met while `doing` on a path
+    /// that cannot end the loop itself; the loop ends at the top of its
+    /// next pass. The first reason recorded is the one said.
+    fn stop_on(&mut self, error: DriveError, doing: &str) {
+        if self.stopping.is_some() {
+            return;
+        }
+        self.stopping = Some(match error {
+            DriveError::Fenced(what) => Stopping::Fenced(what),
+            other => Stopping::Failed(format!("{doing}: {other}; this voter stops")),
+        });
     }
 
     /// A submission a collector in another process made.
@@ -5134,8 +5164,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 }
                 self.frontend.counts.refused += 1;
             }
-            Err(DriveError::Fenced(what)) => self.fenced_stop = Some(what),
-            Err(e) => eprintln!("this voter cannot carry out a submission: {e}"),
+            Err(e) => self.stop_on(e, "this voter cannot carry out a submission"),
         }
         self.route_parked(api);
     }
@@ -8171,12 +8200,24 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
         /// commits lent to a manual materializer under the replay profile
         /// and held for `wait` or 2^32 records.
         fn held_leader(wait: Duration) -> (Voter<Journaled>, ManualHandle<ModelEngine>) {
-            let boot = BootId([1; 16]);
+            held_voter(me(), wait, [me()].into_iter().collect())
+        }
+
+        /// Voter `replica` of a ballot of `voters` that voter 1 leads
+        /// ([`ballot`]), set up as [`held_leader`] is: the leader if
+        /// `replica` is voter 1, a follower otherwise.
+        fn held_voter(
+            replica: ReplicaId,
+            wait: Duration,
+            voters: std::collections::BTreeSet<ReplicaId>,
+        ) -> (Voter<Journaled>, ManualHandle<ModelEngine>) {
+            let boot = BootId([replica.0[0]; 16]);
+            let incarnation = incarnation_of(replica);
             let mut store = JournaledStore::open(
                 ModelJournal::new(),
                 CLUSTER,
-                me(),
-                inc(),
+                replica,
+                incarnation,
                 boot,
                 JournalLimits::default(),
             )
@@ -8188,7 +8229,7 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
                     ModelEngine::new(),
                 )
                 .unwrap();
-            let mut alloc = BarrierAllocator::new(inc(), boot);
+            let mut alloc = BarrierAllocator::new(incarnation, boot);
             let base = store.application_base(DOMAIN).unwrap();
             let genesis = Ballot {
                 epoch: base.configuration,
@@ -8231,45 +8272,62 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
             let domain = JournaledDomain::new(store, DOMAIN, genesis).expect("attached");
             let applier = Applier::new(domain, alloc).unwrap();
             let bootstrapped = applier.store().application_base().execution_position;
-            let alone: std::collections::BTreeSet<ReplicaId> = [me()].into_iter().collect();
-            let mut machine = coord_consensus::Leader::new(
-                coord_consensus::LeaderConfig {
-                    identity: coord_consensus::ConfigurationIdentity {
-                        cluster: CLUSTER,
-                        domain: DOMAIN,
-                        epoch: epoch(),
-                        voters: alone.clone(),
-                        replica: me(),
-                        incarnation: inc(),
-                        role: coord_consensus::ReplicaRole::Voter,
+            let identity = coord_consensus::ConfigurationIdentity {
+                cluster: CLUSTER,
+                domain: DOMAIN,
+                epoch: epoch(),
+                voters: voters.clone(),
+                replica,
+                incarnation,
+                role: coord_consensus::ReplicaRole::Voter,
+            };
+            let quorum =
+                coord_consensus::BallotConfiguration::c2_default(epoch(), ballot(), voters)
+                    .unwrap();
+            let machine = if replica == me() {
+                let mut leader = coord_consensus::Leader::new(
+                    coord_consensus::LeaderConfig {
+                        identity,
+                        quorum,
+                        genesis: ballot(),
+                        frontend: FRONTEND,
+                        capacity: 64,
                     },
-                    quorum: coord_consensus::BallotConfiguration::c2(
-                        epoch(),
-                        ballot(),
-                        alone.clone(),
-                        alone,
-                    )
-                    .unwrap(),
-                    genesis: ballot(),
-                    frontend: FRONTEND,
-                    capacity: 64,
-                },
-                None,
-                bootstrapped,
-            );
-            machine.set_learning(coord_consensus::LearningMode::Full);
-            let mut node = Node::new(Machine::Leader(Box::new(machine)), applier, FRONTEND);
+                    None,
+                    bootstrapped,
+                );
+                leader.set_learning(coord_consensus::LearningMode::Full);
+                Machine::Leader(Box::new(leader))
+            } else {
+                let mut follower =
+                    coord_consensus::Follower::new(coord_consensus::FollowerConfig {
+                        identity,
+                        quorum,
+                        genesis: ballot(),
+                        frontend: FRONTEND,
+                        capacity: 64,
+                    })
+                    .restore_execution(bootstrapped, []);
+                follower.set_learning(coord_consensus::LearningMode::Full);
+                Machine::Follower(Box::new(follower))
+            };
+            let mut node = Node::new(machine, applier, FRONTEND);
             node.lower_in_groups();
             let ingress = Ingress::new(
                 &super::membership(),
-                me(),
+                replica,
                 PeerRole::Frontend,
                 IngressBudget::default(),
             )
             .expect("a committed voter");
             let mut voter = Voter::new(node, ingress, (CLUSTER, DOMAIN), ballot());
-            voter.boot(boot, inc()).expect("boot");
+            voter.boot(boot, incarnation).expect("boot");
             (voter, handle)
+        }
+
+        /// Voter `replica`'s committed incarnation in `membership`.
+        fn incarnation_of(replica: ReplicaId) -> ReplicaIncarnation {
+            ReplicaIncarnation::new(u64::from(replica.0[0]) * 7).unwrap()
         }
 
         /// A collector over the three voters of `membership`.
@@ -8635,6 +8693,167 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
             heard.sort_by_key(key);
             owed_open.sort_by_key(key);
             assert_eq!(heard, owed_open);
+        }
+
+        /// A failure a peer's frame meets stops the voter, as one a turn
+        /// meets does (#185, review 6861674000, item 3).
+        ///
+        /// Voters 1 and 2 of three execute a command; voter 1 leads. Its
+        /// group is open, and the append that journals the group's batch
+        /// with the protocol's is out on the appender's thread, not yet
+        /// run, when voter 2's `NewLeader` for a higher ballot arrives.
+        /// Taking the frame waits for that append, which the model journal
+        /// refuses, so the group is lost on the frame's path. The path records the stop, and the loop ends at the top
+        /// of its next pass, before it takes another event. The applier
+        /// refuses to be used again, so nothing is planned at the lost
+        /// group's positions.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_group_lost_on_a_peers_frame_that_changes_the_ballot_stops_the_voter() {
+            use coord_core::event::PeerProvenance;
+            use coord_store_testkit::journal::AppendScript;
+            use coord_transport::{ConnectionId, Lane, TransportEvent};
+            use coord_transport_testkit::bound_provenance;
+
+            let two = ReplicaId([2; 16]);
+            let voters: std::collections::BTreeSet<ReplicaId> =
+                (1..=3u8).map(|n| ReplicaId([n; 16])).collect();
+            let wait = Duration::from_secs(3600);
+            let (mut leader, _commits) = held_voter(me(), wait, voters.clone());
+            let (mut follower, _its_commits) = held_voter(two, wait, voters);
+            let mut collector = collector();
+            let Submitted::FanOut(fan_out) = collector
+                .submit(MonotonicMillis::ZERO, &admitted(1))
+                .expect("submitted")
+            else {
+                panic!("not new work")
+            };
+            // The fan-out reaches voters 1 and 2; voter 3 is down. Their
+            // frames go between them until the leader has executed.
+            let mut queue = std::collections::VecDeque::new();
+            for (from, voter) in [(me(), &mut leader), (two, &mut follower)] {
+                let out = voter
+                    .on_submission(
+                        PeerRole::Frontend,
+                        &frame(&fan_out.frame),
+                        Origin::Connection(7),
+                    )
+                    .expect("driven")
+                    .expect("admitted");
+                queue.extend(out.peer.into_iter().map(|(to, f)| (from, to.replica, f)));
+            }
+            let executed = leader.node().executed;
+            let at = leader.ballot();
+            for _ in 0..32 {
+                while let Some((from, to, bytes)) = queue.pop_front() {
+                    let voter = if to == me() {
+                        &mut leader
+                    } else if to == two {
+                        &mut follower
+                    } else {
+                        continue;
+                    };
+                    let out = voter
+                        .on_peer(
+                            PeerProvenance::from_local_voter(from, incarnation_of(from)),
+                            bytes,
+                        )
+                        .expect("stepped");
+                    queue.extend(out.peer.into_iter().map(|(next, f)| (to, next.replica, f)));
+                }
+                // The leader's flush in its two steps: what is ready is
+                // staged, then the queue is journaled. The loop stops
+                // between them once the command has executed, so its
+                // group's batch is still queued.
+                let out = leader.node_mut().stage(&at).expect("staged");
+                queue.extend(
+                    out.peer
+                        .into_iter()
+                        .map(|(next, f)| (me(), next.replica, f)),
+                );
+                if leader.node().executed > executed {
+                    break;
+                }
+                let out = leader.node_mut().flush(&at).expect("journaled");
+                queue.extend(
+                    out.peer
+                        .into_iter()
+                        .map(|(next, f)| (me(), next.replica, f)),
+                );
+                let out = follower.flush().expect("journaled");
+                queue.extend(out.peer.into_iter().map(|(next, f)| (two, next.replica, f)));
+            }
+            assert_eq!(leader.node().executed, executed + 1);
+            assert!(
+                leader.node().applier().grouped() > 0
+                    && leader.node().applier().store().queued() > 0,
+                "the command's group is open and its batch queued"
+            );
+            // The journal will refuse the next append, and it is lent to an
+            // appender that runs an append only when told. The flush lends
+            // the append that journals the group: it is out when the frame
+            // arrives.
+            let store = leader.node_mut().applier_mut().store_mut().store_mut();
+            store
+                .journal_mut()
+                .expect("the model journal")
+                .script_append(AppendScript::DefinitelyNotCommitted);
+            let (appender, appends) = coord_storage::ManualAppender::new();
+            store
+                .pipeline_journal(Box::new(appender))
+                .expect("nothing out yet");
+            leader.node_mut().flush(&at).expect("lent");
+            assert!(
+                leader.node().applier().store().appending() && appends.waiting(),
+                "the group's append is out"
+            );
+
+            let mut domain = domain(leader, collector);
+            let api = transport();
+            let higher = Ballot {
+                epoch: epoch(),
+                number: 1,
+                leader: ReplicaId([2; 16]),
+            };
+            domain.on_peer_plane(
+                &api,
+                TransportEvent::PeerFrame {
+                    connection: ConnectionId(7),
+                    lane: Lane::Control,
+                    provenance: bound_provenance(
+                        ReplicaId([2; 16]),
+                        ReplicaIncarnation::new(14).unwrap(),
+                        PeerRole::Voter,
+                        7,
+                    ),
+                    kind: coord_transport::KIND_PEER_EVIDENCE,
+                    version: coord_transport::frames::PEER_EVIDENCE_VERSION,
+                    payload: coord_consensus::ProtocolMessage::NewLeader {
+                        ballot: higher,
+                        executed: coord_types::ids::ExecutionPosition::ZERO,
+                    }
+                    .encode(),
+                },
+            );
+            assert!(
+                !appends.waiting(),
+                "the frame's path took the append's outcome"
+            );
+            match &domain.stopping {
+                Some(super::super::Stopping::Failed(said)) => {
+                    assert!(said.contains("peer's frame"), "{said}");
+                    assert!(said.contains("not journaled"), "{said}");
+                }
+                other => panic!("the voter does not stop: {other:?}"),
+            }
+            // Used again, as by a voter that only logged the loss, the
+            // applier refuses: nothing is planned or lowered at the lost
+            // group's positions.
+            let applier = voter(&mut domain).node_mut().applier_mut();
+            assert!(applier.lost());
+            assert!(matches!(
+                applier.settle(),
+                Err(coord_storage::ApplyError::AfterGroupLost)
+            ));
         }
 
         /// coordd's own guards on a non-voter's link (#272 review,
