@@ -656,6 +656,7 @@ dependencies = [
  "coord-types",
  "postcard",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
