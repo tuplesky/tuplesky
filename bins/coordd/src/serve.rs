@@ -2094,6 +2094,11 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             unordered: self.unordered,
             release: release(&voter.node().release_split()),
             answered: self.frontend.answered,
+            gate: coord_daemon::metrics::Gate {
+                denied: self.frontend.frontend.denied,
+                deferred: self.frontend.frontend.deferred,
+                remembered: u64::try_from(self.frontend.frontend.remembered()).unwrap_or(u64::MAX),
+            },
             evidence_for_marked: self
                 .frontend
                 .frontend
