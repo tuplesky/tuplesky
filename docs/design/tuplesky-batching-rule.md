@@ -5,7 +5,8 @@
 - the cost model, per command and per turn;
 - the proposals that follow from the rule;
 - levers 1 and 2 (option 3 and the proposal frame as a unit) and the leader-log end state they lead to;
-- the buffer as the unit at every stage, filled by the load (Section 9).
+- the buffer as the unit at every stage, filled by the load (Section 9);
+- the frame as the unit of decision, a protocol change put to the owner (Section 10).
 
 What can be built without deciding the end state is in [Section 6.4](#64-what-can-be-built-without-deciding). The owner has parked option 3 and the leader log ([Section 8](#8-order-and-what-the-owner-decides)).
 
@@ -1028,3 +1029,118 @@ The order is by the five-voter sum, each step one PR, with a both-orders pair on
 - a pair of the loops it changes, and a profile of the rows it claims, before and after. That measures the take, which settles the A and B estimates step by step (review carries them at half until then);
 - the audit's counts a buffer (batches, barriers, storage events, appends and vote messages a command);
 - for the caps, depth and p50/p99 at 30, 120 and 480 callers against Section 9.5's table.
+
+## 10. The frame as the unit of decision
+
+**For the owner.** The structural floors round ([#185, 6854728753](https://github.com/tuplesky/tuplesky/pull/185#issuecomment-6854728753)) measured a follower that handles the leader's frame as a unit, one append and one acknowledgement a frame. That takes −0.46 ms an operation off build 1's 0.86, locally at 120 callers [−0.67 of 1.31 on the 7763].
+- Lazy voters (6.6) and lever 2 redesigned (6.7) reach about −0.16 of it without a protocol change.
+- The rest, about −0.30 [−0.44], is each command's own intake, vote, dependency record, rows, settle and forget at every follower. It needs the frame to be the unit of decision.
+
+This section covers the slow path's unit only. Option 3 and the leader executing for everyone (6.1 to 6.3) stay parked.
+
+### 10.1 The two totals
+
+Servers' CPU, ms an operation at 120 callers, storage on:
+
+| | Local | EPYC 7763 | EPYC 9V45 |
+| --- | ---: | ---: | ---: |
+| Without a protocol change | 0.67–0.72 | 1.01–1.06 | 0.65–0.68 |
+| With the frame as the unit of decision | 0.43–0.46 | 0.63–0.66 | 0.40–0.42 |
+| TLS etcd, testing's runs | — | 1.10–1.30 | 0.43–0.52 |
+
+**The bases:**
+- **Without a protocol change:** build 1 less lazy voters (−0.12, measured; the owner's ≤150 ms revocation bound), lever 2 redesigned (−0.04 to −0.06, estimated), long-lived API streams (−0.045, measured) and the bytes path (−0.044, measured). Then plus Section 9.6's storage, 0.07–0.10. The pairs overlap at the followers, so this is the best case.
+- **With it:** the measured floor, 0.364 [0.545]. That is the follower above, plus votes once a frame and the transport switches. Then the same storage. This is before the bytes path and before step 5 (10.5).
+- **The 9V45:** scaled part by part from the 7763 with the runner's profiles of our build ([#98, 6856833756](https://github.com/tuplesky/tuplesky/pull/98#issuecomment-6856833756) and [6851041797](https://github.com/tuplesky/tuplesky/pull/98#issuecomment-6851041797)). Our transport there is 0.58× the 7763's, and our loops, appender and materializer 0.655×. Weighted by each total's transport share, both totals scale by 0.63 to 0.64.
+
+**What they say:**
+- **On the 7763, the path without a protocol change reaches etcd.**
+- **On the 9V45 it doesn't:** 1.3 to 1.5 times etcd.
+  - The faster core helps etcd more. Its transport falls 2.1× and its consensus and storage 2.3×, against our 1.7× and 1.5×.
+  - Our excess is consensus, execution and storage, mostly at the followers (6856833756).
+- **With the frame as the unit, we are at or under etcd on both models.**
+
+### 10.2 The wire and the journal
+
+**On the wire:**
+- **The frame:** task-d102's `ProposalFrame` gets a position in the ballot's frame log and its predecessor's digest. A follower accepts it all or none, in position order, with every payload inside.
+- **`FrameAccept { replica, ballot, through }`** acknowledges a prefix of frames once their records are durable. It replaces each frame command's `SlowAck`. The leader counts a majority a frame.
+- **`Committed { through }`** counts frame positions.
+- **A recovery report** adds each accepted frame above the voter's commit frontier as (position, ballot, digest), and a Sync names frames the same way.
+
+**In the journal:**
+- **One record a frame:** its bytes as received, its ballot and its position, durable before the acknowledgement leaves.
+- **A follower drops, for a frame command,** its dependency row, adoption record, payload row and vote state. The frame holds the payload, the position is the order, and the frame's phase is the command's.
+- **Under proposal 2** (4.1), the frame record is the protocol state.
+
+### 10.3 Recovery and takeover
+
+**Today.** Recovery's source and possible-fast rules read each command's durable phase, ballot, dependencies and path ([design 4.9](tuplesky-design.md#s4-9)).
+
+**For frame commands, they read the frame log instead.**
+- **Selection is by position.** A voter accepts frames in order, so its report is a prefix.
+  - At each position, the selection takes the frame accepted at the highest ballot among a majority's reports, as Multi-Paxos selects a slot.
+  - A decided frame is in every majority, so it is selected whole.
+- **Order.** A frame command's place is its frame's position, then its index in the frame.
+  - This is the leader's order. Task-d71's rule reads it today through the records along dependencies; it becomes a source read directly.
+  - Explicit dependencies remain only on fast commands that conflict with a frame command, and at load there are none.
+- **What a voter carries into a Sync and what it serves** (task-d77, task-d80, task-d81) go by position: a committed frame is carried and served as a committed command is.
+
+**A takeover mid-frame.**
+- **The new leader re-proposes the selected frames whole,** at its ballot and in order, before new ones. No frame is ever split.
+- **A frame no reporter in the majority holds was not decided.** Its commands come back through their clients' retries.
+- **Execution resumes at the durable execution position** (task-d90), which can be inside a frame.
+- **A follower missing frame f waits for the leader's re-send** (task-d07) before taking f + 1. That is head-of-line blocking at one follower, bounded by the re-send.
+
+### 10.4 The fast path, a voter's right to propose, and what stays per command
+
+**The fast path: kept, narrowed to low load. This is the recommendation.**
+- **Below the relay's threshold** (task-d100), a collector proposes fast, as today, with per-command records and possible-fast recovery.
+- **At load,** collectors already relay to the leader, whose frames carry the commands.
+- **A command takes one path.** One whose fast round fails goes into the leader's next frame.
+- **Any voter still proposes and can lead.**
+
+**The alternative: the frame as the only path** (6.4). Recovery reads one source, and the possible-fast rule goes, about 2 to 3 weeks less. It gives up what 6.2 lists: a collector far from the leader pays the leg to it. Both give the same floor at load.
+
+**Per command, unchanged:**
+- **Identity and admission facts.**
+- **Execution in the decided order, in groups as today.**
+- **A `ResponseV1` kept for the retry window,** and the frontend's answer.
+- **The retry window:** a client's sequences and `ack_through`, with deduplication at execution.
+- **Reads at their barrier.**
+
+### 10.5 The staged path
+
+Each step has its own PRs and pair.
+- **Every activation goes through task-d99,** with readers a release ahead of writers, so old and new records are both readable.
+- **A domain doesn't go back below a step it has activated.**
+
+| Step | Activation | Delivers, 7763 at 120 |
+| --- | --- | --- |
+| 1. Without a protocol change: rows (a) to (c), lever 2, lazy voters, API streams, the bytes path | Lever 2's vote message; lazy voters | To 1.01–1.06 |
+| 2. One journal record a frame, read beside the per-command records | None (local format) | About −0.01 (appender) |
+| 3. Recovery and restart read frame records and reports | None | 0 |
+| 4. Followers take frames as the unit; the leader counts once a frame | `FrameDecision` | −0.44 (follower) |
+| 5. The leader proposes by range, without per-command dependencies or records (27 + 13.5 + 16.8 µs a command) | The same | About −0.06, inferred |
+
+### 10.6 Fault runs and weeks
+
+**Fault runs:**
+- **`protocol_sim` rows** at three and five voters, with the oracle checking one order everywhere, over rows 1, 9, 21 and 23. Each of these is a row:
+  - a leader crash with a frame at 1 to n − 1 followers;
+  - repeated elections with different frames at one position;
+  - frames lost or reordered;
+  - a follower frames behind;
+  - conflicting fast and frame commands;
+  - activation over old records.
+- **A model test:** a decided frame is selected whole by every later Sync.
+- **The crash matrix's cuts at a frame record:** torn, and durable but not acknowledged.
+- **The runner's fault runs:** the leader killed or partitioned under load, a follower restarted mid-frame, and activation in a running domain.
+
+**Weeks:**
+- the design step, 1–2;
+- steps 2 to 5, 1, 3–4, 2–3 and 1–2;
+- the simulator, model and crash matrix, 2, alongside them;
+- the runner's runs, 1–2.
+
+**About 10 to 14 weeks narrowed, 8 to 11 with the fast path dropped.** Step 1, already in flight, isn't counted.
