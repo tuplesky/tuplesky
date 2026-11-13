@@ -29,7 +29,7 @@ use coord_core::machine::DeterministicMachine;
 use coord_core::outbox::{BarrierAllocator, Outbox, PendingSend};
 use coord_types::identity::Digest32;
 use coord_types::ids::{Ballot, ExecutionPosition, LocalJournalSeq, ReplicaId, ReplicaIncarnation};
-use coord_types::wire_v1::{MessageV1, decode_stream};
+use coord_types::wire_v1::{MessageV1, RequestV1, decode_stream};
 use coord_types::{CommandId, RetryKey};
 use serde::{Deserialize, Serialize};
 
@@ -3003,21 +3003,30 @@ impl Leader {
             }
             return Vec::new();
         }
-        let request = match decode_stream(frame).as_deref() {
-            Ok([MessageV1::Request(r)]) => r.clone(),
+        // The request is taken out of the decoded stream, not copied: its
+        // logical bytes become the payload record's below.
+        let request = match decode_stream(frame).map(|mut m| (m.len(), m.pop())) {
+            Ok((1, Some(MessageV1::Request(r)))) => r,
             _ => {
                 self.rejections.push(Rejection::MalformedRequest);
                 return Vec::new();
             }
         };
-        let Ok(logical) = request.logical() else {
+        // `logical` checks that the bytes are the canonical encoding of the
+        // request they decode to, so the identity is derived from them as
+        // they are: what `CommandId::derive` would compute from an
+        // encoding made again.
+        if request.logical().is_err() {
             self.rejections.push(Rejection::MalformedRequest);
             return Vec::new();
-        };
-        let Ok(command) = CommandId::derive(&request.retry_key, &logical) else {
-            self.rejections.push(Rejection::MalformedRequest);
-            return Vec::new();
-        };
+        }
+        let command = CommandId::from_canonical(&request.retry_key, request.logical.as_slice());
+        let RequestV1 {
+            retry_key,
+            logical,
+            ack_through,
+            ..
+        } = request;
         self.admitted = Some(command);
         if self.mark_next_admitted {
             self.answer_on_release.insert(command);
@@ -3026,10 +3035,10 @@ impl Leader {
             self.relayed.insert(command);
         }
         let payload = PayloadRecordV1 {
-            retry_key: request.retry_key,
-            logical: request.logical.as_slice().to_vec(),
+            retry_key,
+            logical: logical.into_inner(),
             admission,
-            ack_through: request.ack_through,
+            ack_through,
         };
         // Identity: one retry key binds one payload, first presentation
         // wins. The same identity again is a duplicate only if the facts
@@ -3037,13 +3046,11 @@ impl Leader {
         // -- are the ones this leader proposed it under; and a duplicate
         // is answered rather than ignored, because the submitter
         // presenting it may never have received this leader's reply.
-        match self.bindings.get(&request.retry_key) {
+        match self.bindings.get(&retry_key) {
             Some(bound) if *bound != command => {
                 let bound = *bound;
-                self.rejections.push(Rejection::RequestIdentityConflict {
-                    retry_key: request.retry_key,
-                    bound,
-                });
+                self.rejections
+                    .push(Rejection::RequestIdentityConflict { retry_key, bound });
                 // Said only once the binding is durable (task-d22).
                 if self.served_payloads.contains(&bound) {
                     return self.refuse(command, SubmissionRefusal::OtherCommand { bound });
@@ -3058,7 +3065,7 @@ impl Leader {
                 return match accepted {
                     Some(accepted) if accepted == payload.admission_digest() => {
                         self.rejections.push(Rejection::Duplicate(command));
-                        self.repair_evidence(command, request.retry_key)
+                        self.repair_evidence(command, retry_key)
                     }
                     Some(accepted) => {
                         self.rejections
@@ -3099,12 +3106,12 @@ impl Leader {
             // exact duplicate whose binding was not kept, and
             // `PayloadConflict` is not a duplicate at all.
             Err(InitError::AlreadyInitialized) => {
-                self.bindings.insert(request.retry_key, command);
+                self.bindings.insert(retry_key, command);
                 if !self.payloads.contains_key(&command) {
-                    self.ledger.bound_bare(command, request.retry_key);
+                    self.ledger.bound_bare(command, retry_key);
                 }
                 self.rejections.push(Rejection::Duplicate(command));
-                return self.repair_evidence(command, request.retry_key);
+                return self.repair_evidence(command, retry_key);
             }
             Err(InitError::PayloadConflict) => {
                 self.rejections.push(Rejection::PayloadConflict(command));
@@ -3116,8 +3123,11 @@ impl Leader {
                 };
             }
         };
-        self.bindings.insert(request.retry_key, command);
-        self.payloads.insert(command, payload.clone());
+        self.bindings.insert(retry_key, command);
+        // The row is encoded before the record moves into the map, which
+        // keeps the only copy.
+        let payload_row = payload_update(&command, &payload).expect("bounded");
+        self.payloads.insert(command, payload);
         let ballot = self.config.quorum.ballot();
         let epoch = self.config.identity.epoch;
         let seqnum = self.seqnum;
@@ -3146,7 +3156,7 @@ impl Leader {
             .clone();
         let barrier = self.alloc.as_mut().expect("booted").allocate();
         let updates: Vec<StoreUpdate> = alloc::vec![
-            payload_update(&command, &payload).expect("bounded"),
+            payload_row,
             dependency_update(epoch, &command, &record).expect("bounded"),
             proposal_update(
                 epoch,
