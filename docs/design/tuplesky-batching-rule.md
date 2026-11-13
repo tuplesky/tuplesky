@@ -893,6 +893,31 @@ A stage's cap must not end a buffer the stage before it built. So:
 - **The store's commit spans buffers:** its cap is at least one buffer, and is set on its own (Section 9.6).
 - **Every cap stays within the command table's room for new admission:** capacity less an eighth, 875 of the default 1,000. What is buffered across the stages, plus what is decided and not yet forgotten, must fit there. So no stage's cap should pass an eighth of the table (125, the catch-up page) unless the table grows with it.
 
+**A precondition of raising any cap: no pass over what is in flight once an event.**
+- **Review's direct test** ([6842978632](https://github.com/tuplesky/tuplesky/pull/185#issuecomment-6842978632), Section 3): the loop's three bounds at 512, 480 callers.
+  - A turn reached 25 commands, and the other threads saved 84 to 105 µs a command, 5 to 7% of the servers.
+  - The leader's loop rose 49 to 50 µs a command, 25%, and gave most of it back. The net was −2 to −3%, and completions fell 3 to 4%.
+- **45 of those 49 µs are three passes.** Each walks what is in flight and runs once an event, so a deeper buffer, which holds more in flight, makes each cost more a command:
+
+| Role | Pass | Runs | Walks | Cost pass row | µs a command, capped / bounds at 512 |
+|---|---|---|---|---|---|
+| Leader | `pump_reads`: `ReadBarrier::take_due` with `Leader::executed_below` | after every peer event and every turn | for each held read, the unsettled proposals below its index | 1 | 8.3 / 32.5 |
+| Leader | `Leader::learn`: `Learner::commit_learned_where` | each acknowledgement, each storage event | every command at ACCEPT | 2, and row 4's `learn` | 8.4 / 24.0 |
+| Leader | `adopt_own` | each command | every unsettled barrier, into a set | 19 | 4.7 / 10.4 |
+| Follower | `Follower::learn`: `commit_learned` and `commit_through_leader` | each frame entry, each storage event | every command at ACCEPT, twice | 14, and row 2's `learn` | 6.6 / 10.9, a follower |
+
+- **Other per-event work that grows with what is in flight.** This is read from the code at `c74219e6`, not measured at 512:
+  - **A follower's vote** (`publish_to_leader_and_frontend`, row 18) lists every pending barrier in its `requires`, so the k-th adoption of a frame waits on at least k barriers.
+  - **A follower's `payload_row`** scans every in-flight payload batch (`durable_payloads`), twice an adoption.
+  - **`DurableLedger::written`** scans the staged batches, once for each dependency `carry_unwritten` looks at.
+  - **A follower's `JournalDurable`** checks each payload it made durable against every other in-flight payload batch (`served_payloads`).
+- **So these go by range, or by what changed, before any cap is raised** (Section 9.8, step 4):
+  - the leader's due reads from the lowest unexecuted proposal;
+  - learning, at both roles, of only the commands whose votes, adoption or durability changed, with the commit frontier through an index by sequence number;
+  - the barrier list once a turn at the leader and once a frame at a follower;
+  - the payload rows in flight through an index.
+- **With them, depth is worth what the other threads save,** 5 to 7% at depth 25. Without them it is worth nothing.
+
 ### 9.5 Depth, cost and latency
 
 **Expected depth with the rule** (commands an append at the leader; a follower's follows by Section 9.4):
@@ -913,6 +938,7 @@ A stage's cap must not end a buffer the stage before it built. So:
 | Build 5, stages 1 to 6 once a buffer | 0.65 to 0.75 | 0.56 to 0.57 | 0.52 to 0.55 | 0.49 to 0.52 | 0.47 to 0.51 | 0.46 to 0.51 |
 | The carry, stages 1 to 6 once a buffer | 1.05 to 1.15 | 0.96 to 0.97 | 0.92 to 0.95 | 0.89 to 0.92 | 0.87 to 0.91 | 0.86 to 0.91 |
 
+- **The table assumes Section 9.4's precondition.** Without it, review's direct test at depth 25 measured −2 to −3%: the leader's loop gave back most of what the other threads saved. And every take here is an estimate. Review carries the class A and B takes at half until a pair measures one, since #264 came in at a third of its estimate. Class C is firm.
 - **Most of the gain is the stages, not the depth.** At today's depth (10), doing stages 1 to 6 once a buffer takes about 0.10 ms an operation, −16%. Depth 64 takes another 0.05 to 0.09.
 - **Depth 64 needs a load that fills it.** At 120 closed-loop callers about 80 commands are in flight over all the stages, so one stage's buffer sees 11 to 16. The raised caps are for loads beyond today's bar: more callers, or callers that share a connection (a proxy, kine's adapter, a pipelined SDK).
 - **At 30 callers** the rule adds nothing and takes nothing from depth. The stages still save their once-a-buffer part, about 0.06 to 0.09 ms an operation at depth 4.
@@ -977,11 +1003,12 @@ The order is by the five-voter sum, each step one PR, with a both-orders pair on
    - the vote message, behind a feature.
 2. **Class C at followers** (about 9 µs a follower).
 3. **The leader's proposals:** the `propose` path's copies (8.1), then one barrier a buffer (stage 4, 10.2).
-4. **The caps** (Section 9.4): `flush_commands` beside the event count, which can then be set to none, the journal group's limit following the buffer, the frame cut at the lend, and the execution group's cap. Each is a knob whose default is today's value. A pair at 120 and 480 callers, and at 30, reads the depth and latency of Section 9.5.
-5. **Stages 2 and 5** with lever 5 and proposal 1; **stage 8** after proposal 2.
-6. **Stages 9 and 10** (one frame of submissions, one release frame a collector), behind a feature, once tokio's per-stream share is read.
+4. **The passes over what is in flight, by range or by what changed** (Section 9.4's precondition): the leader's rows 1, 2 and 19, and at a follower `learn` beyond the frame, the vote's barrier list and the payload-row scans. They come before any cap is raised. Their acceptance is the pair review ran ([6842978632](https://github.com/tuplesky/tuplesky/pull/185#issuecomment-6842978632)), the bounds at 512 against capped at 480 callers, with the leader's loop no longer rising.
+5. **The caps** (Section 9.4): `flush_commands` beside the event count, which can then be set to none, the journal group's limit following the buffer, the frame cut at the lend, and the execution group's cap. Each is a knob whose default is today's value. A pair at 120 and 480 callers, and at 30, reads the depth and latency of Section 9.5.
+6. **Stages 2 and 5** with lever 5 and proposal 1; **stage 8** after proposal 2.
+7. **Stages 9 and 10** (one frame of submissions, one release frame a collector), behind a feature, once tokio's per-stream share is read.
 
 **Each step's acceptance:**
-- a pair of the loops it changes;
+- a pair of the loops it changes, and a profile of the rows it claims, before and after. That measures the take, which settles the A and B estimates step by step (review carries them at half until then);
 - the audit's counts a buffer (batches, barriers, storage events, appends and vote messages a command);
 - for the caps, depth and p50/p99 at 30, 120 and 480 callers against Section 9.5's table.
