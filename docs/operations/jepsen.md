@@ -883,6 +883,10 @@ The summary's ratios are over the baseline's mean at the step, with a row
 for each run and a `mean` row for each side that ran twice. SwiftPaxos
 runs after both.
 
+A job with one step and no pair runs TupleSky once, then the baseline
+once: etcd with TLS for `beside+tls` and `beside+tls+auth`, without the
+side rows, which need a sweep.
+
 A sweep's step can offer a fixed load instead of running its clients
 flat out. `CLIENTS@RATE` (`480@2000`) offers 2,000 operations a second
 to 480 clients, through each test's own `--rate`, for both systems

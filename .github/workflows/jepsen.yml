@@ -610,10 +610,16 @@ jobs:
             run_one "$GITHUB_WORKSPACE/tuplesky/target/release" "$RUNNER_TEMP" "$graph" \
               ${head_workers[@]+"${head_workers[@]}"} || rc=$?
             store=$(readlink -f store/latest || true)
-            if [ "$ETCD_BESIDE" = true ] && [ -n "$store" ] && etcd_one "$RUNNER_TEMP/etcd" "beside TupleSky"; then
+            # One run: the etcd baseline alone, with TLS where the input
+            # asks for it (ETCD_HEADLINE), as a sweep's headline is; its
+            # side rows need a sweep.
+            one_beside=""; if [ "$ETCD_BESIDE" = true ]; then one_beside=", beside etcd $ETCD_VERSION${ETCD_HEADLINE:+ with $ETCD_HEADLINE}"; fi
+            if [ "$SWIFTPAXOS_BESIDE" = true ]; then one_beside+=", beside SwiftPaxos"; fi
+            if [ "$ETCD_BESIDE" = true ] && [ -n "$store" ] \
+              && etcd_one "$RUNNER_TEMP/etcd" "beside TupleSky${ETCD_HEADLINE:+, $ETCD_HEADLINE}" "" "${ETCD_HEADLINE:-}"; then
               cp "$RUNNER_TEMP"/cpu-samples* "$store"/ 2>/dev/null || true
               python3 "$ci/jepsen_pairs.py" \
-                --title "TupleSky $head_sha$beside on one runner: $WORKLOAD, $NEMESIS$TITLE_SUFFIX$STORE_SUFFIX$PROFILE_SUFFIX$CHECKPOINT_SUFFIX$WORKERS_SUFFIX$TUPLESKY_SUFFIX" \
+                --title "TupleSky $head_sha$one_beside on one runner: $WORKLOAD, $NEMESIS$TITLE_SUFFIX$STORE_SUFFIX$PROFILE_SUFFIX$CHECKPOINT_SUFFIX$WORKERS_SUFFIX$TUPLESKY_SUFFIX" \
                 "head=$store" "etcd=$etcd_store" || true
             fi
             if [ "$SWIFTPAXOS_BESIDE" = true ]; then
