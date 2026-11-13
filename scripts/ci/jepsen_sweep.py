@@ -91,6 +91,8 @@ class Step:
     clients: dict = field(default_factory=dict)
     # Kind -> (p50, p99) of its `ok`s, in ms.
     latency: dict = field(default_factory=dict)
+    # (kind, `fail` or `info`, error) -> the completions that weren't `ok`.
+    not_ok: dict = field(default_factory=dict)
     # CPU ms per completed operation, by part (see PARTS).
     cpu: dict = field(default_factory=dict)
     idle_cores: float | None = None
@@ -306,6 +308,40 @@ def crowded(s: Step) -> bool:
     return bool(rate and clients and s.busy_clients is not None and s.busy_clients >= 0.8 * clients)
 
 
+def withheld(s: Step) -> int:
+    """A run's reads answered with their output withheld: a permitted read
+    the frontend's output gate didn't show."""
+    return sum(n for (f, _, why), n in s.not_ok.items() if f == ":read" and "withheld" in why)
+
+
+def not_ok_table(steps: list[Step], top: int = 3) -> list[str]:
+    """Each run's completions that weren't `ok`, by kind as `fail` / `info`,
+    its reads whose output was withheld, and its commonest reasons; [] when
+    no run read a history."""
+    runs = [s for s in steps if s.completed]
+    if not runs:
+        return []
+    out = [
+        "**Completions that weren't `ok`** (by kind, `fail` / `info`; the reads answered `output-withheld`, a "
+        "permitted read the frontend's output gate didn't show; and each run's commonest reasons as the history "
+        "gives them. A cas that didn't match fails by design)",
+        "",
+        "| Step | Side | Reads | Writes | Cas | Reads withheld | Commonest reasons |",
+        "| --- | --- | --- | --- | --- | --- | --- |",
+    ]
+    for s in runs:
+        cells = []
+        for k in KINDS:
+            fail = sum(n for (f, t, _), n in s.not_ok.items() if f == k and t == "fail")
+            info = sum(n for (f, t, _), n in s.not_ok.items() if f == k and t == "info")
+            cells.append(f"{fail} / {info}")
+        common = sorted(s.not_ok.items(), key=lambda kv: -kv[1])[:top]
+        reasons = "; ".join(f"{f[1:]} {t} `{why[:60].replace('|', '/')}` ×{n}" for (f, t, why), n in common) or "-"
+        out.append(f"| {name(s)} | " + " | ".join(cells) + f" | {withheld(s)} | {reasons} |")
+    out.append("")
+    return out
+
+
 def capacity(steps: list[Step], step: str) -> float | None:
     """The head's completions a second at a step, the mean of its runs
     there: what a later step's share of the capacity is a share of."""
@@ -355,6 +391,9 @@ def clients_and_mix(step: Step, client: list, start, end) -> None:
             continue
         inv = invoked.pop(o.thread, None)
         done[o.f] = done.get(o.f, 0) + 1
+        if o.type != "ok":
+            why = o.error.strip() or "(none given)"
+            step.not_ok[(o.f, o.type, why)] = step.not_ok.get((o.f, o.type, why), 0) + 1
         if o.type == "ok":
             oks += 1
             if inv is not None:
@@ -695,6 +734,7 @@ def render(steps: list[Step], title: str, baseline: str = "etcd") -> str:
             f"{cell(s.busy_clients, '.1f')}{' ⚠' if crowded(s) else ''} | {mix} | " + " | ".join(lat) + " |"
         )
     out.append("")
+    out += not_ok_table(steps)
 
     out += [
         "**The runner's CPU per operation** (ms per operation completed, from `cpu_sampler.py` over the samples "

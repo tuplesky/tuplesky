@@ -357,7 +357,8 @@ class SweepTests(unittest.TestCase):
         self.assertIn("**Voters behind**", text)
         self.assertIn("| Step | Side | n1 | n2 |", text)
         self.assertIn("| 120 | head | 0 / 0 / - | 2600 / 2 / 41 |", text)
-        self.assertNotIn("| 120 | etcd | 0 / ", text)
+        behind = text.split("**Voters behind**")[1].split("**Against etcd")[0]
+        self.assertNotIn("| 120 | etcd | 0 / ", behind)
 
     def test_the_voters_memory(self):
         path = self.store("m")
@@ -459,6 +460,19 @@ class OfferedRateTests(unittest.TestCase):
         self.assertFalse(sw.crowded(free))
         self.assertTrue(sw.crowded(crowded))
         self.assertFalse(sw.crowded(unthrottled))
+
+
+class NotOkTests(unittest.TestCase):
+    def test_withheld_reads_and_failures_by_kind(self):
+        s = sw.Step("head", "120", "/s", 1)
+        s.completed = 10
+        s.not_ok = {(":read", "fail", ":output-withheld"): 2, (":cas", "fail", "(none given)"): 5,
+                    (":write", "info", ":timeout"): 1}
+        self.assertEqual(sw.withheld(s), 2)
+        text = "\n".join(sw.not_ok_table([s]))
+        self.assertIn("| 120 | head | 2 / 0 | 0 / 1 | 5 / 0 | 2 |", text)
+        self.assertIn("cas fail `(none given)` ×5", text)
+        self.assertEqual(sw.not_ok_table([sw.Step("head", "30", "/s", 1)]), [])
 
 
 class BaselineTests(unittest.TestCase):
