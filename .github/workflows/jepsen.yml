@@ -1114,15 +1114,17 @@ jobs:
             ${tmpfs[@]+"${tmpfs[@]}"}
       - name: Run the etcd test
         # The TupleSky test's rate, fault interval and operations per
-        # register, bounded as it is (scripts/ci/jepsen_etcd.sh).
-        run: tuplesky/scripts/ci/jepsen_etcd.sh run "$RUNNER_TEMP/cpu-samples.csv"
+        # register, bounded as it is (scripts/ci/jepsen_etcd.sh); with TLS
+        # for VERSION+tls and VERSION+tls+auth (ETCD_HEADLINE), as the
+        # baseline beside TupleSky is.
+        run: ETCD_SECURE="${ETCD_HEADLINE:-}" tuplesky/scripts/ci/jepsen_etcd.sh run "$RUNNER_TEMP/cpu-samples.csv"
       - name: Summarize the run
         if: always()
         run: |
           if [ -d etcd-test/store/latest ]; then
             cp "$RUNNER_TEMP"/cpu-samples* etcd-test/store/latest/ 2>/dev/null || true
             python3 tuplesky/scripts/ci/jepsen_summary.py etcd-test/store/latest \
-              --nodes-file "$RUNNER_TEMP/cluster/nodes" --title "etcd $ETCD_VERSION: $WORKLOAD, $NEMESIS$TITLE_SUFFIX$STORE_SUFFIX"
+              --nodes-file "$RUNNER_TEMP/cluster/nodes" --title "etcd $ETCD_VERSION${ETCD_HEADLINE:+ with $ETCD_HEADLINE}: $WORKLOAD, $NEMESIS$TITLE_SUFFIX$STORE_SUFFIX"
           else
             echo "No Jepsen store: the test did not start." >> "$GITHUB_STEP_SUMMARY"
           fi
