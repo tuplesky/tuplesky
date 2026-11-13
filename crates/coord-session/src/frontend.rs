@@ -534,14 +534,23 @@ impl BoundFrontend {
     /// back. It looks before it is added, so it is never among them. So
     /// the work is constant for each record added, however much the
     /// dispatcher holds (its retained results alone can outnumber the
-    /// bound on a busy node), and every record is looked at again within
-    /// a pass of no more than half as many additions as there are
-    /// records. A record forgotten is one the dispatcher let go before
-    /// that pass reached it, which bounds the records by the larger of
-    /// `max_requests` and four times what the dispatcher holds, plus the
-    /// record being added: its
-    /// commands pending or retained for resolution, and its reads
-    /// waiting on a leader.
+    /// bound on a busy node).
+    ///
+    /// Those looks alone do not bound the records, because a record the
+    /// dispatcher let go can be held again: a key that has a record is
+    /// not recorded again, and an answered read presented again waits on
+    /// its leader again (#268 review). A caller that presents its oldest
+    /// answered reads again before each new one keeps the looks on held
+    /// records, and nothing is forgotten. So once the records pass the
+    /// larger of `max_requests` and four times what the dispatcher holds
+    /// (its commands pending or retained for resolution, and its reads
+    /// waiting on a leader), every record is looked at once and each one
+    /// it no longer holds is forgotten. That bounds the records by the
+    /// same figure, plus the record being added. A sweep forgets at least
+    /// three records in four, so the work stays constant for each record
+    /// added on average. Under honest load the looks keep the records
+    /// within that figure (1.3 to 1.4 times what is held, at 120 and 480
+    /// callers), and it does not run.
     fn forget_settled(&mut self) {
         let mut held = 0;
         while self.order.len() >= self.max_requests && held < HELD_LOOKS {
@@ -554,6 +563,17 @@ impl BoundFrontend {
             } else {
                 self.requests.remove(&old);
             }
+        }
+        if self.order.len() > self.max_requests.max(4 * self.dispatcher.held()) {
+            let dispatcher = &self.dispatcher;
+            let requests = &mut self.requests;
+            self.order.retain(|key| {
+                let keep = dispatcher.holds(key);
+                if !keep {
+                    requests.remove(key);
+                }
+                keep
+            });
         }
     }
 

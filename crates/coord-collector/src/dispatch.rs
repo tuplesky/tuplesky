@@ -225,6 +225,11 @@ impl Dispatcher {
         self.reads.contains_key(key) || self.collector.is_bound(key)
     }
 
+    /// How many keys [`Dispatcher::holds`] is true for.
+    pub fn held(&self) -> usize {
+        self.reads.len() + self.collector.bound()
+    }
+
     /// The collector.
     pub const fn collector(&self) -> &Collector {
         &self.collector

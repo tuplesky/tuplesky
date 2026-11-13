@@ -1602,3 +1602,92 @@ fn the_gate_forgets_settled_requests_past_its_bound() {
         .answered();
     assert!(!is_denied(&answered), "{:?}", outcome_of(&answered));
 }
+
+/// A record the dispatcher let go can be held again (#268 review): an
+/// answered read presented again waits on its leader again, and its key
+/// already has a record. A caller that presents its two oldest answered
+/// reads again before each new one keeps the gate's looks on held
+/// records. The records stay within the larger of the bound and four
+/// times what is held, plus the one being added, and every read is
+/// disclosed.
+#[test]
+fn answered_reads_presented_again_keep_the_records_within_the_bound() {
+    let ring = ring();
+    let domain = Domain::new();
+    let hub = WatchHub::new(KvRevision::ZERO, KvRevision::ZERO);
+    let mut f = frontend_remembering(&ring, 4);
+    f.dispatcher_mut().set_leader_reads(true);
+    let bind = frame_of(&bind_frame(&token(&ring, SESSION, NOW + 100)).unwrap());
+    let Ingress::Bound(_) = f.on_frame(&clock(NOW), at(NOW), 1, &bind, &hub, &domain.policy())
+    else {
+        panic!("bound")
+    };
+    let ballot = Ballot {
+        epoch: ConfigurationEpoch::new(1).unwrap(),
+        number: 0,
+        leader: r(0),
+    };
+    let response = postcard::to_allocvec(&Response {
+        revision: KvRevision::new(1).unwrap(),
+        outcome: range_outcome(b"secret"),
+    })
+    .unwrap();
+    let mut order: std::collections::VecDeque<u64> = std::collections::VecDeque::new();
+    let mut most_held = 0usize;
+    let mut most_remembered = 0usize;
+    let mut again = 0usize;
+    let mut disclosed = 0usize;
+    for seq in 1..=600u64 {
+        let mut waiting = Vec::new();
+        if order.len() >= 4 {
+            for _ in 0..2 {
+                let old = order.pop_front().unwrap();
+                let (_, req) = request(old, range(b"secret"));
+                let action = f.on_frame(&clock(NOW), at(NOW), 1, &req, &hub, &domain.policy());
+                assert!(
+                    matches!(action, Ingress::Action(Action::Read(_))),
+                    "an answered read presented again waits on its leader again"
+                );
+                waiting.push(old);
+                again += 1;
+                order.push_back(old);
+            }
+        }
+        let (_, req) = request(seq, range(b"secret"));
+        assert!(matches!(
+            f.on_frame(&clock(NOW), at(NOW), 1, &req, &hub, &domain.policy()),
+            Ingress::Action(Action::Read(_))
+        ));
+        order.push_back(seq);
+        waiting.push(seq);
+        most_held = most_held.max(f.dispatcher().reads_waiting());
+        most_remembered = most_remembered.max(f.remembered());
+        // The leader answers every read before the next request.
+        for s in waiting {
+            let resolution = f.dispatcher_mut().on_read_answer(
+                at(NOW),
+                r(0),
+                coord_collector::ReadAnswerV1 {
+                    retry_key: retry_key(s),
+                    ballot,
+                    outcome: coord_collector::ReadOutcomeV1::Served {
+                        response: response.clone(),
+                    },
+                },
+            );
+            let Some(coord_collector::ReadResolution::Answer(delivery)) = resolution else {
+                panic!("answered")
+            };
+            if !is_denied(&f.deliver(delivery, &domain.policy()).answered()) {
+                disclosed += 1;
+            }
+        }
+        assert_eq!(f.dispatcher().reads_waiting(), 0);
+    }
+    let bound = 4.max(4 * most_held) + 1;
+    assert!(
+        most_remembered <= bound,
+        "remembered at most {most_remembered} over 600 reads and {again} presented again; most held at once {most_held}; bound {bound}"
+    );
+    assert_eq!(disclosed, 600 + again, "every read is disclosed");
+}
