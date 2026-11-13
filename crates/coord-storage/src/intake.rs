@@ -1528,4 +1528,91 @@ mod tests {
         assert_eq!(rows.of(Collection::DecidedV1), 0);
         assert_eq!(rows.of(Collection::ExecutionV1), 0);
     }
+
+    /// A measurement, run by hand (`cargo test --release -p coord-storage
+    /// --lib -- --ignored assignment_cost`): the assignment's cost a
+    /// command, by commands a commit (#185, lead 17:43, the intake index).
+    ///
+    /// Each command is taken in (its payload, a dependency row and a
+    /// proposal row, one record) and later executed (its executed row, one
+    /// record), as a leader lowers it. The index starts with 2,000 commands
+    /// taken in and not executed, and 50,000 executed. Rows are read from an
+    /// ordered map in memory, the same before and after a change.
+    #[test]
+    #[ignore = "a measurement, run by hand"]
+    fn assignment_cost_by_commands_a_commit() {
+        fn id(n: u64) -> CommandId {
+            let mut bytes = [0u8; 32];
+            let mut x = n.wrapping_add(1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            for chunk in bytes.chunks_mut(8) {
+                x ^= x >> 31;
+                x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                x ^= x >> 29;
+                chunk.copy_from_slice(&x.to_be_bytes());
+            }
+            CommandId(Digest32(bytes))
+        }
+        struct Run {
+            base: IntakeIndex,
+            rows: Rows,
+            seq: u64,
+            next: u64,
+            oldest: u64,
+            position: u64,
+        }
+        impl Run {
+            fn commit(&mut self, intake: u64, execute: u64) {
+                let mut assigner = Assigner::new(&self.base);
+                for _ in 0..intake {
+                    let c = id(self.next);
+                    self.next += 1;
+                    let updates = [
+                        payload(&c, Some(7)),
+                        protocol_row(DEPENDENCY_TAG, 1, &c, Some(1)),
+                        protocol_row(PROPOSAL_TAG, 1, &c, Some(2)),
+                    ];
+                    for (i, u) in updates.into_iter().enumerate() {
+                        self.rows
+                            .assign(&mut assigner, self.seq, i as u32, u)
+                            .unwrap();
+                    }
+                    self.seq += 1;
+                }
+                for _ in 0..execute {
+                    let c = id(self.oldest);
+                    self.oldest += 1;
+                    self.rows
+                        .assign(&mut assigner, self.seq, 0, executed(&c, self.position))
+                        .unwrap();
+                    self.position += 1;
+                    self.seq += 1;
+                }
+                let delta = assigner.into_delta();
+                self.base.publish(delta, self.seq);
+            }
+        }
+        let mut run = Run {
+            base: IntakeIndex::default(),
+            rows: Rows::default(),
+            seq: 1,
+            next: 0,
+            oldest: 0,
+            position: 1,
+        };
+        for _ in 0..20 {
+            run.commit(100, 0);
+        }
+        for _ in 0..500 {
+            run.commit(100, 100);
+        }
+        for k in [4u64, 16, 64, 256] {
+            let commits = 20_000 / k;
+            let start = std::time::Instant::now();
+            for _ in 0..commits {
+                run.commit(k, k);
+            }
+            let ns = start.elapsed().as_nanos() as f64 / (commits * k) as f64;
+            println!("{k:>4} commands a commit: {ns:>8.0} ns a command (taken in and executed)");
+        }
+    }
 }
