@@ -393,18 +393,13 @@ So this section asks what a voter has to do on the hot path, and what it can do 
   - **Reads, watches and resolves** need current state. A lazy voter's frontend forwards them to an eager voter. That costs a hop and, on the 7763, about +0.003 ms an operation a lazy frontend (the bar's 34% reads, a fifth of them at that frontend, at about 20 µs of tokio a forwarded read). Total read work doesn't change: each read is still answered once.
   - **Authorization reads this node's own store** (#259's review). `StorePolicySource::barrier` reads the session, the policy and the grants when the frontend admits a request and again on a result's way out, and `retained` reads the retry row when a request arrives. At a lazy voter that state is as old as its last landed batch.
     - **So a batch ends by time as well as by positions:** at a quarter of the table or 50 ms, whichever comes first. Today the bound is the materializer's lag.
-    - **Ending batches by time doesn't bound the age by itself; a check before authorizing does** (Codex on #259, twice). A landing can stall while the frontend still answers, and so can the decisions reaching this voter. So freshness is progress the leader confirmed, not an empty backlog:
-      - **The leader's beacon.** The leader sends each lazy voter its commit frontier at least every 50 ms, idle or not: the frontier it announces at a turn's end under load, and a beacon of tens of bytes when idle.
-      - **Only while it holds a quorum.** A leader sends a beacon only while a quorum has acknowledged it at its ballot within the last 50 ms. A voter that has promised a higher ballot no longer acknowledges the old one, so a deposed leader stops within 50 ms of losing its quorum, wherever it is.
-      - **The age:** the time since this voter received the latest beacon, at the current ballot, whose frontier it has landed through. Decisions or landings that stall, alone or together, both make it grow.
-      - **Under 100 ms**, the frontend authorizes from its own store. **Over it, it fails closed:** admission and the result's authorization go to an eager voter (the stricter way, below). If none answers, the request is deferred, as the disclosure gate defers today.
-      - **The bound,** for a revocation committed at time `t`:
-        - a beacon from the leader that committed it holds a frontier behind it only if sent before `t`, so it keeps a lazy frontend fresh until at most `t` + 100 ms plus a message delay;
-        - a deposed leader's quorum overlaps the new one in a voter whose last acknowledgement to the old leader came before its promise to the new ballot, so before `t`. The old leader's last beacon therefore leaves before `t` + 50 ms, and keeps a frontend fresh until at most `t` + 150 ms plus a message delay;
-        - so the revoked grant can authorize at a lazy frontend for at most 150 ms plus one message delay after `t`, across a leader change too, at any traffic.
-      - It assumes clock rates agree within a few percent over 150 ms, as leader leases do, not that clocks agree. The stricter way assumes nothing about clocks.
+    - **Ending batches by time doesn't bound the age by itself; a check before authorizing does** (Codex on #259). A landing can stall while the frontend still answers.
+      - **The age:** the voter keeps the time it learned the decision of its first position not yet landed. The age is the time since then, or 0 when every decided position has landed.
+      - **Under 100 ms** (the 50 ms batch and a landing's allowance), the frontend authorizes from its own store.
+      - **Over it, it fails closed:** admission and the result's authorization go to an eager voter (the stricter way, below). If none answers, the request is deferred, as the disclosure gate defers today.
+      - So a stalled landing costs hops, not a longer exposure. A lazy frontend authorizes from state at most 100 ms old, at any traffic.
     - **A session opened a moment ago** isn't found there until its batch lands. The frontend's disclosure gate defers rather than refuses, as it does at a lagging replica today.
-    - **A grant revoked a moment ago** still authorizes a result on its way out at a lazy frontend, for up to that bound: 150 ms plus a message delay. That is the owner's to accept.
+    - **A grant revoked a moment ago** still authorizes a result on its way out at a lazy frontend, for up to that bound. That is the owner's to accept.
     - **The stricter way** sends admission and the result's authorization to an eager voter: a hop for every request at a lazy frontend, not only for reads.
     - **At the bar's load the time bound ends batches at about 120 positions,** not 250. The merged current rows then save a little less: under +0.002 ms an operation for three lazy voters.
 - **To be a catch-up donor:**
@@ -449,12 +444,10 @@ So this section asks what a voter has to do on the hot path, and what it can do 
   - **What goes wrong at the floor's 4,096 positions.** A batch that large would fill the table four times over before its first landing. The lazy voter would then refuse new commands, and at `e = 1` ordering needs a lazy voter's vote.
   - **With the window below at half the table, 500 positions,** a lazy voter's table holds at most 500 positions it hasn't landed, plus what is undecided in flight: under 875.
   - **Landing counts as execution for the table.** It marks a batch's positions executed. They retire once the landing's commit is durable, as an execution group's do today (task-d90, point 2).
-  - **What makes a landing durable** (#259's review). Today an execution is durable once the journal holds its outcome (`executions_durable_through`), and under `replay` the projection is synced on a cadence, not at each commit. If a landing's positions retired only at a projection sync, the table would fill between syncs: 875 positions is about 0.4 s at the bar's load. So:
-    - **each landing first journals the batch's execution records,** as received from the eager follower: one append a batch, about ten to twenty a second at the bar's load. The positions retire once that append is durable, as an execution group's do;
-    - **the write set goes to the projection in one commit,** synced on the profile's cadence, as today's commits are;
-    - **why the journal** (Codex on #259). Proposal 2 takes the retry window and executed history out of the projection: an eager voter rebuilds them at boot from its image and the execution records in its journal. A lazy voter whose landings weren't journaled would boot without the retry entries of every batch landed since its image, and after a takeover would execute a retried command again. With the execution records journaled, it rebuilds the retry window, the executed history and the history digest the same way, through its journaled execution frontier;
-    - **after a crash** the voter boots from its image and journal (task-d117). Its projection's stamp gives the landed frontier. Positions journaled above it are executed again from the journal's payloads, or landed again from a donor's batch, and each outcome must match its journaled record. No position is skipped;
-    - **its cost** is the appender's per-byte work on records the eager follower already ships: inferred under +0.002 ms an operation for three lazy voters, inside the rounding of Section 7's lazy rows.
+  - **What makes a landing durable** (#259's review). Today an execution is durable once the journal holds its outcome (`executions_durable_through`), and under `replay` the projection is synced on a cadence, not at each commit. A landing isn't in the lazy voter's journal. If its positions retired only at a projection sync, the table would fill between syncs: 875 positions is about 0.4 s at the bar's load. So:
+    - **each landing is a durable projection commit,** under `replay` as under `strict`: one sync a batch, about ten to twenty a second at the bar's load;
+    - **the batch doesn't go through the lazy voter's journal,** so its appender writes the protocol's records only, as today;
+    - **after a crash** the voter boots from its image and journal (task-d117), reads its landed frontier from the projection's stamp, and lands or executes from there.
   - **The table, its reserve and the recovery reports are unchanged.** A smaller configured table gives smaller batches, so a domain with lazy voters keeps the default.
   - **Batches don't need the floor's boundaries.** The history digest (task-d117, point 3) runs over every executed position, so two executions can be compared at any position.
     - Each eager voter sends its digest through each batch's last position: a position and 32 bytes, in a small peer frame to the lazy voters.
@@ -541,19 +534,18 @@ The last three columns are the servers' ms an operation, from 1.20. The two righ
 - **Roles from the ballot,** and an election that prefers eager voters.
 - **The batch:** a quarter of the table's positions or 50 ms, as a peer frame with the merged write set and the execution records. The eager follower sends it. The leader's load changes only by merging and hashing the batch's write set.
 - **The agreement:** each eager voter's history digest and write-set digest through each batch's last position, in a small peer frame to the lazy voters.
-- **The landing:** the batch's execution records journaled in one append, then its write set lowered as one sorted commit, of bytes whose write-set digest two voters sent, laid over the in-memory state in the same step. Boot rebuilds the retry window and executed history from the journaled records, as at an eager voter.
+- **The landing:** a batch lowered as one sorted, durable commit, of bytes whose write-set digest two voters sent, laid over the in-memory state in the same step.
 - **The eager follower named by the leader,** and named again when it stops answering.
 - **The fallbacks:** own execution when there is no agreement within a bound, on a difference, and past the window.
 - **The window:** the lag tracked, and the campaign's second timeout past it.
 - **The takeover:** execute the tail before answering.
-- **The frontend:** forwarding reads, watches and resolves to an eager voter, and the age check before authorizing from its own store.
-- **The leader's beacon:** its commit frontier to each lazy voter at least every 50 ms, sent only while a quorum has acknowledged it within the last 50 ms.
+- **The frontend:** forwarding reads, watches and resolves to an eager voter.
 - **The donor rule:** a lazy voter serves executed history only up to its landed frontier.
 - **The metrics line:** lag in positions, tail and takeover times, agreements, fallbacks.
 
 **It changes who executes, so it is the owner's to decide,** beside the parked leader log, option 3 and witnesses. It doesn't change what is decided: votes, dependencies, the fast path and recovery are as today. **What the owner trades** (#259's review):
 - **Two executions check each other, where five do today.** With the write-set digest, they check rows as well as results.
-- **A lazy frontend's authorization is as old as the leader's last beacon it has landed through,** checked before each authorization (point 1): a revoked grant can still authorize a result there for up to 150 ms plus a message delay, across a leader change too. Past it, the frontend asks an eager voter or defers. The bound assumes clock rates agree within a few percent, as leader leases do.
+- **A lazy frontend's authorization is as old as its last landed batch,** at most 100 ms, checked before each authorization (point 1): a revoked grant can still authorize a result there for that long. Past it, the frontend asks an eager voter or defers.
 - **One follower down costs the saving for its tail's time,** while the leader names another.
 - **Half of a lazy voter's table is the window.** At the window's edge it has room for 375 commands in flight, and at `e = 1` ordering needs one lazy voter's vote. The bar's 120 callers put about 80 there.
 
@@ -561,7 +553,7 @@ The last three columns are the servers' ms an operation, from 1.20. The two righ
 - **A lazy voter wins an election and serves within the bound:**
   - kill the leader and the eager follower together under load;
   - read the time from the kill to the first answer: the election, the Sync and the tail. The tail should be at most about 0.02 s at 250 positions.
-- **A restarted lazy voter:** it boots from its image and journal (task-d117), resumes landing, and is caught up by donors. Killed just after a landing, it then takes over: a retry of a command from that landing is answered from its retained result, not executed again.
+- **A restarted lazy voter:** it boots from its image and journal (task-d117), resumes landing, and is caught up by donors.
 - **Two in a row:**
   - kill the eager voters, then the lazy voter that took over once it serves;
   - a second lazy voter takes over within the same bound;
@@ -569,7 +561,7 @@ The last three columns are the servers' ms an operation, from 1.20. The two righ
 - **A difference at one eager voter,** in a build that changes one result: the lazy voters execute the batch, the majority decides, and the loser stops.
 - **A wrong write set under right results** at the eager follower, in a build that changes one shipped row: the lazy voters refuse to land it, execute the batch themselves, and the leader isn't stopped.
 - **The eager follower stopped without a change of ballot:** the leader names another, and agreement resumes after that voter's tail.
-- **A revoked grant at a lazy frontend:** the time from the revocation's commit to the first refusal there is under 150 ms plus a message delay. It stays under that with that voter's landing stalled (a build that holds its landings), with its decisions and batches stalled together, and with the old leader and that voter cut off from the rest while a new leader commits the revocation. The frontend fails closed to an eager voter, or defers.
+- **A revoked grant at a lazy frontend:** the time from the revocation's commit to the first refusal there is under 100 ms, and stays under it with that voter's landing stalled (a build that holds its landings): the frontend fails closed to an eager voter, or defers.
 - **The lag under load:** the lazy voters' landed frontier stays within one batch while the leader and eager follower run at the bar's load, and their tables stay under the admission limit, with no initialization refused for room.
 - **A stalled lazy voter:**
   - hold one lazy voter's batches back under load until it passes the window;
