@@ -937,6 +937,7 @@ fn main() -> ExitCode {
             && let Err(why) = enroll::collector_for(
                 &credential,
                 placed.membership.cluster(),
+                placed.membership.domain(),
                 placed.replica,
                 placed.incarnation,
             )

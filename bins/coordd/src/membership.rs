@@ -73,6 +73,11 @@ pub enum IdentityError {
         /// Where the certificate is.
         path: String,
     },
+    /// The certificate names another domain than the genesis does.
+    ForeignDomain {
+        /// Where the certificate is.
+        path: String,
+    },
     /// This node's role votes, but the committed configuration does not
     /// name it as a voter at this incarnation.
     NotACommittedVoter {
@@ -116,6 +121,10 @@ impl core::fmt::Display for IdentityError {
             IdentityError::ForeignCluster { path } => write!(
                 f,
                 "the certificate at {path} belongs to another cluster than this genesis"
+            ),
+            IdentityError::ForeignDomain { path } => write!(
+                f,
+                "the certificate at {path} belongs to another domain than this genesis"
             ),
             IdentityError::NotACommittedVoter {
                 replica,
@@ -233,14 +242,11 @@ pub fn place(
     single_voter_profile(&membership, cfg!(debug_assertions))?;
 
     let (identity, leaf) = leaf_identity(certificate_path)?;
-    // The cluster is checked here and not only at the handshake: a node
-    // of another cluster would otherwise open this domain's store under
-    // its own identity before any peer ever saw its certificate.
-    if identity.cluster != membership.cluster() {
-        return Err(IdentityError::ForeignCluster {
-            path: certificate_path.to_owned(),
-        });
-    }
+    // The cluster and domain are checked here and not only at the
+    // handshake: a node of another cluster or domain would otherwise open
+    // this domain's store under its own identity before any peer ever saw
+    // its certificate.
+    origin(&identity, &membership, certificate_path)?;
     if votes {
         if !membership.is_current_voter(&identity.node, identity.incarnation) {
             return Err(IdentityError::NotACommittedVoter {
@@ -267,6 +273,25 @@ pub fn place(
         incarnation: identity.incarnation,
         role: identity.role,
     })
+}
+
+/// The certificate's cluster and domain are the genesis's.
+fn origin(
+    identity: &coord_node_issuer::NodeIdentity,
+    membership: &Membership,
+    certificate_path: &str,
+) -> Result<(), IdentityError> {
+    if identity.cluster != membership.cluster() {
+        return Err(IdentityError::ForeignCluster {
+            path: certificate_path.to_owned(),
+        });
+    }
+    if identity.domain != membership.domain() {
+        return Err(IdentityError::ForeignDomain {
+            path: certificate_path.to_owned(),
+        });
+    }
+    Ok(())
 }
 
 /// What this node's credential is against committed membership, and
@@ -311,11 +336,7 @@ pub fn inspect(
             reason: format!("{e:?}"),
         })?;
     let (identity, leaf) = leaf_identity(certificate_path)?;
-    if identity.cluster != membership.cluster() {
-        return Err(IdentityError::ForeignCluster {
-            path: certificate_path.to_owned(),
-        });
-    }
+    origin(&identity, &membership, certificate_path)?;
     let credential =
         membership.classify_credential(&identity.node, identity.incarnation, &spki(&leaf));
     let leaf = validity(&leaf);

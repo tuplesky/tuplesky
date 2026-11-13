@@ -3,6 +3,11 @@
 //! node-identity URI SAN from the peer's certificate and binds it to the
 //! declared role, subject to committed membership.
 //!
+//! A certificate reaches only the domain it names. A cluster's domains
+//! share its issuer, so the cluster alone doesn't confine one; the
+//! domain is taken from the certificate, and the caller's `Hello` must
+//! name the same one (design Section 11.1).
+//!
 //! Peer access is never voting access. The binder accepts a well-formed
 //! node certificate of the right cluster and domain for any peer role,
 //! but a `Voter` declaration is bound only when the certificate's node
@@ -106,12 +111,15 @@ impl IdentityBinder for PeerBinder {
     ) -> Result<BoundIdentity, BindError> {
         let leaf = certs.first().ok_or(BindError::NoCertificate)?;
         let identity = node_uri_of(leaf).ok_or(BindError::UnknownCertificate)?;
-        // The certificate's own bindings decide cluster, role and
+        // The certificate's own bindings decide cluster, domain, role and
         // incarnation; the Hello must not claim anything else.
         if identity.cluster != self.cluster || hello.cluster_id != self.cluster {
             return Err(BindError::ClusterMismatch);
         }
-        if hello.domain_id != self.domain {
+        // The domain is the certificate's. A Hello's is only what the
+        // caller says, and a certificate for a sibling domain under the
+        // same issuer would otherwise reach this one by saying it.
+        if identity.domain != self.domain || hello.domain_id != self.domain {
             return Err(BindError::DomainMismatch);
         }
         if hello.role != identity.role {
