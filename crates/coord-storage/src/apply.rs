@@ -117,6 +117,13 @@ pub enum ApplyError {
     /// in it were reported applied (task-d47). Nothing of the group was
     /// released; the replica restarts from its journal.
     GroupLost,
+    /// The applier was used after it reported [`ApplyError::GroupLost`].
+    /// The lost group's commands took positions and revisions that no
+    /// batch of this replica's will hold, so nothing more is planned,
+    /// lowered or settled here: a command planned now would take them
+    /// again, with results no other voter computed (#185, review
+    /// 6861674000).
+    AfterGroupLost,
     /// Within a group, the store has no room for the command's batch
     /// beside what is already queued (task-d47). Nothing was submitted or
     /// changed: the caller lowers the group and the queue, and applies the
@@ -187,6 +194,11 @@ pub struct Applier<P: Persistence> {
     /// The position the projection was last seen committed through, by
     /// [`Applier::settle`] or a drain (task-d63).
     committed: Option<coord_types::ids::ExecutionPosition>,
+    /// Whether a group of this applier's was lost: met by the applier
+    /// ([`ApplyError::GroupLost`]), or by a node's lowering and noted
+    /// ([`Applier::note_journaled`]). Every use after it is refused
+    /// ([`ApplyError::AfterGroupLost`]).
+    lost: bool,
 }
 
 /// A group handed off to a pipelined store's materializer (task-d52).
@@ -351,7 +363,41 @@ impl<P: Persistence> Applier<P> {
             inflight: VecDeque::new(),
             committed: None,
             authorizations: std::cell::RefCell::default(),
+            lost: false,
         })
+    }
+
+    /// [`ApplyError::GroupLost`], remembered: from here on the applier
+    /// refuses to be used ([`Applier::lost`]).
+    fn group_lost(&mut self) -> ApplyError {
+        self.mark_lost();
+        ApplyError::GroupLost
+    }
+
+    /// Remember a lost group, met here or noted from a node's lowering.
+    /// Every use after it is refused, and the authorization contexts are
+    /// emptied: what the store took back may hold rows one was read over,
+    /// and the cache does not rest on the refusal (#279's review, debt 2).
+    fn mark_lost(&mut self) {
+        self.lost = true;
+        self.authorizations.get_mut().clear();
+    }
+
+    /// Refuse a use after a group was lost.
+    const fn usable(&self) -> Result<(), ApplyError> {
+        if self.lost {
+            Err(ApplyError::AfterGroupLost)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Whether a group of this applier's was lost. Its commands were
+    /// reported applied and are not in the journal, so the applier plans,
+    /// lowers and settles nothing more; the replica restarts from its
+    /// journal.
+    pub const fn lost(&self) -> bool {
+        self.lost
     }
 
     /// Keep the storage facts about other batches for
@@ -411,15 +457,6 @@ impl<P: Persistence> Applier<P> {
         Ok(self.store.reconcile()?)
     }
 
-    /// [`ApplyError::GroupLost`], with the authorization contexts emptied:
-    /// what the store took back may hold rows one was read over, and the
-    /// cache does not rest on the voter stopping after the loss (#279's
-    /// review, debt 2).
-    fn group_lost(&mut self) -> ApplyError {
-        self.authorizations.get_mut().clear();
-        ApplyError::GroupLost
-    }
-
     /// Apply the commands that follow as one group (task-d47), when the
     /// store can chain them ([`Persistence::chains_applications`]).
     ///
@@ -470,6 +507,7 @@ impl<P: Persistence> Applier<P> {
     /// cannot be planned again here. A batch journaled whose projection
     /// is still owed is not a failure; lowering goes on.
     pub fn finish_group(&mut self) -> Result<(), ApplyError> {
+        self.usable()?;
         let Some(mut group) = self.group.take() else {
             return Ok(());
         };
@@ -568,6 +606,7 @@ impl<P: Persistence> Applier<P> {
     pub fn hand_off_group(
         &mut self,
     ) -> Result<Option<coord_types::ids::ExecutionPosition>, ApplyError> {
+        self.usable()?;
         if !self.store.pipelined() {
             self.finish_group()?;
             return Ok(None);
@@ -653,6 +692,7 @@ impl<P: Persistence> Applier<P> {
     /// Returns the execution position the projection has committed:
     /// whatever was held to a position at or below it may go out.
     pub fn settle(&mut self) -> Result<coord_types::ids::ExecutionPosition, ApplyError> {
+        self.usable()?;
         if self.store.pipelined() {
             let handed = self.store.hand_off()?;
             self.take_lowered(handed, &BTreeSet::new())?;
@@ -664,6 +704,7 @@ impl<P: Persistence> Applier<P> {
     /// the projection commit out is waited for, and what was journaled
     /// meanwhile is committed after it.
     pub fn drain(&mut self) -> Result<coord_types::ids::ExecutionPosition, ApplyError> {
+        self.usable()?;
         if self.store.pipelined() {
             for _ in 0..GROUP_LOWERINGS {
                 // A drain waits for every group, so none is held for a
@@ -703,9 +744,23 @@ impl<P: Persistence> Applier<P> {
     /// Note a storage fact about one of this applier's batches, met by a
     /// lowering this applier did not run: a node's flush journals a staged
     /// group with the protocol's batches, and an append out on the
-    /// appender's thread is taken back by the node (task-d54). Only
-    /// `JournalDurable` is read (task-d63).
+    /// appender's thread is taken back by the node (task-d54).
+    /// `JournalDurable` is read (task-d63), and so is a batch of an open
+    /// or in-flight group definitely not journaled: the group is lost, met
+    /// where the node lowers, and the applier refuses to be used from
+    /// here on as if it had met the loss itself (#185, review 6861674000,
+    /// item 2).
     pub fn note_journaled(&mut self, event: &StorageEvent) {
+        let own = |barriers: &BTreeSet<BarrierId>| lost(event, barriers);
+        if self
+            .group
+            .as_ref()
+            .is_some_and(|group| own(&group.barriers))
+            || self.inflight.iter().any(|flight| own(&flight.barriers))
+        {
+            self.mark_lost();
+            return;
+        }
         let StorageEvent::JournalDurable { barrier_id, .. } = event else {
             return;
         };
@@ -1029,6 +1084,7 @@ impl<P: Persistence> Applier<P> {
         command: CommandId,
         payload: &PayloadRecordV1,
     ) -> Result<AppliedOutcome, ApplyError> {
+        self.usable()?;
         // Outside a group a command is planned over the projection alone,
         // so whatever a pipelined store still has in flight lands first.
         if self.group.is_none() && !self.inflight.is_empty() {
