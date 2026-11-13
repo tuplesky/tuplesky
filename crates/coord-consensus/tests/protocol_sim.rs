@@ -2014,7 +2014,12 @@ impl Sim {
             }
         }
         let event = Event::Peer(AuthenticatedPeerMessage::new(
-            PeerProvenance::from_transport(r(msg.from), ReplicaIncarnation::new(1).unwrap(), 1),
+            PeerProvenance::from_transport(
+                r(msg.from),
+                ReplicaIncarnation::new(1).unwrap(),
+                coord_types::wire_v1::PeerRole::Voter,
+                1,
+            ),
             msg.frame,
         ));
         self.step_node(msg.to, event);

@@ -784,7 +784,12 @@ impl Node {
         self.events.push(SimEvent::PeerFrame {
             node: self.id,
             lane,
-            provenance: PeerProvenance::from_transport(replica, incarnation, connection_id),
+            provenance: PeerProvenance::from_transport(
+                replica,
+                incarnation,
+                identity.role,
+                connection_id,
+            ),
             kind: frame.kind,
             payload: frame.payload,
         });

@@ -142,6 +142,8 @@ fn build_issuer() -> Issuer {
         policy(2, PeerRole::Voter, "voters", "voter-2"),
         policy(3, PeerRole::Voter, "voters", "voter-3"),
         policy(9, PeerRole::Observer, "observers", "observer-0"),
+        policy(1, PeerRole::Observer, "impostors", "observer-1"),
+        policy(2, PeerRole::Learner, "impostors", "learner-2"),
     ];
     for domain in [DOMAIN, SIBLING] {
         rules.push(policy_in(domain, 1, PeerRole::Voter, "any", "any"));
@@ -506,6 +508,73 @@ fn the_binder_admits_current_voters_and_refuses_everything_else() {
         binder
             .bind(&[der(&voter2_g2)], &hello(PeerRole::Voter, Some(2)))
             .is_ok()
+    );
+}
+
+/// A non-voter peer never holds a committed voter's name (design Section
+/// 10.1). The transport keys a voter's link by its replica, and the
+/// provenance of every frame names the replica it came from; an observer
+/// or learner certificate the issuer signed for a voter's node would be
+/// that voter to both. It is refused at the committed generation and at
+/// any other, while the same roles for nodes that aren't voters bind.
+#[test]
+fn an_observer_or_learner_certificate_naming_a_committed_voter_is_refused() {
+    let admin = admin_key();
+    let mut issuer = build_issuer();
+    let (manifest, _) = manifest_with_voters(&mut issuer, &admin);
+    let binder = PeerBinder::new(Membership::from_genesis(&manifest).unwrap());
+
+    for incarnation in [1, 7] {
+        let observer = issuer.issue(
+            1,
+            incarnation,
+            PeerRole::Observer,
+            "impostors",
+            "observer-1",
+        );
+        assert_eq!(
+            binder.bind(
+                &[der(&observer)],
+                &hello(PeerRole::Observer, Some(incarnation))
+            ),
+            Err(BindError::NonVoterNamesVoter),
+            "an observer certificate for voter 1 at generation {incarnation}"
+        );
+        let learner = issuer.issue(2, incarnation, PeerRole::Learner, "impostors", "learner-2");
+        assert_eq!(
+            binder.bind(
+                &[der(&learner)],
+                &hello(PeerRole::Learner, Some(incarnation))
+            ),
+            Err(BindError::NonVoterNamesVoter),
+            "a learner certificate for voter 2 at generation {incarnation}"
+        );
+    }
+
+    // The control: the same roles for nodes no voter is known by bind,
+    // with their own replica identity.
+    let observer = issuer.issue(9, 1, PeerRole::Observer, "observers", "observer-0");
+    let bound = binder
+        .bind(&[der(&observer)], &hello(PeerRole::Observer, Some(1)))
+        .unwrap();
+    assert_eq!(
+        (bound.role, bound.replica),
+        (PeerRole::Observer, Some(ReplicaId([9; 16])))
+    );
+    let learner = issuer.issue_as(
+        &ecdsa(),
+        10,
+        1,
+        "any",
+        "any",
+        Some((PeerRole::Learner, DOMAIN)),
+    );
+    let bound = binder
+        .bind(&[der(&learner)], &hello(PeerRole::Learner, Some(1)))
+        .unwrap();
+    assert_eq!(
+        (bound.role, bound.replica),
+        (PeerRole::Learner, Some(ReplicaId([10; 16])))
     );
 }
 

@@ -25,8 +25,8 @@
 use std::collections::BTreeSet;
 
 use coord_collector::{
-    Collector, CollectorConfig, FanOut, MonotonicMillis, OfferOutcome, Offered, SubmitRefusal,
-    Submitted,
+    Collector, CollectorConfig, EvidenceError, FanOut, MonotonicMillis, OfferOutcome, Offered,
+    Progress, SubmitRefusal, Submitted,
 };
 use coord_consensus::{BallotConfiguration, ProtocolMessage, SlowAck};
 use coord_core::capability::{AdmissionReceipt, AttestedAdmission, VerifierToken};
@@ -34,7 +34,7 @@ use coord_core::event::{AdmittedRequest, PeerProvenance};
 use coord_types::identity::Digest32;
 use coord_types::ids::*;
 use coord_types::logical_v1::*;
-use coord_types::wire_v1::{MessageV1, RequestV1};
+use coord_types::wire_v1::{MessageV1, PeerRole, RequestV1};
 use coord_types::{CommandId, RetryKey};
 
 const NS: NamespaceId = NamespaceId([5; 16]);
@@ -691,7 +691,17 @@ fn a_voter_that_leaves_the_configuration_is_no_longer_a_destination() {
 /// Establish `command` over `voters` and release it, so the test can
 /// reach settlement without rebuilding the consensus stack.
 fn settle(c: &mut Collector, command: CommandId, voters: &[ReplicaId]) {
-    use coord_core::capability::{EstablishedResult, EstablishmentEvidence, ReleasedResult};
+    settle_as(c, command, voters, PeerRole::Voter);
+}
+
+/// [`settle`], with every frame arriving on a link bound as `role`.
+fn settle_as(c: &mut Collector, command: CommandId, voters: &[ReplicaId], role: PeerRole) {
+    adopt_as(c, command, voters, role);
+    let _ = release_as(c, command, role);
+}
+
+/// Each of `voters` adopts `command`, on a link bound as `role`.
+fn adopt_as(c: &mut Collector, command: CommandId, voters: &[ReplicaId], role: PeerRole) {
     for v in voters {
         // The leader publishes its order as a `LeaderReply` and adopts it
         // with a `SlowAck`; a follower outside the fast set adopts it and
@@ -715,14 +725,14 @@ fn settle(c: &mut Collector, command: CommandId, voters: &[ReplicaId]) {
             })
         };
         let _ = c.on_evidence(
-            PeerProvenance::from_transport(*v, ReplicaIncarnation::new(1).unwrap(), 1),
+            PeerProvenance::from_transport(*v, ReplicaIncarnation::new(1).unwrap(), role, 1),
             message,
         );
         // The leader adopts its own order too, once its acceptance row is
         // durable: its reply alone is not an adoption (task-d19).
         if *v == ballot().leader {
             let _ = c.on_evidence(
-                PeerProvenance::from_transport(*v, ReplicaIncarnation::new(1).unwrap(), 1),
+                PeerProvenance::from_transport(*v, ReplicaIncarnation::new(1).unwrap(), role, 1),
                 ProtocolMessage::SlowAck(SlowAck {
                     replica: *v,
                     ballot: ballot(),
@@ -732,6 +742,15 @@ fn settle(c: &mut Collector, command: CommandId, voters: &[ReplicaId]) {
             );
         }
     }
+}
+
+/// The leader releases `command`'s result, on a link bound as `role`.
+fn release_as(
+    c: &mut Collector,
+    command: CommandId,
+    role: PeerRole,
+) -> Result<Progress, EvidenceError> {
+    use coord_core::capability::{EstablishedResult, EstablishmentEvidence, ReleasedResult};
     let released = ReleasedResult::from_gate(
         EstablishedResult::establish(EstablishmentEvidence {
             command,
@@ -747,10 +766,55 @@ fn settle(c: &mut Collector, command: CommandId, voters: &[ReplicaId]) {
         vec![0xaa],
         true,
     );
-    let _ = c.on_release(
-        PeerProvenance::from_transport(ballot().leader, ReplicaIncarnation::new(1).unwrap(), 1),
+    c.on_release(
+        PeerProvenance::from_transport(
+            ballot().leader,
+            ReplicaIncarnation::new(1).unwrap(),
+            role,
+            1,
+        ),
         released,
-    );
+    )
+}
+
+/// Evidence and a release on an observer's or learner's link count for
+/// nothing, though each names a voter (design Section 10.1). The
+/// collector counts by the identity the transport bound, and a link
+/// bound under another role is not a voter's, whatever replica it names.
+/// The same frames on the voters' own links settle the command.
+#[test]
+fn evidence_on_a_non_voter_link_settles_nothing() {
+    for role in [PeerRole::Observer, PeerRole::Learner] {
+        let mut c = collector(8, usize::MAX);
+        let (command, _) = fan_out(&mut c, 1);
+        settle_as(&mut c, command, &[r(0), r(1)], role);
+        assert!(c.is_pending(&command), "{role:?} links settled the command");
+        settle(&mut c, command, &[r(0), r(1)]);
+        assert!(!c.is_pending(&command), "the voters' own links settle it");
+    }
+}
+
+/// The leader's release on an observer's or learner's link settles
+/// nothing, though it names the leader and every vote is in on the
+/// voters' own links. The release is refused on its own, apart from the
+/// evidence; the same release on the leader's link settles the command.
+#[test]
+fn a_release_on_a_non_voter_link_settles_nothing_though_the_votes_are_in() {
+    for role in [PeerRole::Observer, PeerRole::Learner] {
+        let mut c = collector(8, usize::MAX);
+        let (command, _) = fan_out(&mut c, 1);
+        adopt_as(&mut c, command, &[r(0), r(1)], PeerRole::Voter);
+        assert_eq!(
+            release_as(&mut c, command, role),
+            Err(EvidenceError::NotAVoter {
+                sender: ballot().leader
+            }),
+            "{role:?}"
+        );
+        assert!(c.is_pending(&command), "{role:?}'s release settled it");
+        release_as(&mut c, command, PeerRole::Voter).expect("the leader's own release");
+        assert!(!c.is_pending(&command), "the leader's own link settles it");
+    }
 }
 
 // --- late submission and duplicate safety ------------------------------
@@ -780,7 +844,12 @@ fn a_late_submission_cannot_be_counted_twice() {
         })
     };
     let from = |replica: ReplicaId, connection: u64| {
-        PeerProvenance::from_transport(replica, ReplicaIncarnation::new(1).unwrap(), connection)
+        PeerProvenance::from_transport(
+            replica,
+            ReplicaIncarnation::new(1).unwrap(),
+            PeerRole::Voter,
+            connection,
+        )
     };
 
     // r(1) voted off the leader's proposal, before the submission ever

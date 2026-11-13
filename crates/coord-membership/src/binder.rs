@@ -13,7 +13,10 @@
 //! but a `Voter` declaration is bound only when the certificate's node
 //! and incarnation are the *current* committed voter: a stale generation,
 //! an unknown node, or a frontend, observer or learner certificate
-//! claiming a voter slot is refused. What ultimately counts a vote is
+//! claiming a voter slot is refused. Nor does a non-voter peer get a
+//! voter's name: an observer or learner certificate whose node is a
+//! committed voter's is refused at any generation, since a peer is known
+//! downstream by its replica identity. What ultimately counts a vote is
 //! consensus over the committed configuration; the binder only ensures a
 //! frame's provenance is an exact, current identity, and a cloned
 //! identity carries the same incarnation so it is deduplicated, never
@@ -152,6 +155,20 @@ impl IdentityBinder for PeerBinder {
             {
                 return Err(BindError::IncarnationMismatch);
             }
+        } else if self
+            .membership
+            .read()
+            .expect("membership lock")
+            .non_voter_names_voter(&identity.node, identity.role)
+        {
+            // An observer or learner is bound by its replica identity too,
+            // and a committed voter's is not one it may hold, at any
+            // generation. Everything downstream that knows a peer by its
+            // replica -- the transport's link to it, the provenance of
+            // its frames -- would otherwise take it for that voter. Its
+            // own reason, since it means the issuer signed what it never
+            // should: the transport counts it where it is refused.
+            return Err(BindError::NonVoterNamesVoter);
         }
         Ok(BoundIdentity {
             role: identity.role,

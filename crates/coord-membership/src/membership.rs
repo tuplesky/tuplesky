@@ -6,6 +6,7 @@
 use std::collections::BTreeMap;
 
 use coord_types::ids::{ClusterId, ConfigurationEpoch, DomainId, ReplicaId, ReplicaIncarnation};
+use coord_types::wire_v1::PeerRole;
 
 use crate::genesis::GenesisManifest;
 
@@ -205,6 +206,18 @@ impl Membership {
     /// The committed incarnation of a voter node, if any.
     pub fn voter_incarnation(&self, node: &ReplicaId) -> Option<ReplicaIncarnation> {
         self.voters.get(node).map(|v| v.incarnation)
+    }
+
+    /// Whether a certificate for `role` naming `node` is an observer's
+    /// or a learner's naming a committed voter's node, at any generation
+    /// (design Section 10.1).
+    ///
+    /// A peer is known downstream by its replica identity, and a voter's
+    /// is not one a non-voter may hold. The binder refuses such a
+    /// certificate, and `coordd place` and `inspect` name it on the node
+    /// that holds it, where it can be replaced.
+    pub fn non_voter_names_voter(&self, node: &ReplicaId, role: PeerRole) -> bool {
+        matches!(role, PeerRole::Observer | PeerRole::Learner) && self.voters.contains_key(node)
     }
 
     /// What the credential a node presents *is*, against what this

@@ -540,7 +540,14 @@ fn post_revocation_protected_data_is_denied_even_from_cached_results() {
         leader: r(0),
     };
     let path = Digest32([1; 32]);
-    let prov = |i: u8| PeerProvenance::from_transport(r(i), ReplicaIncarnation::new(1).unwrap(), 1);
+    let prov = |i: u8| {
+        PeerProvenance::from_transport(
+            r(i),
+            ReplicaIncarnation::new(1).unwrap(),
+            coord_types::wire_v1::PeerRole::Voter,
+            1,
+        )
+    };
     let admitted = f
         .dispatcher()
         .collector()
@@ -1245,7 +1252,14 @@ fn a_second_binding_after_the_establishment_executed_is_bound_from_its_outcome()
         leader: r(0),
     };
     let path = Digest32([1; 32]);
-    let prov = |i: u8| PeerProvenance::from_transport(r(i), ReplicaIncarnation::new(1).unwrap(), 1);
+    let prov = |i: u8| {
+        PeerProvenance::from_transport(
+            r(i),
+            ReplicaIncarnation::new(1).unwrap(),
+            coord_types::wire_v1::PeerRole::Voter,
+            1,
+        )
+    };
     let admitted = f
         .dispatcher()
         .collector()
