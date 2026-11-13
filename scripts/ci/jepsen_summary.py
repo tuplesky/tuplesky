@@ -2303,6 +2303,42 @@ def relay_table(voters: dict) -> list[str]:
     return out
 
 
+def hand_offs_table(voters: dict) -> list[str]:
+    """task-d115's hand-offs to the runtime by cause (lever 8, #256
+    review), each voter's last `metrics` line: how many of each, and all
+    of them a flush and a command executed. [] from a build without
+    them."""
+    causes = ("bound", "flush", "idle", "answer", "watch")
+    rows = []
+    for node, v in voters.items():
+        raw = (v.cost.raw or {}) if v.cost else {}
+        h = raw.get("hand_offs")
+        if isinstance(h, dict):
+            flushes = raw.get("flushes")
+            rows.append((node, v.cost.executed, h, flushes.get("flushes") if isinstance(flushes, dict) else None))
+    if not rows:
+        return []
+    out = [
+        "**Hand-offs by cause** (task-d115, each voter's last boot, from its last `metrics` line: a hand-off "
+        "wakes the lane senders and answers what the domain loop queued, counted only when it carried something; "
+        "bound is at a pass's start once the oldest thing held waited the loop's bound, flush before a flush, "
+        "idle before the loop waits, answer before a caller's answer waits for room, watch before a watch's "
+        "stream is opened or written; a flush and a command are over the loop's flushes and the commands the "
+        "voter executed)",
+        "",
+        "| Node | Bound | Flush | Idle | Answer | Watch | All | A flush | A command |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+    ]
+    for node, executed, h, flushes in rows:
+        total = sum(h.get(c, 0) for c in causes)
+        out.append(
+            f"| {node} | " + " | ".join(str(h.get(c, 0)) for c in causes) + f" | {total} "
+            f"| {f'{total / flushes:.2f}' if flushes else '-'} | {f'{total / executed:.3f}' if executed else '-'} |"
+        )
+    out.append("")
+    return out
+
+
 def loop_per_command(voters: dict, follower: str | None = None, leader: str | None = None,
                      sampled: dict | None = None) -> tuple[float | None, float | None]:
     """The leader's loop CPU per command and a follower's, in
@@ -3481,6 +3517,7 @@ def summarize(store: str, nodes: list[str], title: str, profile: str | None = No
             out.extend(leadership_table(voters))
             out.extend(resend_table(voters))
             out.extend(relay_table(voters))
+            out.extend(hand_offs_table(voters))
             out.extend(leader_and_follower(store, voters))
             out.extend(transport_tables(store, voters))
     return "\n".join(out) + "\n"

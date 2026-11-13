@@ -853,6 +853,20 @@ class CheckpointTests(unittest.TestCase):
         line = "metrics " + json.dumps({"stages": [], "cost": {"Observed": cost}}) + "\n"
         self.assertIn("| n1 | 900 | 12 | 3 | - | - | - | - | 0 | 0 (-) | 0.0 | 0.0 | 0 | 0.0 | - | - |", self.summarize(line))
 
+    def test_the_hand_offs_by_cause(self):
+        cost = {"executed": 1000, "busy": {"secs": 1, "nanos": 0}, "uptime": {"secs": 60, "nanos": 0},
+                "recent": {"Unavailable": "NotInstrumented"}, "reads": {"served": 0}}
+        line = lambda: "metrics " + json.dumps({"stages": [], "cost": {"Observed": cost}}) + "\n"
+        # A build from before task-d115: no table.
+        self.assertNotIn("**Hand-offs by cause**", self.summarize(line()))
+        cost["hand_offs"] = {"bound": 10, "flush": 200, "idle": 150, "answer": 30, "watch": 0}
+        text = self.summarize(line())
+        self.assertIn("**Hand-offs by cause** (task-d115", text)
+        self.assertIn("| n1 | 10 | 200 | 150 | 30 | 0 | 390 | - | 0.390 |", text)
+        cost["flushes"] = {"idle": 50, "events": 10, "queued": 0, "appending": 5,
+                           "flushes": 260, "api_events": 120, "peer_events": 300, "by_events": [0] * 9}
+        self.assertIn("| n1 | 10 | 200 | 150 | 30 | 0 | 390 | 1.50 | 0.390 |", self.summarize(line()))
+
 
 
 class CarryReadingTests(unittest.TestCase):
