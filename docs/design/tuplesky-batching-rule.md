@@ -885,7 +885,9 @@ A stage's cap must not end a buffer the stage before it built. So:
 - **The journal group's limit follows the buffer's,** in records and in bytes: at least the records a full buffer writes. Otherwise the group cuts the leader's buffer, as 64 records would at about 21 commands.
 - **The frame closes when its proposals' append is lent,** not at each flush. So a frame is exactly the leader's buffer, up to its 1 MiB.
 - **A follower's buffer is the leader's frame.**
-  - **The frontier rides the frame:** `Committed` is published in the same hand-off as the frames, behind the frame's barrier, so the two arrive together. Followers learn commits one leader append later. That delays followers' execution and reads at followers, not answers, since the leader answers on its own release.
+  - **The frontier rides the frame when a frame is going out.** `Committed` is published in the same hand-off as the frames, behind the frame's barrier, so the two arrive together. Followers learn those commits one leader append later. That delays followers' execution and reads at followers, not answers, since the leader answers on its own release.
+  - **When no frame is going out, the frontier goes on its own, as today.** An isolated write is an example: its frontier moves only once its votes return, after its frame has left, and an idle leader cuts no frame for it to ride (`Leader::cut_frames` emits nothing without queued proposals). So the leader announces it at the end of the turn that moved it, as `announce_advanced` does at the turn's end today, not on the 250 ms re-send timer. The rule changes only which hand-off carries the frontier while frames flow. It never holds the frontier back for a frame that may not come.
+  - **A standalone frontier is a follower's buffer too.** The follower takes it as one event, commits what it adopted up to it (`commit_through_leader`), and flushes at that event's end, since its appender is free. So at low load a follower executes one message after the leader's commit, as it does today (Codex on #267).
   - **A follower flushes at a frame's end** when its appender is free, not at every lull.
   - **One batch, one barrier and one vote message a frame** (Section 6.7, steps 4 and 5).
   - Its append's limit follows the frame's: about two records a command, the adoption and the execution.
@@ -999,7 +1001,7 @@ The order is by the five-voter sum, each step one PR, with a both-orders pair on
 1. **Stage 1, lever 2 (Section 6.7), smallest step first.** The first is learning once a frame and once a step of events, with the commit frontier through an index by sequence number. Then:
    - `Follower::applied` and forgetting by range at both roles;
    - the frame's intake in one pass;
-   - one batch and one barrier a frame, with the frontier riding the frame and the follower's flush at a frame's end;
+   - one batch and one barrier a frame, with the frontier riding the frame when one is going out (on its own otherwise) and the follower's flush at a frame's end;
    - the vote message, behind a feature.
 2. **Class C at followers** (about 9 µs a follower).
 3. **The leader's proposals:** the `propose` path's copies (8.1), then one barrier a buffer (stage 4, 10.2).
