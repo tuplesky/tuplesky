@@ -499,7 +499,15 @@ impl<P: Persistence> Voter<P> {
             return Ok(Outbound::default());
         }
         let before = self.ballot;
-        let message = coord_consensus::ProtocolMessage::decode(&frame).ok();
+        // What this voter acts on itself is below, and a leader's proposal
+        // frame is none of it: the frame goes to the machine undecoded,
+        // and the follower decodes it once (cost pass row 11). It is the
+        // largest message a follower takes, one a turn of its leader's.
+        let message = if coord_consensus::ProtocolMessage::is_proposal_frame(&frame) {
+            None
+        } else {
+            coord_consensus::ProtocolMessage::decode(&frame).ok()
+        };
         if let Some(coord_consensus::ProtocolMessage::NewLeader { ballot, .. }) = &message
             && higher(ballot, &self.ballot)
         {
