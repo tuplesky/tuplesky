@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use coord_daemon::metrics::{
     Answered, Cost, Cpu, Datagrams, Distribution, Durability, FastPath, Flushes, Frontiers,
-    Headroom, History, Interval, Jobs, JournalGroups, Lane, LaneReading, Latency,
+    HandOffs, Headroom, History, Interval, Jobs, JournalGroups, Lane, LaneReading, Latency,
     MAX_REPORTED_SHARDS, Measure, MetricsSnapshot, OldestWait, PipelineWaits, ProposalBytes, Reads,
     Recorder, Relay, Release, ReleaseDistributions, Resends, Scheduling, ShardIndex, ShardReading,
     Stage, StageReading, Table, Traffic, Unavailable, UnorderedPreAcceptances, Wait,
@@ -507,6 +507,13 @@ fn a_rendered_snapshot_carries_no_secret_or_key_shaped_text() {
                 api_events: 4000,
                 peer_events: 6000,
                 by_events: [0, 100, 100, 200, 200, 200, 100, 0, 0],
+            },
+            hand_offs: HandOffs {
+                bound: 40,
+                flush: 900,
+                idle: 2000,
+                answer: 3,
+                watch: 0,
             },
             proposals: ProposalBytes {
                 proposals: 8000,
