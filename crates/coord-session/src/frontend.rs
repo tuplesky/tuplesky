@@ -33,6 +33,12 @@ use crate::binding::{BindError, Binding, BindingConfig, verify_bind};
 use crate::gate::{PolicySource, carries_previous, is_read_output, protected_keys};
 use crate::wire::{BindAckV1, KIND_BIND, bind_ack_frame, decode_bind};
 
+/// How many records the dispatcher still holds that a record added past
+/// the gate's bound moves to the back before it stops looking (#185):
+/// two, so a pass over all the records takes at most half as many
+/// additions as there are records.
+const HELD_LOOKS: usize = 2;
+
 /// What a frame produced.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Ingress {
@@ -137,8 +143,9 @@ pub struct BoundFrontend {
 
 impl BoundFrontend {
     /// Wrap `dispatcher`; `pump_bound` items per watch pump share one
-    /// barrier; `max_requests` request identities are remembered beyond
-    /// those whose result the dispatcher can still deliver.
+    /// barrier; `max_requests` request identities are remembered, and
+    /// past that only those whose result the dispatcher can still
+    /// deliver, within four times what it holds.
     pub fn new(
         dispatcher: Dispatcher,
         config: BindingConfig,
@@ -514,24 +521,31 @@ impl BoundFrontend {
     /// The gate authorizes a read's output from this record, so a record
     /// dropped while its read is outstanding turns an executed read that
     /// policy permits into `OUTPUT_WITHHELD`. The records are shared by
-    /// every connection on the node, and under load they turn over by
-    /// arrival long before a slow read is answered: at 256 records and 96
-    /// callers a node, any read slower than about 2.7 times the mean.
-    /// What the dispatcher holds is bounded by its own limits (reads
-    /// waiting on a leader, commands pending, results retained), so the
-    /// records stay within `max_requests` plus that.
+    /// every connection on the node and turn over by arrival, so under
+    /// load a read slower than the node's last `max_requests` arrivals
+    /// lost its record.
     ///
-    /// A record kept goes to the back of the order, so it isn't looked at
-    /// again until the records that were behind it have been.
+    /// Past the bound, a record added looks at the oldest records in
+    /// turn: it forgets each one the dispatcher no longer holds, and
+    /// moves at most [`HELD_LOOKS`] that it still holds to the back. So
+    /// the work is constant for each record added, however much the
+    /// dispatcher holds (its retained results alone can outnumber the
+    /// bound on a busy node), and every record is looked at again within
+    /// a pass of no more than half as many additions as there are
+    /// records. A record forgotten is one the dispatcher let go before
+    /// that pass reached it, which bounds the records by the larger of
+    /// `max_requests` and four times what the dispatcher holds: its
+    /// commands pending or retained for resolution, and its reads
+    /// waiting on a leader.
     fn forget_settled(&mut self) {
-        let mut kept = 0;
-        while self.order.len() > self.max_requests + kept {
+        let mut held = 0;
+        while self.order.len() > self.max_requests && held < HELD_LOOKS {
             let Some(old) = self.order.pop_front() else {
                 break;
             };
             if self.dispatcher.holds(&old) {
                 self.order.push_back(old);
-                kept += 1;
+                held += 1;
             } else {
                 self.requests.remove(&old);
             }

@@ -1412,6 +1412,57 @@ fn a_read_still_outstanding_when_the_request_memory_turns_over_is_still_disclose
 }
 
 #[test]
+fn the_gate_keeps_what_the_dispatcher_holds_within_four_times_it() {
+    // More is held than the bound: each record added past it looks at a
+    // constant number of records, and the records stay within four times
+    // what the dispatcher holds. Every held read is still disclosed.
+    let ring = ring();
+    let domain = Domain::new();
+    let hub = WatchHub::new(KvRevision::ZERO, KvRevision::ZERO);
+    let mut f = frontend_remembering(&ring, 4);
+    let bind = frame_of(&bind_frame(&token(&ring, SESSION, NOW + 100)).unwrap());
+    let Ingress::Bound(_) = f.on_frame(&clock(NOW), at(NOW), 1, &bind, &hub, &domain.policy())
+    else {
+        panic!()
+    };
+    let held = 8;
+    let mut reads = Vec::new();
+    for seq in 1..=held {
+        let (read, req) = request(seq, range(b"secret"));
+        assert!(matches!(
+            f.on_frame(&clock(NOW), at(NOW), 1, &req, &hub, &domain.policy()),
+            Ingress::Action(Action::FanOut(_))
+        ));
+        reads.push((seq, read));
+    }
+    let bound = 4.max(4 * usize::try_from(held).unwrap()) + 1;
+    let mut most = 0;
+    for seq in held + 1..=held + 200 {
+        let mut logical = LogicalRequest::new(NS, range(b"secret"));
+        logical.canonicalize();
+        let command = CommandId::derive(&retry_key(seq), &logical).unwrap();
+        f.deliver_retained(
+            delivery(1, seq, command, range_outcome(b"secret")),
+            command,
+            &logical,
+            &domain.policy(),
+        );
+        most = most.max(f.remembered());
+        assert!(f.remembered() <= bound, "{} remembered", f.remembered());
+    }
+    assert!(most > 4, "the held reads were kept past the bound");
+    for (seq, read) in reads {
+        let answered = f
+            .deliver(
+                delivery(1, seq, read, range_outcome(b"secret")),
+                &domain.policy(),
+            )
+            .answered();
+        assert!(!is_denied(&answered), "{:?}", outcome_of(&answered));
+    }
+}
+
+#[test]
 fn the_gate_forgets_settled_requests_past_its_bound() {
     // What the gate keeps past its bound is only what the dispatcher can
     // still deliver. A retained result answers a retry from the record:
