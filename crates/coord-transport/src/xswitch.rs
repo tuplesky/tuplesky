@@ -10,6 +10,10 @@
 //!   connection's life, with no open, finish or acknowledgement task a buffer.
 //! - `COORDD_X_DGRAM`: the peer plane sends every frame that fits as a QUIC
 //!   datagram (unreliable), packing a buffer's frames into as few as fit.
+//! - `COORDD_X_APIL` (lead 11:55 (2), with `APIB`): the API plane keeps
+//!   one stream a lane open for the connection's life, as `PSTR` does on
+//!   the peer plane: no open, finish, `STOP_SENDING` or `RESET_STREAM` a
+//!   buffer.
 //! - `COORDD_X_CSTR`: a client keeps one request stream for its
 //!   connection's life, and the frontend answers on it without finishing.
 //! - `COORDD_X_AES128` (structural floors, lead 10:43 (4)): the TLS 1.3
@@ -43,6 +47,12 @@ pub fn apib() -> bool {
 pub fn pstr() -> bool {
     static C: OnceLock<bool> = OnceLock::new();
     on("COORDD_X_PSTR", &C)
+}
+
+/// `COORDD_X_APIL`.
+pub fn apil() -> bool {
+    static C: OnceLock<bool> = OnceLock::new();
+    on("COORDD_X_APIL", &C)
 }
 
 /// `COORDD_X_DGRAM`.

@@ -2098,7 +2098,11 @@ async fn sender_loop(shared: Arc<Shared>, link: Arc<Link>, peer: Arc<Peer>) {
     } else {
         (1, 0)
     };
-    let pstr = peer.class == Class::Peer && peer.batched && crate::xswitch::pstr();
+    let pstr = peer.batched
+        && match peer.class {
+            Class::Peer => crate::xswitch::pstr(),
+            Class::Api => crate::xswitch::apil(),
+        };
     let dgram = peer.class == Class::Peer && crate::xswitch::dgram();
     let mut long: Option<(SendStream, tokio::sync::OwnedSemaphorePermit)> = None;
     loop {
@@ -2186,18 +2190,32 @@ async fn sender_loop(shared: Arc<Shared>, link: Arc<Link>, peer: Arc<Peer>) {
             continue;
         };
         if pstr {
-            // SCRATCH: one stream a lane for the connection's life.
+            // SCRATCH: one stream a lane for the connection's life (PSTR
+            // on the peer plane, APIL on the API plane). The peer plane's
+            // traffic counts stay the peer plane's.
+            let is_peer = peer.class == Class::Peer;
             let lost = || {
                 let mut state = link.lanes[idx].lock().unwrap();
                 state.stats.refused += frames;
-                Traffic::add(&shared.traffic.sent_lost, frames);
-                Traffic::add(&shared.traffic.sent_lost_streams, 1);
+                if is_peer {
+                    Traffic::add(&shared.traffic.sent_lost, frames);
+                    Traffic::add(&shared.traffic.sent_lost_streams, 1);
+                }
             };
             if long.is_none() {
                 let open_permit = link.opens.acquire().await;
-                match timeout(shared.limits.frame_timeout, peer.conn.open_uni()).await {
+                let opened = timeout(shared.limits.frame_timeout, async {
+                    match peer.class {
+                        Class::Peer => peer.conn.open_uni().await,
+                        Class::Api => peer.conn.open_bi().await.map(|(send, _recv)| send),
+                    }
+                })
+                .await;
+                match opened {
                     Ok(Ok(send)) => {
-                        Traffic::add(&shared.traffic.sent_streams, 1);
+                        if is_peer {
+                            Traffic::add(&shared.traffic.sent_streams, 1);
+                        }
                         long = Some((send, open_permit));
                     }
                     _ => {
@@ -2212,8 +2230,10 @@ async fn sender_loop(shared: Arc<Shared>, link: Arc<Link>, peer: Arc<Peer>) {
                 state.stats.frames += frames;
                 state.stats.bytes += bytes as u64;
             }
-            Traffic::add(&shared.traffic.sent_frames, frames);
-            Traffic::add(&shared.traffic.sent_bytes, bytes as u64);
+            if is_peer {
+                Traffic::add(&shared.traffic.sent_frames, frames);
+                Traffic::add(&shared.traffic.sent_bytes, bytes as u64);
+            }
             let mut chunks: Vec<bytes::Bytes> = batch
                 .into_iter()
                 .map(|q| bytes::Bytes::from(q.frame))
@@ -2899,14 +2919,17 @@ async fn read_delivery(
 ) {
     let _held = permit;
     if peer.batched {
-        // SCRATCH (APIB): several deliveries a stream.
+        // SCRATCH (APIB): several deliveries a stream; under APIL one
+        // stream for the connection's life.
+        let wait = if crate::xswitch::apil() {
+            Duration::from_secs(86_400)
+        } else {
+            shared.limits.frame_timeout
+        };
         let mut stream = FrameStream::new(recv);
         loop {
             match stream
-                .next_frame(
-                    shared.limits.frame_timeout,
-                    Some((&shared.receive_budget, peer.lane)),
-                )
+                .next_frame(wait, Some((&shared.receive_budget, peer.lane)))
                 .await
             {
                 Ok(Some(frame)) => emit_delivery(&shared, &peer, frame).await,
@@ -2972,12 +2995,15 @@ async fn read_request(
 ) {
     let _held = permit;
     let long = crate::xswitch::cstr();
+    let lane_long = peer.batched && crate::xswitch::apil();
     if long || peer.batched {
         // SCRATCH (CSTR, APIB): several requests a stream. Under CSTR each
         // is answered on the stream without finishing it; under APIB only
         // the first has the stream to answer on.
         let wait = if long {
             Duration::from_secs(3600)
+        } else if lane_long {
+            Duration::from_secs(86_400)
         } else {
             shared.limits.frame_timeout
         };
@@ -2995,7 +3021,7 @@ async fn read_request(
             {
                 Ok(Some(frame)) => {
                     read += 1;
-                    if !long && read > MAX_FRAMES_PER_STREAM {
+                    if !long && !lane_long && read > MAX_FRAMES_PER_STREAM {
                         close_on(&peer, CloseReason::Malformed("api batch".into()));
                         return;
                     }
