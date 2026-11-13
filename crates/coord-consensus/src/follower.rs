@@ -1831,6 +1831,11 @@ impl Follower {
         proposals: Vec<crate::messages::FramedProposal>,
     ) -> Vec<Effect> {
         self.frames_taken = self.frames_taken.saturating_add(1);
+        let _timed = crate::scratch::time(crate::scratch::Region::FFrame);
+        let once = crate::scratch::l2();
+        if once {
+            crate::scratch::set_in_frame(true);
+        }
         let mut effects = Vec::new();
         for entry in proposals {
             let (vote, payload) = entry.into_vote(replica, ballot);
@@ -1839,7 +1844,18 @@ impl Follower {
                 None => self.on_proposal(from, vote),
             });
         }
+        if once {
+            crate::scratch::set_in_frame(false);
+            effects.extend(self.advance_pending());
+        }
         effects
+    }
+
+    /// SCRATCH: the turn's end, where a learn put off is taken.
+    pub fn scratch_turn_end(&mut self) {
+        if crate::scratch::take_learn_owed() {
+            self.learn();
+        }
     }
 
     /// Proposal frames this follower took (task-d102).
@@ -3624,6 +3640,8 @@ impl Follower {
         command: CommandId,
         outcome: &AppliedOutcome,
     ) -> Result<Vec<Effect>, LearnError> {
+        let _deferred = crate::scratch::DeferLearn::new(crate::scratch::l2());
+        let established = crate::scratch::time(crate::scratch::Region::FEstablished);
         let result = self.learner.established(
             &mut self.table,
             command,
@@ -3631,6 +3649,7 @@ impl Follower {
             self.config.quorum.ballot(),
             outcome,
         )?;
+        drop(established);
         // Read before the history sweep can take its votes.
         if !result.fast_path() {
             let reason = self.missed_fast(&command);
@@ -4423,6 +4442,7 @@ impl Follower {
     /// state that keeps the ledger under the sweep's threshold, so the
     /// sweep is a backstop, for what the queue let go unforgotten.
     fn forget_history(&mut self, executed: CommandId) {
+        let _timed = crate::scratch::time(crate::scratch::Region::FForget);
         self.ledger.executed(executed);
         self.forget_in_order();
         #[cfg(debug_assertions)]
@@ -4681,6 +4701,11 @@ impl Follower {
     }
 
     fn learn(&mut self) {
+        if crate::scratch::defer_learn() {
+            crate::scratch::owe_learn();
+            return;
+        }
+        let _timed = crate::scratch::time(crate::scratch::Region::FLearn);
         loop {
             let learned = self
                 .learner
@@ -5060,6 +5085,7 @@ impl Follower {
         barrier: BarrierId,
         message: ProtocolMessage,
     ) {
+        let _timed = crate::scratch::time(crate::scratch::Region::FVoteOut);
         let Some(boot) = self.boot else {
             return;
         };
@@ -5573,7 +5599,7 @@ impl Follower {
         // hold is examined here, as a `PayloadResponse` has it examined.
         // Left, it waited on itself for ever (task-d102's frames sweep,
         // row 1 at 3 voters, seed 11).
-        if took && held {
+        if took && held && !crate::scratch::in_frame() {
             effects.extend(self.advance_pending());
         }
         effects
@@ -5584,11 +5610,18 @@ impl Follower {
     /// `on_relayed_proposal`). Returns whether it took it.
     fn take_relayed_payload(&mut self, proposal: &FastAck, payload: PayloadRecordV1) -> bool {
         let command = proposal.command;
-        let identity =
+        let checked = crate::scratch::time(crate::scratch::Region::FIdentity);
+        let identity = if crate::scratch::noc() {
+            Some(command)
+        } else {
             postcard::from_bytes::<coord_types::logical_v1::LogicalRequest>(&payload.logical)
                 .ok()
-                .and_then(|r| CommandId::derive(&payload.retry_key, &r).ok());
-        if identity != Some(command) || payload.admission_digest() != proposal.admission {
+                .and_then(|r| CommandId::derive(&payload.retry_key, &r).ok())
+        };
+        let mismatched = identity != Some(command)
+            || (!crate::scratch::noc() && payload.admission_digest() != proposal.admission);
+        drop(checked);
+        if mismatched {
             self.rejections
                 .push(FollowerRejection::PayloadIdentityMismatch(command));
             self.relayed_not_taken = self.relayed_not_taken.saturating_add(1);
@@ -5792,6 +5825,9 @@ impl Follower {
         self.table.watch_moves(true);
         self.held_check.insert(command);
         self.note_lacking(command);
+        if crate::scratch::in_frame() {
+            return Vec::new();
+        }
         self.advance_pending()
     }
 
@@ -6088,6 +6124,7 @@ impl Follower {
     /// Adopt every held proposal whose payload is initialized and whose
     /// dependencies are all at least ACCEPT; repeat while progress is made.
     fn advance_pending(&mut self) -> Vec<Effect> {
+        let _timed = crate::scratch::time(crate::scratch::Region::FAdvance);
         let mut effects = Vec::new();
         // A proposal held before the seal (its payload had not arrived)
         // stays held: adopting it now would acknowledge after the cut the
@@ -6176,6 +6213,7 @@ impl Follower {
                 let record = self.table.record(&command).expect("adopted").clone();
                 let admission = record.payload.unwrap_or_else(|| admission_digest(None, 0));
                 let barrier = self.alloc.as_mut().expect("booted").allocate();
+                let rows = crate::scratch::time(crate::scratch::Region::FRows);
                 let mut updates =
                     alloc::vec![dependency_update(epoch, &command, &record).expect("bounded")];
                 // The payload row with it, where none is durable or being
@@ -6192,6 +6230,7 @@ impl Follower {
                         .push(command);
                 }
                 self.carry_unwritten(barrier, command, &record.deps, &mut updates);
+                drop(rows);
                 effects.push(Effect::Persist(PersistBatch {
                     barrier,
                     base: None,
@@ -6280,6 +6319,8 @@ impl Follower {
     }
 
     fn on_storage_event(&mut self, event: &StorageEvent) -> Vec<Effect> {
+        let _timed = crate::scratch::time(crate::scratch::Region::FSettle);
+        let _deferred = crate::scratch::DeferLearn::new(crate::scratch::l2());
         if let Some(outbox) = self.outbox.as_mut() {
             outbox.observe(event);
         }
@@ -6540,7 +6581,10 @@ impl Follower {
     }
 
     fn on_peer(&mut self, from: PeerId, frame: &[u8]) -> Vec<Effect> {
-        let Ok(message) = ProtocolMessage::decode(frame) else {
+        let decoded = crate::scratch::time(crate::scratch::Region::FDecode);
+        let message = ProtocolMessage::decode(frame);
+        drop(decoded);
+        let Ok(message) = message else {
             self.rejections
                 .push(FollowerRejection::MalformedPeerMessage);
             return Vec::new();

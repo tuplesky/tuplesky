@@ -111,7 +111,7 @@
 //!   consult, and no path from a fence back to `Stable`.
 //! * [`rows`], [`messages`]: the promise, payload, dependency and proposal
 //!   rows and the postcard-encoded protocol messages of this increment.
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 #![no_std]
 #![warn(missing_docs)]
 extern crate alloc;
@@ -136,6 +136,7 @@ pub mod recovery;
 pub mod replay;
 pub mod role;
 pub mod rows;
+pub mod scratch;
 pub mod speculation;
 pub mod summary;
 pub mod vote;

@@ -4537,6 +4537,7 @@ fn seal<E: LocalEngine>(
     seq: LocalJournalSeq,
     predecessor: Digest32,
 ) -> Result<JournalRecordV1, JournaledError> {
+    let _timed = coord_consensus::scratch::time(coord_consensus::scratch::Region::Seal);
     let context = TransitionContext {
         boot: submission.batch.barrier.boot_id,
         configuration: submission.ballot.epoch,

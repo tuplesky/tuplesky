@@ -2982,6 +2982,7 @@ impl Leader {
     }
 
     fn propose(&mut self, frame: &[u8], admission: Option<AdmissionFacts>) -> Vec<Effect> {
+        let _timed = crate::scratch::time(crate::scratch::Region::LPropose);
         let Some(boot) = self.boot else {
             return Vec::new();
         };
@@ -3284,6 +3285,7 @@ impl Leader {
     }
 
     fn on_storage(&mut self, event: &StorageEvent) -> Vec<Effect> {
+        let _timed = crate::scratch::time(crate::scratch::Region::LSettle);
         if let Some(outbox) = self.outbox.as_mut() {
             outbox.observe(event);
         }
@@ -3635,6 +3637,7 @@ impl Leader {
     /// vote recovery may re-execute from, so it counts only where the
     /// payload row is durable here or in a proposal batch it waits on.
     fn adopt_own(&mut self, command: CommandId, barrier: BarrierId) {
+        let _timed = crate::scratch::time(crate::scratch::Region::LAdoptOwn);
         if !self.served_payloads.contains(&command)
             && !self
                 .proposals
@@ -3663,19 +3666,22 @@ impl Leader {
         let context = self.ballots.context(boot, ballot, LocalJournalSeq::ZERO);
         // Batches may complete in any order: the acknowledgement waits on
         // every batch submitted before its own, not on its own alone.
-        let requires: Vec<BarrierId> = self
-            .unsettled
-            .iter()
-            .map(|(_, c)| &self.proposals[c])
-            .filter(|p| !p.durable)
-            .map(|p| p.barrier)
-            .chain(self.own_adoptions.keys().copied())
-            .chain(self.ledger.in_flight())
-            .filter(|b| !self.outbox.as_ref().is_some_and(|o| o.is_failed(b)))
-            .chain(core::iter::once(barrier))
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
+        let requires: Vec<BarrierId> = if crate::scratch::bar() {
+            alloc::vec![barrier]
+        } else {
+            self.unsettled
+                .iter()
+                .map(|(_, c)| &self.proposals[c])
+                .filter(|p| !p.durable)
+                .map(|p| p.barrier)
+                .chain(self.own_adoptions.keys().copied())
+                .chain(self.ledger.in_flight())
+                .filter(|b| !self.outbox.as_ref().is_some_and(|o| o.is_failed(b)))
+                .chain(core::iter::once(barrier))
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect()
+        };
         let frame = ProtocolMessage::SlowAck(ack.clone()).encode();
         let marked = self.answer_on_release.contains(&command);
         let Some(outbox) = self.outbox.as_mut() else {

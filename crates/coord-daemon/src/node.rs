@@ -1109,9 +1109,17 @@ impl<P: Persistence> Node<P> {
     /// goes to each voter once, after what the flush made durable
     /// ([`Node::announce_frontier`]).
     pub fn flush(&mut self, ballot: &Ballot) -> Result<Outbound, DriveError> {
+        // SCRATCH (L2): a learn put off is taken at the turn's end, before
+        // its executions and after them.
+        if let Machine::Follower(f) = self.machine_mut() {
+            f.scratch_turn_end();
+        }
         let was = core::mem::replace(&mut self.flushing, true);
         let flushed = self.flush_queued(ballot);
         self.flushing = was;
+        if let Machine::Follower(f) = self.machine_mut() {
+            f.scratch_turn_end();
+        }
         let mut out = flushed?;
         out.absorb(self.announce_frontier(ballot)?);
         Ok(out)

@@ -487,7 +487,17 @@ impl<P: Persistence> Voter<P> {
         frame: Vec<u8>,
     ) -> Result<Outbound, DriveError> {
         let before = self.ballot;
-        let message = coord_consensus::ProtocolMessage::decode(&frame).ok();
+        // SCRATCH (class C, row 11): a follower's voter leaves a proposal
+        // frame to the follower's own decode.
+        let message = if coord_consensus::scratch::noc()
+            && frame.first() == Some(&coord_consensus::scratch::PROPOSAL_FRAME_TAG)
+            && matches!(self.node.machine(), Machine::Follower(_))
+        {
+            None
+        } else {
+            let _timed = coord_consensus::scratch::time(coord_consensus::scratch::Region::VDecode);
+            coord_consensus::ProtocolMessage::decode(&frame).ok()
+        };
         if let Some(coord_consensus::ProtocolMessage::NewLeader { ballot, .. }) = &message
             && higher(ballot, &self.ballot)
         {
@@ -1193,6 +1203,7 @@ impl<P: Persistence> Voter<P> {
             || self.node.can_execute()
             || self.node.machine().frames_queued()
             || self.node.machine().frontier_owed()
+            || coord_consensus::scratch::learn_owed()
     }
 
     /// Whether a journal append is out on the appender's thread, its

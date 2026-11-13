@@ -1741,6 +1741,34 @@ fn scratch_hold() -> Option<(usize, std::time::Duration)> {
     Some((n, std::time::Duration::from_micros(us)))
 }
 
+/// SCRATCH (ceilings, #185 05:35): the consensus core's switches and the
+/// clock its timers read.
+fn scratch_switches() {
+    let on = |v: &str| coord_storage::scratch::x_var(v).is_some_and(|v| v == "1");
+    let l2 = on("COORDD_X_L2");
+    let noc = on("COORDD_X_NOC");
+    let bar = on("COORDD_X_BAR");
+    let prop = on("COORDD_X_PROP");
+    let time = on("COORDD_X_TIME");
+    let hop = on("COORDD_X_HOP");
+    coord_consensus::scratch::set(l2, noc, bar, prop, time);
+    coord_consensus::scratch::set_hop(hop);
+    coord_consensus::scratch::set_clock(scratch_clock);
+    eprintln!("SCRATCH switches: l2={l2} noc={noc} bar={bar} prop={prop} time={time} hop={hop}");
+}
+
+fn scratch_clock() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    u64::try_from(
+        START
+            .get_or_init(std::time::Instant::now)
+            .elapsed()
+            .as_nanos(),
+    )
+    .unwrap_or(u64::MAX)
+    .saturating_add(1)
+}
+
 const fn flush_due(queued: usize, appending: bool, owed: bool, since_flush: u32) -> bool {
     (queued >= FLUSH_QUEUED && !appending) || (owed && since_flush >= FLUSH_EVENTS)
 }
@@ -1959,7 +1987,10 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             peer_streak: 0,
             since_flush: 0,
             since_flush_api: 0,
-            hold: scratch_hold(),
+            hold: {
+                scratch_switches();
+                scratch_hold()
+            },
             hold_since: None,
             flushes: coord_daemon::metrics::Flushes::default(),
             hand_offs: coord_daemon::metrics::HandOffs::default(),
@@ -2244,6 +2275,9 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         match serde_json::to_string(&snapshot) {
             Ok(rendered) => eprintln!("metrics {rendered}"),
             Err(e) => eprintln!("the metrics snapshot could not be rendered: {e}"),
+        }
+        if coord_consensus::scratch::timing() {
+            eprintln!("scratch-timers{}", coord_consensus::scratch::report());
         }
         eprintln!("{}", self.admission_line());
         let executed = match &self.backing {
@@ -4565,6 +4599,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     /// what they bound is the rate, and the obligation ends at
     /// settlement.
     fn reoffer(&mut self, transport: &Transport) {
+        let _timed = coord_consensus::scratch::time(coord_consensus::scratch::Region::Reoffer);
         let now = self.now_millis();
         let due = self
             .frontend
@@ -4824,6 +4859,9 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         };
         if let Some(delivery) = delivered {
             self.answer(delivery);
+            if coord_consensus::scratch::hop() {
+                self.hand_off_for(coord_daemon::metrics::HandOff::Answer);
+            }
         }
     }
 
@@ -4848,6 +4886,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         connection: u64,
         frame: &Frame,
     ) -> Option<Vec<u8>> {
+        let _timed = coord_consensus::scratch::time(coord_consensus::scratch::Region::Retained);
         retained_answer(
             &mut self.frontend.frontend,
             self.backing.applier().store(),
@@ -5245,6 +5284,11 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                     &plan,
                 );
                 self.record_offer(command, &out);
+                if coord_consensus::scratch::hop()
+                    && matches!(&self.backing, Backing::Voting(v) if !v.leads())
+                {
+                    self.hand_off_for(coord_daemon::metrics::HandOff::Answer);
+                }
             }
             Step::Read(plan) => {
                 // Held before the read goes out, as a submission is: the
