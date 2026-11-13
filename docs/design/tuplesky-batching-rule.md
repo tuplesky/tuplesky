@@ -395,12 +395,13 @@ So this section asks what a voter has to do on the hot path, and what it can do 
     - **So a batch ends by time as well as by positions:** at a quarter of the table or 50 ms, whichever comes first. Today the bound is the materializer's lag.
     - **Ending batches by time doesn't bound the age by itself; a check before authorizing does** (Codex on #259, twice). A landing can stall while the frontend still answers, and so can the decisions reaching this voter. So freshness is progress the leader confirmed, not an empty backlog:
       - **The leader's beacon.** The leader sends each lazy voter its commit frontier at least every 50 ms, idle or not: the frontier it announces at a turn's end under load, and a beacon of tens of bytes when idle.
-      - **Only while it holds a quorum.** A leader sends a beacon only while a quorum has acknowledged it at its ballot within the last 50 ms. A voter that has promised a higher ballot no longer acknowledges the old one, so a deposed leader stops within 50 ms of losing its quorum, wherever it is.
+      - **Only while it holds a quorum, counted from its own sends** (Codex on #263). A leader sends a beacon only while a quorum has acknowledged, at its ballot, a message it sent within the last 50 ms by its own clock. Each acknowledgement names the round it answers, and its freshness runs from when the leader sent that round, not from when the acknowledgement arrives. So an acknowledgement delayed in the network counts for no longer than a prompt one.
+      - A voter that has promised a higher ballot no longer acknowledges the old one. So a deposed leader stops within 50 ms of sending the last round a quorum acknowledged at its ballot, wherever it is and however late those acknowledgements arrive.
       - **The age:** the time since this voter received the latest beacon, at the current ballot, whose frontier it has landed through. Decisions or landings that stall, alone or together, both make it grow.
       - **Under 100 ms**, the frontend authorizes from its own store. **Over it, it fails closed:** admission and the result's authorization go to an eager voter (the stricter way, below). If none answers, the request is deferred, as the disclosure gate defers today.
       - **The bound,** for a revocation committed at time `t`:
         - a beacon from the leader that committed it holds a frontier behind it only if sent before `t`, so it keeps a lazy frontend fresh until at most `t` + 100 ms plus a message delay;
-        - a deposed leader's quorum overlaps the new one in a voter whose last acknowledgement to the old leader came before its promise to the new ballot, so before `t`. The old leader's last beacon therefore leaves before `t` + 50 ms, and keeps a frontend fresh until at most `t` + 150 ms plus a message delay;
+        - a deposed leader's quorum overlaps the new one in a voter whose last acknowledgement to the old leader came before its promise to the new ballot, so before `t`. The round that acknowledgement answers was sent earlier still. The old leader's last beacon therefore leaves before `t` + 50 ms, however late that acknowledgement reaches it, and keeps a frontend fresh until at most `t` + 150 ms plus a message delay;
         - so the revoked grant can authorize at a lazy frontend for at most 150 ms plus one message delay after `t`, across a leader change too, at any traffic.
       - It assumes clock rates agree within a few percent over 150 ms, as leader leases do, not that clocks agree. The stricter way assumes nothing about clocks.
     - **A session opened a moment ago** isn't found there until its batch lands. The frontend's disclosure gate defers rather than refuses, as it does at a lagging replica today.
@@ -547,7 +548,7 @@ The last three columns are the servers' ms an operation, from 1.20. The two righ
 - **The window:** the lag tracked, and the campaign's second timeout past it.
 - **The takeover:** execute the tail before answering.
 - **The frontend:** forwarding reads, watches and resolves to an eager voter, and the age check before authorizing from its own store.
-- **The leader's beacon:** its commit frontier to each lazy voter at least every 50 ms, sent only while a quorum has acknowledged it within the last 50 ms.
+- **The leader's beacon:** its commit frontier to each lazy voter at least every 50 ms, sent only while a quorum has acknowledged a round the leader sent within the last 50 ms by its own clock; each acknowledgement names its round.
 - **The donor rule:** a lazy voter serves executed history only up to its landed frontier.
 - **The metrics line:** lag in positions, tail and takeover times, agreements, fallbacks.
 
@@ -569,7 +570,7 @@ The last three columns are the servers' ms an operation, from 1.20. The two righ
 - **A difference at one eager voter,** in a build that changes one result: the lazy voters execute the batch, the majority decides, and the loser stops.
 - **A wrong write set under right results** at the eager follower, in a build that changes one shipped row: the lazy voters refuse to land it, execute the batch themselves, and the leader isn't stopped.
 - **The eager follower stopped without a change of ballot:** the leader names another, and agreement resumes after that voter's tail.
-- **A revoked grant at a lazy frontend:** the time from the revocation's commit to the first refusal there is under 150 ms plus a message delay. It stays under that with that voter's landing stalled (a build that holds its landings), with its decisions and batches stalled together, and with the old leader and that voter cut off from the rest while a new leader commits the revocation. The frontend fails closed to an eager voter, or defers.
+- **A revoked grant at a lazy frontend:** the time from the revocation's commit to the first refusal there is under 150 ms plus a message delay. It stays under that with that voter's landing stalled (a build that holds its landings), with its decisions and batches stalled together, with the old leader and that voter cut off from the rest while a new leader commits the revocation, and with the old leader's acknowledgements at its ballot delayed until after the new leader commits it (Codex on #263). The frontend fails closed to an eager voter, or defers.
 - **The lag under load:** the lazy voters' landed frontier stays within one batch while the leader and eager follower run at the bar's load, and their tables stay under the admission limit, with no initialization refused for room.
 - **A stalled lazy voter:**
   - hold one lazy voter's batches back under load until it passes the window;
