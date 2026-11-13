@@ -2306,8 +2306,9 @@ async fn negotiate_incoming(
             Ok(b) => b,
             Err(e) => {
                 // Counted here, on the node that refused it: the peer
-                // learns only the refusal, and this one means an issuer
-                // signed what it never should.
+                // learns only the refusal, and until a prepared transition
+                // names a staged learner (task-d39) this one means an
+                // issuer signed what it never should.
                 if e == crate::BindError::NonVoterNamesVoter {
                     Traffic::add(&shared.traffic.refused_voter_names, 1);
                 }

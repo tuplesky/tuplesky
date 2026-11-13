@@ -1168,22 +1168,44 @@ async fn a_non_voter_certificate_naming_a_voter_is_refused_at_the_handshake() {
         }
     }
 
-    // The control: the same role for a node no voter is known by binds.
-    let (certificate, key) = cluster
-        .ca
-        .issue_at(SERVER_NAME, CLUSTER, 9, PeerRole::Observer, 1);
-    let answered = hello_on(
-        n3(1, Lane::Control),
-        &cluster.ca,
-        &certificate,
-        &key,
-        PeerRole::Observer,
-    )
-    .await;
-    assert!(
-        matches!(answered, Some(MessageV1::HelloAck(_))),
-        "an observer for node 9 was refused: {answered:?}"
-    );
+    // The control: the same role for a node no voter is known by binds,
+    // on either lane. The same certificate issued in a sibling domain
+    // does not: the peer plane takes the domain from the certificate too
+    // (#271).
+    for lane in [Lane::Control, Lane::Bulk] {
+        let (certificate, key) =
+            cluster
+                .ca
+                .issue_at(SERVER_NAME, CLUSTER, 9, PeerRole::Observer, 1);
+        let answered = hello_on(
+            n3(1, lane),
+            &cluster.ca,
+            &certificate,
+            &key,
+            PeerRole::Observer,
+        )
+        .await;
+        assert!(
+            matches!(answered, Some(MessageV1::HelloAck(_))),
+            "an observer for node 9 was refused on {lane:?}: {answered:?}"
+        );
+        let (certificate, key) =
+            cluster
+                .ca
+                .issue_in(SERVER_NAME, CLUSTER, [0x33; 16], 9, PeerRole::Observer, 1);
+        let answered = hello_on(
+            n3(1, lane),
+            &cluster.ca,
+            &certificate,
+            &key,
+            PeerRole::Observer,
+        )
+        .await;
+        assert!(
+            !matches!(answered, Some(MessageV1::HelloAck(_))),
+            "a sibling domain's observer for node 9 bound on {lane:?}: {answered:?}"
+        );
+    }
 
     // And the cluster still answers.
     let caller = Caller::bind(&running[0], &cluster.ca, &cluster.ring, [0x44; 16]).await;
