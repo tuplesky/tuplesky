@@ -374,6 +374,18 @@ jobs:
           jepsen/swiftpaxos/build.sh "$RUNNER_TEMP/swiftpaxos-bin" | tee "$RUNNER_TEMP/swiftpaxos-build.txt"
           echo "SwiftPaxos beside TupleSky: $(tail -n 1 "$RUNNER_TEMP/swiftpaxos-build.txt" | sed 's/.* from //'), at $SWIFTPAXOS_STEPS clients" >> "$GITHUB_STEP_SUMMARY"
           (cd jepsen/swiftpaxos && lein deps)
+      - name: Describe the runner's disk
+        # With store disk, both systems' stores sit in the containers'
+        # writable layers, under Docker's data root: its filesystem, the
+        # device under it with its write cache, and an fdatasync's latency
+        # there while the disk is idle (scripts/ci/disk_probe.py). Run for
+        # tmpfs too, so every job says what disk its runner has.
+        continue-on-error: true
+        run: |
+          root=$(docker info -f '{{.DockerRootDir}}' 2>/dev/null || echo /var/lib/docker)
+          sudo python3 -E -s tuplesky/scripts/ci/disk_probe.py "$root/tuplesky-disk-probe" | tee "$RUNNER_TEMP/disk-probe.txt"
+          sudo rmdir "$root/tuplesky-disk-probe" || true
+          { echo "**Runner's disk** (store $STORE; Docker's data root $root):"; echo; sed 's/^/- /' "$RUNNER_TEMP/disk-probe.txt"; echo; } >> "$GITHUB_STEP_SUMMARY"
       - name: Stand the cluster up
         # With store tmpfs, /opt, which holds each voter's binary and store
         # (/opt/tuplesky), is a tmpfs. Not /opt/tuplesky itself: the test
