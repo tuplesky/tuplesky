@@ -209,6 +209,12 @@ fn config(ring: &KeyRing) -> BindingConfig {
 }
 
 fn frontend(ring: &KeyRing) -> BoundFrontend {
+    frontend_remembering(ring, 64)
+}
+
+/// A frontend that remembers `max_requests` request identities for the
+/// gate, and whose collector holds up to 64 commands pending.
+fn frontend_remembering(ring: &KeyRing, max_requests: usize) -> BoundFrontend {
     let fast: BTreeSet<ReplicaId> = (0..2).map(r).collect();
     let quorum = BallotConfiguration::c2(
         ConfigurationEpoch::new(1).unwrap(),
@@ -231,7 +237,7 @@ fn frontend(ring: &KeyRing) -> BoundFrontend {
         }),
         16,
     );
-    BoundFrontend::new(dispatcher, config(ring), 4, 64)
+    BoundFrontend::new(dispatcher, config(ring), 4, max_requests)
 }
 
 fn retry_key(seq: u64) -> RetryKey {
@@ -1352,4 +1358,55 @@ fn a_session_the_bind_barrier_showed_and_then_retired_is_refused_not_held() {
     assert!(!is_pending(&refused));
     assert_eq!(f.deferred, 0);
     assert_eq!(f.denied, 1);
+}
+
+#[test]
+fn a_read_still_outstanding_when_the_request_memory_turns_over_is_still_disclosed() {
+    // The gate authorizes a read's output from the namespace and
+    // intervals it recorded when the dispatcher accepted the read. That
+    // record is bounded, and shared by every connection on the node: in
+    // coordd the bound is `max_outstanding_per_session`, 256. A read
+    // still outstanding when more requests than that have been accepted
+    // since must keep its record. Without it an executed read that
+    // policy permits is answered `OUTPUT_WITHHELD`, which the caller
+    // takes as final. Under load that is any read slower than the time
+    // the node takes to accept 256 requests: in a closed loop with 96
+    // callers a node, about 2.7 times the mean latency.
+    let ring = ring();
+    let domain = Domain::new();
+    let hub = WatchHub::new(KvRevision::ZERO, KvRevision::ZERO);
+    let mut f = frontend_remembering(&ring, 4);
+    let bind = frame_of(&bind_frame(&token(&ring, SESSION, NOW + 100)).unwrap());
+    let Ingress::Bound(_) = f.on_frame(&clock(NOW), at(NOW), 1, &bind, &hub, &domain.policy())
+    else {
+        panic!()
+    };
+    let (read, req) = request(1, range(b"secret"));
+    assert!(matches!(
+        f.on_frame(&clock(NOW), at(NOW), 1, &req, &hub, &domain.policy()),
+        Ingress::Action(Action::FanOut(_))
+    ));
+    // Four writes are accepted and answered while the read is out.
+    for seq in 2..=5 {
+        let (command, req) = request(seq, put(b"a", false));
+        assert!(matches!(
+            f.on_frame(&clock(NOW), at(NOW), 1, &req, &hub, &domain.policy()),
+            Ingress::Action(Action::FanOut(_))
+        ));
+        let ack = f
+            .deliver(
+                delivery(1, seq, command, Outcome::Put { prev: None }),
+                &domain.policy(),
+            )
+            .answered();
+        assert!(!is_denied(&ack), "{:?}", outcome_of(&ack));
+    }
+    // The read's result, which policy permits, is disclosed.
+    let answered = f
+        .deliver(
+            delivery(1, 1, read, range_outcome(b"secret")),
+            &domain.policy(),
+        )
+        .answered();
+    assert!(!is_denied(&answered), "{:?}", outcome_of(&answered));
 }
