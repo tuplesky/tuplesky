@@ -217,6 +217,19 @@ impl Dispatcher {
         self.reads.len()
     }
 
+    /// Whether a result for `key` can still come from here: a read
+    /// waiting on its leader, a command being collected, or one whose
+    /// result is retained for resolution. Each is bounded by this
+    /// dispatcher's own limits.
+    pub fn holds(&self, key: &RetryKey) -> bool {
+        self.reads.contains_key(key) || self.collector.is_bound(key)
+    }
+
+    /// How many keys [`Dispatcher::holds`] is true for.
+    pub fn held(&self) -> usize {
+        self.reads.len() + self.collector.bound()
+    }
+
     /// The collector.
     pub const fn collector(&self) -> &Collector {
         &self.collector

@@ -874,6 +874,11 @@ impl Collector {
         self.bindings.contains_key(key)
     }
 
+    /// Retry keys bound to a command here: being collected, or retained.
+    pub fn bound(&self) -> usize {
+        self.bindings.len()
+    }
+
     /// Submit at `now` a request admitted at `since`, its client deadline
     /// measured from `since`: a read that waited on its leader first
     /// (task-d50) keeps the deadline it was admitted with.
