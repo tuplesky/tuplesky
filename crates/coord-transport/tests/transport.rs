@@ -2916,6 +2916,73 @@ async fn a_turns_frames_to_one_peer_share_a_stream_in_order() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_held_wake_up_leaves_the_frames_queued_until_it_is_released() {
+    // task-d115, lever 8: under a hold, a send admits and queues as
+    // before and its sender is woken only at the release -- once for
+    // all the frames queued -- or when the hold is dropped.
+    let (_f, a, mut b) = linked(limits(), limits()).await;
+    // One frame first, unheld: the sender has taken every wake-up it
+    // was owed and waits for the next.
+    assert!(
+        a.send(dest(1, Lane::Control), DOMAIN, numbered(1).remove(0))
+            .is_ok()
+    );
+    assert_eq!(payloads(&mut b, 1).await, said(1));
+
+    let hold = coord_transport::WakeHold::new();
+    assert_eq!(hold.held_since(), None);
+    let sent = a.send_many(dest(1, Lane::Control), DOMAIN, numbered(3));
+    assert!(sent.iter().all(Result::is_ok), "{sent:?}");
+    let sent = a.send_many(dest(1, Lane::Control), DOMAIN, numbered(2));
+    assert!(sent.iter().all(Result::is_ok), "{sent:?}");
+    assert!(hold.held_since().is_some());
+    assert!(
+        timeout(Duration::from_millis(300), payloads(&mut b, 1))
+            .await
+            .is_err(),
+        "a held frame went out"
+    );
+    // One lane, owed one wake-up for both calls.
+    assert_eq!(hold.release(), 1);
+    assert_eq!(hold.held_since(), None);
+    let mut five = said(3);
+    five.extend(said(2));
+    assert_eq!(sorted(payloads(&mut b, 5).await), sorted(five));
+
+    // Code with no hold at hand releases the thread's (#256 review).
+    let sent = a.send_many(dest(1, Lane::Control), DOMAIN, numbered(2));
+    assert!(sent.iter().all(Result::is_ok), "{sent:?}");
+    assert!(
+        timeout(Duration::from_millis(300), payloads(&mut b, 1))
+            .await
+            .is_err(),
+        "a held frame went out"
+    );
+    assert_eq!(coord_transport::WakeHold::release_this_thread(), 1);
+    assert_eq!(hold.held_since(), None);
+    assert_eq!(sorted(payloads(&mut b, 2).await), sorted(said(2)));
+
+    // Still holding after a release; dropping the hold releases.
+    let sent = a.send_many(dest(1, Lane::Control), DOMAIN, numbered(2));
+    assert!(sent.iter().all(Result::is_ok), "{sent:?}");
+    assert!(
+        timeout(Duration::from_millis(300), payloads(&mut b, 1))
+            .await
+            .is_err(),
+        "a held frame went out"
+    );
+    drop(hold);
+    assert_eq!(sorted(payloads(&mut b, 2).await), sorted(said(2)));
+
+    // No hold: a send wakes its sender at once.
+    assert!(
+        a.send(dest(1, Lane::Control), DOMAIN, numbered(1).remove(0))
+            .is_ok()
+    );
+    assert_eq!(payloads(&mut b, 1).await, said(1));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_stream_carries_no_more_frames_or_bytes_than_its_bounds() {
     // Four frames a stream: ten frames take three streams.
     let four = Limits {

@@ -51,7 +51,7 @@ pub use config::{
 };
 pub use endpoint::{
     CloseCode, CloseReason, ConnectionId, Destination, Dialer, RequestError, Responder, SendError,
-    TrafficReader, Transport, TransportError, TransportEvent,
+    TrafficReader, Transport, TransportError, TransportEvent, WakeHold,
 };
 pub use frames::{
     CAPABILITY_FRAMES_PER_STREAM, FrameError, FrameStream, KIND_PEER_EVIDENCE,

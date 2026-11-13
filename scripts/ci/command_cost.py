@@ -36,7 +36,7 @@ the voter started:
 - the leader's round from a submission to learned, then from learned to
   released, in all and by part;
 - the read barrier's wait;
-- the domain loop's run-queue time a pass, sampled one pass in sixteen,
+- the domain loop's run-queue time a pass, sampled one pass every 10 ms,
   over every sampled pass and over those that executed a command;
 - the journal appender's and the projection's jobs, each job's time
   served (for the appender, an append and its sync: the disk's own
