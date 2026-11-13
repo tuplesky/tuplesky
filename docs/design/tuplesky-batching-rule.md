@@ -1032,9 +1032,14 @@ The order is by the five-voter sum, each step one PR, with a both-orders pair on
 
 ## 10. The frame as the unit of decision
 
-**For the owner.** The structural floors round ([#185, 6854728753](https://github.com/tuplesky/tuplesky/pull/185#issuecomment-6854728753)) measured a follower that handles the leader's frame as a unit, one append and one acknowledgement a frame. That takes −0.46 ms an operation off build 1's 0.86, locally at 120 callers [−0.67 of 1.31 on the 7763].
-- Lazy voters (6.6) and lever 2 redesigned (6.7) reach about −0.16 of it without a protocol change.
-- The rest, about −0.30 [−0.44], is each command's own intake, vote, dependency record, rows, settle and forget at every follower. It needs the frame to be the unit of decision.
+**For the owner.** The structural floors round ([#185, 6854728753](https://github.com/tuplesky/tuplesky/pull/185#issuecomment-6854728753)) measured a follower that handles the leader's frame as a unit, one append and one acknowledgement a frame.
+- **At 120 callers** that takes −0.46 ms an operation off build 1's 0.86 locally [−0.67 of 1.31 on the 7763], at about 10 commands a frame.
+  - Lazy voters (6.6) and lever 2 redesigned (6.7) reach about −0.16 of it without a protocol change.
+  - About −0.04 [−0.06] is the seal and settle records. One record and one durability event a group in place of two a command is a local journal format change, not a protocol change (10.5, step 2).
+  - **The rest, up to about −0.26 [−0.38], needs the frame to be the unit of decision.** It is each command's own intake, vote, dependency record, rows, settle and forget at every follower.
+  - It is an upper bound: a residual of separate pairs (review on #185).
+- **At 5 callers** the floor is −0.50 of 1.86 [−0.72 of 2.92]. What lazy voters and lever 2 take there isn't measured.
+- **At 30 callers,** where a frame is 4.9 commands, the floor isn't measured yet.
 
 This section covers the slow path's unit only. Option 3 and the leader executing for everyone (6.1 to 6.3) stay parked.
 
@@ -1081,9 +1086,13 @@ Servers' CPU, ms an operation at 120 callers, storage on:
 - **Selection is by position.** A voter accepts frames in order, so its report is a prefix.
   - At each position, the selection takes the frame accepted at the highest ballot among a majority's reports, as Multi-Paxos selects a slot.
   - A decided frame is in every majority, so it is selected whole.
-- **Order.** A frame command's place is its frame's position, then its index in the frame.
-  - This is the leader's order. Task-d71's rule reads it today through the records along dependencies; it becomes a source read directly.
-  - Explicit dependencies remain only on fast commands that conflict with a frame command, and at load there are none.
+- **Order.** Every fast and slow quorum includes the ballot's leader ([design 4.1](tuplesky-design.md#s4-1)), so the leader proposes every command under a sequence number, fast or not. Every command is therefore in a frame.
+  - A fast decision decides a command early, by a fast quorum on the leader's path.
+  - A command's place is its frame's position, then its index in the frame.
+  - **Its dependencies are the conflicting commands at lower places.** A voter computes them from the order and the payloads' keys, so they need no record of their own.
+  - **That covers a fast command decided before a conflicting frame command** (Codex on #276). The leader proposed it first, so its place is lower. A follower that lacks it can't execute the frame command until it gets it, as with a missing dependency today.
+  - **A fast command keeps its record of its path and dependencies** for the possible-fast rule. Its place agrees with them, as its path agrees with the leader's order today.
+  - Task-d71's rule reads the leader's order today through the records along dependencies. The order becomes a source it reads directly.
 - **What a voter carries into a Sync and what it serves** (task-d77, task-d80, task-d81) go by position: a committed frame is carried and served as a committed command is.
 
 **A takeover mid-frame.**
@@ -1095,9 +1104,9 @@ Servers' CPU, ms an operation at 120 callers, storage on:
 ### 10.4 The fast path, a voter's right to propose, and what stays per command
 
 **The fast path: kept, narrowed to low load. This is the recommendation.**
-- **Below the relay's threshold** (task-d100), a collector proposes fast, as today, with per-command records and possible-fast recovery.
-- **At load,** collectors already relay to the leader, whose frames carry the commands.
-- **A command takes one path.** One whose fast round fails goes into the leader's next frame.
+- **Every command is in the leader's frames** (10.3).
+- **Below the relay's threshold** (task-d100), a collector also proposes it fast, as today. A fast quorum on the leader's path decides it before its frame does, with per-command records and possible-fast recovery.
+- **At load,** collectors already relay to the leader, and the frame decides.
 - **Any voter still proposes and can lead.**
 
 **The alternative: the frame as the only path** (6.4). Recovery reads one source, and the possible-fast rule goes, about 2 to 3 weeks less. It gives up what 6.2 lists: a collector far from the leader pays the leg to it. Both give the same floor at load.
@@ -1118,9 +1127,9 @@ Each step has its own PRs and pair.
 | Step | Activation | Delivers, 7763 at 120 |
 | --- | --- | --- |
 | 1. Without a protocol change: rows (a) to (c), lever 2, lazy voters, API streams, the bytes path | Lever 2's vote message; lazy voters | To 1.01–1.06 |
-| 2. One journal record a frame, read beside the per-command records | None (local format) | About −0.01 (appender) |
+| 2. One journal record a frame, and one record and one durability event a group for seal and settle, read beside the per-command records | None (local format) | About −0.07: the appender −0.01, and the seal and settle records −0.06 |
 | 3. Recovery and restart read frame records and reports | None | 0 |
-| 4. Followers take frames as the unit; the leader counts once a frame | `FrameDecision` | −0.44 (follower) |
+| 4. Followers take frames as the unit; the leader counts once a frame | `FrameDecision` | Up to −0.38 (follower), at about 10 commands a frame |
 | 5. The leader proposes by range, without per-command dependencies or records (27 + 13.5 + 16.8 µs a command) | The same | About −0.06, inferred |
 
 ### 10.6 Fault runs and weeks
