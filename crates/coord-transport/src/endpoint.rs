@@ -197,7 +197,7 @@ impl TransportEvent {
 
 /// The response half of a unary request stream.
 pub struct Responder {
-    send: SendStream,
+    send: Out,
     lane: Lane,
     link: Arc<Link>,
     node: Arc<Budget>,
@@ -211,6 +211,13 @@ impl core::fmt::Debug for Responder {
             .field("lane", &self.lane)
             .finish()
     }
+}
+
+/// SCRATCH: where a responder writes.
+enum Out {
+    Own(SendStream),
+    Shared(Arc<tokio::sync::Mutex<SendStream>>),
+    Gone,
 }
 
 impl Responder {
@@ -231,18 +238,28 @@ impl Responder {
     pub async fn respond(mut self, frame: Vec<u8>) -> Result<(), SendError> {
         let bytes = frame.len();
         let (dest, node) = self.admit(bytes).await?;
+        let mut send = match std::mem::replace(&mut self.send, Out::Gone) {
+            Out::Own(send) => send,
+            Out::Shared(send) => {
+                let written = timeout(self.deadline, async {
+                    send.lock().await.write_all(&frame).await
+                })
+                .await
+                .map_err(|_| SendError::Timeout)?;
+                drop((dest, node));
+                return written.map_err(|e| SendError::Stream(e.to_string()));
+            }
+            Out::Gone => return Ok(()),
+        };
         timeout(self.deadline, async {
-            self.send
-                .write_all(&frame)
+            send.write_all(&frame)
                 .await
                 .map_err(|e| SendError::Stream(e.to_string()))?;
-            self.send
-                .finish()
-                .map_err(|e| SendError::Stream(e.to_string()))
+            send.finish().map_err(|e| SendError::Stream(e.to_string()))
         })
         .await
         .map_err(|_| SendError::Timeout)??;
-        let stopped = self.send.stopped();
+        let stopped = send.stopped();
         tokio::spawn(async move {
             let _dest = dest;
             let _node = node;
@@ -273,9 +290,14 @@ impl Responder {
     /// [`respond`]: Responder::respond
     pub async fn push(&mut self, frame: &[u8]) -> Result<(), SendError> {
         let (dest, node) = self.admit(frame.len()).await?;
-        let written = timeout(self.deadline, self.send.write_all(frame))
-            .await
-            .map_err(|_| SendError::Timeout)?;
+        let written = match &mut self.send {
+            Out::Own(send) => timeout(self.deadline, send.write_all(frame)).await,
+            Out::Shared(send) => {
+                timeout(self.deadline, async { send.lock().await.write_all(frame).await }).await
+            }
+            Out::Gone => return Err(SendError::Stream("no stream".into())),
+        }
+        .map_err(|_| SendError::Timeout)?;
         drop((dest, node));
         written.map_err(|e| SendError::Stream(e.to_string()))
     }
@@ -285,9 +307,10 @@ impl Responder {
     /// A stream that is dropped instead is reset, which a peer reads as a
     /// failure rather than the orderly end of a subscription.
     pub fn finish(mut self) -> Result<(), SendError> {
-        self.send
-            .finish()
-            .map_err(|e| SendError::Stream(e.to_string()))
+        match &mut self.send {
+            Out::Own(send) => send.finish().map_err(|e| SendError::Stream(e.to_string())),
+            Out::Shared(_) | Out::Gone => Ok(()),
+        }
     }
 
     /// Admit `bytes` under the destination and node budgets.
@@ -484,10 +507,11 @@ impl Peer {
             close_reason: Mutex::new(None),
             accepted,
             readers: Arc::new(Semaphore::new(readers.max(1) as usize)),
-            batched: class == Class::Peer
+            batched: (class == Class::Peer
                 && identity
                     .capabilities
-                    .contains(&CAPABILITY_FRAMES_PER_STREAM),
+                    .contains(&CAPABILITY_FRAMES_PER_STREAM))
+                || (class == Class::Api && crate::xswitch::apib()),
             identity,
         })
     }
@@ -1866,6 +1890,45 @@ impl Transport {
         let _open = timeout_at(until, link.opens.acquire())
             .await
             .map_err(not_admitted)?;
+        if crate::xswitch::cstr() {
+            let entry = crate::xswitch::long_stream(Arc::as_ptr(&self.shared) as usize, connection.0);
+            let mut held = entry.lock().await;
+            if held.is_none() {
+                let (send, recv) = timeout_at(until, peer.conn.open_bi())
+                    .await
+                    .map_err(|_| RequestError::Timeout)?
+                    .map_err(|e| RequestError::Stream(e.to_string()))?;
+                *held = Some((send, FrameStream::new(recv)));
+            }
+            let (send, answers) = held.as_mut().expect("opened above");
+            match timeout_at(until, send.write_all(&frame)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    *held = None;
+                    return Err(RequestError::Stream(e.to_string()));
+                }
+                Err(_) => {
+                    *held = None;
+                    return Err(RequestError::Timeout);
+                }
+            }
+            let left = until.saturating_duration_since(tokio::time::Instant::now());
+            let answer = answers
+                .next_frame(left, Some((&self.shared.receive_budget, lane)))
+                .await;
+            return match answer {
+                Ok(Some(answer)) => Ok(answer),
+                other => {
+                    *held = None;
+                    Err(match other {
+                        Err(FrameError::Timeout) => RequestError::Timeout,
+                        Err(FrameError::Wire(e)) => RequestError::Malformed(format!("{e:?}")),
+                        Err(e) => RequestError::Stream(format!("{e:?}")),
+                        Ok(_) => RequestError::Stream("ended".into()),
+                    })
+                }
+            };
+        }
         let (mut send, mut recv) = timeout_at(until, peer.conn.open_bi())
             .await
             .map_err(|_| RequestError::Timeout)?
@@ -1986,8 +2049,11 @@ async fn sender_loop(shared: Arc<Shared>, link: Arc<Link>, peer: Arc<Peer>) {
     } else {
         (1, 0)
     };
+    let pstr = peer.class == Class::Peer && peer.batched && crate::xswitch::pstr();
+    let dgram = peer.class == Class::Peer && crate::xswitch::dgram();
+    let mut long: Option<(SendStream, tokio::sync::OwnedSemaphorePermit)> = None;
     loop {
-        let batch = {
+        let mut batch = {
             let mut state = link.lanes[idx].lock().unwrap();
             if state.peer.as_ref().is_none_or(|p| p.id != peer.id) {
                 return;
@@ -2014,6 +2080,54 @@ async fn sender_loop(shared: Arc<Shared>, link: Arc<Link>, peer: Arc<Peer>) {
             continue;
         }
         let picked = Instant::now();
+        if dgram {
+            // SCRATCH: every frame that fits goes as a datagram, a
+            // buffer's frames packed into as few as fit.
+            let max = peer.conn.max_datagram_size().unwrap_or(0);
+            let mut rest: Vec<Queued> = Vec::new();
+            let mut grams: Vec<Vec<u8>> = Vec::new();
+            let mut cur: Vec<u8> = Vec::new();
+            let (mut sent_frames, mut sent_bytes) = (0u64, 0u64);
+            for q in batch {
+                if q.frame.len() > max {
+                    crate::xswitch::add(&crate::xswitch::DG_TOO_LARGE, 1);
+                    rest.push(q);
+                    continue;
+                }
+                if cur.len() + q.frame.len() > max {
+                    grams.push(std::mem::take(&mut cur));
+                }
+                sent_frames += 1;
+                sent_bytes += q.frame.len() as u64;
+                cur.extend_from_slice(&q.frame);
+            }
+            if !cur.is_empty() {
+                grams.push(cur);
+            }
+            for gram in grams {
+                crate::xswitch::add(&crate::xswitch::DG_SENT, 1);
+                let sent = timeout(
+                    shared.limits.frame_timeout,
+                    peer.conn.send_datagram_wait(bytes::Bytes::from(gram)),
+                )
+                .await;
+                if !matches!(sent, Ok(Ok(()))) {
+                    crate::xswitch::add(&crate::xswitch::DG_REFUSED, 1);
+                }
+            }
+            crate::xswitch::add(&crate::xswitch::DG_SENT_FRAMES, sent_frames);
+            {
+                let mut state = link.lanes[idx].lock().unwrap();
+                state.stats.frames += sent_frames;
+                state.stats.bytes += sent_bytes;
+            }
+            Traffic::add(&shared.traffic.sent_frames, sent_frames);
+            Traffic::add(&shared.traffic.sent_bytes, sent_bytes);
+            if rest.is_empty() {
+                continue;
+            }
+            batch = rest;
+        }
         let frames = batch.len() as u64;
         let bytes: usize = batch.iter().map(|q| q.frame.len()).sum();
         let Ok(dest_permit) = link.budget.acquire(lane, bytes).await else {
@@ -2022,6 +2136,49 @@ async fn sender_loop(shared: Arc<Shared>, link: Arc<Link>, peer: Arc<Peer>) {
         let Ok(node_permit) = shared.node_budget.acquire(lane, bytes).await else {
             continue;
         };
+        if pstr {
+            // SCRATCH: one stream a lane for the connection's life.
+            let lost = || {
+                let mut state = link.lanes[idx].lock().unwrap();
+                state.stats.refused += frames;
+                Traffic::add(&shared.traffic.sent_lost, frames);
+                Traffic::add(&shared.traffic.sent_lost_streams, 1);
+            };
+            if long.is_none() {
+                let open_permit = link.opens.acquire().await;
+                match timeout(shared.limits.frame_timeout, peer.conn.open_uni()).await {
+                    Ok(Ok(send)) => {
+                        Traffic::add(&shared.traffic.sent_streams, 1);
+                        long = Some((send, open_permit));
+                    }
+                    _ => {
+                        lost();
+                        continue;
+                    }
+                }
+            }
+            {
+                let mut state = link.lanes[idx].lock().unwrap();
+                state.stats.credit_wait.record(picked.elapsed());
+                state.stats.frames += frames;
+                state.stats.bytes += bytes as u64;
+            }
+            Traffic::add(&shared.traffic.sent_frames, frames);
+            Traffic::add(&shared.traffic.sent_bytes, bytes as u64);
+            let mut chunks: Vec<bytes::Bytes> = batch
+                .into_iter()
+                .map(|q| bytes::Bytes::from(q.frame))
+                .collect();
+            let (send, _) = long.as_mut().expect("opened above");
+            let written =
+                timeout(shared.limits.frame_timeout, send.write_all_chunks(&mut chunks)).await;
+            drop((dest_permit, node_permit));
+            if !matches!(written, Ok(Ok(()))) {
+                lost();
+                long = None;
+            }
+            continue;
+        }
         let open_permit = link.opens.acquire().await;
         // A batch is lost whole: a refused stream loses every frame in
         // it, and they are counted as frames lost, so a saturated peer
@@ -2365,6 +2522,10 @@ async fn park_control(send: SendStream, conn: quinn::Connection) {
 /// Serve a negotiated connection until it closes.
 async fn serve(shared: Arc<Shared>, peer: Arc<Peer>, control: ControlStream) {
     tokio::spawn(watch_control(peer.clone(), control));
+    if peer.class == Class::Peer && crate::xswitch::dgram() {
+        crate::xswitch::start_printer();
+        tokio::spawn(read_datagrams(shared.clone(), peer.clone()));
+    }
     let reason = loop {
         // A reader permit is taken before the stream is accepted, so a
         // stalled consumer stops acceptance rather than growing a backlog.
@@ -2420,6 +2581,37 @@ async fn serve(shared: Arc<Shared>, peer: Arc<Peer>, control: ControlStream) {
             reason,
         })
         .await;
+}
+
+/// SCRATCH: peer frames that came as datagrams.
+async fn read_datagrams(shared: Arc<Shared>, peer: Arc<Peer>) {
+    while let Ok(gram) = peer.conn.read_datagram().await {
+        crate::xswitch::add(&crate::xswitch::DG_RECV, 1);
+        let mut reader = coord_types::wire_v1::FrameReader::new();
+        if reader.push(&gram).is_err() {
+            close_on(&peer, CloseReason::Malformed("datagram".into()));
+            return;
+        }
+        loop {
+            match reader.next_frame() {
+                Ok(Some(frame)) => {
+                    crate::xswitch::add(&crate::xswitch::DG_RECV_FRAMES, 1);
+                    if !deliver_peer_frame(&shared, &peer, frame).await {
+                        return;
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    close_on(&peer, CloseReason::Malformed("datagram frame".into()));
+                    return;
+                }
+            }
+        }
+        if reader.finish().is_err() {
+            close_on(&peer, CloseReason::Malformed("datagram tail".into()));
+            return;
+        }
+    }
 }
 
 /// Watch the control stream for an orderly `Close`.
@@ -2478,11 +2670,17 @@ async fn read_uni(
     }
     let mut stream = FrameStream::new(recv);
     let mut read = 0usize;
+    let long = crate::xswitch::pstr();
+    let wait = if long {
+        Duration::from_secs(86_400)
+    } else {
+        shared.limits.frame_timeout
+    };
     loop {
-        match stream.next_frame(shared.limits.frame_timeout, budget).await {
+        match stream.next_frame(wait, budget).await {
             Ok(Some(frame)) => {
                 read += 1;
-                if read > MAX_FRAMES_PER_STREAM {
+                if !long && read > MAX_FRAMES_PER_STREAM {
                     close_on(
                         &peer,
                         CloseReason::Malformed(format!(
@@ -2638,6 +2836,26 @@ async fn read_delivery(
     permit: tokio::sync::OwnedSemaphorePermit,
 ) {
     let _held = permit;
+    if peer.batched {
+        // SCRATCH (APIB): several deliveries a stream.
+        let mut stream = FrameStream::new(recv);
+        loop {
+            match stream
+                .next_frame(
+                    shared.limits.frame_timeout,
+                    Some((&shared.receive_budget, peer.lane)),
+                )
+                .await
+            {
+                Ok(Some(frame)) => emit_delivery(&shared, &peer, frame).await,
+                Ok(None) | Err(FrameError::Stream(_)) => return,
+                Err(e) => {
+                    close_on(&peer, frame_reason(e));
+                    return;
+                }
+            }
+        }
+    }
     match read_frame_within(
         &mut recv,
         shared.limits.frame_timeout,
@@ -2646,7 +2864,19 @@ async fn read_delivery(
     )
     .await
     {
-        Ok(frame) => {
+        Ok(frame) => emit_delivery(&shared, &peer, frame).await,
+        Err(FrameError::Stream(_)) => {}
+        Err(e) => {
+            let reason = frame_reason(e);
+            *peer.close_reason.lock().unwrap() = Some(reason.clone());
+            peer.conn.close(VarInt::from_u32(reason.code() as u32), b"");
+        }
+    }
+}
+
+async fn emit_delivery(shared: &Shared, peer: &Peer, frame: Frame) {
+    {
+        {
             shared
                 .emit(TransportEvent::ApiDelivery {
                     connection: peer.id,
@@ -2663,12 +2893,6 @@ async fn read_delivery(
                 })
                 .await;
         }
-        Err(FrameError::Stream(_)) => {}
-        Err(e) => {
-            let reason = frame_reason(e);
-            *peer.close_reason.lock().unwrap() = Some(reason.clone());
-            peer.conn.close(VarInt::from_u32(reason.code() as u32), b"");
-        }
     }
 }
 
@@ -2680,6 +2904,59 @@ async fn read_request(
     permit: tokio::sync::OwnedSemaphorePermit,
 ) {
     let _held = permit;
+    let long = crate::xswitch::cstr();
+    if long || peer.batched {
+        // SCRATCH (CSTR, APIB): several requests a stream. Under CSTR each
+        // is answered on the stream without finishing it; under APIB only
+        // the first has the stream to answer on.
+        let wait = if long {
+            Duration::from_secs(3600)
+        } else {
+            shared.limits.frame_timeout
+        };
+        let (mut own, common) = if long {
+            (None, Some(Arc::new(tokio::sync::Mutex::new(send))))
+        } else {
+            (Some(send), None)
+        };
+        let mut stream = FrameStream::new(recv);
+        let mut read = 0usize;
+        loop {
+            match stream
+                .next_frame(wait, Some((&shared.receive_budget, peer.lane)))
+                .await
+            {
+                Ok(Some(frame)) => {
+                    read += 1;
+                    if !long && read > MAX_FRAMES_PER_STREAM {
+                        close_on(&peer, CloseReason::Malformed("api batch".into()));
+                        return;
+                    }
+                    let out = match (&common, own.take()) {
+                        (Some(common), _) => Out::Shared(common.clone()),
+                        (None, Some(send)) => Out::Own(send),
+                        (None, None) => Out::Gone,
+                    };
+                    if !admit_request(&shared, &peer, frame, out).await {
+                        return;
+                    }
+                }
+                Ok(None) if read == 0 => {
+                    close_on(&peer, frame_reason(FrameError::Truncated));
+                    return;
+                }
+                Ok(None) | Err(FrameError::Stream(_)) => break,
+                Err(e) => {
+                    close_on(&peer, frame_reason(e));
+                    return;
+                }
+            }
+        }
+        if let Some(common) = common {
+            let _ = common.lock().await.finish();
+        }
+        return;
+    }
     match read_frame_within(
         &mut recv,
         shared.limits.frame_timeout,
@@ -2689,6 +2966,21 @@ async fn read_request(
     .await
     {
         Ok(frame) => {
+            admit_request(&shared, &peer, frame, Out::Own(send)).await;
+        }
+        Err(FrameError::Stream(_)) => {}
+        Err(e) => {
+            let reason = frame_reason(e);
+            *peer.close_reason.lock().unwrap() = Some(reason.clone());
+            peer.conn.close(VarInt::from_u32(reason.code() as u32), b"");
+        }
+    }
+}
+
+/// Check one request frame and hand it inward; whether to read on.
+async fn admit_request(shared: &Arc<Shared>, peer: &Arc<Peer>, frame: Frame, send: Out) -> bool {
+    {
+        {
             let received = Instant::now();
             // Decode here, at the boundary, and accept only what a client
             // may open a request stream with. Emitting an undecodable
@@ -2756,7 +3048,7 @@ async fn read_request(
             if let Some(reason) = reason {
                 *peer.close_reason.lock().unwrap() = Some(reason.clone());
                 peer.conn.close(VarInt::from_u32(reason.code() as u32), b"");
-                return;
+                return false;
             }
             shared
                 .emit(TransportEvent::ApiRequest {
@@ -2767,7 +3059,7 @@ async fn read_request(
                     responder: Responder {
                         send,
                         lane: peer.lane,
-                        link: shared.link(Shared::link_key(&peer)),
+                        link: shared.link(Shared::link_key(peer)),
                         node: shared.node_budget.clone(),
                         deadline: shared.limits.frame_timeout,
                         received,
@@ -2775,11 +3067,6 @@ async fn read_request(
                 })
                 .await;
         }
-        Err(FrameError::Stream(_)) => {}
-        Err(e) => {
-            let reason = frame_reason(e);
-            *peer.close_reason.lock().unwrap() = Some(reason.clone());
-            peer.conn.close(VarInt::from_u32(reason.code() as u32), b"");
-        }
     }
+    true
 }

@@ -44,6 +44,7 @@ pub mod frames;
 pub mod identity;
 pub mod lane;
 pub mod sched;
+pub mod xswitch;
 
 pub use budget::{Budget, BudgetError, BudgetLimits};
 pub use config::{
