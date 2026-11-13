@@ -22,6 +22,8 @@
 //!   `JournalDurable`, `Materialized` and `LocalCheckpointPublished` are
 //!   storage facts; protocol establishment is a separate, privately
 //!   constructed value.
+//! * [`byte_string`]: a `Vec<u8>` field encoded as a byte string, which
+//!   postcard lays out exactly as the derived sequence of `u8`, in one copy.
 //! * [`ports`]: the clock and entropy port traits. Production ports live in
 //!   the runtime crate and deterministic test ports in the test-only
 //!   `coord-sim` crate; this crate never reads the OS clock or entropy.
@@ -32,6 +34,7 @@
 #![warn(missing_docs)]
 extern crate alloc;
 
+pub mod byte_string;
 pub mod capability;
 pub mod effect;
 pub mod event;
