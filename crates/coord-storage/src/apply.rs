@@ -386,12 +386,7 @@ impl<P: Persistence> Applier<P> {
     /// Within a group, a batch of the group found definitely not journaled
     /// ends it: the commands it holds were already reported applied.
     fn reconcile(&mut self) -> Result<(), ApplyError> {
-        // What the store settles can take back writes a context was read
-        // over; none of the authorization's rows is among them unless a
-        // group is lost, which stops the node, but nothing is kept past
-        // an outcome that was unknown.
-        self.authorizations.get_mut().clear();
-        let settled = self.store.reconcile()?;
+        let settled = self.settle_store()?;
         self.note_all(&settled.events);
         let group_lost = self
             .group
@@ -401,9 +396,28 @@ impl<P: Persistence> Applier<P> {
             self.foreign.extend(settled.events);
         }
         if group_lost {
-            return Err(ApplyError::GroupLost);
+            return Err(self.group_lost());
         }
         Ok(())
+    }
+
+    /// Reconcile the store, emptying the authorization contexts first:
+    /// what the store settles can take back writes a context was read
+    /// over, so none is kept past an outcome that was unknown (#279's
+    /// review, debt 2). Every reconcile the applier makes goes through
+    /// here.
+    fn settle_store(&mut self) -> Result<crate::persistence::Lowered, ApplyError> {
+        self.authorizations.get_mut().clear();
+        Ok(self.store.reconcile()?)
+    }
+
+    /// [`ApplyError::GroupLost`], with the authorization contexts emptied:
+    /// what the store took back may hold rows one was read over, and the
+    /// cache does not rest on the voter stopping after the loss (#279's
+    /// review, debt 2).
+    fn group_lost(&mut self) -> ApplyError {
+        self.authorizations.get_mut().clear();
+        ApplyError::GroupLost
     }
 
     /// Apply the commands that follow as one group (task-d47), when the
@@ -476,16 +490,16 @@ impl<P: Persistence> Applier<P> {
                     self.foreign.extend(lowered.events);
                 }
                 if group_lost {
-                    return Err(ApplyError::GroupLost);
+                    return Err(self.group_lost());
                 }
                 if lowered.indeterminate {
-                    let settled = self.store.reconcile()?;
+                    let settled = self.settle_store()?;
                     let group_lost = settled.events.iter().any(|e| lost(e, &group.barriers));
                     if self.sharing {
                         self.foreign.extend(settled.events);
                     }
                     if group_lost {
-                        return Err(ApplyError::GroupLost);
+                        return Err(self.group_lost());
                     }
                 } else if produced == 0
                     && self.store.queued() == 0
@@ -766,17 +780,17 @@ impl<P: Persistence> Applier<P> {
             self.foreign.extend(lowered.events);
         }
         if group_lost {
-            return Err(ApplyError::GroupLost);
+            return Err(self.group_lost());
         }
         if lowered.indeterminate {
-            let settled = self.store.reconcile()?;
+            let settled = self.settle_store()?;
             self.note_all(&settled.events);
             let group_lost = settled.events.iter().any(|e| lost(e, barriers));
             if self.sharing {
                 self.foreign.extend(settled.events);
             }
             if group_lost {
-                return Err(ApplyError::GroupLost);
+                return Err(self.group_lost());
             }
         }
         Ok(())

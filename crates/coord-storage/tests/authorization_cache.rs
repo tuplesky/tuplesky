@@ -2,11 +2,14 @@
 //! lead 15:27; `coord_storage::authorizations`).
 //!
 //! * A session's commands execute under one load of its context until a
-//!   landing writes a session or policy row, and the next command loads
-//!   it again.
+//!   landing writes its session's record or a rule; another session's
+//!   establishment leaves it (#279's review, debt 4).
 //! * Within an execution group, a command reads a session the group's
-//!   own earlier command established, and the session already cached
-//!   loads again after it.
+//!   own earlier command established.
+//! * A session executes in each namespace under that namespace's rules
+//!   (#279's review, debt 1).
+//! * A group the journal refuses empties the cache (#279's review, debt
+//!   2).
 //! * Debug builds check every cached context against the view, so a
 //!   write that goes around the applier is caught at the next command
 //!   that uses the context, and `forget_authorizations` is what such a
@@ -25,8 +28,8 @@ use coord_state::policy::{Action, KeyInterval, PolicyRule};
 use coord_state::{Outcome, Response};
 use coord_storage::journaled::{JournalLimits, JournaledStore, TransitionKind};
 use coord_storage::policy::{bootstrap_session, bootstrap_trust_rule, rule_update};
-use coord_storage::{Applier, GroupLimits, JournaledDomain, Persistence, StoreWorker};
-use coord_store_testkit::journal::ModelJournal;
+use coord_storage::{Applier, ApplyError, GroupLimits, JournaledDomain, Persistence, StoreWorker};
+use coord_store_testkit::journal::{AppendScript, ModelJournal};
 use coord_store_testkit::model::ModelEngine;
 use coord_types::identity::Digest32;
 use coord_types::ids::*;
@@ -60,23 +63,40 @@ fn key(session: SessionId, seq: u64) -> RetryKey {
 }
 
 fn request(op: CanonicalOperation) -> LogicalRequest {
-    let mut r = LogicalRequest::new(NS, op);
+    request_in(NS, op)
+}
+
+fn request_in(namespace: NamespaceId, op: CanonicalOperation) -> LogicalRequest {
+    let mut r = LogicalRequest::new(namespace, op);
     r.canonicalize();
     r
 }
 
-fn put(k: &[u8]) -> LogicalRequest {
-    request(CanonicalOperation::Put(PutOp {
-        key: k.to_vec(),
-        value: b"v".to_vec(),
-        lease: None,
-        prev_kv: false,
-    }))
+fn put_in(namespace: NamespaceId, k: &[u8]) -> LogicalRequest {
+    request_in(
+        namespace,
+        CanonicalOperation::Put(PutOp {
+            key: k.to_vec(),
+            value: b"v".to_vec(),
+            lease: None,
+            prev_kv: false,
+        }),
+    )
 }
 
 /// An ordinary command under `session`.
 fn command(session: SessionId, seq: u64, k: &[u8]) -> (CommandId, PayloadRecordV1) {
-    let request = put(k);
+    command_in(NS, session, seq, k)
+}
+
+/// A put in `namespace` under `session`.
+fn command_in(
+    namespace: NamespaceId,
+    session: SessionId,
+    seq: u64,
+    k: &[u8],
+) -> (CommandId, PayloadRecordV1) {
+    let request = put_in(namespace, k);
     (
         CommandId::derive(&key(session, seq), &request).unwrap(),
         PayloadRecordV1 {
@@ -129,12 +149,16 @@ fn establishment(session: SessionId, receipt: u8) -> (CommandId, PayloadRecordV1
 }
 
 fn rule(id: u8, action: Action) -> StoreUpdate {
+    rule_in(NS, id, action)
+}
+
+fn rule_in(namespace: NamespaceId, id: u8, action: Action) -> StoreUpdate {
     rule_update(
         &PolicyRuleId([id; 16]),
         &PolicyRule {
             principal: ALICE,
             action,
-            namespace: NS,
+            namespace,
             interval: KeyInterval::all(),
         },
     )
@@ -234,20 +258,32 @@ fn a_session_executes_under_one_load_until_a_landing_writes_its_rows() {
     let stats = applier.authorization_cache();
     assert_eq!((stats.loads, stats.hits, stats.cleared), (1, 3, 0));
 
-    // Establishing another session writes a session row: whatever was
-    // kept goes, and the next command loads its context again.
+    // Establishing another session writes that session's row, which no
+    // context of SESSION reads: SESSION's context stays, and OTHER's
+    // first command loads its own (#279's review, debt 4).
     let (id, payload) = establishment(OTHER, 9);
     assert_eq!(
         outcome(&applier.apply_staged(id, &payload).unwrap().response),
         Outcome::SessionCreated { session: OTHER }
     );
-    assert_eq!(applier.authorization_cache().cleared, 1);
+    let stats = applier.authorization_cache();
+    assert_eq!((stats.cleared, stats.forgotten), (0, 0));
     let (id, payload) = command(SESSION, 5, b"after");
     written(&applier.apply_staged(id, &payload).unwrap());
     let (id, payload) = command(OTHER, 1, b"other");
     written(&applier.apply_staged(id, &payload).unwrap());
+    let (id, payload) = command(OTHER, 2, b"other again");
+    written(&applier.apply_staged(id, &payload).unwrap());
     let stats = applier.authorization_cache();
-    assert_eq!((stats.loads, stats.hits), (3, 3));
+    assert_eq!((stats.loads, stats.hits), (2, 5));
+
+    // A rule written empties the cache: the next command loads again.
+    write_around(&mut applier, rule(0x40, Action::Read));
+    applier.forget_authorizations();
+    assert_eq!(applier.authorization_cache().cleared, 1);
+    let (id, payload) = command(SESSION, 6, b"after the rule");
+    written(&applier.apply_staged(id, &payload).unwrap());
+    assert_eq!(applier.authorization_cache().loads, 3);
 }
 
 #[test]
@@ -275,10 +311,61 @@ fn a_group_reads_the_session_its_own_earlier_command_established() {
     written(&applied[2]);
     written(&applied[3]);
     written(&applied[4]);
-    // SESSION loaded, the establishment emptied the cache, SESSION
-    // loaded again, OTHER loaded once and then kept.
+    // SESSION loaded and kept through OTHER's establishment, OTHER
+    // loaded once over the group's own row and then kept.
     let stats = applier.authorization_cache();
-    assert_eq!((stats.loads, stats.hits, stats.cleared), (3, 1, 1));
+    assert_eq!(
+        (stats.loads, stats.hits, stats.cleared, stats.forgotten),
+        (2, 2, 0, 0)
+    );
+}
+
+/// One session in two namespaces whose rules differ: each command
+/// executes under its own namespace's rules, whichever was loaded first
+/// (#279's review, debt 1). The key holds the namespace.
+#[test]
+fn a_session_executes_in_each_namespace_under_that_namespaces_rules() {
+    const ELSEWHERE: NamespaceId = NamespaceId([6; 16]);
+    let mut applier = worker();
+    // Alice may only read in ELSEWHERE.
+    write_around(&mut applier, rule_in(ELSEWHERE, 0x50, Action::Read));
+    applier.forget_authorizations();
+    for round in 0..2u64 {
+        let (id, payload) = command_in(NS, SESSION, 2 * round + 1, b"here");
+        written(&applier.apply_staged(id, &payload).unwrap());
+        let (id, payload) = command_in(ELSEWHERE, SESSION, 2 * round + 2, b"there");
+        assert_eq!(
+            outcome(&applier.apply_staged(id, &payload).unwrap().response),
+            Outcome::ErrPermissionDenied,
+            "round {round}"
+        );
+    }
+    let stats = applier.authorization_cache();
+    assert_eq!((stats.loads, stats.hits), (2, 2));
+}
+
+/// A group the journal refuses is lost, and the contexts its commands
+/// loaded go with it (#279's review, debt 2): the cache does not rest on
+/// the voter stopping after the loss.
+#[test]
+fn a_lost_group_empties_the_cache() {
+    let mut applier = journaled();
+    let items = [establishment(OTHER, 9), command(OTHER, 1, b"a")];
+    support::stage_all(applier.store_mut(), &items);
+    applier
+        .store_mut()
+        .store_mut()
+        .journal_mut()
+        .unwrap()
+        .script_append(AppendScript::DefinitelyNotCommitted);
+    assert!(applier.begin_group());
+    for (id, payload) in &items {
+        applier.apply(*id, payload).expect("applied");
+    }
+    let before = applier.authorization_cache();
+    assert_eq!((before.loads, before.cleared), (1, 0));
+    assert!(matches!(applier.finish_group(), Err(ApplyError::GroupLost)));
+    assert_eq!(applier.authorization_cache().cleared, 1);
 }
 
 /// A rule written around the applier, as a test's bootstrap or a tool
