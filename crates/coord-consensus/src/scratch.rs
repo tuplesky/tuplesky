@@ -157,9 +157,33 @@ pub enum Region {
     Retained,
     /// A frontend's re-offers and solicits (row 8).
     Reoffer,
+    /// The leader's `propose`: the request's decode, its logical form and
+    /// its id (structural floors, 09:13 item 3).
+    LDecode,
+    /// The leader's `propose`: its three rows encoded and the batch.
+    LRows,
+    /// The leader's `propose`: the follower copies queued for frames.
+    LFrameQ,
+    /// The leader's `propose`: the leader reply encoded and retained.
+    LReply,
+    /// The leader's `propose`: its vote set and proposal kept.
+    LVoteSet,
+    /// The leader's peer frames (decode and count of every vote).
+    LPeer,
+    /// The leader's frame acknowledgements, expanded or counted ([`ffloor`]).
+    LFrameAck,
+    /// The voter's intake of a submission before the machine (`on_submission`).
+    LIntake,
+    /// A follower's frame at the floor ([`ffloor`]): one batch, one ack.
+    FFloor,
+    /// The domain loop's `turn`, whole.
+    Turn,
+    /// The domain loop's `turn`: the machine's work in it (local
+    /// submissions, `follow_machine`, `carry`); the rest is housekeeping.
+    TurnWork,
 }
 
-const REGIONS: usize = Region::Reoffer as usize + 1;
+const REGIONS: usize = Region::TurnWork as usize + 1;
 const NAMES: [&str; REGIONS] = [
     "f_frame",
     "f_advance",
@@ -178,6 +202,17 @@ const NAMES: [&str; REGIONS] = [
     "seal",
     "retained",
     "reoffer",
+    "l_decode",
+    "l_rows",
+    "l_frameq",
+    "l_reply",
+    "l_voteset",
+    "l_peer",
+    "l_frame_ack",
+    "l_intake",
+    "f_floor",
+    "turn",
+    "turn_work",
 ];
 
 #[allow(clippy::declare_interior_mutable_const)]
@@ -276,4 +311,77 @@ pub fn hop() -> bool {
 /// Set [`hop`].
 pub fn set_hop(on: bool) {
     HOP.store(on, Ordering::Relaxed);
+}
+
+static FFLOOR: AtomicBool = AtomicBool::new(false);
+static FFLOOR_ON: AtomicBool = AtomicBool::new(false);
+static LVOTE: AtomicBool = AtomicBool::new(false);
+
+/// The follower floor (`COORDD_X_FFLOOR`, structural floors item 1): the
+/// leader always sends a proposal frame, with its frame number after the
+/// message, and keeps the frame's commands; a follower whose floor is on
+/// ([`ffloor_on`]) journals the frame's bytes as one batch and sends one
+/// acknowledgement for it, and does nothing per command; the leader
+/// expands that acknowledgement into the commands' votes.
+pub fn ffloor() -> bool {
+    FFLOOR.load(Ordering::Relaxed)
+}
+
+/// Set [`ffloor`].
+pub fn set_ffloor(on: bool) {
+    FFLOOR.store(on, Ordering::Relaxed);
+}
+
+/// Whether this follower is at its floor now (past the warm-up).
+pub fn ffloor_on() -> bool {
+    FFLOOR_ON.load(Ordering::Relaxed)
+}
+
+/// Set [`ffloor_on`]; whether it changed.
+pub fn set_ffloor_on(on: bool) -> bool {
+    FFLOOR_ON.swap(on, Ordering::Relaxed) != on
+}
+
+/// The leader's votes counted once a frame (`COORDD_X_LVOTE`, item 3,
+/// with [`ffloor`]): a frame acknowledgement raises the follower's
+/// acknowledged sequence number, and the commands up to the quorum's
+/// are counted in one step, not one vote each.
+pub fn lvote() -> bool {
+    LVOTE.load(Ordering::Relaxed)
+}
+
+/// Set [`lvote`].
+pub fn set_lvote(on: bool) {
+    LVOTE.store(on, Ordering::Relaxed);
+}
+
+/// The first byte of a follower's frame acknowledgement: past every
+/// `ProtocolMessage` tag, so nothing decodes it as a message.
+pub const FRAME_ACK_TAG: u8 = 0xF7;
+
+/// A frame acknowledgement for the leader's frame `number`.
+pub fn frame_ack(number: u64) -> alloc::vec::Vec<u8> {
+    let mut out = alloc::vec::Vec::with_capacity(9);
+    out.push(FRAME_ACK_TAG);
+    out.extend_from_slice(&number.to_le_bytes());
+    out
+}
+
+/// The frame number of a frame acknowledgement.
+pub fn frame_ack_number(frame: &[u8]) -> Option<u64> {
+    if frame.len() == 9 && frame[0] == FRAME_ACK_TAG {
+        Some(u64::from_le_bytes(frame[1..9].try_into().ok()?))
+    } else {
+        None
+    }
+}
+
+/// A proposal frame with its number after it (the leader, with
+/// [`ffloor`]): the message and the number.
+pub fn split_numbered(frame: &[u8]) -> Option<(&[u8], u64)> {
+    if frame.first() != Some(&PROPOSAL_FRAME_TAG) || frame.len() < 9 {
+        return None;
+    }
+    let (message, number) = frame.split_at(frame.len() - 8);
+    Some((message, u64::from_le_bytes(number.try_into().ok()?)))
 }

@@ -1751,10 +1751,17 @@ fn scratch_switches() {
     let prop = on("COORDD_X_PROP");
     let time = on("COORDD_X_TIME");
     let hop = on("COORDD_X_HOP");
+    let ffloor = on("COORDD_X_FFLOOR");
+    let lvote = on("COORDD_X_LVOTE");
     coord_consensus::scratch::set(l2, noc, bar, prop, time);
     coord_consensus::scratch::set_hop(hop);
+    coord_consensus::scratch::set_ffloor(ffloor);
+    coord_consensus::scratch::set_lvote(lvote);
     coord_consensus::scratch::set_clock(scratch_clock);
-    eprintln!("SCRATCH switches: l2={l2} noc={noc} bar={bar} prop={prop} time={time} hop={hop}");
+    eprintln!(
+        "SCRATCH switches: l2={l2} noc={noc} bar={bar} prop={prop} time={time} hop={hop} \
+         ffloor={ffloor} lvote={lvote}"
+    );
 }
 
 fn scratch_clock() -> u64 {
@@ -3609,6 +3616,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     /// Returns whether anything happened, which is what tells the loop
     /// to come back rather than wait.
     async fn turn(&mut self, api: &Transport) -> Result<bool, DriveError> {
+        let _turn = coord_consensus::scratch::time(coord_consensus::scratch::Region::Turn);
         self.maintain();
         // Reads whose leader did not answer in time are ordered instead
         // (task-d50), on a serving node as on a voting one.
@@ -3619,7 +3627,9 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         let Backing::Voting(voter) = &mut self.backing else {
             return Ok(false);
         };
+        let work = coord_consensus::scratch::time(coord_consensus::scratch::Region::TurnWork);
         let (mut out, refused) = voter.serve_local(self.budgets.local_per_turn)?;
+        drop(work);
         // A projection commit held past its bound, or asked for, goes out
         // now (task-d86): the hand-off is what lends it.
         if voter
@@ -3672,7 +3682,9 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 out.absorb(o);
             }
         }
+        let work = coord_consensus::scratch::time(coord_consensus::scratch::Region::TurnWork);
         out.absorb(voter.follow_machine()?);
+        drop(work);
         // Lowering in groups, commands are applied when the loop flushes,
         // with whatever else became executable by then (task-d47).
         if !voter.node().lowers_in_groups() {
@@ -3938,7 +3950,9 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         }
         // What this turn executed may be what a held read waited for.
         out.absorb(voter.pump_reads(now));
+        let work = coord_consensus::scratch::time(coord_consensus::scratch::Region::TurnWork);
         self.carry(api, out, provenance);
+        drop(work);
         // A submission is the only thing that can say where this voter's
         // evidence for a command belongs, so whatever was waiting for
         // one is tried again here.

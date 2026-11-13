@@ -295,6 +295,13 @@ fn config(dir: &Path, options: &JournalOptions) -> Result<Config, OpenError> {
         // records from an earlier use.
         enable_log_recycle: false,
         prefill_for_recycle: false,
+        // SCRATCH (structural floors, item 4): LZ4 on a batch over 8 KiB
+        // is raft-engine's default; `COORDD_X_NOCOMP=1` turns it off.
+        batch_compression_threshold: if std::env::var("COORDD_X_NOCOMP").is_ok_and(|v| v == "1") {
+            ReadableSize(0)
+        } else {
+            Config::default().batch_compression_threshold
+        },
         ..Config::default()
     })
 }

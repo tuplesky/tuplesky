@@ -2506,13 +2506,22 @@ impl<P: Persistence> Node<P> {
             // at every voter or at followers only, which then stop
             // executing too.
             let executed_through = self.machine().executed_through().get();
-            if let Some(after) = coord_storage::scratch::store_off_after() {
-                coord_storage::scratch::set_no_mat(executed_through >= after);
+            let store_off = coord_storage::scratch::store_off_after()
+                .is_some_and(|after| executed_through >= after);
+            if coord_storage::scratch::store_off_after().is_some() {
+                coord_storage::scratch::set_no_mat(store_off);
             }
             if let Some(after) = coord_storage::scratch::followers_idle_after() {
                 let idle = !self.machine().leads() && executed_through >= after;
-                coord_storage::scratch::set_no_mat(idle);
+                // Builds 1 and 2 together: storage off at every voter, and
+                // followers idle (structural floors on build 1).
+                coord_storage::scratch::set_no_mat(idle || store_off);
                 coord_storage::scratch::set_stale_reads(idle);
+                if coord_consensus::scratch::ffloor()
+                    && coord_consensus::scratch::set_ffloor_on(idle)
+                {
+                    eprintln!("SCRATCH follower floor {idle}");
+                }
                 if idle {
                     if self.applier.in_group() {
                         out.absorb(self.close_group(&mut held, ballot)?);

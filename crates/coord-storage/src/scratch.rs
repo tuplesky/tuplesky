@@ -58,18 +58,24 @@ pub fn set_stale_reads(on: bool) {
 ///   `NO_GATE=1`);
 /// - `2`: followers journal and vote only (`FOLLOWERS_IDLE_AFTER=10000`);
 /// - `3`: the leader's hold (`HOLD_N=32`, `HOLD_US=2000`);
-/// - `5`: builds 1 and 3 together.
+/// - `5`: builds 1 and 3 together;
+/// - `6`: build 1 with the follower floor (`FOLLOWERS_IDLE_AFTER=10000`,
+///   `FFLOOR=1`; structural floors, 09:13 item 1);
+/// - `7`: build 6 with the leader's votes once a frame (`LVOTE=1`, item 3).
 pub fn x_var(name: &str) -> Option<String> {
     if let Ok(v) = std::env::var(name) {
         return Some(v);
     }
     let build = std::env::var("COORDD_X_BUILD").ok()?;
-    let storage_off = matches!(build.as_str(), "1" | "5");
+    let storage_off = matches!(build.as_str(), "1" | "5" | "6" | "7");
+    let floor = matches!(build.as_str(), "6" | "7");
     let hold = matches!(build.as_str(), "3" | "5");
     let v = match name {
         "COORDD_X_MEM_EXEC" | "COORDD_X_NO_GATE" if storage_off => "1",
         "COORDD_X_STORE_OFF_AFTER" if storage_off => "10000",
-        "COORDD_X_FOLLOWERS_IDLE_AFTER" if build == "2" => "10000",
+        "COORDD_X_FOLLOWERS_IDLE_AFTER" if build == "2" || floor => "10000",
+        "COORDD_X_FFLOOR" if floor => "1",
+        "COORDD_X_LVOTE" if build == "7" => "1",
         "COORDD_X_HOLD_N" if hold => "32",
         "COORDD_X_HOLD_US" if hold => "2000",
         _ => return None,

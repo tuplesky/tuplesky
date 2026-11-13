@@ -707,6 +707,22 @@ pub struct Leader {
     /// since the release left the machine as an effect and nothing here
     /// kept it.
     release_again: Vec<(CommandId, RetryKey, Digest32)>,
+    /// SCRATCH (structural floors): frames sent numbered, and the counts
+    /// a frame acknowledgement moves.
+    x_floor: XFloor,
+}
+
+/// SCRATCH (structural floors, 09:13 items 1 and 3): each frame sent with
+/// [`crate::scratch::ffloor`], by number, with its voter and commands; and,
+/// with [`crate::scratch::lvote`], each follower's highest acknowledged
+/// sequence number and the commands not yet counted, by sequence number.
+#[derive(Debug, Default)]
+struct XFloor {
+    next: u64,
+    frames: BTreeMap<u64, (ReplicaId, Vec<(CommandId, Digest32, u64)>)>,
+    acked: BTreeMap<ReplicaId, (u64, CommandId)>,
+    counted: u64,
+    by_seq: BTreeMap<u64, (CommandId, Digest32)>,
 }
 
 /// This leader's adoption of its own order, published and waiting on the
@@ -808,6 +824,7 @@ impl Leader {
             frames: BTreeMap::new(),
             sent_bytes: SentBytes::default(),
             release_again: Vec::new(),
+            x_floor: XFloor::default(),
             config,
             boot: None,
             alloc: None,
@@ -979,6 +996,7 @@ impl Leader {
             frames: BTreeMap::new(),
             sent_bytes: SentBytes::default(),
             release_again: Vec::new(),
+            x_floor: XFloor::default(),
         };
         // Dependency order among the entries: a command follows every
         // dependency that is itself an entry. A cycle is an invariant
@@ -2583,7 +2601,16 @@ impl Leader {
         mut chunk: Vec<FramedProposal>,
     ) {
         let count = chunk.len() as u64;
-        let message = if chunk.len() == 1 {
+        let ff = crate::scratch::ffloor();
+        let numbered: Vec<(CommandId, Digest32, u64)> = if ff {
+            chunk
+                .iter()
+                .map(|e| (e.command, e.admission, e.seqnum))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let message = if chunk.len() == 1 && !ff {
             let entry = chunk.pop().expect("one");
             let (vote, payload) = entry.into_vote(self.config.identity.replica, ballot);
             match payload {
@@ -2600,7 +2627,23 @@ impl Leader {
             }
         };
         let payload_bytes = message_payload_bytes(&message);
-        let frame = message.encode();
+        let mut frame = message.encode();
+        if ff {
+            let number = self.x_floor.next;
+            self.x_floor.next += 1;
+            frame.extend_from_slice(&number.to_le_bytes());
+            if crate::scratch::lvote() {
+                for (c, a, s) in &numbered {
+                    if *s > self.x_floor.counted {
+                        self.x_floor.by_seq.entry(*s).or_insert((*c, *a));
+                    }
+                }
+            }
+            self.x_floor.frames.insert(number, (voter, numbered));
+            while self.x_floor.frames.len() > 1 << 16 {
+                self.x_floor.frames.pop_first();
+            }
+        }
         self.sent_bytes.proposals += count;
         self.sent_bytes.proposal_bytes += (frame.len() - payload_bytes) as u64;
         self.sent_bytes.payload_bytes += payload_bytes as u64;
@@ -3004,6 +3047,7 @@ impl Leader {
             }
             return Vec::new();
         }
+        let decoded = crate::scratch::time(crate::scratch::Region::LDecode);
         let request = match decode_stream(frame).as_deref() {
             Ok([MessageV1::Request(r)]) => r.clone(),
             _ => {
@@ -3019,6 +3063,7 @@ impl Leader {
             self.rejections.push(Rejection::MalformedRequest);
             return Vec::new();
         };
+        drop(decoded);
         self.admitted = Some(command);
         if self.mark_next_admitted {
             self.answer_on_release.insert(command);
@@ -3146,6 +3191,7 @@ impl Leader {
             .expect("just initialized")
             .clone();
         let barrier = self.alloc.as_mut().expect("booted").allocate();
+        let rows = crate::scratch::time(crate::scratch::Region::LRows);
         let updates: Vec<StoreUpdate> = alloc::vec![
             payload_update(&command, &payload).expect("bounded"),
             dependency_update(epoch, &command, &record).expect("bounded"),
@@ -3166,6 +3212,7 @@ impl Leader {
             base: None,
             updates: updates.clone(),
         });
+        drop(rows);
         self.ledger.stage(barrier, command, record);
         let proposal = FastAck {
             replica: self.config.identity.replica,
@@ -3182,6 +3229,7 @@ impl Leader {
         // proposal leaves now, and its sync runs beside this leader's
         // (task-d98); every other copy waits for the batch. The leader
         // reply below always does: it is this leader's fast vote.
+        let frameq = crate::scratch::time(crate::scratch::Region::LFrameQ);
         let sends = self.proposal_sends(barrier);
         let early = sends.iter().any(|(_, requires)| requires.is_empty());
         let message = self.proposal_message(proposal.clone());
@@ -3216,6 +3264,8 @@ impl Leader {
                 });
             }
         }
+        drop(frameq);
+        let replied = crate::scratch::time(crate::scratch::Region::LReply);
         let outbox = self.outbox.as_mut().expect("booted");
         // A command its collector answers on the release alone gets no
         // reply: nothing at the collector counts it (task-d100, step A).
@@ -3248,6 +3298,8 @@ impl Leader {
                 &self.table,
             );
         }
+        drop(replied);
+        let voteset = crate::scratch::time(crate::scratch::Region::LVoteSet);
         // The leader's own acknowledgement counts toward learning later.
         let mut set = VoteSet::new(self.config.quorum.clone(), command);
         set.add(Vote::Fast(proposal)).expect("leader proposal");
@@ -3269,6 +3321,7 @@ impl Leader {
             published: true,
             sent: None,
         });
+        drop(voteset);
         // The row is ACCEPT at this ballot: once it is durable, it is this
         // leader's adoption of its own order.
         if accepts {
@@ -3883,6 +3936,13 @@ impl Leader {
     }
 
     fn on_peer(&mut self, from: PeerId, frame: &[u8]) -> Vec<Effect> {
+        if crate::scratch::ffloor()
+            && let Some(number) = crate::scratch::frame_ack_number(frame)
+        {
+            let _timed = crate::scratch::time(crate::scratch::Region::LFrameAck);
+            return self.x_frame_ack(from.replica, number);
+        }
+        let _timed = crate::scratch::time(crate::scratch::Region::LPeer);
         let Ok(message) = ProtocolMessage::decode(frame) else {
             self.rejections.push(Rejection::MalformedPeerMessage);
             return Vec::new();
@@ -4121,6 +4181,73 @@ impl Leader {
         for e in refused {
             self.rejections.push(Rejection::Vote(e));
         }
+    }
+
+    /// SCRATCH (structural floors): a follower's acknowledgement of frame
+    /// `number`. With [`crate::scratch::lvote`] it raises the follower's
+    /// acknowledged sequence number and counts the commands up to the slow
+    /// quorum's in one step; without, it is expanded into the frame's
+    /// votes, each counted as today (Section 6.7's leader side).
+    fn x_frame_ack(&mut self, from: ReplicaId, number: u64) -> Vec<Effect> {
+        let Some((voter, entries)) = self.x_floor.frames.remove(&number) else {
+            return Vec::new();
+        };
+        if voter != from {
+            return Vec::new();
+        }
+        let ballot = self.config.quorum.ballot();
+        if !crate::scratch::lvote() {
+            let mut out = Vec::new();
+            for (command, admission, _) in entries {
+                out.extend(self.collect(
+                    from,
+                    Vote::Slow(SlowAck {
+                        replica: from,
+                        ballot,
+                        command,
+                        admission,
+                    }),
+                ));
+            }
+            return out;
+        }
+        if let Some(last) = entries.iter().max_by_key(|e| e.2) {
+            raise(&mut self.x_floor.acked, from, (last.2, last.0));
+            raise(&mut self.adopted_through, from, (last.2, last.0));
+        }
+        let need = self.config.quorum.slow_size().saturating_sub(1).max(1);
+        let mut acked: Vec<(u64, ReplicaId)> =
+            self.x_floor.acked.iter().map(|(r, (s, _))| (*s, *r)).collect();
+        if acked.len() < need {
+            return Vec::new();
+        }
+        acked.sort_unstable_by(|a, b| b.cmp(a));
+        let frontier = acked[need - 1].0;
+        if frontier <= self.x_floor.counted {
+            return Vec::new();
+        }
+        let voters: Vec<ReplicaId> = acked
+            .iter()
+            .take_while(|(s, _)| *s >= frontier)
+            .map(|(_, r)| *r)
+            .collect();
+        let rest = self.x_floor.by_seq.split_off(&(frontier + 1));
+        let range = core::mem::replace(&mut self.x_floor.by_seq, rest);
+        self.x_floor.counted = frontier;
+        for (command, admission) in range.into_values() {
+            if let Some(set) = self.votes.get_mut(&command) {
+                for v in &voters {
+                    let _ = set.add(Vote::Slow(SlowAck {
+                        replica: *v,
+                        ballot,
+                        command,
+                        admission,
+                    }));
+                }
+            }
+        }
+        self.learn();
+        self.release_ready()
     }
 
     fn collect(&mut self, from: ReplicaId, vote: Vote) -> Vec<Effect> {

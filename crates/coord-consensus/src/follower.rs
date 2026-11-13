@@ -6573,6 +6573,41 @@ impl Follower {
         out
     }
 
+    /// SCRATCH (structural floors, item 1): one batch of the frame's bytes
+    /// and one acknowledgement, released when the batch is durable.
+    fn x_floor_frame(&mut self, message: &[u8], number: u64) -> Vec<Effect> {
+        let (Some(boot), Some(alloc)) = (self.boot, self.alloc.as_mut()) else {
+            return Vec::new();
+        };
+        let barrier = alloc.allocate();
+        let mut key = alloc::vec![crate::scratch::FRAME_ACK_TAG];
+        key.extend_from_slice(&number.to_be_bytes());
+        let persist = Effect::Persist(PersistBatch {
+            barrier,
+            base: None,
+            updates: alloc::vec![StoreUpdate {
+                collection: coord_store_api::registry::Collection::ProtocolV1.id(),
+                key,
+                value: Some(message.to_vec()),
+            }],
+        });
+        let ballot = self.config.quorum.ballot();
+        let context = self.ballots.context(boot, ballot, LocalJournalSeq::ZERO);
+        let leader = self.config.quorum.leader();
+        if let Some(outbox) = self.outbox.as_mut() {
+            outbox.publish(PendingSend {
+                context,
+                requires: alloc::vec![barrier],
+                to: PeerId {
+                    replica: leader,
+                    incarnation: ReplicaIncarnation::ZERO,
+                },
+                frame: crate::scratch::frame_ack(number),
+            });
+        }
+        alloc::vec![persist]
+    }
+
     fn release(&mut self) -> Vec<Effect> {
         let promised = self.ballots.promised();
         self.outbox
@@ -6581,6 +6616,21 @@ impl Follower {
     }
 
     fn on_peer(&mut self, from: PeerId, frame: &[u8]) -> Vec<Effect> {
+        // SCRATCH (structural floors, item 1): the leader's frames carry
+        // their number; a follower at its floor journals the frame's bytes
+        // as one batch and acknowledges it once, and reads nothing else.
+        let mut frame = frame;
+        if crate::scratch::ffloor() {
+            if let Some((message, number)) = crate::scratch::split_numbered(frame) {
+                if crate::scratch::ffloor_on() {
+                    let _timed = crate::scratch::time(crate::scratch::Region::FFloor);
+                    return self.x_floor_frame(message, number);
+                }
+                frame = message;
+            } else if crate::scratch::ffloor_on() {
+                return Vec::new();
+            }
+        }
         let decoded = crate::scratch::time(crate::scratch::Region::FDecode);
         let message = ProtocolMessage::decode(frame);
         drop(decoded);

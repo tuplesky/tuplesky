@@ -1378,7 +1378,14 @@ impl Transport {
         binder: Arc<dyn IdentityBinder>,
         limits: Limits,
     ) -> Result<Transport, TransportError> {
-        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+        // SCRATCH (lead 10:43 (4)): AES-128-GCM alone.
+        if crate::xswitch::aes128() {
+            provider.cipher_suites.retain(|s| {
+                s.suite() == rustls::CipherSuite::TLS13_AES_128_GCM_SHA256
+            });
+        }
+        let provider = Arc::new(provider);
         let server_config = server_config(
             &provider,
             &local.roots,
@@ -1479,6 +1486,33 @@ impl Transport {
             }),
         });
         tokio::spawn(accept_loop(endpoint.clone(), shared.clone()));
+        // SCRATCH (lead 10:43): QUIC's own counts by connection kind.
+        if crate::xswitch::qsplit() {
+            let weak = Arc::downgrade(&shared);
+            let local = endpoint.local_addr().map(|a| a.port()).unwrap_or(0);
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    let Some(shared) = weak.upgrade() else { return };
+                    let mut sums: std::collections::BTreeMap<String, crate::xswitch::QuicSum> =
+                        std::collections::BTreeMap::new();
+                    for peer in shared.peers.lock().unwrap().values() {
+                        let kind = format!(
+                            "{:?}-{:?}-{}",
+                            peer.class,
+                            peer.identity.role,
+                            if peer.accepted { "in" } else { "out" }
+                        );
+                        sums.entry(kind).or_default().add(&peer.conn.stats());
+                    }
+                    let mut line = format!("x-quic port={local}");
+                    for (kind, sum) in &sums {
+                        line.push_str(&sum.line(kind));
+                    }
+                    eprintln!("{line}");
+                }
+            });
+        }
         Ok(Transport {
             endpoint,
             shared,

@@ -501,7 +501,7 @@ impl<P: Persistence> Voter<P> {
         let before = self.ballot;
         // SCRATCH (class C, row 11): a follower's voter leaves a proposal
         // frame to the follower's own decode.
-        let message = if coord_consensus::scratch::noc()
+        let message = if (coord_consensus::scratch::noc() || coord_consensus::scratch::ffloor())
             && frame.first() == Some(&coord_consensus::scratch::PROPOSAL_FRAME_TAG)
             && matches!(self.node.machine(), Machine::Follower(_))
         {
@@ -669,10 +669,12 @@ impl<P: Persistence> Voter<P> {
         frame: &coord_types::wire_v1::Frame,
         origin: Origin,
     ) -> Result<Result<Outbound, Refused>, DriveError> {
+        let intake = coord_consensus::scratch::time(coord_consensus::scratch::Region::LIntake);
         let admitted = match admitted_from_submit(submitter, frame, self.origin.0, self.origin.1) {
             Ok(a) => a,
             Err(e) => return Ok(Err(Refused::NotAdmissible(e))),
         };
+        drop(intake);
         // The identity the machine derives, taken from it (task-d60, step
         // 3), or derived the same way here where the machine refuses the
         // request before deriving it. A retry rebinds it: the same command
