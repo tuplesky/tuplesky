@@ -137,7 +137,8 @@ pub struct BoundFrontend {
 
 impl BoundFrontend {
     /// Wrap `dispatcher`; `pump_bound` items per watch pump share one
-    /// barrier; `max_requests` request identities are remembered.
+    /// barrier; `max_requests` request identities are remembered beyond
+    /// those whose result the dispatcher can still deliver.
     pub fn new(
         dispatcher: Dispatcher,
         config: BindingConfig,
@@ -170,6 +171,11 @@ impl BoundFrontend {
     /// The dispatcher, mutably (evidence, releases).
     pub const fn dispatcher_mut(&mut self) -> &mut Dispatcher {
         &mut self.dispatcher
+    }
+
+    /// Request identities the gate remembers.
+    pub fn remembered(&self) -> usize {
+        self.requests.len()
     }
 
     /// The binding of `connection`.
@@ -499,8 +505,34 @@ impl BoundFrontend {
         };
         self.requests.insert(key, info);
         self.order.push_back(key);
-        while self.order.len() > self.max_requests {
-            if let Some(old) = self.order.pop_front() {
+        self.forget_settled();
+    }
+
+    /// Forget the oldest records past `max_requests`, but never one whose
+    /// result the dispatcher can still deliver.
+    ///
+    /// The gate authorizes a read's output from this record, so a record
+    /// dropped while its read is outstanding turns an executed read that
+    /// policy permits into `OUTPUT_WITHHELD`. The records are shared by
+    /// every connection on the node, and under load they turn over by
+    /// arrival long before a slow read is answered: at 256 records and 96
+    /// callers a node, any read slower than about 2.7 times the mean.
+    /// What the dispatcher holds is bounded by its own limits (reads
+    /// waiting on a leader, commands pending, results retained), so the
+    /// records stay within `max_requests` plus that.
+    ///
+    /// A record kept goes to the back of the order, so it isn't looked at
+    /// again until the records that were behind it have been.
+    fn forget_settled(&mut self) {
+        let mut kept = 0;
+        while self.order.len() > self.max_requests + kept {
+            let Some(old) = self.order.pop_front() else {
+                break;
+            };
+            if self.dispatcher.holds(&old) {
+                self.order.push_back(old);
+                kept += 1;
+            } else {
                 self.requests.remove(&old);
             }
         }

@@ -1410,3 +1410,60 @@ fn a_read_still_outstanding_when_the_request_memory_turns_over_is_still_disclose
         .answered();
     assert!(!is_denied(&answered), "{:?}", outcome_of(&answered));
 }
+
+#[test]
+fn the_gate_forgets_settled_requests_past_its_bound() {
+    // What the gate keeps past its bound is only what the dispatcher can
+    // still deliver. A retained result answers a retry from the record:
+    // the dispatcher never holds it, so its record goes once the bound
+    // is passed.
+    let ring = ring();
+    let domain = Domain::new();
+    let hub = WatchHub::new(KvRevision::ZERO, KvRevision::ZERO);
+    let mut f = frontend_remembering(&ring, 4);
+    let bind = frame_of(&bind_frame(&token(&ring, SESSION, NOW + 100)).unwrap());
+    let Ingress::Bound(_) = f.on_frame(&clock(NOW), at(NOW), 1, &bind, &hub, &domain.policy())
+    else {
+        panic!()
+    };
+    for seq in 1..=10 {
+        let mut logical = LogicalRequest::new(NS, range(b"secret"));
+        logical.canonicalize();
+        let command = CommandId::derive(&retry_key(seq), &logical).unwrap();
+        let answered = f
+            .deliver_retained(
+                delivery(1, seq, command, range_outcome(b"secret")),
+                command,
+                &logical,
+                &domain.policy(),
+            )
+            .answered();
+        assert!(!is_denied(&answered), "{:?}", outcome_of(&answered));
+        assert!(f.remembered() <= 4, "{} remembered", f.remembered());
+    }
+    // A read the dispatcher holds is kept past the bound.
+    let (read, req) = request(11, range(b"secret"));
+    assert!(matches!(
+        f.on_frame(&clock(NOW), at(NOW), 1, &req, &hub, &domain.policy()),
+        Ingress::Action(Action::FanOut(_))
+    ));
+    for seq in 12..=20 {
+        let mut logical = LogicalRequest::new(NS, range(b"secret"));
+        logical.canonicalize();
+        let command = CommandId::derive(&retry_key(seq), &logical).unwrap();
+        f.deliver_retained(
+            delivery(1, seq, command, range_outcome(b"secret")),
+            command,
+            &logical,
+            &domain.policy(),
+        );
+    }
+    assert!(f.remembered() <= 5, "{} remembered", f.remembered());
+    let answered = f
+        .deliver(
+            delivery(1, 11, read, range_outcome(b"secret")),
+            &domain.policy(),
+        )
+        .answered();
+    assert!(!is_denied(&answered), "{:?}", outcome_of(&answered));
+}
