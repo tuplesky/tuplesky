@@ -656,6 +656,16 @@ jobs:
             if [ "$SWIFTPAXOS_BESIDE" = true ]; then
               swiftpaxos_one "$RUNNER_TEMP/swiftpaxos" "beside TupleSky" "$SWIFTPAXOS_STEPS" || true
             fi
+            # A run without faults is held to whole key groups too; with
+            # faults a thread can wait out a partition past a short key.
+            if [ "$NEMESIS" = none ] && [ -n "$store" ]; then
+              one_runs=("head=$store")
+              if [ "$ETCD_BESIDE" = true ] && [ -n "${etcd_store:-}" ]; then one_runs+=("etcd=$etcd_store"); fi
+              if ! python3 "$ci/jepsen_key_groups.py" "${one_runs[@]}"; then
+                echo "::error::a run's load generator left threads out of its keys or stopped some (Key groups in the summary)"
+                rc=1
+              fi
+            fi
             exit $rc
           fi
           # Paired, or a sweep: TupleSky's sides in turn on this runner,
