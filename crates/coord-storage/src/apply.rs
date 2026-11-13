@@ -439,19 +439,20 @@ impl<P: Persistence> Applier<P> {
     /// Returns whether commands are now being grouped.
     pub fn begin_group(&mut self) -> bool {
         if self.group.is_none() && self.store.chains_applications() {
-            let mut group = Group::default();
             // The projection may not hold the groups still in flight yet,
             // so a command planned now reads through their rows as well,
             // oldest first. A snapshot that already holds some of them
             // reads the same: those rows are the ones it holds, and every
             // later write is laid over them again. Each group's rows are
             // laid as they are, shared, not copied into one overlay.
-            group.below = self
-                .inflight
-                .iter()
-                .map(|flight| Arc::clone(&flight.own))
-                .collect();
-            self.group = Some(group);
+            self.group = Some(Group {
+                below: self
+                    .inflight
+                    .iter()
+                    .map(|flight| Arc::clone(&flight.own))
+                    .collect(),
+                ..Group::default()
+            });
         }
         self.group.is_some()
     }
