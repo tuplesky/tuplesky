@@ -2339,6 +2339,31 @@ def hand_offs_table(voters: dict) -> list[str]:
     return out
 
 
+def gate_table(voters: dict) -> list[str]:
+    """#268's gate counts, each voter's last `metrics` line: the requests
+    the gate denied, those it deferred, and those it remembered. [] from
+    a build without them."""
+    rows = []
+    for node, v in voters.items():
+        raw = (v.cost.raw or {}) if v.cost else {}
+        g = raw.get("gate")
+        if isinstance(g, dict):
+            rows.append((node, g))
+    if not rows:
+        return []
+    out = [
+        "**Gate** (#268, each voter's last boot, from its last `metrics` line: what the gate denied, deferred and "
+        "remembered, cumulative since the voter started)",
+        "",
+        "| Node | Denied | Deferred | Remembered |",
+        "| --- | --- | --- | --- |",
+    ]
+    for node, g in rows:
+        out.append(f"| {node} | {g.get('denied', '-')} | {g.get('deferred', '-')} | {g.get('remembered', '-')} |")
+    out.append("")
+    return out
+
+
 def loop_per_command(voters: dict, follower: str | None = None, leader: str | None = None,
                      sampled: dict | None = None) -> tuple[float | None, float | None]:
     """The leader's loop CPU per command and a follower's, in
@@ -3518,6 +3543,7 @@ def summarize(store: str, nodes: list[str], title: str, profile: str | None = No
             out.extend(resend_table(voters))
             out.extend(relay_table(voters))
             out.extend(hand_offs_table(voters))
+            out.extend(gate_table(voters))
             out.extend(leader_and_follower(store, voters))
             out.extend(transport_tables(store, voters))
     return "\n".join(out) + "\n"

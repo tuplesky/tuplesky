@@ -867,6 +867,16 @@ class CheckpointTests(unittest.TestCase):
                            "flushes": 260, "api_events": 120, "peer_events": 300, "by_events": [0] * 9}
         self.assertIn("| n1 | 10 | 200 | 150 | 30 | 0 | 390 | 1.50 | 0.390 |", self.summarize(line()))
 
+    def test_the_gate(self):
+        cost = {"executed": 1000, "busy": {"secs": 1, "nanos": 0}, "uptime": {"secs": 60, "nanos": 0},
+                "recent": {"Unavailable": "NotInstrumented"}, "reads": {"served": 0}}
+        line = lambda: "metrics " + json.dumps({"stages": [], "cost": {"Observed": cost}}) + "\n"
+        self.assertNotIn("**Gate**", self.summarize(line()))
+        cost["gate"] = {"denied": 3, "deferred": 41, "remembered": 7}
+        text = self.summarize(line())
+        self.assertIn("**Gate** (#268", text)
+        self.assertIn("| n1 | 3 | 41 | 7 |", text)
+
 
 
 class CarryReadingTests(unittest.TestCase):
