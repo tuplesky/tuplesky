@@ -169,7 +169,12 @@ fn response_of(delivery: &Delivery) -> ResponseV1 {
 }
 
 fn provenance(from: ReplicaId, connection: u64) -> PeerProvenance {
-    PeerProvenance::from_transport(from, inc(), connection)
+    PeerProvenance::from_transport(
+        from,
+        inc(),
+        coord_types::wire_v1::PeerRole::Voter,
+        connection,
+    )
 }
 
 #[allow(clippy::large_enum_variant)]

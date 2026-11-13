@@ -374,8 +374,9 @@ pub enum EvidenceError {
     NotEvidence,
     /// A second, different release for the command.
     ReleaseMismatch,
-    /// A refusal from a replica that is not a voter of the current
-    /// configuration (task-d22).
+    /// Evidence from a replica that is not a voter of the current
+    /// configuration (task-d22), or from a link bound under any role but
+    /// a voter's (design Section 10.1).
     NotAVoter {
         /// Sender.
         sender: ReplicaId,
@@ -1355,6 +1356,11 @@ impl Collector {
         message: ProtocolMessage,
     ) -> Result<Progress, EvidenceError> {
         let sender = from.from();
+        // An observer's or learner's link names a replica too, and may
+        // name any; only a voter's is a vote.
+        if !from.is_voter() {
+            return Err(EvidenceError::NotAVoter { sender });
+        }
         let (kind, vote) = match message {
             ProtocolMessage::LeaderReply {
                 ballot,
@@ -1501,6 +1507,9 @@ impl Collector {
         released: ReleasedResult,
     ) -> Result<Progress, EvidenceError> {
         let sender = from.from();
+        if !from.is_voter() {
+            return Err(EvidenceError::NotAVoter { sender });
+        }
         let command = released.established().command();
         let result = self.check_release(sender, &released);
         match result {

@@ -278,6 +278,17 @@ impl IdentityBinder for TestBinder {
         if peer && hello.incarnation != Some(*incarnation) {
             return Err(BindError::IncarnationMismatch);
         }
+        // A non-voter peer never holds a voter's replica identity, as the
+        // production binder refuses one naming a committed voter: here,
+        // a voter registered with this binder.
+        if peer
+            && *role != PeerRole::Voter
+            && self.known.values().any(|(voter, _, known, domain)| {
+                *known == PeerRole::Voter && voter == replica && *domain == self.domain
+            })
+        {
+            return Err(BindError::NonVoterNamesVoter);
+        }
         Ok(BoundIdentity {
             role: *role,
             replica: peer.then_some(*replica),

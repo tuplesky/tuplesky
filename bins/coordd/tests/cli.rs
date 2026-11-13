@@ -1029,6 +1029,32 @@ async fn hello_on_api(
     key: &rcgen::KeyPair,
     role: coord_types::wire_v1::PeerRole,
 ) -> Option<coord_types::wire_v1::MessageV1> {
+    let to = Plane {
+        addr: daemon.api,
+        alpn: coord_transport::ALPN_API,
+        incarnation: None,
+        lane: coord_transport::Lane::Unary,
+    };
+    hello_on(to, ca, certificate, key, role).await
+}
+
+/// Where a raw `Hello` goes: a daemon's plane, the incarnation it
+/// claims and the lane it asks for.
+struct Plane {
+    addr: std::net::SocketAddr,
+    alpn: &'static [u8],
+    incarnation: Option<u64>,
+    lane: coord_transport::Lane,
+}
+
+/// [`hello_on_api`] on any plane.
+async fn hello_on(
+    to: Plane,
+    ca: &Ca,
+    certificate: &rcgen::Certificate,
+    key: &rcgen::KeyPair,
+    role: coord_types::wire_v1::PeerRole,
+) -> Option<coord_types::wire_v1::MessageV1> {
     let mut roots = rustls::RootCertStore::empty();
     roots
         .add(rustls_pki_types::CertificateDer::from(
@@ -1047,14 +1073,14 @@ async fn hello_on_api(
             rustls_pki_types::PrivateKeyDer::Pkcs8(key.serialize_der().into()),
         )
         .expect("client auth");
-    tls.alpn_protocols = vec![coord_transport::ALPN_API.to_vec()];
+    tls.alpn_protocols = vec![to.alpn.to_vec()];
     let mut endpoint =
         quinn::Endpoint::client("127.0.0.1:0".parse().expect("loopback")).expect("client endpoint");
     endpoint.set_default_client_config(quinn::ClientConfig::new(std::sync::Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(tls).expect("quic tls"),
     )));
     let connection = endpoint
-        .connect(daemon.api, SERVER_NAME)
+        .connect(to.addr, SERVER_NAME)
         .expect("dialable")
         .await
         .ok()?;
@@ -1063,11 +1089,11 @@ async fn hello_on_api(
         role,
         cluster_id: coord_types::ids::ClusterId(CLUSTER),
         domain_id: coord_types::ids::DomainId(DOMAIN),
-        incarnation: None,
-        capabilities: coord_types::wire_v1::BoundedVec::new(vec![
-            coord_transport::Lane::Unary.capability(),
-        ])
-        .expect("bounded"),
+        incarnation: to
+            .incarnation
+            .map(|i| coord_types::ids::ReplicaIncarnation::new(i).expect("positive")),
+        capabilities: coord_types::wire_v1::BoundedVec::new(vec![to.lane.capability()])
+            .expect("bounded"),
     })
     .encode()
     .expect("hello");
@@ -1087,6 +1113,83 @@ async fn hello_on_api(
     .expect("the node answered or closed within the bound");
     connection.close(0u32.into(), b"done");
     answered
+}
+
+/// A non-voter peer certificate naming a committed voter is refused at
+/// the handshake (design Section 10.1; the owner's decision on #185).
+/// The issuer may sign an observer's or learner's certificate for any
+/// node its rule lists, and a voter's link and the provenance of every
+/// frame are keyed by the node's replica identity. Such a certificate
+/// used to bind at n3 as n1 over a key genesis never committed: it took
+/// n1's link at n3, and n3 served its catch-up ask and promised its
+/// campaign (#185, 6846891832). Now n3 refuses it, as an observer or a
+/// learner, at n1's committed generation and at another, on either lane
+/// those roles may use, and the cluster keeps answering. An observer's
+/// certificate for a node that is no voter still binds.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_non_voter_certificate_naming_a_voter_is_refused_at_the_handshake() {
+    use coord_transport::Lane;
+    use coord_types::wire_v1::{MessageV1, PeerRole};
+    let dir = workspace("non-voter-naming-a-voter");
+    let cluster = three_voters(&dir);
+    for config in &cluster.configs {
+        assert_eq!(run(config, &["init"]).code, Some(0));
+    }
+    let running: Vec<Running> = cluster.configs.iter().map(|c| start(c)).collect();
+    for node in &running {
+        assert!(
+            node.waits_to_say("peers connected=2 of 2"),
+            "{}",
+            node.said()
+        );
+    }
+    let n3 = |incarnation, lane| Plane {
+        addr: format!("127.0.0.1:{}", cluster.peer[2])
+            .parse()
+            .expect("address"),
+        alpn: coord_transport::ALPN_PEER,
+        incarnation: Some(incarnation),
+        lane,
+    };
+    for role in [PeerRole::Observer, PeerRole::Learner] {
+        for incarnation in [1, 2] {
+            let (certificate, key) =
+                cluster
+                    .ca
+                    .issue_at(SERVER_NAME, CLUSTER, 1, role, incarnation);
+            for lane in [Lane::Control, Lane::Bulk] {
+                let answered =
+                    hello_on(n3(incarnation, lane), &cluster.ca, &certificate, &key, role).await;
+                assert!(
+                    !matches!(answered, Some(MessageV1::HelloAck(_))),
+                    "{role:?} naming n1 at generation {incarnation} bound on {lane:?}"
+                );
+            }
+        }
+    }
+
+    // The control: the same role for a node no voter is known by binds.
+    let (certificate, key) = cluster
+        .ca
+        .issue_at(SERVER_NAME, CLUSTER, 9, PeerRole::Observer, 1);
+    let answered = hello_on(
+        n3(1, Lane::Control),
+        &cluster.ca,
+        &certificate,
+        &key,
+        PeerRole::Observer,
+    )
+    .await;
+    assert!(
+        matches!(answered, Some(MessageV1::HelloAck(_))),
+        "an observer for node 9 was refused: {answered:?}"
+    );
+
+    // And the cluster still answers.
+    let caller = Caller::bind(&running[0], &cluster.ca, &cluster.ring, [0x44; 16]).await;
+    ask(&caller.connection, &caller.put(1, b"k", b"v"))
+        .await
+        .expect("written");
 }
 
 /// A frontend's certificate reaches only the domain it names (design
@@ -2634,6 +2737,7 @@ struct Cluster {
     ring: coord_sts::KeyRing,
     configs: Vec<PathBuf>,
     api: Vec<u16>,
+    peer: Vec<u16>,
 }
 
 fn three_voters(dir: &Path) -> Cluster {
@@ -2792,6 +2896,7 @@ namespace = "5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e"
         ring,
         configs,
         api,
+        peer,
     }
 }
 
@@ -3949,6 +4054,62 @@ fn inspect_reports_the_credential_against_committed_membership_and_starts_nothin
         !refused.err.contains("collector certificate"),
         "refused for the collector's leaf, not the node's: {}",
         refused.err
+    );
+}
+
+/// A node whose own certificate is an observer's naming a committed
+/// voter: `inspect` says so, and the node refuses to start, rather than
+/// starting to be refused by every peer with nothing said on its own
+/// side (design Section 10.1). The same certificate for a node no voter
+/// holds is reported as what it is.
+#[test]
+fn an_observer_certificate_naming_a_committed_voter_is_named_on_its_own_node() {
+    let dir = workspace("observer-names-voter");
+    let voter = credentials(&dir, 1, coord_types::wire_v1::PeerRole::Voter);
+    genesis_of(&dir, 3, Some(&voter.node_spki));
+    let _ = sts_keys(&dir);
+    let path = config_only(&dir);
+    let config = std::fs::read_to_string(&path).expect("config");
+    assert!(config.contains("role = \"voter-frontend-observer\""));
+    std::fs::write(
+        &path,
+        config.replace(
+            "role = \"voter-frontend-observer\"",
+            "role = \"frontend-observer\"",
+        ),
+    )
+    .expect("config");
+
+    let _ = credentials(&dir, 1, coord_types::wire_v1::PeerRole::Observer);
+    let report = run(&path, &["inspect"]);
+    assert_eq!(report.code, Some(0), "{}", report.err);
+    assert!(
+        report
+            .out
+            .contains("role=Observer state=names-a-committed-voter"),
+        "expected the role named:\n{}",
+        report.out
+    );
+    let refused = run(&path, &[]);
+    assert_eq!(refused.code, Some(2), "{}", refused.out);
+    assert!(
+        refused.err.contains("a committed voter"),
+        "refused for another reason: {}",
+        refused.err
+    );
+    assert!(
+        !dir.join("state").exists(),
+        "a refused node created a store"
+    );
+
+    // The control: an observer of a node no voter holds.
+    let _ = credentials(&dir, 9, coord_types::wire_v1::PeerRole::Observer);
+    let report = run(&path, &["inspect"]);
+    assert_eq!(report.code, Some(0), "{}", report.err);
+    assert!(
+        report.out.contains("role=Observer state=not-a-voter"),
+        "{}",
+        report.out
     );
 }
 

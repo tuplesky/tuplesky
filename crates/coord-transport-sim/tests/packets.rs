@@ -629,3 +629,78 @@ fn a_sibling_domains_certificate_is_refused_here_as_the_real_binder_refuses_it()
     .unwrap();
     assert!(w.run_until(20_000, |w| w.connections(0) == 1));
 }
+
+#[test]
+fn a_non_voter_naming_a_voters_replica_is_refused_as_the_real_binder_refuses_it() {
+    // An observer's certificate naming voter 1's replica would be that
+    // voter to the link it is keyed by and to every frame's provenance
+    // (design Section 10.1). The binder refuses a non-voter peer whose
+    // replica is a voter's, and the simulator, holding the same binder,
+    // refuses it where the real adapter does: at the acceptor.
+    let f = fixture(&[PeerRole::Voter, PeerRole::Voter]);
+    let posing =
+        f.ca.issue("node-1-observer", r(1), inc(), PeerRole::Observer);
+    let mut binder = TestBinder::new(CLUSTER, DOMAIN);
+    for id in f.ids.iter().chain([&posing]) {
+        binder.register(id);
+    }
+    let binder = Arc::new(binder);
+    let configs = f
+        .ids
+        .iter()
+        .chain([&posing])
+        .map(|id| NodeConfig {
+            identity: TestIdentity {
+                name: id.name.clone(),
+                replica: id.replica,
+                incarnation: id.incarnation,
+                role: id.role,
+                chain: id.chain.clone(),
+                key: id.key.clone_key(),
+            },
+            roots: f.ca.roots(),
+            cluster: CLUSTER,
+            domain: DOMAIN,
+            binder: binder.clone(),
+            limits: Limits::default(),
+            capabilities: vec![1],
+        })
+        .collect();
+    let mut w = PacketWorld::new([19; 32], configs);
+
+    w.connect(
+        2,
+        0,
+        PeerRole::Observer,
+        Some(inc()),
+        Lane::Control,
+        "node-0",
+        f.ids[0].expected(),
+    )
+    .unwrap();
+    w.run_until(20_000, |w| w.nodes_closed(0) > 0);
+    assert_eq!(w.connections(0), 0, "the observer took voter 1's name");
+    assert!(
+        w.take_events(0).into_iter().any(|e| matches!(
+            e,
+            SimEvent::Closed {
+                reason: CloseReason::Rejected(ref m),
+                ..
+            } if m.contains("NonVoterNamesVoter")
+        )),
+        "the acceptor refuses it by its role"
+    );
+
+    // Voter 1 itself still negotiates.
+    w.connect(
+        1,
+        0,
+        PeerRole::Voter,
+        Some(inc()),
+        Lane::Control,
+        "node-0",
+        f.ids[0].expected(),
+    )
+    .unwrap();
+    assert!(w.run_until(20_000, |w| w.connections(0) == 1));
+}

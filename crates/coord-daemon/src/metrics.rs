@@ -936,6 +936,12 @@ pub struct Traffic {
     /// collectors' (task-d70), so its datagrams split into its two planes.
     #[serde(default)]
     pub api: Datagrams,
+    /// Handshakes refused because an observer's or learner's certificate
+    /// named a committed voter's node (design Section 20.4). Never a
+    /// legitimate peer: above zero, an issuer signed what it never
+    /// should, and an operator has a certificate to revoke.
+    #[serde(default)]
+    pub refused_voter_names: u64,
 }
 
 /// What QUIC sent and received on one class of connections (task-d70).
