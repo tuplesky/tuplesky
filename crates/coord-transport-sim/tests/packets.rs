@@ -525,3 +525,107 @@ fn the_dialer_binds_the_server_certificate_before_it_accepts_the_ack() {
     .unwrap();
     assert!(w.run_until(20_000, |w| w.connections(0) == 1));
 }
+
+#[test]
+fn a_sibling_domains_certificate_is_refused_here_as_the_real_binder_refuses_it() {
+    // A cluster's domains share its issuer, so a sibling domain's node
+    // holds a certificate from the authority every node here trusts, and
+    // TLS succeeding says nothing about which domain it is for. The
+    // binder takes the domain from the credential, never from the Hello
+    // (Codex's P1 on #267), and the simulator refuses it where the real
+    // adapter does: at the acceptor, and at a dialer that reached it.
+    let sibling = DomainId([3; 16]);
+    let f = fixture(&[PeerRole::Voter, PeerRole::Voter, PeerRole::Observer]);
+    let mut binder = TestBinder::new(CLUSTER, DOMAIN);
+    binder.register(&f.ids[0]);
+    binder.register(&f.ids[1]);
+    binder.register_in(&f.ids[2], sibling);
+    let expected: Vec<BoundIdentity> = f.ids.iter().map(TestIdentity::expected).collect();
+    let binder = Arc::new(binder);
+    let configs = f
+        .ids
+        .iter()
+        .map(|id| NodeConfig {
+            identity: TestIdentity {
+                name: id.name.clone(),
+                replica: id.replica,
+                incarnation: id.incarnation,
+                role: id.role,
+                chain: id.chain.clone(),
+                key: id.key.clone_key(),
+            },
+            roots: f.ca.roots(),
+            cluster: CLUSTER,
+            domain: DOMAIN,
+            binder: binder.clone(),
+            limits: Limits::default(),
+            capabilities: vec![1],
+        })
+        .collect();
+    let mut w = PacketWorld::new([17; 32], configs);
+    let refused = |events: Vec<SimEvent>, what: &str| {
+        events.into_iter().any(|e| {
+            matches!(
+                e,
+                SimEvent::Closed {
+                    reason: CloseReason::Rejected(ref m),
+                    ..
+                } if m.contains(what)
+            )
+        })
+    };
+
+    // The sibling's observer dials a voter here, naming this domain.
+    w.connect(
+        2,
+        0,
+        PeerRole::Observer,
+        Some(inc()),
+        Lane::Control,
+        "node-0",
+        expected[0].clone(),
+    )
+    .unwrap();
+    w.run_until(20_000, |w| w.nodes_closed(0) > 0);
+    assert_eq!(
+        w.connections(0),
+        0,
+        "the sibling's observer is no peer here"
+    );
+    assert!(
+        refused(w.take_events(0), "DomainMismatch"),
+        "the acceptor refuses the sibling's certificate by its domain"
+    );
+
+    // A voter here dials the sibling's node: its certificate is refused
+    // by the dialer's own binding.
+    w.connect(
+        0,
+        2,
+        PeerRole::Voter,
+        Some(inc()),
+        Lane::Control,
+        "node-2",
+        expected[2].clone(),
+    )
+    .unwrap();
+    w.run_until(20_000, |w| w.nodes_closed(0) > 0);
+    assert_eq!(w.connections(0), 0, "the sibling's node is no peer here");
+    assert!(
+        refused(w.take_events(0), "identity"),
+        "the dialer refuses the server's certificate by its domain"
+    );
+
+    // This domain's own voters still negotiate.
+    w.connect(
+        1,
+        0,
+        PeerRole::Voter,
+        Some(inc()),
+        Lane::Control,
+        "node-0",
+        expected[0].clone(),
+    )
+    .unwrap();
+    assert!(w.run_until(20_000, |w| w.connections(0) == 1));
+}

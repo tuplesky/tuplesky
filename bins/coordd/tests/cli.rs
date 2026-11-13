@@ -250,13 +250,40 @@ impl Ca {
         role: coord_types::wire_v1::PeerRole,
         incarnation: u64,
     ) -> (rcgen::Certificate, rcgen::KeyPair) {
+        self.issue_in(name, cluster, DOMAIN, replica, role, incarnation)
+    }
+
+    /// The same, for a chosen domain of the cluster: what a sibling
+    /// domain's node is issued under the same authority.
+    fn issue_in(
+        &self,
+        name: &str,
+        cluster: [u8; 16],
+        domain: [u8; 16],
+        replica: u8,
+        role: coord_types::wire_v1::PeerRole,
+        incarnation: u64,
+    ) -> (rcgen::Certificate, rcgen::KeyPair) {
         let identity = coord_node_issuer::NodeIdentity {
             cluster: coord_types::ids::ClusterId(cluster),
+            domain: coord_types::ids::DomainId(domain),
             node: coord_types::ids::ReplicaId([replica; 16]),
             incarnation: coord_types::ids::ReplicaIncarnation::new(incarnation).expect("positive"),
             role,
         };
         let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("leaf key");
+        let certificate = self.sign_in(&key, name, identity);
+        (certificate, key)
+    }
+
+    /// A leaf for `identity` over a key the caller holds: what the
+    /// authority issues when a node asks with its own key.
+    fn sign_in(
+        &self,
+        key: &rcgen::KeyPair,
+        name: &str,
+        identity: coord_node_issuer::NodeIdentity,
+    ) -> rcgen::Certificate {
         let mut params =
             rcgen::CertificateParams::new(vec![name.to_string()]).expect("leaf params");
         params.extended_key_usages = vec![
@@ -280,8 +307,7 @@ impl Ca {
         let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("ca params");
         ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
         let issuer = rcgen::Issuer::from_params(&ca_params, &self.key);
-        let certificate = params.signed_by(&key, &issuer).expect("leaf cert");
-        (certificate, key)
+        params.signed_by(key, &issuer).expect("leaf cert")
     }
 
     fn root_pem(&self) -> String {
@@ -906,6 +932,7 @@ fn a_certificate_of_another_cluster_never_reaches_this_domains_store() {
     // Same node identity shape, different cluster.
     let identity = coord_node_issuer::NodeIdentity {
         cluster: coord_types::ids::ClusterId([0x77; 16]),
+        domain: coord_types::ids::DomainId(DOMAIN),
         node: coord_types::ids::ReplicaId([1; 16]),
         incarnation: coord_types::ids::ReplicaIncarnation::new(1).expect("positive"),
         role: coord_types::wire_v1::PeerRole::Voter,
@@ -931,6 +958,172 @@ fn a_certificate_of_another_cluster_never_reaches_this_domains_store() {
     assert!(
         !dir.join("state").exists(),
         "a foreign node initialized this domain's store"
+    );
+}
+
+/// A certificate of a sibling domain -- the same cluster, under the same
+/// issuer -- is refused here too: the domain a node serves is the one its
+/// certificate names, and a node holding another's would open this
+/// domain's store as a node of that one.
+#[test]
+fn a_certificate_of_another_domain_never_reaches_this_domains_store() {
+    let dir = workspace("foreign-domain");
+    let ca = credentials(&dir, 1, coord_types::wire_v1::PeerRole::Voter);
+    genesis(&dir, Some(&ca.node_spki));
+    endpoints(&dir, &ca, 3, &[]);
+    let _ = sts_keys(&dir);
+    let path = config_only(&dir);
+
+    // The committed voter, its key and generation, under this domain's
+    // authority: everything this domain commits to but the domain. A
+    // node that serves two domains with one key is issued this.
+    let identity = coord_node_issuer::NodeIdentity {
+        cluster: coord_types::ids::ClusterId(CLUSTER),
+        domain: coord_types::ids::DomainId([0x33; 16]),
+        node: coord_types::ids::ReplicaId([1; 16]),
+        incarnation: coord_types::ids::ReplicaIncarnation::new(1).expect("positive"),
+        role: coord_types::wire_v1::PeerRole::Voter,
+    };
+    let key = rcgen::KeyPair::try_from(ca.node_key.as_slice()).expect("the node's key");
+    let sibling = ca.sign_in(&key, SERVER_NAME, identity);
+    std::fs::write(dir.join("node.pem"), pem("CERTIFICATE", sibling.der())).expect("cert");
+
+    let refused = run(&path, &["init"]);
+    assert_eq!(refused.code, Some(2), "{}{}", refused.out, refused.err);
+    assert!(
+        refused.err.contains("another domain"),
+        "the refusal did not name the mismatch: {}",
+        refused.err
+    );
+    assert!(
+        !dir.join("state").exists(),
+        "a node of another domain initialized this domain's store"
+    );
+}
+
+/// Present `certificate` and `key` on `daemon`'s API plane with a
+/// `Hello` naming this cluster and domain in `role`, and return what the
+/// node answered on the control stream: its acknowledgement, or `None`
+/// once it closed the stream or the connection without one.
+async fn hello_on_api(
+    daemon: &Running,
+    ca: &Ca,
+    certificate: &rcgen::Certificate,
+    key: &rcgen::KeyPair,
+    role: coord_types::wire_v1::PeerRole,
+) -> Option<coord_types::wire_v1::MessageV1> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(rustls_pki_types::CertificateDer::from(
+            ca.certificate.der().to_vec(),
+        ))
+        .expect("ca root");
+    let provider = std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let mut tls = rustls::ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .expect("tls13")
+        .with_root_certificates(roots)
+        .with_client_auth_cert(
+            vec![rustls_pki_types::CertificateDer::from(
+                certificate.der().to_vec(),
+            )],
+            rustls_pki_types::PrivateKeyDer::Pkcs8(key.serialize_der().into()),
+        )
+        .expect("client auth");
+    tls.alpn_protocols = vec![coord_transport::ALPN_API.to_vec()];
+    let mut endpoint =
+        quinn::Endpoint::client("127.0.0.1:0".parse().expect("loopback")).expect("client endpoint");
+    endpoint.set_default_client_config(quinn::ClientConfig::new(std::sync::Arc::new(
+        quinn::crypto::rustls::QuicClientConfig::try_from(tls).expect("quic tls"),
+    )));
+    let connection = endpoint
+        .connect(daemon.api, SERVER_NAME)
+        .expect("dialable")
+        .await
+        .ok()?;
+    let (mut control, mut control_recv) = connection.open_bi().await.ok()?;
+    let hello = coord_types::wire_v1::MessageV1::Hello(coord_types::wire_v1::HelloV1 {
+        role,
+        cluster_id: coord_types::ids::ClusterId(CLUSTER),
+        domain_id: coord_types::ids::DomainId(DOMAIN),
+        incarnation: None,
+        capabilities: coord_types::wire_v1::BoundedVec::new(vec![
+            coord_transport::Lane::Unary.capability(),
+        ])
+        .expect("bounded"),
+    })
+    .encode()
+    .expect("hello");
+    control.write_all(&hello).await.ok()?;
+    let answered = tokio::time::timeout(Duration::from_secs(20), async {
+        let mut reader = coord_types::wire_v1::FrameReader::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = control_recv.read(&mut buf).await.ok()??;
+            reader.push(&buf[..n]).ok()?;
+            if let Some(frame) = reader.next_frame().ok()? {
+                return coord_types::wire_v1::decode(&frame).ok();
+            }
+        }
+    })
+    .await
+    .expect("the node answered or closed within the bound");
+    connection.close(0u32.into(), b"done");
+    answered
+}
+
+/// A frontend's certificate reaches only the domain it names (design
+/// Section 11.1, Codex's P1 on #267). The cluster's domains share its
+/// issuer, so a sibling domain's frontend certificate is signed by the
+/// authority this node trusts and names this cluster. It used to bind
+/// here as a frontend -- the role that submits on callers' behalf and
+/// establishes their sessions -- by naming this domain in its `Hello`.
+/// The handshake now refuses it; this domain's own frontend still binds.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_frontend_certificate_of_another_domain_is_refused_at_the_handshake() {
+    use coord_types::wire_v1::{MessageV1, PeerRole};
+    let dir = workspace("frontend-domain");
+    let ca = credentials(&dir, 7, PeerRole::Frontend);
+    genesis(&dir, Some(&ca.node_spki));
+    endpoints(&dir, &ca, 3, &[]);
+    let _ = sts_keys(&dir);
+    let path = config_only(&dir);
+    let text = std::fs::read_to_string(&path).expect("read");
+    std::fs::write(
+        &path,
+        text.replace("role = \"voter-frontend-observer\"", "role = \"frontend\"")
+            .replace("peer_quic = \"127.0.0.1:0\"\n", ""),
+    )
+    .expect("write");
+    assert_eq!(run(&path, &["init"]).code, Some(0));
+    let daemon = start(&path);
+
+    let (mine, mine_key) = ca.issue_in(
+        "frontend.coordd.test",
+        CLUSTER,
+        DOMAIN,
+        0x0f,
+        PeerRole::Frontend,
+        1,
+    );
+    let answer = hello_on_api(&daemon, &ca, &mine, &mine_key, PeerRole::Frontend).await;
+    assert!(
+        matches!(answer, Some(MessageV1::HelloAck(_))),
+        "this domain's frontend binds: {answer:?}"
+    );
+
+    let (theirs, theirs_key) = ca.issue_in(
+        "frontend.coordd.test",
+        CLUSTER,
+        [0x33; 16],
+        0x0f,
+        PeerRole::Frontend,
+        1,
+    );
+    let answer = hello_on_api(&daemon, &ca, &theirs, &theirs_key, PeerRole::Frontend).await;
+    assert!(
+        !matches!(answer, Some(MessageV1::HelloAck(_))),
+        "a sibling domain's frontend bound here: {answer:?}"
     );
 }
 
@@ -5577,6 +5770,7 @@ impl Ca {
     ) -> (Vec<u8>, u64) {
         let identity = coord_node_issuer::NodeIdentity {
             cluster: coord_types::ids::ClusterId(CLUSTER),
+            domain: coord_types::ids::DomainId(DOMAIN),
             node: coord_types::ids::ReplicaId([replica; 16]),
             incarnation: coord_types::ids::ReplicaIncarnation::new(1).expect("positive"),
             role,
@@ -5683,6 +5877,7 @@ impl NodeIssuerFixture {
                 .into_iter()
                 .collect(),
                 cluster: coord_types::ids::ClusterId(CLUSTER),
+                domain: coord_types::ids::DomainId(DOMAIN),
                 nodes: vec![coord_types::ids::ReplicaId([*n; 16])],
                 role,
                 min_incarnation: 1,

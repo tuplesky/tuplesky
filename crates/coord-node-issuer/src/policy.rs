@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 
 use coord_authn::VerifiedIdentity;
-use coord_types::ids::{ClusterId, ReplicaId, ReplicaIncarnation};
+use coord_types::ids::{ClusterId, DomainId, ReplicaId, ReplicaIncarnation};
 use coord_types::wire_v1::PeerRole;
 
 use crate::identity::NodeIdentity;
@@ -33,6 +33,9 @@ pub struct RolePolicy {
     pub required: BTreeMap<String, String>,
     /// Cluster the node belongs to.
     pub cluster: ClusterId,
+    /// The one domain the certificate may reach. A workload that serves
+    /// two domains holds a rule for each.
+    pub domain: DomainId,
     /// The exact node identities this policy may enroll.
     pub nodes: Vec<ReplicaId>,
     /// Role the certificate grants.
@@ -76,25 +79,41 @@ fn matches(
     rule.issuer == identity.name && rule.required.iter().all(|(k, v)| attrs.get(k) == Some(v))
 }
 
+/// What a request may name to choose among the workload's own rules.
+///
+/// Each narrows which rule answers; neither adds anything a rule does
+/// not grant. A workload with no rule for what the request names is
+/// refused as it would be with no rule at all.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Choice {
+    /// The role asked for.
+    pub role: Option<PeerRole>,
+    /// The domain asked for.
+    pub domain: Option<DomainId>,
+}
+
 /// Build the node policy for `identity` requesting `node`/`incarnation`
 /// with `lifetime_secs`, under the first matching rule -- the first
-/// granting `role`, where the request names one.
+/// granting what `choice` names, where the request names anything.
 ///
-/// The role narrows which of the workload's own rules answers; it adds
-/// nothing a rule does not grant. A workload with no rule for that role
-/// is refused as it would be with no rule at all.
+/// The certificate's cluster, domain and role are the rule's, never the
+/// request's.
 pub fn authorize(
     rules: &[RolePolicy],
     identity: &VerifiedIdentity,
     node: ReplicaId,
     incarnation: ReplicaIncarnation,
-    role: Option<PeerRole>,
+    choice: Choice,
     lifetime_secs: u64,
 ) -> Result<NodePolicy, PolicyError> {
     let attrs = coord_authn::receipt::attributes(identity);
     let rule = rules
         .iter()
-        .find(|r| matches(r, identity, &attrs) && role.is_none_or(|role| r.role == role))
+        .find(|r| {
+            matches(r, identity, &attrs)
+                && choice.role.is_none_or(|role| r.role == role)
+                && choice.domain.is_none_or(|domain| r.domain == domain)
+        })
         .ok_or(PolicyError::NoRule)?;
     if !rule.nodes.contains(&node) {
         return Err(PolicyError::NodeNotAuthorized);
@@ -108,6 +127,7 @@ pub fn authorize(
     Ok(NodePolicy {
         identity: NodeIdentity {
             cluster: rule.cluster,
+            domain: rule.domain,
             node,
             incarnation,
             role: rule.role,
