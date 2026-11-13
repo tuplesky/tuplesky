@@ -681,7 +681,9 @@ A node certificate binds exactly one role: `PeerBinder` refuses a
 `Hello` that declares any role other than the certificate's own
 node-identity URI. So a `coordd` running `role = "voter-frontend-..."`
 holds a voter certificate and, with only that, cannot present itself as
-a collector to anybody.
+a collector to anybody. A certificate binds exactly one domain the same
+way: the URI names it, and a `Hello` naming another domain is refused,
+since a cluster's domains share its issuer.
 
 That matters because a submission is the *collector's*, not the
 voter's. It carries admission claims minted for a client's session, and

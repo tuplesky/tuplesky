@@ -22,7 +22,7 @@ use coord_core::event::{AdmittedRequest, PeerProvenance};
 use coord_types::identity::Digest32;
 use coord_types::ids::*;
 use coord_types::logical_v1::*;
-use coord_types::wire_v1::{MessageV1, OutcomeV1, RequestV1, codes};
+use coord_types::wire_v1::{MessageV1, OutcomeV1, PeerRole, RequestV1, codes};
 use coord_types::{CommandId, RetryKey};
 
 const NS: NamespaceId = NamespaceId([5; 16]);
@@ -112,7 +112,12 @@ fn submit(c: &mut Collector, seq: u64) -> CommandId {
 }
 
 fn from(i: u8) -> PeerProvenance {
-    PeerProvenance::from_transport(r(i), ReplicaIncarnation::new(1).unwrap(), 1)
+    PeerProvenance::from_transport(
+        r(i),
+        ReplicaIncarnation::new(1).unwrap(),
+        PeerRole::Voter,
+        1,
+    )
 }
 
 fn refused(command: CommandId, refusal: SubmissionRefusal) -> ProtocolMessage {
@@ -308,6 +313,31 @@ fn a_refusal_from_a_stranger_is_not_counted() {
         Err(EvidenceError::NotAVoter { sender: r(9) })
     );
     assert!(c.half_established().is_empty());
+}
+
+/// A refusal on an observer's or learner's link is not counted, though
+/// the replica it names is a voter (design Section 10.1): only a link
+/// bound as a voter's carries a voter's word. The same refusal on the
+/// voter's own link is counted.
+#[test]
+fn a_refusal_on_a_non_voter_link_is_not_counted_whatever_replica_it_names() {
+    for role in [PeerRole::Observer, PeerRole::Learner] {
+        let mut c = collector(4);
+        let command = submit(&mut c, 1);
+        let posing =
+            PeerProvenance::from_transport(r(0), ReplicaIncarnation::new(1).unwrap(), role, 1);
+        assert_eq!(
+            c.on_evidence(posing, refused(command, SubmissionRefusal::Forgotten)),
+            Err(EvidenceError::NotAVoter { sender: r(0) }),
+            "{role:?}"
+        );
+        assert!(c.half_established().is_empty());
+        assert_eq!(
+            c.on_evidence(from(0), refused(command, SubmissionRefusal::Forgotten)),
+            Ok(Progress::Held(HoldReason::AwaitingRecord))
+        );
+        assert_eq!(c.half_established().len(), 1);
+    }
 }
 
 /// An entry that holds neither half of a release is submitted to every

@@ -4,7 +4,8 @@
 - the audit against the owner's rule;
 - the cost model, per command and per turn;
 - the proposals that follow from the rule;
-- levers 1 and 2 (option 3 and the proposal frame as a unit) and the leader-log end state they lead to.
+- levers 1 and 2 (option 3 and the proposal frame as a unit) and the leader-log end state they lead to;
+- the buffer as the unit at every stage, filled by the load (Section 9).
 
 What can be built without deciding the end state is in [Section 6.4](#64-what-can-be-built-without-deciding). The owner has parked option 3 and the leader log ([Section 8](#8-order-and-what-the-owner-decides)).
 
@@ -15,7 +16,7 @@ What can be built without deciding the end state is in [Section 6.4](#64-what-ca
 > Journal and store are for recovery. Storing command state individually, paying a storage round trip per command, is not batching. Batching for storage is one storage round trip per batch. Same for networking: one syscall per batch instead of one per command.
 
 **What it means here.**
-- **The batch is a turn:** what the domain loop appends to the journal at once (`Node::flush`). At 120 callers locally a leader's turn holds 9.4 commands and a follower's 12.3.
+- **The batch is a turn:** what the domain loop appends to the journal at once (`Node::flush`). At 120 callers locally a leader's turn holds 9.4 commands and a follower's 12.3. Section 9 makes it a buffer that can span turns, filled by the load.
 - **The journal is the recovery record.** Every row the projection holds is lowered from a journal record, and under `replay` a lost projection is rebuilt from the journal. So a row written only so that recovery can read it is a second copy.
 - **The projection holds what reads need:** current values and events, sessions, leases, policy. It is written behind, once a batch, as one sorted write set. It is not read on the hot path: execution runs from memory.
 - **The network:** one send syscall a peer a turn and one receive a batch. The datagrams follow the bytes.
@@ -396,6 +397,14 @@ So this section asks what a voter has to do on the hot path, and what it can do 
     - **Ending batches by time doesn't bound the age by itself; a check before authorizing does** (Codex on #259, twice). A landing can stall while the frontend still answers, and so can the decisions reaching this voter. So freshness is progress the leader confirmed, not an empty backlog:
       - **The leader's beacon.** The leader sends each lazy voter its commit frontier at least every 50 ms, idle or not: the frontier it announces at a turn's end under load, and a beacon of tens of bytes when idle.
       - **Only while it holds a quorum, counted from its own sends** (Codex on #263). A leader sends a beacon only while a quorum has acknowledged, at its ballot, a message it sent within the last 50 ms by its own clock. Each acknowledgement names the round it answers, and its freshness runs from when the leader sent that round, not from when the acknowledgement arrives. So an acknowledgement delayed in the network counts for no longer than a prompt one.
+      - **Both quorums are majorities of the voters, the leader counting itself:** the one whose acknowledgements keep the beacon going, and the new leader's promise quorum. The bound below needs them to overlap. Of five voters, the leader and any two followers keep it going, and a new ballot needs three promises (#263's review).
+      - **What a quorum acknowledges when idle** (#263's review). Under load, the leader's frames are the rounds, and each follower's vote names the frame it answers. When idle, the leader sends a round of tens of bytes to every follower, eager and lazy, and each acknowledges it at the leader's ballot, naming it, unless it has promised a higher ballot. So an idle leader with any two followers answering keeps its quorum.
+        - Without that acknowledgement, an idle leader would stop beaconing 50 ms after its last acknowledged frame. Every lazy frontend would then fail closed: safe, but a hop for every request after any idle gap.
+        - The acknowledgement is tens of bytes from each follower every 50 ms, about 80 a second at the leader of five voters.
+      - **The round goes every 50 ms while it leads; the beacon rides it only while the quorum holds** (#266's review). The leader sends a round at least every 50 ms for as long as it holds its ballot, whether or not its quorum holds. It puts its frontier on a round, as the beacon, only if a quorum has acknowledged, at its ballot, a round it sent within the last 50 ms.
+        - If the round went only while the quorum held, one lapse would end it until a write: a leader paused past 50 ms while idle would send nothing, so nothing would be acknowledged and nothing would restore its quorum, and every lazy frontend would fail closed until the next frame.
+        - With the round kept going, the first round after the lapse goes without the frontier, a quorum acknowledges it, and the round after it carries the beacon again: within 50 ms and a round trip of the lapse's end, with no write.
+        - A round without the frontier makes no frontend fresh. So the bound below counts only rounds that carry it, and a deposed leader's rounds never regain a quorum: the voters that promised the new ballot don't acknowledge them.
       - A voter that has promised a higher ballot no longer acknowledges the old one. So a deposed leader stops within 50 ms of sending the last round a quorum acknowledged at its ballot, wherever it is and however late those acknowledgements arrive.
       - **The age:** the time since this voter received the latest beacon, at the current ballot, whose frontier it has landed through. Decisions or landings that stall, alone or together, both make it grow.
       - **Under 100 ms**, the frontend authorizes from its own store. **Over it, it fails closed:** admission and the result's authorization go to an eager voter (the stricter way, below). If none answers, the request is deferred, as the disclosure gate defers today.
@@ -419,16 +428,19 @@ So this section asks what a voter has to do on the hot path, and what it can do 
   - So it is the fallback, not the plan.
 - **(b) The eager voters' batches, agreed, landed behind.**
   - At each batch's end (point 3 sizes the batch), each eager voter sends the lazy voters two digests through that position:
-    - **its history digest** (task-d117, point 3): each position's command, admission digest, revision and result digest;
+    - **its history digest** (task-d117, point 3): each position's command, admission digest, revision and result digest. The result digest is over the result's bytes as the retry window keeps them, so a retry answered from a landed record gets the bytes two executions agreed on (#266's review);
     - **its write-set digest:** a digest of the batch's merged write set in a canonical order, by collection and key, each key with its last value or its tombstone (#259's review).
   - The eager follower ships each lazy voter the batch: the merged write set and each position's execution record.
   - **A lazy voter lands a batch only once two executions agree on both digests, and only bytes whose write-set digest two voters sent.** It lands it as one commit, sorted.
+  - **It journals only records whose history digest two voters sent** (#263's review). Before the append, it computes the history digest over the shipped execution records, through the batch's last position, and compares it with the two eager voters' history digests. The write-set digest checks the rows; this checks the records the retry window and executed history are rebuilt from.
   - It executes the batch itself, as in (a), when:
     - no agreement comes within a bound (for example, too few eager voters are up);
     - the digests differ, in which case its execution counts toward the majority that decides;
-    - or the shipped bytes don't match the agreed write-set digest.
+    - or the shipped bytes don't match the agreed write-set digest;
+    - or the shipped execution records don't match the agreed history digest.
   - **Why the write set needs its own digest.** The history digest covers results, not rows, and the bytes a lazy voter lands are built and shipped by the eager follower alone. Without the second digest, a write set that is wrong under results that are right would be landed by every lazy voter: a fault in the merge, or state at the eager follower that has diverged and hasn't shown in a result yet. In a later dispute, each lazy voter would execute from those rows, find the eager follower's result, and outvote the correct leader, which would stop.
-  - **With it, two executions are enough** for one faulty execution. What a lazy voter holds through batch N−1 is what two executions agreed on, byte for byte. Its own execution of a disputed batch N is a third, independent one, from agreed state.
+  - **Why the records need the same check** (#263's review). The records are journaled at the landing, and boot and a takeover rebuild the retry window from them. A wrong result shipped beside a right write set, journaled as received, would be retained: after a takeover this voter would answer that command's retries with it. Checked against the agreed history digest, every record a lazy voter journals is one two executions agreed on.
+  - **With both checks, two executions are enough** for one faulty execution. What a lazy voter holds through batch N−1 is what two executions agreed on, byte for byte. Its own execution of a disputed batch N is a third, independent one, from agreed state.
   - **Trust:** the agreement of two independent executions of the same order and payloads, on results and on rows, with the lazy voters as tie-breakers. The leader's write set alone isn't trusted. That is the difference from option 3, where followers land the leader's write sets on the hot path (Section 6.3).
   - **The leader's share.** It merges and hashes the batch's write set too, about 1 KB a command: about +1.5 µs a command at the leader and +0.5 at the eager follower, which merges the batch already (point 5).
 - **(c) The eager voters' full images, installed every interval.**
@@ -451,7 +463,7 @@ So this section asks what a voter has to do on the hot path, and what it can do 
   - **With the window below at half the table, 500 positions,** a lazy voter's table holds at most 500 positions it hasn't landed, plus what is undecided in flight: under 875.
   - **Landing counts as execution for the table.** It marks a batch's positions executed. They retire once the landing's commit is durable, as an execution group's do today (task-d90, point 2).
   - **What makes a landing durable** (#259's review). Today an execution is durable once the journal holds its outcome (`executions_durable_through`), and under `replay` the projection is synced on a cadence, not at each commit. If a landing's positions retired only at a projection sync, the table would fill between syncs: 875 positions is about 0.4 s at the bar's load. So:
-    - **each landing first journals the batch's execution records,** as received from the eager follower: one append a batch, about ten to twenty a second at the bar's load. The positions retire once that append is durable, as an execution group's do;
+    - **each landing first journals the batch's execution records,** once they match the agreed history digest (point 2 (b)): one append a batch, about ten to twenty a second at the bar's load. The positions retire once that append is durable, as an execution group's do;
     - **the write set goes to the projection in one commit,** synced on the profile's cadence, as today's commits are;
     - **why the journal** (Codex on #259). Proposal 2 takes the retry window and executed history out of the projection: an eager voter rebuilds them at boot from its image and the execution records in its journal. A lazy voter whose landings weren't journaled would boot without the retry entries of every batch landed since its image, and after a takeover would execute a retried command again. With the execution records journaled, it rebuilds the retry window, the executed history and the history digest the same way, through its journaled execution frontier;
     - **after a crash** the voter boots from its image and journal (task-d117). Its projection's stamp gives the landed frontier. Positions journaled above it are executed again from the journal's payloads, or landed again from a donor's batch, and each outcome must match its journaled record. No position is skipped;
@@ -542,13 +554,13 @@ The last three columns are the servers' ms an operation, from 1.20. The two righ
 - **Roles from the ballot,** and an election that prefers eager voters.
 - **The batch:** a quarter of the table's positions or 50 ms, as a peer frame with the merged write set and the execution records. The eager follower sends it. The leader's load changes only by merging and hashing the batch's write set.
 - **The agreement:** each eager voter's history digest and write-set digest through each batch's last position, in a small peer frame to the lazy voters.
-- **The landing:** the batch's execution records journaled in one append, then its write set lowered as one sorted commit, of bytes whose write-set digest two voters sent, laid over the in-memory state in the same step. Boot rebuilds the retry window and executed history from the journaled records, as at an eager voter.
+- **The landing:** the batch's execution records, checked against the agreed history digest and journaled in one append, then its write set lowered as one sorted commit, of bytes whose write-set digest two voters sent, laid over the in-memory state in the same step. Boot rebuilds the retry window and executed history from the journaled records, as at an eager voter.
 - **The eager follower named by the leader,** and named again when it stops answering.
 - **The fallbacks:** own execution when there is no agreement within a bound, on a difference, and past the window.
 - **The window:** the lag tracked, and the campaign's second timeout past it.
 - **The takeover:** execute the tail before answering.
 - **The frontend:** forwarding reads, watches and resolves to an eager voter, and the age check before authorizing from its own store.
-- **The leader's beacon:** its commit frontier to each lazy voter at least every 50 ms, sent only while a quorum has acknowledged a round the leader sent within the last 50 ms by its own clock; each acknowledgement names its round.
+- **The leader's beacon:** a round to every follower at least every 50 ms while it leads, acknowledged by each and named in each acknowledgement; when idle, a round of tens of bytes. The round carries the commit frontier, as the beacon, only while a majority, the leader counting itself, has acknowledged a round the leader sent within the last 50 ms by its own clock.
 - **The donor rule:** a lazy voter serves executed history only up to its landed frontier.
 - **The metrics line:** lag in positions, tail and takeover times, agreements, fallbacks.
 
@@ -569,6 +581,9 @@ The last three columns are the servers' ms an operation, from 1.20. The two righ
   - the digests agree at the next batch's end.
 - **A difference at one eager voter,** in a build that changes one result: the lazy voters execute the batch, the majority decides, and the loser stops.
 - **A wrong write set under right results** at the eager follower, in a build that changes one shipped row: the lazy voters refuse to land it, execute the batch themselves, and the leader isn't stopped.
+- **A wrong result under a right write set** at the eager follower, in a build that changes one shipped result (#263's review): the lazy voters refuse the batch before journaling it and execute it themselves, the leader isn't stopped, and a retry of that command after a lazy voter takes over gets the right answer.
+- **An idle leader keeps its beacon:** with no load for several seconds, the lazy voters' beacon age stays under 100 ms, and no lazy frontend fails closed.
+- **An idle leader gets its beacon back after a pause** (#266's review): with no load, the leader paused for 200 ms (a build that holds its loop). The lazy voters' beacon age is back under 100 ms within 50 ms and a round trip of the pause's end, with no write, and no beacon goes out while its quorum is stale.
 - **The eager follower stopped without a change of ballot:** the leader names another, and agreement resumes after that voter's tail.
 - **A revoked grant at a lazy frontend:** the time from the revocation's commit to the first refusal there is under 150 ms plus a message delay. It stays under that with that voter's landing stalled (a build that holds its landings), with its decisions and batches stalled together, with the old leader and that voter cut off from the rest while a new leader commits the revocation, and with the old leader's acknowledgements at its ballot delayed until after the new leader commits it (Codex on #263). The frontend fails closed to an eager voter, or defers.
 - **The lag under load:** the lazy voters' landed frontier stays within one batch while the leader and eager follower run at the bar's load, and their tables stay under the admission limit, with no initialization refused for room.
@@ -806,3 +821,210 @@ Every figure but the measured ones above is modeled from counts and profile shar
 - **Lazy voters (Section 6.6):** voters that vote on the hot path and land the eager voters' agreed batches behind, at a lag of one batch, a quarter of the command table. Any of them can lead after executing its tail: one batch in steady state, and at most an enforced window of two while any voter within it is up. At one eager follower beside the leader, about −0.09 ms an operation on the 7763, the sender and the write-set check counted. The domain keeps five copies of the store, three of them behind.
 - **Whether the transport moves onto the loop's turn,** once lever 8 is on the carry.
 - **If witnesses are reopened:** whether three copies of five may be read against etcd's five (Section 6.5).
+
+## 9. The buffer: the unit at every stage, filled by the load
+
+**The owner's goal,** relayed by the lead on #185:
+
+> One goal for batching is to do better than per turn batching with per buffer (with configurable size) batching that can cover multiple turns, which trades off client perceived latency with overall throughput.
+
+> Ideally the batching behavior is adaptive, latency neutral at low throughput and filling the buffer at high throughput.
+
+**Why a hold at the leader isn't it.** The ceilings' build 5 held the leader's turn for 32 batches or 2 ms ([6840649501](https://github.com/tuplesky/tuplesky/pull/185#issuecomment-6840649501), Section 2).
+- **It deepened only the leader:** 9.4 to 11.8 commands an append at 120 callers. A follower's appends stayed at 11 to 13, because a follower cuts its own (Section 9.2).
+- **It saved at most 5 to 7%.** Nearly all the cost is per command (Section 3), and the per-turn part is 0.04 to 0.05 ms an operation at depth 10.
+- **At 30 callers its timer cost 10 to 20% of completions for nothing.** Thirty closed-loop callers never fill a 32-command buffer, so only the timer ended it.
+
+So depth buys little while the work stays per command, and a timer pays latency where the load doesn't fill the buffer. This section makes the buffer the unit at every stage, so that what is done once a command today is done once a buffer, and lets the load, not a timer, fill it. The figures are the per-command cost pass's ([6841973195](https://github.com/tuplesky/tuplesky/pull/185#issuecomment-6841973195)): build 5 and the carry at 120 callers, µs a command, summed over the five voters, since a follower's row counts four times. The code is read at the carry `c74219e6`.
+
+### 9.1 What a buffer is
+
+- **A buffer** is the commands a stage takes as one unit of work: one call, one journal append, one frame, one vote message, one send, one commit.
+- **It closes as soon as the stage downstream is free.** With nothing in flight downstream, it goes at once with what it holds, even one command. At low load nothing waits, so it is latency neutral.
+- **While the downstream is busy, arrivals accumulate,** up to the stage's cap. Depth then grows with the load by itself: it is what arrives during one downstream service time.
+- **The cap is the only size knob,** in commands and in bytes. It bounds memory, a record's and a frame's size, and how long a buffer's first command waits on the rest. It is a ceiling, not a target.
+- **No timer closes a buffer,** except at the store, where nothing downstream is busy (Section 9.3, stage 8).
+- **A buffer isn't the loop's turn.** If the downstream is still busy when a pass ends, the buffer stays open into the next pass.
+- **The knobs** go in a new `[batching]` section of `coordd.toml` (`crates/coord-daemon/src/config.rs`, beside `[journal]`). Each has today's value as its default, so the default changes nothing. All of them are compile-time constants today.
+
+### 9.2 Where the loop already follows its downstream, and where it cuts
+
+**Already load-following:**
+- **The journal: one append in flight** (`lend_append`). While an append is out, everything queued waits, and the next group is all of it, up to the group's limit. That is this section's rule exactly.
+- **The loop's idle flush.** The `owes_flush` arm of `Domain::serve` flushes only when no event is ready on either plane. So the loop drains its input before it lowers, and at low load it lowers at once.
+- **The store: one commit out a domain** (`hand_off`), lending everything pending. Under `strict` the next commit goes as soon as the last returns. Under `replay` the commit hold of task-d86 waits for 32 records or 5 ms unless a reader asks.
+- **The store's durable cadence under `replay`:** a durable commit every 64 commits, 4,096 records or 100 ms. That is etcd's shape: its backend commits every 100 ms or 10,000 writes, while its WAL syncs each `Ready`.
+
+**Cut by a count or a moment, not by the downstream:**
+- **`FLUSH_EVENTS` = 64** (`serve.rs`). The loop flushes after 64 events however many more are ready. Every peer frame and vote counts, and about three quarters of a leader's events are peer events. So 64 events hold about 16 caller operations, which is about 10.6 commands at 0.66 commands an operation. Review measured 10.1, 11.4 and 11.4 commands an append at 120, 240 and 480 callers (relayed by the lead): the cut, not the load, sets the leader's depth.
+- **The journal group: 64 records or 256 KiB** (`GroupLimits::DEFAULT`), and `FLUSH_QUEUED` = 64 batches to match. It is the next cut once `FLUSH_EVENTS` is lifted.
+- **Frames are cut at every flush** (`cut_frames` in `flush_queued`), even while the append that carries their proposals is still out. A frame can't leave before that append is durable, so cutting it earlier only makes more, smaller frames.
+- **A follower flushes at every lull.** The frame and the commit frontier leave the leader at different moments: the frame behind its barrier, the frontier with none. So they arrive as two events, and each gets its own append (the cost pass's Section 5). That, not the frame's size, is why a follower's depth doesn't follow the leader's.
+- **Execution groups: 32 commands** (`GROUP_COMMANDS`), or 128 batches queued, or 256 records not yet materialized.
+- **Per command on the wire:**
+  - a collector's submission is one stream and one event;
+  - a release is one frame per command, though a pass's frames to a collector share one `send_many` (lever 4);
+  - a follower's acknowledgement is one message per command (Section 6.7).
+
+### 9.3 Each stage under the rule
+
+| # | Stage | Downstream busy means | Cap (today) | Done once a buffer instead of once a command | µs a command taken, five voters | Cost pass rows |
+|---|---|---|---|---|---:|---|
+| 1 | A follower's intake, append, vote and settle | its own append is out | the leader's frame | the frame's checks, `advance_pending` and `learn` once; one batch, one barrier, one storage event and one vote message a frame; forgetting by range at a group's end | 95 (23.8 a follower), plus the leader's forgetting 7.0 and its votes in by range 6.8 | follower 2, 3, 4, 6, 10, 14, 15, 18, 19; leader 2, 5 |
+| 2 | Execution | the group's append is out | 32 commands | one authorized view, one retry admission, one closure walk a group | 49 (leader 11.6, followers 9.3 each) | leader 6, 9, 24; follower 1 |
+| 3 | The loop's pass | an event is ready | 64 events | the pass's housekeeping once a buffer, not once a pass | 12 (leader 3.3, followers 2.2 each) | leader 12, follower 12 |
+| 4 | The leader's proposals | its append is out | 64 batches | one `PersistBatch` and one barrier for the proposals made while the last append was out; the barrier list once | 10.2 | leader 4, 19 |
+| 5 | The leader's reads | a read round is being served | none | one view a read round; due reads by range | 5.4 | leader 1 |
+| 6 | The frame | its proposals' append is out | 1 MiB | cut when that append is lent: one frame a follower an append, encoded once for all four | 3.7 | leader 17 |
+| 7 | The journal record | an append is out | 64 records, 256 KiB | already one append a buffer; one record a buffer saves nothing more, since the appender's work is per byte (Section 4.3) | 0 | — |
+| 8 | The store | a commit is out; under `replay`, until a reader asks | 32 records or 5 ms (`replay`) | one commit for several buffers, with execution from memory in front (Section 9.6) | 15 to 25, modeled | — |
+| 9 | Intake | the collector has submissions in flight to that voter | 1 | one frame of a collector's queued submissions, behind a feature | not sized: tokio's streams, outside the pass | — |
+| 10 | Releases and answers | the loop's hand-off to that connection is held (lever 8) | 1 | one release frame a collector a buffer, behind a feature | not sized: tokio's streams, outside the pass | leader 11 |
+
+**Ranked by what they take, five voters:** stage 1 (109 µs a command with the leader's half), stage 2 (49), stage 8 (15 to 25), stage 3 (12), stage 4 (10), stage 5 (5), stage 6 (4). Stages 1 to 6 come to about 190 µs a command, 0.126 ms an operation at 0.66 commands an operation. That is the cost pass's classes A and B, now each with a stage.
+
+**Overlaps, counted once:**
+- Stage 1 is Section 6.7's lever 2 (steps 1 to 4, and step 5 for the vote message and the leader's votes in by range).
+- Stage 2's view and retry rows are lever 5's and proposals 1 and 2's.
+- Stage 5 is lever 5's.
+
+**What isn't batching and is ordered beside it:** the cost pass's class C at followers, about 9 µs a follower (the payload kept as the frame's bytes, the records sealed from the bytes already encoded, one decode of a peer frame). Then the leader's `propose` path (8.1). Row 16, a follower checking the relayed payload's identity again, stays: it is a check, not batching.
+
+### 9.4 Caps that don't cut each other
+
+A stage's cap must not end a buffer the stage before it built. So:
+- **The loop's pass ends when no event is ready, or at a cap counted in commands.** Peer events don't count toward it.
+  - Two knobs: `[batching] flush_events`, default 64 (today's `FLUSH_EVENTS`), and `flush_commands`, default none.
+  - The buffered configuration sets `flush_events` to none and `flush_commands` to the cap. The defaults keep today's behaviour.
+- **The journal group's limit follows the buffer's,** in records and in bytes: at least the records a full buffer writes. Otherwise the group cuts the leader's buffer, as 64 records would at about 21 commands.
+- **The frame closes when its proposals' append is lent,** not at each flush. So a frame is exactly the leader's buffer, up to its 1 MiB.
+- **A follower's buffer is the leader's frame.**
+  - **The frontier rides the frame when a frame is going out.** `Committed` is published in the same hand-off as the frames, behind the frame's barrier, so the two arrive together. Followers learn those commits one leader append later. That delays followers' execution and reads at followers, not answers, since the leader answers on its own release.
+  - **When no frame is going out, the frontier goes on its own, as today.** An isolated write is an example: its frontier moves only once its votes return, after its frame has left, and an idle leader cuts no frame for it to ride (`Leader::cut_frames` emits nothing without queued proposals). So the leader announces it at the end of the turn that moved it, as `announce_advanced` does at the turn's end today, not on the 250 ms re-send timer. The rule changes only which hand-off carries the frontier while frames flow. It never holds the frontier back for a frame that may not come.
+  - **A standalone frontier is a follower's buffer too.** The follower takes it as one event, commits what it adopted up to it (`commit_through_leader`), and flushes at that event's end, since its appender is free. So at low load a follower executes one message after the leader's commit, as it does today (Codex on #267).
+  - **A follower flushes at a frame's end** when its appender is free, not at every lull.
+  - **One batch, one barrier and one vote message a frame** (Section 6.7, steps 4 and 5).
+  - Its append's limit follows the frame's: about two records a command, the adoption and the execution.
+- **The execution group's cap is at least the buffer's,** so a decided buffer executes as one group.
+- **The store's commit spans buffers:** its cap is at least one buffer, and is set on its own (Section 9.6).
+- **Every cap stays within the command table's room for new admission:** capacity less an eighth, 875 of the default 1,000. What is buffered across the stages, plus what is decided and not yet forgotten, must fit there. So no stage's cap should pass an eighth of the table (125, the catch-up page) unless the table grows with it.
+
+**A precondition of raising any cap: no pass over what is in flight once an event.**
+- **Review's direct test** ([6842978632](https://github.com/tuplesky/tuplesky/pull/185#issuecomment-6842978632), Section 3): the loop's three bounds at 512, 480 callers.
+  - A turn reached 25 commands, and the other threads saved 84 to 105 µs a command, 5 to 7% of the servers.
+  - The leader's loop rose 49 to 50 µs a command, 25%, and gave most of it back. The net was −2 to −3%, and completions fell 3 to 4%.
+- **45 of those 49 µs are three passes.** Each walks what is in flight and runs once an event, so a deeper buffer, which holds more in flight, makes each cost more a command:
+
+| Role | Pass | Runs | Walks | Cost pass row | µs a command, capped / bounds at 512 |
+|---|---|---|---|---|---|
+| Leader | `pump_reads`: `ReadBarrier::take_due` with `Leader::executed_below` | after every peer event and every turn | for each held read, the unsettled proposals below its index | 1 | 8.3 / 32.5 |
+| Leader | `Leader::learn`: `Learner::commit_learned_where` | each acknowledgement, each storage event | every command at ACCEPT | 2, and row 4's `learn` | 8.4 / 24.0 |
+| Leader | `adopt_own` | each command | every unsettled barrier, into a set | 19 | 4.7 / 10.4 |
+| Follower | `Follower::learn`: `commit_learned` and `commit_through_leader` | each frame entry, each storage event | every command at ACCEPT, twice | 14, and row 2's `learn` | 6.6 / 10.9, a follower |
+
+- **Other per-event work that grows with what is in flight.** This is read from the code at `c74219e6`, not measured at 512:
+  - **A follower's vote** (`publish_to_leader_and_frontend`, row 18) lists every pending barrier in its `requires`, so the k-th adoption of a frame waits on at least k barriers.
+  - **A follower's `payload_row`** scans every in-flight payload batch (`durable_payloads`), twice an adoption.
+  - **`DurableLedger::written`** scans the staged batches, once for each dependency `carry_unwritten` looks at.
+  - **A follower's `JournalDurable`** checks each payload it made durable against every other in-flight payload batch (`served_payloads`).
+- **So these go by range, or by what changed, before any cap is raised** (Section 9.8, step 4):
+  - the leader's due reads from the lowest unexecuted proposal;
+  - learning, at both roles, of only the commands whose votes, adoption or durability changed, with the commit frontier through an index by sequence number;
+  - the barrier list once a turn at the leader and once a frame at a follower;
+  - the payload rows in flight through an index.
+- **With them, depth is worth what the other threads save,** 5 to 7% at depth 25. Without them it is worth nothing.
+
+### 9.5 Depth, cost and latency
+
+**Expected depth with the rule** (commands an append at the leader; a follower's follows by Section 9.4):
+
+| Load | Today | With the rule, default caps | With caps raised to 125 |
+|---|---:|---:|---:|
+| 30 callers | 3.6 to 3.9 | the same | the same: the load doesn't fill a buffer |
+| 120 callers | 9.4 to 10.1 | the same | 11 to 16, expected: about 80 commands are in flight over every stage |
+| A saturating load (480 callers, or an open loop above capacity) | 11.4, cut by `FLUSH_EVENTS` | 11.4 | up to the cap |
+
+**Servers' ms an operation against depth,** local, modeled. It is `floor + P/k`:
+- `P` is the per-buffer part: the per-turn part today, 0.045 to 0.095 ms an operation at depth 10 (the ceilings' fit and Section 3's), plus the moved rows done once a buffer at one to two times one command's cost.
+- The floor is build 5 at 120 (0.672), less the per-turn part and the 0.126 the stages take.
+
+| Depth `k` | 4 | 10 | 16 | 32 | 64 | 125 |
+|---|---:|---:|---:|---:|---:|---:|
+| Build 5 at 120 callers today | 0.74 to 0.82 | 0.672 | 0.64 to 0.66 | 0.61 to 0.64 | 0.59 to 0.63 | 0.59 to 0.63 |
+| Build 5, stages 1 to 6 once a buffer | 0.65 to 0.75 | 0.56 to 0.57 | 0.52 to 0.55 | 0.49 to 0.52 | 0.47 to 0.51 | 0.46 to 0.51 |
+| The carry, stages 1 to 6 once a buffer | 1.05 to 1.15 | 0.96 to 0.97 | 0.92 to 0.95 | 0.89 to 0.92 | 0.87 to 0.91 | 0.86 to 0.91 |
+
+- **The table assumes Section 9.4's precondition.** Without it, review's direct test at depth 25 measured −2 to −3%: the leader's loop gave back most of what the other threads saved. And every take here is an estimate. Review carries the class A and B takes at half until a pair measures one, since #264 came in at a third of its estimate. Class C is firm.
+- **Most of the gain is the stages, not the depth.** At today's depth (10), doing stages 1 to 6 once a buffer takes about 0.10 ms an operation, −16%. Depth 64 takes another 0.05 to 0.09.
+- **Depth 64 needs a load that fills it.** At 120 closed-loop callers about 80 commands are in flight over all the stages, so one stage's buffer sees 11 to 16. The raised caps are for loads beyond today's bar: more callers, or callers that share a connection (a proxy, kine's adapter, a pipelined SDK).
+- **At 30 callers** the rule adds nothing and takes nothing from depth. The stages still save their once-a-buffer part, about 0.06 to 0.09 ms an operation at depth 4.
+
+**Added latency:**
+- **At low load, none:** every buffer closes at once, as the loop's idle flush does today.
+- **At 120 callers, about none at the default caps.** With caps raised, a pass can take more events before it flushes. A command waits at most for the events ready at its arrival, which it would also wait for today: it waits for them behind the flush instead of in front of it.
+- **At a saturating load, the trade the owner names.** A buffer's first command waits on the rest of it: up to the cap times the leader loop's work a command, about 0.2 ms locally. At a cap of 64 that is up to about 13 ms, and up to about 25 ms at 125. Its p99 rises by that much, while queueing already dominates. Completions rise with the cost saved, and in a closed loop at a fixed number of callers the mean latency falls with them.
+
+### 9.6 The storage third: what proposals 1 and 2 and a store commit across buffers keep of build 1
+
+Build 1, storage off at every voter, took 0.369 ms an operation off the carry at 120 callers (1.073 to 0.704, −34%) and 0.419 at 30 (1.267 to 0.848, −33%). Lazy voters would keep about a fifth of build 2's −35% (−6 to −8% of the carry), and the lead will recommend that the owner park them. Here, the same way, is what three things keep of build 1. Execution from memory is proposal 1, protocol rows out of the store at every voter is proposal 2, and the third is one store commit across several buffers.
+
+| At 120 callers, local | ms an operation | Basis |
+|---|---:|---|
+| **Execution from memory, the store still written** | −0.146 | the ceilings' row 1a, measured, one run |
+| **Proposal 2** | −0.115 to −0.136 | the materializers left after row 1a (0.209), less 55 to 65%: Section 4.1's −185 of 284 µs, with 20 to 30 added back for task-d117's rows (#258) |
+| **One commit across buffers** | −0.007 to −0.019 | 10 to 20% of the materializers left (0.073 to 0.094). The commit's own cost is a larger share once proposal 2 has removed the rows: in #233's model by order it is 35.5 µs a command at 8 a commit and 29.8 at 30. task-d86's hold measured −5% at a follower at 120 callers and −15% at 30. |
+| **Together** | **−0.268 to −0.301** | **73 to 82% of build 1's 0.369, so −25 to −28% of the carry** |
+| Left of build 1 | 0.07 to 0.10 | the application rows (`KvCurrentV1`, `EventsV1`), the meta row once a commit, and redb's commit |
+
+**At 30 callers:**
+- Execution from memory measured −0.082 in its one run.
+- Proposal 2 takes −0.127 to −0.150.
+- One commit across buffers takes −0.012 to −0.026. It is larger here because commits are small: 4 a commit.
+- Together, −0.221 to −0.258: 53 to 62% of 0.419, so −17 to −20% of the carry.
+
+**Under `replay` only.** A commit that spans buffers leaves the projection further behind the journal. Under `strict` the commit is on the answer's path, so its buffer is the execution group's and it doesn't span. With execution from memory, no plan reads the projection, so the commit can wait for its cap. What still reads the projection asks for the commit, as with task-d86's hold: a read at a barrier, a watch, a catch-up page, a checkpoint. The 5 ms then bounds only what doesn't ask. Recovery replays from the projection's durable stamp, which the durable cadence bounds, as today.
+
+### 9.7 Recovery and correctness
+
+**No answer before its record is durable at a quorum.**
+- A buffer changes how many commands share one barrier, record, frame or vote message. It doesn't change what an answer waits on.
+- A release still needs its command decided: its leader's batch durable, with a quorum's votes or the fast path's. With one barrier a buffer, that is the buffer's append.
+- A vote message leaves only once every barrier it names is durable, and every barrier still pending before it (Section 6.7). So each vote it carries is durable before it leaves, as each `SlowAck` is today.
+
+**A takeover mid-buffer.** A buffer is not a unit of decision. That would be the leader log (Section 6.1), which stays parked.
+- Each command keeps its own proposal, dependency record and votes. A vote message expands at the leader into exactly the votes that per-command acknowledgements would have added (Section 6.7's property test).
+- A leader that fails mid-buffer leaves some of its commands adopted at some followers and not at others, as it does command by command today. Recovery reads each command's records, unchanged.
+- A buffer whose append didn't complete is lost whole at that voter, as a batch is today:
+  - at the leader, its commands were never answered, and their callers retry;
+  - at a follower, its adoptions were never voted, and the leader's re-send (task-d07) brings them back.
+
+**The command table's bounds.**
+- Admission stops at capacity less an eighth. A buffered command holds its table entry from intake as it does now, so buffering adds no entries. It only lengthens how long one is held, by at most one buffer at each stage.
+- That is why Section 9.4 keeps every cap within an eighth of the table: the reserve still holds one catch-up window, and backpressure still stops admission before recovery's room is touched.
+- The held proposals' bound (`HELD_PROPOSAL_SLACK` tables) is per command and unchanged.
+
+**Liveness.** With no timer, a buffer always closes:
+- when its downstream frees, and every downstream frees by completing: an append, a commit, a frame's acknowledgement;
+- or at its cap.
+
+The store's 5 ms bound stays for readers that don't ask. The loop's 1 ms hand-off bound (`HAND_OFF_WITHIN`) still releases what it holds.
+
+### 9.8 The code steps, in the lead's order
+
+The order is by the five-voter sum, each step one PR, with a both-orders pair on the runner for any that claims over 5%:
+1. **Stage 1, lever 2 (Section 6.7), smallest step first.** The first is learning once a frame and once a step of events, with the commit frontier through an index by sequence number. Then:
+   - `Follower::applied` and forgetting by range at both roles;
+   - the frame's intake in one pass;
+   - one batch and one barrier a frame, with the frontier riding the frame when one is going out (on its own otherwise) and the follower's flush at a frame's end;
+   - the vote message, behind a feature.
+2. **Class C at followers** (about 9 µs a follower).
+3. **The leader's proposals:** the `propose` path's copies (8.1), then one barrier a buffer (stage 4, 10.2).
+4. **The passes over what is in flight, by range or by what changed** (Section 9.4's precondition): the leader's rows 1, 2 and 19, and at a follower `learn` beyond the frame, the vote's barrier list and the payload-row scans. They come before any cap is raised. Their acceptance is the pair review ran ([6842978632](https://github.com/tuplesky/tuplesky/pull/185#issuecomment-6842978632)), the bounds at 512 against capped at 480 callers, with the leader's loop no longer rising.
+5. **The caps** (Section 9.4): `flush_commands` beside the event count, which can then be set to none, the journal group's limit following the buffer, the frame cut at the lend, and the execution group's cap. Each is a knob whose default is today's value. A pair at 120 and 480 callers, and at 30, reads the depth and latency of Section 9.5.
+6. **Stages 2 and 5** with lever 5 and proposal 1; **stage 8** after proposal 2.
+7. **Stages 9 and 10** (one frame of submissions, one release frame a collector), behind a feature, once tokio's per-stream share is read.
+
+**Each step's acceptance:**
+- a pair of the loops it changes, and a profile of the rows it claims, before and after. That measures the take, which settles the A and B estimates step by step (review carries them at half until then);
+- the audit's counts a buffer (batches, barriers, storage events, appends and vote messages a command);
+- for the caps, depth and p50/p99 at 30, 120 and 480 callers against Section 9.5's table.

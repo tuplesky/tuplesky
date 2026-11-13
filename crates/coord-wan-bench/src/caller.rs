@@ -127,8 +127,12 @@ impl Caller {
         // An api link is keyed by the identity on the certificate, so
         // callers that presented one credential would queue behind each
         // other and the run would be measuring the harness.
-        let issued =
-            coord_harness::domain::issue_caller(&authority(provisioned)?, cluster, instance);
+        let issued = coord_harness::domain::issue_caller(
+            &authority(provisioned)?,
+            cluster,
+            domain,
+            instance,
+        );
         let chain = vec![rustls_pki_types::CertificateDer::from(
             issued.certificate.der().to_vec(),
         )];

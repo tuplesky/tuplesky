@@ -1736,6 +1736,211 @@ async fn a_second_connection_on_one_lane_replaces_and_closes_the_first() {
     assert_eq!(a.connections(), 1, "the displaced connection is closed");
 }
 
+/// Binds each registered leaf to the identity it was issued for, and
+/// checks nothing else: in particular not the rule that refuses a
+/// non-voter certificate naming a voter's replica. With it the transport's
+/// own keying of links is tested by itself, as it must hold for a
+/// connection bound before its node's role changed.
+struct BindsAnyRole(std::collections::HashMap<Vec<u8>, (ReplicaId, ReplicaIncarnation, PeerRole)>);
+
+impl coord_transport::IdentityBinder for BindsAnyRole {
+    fn bind(
+        &self,
+        certs: &[rustls_pki_types::CertificateDer<'_>],
+        hello: &HelloV1,
+    ) -> Result<coord_transport::BoundIdentity, coord_transport::BindError> {
+        let leaf = certs
+            .first()
+            .ok_or(coord_transport::BindError::NoCertificate)?;
+        let (replica, incarnation, role) = self
+            .0
+            .get(leaf.as_ref())
+            .ok_or(coord_transport::BindError::UnknownCertificate)?;
+        if hello.role != *role {
+            return Err(coord_transport::BindError::RoleNotAuthorized);
+        }
+        Ok(coord_transport::BoundIdentity {
+            role: *role,
+            replica: Some(*replica),
+            incarnation: Some(*incarnation),
+            capabilities: hello.capabilities.as_slice().to_vec(),
+        })
+    }
+}
+
+/// A connection bound as an observer naming voter 1's replica keeps a
+/// link of its own (design Section 10.1). The replica's link is the one
+/// frames to voter 1 go out on, and a newcomer from the same identity
+/// takes its lane slot; keyed by replica alone, the observer's dial would
+/// close voter 1's connection as replaced and receive what is sent to
+/// voter 1. Keyed by role too, voter 1 keeps its connection and its
+/// frames, and the observer gets none of them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_non_voter_naming_a_voters_replica_does_not_take_its_link() {
+    let f = fixture(&[PeerRole::Voter, PeerRole::Voter]);
+    let posing =
+        f.ca.issue("node-1-observer", r(1), inc(1), PeerRole::Observer);
+    let binder: Arc<dyn coord_transport::IdentityBinder> = Arc::new(BindsAnyRole(
+        f.ids
+            .iter()
+            .chain([&posing])
+            .map(|id| {
+                (
+                    id.chain[0].as_ref().to_vec(),
+                    (id.replica, id.incarnation, id.role),
+                )
+            })
+            .collect(),
+    ));
+    let at = |id: &TestIdentity| {
+        Transport::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            id.local(&f.ca, CLUSTER, DOMAIN, vec![1, 2]),
+            binder.clone(),
+            limits(),
+        )
+        .unwrap()
+    };
+    let mut a = at(&f.ids[0]);
+    let mut b = at(&f.ids[1]);
+    let mut observer = at(&posing);
+
+    connect_lane(&b, &a, &f.ids[0], Lane::Control).await;
+    assert!(matches!(
+        event(&mut a).await,
+        TransportEvent::Connected { .. }
+    ));
+    assert!(matches!(
+        event(&mut b).await,
+        TransportEvent::Connected { .. }
+    ));
+
+    observer
+        .connect(
+            a.local_addr().unwrap(),
+            &f.ids[0].name,
+            PeerRole::Observer,
+            Some(inc(1)),
+            Lane::Control,
+            f.ids[0].expected(),
+        )
+        .await
+        .unwrap();
+    match event(&mut a).await {
+        TransportEvent::Connected { identity, .. } => {
+            assert_eq!(identity.role, PeerRole::Observer);
+            assert_eq!(identity.replica, Some(r(1)));
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(matches!(
+        event(&mut observer).await,
+        TransportEvent::Connected { .. }
+    ));
+    // Voter 1's connection is not closed as replaced: no event at all
+    // follows at `a`, and both connections stay.
+    assert!(
+        timeout(Duration::from_millis(500), a.next_event())
+            .await
+            .is_err(),
+        "voter 1's link moved"
+    );
+    assert_eq!(a.connections(), 2);
+
+    // What is sent to voter 1 reaches voter 1, and never the observer.
+    a.send(
+        dest(1, Lane::Control),
+        DOMAIN,
+        evidence_frame(b"to-voter-1").unwrap(),
+    )
+    .unwrap();
+    match event(&mut b).await {
+        TransportEvent::PeerFrame { payload, .. } => assert_eq!(payload, b"to-voter-1"),
+        other => panic!("{other:?}"),
+    }
+    assert!(
+        timeout(Duration::from_millis(300), observer.next_event())
+            .await
+            .is_err(),
+        "the observer received voter 1's frame"
+    );
+}
+
+/// A binder that refuses every certificate with one reason.
+struct Refuses(coord_transport::BindError);
+
+impl coord_transport::IdentityBinder for Refuses {
+    fn bind(
+        &self,
+        _: &[rustls_pki_types::CertificateDer<'_>],
+        _: &HelloV1,
+    ) -> Result<coord_transport::BoundIdentity, coord_transport::BindError> {
+        Err(self.0.clone())
+    }
+}
+
+/// A handshake refused because an observer's or learner's certificate
+/// names a committed voter is counted on the node that refused it, and
+/// no other refusal is (design Section 20.4). The peer learns only that
+/// it was refused; what the count says -- an issuer signed what it never
+/// should -- is for this node's operator.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_non_voter_naming_a_voter_is_counted_where_it_is_refused() {
+    use coord_transport::BindError;
+    let f = fixture(&[PeerRole::Voter]);
+    let posing =
+        f.ca.issue("node-1-observer", r(1), inc(1), PeerRole::Observer);
+    // The dialer accepts the voter it dials; only the acceptor refuses.
+    let dialer: Arc<dyn coord_transport::IdentityBinder> = Arc::new(BindsAnyRole(
+        f.ids
+            .iter()
+            .map(|id| {
+                (
+                    id.chain[0].as_ref().to_vec(),
+                    (id.replica, id.incarnation, id.role),
+                )
+            })
+            .collect(),
+    ));
+    for (reason, counted) in [
+        (BindError::NonVoterNamesVoter, 1),
+        (BindError::RoleNotAuthorized, 0),
+        (BindError::IncarnationMismatch, 0),
+    ] {
+        let accepting = Transport::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            f.ids[0].local(&f.ca, CLUSTER, DOMAIN, vec![1, 2]),
+            Arc::new(Refuses(reason.clone())),
+            limits(),
+        )
+        .unwrap();
+        let observer = Transport::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            posing.local(&f.ca, CLUSTER, DOMAIN, vec![1, 2]),
+            dialer.clone(),
+            limits(),
+        )
+        .unwrap();
+        let refused = observer
+            .connect(
+                accepting.local_addr().unwrap(),
+                &f.ids[0].name,
+                PeerRole::Observer,
+                Some(inc(1)),
+                Lane::Control,
+                f.ids[0].expected(),
+            )
+            .await;
+        assert!(refused.is_err(), "{reason:?}: the handshake completed");
+        assert_eq!(
+            accepting.peer_traffic().refused_voter_names,
+            counted,
+            "{reason:?}"
+        );
+        assert_eq!(observer.peer_traffic().refused_voter_names, 0);
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn an_idle_link_is_not_kept_for_the_process_lifetime() {
     // Every API connection and every replica incarnation is its own link
@@ -2915,7 +3120,11 @@ async fn a_turns_frames_to_one_peer_share_a_stream_in_order() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
+// One thread: the lane's sender runs only when this test yields, so it has
+// parked by the time `b` reads a batch, and a frame queued under the hold
+// can only leave at the release. On several threads, a sender still
+// finishing the last batch drains the held frames, which the hold allows.
+#[tokio::test]
 async fn a_held_wake_up_leaves_the_frames_queued_until_it_is_released() {
     // task-d115, lever 8: under a hold, a send admits and queues as
     // before and its sender is woken only at the release -- once for

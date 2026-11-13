@@ -7,7 +7,7 @@
 use std::time::Duration;
 
 use coord_daemon::metrics::{
-    Answered, Cost, Cpu, Datagrams, Distribution, Durability, FastPath, Flushes, Frontiers,
+    Answered, Cost, Cpu, Datagrams, Distribution, Durability, FastPath, Flushes, Frontiers, Gate,
     HandOffs, Headroom, History, Interval, Jobs, JournalGroups, Lane, LaneReading, Latency,
     MAX_REPORTED_SHARDS, Measure, MetricsSnapshot, OldestWait, PipelineWaits, ProposalBytes, Reads,
     Recorder, Relay, Release, ReleaseDistributions, Resends, Scheduling, ShardIndex, ShardReading,
@@ -464,6 +464,11 @@ fn a_rendered_snapshot_carries_no_secret_or_key_shaped_text() {
                 writes: distribution(&[2, 3, 3, 14]),
                 reads: distribution(&[1, 2, 5]),
             },
+            gate: Gate {
+                denied: 2,
+                deferred: 1,
+                remembered: 40,
+            },
             traffic: Measure::Observed(Traffic {
                 sent_frames: 9000,
                 sent_bytes: 2_700_000,
@@ -478,6 +483,7 @@ fn a_rendered_snapshot_carries_no_secret_or_key_shaped_text() {
                 received_frames: 8800,
                 received_bytes: 1_900_000,
                 received_streams: 8800,
+                refused_voter_names: 0,
                 api: Datagrams {
                     datagrams_sent: 4100,
                     datagrams_received: 4000,

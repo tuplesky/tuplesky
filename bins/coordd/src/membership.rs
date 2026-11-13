@@ -73,6 +73,11 @@ pub enum IdentityError {
         /// Where the certificate is.
         path: String,
     },
+    /// The certificate names another domain than the genesis does.
+    ForeignDomain {
+        /// Where the certificate is.
+        path: String,
+    },
     /// This node's role votes, but the committed configuration does not
     /// name it as a voter at this incarnation.
     NotACommittedVoter {
@@ -86,6 +91,14 @@ pub enum IdentityError {
     NotTheCommittedKey {
         /// The replica the certificate names.
         replica: ReplicaId,
+    },
+    /// This node's certificate is an observer's or a learner's, and the
+    /// node it names is a committed voter's.
+    NonVoterNamesVoter {
+        /// The replica the certificate names.
+        replica: ReplicaId,
+        /// The role it was issued for.
+        role: PeerRole,
     },
 }
 
@@ -117,6 +130,10 @@ impl core::fmt::Display for IdentityError {
                 f,
                 "the certificate at {path} belongs to another cluster than this genesis"
             ),
+            IdentityError::ForeignDomain { path } => write!(
+                f,
+                "the certificate at {path} belongs to another domain than this genesis"
+            ),
             IdentityError::NotACommittedVoter {
                 replica,
                 incarnation,
@@ -131,6 +148,14 @@ impl core::fmt::Display for IdentityError {
                 f,
                 "the committed configuration names {} as a voter but commits to a \
                  different key than this node holds: no peer would accept it",
+                hex(&replica.0)
+            ),
+            IdentityError::NonVoterNamesVoter { replica, role } => write!(
+                f,
+                "this node's {role:?} certificate names {}, a committed voter: every peer \
+                 refuses it, since a non-voter never holds a voter's name. Issue this node \
+                 a certificate under a node of its own, or its Voter certificate once it \
+                 is committed",
                 hex(&replica.0)
             ),
         }
@@ -233,14 +258,12 @@ pub fn place(
     single_voter_profile(&membership, cfg!(debug_assertions))?;
 
     let (identity, leaf) = leaf_identity(certificate_path)?;
-    // The cluster is checked here and not only at the handshake: a node
-    // of another cluster would otherwise open this domain's store under
-    // its own identity before any peer ever saw its certificate.
-    if identity.cluster != membership.cluster() {
-        return Err(IdentityError::ForeignCluster {
-            path: certificate_path.to_owned(),
-        });
-    }
+    // The cluster and domain are checked here and not only at the
+    // handshake: a node of another cluster or domain would otherwise open
+    // this domain's store under its own identity before any peer ever saw
+    // its certificate.
+    origin(&identity, &membership, certificate_path)?;
+    non_voter_role(&identity, &membership)?;
     if votes {
         if !membership.is_current_voter(&identity.node, identity.incarnation) {
             return Err(IdentityError::NotACommittedVoter {
@@ -269,6 +292,42 @@ pub fn place(
     })
 }
 
+/// An observer's or learner's certificate does not name a committed
+/// voter's node. Such a node would start, and every peer would refuse
+/// it with nothing said on its own side; it is this node's problem, and
+/// knowable here (design Section 10.1).
+fn non_voter_role(
+    identity: &coord_node_issuer::NodeIdentity,
+    membership: &Membership,
+) -> Result<(), IdentityError> {
+    if membership.non_voter_names_voter(&identity.node, identity.role) {
+        return Err(IdentityError::NonVoterNamesVoter {
+            replica: identity.node,
+            role: identity.role,
+        });
+    }
+    Ok(())
+}
+
+/// The certificate's cluster and domain are the genesis's.
+fn origin(
+    identity: &coord_node_issuer::NodeIdentity,
+    membership: &Membership,
+    certificate_path: &str,
+) -> Result<(), IdentityError> {
+    if identity.cluster != membership.cluster() {
+        return Err(IdentityError::ForeignCluster {
+            path: certificate_path.to_owned(),
+        });
+    }
+    if identity.domain != membership.domain() {
+        return Err(IdentityError::ForeignDomain {
+            path: certificate_path.to_owned(),
+        });
+    }
+    Ok(())
+}
+
 /// What this node's credential is against committed membership, and
 /// when it has to be renewed (task-58).
 ///
@@ -286,6 +345,10 @@ pub struct Inspected {
     pub role: PeerRole,
     /// What the credential is against committed membership.
     pub credential: coord_membership::CredentialChange,
+    /// Whether the certificate is an observer's or learner's naming a
+    /// committed voter's node, which every peer refuses whatever
+    /// `credential` says.
+    pub names_a_voter: bool,
     /// The leaf's validity window.
     pub leaf: coord_node_issuer::Leaf,
     /// What to do about the leaf at the given instant.
@@ -311,11 +374,7 @@ pub fn inspect(
             reason: format!("{e:?}"),
         })?;
     let (identity, leaf) = leaf_identity(certificate_path)?;
-    if identity.cluster != membership.cluster() {
-        return Err(IdentityError::ForeignCluster {
-            path: certificate_path.to_owned(),
-        });
-    }
+    origin(&identity, &membership, certificate_path)?;
     let credential =
         membership.classify_credential(&identity.node, identity.incarnation, &spki(&leaf));
     let leaf = validity(&leaf);
@@ -327,6 +386,7 @@ pub fn inspect(
         replica: identity.node,
         incarnation: identity.incarnation,
         role: identity.role,
+        names_a_voter: non_voter_role(&identity, &membership).is_err(),
         credential,
         leaf,
         renewal: crate::renewal::bounded(*policy, &leaf).decide(&leaf, now, seed),
@@ -431,6 +491,47 @@ mod tests {
             protocol_version: 1,
         })
         .expect("membership")
+    }
+
+    /// An observer's or learner's certificate naming a committed voter is
+    /// refused on its own node, by name, at any generation: started, it
+    /// would be refused by every peer with nothing said here. The same
+    /// roles for a node no voter holds, and a voter's own, are placed.
+    #[test]
+    fn a_non_voter_certificate_naming_a_committed_voter_is_refused_on_its_node() {
+        let membership = membership(3);
+        let identity =
+            |node: u8, incarnation: u64, role: PeerRole| coord_node_issuer::NodeIdentity {
+                cluster: membership.cluster(),
+                domain: membership.domain(),
+                node: ReplicaId([node; 16]),
+                incarnation: ReplicaIncarnation::new(incarnation).unwrap(),
+                role,
+            };
+        for role in [PeerRole::Observer, PeerRole::Learner] {
+            for incarnation in [1, 4] {
+                let refused = non_voter_role(&identity(2, incarnation, role), &membership);
+                assert_eq!(
+                    refused,
+                    Err(IdentityError::NonVoterNamesVoter {
+                        replica: ReplicaId([2; 16]),
+                        role,
+                    }),
+                    "{role:?} at {incarnation}"
+                );
+                assert!(
+                    refused
+                        .unwrap_err()
+                        .to_string()
+                        .contains("a committed voter"),
+                    "the reason names it"
+                );
+            }
+            assert_eq!(non_voter_role(&identity(9, 1, role), &membership), Ok(()));
+        }
+        for role in [PeerRole::Voter, PeerRole::Frontend] {
+            assert_eq!(non_voter_role(&identity(2, 1, role), &membership), Ok(()));
+        }
     }
 
     /// One voter is the test profile: a test build runs it, a release

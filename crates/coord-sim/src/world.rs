@@ -577,6 +577,7 @@ impl World {
                 let provenance = PeerProvenance::from_transport(
                     replica_of(from),
                     self.nodes[from as usize].incarnation,
+                    coord_types::wire_v1::PeerRole::Voter,
                     u64::from(from) << 16 | u64::from(to),
                 );
                 self.dispatch(

@@ -481,11 +481,23 @@ impl<P: Persistence> Voter<P> {
     /// recorded under a ballot this voter was leaving, which the fence at
     /// the new ballot refuses. If the machine does not promise after all
     /// -- a guard it applies and this does not -- the ballot goes back.
+    ///
+    /// Only a voter's frames get that far (design Section 10.1). An
+    /// observer's or learner's link is peer access, never a vote, and its
+    /// provenance still names a replica: everything below -- the ballot
+    /// raised for a higher `NewLeader`, a promise answered with the won
+    /// selection, a catch-up ask served, a floor or feature promise
+    /// heard, the machines' own counting -- would take it for the voter
+    /// that replica is. So a frame on any other role's provenance is
+    /// dropped first, before it is even decoded.
     pub fn on_peer(
         &mut self,
         provenance: PeerProvenance,
         frame: Vec<u8>,
     ) -> Result<Outbound, DriveError> {
+        if !provenance.is_voter() {
+            return Ok(Outbound::default());
+        }
         let before = self.ballot;
         // SCRATCH (class C, row 11): a follower's voter leaves a proposal
         // frame to the follower's own decode.
