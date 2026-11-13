@@ -27,8 +27,11 @@ amd64, and the host's `perf` reads the binary's symbols through the
 process's mount namespace. Each one's samples go to FILE with
 -etcd-leader and -etcd-follower before its extension, a sample a line:
 the stack folded from its leaf (`leaf;caller;...`), for the summary's
-split by kind of work. A stripped binary leaves addresses; the summary
-says so.
+split by kind of work. etcd's release binary is stripped of the symbols
+`perf` reads, so an unnamed frame keeps its address and is named from the
+binary's own Go function table (`go tool addr2line`, the binary copied out
+while the member runs); one it cannot name stays an address, and the
+summary counts those as unresolved.
 
 Exits 0 whatever happens: counts that cannot be taken (no `perf`, no
 permission, no load before SIGTERM) leave FILE saying why, and the test is
@@ -41,6 +44,7 @@ from __future__ import annotations
 import argparse
 import glob
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -103,9 +107,10 @@ def sibling(path: str, suffix: str) -> str:
     return f"{root}{suffix}{ext}"
 
 
-def folded(data: str, out: str) -> str | None:
+def folded(data: str, out: str, exe: str | None = None) -> str | None:
     """`perf script` on DATA, each sample's stack folded leaf first into
-    OUT, a sample a line. None, or why not."""
+    OUT, a sample a line, its unnamed frames named from EXE where it can
+    (`symbolize`). None, or why not."""
     proc = subprocess.run(
         ["sudo", "-n", "perf", "script", "-i", data, "-F", "ip,sym"],
         capture_output=True, text=True, errors="replace",
@@ -113,6 +118,8 @@ def folded(data: str, out: str) -> str | None:
     if proc.returncode != 0:
         return f"perf script failed ({proc.returncode}): {proc.stderr.strip()[-300:]}"
     stacks = fold(proc.stdout)
+    if exe:
+        stacks = symbolize(stacks, exe)
     with open(out, "w") as f:
         f.write("\n".join(stacks) + ("\n" if stacks else ""))
     return None
@@ -137,10 +144,42 @@ def fold(text: str) -> list[str]:
         # since a bare name does not say whose it is.
         if parts[0].lower().startswith("ffff"):
             sym = "[k]" + sym
+        elif sym == "[unknown]" and len(parts) > 1:
+            # An unnamed frame of the process keeps its address, for
+            # `symbolize` to name from the binary's own tables.
+            sym = "0x" + parts[0].lower().removeprefix("0x")
         frames.append(sym.replace(";", ","))
     if frames:
         stacks.append(";".join(frames))
     return stacks
+
+
+def symbolize(stacks: list[str], exe: str) -> list[str]:
+    """Name each `0x...` frame of STACKS from EXE's Go function table.
+
+    etcd's release binaries are stripped of the ELF symbol table `perf`
+    reads, but a Go binary keeps its own (`.gopclntab`), which `go tool
+    addr2line` reads; the binary is statically linked at a fixed address,
+    so a sampled address is an address in the file. Frames it cannot name,
+    or every frame when there is no `go`, stay as they were."""
+    addresses = sorted({f for st in stacks for f in st.split(";") if f.startswith("0x")})
+    if not addresses:
+        return stacks
+    go = shutil.which("go") or next(iter(sorted(glob.glob("/opt/hostedtoolcache/go/*/x64/bin/go"), reverse=True)), None)
+    if not go:
+        return stacks
+    try:
+        proc = subprocess.run([go, "tool", "addr2line", exe], input="\n".join(addresses) + "\n",
+                              capture_output=True, text=True, timeout=300)
+    except (OSError, subprocess.SubprocessError):
+        return stacks
+    lines = proc.stdout.splitlines()
+    names = {}
+    for i, address in enumerate(addresses):
+        name = lines[2 * i].strip() if 2 * i < len(lines) else ""
+        if name and name not in ("?", "??"):
+            names[address] = name.replace(";", ",")
+    return [";".join(names.get(f, f) for f in st.split(";")) for st in stacks]
 
 
 def main() -> int:
@@ -200,7 +239,13 @@ def main() -> int:
         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
     )
     graphs = {}
+    exe = None
     if args.call_graph and comm == "etcd":
+        # The member's binary, for `symbolize`, while it is running.
+        exe = sibling(args.out, "-etcd.exe")
+        with open(exe, "wb") as f:
+            if subprocess.run(["sudo", "-n", "cat", f"/proc/{by_load[0]}/exe"], stdout=f).returncode != 0:
+                exe = None
         for role, pid in zip(("leader", "follower"), by_load[:2]):
             data = sibling(args.out, f"-etcd-{role}") + ".data"
             graphs[role] = (pid, data, subprocess.Popen(
@@ -234,10 +279,15 @@ def main() -> int:
         if proc.returncode != 0:
             lines.append(f"{role}_error=perf record failed ({proc.returncode}): {gerr.strip()[-300:]}")
             continue
-        why = folded(data, sibling(args.out, f"-etcd-{role}"))
+        why = folded(data, sibling(args.out, f"-etcd-{role}"), exe)
         if why:
             lines.append(f"{role}_error={why}")
         subprocess.run(["sudo", "-n", "rm", "-f", data], capture_output=True)
+    if exe:
+        try:
+            os.remove(exe)
+        except OSError:
+            pass
     write(args.out, lines)
     return 0
 
