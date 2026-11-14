@@ -14,7 +14,8 @@ use std::collections::BTreeSet;
 
 use coord_collector::{
     Collector, CollectorConfig, CollectorEvent, EvidenceError, HoldReason, MonotonicMillis,
-    Progress, SOLICIT_AFTER_MILLIS, SettleError, SubmitRefusal, Submitted,
+    OfferOutcome, Offered, Progress, RELAY_FALLBACK_MILLIS, SOLICIT_AFTER_MILLIS, SettleError,
+    SubmitRefusal, Submitted,
 };
 use coord_consensus::{BallotConfiguration, ProtocolMessage, SubmissionRefusal};
 use coord_core::capability::{AdmissionReceipt, AttestedAdmission, VerifierToken};
@@ -458,6 +459,117 @@ fn not_leading_falls_back_a_relayed_entry_and_settles_nothing() {
             .iter()
             .any(|e| matches!(e, CollectorEvent::RelayFellBack { .. }))
     );
+}
+
+/// Storm fix 3: a relayed entry its leader took and hasn't answered by
+/// the bound is asked of that leader alone again, once, with the relayed
+/// frame as it was submitted. Only a bound later is it fanned out, to the
+/// voters that didn't take it.
+#[test]
+fn a_relayed_entry_its_leader_took_is_asked_of_the_leader_again_before_it_falls_back() {
+    let mut c = collector(4);
+    c.set_answer_on_release(true);
+    c.set_relay(true);
+    let (command, request) = admitted(1);
+    let Ok(Submitted::FanOut(relayed)) = c.submit(MonotonicMillis::ZERO, &request) else {
+        panic!("not new work");
+    };
+    assert_eq!(relayed.targets, vec![r(0)]);
+    c.offered(
+        MonotonicMillis::ZERO,
+        &Offered {
+            command,
+            outcomes: vec![(r(0), OfferOutcome::Queued)],
+        },
+    );
+
+    let bound = MonotonicMillis::new(RELAY_FALLBACK_MILLIS);
+    assert_eq!(c.next_solicit(), Some(bound));
+    let before = MonotonicMillis::new(RELAY_FALLBACK_MILLIS - 1);
+    assert!(c.due_solicits(before, 16).is_empty());
+    let asked = c.due_solicits(bound, 16);
+    assert_eq!(asked.len(), 1);
+    assert_eq!(asked[0].command, command);
+    assert_eq!(asked[0].targets, vec![r(0)], "the leader alone");
+    assert_eq!(asked[0].frame, relayed.frame, "the relayed frame");
+    assert_eq!((c.relay_leader_asks(), c.relay_fallbacks()), (1, 0));
+
+    // Once: a bound later it is fanned out.
+    let next = MonotonicMillis::new(2 * RELAY_FALLBACK_MILLIS);
+    assert_eq!(c.next_solicit(), Some(next));
+    let before = MonotonicMillis::new(2 * RELAY_FALLBACK_MILLIS - 1);
+    assert!(c.due_solicits(before, 16).is_empty());
+    let fanned = c.due_solicits(next, 16);
+    assert_eq!(fanned.len(), 1);
+    assert_eq!(
+        fanned[0].targets,
+        vec![r(1), r(2)],
+        "the voters that didn't take it"
+    );
+    assert_eq!(
+        version(&fanned[0].frame),
+        coord_collector::VERSION_ANSWER_ON_RELEASE
+    );
+    assert_eq!((c.relay_leader_asks(), c.relay_fallbacks()), (1, 1));
+    let steps: Vec<&str> = c
+        .trace()
+        .iter()
+        .filter_map(|e| match e {
+            CollectorEvent::RelayAskedLeader { .. } => Some("asked the leader"),
+            CollectorEvent::RelayFellBack { .. } => Some("fell back"),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(steps, ["asked the leader", "fell back"]);
+}
+
+/// Storm fix 3 asks again only a leader that took the relayed frame and
+/// may still be leading. One whose link refused the frame up to the bound
+/// is fanned out at the bound, and one that said it isn't leading at
+/// once, both as before and without asking it again.
+#[test]
+fn a_relayed_entry_its_leader_never_took_or_refused_is_fanned_out_without_asking_it_again() {
+    let mut c = collector(4);
+    c.set_answer_on_release(true);
+    c.set_relay(true);
+    let refused_by_link = submit(&mut c, 1);
+    let not_leading = submit(&mut c, 2);
+    c.offered(
+        MonotonicMillis::ZERO,
+        &Offered {
+            command: refused_by_link,
+            outcomes: vec![(r(0), OfferOutcome::Saturated)],
+        },
+    );
+    c.offered(
+        MonotonicMillis::ZERO,
+        &Offered {
+            command: not_leading,
+            outcomes: vec![(r(0), OfferOutcome::Queued)],
+        },
+    );
+    assert_eq!(
+        c.on_evidence(from(0), refused(not_leading, SubmissionRefusal::NotLeading)),
+        Ok(Progress::Held(HoldReason::AwaitingRelease))
+    );
+    let now = c.due_solicits(MonotonicMillis::ZERO, 16);
+    assert_eq!(now.len(), 1);
+    assert_eq!(now[0].command, not_leading);
+    assert_eq!(now[0].targets, vec![r(1), r(2)]);
+
+    // (The one fanned out at once is also due its step-A early solicit
+    // at this bound, as any step-A entry is.)
+    let at_bound = c.due_solicits(MonotonicMillis::new(RELAY_FALLBACK_MILLIS), 16);
+    let fanned = at_bound
+        .iter()
+        .find(|f| f.command == refused_by_link)
+        .expect("fanned out at the bound");
+    assert_eq!(fanned.targets, (0..3).map(r).collect::<Vec<_>>());
+    assert_eq!(
+        version(&fanned.frame),
+        coord_collector::VERSION_ANSWER_ON_RELEASE
+    );
+    assert_eq!((c.relay_leader_asks(), c.relay_fallbacks()), (0, 2));
 }
 
 /// task-d102: the relay only applies to marked submissions: with answer
