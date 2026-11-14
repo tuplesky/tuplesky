@@ -587,7 +587,16 @@ impl IntakeIndex {
     /// Publish `delta`, the changes of the commit stamped `stamp`, made
     /// over this index as it is: each command it changes takes the rows
     /// the delta leaves it.
+    ///
+    /// Debug builds check the delta was made over this index at this
+    /// stamp (#282's review): a command's rows are replaced whole, so a
+    /// delta published onto another base would put back rows a later
+    /// commit had changed.
     pub fn publish(&mut self, delta: IndexDelta, stamp: u64) {
+        debug_assert_eq!(
+            delta.base, self.stamp,
+            "an index delta made over the index at one stamp, published onto it at another"
+        );
         for (command, rows) in delta.live {
             let held = self.live.get(&command).map_or(0, Vec::len);
             self.len = self.len - held + rows.len();
@@ -662,6 +671,9 @@ pub struct IndexDelta {
     pub(crate) kv: crate::kv_index::KvDelta,
     executed_added: BTreeSet<(u64, u64)>,
     executed_removed: BTreeSet<(u64, u64)>,
+    /// The stamp of the index it was made over, which
+    /// [`IntakeIndex::publish`] checks in debug builds.
+    base: u64,
 }
 
 impl IndexDelta {
@@ -740,7 +752,10 @@ impl<'a> Assigner<'a> {
     pub fn new(base: &'a IntakeIndex) -> Self {
         Assigner {
             base,
-            delta: IndexDelta::default(),
+            delta: IndexDelta {
+                base: base.stamp,
+                ..IndexDelta::default()
+            },
         }
     }
 
@@ -966,7 +981,9 @@ impl<'a> Assigner<'a> {
         match parse(&update.key) {
             ProtocolKey::Other => Ok(Assigned::AsIs),
             // A row named by its intake key: a trim step's deletion. It is
-            // lowered as it is, and the index follows it.
+            // lowered as it is, and the index follows it. No writer puts a
+            // row under its intake key (every put names its row by command,
+            // and this lowering keys it); the put is followed all the same.
             ProtocolKey::Intake {
                 epoch,
                 tag,
@@ -1457,6 +1474,30 @@ mod tests {
             rows.assign(&mut assigner, 4, 1, gone).unwrap(),
             Assigned::Skip
         );
+    }
+
+    /// A delta is published onto the index it was made over (#282's
+    /// review), and debug builds refuse one made at another stamp. Here two
+    /// deltas are made over one index and both published: the second's
+    /// commands would take the rows it left them, over whatever the first
+    /// had changed.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "published onto it at another")]
+    fn a_delta_made_over_another_stamp_is_refused_in_debug_builds() {
+        let mut base = IntakeIndex::default();
+        let mut rows = Rows::default();
+        let (first, second) = {
+            let mut a = Assigner::new(&base);
+            rows.assign(&mut a, 1, 0, payload(&cmd(1), Some(1)))
+                .unwrap();
+            let mut b = Assigner::new(&base);
+            rows.assign(&mut b, 2, 0, payload(&cmd(2), Some(2)))
+                .unwrap();
+            (a.into_delta(), b.into_delta())
+        };
+        base.publish(first, 1);
+        base.publish(second, 2);
     }
 
     fn protocol_row(tag: u8, epoch: u64, command: &CommandId, value: Option<u8>) -> StoreUpdate {

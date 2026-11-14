@@ -1140,6 +1140,116 @@ fn catch_up_finds_each_of_two_executed_commands_that_share_a_prefix() {
     }
 }
 
+/// The first of two executed commands that share the index's prefix is
+/// deleted (review on #282): the executed part moves the second's position
+/// up, so the second still reads as executed. Had the prefix gone with the
+/// first, catch-up would not find the second, and a later payload put of
+/// it would be written pending, against rule (a).
+#[test]
+fn deleting_the_first_of_two_executed_commands_that_share_a_prefix_keeps_the_second() {
+    for mut store in [Store::journaled(), Store::worker()] {
+        let sharing = |tail: u8| {
+            let mut bytes = [0x3c; 32];
+            bytes[8..].fill(tail);
+            CommandId(Digest32(bytes))
+        };
+        let (first, second) = (sharing(1), sharing(2));
+        let first_row = record(Phase::Commit, &[]);
+        let second_row = record(Phase::Commit, &[first]);
+        for (n, command, row) in [(1, first, &first_row), (2, second, &second_row)] {
+            store.protocol(vec![
+                dependency_update(epoch(), &command, row).unwrap(),
+                payload_update(&command, &payload_of(n)).unwrap(),
+            ]);
+        }
+        store.application(1, vec![executed(&first, 1)]);
+        store.application(2, vec![executed(&second, 2)]);
+        // Published before the delete, so the delete meets both entries in
+        // the index, the first's under the prefix's own.
+        store.materialize();
+        store.application(
+            3,
+            vec![StoreUpdate {
+                value: None,
+                ..executed(&first, 1)
+            }],
+        );
+        store.materialize();
+        store.assert_index_is_the_rows("after the delete");
+        let gated = store.reader().snapshot().unwrap();
+        assert_eq!(
+            catch_up_entry(&gated, epoch(), &first).unwrap(),
+            None,
+            "the first no longer executed"
+        );
+        let entry = catch_up_entry(&gated, epoch(), &second)
+            .unwrap()
+            .expect("the second still executed");
+        assert_eq!(entry.command, second);
+        assert_eq!(entry.decided, Some(second_row));
+        drop(gated);
+        // Rule (a): a payload put of an executed command writes nothing.
+        store.protocol(vec![payload_update(&second, &payload_of(2)).unwrap()]);
+        store.materialize();
+        let raw = store.raw().snapshot().unwrap();
+        assert!(
+            rows(&raw, Collection::PendingPayloadV1).is_empty(),
+            "rule (a)"
+        );
+        store.assert_index_is_the_rows("after the payload put");
+    }
+}
+
+/// A trim step names a row by its intake key (review on #282), and the
+/// index follows the delete: a command touched again after its row was
+/// trimmed is lowered as having none. A put by command is a new row under
+/// a later intake key, and a delete by command then takes that one. Had
+/// the index kept the trimmed row, the put would be written under the
+/// trimmed key (debug builds' check refuses it first: the row is not
+/// there).
+#[test]
+fn a_command_touched_again_after_its_row_was_trimmed_by_intake_key_has_none() {
+    fn keys_of(rows: &[RawRow], c: CommandId) -> Vec<Vec<u8>> {
+        rows.iter()
+            .filter(|(k, _)| matches!(intake::parse(k), ProtocolKey::Intake { command, .. } if command == c))
+            .map(|(k, _)| k.clone())
+            .collect()
+    }
+    for mut store in [Store::journaled(), Store::worker()] {
+        let (c1, c2) = (command_of(1), command_of(2));
+        for c in [c1, c2] {
+            store.protocol(vec![
+                dependency_update(epoch(), &c, &record(Phase::PreAccept, &[])).unwrap(),
+            ]);
+        }
+        store.materialize();
+        let [trimmed] = keys_of(&intake_rows(&store.raw()), c1)
+            .try_into()
+            .expect("one row");
+        // The trim step: c1's row, named by its intake key.
+        store.protocol(vec![StoreUpdate {
+            collection: Collection::ProtocolV1.id(),
+            key: trimmed.clone(),
+            value: None,
+        }]);
+        store.materialize();
+        store.assert_index_is_the_rows("after the trim");
+        let accepted = record(Phase::Accept, &[c2]);
+        store.protocol(vec![dependency_update(epoch(), &c1, &accepted).unwrap()]);
+        store.materialize();
+        let [now] = keys_of(&intake_rows(&store.raw()), c1)
+            .try_into()
+            .expect("one row");
+        assert!(now > trimmed, "a later intake key, not the trimmed one");
+        store.assert_index_is_the_rows("after the put");
+        store.protocol(vec![dependency_delete(epoch(), &c1)]);
+        store.materialize();
+        assert!(keys_of(&intake_rows(&store.raw()), c1).is_empty());
+        assert_eq!(keys_of(&intake_rows(&store.raw()), c2).len(), 1);
+        store.assert_index_is_the_rows("after the delete");
+    }
+}
+
 /// Rule (e)'s timing (review on #233, 6813935632): the materializer moves
 /// the gate as its commit returns, before the store takes the commit back,
 /// so a cut's snapshot can be one commit ahead of the take-back. The

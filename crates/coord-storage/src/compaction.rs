@@ -165,14 +165,12 @@ pub struct GcPlan {
 }
 
 fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, EngineError> {
-    let payload = postcard::to_allocvec(value)
-        .map_err(|_| EngineError::new(ErrorClass::Limit, "gc cursor encode"))?;
-    coord_store_api::envelope::StoreEnvelopeV1 {
-        record_kind: GC_RECORD_KIND,
-        schema_version: 1,
-        payload,
-    }
-    .encode()
+    coord_store_api::envelope::StoreEnvelopeV1::encode_value(
+        GC_RECORD_KIND,
+        1,
+        value,
+        "gc cursor encode",
+    )
 }
 
 fn decode<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, EngineError> {
