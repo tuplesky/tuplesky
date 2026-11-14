@@ -1206,7 +1206,8 @@ Each step has its own PRs and pair.
 **Where it stands (2026-11-14).**
 - **Steps 0 to 5:** the plan of record through steps 4 and 5's Sync rule, by the re-check on #283 ([6868671574](https://github.com/tuplesky/tuplesky/pull/283#issuecomment-6868671574)). #283 is merged.
 - **Owed before 5a, now written:** a frame a voter holds by name without its bytes (step 4, and 5a). It doesn't block 4a or 4b.
-- **Step 0:** B0 and B1 are measured (below). **Step 1:** 1a is #286.
+- **Step 0:** B0 and B1 are measured (below), and B1 again on the carry `ab209310` before step 2 (below).
+- **Step 1:** 1a is #286. 1b is #288, parked: on today's carry it saves a few µs a command, inside a pair's noise, so it merges only with a later step that needs it, and none does (step 1, below).
 - **The thresholds (R12) are the owner's, confirmed as written (2026-11-14).** The go/no-go below says what each one decides.
 - The first review's 16 points ([6865705600](https://github.com/tuplesky/tuplesky/pull/283#issuecomment-6865705600)) are marked (R1) to (R16) in the steps they change.
 
@@ -1214,6 +1215,12 @@ Each step has its own PRs and pair.
 - **Bounded before it's built.** Inferred savings have come in at a quarter to a third of their estimates. So no step is built on an inferred figure.
   - Its saving is measured first on a scratch build, which gets no PR, as a pair against the carry.
   - Where the bound is under what a pair can see, a profiled pair measures it: the named functions' share before and after, as for #282.
+- **Re-measured on the carry its step is built on (2026-11-14).** A bound read at step 0 is read again, as a pair, before its step is built. The step's checkpoint is half of that reading, not of step 0's. B2 − B1, which the go/no-go reads, is measured the same way.
+  - **The bound's re-read and the step's pair run on the same carry commit.** If the step's branch takes a newer carry before its pair is read, the bound is read again on that carry, unless only docs or tests came in. That covers a newer carry at the branch's cut and one merged in later (review of #289).
+  - **Why:** PRs merged between a bound and its step can take the same work first. B0 read −39 µs a command in the appenders and the materializers against `ba947188`.
+  - By `ab209310` the carry had merged #280 to #287. In one alternation of the three builds, the carry's base was already below B0 (−10.4 µs a command in the appenders, −18.8 in the materializers), and below step 0's base by more than B0 took off it.
+  - The work B0 removed was per-record work, and the merged PRs took most of it first, #284 above all: a record is checked against its stream instead of its digest again, and its encoded length is counted once.
+  - 1b, built in B0's shape, then saved about −5 µs a command by its profile (−2 in the appenders, −3 in the materializers), which its pair can't resolve. It has no measured gain to merge on ([6871540739](https://github.com/tuplesky/tuplesky/pull/185#issuecomment-6871540739)).
 - **What a pair can see.** The base runs alone span about ±3% at 120 callers. In the journal re-verify pair (#284, 10.8) that was 0.848 to 0.891 ms an operation, and 1,319 to 1,398 µs a command for the five voters. So a saving under about 0.03 ms an operation is read in the part it moves (the appender, a follower's loop, the leader's loop) and in the counts a turn, not in the total.
 - **Every reading is one pair (R13).** Two builds are compared by running them against each other, never as a difference of two pairs against a third. That difference is what left today's −0.38 an upper bound.
   - Four runs of the base and three of the change, alternating.
@@ -1273,13 +1280,13 @@ Each step has its own PRs and pair.
 - **The 9V45 isn't decided by this.** Getting under etcd there takes both the frame and lazy voters (10.1), whatever B2 shows.
 - **The 7763 figures in brackets** translate the local ones. They are re-read after testing's re-baseline of the load generator (review's note).
 
-**The steps.** The bounds now are local at 120 callers [7763]. Every one of them is to be measured at step 0 before its step is built.
+**The steps.** The bounds now are local at 120 callers [7763]. Every one of them is measured at step 0, and again on the carry just before its step is built (the rule above).
 
 | Step | Activation | Bound | Checkpoint |
 | --- | --- | --- | --- |
 | 0. The bounds | — | — | — |
 | 1. One application record and one durability event a group, split at the store's bounds | None: local format | B0 | Half of B0, in the appender and the materializer |
-| 2. A follower takes a frame in one pass: its adoptions in a few batches, split at the store's bounds | None | B1; −15 to −21 µs a follower inferred (6.7) | Half of B1, in a follower's loop |
+| 2. A follower takes a frame in one pass: its adoptions in a few batches, split at the store's bounds | None | B1: −9.4 µs a command in a follower's loop on `ab209310` (step 0); −15 to −21 a follower inferred (6.7) | Half of B1, in a follower's loop |
 | 3. The frame log's kinds, read only, and the frame fetch | None: nothing writes or sends them | 0 | A null step |
 | 4. Frame records written in order beside the per-command ones; recovery selects both ways and checks they agree | `FrameLog`, dark | B1W against B1, one pair: the cost added | Inactive, a null step. Active, no more than its bound, and no disagreement |
 | 5. The frame decides above a boundary position | `FrameDecision` | B2 − B1, one pair; −0.26 [−0.38] an upper bound | The go/no-go above, then half of B2 − B1; then the runner's pair |
@@ -1328,6 +1335,33 @@ Each step has its own PRs and pair.
   - at 30 neither has anything to halve;
   - at 1 and 5 callers, each step is held to no rise beyond the base's spread, in CPU or in latency (R16). Step 1's pair at 5 reads the two rows above by name.
 - Steps 1 and 2 need nothing more from step 0.
+- **B1 again, on the carry `ab209310` (2026-11-14), before step 2 is built** (#185, [6872326710](https://github.com/tuplesky/tuplesky/pull/185#issuecomment-6872326710)). Step 0's scratch for B1 was ported onto that carry (local, never pushed), one binary as above, with the same alternation at each load.
+
+| Callers | 120 | 30 | 5 | 1 |
+| --- | ---: | ---: | ---: | ---: |
+| B1's protocol records a command, a follower (the base's: 1.00 at every load) | 0.11 | 0.25 | 0.81 | 1.00 |
+| Base: five voters' CPU, µs a command | 890 | 1,070 | 1,785 | 3,257 |
+| B1 − base: five voters' CPU | **−65 (−7.3%)** | +65 | +152 | −106 |
+| The base runs' spread | 170 | 263 | 113 | 288 |
+| B1 − base: a follower's loop | **−9.4 (−10.5%)** | +5.3 | +13.9 | −8.7 |
+
+  - **At 120 B1 keeps what it bounds.**
+    - A follower's loop reads −9.4 µs a command, against −10.8 at step 0. All three runs are below the base runs on either side of them: −11.0, −8.4 and −8.7.
+    - Operations a second rise 4.5%.
+    - The base runs drift today (797 to 968 µs a command), so the four followers' −37.5 is inside the base runs' spread of 63.
+    - **So a profiled pair reads it** (b1 y1 b2 y2 b3 at 120). A follower's loop goes from 90.1 to 79.2 µs a command (−10.9). The functions B1 changes move beyond their own base spreads:
+      - `on_relayed_proposal`: 14.6 → 6.9 (−7.7, spread 1.3);
+      - `settle`: 10.8 → 5.3 (−5.5, spread 3.1);
+      - `on_storage`: 6.7 → 2.7 (−3.9);
+      - `lower_once`: 11.1 → 7.0 (−4.1).
+    - Step 0's profiled pair read `on_relayed_proposal` 21.3 → 9.7 and `settle` 13.9 → 9.3.
+  - **Its appender share is gone,** as B0's was: +0.1 µs a command over four followers, against −9.0 at step 0. That was per-record work, which the carry took first (the rule above).
+  - **At 30 and at 5 it isn't told from the base.** At 30 the runs read +267, +98 and −172. At 5, two runs read +26 and +5. The third read +425, with every part on every node up about 25% and operations a second down 6%, which is the host and not B1.
+  - **Latency (R16).** At 1 and 5 callers, no p50 or p99 rises beyond the base runs' spread.
+    - At 5: get p50 +0.02 ms against a spread of 0.10, and p99 +0.01 against 0.75.
+    - At 1: p50 −0.02 to −0.04 ms, and p99 −0.05 to −0.01.
+    - Step 0's rise in a get's p99 at one caller (+0.14 ms) isn't reproduced.
+  - **What it sets for step 2:** about −4.7 µs a command in a follower's loop at 120 callers, half of today's −9.4, with no rise beyond the base's spread at 1 and 5.
 
 **Step 1: one application record and one durability event a group.** This is the application half of 10.5's step 2 without the frame record, and the fifth item of 10.8.
 - **Which half is which.** 10.5 named the journal part "seal and settle", and its two halves fall in different steps.
@@ -1336,23 +1370,28 @@ Each step has its own PRs and pair.
   - So the floors round's −0.04 [−0.06] for the seal and settle records splits between B0 and B1. Step 1's bound is B0 alone.
 - **PRs:**
   - 1a: the journal's reader and replay take a group's application record, and nothing writes one;
-  - 1b: the applier writes one application record a group in place of one a command, cut at the bounds below, and waits on one durability event for each.
+  - 1b: the store seals each run of the queue's application outcomes as one record when it lowers them into a journal group, cut at the bounds below. The record's one durability event reports every outcome's barrier. This is B0's shape. The applier's cuts, an earlier shape, stopped ([6870490427](https://github.com/tuplesky/tuplesky/pull/185#issuecomment-6870490427)).
+  - **1b is parked (#288, 2026-11-14).** By the rule above, it doesn't merge without a measured gain, and on `ab209310` it saves a few µs a command (the reason under the rules). It merges with a later step's PR only if that step needs its writer or its run sealing, and none does: none of steps 2 to 7 changes how an application outcome is journaled, and none writes 1b's format (step 3's format line below).
   - 1a doesn't need the split: it is #286. 1b is built with it.
 - **How 1b bounds a group's record (Codex).** An execution group holds up to 32 commands (`GROUP_COMMANDS`), and the applier's queue is bounded at 16 MiB, not at the record's 4 MiB and 4,096 updates. Each outcome is under the record's bounds today, but 32 together needn't be. Since #280 a record the store refuses stops the voter.
-  - **The rule:** the same as step 2's. A group's outcomes go in records cut in execution order. A record closes before an outcome that would take it past 1,024 updates or 1 MiB of rows.
-  - **An outcome over either bound goes alone,** in a record of its own, as every outcome does today.
+  - **The rule:** a group's outcomes go in records cut in execution order. A record closes before an outcome that would take it past 1,024 updates, or past half the journal group's bytes in rows: 128 KiB at today's 256 KiB group (`run_bytes`).
+  - **Records stay under the format's bounds for a group record,** 1,024 updates and 1 MiB (`GROUP_RECORD_UPDATES`, `GROUP_RECORD_BYTES`), which are step 2's. The run's byte cap follows the journal group instead, so a run fits an ordinary group even with half of it taken by other domains' entries, and it never passes 1 MiB.
+  - **Why not 1 MiB (review of #288).** A run over the group's bytes could only take the large-record path, which takes a domain only when it is first in a lowering. Behind a domain with something queued at every lowering, its run could wait indefinitely. That matters once a voter serves several domains.
+  - **An outcome over either bound goes alone,** in a record of its own, as every outcome does today. Only such a lone outcome over the journal group takes the large-record path.
   - **One durability event a record.** The group's answers wait on its last record, since the journal keeps records in order.
   - At the bench's sizes a group is one record. Groups of large outcomes take a few.
-  - B0 cuts a run at half the journal group's byte limit and at the record's update bound. At the bench's sizes neither binds, so it bounds step 1 as written.
+  - B0 cut a run the same way, at half the journal group's bytes and at 1,024 updates. At the bench's sizes neither binds, so it bounds step 1 as written.
 - **What recovery reads:** replay reads a group record as the application outcome of each command it names. Those are the same facts, in one record. The decision's records are untouched.
-- **Mixed versions:** the format is local, since only this voter reads its journal. 1b raises the journal record's format, the one it writes (`current`), from 1 to 2. 1a's release reads 2, since its window reads ahead to it, and an older release refuses it as unsupported. So a voter goes back at most to 1a's release.
+- **Mixed versions:** the format is local, since only this voter reads its journal. 1b raises the journal record's format, the one it writes (`current`), from 1 to 2. 1a's release reads 2, since its window reads ahead to it. An older release can't read it, so a voter goes back at most to 1a's release. Such a release refuses a format-2 record as unsupported, or as malformed if its body is a group: the decoder decodes the body before it checks the format (`JournalRecordV1::decode`; Codex on #289).
   - **Only the record's format moves.** The local checkpoint's stays as it is: raising it too would leave 1a unable to open a 1b image, and so close the way back.
   - 1b raises `current` in the registry; it doesn't seal through `seal_as`, which stays for fixtures.
 - **Pinned by:**
-  - a group of 32 outcomes near 1 MiB each, cut into records under the bounds;
-  - a lone outcome over 1 MiB, in a record of its own;
+  - a group of 32 outcomes near the run's bytes each, cut into records under the bounds, past what the queue holds;
+  - a lone outcome over the run's bytes, in a record of its own: one in an ordinary journal group, and one over 1 MiB on the large-record path;
   - a group past 1,024 updates;
-  - a compile-time check of the bounds against the record's, like `journaled.rs`'s for the commit rows;
+  - a run of large outcomes behind a domain with something queued at every lowering, durable within a few appends (review of #288);
+  - two consecutive outcomes at two ballots, sealed as two records, each under its own ballot;
+  - a compile-time check of the bounds against the record's, like `journaled.rs`'s for the commit rows, and of the run's bytes at the default group against them;
   - the crash matrix's cuts at the group record: torn, durable but not acknowledged, and between two records of one group;
     - the last adds no state: per-command records already allow a crash between two commands of one group. Its expected result is that state's: the durable records' commands count as applied, and the rest are executed again;
   - a journal holding both forms replays to the same state as either alone;
@@ -1372,6 +1411,17 @@ Each step has its own PRs and pair.
   - At 120 callers a frame (about 10 commands) is one batch. A full 1 MiB frame of the smallest commands is about fifteen.
 - **What recovery reads:** the same records as today. A crash keeps a prefix of a frame's batches. The adoptions in the batches it loses come back with the leader's re-send (task-d07), as a lost batch does today.
 - **Mixed versions:** nothing changes on the wire or in a record.
+- **Settings that count journal records, not commands (review of #288).** Three settings count a voter's journal records:
+  - checkpoint publication (`checkpoint_after_records`): 4,096 strict, and 65,536 with 30 s under replay;
+  - `projection_durable_records` (4,096): what a crash makes the next start replay;
+  - `projection_commit_records` (32): the projection commit hold (task-d86).
+  - **What step 2 changes.** Under B1 a follower writes 1.11 records a command at 120 callers, not 2.00. So each of those intervals spans 1.8 times as many commands at a follower. With 1b as well it would be 0.18 records a command, and about 11 times as many.
+  - **Step 2's PR restates them in commands or bytes,** or keeps them in records and says in its body what each interval becomes. Its pair reports projection commits and checkpoint publications a command.
+    - **An effective value is per role.** A follower writes 2.00 records a command today at every load, and the leader's count needn't match it, so one figure in commands can keep one role's interval and move the other's. The PR body says what each interval becomes at the leader and at a follower.
+    - **A restatement that changes an effective value is read with and without it,** so step 2's own saving is told apart from the setting's. That is one alternation of three builds: the carry, step 2, and step 2 with the restatement, each run read against its neighbours (R13), as B0 was read against two bases. Two pairs against the carry would be the difference R13 rules out (review of #289).
+  - **The hold's unit may be part of B1's materializer reading.** Under B1 a follower's projection commits fall from about 0.047 to 0.038 a command (−19%). In B1's profiled pair, its redb `commit` falls from 10.0 to 8.1 µs a command (base spread 1.3), and its materializer thread from 38.6 to 34.7.
+    - Under 1b the commits fell as much at every voter, with redb's `commit` flat (8.91 → 8.89 µs at a follower) and no saving in the materializers.
+    - So step 2's checkpoint stays in a follower's loop. A saving in the materializers that a larger `projection_commit_records` alone would buy isn't step 2's.
 - **Pinned by:**
   - 6.7's property test: a frame taken as a unit leaves every path log as taking its entries one at a time does;
   - **a 1 MiB frame of the smallest commands:** taken in batches each under the record's bounds, the voter still running, and every adoption voted;
@@ -1381,12 +1431,19 @@ Each step has its own PRs and pair.
   - the crash matrix's cuts at a frame's batch and between two of its batches;
   - `protocol_sim`'s rows, unchanged.
 - **Bound:** B1. The inferred −15 to −21 µs a follower is about −0.04 to −0.05 ms an operation locally. A quarter to a third of that is −0.01 to −0.02, under what a pair sees, so the profiled pair may be the whole reading. Step 2 is built even then, since step 5 stands on it.
-- **Checkpoint:** half of B1 in a follower's loop, as µs a command, and one batch, one barrier and one storage event a frame at 120 callers. Then the drift pair against the carry before step 1.
+- **Checkpoint:** half of B1 in a follower's loop, as µs a command, and one batch, one barrier and one storage event a frame at 120 callers. By B1 on `ab209310` that is about −4.7 µs a command (step 0 read −5.4). B1's re-read and step 2's pair run on the same carry commit, by the rule above. Then the drift pair against the carry before step 1.
 
 **Step 3: the frame log's kinds, read only.**
 - **One PR.** Each piece is a new kind that every voter decodes before any voter sends or writes one:
   - a frame with its position in the domain's frame log, its predecessor's digest and its boundary bit (step 5), sent only while `FrameLog` is active, as `ProposalFrame` is behind `BatchedRound`;
   - the journal's frame record;
+    - **Its format is 3,** read ahead by step 3 and written by 4a, while 1b is parked. 2 keeps its meaning, a record that may hold a group's application outcomes, which 1a's release reads and nothing writes. If 1b merges first, the frame record still takes 3.
+    - **A release before step 3 can't tell a frame record from a damaged one (Codex on #289).** `JournalRecordV1::decode` decodes the whole record, typed body included, before it checks the format. So 1a's release refuses a frame record as malformed, whatever its format number.
+      - That isn't a gap in the rollback rule: once 4a writes, a voter goes back at most to step 3's release, which reads frame records.
+      - **Step 3's PR moves the format check ahead of the body.** The format is the record's first field, so the decoder reads it, refuses one past `newest` as unsupported, and only then decodes the body. A kind added after step 3 then reads, to the release before it, as an unsupported format and not as a damaged record.
+      - Pinned by a fixture: a record at the next format with a body kind this build doesn't know is refused as `UnsupportedFormat`.
+    - **A frame record below format 3 is refused,** as `check_body` refuses a group below format 2 (`GroupBeforeItsFormat`). `seal` runs `check_body`, so a frame record can't be written at 2, where 1a's release would read it as damaged. A format number then always names the body kinds a record may hold (review of #289).
+      - Pinned beside the fixture above: a frame record at format 2 is refused.
   - frame entries in a recovery report and in a Sync;
   - **the frame fetch (R7):** `FrameRequest { position, ballot, digest }`, answered with the frame record's bytes, which the asker checks against the digest. It is to frames what `PayloadRequest` is to payloads today.
 - **What recovery reads:** what it reads today.
