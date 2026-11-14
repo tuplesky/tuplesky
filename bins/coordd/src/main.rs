@@ -579,6 +579,8 @@ fn report_metrics(
         } else {
             Measure::Unavailable(Unavailable::NotThisRole)
         },
+        // No connection is open before the first turn.
+        paths: Vec::new(),
     };
     match serde_json::to_string(&snapshot) {
         Ok(rendered) => println!("metrics {rendered}"),

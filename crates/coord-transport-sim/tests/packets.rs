@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use coord_transport::{
-    BoundIdentity, CloseReason, Lane, Limits, SendError, TransportError, evidence_frame,
+    BoundIdentity, CloseReason, Lane, Limits, Reordering, SendError, TransportError, evidence_frame,
 };
 use coord_transport_sim::{LinkFaults, NodeConfig, PacketWorld, SimEvent};
 use coord_transport_testkit::{TestBinder, TestCa, TestIdentity};
@@ -703,4 +703,136 @@ fn a_non_voter_naming_a_voters_replica_is_refused_as_the_real_binder_refuses_it(
     )
     .unwrap();
     assert!(w.run_until(20_000, |w| w.connections(0) == 1));
+}
+
+/// What one voter's stream of frames to another cost under a link's
+/// faults: virtual time to move them all, and what the sender's QUIC
+/// counted.
+#[derive(Debug)]
+struct Moved {
+    ticks: u64,
+    lost: u64,
+    congestion_events: u64,
+    dropped: u64,
+}
+
+/// Voter 0 sends voter 1 `frames` evidence frames of a kilobyte, one a
+/// millisecond, and voter 1 answers each with a small one: a peer lane
+/// under steady load. A frame the lane's queue refuses is offered again
+/// a millisecond later. Returns once both ends have every frame.
+fn steady(
+    f: &Fixture,
+    seed: u8,
+    faults: LinkFaults,
+    reordering: Reordering,
+    frames: usize,
+) -> Moved {
+    let limits = Limits {
+        reordering,
+        ..Limits::node()
+    };
+    let (mut w, expected) = registered_world(f, seed, limits);
+    w.set_default_faults(faults);
+    w.connect(
+        0,
+        1,
+        PeerRole::Voter,
+        Some(inc()),
+        Lane::Control,
+        "node-1",
+        expected[1].clone(),
+    )
+    .unwrap();
+    assert!(w.run_until(20_000, |w| w.connections(0) == 1 && w.connections(1) == 1));
+    let start = w.tick();
+    let mut sent = 0;
+    let offer = |w: &mut PacketWorld, from: usize, to: u8, bytes: Vec<u8>| loop {
+        match w.send(
+            from,
+            r(to),
+            inc(),
+            Lane::Control,
+            DOMAIN,
+            evidence_frame(&bytes).unwrap(),
+        ) {
+            Ok(()) => return,
+            Err(SendError::QueueFull { .. } | SendError::TooManyGroups { .. }) => {
+                let t = w.tick();
+                w.run_until(1, |w| w.tick() > t);
+            }
+            Err(e) => panic!("{e:?}"),
+        }
+    };
+    while sent < frames {
+        let mut big = vec![0xa0; 1000];
+        big[..8].copy_from_slice(&(sent as u64).to_be_bytes());
+        offer(&mut w, 0, 1, big);
+        let mut small = vec![0xb0; 40];
+        small[..8].copy_from_slice(&(sent as u64).to_be_bytes());
+        offer(&mut w, 1, 0, small);
+        sent += 1;
+        let t = w.tick();
+        w.run_until(1, |w| w.tick() > t);
+    }
+    let done = |w: &PacketWorld| {
+        let o = w.visible_outcome();
+        o.get(&(1, r(0), Lane::Control)).map_or(0, Vec::len) == frames
+            && o.get(&(0, r(1), Lane::Control)).map_or(0, Vec::len) == frames
+    };
+    assert!(w.run_until(600_000, done), "every frame arrives");
+    let paths = w.path_stats(0);
+    assert_eq!(paths.len(), 1, "one connection");
+    Moved {
+        ticks: w.tick() - start,
+        lost: paths[0].lost_packets,
+        congestion_events: paths[0].congestion_events,
+        dropped: w.datagrams().1,
+    }
+}
+
+/// A link whose delay jitters reorders datagrams and loses none (#98's
+/// +jitter10 cell, here in virtual time). At QUIC's thresholds the
+/// sender calls lost what is only late, cuts its window for it, and
+/// moves the same frames many times slower; at the default it calls next
+/// to nothing lost. On the same link with real loss the default still
+/// finds the losses, and every frame arrives.
+#[test]
+fn a_jittered_link_that_loses_nothing_is_not_called_lossy_at_the_default_thresholds() {
+    let f = fixture(&[PeerRole::Voter, PeerRole::Voter]);
+    // One-way delay 50 ms with uniform jitter of 10 either side: a
+    // standard deviation near 12% of the delay.
+    let jitter = LinkFaults {
+        delay_min: 40,
+        delay_max: 60,
+        ..LinkFaults::default()
+    };
+    let frames = 1000;
+    let quic = steady(&f, 2, jitter, Reordering::QUIC, frames);
+    let default = steady(&f, 2, jitter, Reordering::DEFAULT, frames);
+    assert_eq!(
+        (quic.dropped, default.dropped),
+        (0, 0),
+        "the link loses nothing"
+    );
+    // The hypothesis, reproduced: reordering alone is called loss.
+    assert!(
+        quic.lost >= 50 && quic.congestion_events >= 20,
+        "QUIC's thresholds call reordering loss: {quic:?}"
+    );
+    assert!(
+        default.lost * 20 <= quic.lost && default.congestion_events * 20 <= quic.congestion_events,
+        "the default calls next to nothing lost: {default:?} against {quic:?}"
+    );
+    assert!(
+        default.ticks * 3 <= quic.ticks,
+        "and moves the frames at least three times sooner: {default:?} against {quic:?}"
+    );
+
+    // Real loss on the same link is still found, and recovered.
+    let lossy = LinkFaults {
+        loss_ppm: 10_000,
+        ..jitter
+    };
+    let found = steady(&f, 2, lossy, Reordering::DEFAULT, frames);
+    assert!(found.dropped > 0 && found.lost > 0, "{found:?}");
 }

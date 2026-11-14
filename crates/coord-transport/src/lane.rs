@@ -11,7 +11,7 @@ use std::time::Duration;
 use coord_types::wire_v1::{HelloV1, PeerRole};
 use quinn::VarInt;
 
-use crate::config::AckFrequency;
+use crate::config::{AckFrequency, Reordering};
 
 /// One traffic lane of a peer link.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -199,6 +199,7 @@ pub fn transport_config(
     idle_timeout: Duration,
     keep_alive: Duration,
     ack_frequency: Option<AckFrequency>,
+    reordering: Reordering,
 ) -> Result<Arc<quinn::TransportConfig>, String> {
     let mut transport = quinn::TransportConfig::default();
     transport
@@ -211,12 +212,15 @@ pub fn transport_config(
             quinn::IdleTimeout::try_from(idle_timeout).map_err(|e| e.to_string())?,
         ))
         .keep_alive_interval(Some(keep_alive))
-        .congestion_controller_factory(Arc::new(quinn::congestion::CubicConfig::default()));
+        .congestion_controller_factory(Arc::new(quinn::congestion::CubicConfig::default()))
+        .packet_threshold(reordering.packets)
+        .time_threshold(reordering.time_threshold());
     if let Some(ack) = ack_frequency {
         let mut config = quinn::AckFrequencyConfig::default();
         config
             .ack_eliciting_threshold(VarInt::from_u32(ack.threshold))
-            .max_ack_delay(ack.max_delay);
+            .max_ack_delay(ack.max_delay)
+            .reordering_threshold(VarInt::from_u32(reordering.packets.saturating_sub(1)));
         transport.ack_frequency_config(Some(config));
     }
     Ok(Arc::new(transport))

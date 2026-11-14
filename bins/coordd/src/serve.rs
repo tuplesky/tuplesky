@@ -496,6 +496,12 @@ impl PeerPlane {
         self.transport.peer_traffic()
     }
 
+    /// Each open connection's path to another voter, as QUIC estimates
+    /// it (the lead's item 2 on #185).
+    pub fn path_readings(&self) -> Vec<coord_transport::PathReading> {
+        self.transport.path_readings()
+    }
+
     /// The plane over `transport`, for the voters in `peers`.
     pub fn new(
         transport: Transport,
@@ -2117,6 +2123,16 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                         .saturating_mul(coord_storage::intake::EXECUTED_ENTRY_BYTES),
                 }
             },
+            offers: {
+                let counts = &self.frontend.counts;
+                coord_daemon::metrics::Offers {
+                    reoffered: counts.reoffered,
+                    solicited: counts.solicited,
+                    refused: counts.refused,
+                    returned: counts.returned,
+                    unreturnable: counts.unreturnable,
+                }
+            },
             busy,
             uptime: now.saturating_duration_since(self.started),
             recent,
@@ -2349,6 +2365,20 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             view_age: Measure::Unavailable(Unavailable::NotInstrumented),
             engine_pressure: Measure::Unavailable(Unavailable::NoBound),
             cost: self.cost(),
+            // Both planes' connections to voters and collectors: the peer
+            // plane's, and the api plane's this node's collector dialed or
+            // a collector elsewhere dialed to it.
+            paths: self
+                .plane
+                .iter()
+                .flat_map(PeerPlane::path_readings)
+                .chain(
+                    self.api_traffic
+                        .iter()
+                        .flat_map(coord_transport::TrafficReader::path_readings),
+                )
+                .map(|reading| coord_daemon::metrics::Path::of(&reading))
+                .collect(),
         }
     }
 
@@ -6345,6 +6375,20 @@ fn endpoint(
             ),
         }
     }
+    // How far out of order a packet may arrive before loss detection
+    // calls it lost, overridden from the environment for the same reason:
+    // `<packets>,<eighths of the round trip>`, or `quic` for QUIC's own
+    // three packets and 9/8, the control. Unset, the transport's default.
+    if let Ok(value) = std::env::var("COORDD_REORDERING") {
+        match reordering(&value) {
+            Some(reordering) => limits.reordering = reordering,
+            None => eprintln!(
+                "COORDD_REORDERING={value:?} is not <packets>,<eighths of the \
+                 round trip> (at least 3 and 9) or quic: the default \
+                 reordering thresholds are kept"
+            ),
+        }
+    }
     Transport::with_socket(socket, identity, std::sync::Arc::new(binder), limits)
         .map_err(|e| TransportError::Endpoint(format!("{e:?}")))
 }
@@ -6368,6 +6412,24 @@ fn ack_frequency(value: &str) -> Option<Option<coord_transport::AckFrequency>> {
         threshold: threshold.trim().parse().ok()?,
         max_delay: delay,
     }))
+}
+
+/// Reordering thresholds written `<packets>,<eighths of the round trip>`,
+/// at least QUIC's three and nine, or `quic` for QUIC's own. `None` is a
+/// malformed value, or one below QUIC's.
+fn reordering(value: &str) -> Option<coord_transport::Reordering> {
+    let value = value.trim();
+    if value == "quic" {
+        return Some(coord_transport::Reordering::QUIC);
+    }
+    let (packets, eighths) = value.split_once(',')?;
+    let reordering = coord_transport::Reordering {
+        packets: packets.trim().parse().ok()?,
+        time_eighths: eighths.trim().parse().ok()?,
+    };
+    let quic = coord_transport::Reordering::QUIC;
+    (reordering.packets >= quic.packets && reordering.time_eighths >= quic.time_eighths)
+        .then_some(reordering)
 }
 
 /// Why the endpoint could not be built.
@@ -7556,6 +7618,35 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
             "none",
         ] {
             assert_eq!(super::ack_frequency(malformed), None, "{malformed:?}");
+        }
+    }
+
+    #[test]
+    fn reordering_thresholds_parse_from_the_environments_spelling() {
+        use coord_transport::Reordering;
+        assert_eq!(
+            super::reordering(" 16, 10 "),
+            Some(Reordering {
+                packets: 16,
+                time_eighths: 10,
+            })
+        );
+        // `quic` is QUIC's own thresholds, the control.
+        assert_eq!(super::reordering("quic"), Some(Reordering::QUIC));
+        assert_eq!(super::reordering("3,9"), Some(Reordering::QUIC));
+        // Below QUIC's is refused: the setting tolerates more, never less.
+        for refused in [
+            "",
+            "16",
+            "16,",
+            ",10",
+            "2,10",
+            "16,8",
+            "sixteen,10",
+            "16,1.25",
+            "off",
+        ] {
+            assert_eq!(super::reordering(refused), None, "{refused:?}");
         }
     }
 

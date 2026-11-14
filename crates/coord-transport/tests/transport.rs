@@ -285,6 +285,104 @@ async fn voters_negotiate_roles_and_exchange_frames_with_bound_provenance() {
     assert_eq!(c.peer_traffic(), coord_transport::PeerTraffic::default());
 }
 
+/// Each open connection's path as QUIC estimates it (the lead's item 2 on
+/// #185): read for a link to a voter and for a collector's link, never
+/// for a client's, which are as many as the callers.
+#[tokio::test(flavor = "multi_thread")]
+async fn path_readings_cover_voters_and_collectors_but_not_clients() {
+    let f = fixture(&[
+        PeerRole::Voter,
+        PeerRole::Voter,
+        PeerRole::Client,
+        PeerRole::Frontend,
+    ]);
+    let mut a = bind(&f, 0);
+    let mut b = bind(&f, 1);
+    let client = bind(&f, 2);
+    let frontend = bind(&f, 3);
+    connect_lane(&a, &b, &f.ids[1], Lane::Control).await;
+    drained(&mut a).await;
+    drained(&mut b).await;
+    a.send(
+        dest(1, Lane::Control),
+        DOMAIN,
+        evidence_frame(b"vote").unwrap(),
+    )
+    .unwrap();
+    match event(&mut b).await {
+        TransportEvent::PeerFrame { payload, .. } => assert_eq!(payload, b"vote"),
+        other => panic!("{other:?}"),
+    }
+    for (caller, role) in [(&client, PeerRole::Client), (&frontend, PeerRole::Frontend)] {
+        caller
+            .connect(
+                a.local_addr().unwrap(),
+                &f.ids[0].name,
+                role,
+                None,
+                Lane::Unary,
+                f.ids[0].expected(),
+            )
+            .await
+            .expect("the caller connected");
+        drained(&mut a).await;
+    }
+
+    // The voter reads its link to the other voter, then the collector's
+    // connection it accepted; the client's is not read.
+    let readings = a.path_readings();
+    assert_eq!(readings.len(), 2, "{readings:?}");
+    let peer = &readings[0];
+    assert_eq!(
+        (
+            peer.class,
+            peer.lane,
+            peer.role,
+            peer.replica,
+            peer.accepted
+        ),
+        (
+            Class::Peer,
+            Lane::Control,
+            PeerRole::Voter,
+            Some(r(1)),
+            false
+        )
+    );
+    assert!(
+        peer.sent_packets > 0 && peer.rtt > Duration::ZERO && peer.cwnd > 0,
+        "{peer:?}"
+    );
+    let collector = &readings[1];
+    assert_eq!(
+        (
+            collector.class,
+            collector.lane,
+            collector.role,
+            collector.replica,
+            collector.accepted
+        ),
+        (Class::Api, Lane::Unary, PeerRole::Frontend, None, true)
+    );
+    assert!(collector.sent_packets > 0, "{collector:?}");
+    // The collector reads its link to the voter, named by the voter's
+    // replica: the connection a relay to the leader goes on.
+    let dialed = frontend.path_readings();
+    assert_eq!(dialed.len(), 1, "{dialed:?}");
+    assert_eq!(
+        (
+            dialed[0].class,
+            dialed[0].role,
+            dialed[0].replica,
+            dialed[0].accepted
+        ),
+        (Class::Api, PeerRole::Voter, Some(r(0)), false)
+    );
+    // What is left out is by the other end's role: a client reads its own
+    // link to the voter.
+    assert_eq!(client.path_readings().len(), 1);
+}
+
 /// A raw client endpoint presenting `id`'s certificate, for driving the
 /// acceptor with hand-built frames.
 fn raw_client(f: &Fixture, id: &TestIdentity, alpn: &[u8]) -> quinn::Endpoint {
