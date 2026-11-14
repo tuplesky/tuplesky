@@ -23,7 +23,8 @@ use coord_journal_api::failure::JournalFailure;
 use coord_journal_api::frontier::CheckpointPointerV1;
 use coord_journal_api::group::GroupLimits;
 use coord_journal_api::record::{
-    JournalRecordV1, LifecycleRecordV1, RecordBody, RecordDraft, RecordError, RecordOrigin,
+    GroupOutcomeV1, JOURNAL_RECORD_FORMAT_GROUPS, JournalRecordV1, LifecycleRecordV1, RecordBody,
+    RecordDraft, RecordError, RecordOrigin,
 };
 use coord_journal_api::stream::ShardId;
 use coord_storage::journaled::{
@@ -949,6 +950,337 @@ fn workload_store(materialize_inline: bool) -> JournaledStore<ModelJournal, Mode
     assert_eq!(recovered.materialized(), recovered.durable());
     assert_eq!(next.status(A), Some(DomainStatus::Ready));
     next
+}
+
+/// The four application updates of [`workload_store`]'s step `step`: a
+/// put, its event row, the payload and the executed row that moves it.
+fn workload_updates(step: u64) -> Vec<StoreUpdate> {
+    let events = coord_store_api::registry::Collection::EventsV1.id();
+    vec![
+        kv_update(format!("key-{step}").as_bytes(), b"value"),
+        StoreUpdate {
+            collection: events,
+            key: coord_storage::codecs::event_key(KvRevision::new(step).unwrap(), 0),
+            value: Some(
+                coord_storage::codecs::encode_event(&coord_storage::codecs::EventRecordV1 {
+                    kind: coord_state::KvEventKind::Put,
+                    namespace: NamespaceId([0; 16]),
+                    key: format!("key-{step}").into_bytes(),
+                    entry: Some(coord_state::KvEntry {
+                        value: b"value".to_vec(),
+                        create_revision: KvRevision::new(step).unwrap(),
+                        mod_revision: KvRevision::new(step).unwrap(),
+                        version: 1,
+                        lease: None,
+                        lease_generation: None,
+                    }),
+                    prev: None,
+                })
+                .unwrap(),
+            ),
+        },
+        StoreUpdate {
+            collection: coord_store_api::registry::Collection::PayloadV1.id(),
+            key: command(step as u8).as_bytes().to_vec(),
+            value: Some(vec![step as u8; 16]),
+        },
+        coord_storage::retry::executed_update(
+            &command(step as u8),
+            position(step),
+            None,
+            Digest32([step as u8; 32]),
+        )
+        .unwrap(),
+    ]
+}
+
+/// How [`regrouped`] rewrites the run of application records.
+#[derive(Clone, Copy, Debug)]
+enum Form {
+    /// The next `n` outcomes as one group record.
+    Group(usize),
+    /// The next outcome as its own record, as it was written.
+    Single,
+}
+
+/// Four promises, then four application outcomes in a row, journaled and
+/// left unmaterialized, so the next boot replays every outcome. Returns
+/// the journal, the projection, and how many records precede the
+/// outcomes.
+fn outcomes_unmaterialized() -> (ModelJournal, ModelEngine, usize) {
+    let mut world = World::new();
+    for step in 1..=4u64 {
+        world.protocol(A, ballot(step), promise(step));
+        world.store.append_pending().unwrap();
+    }
+    for step in 1..=4u64 {
+        world.application(A, 4, position(step), workload_updates(step));
+        world.store.append_pending().unwrap();
+    }
+    let (journal, mut engines) = world.store.into_parts();
+    let engine = engines.pop().expect("one domain").1;
+    let stream = journal_stream(&journal);
+    let records = journal.records(stream);
+    let prefix = records.len() - 4;
+    assert!(
+        records[prefix..]
+            .iter()
+            .all(|r| matches!(r.body(), RecordBody::ApplicationOutcome { .. })),
+        "the last four records are the outcomes"
+    );
+    (journal, engine, prefix)
+}
+
+fn journal_stream(journal: &ModelJournal) -> coord_journal_api::stream::StorageStreamId {
+    // One domain, one stream: the one the boot record names.
+    let mut streams = BTreeSet::new();
+    for id in 0..64 {
+        if let Ok(stream) = coord_journal_api::stream::StorageStreamId::from_durable(id)
+            && !journal.records(stream).is_empty()
+        {
+            streams.insert(stream);
+        }
+    }
+    assert_eq!(streams.len(), 1, "one stream");
+    streams.into_iter().next().unwrap()
+}
+
+/// The journal of [`outcomes_unmaterialized`] with its outcomes rewritten
+/// in the given forms, sealed at [`JOURNAL_RECORD_FORMAT_GROUPS`]: what the
+/// writer of groups (step 1b) would have left.
+fn regrouped(journal: &mut ModelJournal, prefix: usize, forms: &[Form]) {
+    let stream = journal_stream(journal);
+    let records = journal.records(stream).to_vec();
+    let mut outcomes = records[prefix..].iter();
+    let mut last = records[prefix - 1].clone();
+    journal.truncate_records(stream, prefix);
+    let mut place = |body: RecordBody, last: &mut JournalRecordV1| {
+        let record = JournalRecordV1::seal_as(
+            JOURNAL_RECORD_FORMAT_GROUPS,
+            RecordDraft {
+                origin: *last.origin(),
+                seq: last.seq().checked_next().unwrap(),
+                predecessor: last.digest(),
+                body,
+            },
+        )
+        .unwrap();
+        journal.inject_record(stream, record.clone());
+        *last = record;
+    };
+    for form in forms {
+        match *form {
+            Form::Single => place(outcomes.next().unwrap().body().clone(), &mut last),
+            Form::Group(n) => {
+                let (mut context, mut base) = (None, None);
+                let (mut group, mut updates) = (Vec::new(), Vec::new());
+                for record in outcomes.by_ref().take(n) {
+                    let RecordBody::ApplicationOutcome {
+                        context: c,
+                        base: b,
+                        position,
+                        revision,
+                        result_digest,
+                        updates: u,
+                    } = record.body()
+                    else {
+                        panic!("an outcome")
+                    };
+                    assert_eq!(*context.get_or_insert(*c), *c, "one context a group");
+                    base.get_or_insert(*b);
+                    group.push(GroupOutcomeV1 {
+                        position: *position,
+                        revision: *revision,
+                        result_digest: *result_digest,
+                        updates: u.len() as u32,
+                    });
+                    updates.extend(u.iter().cloned());
+                }
+                assert_eq!(group.len(), n);
+                place(
+                    RecordBody::ApplicationGroup {
+                        context: context.unwrap(),
+                        base: base.unwrap(),
+                        outcomes: group,
+                        updates,
+                    },
+                    &mut last,
+                );
+            }
+        }
+    }
+    assert!(outcomes.next().is_none(), "every outcome placed");
+}
+
+/// The projection's rows but its stamp, which names the last record by
+/// its sequence and digest: those differ between the two forms, and
+/// nothing else may.
+fn rows_but_the_stamp(engine: &ModelEngine) -> Vec<(u16, Vec<u8>, Vec<u8>)> {
+    let meta = coord_store_api::registry::Collection::MetaV1.id().0;
+    engine
+        .durable_rows()
+        .into_iter()
+        .filter(|(c, k, _)| {
+            !(*c == meta && k.as_slice() == coord_store_api::registry::meta_fields::APPLIED_STAMP)
+        })
+        .collect()
+}
+
+/// Reopen over `journal`, replay, then run a fifth command on the frontier
+/// the replay leaves.
+fn replay_and_continue(
+    journal: ModelJournal,
+    engine: ModelEngine,
+) -> JournaledStore<ModelJournal, ModelEngine> {
+    let mut next = JournaledStore::open(
+        journal,
+        CLUSTER,
+        REPLICA,
+        inc(),
+        BootId([0x88; 16]),
+        JournalLimits::default(),
+    )
+    .unwrap();
+    next.attach(A, shard(), engine).unwrap();
+    let recovered = next.frontiers(A).unwrap();
+    assert_eq!(recovered.materialized(), recovered.durable());
+    assert_eq!(next.status(A), Some(DomainStatus::Ready));
+    // The outcomes extend the initial configuration (`World::application`),
+    // and comparing the rows holds a grouped journal's frontier to the
+    // per-command one's configuration as well.
+    assert_eq!(
+        next.application_base(A).map(|base| base.execution_position),
+        Some(position(4)),
+        "the replay leaves the frontier at the last outcome's position"
+    );
+    let mut world = World {
+        store: next,
+        barriers: BarrierAllocator::new(inc(), BootId([0x88; 16])),
+    };
+    world.application(A, 4, position(5), workload_updates(5));
+    world.store.flush().unwrap();
+    let frontiers = world.store.frontiers(A).unwrap();
+    assert_eq!(frontiers.materialized(), frontiers.durable());
+    world.store
+}
+
+/// A journal holding groups of application outcomes replays to the same
+/// state as one holding a record a command, and the store goes on from
+/// there (the batching-rule doc's 10.7, step 1a). This build writes no
+/// group; the journals here are rewritten as its successor would write
+/// them: one group of four, groups of one, and groups beside per-command
+/// records.
+#[test]
+fn a_journal_of_grouped_outcomes_replays_to_the_state_of_per_command_records() {
+    let (journal, engine, _) = outcomes_unmaterialized();
+    let reference = replay_and_continue(journal, engine);
+    let expected = rows_but_the_stamp(reference.projection(A).unwrap());
+    assert!(
+        expected
+            .iter()
+            .any(|(c, ..)| *c == coord_store_api::registry::Collection::EventsV1.id().0),
+        "the workload writes revision events"
+    );
+    for forms in [
+        &[Form::Group(4)][..],
+        &[
+            Form::Group(1),
+            Form::Group(1),
+            Form::Group(1),
+            Form::Group(1),
+        ],
+        &[Form::Group(2), Form::Single, Form::Single],
+        &[Form::Single, Form::Group(3)],
+        &[Form::Single, Form::Group(2), Form::Single],
+    ] {
+        let (mut journal, engine, prefix) = outcomes_unmaterialized();
+        regrouped(&mut journal, prefix, forms);
+        assert_eq!(
+            journal.records(journal_stream(&journal)).len(),
+            prefix + forms.len(),
+            "{forms:?}: a record a form"
+        );
+        let store = replay_and_continue(journal, engine);
+        assert_eq!(
+            rows_but_the_stamp(store.projection(A).unwrap()),
+            expected,
+            "{forms:?}"
+        );
+    }
+}
+
+/// A group whose base isn't the projection's frontier is refused at
+/// replay, as a per-command outcome's would be: the record checks its
+/// outcomes against one another, and the materializer checks the group
+/// against what the projection holds.
+#[test]
+fn a_group_that_does_not_extend_the_projection_is_refused_at_replay() {
+    let (mut journal, engine, prefix) = outcomes_unmaterialized();
+    // The first outcome dropped: the group of the other three names a
+    // base the projection never reached.
+    let stream = journal_stream(&journal);
+    let records = journal.records(stream).to_vec();
+    journal.truncate_records(stream, prefix);
+    let last = &records[prefix - 1];
+    let RecordBody::ApplicationOutcome { context, base, .. } = records[prefix + 1].body() else {
+        panic!("an outcome")
+    };
+    let mut group = Vec::new();
+    let mut updates = Vec::new();
+    for record in &records[prefix + 1..] {
+        let RecordBody::ApplicationOutcome {
+            position,
+            revision,
+            result_digest,
+            updates: u,
+            ..
+        } = record.body()
+        else {
+            panic!("an outcome")
+        };
+        group.push(GroupOutcomeV1 {
+            position: *position,
+            revision: *revision,
+            result_digest: *result_digest,
+            updates: u.len() as u32,
+        });
+        updates.extend(u.iter().cloned());
+    }
+    let record = JournalRecordV1::seal_as(
+        JOURNAL_RECORD_FORMAT_GROUPS,
+        RecordDraft {
+            origin: *last.origin(),
+            seq: last.seq().checked_next().unwrap(),
+            predecessor: last.digest(),
+            body: RecordBody::ApplicationGroup {
+                context: *context,
+                base: *base,
+                outcomes: group,
+                updates,
+            },
+        },
+    )
+    .unwrap();
+    journal.inject_record(stream, record);
+    let mut next = JournaledStore::open(
+        journal,
+        CLUSTER,
+        REPLICA,
+        inc(),
+        BootId([0x88; 16]),
+        JournalLimits::default(),
+    )
+    .unwrap();
+    let attached = next.attach(A, shard(), engine);
+    let refused = matches!(
+        attached,
+        Err(JournaledError::Quarantined(what)) if what.contains("does not extend")
+    ) || next.status(A) == Some(DomainStatus::Quarantined);
+    assert!(
+        refused,
+        "a group past a gap is not replayed: {:?}",
+        attached.err()
+    );
 }
 
 #[test]
