@@ -361,6 +361,33 @@ class SweepTests(unittest.TestCase):
         self.assertIn("| 120 | head | n2 | 2000 | 500 | 4.00 | 4.00 | 50 | 3.00 | 1.00 | 3.00 | 8.00 | 1.50 | 0.500 |",
                       text)
 
+    def test_client_deadlines_and_paths_by_plane(self):
+        path = self.store("h120")
+        with open(os.path.join(path, "shim-stats.txt"), "w") as f:
+            f.write("late_established=30 late_gave_up=5 late_ms=60000 late_other=0 late_unknown=15 ops=1000 "
+                    "resolves=80 shims=120 timed_out=50\n")
+        path_of = lambda plane, cwnd, sent, lost, events, rtt, least: (
+            f'{{"plane":"{plane}","lane":"Control","role":"Voter","replica":"aa","rtt_micros":{rtt},'
+            f'"min_rtt_micros":{least},"cwnd":{cwnd},"congestion_events":{events},"lost_packets":{lost},'
+            f'"lost_bytes":0,"sent_packets":{sent}}}')
+        with open(os.path.join(path, "n2", "coordd.log"), "a") as f:
+            f.write('metrics {"cost":{"Observed":{"executed":2000,"busy":{"secs":1,"nanos":0},'
+                    '"uptime":{"secs":10,"nanos":0}}},"paths":['
+                    + ",".join([path_of("Api", 12000, 1000, 10, 4, 70000, 69000),
+                                path_of("Api", 24000, 3000, 30, 2, 140000, 139000),
+                                path_of("Api", 99999, 50, 0, 0, 70000, 69000),
+                                path_of("Peer", 500000, 9000, 9, 1, 80000, 79000)])
+                    + ']}\n')
+        step = sw.read_step("head", "120", path)
+        self.assertEqual(step.shims["timed_out"], 50)
+        api = step.planes["api"]
+        self.assertEqual((api.paths, api.window_p50, api.window_min, api.window_max, api.lost, api.sent),
+                         (2, 24000, 12000, 24000, 40, 4000))
+        text = sw.render([step], "Sweep")
+        self.assertIn("| 120 | head | 1000 | 50 (5.0%) | 30 (60%) | 15 (30%) | 5 (10%) | 0 (0%) | 1.60 | 1200 |", text)
+        self.assertIn("| 120 | head | api | 2 | 24000 (12000–24000) | 40 of 4000 (1.00%) | 3.0 | 140.0 | 69.0 |", text)
+        self.assertIn("| 120 | head | peer | 1 | 500000 (500000–500000) | 9 of 9000 (0.10%) | 1.0 | 80.0 | 79.0 |", text)
+
     def test_voters_behind(self):
         path = self.store("h120")
         # n1 executed to 5000 and kept up; n2 stopped 2600 short, was

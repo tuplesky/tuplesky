@@ -135,6 +135,9 @@ async fn serve(cli: Cli) -> ExitCode {
             return ExitCode::FAILURE;
         }
     }
+    // The end of the input: what the session's operations met, for the
+    // test's summary (jepsen.tuplesky's shim-stats checker).
+    eprintln!("{}", session.stats.line());
     ExitCode::SUCCESS
 }
 

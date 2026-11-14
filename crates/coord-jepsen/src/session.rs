@@ -99,6 +99,71 @@ pub struct Session {
     pub session: SessionId,
     /// Connections opened, the first included.
     pub connects: u64,
+    /// What this session's operations met, cumulative.
+    pub stats: Stats,
+}
+
+/// What a session's operations met, cumulative since it opened: where an
+/// operation's time went once its answer did not arrive within one
+/// attempt (the SDK's deadline), so that the shim asked by identity. Under
+/// loss this splits a slow operation into one that had committed (its
+/// answer lost or late) and one the endpoint never knew (its submission
+/// lost, or never admitted).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Stats {
+    /// Operations submitted.
+    pub ops: u64,
+    /// Of them, those whose answer did not arrive within one attempt.
+    pub timed_out: u64,
+    /// Of those, established after all: committed, the answer late or lost.
+    pub late_established: u64,
+    /// Of those, answered `Unknown` by identity: the endpoint did not
+    /// know the command, so its submission never got in.
+    pub late_unknown: u64,
+    /// Of those, still unknown at the operation's deadline.
+    pub late_gave_up: u64,
+    /// Of those, ended another way: refused, withheld or retired.
+    pub late_other: u64,
+    /// Resolutions sent: one `ResolveRequest` each.
+    pub resolves: u64,
+    /// Milliseconds from each such operation's first missed attempt to its
+    /// end, summed.
+    pub late_ms: u64,
+}
+
+impl Stats {
+    /// The line the shim writes to its log at the end of its input:
+    /// `coord-jepsen stats` and `key=value` pairs.
+    pub fn line(&self) -> String {
+        format!(
+            "coord-jepsen stats ops={} timed_out={} late_established={} late_unknown={} \
+             late_gave_up={} late_other={} resolves={} late_ms={}",
+            self.ops,
+            self.timed_out,
+            self.late_established,
+            self.late_unknown,
+            self.late_gave_up,
+            self.late_other,
+            self.resolves,
+            self.late_ms
+        )
+    }
+
+    fn settle(&mut self, answer: &Answer, missed: Option<Instant>) {
+        if matches!(answer, Answer::NotSubmitted(_)) && missed.is_none() {
+            return;
+        }
+        self.ops += 1;
+        let Some(at) = missed else { return };
+        self.timed_out += 1;
+        self.late_ms += u64::try_from(at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        match answer {
+            Answer::Established(_) => self.late_established += 1,
+            Answer::Unknown(why) if why == "resolved-unknown" => self.late_unknown += 1,
+            Answer::Unknown(_) => self.late_gave_up += 1,
+            Answer::NotSubmitted(_) => self.late_other += 1,
+        }
+    }
 }
 
 pub(crate) fn parse_id(hex: &str) -> Result<[u8; 16], OpenError> {
@@ -240,6 +305,7 @@ impl Session {
             namespace,
             session: SessionId(session),
             connects: 0,
+            stats: Stats::default(),
         };
         this.connect(by).await.map_err(OpenError)?;
         Ok(this)
@@ -414,6 +480,23 @@ impl Session {
         retire_unknown: bool,
         deadline: Instant,
     ) -> Answer {
+        let mut missed = None;
+        let answer = self
+            .carry_counted(request, retire_unknown, deadline, &mut missed)
+            .await;
+        self.stats.settle(&answer, missed);
+        answer
+    }
+
+    /// [`Session::carry`], noting in `missed` when an attempt first went
+    /// unanswered.
+    async fn carry_counted(
+        &mut self,
+        request: &LogicalRequest,
+        retire_unknown: bool,
+        deadline: Instant,
+        missed: &mut Option<Instant>,
+    ) -> Answer {
         if Instant::now() >= deadline {
             // An earlier phase spent the operation's budget: submitting
             // now could only leave an effect the caller cannot wait for.
@@ -461,6 +544,9 @@ impl Session {
                     SdkAction::Reset { .. } | SdkAction::Bind { .. } => continue,
                 };
                 sent = true;
+                if resolving {
+                    self.stats.resolves += 1;
+                }
                 let left = deadline.saturating_duration_since(Instant::now());
                 let wait = self.timing.attempt.min(left).max(Duration::from_millis(1));
                 let transport = coord_transport::ConnectionId(connection.0);
@@ -502,6 +588,7 @@ impl Session {
                     }
                     Err(coord_transport::RequestError::Timeout) => {
                         last = "timeout".into();
+                        missed.get_or_insert_with(Instant::now);
                         // Past the SDK's own deadline the invocation
                         // becomes unknown and is resolved by identity.
                         self.client.tick(self.now());
@@ -623,6 +710,34 @@ fn load_roots(path: &Path) -> Result<rustls::RootCertStore, OpenError> {
 mod tests {
     use super::*;
     use crate::ops::{Verdict, read_verdict, write_verdict};
+
+    /// An operation is counted once; one whose attempt went unanswered is
+    /// split by how it ended, and one never submitted is not counted.
+    #[test]
+    fn stats_split_late_operations_by_their_end() {
+        let mut stats = Stats::default();
+        let late = Some(Instant::now());
+        stats.settle(&Answer::NotSubmitted("budget spent".into()), None);
+        stats.settle(&Answer::Unknown("timeout".into()), None);
+        stats.settle(&Answer::Unknown("resolved-unknown".into()), late);
+        stats.settle(&Answer::Unknown("pending".into()), late);
+        stats.settle(&Answer::NotSubmitted("payload-conflict".into()), late);
+        assert_eq!(
+            (
+                stats.ops,
+                stats.timed_out,
+                stats.late_unknown,
+                stats.late_gave_up,
+                stats.late_other
+            ),
+            (4, 3, 1, 1, 1)
+        );
+        assert!(
+            stats
+                .line()
+                .starts_with("coord-jepsen stats ops=4 timed_out=3 late_established=0 ")
+        );
+    }
 
     /// A command that executed with its result withheld, or whose result
     /// was retired, is never reported as having had no effect.

@@ -135,6 +135,11 @@ class Step:
     behind: dict = field(default_factory=dict)
     # Each voter's batching (see turns_of): node -> Turns.
     turns: dict = field(default_factory=dict)
+    # The clients' shims' stats (see shim_stats_of): key -> count, {}
+    # where the run has no shim-stats.txt.
+    shims: dict = field(default_factory=dict)
+    # The voters' QUIC paths by plane (see planes_of): plane -> PlanePaths.
+    planes: dict = field(default_factory=dict)
     # Each voter's executed commands over its projection commits, from its
     # last `metrics` line since it started: node -> (commands a commit,
     # whether it is the leader).
@@ -657,6 +662,76 @@ class Turns:
         return self.executed / self.turns if self.turns else None
 
 
+def shim_stats_of(store: str) -> dict:
+    """The clients' shims' stats from the test's shim-stats.txt (written by
+    jepsen.tuplesky's shim-stats checker): key -> count, such as ops,
+    timed_out (operations whose answer did not arrive within one attempt)
+    and how those ended; {} without the file."""
+    path = os.path.join(store, "shim-stats.txt")
+    if not os.path.exists(path):
+        return {}
+    with open(path, encoding="utf-8", errors="replace") as f:
+        return {k: int(v) for k, v in re.findall(r"(\w+)=(\d+)", f.read())}
+
+
+@dataclass(frozen=True)
+class PlanePaths:
+    """One plane's QUIC paths over the five voters (#297), those that sent
+    MIN_PATH_PACKETS or more: how many, the median, least and largest
+    congestion window, the packets lost over those sent, the congestion
+    events a path, and the median smoothed and the least round trip."""
+
+    paths: int
+    window_p50: int
+    window_min: int
+    window_max: int
+    lost: int
+    sent: int
+    events_per_path: float
+    rtt_p50_ms: float
+    least_rtt_ms: float
+
+    @property
+    def lost_share(self) -> float:
+        return self.lost / self.sent if self.sent else 0.0
+
+
+MIN_PATH_PACKETS = 100
+
+
+def planes_of(store: str) -> dict:
+    """Each plane's PlanePaths from every voter's last `metrics` line's
+    `paths`: "peer" and "api"; {} from a build without paths."""
+    found = {"peer": [], "api": []}
+    for node in sorted(os.listdir(store)):
+        path = os.path.join(store, node, "coordd.log")
+        if not os.path.exists(path):
+            continue
+        with open(path, encoding="utf-8", errors="replace") as f:
+            voter = js.parse_voter(f.readlines())
+        for p in voter.paths or []:
+            if (p.get("sent_packets") or 0) >= MIN_PATH_PACKETS:
+                found["peer" if p.get("plane") == "Peer" else "api"].append(p)
+    out = {}
+    for plane, paths in found.items():
+        if not paths:
+            continue
+        windows = sorted(int(p.get("cwnd") or 0) for p in paths)
+        rtts = sorted(int(p.get("rtt_micros") or 0) for p in paths)
+        out[plane] = PlanePaths(
+            paths=len(paths),
+            window_p50=windows[len(windows) // 2],
+            window_min=windows[0],
+            window_max=windows[-1],
+            lost=sum(int(p.get("lost_packets") or 0) for p in paths),
+            sent=sum(int(p.get("sent_packets") or 0) for p in paths),
+            events_per_path=sum(int(p.get("congestion_events") or 0) for p in paths) / len(paths),
+            rtt_p50_ms=rtts[len(rtts) // 2] / 1000,
+            least_rtt_ms=min(int(p.get("min_rtt_micros") or 0) for p in paths) / 1000,
+        )
+    return out
+
+
 def turns_of(store: str) -> dict:
     """Each voter's batching over its last boot, from its last `metrics`
     line: node -> Turns, its domain loop's turns and what each carried,
@@ -989,6 +1064,8 @@ def read_step(side: str, step_name: str, store: str, rep: int = 1) -> Step:
         step.per_projection_commit = read_per_projection_commit(store)
         step.behind = behind_of(store)
         step.turns = turns_of(store)
+        step.shims = shim_stats_of(store)
+        step.planes = planes_of(store)
         step.leader_node = tuplesky_leader_of(store)
     else:
         step.etcd_leader = etcd_leader_of(store)
@@ -1395,6 +1472,57 @@ def render(steps: list[Step], title: str, baseline: str = "etcd") -> str:
                     f"| {f2(t.events_per_turn)} | {f0(t.turns_per_s)} | {f2(t.peer_datagrams)} "
                     f"| {f2(t.api_datagrams)} | {f2(t.send_calls)} | {f2(t.per_frame)} | {f2(t.switches)} "
                     f"| {f2(t.loop_ms) if t.loop_ms is None else f'{t.loop_ms:.3f}'} |"
+                )
+        out.append("")
+
+    rows = [s for s in steps if s.shims.get("ops")]
+    if rows:
+        out += [
+            "**Client deadlines** (each TupleSky run, its clients' shims, summed from the test's shim-stats.txt: "
+            "the operations they submitted; those whose answer did not arrive within one attempt (the SDK's "
+            "2 s deadline), after which the shim asks by identity; and how those ended: committed after all, so "
+            "the answer was late or lost on its way back; unknown to the endpoint, so the submission never got in; "
+            "still unknown at the operation's deadline; or another way; with the resolutions sent a timed-out "
+            "operation and its mean time from the missed attempt to its end)",
+            "",
+            "| Step | Side | Operations | Timed out | Of them committed | Unknown to the endpoint | Gave up "
+            "| Other | Resolutions a timed-out op | Mean after the miss (ms) |",
+            "| --- " * 10 + "|",
+        ]
+        for s in rows:
+            sh = s.shims
+            t = sh.get("timed_out", 0)
+            share = lambda k: f"{sh.get(k, 0)} ({100 * sh.get(k, 0) / t:.0f}%)" if t else str(sh.get(k, 0))
+            out.append(
+                f"| {name(s)} | {sh['ops']} | {t} ({100 * t / sh['ops']:.1f}%) | {share('late_established')} "
+                f"| {share('late_unknown')} | {share('late_gave_up')} | {share('late_other')} "
+                f"| {sh.get('resolves', 0) / t:.2f} | {sh.get('late_ms', 0) / t:.0f} |" if t else
+                f"| {name(s)} | {sh['ops']} | 0 | - | - | - | - | - | - |"
+            )
+        out.append("")
+
+    rows = [s for s in steps if s.planes]
+    if rows:
+        out += [
+            "**QUIC paths by plane** (each TupleSky run, every voter's paths on its last `metrics` line (#297) "
+            f"that sent {MIN_PATH_PACKETS} packets or more, by plane: the api plane is the clients' and "
+            "collectors' links to the voters, the peer plane the voters' to each other; the congestion window's "
+            "median and range in bytes, the packets declared lost of those sent, congestion events a path, and "
+            "the median smoothed and the least round trip, which near zero means a path dialed before the shaping)",
+            "",
+            "| Step | Side | Plane | Paths | Window p50 (min–max) | Lost of sent | Congestion events a path "
+            "| Round trip p50 (ms) | Least round trip (ms) |",
+            "| --- " * 9 + "|",
+        ]
+        for s in rows:
+            for plane in ("api", "peer"):
+                pp = s.planes.get(plane)
+                if pp is None:
+                    continue
+                out.append(
+                    f"| {name(s)} | {plane} | {pp.paths} | {pp.window_p50} ({pp.window_min}–{pp.window_max}) "
+                    f"| {pp.lost} of {pp.sent} ({100 * pp.lost_share:.2f}%) | {pp.events_per_path:.1f} "
+                    f"| {pp.rtt_p50_ms:.1f} | {pp.least_rtt_ms:.1f} |"
                 )
         out.append("")
 
