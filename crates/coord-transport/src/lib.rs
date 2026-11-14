@@ -50,8 +50,8 @@ pub use config::{
     ALPN_API, ALPN_PEER, AckFrequency, Class, ClientIdentity, Limits, LocalIdentity, TlsProfile,
 };
 pub use endpoint::{
-    CloseCode, CloseReason, ConnectionId, Destination, Dialer, RequestError, Responder, SendError,
-    TrafficReader, Transport, TransportError, TransportEvent, WakeHold,
+    CloseCode, CloseReason, ConnectionId, Destination, Dialer, PathReading, RequestError,
+    Responder, SendError, TrafficReader, Transport, TransportError, TransportEvent, WakeHold,
 };
 pub use frames::{
     CAPABILITY_FRAMES_PER_STREAM, FrameError, FrameStream, KIND_PEER_EVIDENCE,

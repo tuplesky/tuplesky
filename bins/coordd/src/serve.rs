@@ -494,6 +494,12 @@ impl PeerPlane {
         self.transport.peer_traffic()
     }
 
+    /// Each open connection's path to another voter, as QUIC estimates
+    /// it (the lead's item 2 on #185).
+    pub fn path_readings(&self) -> Vec<coord_transport::PathReading> {
+        self.transport.path_readings()
+    }
+
     /// The plane over `transport`, for the voters in `peers`.
     pub fn new(
         transport: Transport,
@@ -2322,6 +2328,27 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 }]
             })
             .unwrap_or_default();
+        // Both planes' connections to voters and collectors: the peer
+        // plane's, and the api plane's this node's collector dialed or a
+        // collector elsewhere dialed to it. The peer plane's come first,
+        // so a cap reached by many collectors leaves the voters' in.
+        let (paths, paths_unreported) = coord_daemon::metrics::Path::bounded(
+            self.plane.iter().flat_map(PeerPlane::path_readings).chain(
+                self.api_traffic
+                    .iter()
+                    .flat_map(coord_transport::TrafficReader::path_readings),
+            ),
+        );
+        let offers = {
+            let counts = &self.frontend.counts;
+            coord_daemon::metrics::Offers {
+                reoffered: counts.reoffered,
+                solicited: counts.solicited,
+                refused: counts.refused,
+                returned: counts.returned,
+                unreturnable: counts.unreturnable,
+            }
+        };
         MetricsSnapshot {
             stages: recorder.snapshot_stages(roles),
             lanes,
@@ -2333,6 +2360,9 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             view_age: Measure::Unavailable(Unavailable::NotInstrumented),
             engine_pressure: Measure::Unavailable(Unavailable::NoBound),
             cost: self.cost(),
+            paths,
+            paths_unreported,
+            offers,
         }
     }
 
