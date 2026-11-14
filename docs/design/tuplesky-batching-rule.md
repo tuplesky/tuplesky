@@ -1229,7 +1229,7 @@ Each step has its own PRs and pair.
   - the fall, as µs a command, is at least half its bound;
   - and it is larger than the base runs' own spread of that same quantity, over at least the four base runs that gave the spread.
   - A part read from a profile is its share of samples times its thread's CPU a command, both from the same runs. A share alone moves when anything else on the thread moves.
-  - **A drifting base.** When the pair's base runs spread wider than the reading, the profiled pair decides, by function, with at least three base runs: the part named, read as its thread's CPU a command, must fall by more than its own base runs' spread, and the functions the step cuts must fall where its bound says they do. The base drifted in B1's re-read and again in 2b's pair (#290, accepted on its profiled pair).
+  - **A drifting base.** When the pair's base runs spread wider than the reading, the profiled pair decides, by function, with at least three base runs: the part named, read as its thread's CPU a command, must still fall by at least half its bound and by more than its own base runs' spread, and the functions the step cuts must fall where its bound says they do. The base drifted in B1's re-read and again in 2b's pair (#290, accepted on its profiled pair).
   - The pair runs at 120 and 30 callers, five voters on tmpfs, replay.
   - A step that misses its checkpoint stops the plan: the next step isn't built until the lead has the reading.
 - **Every checkpoint reads latency (R16).** The owner's goal for batching is latency neutral at low load.

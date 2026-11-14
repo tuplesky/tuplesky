@@ -573,7 +573,51 @@ pub fn build_read_view<V: OrderedRead>(
     read_view.lease_authority = codecs::read_lease_authority(view)?;
     let touched = touches(&request.operation);
     let mut seen: BTreeSet<Vec<u8>> = BTreeSet::new();
+    // An exact key's row, by the bytes it is charged: read with one point
+    // read, once however often the request touches the key (a contended
+    // transaction's compare, success put and failure put touch one key
+    // three times).
+    let mut exact: BTreeMap<&[u8], Option<usize>> = BTreeMap::new();
     for touch in &touched {
+        if let Touch::Exact(key) = touch {
+            // Each touch is charged as the one-row scan it replaces
+            // (`scan_all`) charged it, because the budget's refusal is a
+            // replicated outcome: a touch with no bytes left is refused
+            // before it reads, a row larger than the bytes left is the
+            // page's `Limit` error, and a row is charged on every touch
+            // that finds it.
+            if budget.bytes == 0 {
+                return Err(ViewBuildError::BudgetExceeded);
+            }
+            let (cost, value) = match exact.get(key.as_slice()) {
+                Some(cost) => (*cost, None),
+                None => {
+                    let row_key = codecs::current_key(&namespace, key);
+                    let value = view.get(Collection::KvCurrentV1.id(), &row_key)?;
+                    let cost = value.as_ref().map(|value| row_key.len() + value.len());
+                    exact.insert(key, cost);
+                    (cost, value)
+                }
+            };
+            if let Some(cost) = cost {
+                if cost > budget.bytes as usize {
+                    return Err(EngineError::new(
+                        ErrorClass::Limit,
+                        "row larger than the page byte budget",
+                    )
+                    .into());
+                }
+                budget.charge(1, cost)?;
+            }
+            if let Some(value) = value
+                && seen.insert(key.clone())
+            {
+                read_view
+                    .current
+                    .insert(key.clone(), codecs::decode_current(&value)?);
+            }
+            continue;
+        }
         let (lower, upper) = current_bounds(&namespace, touch);
         for (row_key, value) in scan_all(view, Collection::KvCurrentV1, lower, upper, &mut budget)?
         {

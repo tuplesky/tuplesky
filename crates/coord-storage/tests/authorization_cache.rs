@@ -432,3 +432,64 @@ fn a_write_around_the_applier_that_does_not_say_so_is_caught() {
     let (id, payload) = command(SESSION, 2, b"b");
     let _ = applier.apply_staged(id, &payload);
 }
+
+/// A session whose trust rule was disabled, regenerated or removed is
+/// refused at execution, from the cached context as from its rows. The
+/// applier takes the session's standing from the context its command
+/// executes under, so the context has to judge the rule as
+/// `retry::record_executable` does: a standing taken from the session
+/// row alone admits the command, and the debug check says the context's
+/// admission is not the rows'.
+#[test]
+fn a_session_its_trust_rule_no_longer_stands_behind_is_refused_from_its_context() {
+    let trust_rule = |rule: Option<coord_state::policy::TrustRule>| StoreUpdate {
+        collection: coord_store_api::registry::Collection::PolicyV1.id(),
+        key: coord_storage::codecs::trust_rule_key(&RULE),
+        value: rule.map(|rule| coord_storage::codecs::encode_trust_rule(&rule).unwrap()),
+    };
+    let changes = [
+        (
+            "disabled",
+            trust_rule(Some(coord_state::policy::TrustRule {
+                enabled: false,
+                generation: 1,
+            })),
+        ),
+        (
+            "regenerated",
+            trust_rule(Some(coord_state::policy::TrustRule {
+                enabled: true,
+                generation: 2,
+            })),
+        ),
+        ("removed", trust_rule(None)),
+    ];
+    for (change, update) in changes {
+        let mut applier = worker();
+        let (id, payload) = establishment(OTHER, 9);
+        assert_eq!(
+            outcome(&applier.apply_staged(id, &payload).unwrap().response),
+            Outcome::SessionCreated { session: OTHER }
+        );
+        let (id, payload) = command(OTHER, 1, b"a");
+        written(&applier.apply_staged(id, &payload).unwrap());
+        write_around(&mut applier, update);
+        applier.forget_authorizations();
+        let at = applier.authorization_cache();
+        let before = applier.kv_revision().unwrap();
+        for seq in [2, 3] {
+            let (id, payload) = command(OTHER, seq, b"b");
+            let applied = applier.apply_staged(id, &payload).unwrap();
+            assert_eq!(applied.revision, None, "{change}: a refusal writes nothing");
+        }
+        assert_eq!(applier.kv_revision().unwrap(), before, "{change}");
+        // The first refusal loads the context; the second is answered
+        // from it.
+        let stats = applier.authorization_cache();
+        assert_eq!(
+            (stats.loads - at.loads, stats.hits - at.hits),
+            (1, 1),
+            "{change}: {stats:?}"
+        );
+    }
+}

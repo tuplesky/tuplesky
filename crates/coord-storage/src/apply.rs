@@ -86,6 +86,24 @@ pub fn retained_is_authorized<V: coord_store_api::engine::OrderedRead>(
     Ok(authorize_retained(&auth, &namespace, request, &stored.outcome).is_ok())
 }
 
+/// What `binding`'s acknowledgement retires and how it is admitted, read
+/// from `view` row by row: [`retry::retirement`], then [`retry::admit`]
+/// with that retirement. What a command's authorization context answers
+/// ([`retry::retire_and_admit`]) when there is no context to answer from.
+fn retire_and_admit_by_reads<V: coord_store_api::engine::OrderedRead>(
+    view: &V,
+    binding: &RetryBinding,
+    ack_through: u64,
+    authorize: impl FnOnce(&crate::codecs::RetryRecordV1) -> Result<bool, EngineError>,
+) -> Result<(Option<retry::Retirement>, Admission), EngineError> {
+    let retires = retry::retirement(view, &binding.retry_key, ack_through)?;
+    let binding = RetryBinding {
+        retires,
+        ..binding.clone()
+    };
+    Ok((retires, retry::admit(view, &binding, authorize)?))
+}
+
 /// Why a command could not be applied.
 #[derive(Debug)]
 pub enum ApplyError {
@@ -1458,12 +1476,59 @@ impl<P: Persistence> Applier<P> {
             // a filled window is the one that acknowledges everything
             // in it, and refusing it would leave the window shut for
             // good.
-            let retires = retry::retirement(gated.view(), &binding.retry_key, payload_ack)?;
+            //
+            // Both read the session's record and its trust rule, which the
+            // authorization context the command executes under holds, kept
+            // between commands until a landing writes one of them
+            // ([`crate::authorizations`]). So they are taken from it, and
+            // the floor is read once for both. A context that can't be
+            // loaded (over the schema's budget, or an engine failure) is
+            // read around as before; the view build below meets it again.
+            let loaded = self
+                .authorizations
+                .borrow_mut()
+                .load(gated.view(), namespace, &session);
+            let (retires, admission) = match &loaded {
+                Ok(context) => {
+                    let standing = context
+                        .session
+                        .as_ref()
+                        .map(|record| (record, context.valid_session().is_some()));
+                    let found = retry::retire_and_admit(
+                        gated.view(),
+                        binding,
+                        payload_ack,
+                        standing,
+                        authorized,
+                    )?;
+                    // Every test that executes a command checks that the
+                    // context answers as the rows do.
+                    #[cfg(debug_assertions)]
+                    {
+                        let read = retire_and_admit_by_reads(
+                            gated.view(),
+                            binding,
+                            payload_ack,
+                            |record| {
+                                retained_is_authorized(gated.view(), &session, request, record)
+                            },
+                        )?;
+                        assert_eq!(
+                            found, read,
+                            "admission from the authorization context differs from the view's"
+                        );
+                    }
+                    found
+                }
+                Err(_) => {
+                    retire_and_admit_by_reads(gated.view(), binding, payload_ack, authorized)?
+                }
+            };
             let binding = &RetryBinding {
                 retires,
                 ..binding.clone()
             };
-            match retry::admit(gated.view(), binding, authorized)? {
+            match admission {
                 Admission::New => {}
                 Admission::Retry(record) => {
                     drop(gated);
@@ -1529,19 +1594,15 @@ impl<P: Persistence> Applier<P> {
             // never a local setting: a command that overruns it overruns
             // it everywhere, so the rejection below is a replicated result
             // and not this node's resource limit leaking into the history.
-            let built = self
-                .authorizations
-                .borrow_mut()
-                .load(gated.view(), namespace, &session)
-                .and_then(|authorization| {
-                    build_view_under(
-                        &gated,
-                        namespace,
-                        authorization,
-                        request,
-                        ViewBudget::SCHEMA,
-                    )
-                });
+            let built = loaded.and_then(|authorization| {
+                build_view_under(
+                    &gated,
+                    namespace,
+                    authorization,
+                    request,
+                    ViewBudget::SCHEMA,
+                )
+            });
             let planned = match built {
                 Ok(view) => match plan(request, &view, &PlanLimits::default()) {
                     Ok(planned) => planned,
