@@ -2169,6 +2169,8 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                     payloads_taken: taken.taken,
                     known: taken.known,
                     not_taken: taken.not_taken,
+                    frame_batches: taken.frame_batches,
+                    frame_adoptions: taken.frame_adoptions,
                 }
             },
             traffic: self.plane.as_ref().map_or(

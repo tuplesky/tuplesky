@@ -863,6 +863,13 @@ pub struct Relay {
     /// match the vote, or no room.
     #[serde(default)]
     pub not_taken: u64,
+    /// As a follower, since the node started: adoption batches its
+    /// proposal frames wrote (step 2b of the batching rule's 10.7).
+    #[serde(default)]
+    pub frame_batches: u64,
+    /// Adoptions in them.
+    #[serde(default)]
+    pub frame_adoptions: u64,
 }
 
 /// The durable command records a voter holds, and its history sweeps
