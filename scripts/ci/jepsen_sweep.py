@@ -133,6 +133,8 @@ class Step:
     counts: dict = field(default_factory=dict)
     # Whether a voter fell behind (see behind_of): node -> Behind.
     behind: dict = field(default_factory=dict)
+    # Each voter's batching (see turns_of): node -> Turns.
+    turns: dict = field(default_factory=dict)
     # Each voter's executed commands over its projection commits, from its
     # last `metrics` line since it started: node -> (commands a commit,
     # whether it is the leader).
@@ -615,6 +617,81 @@ def behind_of(store: str) -> dict:
     }
 
 
+@dataclass(frozen=True)
+class Turns:
+    # Commands executed over the voter's last boot.
+    executed: int
+    # Its domain loop's turns, each ending in one flush (task-d102).
+    turns: int | None = None
+    # The events a turn took in, peer and api together.
+    events_per_turn: float | None = None
+    # Turns a second over its uptime (boot to its last `metrics` line).
+    turns_per_s: float | None = None
+    # Datagrams a command it executed, by plane, and its send calls (both
+    # planes) a command.
+    peer_datagrams: float | None = None
+    api_datagrams: float | None = None
+    send_calls: float | None = None
+    # Proposals a proposal frame, where it sent any (the leader).
+    per_frame: float | None = None
+    # Its loop's voluntary context switches (a park and its wakeup) and
+    # its CPU, a command.
+    switches: float | None = None
+    loop_ms: float | None = None
+
+    @property
+    def per_turn(self) -> float | None:
+        return self.executed / self.turns if self.turns else None
+
+
+def turns_of(store: str) -> dict:
+    """Each voter's batching over its last boot, from its last `metrics`
+    line: node -> Turns, its domain loop's turns and what each carried,
+    its datagrams and send calls a command, the leader's proposals a frame,
+    and its loop's parks and CPU a command; a reading its build lacks is
+    None. Whether a slower network shrinks the batches shows here as
+    fewer commands a turn and more turns, datagrams and parks a command at
+    the same load."""
+    rows = {}
+    for node in sorted(os.listdir(store)):
+        path = os.path.join(store, node, "coordd.log")
+        if not os.path.exists(path):
+            continue
+        with open(path, encoding="utf-8", errors="replace") as f:
+            voter = js.parse_voter(f.readlines())
+        if not voter.cost or not voter.cost.executed:
+            continue
+        raw = voter.cost.raw or {}
+        executed = voter.cost.executed
+        per = lambda v: v / executed if v is not None else None
+        turns = count_at(raw, ("flushes", "flushes"))
+        peer_events = count_at(raw, ("flushes", "peer_events"))
+        api_events = count_at(raw, ("flushes", "api_events"))
+        uptime = raw.get("uptime")
+        up = cc.seconds(uptime) if isinstance(uptime, dict) and "secs" in uptime else None
+        peer_calls = count_at(raw, ("traffic", "Observed", "send_calls"))
+        api_calls = count_at(raw, ("traffic", "Observed", "api", "send_calls"))
+        proposals = count_at(raw, ("proposals", "proposals"))
+        frames = count_at(raw, ("proposals", "frames"))
+        domain = ((raw.get("cpu") or {}).get("Observed") or {}).get("domain")
+        loop_s = cc.seconds(domain) if isinstance(domain, dict) and "secs" in domain else None
+        rows[node] = Turns(
+            executed=executed,
+            turns=turns,
+            events_per_turn=((peer_events or 0) + (api_events or 0)) / turns
+            if turns and (peer_events is not None or api_events is not None) else None,
+            turns_per_s=turns / up if turns and up else None,
+            peer_datagrams=per(count_at(raw, ("traffic", "Observed", "datagrams_sent"))),
+            api_datagrams=per(count_at(raw, ("traffic", "Observed", "api", "datagrams_sent"))),
+            send_calls=per((peer_calls or 0) + (api_calls or 0))
+            if peer_calls is not None or api_calls is not None else None,
+            per_frame=proposals / frames if proposals and frames else None,
+            switches=per(count_at(raw, ("cpu", "Observed", "domain_scheduling", "Observed", "voluntary"))),
+            loop_ms=loop_s * 1000 / executed if loop_s is not None else None,
+        )
+    return rows
+
+
 def voter_costs(store: str) -> list:
     """Each voter's last `metrics` cost reading that has its loop's CPU and
     executed commands."""
@@ -892,6 +969,7 @@ def read_step(side: str, step_name: str, store: str, rep: int = 1) -> Step:
         step.counts = read_counts(store)
         step.per_projection_commit = read_per_projection_commit(store)
         step.behind = behind_of(store)
+        step.turns = turns_of(store)
         step.leader_node = tuplesky_leader_of(store)
     else:
         step.etcd_leader = etcd_leader_of(store)
@@ -1267,6 +1345,36 @@ def render(steps: list[Step], title: str, baseline: str = "etcd") -> str:
                         f"| {dash(b.payloads_taken)} | {dash(b.not_taken)} | {per} | {lost} |"
                     )
             out.append("")
+
+    rows = [s for s in steps if s.turns]
+    if rows:
+        f2 = lambda v: f"{v:.2f}" if v is not None else "-"
+        f0 = lambda v: f"{v:.0f}" if v is not None else "-"
+        out += [
+            "**Batching by voter** (each TupleSky run, each voter, from its last `metrics` line over its last "
+            "boot: its domain loop's turns, each ending in one flush, and the commands and events (peer and api) "
+            "a turn carried, with turns a second over its uptime; its datagrams a command it executed, by plane, "
+            "and its send calls a command, both planes; the proposals a proposal frame where it sent any (the "
+            "leader); and its loop's voluntary context switches, each a park and its wakeup, and its loop's CPU, "
+            "a command. At the same load, smaller batches show as fewer commands a turn and more turns, "
+            "datagrams, send calls and parks a command)",
+            "",
+            "| Step | Side | Node | Executed | Turns | Commands a turn | Events a turn | Turns a second "
+            "| Peer datagrams a command | Api datagrams a command | Send calls a command | Proposals a frame "
+            "| Loop parks a command | Loop CPU a command (ms) |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        ]
+        for s in rows:
+            for n in sorted(s.turns):
+                t = s.turns[n]
+                star = "*" if n == s.leader_node else ""
+                out.append(
+                    f"| {name(s)} | {n}{star} | {t.executed} | {dash(t.turns)} | {f2(t.per_turn)} "
+                    f"| {f2(t.events_per_turn)} | {f0(t.turns_per_s)} | {f2(t.peer_datagrams)} "
+                    f"| {f2(t.api_datagrams)} | {f2(t.send_calls)} | {f2(t.per_frame)} | {f2(t.switches)} "
+                    f"| {f2(t.loop_ms) if t.loop_ms is None else f'{t.loop_ms:.3f}'} |"
+                )
+        out.append("")
 
     rows = [s for s in steps if s.memory]
     if rows:

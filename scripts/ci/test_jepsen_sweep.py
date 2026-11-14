@@ -339,6 +339,27 @@ class SweepTests(unittest.TestCase):
         # No etcd at 60: no ratio row for it.
         self.assertNotIn("| 60 | head | 1.00×", text)
 
+    def test_batching_by_voter(self):
+        path = self.store("h120")
+        with open(os.path.join(path, "n2", "coordd.log"), "a") as f:
+            f.write('metrics {"cost":{"Observed":{"executed":2000,"busy":{"secs":1,"nanos":0},'
+                    '"uptime":{"secs":10,"nanos":0},'
+                    '"flushes":{"flushes":500,"peer_events":1500,"api_events":500},'
+                    '"proposals":{"proposals":800,"frames":100},'
+                    '"cpu":{"Observed":{"domain":{"secs":1,"nanos":0},'
+                    '"domain_scheduling":{"Observed":{"voluntary":3000,"involuntary":5}}}},'
+                    '"traffic":{"Observed":{"datagrams_sent":6000,"send_calls":5000,'
+                    '"api":{"datagrams_sent":2000,"send_calls":1000}}}}}}\n')
+        step = sw.read_step("head", "120", path)
+        t = step.turns["n2"]
+        self.assertEqual((t.executed, t.turns, t.per_turn, t.events_per_turn, t.turns_per_s), (2000, 500, 4.0, 4.0, 50.0))
+        self.assertEqual((t.peer_datagrams, t.api_datagrams, t.send_calls, t.per_frame, t.switches, t.loop_ms),
+                         (3.0, 1.0, 3.0, 8.0, 1.5, 0.5))
+        text = sw.render([step], "Sweep")
+        self.assertIn("**Batching by voter**", text)
+        self.assertIn("| 120 | head | n2 | 2000 | 500 | 4.00 | 4.00 | 50 | 3.00 | 1.00 | 3.00 | 8.00 | 1.50 | 0.500 |",
+                      text)
+
     def test_voters_behind(self):
         path = self.store("h120")
         # n1 executed to 5000 and kept up; n2 stopped 2600 short, was
