@@ -996,6 +996,34 @@ fn persisted(effects: &[Effect]) -> Vec<coord_core::effect::PersistBatch> {
         .collect()
 }
 
+/// What a step does, apart from how its rows are cut into batches: the
+/// rows it writes, in order, and its other effects, each send without the
+/// barriers it waits on. A frame writes its adoptions in one batch (step
+/// 2b of the batching rule's 10.7) where its entries one at a time write
+/// one an adoption, so only the batches and their barriers differ.
+fn rows_and_rest(effects: &[Effect]) -> (Vec<coord_core::effect::StoreUpdate>, Vec<Effect>) {
+    let rows = persisted(effects)
+        .into_iter()
+        .flat_map(|b| b.updates)
+        .collect();
+    let rest = effects
+        .iter()
+        .filter(|e| !matches!(e, Effect::Persist(_)))
+        .map(|e| match e {
+            Effect::SendWhenDurable {
+                context, to, frame, ..
+            } => Effect::SendWhenDurable {
+                context: *context,
+                requires: Vec::new(),
+                to: *to,
+                frame: frame.clone(),
+            },
+            other => other.clone(),
+        })
+        .collect();
+    (rows, rest)
+}
+
 // ---------------------------------------------------------------------
 // task-55: a seal fences the follower's ordinary voting.
 // ---------------------------------------------------------------------
@@ -2327,6 +2355,376 @@ fn a_refused_entry_leaves_the_frames_others_as_they_are() {
     );
     assert_ne!(f.table().phase_of(&c1), Some(Phase::Accept));
     assert_eq!(f.table().phase_of(&c2), Some(Phase::Accept));
+}
+
+/// A chain of relayed proposals for `seqs`, each depending on the one
+/// before it, as a leader whose table saw them in that order proposes
+/// them.
+fn relayed_chain(seqs: &[u64]) -> (Vec<ProtocolMessage>, Vec<CommandId>) {
+    let mut leader_view = coord_consensus::CommandTable::new();
+    let mut entries = Vec::new();
+    let mut commands: Vec<CommandId> = Vec::new();
+    for (i, seq) in seqs.iter().enumerate() {
+        let (payload, c) = relayed_payload(*seq, *seq as u8, *seq as u8);
+        let l = leader_view
+            .initialize(c, c.0, vec![CONSERVATIVE_KEY.to_vec()])
+            .unwrap();
+        let deps = commands.last().copied().into_iter().collect();
+        entries.push(relayed(
+            proposal(c, deps, i as u64, l.paths, l.path),
+            payload,
+        ));
+        commands.push(c);
+    }
+    (entries, commands)
+}
+
+/// Lever 2, step 1: a frame's entries share its learning passes. The
+/// frame makes one full pass, at its first entry, and passes over the
+/// others, after which nothing could be committed; taken one at a time,
+/// each entry makes its own. The frame leaves the same table, rows and
+/// effects either way, its adoptions in one batch (step 2b).
+#[test]
+fn a_frame_makes_one_full_learning_pass() {
+    let (entries, commands) = relayed_chain(&[1, 2, 3, 4, 5, 6, 7, 8]);
+    let n = entries.len() as u64;
+    let mut f = booted(1);
+    let before = f.learn_passes();
+    let framed_effects = f.step(peer(0, framed(entries.clone())));
+    let after = f.learn_passes();
+    let mut g = booted(1);
+    let g_before = g.learn_passes();
+    let mut one_at_a_time = Vec::new();
+    for entry in entries {
+        one_at_a_time.extend(g.step(peer(0, entry)));
+    }
+    let g_after = g.learn_passes();
+    assert_eq!(after.full - before.full, 1, "one full pass for the frame");
+    assert_eq!(
+        after.skipped - before.skipped,
+        n - 1,
+        "the others passed over"
+    );
+    assert_eq!(g_after.full - g_before.full, n, "one full pass an entry");
+    assert_eq!(g_after.skipped, g_before.skipped);
+    assert_eq!(
+        rows_and_rest(&framed_effects),
+        rows_and_rest(&one_at_a_time),
+        "the same rows in order, and the same effects"
+    );
+    assert_eq!(
+        persisted(&framed_effects).len(),
+        1,
+        "one batch for the frame"
+    );
+    assert_eq!(persisted(&one_at_a_time).len() as u64, n);
+    for c in &commands {
+        assert_eq!(f.table().record(c), g.table().record(c));
+        assert_eq!(f.table().phase_of(c), Some(Phase::Accept));
+    }
+    assert_eq!(f.take_rejections(), g.take_rejections());
+}
+
+/// Lever 2, step 1: a pass a frame's entry needs is made. The follower
+/// took c1's submission and its own fast vote is durable, so the leader's
+/// proposal of c1 decides it here: the entry's pass commits it, before
+/// the next entry, which depends on it, is taken -- as taking the entries
+/// one at a time does. The entry after it can commit nothing, and its
+/// pass is passed over.
+#[test]
+fn a_frame_commits_what_an_entry_decides_before_its_next_entry() {
+    let (e1, c1) = admitted(1, 1, 1);
+    let mut leader_view = coord_consensus::CommandTable::new();
+    let l1 = leader_view
+        .initialize(c1, c1.0, vec![CONSERVATIVE_KEY.to_vec()])
+        .unwrap();
+    let (p0, c0) = relayed_payload(2, 2, 2);
+    let l0 = leader_view
+        .initialize(c0, c0.0, vec![CONSERVATIVE_KEY.to_vec()])
+        .unwrap();
+    let (p2, c2) = relayed_payload(3, 3, 3);
+    let l2 = leader_view
+        .initialize(c2, c2.0, vec![CONSERVATIVE_KEY.to_vec()])
+        .unwrap();
+    let (p1, same) = relayed_payload(1, 1, 1);
+    assert_eq!(same, c1);
+    let entries = vec![
+        relayed(proposal(c0, vec![], 0, l0.paths, l0.path), p0),
+        relayed(proposal(c1, vec![], 1, l1.paths, l1.path), p1),
+        relayed(proposal(c2, vec![c1], 2, l2.paths, l2.path), p2),
+    ];
+    let mut f = booted(1);
+    let mut g = booted(1);
+    for m in [&mut f, &mut g] {
+        let votes = m.step(e1.clone());
+        for event in durable_of(&votes, 1) {
+            m.step(event);
+        }
+    }
+    let before = f.learn_passes();
+    let framed_effects = f.step(peer(0, framed(entries.clone())));
+    let after = f.learn_passes();
+    let mut one_at_a_time = Vec::new();
+    for entry in entries {
+        one_at_a_time.extend(g.step(peer(0, entry)));
+    }
+    assert_eq!(f.table().phase_of(&c1), Some(Phase::Commit), "decided here");
+    assert_eq!(f.table().phase_of(&c0), Some(Phase::Accept));
+    assert_eq!(f.table().phase_of(&c2), Some(Phase::Accept));
+    assert_eq!(
+        (after.full - before.full, after.skipped - before.skipped),
+        (2, 1),
+        "the frame's first pass, c1's, and c2's passed over"
+    );
+    assert_eq!(
+        rows_and_rest(&framed_effects),
+        rows_and_rest(&one_at_a_time),
+        "the same rows in order, and the same effects"
+    );
+    for c in [c0, c1, c2] {
+        assert_eq!(f.table().record(&c), g.table().record(&c));
+    }
+    assert_eq!(f.take_rejections(), g.take_rejections());
+}
+
+/// The storage events of `events`, as a node hands a step of them over.
+fn storage_of(events: Vec<Event>) -> Vec<StorageEvent> {
+    events
+        .into_iter()
+        .map(|e| match e {
+            Event::Storage(s) => s,
+            other => panic!("not a storage event: {other:?}"),
+        })
+        .collect()
+}
+
+/// The leader's commit frontier at ballot 0, through `through`.
+fn committed_through(through: u64) -> Event {
+    peer(
+        0,
+        ProtocolMessage::Committed {
+            ballot: ballot(0, 0),
+            through,
+        },
+    )
+}
+
+/// Two followers that took the same relayed chain entry by entry, and
+/// the storage events of the batches it wrote: one an adoption. (A frame
+/// writes its adoptions in one batch since step 2b, which would make the
+/// step one event; `a_frames_one_batch_made_durable_learns_each_adoption`
+/// takes that case.)
+fn took_chain(seqs: &[u64]) -> (Follower, Follower, Vec<StorageEvent>, Vec<CommandId>) {
+    let (entries, commands) = relayed_chain(seqs);
+    let mut f = booted(1);
+    let mut g = booted(1);
+    let mut adopted = Vec::new();
+    for entry in entries {
+        let effects = f.step(peer(0, entry.clone()));
+        assert_eq!(g.step(peer(0, entry)), effects);
+        adopted.extend(effects);
+    }
+    let events = storage_of(durable_of(&adopted, 1));
+    assert!(events.len() >= commands.len(), "a batch a command at least");
+    (f, g, events, commands)
+}
+
+/// Lever 2, step 1: a step of storage events shares its learning passes.
+/// The frame's adoptions made durable in one step make one full pass, at
+/// the first event, and pass the others over, as none commits anything
+/// before the leader's frontier; one event at a time, each makes its
+/// own. Either way the same effects and records, and once the frontier
+/// comes, the same commits.
+#[test]
+fn a_step_of_storage_events_makes_one_full_learning_pass() {
+    let (mut f, mut g, events, commands) = took_chain(&[1, 2, 3, 4, 5, 6, 7, 8]);
+    let n = events.len() as u64;
+    let before = f.learn_passes();
+    let stepped = f.step_storage(events.clone());
+    let after = f.learn_passes();
+    let g_before = g.learn_passes();
+    let mut one_at_a_time = Vec::new();
+    for event in events {
+        one_at_a_time.extend(g.step(Event::Storage(event)));
+    }
+    let g_after = g.learn_passes();
+    assert_eq!(
+        (
+            after.full - before.full,
+            after.skipped_storage - before.skipped_storage
+        ),
+        (1, n - 1),
+        "one full pass for the step, the others passed over"
+    );
+    assert_eq!(
+        (
+            g_after.full - g_before.full,
+            g_after.skipped_storage - g_before.skipped_storage
+        ),
+        (n, 0),
+        "one full pass an event"
+    );
+    assert_eq!(stepped, one_at_a_time, "the same effects, in order");
+    for c in &commands {
+        assert_eq!(f.table().record(c), g.table().record(c));
+        assert_eq!(f.table().phase_of(c), Some(Phase::Accept));
+    }
+    let through = commands.len() as u64 - 1;
+    assert_eq!(
+        f.step(committed_through(through)),
+        g.step(committed_through(through))
+    );
+    for c in &commands {
+        assert_eq!(f.table().phase_of(c), Some(Phase::Commit));
+        assert_eq!(g.table().phase_of(c), Some(Phase::Commit));
+    }
+    assert_eq!(f.take_rejections(), g.take_rejections());
+}
+
+/// Lever 2, step 1: a pass a storage event needs is made. With the
+/// leader's frontier already past the chain, each adoption made durable
+/// commits its command, which the next one depends on: no pass is passed
+/// over, and the step commits the chain as one event at a time does.
+#[test]
+fn a_step_of_storage_events_commits_what_each_event_makes_learnable() {
+    let (mut f, mut g, events, commands) = took_chain(&[1, 2, 3, 4]);
+    let through = commands.len() as u64 - 1;
+    assert_eq!(
+        f.step(committed_through(through)),
+        g.step(committed_through(through))
+    );
+    for c in &commands {
+        assert_eq!(
+            f.table().phase_of(c),
+            Some(Phase::Accept),
+            "not durable yet"
+        );
+    }
+    let before = f.learn_passes();
+    let stepped = f.step_storage(events.clone());
+    let after = f.learn_passes();
+    let mut one_at_a_time = Vec::new();
+    for event in events {
+        one_at_a_time.extend(g.step(Event::Storage(event)));
+    }
+    assert_eq!(
+        after.skipped_storage, before.skipped_storage,
+        "none passed over"
+    );
+    assert_eq!(stepped, one_at_a_time, "the same effects, in order");
+    for c in &commands {
+        assert_eq!(f.table().phase_of(c), Some(Phase::Commit));
+        assert_eq!(f.table().record(c), g.table().record(c));
+    }
+    assert_eq!(f.take_rejections(), g.take_rejections());
+}
+
+/// Lever 2, step 1: a storage event other than a vote or adoption batch
+/// made durable -- here the second batch failing -- makes its own pass
+/// and the next one full. The step leaves the same effects, records and
+/// refusals as one event at a time.
+#[test]
+fn a_failure_in_a_step_of_storage_events_makes_the_passes_around_it_full() {
+    let (mut f, mut g, mut events, commands) = took_chain(&[1, 2, 3, 4]);
+    let failed = events[1].barrier().expect("a batch");
+    events[1] = StorageEvent::Failed {
+        barrier_id: failed,
+        error: StorageError::NoSpace,
+    };
+    let n = events.len() as u64;
+    let before = f.learn_passes();
+    let stepped = f.step_storage(events.clone());
+    let after = f.learn_passes();
+    let mut one_at_a_time = Vec::new();
+    for event in events {
+        one_at_a_time.extend(g.step(Event::Storage(event)));
+    }
+    let full = after.full - before.full;
+    let skipped = after.skipped_storage - before.skipped_storage;
+    assert_eq!(full + skipped, n, "a pass an event");
+    assert!(
+        full >= 3,
+        "the first, the failure's and the next are full: {full}"
+    );
+    assert_eq!(stepped, one_at_a_time, "the same effects, in order");
+    for c in &commands {
+        assert_eq!(f.table().record(c), g.table().record(c));
+    }
+    assert_eq!(f.take_rejections(), g.take_rejections());
+}
+
+/// Lever 2, step 1, with step 2b: a frame's adoptions are one batch, so
+/// one storage event makes them all durable. That event marks each of
+/// them durable, indexes each by its sequence number for the leader's
+/// frontier, and touches each for learning, as their batches one at a
+/// time do. A chain comes in two frames, so a step holds two events, the
+/// second frame's batch after the first's:
+/// - the frontier coming after the step commits the whole chain, through
+///   the index;
+/// - the frontier coming before it, the step commits the whole chain: the
+///   second event's pass is made, as each of its adoptions was touched.
+///
+/// The debug build checks the index and every pass passed over against
+/// the walks they replace.
+#[test]
+fn a_frames_one_batch_made_durable_learns_each_adoption() {
+    for frontier_first in [false, true] {
+        let (entries, commands) = relayed_chain(&[1, 2, 3, 4, 5, 6]);
+        let through = commands.len() as u64 - 1;
+        let mut f = booted(1);
+        let mut g = booted(1);
+        let mut framed_effects = f.step(peer(0, framed(entries[..3].to_vec())));
+        framed_effects.extend(f.step(peer(0, framed(entries[3..].to_vec()))));
+        let mut one_at_a_time = Vec::new();
+        for entry in entries {
+            one_at_a_time.extend(g.step(peer(0, entry)));
+        }
+        let framed_events = storage_of(durable_of(&framed_effects, 1));
+        let single_events = storage_of(durable_of(&one_at_a_time, 1));
+        assert_eq!(framed_events.len(), 2, "one batch a frame");
+        assert_eq!(single_events.len(), commands.len());
+        if frontier_first {
+            f.step(committed_through(through));
+            g.step(committed_through(through));
+        }
+        let before = f.learn_passes();
+        let stepped = f.step_storage(framed_events);
+        let after = f.learn_passes();
+        let mut single_stepped = Vec::new();
+        for event in single_events {
+            single_stepped.extend(g.step(Event::Storage(event)));
+        }
+        assert_eq!(
+            sends(&stepped),
+            sends(&single_stepped),
+            "the same acknowledgements"
+        );
+        if frontier_first {
+            assert_eq!(
+                (
+                    after.full - before.full,
+                    after.skipped_storage - before.skipped_storage
+                ),
+                (2, 0),
+                "the second frame's batch commits, so its pass is made"
+            );
+        } else {
+            for c in &commands {
+                assert_eq!(f.table().phase_of(c), Some(Phase::Accept));
+            }
+            f.step(committed_through(through));
+            g.step(committed_through(through));
+        }
+        for c in &commands {
+            assert_eq!(
+                f.table().phase_of(c),
+                Some(Phase::Commit),
+                "frontier first: {frontier_first}"
+            );
+            assert_eq!(f.table().record(c), g.table().record(c));
+        }
+        assert_eq!(f.take_rejections(), g.take_rejections());
+    }
 }
 
 /// task-d102: a proposal held for want of its payload -- a plain copy
