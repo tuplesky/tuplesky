@@ -734,8 +734,8 @@ fn active_lease_recovery_pages_past_tombstones_within_a_small_budget() {
         "the drained listing pages internally"
     );
     // A budget too small for even one row is an error, not an empty page
-    // that would never advance.
-    assert!(
+    // that would never advance: the budget's refusal, not the engine's.
+    assert!(matches!(
         active_leases_page(
             gated.view(),
             None,
@@ -743,7 +743,61 @@ fn active_lease_recovery_pages_past_tombstones_within_a_small_budget() {
                 max_rows: 1,
                 max_bytes: 8,
             }
+        ),
+        Err(coord_storage::ViewBuildError::BudgetExceeded)
+    ));
+}
+
+#[test]
+fn a_lease_row_past_the_bytes_left_ends_the_page_before_it() {
+    // The byte budget ends a page as the row budget does: the row past it
+    // is the next page's first. A page that asked the engine for only the
+    // bytes left was refused by the engine instead, its first row being
+    // larger than the page, and the whole scan failed.
+    use coord_storage::active_leases_page;
+    let mut d = Domain::new(ModelEngine::new());
+    let ids: Vec<LeaseId> = (0..3u8).map(|i| LeaseId([i + 0x10; 16])).collect();
+    for id in &ids {
+        d.run_as(ALICE, &grant(*id, 30));
+    }
+    let gated = d.worker.reader().snapshot().unwrap();
+    // The rows, as the scan charges them.
+    let rows = gated
+        .view()
+        .scan_page(
+            Collection::LeaseV1.id(),
+            &ScanRequest {
+                lower: std::ops::Bound::Unbounded,
+                upper: std::ops::Bound::Unbounded,
+                direction: coord_store_api::engine::Direction::Forward,
+                resume_after: None,
+                max_rows: 16.try_into().unwrap(),
+                max_bytes: (1 << 20).try_into().unwrap(),
+            },
         )
-        .is_err()
+        .unwrap()
+        .rows;
+    assert_eq!(rows.len(), 3);
+    let cost = |i: usize| u32::try_from(rows[i].key.len() + rows[i].value.len()).unwrap();
+    // Room for the first row and half the second.
+    let budget = ViewBudget {
+        max_rows: 100,
+        max_bytes: cost(0) + cost(1) / 2,
+    };
+    let page = active_leases_page(gated.view(), None, budget)
+        .expect("a page that ends before the row, not the engine's refusal");
+    assert_eq!(
+        page.leases.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        vec![ids[0]]
+    );
+    assert_eq!(page.next, Some(ids[0]));
+    // Paging on reaches the rest, one a page.
+    assert_eq!(
+        active_leases(gated.view(), budget)
+            .unwrap()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect::<Vec<_>>(),
+        ids
     );
 }
