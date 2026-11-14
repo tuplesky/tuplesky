@@ -9,7 +9,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use coord_core::effect::{BarrierId, BootId, StoreUpdate};
+use coord_core::effect::{ApplyBase, BarrierId, BootId, StoreUpdate};
 use coord_journal_api::engine::{JournalEngine, ReadBudget};
 use coord_journal_api::failure::{JournalErrorClass, JournalFailure};
 use coord_journal_api::frontier::{
@@ -17,8 +17,9 @@ use coord_journal_api::frontier::{
 };
 use coord_journal_api::group::{GroupEntry, GroupLimits, GroupWrite};
 use coord_journal_api::record::{
-    GENESIS_PREDECESSOR, JOURNAL_RECORD_FORMAT_V1, JournalRecordV1, LifecycleRecordV1,
-    MAX_RECORD_BYTES, RecordBody, RecordDraft, RecordExpectation, RecordOrigin, TransitionContext,
+    GENESIS_PREDECESSOR, GroupOutcomeV1, JOURNAL_RECORD_FORMAT_GROUPS, JOURNAL_RECORD_FORMAT_V1,
+    JournalRecordV1, LifecycleRecordV1, MAX_RECORD_BYTES, RecordBody, RecordDraft,
+    RecordExpectation, RecordOrigin, TransitionContext,
 };
 use coord_journal_api::stream::{
     ShardId, StorageStreamId, StreamAllocator, StreamHighWater, StreamKey, StreamMappingV1,
@@ -29,7 +30,8 @@ use coord_journal_raft_engine::{
 use coord_store_api::registry::Collection;
 use coord_types::identity::Digest32;
 use coord_types::ids::{
-    Ballot, ClusterId, ConfigurationEpoch, DomainId, LocalJournalSeq, ReplicaId, ReplicaIncarnation,
+    Ballot, ClusterId, ConfigurationEpoch, DomainId, ExecutionPosition, KvRevision,
+    LocalJournalSeq, ReplicaId, ReplicaIncarnation,
 };
 use raft_engine::ValueCodec;
 use raft_engine::env::{DefaultFileSystem, FileSystem, Handle, Permission};
@@ -883,6 +885,113 @@ fn a_journal_retaining_a_pointer_of_an_older_image_format_opens() {
         })
         .collect();
     assert_eq!(pointers, vec![pointer]);
+}
+
+/// A stream of the format a successor writes goes through this journal,
+/// the one that successor writes to (the batching-rule doc's 10.7, step
+/// 1a; review of #286). Its records are sealed at 2, a group's
+/// application outcomes among them. Appended, the journal reopens and
+/// reads them back equal: the open decodes every retained record and
+/// checks the chain, so the codec, open's check and the chain all meet
+/// format 2 in the build that must read them. A record this build writes
+/// then follows them, as on a voter gone back from its successor, and the
+/// journal opens again.
+#[test]
+fn a_stream_of_the_format_a_successor_writes_reopens_and_reads_back_equal() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("j");
+    let (mut journal, _, streams) = create(&root, Arc::new(DefaultFileSystem), &[1]);
+    let s = &streams[0];
+    let epoch = context().configuration;
+    let position = |p: u64| ExecutionPosition::new(p).unwrap();
+    let kv = |tag: u8| StoreUpdate {
+        collection: Collection::KvCurrentV1.id(),
+        key: vec![tag],
+        value: Some(vec![tag; 3]),
+    };
+    let bodies = vec![
+        RecordBody::Lifecycle(LifecycleRecordV1::Genesis {
+            format: JOURNAL_RECORD_FORMAT_GROUPS,
+        }),
+        transition(1, 8),
+        // Three commands after position 4: two rows, none, one.
+        RecordBody::ApplicationGroup {
+            context: context(),
+            base: ApplyBase {
+                configuration: epoch,
+                execution_position: position(4),
+            },
+            outcomes: [(5, 2), (6, 0), (7, 1)]
+                .into_iter()
+                .map(|(p, updates)| GroupOutcomeV1 {
+                    position: position(p),
+                    revision: KvRevision::new(p * 10).ok(),
+                    result_digest: Digest32([p as u8; 32]),
+                    updates,
+                })
+                .collect(),
+            updates: vec![kv(1), kv(2), kv(3)],
+        },
+        // A lone outcome after the group's last.
+        RecordBody::ApplicationOutcome {
+            context: context(),
+            base: ApplyBase {
+                configuration: epoch,
+                execution_position: position(7),
+            },
+            position: position(8),
+            revision: None,
+            result_digest: Digest32([8; 32]),
+            updates: vec![kv(4)],
+        },
+        transition(2, 8),
+    ];
+    let mut written = Vec::new();
+    let mut predecessor = GENESIS_PREDECESSOR;
+    for (i, body) in bodies.into_iter().enumerate() {
+        let record = JournalRecordV1::seal_as(
+            JOURNAL_RECORD_FORMAT_GROUPS,
+            RecordDraft {
+                origin: s.origin,
+                seq: LocalJournalSeq::new(i as u64 + 1).unwrap(),
+                predecessor,
+                body,
+            },
+        )
+        .unwrap();
+        predecessor = record.digest();
+        written.push(record);
+    }
+    assert!(
+        written
+            .iter()
+            .any(|r| matches!(r.body(), RecordBody::ApplicationGroup { .. }))
+    );
+    journal
+        .append_group(&group(vec![(barrier(1), s.id, written.clone())]))
+        .unwrap();
+    drop(journal);
+
+    let mut reopened = RaftEngineJournal::open_existing(&root, identity(), &options()).unwrap();
+    let read = read_all(&reopened, s.id);
+    assert_eq!(read, written);
+    assert!(
+        read.iter()
+            .all(|r| r.format() == JOURNAL_RECORD_FORMAT_GROUPS),
+        "every record reads back at the format it was sealed at"
+    );
+
+    // This build writes format 1 after them, and the journal opens again.
+    let last = written.last().unwrap();
+    let after = chain(s.origin, last.seq(), last.digest(), vec![transition(3, 8)]);
+    assert_eq!(after[0].format(), JOURNAL_RECORD_FORMAT_V1);
+    reopened
+        .append_group(&group(vec![(barrier(2), s.id, after.clone())]))
+        .unwrap();
+    drop(reopened);
+    let again = RaftEngineJournal::open_existing(&root, identity(), &options()).unwrap();
+    written.extend(after);
+    assert_eq!(read_all(&again, s.id), written);
 }
 
 fn read_all_from(
