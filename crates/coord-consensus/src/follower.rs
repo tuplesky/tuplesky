@@ -1855,7 +1855,7 @@ impl Follower {
                     }
                 };
             // The campaign is borrowed: the check `allocate` makes, by field.
-            debug_assert!(
+            assert!(
                 self.frame_batch.is_none(),
                 "a barrier allocated while a proposal frame's batch is open"
             );
@@ -2023,8 +2023,15 @@ impl Follower {
     /// would have a newer barrier than that batch yet be written ahead of
     /// it, at the frame's end; a path a frame can reach takes
     /// [`Follower::barrier_outside_frame`] instead.
+    ///
+    /// The check holds in a release build too (#290's review): a crash
+    /// keeping a prefix of a frame's batches, and the ledger's view of the
+    /// newest record in flight, both rest on batches going out in their
+    /// barriers' order. A miss stops the voter, as a refused batch does
+    /// (#280), rather than reorder its journal unseen. It costs one
+    /// `is_none()` a batch.
     fn allocate(&mut self) -> BarrierId {
-        debug_assert!(
+        assert!(
             self.frame_batch.is_none(),
             "a barrier allocated while a proposal frame's batch is open"
         );
@@ -4566,7 +4573,7 @@ impl Follower {
         self.payloads.insert(command, entry.payload.clone());
         self.note_lacking(command);
         let epoch = self.config.identity.epoch;
-        debug_assert!(
+        assert!(
             self.frame_batch.is_none(),
             "a barrier allocated while a proposal frame's batch is open"
         );

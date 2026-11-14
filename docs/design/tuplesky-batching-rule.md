@@ -1229,6 +1229,7 @@ Each step has its own PRs and pair.
   - the fall, as µs a command, is at least half its bound;
   - and it is larger than the base runs' own spread of that same quantity, over at least the four base runs that gave the spread.
   - A part read from a profile is its share of samples times its thread's CPU a command, both from the same runs. A share alone moves when anything else on the thread moves.
+  - **A drifting base.** When the pair's base runs spread wider than the reading, the profiled pair decides, by function, with at least three base runs: the part named, read as its thread's CPU a command, must fall by more than its own base runs' spread, and the functions the step cuts must fall where its bound says they do. The base drifted in B1's re-read and again in 2b's pair (#290, accepted on its profiled pair).
   - The pair runs at 120 and 30 callers, five voters on tmpfs, replay.
   - A step that misses its checkpoint stops the plan: the next step isn't built until the lead has the reading.
 - **Every checkpoint reads latency (R16).** The owner's goal for batching is latency neutral at low load.
@@ -1404,7 +1405,7 @@ Each step has its own PRs and pair.
   - 2a: the frame's checks run once. Each adoptable entry is adopted in one pass, without `held` or a `VoteSet`, and the path logs' suffixes are recomputed once a key at the frame's end.
   - 2b: a frame's adoptions go in as few batches as the store's bounds allow, each with one barrier and one `pending` entry naming its adoptions. Votes stay one a command, in one hand-off a turn (lever 8).
     - **As built.** Adoption goes entry by entry in today's order, so the path logs and `held` are as today. Only where an adoption's rows go changes.
-    - **A batch of its own written mid-frame closes the frame's open batch first.** A decided command's acknowledgement is one. So batches go out in their barriers' order. Every other barrier is allocated with no frame batch open, which a debug assertion checks.
+    - **A batch of its own written mid-frame closes the frame's open batch first.** A decided command's acknowledgement is one. So batches go out in their barriers' order. Every other barrier is allocated with no frame batch open, which an assertion checks in every build: a miss stops the voter rather than reorder its journal.
     - **The payload rows in flight are found through an index** by command, not a scan of the batches in flight.
     - **Counts:** a follower's metrics line gives `frame_batches` and `frame_adoptions` beside `frames_taken`.
 - **How a frame's batch is split (R1).** Since #280 a batch the store refuses stops the voter. Full frames are what a new leader's backlog sends (#242), so one batch a frame would stop every follower at once, under a fault.

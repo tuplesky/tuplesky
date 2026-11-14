@@ -2460,6 +2460,7 @@ fn adopted_in(batch: &coord_core::effect::PersistBatch) -> Vec<CommandId> {
 #[test]
 fn a_frame_taken_whole_leaves_what_its_entries_one_at_a_time_leave() {
     let mut frames_with_two_or_more = 0;
+    let mut own_votes = 0;
     for seed in 0..96u64 {
         let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
         let mut next = |n: u64| {
@@ -2587,10 +2588,29 @@ fn a_frame_taken_whole_leaves_what_its_entries_one_at_a_time_leave() {
             single.take_rejections(),
             "seed {seed}"
         );
+
+        // The same votes counted (#290's review, control m3): once its
+        // batch is durable, an adopted command's set holds this replica's
+        // own vote, which `learn` counts, on the frame's path as on the
+        // one-adoption path, and a command not adopted holds none. (A
+        // duplicate entry can write a second batch for a command, so this
+        // goes by command, not by batch.)
+        for c in &commands {
+            let voted = |f: &Follower| f.votes(c).map(|v| v.voted());
+            assert_eq!(voted(&whole), voted(&single), "seed {seed}");
+            let own = voted(&whole).is_some_and(|v| v.contains(&r(1)));
+            let adopted = whole.table().phase_of(c) == Some(Phase::Accept);
+            assert_eq!(own, adopted, "seed {seed}");
+            own_votes += usize::from(own);
+        }
     }
     assert!(
         frames_with_two_or_more >= 20,
         "the seeds reach frames of several adoptions: {frames_with_two_or_more}"
+    );
+    assert!(
+        own_votes >= 96,
+        "the seeds reach adopted commands' own votes: {own_votes}"
     );
 }
 
@@ -2832,6 +2852,12 @@ fn a_frames_batches_fail_and_crash_as_its_adoptions_one_at_a_time_would() {
         error: StorageError::NoSpace,
     }));
     assert!(sends(&failed).is_empty(), "none of the failed batch's");
+    // The first batch's adoptions count this replica's vote; the failed
+    // batch's don't (#290's review, control m3).
+    for (i, c) in commands.iter().enumerate() {
+        let own = f.votes(c).is_some_and(|v| v.voted().contains(&r(1)));
+        assert_eq!(own, i < per_batch, "command {i}");
+    }
     assert_eq!(
         f.take_rejections(),
         commands[per_batch..]
