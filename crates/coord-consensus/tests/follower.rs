@@ -9,8 +9,8 @@ use std::collections::BTreeSet;
 use coord_consensus::{
     BallotConfiguration, CONSERVATIVE_KEY, CommandRecord, ConfigurationIdentity, FRAME_BATCH_BYTES,
     FRAME_BATCH_UPDATES, FastAck, Follower, FollowerConfig, FollowerRejection, FramedProposal,
-    PayloadRecordV1, Phase, ProtocolMessage, RelayTaken, ReplayRefusal, ReplicaRole, SlowAck,
-    decode_dependency, decode_payload, dependency_key,
+    MAX_PROPOSAL_FRAME_BYTES, PayloadRecordV1, Phase, ProtocolMessage, RelayTaken, ReplayRefusal,
+    ReplicaRole, SlowAck, decode_dependency, decode_payload, dependency_key,
 };
 use coord_core::capability::{AdmissionReceipt, AttestedAdmission, VerifierToken};
 use coord_core::effect::{BootId, Effect, PeerId};
@@ -2594,24 +2594,56 @@ fn a_frame_taken_whole_leaves_what_its_entries_one_at_a_time_leave() {
     );
 }
 
-/// Step 2b: a frame of more of the smallest commands than one batch's
-/// updates bound holds is written in batches cut in frame order, each
-/// within [`FRAME_BATCH_UPDATES`] and [`FRAME_BATCH_BYTES`]. Every entry
-/// is adopted and every adoption acknowledged once its batch is durable.
+/// Step 2b (10.7's pin): a 1 MiB frame of the smallest commands -- as
+/// many as the leader puts in one frame, cut at
+/// [`MAX_PROPOSAL_FRAME_BYTES`] as `publish_frame` cuts it -- is written
+/// in batches cut in frame order, each within [`FRAME_BATCH_UPDATES`] and
+/// [`FRAME_BATCH_BYTES`]. Every entry is adopted and acknowledged once its
+/// batch is durable, and nothing is refused: the follower keeps going.
 #[test]
-fn a_frame_past_a_batchs_updates_bound_is_written_in_batches_within_the_bounds() {
-    // Each adoption writes its dependency row and its payload row.
-    let per_batch = FRAME_BATCH_UPDATES / 2;
-    let n = 2 * per_batch + 7;
-    let mut f = booted_holding(1, 2 * n);
+fn a_1_mib_frame_of_the_smallest_commands_is_written_in_batches_within_the_bounds() {
+    let offered = 8_000usize;
     let mut leader_view = coord_consensus::CommandTable::new();
-    let payloads: Vec<_> = (0..n)
+    let payloads: Vec<_> = (0..offered)
         .map(|i| relayed_payload(i as u64 + 1, (i % 251) as u8, (i / 251) as u8))
         .collect();
-    let commands: Vec<CommandId> = payloads.iter().map(|(_, c)| *c).collect();
-    let effects = f.step(peer(0, framed(leader_order(&mut leader_view, payloads, 0))));
+    let all: Vec<CommandId> = payloads.iter().map(|(_, c)| *c).collect();
+    let ProtocolMessage::ProposalFrame {
+        replica,
+        ballot,
+        proposals,
+    } = framed(leader_order(&mut leader_view, payloads, 0))
+    else {
+        unreachable!()
+    };
+    let mut size = 0usize;
+    let proposals: Vec<FramedProposal> = proposals
+        .into_iter()
+        .take_while(|p| {
+            size += postcard::experimental::serialized_size(p).unwrap();
+            size <= MAX_PROPOSAL_FRAME_BYTES
+        })
+        .collect();
+    let n = proposals.len();
+    assert!(n < offered, "the frame is cut at 1 MiB");
+    let commands = all[..n].to_vec();
+    // Each adoption writes its dependency row and its payload row.
+    let per_batch = FRAME_BATCH_UPDATES / 2;
+    let mut f = booted_holding(1, 2 * n);
+    let effects = f.step(peer(
+        0,
+        ProtocolMessage::ProposalFrame {
+            replica,
+            ballot,
+            proposals,
+        },
+    ));
     let batches = persisted(&effects);
-    assert_eq!(batches.len(), 3, "cut at {per_batch} adoptions");
+    assert_eq!(
+        batches.len(),
+        n.div_ceil(per_batch),
+        "cut at {per_batch} adoptions"
+    );
     let mut taken = Vec::new();
     for batch in &batches {
         assert!(batch.updates.len() <= FRAME_BATCH_UPDATES);
@@ -2628,7 +2660,10 @@ fn a_frame_past_a_batchs_updates_bound_is_written_in_batches_within_the_bounds()
         assert_eq!(f.table().phase_of(c), Some(Phase::Accept));
     }
     let taken = f.relay_taken();
-    assert_eq!((taken.frame_batches, taken.frame_adoptions), (3, n as u64));
+    assert_eq!(
+        (taken.frame_batches, taken.frame_adoptions),
+        (batches.len() as u64, n as u64)
+    );
     assert!(sends(&effects).is_empty());
     let mut released = Vec::new();
     for event in durable_of(&effects, 1) {
@@ -2641,6 +2676,64 @@ fn a_frame_past_a_batchs_updates_bound_is_written_in_batches_within_the_bounds()
             .all(|(to, m)| *to == r(0) && matches!(m, ProtocolMessage::SlowAck(_)))
     );
     assert!(f.take_rejections().is_empty());
+}
+
+/// Step 2b: a batch of its own that one of a frame's entries writes while
+/// the frame's batch is open -- here a decided command's payload row,
+/// written again because the batch that first wrote it failed -- goes
+/// after the frame's open batch, so the journal takes the batches in
+/// their barriers' order. The decided command is acknowledged once that
+/// row is durable, as outside a frame.
+#[test]
+fn a_batch_of_its_own_written_mid_frame_follows_the_frames_open_batch() {
+    let (c1, (mut rows, mut payloads)) = durable_admission();
+    rows[0].1.phase = Phase::Commit;
+    let record = rows[0].1.clone();
+    let payload = payloads.remove(0).1;
+    let mut f = Follower::recover(config(2), None, rows, Vec::new(), ExecutionPosition::ZERO);
+    f.step(boot_event());
+    // The payload comes, and the batch of its own that writes it fails:
+    // held here, with no row durable or in flight.
+    let effects = f.step(peer(
+        0,
+        ProtocolMessage::PayloadResponse {
+            command: c1,
+            payload,
+        },
+    ));
+    let first = persisted(&effects);
+    assert_eq!(first.len(), 1, "{effects:?}");
+    f.step(Event::Storage(StorageEvent::Failed {
+        barrier_id: first[0].barrier,
+        error: StorageError::NoSpace,
+    }));
+    // A frame: a fresh command, adopted into the frame's batch, then the
+    // decided one proposed again.
+    let mut leader_view = coord_consensus::CommandTable::new();
+    let (fresh_payload, c2) = relayed_payload(77, 7, 7);
+    let mut entries = leader_order(&mut leader_view, vec![(fresh_payload, c2)], 1);
+    entries.push(proposal(c1, vec![], 0, record.paths.clone(), record.path));
+    let effects = f.step(peer(0, framed(entries)));
+    let batches = persisted(&effects);
+    let barriers: Vec<_> = batches.iter().map(|b| b.barrier).collect();
+    assert!(batches.len() >= 2, "{batches:?}");
+    assert!(
+        barriers.windows(2).all(|w| w[0] < w[1]),
+        "written in their barriers' order: {barriers:?}"
+    );
+    assert_eq!(adopted_in(&batches[0]), vec![c2], "the frame's batch first");
+    let mut released = Vec::new();
+    for event in durable_of(&effects, 1) {
+        released.extend(f.step(event));
+    }
+    let acked: BTreeSet<CommandId> = sends(&released)
+        .iter()
+        .filter_map(|(_, m)| match m {
+            ProtocolMessage::SlowAck(a) => Some(a.command),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(acked, BTreeSet::from([c1, c2]));
 }
 
 /// Step 2b: large requests cut a frame's batches by bytes, and a request
