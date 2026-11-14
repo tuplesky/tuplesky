@@ -2147,6 +2147,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                     relayed: collector.relayed(),
                     fallbacks: collector.relay_fallbacks(),
                     not_leading: collector.not_leading(),
+                    asked_leader: collector.relay_leader_asks(),
                     frames_taken: taken.frames,
                     payloads_taken: taken.taken,
                     known: taken.known,

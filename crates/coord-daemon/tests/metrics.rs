@@ -534,6 +534,7 @@ fn a_rendered_snapshot_carries_no_secret_or_key_shaped_text() {
                 relayed: 4000,
                 fallbacks: 3,
                 not_leading: 1,
+                asked_leader: 5,
                 frames_taken: 500,
                 payloads_taken: 3900,
                 known: 20,

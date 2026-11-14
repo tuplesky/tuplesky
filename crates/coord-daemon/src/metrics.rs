@@ -831,6 +831,11 @@ pub struct Relay {
     pub fallbacks: u64,
     /// `NotLeading` refusals taken.
     pub not_leading: u64,
+    /// Relayed submissions asked of the leader alone again at the
+    /// bound, before any fan-out (storm fix 3): what `fallbacks` would
+    /// have been, less those the leader answered.
+    #[serde(default)]
+    pub asked_leader: u64,
     /// As a follower, since the node started (#224 review): proposal
     /// frames taken.
     #[serde(default)]
