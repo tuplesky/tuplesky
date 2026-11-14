@@ -686,17 +686,24 @@ jobs:
           # A key's group of threads in the register workloads: 2n, n the
           # nodes (jepsen_key_groups.py; key 0 alone can hide it).
           key_group=$((2 * $(grep -c . "$RUNNER_TEMP/cluster/nodes")))
-          # The key-group gate over the runs LABEL=STORE: a run that leaves
-          # threads out of its keys, or stops some, fails the job; but a
-          # quirks: base, drawn as an older generator on purpose, is
-          # reported beside the rest and fails nothing.
+          # The key-group gate over the runs LABEL=STORE: a TupleSky run
+          # that leaves threads out of its keys, or stops some, fails the
+          # job. Reported beside them and failing nothing: a quirks: base,
+          # drawn as an older generator on purpose, and the etcd and
+          # SwiftPaxos runs, whose own tests' generators this job doesn't
+          # draw (etcd's Jepsen at 120 clients on 4 CPUs leaves threads out
+          # of its keys: 43531487187).
           key_groups() {
             local r gated=() reported=()
             for r in "$@"; do
-              if [[ $IN_PAIR_BASE == quirks:* && $r == base[@#]* ]]; then reported+=("$r"); else gated+=("$r"); fi
+              if [[ $IN_PAIR_BASE == quirks:* && $r == base[@#]* ]] || [[ $r == etcd* || $r == swiftpaxos* ]]; then
+                reported+=("$r")
+              else
+                gated+=("$r")
+              fi
             done
             if [ ${#reported[@]} -gt 0 ] && ! python3 "$ci/jepsen_key_groups.py" --group-size "$key_group" "${reported[@]}"; then
-              echo "::warning::the base, the etcd mix drawn with ${IN_PAIR_BASE#quirks:}, left threads out of its keys or stopped some (Key groups in the summary; not counted)"
+              echo "::warning::a run this job doesn't draw (etcd's or SwiftPaxos's own test, or a quirks: base) left threads out of its keys or stopped some (Key groups in the summary; not counted)"
             fi
             if [ ${#gated[@]} -gt 0 ] && ! python3 "$ci/jepsen_key_groups.py" --group-size "$key_group" "${gated[@]}"; then
               echo "::error::a run's load generator left threads out of its keys or stopped some (Key groups in the summary)"
