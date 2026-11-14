@@ -1365,6 +1365,7 @@ fn server_config(
         limits.idle_timeout,
         limits.keep_alive,
         limits.ack_frequency,
+        limits.reordering,
     )
     .map_err(TransportError::Tls)?;
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server));
@@ -1455,6 +1456,7 @@ impl Transport {
                 limits.idle_timeout,
                 limits.keep_alive,
                 limits.ack_frequency,
+                limits.reordering,
             )
             .map_err(TransportError::Tls)
         };
