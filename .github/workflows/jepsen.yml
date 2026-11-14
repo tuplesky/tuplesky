@@ -718,8 +718,12 @@ jobs:
           # SwiftPaxos runs, whose own tests' generators this job doesn't
           # draw (etcd's Jepsen at 120 clients on 4 CPUs leaves threads out
           # of its keys: 43531487187).
+          # The turn rule (a missing thread counts only if it invoked while
+          # the key was open) under a WAN and at a rate; the free rule on a
+          # LAN closed loop. A sweep's @RATE steps get it from their labels.
           key_groups() {
-            local r gated=() reported=()
+            local r gated=() reported=() turns=()
+            if [ "$WAN" != none ] || [ "${RATE:-0}" != 0 ]; then turns=(--turns); fi
             for r in "$@"; do
               if [[ $IN_PAIR_BASE == quirks:* && $r == base[@#]* ]] || [[ $r == etcd* || $r == swiftpaxos* ]]; then
                 reported+=("$r")
@@ -727,10 +731,10 @@ jobs:
                 gated+=("$r")
               fi
             done
-            if [ ${#reported[@]} -gt 0 ] && ! python3 "$ci/jepsen_key_groups.py" --group-size "$key_group" "${reported[@]}"; then
+            if [ ${#reported[@]} -gt 0 ] && ! python3 "$ci/jepsen_key_groups.py" --group-size "$key_group" ${turns[@]+"${turns[@]}"} "${reported[@]}"; then
               echo "::warning::a run this job doesn't draw (etcd's or SwiftPaxos's own test, or a quirks: base) left threads out of its keys or stopped some (Key groups in the summary; not counted)"
             fi
-            if [ ${#gated[@]} -gt 0 ] && ! python3 "$ci/jepsen_key_groups.py" --group-size "$key_group" "${gated[@]}"; then
+            if [ ${#gated[@]} -gt 0 ] && ! python3 "$ci/jepsen_key_groups.py" --group-size "$key_group" ${turns[@]+"${turns[@]}"} "${gated[@]}"; then
               echo "::error::a run's load generator left threads out of its keys or stopped some (Key groups in the summary)"
               return 1
             fi

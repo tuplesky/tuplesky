@@ -138,6 +138,32 @@ class KeyGroupTests(unittest.TestCase):
         g = kg.check("head@30", ops, 10)
         self.assertNotIn(29, [t for t, _ in g.stopped], kg.line(g))
 
+    def test_the_turn_rule_counts_only_a_thread_that_had_a_turn(self):
+        # Thread 29 is free through group 2's fifth key and invokes nothing
+        # while it's open: the free rule fails the key, the turn rule (at a
+        # rate, under a WAN) doesn't.
+        ops = run(3, 10, 20, 100, drop=lambda grp, i: {29} if (grp, i) == (2, 4) else set())
+        g = kg.check("head@120", ops)
+        self.assertEqual((g.rule, g.short), ("free", [(14, 2, 9)]))
+        self.assertIn("| free | **fails** |", kg.line(g))
+        g = kg.check("head@120", ops, turns=True)
+        self.assertEqual((g.rule, g.short, g.excused), ("turn", [], 1))
+        self.assertIn("| turn | ok |", kg.line(g))
+        self.assertIn("1 missing a thread that was busy, not yet started or without a turn while the key was open", kg.line(g))
+        # A step with a rate in its label gets the turn rule without --turns.
+        self.assertEqual(kg.check("head@120@800", ops).rule, "turn")
+        self.assertEqual(kg.check("etcd-tls@120@0.5#2", ops).rule, "turn")
+        self.assertEqual(kg.check("head@480#2", ops).rule, "free")
+        # Thread 29 takes a turn on another key while key 14 is open: it
+        # was passed over, and the turn rule fails the key too.
+        k14 = sorted(o.at for o in ops if o.value == "[14 1]" and o.type == "invoke")
+        mid = (k14[len(k14) // 2] - T0).total_seconds() * 1000
+        ops += [invoke(mid, 29, 99), ok(mid + 1, 29, 99)]
+        ops.sort(key=lambda o: (o.at, o.type != "ok"))
+        g = kg.check("head@120", ops, turns=True)
+        self.assertEqual(g.short, [(14, 2, 9)], kg.line(g))
+        self.assertTrue(g.failed)
+
     def test_unkeyed_runs_are_skipped(self):
         ops = [js.Op(T0, "jepsen worker 0", "0", "invoke", ":txn", "[[:append 1 2]]", "")]
         g = kg.check("head@30", ops)
@@ -168,6 +194,10 @@ class KeyGroupTests(unittest.TestCase):
             )
             self.assertEqual(no.returncode, 1, no.stdout + no.stderr)
             self.assertIn("| etcd#1 |", no.stdout)
+            self.assertIn("| free | ok |", ok.stdout)
+            turn = subprocess.run([sys.executable, script, "--turns", f"head@30={good}"], capture_output=True, text=True, env=env)
+            self.assertEqual(turn.returncode, 0, turn.stdout + turn.stderr)
+            self.assertIn("| turn | ok |", turn.stdout)
 
 
 if __name__ == "__main__":

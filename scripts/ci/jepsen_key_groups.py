@@ -21,6 +21,16 @@ some keys two threads and others none). So, from each run's `jepsen.log`:
   invoked anything (its client still opening), or one whose own operation
   was open from the key's first invocation to its last; keys begun in the
   run's first 10 s (the warm-up) are reported, not held to it;
+- under the turn rule (--turns, and any run whose label's step carries a
+  rate, `CLIENTS@RATE` or `CLIENTS@SHARE`), a missing thread counts against
+  a key only if it had a turn while the key was open: it invoked something
+  from the key's first invocation to its last. At a fixed rate, or where
+  operations take WAN-length times, a free thread can wait out a short
+  key's whole life for its next turn (43595115299, 43598928192: keys on 9
+  of 10 at 120@800 and at 480 under a WAN, etcd's runs too), so being free
+  isn't being passed over; a thread that never gets a turn is still caught
+  by the end-of-run check below. The free rule is the default, for LAN
+  closed-loop steps;
 - every thread must invoke within the run's last 5 s, or within three of
   its turns if a turn comes slower (its own median gap between
   invocations, or the run's, threads over invocations a second, whichever
@@ -58,6 +68,8 @@ OPS_A_THREAD = 5
 # of a group without an operation for a key (43527949820: 3 keys of 2245,
 # each one thread short, at 4.7-5.7 s; none after).
 WARMUP_S = 10.0
+# A run's step with a rate: CLIENTS@RATE or CLIENTS@SHARE in its label.
+RATE_STEP = re.compile(r"@\d+@[\d.]+")
 
 
 @dataclass
@@ -82,6 +94,9 @@ class Groups:
     stopped: list = field(default_factory=list)
     # group -> threads that read
     readers: dict = field(default_factory=dict)
+    # "free": a missing thread counts if it could take work; "turn": only
+    # if it also invoked something while the key was open.
+    rule: str = "free"
     note: str = ""
 
     @property
@@ -102,11 +117,18 @@ def occupied(spans: list, start, end) -> bool:
     return i >= 0 and (spans[i][1] is None or spans[i][1] >= end)
 
 
+def had_turn(spans: list, start, end) -> bool:
+    """Whether a thread invoked anything from `start` to `end`."""
+    starts = [s[0] for s in spans]
+    i = bisect.bisect_left(starts, start)
+    return i < len(starts) and starts[i] <= end
+
+
 UNREADABLE = "**fails**: can't tell the groups (key 0 didn't run on threads 0 to n - 1, and no --group-size)"
 
 
-def check(label: str, ops: list, size: int | None = None) -> Groups:
-    g = Groups(label)
+def check(label: str, ops: list, size: int | None = None, turns: bool = False) -> Groups:
+    g = Groups(label, rule="turn" if turns or RATE_STEP.search(label) else "free")
     invokes = []
     # Each thread's operations as [invoked, completed or None], in order.
     spans = {}
@@ -163,6 +185,8 @@ def check(label: str, ops: list, size: int | None = None) -> Groups:
         for k in keys[:-1]:
             g.finished += 1
             missing = {t for t in whole - on[k] if not occupied(spans.get(t, []), first[k], last[k])}
+            if g.rule == "turn":
+                missing = {t for t in missing if had_turn(spans.get(t, []), first[k], last[k])}
             if len(missing) < len(whole - on[k]):
                 g.excused += 1
             if not missing:
@@ -210,7 +234,7 @@ def ranges(ts) -> str:
 
 def line(g: Groups) -> str:
     if g.note:
-        return f"| {g.label} | {g.threads or '-'} | - | - | - | - | {g.note} |"
+        return f"| {g.label} | {g.threads or '-'} | - | - | - | - | - | {g.note} |"
     short = ", ".join(f"key {k} (group {grp}) on {n} of {g.size}" for k, grp, n in g.short[:6])
     if len(g.short) > 6:
         short += f", and {len(g.short) - 6} more"
@@ -219,7 +243,8 @@ def line(g: Groups) -> str:
     if g.short_warmup:
         short += ("; " if short else "") + f"{g.short_warmup} begun in the first {WARMUP_S:.0f} s on fewer (not counted)"
     if g.excused:
-        short += ("; " if short else "") + f"{g.excused} missing a thread that was busy or not yet started (not counted)"
+        why = "busy or not yet started" if g.rule == "free" else "busy, not yet started or without a turn while the key was open"
+        short += ("; " if short else "") + f"{g.excused} missing a thread that was {why} (not counted)"
     stopped = ", ".join(
         f"{t} ({'never' if s is None else f'{s:.0f} s before the end'})" for t, s in g.stopped[:8]
     )
@@ -229,7 +254,7 @@ def line(g: Groups) -> str:
     verdict = "**fails**" if g.failed else "ok"
     return (
         f"| {g.label} | {g.threads} | {g.size} × {g.threads // g.size} | {g.finished} of {g.keys} | "
-        f"{short or 'none'} | {stopped or 'none'} | {readers} | {verdict} |"
+        f"{short or 'none'} | {stopped or 'none'} | {readers} | {g.rule} | {verdict} |"
     )
 
 
@@ -240,10 +265,13 @@ def render(groups: list[Groups]) -> str:
         "Every finished key should be invoked on by every thread of its group that was free to take it (after "
         f"the first {WARMUP_S:.0f} s), and every thread not waiting on an operation should invoke within the run's "
         f"last {TAIL_S:.0f} s, or {TAIL_TURNS} of its turns if they come slower; a run "
-        "that doesn't fails the job (the load generator ran it at fewer clients than it says).",
+        "that doesn't fails the job (the load generator ran it at fewer clients than it says). Rule `free`: a "
+        "missing thread counts if it was free to take the key (LAN closed-loop steps); rule `turn`: only if it "
+        "also invoked something while the key was open (steps at a rate, and runs under a WAN, where a free "
+        "thread can wait out a short key for its next turn).",
         "",
-        "| Run | Threads | Group size × groups | Keys finished | Keys short of their group | Threads stopped early | Threads that read | |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- |",
+        "| Run | Threads | Group size × groups | Keys finished | Keys short of their group | Threads stopped early | Threads that read | Rule | |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     out += [line(g) for g in groups]
     return "\n".join(out) + "\n"
@@ -254,6 +282,10 @@ def main() -> int:
     parser.add_argument(
         "--group-size", type=int, metavar="N",
         help="the threads a key's group holds, 2n for n nodes; without it, key 0's threads, which a starved run can hide",
+    )
+    parser.add_argument(
+        "--turns", action="store_true",
+        help="hold every run to the turn rule (runs under a WAN, or at a rate); a run whose label's step has @RATE gets it anyway",
     )
     parser.add_argument("runs", nargs="*", metavar="LABEL=STORE")
     args = parser.parse_args()
@@ -266,7 +298,7 @@ def main() -> int:
         if not os.path.exists(log):
             continue
         with open(log, encoding="utf-8", errors="replace") as f:
-            groups.append(check(label, js.parse_ops(f.readlines()), args.group_size))
+            groups.append(check(label, js.parse_ops(f.readlines()), args.group_size, args.turns))
     if not groups:
         return 0
     text = render(groups)
