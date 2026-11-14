@@ -3,7 +3,7 @@
   "format": 1,
   "max_record_bytes": 4194304,
   "max_record_updates": 4096,
-  "max_record_key_bytes": 16384,
+  "max_record_key_bytes": 32768,
   "max_record_value_bytes": 2117648,
   "records": [
     [
