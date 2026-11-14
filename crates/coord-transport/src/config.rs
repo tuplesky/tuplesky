@@ -161,21 +161,35 @@ impl AckFrequency {
 ///   to its `max_ack_delay` (25 ms), longer than the eighth of a round
 ///   trip QUIC's time threshold leaves.
 ///
-/// In the packet simulator, a link of 50 ms each way that jitters by
-/// 10 ms either side and loses nothing had 269 to 290 of about 2,000
-/// packets called lost at QUIC's thresholds, the window cut about 200
-/// times, and the transfer take 49 to 54 s. At [`Reordering::BY_TIME`]
-/// 0 or 1 were called lost, and it took 2.8 to 6.9 s.
+/// In the packet simulator, a link of 35 ms each way whose delay jitters
+/// with a standard deviation of a tenth of it (29 to 41 ms), and which
+/// loses nothing, had about 450 of 2,200 packets called lost with CUBIC
+/// at QUIC's thresholds, the window cut about 300 times, and 2 s of
+/// frames take 46 to 52 s to move. At [`Reordering::BY_TIME`] 6 seeds of
+/// 10 called none lost and moved them in 2.0 s; the other 4 called one
+/// to seven early, in slow start, and took 4.9 to 6.5 s.
 ///
-/// [`Reordering::BY_TIME`] calls loss by time alone, as Linux's RACK does
-/// once it has seen reordering (RFC 8985): no count of packets is
-/// reached, so a send rate that reorders more packets in the same
-/// milliseconds does not change it. A real loss is found 7/4 of a round
-/// trip after the packet was sent, where QUIC's thresholds find it about
-/// one round trip after, once three later packets are acknowledged. In
-/// the same simulator it still moved the transfer sooner than QUIC's
-/// thresholds with real loss: 2.2 to 5.3 times at 1% loss, with jitter
-/// or without, and 1.5 to 2 times at 3% without jitter.
+/// [`Reordering::BY_TIME`] calls loss by time alone: no count of packets
+/// is reached, so a send rate that reorders more packets in the same
+/// milliseconds does not change it. RACK (RFC 8985) also calls loss by
+/// time once it has seen reordering, but its window is not fixed: it
+/// starts at a quarter of the minimum round trip and widens, as
+/// retransmissions prove spurious, up to one smoothed round trip, so a
+/// packet is called lost between 5/4 and 2 round trips after it was
+/// sent. 7/4 sits in that range, fixed. Linux also undoes a window cut
+/// that a spurious retransmission caused, and quinn does not, which is
+/// why a wide window suits here.
+///
+/// A real loss is found 7/4 of a round trip after the packet was sent,
+/// where QUIC's thresholds find it about one round trip after, once
+/// three later packets are acknowledged. So it helps where the path
+/// reorders, and costs a little where it only loses. In the same
+/// simulator at 1% loss: on a link that keeps order CUBIC moved the
+/// frames about as soon either way (medians 6.4 against 7.9 s at a 70 ms
+/// round trip, 12.0 against 15.0 s at 140, with a wide spread across
+/// seeds), and BBR a little later (2.12 against 2.07 s, 2.32 against
+/// 2.18 s); on a link that also jitters, CUBIC 4.9 and 3.8 times sooner
+/// (10.1 against 49.7 s, 20.2 against 77.3 s).
 ///
 /// QUIC's stay the default until testing's WAN cells confirm another
 /// (#185); a node picks one per run from `COORDD_REORDERING`.
@@ -183,8 +197,8 @@ impl AckFrequency {
 /// The thresholds are the sender's, but the receiver decides when an
 /// acknowledgement goes: with [`AckFrequency`] set, the peer is asked to
 /// acknowledge out of order arrivals at once only when the gap could call
-/// a packet lost, `packets - 1` (quinn's advice), so never at
-/// [`Reordering::BY_TIME`].
+/// a packet lost, `packets - 1` (quinn's advice), and at
+/// [`Reordering::BY_TIME`] never ([`Reordering::peer_threshold`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Reordering {
     /// Packets sent after a packet, and acknowledged before it, that call
@@ -193,7 +207,8 @@ pub struct Reordering {
     /// The time threshold in eighths of the round trip: a packet is
     /// called lost once this long has passed since it was sent and a
     /// packet sent after it has been acknowledged. Nine is QUIC's 9/8; at
-    /// least nine.
+    /// least nine, and from `COORDD_REORDERING` at most
+    /// [`Reordering::MAX_TIME_EIGHTHS`].
     pub time_eighths: u32,
 }
 
@@ -212,10 +227,28 @@ impl Reordering {
         time_eighths: 14,
     };
 
+    /// The widest time threshold a node takes from `COORDD_REORDERING`:
+    /// four round trips. Wider, a loss would wait for the probe timeout.
+    pub const MAX_TIME_EIGHTHS: u32 = 32;
+
     /// The time threshold as quinn takes it, a multiple of the round
     /// trip.
     pub fn time_threshold(self) -> f32 {
         self.time_eighths as f32 / 8.0
+    }
+
+    /// The reordering threshold asked of the peer with an acknowledgement
+    /// cadence: the gap at which an out of order arrival is acknowledged
+    /// at once, `packets - 1`, the gap that could call a packet lost
+    /// (quinn's advice). With no count of packets ([`Reordering::BY_TIME`])
+    /// it is 0, which asks the peer to take no special action for an out
+    /// of order arrival.
+    pub fn peer_threshold(self) -> u32 {
+        if self.packets == u32::MAX {
+            0
+        } else {
+            self.packets.saturating_sub(1)
+        }
     }
 }
 

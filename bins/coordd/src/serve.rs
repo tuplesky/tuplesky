@@ -6364,8 +6364,8 @@ fn endpoint(
             Some(reordering) => limits.reordering = reordering,
             None => eprintln!(
                 "COORDD_REORDERING={value:?} is not <packets>,<eighths of the \
-                 round trip> (at least 3 and 9), time or quic: the default \
-                 reordering thresholds are kept"
+                 round trip> (at least 3, and 9 to 32 eighths), time or quic: \
+                 the default reordering thresholds are kept"
             ),
         }
     }
@@ -6415,9 +6415,10 @@ fn ack_frequency(value: &str) -> Option<Option<coord_transport::AckFrequency>> {
 }
 
 /// Reordering thresholds written `<packets>,<eighths of the round trip>`,
-/// at least QUIC's three and nine, `time` for loss by time alone, or
-/// `quic` for QUIC's own. `None` is a malformed value, or one below
-/// QUIC's.
+/// at least QUIC's three and nine and at most
+/// [`Reordering::MAX_TIME_EIGHTHS`](coord_transport::Reordering::MAX_TIME_EIGHTHS)
+/// eighths, `time` for loss by time alone, or `quic` for QUIC's own.
+/// `None` is a malformed value, or one out of those bounds.
 fn reordering(value: &str) -> Option<coord_transport::Reordering> {
     let value = value.trim();
     match value {
@@ -6431,8 +6432,10 @@ fn reordering(value: &str) -> Option<coord_transport::Reordering> {
         time_eighths: eighths.trim().parse().ok()?,
     };
     let quic = coord_transport::Reordering::QUIC;
-    (reordering.packets >= quic.packets && reordering.time_eighths >= quic.time_eighths)
-        .then_some(reordering)
+    (reordering.packets >= quic.packets
+        && (quic.time_eighths..=coord_transport::Reordering::MAX_TIME_EIGHTHS)
+            .contains(&reordering.time_eighths))
+    .then_some(reordering)
 }
 
 /// A congestion controller written `cubic`, `bbr` or `newreno`. `None` is
@@ -7658,7 +7661,16 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
         assert_eq!(super::reordering("quic"), Some(Reordering::QUIC));
         assert_eq!(super::reordering("3,9"), Some(Reordering::QUIC));
         assert_eq!(super::reordering(" time "), Some(Reordering::BY_TIME));
+        assert_eq!(
+            super::reordering("3,32"),
+            Some(Reordering {
+                packets: 3,
+                time_eighths: Reordering::MAX_TIME_EIGHTHS,
+            })
+        );
         // Below QUIC's is refused: the setting tolerates more, never less.
+        // Past four round trips is refused too: a loss would wait for the
+        // probe timeout.
         for refused in [
             "",
             "16",
@@ -7666,6 +7678,8 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
             ",10",
             "2,10",
             "16,8",
+            "3,33",
+            "3,100000",
             "sixteen,10",
             "16,1.25",
             "off",
