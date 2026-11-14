@@ -734,6 +734,28 @@ def runner_cpu(
     return out
 
 
+def read_proc_cpu(path: str) -> dict:
+    """The rows `cpu_sampler.py --procs` wrote, by their time cell (the same
+    as the main file's row of that sample), each a map from a server's
+    (pid, start) to its CPU seconds since it started; {} without the file or
+    with a row that does not parse."""
+    if not os.path.exists(path):
+        return {}
+    by_time: dict = {}
+    try:
+        with open(path) as f:
+            f.readline()
+            for line in f:
+                cells = line.strip().split(",")
+                if len(cells) != 4:
+                    continue
+                when = datetime.datetime.strptime(cells[0], "%Y-%m-%d %H:%M:%S.%f")
+                by_time.setdefault(when, {})[(int(cells[1]), int(cells[2]))] = float(cells[3])
+    except (OSError, ValueError):
+        return {}
+    return by_time
+
+
 def read_thread_samples(path: str) -> dict:
     """The rows `cpu_sampler.py --threads` wrote, by their time cell (the
     same as the main file's row of that sample), each a map from a coordd

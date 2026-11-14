@@ -138,6 +138,12 @@ class Step:
     memory: dict = field(default_factory=dict)
     # The etcd member that led (see etcd_leader_of), for an etcd run.
     etcd_leader: str | None = None
+    # Each server's CPU over the window, per completed operation in ms, from
+    # `cpu_sampler.py --procs` named by its `--nodes` file: node -> ms.
+    node_cpu: dict = field(default_factory=dict)
+    # The node that led: TupleSky's by its read barrier (lead), etcd's by
+    # its log (etcd_leader_of).
+    leader_node: str | None = None
     # The batch depth (see batch_of): commands a proposal frame and a
     # leader turn, from the leader's last `metrics` line.
     batch: dict = field(default_factory=dict)
@@ -461,6 +467,10 @@ def runner(step: Step, start, end, completed: int) -> None:
     secs = (b["time"] - a["time"]).total_seconds()
     if secs <= 0:
         return
+    step.node_cpu = {
+        node: cpu * 1000 / completed
+        for node, cpu in node_cpu(store, a["time"], b["time"]).items()
+    }
     d = lambda key: b.get(key, 0.0) - a.get(key, 0.0)  # noqa: E731
     busy = d("host_busy_s")
     steal = d("steal_s")
@@ -606,6 +616,41 @@ def memory_of(store: str) -> dict:
         node: (max(runs, key=lambda r: r[-1][0])[-1][1], max(r[-1][2] for r in runs))
         for node, runs in sorted(boots.items())
     }
+
+
+def node_cpu(store: str, a: datetime.datetime, b: datetime.datetime) -> dict:
+    """Each server's CPU seconds between the sampler's rows at `a` and `b`
+    (the rows around the workload), from `cpu_sampler.py --procs` named by
+    its `--nodes` file, a node's boots summed: node -> seconds; {} without
+    both files. A process that started after `a` counts from its start."""
+    rows = js.read_proc_cpu(os.path.join(store, "cpu-samples-procs.csv"))
+    named = js.read_node_map(os.path.join(store, "cpu-samples-nodes.csv"))
+    first, last = rows.get(a), rows.get(b)
+    if not first or not last or not named:
+        return {}
+    out: dict = {}
+    for key, cpu in last.items():
+        if key in named:
+            out[named[key]] = out.get(named[key], 0.0) + cpu - first.get(key, 0.0)
+    return dict(sorted(out.items()))
+
+
+def tuplesky_leader_of(store: str) -> str | None:
+    """The voter that led, as `lead` takes it from the voters' last
+    `metrics` lines: the one whose read barrier served reads."""
+    readings = {}
+    for node in sorted(os.listdir(store)):
+        path = os.path.join(store, node, "coordd.log")
+        if not os.path.exists(path):
+            continue
+        with open(path, encoding="utf-8", errors="replace") as f:
+            voter = js.parse_voter(f.readlines())
+        if voter.cost and voter.cost.cpu and voter.cost.executed:
+            readings[node] = voter.cost
+    if not readings:
+        return None
+    leader = lead(list(readings.values()))
+    return next(n for n, c in readings.items() if c is leader)
 
 
 BECAME_LEADER = re.compile(r"became leader at term (\d+)")
@@ -771,8 +816,10 @@ def read_step(side: str, step_name: str, store: str, rep: int = 1) -> Step:
         step.counts = read_counts(store)
         step.per_projection_commit = read_per_projection_commit(store)
         step.behind = behind_of(store)
+        step.leader_node = tuplesky_leader_of(store)
     else:
         step.etcd_leader = etcd_leader_of(store)
+        step.leader_node = step.etcd_leader
     step.memory = memory_of(store)
     return step
 
@@ -1141,6 +1188,30 @@ def render(steps: list[Step], title: str, baseline: str = "etcd") -> str:
                 cells.append(f"{cell(end, '.0f')} / {cell(peak, '.0f')}{star}")
             out.append(f"| {name(s)} | " + " | ".join(cells) + " |")
         out += ["", "(each cell: resident at the end / high-water mark)", ""]
+
+    rows = [s for s in steps if s.node_cpu]
+    if rows:
+        out += [
+            "**The servers' CPU per operation by role** (each run, each voter's or etcd member's own process from "
+            "`cpu_sampler.py --procs`, over the samples around the workload, per completed operation in ms; the "
+            "leader is TupleSky's voter whose read barrier served reads and etcd's member whose `etcd.log` last says "
+            "it became leader; followers are the others, their mean and range)",
+            "",
+            "| Step | Side | Leader | Leader (ms) | Followers' mean (ms) | Followers' range (ms) "
+            "| Leader ÷ follower | All servers (ms) |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- |",
+        ]
+        for s in rows:
+            lead_ms = s.node_cpu.get(s.leader_node) if s.leader_node else None
+            followers = [v for n, v in s.node_cpu.items() if n != s.leader_node] if lead_ms is not None else []
+            mean = sum(followers) / len(followers) if followers else None
+            span = f"{min(followers):.3f}–{max(followers):.3f}" if followers else "-"
+            ratio = f"{lead_ms / mean:.2f}" if lead_ms is not None and mean else "-"
+            out.append(
+                f"| {name(s)} | {s.leader_node or '-'} | {cell(lead_ms, '.3f')} | {cell(mean, '.3f')} | {span} "
+                f"| {ratio} | {sum(s.node_cpu.values()):.3f} |"
+            )
+        out.append("")
 
     out += head_against_base(steps)
 

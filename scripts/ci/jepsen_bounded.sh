@@ -58,7 +58,8 @@ if [ -n "${JEPSEN_CPU_SAMPLES:-}" ]; then
     --threads "${JEPSEN_CPU_SAMPLES%.csv}-threads.csv" \
     --memory "${JEPSEN_CPU_SAMPLES%.csv}-memory.csv" \
     --wakeups "${JEPSEN_CPU_SAMPLES%.csv}-wakeups.csv" \
-    --nodes "${JEPSEN_CPU_SAMPLES%.csv}-nodes.csv" &
+    --nodes "${JEPSEN_CPU_SAMPLES%.csv}-nodes.csv" \
+    --procs "${JEPSEN_CPU_SAMPLES%.csv}-procs.csv" &
   sampler=$!
 fi
 

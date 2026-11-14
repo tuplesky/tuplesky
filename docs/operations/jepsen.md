@@ -748,6 +748,14 @@ then gives a table of the steps, each run labelled `SIDE@STEP`:
   from `cpu_sampler.py --memory` and the `--nodes` file, the leader
   starred, so a change that holds an index in memory shows its cost at
   each voter against the base's;
+* each run's servers' CPU per operation by role (The servers' CPU per
+  operation by role): each voter's or etcd member's own process from
+  `cpu_sampler.py --procs` and the `--nodes` file, over the samples
+  around the workload, the leader's against the followers' mean and
+  range. TupleSky's leader is the voter whose read barrier served reads,
+  etcd's the member whose `etcd.log` last says it became leader, so a CPU
+  gap between the two shows whether it sits at the leader or the
+  followers;
 * each TupleSky run's ratio to etcd's at its step, the runner's CPU
   model in the caption.
 

@@ -50,6 +50,11 @@ switch is the thread giving up its CPU to wait, so it counts its parks. A thread
 reading in the sums, so they stay cumulative while short-lived threads (a
 publication's) come and go.
 
+With --procs, each row also appends one row per server, each `coordd`
+and each `etcd`, to that file: the time, its pid and start time, and its
+user and system CPU seconds since it started, so the sweep can split the
+servers' CPU between the leader and the followers.
+
 With --nodes, the first row that sees a `coordd` or an `etcd` also
 appends one row for it to that file: its pid and start time and the node it runs on, its
 container's hostname (each Jepsen node is a container named and
@@ -293,6 +298,7 @@ def main() -> int:
     parser.add_argument("--memory")
     parser.add_argument("--wakeups")
     parser.add_argument("--nodes")
+    parser.add_argument("--procs")
     parser.add_argument("--interval", type=float, default=1.0)
     args = parser.parse_args()
 
@@ -323,6 +329,9 @@ def main() -> int:
     if wake:
         wake.write("time,pid,start,kind,threads,cpu_s,runq_s,slices,parks\n")
     named = open(args.nodes, "w") if args.nodes else None
+    procs = open(args.procs, "w") if args.procs else None
+    if procs:
+        procs.write("time,pid,start,cpu_s\n")
     known: set = set()
     if named:
         named.write("pid,start,node\n")
@@ -360,6 +369,10 @@ def main() -> int:
                 for cells in memory(servers):
                     mem.write(f"{now:%Y-%m-%d %H:%M:%S.%f},{cells}\n")
                 mem.flush()
+            if procs:
+                for key in servers:
+                    procs.write(f"{now:%Y-%m-%d %H:%M:%S.%f},{key[0]},{key[1]},{last[key][1] / TICK:.2f}\n")
+                procs.flush()
             if wake:
                 for cells in wakeups(coordd, seen):
                     wake.write(f"{now:%Y-%m-%d %H:%M:%S.%f},{cells}\n")

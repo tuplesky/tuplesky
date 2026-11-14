@@ -1,5 +1,6 @@
 """Tests for jepsen_sweep.py: python3 -m unittest test_jepsen_sweep (from scripts/ci)."""
 
+import datetime
 import json
 import os
 import tempfile
@@ -603,3 +604,38 @@ class BaselineTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ByRoleTests(unittest.TestCase):
+    """Each server's CPU over the window, and the leader against the followers."""
+
+    def test_node_cpu_takes_each_server_between_the_two_rows(self):
+        with tempfile.TemporaryDirectory() as store:
+            with open(os.path.join(store, "cpu-samples-nodes.csv"), "w") as f:
+                f.write("pid,start,node\n10,1,n1\n11,1,n2\n12,9,n2\n")
+            with open(os.path.join(store, "cpu-samples-procs.csv"), "w") as f:
+                f.write(
+                    "time,pid,start,cpu_s\n"
+                    "2026-11-14 08:00:00.000000,10,1,5.00\n"
+                    "2026-11-14 08:00:00.000000,11,1,3.00\n"
+                    "2026-11-14 08:02:00.000000,10,1,65.00\n"
+                    "2026-11-14 08:02:00.000000,11,1,23.00\n"
+                    # n2 restarted inside the window: its new process counts from its start.
+                    "2026-11-14 08:02:00.000000,12,9,4.00\n"
+                )
+            a = datetime.datetime(2026, 11, 14, 8, 0, 0)
+            b = datetime.datetime(2026, 11, 14, 8, 2, 0)
+            self.assertEqual(sw.node_cpu(store, a, b), {"n1": 60.0, "n2": 24.0})
+            self.assertEqual(sw.node_cpu(store, a, datetime.datetime(2026, 11, 14, 8, 1, 0)), {})
+
+    def test_the_table_puts_the_leader_against_the_followers_mean(self):
+        steps = []
+        for side, leader in (("head", "n1"), ("etcd-tls", "n3")):
+            step = sw.Step(side, "120", "/s")
+            step.node_cpu = {"n1": 0.5, "n2": 0.2, "n3": 0.3, "n4": 0.2, "n5": 0.3}
+            step.leader_node = leader
+            steps.append(step)
+        text = sw.render(steps, "Sweep", baseline="etcd-tls")
+        self.assertIn("**The servers' CPU per operation by role**", text)
+        self.assertIn("| 120 | head | n1 | 0.500 | 0.250 | 0.200–0.300 | 2.00 | 1.500 |", text)
+        self.assertIn("| 120 | etcd-tls | n3 | 0.300 | 0.300 | 0.200–0.500 | 1.00 | 1.500 |", text)
