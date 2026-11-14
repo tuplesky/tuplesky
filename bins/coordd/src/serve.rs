@@ -35,11 +35,14 @@ use coord_daemon::serve::{Step, step};
 use coord_daemon::voter::Voter;
 use coord_daemon::{Config, fanout};
 use coord_membership::membership::Membership;
-use coord_session::{BindingConfig, BoundFrontend, Delivered, StorePolicySource};
+use coord_session::{
+    AuthorizationBarrier, BindingConfig, BoundFrontend, Delivered, PolicyError, PolicySource,
+    StorePolicySource, ViewPolicySource,
+};
 use coord_storage::views::ViewBudget;
 use coord_storage::{Applier, Persistence};
 use coord_transport::{Responder, Transport, TransportEvent};
-use coord_types::ids::ReplicaId;
+use coord_types::ids::{NamespaceId, ReplicaId, SessionId};
 use coord_types::wire_v1::{Frame, MessageV1, decode};
 use coord_types::{CommandId, RetryKey};
 
@@ -4823,8 +4826,8 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         {
             return;
         }
-        let policy = StorePolicySource {
-            store: self.backing.applier().store(),
+        let policy = ReadViewPolicy {
+            applier: self.backing.applier(),
             budget: ViewBudget::default(),
         };
         let delivery = match self.frontend.frontend.deliver(delivery, &policy) {
@@ -6251,6 +6254,37 @@ impl core::fmt::Display for TransportError {
             TransportError::Identity(e) => write!(f, "cannot present an identity: {e}"),
             TransportError::Endpoint(e) => write!(f, "cannot serve on the bound socket: {e}"),
         }
+    }
+}
+
+/// Barriers over the view a read is served from (#281): the projection's
+/// snapshot with the journaled groups still in flight laid over it.
+///
+/// A read's output is reauthorized at a position no older than the one it
+/// was read at. So a session created in a group the projection hasn't
+/// committed yet is one this node has seen, and a grant revoked in such a
+/// group is seen too. The view is taken only when the gate reads a
+/// barrier, so an answer that discloses nothing doesn't pay for it.
+struct ReadViewPolicy<'a, P: Persistence> {
+    applier: &'a Applier<P>,
+    budget: ViewBudget,
+}
+
+impl<P: Persistence> PolicySource for ReadViewPolicy<'_, P> {
+    fn barrier(
+        &self,
+        namespace: NamespaceId,
+        session: &SessionId,
+    ) -> Result<AuthorizationBarrier, PolicyError> {
+        let view = self
+            .applier
+            .read_view()
+            .map_err(|_| PolicyError::Unavailable)?;
+        ViewPolicySource {
+            view: &view,
+            budget: self.budget,
+        }
+        .barrier(namespace, session)
     }
 }
 
