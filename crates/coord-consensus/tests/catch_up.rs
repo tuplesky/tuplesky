@@ -1039,9 +1039,13 @@ fn a_store_that_refuses_every_batch_fails_one_window_a_page() {
 /// Put back on the queue, as the window was, `next_executable` read the
 /// learner's order, whose next command was the window's front: committed
 /// over executed dependencies, with no payload row durable or in a batch
-/// submitted, an execution `coordd`'s lowering refuses (rule (b)). The
-/// front here is one its donor kept no row of, as it was there: one with
-/// a decided record was held back as stale, its record ahead of its row.
+/// submitted, an execution `coordd`'s lowering refuses (rule (b)).
+/// Nothing marked it stale. At seed 260 the front was decided, over a
+/// durable dependency row of the same decision, so the failure left its
+/// record current, and its one payload row, the window's, is not tracked
+/// in `payload_unwritten`. The front here is one its donor kept no row
+/// of, which reaches the same state: a decided front with no row of its
+/// decision was marked stale at the failure and held back.
 #[test]
 fn a_window_whose_batch_failed_runs_nothing_until_its_rows_are_written_again() {
     let mut runnable = 0;
