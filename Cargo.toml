@@ -103,7 +103,8 @@ rustls-pki-types = { version = "=1.15.1", default-features = false, features = [
 tokio = { version = "=1.53.3", default-features = false, features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util"] }
 # coordd's global allocator (task-d60): size-class heaps with thread-local
 # caches, for the many small short-lived allocations every voter's loop makes.
-mimalloc = { version = "=0.1.52", default-features = false }
+# jemalloc in mimalloc's place (#185, lead 11:58).
+tikv-jemallocator = { version = "=0.6.1" }
 # Test certificates only (never a production dependency edge).
 rcgen = { version = "=0.14.10", default-features = false, features = ["aws_lc_rs", "x509-parser"] }
 x509-parser = { version = "=0.18.1", default-features = false }
