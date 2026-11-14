@@ -512,6 +512,8 @@ impl Machine {
                 taken: 0,
                 known: 0,
                 not_taken: 0,
+                kept: 0,
+                kept_taken: 0,
                 frame_batches: 0,
                 frame_adoptions: 0,
             },
