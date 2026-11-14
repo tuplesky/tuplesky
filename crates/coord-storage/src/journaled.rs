@@ -97,7 +97,7 @@ use coord_journal_api::frontier::{
 use coord_journal_api::group::{GroupEntry, GroupError, GroupLimits, GroupReceipt, GroupWrite};
 use coord_journal_api::head::{HeadError, HeadState, Reconciled, StreamHead, WrittenBytes};
 use coord_journal_api::record::{
-    JOURNAL_RECORD_FORMAT_V1, JournalRecordV1, LifecycleRecordV1, MAX_RECORD_BYTES,
+    GroupOutcomeV1, JOURNAL_RECORD_FORMAT_V1, JournalRecordV1, LifecycleRecordV1, MAX_RECORD_BYTES,
     MAX_RECORD_KEY_BYTES, MAX_RECORD_UPDATES, MAX_RECORD_VALUE_BYTES, RecordBody, RecordDraft,
     RecordError, RecordExpectation, RecordOrigin, TransitionContext,
 };
@@ -654,12 +654,32 @@ fn alloc_one(record: JournalRecordV1) -> Vec<JournalRecordV1> {
 }
 
 /// A record that is durable in the journal and waiting to be materialized,
-/// together with the barrier of this boot it completes (lifecycle records
-/// and records replayed from an earlier boot complete no barrier).
+/// together with the barriers of this boot it completes (lifecycle records
+/// and records replayed from an earlier boot complete none).
 #[derive(Clone, Debug)]
 struct Durable {
     barrier: Option<BarrierId>,
+    /// The other submissions' barriers, when the record holds a run of
+    /// queued application outcomes (the batching-rule doc's 10.7, step 1b):
+    /// the record is each one's durability, and its materialization.
+    also: Vec<BarrierId>,
     record: JournalRecordV1,
+}
+
+impl Durable {
+    /// A record that completes `barrier`, or none.
+    fn new(barrier: Option<BarrierId>, record: JournalRecordV1) -> Self {
+        Durable {
+            barrier,
+            also: Vec::new(),
+            record,
+        }
+    }
+
+    /// Every barrier the record completes, in submission order.
+    fn barriers(&self) -> impl Iterator<Item = BarrierId> + '_ {
+        self.barrier.into_iter().chain(self.also.iter().copied())
+    }
 }
 
 /// One domain: its stream, its accepted durable head, its frontiers and the
@@ -1695,10 +1715,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                 first = false;
                 accepted = written_at;
                 expect = expect.after(&record)?;
-                batch.push(Durable {
-                    barrier: None,
-                    record,
-                });
+                batch.push(Durable::new(None, record));
                 if batch.len() >= limits.max_replay_batch {
                     break;
                 }
@@ -1770,10 +1787,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                 state.head_digest = last.digest();
                 state.pending = records
                     .into_iter()
-                    .map(|record| Durable {
-                        barrier: None,
-                        record,
-                    })
+                    .map(|record| Durable::new(None, record))
                     .collect();
                 Self::materialize_domain(state, self.profile)?;
                 Ok(())
@@ -1788,10 +1802,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                         state.head.fail_indeterminate(barrier)?;
                         state.inflight = records
                             .into_iter()
-                            .map(|record| Durable {
-                                barrier: None,
-                                record,
-                            })
+                            .map(|record| Durable::new(None, record))
                             .collect();
                         state.status = DomainStatus::JournalUncertain;
                     }
@@ -1928,10 +1939,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                 state.frontiers.advance_durable(record.seq())?;
                 state.head_digest = record.digest();
                 state.held_since.get_or_insert_with(Instant::now);
-                state.pending.push(Durable {
-                    barrier: None,
-                    record,
-                });
+                state.pending.push(Durable::new(None, record));
                 Self::materialize_domain(state, self.profile)?;
                 state
                     .frontiers
@@ -1955,10 +1963,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                         state.head.fail_indeterminate(barrier)?;
                         state.inflight = alloc_one(record)
                             .into_iter()
-                            .map(|record| Durable {
-                                barrier: None,
-                                record,
-                            })
+                            .map(|record| Durable::new(None, record))
                             .collect();
                         state.status = DomainStatus::JournalUncertain;
                     }
@@ -2523,9 +2528,11 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
     /// append (Section 17.3.3).
     ///
     /// A stream contributes one entry: its queued transitions in order,
-    /// each its own record under its own barrier, chained onto the one
-    /// before. The entry is reserved and completed as one batch, under
-    /// the first transition's barrier, and each record still reports its
+    /// chained onto the one before, each its own record under its own
+    /// barrier but for a run of application outcomes, which is one record
+    /// that reports every outcome's barrier (the batching-rule doc's 10.7,
+    /// step 1b). The entry is reserved and completed as one batch, under
+    /// the first transition's barrier, and each barrier still reports its
     /// own `JournalDurable`. Nothing is split: what does not fit stays
     /// queued for the next group (task-d47).
     ///
@@ -2576,6 +2583,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
     /// owes is returned with the group, to run after its append.
     fn seal_group(&mut self) -> Result<Option<Sealing>, JournaledError> {
         let mut group = GroupWrite::new(self.limits.group);
+        let cap = run_bytes(self.limits.group);
         let mut sealed: Vec<Sealed> = Vec::new();
         let mut retires: Vec<Retire> = Vec::new();
         let mut full = false;
@@ -2620,14 +2628,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                     .reserve(checkpoint_barrier, NonZeroU32::new(1).expect("non-zero"))?;
                 state.seal_checkpoint();
                 retires.push((state.origin.stream, pointer));
-                sealed.push((
-                    *id,
-                    checkpoint_barrier,
-                    vec![Durable {
-                        barrier: None,
-                        record,
-                    }],
-                ));
+                sealed.push((*id, checkpoint_barrier, vec![Durable::new(None, record)]));
                 continue;
             };
             let entry_barrier = first.batch.barrier;
@@ -2651,7 +2652,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
             let mut pointer = pointer;
             let mut carried = None;
             let mut dequeued = 0usize;
-            for submission in &state.queue {
+            while dequeued < state.queue.len() {
                 if dequeued == ahead
                     && let Some(p) = pointer.take()
                 {
@@ -2667,14 +2668,15 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                     bytes += len;
                     seq = record.seq().checked_next().map_err(HeadError::from)?;
                     predecessor = record.digest();
-                    records.push(Durable {
-                        barrier: None,
-                        record,
-                    });
+                    records.push(Durable::new(None, record));
                     carried = Some(p);
                 }
-                let record = seal(state, submission, seq, predecessor)?;
-                let len = record.encoded_len()?;
+                // A run of queued application outcomes goes in one record,
+                // up to the checkpoint pointer's place (the batching-rule
+                // doc's 10.7, step 1b).
+                let run = run_len(&state.queue, dequeued, room_before(ahead, dequeued), cap);
+                let item = seal_run(state, dequeued, run, seq, predecessor)?;
+                let len = item.record.encoded_len()?;
                 if group.record_count() + records.len() + 1 > limits.max_records
                     || group.bytes().saturating_add(bytes).saturating_add(len) > limits.max_bytes
                 {
@@ -2682,13 +2684,10 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                     break;
                 }
                 bytes += len;
-                seq = record.seq().checked_next().map_err(HeadError::from)?;
-                predecessor = record.digest();
-                records.push(Durable {
-                    barrier: Some(submission.batch.barrier),
-                    record,
-                });
-                dequeued += 1;
+                seq = item.record.seq().checked_next().map_err(HeadError::from)?;
+                predecessor = item.record.digest();
+                records.push(item);
+                dequeued += run;
             }
             if records.is_empty() {
                 // A pointer that goes first and did not fit waits for the
@@ -2699,26 +2698,23 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                 }
                 // One valid record larger than the ordinary budget takes
                 // the separately bounded large-record path, alone, instead
-                // of being split illegally.
-                let record = seal(state, first, state.head.next_seq()?, state.head_digest)?;
+                // of being split illegally: a lone outcome over the run
+                // bound, since a run under it fits an ordinary group.
+                let run = run_len(&state.queue, 0, room_before(ahead, 0), cap);
+                let item = seal_run(state, 0, run, state.head.next_seq()?, state.head_digest)?;
                 group = GroupWrite::new(GroupLimits::LARGE_RECORD);
                 group.push(GroupEntry::new(
                     entry_barrier,
                     state.origin.stream,
-                    vec![record.clone()],
+                    vec![item.record.clone()],
                 )?)?;
                 state
                     .head
                     .reserve(entry_barrier, NonZeroU32::new(1).expect("non-zero"))?;
-                state.dequeue();
-                sealed.push((
-                    *id,
-                    entry_barrier,
-                    vec![Durable {
-                        barrier: Some(entry_barrier),
-                        record,
-                    }],
-                ));
+                for _ in 0..run {
+                    state.dequeue();
+                }
+                sealed.push((*id, entry_barrier, vec![item]));
                 break;
             }
             // The pointer, behind everything queued, when all of that
@@ -2734,10 +2730,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                 {
                     full = true;
                 } else {
-                    records.push(Durable {
-                        barrier: None,
-                        record,
-                    });
+                    records.push(Durable::new(None, record));
                     carried = Some(pointer);
                 }
             }
@@ -2807,7 +2800,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                         state.head_digest = record.digest();
                         state.journaled_frontier = frontier_after(state.journaled_frontier, record);
                         report.journaled += 1;
-                        if let Some(barrier) = item.barrier {
+                        for barrier in item.barriers() {
                             report.events.push(StorageEvent::JournalDurable {
                                 barrier_id: barrier,
                                 journal_seq: record.seq(),
@@ -2856,7 +2849,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                     // and the prior publication stands.
                     state.fail_checkpoint(&failure);
                     for item in records {
-                        if let Some(barrier) = item.barrier {
+                        for barrier in item.barriers() {
                             report.rejected += 1;
                             report.events.push(StorageEvent::Failed {
                                 barrier_id: barrier,
@@ -3235,7 +3228,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                         for item in inflight {
                             state.journaled_frontier =
                                 frontier_after(state.journaled_frontier, &item.record);
-                            if let Some(barrier) = item.barrier {
+                            for barrier in item.barriers() {
                                 report.events.push(StorageEvent::JournalDurable {
                                     barrier_id: barrier,
                                     journal_seq: item.record.seq(),
@@ -3248,7 +3241,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                     }
                     Ok(Reconciled::Absent(_)) => {
                         for item in &inflight {
-                            if let Some(barrier) = item.barrier {
+                            for barrier in item.barriers() {
                                 report.rejected += 1;
                                 report.events.push(StorageEvent::Failed {
                                     barrier_id: barrier,
@@ -3298,7 +3291,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                     report.materialized = applied.len();
                     report.commits = 1;
                     for item in applied {
-                        if let Some(barrier) = item.barrier {
+                        for barrier in item.barriers() {
                             report.events.push(StorageEvent::Materialized {
                                 barrier_id: barrier,
                                 journal_seq: item.record.seq(),
@@ -3541,7 +3534,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                 report.commits = 1;
                 report.materialized = pending.len();
                 for item in pending {
-                    if let Some(barrier) = item.barrier {
+                    for barrier in item.barriers() {
                         report.events.push(StorageEvent::Materialized {
                             barrier_id: barrier,
                             journal_seq: item.record.seq(),
@@ -4034,7 +4027,7 @@ fn take_back<E: LocalEngine>(
             report.commits = 1;
             report.materialized = records.len();
             for item in records {
-                if let Some(barrier) = item.barrier {
+                for barrier in item.barriers() {
                     report.events.push(StorageEvent::Materialized {
                         barrier_id: barrier,
                         journal_seq: item.record.seq(),
@@ -4456,6 +4449,34 @@ const _: () = assert!(
         <= MAX_RECORD_BYTES
 );
 
+/// A run of queued application outcomes goes in one record, closed before
+/// an outcome that would take it past this many updates (the
+/// batching-rule doc's 10.7, step 1b): task-d106's bound for a follower's
+/// commit rows.
+pub const GROUP_RECORD_UPDATES: usize = 1024;
+/// ... or past this many bytes, as [`batch_bytes`] counts each outcome's
+/// batch: its rows, sixteen bytes an update and sixty-four for the
+/// outcome, which more than covers its position, revision, digest and
+/// count in the record. The bound the format holds a group record to; a
+/// run is closed sooner, at [`run_bytes`].
+pub const GROUP_RECORD_BYTES: usize = 1024 * 1024;
+const _: () = assert!(GROUP_RECORD_UPDATES <= MAX_RECORD_UPDATES);
+const _: () = assert!(GROUP_RECORD_BYTES + RECORD_HEADER_ALLOWANCE <= MAX_RECORD_BYTES);
+const _: () = assert!(GroupLimits::DEFAULT.max_bytes / 2 <= GROUP_RECORD_BYTES);
+
+/// The bytes a run of outcomes may take, as [`batch_bytes`] counts them:
+/// half an ordinary journal group's (128 KiB at [`GroupLimits::DEFAULT`]),
+/// and never past [`GROUP_RECORD_BYTES`]. A run then fits an ordinary
+/// group even with half of it taken by other domains' entries, so it never
+/// needs the large-record path, which takes a domain only when it is first
+/// in a lowering: with several domains a run over the group could wait
+/// there indefinitely (review of #288). An outcome over this bound is a record
+/// of its own, as every outcome was before step 1b, and only such a lone
+/// outcome takes the large-record path.
+pub fn run_bytes(group: GroupLimits) -> usize {
+    (group.max_bytes / 2).min(GROUP_RECORD_BYTES)
+}
+
 fn check_update_bounds(batch: &PersistBatch, kind: &TransitionKind) -> Result<(), RecordError> {
     if batch.updates.is_empty() && matches!(kind, TransitionKind::Protocol) {
         return Err(RecordError::EmptyUpdates);
@@ -4517,6 +4538,126 @@ fn seal<E: LocalEngine>(
         predecessor,
         body,
     })?)
+}
+
+/// How many queued submissions from `at` one record may take before the
+/// checkpoint pointer, which goes right after the first `ahead` of them:
+/// no bound once past its place, or when it has none.
+fn room_before(ahead: usize, at: usize) -> usize {
+    if at < ahead { ahead - at } else { usize::MAX }
+}
+
+/// How many queued submissions from `at` one record takes, at most `room`
+/// (the batching-rule doc's 10.7, step 1b): a run of application outcomes
+/// under one context, each extending the one before it, closed before an
+/// outcome that would take the record past [`GROUP_RECORD_UPDATES`]
+/// updates or `cap` bytes ([`run_bytes`]); otherwise one. An outcome over
+/// either bound is a record of its own.
+fn run_len(queue: &VecDeque<Submission>, at: usize, room: usize, cap: usize) -> usize {
+    let first = &queue[at];
+    let (TransitionKind::Application { mut position, .. }, Some(base)) =
+        (first.kind, first.batch.base)
+    else {
+        return 1;
+    };
+    let mut updates = first.batch.updates.len();
+    let mut bytes = batch_bytes(&first.batch);
+    let mut run = 1;
+    while run < room
+        && let Some(next) = queue.get(at + run)
+    {
+        let TransitionKind::Application {
+            position: after, ..
+        } = next.kind
+        else {
+            break;
+        };
+        let extends = next.batch.base
+            == Some(ApplyBase {
+                configuration: base.configuration,
+                execution_position: position,
+            });
+        if !extends
+            || next.ballot != first.ballot
+            || next.batch.barrier.boot_id != first.batch.barrier.boot_id
+            || updates + next.batch.updates.len() > GROUP_RECORD_UPDATES
+            || bytes + batch_bytes(&next.batch) > cap
+        {
+            break;
+        }
+        updates += next.batch.updates.len();
+        bytes += batch_bytes(&next.batch);
+        position = after;
+        run += 1;
+    }
+    run
+}
+
+/// Seal `run` queued submissions from `at` as one record at `seq`, chained
+/// onto `predecessor`, with every barrier it completes: one as [`seal`]
+/// seals it, or a run of application outcomes ([`run_len`]) as one group
+/// (the batching-rule doc's 10.7, step 1b) -- the first's context and
+/// base, each outcome in order, and every update in order.
+fn seal_run<E: LocalEngine>(
+    state: &Domain<E>,
+    at: usize,
+    run: usize,
+    seq: LocalJournalSeq,
+    predecessor: Digest32,
+) -> Result<Durable, JournaledError> {
+    let first = &state.queue[at];
+    if run == 1 {
+        let record = seal(state, first, seq, predecessor)?;
+        return Ok(Durable::new(Some(first.batch.barrier), record));
+    }
+    let submissions = state.queue.range(at..at + run);
+    let mut outcomes = Vec::with_capacity(run);
+    let mut updates = Vec::with_capacity(submissions.clone().map(|s| s.batch.updates.len()).sum());
+    for submission in submissions {
+        let TransitionKind::Application {
+            position,
+            revision,
+            result_digest,
+        } = submission.kind
+        else {
+            unreachable!("a run holds application outcomes only");
+        };
+        outcomes.push(GroupOutcomeV1 {
+            position,
+            revision,
+            result_digest,
+            updates: u32::try_from(submission.batch.updates.len())
+                .map_err(|_| JournaledError::Record(RecordError::TooManyUpdates))?,
+        });
+        updates.extend(submission.batch.updates.iter().cloned());
+    }
+    let record = JournalRecordV1::seal(RecordDraft {
+        origin: state.origin,
+        seq,
+        predecessor,
+        body: RecordBody::ApplicationGroup {
+            context: TransitionContext {
+                boot: first.batch.barrier.boot_id,
+                configuration: first.ballot.epoch,
+                ballot: first.ballot,
+            },
+            base: first
+                .batch
+                .base
+                .ok_or(JournaledError::Record(RecordError::PositionNotAfterBase))?,
+            outcomes,
+            updates,
+        },
+    })?;
+    Ok(Durable {
+        barrier: Some(first.batch.barrier),
+        also: state
+            .queue
+            .range(at + 1..at + run)
+            .map(|s| s.batch.barrier)
+            .collect(),
+        record,
+    })
 }
 
 #[cfg(test)]
