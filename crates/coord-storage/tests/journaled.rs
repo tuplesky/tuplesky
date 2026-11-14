@@ -28,8 +28,8 @@ use coord_journal_api::record::{
 };
 use coord_journal_api::stream::ShardId;
 use coord_storage::journaled::{
-    CutError, DomainStatus, JournalLimits, JournaledError, JournaledStore, Submission,
-    SubmitRefused, TransitionKind,
+    CutError, DomainStatus, GROUP_RECORD_BYTES, JournalLimits, JournaledError, JournaledStore,
+    Submission, SubmitRefused, TransitionKind, run_bytes,
 };
 use coord_storage::protocol::read_protocol;
 use coord_storage::views::ViewBudget;
@@ -1540,6 +1540,100 @@ fn a_run_of_outcomes_stops_at_a_queued_checkpoint_pointer() {
     assert_eq!(positions(&records[at - 1]), [1, 2, 3]);
     assert_eq!(positions(&records[at + 1]), [4, 5]);
     assert_eq!(records.len(), at + 2, "nothing after the second run");
+}
+
+/// A run holds outcomes under one ballot (`run_len`; review of #288): two
+/// consecutive outcomes at ballots 1 and 2, the second extending the
+/// first, are sealed as two records, each under its own ballot. As one
+/// record, the second outcome would be journaled under the first's
+/// ballot.
+#[test]
+fn consecutive_outcomes_at_two_ballots_are_two_records_each_under_its_own() {
+    let mut world = World::new();
+    world.protocol(A, ballot(1), promise(1));
+    world.store.flush().unwrap();
+    let first = world.application(A, 1, position(1), vec![kv_update(b"k", b"v1")]);
+    let second = world.application(A, 2, position(2), vec![kv_update(b"k", b"v2")]);
+    let report = world.store.append_pending().unwrap();
+    let durable: BTreeMap<BarrierId, LocalJournalSeq> = report
+        .events
+        .iter()
+        .filter_map(|e| match e {
+            StorageEvent::JournalDurable {
+                barrier_id,
+                journal_seq,
+            } if [first, second].contains(barrier_id) => Some((*barrier_id, *journal_seq)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(durable.len(), 2, "both durable in one append: {durable:?}");
+    assert_ne!(durable[&first], durable[&second], "two records");
+    let journal = world.store.journal();
+    let ballots: Vec<(u64, u64)> = journal
+        .records(journal_stream(journal))
+        .iter()
+        .filter_map(|r| match r.body() {
+            RecordBody::ApplicationOutcome {
+                context, position, ..
+            } => Some((position.get(), context.ballot.number)),
+            RecordBody::ApplicationGroup { .. } => panic!("one record: {:?}", r.body()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ballots, [(1, 1), (2, 2)], "each under its own ballot");
+}
+
+/// A run's bytes follow the journal group's (review of #288): half of it,
+/// so a run fits an ordinary group even with half of it taken by other
+/// domains' entries, and never past the format's bound for a group record.
+#[test]
+fn a_runs_bytes_are_half_the_journal_groups() {
+    assert_eq!(run_bytes(GroupLimits::DEFAULT), 128 * 1024);
+    let group = |max_bytes| GroupLimits {
+        max_bytes,
+        ..GroupLimits::DEFAULT
+    };
+    assert_eq!(run_bytes(group(64 * 1024)), 32 * 1024);
+    assert_eq!(run_bytes(group(8 * 1024 * 1024)), GROUP_RECORD_BYTES);
+}
+
+/// A run over the journal group's bytes could only take the large-record
+/// path, which takes a domain only when it is first in a lowering: behind
+/// a domain with something queued at every lowering, it would wait
+/// indefinitely (review of #288). Capped at half the group's bytes, B's
+/// four 80 KiB outcomes are records of their own, each fits an ordinary
+/// group beside A's entry, and all are durable within a few appends.
+#[test]
+fn a_large_run_behind_a_busy_domain_is_made_durable() {
+    let mut world = World::with_domains(&[A, B]);
+    world.protocol(A, ballot(1), promise(1));
+    world.protocol(B, ballot(1), promise(1));
+    world.store.flush().unwrap();
+    let big = [0x5a; 80 * 1024];
+    let mut owed = BTreeSet::new();
+    for n in 1..=4u64 {
+        let key = format!("b{n}");
+        owed.insert(world.application(B, 1, position(n), vec![kv_update(key.as_bytes(), &big)]));
+    }
+    let mut durable = BTreeSet::new();
+    let mut appends = 0;
+    for _ in 0..8 {
+        // A has a transition queued at every lowering, ahead of B.
+        world.protocol(A, ballot(1), promise(1));
+        let report = world.store.append_pending().unwrap();
+        appends += 1;
+        for e in &report.events {
+            if let StorageEvent::JournalDurable { barrier_id, .. } = e
+                && owed.contains(barrier_id)
+            {
+                durable.insert(*barrier_id);
+            }
+        }
+        if durable == owed {
+            break;
+        }
+    }
+    assert_eq!(durable, owed, "B's outcomes after {appends} appends");
 }
 
 /// A group whose base isn't the projection's frontier is refused at

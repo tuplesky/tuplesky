@@ -1339,20 +1339,24 @@ Each step has its own PRs and pair.
   - 1b: the applier writes one application record a group in place of one a command, cut at the bounds below, and waits on one durability event for each.
   - 1a doesn't need the split: it is #286. 1b is built with it.
 - **How 1b bounds a group's record (Codex).** An execution group holds up to 32 commands (`GROUP_COMMANDS`), and the applier's queue is bounded at 16 MiB, not at the record's 4 MiB and 4,096 updates. Each outcome is under the record's bounds today, but 32 together needn't be. Since #280 a record the store refuses stops the voter.
-  - **The rule:** the same as step 2's. A group's outcomes go in records cut in execution order. A record closes before an outcome that would take it past 1,024 updates or 1 MiB of rows.
-  - **An outcome over either bound goes alone,** in a record of its own, as every outcome does today.
+  - **The rule:** a group's outcomes go in records cut in execution order. A record closes before an outcome that would take it past 1,024 updates, or past half the journal group's bytes in rows: 128 KiB at today's 256 KiB group (`run_bytes`).
+  - **Records stay under the format's bounds for a group record,** 1,024 updates and 1 MiB (`GROUP_RECORD_UPDATES`, `GROUP_RECORD_BYTES`), which are step 2's. The run's byte cap follows the journal group instead, so a run fits an ordinary group even with half of it taken by other domains' entries, and it never passes 1 MiB.
+  - **Why not 1 MiB (review of #288).** A run over the group's bytes could only take the large-record path, which takes a domain only when it is first in a lowering. Behind a domain with something queued at every lowering, its run could wait indefinitely. That matters once a voter serves several domains.
+  - **An outcome over either bound goes alone,** in a record of its own, as every outcome does today. Only such a lone outcome over the journal group takes the large-record path.
   - **One durability event a record.** The group's answers wait on its last record, since the journal keeps records in order.
   - At the bench's sizes a group is one record. Groups of large outcomes take a few.
-  - B0 cuts a run at half the journal group's byte limit and at the record's update bound. At the bench's sizes neither binds, so it bounds step 1 as written.
+  - B0 cut a run the same way, at half the journal group's bytes and at 1,024 updates. At the bench's sizes neither binds, so it bounds step 1 as written.
 - **What recovery reads:** replay reads a group record as the application outcome of each command it names. Those are the same facts, in one record. The decision's records are untouched.
 - **Mixed versions:** the format is local, since only this voter reads its journal. 1b raises the journal record's format, the one it writes (`current`), from 1 to 2. 1a's release reads 2, since its window reads ahead to it, and an older release refuses it as unsupported. So a voter goes back at most to 1a's release.
   - **Only the record's format moves.** The local checkpoint's stays as it is: raising it too would leave 1a unable to open a 1b image, and so close the way back.
   - 1b raises `current` in the registry; it doesn't seal through `seal_as`, which stays for fixtures.
 - **Pinned by:**
-  - a group of 32 outcomes near 1 MiB each, cut into records under the bounds;
-  - a lone outcome over 1 MiB, in a record of its own;
+  - a group of 32 outcomes near the run's bytes each, cut into records under the bounds, past what the queue holds;
+  - a lone outcome over the run's bytes, in a record of its own: one in an ordinary journal group, and one over 1 MiB on the large-record path;
   - a group past 1,024 updates;
-  - a compile-time check of the bounds against the record's, like `journaled.rs`'s for the commit rows;
+  - a run of large outcomes behind a domain with something queued at every lowering, durable within a few appends (review of #288);
+  - two consecutive outcomes at two ballots, sealed as two records, each under its own ballot;
+  - a compile-time check of the bounds against the record's, like `journaled.rs`'s for the commit rows, and of the run's bytes at the default group against them;
   - the crash matrix's cuts at the group record: torn, durable but not acknowledged, and between two records of one group;
     - the last adds no state: per-command records already allow a crash between two commands of one group. Its expected result is that state's: the durable records' commands count as applied, and the rest are executed again;
   - a journal holding both forms replays to the same state as either alone;

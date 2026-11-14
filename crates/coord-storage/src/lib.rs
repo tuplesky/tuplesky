@@ -129,7 +129,7 @@ pub use journaled::{
     GROUP_RECORD_BYTES, GROUP_RECORD_UPDATES, GroupMix, HoldEnds, JournalLimits, JournaledError,
     JournaledStore, LoweringCost, MaterializeDone, MaterializeJob, Materializer, PublishPhases,
     PublishThread, Published, Replayed, Submission, SubmitRefused, ThreadClock, ThreadTime,
-    TransitionKind,
+    TransitionKind, run_bytes,
 };
 pub use lowering::{GroupDigest, batch_digest};
 pub use materialize::{

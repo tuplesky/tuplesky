@@ -2528,9 +2528,11 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
     /// append (Section 17.3.3).
     ///
     /// A stream contributes one entry: its queued transitions in order,
-    /// each its own record under its own barrier, chained onto the one
-    /// before. The entry is reserved and completed as one batch, under
-    /// the first transition's barrier, and each record still reports its
+    /// chained onto the one before, each its own record under its own
+    /// barrier but for a run of application outcomes, which is one record
+    /// that reports every outcome's barrier (the batching-rule doc's 10.7,
+    /// step 1b). The entry is reserved and completed as one batch, under
+    /// the first transition's barrier, and each barrier still reports its
     /// own `JournalDurable`. Nothing is split: what does not fit stays
     /// queued for the next group (task-d47).
     ///
@@ -2581,6 +2583,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
     /// owes is returned with the group, to run after its append.
     fn seal_group(&mut self) -> Result<Option<Sealing>, JournaledError> {
         let mut group = GroupWrite::new(self.limits.group);
+        let cap = run_bytes(self.limits.group);
         let mut sealed: Vec<Sealed> = Vec::new();
         let mut retires: Vec<Retire> = Vec::new();
         let mut full = false;
@@ -2671,7 +2674,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                 // A run of queued application outcomes goes in one record,
                 // up to the checkpoint pointer's place (the batching-rule
                 // doc's 10.7, step 1b).
-                let run = run_len(&state.queue, dequeued, room_before(ahead, dequeued));
+                let run = run_len(&state.queue, dequeued, room_before(ahead, dequeued), cap);
                 let item = seal_run(state, dequeued, run, seq, predecessor)?;
                 let len = item.record.encoded_len()?;
                 if group.record_count() + records.len() + 1 > limits.max_records
@@ -2695,9 +2698,9 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                 }
                 // One valid record larger than the ordinary budget takes
                 // the separately bounded large-record path, alone, instead
-                // of being split illegally: an outcome, or a run of them,
-                // within a record's bounds.
-                let run = run_len(&state.queue, 0, room_before(ahead, 0));
+                // of being split illegally: a lone outcome over the run
+                // bound, since a run under it fits an ordinary group.
+                let run = run_len(&state.queue, 0, room_before(ahead, 0), cap);
                 let item = seal_run(state, 0, run, state.head.next_seq()?, state.head_digest)?;
                 group = GroupWrite::new(GroupLimits::LARGE_RECORD);
                 group.push(GroupEntry::new(
@@ -4454,12 +4457,25 @@ pub const GROUP_RECORD_UPDATES: usize = 1024;
 /// ... or past this many bytes, as [`batch_bytes`] counts each outcome's
 /// batch: its rows, sixteen bytes an update and sixty-four for the
 /// outcome, which more than covers its position, revision, digest and
-/// count in the record. An outcome over either bound is a record of its
-/// own, as every outcome was before step 1b, under the bounds every
-/// record is held to at submission.
+/// count in the record. The bound the format holds a group record to; a
+/// run is closed sooner, at [`run_bytes`].
 pub const GROUP_RECORD_BYTES: usize = 1024 * 1024;
 const _: () = assert!(GROUP_RECORD_UPDATES <= MAX_RECORD_UPDATES);
 const _: () = assert!(GROUP_RECORD_BYTES + RECORD_HEADER_ALLOWANCE <= MAX_RECORD_BYTES);
+const _: () = assert!(GroupLimits::DEFAULT.max_bytes / 2 <= GROUP_RECORD_BYTES);
+
+/// The bytes a run of outcomes may take, as [`batch_bytes`] counts them:
+/// half an ordinary journal group's (128 KiB at [`GroupLimits::DEFAULT`]),
+/// and never past [`GROUP_RECORD_BYTES`]. A run then fits an ordinary
+/// group even with half of it taken by other domains' entries, so it never
+/// needs the large-record path, which takes a domain only when it is first
+/// in a lowering: with several domains a run over the group could wait
+/// there indefinitely (review of #288). An outcome over this bound is a record
+/// of its own, as every outcome was before step 1b, and only such a lone
+/// outcome takes the large-record path.
+pub fn run_bytes(group: GroupLimits) -> usize {
+    (group.max_bytes / 2).min(GROUP_RECORD_BYTES)
+}
 
 fn check_update_bounds(batch: &PersistBatch, kind: &TransitionKind) -> Result<(), RecordError> {
     if batch.updates.is_empty() && matches!(kind, TransitionKind::Protocol) {
@@ -4535,9 +4551,9 @@ fn room_before(ahead: usize, at: usize) -> usize {
 /// (the batching-rule doc's 10.7, step 1b): a run of application outcomes
 /// under one context, each extending the one before it, closed before an
 /// outcome that would take the record past [`GROUP_RECORD_UPDATES`]
-/// updates or [`GROUP_RECORD_BYTES`] bytes; otherwise one. An outcome over
+/// updates or `cap` bytes ([`run_bytes`]); otherwise one. An outcome over
 /// either bound is a record of its own.
-fn run_len(queue: &VecDeque<Submission>, at: usize, room: usize) -> usize {
+fn run_len(queue: &VecDeque<Submission>, at: usize, room: usize, cap: usize) -> usize {
     let first = &queue[at];
     let (TransitionKind::Application { mut position, .. }, Some(base)) =
         (first.kind, first.batch.base)
@@ -4565,7 +4581,7 @@ fn run_len(queue: &VecDeque<Submission>, at: usize, room: usize) -> usize {
             || next.ballot != first.ballot
             || next.batch.barrier.boot_id != first.batch.barrier.boot_id
             || updates + next.batch.updates.len() > GROUP_RECORD_UPDATES
-            || bytes + batch_bytes(&next.batch) > GROUP_RECORD_BYTES
+            || bytes + batch_bytes(&next.batch) > cap
         {
             break;
         }

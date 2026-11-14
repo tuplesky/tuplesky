@@ -29,7 +29,7 @@ use coord_storage::journaled::{JournalLimits, JournaledStore, TransitionKind};
 use coord_storage::policy::{bootstrap_session, rule_update};
 use coord_storage::{
     Applier, ApplyError, ApplyOutcome, GROUP_RECORD_BYTES, GROUP_RECORD_UPDATES, GroupLimits,
-    JournaledDomain, Persistence, StoreWorker, complete, submit,
+    JournaledDomain, Persistence, StoreWorker, complete, run_bytes, submit,
 };
 use coord_store_testkit::journal::{AppendScript, ModelJournal};
 use coord_store_testkit::model::{CommitScript, ModelEngine};
@@ -129,15 +129,13 @@ fn reference() -> Applier<StoreWorker<ModelEngine>> {
 
 /// The serving driver: one shared journal, one attached projection.
 fn journaled() -> Applier<JournaledDomain<ModelJournal, ModelEngine>> {
-    let mut store = JournaledStore::open(
-        ModelJournal::new(),
-        CLUSTER,
-        REPLICA,
-        inc(),
-        BOOT,
-        JournalLimits::default(),
-    )
-    .unwrap();
+    journaled_with(JournalLimits::default())
+}
+
+/// [`journaled`] over `limits`.
+fn journaled_with(limits: JournalLimits) -> Applier<JournaledDomain<ModelJournal, ModelEngine>> {
+    let mut store =
+        JournaledStore::open(ModelJournal::new(), CLUSTER, REPLICA, inc(), BOOT, limits).unwrap();
     store
         .attach(DOMAIN, ShardId::new(0).unwrap(), ModelEngine::new())
         .unwrap();
@@ -1551,10 +1549,17 @@ fn apply_in_groups(
     (outcomes, ends)
 }
 
+/// The bytes a run of outcomes may take under [`journaled`]'s limits:
+/// half the default journal group's, 128 KiB.
+fn run_cap() -> usize {
+    run_bytes(JournalLimits::default().group)
+}
+
 /// The cut rule (the batching-rule doc's 10.7, step 1b), checked over
 /// every record a run left:
 /// - the records hold the outcomes in execution order, none left out;
-/// - a record of several outcomes is within both bounds;
+/// - a record of several outcomes is within both bounds: 1,024 updates
+///   and the run's bytes ([`run_cap`]);
 /// - an outcome over either bound is alone in its record;
 /// - a record closed where its group did not end only because the next
 ///   outcome would have taken it past a bound.
@@ -1571,7 +1576,8 @@ fn assert_cut_at_the_bounds(
             record.iter().map(|o| o.2).sum::<usize>(),
         )
     };
-    let over = |o: &(u64, usize, usize)| o.1 > GROUP_RECORD_UPDATES || o.2 > GROUP_RECORD_BYTES;
+    let cap = run_cap();
+    let over = |o: &(u64, usize, usize)| o.1 > GROUP_RECORD_UPDATES || o.2 > cap;
     let positions: Vec<u64> = records.iter().flatten().map(|o| o.0).collect();
     assert_eq!(
         positions,
@@ -1582,7 +1588,7 @@ fn assert_cut_at_the_bounds(
         let (updates, bytes) = total(record);
         if record.len() > 1 {
             assert!(
-                updates <= GROUP_RECORD_UPDATES && bytes <= GROUP_RECORD_BYTES,
+                updates <= GROUP_RECORD_UPDATES && bytes <= cap,
                 "a record of {} outcomes past the bounds: {updates} updates, {bytes} bytes",
                 record.len()
             );
@@ -1601,7 +1607,7 @@ fn assert_cut_at_the_bounds(
         let (updates, bytes) = total(this);
         let (past_updates, past_bytes) = (
             updates + next.1 > GROUP_RECORD_UPDATES,
-            bytes + next.2 > GROUP_RECORD_BYTES,
+            bytes + next.2 > cap,
         );
         assert!(
             past_updates || past_bytes,
@@ -1663,27 +1669,26 @@ fn assert_same_as_alone(
     assert_eq!(grouped.store().unmaterialized(), 0);
 }
 
-/// A group of 32 outcomes near 1 MiB each is cut into records under the
-/// bounds (the batching-rule doc's 10.7, step 1b): no two fit one record,
-/// so the store seals each as a record of its own. The queue holds 16 MiB,
-/// so it fills partway: the outcome it has no room for is refused as the
-/// group being full, the node's way, and the group is lowered and the
-/// command applied again in the next.
+/// A group of 32 outcomes near the run's bytes each ([`run_cap`]) is cut
+/// into records under the bounds (the batching-rule doc's 10.7, step 1b):
+/// no two fit one record, so the store seals each as a record of its own.
+/// The queue is held to 2 MiB here, so it fills partway: the outcome it
+/// has no room for is refused as the group being full, the node's way, and
+/// the group is lowered and the command applied again in the next.
 #[test]
-fn a_group_of_outcomes_near_a_mebibyte_each_is_cut_into_records_under_the_bounds() {
-    let len = value_for(GROUP_RECORD_BYTES - 32 * 1024);
+fn a_group_of_outcomes_near_the_run_bytes_each_is_cut_into_records_under_the_bounds() {
+    let len = value_for(run_cap() - 8 * 1024);
     let commands: Vec<_> = (1..=32).map(|seq| put_of(seq, len)).collect();
-    let mut applier = journaled();
+    let mut applier = journaled_with(JournalLimits {
+        max_queued_bytes_per_domain: 2 * 1024 * 1024,
+        ..JournalLimits::default()
+    });
     let (together, ends) = apply_in_groups(&mut applier, &commands);
     let records = application_records(&applier);
     let first = together[0].position.get();
     let (_, at_bytes) = assert_cut_at_the_bounds(&records, first, &ends);
     assert_eq!(records.len(), 32, "one outcome a record");
-    assert!(
-        records
-            .iter()
-            .all(|record| record[0].2 <= GROUP_RECORD_BYTES)
-    );
+    assert!(records.iter().all(|record| record[0].2 <= run_cap()));
     assert!(ends.len() > 1, "the queue filled: {ends:?}");
     assert_eq!(
         at_bytes,
@@ -1694,14 +1699,14 @@ fn a_group_of_outcomes_near_a_mebibyte_each_is_cut_into_records_under_the_bounds
 }
 
 /// Outcomes of mixed sizes: each record closes before the outcome that
-/// would take it past 1 MiB, and holds as many as fit before it.
+/// would take it past the run's bytes, and holds as many as fit before it.
 #[test]
 fn a_group_of_mixed_outcomes_closes_each_record_before_the_outcome_that_would_pass_it() {
     let fractions = [95, 40, 40, 15, 60, 2, 30, 30];
     let commands: Vec<_> = (1..=32u64)
         .map(|seq| {
             let share = fractions[(seq as usize - 1) % fractions.len()];
-            put_of(seq, value_for(GROUP_RECORD_BYTES * share / 100))
+            put_of(seq, value_for(run_cap() * share / 100))
         })
         .collect();
     let mut applier = journaled();
@@ -1726,26 +1731,33 @@ fn a_group_of_mixed_outcomes_closes_each_record_before_the_outcome_that_would_pa
     assert_same_as_alone(&commands, &applier, &together);
 }
 
-/// An outcome over 1 MiB goes in a record of its own, as every outcome
-/// did before step 1b, and the outcomes on either side of it share
-/// records.
+/// An outcome over the run's bytes goes in a record of its own, as every
+/// outcome did before step 1b, and the outcomes on either side of it
+/// share records: one that still fits an ordinary journal group, and one
+/// over 1 MiB, which takes the large-record path.
 #[test]
-fn an_outcome_over_a_mebibyte_goes_in_a_record_of_its_own() {
+fn an_outcome_over_the_run_bytes_goes_in_a_record_of_its_own() {
     let commands = vec![
         put_of(1, 16),
         put_of(2, 16),
-        put_of(3, limits::MAX_VALUE_BYTES),
+        put_of(3, value_for(run_cap() * 3 / 2)),
         put_of(4, 16),
         put_of(5, 16),
+        put_of(6, limits::MAX_VALUE_BYTES),
+        put_of(7, 16),
+        put_of(8, 16),
     ];
     let mut applier = journaled();
     let (together, ends) = apply_in_groups(&mut applier, &commands);
     let records = application_records(&applier);
     assert_cut_at_the_bounds(&records, together[0].position.get(), &ends);
     let shape: Vec<usize> = records.iter().map(Vec::len).collect();
-    assert_eq!(shape, [2, 1, 2], "{records:?}");
-    assert!(records[1][0].2 > GROUP_RECORD_BYTES);
+    assert_eq!(shape, [2, 1, 2, 1, 2], "{records:?}");
+    assert!(records[1][0].2 > run_cap());
+    assert!(records[1][0].2 < JournalLimits::default().group.max_bytes);
     assert_eq!(records[1][0].0, together[2].position.get());
+    assert!(records[3][0].2 > GROUP_RECORD_BYTES);
+    assert_eq!(records[3][0].0, together[5].position.get());
     assert_same_as_alone(&commands, &applier, &together);
 }
 
