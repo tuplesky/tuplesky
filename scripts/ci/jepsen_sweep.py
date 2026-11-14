@@ -553,6 +553,10 @@ class Behind:
     # not take as a follower (the `relay` block), None without one.
     payloads_taken: int | None = None
     not_taken: int | None = None
+    # Of the relayed payloads it could not take at once, those it kept
+    # for later, and of those the ones it took (#296), None without them.
+    kept: int | None = None
+    kept_taken: int | None = None
     # Its sends (`traffic`): bytes over the commands it executed, and the
     # frames and streams it sent that were lost; None without them.
     sent_bytes_per_command: float | None = None
@@ -604,6 +608,8 @@ def behind_of(store: str) -> dict:
                 pages=pages,
                 payloads_taken=relay.get("payloads_taken"),
                 not_taken=relay.get("not_taken"),
+                kept=relay.get("kept"),
+                kept_taken=relay.get("kept_taken"),
                 sent_bytes_per_command=(traffic["sent_bytes"] / executed
                                         if executed and "sent_bytes" in traffic else None),
                 sent_lost=traffic.get("sent_lost"),
@@ -1325,14 +1331,16 @@ def render(steps: list[Step], title: str, baseline: str = "etcd") -> str:
                 "refused or pulled pages, each voter: the submissions its voter refused at its door, exactly, "
                 "from its `the api plane ended` line (`-` when it did not stop cleanly); then from its last "
                 "`metrics` line the relayed payloads it took "
-                "as a follower and those it did not take (the `relay` block); its sends (`traffic`): bytes over "
+                "as a follower and those it did not take, and of those it kept for later, the ones it took then "
+                "(the `relay` block's `kept` and `kept_taken`, #296); its sends (`traffic`): bytes over "
                 "the commands it executed, and the frames it could not write (no stream opened, or the write did "
                 "not complete; a packet the network lost and QUIC sent again is not one), with their streams. A "
                 "voter that fell behind with sends lost near 0 fell behind on throughput, not on stalls)",
                 "",
                 "| Step | Side | Node | Commands short | `Backpressure`, at least | Refused at its door "
-                "| Catch-up pages | Payloads taken | Not taken | Sent bytes per command | Sent lost (streams) |",
-                "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+                "| Catch-up pages | Payloads taken | Not taken | Kept | Kept, taken | Sent bytes per command "
+                "| Sent lost (streams) |",
+                "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
             ]
             for s in fell:
                 for n in sorted(s.behind):
@@ -1342,7 +1350,8 @@ def render(steps: list[Step], title: str, baseline: str = "etcd") -> str:
                     out.append(
                         f"| {name(s)} | {n} | {dash(b.short)} | {at_least(b.backpressure)} | {dash(b.refused)} "
                         f"| {dash(b.pages)} "
-                        f"| {dash(b.payloads_taken)} | {dash(b.not_taken)} | {per} | {lost} |"
+                        f"| {dash(b.payloads_taken)} | {dash(b.not_taken)} | {dash(b.kept)} | {dash(b.kept_taken)} "
+                        f"| {per} | {lost} |"
                     )
             out.append("")
 

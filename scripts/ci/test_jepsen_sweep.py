@@ -381,7 +381,7 @@ class SweepTests(unittest.TestCase):
             f.write('metrics {"cost":{"Observed":{"executed":2400,"busy":{"secs":1,"nanos":0},'
                     '"uptime":{"secs":10,"nanos":0},'
                     '"traffic":{"Observed":{"sent_bytes":480000,"sent_lost":0,"sent_lost_streams":0}},'
-                    '"relay":{"payloads_taken":2390,"not_taken":4}}}}\n')
+                    '"relay":{"payloads_taken":2390,"not_taken":4,"kept":3,"kept_taken":2}}}}\n')
             f.write("the api plane ended: queued_local=9 queued_remote=1 refused=4 released=5\n")
             f.write("catch-up paths: pacer_asks=9 asked=50 pages=41 pulled=2624\n")
         step = sw.read_step("head", "120", path)
@@ -400,7 +400,7 @@ class SweepTests(unittest.TestCase):
             (n2.payloads_taken, n2.not_taken, n2.sent_bytes_per_command, n2.sent_lost, n2.sent_lost_streams),
             (2390, 4, 200.0, 0, 0),
         )
-        self.assertIn("| 120 | head | n2 | 2600 | ≥2 | 7 | 41 | 2390 | 4 | 200 | 0 (0) |", text)
+        self.assertIn("| 120 | head | n2 | 2600 | ≥2 | 7 | 41 | 2390 | 4 | 3 | 2 | 200 | 0 (0) |", text)
         self.assertIn("| 120 | head | n1 | 0 | 0 | - | - | - | - | - | - |", text)
 
     def test_the_voters_memory(self):
