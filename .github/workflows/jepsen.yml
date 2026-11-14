@@ -127,6 +127,7 @@ on:
       - scripts/ci/jepsen_cpu_quota.sh
       - scripts/ci/jepsen_etcd.sh
       - scripts/ci/jepsen_key_groups.py
+      - scripts/ci/jepsen_fork_tests
       - scripts/ci/jepsen_pairs.py
       - scripts/ci/jepsen_sweep.py
       - scripts/ci/leader_profile.py
@@ -356,6 +357,34 @@ jobs:
       - name: Run the Jepsen project's unit tests
         working-directory: jepsen/tuplesky
         run: lein test
+      - name: Test the jepsen fork's listed commits
+        # tuplesky/jepsen runs no CI of its own: each line of
+        # scripts/ci/jepsen_fork_tests, a commit and a test namespace, is
+        # checked out beside the job's jepsen-ref and that namespace tested
+        # there, its result in the step summary. A failure marks this step
+        # and not the job's runs.
+        continue-on-error: true
+        env:
+          LIST: ${{ github.workspace }}/tuplesky/scripts/ci/jepsen_fork_tests
+        run: |
+          rc=0
+          while read -r sha ns _; do
+            case $sha in ""|\#*) continue ;; esac
+            dir="$RUNNER_TEMP/fork-$sha"
+            if ! git -C jepsen fetch -q --depth 1 origin "$sha" || ! git -C jepsen worktree add -q --detach "$dir" "$sha"; then
+              echo "::error::tuplesky/jepsen@$sha: could not check it out"
+              echo "- tuplesky/jepsen@${sha:0:8} \`$ns\`: **not checked out**" >> "$GITHUB_STEP_SUMMARY"
+              rc=1; continue
+            fi
+            if (cd "$dir/jepsen" && lein test :only "$ns") 2>&1 | tee "$RUNNER_TEMP/fork-$sha.log"; [ "${PIPESTATUS[0]}" = 0 ]; then
+              verdict=passes
+            else
+              verdict="**fails**"; rc=1
+              echo "::error::tuplesky/jepsen@$sha: lein test :only $ns failed"
+            fi
+            echo "- tuplesky/jepsen@${sha:0:8} \`lein test :only $ns\`: $verdict ($(grep -E '^Ran [0-9]+ tests|assertions' "$RUNNER_TEMP/fork-$sha.log" | tr '\n' ' '))" >> "$GITHUB_STEP_SUMMARY"
+          done < "$LIST"
+          exit $rc
       - name: Fetch the etcd test's dependencies
         # Before the runs, so a slow fetch fails here rather than inside
         # the etcd run's bound (scripts/ci/jepsen_etcd.sh deps).
