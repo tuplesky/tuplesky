@@ -401,6 +401,24 @@ pub enum SendError {
     Stream(String),
 }
 
+impl SendError {
+    /// Whether the same frame may be admitted later as it stands: the
+    /// lane's queue was full, which drains. A frame with no connection
+    /// or too large for the lane never will be.
+    pub const fn passes(&self) -> bool {
+        matches!(self, Self::QueueFull { .. } | Self::TooManyGroups { .. })
+    }
+}
+
+/// A frame [`Transport::offer_many`] did not admit, handed back.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Refused {
+    /// Why it was not admitted.
+    pub error: SendError,
+    /// The frame, as it was offered.
+    pub frame: Vec<u8>,
+}
+
 /// Why the endpoint could not be built or a connection could not be made.
 #[derive(Debug)]
 pub enum TransportError {
@@ -1758,7 +1776,32 @@ impl Transport {
         group: DomainId,
         frames: Vec<Vec<u8>>,
     ) -> Vec<Result<(), SendError>> {
-        let refused = |n: usize, e: SendError| (0..n).map(|_| Err(e.clone())).collect();
+        self.offer_many(to, group, frames)
+            .into_iter()
+            .map(|result| result.map_err(|refused| refused.error))
+            .collect()
+    }
+
+    /// [`Self::send_many`], handing each frame it did not admit back
+    /// with why, so a caller that means to offer it again keeps it
+    /// without having copied it first.
+    pub fn offer_many(
+        &self,
+        to: Destination,
+        group: DomainId,
+        frames: Vec<Vec<u8>>,
+    ) -> Vec<Result<(), Refused>> {
+        let refused = |frames: Vec<Vec<u8>>, error: SendError| {
+            frames
+                .into_iter()
+                .map(|frame| {
+                    Err(Refused {
+                        error: error.clone(),
+                        frame,
+                    })
+                })
+                .collect()
+        };
         let (key, lane) = match to {
             Destination::Replica {
                 replica,
@@ -1768,18 +1811,19 @@ impl Transport {
             Destination::Connection(id) => {
                 let peer = self.shared.peers.lock().unwrap().get(&id).cloned();
                 let Some(peer) = peer else {
-                    return refused(frames.len(), SendError::NotConnected);
+                    return refused(frames, SendError::NotConnected);
                 };
                 (Shared::link_key(&peer), peer.lane)
             }
         };
         let link = self.shared.links.lock().unwrap().get(&key).cloned();
         let Some(link) = link else {
-            return refused(frames.len(), SendError::NotConnected);
+            return refused(frames, SendError::NotConnected);
         };
         let mut state = link.lanes[lane.index()].lock().unwrap();
         if state.peer.is_none() {
-            return refused(frames.len(), SendError::NotConnected);
+            drop(state);
+            return refused(frames, SendError::NotConnected);
         }
         let now = Instant::now();
         let mut queued = false;
@@ -1789,10 +1833,13 @@ impl Transport {
                 let bytes = frame.len();
                 for budget in [&link.budget, self.shared.node_budget.as_ref()] {
                     if let Err(BudgetError::TooLarge { bytes, limit }) = budget.check(lane, bytes) {
-                        return Err(SendError::TooLarge { bytes, limit });
+                        return Err(Refused {
+                            error: SendError::TooLarge { bytes, limit },
+                            frame,
+                        });
                     }
                 }
-                let result = state.queue.push(Queued {
+                let result = state.queue.push_or_return(Queued {
                     group,
                     frame,
                     enqueued: now,
@@ -1802,13 +1849,16 @@ impl Transport {
                         queued = true;
                         Ok(())
                     }
-                    Err(QueueError::GroupFull) => {
+                    Err((error, back)) => {
                         state.stats.refused += 1;
-                        Err(SendError::QueueFull { lane })
-                    }
-                    Err(QueueError::TooManyGroups) => {
-                        state.stats.refused += 1;
-                        Err(SendError::TooManyGroups { lane })
+                        let error = match error {
+                            QueueError::GroupFull => SendError::QueueFull { lane },
+                            QueueError::TooManyGroups => SendError::TooManyGroups { lane },
+                        };
+                        Err(Refused {
+                            error,
+                            frame: back.frame,
+                        })
                     }
                 }
             })

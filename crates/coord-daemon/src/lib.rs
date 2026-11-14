@@ -87,6 +87,7 @@ pub mod serve;
 pub mod settle;
 pub mod startup;
 pub mod supervise;
+pub mod unreturned;
 pub mod voter;
 
 pub use config::{
