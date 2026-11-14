@@ -326,6 +326,18 @@ fn report_backup(manifest: &coord_checkpoint::BackupManifestV1) {
 }
 
 /// The first eight bytes of a digest, for a line an operator reads.
+/// A format's versions for the build line: the one it reads and writes,
+/// when its window is one version wide, or else `oldest..newest`, the
+/// versions it reads.
+fn versions(f: coord_types::formats::Format) -> String {
+    let w = f.window();
+    if w.oldest == w.newest {
+        w.current.to_string()
+    } else {
+        format!("{}..{}", w.oldest, w.newest)
+    }
+}
+
 fn hex16(bytes: &[u8; 32]) -> String {
     bytes[..8].iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -686,14 +698,21 @@ fn main() -> ExitCode {
     // What this build is, before it opens anything (task-60). Formats
     // are what it reads and writes; features are what the cluster may
     // have turned on. An operator reconciling a mixed fleet reads this
-    // line on every node and compares it.
+    // line on every node and compares it. A format whose window is wider
+    // than one version prints the versions it reads, `oldest..newest`:
+    // the journal's `1..2` says this build reads what its successor
+    // writes, so a voter can go back to it (the batching-rule doc's
+    // 10.7, step 1a). The journal's written version is given beside it,
+    // since a build and its successor read the same window and differ in
+    // what they write.
     println!(
-        "build schema={} journal={} shared_checkpoint={} local_checkpoint={} backup={} features={}",
-        coord_types::formats::Format::StoreSchema.current(),
+        "build schema={} journal={} journal_writes={} shared_checkpoint={} local_checkpoint={} backup={} features={}",
+        versions(coord_types::formats::Format::StoreSchema),
+        versions(coord_types::formats::Format::JournalRecord),
         coord_types::formats::Format::JournalRecord.current(),
-        coord_types::formats::Format::SharedCheckpoint.current(),
-        coord_types::formats::Format::LocalCheckpoint.current(),
-        coord_types::formats::Format::Backup.current(),
+        versions(coord_types::formats::Format::SharedCheckpoint),
+        versions(coord_types::formats::Format::LocalCheckpoint),
+        versions(coord_types::formats::Format::Backup),
         coord_types::formats::Supported::features()
             .iter()
             .map(|f| f.name())

@@ -1209,6 +1209,76 @@ fn a_journal_of_grouped_outcomes_replays_to_the_state_of_per_command_records() {
     }
 }
 
+/// The stream a voter leaves when it goes back from its successor to
+/// this build: genesis and promises at format 1, the outcomes at 2 as its
+/// successor wrote them, and this build's next command at 1 again. It
+/// opens, and opens again after that, each time with the frontier at the
+/// fifth command and the per-command journal's rows, but for the stamp
+/// (the batching-rule doc's 10.7, step 1a; review's scratch test on #286).
+#[test]
+fn a_stream_of_formats_one_two_one_opens_and_opens_again() {
+    fn reopen(
+        journal: ModelJournal,
+        engine: ModelEngine,
+    ) -> JournaledStore<ModelJournal, ModelEngine> {
+        let mut next = JournaledStore::open(
+            journal,
+            CLUSTER,
+            REPLICA,
+            inc(),
+            BootId([0x99; 16]),
+            JournalLimits::default(),
+        )
+        .unwrap();
+        next.attach(A, shard(), engine).unwrap();
+        let f = next.frontiers(A).unwrap();
+        assert_eq!(f.materialized(), f.durable());
+        assert_eq!(next.status(A), Some(DomainStatus::Ready));
+        assert_eq!(
+            next.application_base(A).map(|b| b.execution_position),
+            Some(position(5))
+        );
+        next
+    }
+    let (journal, engine, _) = outcomes_unmaterialized();
+    let (j, mut e) = replay_and_continue(journal, engine).into_parts();
+    let reference = reopen(j, e.pop().unwrap().1);
+    let expected = rows_but_the_stamp(reference.projection(A).unwrap());
+    for forms in [
+        &[Form::Group(4)][..],
+        &[Form::Single, Form::Group(2), Form::Single],
+    ] {
+        let (mut journal, engine, prefix) = outcomes_unmaterialized();
+        regrouped(&mut journal, prefix, forms);
+        let (j, mut e) = replay_and_continue(journal, engine).into_parts();
+        let formats: Vec<u16> = j
+            .records(journal_stream(&j))
+            .iter()
+            .map(|r| r.format())
+            .collect();
+        assert_eq!(formats[0], 1, "{formats:?}");
+        assert!(formats.contains(&2), "{formats:?}");
+        assert_eq!(
+            *formats.last().unwrap(),
+            1,
+            "{formats:?}: this build writes 1"
+        );
+        let again = reopen(j, e.pop().unwrap().1);
+        assert_eq!(
+            rows_but_the_stamp(again.projection(A).unwrap()),
+            expected,
+            "{forms:?}"
+        );
+        let (j, mut e) = again.into_parts();
+        let third = reopen(j, e.pop().unwrap().1);
+        assert_eq!(
+            rows_but_the_stamp(third.projection(A).unwrap()),
+            expected,
+            "{forms:?}"
+        );
+    }
+}
+
 /// A group whose base isn't the projection's frontier is refused at
 /// replay, as a per-command outcome's would be: the record checks its
 /// outcomes against one another, and the materializer checks the group
