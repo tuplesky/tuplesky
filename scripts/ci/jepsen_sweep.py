@@ -45,8 +45,13 @@ or the final heal):
   time in jobs served in 16.4 ms or more (a bucket's edge), beside the
   leader's round from submitted to learned;
 * whether a voter fell behind, for TupleSky: each voter's executed
-  position at the end against the most advanced voter's, its
-  `Backpressure` refusals and the catch-up pages it pulled;
+  position at the end against the most advanced voter's, the submissions
+  its own voter refused at its door (`refused=` on its `the api plane
+  ended` line, an exact count: the log's `(N so far)` lines are sampled
+  at powers of two) and the catch-up pages it pulled; and for a run where
+  one did, each voter's relayed payloads taken and not taken (the
+  `relay` block) and its sends (`traffic`: bytes a command, and the
+  frames and streams it sent that were lost);
 * counts a command over the five voters: datagrams, ACK frames and
   frames on each plane, the api plane's frames by kind, the evidence for
   marked commands where counted, and the journal groups and projection
@@ -124,9 +129,7 @@ class Step:
     # Counts a command over the voters (see COUNTS), from each voter's
     # last `metrics` line over the leader's executed commands.
     counts: dict = field(default_factory=dict)
-    # Whether a voter fell behind (see behind_of): node -> (commands short
-    # of the most advanced voter at the end or None, Backpressure
-    # refusals, catch-up pages pulled or None).
+    # Whether a voter fell behind (see behind_of): node -> Behind.
     behind: dict = field(default_factory=dict)
     # Each voter's executed commands over its projection commits, from its
     # last `metrics` line since it started: node -> (commands a commit,
@@ -510,17 +513,49 @@ def runner(step: Step, start, end, completed: int) -> None:
 
 
 CATCH_UP = re.compile(r"^catch-up paths: .*\bpages=(\d+)\b")
+# A voter's frontend counts as it stops (main.rs): `refused` is the
+# submissions its own voter refused at its door, exactly; the log's
+# "refused a submission ... (N so far)" lines are said only at powers of
+# two (Recurring::seen), so a count read from them is a power of two.
+API_ENDED = re.compile(r"^the api plane ended: .*\brefused=(\d+)\b")
+
+
+def dash(x) -> str:
+    """A reading, or `-` without one."""
+    return "-" if x is None else str(x)
+
+
+@dataclass(frozen=True)
+class Behind:
+    # Commands short of the most advanced voter's executed position at
+    # the end, or None without one.
+    short: int | None
+    # Submissions its own voter refused at its door, over its boots (each
+    # boot's last `the api plane ended` line, summed), or None without one.
+    refused: int | None
+    # Catch-up pages its last boot pulled, or None without a line.
+    pages: int | None
+    # From its last `metrics` line: the relayed payloads it took and did
+    # not take as a follower (the `relay` block), None without one.
+    payloads_taken: int | None = None
+    not_taken: int | None = None
+    # Its sends (`traffic`): bytes over the commands it executed, and the
+    # frames and streams it sent that were lost; None without them.
+    sent_bytes_per_command: float | None = None
+    sent_lost: int | None = None
+    sent_lost_streams: int | None = None
 
 
 def behind_of(store: str) -> dict:
-    """Whether a voter fell behind over the run: node -> (how many
+    """Whether a voter fell behind over the run: node -> Behind: how many
     commands its executed position at the end, read from its store after
-    the run, is short of the most advanced voter's, or None without one;
-    its `Backpressure` refusals, the highest "so far" of each boot summed,
-    as the summary counts them; the catch-up pages its last boot pulled,
-    from its last `catch-up paths` line, or None without one). A voter
-    that fell past the leader's history pulls pages to come back, and one
-    that was refused for backpressure fell behind its frontend's load."""
+    the run, is short of the most advanced voter's; the submissions its
+    own voter refused at its door, exactly; the catch-up pages its last
+    boot pulled; and from its last `metrics` line the relayed payloads it
+    took and did not take, and its sends and their losses. A voter that
+    fell past the leader's history pulls pages to come back, and one that
+    refused submissions fell behind its frontend's load; sends lost near
+    0 say it fell behind on throughput, not on stalls."""
     rows = {}
     for node in sorted(os.listdir(store)):
         path = os.path.join(store, node, "coordd.log")
@@ -531,12 +566,40 @@ def behind_of(store: str) -> dict:
         voter = js.parse_voter(lines)
         end = js.read_executed_at_end(os.path.join(store, node))
         pages = None
+        refused, boot_refused = None, None
         for line in lines:
-            if (m := CATCH_UP.match(line)):
+            if line.startswith("coordd domain="):
+                if boot_refused is not None:
+                    refused = (refused or 0) + boot_refused
+                boot_refused = None
+            elif (m := CATCH_UP.match(line)):
                 pages = int(m[1])
-        rows[node] = (int(end) if end.isdigit() else None, voter.counts.get("Backpressure", 0), pages)
-    top = max((e for e, _, _ in rows.values() if e is not None), default=None)
-    return {n: (top - e if e is not None and top is not None else None, bp, pages) for n, (e, bp, pages) in rows.items()}
+            elif (m := API_ENDED.match(line)):
+                boot_refused = int(m[1])
+        if boot_refused is not None:
+            refused = (refused or 0) + boot_refused
+        raw = (voter.cost.raw or {}) if voter.cost else {}
+        relay = raw.get("relay") if isinstance(raw.get("relay"), dict) else {}
+        traffic = (voter.cost.traffic or {}) if voter.cost else {}
+        executed = voter.cost.executed if voter.cost else 0
+        rows[node] = (
+            int(end) if end.isdigit() else None,
+            dict(
+                refused=refused,
+                pages=pages,
+                payloads_taken=relay.get("payloads_taken"),
+                not_taken=relay.get("not_taken"),
+                sent_bytes_per_command=(traffic["sent_bytes"] / executed
+                                        if executed and "sent_bytes" in traffic else None),
+                sent_lost=traffic.get("sent_lost"),
+                sent_lost_streams=traffic.get("sent_lost_streams"),
+            ),
+        )
+    top = max((e for e, _ in rows.values() if e is not None), default=None)
+    return {
+        n: Behind(short=top - e if e is not None and top is not None else None, **rest)
+        for n, (e, rest) in rows.items()
+    }
 
 
 def voter_costs(store: str) -> list:
@@ -1146,8 +1209,9 @@ def render(steps: list[Step], title: str, baseline: str = "etcd") -> str:
         out += [
             "**Voters behind** (each TupleSky run, each voter: the commands its executed position at the end, read "
             "from its store after the run, is short of the most advanced voter's (under the replay profile the "
-            "projection's last durable commit, so a voter that kept up can read up to one cadence short); its "
-            "`Backpressure` refusals; "
+            "projection's last durable commit, so a voter that kept up can read up to one cadence short); the "
+            "submissions its own voter refused at its door, exactly (`refused=` on its `the api plane ended` "
+            "line, each boot's summed; the log's `(N so far)` lines are said only at powers of two); "
             "and the catch-up pages its last boot pulled, which only a voter that fell past the leader's history "
             "pulls. A voter that kept up shows a few commands or none, no refusals and no pages; one that fell "
             "behind under the step's load distorts its throughput and CPU readings)",
@@ -1158,12 +1222,33 @@ def render(steps: list[Step], title: str, baseline: str = "etcd") -> str:
         for s in rows:
             cells = []
             for n in nodes:
-                gap, bp, pages = s.behind.get(n, (None, 0, None))
-                cells.append(
-                    f"{gap if gap is not None else '-'} / {bp} / {pages if pages is not None else '-'}"
-                )
+                b = s.behind.get(n)
+                cells.append(" / ".join(dash(x) for x in (b.short, b.refused, b.pages)) if b else "-")
             out.append(f"| {name(s)} | " + " | ".join(cells) + " |")
-        out += ["", "(each cell: commands short / backpressure refusals / catch-up pages)", ""]
+        out += ["", "(each cell: commands short / refused at its door / catch-up pages)", ""]
+        fell = [s for s in rows if any((b.short or 0) > 0 or b.refused or b.pages for b in s.behind.values())]
+        if fell:
+            out += [
+                "**Voters behind, their relay and sends** (each TupleSky run where a voter fell behind, was "
+                "refused or pulled pages, each voter, from its last `metrics` line: the relayed payloads it took "
+                "as a follower and those it did not take (the `relay` block); its sends (`traffic`): bytes over "
+                "the commands it executed, and the frames it sent that were lost, with their streams. A voter "
+                "that fell behind with sends lost near 0 fell behind on throughput, not on stalls)",
+                "",
+                "| Step | Side | Node | Commands short | Refused at its door | Catch-up pages | Payloads taken "
+                "| Not taken | Sent bytes per command | Sent lost (streams) |",
+                "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+            ]
+            for s in fell:
+                for n in sorted(s.behind):
+                    b = s.behind[n]
+                    per = f"{b.sent_bytes_per_command:.0f}" if b.sent_bytes_per_command is not None else "-"
+                    lost = f"{dash(b.sent_lost)} ({dash(b.sent_lost_streams)})" if b.sent_lost is not None else "-"
+                    out.append(
+                        f"| {name(s)} | {n} | {dash(b.short)} | {dash(b.refused)} | {dash(b.pages)} "
+                        f"| {dash(b.payloads_taken)} | {dash(b.not_taken)} | {per} | {lost} |"
+                    )
+            out.append("")
 
     rows = [s for s in steps if s.memory]
     if rows:
