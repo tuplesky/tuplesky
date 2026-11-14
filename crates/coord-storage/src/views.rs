@@ -39,6 +39,20 @@ impl ViewBudget {
     };
 }
 
+// A revoke or an expiry loads all of its lease's attachments into one view:
+// each attached key's reverse-index row and its current row, whose value is
+// the previous value the command deletes. A key is stored escaped, at most
+// twice its length and a terminator, so the two rows hold at most four
+// copies of the key, the value, and the ids and encodings (well under 512
+// bytes). That's less than the key's `attachment_cost` (seven copies, the
+// value and 512 bytes), so a lease within `MAX_LEASE_BYTES` loads less than
+// that. This keeps such a view inside the schema budget, with room for the
+// lease's own row, so a lease at its quota is revoked or expires rather than
+// being refused as `ViewTooLarge`. (Its attachments, at most
+// `max_lease_attachments`, 128, are 256 rows, inside `max_rows`.)
+const _: () =
+    assert!(coord_state::MAX_LEASE_BYTES + 64 * 1024 <= ViewBudget::SCHEMA.max_bytes as u64);
+
 impl Default for ViewBudget {
     fn default() -> Self {
         ViewBudget::SCHEMA

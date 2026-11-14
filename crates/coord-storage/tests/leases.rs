@@ -511,9 +511,11 @@ fn a_crash_during_revoke_leaves_all_attachments_or_none() {
 #[test]
 fn a_lease_at_its_byte_quota_is_still_revocable_in_one_batch() {
     // Worst case for the revoke batch: keys of the maximum length made of
-    // zero bytes (the ordered-key escaping doubles them in three row keys)
-    // holding values of the maximum length. The quota must admit exactly
-    // what one revocation can write below the worker's single-batch limit.
+    // zero bytes (the ordered-key escaping doubles them in the two row keys
+    // a revoke deletes) holding values of the maximum length. The quota must
+    // admit exactly what one revocation can write in one journal record,
+    // which is also below the worker's single-batch limit. That the batch is
+    // one record checks `attachment_cost`'s count of a key's copies.
     use coord_storage::lowering::batch_bytes;
     use coord_types::logical_v1::limits::{MAX_KEY_BYTES, MAX_VALUE_BYTES};
     let mut d = Domain::new(ModelEngine::new());
@@ -541,8 +543,8 @@ fn a_lease_at_its_byte_quota_is_still_revocable_in_one_batch() {
     let record = d.lease(L1).unwrap();
     assert_eq!(record.attached_bytes, fits * per_key);
     assert!(record.attached_bytes <= limits.max_lease_bytes);
-    // The materialized revoke batch, retry binding included, stays under
-    // the worker's single-batch limit and applies.
+    // The materialized revoke batch, retry binding included, is one journal
+    // record, stays under the worker's single-batch limit and applies.
     let r = revoke(L1);
     let bound = binding(7, &r);
     let gated = d.worker.reader().snapshot().unwrap();
@@ -552,6 +554,11 @@ fn a_lease_at_its_byte_quota_is_still_revocable_in_one_batch() {
     let batch =
         coord_storage::plan_to_batch(d.alloc.allocate(), NS, &planned, Some(&bound)).unwrap();
     let bytes = batch_bytes(&batch);
+    assert_eq!(
+        coord_storage::journaled::record_refusal(&batch),
+        None,
+        "a revoke batch of {bytes} bytes is one journal record"
+    );
     assert!(
         bytes <= GroupLimits::default().max_single_batch_bytes,
         "revoke batch of {bytes} bytes exceeds the single-batch limit"

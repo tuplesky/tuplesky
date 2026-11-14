@@ -36,9 +36,7 @@ use coord_store_api::engine::{CollectionId, OrderedRead, RowPage, ScanRequest, S
 use crate::authorizations::{AuthorizationCache, AuthorizationCacheStats};
 use crate::cut::{CutOverlay, LayeredOverlay, RecoveryCut};
 use crate::lowering::ExecutionFrontier;
-use crate::materialize::{
-    ApplyOutcome, Pending, Submitted, apply_plan_sharing, apply_refused_plan_sharing, prepare,
-};
+use crate::materialize::{ApplyOutcome, Pending, Submitted, land_prepared_sharing, prepare};
 use crate::persistence::Persistence;
 use crate::retry::{self, Admission, RetryBinding};
 use crate::view::{GatedView, ViewError};
@@ -357,6 +355,32 @@ fn lost(event: &StorageEvent, barriers: &BTreeSet<BarrierId>) -> bool {
 /// How many lowerings finishing a group may wait through (as
 /// `materialize::complete` waits for one application).
 const GROUP_LOWERINGS: usize = 64;
+
+/// What [`Applier::land`] did with a plan.
+enum Landed {
+    /// Submitted, with what came of it.
+    Outcome(ApplyOutcome),
+    /// Not submitted: its batch can't be one journal record
+    /// (`journaled::record_refusal`).
+    TooLarge,
+}
+
+impl Landed {
+    /// What came of landing a refusal. A refusal's batch always fits one
+    /// record: no rows of state, a rejection's response, the executed row
+    /// and a retirement of at most [`retry::MAX_RETIRE_PER_COMMAND`]
+    /// sequences. One that didn't would be a codec's or a bound's mistake,
+    /// so it stops the voter like any engine fault.
+    fn refusal_fits(self) -> Result<ApplyOutcome, ApplyError> {
+        match self {
+            Landed::Outcome(outcome) => Ok(outcome),
+            Landed::TooLarge => Err(ApplyError::Engine(EngineError::new(
+                coord_store_api::engine::ErrorClass::Limit,
+                "a refusal's batch exceeds one journal record",
+            ))),
+        }
+    }
+}
 
 impl<P: Persistence> Applier<P> {
     /// An applier over an opened store; the watch hub starts at the
@@ -1006,7 +1030,13 @@ impl<P: Persistence> Applier<P> {
 
     /// Make `plan` durable as its own batch, or, within a group, submit it
     /// and add it to the group. `refused` is the command a refusal records
-    /// as executed ([`apply_refused_plan_sharing`]).
+    /// as executed ([`crate::materialize::apply_refused_plan`]).
+    ///
+    /// A batch that can't be one journal record is not submitted:
+    /// [`Landed::TooLarge`] says so, and the caller lands the command's
+    /// refusal instead ([`Applier::land_or_refuse`]). The measure is the
+    /// batch's own (`journaled::record_refusal`), so every voter reaches
+    /// it for the same command, whatever its store and role.
     fn land(
         &mut self,
         barrier: BarrierId,
@@ -1014,26 +1044,7 @@ impl<P: Persistence> Applier<P> {
         plan: &coord_state::ApplyPlan,
         binding: Option<&RetryBinding>,
         refused: Option<&CommandId>,
-    ) -> Result<ApplyOutcome, ApplyError> {
-        // Before the plan lands, so that whatever its outcome no context
-        // read before a write of its rows is used after it.
-        self.authorizations.get_mut().landing(&plan.mutations);
-        if self.group.is_none() {
-            let others = self.sharing.then_some(&mut self.foreign);
-            return Ok(match refused {
-                Some(command) => apply_refused_plan_sharing(
-                    &mut self.store,
-                    barrier,
-                    namespace,
-                    plan,
-                    command,
-                    others,
-                ),
-                None => {
-                    apply_plan_sharing(&mut self.store, barrier, namespace, plan, binding, others)
-                }
-            }?);
-        }
+    ) -> Result<Landed, ApplyError> {
         let (mut batch, kind, pending) = prepare(barrier, namespace, plan, binding)?;
         if let Some(command) = refused {
             batch.updates.push(crate::retry::executed_update(
@@ -1042,6 +1053,22 @@ impl<P: Persistence> Applier<P> {
                 plan.revision,
                 pending.result_digest,
             )?);
+        }
+        if crate::journaled::record_refusal(&batch).is_some() {
+            return Ok(Landed::TooLarge);
+        }
+        // Before the plan lands, so that whatever its outcome no context
+        // read before a write of its rows is used after it.
+        self.authorizations.get_mut().landing(&plan.mutations);
+        if self.group.is_none() {
+            let others = self.sharing.then_some(&mut self.foreign);
+            return Ok(Landed::Outcome(land_prepared_sharing(
+                &mut self.store,
+                batch,
+                kind,
+                &pending,
+                others,
+            )?));
         }
         // A group's batches stay queued until it is lowered, so the queue
         // can fill -- in bytes as well as in batches -- before the group's
@@ -1055,18 +1082,54 @@ impl<P: Persistence> Applier<P> {
             return Err(ApplyError::GroupFull);
         }
         let updates = batch.updates.clone();
-        match crate::materialize::submit(&mut self.store, batch, kind)? {
-            Submitted::Accepted => {
-                let group = self.group.as_mut().expect("checked above");
-                Arc::make_mut(&mut group.own).extend(&updates);
-                group.barriers.insert(barrier);
-                group.unjournaled.insert(barrier);
-                group.last = Some(pending);
-                Ok(ApplyOutcome::Applied(Vec::new()))
-            }
-            Submitted::Replan => Ok(ApplyOutcome::Replan),
-            Submitted::Indeterminate => Ok(ApplyOutcome::Indeterminate),
+        Ok(Landed::Outcome(
+            match crate::materialize::submit(&mut self.store, batch, kind)? {
+                Submitted::Accepted => {
+                    let group = self.group.as_mut().expect("checked above");
+                    Arc::make_mut(&mut group.own).extend(&updates);
+                    group.barriers.insert(barrier);
+                    group.unjournaled.insert(barrier);
+                    group.last = Some(pending);
+                    ApplyOutcome::Applied(Vec::new())
+                }
+                Submitted::Replan => ApplyOutcome::Replan,
+                Submitted::Indeterminate => ApplyOutcome::Indeterminate,
+            },
+        ))
+    }
+
+    /// [`Applier::land`] `planned`, or, when its batch can't be one journal
+    /// record, its refusal as [`RejectionReason::TooManyEvents`] at the
+    /// same position: the plan that landed, and how.
+    ///
+    /// Without this a command too large for one record was refused by the
+    /// journal on submit, which `apply_bound` returned as an engine error:
+    /// the voter stopped on it, every voter stopped on the same command,
+    /// and replay reached it again. The refusal is a replicated result
+    /// instead, measured from the batch alone, so every voter makes it.
+    fn land_or_refuse(
+        &mut self,
+        barrier: BarrierId,
+        namespace: NamespaceId,
+        planned: coord_state::ApplyPlan,
+        binding: Option<&RetryBinding>,
+    ) -> Result<(coord_state::ApplyPlan, ApplyOutcome), ApplyError> {
+        if let Landed::Outcome(outcome) = self.land(barrier, namespace, &planned, binding, None)? {
+            return Ok((planned, outcome));
         }
+        // The planning view the oversized plan was built on: nothing was
+        // submitted since, so its revision is the plan's base revision.
+        let revision = {
+            let gated = self.planning_view()?;
+            crate::codecs::read_kv_revision(gated.view())?
+        };
+        let refusal = rejection_plan_at(planned.base, revision, RejectionReason::TooManyEvents)
+            .map_err(ApplyError::Plan)?;
+        // The barrier was never submitted, so the refusal may take it.
+        let outcome = self
+            .land(barrier, namespace, &refusal, binding, None)?
+            .refusal_fits()?;
+        Ok((refusal, outcome))
     }
 
     /// Announce `revision`'s complete event set to watches, once it is
@@ -1374,7 +1437,9 @@ impl<P: Persistence> Applier<P> {
             // command changed -- a session row and a consumed receipt,
             // an authority epoch, a deleted key -- so the outcome is
             // recoverable exactly when the change is.
-            match self.land(barrier, namespace, &planned, Some(binding), None)? {
+            let (planned, landed) =
+                self.land_or_refuse(barrier, namespace, planned, Some(binding))?;
+            match landed {
                 ApplyOutcome::Applied(_) => {
                     let response = postcard::to_allocvec(&planned.response)
                         .map_err(|_| ApplyError::MalformedPayload)?;
@@ -1413,7 +1478,10 @@ impl<P: Persistence> Applier<P> {
             .map_err(ApplyError::Plan)?;
             drop(gated);
             let barrier = self.alloc.allocate();
-            match self.land(barrier, namespace, &planned, None, Some(&command))? {
+            match self
+                .land(barrier, namespace, &planned, None, Some(&command))?
+                .refusal_fits()?
+            {
                 ApplyOutcome::Applied(_) => {
                     let response = postcard::to_allocvec(&planned.response)
                         .map_err(|_| ApplyError::MalformedPayload)?;
@@ -1565,13 +1633,16 @@ impl<P: Persistence> Applier<P> {
                     .map_err(ApplyError::Plan)?;
                     drop(gated);
                     let barrier = self.alloc.allocate();
-                    match self.land(
-                        barrier,
-                        namespace,
-                        &planned,
-                        None,
-                        Some(&binding.command_id),
-                    )? {
+                    match self
+                        .land(
+                            barrier,
+                            namespace,
+                            &planned,
+                            None,
+                            Some(&binding.command_id),
+                        )?
+                        .refusal_fits()?
+                    {
                         ApplyOutcome::Applied(_) => {
                             let response = postcard::to_allocvec(&planned.response)
                                 .map_err(|_| ApplyError::MalformedPayload)?;
@@ -1634,7 +1705,9 @@ impl<P: Persistence> Applier<P> {
             };
             drop(gated);
             let barrier = self.alloc.allocate();
-            match self.land(barrier, namespace, &planned, Some(binding), None)? {
+            let (planned, landed) =
+                self.land_or_refuse(barrier, namespace, planned, Some(binding))?;
+            match landed {
                 ApplyOutcome::Applied(_) => {
                     if let Some(revision) = planned.revision {
                         // Irrevocable now: the revision's complete event set
