@@ -17,6 +17,18 @@
 //!   Enforcing it in the types is the only enforcement that holds: a
 //!   naming convention is one careless `format!` away from a cardinality
 //!   explosion and a data leak in the same line.
+//!
+//!   One type adds to that: a [`Path`] series is keyed by its [`Plane`],
+//!   its [`PeerRole`](coord_types::wire_v1::PeerRole) and its lane, all
+//!   frozen, and by the replica at the other end. A replica is named by
+//!   the first four bytes of its identity, as the daemon's log lines name
+//!   a voter, and it is bounded by the domain's configuration: the
+//!   voters, observers and learners an operator set, never a caller. A
+//!   path's connection number is on the line too, but it is not a label:
+//!   it only marks where a connection's counts started again. And the
+//!   paths a snapshot carries are capped ([`MAX_REPORTED_PATHS`]), the
+//!   rest counted, so a node that many collectors dial still reports a
+//!   bounded line.
 //! * **The distinct durability quantities stay distinct.** A sync, the
 //!   whole-operation commit-return and backpressure are three different
 //!   numbers that a single "write latency" would blur. Section 22.3
@@ -457,6 +469,147 @@ pub struct MetricsSnapshot {
     /// What this node's work has cost since it started, or why it has
     /// no such reading (task-d45).
     pub cost: Measure<Cost>,
+    /// Each open connection's path to a voter or a collector, as QUIC
+    /// estimates it (the lead's item 2 on #185), on either plane, at most
+    /// [`MAX_REPORTED_PATHS`]. Empty where the node has no transport yet.
+    #[serde(default)]
+    pub paths: Vec<Path>,
+    /// Connections past [`MAX_REPORTED_PATHS`], left out of `paths`.
+    #[serde(default)]
+    pub paths_unreported: u64,
+    /// What this node's collector offered and asked again, and what its
+    /// voter refused at its door or could not send back, since the node
+    /// started (the +loss1 reading on #185). Here rather than in
+    /// [`Cost`], which is a voter's, so that a node with a frontend and no
+    /// voter reports its collector's too. They are counts of events, so a
+    /// role without them reads zero: a node with no voter refuses and
+    /// returns nothing.
+    #[serde(default)]
+    pub offers: Offers,
+}
+
+/// The plane a connection is on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Plane {
+    /// Between voters.
+    Peer,
+    /// Between collectors, clients and voters.
+    Api,
+}
+
+/// One open connection's path as QUIC estimates it (the lead's item 2 on
+/// #185, after the +loss1 reading): whether a link is held back by its
+/// congestion window, and by how much loss.
+///
+/// One a connection, and each lane is a connection of its own. Read for a
+/// voter's, an observer's or a learner's connections on either plane, and
+/// for a collector's on the api plane; never for a client's, which are as
+/// many as the callers.
+///
+/// **A series is keyed by (`plane`, `role`, `lane`, `replica`).** The
+/// counts are cumulative over a connection's life and start again with a
+/// new one, after a redial or the peer's restart. `connection` only marks
+/// that: a reader that sees it change takes the new counts from zero, not
+/// as a fall. It is not a label. Two entries can share a key for a moment,
+/// when both ends of a pair dial and before one of the two connections is
+/// closed, and `connection` tells them apart until then.
+///
+/// A collector's connection this side accepted names no replica, so every
+/// collector that dialed this node shares its key: read those entries as
+/// samples of that plane, role and lane, and aggregate them (a sum of the
+/// counts, a spread of the round trips), not as one series.
+///
+/// At most [`MAX_REPORTED_PATHS`] a snapshot ([`Path::bounded`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Path {
+    /// The plane.
+    pub plane: Plane,
+    /// The lane.
+    pub lane: Lane,
+    /// The role bound to the other end.
+    pub role: coord_types::wire_v1::PeerRole,
+    /// The replica at the other end, as the first four bytes of its
+    /// identity in hex, as the daemon's log lines name a voter. None for
+    /// a collector's connection this side accepted, whose binding names
+    /// no replica: `connection` tells those apart.
+    pub replica: Option<String>,
+    /// The connection, as this endpoint numbers them (never reused): not
+    /// a label, only where the counts started again.
+    pub connection: u64,
+    /// Whether this side accepted it.
+    pub accepted: bool,
+    /// The smoothed round trip, in microseconds.
+    pub rtt_micros: u64,
+    /// The least raw round-trip sample over the connection's life, the
+    /// peer's ACK delay not taken out, in microseconds. It never
+    /// expires: a sample from before a path's delay changed stays.
+    pub min_rtt_micros: u64,
+    /// The congestion window, in bytes.
+    pub cwnd: u64,
+    /// Congestion events: each one a cut of the window.
+    pub congestion_events: u64,
+    /// Packets this side sent and judged lost.
+    pub lost_packets: u64,
+    /// Their bytes.
+    pub lost_bytes: u64,
+    /// Packets this side sent.
+    pub sent_packets: u64,
+}
+
+/// Most connections a snapshot reports a [`Path`] for. A voter's are
+/// bounded by its domain's configuration, four lanes a peer on each plane;
+/// the collectors that dial it are not, so the line is capped here rather
+/// than let grow with them. 256 is 64 peers' four lanes.
+pub const MAX_REPORTED_PATHS: usize = 256;
+
+impl Path {
+    /// The metrics line's readings of the transport's, in the order given,
+    /// at most [`MAX_REPORTED_PATHS`]; and how many past that were left
+    /// out. Only those reported are rendered.
+    pub fn bounded(
+        readings: impl IntoIterator<Item = coord_transport::PathReading>,
+    ) -> (Vec<Path>, u64) {
+        let mut paths = Vec::new();
+        let mut unreported = 0u64;
+        for reading in readings {
+            if paths.len() < MAX_REPORTED_PATHS {
+                paths.push(Path::of(&reading));
+            } else {
+                unreported += 1;
+            }
+        }
+        (paths, unreported)
+    }
+
+    /// The metrics line's reading of one of the transport's.
+    pub fn of(reading: &coord_transport::PathReading) -> Self {
+        let micros = |d: Duration| u64::try_from(d.as_micros()).unwrap_or(u64::MAX);
+        Self {
+            plane: match reading.class {
+                coord_transport::Class::Peer => Plane::Peer,
+                coord_transport::Class::Api => Plane::Api,
+            },
+            lane: match reading.lane {
+                coord_transport::Lane::Control => Lane::Control,
+                coord_transport::Lane::Unary => Lane::Unary,
+                coord_transport::Lane::Watch => Lane::Watch,
+                coord_transport::Lane::Bulk => Lane::Bulk,
+            },
+            role: reading.role,
+            replica: reading
+                .replica
+                .map(|r| r.0[..4].iter().map(|b| format!("{b:02x}")).collect()),
+            connection: reading.connection.0,
+            accepted: reading.accepted,
+            rtt_micros: micros(reading.rtt),
+            min_rtt_micros: micros(reading.min_rtt),
+            cwnd: reading.cwnd,
+            congestion_events: reading.congestion_events,
+            lost_packets: reading.lost_packets,
+            lost_bytes: reading.lost_bytes,
+            sent_packets: reading.sent_packets,
+        }
+    }
 }
 
 /// What a voter's work has cost since it started (task-d45).
@@ -586,6 +739,60 @@ pub struct Cost {
     /// (task-d113): its entries, and the bytes they take.
     #[serde(default)]
     pub intake_index: IntakeIndexSize,
+    /// Times this node's protocol machine found its command table full
+    /// (`Backpressure`), as a leader or a follower, since the node started
+    /// (testing's ask on #185). Exact, where the log says them only at
+    /// each doubling.
+    ///
+    /// Not refusals at the door alone. At a leader each is a submission
+    /// the machine refused. At a follower it is that, a payload answer
+    /// refused, a leader's proposal held with no record made for it, or a
+    /// relayed payload the table had no room for (task-d102; kept since
+    /// #296): a follower behind on a full table counts these while no
+    /// caller was refused. A submission the voter refused before its
+    /// machine saw it is [`Offers::refused`].
+    #[serde(default)]
+    pub table_full: u64,
+}
+
+/// What a node's collector sent again, and what its voter refused or could
+/// not send back, cumulative since the node started (the +loss1 reading on
+/// #185). Before these were on the metrics line, `reoffered` and
+/// `solicited` reached only the log, at powers of two, and `refused` only
+/// the api plane's end line at shutdown.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Offers {
+    /// Offers of a submission made again to a voter that had not taken
+    /// it: the same envelope, after the voter's lane refused it.
+    pub reoffered: u64,
+    /// Submissions of pending commands sent again to ask for evidence:
+    /// the relay's ask of the leader, and the ask of every voter
+    /// (task-d22).
+    pub solicited: u64,
+    /// Submissions this node's own voter refused at its door, before its
+    /// machine saw them: malformed, or not a submission their submitter
+    /// may make. One its machine refused for a full table is
+    /// [`Cost::table_full`].
+    pub refused: u64,
+    /// Evidence and releases this voter handed to the transport for a
+    /// collector in another process.
+    pub returned: u64,
+    /// Evidence and releases for such a collector let go unsent: the
+    /// connection had gone, the frame could never fit its lane, or it
+    /// was refused for a full queue and could not be kept, or was kept
+    /// past the hold ([`crate::unreturned`]).
+    pub unreturnable: u64,
+    /// Evidence and releases kept to be offered again: refused because
+    /// the collector's lane queue was full, or made while frames for
+    /// that collector were kept, and queued behind them.
+    #[serde(default)]
+    pub kept: u64,
+    /// Of `returned`, frames that had been kept first.
+    #[serde(default)]
+    pub returned_again: u64,
+    /// Frames kept at this line, not yet returned or let go.
+    #[serde(default)]
+    pub kept_now: u64,
 }
 
 /// The size of the projection's index by command of its intake-keyed rows
@@ -831,6 +1038,11 @@ pub struct Relay {
     pub fallbacks: u64,
     /// `NotLeading` refusals taken.
     pub not_leading: u64,
+    /// Relayed submissions asked of the leader alone again at the
+    /// bound, before any fan-out (storm fix 3): what `fallbacks` would
+    /// have been, less those the leader answered.
+    #[serde(default)]
+    pub asked_leader: u64,
     /// As a follower, since the node started (#224 review): proposal
     /// frames taken.
     #[serde(default)]

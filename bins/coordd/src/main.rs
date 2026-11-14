@@ -579,6 +579,11 @@ fn report_metrics(
         } else {
             Measure::Unavailable(Unavailable::NotThisRole)
         },
+        // No connection is open before the first turn, and the frontend
+        // has offered nothing.
+        paths: Vec::new(),
+        paths_unreported: 0,
+        offers: coord_daemon::metrics::Offers::default(),
     };
     match serde_json::to_string(&snapshot) {
         Ok(rendered) => println!("metrics {rendered}"),

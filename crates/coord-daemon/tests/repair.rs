@@ -2491,8 +2491,9 @@ fn a_relayed_submission_at_a_follower_is_refused_and_falls_back() {
     assert_eq!(w.collector.relay_fallbacks(), 1);
 }
 
-/// A relayed entry its leader never answers falls back to every voter at
-/// the bound, and not before; until then it is asked of the leader alone.
+/// A relayed entry its leader never took falls back to every voter at the
+/// bound, and not before: no offer of it was reported taken, so there is
+/// no leader to ask again (storm fix 3 asks only one that took it).
 #[test]
 fn a_relayed_entry_falls_back_at_its_bound() {
     let mut w = Cluster::new(256);
@@ -2532,6 +2533,56 @@ fn a_relayed_entry_falls_back_at_its_bound() {
     assert_eq!(w.executed(), [1, 1, 1]);
     assert_eq!(w.releases.len(), 1);
     assert!(!w.collector.is_pending(&command));
+}
+
+/// Storm fix 3: a relayed command whose release was lost is asked of its
+/// leader alone again at the bound, with the relayed frame. The leader,
+/// which executed it, publishes the release again, and the command is
+/// answered without a frame to any follower.
+#[test]
+fn a_relayed_command_whose_release_was_lost_is_answered_by_its_leader_at_the_bound() {
+    let mut w = Cluster::new(256);
+    w.collector.set_answer_on_release(true);
+    w.collector.set_relay(true);
+    w.lose = Lose::Releases;
+    let (targets, submit) = w.submit_to(1);
+    let command = w.command(1);
+    let leader = usize::from(targets[0].0[0]);
+    w.collector.offered(
+        MonotonicMillis::ZERO,
+        &coord_collector::Offered {
+            command,
+            outcomes: vec![(targets[0], coord_collector::OfferOutcome::Queued)],
+        },
+    );
+    w.deliver_submission(leader, &submit);
+    w.settle();
+    assert_eq!(w.executed(), [1, 1, 1]);
+    assert!(w.collector.is_pending(&command), "the release was lost");
+    w.lose = Lose::Nothing;
+
+    let bound = MonotonicMillis::new(coord_collector::RELAY_FALLBACK_MILLIS);
+    let asked = w.collector.due_solicits(bound, 16);
+    assert_eq!(asked.len(), 1);
+    assert_eq!(asked[0].targets, targets, "the leader alone");
+    assert_eq!(
+        frame(&asked[0].frame).version,
+        coord_collector::VERSION_RELAYED
+    );
+    let shape = w.deliver_submission(leader, &asked[0].frame);
+    assert_eq!(shape.frontend, 1, "the release, published again");
+    assert!(!w.collector.is_pending(&command), "answered at the bound");
+    assert_eq!(w.releases.len(), 1);
+    assert!(w.rejected.is_empty(), "{:?}", w.rejected);
+    assert_eq!(
+        (
+            w.collector.relay_leader_asks(),
+            w.collector.relay_fallbacks()
+        ),
+        (1, 0),
+        "nothing was fanned out"
+    );
+    assert_eq!(w.executed(), [1, 1, 1], "executed once");
 }
 
 /// Voter 0, the leader, stops; voter 1 campaigns and wins with voter 2,

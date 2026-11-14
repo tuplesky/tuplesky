@@ -401,6 +401,24 @@ pub enum SendError {
     Stream(String),
 }
 
+impl SendError {
+    /// Whether the same frame may be admitted later as it stands: the
+    /// lane's queue was full, which drains. A frame with no connection
+    /// or too large for the lane never will be.
+    pub const fn passes(&self) -> bool {
+        matches!(self, Self::QueueFull { .. } | Self::TooManyGroups { .. })
+    }
+}
+
+/// A frame [`Transport::offer_many`] did not admit, handed back.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Refused {
+    /// Why it was not admitted.
+    pub error: SendError,
+    /// The frame, as it was offered.
+    pub frame: Vec<u8>,
+}
+
 /// Why the endpoint could not be built or a connection could not be made.
 #[derive(Debug)]
 pub enum TransportError {
@@ -619,6 +637,81 @@ impl TrafficReader {
     pub fn read(&self) -> PeerTraffic {
         self.shared.read_traffic()
     }
+
+    /// The same as [`Transport::path_readings`].
+    pub fn path_readings(&self) -> Vec<PathReading> {
+        self.shared.path_readings()
+    }
+}
+
+/// One open connection's path as QUIC estimates it (the lead's item 2 on
+/// #185, after the +loss1 reading): whether a link is held back by its
+/// congestion window, and by how much loss.
+///
+/// Read for every connection to a voter, an observer or a learner, on
+/// either plane, and for every api connection of a collector
+/// ([`PeerRole::may_submit_for_clients`]); not for a client's, which are
+/// as many as the callers. Each lane is a connection of its own, so a
+/// link reads as one of these a lane. The counts are cumulative over the
+/// connection's life and start again with a new connection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PathReading {
+    /// The plane the connection is on.
+    pub class: Class,
+    /// Its lane.
+    pub lane: Lane,
+    /// The role bound to the other end.
+    pub role: PeerRole,
+    /// The replica at the other end, where the binding names one: a peer
+    /// role on either plane, or a voter this side dialed on the api
+    /// plane. A collector's connection this side accepted names none.
+    pub replica: Option<ReplicaId>,
+    /// The connection, for the reading that names no replica.
+    pub connection: ConnectionId,
+    /// Whether this side accepted it.
+    pub accepted: bool,
+    /// The smoothed round trip.
+    pub rtt: Duration,
+    /// The least raw round-trip sample over the connection's life, the
+    /// peer's ACK delay not taken out (quinn's `RttEstimator::min`). It
+    /// never expires: a sample from before a path's delay changed stays.
+    pub min_rtt: Duration,
+    /// The congestion window, in bytes.
+    pub cwnd: u64,
+    /// Congestion events: each a cut of the window.
+    pub congestion_events: u64,
+    /// Packets this side sent and judged lost.
+    pub lost_packets: u64,
+    /// Their bytes.
+    pub lost_bytes: u64,
+    /// Packets this side sent.
+    pub sent_packets: u64,
+}
+
+impl PathReading {
+    fn of(peer: &Peer) -> Self {
+        let path = peer.conn.stats().path;
+        PathReading {
+            class: peer.class,
+            lane: peer.lane,
+            role: peer.identity.role,
+            replica: peer.identity.replica,
+            connection: peer.id,
+            accepted: peer.accepted,
+            rtt: path.rtt,
+            min_rtt: path.min_rtt,
+            cwnd: path.cwnd,
+            congestion_events: path.congestion_events,
+            lost_packets: path.lost_packets,
+            lost_bytes: path.lost_bytes,
+            sent_packets: path.sent_packets,
+        }
+    }
+
+    /// Whether a connection is read: not a client's.
+    fn reads(peer: &Peer) -> bool {
+        peer.identity.replica.is_some() || peer.identity.role.may_submit_for_clients()
+    }
 }
 
 /// Everything shared by the lanes to one destination.
@@ -829,6 +922,19 @@ struct Tls {
 impl Shared {
     fn read_traffic(&self) -> PeerTraffic {
         self.traffic.read(&self.peers)
+    }
+
+    fn path_readings(&self) -> Vec<PathReading> {
+        let mut readings: Vec<PathReading> = self
+            .peers
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|peer| PathReading::reads(peer))
+            .map(|peer| PathReading::of(peer))
+            .collect();
+        readings.sort_by_key(|r| (r.class == Class::Api, r.replica, r.connection, r.lane));
+        readings
     }
 
     /// The client configuration a dial of `class` presents now, and when
@@ -1672,7 +1778,32 @@ impl Transport {
         group: DomainId,
         frames: Vec<Vec<u8>>,
     ) -> Vec<Result<(), SendError>> {
-        let refused = |n: usize, e: SendError| (0..n).map(|_| Err(e.clone())).collect();
+        self.offer_many(to, group, frames)
+            .into_iter()
+            .map(|result| result.map_err(|refused| refused.error))
+            .collect()
+    }
+
+    /// [`Self::send_many`], handing each frame it did not admit back
+    /// with why, so a caller that means to offer it again keeps it
+    /// without having copied it first.
+    pub fn offer_many(
+        &self,
+        to: Destination,
+        group: DomainId,
+        frames: Vec<Vec<u8>>,
+    ) -> Vec<Result<(), Refused>> {
+        let refused = |frames: Vec<Vec<u8>>, error: SendError| {
+            frames
+                .into_iter()
+                .map(|frame| {
+                    Err(Refused {
+                        error: error.clone(),
+                        frame,
+                    })
+                })
+                .collect()
+        };
         let (key, lane) = match to {
             Destination::Replica {
                 replica,
@@ -1682,18 +1813,19 @@ impl Transport {
             Destination::Connection(id) => {
                 let peer = self.shared.peers.lock().unwrap().get(&id).cloned();
                 let Some(peer) = peer else {
-                    return refused(frames.len(), SendError::NotConnected);
+                    return refused(frames, SendError::NotConnected);
                 };
                 (Shared::link_key(&peer), peer.lane)
             }
         };
         let link = self.shared.links.lock().unwrap().get(&key).cloned();
         let Some(link) = link else {
-            return refused(frames.len(), SendError::NotConnected);
+            return refused(frames, SendError::NotConnected);
         };
         let mut state = link.lanes[lane.index()].lock().unwrap();
         if state.peer.is_none() {
-            return refused(frames.len(), SendError::NotConnected);
+            drop(state);
+            return refused(frames, SendError::NotConnected);
         }
         let now = Instant::now();
         let mut queued = false;
@@ -1703,10 +1835,13 @@ impl Transport {
                 let bytes = frame.len();
                 for budget in [&link.budget, self.shared.node_budget.as_ref()] {
                     if let Err(BudgetError::TooLarge { bytes, limit }) = budget.check(lane, bytes) {
-                        return Err(SendError::TooLarge { bytes, limit });
+                        return Err(Refused {
+                            error: SendError::TooLarge { bytes, limit },
+                            frame,
+                        });
                     }
                 }
-                let result = state.queue.push(Queued {
+                let result = state.queue.push_or_return(Queued {
                     group,
                     frame,
                     enqueued: now,
@@ -1716,13 +1851,16 @@ impl Transport {
                         queued = true;
                         Ok(())
                     }
-                    Err(QueueError::GroupFull) => {
+                    Err((error, back)) => {
                         state.stats.refused += 1;
-                        Err(SendError::QueueFull { lane })
-                    }
-                    Err(QueueError::TooManyGroups) => {
-                        state.stats.refused += 1;
-                        Err(SendError::TooManyGroups { lane })
+                        let error = match error {
+                            QueueError::GroupFull => SendError::QueueFull { lane },
+                            QueueError::TooManyGroups => SendError::TooManyGroups { lane },
+                        };
+                        Err(Refused {
+                            error,
+                            frame: back.frame,
+                        })
                     }
                 }
             })
@@ -1774,6 +1912,13 @@ impl Transport {
         TrafficReader {
             shared: self.shared.clone(),
         }
+    }
+
+    /// Each open connection's path, as QUIC estimates it, for every
+    /// connection but a client's ([`PathReading`]), in plane, replica,
+    /// connection and lane order.
+    pub fn path_readings(&self) -> Vec<PathReading> {
+        self.shared.path_readings()
     }
 
     /// Accounting of one lane of a replica link, with the path RTT.
