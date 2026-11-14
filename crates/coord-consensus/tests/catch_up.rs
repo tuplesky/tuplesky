@@ -1061,7 +1061,11 @@ fn a_window_whose_batch_failed_runs_nothing_until_its_rows_are_written_again() {
         cluster.deliver_page(4, 0, &page);
         assert_eq!(cluster.failed, 1, "seed {seed}");
         let f = cluster.follower(4);
-        assert_eq!(f.table().phase_of(&front), Some(Phase::Commit), "seed {seed}");
+        assert_eq!(
+            f.table().phase_of(&front),
+            Some(Phase::Commit),
+            "seed {seed}"
+        );
         assert!(
             !cluster.nodes[4]
                 .storage
@@ -1099,8 +1103,15 @@ fn a_window_whose_batch_failed_runs_nothing_until_its_rows_are_written_again() {
         cluster.serve = true;
         cluster.catching = vec![4];
         cluster.settle_ticking(8);
-        assert_eq!(cluster.nodes[4].executed, cluster.nodes[0].executed, "seed {seed}");
-        assert_eq!(cluster.follower(4).catch_up_divergence(), None, "seed {seed}");
+        assert_eq!(
+            cluster.nodes[4].executed, cluster.nodes[0].executed,
+            "seed {seed}"
+        );
+        assert_eq!(
+            cluster.follower(4).catch_up_divergence(),
+            None,
+            "seed {seed}"
+        );
     }
     assert!(runnable > 0, "no seed left the learner a front to run");
 }
@@ -1183,7 +1194,11 @@ fn a_failed_window_runs_over_its_rows_after_a_new_ballot_is_activated() {
         cluster.handle(4, vec![Effect::Persist(marker)]);
         let f = cluster.follower(4);
         assert_eq!(f.quorum().ballot(), b1, "seed {seed}");
-        assert_eq!(f.table().phase_of(&front), Some(Phase::Commit), "seed {seed}");
+        assert_eq!(
+            f.table().phase_of(&front),
+            Some(Phase::Commit),
+            "seed {seed}"
+        );
         let before = cluster.nodes[4].executed.len();
         cluster.execute_checked(4, usize::MAX);
         assert_eq!(
