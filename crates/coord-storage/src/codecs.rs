@@ -114,6 +114,21 @@ pub fn lease_key(lease: &LeaseId, namespace: &NamespaceId, key: &[u8]) -> Vec<u8
     out
 }
 
+/// The longest row key a command writes: a lease's reverse-index row
+/// ([`lease_key`]) of a logical key at its limit, every byte zero. That is
+/// the lease id, the namespace, the key escaped (each zero byte written as
+/// two) and the terminator. A current row's key is the same less the lease
+/// id, and an event row's key is its revision and ordinal.
+pub const LONGEST_ROW_KEY_BYTES: usize = LeaseId::LEN
+    + ordered_key::NAMESPACE_LEN
+    + 2 * coord_types::logical_v1::limits::MAX_KEY_BYTES
+    + 2;
+
+// A journal record holds every row key a command writes, so the record's
+// bound can't stop a voter on a key validation allowed. Its other end, at
+// most a checkpoint's row bound, is asserted in `coord-checkpoint`.
+const _: () = assert!(coord_journal_api::record::MAX_RECORD_KEY_BYTES >= LONGEST_ROW_KEY_BYTES);
+
 /// Prefix of every reverse-index key of `lease` in `namespace`.
 pub fn lease_key_prefix(lease: &LeaseId, namespace: &NamespaceId) -> Vec<u8> {
     let mut out = Vec::with_capacity(32);
