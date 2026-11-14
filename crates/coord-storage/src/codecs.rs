@@ -32,15 +32,10 @@ fn corrupt(what: &'static str) -> EngineError {
     EngineError::new(ErrorClass::Corrupt, what)
 }
 
+/// A row's value: `value` encoded in place after its envelope's header,
+/// in one buffer sized once.
 fn encode<T: Serialize>(kind: u16, value: &T) -> Result<Vec<u8>, EngineError> {
-    let payload = postcard::to_allocvec(value)
-        .map_err(|_| EngineError::new(ErrorClass::Limit, "record encode"))?;
-    StoreEnvelopeV1 {
-        record_kind: kind,
-        schema_version: 1,
-        payload,
-    }
-    .encode()
+    StoreEnvelopeV1::encode_value(kind, 1, value, "record encode")
 }
 
 fn decode<T: for<'de> Deserialize<'de>>(

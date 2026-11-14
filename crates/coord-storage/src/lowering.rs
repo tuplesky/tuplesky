@@ -79,18 +79,7 @@ impl ExecutionFrontier {
     }
 
     fn encode(&self) -> Result<Vec<u8>, EngineError> {
-        let payload = postcard::to_allocvec(self).map_err(|_| {
-            EngineError::new(
-                coord_store_api::engine::ErrorClass::Limit,
-                "frontier encode",
-            )
-        })?;
-        StoreEnvelopeV1 {
-            record_kind: FRONTIER_RECORD_KIND,
-            schema_version: 1,
-            payload,
-        }
-        .encode()
+        StoreEnvelopeV1::encode_value(FRONTIER_RECORD_KIND, 1, self, "frontier encode")
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, EngineError> {
