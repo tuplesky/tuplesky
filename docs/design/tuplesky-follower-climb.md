@@ -244,7 +244,7 @@ The relays are dropped, and pages must outrun the domain: intake I > R, with I =
 | Bounded by | E, once the hole is filled | min(pipeline, E, path) |
 | 100k at 140 ms, loss-bound, four donors | 139 to 229 s with an 80 MiB bound | never |
 | 100k on a path without loss, E = 4,500 | 61 s | 77 s (the pipeline at 3,900) |
-| Memory | the kept bound, configured | 9 pages (9 MiB) |
+| Memory | the kept bound, configured | 9 pages: about 1 MiB typically, 27 MiB at worst |
 | Network | the live stream it must carry anyway, plus the hole's pages | every command twice: the relay it drops, and the page |
 | Where it fails | the run reaching its bound, or the stream not fitting the path (Section 3) | any path or pipeline below (1 + m)·R |
 
@@ -291,6 +291,7 @@ While a follower F is behind:
 **Which donors.**
 - Asks go round the executors at the leader's frontier, so pages come over up to (voters − 1) bulk connections, each with its own window.
 - The leader takes one ask in K.
+- At most 5 asks are outstanding to any one donor (Section 9), so with fewer donors K is lower.
 - A donor behind the range answers less or nothing, and the range is asked again of the leader.
 
 **A lost ask or page.** A range asked more than 2C + 100 ms ago and not answered is asked again of another donor. The pacer stays the backstop.
@@ -332,9 +333,12 @@ The leader keeps sending F the commit frontier.
 
 **Memory per behind follower:**
 - **The kept run:** at most `KEPT_BOUND`, 64 MiB by default, charging the proposal and the payload. Today it is 4 MiB of payloads, plus up to 8,000 held proposals that aren't charged.
-- **Pages:** at most `K_MAX` = 8 asked for or outside the table, and one window in it: 9 pages, 1,125 commands and 9 MiB. Today it is 2 pages.
+- **Pages:** at most `K_MAX` = 8 asked for or outside the table, and one window in it: 9 pages and 1,125 commands. Today it is 2 pages.
+  - `MAX_CATCH_UP_BYTES` (1 MiB) bounds a page beyond its first command, which is exempt so that a command of any size is still served (`messages.rs:68-76`). A request may be up to 2 MiB (`MAX_REQUEST_BYTES`).
+  - So a page is at most about 3 MiB with its records, and 9 pages are at most about 27 MiB.
+  - In the common case, 125 commands of a few hundred bytes, 9 pages are about 1 MiB.
 - **The table:** capacity, reserve and report bound unchanged. The run enters it only in turn.
-- **At the donors:** at most `K_MAX` pages outstanding for one follower, 8 MiB, inside the transport's 16 MiB a destination.
+- **At the donors:** at most 5 asks outstanding to one donor (Section 7), so at most about 15 MiB a donor at the worst page size, inside the transport's 16 MiB a destination. `CatchUpRequest` carries no byte limit, so the follower bounds by count.
 - **At the leader:** a few words a follower for the exemption.
 
 **A 100k lag at 140 ms, R = 2,600, E = 4,500:**
@@ -365,7 +369,7 @@ New counts on the metrics line:
 **Step 2, the leader** (one versioned field in `CatchUpRequest`): the exemption past the kept bound, and the handoff. Counts of followers exempted and relays withheld.
 
 **Tests and acceptance:**
-- **In-process:** a voter stopped under load and returned 100k behind, on a link of 140 ms round trip, without loss and with 0.1% loss, under `bbr` and `cubic`. It levels within Section 9's time for that row, or is exempted where Section 9 says it is. It never holds more than its bound or 9 pages.
+- **In-process:** a voter stopped under load and returned 100k behind, on a link of 140 ms round trip, without loss and with 0.1% loss, under `bbr` and `cubic`. It levels within Section 9's time for that row, or is exempted where Section 9 says it is. It never holds more than its kept bound or 9 pages, and never more than 5 asks outstanding to one donor.
 - **n5's shape:** a follower whose hole takes longer to fill than the old held cap allowed. With deep keep, nothing past its kept run is dropped, and it drains its run once the hole is filled.
 - **The handoff test,** after an exemption: no proposal not executed at E_L is missed.
 - **Negative controls:**
