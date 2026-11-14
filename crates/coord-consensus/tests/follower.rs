@@ -3280,6 +3280,86 @@ fn a_catch_up_page_that_installs_a_kept_command_drops_its_kept_copy() {
     assert_eq!(f.kept_relayed(), (0, 0));
 }
 
+/// A Sync that releases a kept command undecided (#296 review's u1). A
+/// payload answer passes no promise fence, so behind a promise in flight
+/// it initializes the record of a command whose payload is kept, and the
+/// held proposal waits on the promise. r2's Sync leaves the command out,
+/// and r0's higher promise is made durable before the Sync's row is: the
+/// Sync is superseded and nothing is activated, but its row releases the
+/// command undecided, and the kept copy goes with the held proposal.
+#[test]
+fn a_sync_that_releases_a_kept_command_undecided_drops_its_kept_copy() {
+    let (capacity, over) = (8, 5);
+    let fit = capacity + 1;
+    let mut seq = 1;
+    let (mut f, order, payloads) = filled_by_relay(capacity, over, None, &mut seq);
+    commit_adopted(&mut f, &order[..fit], &mut seq);
+    let promise = f.step(peer(
+        2,
+        ProtocolMessage::NewLeader {
+            ballot: ballot(1, 2),
+            executed: ExecutionPosition::ZERO,
+        },
+    ));
+    // Executed behind the promise: room comes, and nothing kept is taken.
+    assert_eq!(execute_ready(&mut f, &mut seq), order[..fit]);
+    assert_eq!(f.kept_relayed().0, over);
+    // A payload answer for the first kept command takes the room.
+    let released = order[fit];
+    let effects = f.step(peer(
+        0,
+        ProtocolMessage::PayloadResponse {
+            command: released,
+            payload: payloads[fit].clone(),
+        },
+    ));
+    settle(&mut f, effects, &mut seq);
+    assert!(
+        f.table().record(&released).is_some(),
+        "{:?}",
+        f.take_rejections()
+    );
+    assert!(f.held().contains_key(&released));
+    assert_eq!(f.kept_relayed().0, over, "kept beside the record");
+    settle(&mut f, promise, &mut seq);
+    assert_eq!(f.ballots().promised(), ballot(1, 2));
+    let synced = f.step(empty_sync(2, ballot(1, 2)));
+    let promised = f.step(peer(
+        0,
+        ProtocolMessage::NewLeader {
+            ballot: ballot(2, 0),
+            executed: ExecutionPosition::new(fit as u64).unwrap(),
+        },
+    ));
+    settle(&mut f, promised, &mut seq);
+    assert_eq!(
+        f.ballots().promised(),
+        ballot(2, 0),
+        "{:?}",
+        f.take_rejections()
+    );
+    settle(&mut f, synced, &mut seq);
+    let rejections = f.take_rejections();
+    assert!(
+        rejections.contains(&FollowerRejection::SyncSuperseded(ballot(1, 2))),
+        "{rejections:?}"
+    );
+    assert!(f.table().record(&released).is_none(), "released undecided");
+    assert!(!f.held().contains_key(&released));
+    assert_eq!(f.kept_relayed().0, over - 1, "its kept copy goes with it");
+    assert_eq!(f.missing_payload_count(usize::MAX), 0);
+    // r0's Sync drops the rest with their proposals.
+    let synced = f.step(empty_sync(0, ballot(2, 0)));
+    settle(&mut f, synced, &mut seq);
+    assert_eq!(
+        f.ballots().synced(),
+        ballot(2, 0),
+        "{:?}",
+        f.take_rejections()
+    );
+    assert_eq!(f.kept_relayed(), (0, 0));
+}
+
 /// #296 review's question: a kept payload is taken only from `applied`,
 /// and never asked for. A promise row in flight stops the take; if it
 /// fails, this replica votes at its ballot again with no new ballot to
