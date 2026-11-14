@@ -511,10 +511,11 @@ fn a_crash_during_revoke_leaves_all_attachments_or_none() {
 #[test]
 fn a_lease_at_its_byte_quota_is_still_revocable_in_one_batch() {
     // Worst case for the revoke batch: keys of the maximum length made of
-    // zero bytes (the ordered-key escaping doubles them in three row keys)
-    // holding values of the maximum length. The quota must admit exactly
-    // what one revocation can write in one journal record, which is also
-    // below the worker's single-batch limit.
+    // zero bytes (the ordered-key escaping doubles them in the two row keys
+    // a revoke deletes) holding values of the maximum length. The quota must
+    // admit exactly what one revocation can write in one journal record,
+    // which is also below the worker's single-batch limit. That the batch is
+    // one record checks `attachment_cost`'s count of a key's copies.
     use coord_storage::lowering::batch_bytes;
     use coord_types::logical_v1::limits::{MAX_KEY_BYTES, MAX_VALUE_BYTES};
     let mut d = Domain::new(ModelEngine::new());
@@ -525,19 +526,16 @@ fn a_lease_at_its_byte_quota_is_still_revocable_in_one_batch() {
     let per_key = coord_state::attachment_cost(&vec![0; MAX_KEY_BYTES], &value);
     let fits = limits.max_lease_bytes / per_key;
     assert!(fits >= 2, "the default quota admits several maximal keys");
-    // Keys of nonzero bytes: a zero escapes to two bytes in a row key, and a
-    // key of zeros at its limit is a row key no journal record holds
-    // (`record_bound.rs`), whatever its lease.
     for i in 0..fits {
-        let mut key = vec![b'k'; MAX_KEY_BYTES];
-        key[MAX_KEY_BYTES - 1] = b'0' + i as u8;
+        let mut key = vec![0u8; MAX_KEY_BYTES];
+        key[MAX_KEY_BYTES - 1] = i as u8;
         assert_eq!(
             d.run_as(ALICE, &put(&key, &value, Some(L1))),
             Outcome::Put { prev: None }
         );
     }
-    let mut over = vec![b'k'; MAX_KEY_BYTES];
-    over[MAX_KEY_BYTES - 1] = b'z';
+    let mut over = vec![0u8; MAX_KEY_BYTES];
+    over[MAX_KEY_BYTES - 1] = 0xff;
     assert_eq!(
         d.run_as(ALICE, &put(&over, &value, Some(L1))),
         Outcome::ErrLeaseQuota

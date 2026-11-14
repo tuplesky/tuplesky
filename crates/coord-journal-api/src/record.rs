@@ -40,8 +40,19 @@ pub const JOURNAL_RECORD_FORMAT_V1: u16 =
 pub const MAX_RECORD_BYTES: usize = 4 * 1024 * 1024;
 /// Most logical updates in one record.
 pub const MAX_RECORD_UPDATES: usize = 4096;
-/// Longest ordered key in an update.
-pub const MAX_RECORD_KEY_BYTES: usize = 16 * 1024;
+/// Longest ordered key in an update: a row key of a logical key at its
+/// limit, escaped (each zero byte written as two), with its prefix and
+/// terminator, as a checkpoint's row bound allows. Two assertions hold it
+/// between them: `coord_storage::codecs`, that it is at least the longest
+/// row key a command writes, and `coord_checkpoint::manifest`, that it is at
+/// most a checkpoint's `MAX_ROW_KEY_BYTES`.
+///
+/// It was 16 KiB, which a key of 8 KiB zeros passes once escaped: the
+/// journal refused that put's batch and every voter stopped on it. A build
+/// from before the raise can't read a record holding such a key, so a
+/// voter that wrote one can't go back to it without a restore; no other
+/// record changes.
+pub const MAX_RECORD_KEY_BYTES: usize = 32 * 1024;
 /// Longest encoded value in an update (an envelope at its payload limit).
 pub const MAX_RECORD_VALUE_BYTES: usize = MAX_ENVELOPE_PAYLOAD + 16;
 /// Predecessor digest of the first record of a stream.

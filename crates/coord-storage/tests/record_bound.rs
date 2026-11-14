@@ -9,9 +9,10 @@
 //! refusal as `ApplyError::Engine`, the voter stopped on it, every voter
 //! stopped on the same command, and replay reached it again. A projection
 //! alone allows 8 MiB and so accepted it, which no voter of a node is.
-//! A record also bounds each row key at 16 KiB, and a row key is the
+//! A record also bounded each row key at 16 KiB, and a row key is the
 //! request's key escaped, which writes each zero byte as two: a key of
-//! 8 KiB zeros was stopping the domain the same way.
+//! 8 KiB zeros was stopping the domain the same way. A record now holds the
+//! longest row key a command writes.
 //!
 //! The applier now measures the batch against the record's bound before
 //! submitting it, whatever its store, so a journal and a projection alone
@@ -289,32 +290,146 @@ fn oversized_delete<P: Persistence>(mut a: Applier<P>) -> Vec<(AppliedOutcome, O
     out
 }
 
-/// The two stores answer the same, byte for byte, at the same positions.
-/// A key a request may carry whose row key a record can't: the ordered-key
-/// escaping writes each zero byte as two, so a key of `MAX_KEY_BYTES` zeros
-/// is a row key of twice that and more, past `MAX_RECORD_KEY_BYTES`.
-fn escaped_key<P: Persistence>(mut a: Applier<P>) -> Vec<(AppliedOutcome, Outcome)> {
-    let mut out = Vec::new();
-    // Control: a key of the same length that escapes to itself fits.
-    let (_, outcome) = apply(&mut a, &put(1, &vec![b'k'; MAX_KEY_BYTES], 16, false));
-    assert!(
-        matches!(outcome, Outcome::Put { prev: None }),
-        "{outcome:?}"
-    );
-    let kept = a.kv_revision().unwrap();
+fn small_put(key: String) -> BranchOp {
+    BranchOp::Put(PutOp {
+        key: key.into_bytes(),
+        value: b"v".to_vec(),
+        lease: None,
+        prev_kv: false,
+    })
+}
 
-    let (refused, outcome) = apply(&mut a, &put(2, &vec![0; MAX_KEY_BYTES], 16, false));
+/// A range delete of 2,160 small keys: each is a current-row deletion and
+/// an event row, and the command adds its own three, so its batch is 4,323
+/// rows, past a record's 4,096 updates though it is a few hundred KiB and
+/// the planner allows 4,096 deleted keys. A deleted key is two rows (three
+/// if attached to a lease), so a range delete of more than 2,046 keys is
+/// refused `TooManyEvents`. This is the test that reaches the record's
+/// update count.
+fn too_many_rows<P: Persistence>(mut a: Applier<P>) -> Vec<(AppliedOutcome, Outcome)> {
+    let mut out = Vec::new();
+    let mut seq = 1;
+    for batch in 0..18u32 {
+        let success = (0..120u32)
+            .map(|i| small_put(format!("m/{:05}", batch * 120 + i)))
+            .collect();
+        let (_, outcome) = apply(
+            &mut a,
+            &command(
+                seq,
+                CanonicalOperation::Txn(TxnOp {
+                    compares: Vec::new(),
+                    success,
+                    failure: Vec::new(),
+                }),
+            ),
+        );
+        assert!(
+            matches!(
+                outcome,
+                Outcome::Txn {
+                    succeeded: true,
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+        seq += 1;
+    }
+    let kept = a.kv_revision().unwrap();
+    let (refused, outcome) = apply(&mut a, &delete_range(seq, b"m/", b"m0"));
+    seq += 1;
     assert_eq!(outcome, REFUSED);
-    assert_eq!(refused.revision, None, "a refusal writes no revision");
-    assert_eq!(a.kv_revision().unwrap(), kept, "nothing changed");
-    out.push((refused.clone(), REFUSED));
-    let (next, outcome) = apply(&mut a, &put(3, b"k", 16, false));
+    assert_eq!(refused.revision, None);
+    assert_eq!(a.kv_revision().unwrap(), kept);
+    out.push((refused, REFUSED));
+    // Control: 2,000 of them are 4,003 rows, which fit.
+    let (deleted, outcome) = apply(&mut a, &delete_range(seq, b"m/", b"m/02000"));
+    assert!(
+        matches!(outcome, Outcome::Delete { deleted: 2000, .. }),
+        "{outcome:?}"
+    );
+    out.push((deleted, outcome));
+    out
+}
+
+/// A key a request may carry at its longest, every byte zero. The
+/// ordered-key escaping writes each zero byte as two, so its rows' keys are
+/// twice its length and more; attached to a lease, its reverse-index row
+/// has the longest row key a command writes
+/// (`codecs::LONGEST_ROW_KEY_BYTES`). A record held row keys of 16 KiB,
+/// which that one passes: the put stopped every voter, and #294's first
+/// version refused it. A record now holds it, so the key is put, read and
+/// revoked with its lease like any other.
+fn escaped_key<P: Persistence>(mut a: Applier<P>) -> Vec<(AppliedOutcome, Outcome)> {
+    const LEASE: LeaseId = LeaseId([8; 16]);
+    let zeros = vec![0; MAX_KEY_BYTES];
+    let longest = coord_storage::codecs::lease_key(&LEASE, &NS, &zeros).len();
+    assert_eq!(longest, coord_storage::codecs::LONGEST_ROW_KEY_BYTES);
+    assert!(longest > 16 * 1024, "past the record's old bound");
+    let mut out = Vec::new();
+    let (granted, outcome) = apply(
+        &mut a,
+        &command(
+            1,
+            CanonicalOperation::LeaseGrant {
+                lease_id: LEASE,
+                ttl_seconds: 60,
+            },
+        ),
+    );
+    assert!(
+        matches!(outcome, Outcome::LeaseGranted { .. }),
+        "{outcome:?}"
+    );
+    out.push((granted, outcome));
+    let (written, outcome) = apply(
+        &mut a,
+        &command(
+            2,
+            CanonicalOperation::Put(PutOp {
+                key: zeros.clone(),
+                value: vec![7; 16],
+                lease: Some(LEASE),
+                prev_kv: false,
+            }),
+        ),
+    );
     assert!(
         matches!(outcome, Outcome::Put { prev: None }),
         "{outcome:?}"
     );
-    assert_eq!(next.position.get(), refused.position.get() + 1);
-    out.push((next, outcome));
+    assert!(written.revision.is_some(), "a put writes a revision");
+    out.push((written, outcome));
+    let (read, outcome) = apply(
+        &mut a,
+        &command(
+            3,
+            CanonicalOperation::Range(RangeOp {
+                range: KeyRange::exact(zeros.clone()),
+                revision: None,
+                limit: 0,
+                count_only: false,
+                keys_only: false,
+            }),
+        ),
+    );
+    let Outcome::Range {
+        items, count: 1, ..
+    } = &outcome
+    else {
+        panic!("{outcome:?}");
+    };
+    assert_eq!(items.len(), 1);
+    out.push((read, outcome));
+    let before = a.kv_revision().unwrap();
+    let (revoked, outcome) = apply(
+        &mut a,
+        &command(4, CanonicalOperation::LeaseRevoke { lease_id: LEASE }),
+    );
+    assert_eq!(outcome, Outcome::LeaseRevoked { deleted: 1 });
+    assert_eq!(a.kv_revision().unwrap().get(), before.get() + 1);
+    out.push((revoked, outcome));
     out
 }
 
@@ -432,6 +547,7 @@ fn lease_at_quota<P: Persistence>(mut a: Applier<P>) -> Vec<(AppliedOutcome, Out
     out
 }
 
+/// The two stores answer the same, byte for byte, at the same positions.
 fn same(journal: &[(AppliedOutcome, Outcome)], worker: &[(AppliedOutcome, Outcome)]) {
     assert_eq!(journal.len(), worker.len());
     for ((j, jo), (w, wo)) in journal.iter().zip(worker) {
@@ -454,7 +570,12 @@ fn a_delete_too_large_for_one_record_is_refused_alike_on_a_journal_and_a_project
 }
 
 #[test]
-fn a_key_whose_row_key_is_too_long_for_a_record_is_refused_alike_on_a_journal_and_a_projection() {
+fn a_delete_of_more_rows_than_a_record_holds_is_refused_alike_on_a_journal_and_a_projection() {
+    same(&too_many_rows(journaled()), &too_many_rows(worker()));
+}
+
+#[test]
+fn a_key_of_zeros_at_its_limit_is_put_read_and_revoked_alike_on_a_journal_and_a_projection() {
     same(&escaped_key(journaled()), &escaped_key(worker()));
 }
 
