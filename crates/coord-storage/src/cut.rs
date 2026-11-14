@@ -28,6 +28,7 @@
 
 use std::borrow::Borrow;
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::Arc;
 
 use coord_core::effect::{CollectionId, StoreUpdate};
 use coord_store_api::engine::{
@@ -151,6 +152,154 @@ impl CutOverlay {
     }
 }
 
+/// What a [`RecoveryCut`] reads over its snapshot: one overlay, or
+/// several laid over each other ([`LayeredOverlay`]).
+pub trait Overlay {
+    /// Whether it adds nothing to the snapshot.
+    fn is_empty(&self) -> bool;
+
+    /// Its row for `key`: `Some(None)` is a tombstone, and `None` means it
+    /// holds nothing for the key and the snapshot's row stands.
+    fn row(&self, collection: CollectionId, key: &[u8]) -> Option<Option<Vec<u8>>>;
+
+    /// Its entries of one collection inside the request's interval and
+    /// past its cursor, in scan order.
+    fn in_scan_order(
+        &self,
+        collection: CollectionId,
+        request: &ScanRequest,
+    ) -> VecDeque<(Vec<u8>, Option<Vec<u8>>)>;
+}
+
+impl Overlay for CutOverlay {
+    fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    fn row(&self, collection: CollectionId, key: &[u8]) -> Option<Option<Vec<u8>>> {
+        self.rows.get(&(collection, key.to_vec())).cloned()
+    }
+
+    fn in_scan_order(
+        &self,
+        collection: CollectionId,
+        request: &ScanRequest,
+    ) -> VecDeque<(Vec<u8>, Option<Vec<u8>>)> {
+        CutOverlay::in_scan_order(self, collection, request)
+    }
+}
+
+impl Overlay for Arc<CutOverlay> {
+    fn is_empty(&self) -> bool {
+        self.as_ref().rows.is_empty()
+    }
+
+    fn row(&self, collection: CollectionId, key: &[u8]) -> Option<Option<Vec<u8>>> {
+        Overlay::row(self.as_ref(), collection, key)
+    }
+
+    fn in_scan_order(
+        &self,
+        collection: CollectionId,
+        request: &ScanRequest,
+    ) -> VecDeque<(Vec<u8>, Option<Vec<u8>>)> {
+        CutOverlay::in_scan_order(self.as_ref(), collection, request)
+    }
+}
+
+/// Overlays laid over each other, oldest first, each shared and none
+/// copied: a later layer's row of a key wins, as if each had been
+/// [`CutOverlay::absorb`]ed into one in order (#185, lead 17:43, the
+/// commit cadence).
+///
+/// An applier reads the groups in flight through it: each group's own
+/// rows are one layer, so a group begun or a read served over them costs
+/// a pointer a group, where absorbing them copied every row in flight
+/// each time.
+#[derive(Clone, Debug, Default)]
+pub struct LayeredOverlay {
+    layers: Vec<Arc<CutOverlay>>,
+}
+
+impl LayeredOverlay {
+    /// `layers`, oldest first. Empty ones are left out.
+    pub fn new(layers: impl IntoIterator<Item = Arc<CutOverlay>>) -> Self {
+        LayeredOverlay {
+            layers: layers.into_iter().filter(|l| !l.is_empty()).collect(),
+        }
+    }
+
+    /// Lay `layer` over the others.
+    pub fn push(&mut self, layer: Arc<CutOverlay>) {
+        if !layer.is_empty() {
+            self.layers.push(layer);
+        }
+    }
+
+    /// The layers, oldest first.
+    pub fn layers(&self) -> &[Arc<CutOverlay>] {
+        &self.layers
+    }
+
+    /// The one overlay the layers read as, absorbed in order (tests and
+    /// diagnostics).
+    pub fn flattened(&self) -> CutOverlay {
+        let mut out = CutOverlay::new();
+        for layer in &self.layers {
+            out.absorb(layer);
+        }
+        out
+    }
+}
+
+impl Overlay for LayeredOverlay {
+    fn is_empty(&self) -> bool {
+        self.layers.is_empty()
+    }
+
+    fn row(&self, collection: CollectionId, key: &[u8]) -> Option<Option<Vec<u8>>> {
+        let key = (collection, key.to_vec());
+        self.layers
+            .iter()
+            .rev()
+            .find_map(|layer| layer.rows.get(&key).cloned())
+    }
+
+    fn in_scan_order(
+        &self,
+        collection: CollectionId,
+        request: &ScanRequest,
+    ) -> VecDeque<(Vec<u8>, Option<Vec<u8>>)> {
+        match self.layers.as_slice() {
+            [] => VecDeque::new(),
+            [one] => one.in_scan_order(collection, request),
+            many => {
+                // Each layer's entries in key order, a later layer's
+                // winning; then the request's direction.
+                let mut merged: BTreeMap<&[u8], &Option<Vec<u8>>> = BTreeMap::new();
+                for layer in many {
+                    for ((_, key), value) in layer
+                        .rows
+                        .range((collection, Vec::new())..)
+                        .take_while(|((c, _), _)| *c == collection)
+                        .filter(|((_, key), _)| request.contains(key) && request.past_cursor(key))
+                    {
+                        merged.insert(key.as_slice(), value);
+                    }
+                }
+                let selected = merged
+                    .into_iter()
+                    .map(|(key, value)| (key.to_vec(), value.clone()));
+                if request.direction == Direction::Reverse {
+                    selected.rev().collect()
+                } else {
+                    selected.collect()
+                }
+            }
+        }
+    }
+}
+
 /// A gated snapshot plus the journal suffix that is durable but not yet
 /// materialized: the authoritative cut a recovery summary is built from.
 ///
@@ -164,7 +313,7 @@ pub struct RecoveryCut<V, O = CutOverlay> {
     durable: LocalJournalSeq,
 }
 
-impl<V: OrderedRead, O: Borrow<CutOverlay>> RecoveryCut<V, O> {
+impl<V: OrderedRead, O> RecoveryCut<V, O> {
     /// Bind a snapshot to the overlay of the records durable through
     /// `durable` but not represented by the snapshot's stamp.
     pub const fn new(snapshot: GatedView<V>, overlay: O, durable: LocalJournalSeq) -> Self {
@@ -184,7 +333,9 @@ impl<V: OrderedRead, O: Borrow<CutOverlay>> RecoveryCut<V, O> {
     pub fn materialized(&self) -> LocalJournalSeq {
         self.snapshot.meta().stamp.journal_seq()
     }
+}
 
+impl<V: OrderedRead, O: Borrow<CutOverlay>> RecoveryCut<V, O> {
     /// The overlay the cut adds over the snapshot.
     pub fn overlay(&self) -> &CutOverlay {
         self.overlay.borrow()
@@ -200,13 +351,13 @@ enum Side {
     Both,
 }
 
-impl<V: OrderedRead, O: Borrow<CutOverlay>> OrderedRead for RecoveryCut<V, O> {
+impl<V: OrderedRead, O: Overlay> OrderedRead for RecoveryCut<V, O> {
     fn get(&self, collection: CollectionId, key: &[u8]) -> Result<Option<Vec<u8>>, EngineError> {
-        if self.overlay().is_empty() {
+        if self.overlay.is_empty() {
             return self.snapshot.view().get(collection, key);
         }
-        match self.overlay().rows.get(&(collection, key.to_vec())) {
-            Some(value) => Ok(value.clone()),
+        match self.overlay.row(collection, key) {
+            Some(value) => Ok(value),
             None => self.snapshot.view().get(collection, key),
         }
     }
@@ -216,10 +367,10 @@ impl<V: OrderedRead, O: Borrow<CutOverlay>> OrderedRead for RecoveryCut<V, O> {
         collection: CollectionId,
         request: &ScanRequest,
     ) -> Result<RowPage, EngineError> {
-        if self.overlay().is_empty() {
+        if self.overlay.is_empty() {
             return self.snapshot.view().scan_page(collection, request);
         }
-        let mut overlay = self.overlay().in_scan_order(collection, request);
+        let mut overlay = self.overlay.in_scan_order(collection, request);
         let mut base: VecDeque<Row> = VecDeque::new();
         let mut base_cursor = request.resume_after.clone();
         let mut base_exhausted = false;
@@ -410,7 +561,10 @@ mod tests {
         )
     }
 
-    fn scan(cut: &RecoveryCut<Base>, request: &ScanRequest) -> Vec<(Vec<u8>, Vec<u8>)> {
+    fn scan<O: Overlay>(
+        cut: &RecoveryCut<Base, O>,
+        request: &ScanRequest,
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
         let mut out = Vec::new();
         let mut resume = request.resume_after.clone();
         loop {
@@ -503,6 +657,123 @@ mod tests {
                 .collect::<Vec<u8>>(),
             vec![4, 3, 2, 1, 0]
         );
+    }
+
+    /// Overlays laid over each other read as the one overlay they absorb
+    /// into, oldest first: every key, and every scan in both directions,
+    /// paged, bounded and resumed, with rewrites and tombstones across the
+    /// layers (#185, lead 17:43, the commit cadence).
+    #[test]
+    fn layered_overlays_read_as_the_overlay_they_absorb_into() {
+        let key = |i: u8| vec![b'k', i];
+        let base_rows: Vec<(Vec<u8>, Vec<u8>)> = (0u8..12)
+            .filter(|i| i % 3 == 0)
+            .map(|i| (key(i), vec![b'b', i]))
+            .collect();
+        let base_refs: Vec<(&[u8], &[u8])> = base_rows
+            .iter()
+            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+            .collect();
+        // A write of every other key; then a rewrite of some and a delete
+        // of others; then a key written again, one deleted, and a new one.
+        let layers: Vec<Vec<StoreUpdate>> = vec![
+            (0u8..12)
+                .step_by(2)
+                .map(|i| update(&key(i), Some(&[b'1', i])))
+                .collect(),
+            (0u8..12)
+                .filter(|i| i % 4 == 0)
+                .map(|i| update(&key(i), Some(&[b'2', i])))
+                .chain(
+                    (0u8..12)
+                        .filter(|i| i % 3 == 0)
+                        .map(|i| update(&key(i), None)),
+                )
+                .collect(),
+            vec![
+                update(&key(6), Some(b"36")),
+                update(&key(11), None),
+                update(&key(13), Some(b"313")),
+            ],
+        ];
+        let shared: Vec<Arc<CutOverlay>> = layers
+            .iter()
+            .map(|updates| {
+                let mut overlay = CutOverlay::new();
+                overlay.extend(updates);
+                Arc::new(overlay)
+            })
+            .collect();
+        let layered = LayeredOverlay::new(
+            shared
+                .iter()
+                .cloned()
+                .chain(std::iter::once(Arc::new(CutOverlay::new()))),
+        );
+        assert_eq!(layered.layers().len(), 3, "an empty layer is left out");
+        let flat = layered.flattened();
+        let layered_cut = RecoveryCut::new(
+            crate::view::GatedView::new(base(&base_refs), DurableMeta::initial()),
+            layered,
+            LocalJournalSeq::ZERO,
+        );
+        let flat_cut = RecoveryCut::new(
+            crate::view::GatedView::new(base(&base_refs), DurableMeta::initial()),
+            flat,
+            LocalJournalSeq::ZERO,
+        );
+        for i in 0u8..16 {
+            assert_eq!(
+                layered_cut.get(KV, &key(i)).unwrap(),
+                flat_cut.get(KV, &key(i)).unwrap(),
+                "key {i}"
+            );
+        }
+        // Written, rewritten, deleted and written again: the last wins.
+        assert_eq!(layered_cut.get(KV, &key(6)).unwrap(), Some(b"36".to_vec()));
+        assert_eq!(layered_cut.get(KV, &key(0)).unwrap(), None);
+        assert_eq!(layered_cut.get(KV, &key(3)).unwrap(), None);
+        assert_eq!(layered_cut.get(KV, &key(4)).unwrap(), Some(vec![b'2', 4]));
+        let requests = [
+            ScanRequest::all(16, 4096),
+            ScanRequest::all(1, 4096),
+            // Rows are four or five bytes: a page of one row each.
+            ScanRequest::all(16, 5),
+            ScanRequest {
+                lower: Bound::Included(key(2)),
+                upper: Bound::Excluded(key(9)),
+                resume_after: Some(key(2)),
+                ..ScanRequest::all(2, 4096)
+            },
+            ScanRequest {
+                direction: Direction::Reverse,
+                ..ScanRequest::all(3, 4096)
+            },
+            ScanRequest {
+                direction: Direction::Reverse,
+                resume_after: Some(key(10)),
+                ..ScanRequest::all(2, 4096)
+            },
+        ];
+        for request in &requests {
+            let rows = scan(&layered_cut, request);
+            assert_eq!(rows, scan(&flat_cut, request), "{request:?}");
+        }
+        assert!(!scan(&layered_cut, &ScanRequest::all(16, 4096)).is_empty());
+        // One layer reads as that overlay.
+        let one = RecoveryCut::new(
+            crate::view::GatedView::new(base(&base_refs), DurableMeta::initial()),
+            LayeredOverlay::new([Arc::clone(&shared[0])]),
+            LocalJournalSeq::ZERO,
+        );
+        let alone = RecoveryCut::new(
+            crate::view::GatedView::new(base(&base_refs), DurableMeta::initial()),
+            Arc::clone(&shared[0]),
+            LocalJournalSeq::ZERO,
+        );
+        for request in &requests {
+            assert_eq!(scan(&one, request), scan(&alone, request), "{request:?}");
+        }
     }
 
     #[test]
