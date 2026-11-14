@@ -1665,10 +1665,10 @@ fn assert_same_as_alone(
 
 /// A group of 32 outcomes near 1 MiB each is cut into records under the
 /// bounds (the batching-rule doc's 10.7, step 1b): no two fit one record,
-/// so each is a record of its own, closed as the next lands. The queue
-/// holds 16 MiB, so it fills partway: the record that has no room is
-/// refused as the group being full, the node's way, and the group is
-/// lowered and the command applied again in the next.
+/// so the store seals each as a record of its own. The queue holds 16 MiB,
+/// so it fills partway: the outcome it has no room for is refused as the
+/// group being full, the node's way, and the group is lowered and the
+/// command applied again in the next.
 #[test]
 fn a_group_of_outcomes_near_a_mebibyte_each_is_cut_into_records_under_the_bounds() {
     let len = value_for(GROUP_RECORD_BYTES - 32 * 1024);
