@@ -21,6 +21,18 @@ test_dir=${ETCD_TEST_DIR:-etcd-test}
 jepsen_dir=${JEPSEN_DIR:-jepsen}
 
 prepare() {
+  # @fork anywhere in it (beside+tls@fork): the etcd test on the jepsen-ref's
+  # Jepsen, the jar the job installs from jepsen/jepsen (0.3.15-tuplesky at
+  # 055c0fa), in place of the 0.3.11 its project.clj names, so both tests
+  # run one interpreter and generator (#98). Only beside TupleSky, where
+  # that jar is installed before the test's dependencies are fetched.
+  local fork=""
+  case $ETCD_VERSION in
+    *@fork*) fork=yes ETCD_VERSION=${ETCD_VERSION/@fork/} ;;
+  esac
+  if [ -n "$fork" ] && [ "${ETCD_BESIDE:-}" != true ]; then
+    echo "::error::etcd-version @fork runs only beside TupleSky (beside...@fork)"; exit 1
+  fi
   # VERSION/COUNT (beside/100, beside:3.7.3/100, 3.7.3/100): etcd at its
   # default snapshot count, and in a TupleSky sweep a second run at each
   # step with --snapshot-count COUNT (ETCD_SNAPSHOT_EXTRA), so a setting's
@@ -129,6 +141,44 @@ if src.count(old) != 1:
 open(path, "w").write(src.replace(old, new))
 PY
     grep -n -A2 'gen/any' "$test_dir/src/jepsen/etcd/register.clj"
+  fi
+
+  # @fork: the dependency, and the one change the newer Jepsen needs to
+  # keep etcd's runs as they were. Its gen/reserve (generator 0.1.5 on)
+  # reserves the first n threads of the context it is first shown, a key's
+  # group's or the whole test's, so etcd's literal `(gen/reserve n r)` would
+  # read from a timing-dependent set of threads (jepsen.tuplesky's
+  # etcd-register-key-generator). Its runs on 0.3.11 read from threads 0 to
+  # n - 1 of the whole test, which gen/on-threads draws exactly, as
+  # jepsen.tuplesky's etcd mix does (quirk on-threads). The swiftpaxos mix
+  # above already draws by thread.
+  echo "ETCD_JEPSEN=" >> "${GITHUB_ENV:-/dev/null}"
+  if [ -n "$fork" ]; then
+    local jar
+    jar=$(sed -n 's/^(defproject jepsen "\([^"]*\)".*/\1/p' "$jepsen_dir/jepsen/project.clj")
+    if [ -z "$jar" ]; then
+      echo "::error::no Jepsen version in $jepsen_dir/jepsen/project.clj"; exit 1
+    fi
+    python3 - "$test_dir/project.clj" "$test_dir/src/jepsen/etcd/register.clj" "$jar" "${REGISTER_MIX:-}" <<'PY'
+import sys
+project, register, jar, mix = sys.argv[1:]
+def edit(path, old, new):
+    src = open(path).read()
+    if src.count(old) != 1:
+        sys.exit(f"{path} no longer has: {old!r}")
+    open(path, "w").write(src.replace(old, new))
+edit(project, '[jepsen "0.3.11"', f'[jepsen "{jar}"')
+if mix != "swiftpaxos":
+    edit(register,
+         "(->> (gen/mix [w cas])\n                         (gen/reserve n r)",
+         "(->> (gen/any\n"
+         "                           (gen/on-threads #(and (integer? %) (< % n)) r)\n"
+         "                           (gen/on-threads #(not (and (integer? %) (< % n))) (gen/mix [w cas])))")
+PY
+    grep -n '\[jepsen "' "$test_dir/project.clj"
+    grep -n -A2 'gen/any' "$test_dir/src/jepsen/etcd/register.clj"
+    echo "ETCD_JEPSEN=$jar" >> "${GITHUB_ENV:-/dev/null}"
+    echo "etcd baseline: the test on Jepsen $jar from tuplesky/jepsen@${JEPSEN_REF:-?}, in place of its own 0.3.11" >> "${GITHUB_STEP_SUMMARY:-/dev/stdout}"
   fi
 
   # cu/grepkill! runs `pgrep -f etcd | xargs kill -stop` in a `bash -c`

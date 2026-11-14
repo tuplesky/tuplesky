@@ -894,6 +894,17 @@ A job with one step and no pair runs TupleSky once, then the baseline
 once: etcd with TLS for `beside+tls` and `beside+tls+auth`, without the
 side rows, which need a sweep.
 
+`@fork` in a beside setting (`beside+tls@fork`) runs the etcd test on the
+`jepsen-ref`'s Jepsen, the jar the job installs (0.3.15-tuplesky at
+`055c0fa`), in place of the 0.3.11 its `project.clj` names, so both tests
+run one interpreter and generator; its titles say `on Jepsen VERSION`. The
+test needs no other change to build on it. One change keeps its runs as
+they were: on 0.3.11, `(gen/reserve n r)` reads from threads 0 to n - 1 of
+the whole test (17% of operations at 30 clients, 4% at 120), but on the
+newer generator it reserves within each key's group, half of every group,
+so half the operations would be reads. `@fork` draws the 0.3.11 split by
+thread with `gen/on-threads`, as `jepsen.tuplesky`'s etcd mix does.
+
 With `leader-profile: call-graph`, `scripts/ci/server_profile.py` also
 runs beside every TupleSky and etcd run. Over 20 s of the settled
 workload it counts every server process's system calls, context switches
