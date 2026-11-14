@@ -209,6 +209,12 @@ fn config(ring: &KeyRing) -> BindingConfig {
 }
 
 fn frontend(ring: &KeyRing) -> BoundFrontend {
+    frontend_remembering(ring, 64)
+}
+
+/// A frontend that remembers `max_requests` request identities for the
+/// gate, and whose collector holds up to 64 commands pending.
+fn frontend_remembering(ring: &KeyRing, max_requests: usize) -> BoundFrontend {
     let fast: BTreeSet<ReplicaId> = (0..2).map(r).collect();
     let quorum = BallotConfiguration::c2(
         ConfigurationEpoch::new(1).unwrap(),
@@ -231,7 +237,7 @@ fn frontend(ring: &KeyRing) -> BoundFrontend {
         }),
         16,
     );
-    BoundFrontend::new(dispatcher, config(ring), 4, 64)
+    BoundFrontend::new(dispatcher, config(ring), 4, max_requests)
 }
 
 fn retry_key(seq: u64) -> RetryKey {
@@ -328,8 +334,11 @@ impl Answered for coord_session::Delivered {
     }
 }
 
+/// The gate withheld an executed command's result: `OUTPUT_WITHHELD`,
+/// never `NOT_ADMITTED`, which would tell the caller the command did not
+/// happen (task-d23).
 fn is_denied(d: &Delivery) -> bool {
-    matches!(outcome_of(d), OutcomeV1::Err { code, .. } if code == codes::NOT_ADMITTED)
+    matches!(outcome_of(d), OutcomeV1::Err { code, .. } if code == codes::OUTPUT_WITHHELD)
 }
 
 fn range_outcome(k: &[u8]) -> Outcome {
@@ -463,7 +472,12 @@ fn an_expired_warm_connection_cannot_admit_and_a_rebind_keeps_the_identity() {
         &hub,
         &domain.policy(),
     ) {
-        Ingress::Action(Action::Respond(d)) => assert!(is_denied(&d)),
+        // Refused at the door: nothing was admitted, so this is not a
+        // withheld result.
+        Ingress::Action(Action::Respond(d)) => assert!(matches!(
+            outcome_of(&d),
+            OutcomeV1::Err { code, .. } if code == codes::NOT_ADMITTED
+        )),
         other => panic!("{other:?}"),
     }
 }
@@ -526,7 +540,14 @@ fn post_revocation_protected_data_is_denied_even_from_cached_results() {
         leader: r(0),
     };
     let path = Digest32([1; 32]);
-    let prov = |i: u8| PeerProvenance::from_transport(r(i), ReplicaIncarnation::new(1).unwrap(), 1);
+    let prov = |i: u8| {
+        PeerProvenance::from_transport(
+            r(i),
+            ReplicaIncarnation::new(1).unwrap(),
+            coord_types::wire_v1::PeerRole::Voter,
+            1,
+        )
+    };
     let admitted = f
         .dispatcher()
         .collector()
@@ -1198,6 +1219,419 @@ fn a_projection_that_is_behind_holds_a_disclosure_instead_of_refusing_it() {
     assert_eq!(f.denied, 1);
 }
 
+/// A frontend bound from an establishment this node has not projected
+/// yet, with one read of `a` admitted as `command` under `deadline_ms`.
+fn bound_behind(
+    ring: &KeyRing,
+    hub: &WatchHub,
+    domain: &Domain,
+    deadline_ms: u32,
+) -> (BoundFrontend, CommandId) {
+    let mut f = frontend(ring);
+    let credential = token(ring, SESSION, NOW + 1000);
+    let bind = frame_of(&bind_frame(&credential).unwrap());
+    assert!(matches!(
+        f.on_frame(&clock(NOW), at(NOW), 7, &bind, hub, &Behind),
+        Ingress::Establishing(_)
+    ));
+    let key = coord_session::verify_bind(&config(ring), &credential, &clock(NOW), None)
+        .unwrap()
+        .establishment_key(&config(ring));
+    let mut logical = LogicalRequest::new(NS, range(b"a"));
+    logical.canonicalize();
+    let retry = retry_key(1);
+    let command = CommandId::derive(&retry, &logical).unwrap();
+    let read = frame_of(
+        &MessageV1::Request(RequestV1::new(retry, &logical, deadline_ms, 0).unwrap())
+            .encode()
+            .unwrap(),
+    );
+    let mut created = delivery(7, 1, command, Outcome::SessionCreated { session: SESSION });
+    created.retry_key = key;
+    assert!(matches!(
+        f.deliver(created, &Behind),
+        coord_session::Delivered::Answer(_)
+    ));
+    assert!(matches!(
+        f.on_frame(&clock(NOW), at(NOW), 7, &read, hub, &domain.policy()),
+        Ingress::Action(Action::FanOut(_))
+    ));
+    (f, command)
+}
+
+/// A disclosure the gate holds keeps its request's record while it is
+/// held, through any number of requests accepted since (task-d93, Codex on
+/// #98): the dispatcher let a leader-read answer go when it was answered,
+/// so without the hold counting as held the record turned over, and the
+/// release found no record to authorize from and refused a permitted read
+/// with a final `OUTPUT_WITHHELD`.
+#[test]
+fn a_held_disclosure_keeps_its_record_through_request_churn() {
+    let ring = ring();
+    let hub = WatchHub::new(KvRevision::ZERO, KvRevision::ZERO);
+    let domain = Domain::new();
+    let mut f = frontend_remembering(&ring, 4);
+    f.dispatcher_mut().set_leader_reads(true);
+    let credential = token(&ring, SESSION, NOW + 1000);
+    let bind = frame_of(&bind_frame(&credential).unwrap());
+    assert!(matches!(
+        f.on_frame(&clock(NOW), at(NOW), 7, &bind, &hub, &Behind),
+        Ingress::Establishing(_)
+    ));
+    let key = coord_session::verify_bind(&config(&ring), &credential, &clock(NOW), None)
+        .unwrap()
+        .establishment_key(&config(&ring));
+    let mut logical = LogicalRequest::new(NS, range(b"a"));
+    logical.canonicalize();
+    let command = CommandId::derive(&retry_key(1), &logical).unwrap();
+    let mut created = delivery(7, 1, command, Outcome::SessionCreated { session: SESSION });
+    created.retry_key = key;
+    assert!(matches!(
+        f.deliver(created, &Behind),
+        coord_session::Delivered::Answer(_)
+    ));
+    let (_, req) = request(1, range(b"a"));
+    assert!(matches!(
+        f.on_frame(&clock(NOW), at(NOW), 7, &req, &hub, &domain.policy()),
+        Ingress::Action(Action::Read(_))
+    ));
+    let response = postcard::to_allocvec(&Response {
+        revision: KvRevision::new(1).unwrap(),
+        outcome: range_outcome(b"a"),
+    })
+    .unwrap();
+    let Some(coord_collector::ReadResolution::Answer(answer)) = f.dispatcher_mut().on_read_answer(
+        at(NOW),
+        PeerProvenance::from_transport(
+            r(0),
+            ReplicaIncarnation::new(1).unwrap(),
+            coord_types::wire_v1::PeerRole::Voter,
+            1,
+        ),
+        coord_collector::ReadAnswerV1 {
+            retry_key: retry_key(1),
+            ballot: Ballot {
+                epoch: ConfigurationEpoch::new(1).unwrap(),
+                number: 0,
+                leader: r(0),
+            },
+            outcome: coord_collector::ReadOutcomeV1::Served { response },
+        },
+    ) else {
+        panic!("answered")
+    };
+    assert!(matches!(
+        f.deliver_at(at(NOW), answer, &Behind),
+        coord_session::Delivered::Held
+    ));
+    // More requests than the frontend remembers are accepted and answered
+    // while the projection lags.
+    for seq in 2..=11 {
+        let mut logical = LogicalRequest::new(NS, range(b"a"));
+        logical.canonicalize();
+        let command = CommandId::derive(&retry_key(seq), &logical).unwrap();
+        f.deliver_retained(
+            delivery(7, seq, command, range_outcome(b"a")),
+            command,
+            &logical,
+            &Behind,
+        );
+    }
+    assert!(f.remembered() <= 6, "{} remembered", f.remembered());
+    // The projection catches up: the held read goes out, disclosed.
+    let out = f.release_held(at(NOW).plus(20), &domain.policy());
+    assert_eq!(out.len(), 1);
+    assert!(
+        !is_denied(&out[0]) && !is_pending(&out[0]),
+        "{:?}",
+        outcome_of(&out[0])
+    );
+}
+
+/// Delivered at a time, a disclosure whose session this node has not
+/// projected yet is held at the gate, and goes out, disclosed, once the
+/// projection shows the session (task-d93).
+///
+/// A follower projects a command one leader turn and a hop after the
+/// leader does (task-d74), so a read right after a bind there would
+/// otherwise come back `Pending`: the client library reports that as an
+/// unknown outcome, and resolving a read finds nothing, so the
+/// application reads again for what was a few milliseconds of lag.
+#[test]
+fn a_disclosure_the_projection_is_behind_for_is_held_until_it_catches_up() {
+    let ring = ring();
+    let hub = WatchHub::new(KvRevision::ZERO, KvRevision::ZERO);
+    let domain = Domain::new();
+    let (mut f, command) = bound_behind(&ring, &hub, &domain, 0);
+
+    assert!(matches!(
+        f.deliver_at(
+            at(NOW),
+            delivery(7, 1, command, range_outcome(b"a")),
+            &Behind
+        ),
+        coord_session::Delivered::Held
+    ));
+    assert_eq!((f.holds, f.deferred, f.denied), (1, 0, 0));
+    assert_eq!(
+        f.next_hold_deadline(),
+        Some(at(NOW).plus(coord_session::GATE_HOLD_MILLIS))
+    );
+
+    // Still behind: it stays held, and nothing is written.
+    assert!(f.release_held(at(NOW).plus(10), &Behind).is_empty());
+    assert!(f.holds_any());
+
+    // The projection catches up: the held answer goes out, disclosed.
+    let out = f.release_held(at(NOW).plus(20), &domain.policy());
+    assert_eq!(out.len(), 1);
+    assert!(
+        !is_denied(&out[0]) && !is_pending(&out[0]),
+        "{:?}",
+        outcome_of(&out[0])
+    );
+    assert!(!f.holds_any());
+    assert_eq!((f.holds, f.deferred, f.denied), (1, 0, 0));
+}
+
+/// A held disclosure the projection still has not caught up with by its
+/// deadline is answered `Pending`, as it was before the hold: the
+/// client's own deadline when it named an earlier one than the gate's
+/// bound, and the gate's bound otherwise (task-d93).
+#[test]
+fn a_held_disclosure_still_behind_at_its_deadline_is_answered_pending() {
+    let ring = ring();
+    let hub = WatchHub::new(KvRevision::ZERO, KvRevision::ZERO);
+    let domain = Domain::new();
+
+    // The client named 50 ms.
+    let (mut f, command) = bound_behind(&ring, &hub, &domain, 50);
+    assert!(matches!(
+        f.deliver_at(
+            at(NOW),
+            delivery(7, 1, command, range_outcome(b"a")),
+            &Behind
+        ),
+        coord_session::Delivered::Held
+    ));
+    assert_eq!(f.next_hold_deadline(), Some(at(NOW).plus(50)));
+    assert!(f.release_held(at(NOW).plus(49), &Behind).is_empty());
+    let out = f.release_held(at(NOW).plus(50), &Behind);
+    assert_eq!(out.len(), 1);
+    assert!(is_pending(&out[0]), "{:?}", outcome_of(&out[0]));
+    assert!(!f.holds_any());
+    assert_eq!((f.holds, f.deferred, f.denied), (1, 1, 0));
+
+    // The client named none: the gate's own bound.
+    let (mut g, command) = bound_behind(&ring, &hub, &domain, 0);
+    assert!(matches!(
+        g.deliver_at(
+            at(NOW),
+            delivery(7, 1, command, range_outcome(b"a")),
+            &Behind
+        ),
+        coord_session::Delivered::Held
+    ));
+    let bound = coord_session::GATE_HOLD_MILLIS;
+    assert!(g.release_held(at(NOW).plus(bound - 1), &Behind).is_empty());
+    let out = g.release_held(at(NOW).plus(bound), &Behind);
+    assert!(out.len() == 1 && is_pending(&out[0]));
+}
+
+/// A retry the dispatcher accepts waits under the deadline it presented,
+/// and so does the disclosure the gate holds for it: the first request's
+/// deadline is not the one the caller is now waiting on (#186 review).
+#[test]
+fn a_held_disclosure_waits_under_the_deadline_its_retry_presented() {
+    let ring = ring();
+    let hub = WatchHub::new(KvRevision::ZERO, KvRevision::ZERO);
+    let domain = Domain::new();
+    // The first request named no deadline: the gate's own bound.
+    let (mut f, command) = bound_behind(&ring, &hub, &domain, 0);
+    assert!(matches!(
+        f.deliver_at(
+            at(NOW),
+            delivery(7, 1, command, range_outcome(b"a")),
+            &Behind
+        ),
+        coord_session::Delivered::Held
+    ));
+    assert_eq!(
+        f.next_hold_deadline(),
+        Some(at(NOW).plus(coord_session::GATE_HOLD_MILLIS))
+    );
+
+    // Its retry, 10 ms later, names 50 ms.
+    let mut logical = LogicalRequest::new(NS, range(b"a"));
+    logical.canonicalize();
+    let retry = frame_of(
+        &MessageV1::Request(RequestV1::new(retry_key(1), &logical, 50, 0).unwrap())
+            .encode()
+            .unwrap(),
+    );
+    let accepted = f.on_frame(
+        &clock(NOW),
+        at(NOW).plus(10),
+        7,
+        &retry,
+        &hub,
+        &domain.policy(),
+    );
+    assert!(
+        matches!(
+            accepted,
+            Ingress::Action(Action::Pending { .. } | Action::FanOut(_))
+        ),
+        "the retry was not accepted"
+    );
+    assert_eq!(f.next_hold_deadline(), Some(at(NOW).plus(60)));
+    assert!(f.release_held(at(NOW).plus(59), &Behind).is_empty());
+    let out = f.release_held(at(NOW).plus(60), &Behind);
+    assert!(out.len() == 1 && is_pending(&out[0]));
+}
+
+/// A held disclosure goes with its connection: nobody is waiting for it,
+/// and nothing is written later to a stream that is gone.
+#[test]
+fn a_held_disclosure_goes_with_its_connection() {
+    let ring = ring();
+    let hub = WatchHub::new(KvRevision::ZERO, KvRevision::ZERO);
+    let domain = Domain::new();
+    let (mut f, command) = bound_behind(&ring, &hub, &domain, 0);
+    assert!(matches!(
+        f.deliver_at(
+            at(NOW),
+            delivery(7, 1, command, range_outcome(b"a")),
+            &Behind
+        ),
+        coord_session::Delivered::Held
+    ));
+    f.on_connection_closed(7, &hub);
+    assert!(!f.holds_any());
+    assert!(
+        f.release_held(at(NOW).plus(10), &domain.policy())
+            .is_empty()
+    );
+}
+
+/// A second binding of a session whose establishment already executed
+/// is settled from that outcome, also before this node's projection
+/// shows the row.
+///
+/// A result is released once its group is journaled (task-d63), before
+/// the projection commit the bind barrier reads. So a caller that binds
+/// again on a second connection, right after its first binding was
+/// acknowledged, can find no row yet. Its establishment is the same
+/// invocation, which the collector holds resolved, and answering it
+/// from that outcome is what the first connection was answered from.
+/// Refusing it told the caller "bind refused" for a session that
+/// exists (coordd's `a_caller_binds_a_session_against_the_running_daemon`,
+/// once on aarch64).
+#[test]
+fn a_second_binding_after_the_establishment_executed_is_bound_from_its_outcome() {
+    let ring = ring();
+    let hub = WatchHub::new(KvRevision::ZERO, KvRevision::ZERO);
+    let mut f = frontend(&ring);
+    let bind = frame_of(&bind_frame(&token(&ring, SESSION, NOW + 1000)).unwrap());
+    let Ingress::Establishing(plan) = f.on_frame(&clock(NOW), at(NOW), 7, &bind, &hub, &Behind)
+    else {
+        panic!("the first binding did not submit its establishment");
+    };
+    let command = plan.command;
+
+    // The collector establishes it from voter evidence and the leader's
+    // release, as it does a request: that is what retains the outcome.
+    let ballot = Ballot {
+        epoch: ConfigurationEpoch::new(1).unwrap(),
+        number: 0,
+        leader: r(0),
+    };
+    let path = Digest32([1; 32]);
+    let prov = |i: u8| {
+        PeerProvenance::from_transport(
+            r(i),
+            ReplicaIncarnation::new(1).unwrap(),
+            coord_types::wire_v1::PeerRole::Voter,
+            1,
+        )
+    };
+    let admitted = f
+        .dispatcher()
+        .collector()
+        .admission(&command)
+        .expect("outstanding");
+    f.dispatcher_mut()
+        .on_evidence(
+            prov(0),
+            ProtocolMessage::LeaderReply {
+                ballot,
+                command,
+                seqnum: 1,
+                deps: vec![],
+                path,
+            },
+        )
+        .unwrap();
+    f.dispatcher_mut()
+        .on_evidence(
+            prov(1),
+            ProtocolMessage::FastAck(FastAck {
+                replica: r(1),
+                ballot,
+                command,
+                deps: vec![],
+                paths: vec![],
+                path,
+                admission: admitted,
+                seqnum: None,
+            }),
+        )
+        .unwrap();
+    let response = Response {
+        revision: KvRevision::new(1).unwrap(),
+        outcome: Outcome::SessionCreated { session: SESSION },
+    };
+    let released = ReleasedResult::from_gate(
+        EstablishedResult::establish(EstablishmentEvidence {
+            command,
+            epoch: ConfigurationEpoch::new(1).unwrap(),
+            ballot,
+            position: ExecutionPosition::new(1).unwrap(),
+            closed_predecessors: vec![],
+            result_digest: Digest32([2; 32]),
+            revision: Some(KvRevision::new(1).unwrap()),
+            fast_path: true,
+        })
+        .unwrap(),
+        postcard::to_allocvec(&response).unwrap(),
+        false,
+    );
+    let delivered = f
+        .dispatcher_mut()
+        .on_release(prov(0), released)
+        .unwrap()
+        .expect("the first binding's stream");
+    assert!(matches!(
+        f.deliver(delivered, &Behind),
+        coord_session::Delivered::Answer(_)
+    ));
+    assert!(f.binding(7).is_some(), "the first connection was not bound");
+
+    // The same credential on a second connection, while the projection
+    // still does not show the row.
+    match f.on_frame(&clock(NOW), at(NOW), 8, &bind, &hub, &Behind) {
+        Ingress::Bound(ack) => {
+            let ack = coord_session::decode_bind_ack(&frame_of(&ack)).unwrap();
+            assert_eq!(ack.session, SESSION);
+        }
+        other => panic!("a second binding of an executed establishment was not bound: {other:?}"),
+    }
+    assert!(
+        f.binding(8).is_some(),
+        "the second connection was not bound"
+    );
+}
+
 /// The bind barrier counts as having seen the row. A connection that
 /// bound against a present session and read nothing before that session
 /// was retired gets the real refusal on its first gated read, not a
@@ -1233,4 +1667,341 @@ fn a_session_the_bind_barrier_showed_and_then_retired_is_refused_not_held() {
     assert!(!is_pending(&refused));
     assert_eq!(f.deferred, 0);
     assert_eq!(f.denied, 1);
+}
+
+#[test]
+fn a_read_still_outstanding_when_the_request_memory_turns_over_is_still_disclosed() {
+    // The gate authorizes a read's output from the namespace and
+    // intervals it recorded when the dispatcher accepted the read. That
+    // record is bounded, and shared by every connection on the node: in
+    // coordd the bound is `max_outstanding_per_session`, 256. A read
+    // still outstanding when more requests than that have been accepted
+    // since must keep its record. Without it an executed read that
+    // policy permits is answered `OUTPUT_WITHHELD`, which the caller
+    // takes as final. Under load that is any read slower than the time
+    // the node takes to accept 256 requests: in a closed loop with 96
+    // callers a node, about 2.7 times the mean latency.
+    let ring = ring();
+    let domain = Domain::new();
+    let hub = WatchHub::new(KvRevision::ZERO, KvRevision::ZERO);
+    let mut f = frontend_remembering(&ring, 4);
+    let bind = frame_of(&bind_frame(&token(&ring, SESSION, NOW + 100)).unwrap());
+    let Ingress::Bound(_) = f.on_frame(&clock(NOW), at(NOW), 1, &bind, &hub, &domain.policy())
+    else {
+        panic!()
+    };
+    let (read, req) = request(1, range(b"secret"));
+    assert!(matches!(
+        f.on_frame(&clock(NOW), at(NOW), 1, &req, &hub, &domain.policy()),
+        Ingress::Action(Action::FanOut(_))
+    ));
+    // Four writes are accepted and answered while the read is out.
+    for seq in 2..=5 {
+        let (command, req) = request(seq, put(b"a", false));
+        assert!(matches!(
+            f.on_frame(&clock(NOW), at(NOW), 1, &req, &hub, &domain.policy()),
+            Ingress::Action(Action::FanOut(_))
+        ));
+        let ack = f
+            .deliver(
+                delivery(1, seq, command, Outcome::Put { prev: None }),
+                &domain.policy(),
+            )
+            .answered();
+        assert!(!is_denied(&ack), "{:?}", outcome_of(&ack));
+    }
+    // The read's result, which policy permits, is disclosed.
+    let answered = f
+        .deliver(
+            delivery(1, 1, read, range_outcome(b"secret")),
+            &domain.policy(),
+        )
+        .answered();
+    assert!(!is_denied(&answered), "{:?}", outcome_of(&answered));
+}
+
+#[test]
+fn a_read_waiting_on_its_leader_keeps_its_record_past_the_bound() {
+    // The half of what the dispatcher holds that isn't a command: a
+    // current read sent to the leader's barrier waits outside the
+    // collector, and its record is kept while it waits.
+    let ring = ring();
+    let domain = Domain::new();
+    let hub = WatchHub::new(KvRevision::ZERO, KvRevision::ZERO);
+    let mut f = frontend_remembering(&ring, 4);
+    f.dispatcher_mut().set_leader_reads(true);
+    let bind = frame_of(&bind_frame(&token(&ring, SESSION, NOW + 100)).unwrap());
+    let Ingress::Bound(_) = f.on_frame(&clock(NOW), at(NOW), 1, &bind, &hub, &domain.policy())
+    else {
+        panic!()
+    };
+    let (read, req) = request(1, range(b"secret"));
+    assert!(matches!(
+        f.on_frame(&clock(NOW), at(NOW), 1, &req, &hub, &domain.policy()),
+        Ingress::Action(Action::Read(_))
+    ));
+    assert_eq!(f.dispatcher().reads_waiting(), 1);
+    for seq in 2..=11 {
+        let mut logical = LogicalRequest::new(NS, range(b"secret"));
+        logical.canonicalize();
+        let command = CommandId::derive(&retry_key(seq), &logical).unwrap();
+        f.deliver_retained(
+            delivery(1, seq, command, range_outcome(b"secret")),
+            command,
+            &logical,
+            &domain.policy(),
+        );
+    }
+    assert!(f.remembered() <= 5, "{} remembered", f.remembered());
+    let answered = f
+        .deliver(
+            delivery(1, 1, read, range_outcome(b"secret")),
+            &domain.policy(),
+        )
+        .answered();
+    assert!(!is_denied(&answered), "{:?}", outcome_of(&answered));
+}
+
+#[test]
+fn a_result_gated_as_it_is_recorded_keeps_its_record_at_a_bound_of_one() {
+    // At a bound of one, with one record held, the record of a retained
+    // answer is added and gated at once: making room never forgets the
+    // record being added.
+    let ring = ring();
+    let domain = Domain::new();
+    let hub = WatchHub::new(KvRevision::ZERO, KvRevision::ZERO);
+    let mut f = frontend_remembering(&ring, 1);
+    let bind = frame_of(&bind_frame(&token(&ring, SESSION, NOW + 100)).unwrap());
+    let Ingress::Bound(_) = f.on_frame(&clock(NOW), at(NOW), 1, &bind, &hub, &domain.policy())
+    else {
+        panic!()
+    };
+    let (read, req) = request(1, range(b"secret"));
+    assert!(matches!(
+        f.on_frame(&clock(NOW), at(NOW), 1, &req, &hub, &domain.policy()),
+        Ingress::Action(Action::FanOut(_))
+    ));
+    for seq in 2..=4 {
+        let mut logical = LogicalRequest::new(NS, range(b"secret"));
+        logical.canonicalize();
+        let command = CommandId::derive(&retry_key(seq), &logical).unwrap();
+        let answered = f
+            .deliver_retained(
+                delivery(1, seq, command, range_outcome(b"secret")),
+                command,
+                &logical,
+                &domain.policy(),
+            )
+            .answered();
+        assert!(!is_denied(&answered), "{:?}", outcome_of(&answered));
+    }
+    let answered = f
+        .deliver(
+            delivery(1, 1, read, range_outcome(b"secret")),
+            &domain.policy(),
+        )
+        .answered();
+    assert!(!is_denied(&answered), "{:?}", outcome_of(&answered));
+}
+
+#[test]
+fn the_gate_keeps_what_the_dispatcher_holds_within_four_times_it() {
+    // More is held than the bound: each record added past it looks at a
+    // constant number of records, and the records stay within four times
+    // what the dispatcher holds. Every held read is still disclosed.
+    let ring = ring();
+    let domain = Domain::new();
+    let hub = WatchHub::new(KvRevision::ZERO, KvRevision::ZERO);
+    let mut f = frontend_remembering(&ring, 4);
+    let bind = frame_of(&bind_frame(&token(&ring, SESSION, NOW + 100)).unwrap());
+    let Ingress::Bound(_) = f.on_frame(&clock(NOW), at(NOW), 1, &bind, &hub, &domain.policy())
+    else {
+        panic!()
+    };
+    let held = 8;
+    let mut reads = Vec::new();
+    for seq in 1..=held {
+        let (read, req) = request(seq, range(b"secret"));
+        assert!(matches!(
+            f.on_frame(&clock(NOW), at(NOW), 1, &req, &hub, &domain.policy()),
+            Ingress::Action(Action::FanOut(_))
+        ));
+        reads.push((seq, read));
+    }
+    let bound = 4.max(4 * usize::try_from(held).unwrap()) + 1;
+    let mut most = 0;
+    for seq in held + 1..=held + 200 {
+        let mut logical = LogicalRequest::new(NS, range(b"secret"));
+        logical.canonicalize();
+        let command = CommandId::derive(&retry_key(seq), &logical).unwrap();
+        f.deliver_retained(
+            delivery(1, seq, command, range_outcome(b"secret")),
+            command,
+            &logical,
+            &domain.policy(),
+        );
+        most = most.max(f.remembered());
+        assert!(f.remembered() <= bound, "{} remembered", f.remembered());
+    }
+    assert!(most > 4, "the held reads were kept past the bound");
+    for (seq, read) in reads {
+        let answered = f
+            .deliver(
+                delivery(1, seq, read, range_outcome(b"secret")),
+                &domain.policy(),
+            )
+            .answered();
+        assert!(!is_denied(&answered), "{:?}", outcome_of(&answered));
+    }
+}
+
+#[test]
+fn the_gate_forgets_settled_requests_past_its_bound() {
+    // What the gate keeps past its bound is only what the dispatcher can
+    // still deliver. A retained result answers a retry from the record:
+    // the dispatcher never holds it, so its record goes once the bound
+    // is passed.
+    let ring = ring();
+    let domain = Domain::new();
+    let hub = WatchHub::new(KvRevision::ZERO, KvRevision::ZERO);
+    let mut f = frontend_remembering(&ring, 4);
+    let bind = frame_of(&bind_frame(&token(&ring, SESSION, NOW + 100)).unwrap());
+    let Ingress::Bound(_) = f.on_frame(&clock(NOW), at(NOW), 1, &bind, &hub, &domain.policy())
+    else {
+        panic!()
+    };
+    for seq in 1..=10 {
+        let mut logical = LogicalRequest::new(NS, range(b"secret"));
+        logical.canonicalize();
+        let command = CommandId::derive(&retry_key(seq), &logical).unwrap();
+        let answered = f
+            .deliver_retained(
+                delivery(1, seq, command, range_outcome(b"secret")),
+                command,
+                &logical,
+                &domain.policy(),
+            )
+            .answered();
+        assert!(!is_denied(&answered), "{:?}", outcome_of(&answered));
+        assert!(f.remembered() <= 4, "{} remembered", f.remembered());
+    }
+    // A read the dispatcher holds is kept past the bound.
+    let (read, req) = request(11, range(b"secret"));
+    assert!(matches!(
+        f.on_frame(&clock(NOW), at(NOW), 1, &req, &hub, &domain.policy()),
+        Ingress::Action(Action::FanOut(_))
+    ));
+    for seq in 12..=20 {
+        let mut logical = LogicalRequest::new(NS, range(b"secret"));
+        logical.canonicalize();
+        let command = CommandId::derive(&retry_key(seq), &logical).unwrap();
+        f.deliver_retained(
+            delivery(1, seq, command, range_outcome(b"secret")),
+            command,
+            &logical,
+            &domain.policy(),
+        );
+    }
+    assert!(f.remembered() <= 5, "{} remembered", f.remembered());
+    let answered = f
+        .deliver(
+            delivery(1, 11, read, range_outcome(b"secret")),
+            &domain.policy(),
+        )
+        .answered();
+    assert!(!is_denied(&answered), "{:?}", outcome_of(&answered));
+}
+
+/// A record the dispatcher let go can be held again (#268 review): an
+/// answered read presented again waits on its leader again, and its key
+/// already has a record. A caller that presents its two oldest answered
+/// reads again before each new one keeps the gate's looks on held
+/// records. The records stay within the larger of the bound and four
+/// times what is held, plus the one being added, and every read is
+/// disclosed.
+#[test]
+fn answered_reads_presented_again_keep_the_records_within_the_bound() {
+    let ring = ring();
+    let domain = Domain::new();
+    let hub = WatchHub::new(KvRevision::ZERO, KvRevision::ZERO);
+    let mut f = frontend_remembering(&ring, 4);
+    f.dispatcher_mut().set_leader_reads(true);
+    let bind = frame_of(&bind_frame(&token(&ring, SESSION, NOW + 100)).unwrap());
+    let Ingress::Bound(_) = f.on_frame(&clock(NOW), at(NOW), 1, &bind, &hub, &domain.policy())
+    else {
+        panic!("bound")
+    };
+    let ballot = Ballot {
+        epoch: ConfigurationEpoch::new(1).unwrap(),
+        number: 0,
+        leader: r(0),
+    };
+    let response = postcard::to_allocvec(&Response {
+        revision: KvRevision::new(1).unwrap(),
+        outcome: range_outcome(b"secret"),
+    })
+    .unwrap();
+    let mut order: std::collections::VecDeque<u64> = std::collections::VecDeque::new();
+    let mut most_held = 0usize;
+    let mut most_remembered = 0usize;
+    let mut again = 0usize;
+    let mut disclosed = 0usize;
+    for seq in 1..=600u64 {
+        let mut waiting = Vec::new();
+        if order.len() >= 4 {
+            for _ in 0..2 {
+                let old = order.pop_front().unwrap();
+                let (_, req) = request(old, range(b"secret"));
+                let action = f.on_frame(&clock(NOW), at(NOW), 1, &req, &hub, &domain.policy());
+                assert!(
+                    matches!(action, Ingress::Action(Action::Read(_))),
+                    "an answered read presented again waits on its leader again"
+                );
+                waiting.push(old);
+                again += 1;
+                order.push_back(old);
+            }
+        }
+        let (_, req) = request(seq, range(b"secret"));
+        assert!(matches!(
+            f.on_frame(&clock(NOW), at(NOW), 1, &req, &hub, &domain.policy()),
+            Ingress::Action(Action::Read(_))
+        ));
+        order.push_back(seq);
+        waiting.push(seq);
+        most_held = most_held.max(f.dispatcher().reads_waiting());
+        most_remembered = most_remembered.max(f.remembered());
+        // The leader answers every read before the next request.
+        for s in waiting {
+            let resolution = f.dispatcher_mut().on_read_answer(
+                at(NOW),
+                PeerProvenance::from_transport(
+                    r(0),
+                    ReplicaIncarnation::new(1).unwrap(),
+                    coord_types::wire_v1::PeerRole::Voter,
+                    1,
+                ),
+                coord_collector::ReadAnswerV1 {
+                    retry_key: retry_key(s),
+                    ballot,
+                    outcome: coord_collector::ReadOutcomeV1::Served {
+                        response: response.clone(),
+                    },
+                },
+            );
+            let Some(coord_collector::ReadResolution::Answer(delivery)) = resolution else {
+                panic!("answered")
+            };
+            if !is_denied(&f.deliver(delivery, &domain.policy()).answered()) {
+                disclosed += 1;
+            }
+        }
+        assert_eq!(f.dispatcher().reads_waiting(), 0);
+    }
+    let bound = 4.max(4 * most_held) + 1;
+    assert!(
+        most_remembered <= bound,
+        "remembered at most {most_remembered} over 600 reads and {again} presented again; most held at once {most_held}; bound {bound}"
+    );
+    assert_eq!(disclosed, 600 + again, "every read is disclosed");
 }

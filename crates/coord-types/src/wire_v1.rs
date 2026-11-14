@@ -133,9 +133,41 @@ pub const SESSION_BIND_VERSION: u16 = 1;
 /// different number, and a second registry is how they would come to.
 pub const KIND_COLLECTOR_SUBMIT: u16 = 0x0103;
 
-/// The only schema version of a collector submission this build
-/// understands.
+/// The schema version of a collector submission answered as it always
+/// was, on the collector's own count of the evidence.
 pub const COLLECTOR_SUBMIT_VERSION: u16 = 1;
+
+/// The schema version of a collector submission marked as answered on
+/// the leader's release alone (task-d100, step A): the same payload as
+/// [`COLLECTOR_SUBMIT_VERSION`], and the voters send its frontend no
+/// evidence.
+pub const COLLECTOR_SUBMIT_ANSWER_ON_RELEASE_VERSION: u16 = 2;
+
+/// Schema version of a collector submission relayed to its ballot's
+/// leader alone (task-d102, task-d100's step B): the same payload as
+/// [`COLLECTOR_SUBMIT_VERSION`], answered on the leader's release alone
+/// as version 2 is, and proposed with its payload. A voter that isn't
+/// leading refuses it rather than voting on it.
+pub const COLLECTOR_SUBMIT_RELAYED_VERSION: u16 = 3;
+
+/// Every schema version of a collector submission this build
+/// understands.
+pub const COLLECTOR_SUBMIT_VERSIONS: [u16; 3] = [
+    COLLECTOR_SUBMIT_VERSION,
+    COLLECTOR_SUBMIT_ANSWER_ON_RELEASE_VERSION,
+    COLLECTOR_SUBMIT_RELAYED_VERSION,
+];
+
+/// A trusted collector's current read, sent to the leader it follows
+/// only (`spec/wire-v1.md`, "Collector frames"; task-d50, design Section
+/// 6.3). A raw kind of the API range like [`KIND_COLLECTOR_SUBMIT`], and
+/// admitted on a request stream on the same terms: from a role that
+/// [`PeerRole::may_submit_for_clients`]. Its payload is
+/// `coord_collector::wire::ReadV1`.
+pub const KIND_COLLECTOR_READ: u16 = 0x0107;
+
+/// The only schema version of a collector read this build understands.
+pub const COLLECTOR_READ_VERSION: u16 = 1;
 
 /// Registered message kinds with frozen discriminants.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -410,6 +442,18 @@ impl FrameReader {
         }
         self.buf.extend_from_slice(bytes);
         Ok(())
+    }
+
+    /// The whole length of the frame whose header is buffered, once the
+    /// header is complete: what receiving that frame will hold.
+    pub fn pending_frame_len(&self) -> Option<Result<usize, WireError>> {
+        let avail = &self.buf[self.start..];
+        if avail.len() < HEADER_LEN {
+            return None;
+        }
+        let mut header = [0u8; HEADER_LEN];
+        header.copy_from_slice(&avail[..HEADER_LEN]);
+        Some(check_header(&header))
     }
 
     /// Bytes buffered but not yet consumed as frames.
@@ -780,6 +824,15 @@ impl RequestV1 {
         }
         Ok(request)
     }
+
+    /// The embedded logical request, verified as [`Self::logical`]
+    /// verifies it, and its command identity derived from the bytes it
+    /// verified: one canonical encoding rather than two (task-d60).
+    pub fn command(&self) -> Result<(LogicalRequest, CommandId), WireError> {
+        let request = self.logical()?;
+        let command = CommandId::from_canonical(&self.retry_key, self.logical.as_slice());
+        Ok((request, command))
+    }
 }
 
 /// Outcome of a request.
@@ -801,7 +854,10 @@ pub enum OutcomeV1 {
     },
     /// Outcome not yet resolvable; retry `ResolveRequest` later.
     Pending,
-    /// Outcome unknown to this endpoint (session retired or history lost).
+    /// Outcome unknown to this endpoint: neither its memory nor its
+    /// durable record says what came of the invocation. Submitting the
+    /// same invocation again, under the same identity, is how a client
+    /// learns more (task-d23).
     Unknown,
 }
 
@@ -1072,4 +1128,15 @@ pub mod codes {
     /// `max_request_bytes`); nothing was submitted, and the same request
     /// will be refused again.
     pub const REQUEST_TOO_LARGE: u16 = 0x0006;
+    /// The command executed, and its result is not disclosed to this
+    /// caller: the output gate withholds it under the current policy, or
+    /// the session may no longer read it (task-d23). The operation
+    /// happened; it is not submitted again, and it is not a refusal to
+    /// admit.
+    pub const OUTPUT_WITHHELD: u16 = 0x0007;
+    /// The outcome is retired: the invocation's sequence is at or below
+    /// its client instance's retirement floor, and no result is kept for
+    /// it (task-d23). Whether it happened is not retrievable any more,
+    /// here or anywhere.
+    pub const RESULT_RETIRED: u16 = 0x0008;
 }

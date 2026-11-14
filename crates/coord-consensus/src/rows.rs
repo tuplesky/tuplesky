@@ -65,14 +65,7 @@ pub fn promise_key(epoch: ConfigurationEpoch) -> Vec<u8> {
 
 /// Encode the promise row.
 pub fn encode_promise(record: &PromiseRecordV1) -> Result<Vec<u8>, EngineError> {
-    let payload = postcard::to_allocvec(record)
-        .map_err(|_| EngineError::new(ErrorClass::Limit, "promise encode"))?;
-    StoreEnvelopeV1 {
-        record_kind: PROMISE_KIND,
-        schema_version: 1,
-        payload,
-    }
-    .encode()
+    envelope(PROMISE_KIND, record, "promise encode")
 }
 
 /// Decode the promise row.
@@ -113,14 +106,7 @@ pub fn dependency_key(epoch: ConfigurationEpoch, command: &CommandId) -> Vec<u8>
 /// Encode a command's required dependency state (phase, dependencies,
 /// payload binding and path evidence).
 pub fn encode_dependency(record: &CommandRecord) -> Result<Vec<u8>, EngineError> {
-    let payload = postcard::to_allocvec(record)
-        .map_err(|_| EngineError::new(ErrorClass::Limit, "dependency encode"))?;
-    StoreEnvelopeV1 {
-        record_kind: DEPENDENCY_KIND,
-        schema_version: 1,
-        payload,
-    }
-    .encode()
+    envelope(DEPENDENCY_KIND, record, "dependency encode")
 }
 
 /// Decode a dependency row.
@@ -150,6 +136,18 @@ pub fn dependency_update(
     })
 }
 
+/// The update deleting a command's dependency row in an epoch
+/// (task-d08): a command pulled from a peer without the peer's decided
+/// record goes to history, and the record this replica had of it must
+/// not come back after a restart to be reported as that decision.
+pub fn dependency_delete(epoch: ConfigurationEpoch, command: &CommandId) -> StoreUpdate {
+    StoreUpdate {
+        collection: Collection::ProtocolV1.id(),
+        key: dependency_key(epoch, command),
+        value: None,
+    }
+}
+
 /// The immutable canonical command in `payload_v1`, keyed by command
 /// identity: retry key, canonical logical bytes (rehashed on read), and
 /// the admission the command was accepted under.
@@ -158,6 +156,7 @@ pub struct PayloadRecordV1 {
     /// Stable invocation identity.
     pub retry_key: RetryKey,
     /// Canonical `LogicalRequest` encoding.
+    #[serde(with = "coord_core::byte_string")]
     pub logical: Vec<u8>,
     /// What the admitting verifier attested, as part of what this
     /// command durably *is*.
@@ -221,20 +220,17 @@ pub fn payload_key(command: &CommandId) -> Vec<u8> {
     command.as_bytes().to_vec()
 }
 
+/// `StoreEnvelopeV1 { record_kind, schema_version, payload }` with
+/// `value` as its payload, in one allocation
+/// ([`StoreEnvelopeV1::encode_value`]). The bytes are the envelope's
+/// (`envelope_is_the_envelopes_encoding`).
 fn envelope_at<T: Serialize>(
     kind: u16,
     schema_version: u16,
     value: &T,
     what: &'static str,
 ) -> Result<Vec<u8>, EngineError> {
-    let payload =
-        postcard::to_allocvec(value).map_err(|_| EngineError::new(ErrorClass::Limit, what))?;
-    StoreEnvelopeV1 {
-        record_kind: kind,
-        schema_version,
-        payload,
-    }
-    .encode()
+    StoreEnvelopeV1::encode_value(kind, schema_version, value, what)
 }
 
 fn envelope<T: Serialize>(
@@ -302,6 +298,18 @@ pub fn payload_update(
     })
 }
 
+/// The update deleting a command's payload row (task-d24): a record a
+/// Sync released goes with its payload, so the replica is as if it never
+/// held the command, and a later proposal of it fetches the payload as
+/// any missing one is fetched, before and after a restart.
+pub fn payload_delete(command: &CommandId) -> StoreUpdate {
+    StoreUpdate {
+        collection: Collection::PayloadV1.id(),
+        key: payload_key(command),
+        value: None,
+    }
+}
+
 /// The leader's recoverable proposal state for a command.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ProposalRecordV1 {
@@ -366,33 +374,11 @@ pub fn sync_key(epoch: ConfigurationEpoch, ballot: &Ballot) -> Vec<u8> {
 }
 
 /// Schema version of the Sync row. Version 1 carried no path evidence in
-/// its entries; version 2 (task-28) carries the combined digest, the
+/// its entries; version 2 (task-28) added the combined digest, the
 /// per-key digests and the leader sequence number they were synchronized
-/// at, so the layout changed and the version had to change with it.
-pub const SYNC_SCHEMA_VERSION: u16 = 2;
-
-/// A version 1 Sync entry: dependencies only, no path evidence.
-#[derive(Clone, Debug, Deserialize)]
-struct SyncEntryV1 {
-    command: CommandId,
-    phase: crate::phase::Phase,
-    deps: Vec<CommandId>,
-}
-
-/// A version 1 Sync decision.
-#[derive(Clone, Debug, Deserialize)]
-struct SyncDecisionV1 {
-    ballot: Ballot,
-    source_ballot: Ballot,
-    entries: alloc::collections::BTreeMap<CommandId, SyncEntryV1>,
-    reproposed: alloc::collections::BTreeSet<CommandId>,
-}
-
-/// A version 1 Sync row.
-#[derive(Clone, Debug, Deserialize)]
-struct SyncRecordV1Legacy {
-    decision: SyncDecisionV1,
-}
+/// at; version 3 (task-d14) adds the admission digest each entry was
+/// accepted under.
+pub const SYNC_SCHEMA_VERSION: u16 = 3;
 
 /// The durable seal of one replica on one configuration (design
 /// Section 10.3.2).
@@ -451,48 +437,84 @@ pub fn encode_sync(record: &SyncRecordV1) -> Result<Vec<u8>, EngineError> {
     envelope_at(SYNC_KIND, SYNC_SCHEMA_VERSION, record, "sync encode")
 }
 
-/// Decode a Sync row, including one written by a revision that stored the
-/// version 1 layout. A version 1 selection is read back with empty path
-/// evidence, which is what that revision knew: the dependencies it bound
-/// are preserved exactly, and the replica realigns nothing it has no
-/// evidence for. Any other version is refused rather than misread.
+/// Decode a Sync row.
+///
+/// Only the current layout is read. A row of an earlier version names no
+/// admission facts, and reading it as a selection without them would let
+/// the replica install and execute its entries under whichever facts it
+/// happens to hold, which is the divergence version 3 exists to prevent
+/// (task-d14). It is refused as corrupt, loudly, and the store has to be
+/// started fresh.
 pub fn decode_sync(bytes: &[u8]) -> Result<SyncRecordV1, EngineError> {
     let (version, payload) = open(SYNC_KIND, bytes, "sync record")?;
     match version {
         SYNC_SCHEMA_VERSION => decode_exact(&payload, "sync record"),
-        1 => {
-            let legacy: SyncRecordV1Legacy = decode_exact(&payload, "sync record")?;
-            Ok(SyncRecordV1 {
-                decision: SyncDecision {
-                    ballot: legacy.decision.ballot,
-                    source_ballot: legacy.decision.source_ballot,
-                    entries: legacy
-                        .decision
-                        .entries
-                        .into_iter()
-                        .map(|(c, e)| {
-                            (
-                                c,
-                                crate::recovery::SyncEntry {
-                                    command: e.command,
-                                    phase: e.phase,
-                                    deps: e.deps,
-                                    path: crate::graph::empty_path(),
-                                    paths: Vec::new(),
-                                    seqnum: 0,
-                                },
-                            )
-                        })
-                        .collect(),
-                    reproposed: legacy.decision.reproposed,
-                },
-            })
-        }
+        1 | 2 => Err(EngineError::new(
+            ErrorClass::Corrupt,
+            "sync record of a layout without admission facts (before task-d14)",
+        )),
         _ => Err(EngineError::new(
             ErrorClass::Corrupt,
             "sync record of an unsupported schema version",
         )),
     }
+}
+
+/// The update binding `decision`, if its Sync fits both the row it is
+/// written in and the frame it is published in (task-d20); otherwise the
+/// named refusal, with its size.
+///
+/// A Sync is written as one row by the candidate and by every voter that
+/// installs it, and a write that did not fit ended the process in the
+/// middle of an election.
+pub fn bounded_sync_update(
+    epoch: ConfigurationEpoch,
+    decision: &crate::recovery::SyncDecision,
+) -> Result<StoreUpdate, crate::recovery::RecoveryError> {
+    let frame_limit = coord_types::wire_v1::KindRange::ProtocolEvidence.max_frame_length() as usize;
+    let limit = coord_store_api::envelope::MAX_ENVELOPE_PAYLOAD.min(frame_limit);
+    let too_large = |bytes: usize| crate::recovery::RecoveryError::SyncTooLarge {
+        entries: decision.entries.len(),
+        bytes,
+        limit,
+    };
+    // Encoded once (task-d26): the frame is the Sync's tag before these
+    // bytes, and the row's payload is these bytes, a record of one field
+    // encoding as that field. Encoding the message and the record apart
+    // held two copies of the largest structure an election builds beside
+    // their two encodings.
+    let body = postcard::to_allocvec(decision).map_err(|_| too_large(usize::MAX))?;
+    let frame = sync_frame_overhead(decision.ballot) + body.len();
+    if frame > frame_limit {
+        return Err(too_large(frame));
+    }
+    // A row that does not fit is reported with the row's own size, not
+    // the frame's that fitted.
+    let row = body.len();
+    let value = StoreEnvelopeV1 {
+        record_kind: SYNC_KIND,
+        schema_version: SYNC_SCHEMA_VERSION,
+        payload: body,
+    }
+    .encode()
+    .map_err(|_| too_large(row))?;
+    Ok(StoreUpdate {
+        collection: Collection::ProtocolV1.id(),
+        key: sync_key(epoch, &decision.ballot),
+        value: Some(value),
+    })
+}
+
+/// The bytes a Sync frame carries before its selection's encoding.
+fn sync_frame_overhead(ballot: Ballot) -> usize {
+    let empty = crate::recovery::SyncDecision {
+        ballot,
+        source_ballot: ballot,
+        entries: alloc::collections::BTreeMap::new(),
+        reproposed: alloc::collections::BTreeSet::new(),
+    };
+    let body = postcard::to_allocvec(&empty).map_or(0, |b| b.len());
+    crate::messages::ProtocolMessage::Sync(empty).encode().len() - body
 }
 
 /// The update persisting a bound Sync selection.
@@ -505,4 +527,162 @@ pub fn sync_update(
         key: sync_key(epoch, &record.decision.ballot),
         value: Some(encode_sync(record)?),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use coord_store_api::envelope::MAX_ENVELOPE_PAYLOAD;
+    use coord_types::ids::{
+        ClientInstanceId, ClusterId, DomainId, ReplicaId, RequestSequence, SessionId,
+    };
+
+    fn retry_key(seq: u64) -> RetryKey {
+        RetryKey {
+            cluster_id: ClusterId([1; 16]),
+            domain_id: DomainId([2; 16]),
+            session_id: SessionId([3; 16]),
+            client_instance_id: ClientInstanceId([4; 16]),
+            request_sequence: RequestSequence::new(seq).unwrap(),
+        }
+    }
+
+    /// Lengths either side of each varint width a byte string's length
+    /// takes, and the bench's request size.
+    const LENGTHS: [usize; 9] = [0, 1, 127, 128, 2500, 16_383, 16_384, 70_000, 2_097_151];
+
+    fn payload(len: usize) -> PayloadRecordV1 {
+        PayloadRecordV1 {
+            retry_key: retry_key(len as u64 + 1),
+            logical: (0..len).map(|i| (i % 251) as u8).collect(),
+            admission: None,
+            ack_through: len as u64,
+        }
+    }
+
+    /// The payload record as it was before its logical bytes were a byte
+    /// string: a `Vec<u8>` serde takes as a sequence.
+    #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+    struct PayloadAsItWas {
+        retry_key: RetryKey,
+        logical: Vec<u8>,
+        #[serde(default)]
+        admission: Option<AdmissionFacts>,
+        #[serde(default)]
+        ack_through: u64,
+    }
+
+    impl From<&PayloadRecordV1> for PayloadAsItWas {
+        fn from(p: &PayloadRecordV1) -> Self {
+            PayloadAsItWas {
+                retry_key: p.retry_key,
+                logical: p.logical.clone(),
+                admission: p.admission,
+                ack_through: p.ack_through,
+            }
+        }
+    }
+
+    /// What `envelope_at` replaced: the value encoded on its own, then
+    /// the envelope around it.
+    fn as_it_was<T: Serialize>(kind: u16, schema_version: u16, value: &T) -> Vec<u8> {
+        StoreEnvelopeV1 {
+            record_kind: kind,
+            schema_version,
+            payload: postcard::to_allocvec(value).unwrap(),
+        }
+        .encode()
+        .unwrap()
+    }
+
+    #[test]
+    fn a_byte_string_is_encoded_as_the_sequence_was() {
+        for len in LENGTHS {
+            let record = payload(len);
+            let before = PayloadAsItWas::from(&record);
+            let bytes = postcard::to_allocvec(&record).unwrap();
+            assert_eq!(bytes, postcard::to_allocvec(&before).unwrap(), "{len}");
+            // A row written before reads as it did, and one written now
+            // reads with the record as it was.
+            assert_eq!(
+                postcard::from_bytes::<PayloadRecordV1>(&bytes).unwrap(),
+                record
+            );
+            assert_eq!(
+                postcard::from_bytes::<PayloadAsItWas>(&bytes).unwrap(),
+                before
+            );
+            // A format without byte strings (JSON, a sequence of numbers)
+            // reads the field as it always did.
+            if len <= 2500 {
+                let json = serde_json::to_string(&before).unwrap();
+                assert_eq!(serde_json::to_string(&record).unwrap(), json);
+                assert_eq!(
+                    serde_json::from_str::<PayloadRecordV1>(&json).unwrap(),
+                    record
+                );
+            }
+        }
+        // The length is still checked against the bytes there are.
+        let mut short = postcard::to_allocvec(&payload(2500)).unwrap();
+        short.truncate(short.len() - 9);
+        assert!(postcard::from_bytes::<PayloadRecordV1>(&short).is_err());
+    }
+
+    #[test]
+    fn envelope_is_the_envelopes_encoding() {
+        for len in LENGTHS {
+            let record = payload(len);
+            let row = encode_payload(&record).unwrap();
+            assert_eq!(row, as_it_was(PAYLOAD_KIND, 1, &record), "{len}");
+            assert_eq!(decode_payload(&row).unwrap(), record);
+        }
+        let ballot = Ballot {
+            epoch: ConfigurationEpoch::new(7).unwrap(),
+            number: 300,
+            leader: ReplicaId([9; 16]),
+        };
+        let promise = PromiseRecordV1 {
+            promised: ballot,
+            synced: ballot,
+        };
+        assert_eq!(
+            encode_promise(&promise).unwrap(),
+            as_it_was(PROMISE_KIND, 1, &promise)
+        );
+        assert_eq!(
+            decode_promise(&encode_promise(&promise).unwrap()).unwrap(),
+            promise
+        );
+        for deps in [0, 1, 200] {
+            let proposal = ProposalRecordV1 {
+                ballot,
+                seqnum: 1 << 40,
+                deps: (0..deps)
+                    .map(|i| CommandId::from_canonical(&retry_key(i + 1), &[i as u8]))
+                    .collect(),
+                path: Digest32([3; 32]),
+            };
+            assert_eq!(
+                encode_proposal(&proposal).unwrap(),
+                as_it_was(PROPOSAL_KIND, 1, &proposal)
+            );
+        }
+        // An envelope over the limit is refused as it was.
+        let over = PayloadRecordV1 {
+            logical: alloc::vec![0; MAX_ENVELOPE_PAYLOAD],
+            ..payload(0)
+        };
+        let refused = encode_payload(&over).unwrap_err();
+        assert_eq!(refused.class, ErrorClass::Limit);
+        assert!(
+            StoreEnvelopeV1 {
+                record_kind: PAYLOAD_KIND,
+                schema_version: 1,
+                payload: postcard::to_allocvec(&over).unwrap(),
+            }
+            .encode()
+            .is_err()
+        );
+    }
 }

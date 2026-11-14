@@ -39,6 +39,20 @@ impl ViewBudget {
     };
 }
 
+// A revoke or an expiry loads all of its lease's attachments into one view:
+// each attached key's reverse-index row and its current row, whose value is
+// the previous value the command deletes. A key is stored escaped, at most
+// twice its length and a terminator, so the two rows hold at most four
+// copies of the key, the value, and the ids and encodings (well under 512
+// bytes). That's less than the key's `attachment_cost` (seven copies, the
+// value and 512 bytes), so a lease within `MAX_LEASE_BYTES` loads less than
+// that. This keeps such a view inside the schema budget, with room for the
+// lease's own row, so a lease at its quota is revoked or expires rather than
+// being refused as `ViewTooLarge`. (Its attachments, at most
+// `max_lease_attachments`, 128, are 256 rows, inside `max_rows`.)
+const _: () =
+    assert!(coord_state::MAX_LEASE_BYTES + 64 * 1024 <= ViewBudget::SCHEMA.max_bytes as u64);
+
 impl Default for ViewBudget {
     fn default() -> Self {
         ViewBudget::SCHEMA
@@ -169,6 +183,46 @@ struct Budget {
     bytes: u32,
 }
 
+/// The fewest bytes a budgeted page asks for: more than any row a view
+/// reads, which is a key at its limit as it is stored (escaped, with its
+/// collection's ids and terminator) and an envelope at its limit with its
+/// header.
+///
+/// An engine refuses a page whose first row is larger than the page
+/// (`ErrorClass::Limit`, [`OrderedRead::scan_page`]). Were a page to ask
+/// for no more than the bytes the budget has left, a row that doesn't fit
+/// them would come back as that engine error, and a command whose view
+/// overruns the budget would stop the voter instead of being refused, at
+/// every voter and again on replay. Asking for at least a whole row leaves
+/// the refusal to [`Budget::charge`], which every replica makes the same
+/// way.
+const PAGE_BYTES_FLOOR: u32 = {
+    let floor = coord_store_api::envelope::MAX_ENVELOPE_PAYLOAD + 64 * 1024;
+    assert!(floor <= u32::MAX as usize);
+    floor as u32
+};
+
+// A row key holds the request's key escaped (`ordered_key` writes each zero
+// byte as two), so a key at its limit is stored in up to twice its length.
+// The 64 covers the rest of the longest row key and its value's header: a
+// reverse-index row's two ids (the lease and the namespace, 32 bytes), the
+// key's terminator (2) and the envelope's header (`HEADER_MAX`, 16).
+const _: () = assert!(
+    2 * coord_types::logical_v1::limits::MAX_KEY_BYTES + 64 < 64 * 1024,
+    "a key at its limit, escaped, with its row's ids, its terminator and an envelope's header \
+     fits the floor's margin"
+);
+
+/// The byte limit for the next page of a budgeted scan: what the budget
+/// has left, and never less than [`PAGE_BYTES_FLOOR`]. A budget with no
+/// bytes left is refused before anything is read.
+fn page_bytes(budget: &Budget) -> Result<NonZeroU32, ViewBuildError> {
+    if budget.bytes == 0 {
+        return Err(ViewBuildError::BudgetExceeded);
+    }
+    Ok(NonZeroU32::new(budget.bytes.max(PAGE_BYTES_FLOOR)).expect("nonzero"))
+}
+
 impl Budget {
     fn charge(&mut self, rows: usize, bytes: usize) -> Result<(), ViewBuildError> {
         let rows = u32::try_from(rows).map_err(|_| ViewBuildError::BudgetExceeded)?;
@@ -186,48 +240,6 @@ impl Budget {
 }
 
 /// Scan every row of `collection` in `[lower, upper)` within the budget.
-/// Every history row in `[lower, upper)`, read in bounded pages.
-///
-/// The work is local and the pages bound it; what the pages must not do
-/// is decide a replicated outcome, so nothing here is charged to the
-/// view budget. The range itself is bounded by the replicated retention
-/// floor, which is the same on every replica.
-fn scan_history<V: OrderedRead>(
-    view: &V,
-    lower: Vec<u8>,
-    upper: Bound<Vec<u8>>,
-) -> Result<RawRows, ViewBuildError> {
-    /// One page of history rows. Large enough for any schema-valid row.
-    const PAGE_BYTES: u32 = 16 * 1024 * 1024;
-    let mut out = Vec::new();
-    let mut request = ScanRequest {
-        lower: Bound::Included(lower),
-        upper,
-        direction: Direction::Forward,
-        resume_after: None,
-        max_rows: NonZeroU32::new(256).expect("nonzero"),
-        max_bytes: NonZeroU32::new(PAGE_BYTES).expect("nonzero"),
-    };
-    loop {
-        let page = view.scan_page(Collection::KvHistoryV1.id(), &request)?;
-        let last = page.rows.last().map(|r| r.key.clone());
-        out.extend(page.rows.into_iter().map(|r| (r.key, r.value)));
-        if page.exhausted {
-            return Ok(out);
-        }
-        match last {
-            Some(key) => request.resume_after = Some(key),
-            // A page that is neither exhausted nor advancing would loop.
-            None => {
-                return Err(ViewBuildError::Engine(EngineError::new(
-                    ErrorClass::Corrupt,
-                    "history scan made no progress",
-                )));
-            }
-        }
-    }
-}
-
 fn scan_all<V: OrderedRead>(
     view: &V,
     collection: Collection,
@@ -242,14 +254,13 @@ fn scan_all<V: OrderedRead>(
         direction: Direction::Forward,
         resume_after: None,
         max_rows: NonZeroU32::new(256).expect("nonzero"),
-        // The page byte limit is the remaining view budget, so any
-        // schema-valid row (a value near `MAX_VALUE_BYTES` plus key and
-        // envelope) fits a page while the budget allows it.
-        max_bytes: NonZeroU32::new(budget.bytes).ok_or(ViewBuildError::BudgetExceeded)?,
+        max_bytes: page_bytes(budget)?,
     };
     loop {
-        request.max_bytes = NonZeroU32::new(budget.bytes).ok_or(ViewBuildError::BudgetExceeded)?;
+        request.max_bytes = page_bytes(budget)?;
         let page = view.scan_page(collection.id(), &request)?;
+        // A page may hold rows past the budget; the first of them is
+        // refused here.
         for row in &page.rows {
             budget.charge(1, row.key.len() + row.value.len())?;
         }
@@ -271,19 +282,6 @@ fn current_bounds(namespace: &NamespaceId, touch: &Touch) -> (Vec<u8>, Bound<Vec
         Touch::Interval(lo, hi) => (
             codecs::current_key(namespace, lo),
             Bound::Excluded(codecs::current_key(namespace, hi)),
-        ),
-    }
-}
-
-fn history_bounds(namespace: &NamespaceId, touch: &Touch) -> (Vec<u8>, Bound<Vec<u8>>) {
-    match touch {
-        Touch::Exact(k) => {
-            let (lo, hi) = ordered_key::history_bounds(namespace, k);
-            (lo, Bound::Excluded(hi))
-        }
-        Touch::Interval(lo, hi) => (
-            codecs::history_key(namespace, lo, KvRevision::ZERO),
-            Bound::Excluded(codecs::history_key(namespace, hi, KvRevision::ZERO)),
         ),
     }
 }
@@ -388,6 +386,18 @@ pub fn build_authorized_view<V: OrderedRead>(
     budget: ViewBudget,
 ) -> Result<ReadView, ViewBuildError> {
     let authorization = load_authorization(gated.view(), namespace, session, budget)?;
+    build_view_under(gated, namespace, authorization, request, budget)
+}
+
+/// [`build_authorized_view`] with the authorization context already
+/// loaded, from this view or one that reads the same rows.
+pub fn build_view_under<V: OrderedRead>(
+    gated: &GatedView<V>,
+    namespace: NamespaceId,
+    authorization: Authorization,
+    request: &LogicalRequest,
+    budget: ViewBudget,
+) -> Result<ReadView, ViewBuildError> {
     let principal = authorization
         .session
         .as_ref()
@@ -489,14 +499,16 @@ pub fn active_leases_page<V: OrderedRead>(
         direction: Direction::Forward,
         resume_after: after.map(|id| codecs::lease_row_key(&id)),
         max_rows: NonZeroU32::new(256).expect("nonzero"),
-        max_bytes: NonZeroU32::new(budget.bytes).ok_or(ViewBuildError::BudgetExceeded)?,
+        max_bytes: page_bytes(&budget)?,
     };
     let mut leases = Vec::new();
     let mut last: Option<LeaseId> = None;
     loop {
         request.max_rows =
             NonZeroU32::new(budget.rows.min(256)).ok_or(ViewBuildError::BudgetExceeded)?;
-        request.max_bytes = NonZeroU32::new(budget.bytes).ok_or(ViewBuildError::BudgetExceeded)?;
+        // At least a whole row, so a row past the bytes left ends the page
+        // below rather than failing the scan ([`PAGE_BYTES_FLOOR`]).
+        request.max_bytes = page_bytes(&budget)?;
         let page = view.scan_page(Collection::LeaseV1.id(), &request)?;
         for row in &page.rows {
             if budget.charge(1, row.key.len() + row.value.len()).is_err() {
@@ -582,7 +594,51 @@ pub fn build_read_view<V: OrderedRead>(
     read_view.lease_authority = codecs::read_lease_authority(view)?;
     let touched = touches(&request.operation);
     let mut seen: BTreeSet<Vec<u8>> = BTreeSet::new();
+    // An exact key's row, by the bytes it is charged: read with one point
+    // read, once however often the request touches the key (a contended
+    // transaction's compare, success put and failure put touch one key
+    // three times).
+    let mut exact: BTreeMap<&[u8], Option<usize>> = BTreeMap::new();
     for touch in &touched {
+        if let Touch::Exact(key) = touch {
+            // Each touch is charged as the one-row scan it replaces
+            // (`scan_all`) charged it, because the budget's refusal is a
+            // replicated outcome: a touch with no bytes left is refused
+            // before it reads, a row larger than the bytes left is refused
+            // by the budget (`BudgetExceeded`), and a row is charged on
+            // every touch that finds it. A row larger than the page itself
+            // is the page's `Limit` error, as `scan_page` gives it; the
+            // page's floor is larger than any row a view reads.
+            let page = page_bytes(&budget)?;
+            let (cost, value) = match exact.get(key.as_slice()) {
+                Some(cost) => (*cost, None),
+                None => {
+                    let row_key = codecs::current_key(&namespace, key);
+                    let value = view.get(Collection::KvCurrentV1.id(), &row_key)?;
+                    let cost = value.as_ref().map(|value| row_key.len() + value.len());
+                    exact.insert(key, cost);
+                    (cost, value)
+                }
+            };
+            if let Some(cost) = cost {
+                if cost > page.get() as usize {
+                    return Err(EngineError::new(
+                        ErrorClass::Limit,
+                        "row larger than the page byte budget",
+                    )
+                    .into());
+                }
+                budget.charge(1, cost)?;
+            }
+            if let Some(value) = value
+                && seen.insert(key.clone())
+            {
+                read_view
+                    .current
+                    .insert(key.clone(), codecs::decode_current(&value)?);
+            }
+            continue;
+        }
         let (lower, upper) = current_bounds(&namespace, touch);
         for (row_key, value) in scan_all(view, Collection::KvCurrentV1, lower, upper, &mut budget)?
         {
@@ -615,9 +671,27 @@ pub fn build_read_view<V: OrderedRead>(
         if r > kv_revision || r < compact_floor {
             continue;
         }
-        let mut chosen: BTreeMap<Vec<u8>, Option<KvEntry>> = BTreeMap::new();
+        let mut entries: BTreeMap<Vec<u8>, KvEntry> = BTreeMap::new();
+        // A key's version at R, once the scan has moved past the key: the
+        // one the request reads, charged as it is kept (task-d26). Rows
+        // arrive in (key, revision) order, so the last version at or below
+        // R for a key wins, and a key is final when the next one starts.
+        // A key two ranges share is kept and charged once, as the same
+        // version, so the charge is the same on every replica whatever
+        // each has collected.
+        let mut settle = |entries: &mut BTreeMap<Vec<u8>, KvEntry>,
+                          key: Vec<u8>,
+                          entry: Option<KvEntry>|
+         -> Result<(), ViewBuildError> {
+            if let Some(entry) = entry
+                && !entries.contains_key(&key)
+            {
+                budget.charge(1, key.len() + entry.value.len())?;
+                entries.insert(key, entry);
+            }
+            Ok(())
+        };
         for touch in historical_touches(&request.operation, r) {
-            let (lower, upper) = history_bounds(&namespace, &touch);
             // Physical versions are not charged to the replicated budget.
             // How many obsolete versions of a key are still on disk is a
             // local matter: garbage collection runs at its own pace on
@@ -628,26 +702,20 @@ pub fn build_read_view<V: OrderedRead>(
             // same chosen command, one executing it and one recording a
             // rejection. The selection below is charged instead, and it
             // is the same everywhere.
-            for (row_key, value) in scan_history(view, lower, upper)? {
-                let decoded = ordered_key::decode_history(&row_key)
-                    .map_err(|_| EngineError::new(ErrorClass::Corrupt, "kv_history key"))?;
-                let version = decoded.revision.expect("history key carries a revision");
-                if decoded.namespace != namespace || version > r {
-                    continue;
-                }
-                // Rows arrive in (key, revision) order, so the last version
-                // at or below R for a key wins.
-                chosen.insert(decoded.key, codecs::decode_history(&value)?.entry);
-            }
-        }
-        let entries: BTreeMap<Vec<u8>, KvEntry> = chosen
-            .into_iter()
-            .filter_map(|(k, e)| e.map(|e| (k, e)))
-            .collect();
-        // What the request actually reads: one version per key, the same
-        // on every replica whatever each has collected.
-        for (key, entry) in &entries {
-            budget.charge(1, key.len() + entry.value.len())?;
+            //
+            // Each key's version at R comes from the key index and the
+            // event row it names (task-d105), not from a scan of every
+            // version on disk.
+            let (lower, upper) = match &touch {
+                Touch::Exact(k) => (k.clone(), Bound::Included(k.as_slice())),
+                Touch::Interval(lo, hi) => (lo.clone(), Bound::Excluded(hi.as_slice())),
+            };
+            // Each version is read as it is settled, so the budget stops
+            // the read, not only what it keeps.
+            kv_versions_at(gated, namespace, &lower, upper, r, |key, chosen| {
+                settle(&mut entries, key, chosen)?;
+                Ok(true)
+            })?;
         }
         read_view.historical.push(HistoricalView {
             revision: r,
@@ -655,6 +723,30 @@ pub fn build_read_view<V: OrderedRead>(
         });
     }
     Ok(read_view)
+}
+
+/// Hand each key of `namespace` in `[lower, upper)` with what it holds at
+/// `at` to `each`, in key order, through the published key index and the
+/// view's own event rows above it (task-d105). A view with no gate reads
+/// every event row.
+fn kv_versions_at<V: OrderedRead>(
+    gated: &GatedView<V>,
+    namespace: NamespaceId,
+    lower: &[u8],
+    upper: Bound<&[u8]>,
+    at: KvRevision,
+    each: impl FnMut(Vec<u8>, Option<KvEntry>) -> Result<bool, ViewBuildError>,
+) -> Result<(), ViewBuildError> {
+    let empty = crate::kv_index::KvIndex::default();
+    let held;
+    let index = match gated.gate() {
+        Some(gate) => {
+            held = gate.kv_index();
+            &*held
+        }
+        None => &empty,
+    };
+    crate::kv_index::versions_at(index, gated.view(), namespace, lower, upper, at, each)
 }
 
 /// The ranges of `op` that read revision `r`.

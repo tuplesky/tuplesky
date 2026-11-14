@@ -18,6 +18,7 @@
 //! configuration every replica agreed on.
 
 mod backup;
+mod cpu;
 mod election;
 mod enroll;
 mod genesis;
@@ -33,6 +34,15 @@ use std::process::ExitCode;
 
 use clap::Parser;
 use coord_daemon::{Config, Diagnostics, Lifecycle, QuarantineReason, Readiness, bind_listeners};
+
+/// The daemon's allocator (task-d60). A third of every voter's domain
+/// thread was glibc's allocator and copies, spread over every phase of the
+/// loop rather than one site: many small allocations that live a turn.
+/// mimalloc's size-class heaps with thread-local caches serve those
+/// without glibc's bin management (`_int_malloc`, `unlink_chunk`,
+/// `malloc_consolidate`).
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[derive(Parser)]
 #[command(name = "coordd", about = "TupleSky node daemon (reference preview)")]
@@ -316,6 +326,18 @@ fn report_backup(manifest: &coord_checkpoint::BackupManifestV1) {
 }
 
 /// The first eight bytes of a digest, for a line an operator reads.
+/// A format's versions for the build line: the one it reads and writes,
+/// when its window is one version wide, or else `oldest..newest`, the
+/// versions it reads.
+fn versions(f: coord_types::formats::Format) -> String {
+    let w = f.window();
+    if w.oldest == w.newest {
+        w.current.to_string()
+    } else {
+        format!("{}..{}", w.oldest, w.newest)
+    }
+}
+
 fn hex16(bytes: &[u8; 32]) -> String {
     bytes[..8].iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -486,6 +508,14 @@ fn report_metrics(
     storage: &store::Storage,
     domain: coord_types::ids::DomainId,
 ) {
+    let recorder = serve::recorder(roles.votes());
+    // The boot's replay has happened by now, so the first snapshot has
+    // its one recovery sample (task-d55).
+    if let Some(replayed) = storage.domain.store().replayed(domain) {
+        use coord_daemon::metrics::Stage;
+        recorder.entered(Stage::Recovery);
+        recorder.completed(Stage::Recovery, replayed.took);
+    }
     use coord_daemon::metrics::{
         Frontiers, Lane, LaneReading, Measure, MetricsSnapshot, ShardIndex, ShardReading,
         Unavailable,
@@ -496,6 +526,8 @@ fn report_metrics(
             journal: held.durable().get(),
             materialized: held.materialized().get(),
             checkpoint: held.checkpoint().get(),
+            projection_durable: coord_storage::Persistence::projection_durable(&storage.domain)
+                .map(|seq| seq.get()),
         }),
         // A domain whose projection is not attached has no frontiers to
         // report, and saying so is the point: three zeroes would read
@@ -532,13 +564,21 @@ fn report_metrics(
         // Nothing has been recorded before the first turn, but which
         // stages this daemon records is already known, and the ones it
         // does not are stated as such rather than as zeroes.
-        stages: serve::recorder(roles.votes()).snapshot_stages(roles),
+        stages: recorder.snapshot_stages(roles),
         lanes,
         shards,
         durability: Measure::Unavailable(Unavailable::NotInstrumented),
         frontiers,
         view_age: Measure::Unavailable(Unavailable::NotInstrumented),
         engine_pressure: Measure::Unavailable(Unavailable::NoBound),
+        // Before the first turn there is a cost to report only where a
+        // voter will run, and it has executed nothing yet: the counts
+        // the serving loop prints start from this point (task-d45).
+        cost: if roles.votes() {
+            Measure::Unavailable(Unavailable::NoSamples)
+        } else {
+            Measure::Unavailable(Unavailable::NotThisRole)
+        },
     };
     match serde_json::to_string(&snapshot) {
         Ok(rendered) => println!("metrics {rendered}"),
@@ -546,7 +586,18 @@ fn report_metrics(
     }
 }
 
+/// Key the consensus machines' digest maps (task-d60, step 3) from the
+/// operating system's randomness, through the standard library's own
+/// randomly keyed hasher, before any machine is built: a caller who
+/// cannot learn the key cannot pick identities that share a bucket.
+fn seed_digest_maps() {
+    use std::hash::{BuildHasher, RandomState};
+    let state = RandomState::new();
+    coord_consensus::digest::seed(state.hash_one(0u64), state.hash_one(1u64));
+}
+
 fn main() -> ExitCode {
+    seed_digest_maps();
     let cli = Cli::parse();
     let text = match std::fs::read_to_string(&cli.config) {
         Ok(t) => t,
@@ -594,7 +645,13 @@ fn main() -> ExitCode {
                     short(&report.replica.0),
                     report.incarnation.get(),
                     report.role,
-                    credential_state(&report.credential),
+                    // A non-voter naming a voter is refused for its role,
+                    // whatever its generation and key say.
+                    if report.names_a_voter {
+                        "names-a-committed-voter".to_owned()
+                    } else {
+                        credential_state(&report.credential)
+                    },
                 );
                 println!(
                     "leaf issued_at={} expires_at={} renewal={} driver={}",
@@ -641,14 +698,21 @@ fn main() -> ExitCode {
     // What this build is, before it opens anything (task-60). Formats
     // are what it reads and writes; features are what the cluster may
     // have turned on. An operator reconciling a mixed fleet reads this
-    // line on every node and compares it.
+    // line on every node and compares it. A format whose window is wider
+    // than one version prints the versions it reads, `oldest..newest`:
+    // the journal's `1..2` says this build reads what its successor
+    // writes, so a voter can go back to it (the batching-rule doc's
+    // 10.7, step 1a). The journal's written version is given beside it,
+    // since a build and its successor read the same window and differ in
+    // what they write.
     println!(
-        "build schema={} journal={} shared_checkpoint={} local_checkpoint={} backup={} features={}",
-        coord_types::formats::Format::StoreSchema.current(),
+        "build schema={} journal={} journal_writes={} shared_checkpoint={} local_checkpoint={} backup={} features={}",
+        versions(coord_types::formats::Format::StoreSchema),
+        versions(coord_types::formats::Format::JournalRecord),
         coord_types::formats::Format::JournalRecord.current(),
-        coord_types::formats::Format::SharedCheckpoint.current(),
-        coord_types::formats::Format::LocalCheckpoint.current(),
-        coord_types::formats::Format::Backup.current(),
+        versions(coord_types::formats::Format::SharedCheckpoint),
+        versions(coord_types::formats::Format::LocalCheckpoint),
+        versions(coord_types::formats::Format::Backup),
         coord_types::formats::Supported::features()
             .iter()
             .map(|f| f.name())
@@ -898,6 +962,7 @@ fn main() -> ExitCode {
             && let Err(why) = enroll::collector_for(
                 &credential,
                 placed.membership.cluster(),
+                placed.membership.domain(),
                 placed.replica,
                 placed.incarnation,
             )
@@ -949,6 +1014,7 @@ fn main() -> ExitCode {
     // The store is opened before a listener exists. A process that bound
     // first would accept connections it could not serve, and a caller
     // cannot tell that from one it is merely slow to answer.
+    let booting = std::time::Instant::now();
     let mut opened = match store::open_storage(
         &config,
         store::Intent::Serve,
@@ -978,6 +1044,7 @@ fn main() -> ExitCode {
         eprintln!("{e}");
         return ExitCode::from(2);
     }
+    let attaching = std::time::Instant::now();
     let storage = match opened.attach() {
         Ok(s) => s,
         Err(e) => {
@@ -1006,6 +1073,22 @@ fn main() -> ExitCode {
         // image was opened above, before the domain was attached.
         storage.baseline.as_ref().map_or(0, |p| p.represented.get()),
     );
+    // How long the restart's replay took, and over how much (task-d55).
+    // `owed=0` above says the replay is complete, not what it cost, and
+    // under the replay profile it is the price of every working commit a
+    // crash lost. The attach's own time is beside it: a reinstall from
+    // the baseline's image is in it and not in the replay.
+    let replayed = storage.domain.store().replayed(placed.membership.domain());
+    if let Some(replayed) = &replayed {
+        println!(
+            "replayed records={} from={} through={} took_ms={:.1} attach_ms={:.1}",
+            replayed.records(),
+            replayed.from.get(),
+            replayed.through.get(),
+            replayed.took.as_secs_f64() * 1000.0,
+            attaching.elapsed().as_secs_f64() * 1000.0,
+        );
+    }
     // The bounded snapshot (task-61), on the startup report where an
     // operator already looks. Rendered whole: every field is a number
     // or a frozen enum, so there is nothing in it to redact, and every
@@ -1023,7 +1106,9 @@ fn main() -> ExitCode {
     // problem and is the most expensive kind of misconfiguration to
     // find. This is the order that makes `live` mean it.
     let boot = storage.boot;
+    let phases = storage.phases;
     let checkpoints = storage.checkpoints;
+    let early_proposal = early_proposal(&storage.active);
     let applier = match coord_storage::Applier::new(
         storage.domain,
         coord_core::outbox::BarrierAllocator::new(placed.incarnation, boot),
@@ -1039,8 +1124,24 @@ fn main() -> ExitCode {
     // frontend reads. One writer, one domain: a second handle on this
     // store would be a second writer's worth of opportunity, and the
     // profile has exactly one.
+    // Notified by the voter's materializer thread as each projection
+    // commit finishes (task-d52), and by its appender thread as each
+    // journal append does (task-d54).
+    let materialized = std::sync::Arc::new(tokio::sync::Notify::new());
+    // Where the loop's waits on those two threads are counted.
+    let mut waits = None;
+    let building = std::time::Instant::now();
     let backing = if roles.votes() {
-        match voter(&placed, applier, boot) {
+        match voter(
+            &placed,
+            applier,
+            boot,
+            config.limits.command_table_capacity,
+            early_proposal,
+        )
+        .and_then(|v| keep_floor(&placed, &config, v))
+        .and_then(|v| pipeline(v, &materialized, &mut waits))
+        {
             Ok(v) => serve::Backing::Voting(Box::new(v)),
             Err(e) => {
                 eprintln!("{e}");
@@ -1050,6 +1151,15 @@ fn main() -> ExitCode {
     } else {
         serve::Backing::Serving(Box::new(applier))
     };
+    println!(
+        "{}",
+        boot_line(
+            &phases,
+            replayed.as_ref(),
+            building.elapsed(),
+            booting.elapsed()
+        )
+    );
     // The local route is the voter's to hand over, and it exists only
     // because a voter is running here. A frontend-only process gets
     // `None` and reaches every voter over the wire.
@@ -1115,10 +1225,27 @@ fn main() -> ExitCode {
         Vec::new()
     };
     let mut domain = serve::Domain::new(frontend, backing, serve::Budgets::default())
-        // Where this node keeps its own recovery images, and how much
-        // unrepresented journal it tolerates before making one. Local
-        // to this node: no replicated result depends on the answer.
-        .with_checkpoints(checkpoints, config.limits.checkpoint_after_records);
+        .wake_on_materialized(materialized);
+    if let Some(replayed) = replayed {
+        domain = domain.recovered_in(replayed.took);
+    }
+    if let Some((appender, materializer)) = waits {
+        domain = domain.count_pipeline_waits(appender, materializer);
+    }
+    // Where this node keeps its own recovery images, and how much
+    // unrepresented journal and how long it tolerates before making one.
+    // Local to this node: no replicated result depends on the answer.
+    let (after, every) = config.checkpoint_cadence();
+    let domain = domain.with_checkpoints(checkpoints, after, every);
+    // Under the replay-backed profile, the time bound on a working
+    // projection commit (task-j06); the store keeps the other two.
+    let mut domain = if config.journal.replays_projection() {
+        domain.with_durable_projection_every(std::time::Duration::from_millis(
+            config.journal.projection_durable_ms,
+        ))
+    } else {
+        domain
+    };
     println!(
         "frontend ready waiting={} voting={}",
         domain.waiting(),
@@ -1154,10 +1281,13 @@ fn main() -> ExitCode {
     // on the address it reported.
     let api_socket = listeners.take_api();
     let peer_socket = listeners.take_peer();
-    let runtime = match tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-    {
+    // The runtime's worker count is the configuration's if it sets one,
+    // and tokio's (a worker a core) otherwise (task-d91).
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    if let Some(workers) = config.runtime.worker_threads {
+        builder.worker_threads(workers.get());
+    }
+    let runtime = match builder.enable_all().build() {
         Ok(r) => r,
         Err(e) => {
             eprintln!("cannot start the runtime: {e}");
@@ -1207,6 +1337,20 @@ fn main() -> ExitCode {
             domain = domain.with_peers(plane);
         }
         domain = domain.with_links(serve::CollectorLinks::new(links));
+        // An operator reaches a voter's feature activation through a
+        // socket beside its state, local and the owner's alone (task-d99):
+        // `coordctl feature --socket <state>/admin.sock activate <name>`.
+        if voting {
+            let path = std::path::Path::new(&config.state_directory).join(ADMIN_SOCKET);
+            match serve::listen_admin(&path) {
+                Ok(admin) => domain = domain.with_admin(admin),
+                Err(e) => eprintln!(
+                    "the admin socket at {} could not be opened, and this node takes no \
+                     operator requests: {e}",
+                    path.display()
+                ),
+            }
+        }
         // Expiry is scheduled where this process votes. A frontend-only
         // node schedules nothing: it proposes no commands, and an
         // expiry is a command like any other.
@@ -1218,6 +1362,15 @@ fn main() -> ExitCode {
         // name another role (task-d02).
         for renewing in renewings {
             domain = domain.with_renewal(renewing);
+        }
+        // A snapshot on an interval as well as at the end, so a daemon
+        // that is killed leaves its last interval's counters in its log
+        // (task-d45).
+        if config.metrics.interval_seconds > 0 {
+            domain.report_every(
+                std::time::Duration::from_secs(config.metrics.interval_seconds),
+                roles.clone(),
+            );
         }
         // The leaf's deadline is raced against the whole loop, not only
         // checked at the top of each pass: a pass can wait inside itself
@@ -1257,6 +1410,9 @@ fn main() -> ExitCode {
         if let Some(principal) = raced {
             domain.leaf_expired_while_serving(principal);
         }
+        // A clean stop leaves the projection durable where it stands, so
+        // the next start replays nothing it had applied (task-j06).
+        domain.sync_projections();
         eprintln!(
             "peers connected={} submittable={}",
             domain.reachable(),
@@ -1275,11 +1431,14 @@ fn main() -> ExitCode {
             Ok(rendered) => eprintln!("metrics {rendered}"),
             Err(e) => eprintln!("the metrics snapshot could not be rendered: {e}"),
         }
+        if let Some(line) = domain.catch_up_line() {
+            eprintln!("{line}");
+        }
         let counts = domain.counts();
         eprintln!(
             "the api plane ended: queued_local={} queued_remote={} not_a_voter={} \
 saturated={} unavailable={} refused={} released={} returned={} unreturnable={} \
-watches={} watch_frames={} watches_lost={} unserved={} parked={} unclaimed={} \
+returned_sends={} watches={} watch_frames={} watches_lost={} unserved={} parked={} unclaimed={} \
 crowded_out={}",
             counts.queued_local,
             counts.queued_remote,
@@ -1290,6 +1449,7 @@ crowded_out={}",
             counts.released,
             counts.returned,
             counts.unreturnable,
+            counts.returned_sends,
             counts.watches,
             counts.watch_frames,
             counts.watches_lost,
@@ -1342,6 +1502,31 @@ crowded_out={}",
     })
 }
 
+/// The admin socket's name in the state directory (task-d99).
+const ADMIN_SOCKET: &str = "admin.sock";
+
+/// Whether this node's leaders send the proposal before its batch is
+/// durable (task-d98): only where the domain activated `EarlyProposal`,
+/// which every configured voter's build supports, or in a build made for
+/// task-d98's local reading alone (`early-proposal-without-activation`),
+/// never built for anything else. Section 23 rules out an operator flag
+/// around a correctness gate, so there is no setting for it.
+///
+/// In a running domain the feature driver activates it (task-d99), and
+/// narrows the early send to the followers known to hold the activation;
+/// this is the value at start, from the activation the store holds.
+fn early_proposal(active: &std::collections::BTreeSet<coord_types::formats::Feature>) -> bool {
+    if cfg!(feature = "early-proposal-without-activation") {
+        eprintln!(
+            "coordd: built with early-proposal-without-activation, task-d98's local reading: \
+             a leader sends its proposal before its batch is durable without the domain having \
+             activated it, so a voter built before task-d74 may count it toward a fast decision"
+        );
+        return true;
+    }
+    active.contains(&coord_types::formats::Feature::EarlyProposal)
+}
+
 /// This node's voter, booted, over the store it will write.
 ///
 /// The role it takes is not a setting. The committed configuration says
@@ -1354,6 +1539,8 @@ fn voter(
     placed: &membership::Placed,
     applier: coord_storage::Applier<store::Persistence>,
     boot: coord_core::effect::BootId,
+    capacity: usize,
+    early_proposal: bool,
 ) -> Result<coord_daemon::Voter<store::Persistence>, String> {
     use coord_consensus::{
         ConfigurationIdentity, Follower, FollowerConfig, Leader, LeaderConfig, LearningMode,
@@ -1398,11 +1585,12 @@ fn voter(
         applier.store().application_base().execution_position
     };
     println!(
-        "recovered promise={:?} records={} payloads={} executed={} frontier={} position={}",
+        "recovered promise={:?} records={} payloads={} executed={} history={} frontier={} position={}",
         recovered.promise.as_ref().map(|p| p.promised.number),
         recovered.records.len(),
         recovered.payloads.len(),
         recovered.executed.len(),
+        recovered.history.len(),
         recovered.frontier.get(),
         executed_through.get(),
     );
@@ -1451,6 +1639,7 @@ fn voter(
         && recovered.records.is_empty()
         && recovered.payloads.is_empty()
         && recovered.executed.is_empty()
+        && recovered.history.is_empty()
         && recovered.syncs.is_empty()
         && recovered.frontier.get() == 0;
     let machine = if placed.replica == ballot.leader && promised == ballot && fresh {
@@ -1460,7 +1649,7 @@ fn voter(
                 quorum,
                 genesis: ballot,
                 frontend: collector,
-                capacity: 64,
+                capacity,
             },
             recovered.promise.clone(),
             // A replica comes back sealed because its row says so
@@ -1478,7 +1667,7 @@ fn voter(
                 quorum,
                 genesis: ballot,
                 frontend: collector,
-                capacity: 64,
+                capacity,
             },
             recovered.promise.clone(),
             recovered.seal,
@@ -1487,7 +1676,19 @@ fn voter(
             recovered.syncs.clone(),
             executed_through,
         )
-        .restore_execution(executed_through, recovered.executed.iter().map(|(c, _)| *c))
+        // The executed identities whose dependency rows a trim removed
+        // first: they are older than every surviving one, and they are
+        // the executed answer for what a live record may still name.
+        // Both in execution order, so the last one replayed is the last
+        // command this replica executed (task-d12).
+        .restore_execution(
+            executed_through,
+            recovered
+                .history
+                .iter()
+                .copied()
+                .chain(recovered.executed.iter().map(|(c, _)| *c)),
+        )
         .restore_payloads(recovered.payloads.clone());
         follower.set_learning(LearningMode::Full);
         coord_daemon::Machine::Follower(Box::new(follower))
@@ -1505,9 +1706,51 @@ fn voter(
         (m.cluster(), m.domain()),
         promised,
     );
+    // Given to the node before its boot, so the leader it holds now and
+    // every one it becomes later sends as the domain allows (task-d98):
+    // from the activation this store holds, and from here on from the
+    // feature driver, which turns it on once its own activation row is
+    // durable and keeps the followers known to hold it (task-d99).
+    voter.node_mut().set_early_proposal(early_proposal);
+    let features = {
+        use coord_storage::Persistence;
+        let voters = coord_consensus::quorum::EpochVoters::new(
+            m.epoch(),
+            m.voters().map(|v| v.node).collect(),
+        )
+        .ok_or("a configuration without voters")?;
+        let gated = voter
+            .node()
+            .applier()
+            .store()
+            .reader()
+            .snapshot()
+            .map_err(|e| format!("the feature rows cannot be read: {e:?}"))?;
+        coord_daemon::feature::Features::open(
+            m.cluster(),
+            m.domain(),
+            placed.replica,
+            voters,
+            gated.view(),
+            placed.incarnation,
+            boot,
+        )
+        .map_err(|e| format!("the feature rows cannot be read: {e}"))?
+    };
+    // The release rule (task-d90) has no start value of its own: the
+    // driver reports its active set as changed when opened, so this sets
+    // it from the same activation the store holds.
+    voter.node_mut().keep_features(features);
+    if cfg!(feature = "early-proposal-without-activation") {
+        voter.node_mut().send_early_without_activation();
+    }
     voter
         .boot(boot, placed.incarnation)
         .map_err(|e| format!("this voter cannot record its own boot: {e}"))?;
+    // From here a round's batches wait for the loop's flush, and are
+    // lowered with the events after it as one group (task-d47). The boot
+    // record above was lowered on its own.
+    voter.node_mut().lower_in_groups();
     // A campaign that bound its selection and then stopped is not taken
     // up: taking it up would make this replica the proposer of that
     // ballot again, with the same memory loss as above if it had led it
@@ -1521,6 +1764,126 @@ fn voter(
             promised.number
         );
     }
+    Ok(voter)
+}
+
+/// Commit the voter's projection on a thread of its own (task-d52): the
+/// domain thread journals a group and goes on executing, and the group's
+/// results go out once the materializer has committed it and
+/// `materialized` has woken the loop to take it back.
+///
+/// The journal's synced appends leave the domain thread the same way
+/// (task-d54): the domain thread seals a group and goes on, and what the
+/// group made durable is released once the appender has synced it and
+/// `materialized` has woken the loop to take it back.
+///
+/// The counters of the loop's waits on the two threads go to `waits`.
+#[allow(clippy::type_complexity)]
+fn pipeline(
+    mut voter: coord_daemon::Voter<store::Persistence>,
+    materialized: &std::sync::Arc<tokio::sync::Notify>,
+    waits: &mut Option<(
+        std::sync::Arc<coord_storage::Waits>,
+        std::sync::Arc<coord_storage::Waits>,
+    )>,
+) -> Result<coord_daemon::Voter<store::Persistence>, String> {
+    let notify = std::sync::Arc::clone(materialized);
+    let materializer = coord_storage::ThreadMaterializer::new(std::sync::Arc::new(move || {
+        notify.notify_one();
+    }))
+    .map_err(|e| format!("the materializer thread could not start: {e}"))?;
+    let materializer_waits = materializer.waits();
+    voter
+        .node_mut()
+        .applier_mut()
+        .store_mut()
+        .store_mut()
+        .pipeline(Box::new(materializer))
+        .map_err(|e| format!("the projection could not be pipelined: {e:?}"))?;
+    let notify = std::sync::Arc::clone(materialized);
+    let appender = coord_storage::ThreadAppender::new(std::sync::Arc::new(move || {
+        notify.notify_one();
+    }))
+    .map_err(|e| format!("the appender thread could not start: {e}"))?;
+    *waits = Some((appender.waits(), materializer_waits));
+    voter
+        .node_mut()
+        .applier_mut()
+        .store_mut()
+        .store_mut()
+        .pipeline_journal(Box::new(appender))
+        .map_err(|e| format!("the journal could not be pipelined: {e:?}"))?;
+    Ok(voter)
+}
+
+/// Take part in agreeing a forgetting floor, when configured to
+/// (task-d27): the promises and the floor this store already holds are
+/// read back, so a restarted voter neither promises less than it did nor
+/// forgets a floor it activated.
+fn keep_floor(
+    placed: &membership::Placed,
+    config: &coord_daemon::config::Config,
+    mut voter: coord_daemon::Voter<store::Persistence>,
+) -> Result<coord_daemon::Voter<store::Persistence>, String> {
+    use coord_daemon::floor::{FLOOR_INTERVAL, Floor, FloorSettings};
+
+    if !config.floor.enabled {
+        return Ok(voter);
+    }
+    let m = &placed.membership;
+    let settings_images = store::root_path(&config.state_directory, &config.floor.images);
+    let settings = FloorSettings {
+        interval: FLOOR_INTERVAL,
+        images: settings_images.clone(),
+        headroom_bytes: config.floor.headroom_bytes,
+        origin: coord_checkpoint::CheckpointOrigin {
+            cluster: m.cluster(),
+            domain: m.domain(),
+        },
+        voters: m.voters().map(|v| v.node).collect(),
+        me: placed.replica,
+    };
+    let floor = {
+        use coord_storage::Persistence;
+        let applier = voter.node().applier();
+        let gated = applier
+            .store()
+            .reader()
+            .snapshot()
+            .map_err(|e| format!("the floor cannot read this store: {e:?}"))?;
+        Floor::open(
+            settings,
+            gated.view(),
+            placed.incarnation,
+            applier.store().boot(),
+        )
+        .map_err(|e| format!("the floor cannot start: {e}"))?
+    };
+    // The configuration refused one directory spelled two ways; this
+    // refuses one reached through a link. Each store reclaims every
+    // image it does not keep, so sharing one would remove the other's.
+    let checkpoints = store::root_path(&config.state_directory, &config.state.checkpoints);
+    let (Ok(images), Ok(checkpoints)) = (
+        std::fs::canonicalize(&settings_images),
+        std::fs::canonicalize(&checkpoints),
+    ) else {
+        return Err("the floor cannot compare its images' directory with the checkpoints'".into());
+    };
+    if images.starts_with(&checkpoints) || checkpoints.starts_with(&images) {
+        return Err(format!(
+            "the floor's images ({}) and the local checkpoints ({}) share a directory",
+            images.display(),
+            checkpoints.display()
+        ));
+    }
+    println!(
+        "floor interval={FLOOR_INTERVAL} promised={} activated={}",
+        floor.promised().map_or(0, |p| p.get()),
+        floor
+            .activated()
+            .map_or(0, |a| a.boundary.execution_position.get()),
+    );
+    voter.node_mut().keep_floor(floor);
     Ok(voter)
 }
 
@@ -1546,4 +1909,39 @@ fn now_seconds() -> u64 {
 /// an identity, not a secret, and the full value is in the certificate.
 fn short(bytes: &[u8; 16]) -> String {
     bytes[..4].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The startup report's `boot` line: how long each step before the
+/// runtime starts took, in milliseconds, with the sizes of what the
+/// attach indexed (#245; the lead on #185 asked what grows with history
+/// there). `voter_ms` is building the voter over the attached store;
+/// `total_ms` runs from the journal's open to the voter built.
+fn boot_line(
+    phases: &store::BootPhases,
+    replayed: Option<&coord_storage::Replayed>,
+    voter: std::time::Duration,
+    total: std::time::Duration,
+) -> String {
+    let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+    let (intake, entries, keys, versions, replay) = replayed.map_or((0.0, 0, 0.0, 0, 0.0), |r| {
+        (
+            ms(r.intake_index),
+            r.intake_entries,
+            ms(r.key_index),
+            r.key_versions,
+            ms(r.took),
+        )
+    });
+    format!(
+        "boot journal_open_ms={:.1} projection_open_ms={:.1} baseline_ms={:.1} guard_scan_ms={:.1} \
+attach_ms={:.1} intake_index_ms={intake:.1} intake_entries={entries} key_index_ms={keys:.1} \
+key_versions={versions} replay_ms={replay:.1} voter_ms={:.1} total_ms={:.1}",
+        ms(phases.journal_open),
+        ms(phases.projection_open),
+        ms(phases.baseline),
+        ms(phases.guard_scan),
+        ms(phases.attach),
+        ms(voter),
+        ms(total),
+    )
 }

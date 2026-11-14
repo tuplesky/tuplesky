@@ -15,6 +15,16 @@ role = "production"
 name = "coordd"
 path = "src/main.rs"
 
+[features]
+# See coord-daemon's feature of the same name: the register check's
+# negative control, never built for anything else.
+skip-read-confirmation = ["coord-daemon/skip-read-confirmation"]
+# task-d98's local reading: a leader sends its proposal before its batch
+# is durable without the domain having activated `EarlyProposal`. Never
+# built for anything else; the fault runs and the batch use the
+# activation (task-d99).
+early-proposal-without-activation = []
+
 [dependencies]
 coord-daemon.workspace = true
 coord-membership.workspace = true
@@ -29,6 +39,7 @@ coord-journal-api.workspace = true
 coord-journal-raft-engine.workspace = true
 coord-checkpoint.workspace = true
 coord-storage.workspace = true
+rustix.workspace = true
 coord-state.workspace = true
 coord-store-api.workspace = true
 coord-storage-redb.workspace = true
@@ -39,12 +50,14 @@ x509-parser.workspace = true
 quinn.workspace = true
 coord-types.workspace = true
 clap.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "signal"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "signal", "net", "io-util", "sync"] }
 # Leaf renewal (task-d02): the enrollment request is signed with the
 # node's own key, and posted to the node issuer over a hardened client.
 rcgen.workspace = true
 reqwest.workspace = true
 rustls.workspace = true
+# The global allocator (task-d60).
+mimalloc.workspace = true
 
 [dev-dependencies]
 coord-sdk.workspace = true
@@ -56,6 +69,8 @@ coord-membership.workspace = true
 coord-session.workspace = true
 coord-store-api.workspace = true
 coord-store-testkit.workspace = true
+# Reading a projection's rows in the activation tests.
+redb.workspace = true
 coord-sts.workspace = true
 rustls.workspace = true
 rustls-pki-types.workspace = true
@@ -70,6 +85,12 @@ serde_json.workspace = true
 # daemon itself.
 coord-harness.workspace = true
 coord-wan-bench.workspace = true
+# The Jepsen client shim, driven against a running domain; test-only too.
+coord-jepsen.workspace = true
 time.workspace = true
 axum.workspace = true
 coord-authn.workspace = true
+# A dial against real listeners of both planes (task-d16).
+coord-transport-testkit.workspace = true
+# `coordctl feature`'s request to a running node's admin socket (task-d99).
+coordctl.workspace = true

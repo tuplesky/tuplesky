@@ -19,10 +19,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use coord_collector::{
-    Action, Admission, AdmissionLimits, AdmissionRefusal, Caller, Collector, CollectorConfig,
-    CollectorEvent, Delivery, Dispatcher, EvidenceError, HoldReason, KIND_EVIDENCE, KIND_RELEASE,
-    MonotonicMillis, OfferOutcome, Offered, Progress, SubmitRefusal, Submitted,
-    admitted_from_submit, codes, decode_evidence, decode_release, frontend_frame,
+    Action, Admission, AdmissionLimits, AdmissionRefusal, AdmissionRefusals, Caller, Collector,
+    CollectorConfig, CollectorEvent, Delivery, Dispatcher, EvidenceError, HoldReason,
+    KIND_EVIDENCE, KIND_RELEASE, MonotonicMillis, OfferOutcome, Offered, Progress, SubmitRefusal,
+    Submitted, admitted_from_submit, codes, decode_evidence, decode_release, frontend_frame,
 };
 use coord_consensus::{
     AppliedOutcome, BallotConfiguration, ConfigurationIdentity, FastAck, Follower, FollowerConfig,
@@ -169,7 +169,12 @@ fn response_of(delivery: &Delivery) -> ResponseV1 {
 }
 
 fn provenance(from: ReplicaId, connection: u64) -> PeerProvenance {
-    PeerProvenance::from_transport(from, inc(), connection)
+    PeerProvenance::from_transport(
+        from,
+        inc(),
+        coord_types::wire_v1::PeerRole::Voter,
+        connection,
+    )
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -347,7 +352,7 @@ impl World {
     }
 
     fn with_bound(seed: u64, max_pending: usize) -> Self {
-        let collector = Collector::new(CollectorConfig {
+        let collector = Collector::traced(CollectorConfig {
             quorum: quorum(3),
             max_pending,
             max_resolved: 16,
@@ -908,7 +913,7 @@ fn cancellation_preserves_identity_and_outcome_resolution() {
 
 #[test]
 fn voter_identities_are_counted_rather_than_connections() {
-    let mut c = Collector::new(CollectorConfig {
+    let mut c = Collector::traced(CollectorConfig {
         quorum: quorum(3),
         max_pending: 8,
         max_resolved: 8,
@@ -970,8 +975,9 @@ fn voter_identities_are_counted_rather_than_connections() {
         c.on_release(provenance(r(0), 1), released.clone()),
         Ok(Progress::Held(HoldReason::AwaitingVotes))
     );
-    // The leader's proposal plus one adopter is the slow majority of three:
-    // with the release already present, the second identity releases.
+    // Two adoptions are the slow majority of three, the leader's own among
+    // them once its acceptance row is durable (task-d19): with the release
+    // already present, the second adoption releases.
     let admitted_under = c.admission(&command).expect("outstanding");
     let slow = |replica: u8| {
         ProtocolMessage::SlowAck(SlowAck {
@@ -985,7 +991,12 @@ fn voter_identities_are_counted_rather_than_connections() {
         c.on_evidence(provenance(r(0), 1), reply.clone()),
         Ok(Progress::Held(HoldReason::AwaitingVotes))
     );
-    match c.on_evidence(provenance(r(2), 20), slow(2)) {
+    assert_eq!(
+        c.on_evidence(provenance(r(2), 20), slow(2)),
+        Ok(Progress::Held(HoldReason::AwaitingVotes)),
+        "the leader's reply is not its adoption"
+    );
+    match c.on_evidence(provenance(r(0), 1), slow(0)) {
         Ok(Progress::Released(release)) => {
             assert!(!release.fast);
             assert_eq!(ok_result(&release.response), (Some(1), vec![0xaa]));
@@ -1115,7 +1126,12 @@ fn voter_identities_are_counted_rather_than_connections() {
             admission: admitted_under,
         })
     };
-    match c.on_evidence(provenance(r(2), 3), slow(2)) {
+    assert_eq!(
+        c.on_evidence(provenance(r(2), 3), slow(2)),
+        Ok(Progress::Held(HoldReason::AwaitingVotes)),
+        "r2 and the leader's reply: the leader has not adopted yet"
+    );
+    match c.on_evidence(provenance(r(0), 1), slow(0)) {
         Ok(Progress::Released(release)) => {
             assert!(!release.fast);
             assert_eq!(release.command, command);
@@ -1143,6 +1159,18 @@ fn collection_is_bounded_per_domain_without_evicting_unresolved_work() {
         Action::Respond(d) => assert_eq!(err_code(&response_of(&d)), codes::BACKPRESSURE),
         other => panic!("{other:?}"),
     }
+    // The gate admitted it and the collector refused it: counted apart
+    // from the gate's own refusals, and in their total (#228 review).
+    assert_eq!(
+        w.frontend.admission().refusals(),
+        AdmissionRefusals {
+            rate_limited: 0,
+            session_busy: 0,
+            other: 0,
+            collection_bound: 1,
+        }
+    );
+    assert_eq!(w.frontend.admission().refusals().total(), 1);
     w.settle();
     assert_eq!(w.frontend.collector().pending(), 2, "nothing evicted");
     assert!(w.frontend.collector().is_pending(&c1) && w.frontend.collector().is_pending(&c2));
@@ -1152,7 +1180,7 @@ fn collection_is_bounded_per_domain_without_evicting_unresolved_work() {
     let (_, a4) = w.submit(2, 4, put(b"d", b"1"));
     assert!(matches!(a4, Action::Respond(_)));
     // Direct collector bound: same refusal.
-    let mut c = Collector::new(CollectorConfig {
+    let mut c = Collector::traced(CollectorConfig {
         quorum: quorum(3),
         max_pending: 1,
         max_resolved: 1,
@@ -1533,6 +1561,10 @@ fn the_collector_event_trace_is_frozen_for_go_reuse() {
             CollectorEvent::Reconfigured { .. } => "reconfigured",
             CollectorEvent::Reoffered { .. } => "reoffered",
             CollectorEvent::Undisseminated { .. } => "undisseminated",
+            CollectorEvent::VoterRefused { .. } => "voter-refused",
+            CollectorEvent::Solicited { .. } => "solicited",
+            CollectorEvent::SolicitedLeader { .. } => "solicited-leader",
+            CollectorEvent::RelayFellBack { .. } => "relay-fell-back",
         })
         .collect();
     for k in [
@@ -1588,6 +1620,73 @@ fn a_retry_of_an_unresolved_request_takes_no_second_admission_slot() {
     gate.settled(&first.retry_key);
     gate.admit(0, &caller(), &other).expect("the slot is free");
     assert_eq!(gate.pending(&SESSION), 1);
+    // The one refusal was the session's bound, counted as such.
+    assert_eq!(
+        gate.refusals(),
+        AdmissionRefusals {
+            rate_limited: 0,
+            session_busy: 1,
+            other: 0,
+            collection_bound: 0,
+        }
+    );
+}
+
+/// New requests are admitted at no more than the configured rate, with a
+/// second's worth as a burst (task-d26); a retry of an outstanding request
+/// is not a new one, and the rate refills with time.
+#[test]
+fn admission_is_bounded_by_its_rate_and_a_retry_takes_nothing() {
+    let mut gate = Admission::new(
+        CLUSTER,
+        DOMAIN,
+        AdmissionLimits {
+            max_admitted_per_second: Some(4),
+            ..AdmissionLimits::default()
+        },
+    );
+    let at = MonotonicMillis::new;
+    let mut admitted = Vec::new();
+    for n in 1..=4u64 {
+        let (_, req) = request(n, put(b"a", b"1"), 0);
+        gate.admit_at(0, at(0), &caller(), &req)
+            .expect("within the burst");
+        admitted.push(req);
+    }
+    let (_, fifth) = request(5, put(b"a", b"1"), 0);
+    assert_eq!(
+        gate.admit_at(0, at(0), &caller(), &fifth).err(),
+        Some(AdmissionRefusal::RateLimited { per_second: 4 })
+    );
+    // A retry of an outstanding request goes through, and takes nothing.
+    gate.admit_at(0, at(0), &caller(), &admitted[0])
+        .expect("a retry is the same request");
+    // A quarter of a second is one more admission; the rate held since
+    // is none.
+    assert!(gate.admit_at(0, at(200), &caller(), &fifth).is_err());
+    gate.admit_at(0, at(250), &caller(), &fifth)
+        .expect("one refilled");
+    let (_, sixth) = request(6, put(b"a", b"1"), 0);
+    assert!(gate.admit_at(0, at(250), &caller(), &sixth).is_err());
+    // Idle for longer than a second refills a second's worth, no more.
+    for n in 6..=9u64 {
+        let (_, req) = request(n, put(b"a", b"1"), 0);
+        gate.admit_at(0, at(60_000), &caller(), &req)
+            .expect("a second's worth");
+    }
+    let (_, tenth) = request(10, put(b"a", b"1"), 0);
+    assert!(gate.admit_at(0, at(60_000), &caller(), &tenth).is_err());
+    // Each refusal is counted by why, for the metrics line: the rate
+    // refused four, and nothing else was refused.
+    assert_eq!(
+        gate.refusals(),
+        AdmissionRefusals {
+            rate_limited: 4,
+            session_busy: 0,
+            other: 0,
+            collection_bound: 0,
+        }
+    );
 }
 
 #[test]
@@ -1709,6 +1808,7 @@ fn a_request_larger_than_the_frontend_admits_is_refused_before_it_takes_a_slot()
         AdmissionLimits {
             max_pending_per_session: 1,
             max_request_bytes: 1024,
+            max_admitted_per_second: None,
         },
     );
     // The bound is what the protocol counts, the bytes of the key and
@@ -1751,4 +1851,203 @@ fn the_default_bound_refuses_nothing_the_protocol_admits() {
     let (_, largest) = request(1, put(&key, &value), 0);
     gate.admit(0, &caller(), &largest)
         .expect("the protocol's largest write");
+}
+
+/// task-d19: the collector releases a result only on the leader's proposal
+/// and adoptions, never on a fast acknowledgement counted as an adoption.
+///
+/// Five voters, fast set {r0, r1, r2}. r1's fast acknowledgement carries
+/// the leader's dependencies over another path, and r3 adopts. That used to
+/// be a slow majority, and a recovery from r1, r2 and r4 then re-proposed
+/// the command with other dependencies after the caller was answered.
+#[test]
+fn a_fast_acknowledgement_is_not_counted_as_an_adoption() {
+    let mut c = Collector::traced(CollectorConfig {
+        quorum: quorum(5),
+        max_pending: 8,
+        max_resolved: 8,
+        max_undelivered_bytes: usize::MAX,
+    });
+    let (command, req) = request(1, put(b"x", b"1"), 0);
+    let admitted = AdmittedRequest {
+        receipt: AdmissionReceipt::submitting(
+            VerifierToken::for_boundary(),
+            AttestedAdmission {
+                cluster: CLUSTER,
+                domain: DOMAIN,
+                session: SESSION,
+                rule_generation: 1,
+                scope_ceiling: u32::MAX,
+                receipt_id: Digest32([7; 32]),
+                admitted_at_ticks: 0,
+            },
+        ),
+        frame: MessageV1::Request(req).encode().unwrap(),
+    };
+    c.submit(MonotonicMillis::ZERO, &admitted).unwrap();
+    let path = Digest32([1; 32]);
+    let released = ReleasedResult::from_gate(
+        EstablishedResult::establish(EstablishmentEvidence {
+            command,
+            epoch: epoch(),
+            ballot: ballot(),
+            position: ExecutionPosition::new(1).unwrap(),
+            closed_predecessors: vec![],
+            result_digest: Digest32([2; 32]),
+            revision: Some(KvRevision::new(1).unwrap()),
+            fast_path: false,
+        })
+        .unwrap(),
+        vec![0xaa],
+        false,
+    );
+    assert_eq!(
+        c.on_release(provenance(r(0), 1), released),
+        Ok(Progress::Held(HoldReason::AwaitingVotes))
+    );
+    let admitted_under = c.admission(&command).expect("outstanding");
+    let reply = ProtocolMessage::LeaderReply {
+        ballot: ballot(),
+        command,
+        seqnum: 1,
+        deps: vec![],
+        path,
+    };
+    assert_eq!(
+        c.on_evidence(provenance(r(0), 1), reply),
+        Ok(Progress::Held(HoldReason::AwaitingVotes))
+    );
+    // r1: the leader's dependencies, another path.
+    let fast = ProtocolMessage::FastAck(FastAck {
+        replica: r(1),
+        ballot: ballot(),
+        command,
+        deps: vec![],
+        paths: vec![],
+        path: Digest32([9; 32]),
+        admission: admitted_under,
+        seqnum: None,
+    });
+    assert_eq!(
+        c.on_evidence(provenance(r(1), 2), fast),
+        Ok(Progress::Held(HoldReason::AwaitingVotes))
+    );
+    let slow = |replica: u8| {
+        ProtocolMessage::SlowAck(SlowAck {
+            replica: r(replica),
+            ballot: ballot(),
+            command,
+            admission: admitted_under,
+        })
+    };
+    assert_eq!(
+        c.on_evidence(provenance(r(3), 3), slow(3)),
+        Ok(Progress::Held(HoldReason::AwaitingVotes)),
+        "the leader, r1's fast acknowledgement and r3's adoption released the result"
+    );
+    assert!(c.is_pending(&command));
+    // r1 adopts, then the leader's own adoption arrives: three adoptions
+    // are the slow majority (task-d19).
+    assert_eq!(
+        c.on_evidence(provenance(r(1), 2), slow(1)),
+        Ok(Progress::Held(HoldReason::AwaitingVotes)),
+        "the leader's reply is not its adoption"
+    );
+    match c.on_evidence(provenance(r(0), 1), slow(0)) {
+        Ok(Progress::Released(release)) => {
+            assert!(!release.fast);
+            assert_eq!(ok_result(&release.response), (Some(1), vec![0xaa]));
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// At five voters the leader's proposal is not its adoption (task-d19):
+/// the leader's reply and two adoptions are not a slow majority, and the
+/// command releases only on the leader's own adoption -- sent once its
+/// acceptance row is durable -- or a third adopter's.
+#[test]
+fn the_leaders_reply_is_not_its_adoption_at_five_voters() {
+    for third in [0u8, 3] {
+        let mut c = Collector::traced(CollectorConfig {
+            quorum: quorum(5),
+            max_pending: 8,
+            max_resolved: 8,
+            max_undelivered_bytes: usize::MAX,
+        });
+        let (command, req) = request(1, put(b"x", b"1"), 0);
+        let admitted = AdmittedRequest {
+            receipt: AdmissionReceipt::submitting(
+                VerifierToken::for_boundary(),
+                AttestedAdmission {
+                    cluster: CLUSTER,
+                    domain: DOMAIN,
+                    session: SESSION,
+                    rule_generation: 1,
+                    scope_ceiling: u32::MAX,
+                    receipt_id: Digest32([7; 32]),
+                    admitted_at_ticks: 0,
+                },
+            ),
+            frame: MessageV1::Request(req).encode().unwrap(),
+        };
+        c.submit(MonotonicMillis::ZERO, &admitted).unwrap();
+        let released = ReleasedResult::from_gate(
+            EstablishedResult::establish(EstablishmentEvidence {
+                command,
+                epoch: epoch(),
+                ballot: ballot(),
+                position: ExecutionPosition::new(1).unwrap(),
+                closed_predecessors: vec![],
+                result_digest: Digest32([2; 32]),
+                revision: Some(KvRevision::new(1).unwrap()),
+                fast_path: false,
+            })
+            .unwrap(),
+            vec![0xaa],
+            true,
+        );
+        assert_eq!(
+            c.on_release(provenance(r(0), 1), released),
+            Ok(Progress::Held(HoldReason::AwaitingVotes))
+        );
+        let reply = ProtocolMessage::LeaderReply {
+            ballot: ballot(),
+            command,
+            seqnum: 1,
+            deps: vec![],
+            path: Digest32([1; 32]),
+        };
+        assert_eq!(
+            c.on_evidence(provenance(r(0), 1), reply),
+            Ok(Progress::Held(HoldReason::AwaitingVotes))
+        );
+        let admitted_under = c.admission(&command).expect("outstanding");
+        let slow = |replica: u8| {
+            ProtocolMessage::SlowAck(SlowAck {
+                replica: r(replica),
+                ballot: ballot(),
+                command,
+                admission: admitted_under,
+            })
+        };
+        for adopter in [1u8, 2] {
+            assert_eq!(
+                c.on_evidence(
+                    provenance(r(adopter), 10 + u64::from(adopter)),
+                    slow(adopter)
+                ),
+                Ok(Progress::Held(HoldReason::AwaitingVotes)),
+                "the leader's reply and r{adopter}: its proposal is not an adoption"
+            );
+        }
+        match c.on_evidence(provenance(r(third), 20), slow(third)) {
+            Ok(Progress::Released(release)) => {
+                assert!(!release.fast);
+                assert_eq!(ok_result(&release.response), (Some(1), vec![0xaa]));
+            }
+            other => panic!("third adoption from r{third}: {other:?}"),
+        }
+        assert!(!c.is_pending(&command));
+    }
 }

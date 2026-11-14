@@ -250,13 +250,40 @@ impl Ca {
         role: coord_types::wire_v1::PeerRole,
         incarnation: u64,
     ) -> (rcgen::Certificate, rcgen::KeyPair) {
+        self.issue_in(name, cluster, DOMAIN, replica, role, incarnation)
+    }
+
+    /// The same, for a chosen domain of the cluster: what a sibling
+    /// domain's node is issued under the same authority.
+    fn issue_in(
+        &self,
+        name: &str,
+        cluster: [u8; 16],
+        domain: [u8; 16],
+        replica: u8,
+        role: coord_types::wire_v1::PeerRole,
+        incarnation: u64,
+    ) -> (rcgen::Certificate, rcgen::KeyPair) {
         let identity = coord_node_issuer::NodeIdentity {
             cluster: coord_types::ids::ClusterId(cluster),
+            domain: coord_types::ids::DomainId(domain),
             node: coord_types::ids::ReplicaId([replica; 16]),
             incarnation: coord_types::ids::ReplicaIncarnation::new(incarnation).expect("positive"),
             role,
         };
         let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("leaf key");
+        let certificate = self.sign_in(&key, name, identity);
+        (certificate, key)
+    }
+
+    /// A leaf for `identity` over a key the caller holds: what the
+    /// authority issues when a node asks with its own key.
+    fn sign_in(
+        &self,
+        key: &rcgen::KeyPair,
+        name: &str,
+        identity: coord_node_issuer::NodeIdentity,
+    ) -> rcgen::Certificate {
         let mut params =
             rcgen::CertificateParams::new(vec![name.to_string()]).expect("leaf params");
         params.extended_key_usages = vec![
@@ -280,8 +307,7 @@ impl Ca {
         let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("ca params");
         ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
         let issuer = rcgen::Issuer::from_params(&ca_params, &self.key);
-        let certificate = params.signed_by(&key, &issuer).expect("leaf cert");
-        (certificate, key)
+        params.signed_by(key, &issuer).expect("leaf cert")
     }
 
     fn root_pem(&self) -> String {
@@ -906,6 +932,7 @@ fn a_certificate_of_another_cluster_never_reaches_this_domains_store() {
     // Same node identity shape, different cluster.
     let identity = coord_node_issuer::NodeIdentity {
         cluster: coord_types::ids::ClusterId([0x77; 16]),
+        domain: coord_types::ids::DomainId(DOMAIN),
         node: coord_types::ids::ReplicaId([1; 16]),
         incarnation: coord_types::ids::ReplicaIncarnation::new(1).expect("positive"),
         role: coord_types::wire_v1::PeerRole::Voter,
@@ -932,6 +959,306 @@ fn a_certificate_of_another_cluster_never_reaches_this_domains_store() {
         !dir.join("state").exists(),
         "a foreign node initialized this domain's store"
     );
+}
+
+/// A certificate of a sibling domain -- the same cluster, under the same
+/// issuer -- is refused here too: the domain a node serves is the one its
+/// certificate names, and a node holding another's would open this
+/// domain's store as a node of that one.
+#[test]
+fn a_certificate_of_another_domain_never_reaches_this_domains_store() {
+    let dir = workspace("foreign-domain");
+    let ca = credentials(&dir, 1, coord_types::wire_v1::PeerRole::Voter);
+    genesis(&dir, Some(&ca.node_spki));
+    endpoints(&dir, &ca, 3, &[]);
+    let _ = sts_keys(&dir);
+    let path = config_only(&dir);
+
+    // The committed voter, its key and generation, under this domain's
+    // authority: everything this domain commits to but the domain. A
+    // node that serves two domains with one key is issued this.
+    let identity = coord_node_issuer::NodeIdentity {
+        cluster: coord_types::ids::ClusterId(CLUSTER),
+        domain: coord_types::ids::DomainId([0x33; 16]),
+        node: coord_types::ids::ReplicaId([1; 16]),
+        incarnation: coord_types::ids::ReplicaIncarnation::new(1).expect("positive"),
+        role: coord_types::wire_v1::PeerRole::Voter,
+    };
+    let key = rcgen::KeyPair::try_from(ca.node_key.as_slice()).expect("the node's key");
+    let sibling = ca.sign_in(&key, SERVER_NAME, identity);
+    std::fs::write(dir.join("node.pem"), pem("CERTIFICATE", sibling.der())).expect("cert");
+
+    let refused = run(&path, &["init"]);
+    assert_eq!(refused.code, Some(2), "{}{}", refused.out, refused.err);
+    assert!(
+        refused.err.contains("another domain"),
+        "the refusal did not name the mismatch: {}",
+        refused.err
+    );
+    assert!(
+        !dir.join("state").exists(),
+        "a node of another domain initialized this domain's store"
+    );
+
+    // And `inspect`, which reports a credential `place` would refuse,
+    // says which mismatch it is rather than reading it as this domain's.
+    let inspected = run(&path, &["inspect"]);
+    assert_eq!(
+        inspected.code,
+        Some(2),
+        "{}{}",
+        inspected.out,
+        inspected.err
+    );
+    assert!(
+        inspected.err.contains("another domain"),
+        "inspect did not name the mismatch: {}{}",
+        inspected.out,
+        inspected.err
+    );
+}
+
+/// Present `certificate` and `key` on `daemon`'s API plane with a
+/// `Hello` naming this cluster and domain in `role`, and return what the
+/// node answered on the control stream: its acknowledgement, or `None`
+/// once it closed the stream or the connection without one.
+async fn hello_on_api(
+    daemon: &Running,
+    ca: &Ca,
+    certificate: &rcgen::Certificate,
+    key: &rcgen::KeyPair,
+    role: coord_types::wire_v1::PeerRole,
+) -> Option<coord_types::wire_v1::MessageV1> {
+    let to = Plane {
+        addr: daemon.api,
+        alpn: coord_transport::ALPN_API,
+        incarnation: None,
+        lane: coord_transport::Lane::Unary,
+    };
+    hello_on(to, ca, certificate, key, role).await
+}
+
+/// Where a raw `Hello` goes: a daemon's plane, the incarnation it
+/// claims and the lane it asks for.
+struct Plane {
+    addr: std::net::SocketAddr,
+    alpn: &'static [u8],
+    incarnation: Option<u64>,
+    lane: coord_transport::Lane,
+}
+
+/// [`hello_on_api`] on any plane.
+async fn hello_on(
+    to: Plane,
+    ca: &Ca,
+    certificate: &rcgen::Certificate,
+    key: &rcgen::KeyPair,
+    role: coord_types::wire_v1::PeerRole,
+) -> Option<coord_types::wire_v1::MessageV1> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(rustls_pki_types::CertificateDer::from(
+            ca.certificate.der().to_vec(),
+        ))
+        .expect("ca root");
+    let provider = std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let mut tls = rustls::ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .expect("tls13")
+        .with_root_certificates(roots)
+        .with_client_auth_cert(
+            vec![rustls_pki_types::CertificateDer::from(
+                certificate.der().to_vec(),
+            )],
+            rustls_pki_types::PrivateKeyDer::Pkcs8(key.serialize_der().into()),
+        )
+        .expect("client auth");
+    tls.alpn_protocols = vec![to.alpn.to_vec()];
+    let mut endpoint =
+        quinn::Endpoint::client("127.0.0.1:0".parse().expect("loopback")).expect("client endpoint");
+    endpoint.set_default_client_config(quinn::ClientConfig::new(std::sync::Arc::new(
+        quinn::crypto::rustls::QuicClientConfig::try_from(tls).expect("quic tls"),
+    )));
+    let connection = endpoint
+        .connect(to.addr, SERVER_NAME)
+        .expect("dialable")
+        .await
+        .ok()?;
+    let (mut control, mut control_recv) = connection.open_bi().await.ok()?;
+    let hello = coord_types::wire_v1::MessageV1::Hello(coord_types::wire_v1::HelloV1 {
+        role,
+        cluster_id: coord_types::ids::ClusterId(CLUSTER),
+        domain_id: coord_types::ids::DomainId(DOMAIN),
+        incarnation: to
+            .incarnation
+            .map(|i| coord_types::ids::ReplicaIncarnation::new(i).expect("positive")),
+        capabilities: coord_types::wire_v1::BoundedVec::new(vec![to.lane.capability()])
+            .expect("bounded"),
+    })
+    .encode()
+    .expect("hello");
+    control.write_all(&hello).await.ok()?;
+    let answered = tokio::time::timeout(Duration::from_secs(20), async {
+        let mut reader = coord_types::wire_v1::FrameReader::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = control_recv.read(&mut buf).await.ok()??;
+            reader.push(&buf[..n]).ok()?;
+            if let Some(frame) = reader.next_frame().ok()? {
+                return coord_types::wire_v1::decode(&frame).ok();
+            }
+        }
+    })
+    .await
+    .expect("the node answered or closed within the bound");
+    connection.close(0u32.into(), b"done");
+    answered
+}
+
+/// A non-voter peer certificate naming a committed voter is refused at
+/// the handshake (design Section 10.1; the owner's decision on #185).
+/// The issuer may sign an observer's or learner's certificate for any
+/// node its rule lists, and a voter's link and the provenance of every
+/// frame are keyed by the node's replica identity. Such a certificate
+/// used to bind at n3 as n1 over a key genesis never committed: it took
+/// n1's link at n3, and n3 served its catch-up ask and promised its
+/// campaign (#185, 6846891832). Now n3 refuses it, as an observer or a
+/// learner, at n1's committed generation and at another, on either lane
+/// those roles may use, and the cluster keeps answering. An observer's
+/// certificate for a node that is no voter still binds.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_non_voter_certificate_naming_a_voter_is_refused_at_the_handshake() {
+    use coord_transport::Lane;
+    use coord_types::wire_v1::{MessageV1, PeerRole};
+    let dir = workspace("non-voter-naming-a-voter");
+    let cluster = three_voters(&dir);
+    for config in &cluster.configs {
+        assert_eq!(run(config, &["init"]).code, Some(0));
+    }
+    let running: Vec<Running> = cluster.configs.iter().map(|c| start(c)).collect();
+    for node in &running {
+        assert!(
+            node.waits_to_say("peers connected=2 of 2"),
+            "{}",
+            node.said()
+        );
+    }
+    let n3 = |incarnation, lane| Plane {
+        addr: format!("127.0.0.1:{}", cluster.peer[2])
+            .parse()
+            .expect("address"),
+        alpn: coord_transport::ALPN_PEER,
+        incarnation: Some(incarnation),
+        lane,
+    };
+    for role in [PeerRole::Observer, PeerRole::Learner] {
+        for incarnation in [1, 2] {
+            let (certificate, key) =
+                cluster
+                    .ca
+                    .issue_at(SERVER_NAME, CLUSTER, 1, role, incarnation);
+            for lane in [Lane::Control, Lane::Bulk] {
+                let answered =
+                    hello_on(n3(incarnation, lane), &cluster.ca, &certificate, &key, role).await;
+                assert!(
+                    !matches!(answered, Some(MessageV1::HelloAck(_))),
+                    "{role:?} naming n1 at generation {incarnation} bound on {lane:?}"
+                );
+            }
+        }
+    }
+
+    // The control: the same role for a node no voter is known by binds,
+    // on either lane. The same certificate issued in a sibling domain
+    // does not: the peer plane takes the domain from the certificate too
+    // (#271).
+    for lane in [Lane::Control, Lane::Bulk] {
+        let (certificate, key) =
+            cluster
+                .ca
+                .issue_at(SERVER_NAME, CLUSTER, 9, PeerRole::Observer, 1);
+        let answered = hello_on(
+            n3(1, lane),
+            &cluster.ca,
+            &certificate,
+            &key,
+            PeerRole::Observer,
+        )
+        .await;
+        assert!(
+            matches!(answered, Some(MessageV1::HelloAck(_))),
+            "an observer for node 9 was refused on {lane:?}: {answered:?}"
+        );
+        let (certificate, key) =
+            cluster
+                .ca
+                .issue_in(SERVER_NAME, CLUSTER, [0x33; 16], 9, PeerRole::Observer, 1);
+        let answered = hello_on(
+            n3(1, lane),
+            &cluster.ca,
+            &certificate,
+            &key,
+            PeerRole::Observer,
+        )
+        .await;
+        assert!(
+            !matches!(answered, Some(MessageV1::HelloAck(_))),
+            "a sibling domain's observer for node 9 bound on {lane:?}: {answered:?}"
+        );
+    }
+
+    // And the cluster still answers.
+    let caller = Caller::bind(&running[0], &cluster.ca, &cluster.ring, [0x44; 16]).await;
+    ask(&caller.connection, &caller.put(1, b"k", b"v"))
+        .await
+        .expect("written");
+}
+
+/// A frontend's certificate reaches only the domain it names (design
+/// Section 11.1, Codex's P1 on #267). The cluster's domains share its
+/// issuer, so a sibling domain's frontend certificate is signed by the
+/// authority this node trusts and names this cluster. It used to bind
+/// here as a frontend -- the role that submits on callers' behalf and
+/// establishes their sessions -- by naming this domain in its `Hello`.
+/// The handshake now refuses it; this domain's own frontend still binds.
+/// The same holds for a Kine collector's certificate.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_frontend_certificate_of_another_domain_is_refused_at_the_handshake() {
+    use coord_types::wire_v1::{MessageV1, PeerRole};
+    let dir = workspace("frontend-domain");
+    let ca = credentials(&dir, 7, PeerRole::Frontend);
+    genesis(&dir, Some(&ca.node_spki));
+    endpoints(&dir, &ca, 3, &[]);
+    let _ = sts_keys(&dir);
+    let path = config_only(&dir);
+    let text = std::fs::read_to_string(&path).expect("read");
+    std::fs::write(
+        &path,
+        text.replace("role = \"voter-frontend-observer\"", "role = \"frontend\"")
+            .replace("peer_quic = \"127.0.0.1:0\"\n", ""),
+    )
+    .expect("write");
+    assert_eq!(run(&path, &["init"]).code, Some(0));
+    let daemon = start(&path);
+
+    // Both collector roles: the frontend, and the Kine collector, the
+    // role the code calls "for one domain", which submits too.
+    for role in [PeerRole::Frontend, PeerRole::KineCollector] {
+        let (mine, mine_key) = ca.issue_in("frontend.coordd.test", CLUSTER, DOMAIN, 0x0f, role, 1);
+        let answer = hello_on_api(&daemon, &ca, &mine, &mine_key, role).await;
+        assert!(
+            matches!(answer, Some(MessageV1::HelloAck(_))),
+            "this domain's {role:?} binds: {answer:?}"
+        );
+
+        let (theirs, theirs_key) =
+            ca.issue_in("frontend.coordd.test", CLUSTER, [0x33; 16], 0x0f, role, 1);
+        let answer = hello_on_api(&daemon, &ca, &theirs, &theirs_key, role).await;
+        assert!(
+            !matches!(answer, Some(MessageV1::HelloAck(_))),
+            "a sibling domain's {role:?} bound here: {answer:?}"
+        );
+    }
 }
 
 /// Start `coordd` and read its startup report, then stop it.
@@ -1395,6 +1722,12 @@ impl Caller {
 
     /// One `Range` of exactly `key`, as a client would send it.
     fn range(&self, sequence: u64, key: &[u8]) -> Vec<u8> {
+        self.range_acking(sequence, key, 0)
+    }
+
+    /// One `Range` of exactly `key` that acknowledges every result
+    /// through `ack_through`.
+    fn range_acking(&self, sequence: u64, key: &[u8], ack_through: u64) -> Vec<u8> {
         let mut logical = coord_types::logical_v1::LogicalRequest::new(
             coord_types::ids::NamespaceId([0x5e; 16]),
             coord_types::logical_v1::CanonicalOperation::Range(coord_types::logical_v1::RangeOp {
@@ -1407,8 +1740,13 @@ impl Caller {
         );
         logical.canonicalize();
         coord_types::wire_v1::MessageV1::Request(
-            coord_types::wire_v1::RequestV1::new(self.invocation(sequence), &logical, 0, 0)
-                .expect("bounded"),
+            coord_types::wire_v1::RequestV1::new(
+                self.invocation(sequence),
+                &logical,
+                0,
+                ack_through,
+            )
+            .expect("bounded"),
         )
         .encode()
         .expect("bounded")
@@ -1724,6 +2062,93 @@ async fn a_request_is_served_end_to_end_by_the_voter_in_this_process() {
     );
 }
 
+/// The cost a daemon reports outlives the daemon (task-d45).
+///
+/// A snapshot printed only at a clean end is the one a killed daemon
+/// never prints, and a killed daemon is what a fault run and a stuck
+/// node leave behind. With an interval, the last interval's counters
+/// are in the log whatever ended the process: here SIGKILL, after it
+/// executed the caller's session and three writes.
+///
+/// The counts are checked for what they must be, not for exact values:
+/// every command this voter executed was lowered at least once, every
+/// lowering wrote a journal group or a projection commit, and the
+/// journal synced at least once per group it appended.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_killed_daemon_leaves_its_last_intervals_cost_in_its_log() {
+    let dir = workspace("cost-on-kill");
+    let ca = credentials(&dir, 1, coord_types::wire_v1::PeerRole::Voter);
+    genesis_of(&dir, 1, Some(&ca.node_spki));
+    let ring = sts_keys(&dir);
+    let path = config_only(&dir);
+    let mut text = std::fs::read_to_string(&path).expect("read config");
+    text.push_str("\n[metrics]\ninterval_seconds = 1\n");
+    std::fs::write(&path, text).expect("write config");
+
+    assert_eq!(run(&path, &["init"]).code, Some(0));
+    let mut daemon = start(&path);
+    let caller = Caller::bind(&daemon, &ca, &ring, [0x46; 16]).await;
+    for sequence in 1..=3u64 {
+        ask(&caller.connection, &caller.put(sequence, b"k", b"v"))
+            .await
+            .expect("the daemon answered the write");
+    }
+    // An interval snapshot after the work: the first one of a run has
+    // no interval behind it, so this waits for one that has.
+    let executed = |line: &str| -> Option<u64> {
+        let snapshot: serde_json::Value =
+            serde_json::from_str(line.strip_prefix("metrics ")?).ok()?;
+        let cost = &snapshot["cost"]["Observed"];
+        cost["recent"]["Observed"].is_object().then_some(())?;
+        cost["executed"].as_u64()
+    };
+    assert!(
+        daemon.waits_until(10, |said| said.lines().filter_map(executed).any(|n| n >= 4)),
+        "no interval snapshot counted the session and the three writes:\n{}",
+        daemon.said()
+    );
+
+    // SIGKILL: nothing at the end of the run is printed.
+    daemon.child.kill().expect("killed");
+    daemon.child.wait().expect("reaped");
+    std::thread::sleep(Duration::from_millis(200));
+    let said = daemon.said();
+    assert!(
+        !said.contains("the api plane ended"),
+        "the daemon ended cleanly, so this is not a killed daemon's log"
+    );
+    let last = said
+        .lines()
+        .rfind(|line| line.starts_with("metrics "))
+        .expect("a snapshot was printed before the kill");
+    let snapshot: serde_json::Value =
+        serde_json::from_str(last.strip_prefix("metrics ").expect("prefixed")).expect("json");
+    let cost = &snapshot["cost"]["Observed"];
+    let count = |field: &str| {
+        cost[field]
+            .as_u64()
+            .unwrap_or_else(|| panic!("{field}: {last}"))
+    };
+    assert!(count("executed") >= 4, "{last}");
+    assert!(count("lowerings") >= count("executed"), "{last}");
+    assert!(
+        count("lowerings") <= count("journal_appends") + count("projection_commits"),
+        "a lowering was counted that wrote nothing: {last}"
+    );
+    let syncs = cost["journal_syncs"]["Observed"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("the raft-engine journal counts its syncs: {last}"));
+    assert!(syncs >= count("journal_appends"), "{last}");
+    assert!(
+        cost["recent"]["Observed"].is_object(),
+        "an interval snapshot carries its interval: {last}"
+    );
+    assert!(
+        cost["busy"]["secs"].as_u64().is_some() && cost["uptime"]["secs"].as_u64().is_some(),
+        "{last}"
+    );
+}
+
 /// The same invocation is answered the same way after a restart.
 ///
 /// The daemon stops, the process that held the collector's retained
@@ -1782,6 +2207,56 @@ async fn the_same_invocation_is_answered_the_same_way_after_a_restart() {
     );
 }
 
+/// A new session's first read is answered while the group that created
+/// the session waits for the projection to commit it (#281).
+///
+/// A read is served over the projection's snapshot with the journaled
+/// groups still in flight laid over it, and doesn't ask for a commit. Its
+/// output is reauthorized on the way out. That barrier read the committed
+/// snapshot, so a session created in a group held for a larger commit was
+/// one the node had never seen, and its read was answered pending. Here
+/// the hold outlasts the test. A session's record can still reach the
+/// commit first (the settle of a half-established entry asks for one), so
+/// five sessions each read once, and every read has to be answered.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_sessions_first_read_is_answered_while_the_projection_holds_its_commit() {
+    let dir = workspace("read-held-commit");
+    let ca = credentials(&dir, 1, coord_types::wire_v1::PeerRole::Voter);
+    genesis_of(&dir, 1, Some(&ca.node_spki));
+    let ring = sts_keys(&dir);
+    let path = config_only(&dir);
+    let text = std::fs::read_to_string(&path).expect("the config was written");
+    let journal = "[journal]\nroot = \"journal\"\nshards = 1\n";
+    assert!(text.contains(journal), "the config's journal section moved");
+    std::fs::write(
+        &path,
+        text.replace(
+            journal,
+            &format!(
+                "{journal}profile = \"journaled-replay-v1\"\n\
+                 projection_commit_records = 1000000\n\
+                 projection_commit_ms = 600000\n"
+            ),
+        ),
+    )
+    .expect("the config was rewritten");
+    assert_eq!(run(&path, &["init"]).code, Some(0));
+
+    let daemon = start(&path);
+    for session in 0x47..0x4c {
+        let caller = Caller::bind(&daemon, &ca, &ring, [session; 16]).await;
+        let answer = ask(&caller.connection, &caller.range(1, b"k"))
+            .await
+            .unwrap_or_else(|| panic!("the daemon answered the read\n{}", daemon.said()));
+        let outcome = response_of(&answer).outcome;
+        assert!(
+            matches!(outcome, coord_types::wire_v1::OutcomeV1::Ok { .. }),
+            "session {session:#x}'s first read was answered {outcome:?}:\n{}",
+            daemon.said()
+        );
+    }
+}
+
 /// A read retried after a restart is answered with its retained result,
 /// not refused.
 ///
@@ -1833,6 +2308,47 @@ async fn a_read_retried_after_a_restart_gets_its_retained_result() {
         again.outcome, first.outcome,
         "a read retried after a restart was not given its retained result"
     );
+}
+
+/// A session that only reads keeps being served past its window.
+///
+/// A read the leader serves without ordering it records nothing and so
+/// retires nothing; only an ordered command moves the session's floor.
+/// A session that read through the leader alone walked its sequence out
+/// of its 1024-wide window and was then refused everything, ordered
+/// requests included (task-d50). Past half the window the leader now
+/// leaves the read to the ordered path, which retires behind it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_that_only_reads_is_served_past_its_window() {
+    let dir = workspace("read-window");
+    let ca = credentials(&dir, 1, coord_types::wire_v1::PeerRole::Voter);
+    genesis_of(&dir, 1, Some(&ca.node_spki));
+    let ring = sts_keys(&dir);
+    let path = config_only(&dir);
+    assert_eq!(run(&path, &["init"]).code, Some(0));
+    let daemon = start(&path);
+    let caller = Caller::bind(&daemon, &ca, &ring, [0x47; 16]).await;
+    ask(&caller.connection, &caller.put(1, b"k", b"v"))
+        .await
+        .expect("the daemon answered the write");
+    for sequence in 2..=2600u64 {
+        let answer = ask(
+            &caller.connection,
+            &caller.range_acking(sequence, b"k", sequence - 1),
+        )
+        .await
+        .unwrap_or_else(|| panic!("read {sequence} was not answered\n{}", daemon.said()));
+        let response = response_of(&answer);
+        let coord_types::wire_v1::OutcomeV1::Ok { result, .. } = &response.outcome else {
+            panic!("read {sequence} was not answered with a result: {response:?}");
+        };
+        let read: coord_state::Response =
+            postcard::from_bytes(result.as_slice()).expect("the read's result decodes");
+        assert!(
+            matches!(read.outcome, coord_state::Outcome::Range { .. }),
+            "read {sequence} was answered {read:?}"
+        );
+    }
 }
 
 /// A restarted replica comes back owing what it already owed.
@@ -2293,6 +2809,7 @@ struct Cluster {
     ring: coord_sts::KeyRing,
     configs: Vec<PathBuf>,
     api: Vec<u16>,
+    peer: Vec<u16>,
 }
 
 fn three_voters(dir: &Path) -> Cluster {
@@ -2451,6 +2968,7 @@ namespace = "5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e"
         ring,
         configs,
         api,
+        peer,
     }
 }
 
@@ -3420,6 +3938,47 @@ async fn a_node_publishes_its_own_baseline_and_comes_back_on_it() {
             "the daemon never published a recovery checkpoint\n{}",
             daemon.said()
         );
+        // And it says how long each of its steps took, so a run whose
+        // publications grow shows which step grew (task-d55).
+        let said = daemon.said();
+        let line = said
+            .lines()
+            .find(|line| line.starts_with("checkpoint ") && line.contains("retired=true"))
+            .expect("the publication's line");
+        for phase in [
+            " took_ms=",
+            " loop_ms=",
+            " pin_ms=",
+            " export_ms=",
+            " write_ms=",
+            " drain_ms=",
+            " sync_ms=",
+            " append_ms=",
+            " retire_ms=",
+            " queued_ms=",
+            " reclaim_ms=",
+        ] {
+            assert!(line.contains(phase), "no{phase} in {line}");
+        }
+        let value_of = |key: &str| {
+            line.split(key)
+                .nth(1)
+                .and_then(|rest| rest.split_whitespace().next())
+                .unwrap_or_else(|| panic!("no{key} in {line}"))
+        };
+        // A voter publishes its pointer on the journal worker (task-d66):
+        // from the queue to the outcome, the group it rode and the
+        // retirement after it.
+        assert!(value_of(" queued_ms=").parse::<f64>().is_ok(), "{line}");
+        // So the domain thread ran none of the journal's steps, and has
+        // no time of its own over them to give, where on the calling
+        // thread it is read on Linux.
+        for step in ["drain", "sync", "append", "retire"] {
+            for of in ["cpu", "runq"] {
+                let key = format!(" {step}_{of}_ms=");
+                assert_eq!(value_of(&key), "-", "{key} in {line}");
+            }
+        }
         response_of(&answer)
     };
 
@@ -3567,6 +4126,62 @@ fn inspect_reports_the_credential_against_committed_membership_and_starts_nothin
         !refused.err.contains("collector certificate"),
         "refused for the collector's leaf, not the node's: {}",
         refused.err
+    );
+}
+
+/// A node whose own certificate is an observer's naming a committed
+/// voter: `inspect` says so, and the node refuses to start, rather than
+/// starting to be refused by every peer with nothing said on its own
+/// side (design Section 10.1). The same certificate for a node no voter
+/// holds is reported as what it is.
+#[test]
+fn an_observer_certificate_naming_a_committed_voter_is_named_on_its_own_node() {
+    let dir = workspace("observer-names-voter");
+    let voter = credentials(&dir, 1, coord_types::wire_v1::PeerRole::Voter);
+    genesis_of(&dir, 3, Some(&voter.node_spki));
+    let _ = sts_keys(&dir);
+    let path = config_only(&dir);
+    let config = std::fs::read_to_string(&path).expect("config");
+    assert!(config.contains("role = \"voter-frontend-observer\""));
+    std::fs::write(
+        &path,
+        config.replace(
+            "role = \"voter-frontend-observer\"",
+            "role = \"frontend-observer\"",
+        ),
+    )
+    .expect("config");
+
+    let _ = credentials(&dir, 1, coord_types::wire_v1::PeerRole::Observer);
+    let report = run(&path, &["inspect"]);
+    assert_eq!(report.code, Some(0), "{}", report.err);
+    assert!(
+        report
+            .out
+            .contains("role=Observer state=names-a-committed-voter"),
+        "expected the role named:\n{}",
+        report.out
+    );
+    let refused = run(&path, &[]);
+    assert_eq!(refused.code, Some(2), "{}", refused.out);
+    assert!(
+        refused.err.contains("a committed voter"),
+        "refused for another reason: {}",
+        refused.err
+    );
+    assert!(
+        !dir.join("state").exists(),
+        "a refused node created a store"
+    );
+
+    // The control: an observer of a node no voter holds.
+    let _ = credentials(&dir, 9, coord_types::wire_v1::PeerRole::Observer);
+    let report = run(&path, &["inspect"]);
+    assert_eq!(report.code, Some(0), "{}", report.err);
+    assert!(
+        report.out.contains("role=Observer state=not-a-voter"),
+        "{}",
+        report.out
     );
 }
 
@@ -4281,6 +4896,14 @@ fn a_node_refuses_a_store_that_activated_something_this_build_cannot_do() {
         report.contains("build schema=1") && report.contains("features=checkpoint-floor"),
         "the daemon did not report what this build is:\n{report}"
     );
+    // The journal's window reads ahead, so the line gives the versions
+    // read, and the one written beside them: an operator checking a fleet
+    // before a rollback sees which nodes read what a successor writes,
+    // and which already write it (10.7, step 1a).
+    assert!(
+        report.contains("journal=1..2 journal_writes=1 "),
+        "the build line did not give the journal's read window and written version:\n{report}"
+    );
 
     // Nothing activated: it serves, which is the coexistence half.
     assert_eq!(run(&path, &["--check"]).code, Some(0));
@@ -4298,6 +4921,15 @@ fn a_node_refuses_a_store_that_activated_something_this_build_cannot_do() {
         refused.out,
         refused.err
     );
+    // It says why as an operator needs it: this build is too old, and the
+    // id it doesn't know, not a corrupt record (#227 review).
+    assert!(
+        format!("{}{}", refused.out, refused.err).contains("too old")
+            && format!("{}{}", refused.out, refused.err).contains("0x7fff"),
+        "the refusal didn't say this build is too old:\n{}{}",
+        refused.out,
+        refused.err
+    );
 
     // And one it does support is admitted again: the guard is about
     // capability, not about the record existing.
@@ -4310,14 +4942,19 @@ fn a_node_refuses_a_store_that_activated_something_this_build_cannot_do() {
 }
 
 /// Write the cluster's activation record straight into the selected
-/// generation, as the replicated path will once task-m02 drives it.
+/// generation, as the replicated path will once task-d99 drives it.
 fn write_activation(dir: &Path, features: &[u16]) {
+    write_activation_of(dir, 1, features, &[1]);
+}
+
+/// [`write_activation`] into voter `node`'s store, naming `reporters`.
+fn write_activation_of(dir: &Path, node: u8, features: &[u16], reporters: &[u8]) {
     use coord_store_api::engine::{LocalEngine, WriteTxn};
     let root = dir.join("state");
     let identity = coord_storage_redb::StoreIdentity {
         cluster_id: coord_types::ids::ClusterId(CLUSTER),
         domain_id: coord_types::ids::DomainId(DOMAIN),
-        replica_id: coord_types::ids::ReplicaId([1; 16]),
+        replica_id: coord_types::ids::ReplicaId([node; 16]),
         incarnation: coord_types::ids::ReplicaIncarnation::new(1).unwrap(),
     };
     let options = coord_storage_redb::OpenOptions {
@@ -4330,7 +4967,10 @@ fn write_activation(dir: &Path, features: &[u16]) {
         domain: coord_types::ids::DomainId(DOMAIN),
         configuration: coord_types::ids::ConfigurationEpoch::new(1).unwrap(),
         features: features.to_vec(),
-        reporters: vec![coord_types::ids::ReplicaId([1; 16])],
+        reporters: reporters
+            .iter()
+            .map(|r| coord_types::ids::ReplicaId([*r; 16]))
+            .collect(),
     };
     let mut tx = generation.engine().begin_write().expect("write");
     tx.put(
@@ -4418,12 +5058,33 @@ async fn a_node_reports_bounded_secret_free_metrics() {
             .unwrap_or_else(|| panic!("no {name} reading:\n{rendered}"))["metrics"]
             .clone()
     };
-    for recorded in ["Admission", "Journal", "Materialization"] {
+    for recorded in [
+        "Admission",
+        "Journal",
+        "Materialization",
+        "Checkpoint",
+        "Recovery",
+    ] {
         assert!(
             reading(recorded).get("Observed").is_some(),
             "{recorded} is recorded by this daemon but was not observed:\n{rendered}"
         );
     }
+    // The restart replayed its journal before the report, and the report
+    // has that replay as its one recovery sample (task-d55).
+    assert_eq!(
+        reading("Recovery").pointer("/Observed/completed"),
+        Some(&serde_json::json!(1)),
+        "the boot's replay is not the recovery stage's sample:\n{rendered}"
+    );
+    let replay = said
+        .lines()
+        .find(|line| line.starts_with("replayed records="))
+        .unwrap_or_else(|| panic!("the daemon never said what it replayed:\n{said}"));
+    assert!(
+        replay.contains(" took_ms=") && replay.contains(" attach_ms="),
+        "{replay}"
+    );
     for unrecorded in ["FanOut", "ClientTransit", "EvidenceLearning"] {
         assert_eq!(
             reading(unrecorded)
@@ -5359,6 +6020,7 @@ impl Ca {
     ) -> (Vec<u8>, u64) {
         let identity = coord_node_issuer::NodeIdentity {
             cluster: coord_types::ids::ClusterId(CLUSTER),
+            domain: coord_types::ids::DomainId(DOMAIN),
             node: coord_types::ids::ReplicaId([replica; 16]),
             incarnation: coord_types::ids::ReplicaIncarnation::new(1).expect("positive"),
             role,
@@ -5465,6 +6127,7 @@ impl NodeIssuerFixture {
                 .into_iter()
                 .collect(),
                 cluster: coord_types::ids::ClusterId(CLUSTER),
+                domain: coord_types::ids::DomainId(DOMAIN),
                 nodes: vec![coord_types::ids::ReplicaId([*n; 16])],
                 role,
                 min_incarnation: 1,
@@ -5674,10 +6337,12 @@ async fn a_leaf_that_falls_due_is_renewed_in_place_and_serving_carries_on() {
     let answer = ask(&early.connection, &early.put(1, b"k", b"v"))
         .await
         .expect("a caller connected before the renewal is served inside the old leaf's life");
-    assert!(matches!(
-        response_of(&answer).outcome,
-        coord_types::wire_v1::OutcomeV1::Ok { .. }
-    ));
+    let outcome = response_of(&answer).outcome;
+    assert!(
+        matches!(outcome, coord_types::wire_v1::OutcomeV1::Ok { .. }),
+        "the early caller's write was answered {outcome:?}:\n{}",
+        daemon.said()
+    );
     // ...and closed at it: that connection was authenticated under the
     // old leaf, and nothing is carried under a leaf past its end.
     until_past(old_not_after + 1).await;
@@ -5698,10 +6363,12 @@ async fn a_leaf_that_falls_due_is_renewed_in_place_and_serving_carries_on() {
     let answer = ask(&late.connection, &late.range(1, b"k"))
         .await
         .expect("a caller arriving after the old leaf's end is served");
-    assert!(matches!(
-        response_of(&answer).outcome,
-        coord_types::wire_v1::OutcomeV1::Ok { .. }
-    ));
+    let outcome = response_of(&answer).outcome;
+    assert!(
+        matches!(outcome, coord_types::wire_v1::OutcomeV1::Ok { .. }),
+        "the late caller's read was answered {outcome:?}:\n{}",
+        daemon.said()
+    );
     assert!(
         !daemon.said().contains("renewal expired"),
         "{}",
@@ -6234,6 +6901,310 @@ async fn a_leader_restarted_before_it_is_missed_campaigns_rather_than_resuming_i
     }
 }
 
+/// The proposals an early-sending leader sent, from the last interval
+/// snapshot in `said` (task-d98).
+fn early_sends(said: &str) -> u64 {
+    said.lines()
+        .rev()
+        .filter_map(|line| line.strip_prefix("metrics "))
+        .filter_map(|rendered| serde_json::from_str::<serde_json::Value>(rendered).ok())
+        .filter_map(|snapshot| {
+            snapshot
+                .pointer("/cost/Observed/resends/early")
+                .and_then(serde_json::Value::as_u64)
+        })
+        .next()
+        .unwrap_or(0)
+}
+
+/// A genesis leader that sent its proposals before their batches were
+/// durable, killed and started again at once, comes back following
+/// (task-d98, design Section 4.8's fourth condition).
+///
+/// With `EarlyProposal` active on every voter's store, the leader sends a
+/// proposal to the follower outside the fast set as soon as it is
+/// batched, once its first batch is durable. That first batch is what
+/// keeps a restart from reading its store as fresh: had it come back
+/// leading the genesis ballot, it would have numbered its proposals from
+/// zero again over orders that follower already held. It campaigns
+/// instead, and what was written before is what every voter reads after.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_leader_that_sent_early_and_restarted_comes_back_following() {
+    let dir = workspace("early-restart");
+    let cluster = three_voters(&dir);
+    for (i, config) in cluster.configs.iter().enumerate() {
+        let mut text = std::fs::read_to_string(config).expect("read config");
+        text.push_str("\n[metrics]\ninterval_seconds = 1\n");
+        std::fs::write(config, text).expect("write config");
+        assert_eq!(run(config, &["init"]).code, Some(0));
+        let node = u8::try_from(i + 1).unwrap();
+        write_activation_of(
+            &dir.join(format!("n{node}")),
+            node,
+            &[coord_types::formats::Feature::EarlyProposal.id()],
+            &[1, 2, 3],
+        );
+    }
+    let mut running: Vec<Running> = cluster.configs.iter().map(|c| start(c)).collect();
+    for node in &running {
+        assert!(
+            node.waits_to_say("voters submittable=2 of 2"),
+            "{}",
+            node.said()
+        );
+    }
+    assert!(
+        running[0].waits_to_say("this voter leads ballot 0"),
+        "{}",
+        running[0].said()
+    );
+    // Writes, paced, until the leader has sent one early: it sends early
+    // only to a follower that has said it holds the activation (task-d99),
+    // which may land after the first few writes.
+    let before = Caller::bind(&running[1], &cluster.ca, &cluster.ring, [0x65; 16]).await;
+    let mut sequence = 0u64;
+    while early_sends(&running[0].said()) == 0 {
+        sequence += 1;
+        assert!(
+            sequence <= 60,
+            "the leader sent nothing early with the feature active:\n{}",
+            running[0].said()
+        );
+        let put = ask(&before.connection, &before.put(sequence, b"k", b"before"))
+            .await
+            .expect("the domain established a write while its leader was up");
+        assert!(matches!(
+            response_of(&put).outcome,
+            coord_types::wire_v1::OutcomeV1::Ok { .. }
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+
+    drop(running.remove(0));
+    let back = start(&cluster.configs[0]);
+    running.insert(0, back);
+    assert!(
+        running[0].waits_until(120, |said| said.contains("this voter leads ballot 1")),
+        "the restarted leader did not win the next ballot:\n-- 1 --\n{}\n-- 2 --\n{}\n-- 3 --\n{}",
+        running[0].said(),
+        running[1].said(),
+        running[2].said()
+    );
+    assert!(
+        !running[0].said().contains("this voter leads ballot 0"),
+        "the restarted leader resumed the genesis ballot:\n{}",
+        running[0].said()
+    );
+    for node in &running[1..] {
+        assert!(
+            node.waits_until(90, |said| healed(said, "voters submittable=", 2)),
+            "a survivor's collector did not get its link to the restarted leader back:\n{}",
+            node.said()
+        );
+    }
+    let callers = [
+        Caller::bind(&running[0], &cluster.ca, &cluster.ring, [0x66; 16]).await,
+        Caller::bind(&running[1], &cluster.ca, &cluster.ring, [0x67; 16]).await,
+        Caller::bind(&running[2], &cluster.ca, &cluster.ring, [0x68; 16]).await,
+    ];
+    for (n, caller) in callers.iter().enumerate() {
+        let read = ask(&caller.connection, &caller.range(1, b"k"))
+            .await
+            .unwrap_or_else(|| panic!("voter {} did not answer a read", n + 1));
+        assert_eq!(
+            read_value(&read).as_deref(),
+            Some(&b"before"[..]),
+            "voter {}",
+            n + 1
+        );
+    }
+}
+
+/// `coordctl feature`'s request to voter `n`'s admin socket (task-d99).
+async fn admin(dir: &Path, n: u8, line: &str) -> coordctl::admin::Answer {
+    let socket = dir.join(format!("n{n}")).join("admin.sock");
+    let line = line.to_owned();
+    tokio::task::spawn_blocking(move || {
+        coordctl::admin::request(&socket, &line, std::time::Duration::from_secs(20))
+    })
+    .await
+    .expect("the request ran")
+    .expect("the node answered")
+}
+
+/// An operator activates `EarlyProposal` in a running domain with
+/// `coordctl feature` (task-d99): a follower refuses and names the
+/// leader; the leader prepares every voter, activates, and every voter
+/// ends up holding it, with no restart; its leader then sends early; and
+/// a voter restarted after it still holds it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_operator_activates_a_feature_in_a_running_domain() {
+    let dir = workspace("feature");
+    let cluster = three_voters(&dir);
+    for config in &cluster.configs {
+        let mut text = std::fs::read_to_string(config).expect("read config");
+        text.push_str("\n[metrics]\ninterval_seconds = 1\n");
+        std::fs::write(config, text).expect("write config");
+        assert_eq!(run(config, &["init"]).code, Some(0));
+    }
+    let mut running: Vec<Running> = cluster.configs.iter().map(|c| start(c)).collect();
+    for node in &running {
+        assert!(
+            node.waits_to_say("voters submittable=2 of 2"),
+            "{}",
+            node.said()
+        );
+    }
+    assert!(
+        running[0].waits_to_say("this voter leads ballot 0"),
+        "{}",
+        running[0].said()
+    );
+    let refused = admin(&dir, 2, "feature activate early-proposal").await;
+    assert!(!refused.ok, "a follower activated: {}", refused.text);
+    assert!(refused.text.contains("does not lead"), "{}", refused.text);
+    let refused = admin(&dir, 1, "feature activate no-such-feature").await;
+    assert!(!refused.ok);
+    // Every voter's advertisement reaches the leader as its links come
+    // up; until then the request is refused, naming the voters.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let answer = admin(&dir, 1, "feature activate early-proposal").await;
+        if answer.ok {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the leader never had every voter's advertisement: {}\n-- 1 --\n{}\n-- 2 --\n{}",
+            answer.text,
+            running[0].said(),
+            running[1].said()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    let held = |text: &str| {
+        text.contains("active early-proposal")
+            && text
+                .lines()
+                .filter(|l| l.starts_with("voter "))
+                .all(|l| l.contains(" held early-proposal"))
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut status = admin(&dir, 1, "feature status").await;
+    while !held(&status.text) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "not every voter holds the activation:\n{}",
+            status.text
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        status = admin(&dir, 1, "feature status").await;
+    }
+    assert!(status.ok);
+    let caller = Caller::bind(&running[1], &cluster.ca, &cluster.ring, [0x71; 16]).await;
+    for sequence in 1..=5u64 {
+        let put = ask(&caller.connection, &caller.put(sequence, b"k", b"v"))
+            .await
+            .expect("the domain established a write");
+        assert!(matches!(
+            response_of(&put).outcome,
+            coord_types::wire_v1::OutcomeV1::Ok { .. }
+        ));
+    }
+    assert!(
+        running[0].waits_until(30, |said| early_sends(said) > 0),
+        "the leader sent nothing early once the feature was active:\n{}",
+        running[0].said()
+    );
+    // The release rule (task-d90) is activated the same way, beside the
+    // first, and the domain goes on answering under it.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let answer = admin(&dir, 1, "feature activate release-at-execution").await;
+        if answer.ok {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the release rule was never activated: {}",
+            answer.text
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    let both = |text: &str| {
+        text.lines()
+            .any(|l| l.starts_with("active ") && l.contains("release-at-execution"))
+            && text
+                .lines()
+                .filter(|l| l.starts_with("voter "))
+                .filter_map(|l| l.split(" held ").nth(1))
+                .all(|held| {
+                    held.contains("early-proposal") && held.contains("release-at-execution")
+                })
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut status = admin(&dir, 1, "feature status").await;
+    while !both(&status.text) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "not every voter holds both activations:\n{}",
+            status.text
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        status = admin(&dir, 1, "feature status").await;
+    }
+    for sequence in 6..=10u64 {
+        let put = ask(&caller.connection, &caller.put(sequence, b"k", b"v"))
+            .await
+            .expect("the domain established a write under the release rule");
+        assert!(matches!(
+            response_of(&put).outcome,
+            coord_types::wire_v1::OutcomeV1::Ok { .. }
+        ));
+    }
+    // A voter restarted after the activation holds it, and says so again.
+    drop(running.remove(2));
+    running.push(start(&cluster.configs[2]));
+    assert!(
+        running[2].waits_to_say("voters submittable=2 of 2"),
+        "{}",
+        running[2].said()
+    );
+    let mine = admin(&dir, 3, "feature status").await;
+    assert!(
+        mine.text.contains("active early-proposal"),
+        "the restarted voter's own switch is off:\n{}",
+        mine.text
+    );
+    assert!(
+        mine.text
+            .lines()
+            .any(|l| l.starts_with("active ") && l.contains("release-at-execution")),
+        "the restarted voter's release switch is off:\n{}",
+        mine.text
+    );
+    // The restart may have moved leadership: the leader's view is the
+    // domain's, wherever it is now.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    'held: loop {
+        let mut seen = Vec::new();
+        for n in 1..=3u8 {
+            let status = admin(&dir, n, "feature status").await;
+            if status.text.contains("(this node)") && held(&status.text) {
+                break 'held;
+            }
+            seen.push(status.text);
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no leader sees every voter holding the activation:\n{}\n{}",
+            seen.join("\n"),
+            running[2].said()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
 /// The survivors of a stopped leader elect one of themselves and go on
 /// serving; the old leader, started again, follows the new one; and what
 /// was established before is still there (task-d01).
@@ -6278,13 +7249,27 @@ async fn the_survivors_of_a_stopped_leader_elect_another_and_it_follows_when_it_
     // The genesis leader goes away.
     let leader = running.remove(0);
     drop(leader);
+    let stopped = std::time::Instant::now();
     let elected = |said: &str| said.contains("this voter leads ballot 1");
     let followed = |said: &str| said.contains("this voter follows ballot 1");
+    let settled = running[0].waits_until(90, |said| elected(said) || followed(said))
+        && running[1].waits_until(30, |said| elected(said) || followed(said));
+    // Taken once both have settled on ballot 1. The check of which one
+    // leads used to wait 30 s on the first survivor even when the other
+    // led, and that wait was counted here (task-d81's CI, 36 s). Settled,
+    // the leader has said so already, so the first is only looked at.
+    let took = stopped.elapsed();
     assert!(
-        running[0].waits_until(90, |said| elected(said) || followed(said))
-            && running[1].waits_until(30, |said| elected(said) || followed(said))
-            && (running[0].waits_until(30, elected) || running[1].waits_until(1, elected)),
+        settled && (elected(&running[0].said()) || running[1].waits_until(30, elected)),
         "the survivors did not elect a leader:\n-- 2 --\n{}\n-- 3 --\n{}",
+        running[0].said(),
+        running[1].said()
+    );
+    // Within seconds of the kill, not the 30 s a dead process's links
+    // took to close before the peer plane's idle timeout (task-d82).
+    assert!(
+        took < Duration::from_secs(20),
+        "the survivors elected a leader {took:?} after the kill:\n-- 2 --\n{}\n-- 3 --\n{}",
         running[0].said(),
         running[1].said()
     );
@@ -6346,6 +7331,117 @@ async fn the_survivors_of_a_stopped_leader_elect_another_and_it_follows_when_it_
                 back.said(),
                 running[0].said(),
                 running[1].said()
+            )
+        });
+    assert!(matches!(
+        response_of(&put).outcome,
+        coord_types::wire_v1::OutcomeV1::Ok { .. }
+    ));
+}
+
+/// A leader killed and started again at once leaves the domain without a
+/// leader for seconds, not for the transport's idle timeout (task-d82).
+///
+/// On the Jepsen runner (#98, the #173 carry's leader-kill run) a leader
+/// back within the old 30 s came back still the leader on record. The
+/// survivors had not seen its links end, so neither campaigned, and its
+/// own dials lost the lane to their connections to the dead process until
+/// those timed out: no node served for 67 s at worst. With the peer
+/// plane's idle timeout at seconds, a write is established again within a
+/// few, whichever voter then leads.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_leader_killed_and_started_again_at_once_serves_again_within_seconds() {
+    let dir = workspace("leader-back");
+    let cluster = three_voters(&dir);
+    for config in &cluster.configs {
+        assert_eq!(run(config, &["init"]).code, Some(0));
+    }
+    let mut running: Vec<Running> = cluster.configs.iter().map(|c| start(c)).collect();
+    for node in &running {
+        assert!(
+            node.waits_to_say("voters submittable=2 of 2"),
+            "{}",
+            node.said()
+        );
+    }
+    let caller = Caller::bind(&running[0], &cluster.ca, &cluster.ring, [0x52; 16]).await;
+    let put = ask(&caller.connection, &caller.put(1, b"k", b"before"))
+        .await
+        .expect("the domain established a write under its first leader");
+    assert!(matches!(
+        response_of(&put).outcome,
+        coord_types::wire_v1::OutcomeV1::Ok { .. }
+    ));
+
+    // The highest identity leads, as n5 did on the runner: the pair rule
+    // keeps the connection its lower peers dialled to it, so its own
+    // dials after a restart lose to theirs until those close.
+    let asked = std::process::Command::new("kill")
+        .args(["-USR1", &running[2].child.id().to_string()])
+        .status()
+        .expect("kill runs");
+    assert!(asked.success());
+    assert!(
+        running[2].waits_until(20, |said| said.contains("this voter leads ballot 1")),
+        "voter 3 did not take the lead it was asked to:\n{}",
+        running[2].said()
+    );
+    for node in running.iter().take(2) {
+        assert!(
+            node.waits_until(20, |said| said
+                .contains("this voter follows ballot 1 led by 03030303")),
+            "{}",
+            node.said()
+        );
+    }
+
+    // Killed, and started again at once, well within the old idle timeout.
+    drop(running.remove(2));
+    let killed = std::time::Instant::now();
+    let back = start(&cluster.configs[2]);
+
+    // A voter leads a later ballot within the bound: before the peer
+    // plane's idle timeout was seconds, nobody did for about 30 s.
+    let leads_later = |said: &str| {
+        said.lines().any(|line| {
+            line.strip_prefix("this voter leads ballot ")
+                .and_then(|rest| rest.split_whitespace().next())
+                .and_then(|n| n.parse::<u64>().ok())
+                .is_some_and(|n| n >= 2)
+        })
+    };
+    let bound = Duration::from_secs(15);
+    while killed.elapsed() < bound
+        && !(leads_later(&back.said()) || running.iter().any(|n| leads_later(&n.said())))
+    {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        killed.elapsed() < bound,
+        "no voter led a later ballot within {bound:?} of the leader's kill\n-- 1 --\n{}\n-- 2 --\n{}\n-- 3 --\n{}",
+        running[0].said(),
+        running[1].said(),
+        back.said()
+    );
+
+    // And the domain serves again through a survivor, also within
+    // seconds: a frontend's submission link to the dead voter is an api
+    // connection, and a submission sent on it waited out the same idle
+    // timeout.
+    let serves = Duration::from_secs(20);
+    let put = tokio::time::timeout(
+        serves.saturating_sub(killed.elapsed()),
+        ask(&caller.connection, &caller.put(2, b"k", b"after")),
+    )
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or_else(|| {
+            panic!(
+                "the domain did not establish a write within {serves:?} of the leader's kill\n-- 1 --\n{}\n-- 2 --\n{}\n-- 3 --\n{}",
+                running[0].said(),
+                running[1].said(),
+                back.said()
             )
         });
     assert!(matches!(
@@ -6493,4 +7589,180 @@ async fn a_request_above_the_configured_bound_is_refused_and_one_below_is_served
         coord_sdk::Outcome::Failed(coord_sdk::RetryError::RequestTooLarge),
         "{completion:?}"
     );
+}
+
+/// A voter killed under load and started again late catches up in pages,
+/// not one command per re-send (task-d94).
+///
+/// It can come back holding pre-acceptances the others decided while it
+/// was gone, and decide one each time the leader's re-send reaches it,
+/// every 250 ms. Its frontier then creeps rather than stands, and a pacer
+/// that asked only once the frontier had been still for a second never
+/// asked: in a leader-kill run on the Jepsen runner such a voter executed
+/// about 4 commands a second for minutes, holding hundreds of them.
+///
+/// Whether it creeps depends on what it holds when it starts, so this
+/// fails on the old pacer in some runs, not all (3 of 6 when it
+/// was written); the pacer's own test,
+/// `a_voter_whose_frontier_creeps_asks_for_a_page`, fails on it every
+/// time.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_voter_restarted_late_under_load_catches_up_in_pages() {
+    let dir = workspace("late-restart");
+    let cluster = three_voters(&dir);
+    for config in &cluster.configs {
+        let mut text = std::fs::read_to_string(config).expect("read config");
+        text.push_str("\n[metrics]\ninterval_seconds = 1\n");
+        std::fs::write(config, text).expect("write config");
+        assert_eq!(run(config, &["init"]).code, Some(0));
+    }
+    let mut running: Vec<Running> = cluster.configs.iter().map(|c| start(c)).collect();
+    for node in &running {
+        assert!(
+            node.waits_to_say("voters submittable=2 of 2"),
+            "{}",
+            node.said()
+        );
+    }
+    // The restarted voter's last reading: commands it executed since it
+    // started, and the pre-acceptances it holds that the leader hasn't
+    // ordered. Behind, it holds hundreds; caught up, none.
+    let standing = |said: &str| -> (u64, u64) {
+        said.lines()
+            .filter_map(|line| {
+                let v: serde_json::Value =
+                    serde_json::from_str(line.strip_prefix("metrics ")?).ok()?;
+                let cost = &v["cost"]["Observed"];
+                Some((
+                    cost["executed"].as_u64()?,
+                    cost["unordered"]["pending"].as_u64().unwrap_or(0),
+                ))
+            })
+            .next_back()
+            .unwrap_or((0, u64::MAX))
+    };
+    // Callers on voters 2 and 3, which stay up.
+    let mut callers = Vec::new();
+    for (n, node) in running.iter().enumerate().skip(1) {
+        for k in 0..2 {
+            let session = [0x70 + (n * 2 + k) as u8; 16];
+            callers.push(Caller::bind(node, &cluster.ca, &cluster.ring, session).await);
+        }
+    }
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut loads = Vec::new();
+    for (i, caller) in callers.into_iter().enumerate() {
+        let stop = stop.clone();
+        loads.push(tokio::spawn(async move {
+            let mut n = 0u64;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                n += 1;
+                let key = format!("l{i}-{}", n % 64).into_bytes();
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(3),
+                    ask(&caller.connection, &caller.put(n, &key, b"v")),
+                )
+                .await;
+            }
+        }));
+    }
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    // Voter 1, the leader, goes; the others elect one and carry the load.
+    drop(running.remove(0));
+    tokio::time::sleep(Duration::from_secs(25)).await;
+    // Back while the load still runs, so it takes submissions the others
+    // order without it before it has caught up.
+    running.insert(0, start(&cluster.configs[0]));
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    for load in loads {
+        let _ = load.await;
+    }
+    // Caught up is holding nothing unordered, with the executed count
+    // settled: at a page of 64 commands an ask that takes seconds. At one
+    // command per re-send the voter holds hundreds for minutes, and its
+    // count moves every second.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let mut seen: Vec<(u64, u64)> = Vec::new();
+    while std::time::Instant::now() < deadline {
+        seen.push(standing(&running[0].said()));
+        let settled = seen.len() >= 5
+            && seen[seen.len() - 5..]
+                .iter()
+                .all(|&(executed, pending)| pending == 0 && executed == seen[seen.len() - 1].0);
+        if settled && seen[seen.len() - 1].0 > 0 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let last = seen.last().copied();
+    panic!(
+        "the restarted voter did not catch up within 30 s: (executed, unordered) {last:?}\n-- voter 1 --\n{}",
+        running[0]
+            .said()
+            .lines()
+            .filter(|l| !l.starts_with("metrics "))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
+/// A node whose configuration sets the runtime's worker count runs that
+/// many tokio workers and serves with its peers; one that doesn't runs
+/// tokio's default (task-d91).
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn the_runtime_runs_the_configured_number_of_workers() {
+    let dir = workspace("worker-threads");
+    let cluster = three_voters(&dir);
+    {
+        let mut text = std::fs::read_to_string(&cluster.configs[0]).expect("read config");
+        text.push_str("\n[runtime]\nworker_threads = 1\n");
+        std::fs::write(&cluster.configs[0], text).expect("write config");
+    }
+    for config in &cluster.configs {
+        assert_eq!(run(config, &["init"]).code, Some(0));
+    }
+    // The configured node and the second run with tokio's environment
+    // variable set, as the Jepsen job sets it for every voter: the
+    // configuration wins on the first, the variable holds on the second
+    // (#190 review).
+    let running: Vec<Running> = cluster
+        .configs
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            if i < 2 {
+                start_with(c, &[("TOKIO_WORKER_THREADS", "2")])
+            } else {
+                start(c)
+            }
+        })
+        .collect();
+    for node in &running {
+        assert!(
+            node.waits_to_say("voters submittable=2 of 2"),
+            "{}",
+            node.said()
+        );
+    }
+    // tokio names its workers' threads; the blocking pool's are named
+    // apart, and the domain loop and store workers are threads of their
+    // own.
+    let workers = |node: &Running| -> usize {
+        let pid = node.child.id();
+        std::fs::read_dir(format!("/proc/{pid}/task"))
+            .expect("the daemon's threads")
+            .filter_map(|t| std::fs::read_to_string(t.ok()?.path().join("comm")).ok())
+            .filter(|name| name.trim() == "tokio-rt-worker")
+            .count()
+    };
+    assert_eq!(workers(&running[0]), 1, "the setting beats the variable");
+    assert_eq!(workers(&running[1]), 2, "the variable, with no setting");
+    // tokio's own default, which its environment variable overrides.
+    let default = std::env::var("TOKIO_WORKER_THREADS")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
+    assert_eq!(workers(&running[2]), default);
 }

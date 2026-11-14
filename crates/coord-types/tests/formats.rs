@@ -39,13 +39,17 @@ fn a_version_outside_the_window_is_refused_and_says_which_way() {
     for format in Format::ALL {
         let window = format.window();
         assert!(
-            window.oldest >= 1 && window.oldest <= window.current,
+            window.oldest >= 1
+                && window.oldest <= window.current
+                && window.current <= window.newest,
             "{} has an impossible window {window:?}",
             format.name()
         );
         assert!(format.supports(window.oldest));
         assert!(format.supports(window.current));
+        assert!(format.supports(window.newest));
         assert_eq!(admit(format, window.current), Ok(()));
+        assert_eq!(admit(format, window.newest), Ok(()));
 
         // Below: a format that has been retired.
         if window.oldest > 1 {
@@ -63,14 +67,14 @@ fn a_version_outside_the_window_is_refused_and_says_which_way() {
         // Above: something else wrote it. Never guessed at, because
         // guessing is how a store gets written by a build that did not
         // understand it.
-        let newer = window.current + 1;
+        let newer = window.newest + 1;
         assert!(!format.supports(newer));
         assert_eq!(
             admit(format, newer),
             Err(FormatError::Newer {
                 format,
                 found: newer,
-                current: window.current,
+                newest: window.newest,
             })
         );
         assert!(admit(format, 0).is_err(), "zero is never a version");
@@ -124,4 +128,37 @@ fn every_feature_in_the_registry_is_one_this_build_supports() {
     }
     assert_eq!(Feature::from_id(0), None);
     assert_eq!(Supported::features().len(), Feature::ALL.len());
+}
+
+/// A prepare marker and its feature name each other, the marker is never
+/// reported, and the frozen id is the one the design names (task-d99).
+#[test]
+fn a_prepare_marker_names_its_feature_and_is_never_reported() {
+    assert_eq!(Feature::EarlyProposalPrepared.id(), 0x0005);
+    assert_eq!(Feature::ReleaseAtExecution.id(), 0x0006);
+    assert_eq!(Feature::ReleaseAtExecutionPrepared.id(), 0x0007);
+    assert_eq!(
+        Feature::ReleaseAtExecution.prepare_marker(),
+        Some(Feature::ReleaseAtExecutionPrepared)
+    );
+    assert_eq!(
+        Feature::EarlyProposal.prepare_marker(),
+        Some(Feature::EarlyProposalPrepared)
+    );
+    assert_eq!(
+        Feature::EarlyProposalPrepared.marks(),
+        Some(Feature::EarlyProposal)
+    );
+    for feature in Feature::ALL {
+        if let Some(marker) = feature.prepare_marker() {
+            assert_eq!(marker.marks(), Some(feature));
+            assert!(marker.is_marker() && !feature.is_marker());
+        }
+        assert_eq!(Feature::from_name(feature.name()), Some(feature));
+    }
+    assert!(Supported::reported().all(|f| !f.is_marker()));
+    assert_eq!(
+        Supported::reported().count(),
+        Feature::ALL.iter().filter(|f| !f.is_marker()).count()
+    );
 }

@@ -1,0 +1,578 @@
+#!/usr/bin/env python3
+"""Profile the leader's domain loop thread while a Jepsen test runs.
+
+    scripts/ci/leader_profile.py --out FILE [--settle SECONDS] [--seconds SECONDS] [--call-graph]
+
+Polls every `coordd`'s main thread (where the domain loop runs, in the
+runtime's `block_on`) once a second from the host's `/proc`. Once the
+busiest of them has used more than a tenth of a core for five seconds in a
+row, the workload has started; after `--settle` more seconds the busiest
+loop over the last five is the leader's, and `perf record` samples that
+thread alone for `--seconds`. `perf report` then writes the symbols that
+held it, by their own share of the samples, to FILE, under a header naming
+the thread and the window. The containers share the host's kernel, so the
+host's `perf` sees their threads, and it reads `coordd`'s symbols through
+the process's own mount namespace.
+
+With --call-graph, `perf record` walks each sample's stack by its frame
+pointers (`--call-graph fp`), so `coordd` must be built with them
+(`-C force-frame-pointers=yes`), and libc too for the allocator's callers
+(Ubuntu 24.04's glibc keeps them, Debian's does not): DWARF unwinding from a copied stack
+stopped short of the domain loop, below the runtime's `block_on`, in nine
+samples of ten. A frame in a library built without them (libc's allocator)
+hides its caller, and the walk resumes at the caller's caller. The
+busiest follower's loop is sampled the same way over the same window, into
+FILE with "leader" replaced by "follower" (follower-profile.txt beside
+leader-profile.txt), so each phase's leader-only part is the difference.
+After both, a 10 s DWARF sample of the leader (250 Hz, 16 KiB of stack)
+goes to FILE with -alloc-chains before its extension, folded: it unwinds
+out of libc's allocator, which a frame-pointer walk cannot, to name the
+TupleSky function that allocated. FILE gets the same flat report, and
+FILE with -inclusive before its extension gets each symbol's share with
+everything it called (`perf report --children`), which splits the loop's
+time by caller rather than by the function that happened to be running,
+and FILE with -chains gets every sample's stack, folded, under the symbol
+it was in (`perf report -g folded`), for the summary's split of the loop
+by phase and of the allocator by caller.
+
+With --call-graph, the leader's tokio threads (the transport's workers and
+the runtime's blocking pool, `tokio-rt-worker`) are profiled over the same
+window too: `perf record -p` on the leader's whole process, reported for
+those threads alone (`--comms`), into FILE with "leader" replaced by
+"transport" (transport-profile.txt, -inclusive and -chains beside it). A
+task moves between workers, so their samples are pooled rather than one
+worker's taken. Over the same window `perf stat --per-thread` counts each
+of the process's threads' CPU (`task-clock`) and its system calls on the
+transport's and the runtime's paths (futex, the UDP sends and receives,
+epoll, write), into FILE with -syscalls before its extension, as perf
+wrote them; the summary turns them into calls per command by the domain
+loop's own CPU in the window. The busiest follower's tokio threads are
+profiled the same way over the same window, into the transport profile's
+name with -follower before its extension (transport-profile-follower.txt,
+its -inclusive and -chains beside it), and its threads counted into the
+follower profile's name with -syscalls (follower-profile-syscalls.txt), so
+the summary sets a follower's transport beside the leader's. The same two
+whole-process samples are reported for each voter's store threads as well,
+its materializer and its appender, into materializer-profile.txt and
+appender-profile.txt (and -follower beside each, with -inclusive and -chains),
+so the projection's commits are profiled on the runner beside the loop.
+
+With --loops-hz HZ, `perf record -a` samples every CPU from the start to
+SIGTERM at that rate, with call graphs by frame pointer, and each coordd
+domain loop's samples (a process's main thread) are folded by UTC second
+into FILE with -loops before its extension: `HH:MM:SS pid samples stack`.
+A stall the watch's bar misses, such as an election's winner computing for
+a few seconds before it leads, is in it with what the loop ran.
+
+Exits 0 whatever happens: a profile that cannot be taken (no `perf`, no
+permission, no load before SIGTERM) leaves FILE saying why, and the test
+is never failed by it.
+"""
+from __future__ import annotations
+
+import argparse
+import collections
+import datetime
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+
+
+# Seconds of the leader's DWARF sample, taken after the frame-pointer one.
+ALLOC_SECONDS = 10
+
+# What tokio names its threads, its workers and its blocking pool's alike
+# (`comm` is cut at 15 characters), as cpu_sampler.py reads them.
+TOKIO_THREADS = ("tokio-rt-worker", "tokio-runtime-w")
+
+# The store's pipeline threads (coord-storage's pipeline.rs names them),
+# reported from the transport's whole-process sample of the same voter: the
+# materializer's projection commits (redb) and the appender's journal
+# writes, into <name>-profile.txt beside the transport's.
+PIPELINE_THREADS = (("materializer", ("materializer",)), ("appender", ("appender",)))
+
+# The system calls counted per thread beside the transport's profile.
+SYSCALLS = ("futex", "sendmsg", "sendmmsg", "sendto", "recvmsg", "recvmmsg", "recvfrom", "epoll_wait", "epoll_pwait", "write")
+
+
+def loops() -> dict:
+    """Each coordd's main thread: (pid, start) -> seconds on a CPU."""
+    out = {}
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/stat") as f:
+                stat = f.read()
+            head, _, rest = stat.rpartition(")")
+            if head.partition("(")[2] != "coordd":
+                continue
+            start = int(rest.split()[19])
+            with open(f"/proc/{entry}/schedstat") as f:
+                on_cpu = int(f.read().split()[0]) / 1e9
+        except (OSError, ValueError, IndexError):
+            continue
+        out[(int(entry), start)] = on_cpu
+    return out
+
+
+def node_of(pid: int) -> str | None:
+    """The node a coordd runs on: its container's hostname (each Jepsen
+    node is a container named and hostnamed after the node), so a profile
+    says which voter it sampled; None where it cannot be read."""
+    done = subprocess.run(["sudo", "-n", "cat", f"/proc/{pid}/root/etc/hostname"], capture_output=True, text=True)
+    name = done.stdout.strip()
+    return name if done.returncode == 0 and name and " " not in name else None
+
+
+def now() -> str:
+    return f"{datetime.datetime.now(datetime.timezone.utc):%Y-%m-%d %H:%M:%S}"
+
+
+# Set once SIGTERM or SIGINT arrives, for main's whole-run sampler.
+STOPPED = False
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("--out", required=True)
+    parser.add_argument("--settle", type=float, default=30.0)
+    parser.add_argument("--seconds", type=float, default=20.0)
+    parser.add_argument("--frequency", type=int)
+    parser.add_argument("--call-graph", action="store_true")
+    parser.add_argument("--watch-pegged", type=int, default=0)
+    parser.add_argument("--loops-hz", type=int, default=0)
+    args = parser.parse_args()
+    if args.frequency is None:
+        args.frequency = 999
+    loops = start_loops(args) if args.loops_hz > 0 else None
+    rc = profile(args)
+    if loops is not None:
+        while not STOPPED:
+            time.sleep(1)
+        finish_loops(args, loops)
+    return rc
+
+
+def profile(args) -> int:
+    stopping = False
+
+    def stop(*_):
+        global STOPPED
+        nonlocal stopping
+        stopping = True
+        STOPPED = True
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+
+    def write(text: str) -> None:
+        with open(args.out, "w") as f:
+            f.write(text)
+
+    write(f"No profile: the workload had not started when the test ended ({now()}).\n")
+    history: list[dict] = []
+    busy_for = 0
+    while not stopping:
+        history = (history + [loops()])[-6:]
+        if len(history) >= 2:
+            a, b = history[-2], history[-1]
+            rates = [b[k] - a[k] for k in b if k in a]
+            busy_for = busy_for + 1 if rates and max(rates) > 0.1 else 0
+        if busy_for >= 5:
+            break
+        time.sleep(1)
+    if stopping:
+        return 0
+    # The boots running when the workload started; a later one is a restart.
+    initial = set(history[-1])
+    deadline = time.monotonic() + args.settle
+    while not stopping and time.monotonic() < deadline:
+        history = (history + [loops()])[-6:]
+        time.sleep(1)
+    if stopping:
+        return 0
+    first, last = history[0], history[-1]
+    candidates = {k: last[k] - first[k] for k in last if k in first}
+    if not candidates:
+        write("No profile: no coordd ran through the settle window.\n")
+        return 0
+    ranked = sorted(candidates.items(), key=lambda kv: kv[1], reverse=True)
+    (pid, _), used = ranked[0]
+    span = len(history) - 1
+    stem, dot, ext = args.out.rpartition(".")
+
+    def beside(suffix: str) -> str:
+        return f"{stem}-{suffix}.{ext}" if dot else f"{args.out}-{suffix}"
+
+    def record(tid: int, data: str, graph: list[str], seconds: float, frequency: int, whole: bool = False) -> subprocess.Popen:
+        return subprocess.Popen(
+            ["sudo", "-n", "perf", "record", "-F", str(frequency), "-p" if whole else "-t", str(tid), "-o", data]
+            + graph
+            + ["--", "sleep", str(seconds)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+    def report(data: str, fields: str, limit: str, children: bool = False, graph: str = "none",
+               comms: tuple[str, ...] = ()) -> tuple[list[str], str]:
+        done = subprocess.run(
+            ["sudo", "-n", "perf", "report", "-i", data, "--stdio", "-F", fields, "--percent-limit", limit, "-g", graph]
+            + (["--children"] if children else ["--no-children"])
+            # Shares of the chosen threads' own samples, not the process's.
+            + (["--comms", ",".join(comms), "--percentage", "relative"] if comms else []),
+            capture_output=True,
+            text=True,
+        )
+        lines = done.stdout.splitlines()
+        samples = next((line for line in lines if line.startswith("# Samples")), "")
+        return [line for line in lines if line.strip() and not line.startswith("#")], samples.lstrip("# ").strip()
+
+    def write_profile(out: str, role: str, tid: int, used: float | None, data: str, started: str, ended: str,
+                      comms: tuple[str, ...] = (), node: str | None = None, label: str = "tokio") -> None:
+        symbols, samples = report(data, "overhead,dso,sym", "0.2", comms=comms)
+        if comms:
+            # perf's object report ignores relative percentages; sum the
+            # chosen threads' symbols by object instead.
+            every, _ = report(data, "overhead,dso,sym", "0", comms=comms)
+            totals: dict = {}
+            for line in every:
+                cells = line.split()
+                if len(cells) >= 2 and cells[0].endswith("%"):
+                    totals[cells[1]] = totals.get(cells[1], 0.0) + float(cells[0].rstrip("%"))
+            objects = [f"{share:.2f}% {name}" for name, share in sorted(totals.items(), key=lambda kv: -kv[1])]
+        else:
+            objects, _ = report(data, "overhead,dso", "0")
+        by_object = ", ".join(f"{' '.join(line.split()[1:])} {line.split()[0]}" for line in objects[:6] if line.split())
+        who = (
+            f"{role} thread {tid}{f' ({node})' if node else ''}, {used / span:.2f} of a core over "
+            f"the {span} s before"
+            if used is not None
+            else f"{role}: the {label} threads ({', '.join(comms)}) of the "
+            f"{'follower' if role.startswith('follower') else 'leader'}'s process {tid}{f' ({node})' if node else ''}, pooled"
+        )
+        header = (
+            f"{who}, sampled at "
+            f"{args.frequency} Hz{' with call graphs by frame pointer' if args.call_graph else ''} from {started} to "
+            f"{ended} UTC; {samples}"
+        )
+        if args.call_graph:
+            o_stem, o_dot, o_ext = out.rpartition(".")
+            inclusive, _ = report(data, "overhead_children,overhead,dso,sym", "0.5", children=True, comms=comms)
+            chains, _ = report(data, "overhead,dso,sym", "0", graph="folded,0,caller,function,percent", comms=comms)
+            with open(f"{o_stem}-inclusive.{o_ext}" if o_dot else out + "-inclusive", "w") as f:
+                f.write(header + "; each symbol with everything it called, then its own share\n" + "\n".join(inclusive) + "\n")
+            with open(f"{o_stem}-chains.{o_ext}" if o_dot else out + "-chains", "w") as f:
+                f.write(header + "; each symbol, then its stacks from the root, in percent of the samples\n" + "\n".join(chains) + "\n")
+        with open(out, "w") as f:
+            f.write(header + "\n" f"by object: {by_object}\n" + "\n".join(symbols) + "\n")
+
+    graph = ["--call-graph", "fp"] if args.call_graph else []
+    # With a call graph, the busiest follower too, over the same window, so
+    # each phase's leader-only part is the difference between the two.
+    jobs = [("leader", pid, used, args.out)]
+    if args.call_graph and len(ranked) > 1:
+        (fpid, _), fused = ranked[1]
+        jobs.append(("follower", fpid, fused, follower_path(args.out)))
+    # With a call graph, the leader's tokio threads too: its whole process,
+    # reported for those threads alone, and its threads' system calls.
+    if args.call_graph:
+        jobs.append(("transport", pid, None, role_path(args.out, "transport")))
+    # And the follower's tokio threads, the same way, so the transport's
+    # cost on a follower is read beside the leader's.
+    follower = ranked[1][0][0] if args.call_graph and len(ranked) > 1 else None
+    if follower is not None:
+        jobs.append(("follower-transport", follower, None, suffixed(role_path(args.out, "transport"), "follower")))
+    # Each sampled voter's node, read before the window: a kill in it takes
+    # the process, and its /proc entry, with it.
+    nodes = {tid: node_of(tid) for _, tid, _, _ in jobs}
+    started = now()
+    running = [(role, tid, u, out, out + ".data",
+                record(tid, out + ".data", graph, args.seconds, args.frequency, whole=role.endswith("transport")))
+               for role, tid, u, out in jobs]
+    counting = []
+    if args.call_graph:
+        events = ",".join(["task-clock"] + [f"syscalls:sys_enter_{name}" for name in SYSCALLS])
+        targets = [("leader", pid, beside("syscalls"))]
+        if follower is not None:
+            targets.append(("follower", follower, suffixed(follower_path(args.out), "syscalls")))
+        for role, target, counts in targets:
+            counting.append((role, target, counts, subprocess.Popen(
+                ["sudo", "-n", "perf", "stat", "-x,", "--per-thread", "-e", events, "-p", str(target), "-o",
+                 counts + ".raw", "--", "sleep", str(args.seconds)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+            )))
+    failed = []
+    for role, tid, u, out, data, proc in running:
+        _, err = proc.communicate()
+        if proc.returncode != 0:
+            failed.append((role, out, proc.returncode, err))
+    ended = now()
+    for role, out, code, err in failed:
+        with open(out, "w") as f:
+            f.write(f"No profile: perf record failed ({code}): {err.strip()[-500:]}\n")
+    for role, tid, u, out, data, proc in running:
+        if proc.returncode == 0:
+            write_profile(out, role, tid, u, data, started, ended,
+                          comms=TOKIO_THREADS if role.endswith("transport") else (), node=nodes[tid])
+            # The same whole-process sample holds the voter's store threads.
+            if role.endswith("transport"):
+                for name, comms in PIPELINE_THREADS:
+                    path = role_path(args.out, name)
+                    if role.startswith("follower"):
+                        path = suffixed(path, "follower")
+                    write_profile(path, role.replace("transport", name), tid, None, data, started, ended,
+                                  comms=comms, node=nodes[tid], label=name)
+        subprocess.run(["sudo", "-n", "rm", "-f", data], capture_output=True)
+    for role, target, counts, proc in counting:
+        _, err = proc.communicate()
+        try:
+            with open(counts + ".raw") as f:
+                lines = [line for line in f.read().splitlines() if line.strip() and not line.startswith("#")]
+        except OSError:
+            lines = []
+        with open(counts, "w") as f:
+            if proc.returncode == 0 and lines:
+                f.write(f"{role} process {target}, each thread's CPU and system calls, counted from {started} to {ended} "
+                        f"UTC ({args.seconds:g} s); perf stat -x, --per-thread\n" + "\n".join(lines) + "\n")
+            else:
+                f.write(f"No counts: perf stat failed ({proc.returncode}): {err.strip()[-500:]}\n")
+        subprocess.run(["sudo", "-n", "rm", "-f", counts + ".raw"], capture_output=True)
+
+    # The allocator's callers: libc's allocator keeps no frame pointer, so
+    # a walk that starts inside it gives out at once. A short DWARF sample
+    # of the leader unwinds from the copied stack instead, which reaches
+    # the first TupleSky frame above malloc even where it stops short of
+    # the loop.
+    if args.call_graph and not stopping:
+        data = args.out + ".dwarf.data"
+        started = now()
+        proc = record(pid, data, ["--call-graph", "dwarf,16384"], ALLOC_SECONDS, 250)
+        _, err = proc.communicate()
+        ended = now()
+        if proc.returncode == 0:
+            chains, samples = report(data, "overhead,dso,sym", "0", graph="folded,0,caller,function,percent")
+            with open(beside("alloc-chains"), "w") as f:
+                f.write(
+                    f"leader thread {pid}, sampled at 250 Hz with DWARF call graphs from {started} to {ended} UTC; "
+                    f"{samples}; each symbol, then its stacks from the root, in percent of the samples\n"
+                    + "\n".join(chains)
+                    + "\n"
+                )
+        subprocess.run(["sudo", "-n", "rm", "-f", data], capture_output=True)
+    if args.watch_pegged > 0 and not stopping:
+        watch_pegged(args, initial, beside, record, write_profile, graph, lambda: stopping)
+    return 0
+
+
+# A voter's loop is pegged once it has used at least this much
+# of a core for PEGGED_SECONDS in a row.
+PEGGED_SHARE = 0.9
+PEGGED_SECONDS = 5
+# The least time between two profiles of one boot.
+PEGGED_AGAIN_SECONDS = 60
+
+
+def watch_pegged(args, initial: set, beside, record, write_profile, graph: list[str], stopping) -> None:
+    """After the leader's window, until the test ends: every voter boot
+    whose loop stays pegged, a restarted one or one running since the
+    workload started, is written down, and profiled the way the leader was, for --seconds, into
+    FILE with -pegged-N before its extension (its -inclusive and -chains
+    beside it with --call-graph). Each boot is profiled at most twice, at
+    least PEGGED_AGAIN_SECONDS apart, and --watch-pegged profiles in all.
+    FILE with -pegged before its extension lists each pegged stretch: the
+    node, the boot, when it began and ended, and its share of a core."""
+    index = beside("pegged")
+    lines: list[str] = []
+
+    def flush() -> None:
+        with open(index, "w") as f:
+            f.write(f"Voters' loops at or above {PEGGED_SHARE:g} of a core for {PEGGED_SECONDS} s or more, "
+                    f"watched from {started} UTC" + (" to " + now() + " UTC" if stopping() else "") + "\n")
+            f.write("\n".join(lines) + ("\n" if lines else "No stretch so far.\n"))
+
+    started = now()
+    flush()
+    last = loops()
+    run: dict = {}  # boot -> (seconds pegged in a row, when it began, CPU seconds since)
+    profiled: dict = {}  # boot -> (times, monotonic time of the last)
+    nodes: dict = {}
+    taken = 0
+    open_stretch: dict = {}  # boot -> index in lines
+    while not stopping():
+        time.sleep(1)
+        current = loops()
+        for key in list(run):
+            if key not in current:
+                if key in open_stretch:
+                    lines[open_stretch.pop(key)] += f", until it stopped by {now()}"
+                run.pop(key)
+        for key, cpu in current.items():
+            if key not in last:
+                continue
+            rate = cpu - last[key]
+            seconds, began, used = run.get(key, (0, now(), 0.0))
+            if rate >= PEGGED_SHARE:
+                run[key] = (seconds + 1, began, used + rate)
+            else:
+                if key in open_stretch:
+                    seconds_, began_, used_ = run.get(key, (0, began, 0.0))
+                    lines[open_stretch.pop(key)] += f", until {now()} ({seconds_} s, {used_ / max(seconds_, 1):.2f} of a core)"
+                run.pop(key, None)
+                continue
+            seconds, began, used = run[key]
+            if seconds < PEGGED_SECONDS:
+                continue
+            if key not in nodes:
+                nodes[key] = node_of(key[0])
+            if key not in open_stretch:
+                open_stretch[key] = len(lines)
+                boot = "its first boot" if key in initial else "restarted"
+                lines.append(f"{nodes[key] or '?'} pid {key[0]} ({boot}, at tick {key[1]}): pegged from {began}")
+            times, at = profiled.get(key, (0, 0.0))
+            if taken >= args.watch_pegged or times >= 2 or (times and time.monotonic() - at < PEGGED_AGAIN_SECONDS):
+                continue
+            taken += 1
+            profiled[key] = (times + 1, time.monotonic())
+            out = beside(f"pegged-{taken}")
+            data = out + ".data"
+            began_profile = now()
+            proc = record(key[0], data, graph, args.seconds, args.frequency)
+            _, err = proc.communicate()
+            ended = now()
+            if proc.returncode == 0:
+                write_profile(out, f"pegged loop {taken}", key[0], used / seconds * 5, data,
+                              began_profile, ended, node=nodes[key])
+            else:
+                with open(out, "w") as f:
+                    f.write(f"No profile: perf record failed ({proc.returncode}): {err.strip()[-500:]}\n")
+            subprocess.run(["sudo", "-n", "rm", "-f", data], capture_output=True)
+            lines[open_stretch[key]] += f", profiled into {os.path.basename(out)} from {began_profile} to {ended}"
+            # The profile took --seconds: start the next reading afresh.
+            current = loops()
+        last = current
+        flush()
+    for key, i in open_stretch.items():
+        seconds, began, used = run.get(key, (0, "", 0.0))
+        lines[i] += f", still pegged at the end ({seconds} s, {used / max(seconds, 1):.2f} of a core)"
+    flush()
+
+
+def loops_path(out: str) -> str:
+    """The whole-run sample of every loop, beside the leader's profile:
+    leader-profile.txt gives leader-profile-loops.txt."""
+    return suffixed(out, "loops")
+
+
+def start_loops(args):
+    """--loops-hz: `perf record` on every CPU for the whole test, at that
+    rate, with call graphs by frame pointer, timed on CLOCK_MONOTONIC, so
+    a stall too short for the watch (an election's winner computing for a
+    few seconds) is still sampled. Returns (the recorder, the offset from
+    that clock to UTC), or None where it cannot start."""
+    data = loops_path(args.out) + ".data"
+    offset = time.time() - time.clock_gettime(time.CLOCK_MONOTONIC)
+    try:
+        proc = subprocess.Popen(
+            ["sudo", "-n", "perf", "record", "-F", str(args.loops_hz), "--call-graph", "fp", "-a",
+             "-k", "monotonic", "-o", data],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except OSError as e:
+        with open(loops_path(args.out), "w") as f:
+            f.write(f"No loop samples: perf could not start: {e}\n")
+        return None
+    return proc, offset, data
+
+
+def fold_loops(text: str, offset: float) -> dict:
+    """`perf script -F comm,pid,tid,time,ip,sym` output, each sample of a
+    process's main thread (its domain loop) folded by (UTC second, pid,
+    stack from the root) to a count; `offset` turns the sample's clock
+    into UTC."""
+    head = re.compile(r"^\s*\S+\s+(\d+)/(\d+)\s+([\d.]+):")
+    folded: dict = collections.Counter()
+    key = None
+    frames: list = []
+
+    def flush():
+        if key is not None and frames:
+            folded[key + (";".join(reversed(frames)),)] += 1
+
+    for line in text.splitlines():
+        m = head.match(line)
+        if m:
+            flush()
+            pid, tid, at = int(m[1]), int(m[2]), float(m[3])
+            frames = []
+            key = (int(at + offset), pid) if pid == tid else None
+            continue
+        cells = line.split(None, 1)
+        if key is not None and len(cells) == 2:
+            frames.append(cells[1].split("+0x")[0].strip())
+    flush()
+    return folded
+
+
+def finish_loops(args, loops) -> None:
+    """Stops the whole-run recorder and folds its samples of each coordd
+    domain loop (the process's main thread) by UTC second: one line per
+    second, pid and stack, `HH:MM:SS pid samples root;...;leaf`."""
+    proc, offset, data = loops
+    out = loops_path(args.out)
+    proc.send_signal(signal.SIGINT)
+    try:
+        _, err = proc.communicate(timeout=120)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        _, err = proc.communicate()
+    script = subprocess.run(
+        ["sudo", "-n", "perf", "script", "-i", data, "--comms", "coordd", "-F", "comm,pid,tid,time,ip,sym"],
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(["sudo", "-n", "rm", "-f", data], capture_output=True)
+    if script.returncode != 0 or not script.stdout.strip():
+        with open(out, "w") as f:
+            f.write(f"No loop samples: perf record exited {proc.returncode}, perf script {script.returncode}: "
+                    f"{(err or '').strip()[-300:]} {script.stderr.strip()[-300:]}\n")
+        return
+    folded = fold_loops(script.stdout, offset)
+    with open(out, "w") as f:
+        f.write(f"Every coordd domain loop, sampled at {args.loops_hz} Hz with call graphs by frame pointer "
+                "through the whole test (perf record -a), by UTC second: time, pid, samples, stack from the root\n")
+        for (second, pid, stack), n in sorted(folded.items()):
+            when = datetime.datetime.fromtimestamp(second, datetime.timezone.utc)
+            f.write(f"{when:%H:%M:%S} {pid} {n} {stack}\n")
+
+
+def suffixed(path: str, suffix: str) -> str:
+    """A file beside `path` with -suffix before its extension:
+    transport-profile.txt gives transport-profile-follower.txt."""
+    stem, dot, ext = path.rpartition(".")
+    return f"{stem}-{suffix}.{ext}" if dot else f"{path}-{suffix}"
+
+
+def follower_path(out: str) -> str:
+    """The follower's profile beside the leader's: leader-profile.txt gives
+    follower-profile.txt."""
+    return role_path(out, "follower")
+
+
+def role_path(out: str, role: str) -> str:
+    """Another thread's profile beside the leader's: leader-profile.txt
+    gives <role>-profile.txt."""
+    head, base = os.path.split(out)
+    name = base.replace("leader", role, 1) if "leader" in base else f"{role}-" + base
+    return os.path.join(head, name)
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -45,13 +45,13 @@
 //!   bounded by the number of epochs, and stays.
 //! * a bound **Sync row**. Section 4.9 requires a selection to be reused
 //!   after a crash, never reselected.
-//! * anything for a command that `executed_v1` does not place at or below
+//! * anything for a command that `execution_v1` does not place at or below
 //!   the floor: an unresolved obligation is never evicted, under any
 //!   pressure. The dependency row's own phase is not consulted, because
 //!   execution is never written back into it: normal execution records the
-//!   `executed_v1` identity and leaves the durable row at `Accept` or
-//!   `Commit`, and recovery restores the executed phase from `executed_v1`
-//!   too.
+//!   executed row (by position, task-d113 step 2) and leaves the durable
+//!   row at `Accept` or `Commit`, and recovery restores the executed phase
+//!   from `execution_v1` too.
 //! * anything a retained command still names as a direct dependency. The
 //!   retained command's own record survives with its dependency identities,
 //!   and the trimmed dependency's outcome stays in the common collections;
@@ -63,7 +63,7 @@
 //! Retention stays separated (Section 17.16.5). Trimming reads the
 //! replicated MVCC retention floor only as part of the boundary it compares
 //! against; it never lowers it, never touches `kv_history_v1`, `events_v1`,
-//! `executed_v1`, `retry_v1` or `payload_v1`, and emits no journal or
+//! `execution_v1`, `retry_v1` or `payload_v1`, and emits no journal or
 //! materialization progress. Because `protocol_v1` is node-private, a
 //! trimmed replica re-exports (task-49) the same root as an untrimmed one.
 //! Conversely, local redo compaction is not this: a complete local
@@ -82,7 +82,7 @@ use coord_consensus::rows::{
     DEPENDENCY_TAG, PROPOSAL_TAG, SYNC_TAG, decode_dependency, decode_proposal,
 };
 use coord_core::effect::StoreUpdate;
-use coord_storage::codecs;
+use coord_storage::intake;
 use coord_store_api::engine::{
     Direction, EngineError, ErrorClass, OrderedRead, ScanRequest, WriteTxn,
 };
@@ -508,23 +508,22 @@ impl TrimFence {
 
     /// A message about `command`: below the floor when the command is
     /// already executed at or below the floor's execution position. The
-    /// answer comes from `executed_v1`, which trimming never touches, so it
-    /// stays available after the command's protocol rows are gone.
+    /// answer comes from `execution_v1`, which trimming never touches, so
+    /// it stays available after the command's protocol rows are gone.
+    ///
+    /// Keyed by position since task-d113's step 2, the rows at or below
+    /// the floor are read as one range: a command's position is a lookup
+    /// only through a running node's index, which this view need not have.
     pub fn command<V: OrderedRead>(
         &self,
         view: &V,
         command: &CommandId,
     ) -> Result<FenceDecision, TrimError> {
-        match view.get(Collection::ExecutedV1.id(), &codecs::executed_key(command))? {
-            None => Ok(FenceDecision::Admit),
-            Some(bytes) => {
-                let record = codecs::decode_executed(&bytes)?;
-                if record.position <= self.floor.boundary.execution_position {
-                    Ok(FenceDecision::BelowFloor)
-                } else {
-                    Ok(FenceDecision::Admit)
-                }
-            }
+        let below = executed_below(view, self.floor.boundary.execution_position)?;
+        if below.contains(command) {
+            Ok(FenceDecision::BelowFloor)
+        } else {
+            Ok(FenceDecision::Admit)
         }
     }
 }
@@ -621,25 +620,30 @@ pub fn trim_backpressure<V: OrderedRead>(
 ) -> Result<TrimBackpressure, TrimError> {
     limits.validate()?;
     let mut rows = 0u32;
-    let mut resume: Option<Vec<u8>> = None;
-    while rows < limits.max_protocol_rows {
-        let page = view.scan_page(
-            Collection::ProtocolV1.id(),
-            &ScanRequest {
-                lower: Bound::Unbounded,
-                upper: Bound::Unbounded,
-                direction: Direction::Forward,
-                resume_after: resume.clone(),
-                max_rows: limits.page_rows(),
-                max_bytes: limits.page_bytes(),
-            },
-        )?;
-        rows = rows
-            .saturating_add(page.rows.len() as u32)
-            .min(limits.max_protocol_rows);
-        match page.rows.last() {
-            Some(last) if !page.exhausted => resume = Some(last.key.clone()),
-            _ => break,
+    // An executed command's decided record, moved at its execution to
+    // `decided_v1` (task-d113, step 2), is the row its dependency row was:
+    // what a missing voter's acknowledgement keeps from being trimmed.
+    for collection in [Collection::ProtocolV1, Collection::DecidedV1] {
+        let mut resume: Option<Vec<u8>> = None;
+        while rows < limits.max_protocol_rows {
+            let page = view.scan_page(
+                collection.id(),
+                &ScanRequest {
+                    lower: Bound::Unbounded,
+                    upper: Bound::Unbounded,
+                    direction: Direction::Forward,
+                    resume_after: resume.clone(),
+                    max_rows: limits.page_rows(),
+                    max_bytes: limits.page_bytes(),
+                },
+            )?;
+            rows = rows
+                .saturating_add(page.rows.len() as u32)
+                .min(limits.max_protocol_rows);
+            match page.rows.last() {
+                Some(last) if !page.exhausted => resume = Some(last.key.clone()),
+                _ => break,
+            }
         }
     }
     let mut missing: Vec<ReplicaId> = missing.to_vec();
@@ -656,7 +660,8 @@ pub fn trim_backpressure<V: OrderedRead>(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TrimPlan {
     /// Deletions to apply as one durable batch. Every entry targets
-    /// `protocol_v1` and carries no value.
+    /// `protocol_v1`, or `decided_v1` for a decided record moved at its
+    /// command's execution (task-d113, step 2), and carries no value.
     pub updates: Vec<StoreUpdate>,
     /// Protocol rows examined.
     pub examined: u32,
@@ -700,12 +705,21 @@ pub fn plan_trim<V: OrderedRead>(
     check_store_origin(view, floor)?;
     check_floor_durable(view, floor)?;
     let boundary = floor.boundary.execution_position;
+    // What executed at or below the boundary, read once: what decides each
+    // row below, and which command a decided record by position is.
+    let executed_rows = coord_storage::protocol::executed_through(
+        view,
+        boundary,
+        coord_storage::views::ViewBudget::default(),
+    )?;
+    let executed: BTreeSet<CommandId> = executed_rows.iter().map(|(_, c)| *c).collect();
+    let at_position: BTreeMap<ExecutionPosition, CommandId> = executed_rows.into_iter().collect();
     // Every epoch at or below the floor's, through its Sync rows; epochs
     // above the floor are outside the acknowledged history entirely.
     let mut upper = floor.configuration.to_be_bytes().to_vec();
     upper.push(SYNC_TAG + 1);
 
-    let mut candidates: Vec<(Vec<u8>, CommandId)> = Vec::new();
+    let mut candidates: Vec<(Collection, Vec<u8>, CommandId)> = Vec::new();
     let mut pins: BTreeSet<CommandId> = BTreeSet::new();
     // Dependencies of every command seen, so a pin can be closed over
     // them. Pinning only the direct dependencies of retained commands
@@ -735,7 +749,7 @@ pub fn plan_trim<V: OrderedRead>(
                     limit: limits.max_examined_rows,
                 });
             }
-            match classify(view, row.key.as_slice(), &row.value, boundary)? {
+            match classify(&executed, row.key.as_slice(), &row.value)? {
                 Verdict::Retain => retained += 1,
                 Verdict::RetainPinning(deps) => {
                     retained += 1;
@@ -746,9 +760,60 @@ pub fn plan_trim<V: OrderedRead>(
                     // though it is a candidate: a command pinned later may
                     // depend on it, and closure has to continue through it.
                     deps_of.entry(command).or_insert(deps);
-                    candidates.push((row.key.clone(), command));
+                    candidates.push((Collection::ProtocolV1, row.key.clone(), command));
                 }
             }
+        }
+        match page.rows.last() {
+            Some(last) if !page.exhausted => resume = Some(last.key.clone()),
+            _ => break,
+        }
+    }
+    // An executed command's decided record moved at its execution to
+    // `decided_v1`, under its position (task-d113, step 2, the bound). Of an
+    // epoch at or below the floor's, they are decided as their dependency
+    // rows were: at or below the boundary, eligible under the same pins;
+    // above it, retained, and pinning what they depend on, so a command
+    // executed after the boundary keeps reaching its dependencies below it.
+    let floor_epoch = floor.configuration.to_be_bytes();
+    let mut resume: Option<Vec<u8>> = None;
+    loop {
+        let page = view.scan_page(
+            Collection::DecidedV1.id(),
+            &ScanRequest {
+                lower: Bound::Unbounded,
+                upper: Bound::Unbounded,
+                direction: Direction::Forward,
+                resume_after: resume.clone(),
+                max_rows: limits.page_rows(),
+                max_bytes: limits.page_bytes(),
+            },
+        )?;
+        for row in &page.rows {
+            let position = coord_storage::codecs::position_of(&row.key)?;
+            let (epoch, record) = coord_storage::codecs::split_decided(&row.value)?;
+            if epoch > floor_epoch {
+                // Outside the acknowledged history, as a later epoch's
+                // rows are outside the survey above.
+                continue;
+            }
+            examined += 1;
+            if examined > limits.max_examined_rows {
+                return Err(TrimError::ExaminationBudget {
+                    limit: limits.max_examined_rows,
+                });
+            }
+            let deps = decode_dependency(record)?.deps;
+            if position > boundary {
+                retained += 1;
+                pins.extend(deps);
+                continue;
+            }
+            let command = *at_position
+                .get(&position)
+                .ok_or_else(|| corrupt("a decided record at a position with no executed row"))?;
+            deps_of.entry(command).or_insert(deps);
+            candidates.push((Collection::DecidedV1, row.key.clone(), command));
         }
         match page.rows.last() {
             Some(last) if !page.exhausted => resume = Some(last.key.clone()),
@@ -773,7 +838,7 @@ pub fn plan_trim<V: OrderedRead>(
     let mut updates = Vec::new();
     let mut eligible = 0u32;
     let mut pinned = 0u32;
-    for (key, command) in candidates {
+    for (collection, key, command) in candidates {
         if pins.contains(&command) {
             pinned += 1;
             retained += 1;
@@ -784,7 +849,7 @@ pub fn plan_trim<V: OrderedRead>(
             continue;
         }
         updates.push(StoreUpdate {
-            collection: Collection::ProtocolV1.id(),
+            collection: collection.id(),
             key,
             value: None,
         });
@@ -862,25 +927,28 @@ enum Verdict {
 /// Decide one `protocol_v1` row. Anything whose tag or key shape this build
 /// does not recognize is retained: an unreadable row is never a licence to
 /// delete it.
-fn classify<V: OrderedRead>(
-    view: &V,
+///
+/// Dependency and proposal rows are keyed by intake order (task-d113):
+/// epoch, tag, intake order, command. The survey reads them in that order,
+/// and the command is the key's suffix.
+fn classify(
+    executed: &BTreeSet<CommandId>,
     key: &[u8],
     value: &[u8],
-    boundary: ExecutionPosition,
 ) -> Result<Verdict, TrimError> {
     let Some(&tag) = key.get(8) else {
         return Ok(Verdict::Retain);
     };
     match tag {
-        // A dependency row is eligible only when `executed_v1` places the
+        // A dependency row is eligible only when `execution_v1` places the
         // command's execution at or below the boundary. Anything else is an
         // obligation. The row's own phase says nothing either way: the
         // durable row stays at `Accept` or `Commit` after execution, which
-        // is recorded only in `executed_v1`.
-        DEPENDENCY_TAG if key.len() == 41 => {
+        // is recorded only in `execution_v1`.
+        DEPENDENCY_TAG if key.len() == intake::INTAKE_KEY_LEN => {
             let command = command_of(key)?;
             let record = decode_dependency(value)?;
-            if executed_within(view, &command, boundary)? {
+            if executed.contains(&command) {
                 Ok(Verdict::Eligible(command, record.deps))
             } else {
                 Ok(Verdict::RetainPinning(record.deps))
@@ -888,10 +956,10 @@ fn classify<V: OrderedRead>(
         }
         // A proposal row follows its command: the leader must be able to
         // resume a proposal that is not yet settled.
-        PROPOSAL_TAG if key.len() == 41 => {
+        PROPOSAL_TAG if key.len() == intake::INTAKE_KEY_LEN => {
             let command = command_of(key)?;
             let proposal_deps = decode_proposal(value)?.deps;
-            if executed_within(view, &command, boundary)? {
+            if executed.contains(&command) {
                 Ok(Verdict::Eligible(command, proposal_deps))
             } else {
                 Ok(Verdict::RetainPinning(proposal_deps))
@@ -909,22 +977,27 @@ fn classify<V: OrderedRead>(
 }
 
 fn command_of(key: &[u8]) -> Result<CommandId, TrimError> {
-    let mut id = [0u8; 32];
-    id.copy_from_slice(key.get(9..41).ok_or_else(|| corrupt("protocol row key"))?);
-    Ok(CommandId(Digest32(id)))
+    match intake::parse(key) {
+        intake::ProtocolKey::Intake { command, .. } => Ok(command),
+        _ => Err(corrupt("protocol row key").into()),
+    }
 }
 
-/// Whether `command` is executed at or below the boundary. `executed_v1` is
-/// common state the trim never touches, so this answer survives the trim.
-fn executed_within<V: OrderedRead>(
+/// The commands executed at or below `boundary`. `execution_v1` is common
+/// state the trim never touches, so this answer survives the trim. Keyed
+/// by position (task-d113, step 2), it is one range of the table.
+fn executed_below<V: OrderedRead>(
     view: &V,
-    command: &CommandId,
     boundary: ExecutionPosition,
-) -> Result<bool, TrimError> {
-    match view.get(Collection::ExecutedV1.id(), &codecs::executed_key(command))? {
-        None => Ok(false),
-        Some(bytes) => Ok(codecs::decode_executed(&bytes)?.position <= boundary),
-    }
+) -> Result<BTreeSet<CommandId>, TrimError> {
+    Ok(coord_storage::protocol::executed_through(
+        view,
+        boundary,
+        coord_storage::views::ViewBudget::default(),
+    )?
+    .into_iter()
+    .map(|(_, command)| command)
+    .collect())
 }
 
 /// Why trimming was refused or stopped. Every variant leaves the store

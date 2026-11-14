@@ -161,7 +161,8 @@
                 ]
               ]
             ],
-            "seqnum": 0
+            "seqnum": 0,
+            "admission": null
           },
           {
             "command": [
@@ -310,7 +311,8 @@
                 ]
               ]
             ],
-            "seqnum": 0
+            "seqnum": 0,
+            "admission": null
           }
         ],
         "reproposed": []
@@ -476,7 +478,8 @@
                   ]
                 ]
               ],
-              "seqnum": 0
+              "seqnum": 0,
+              "admission": null
             },
             {
               "command": [
@@ -625,7 +628,8 @@
                   ]
                 ]
               ],
-              "seqnum": 0
+              "seqnum": 0,
+              "admission": null
             }
           ],
           "reproposed": []
@@ -796,7 +800,8 @@
                 ]
               ]
             ],
-            "seqnum": 0
+            "seqnum": 0,
+            "admission": null
           }
         ],
         "reproposed": [
@@ -997,7 +1002,8 @@
                   ]
                 ]
               ],
-              "seqnum": 0
+              "seqnum": 0,
+              "admission": null
             }
           ],
           "reproposed": [
@@ -1208,7 +1214,8 @@
                 ]
               ]
             ],
-            "seqnum": 0
+            "seqnum": 0,
+            "admission": null
           }
         ],
         "reproposed": [
@@ -1443,7 +1450,8 @@
                   ]
                 ]
               ],
-              "seqnum": 0
+              "seqnum": 0,
+              "admission": null
             }
           ],
           "reproposed": [

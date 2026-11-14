@@ -53,6 +53,15 @@ pub struct AdmissionLimits {
     /// default, the protocol's own bound, no request that validates is
     /// refused for its size.
     pub max_request_bytes: usize,
+    /// New requests this frontend admits a second, with a second's worth
+    /// as a burst (task-d26); `None` admits at any rate. A retry of a
+    /// request still outstanding is not a new one and takes nothing.
+    ///
+    /// Bounded below the rate at which a voter catching up executes
+    /// (task-d25), so that a voter returning behind closes its gap in a
+    /// time bounded by the gap: it gains on the domain by the
+    /// difference.
+    pub max_admitted_per_second: Option<u32>,
 }
 
 impl Default for AdmissionLimits {
@@ -60,6 +69,7 @@ impl Default for AdmissionLimits {
         AdmissionLimits {
             max_pending_per_session: 256,
             max_request_bytes: coord_types::logical_v1::limits::MAX_REQUEST_BYTES,
+            max_admitted_per_second: None,
         }
     }
 }
@@ -83,6 +93,13 @@ pub enum AdmissionRefusal {
         /// Requests pending for the session.
         pending: usize,
     },
+    /// New requests are arriving faster than this frontend admits them
+    /// (task-d26). Nothing was taken; the same request is admitted once
+    /// the rate allows.
+    RateLimited {
+        /// The bound, in new requests a second.
+        per_second: u32,
+    },
     /// The request is larger than this frontend admits.
     RequestTooLarge {
         /// What the request costs, as the protocol counts it.
@@ -104,6 +121,55 @@ pub struct Admission {
     /// and, since a request is settled once, cannot leak one either.
     pending: BTreeMap<SessionId, BTreeSet<RetryKey>>,
     minted: u64,
+    /// Thousandths of an admission available now, and the reading they
+    /// were counted at: a token bucket of `max_admitted_per_second`.
+    tokens: u64,
+    counted_at: Option<crate::clock::MonotonicMillis>,
+    refusals: AdmissionRefusals,
+}
+
+/// Requests a gate refused, by why, since it started. Cumulative.
+///
+/// The two `BACKPRESSURE` refusals are apart: a session at its pending
+/// bound is the caller's own window, while the admission rate is this
+/// frontend's bound on the domain (task-d26). A load generator that sees
+/// only the code cannot tell them apart.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AdmissionRefusals {
+    /// Refused by the admission rate (`RateLimited`).
+    pub rate_limited: u64,
+    /// Refused because the session was at its pending bound
+    /// (`SessionBusy`).
+    pub session_busy: u64,
+    /// Refused for any other reason: malformed, too large, or not
+    /// admitted here.
+    pub other: u64,
+    /// Admitted here, then refused `BACKPRESSURE` by the collector's own
+    /// bound: the domain's pending commands at this frontend, or the
+    /// bytes it still owes its destinations (#228 review). Not the gate's
+    /// decision, but the same answer to the caller, so counted beside it.
+    pub collection_bound: u64,
+}
+
+impl AdmissionRefusals {
+    fn count(&mut self, refusal: &AdmissionRefusal) {
+        let n = match refusal {
+            AdmissionRefusal::RateLimited { .. } => &mut self.rate_limited,
+            AdmissionRefusal::SessionBusy { .. } => &mut self.session_busy,
+            AdmissionRefusal::RoleNotAdmitted(_)
+            | AdmissionRefusal::Malformed
+            | AdmissionRefusal::WrongCluster
+            | AdmissionRefusal::WrongDomain
+            | AdmissionRefusal::SessionMismatch
+            | AdmissionRefusal::RequestTooLarge { .. } => &mut self.other,
+        };
+        *n += 1;
+    }
+
+    /// Every refusal counted.
+    pub const fn total(&self) -> u64 {
+        self.rate_limited + self.session_busy + self.other + self.collection_bound
+    }
 }
 
 impl Admission {
@@ -115,13 +181,100 @@ impl Admission {
             limits,
             pending: BTreeMap::new(),
             minted: 0,
+            tokens: 0,
+            counted_at: None,
+            refusals: AdmissionRefusals {
+                rate_limited: 0,
+                session_busy: 0,
+                other: 0,
+                collection_bound: 0,
+            },
         }
     }
 
+    /// Take one new admission from the rate bound at `now`, if the bound
+    /// allows one.
+    fn take_rate(&mut self, now: crate::clock::MonotonicMillis) -> Result<(), AdmissionRefusal> {
+        let Some(per_second) = self.limits.max_admitted_per_second else {
+            return Ok(());
+        };
+        let full = u64::from(per_second) * 1000;
+        self.tokens = match self.counted_at {
+            // A second's worth to start with.
+            None => full,
+            Some(at) => self
+                .tokens
+                .saturating_add(
+                    now.get()
+                        .saturating_sub(at.get())
+                        .saturating_mul(u64::from(per_second)),
+                )
+                .min(full),
+        };
+        self.counted_at = Some(now);
+        if self.tokens < 1000 {
+            return Err(AdmissionRefusal::RateLimited { per_second });
+        }
+        self.tokens -= 1000;
+        Ok(())
+    }
+
+    /// [`Admission::admit`] under the rate bound, read at `now`.
+    pub fn admit_at(
+        &mut self,
+        now_ticks: u64,
+        now: crate::clock::MonotonicMillis,
+        caller: &Caller,
+        request: &RequestV1,
+    ) -> Result<Admitted, AdmissionRefusal> {
+        self.admit_inner(now_ticks, Some(now), caller, request)
+    }
+
     /// Admit `request` from `caller` at `now_ticks`, minting its receipt.
+    /// No rate bound applies: [`Admission::admit_at`] is what reads one.
     pub fn admit(
         &mut self,
         now_ticks: u64,
+        caller: &Caller,
+        request: &RequestV1,
+    ) -> Result<Admitted, AdmissionRefusal> {
+        self.admit_inner(now_ticks, None, caller, request)
+    }
+
+    fn admit_inner(
+        &mut self,
+        now_ticks: u64,
+        now: Option<crate::clock::MonotonicMillis>,
+        caller: &Caller,
+        request: &RequestV1,
+    ) -> Result<Admitted, AdmissionRefusal> {
+        let decided = self.decide(now_ticks, now, caller, request);
+        if let Err(refusal) = &decided {
+            self.refusals.count(refusal);
+        }
+        decided
+    }
+
+    /// Count a request this gate admitted and the collector then refused
+    /// at its own bound (`SubmitRefusal::Backpressure`).
+    pub fn refused_at_collection_bound(&mut self) {
+        self.refusals.collection_bound += 1;
+    }
+
+    /// What this gate has refused since it started.
+    pub const fn refusals(&self) -> AdmissionRefusals {
+        self.refusals
+    }
+
+    /// The limits this gate admits under.
+    pub const fn limits(&self) -> &AdmissionLimits {
+        &self.limits
+    }
+
+    fn decide(
+        &mut self,
+        now_ticks: u64,
+        now: Option<crate::clock::MonotonicMillis>,
         caller: &Caller,
         request: &RequestV1,
     ) -> Result<Admitted, AdmissionRefusal> {
@@ -165,6 +318,10 @@ impl Admission {
                 pending: pending.len(),
             });
         }
+        if !held && let Some(now) = now {
+            self.take_rate(now)?;
+        }
+        let pending = self.pending.entry(caller.session).or_default();
         pending.insert(*key);
         // Whether this presentation is what took the slot. A refusal of
         // a re-presentation must not release it: the request that holds

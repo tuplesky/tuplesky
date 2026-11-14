@@ -145,19 +145,75 @@ Each lane is a separate connection with its own stream limits, windows and
 queues; a peer pair therefore holds at most one connection per admitted
 lane and direction.
 
+Several frames a stream (task-d61): on the peer plane, a `Hello` may offer
+capability `0x0020` and the acceptor grants it in `HelloAck` when it offers
+it too. Where it is granted, a unidirectional peer stream carries one or
+more `PeerEvidence` frames back to back, at most 256, and ends after the
+last; each frame is unchanged, frames on one stream are delivered in
+order, and frames on different streams are not ordered against each
+other, as before. A stream with no frame, one that ends inside a frame,
+or one with more than 256 frames closes the connection as a protocol
+violation. Where it is not granted, a peer stream carries exactly one
+frame, and a byte after it is a violation. The capability is never
+offered or granted on the API plane.
+
+| Capability | Meaning | Plane |
+|---|---|---|
+| `0x0020` | several peer-evidence frames on one stream, at most 256 | peer |
+
 ## Collector frames (task-33)
 
-The trusted collector (`spec/collector-v1.md`) uses three raw kinds. Two
-are in the API range because they carry or answer a client request and
-take its class limit; the evidence frame is in the collector-evidence
-range. None is decodable by the typed decoder: they are dispatched by raw
+The trusted collector (`spec/collector-v1.md`) uses five raw kinds. Two
+are in the API range because they carry a client request and take its
+class limit; the answers and the evidence frame are in the
+collector-evidence range. None is decodable by the typed decoder: they are dispatched by raw
 kind at the collector boundary, like peer evidence.
 
 | Kind | Value | Direction | Payload |
 |---|---|---|---|
-| Submit | `0x0103` | collector to every voter | `SubmitV1 { receipt: AdmissionFacts, request: RequestV1 }` (postcard); API class limit |
-| Release | `0x0701` | leader to collector | `ReleasedResult` (postcard); collector-evidence class limit |
-| Evidence | `0x0700` | voter to collector | Opaque `coord-consensus` protocol message (`LeaderReply`, `FastAck`, `SlowAck`); collector-evidence class limit |
+| Submit | `0x0103` | collector to every voter | `SubmitV1 { receipt: AdmissionFacts, request: RequestV1 }` (postcard); version 1, or version 2 for a command answered on the leader's release alone (the same payload: the version is the mark, task-d100 step A), or version 3 for one also relayed to its ballot's leader alone (the same payload, sent only to the leader while `Feature::BatchedRound` is active; a voter that isn't leading answers it with `Refused { NotLeading }` and holds nothing, task-d102); API class limit |
+| Release | `0x0701` | leader to collector | Version 1: `ReleasedResult` (postcard). Version 2, for a command marked by its submission: `ReleaseV2 { released: ReleasedResult, admission: Digest32 }`, the admission digest of the payload the leader decided; collector-evidence class limit |
+| Evidence | `0x0700` | voter to collector | Opaque `coord-consensus` protocol message (`LeaderReply`, `FastAck`, `SlowAck`, `Refused`); collector-evidence class limit |
+| Read | `0x0107` | frontend to the leader it follows | `ReadV1 { ballot, request: RequestV1 }` (postcard): a Range without an explicit revision, for the leader read barrier (task-d50); API class limit |
+| ReadAnswer | `0x0702` | leader to frontend | `ReadAnswerV1 { retry_key, ballot, outcome: Served { response } \| Refused { reason } }` (postcard), `reason` one of `NotLeading`, `NothingProposed`, `Expired`, `NotServable`, `Busy`; collector-evidence class limit |
+
+A relayed command's proposal (task-d102) is the peer message
+`RelayedProposal { vote, payload }`, appended after every older
+variant: the leader's proposal exactly as `Proposal` carries it, then
+the command's payload record. A follower checks the payload as it checks
+a `PayloadResponse` (it rehashes to the vote's command, and its
+admission digest is the vote's) and adopts the command from it without
+pre-accepting it; one it would not take leaves the proposal to be
+handled as a `Proposal`. An older build cannot decode the variant, which
+is why the leader sends it only for a version-3 submission.
+
+While `Feature::BatchedRound` is active and its node lowers persists in
+groups, a leader sends a turn's fresh proposals to each follower in one
+peer message (task-d102), `ProposalFrame { replica, ballot, proposals }`,
+appended after `RelayedProposal`. The sender and the ballot ride once;
+each entry is a `FramedProposal { command, deps, paths, path, admission,
+seqnum, payload }`: a `Proposal`'s vote without the two fields the frame
+names, and a relayed command's payload record (`None` for any other).
+Entries are in sequence-number order. The frame is cut where the
+leader's loop lowers the turn's group, with no timer, and waits on every
+batch its entries wait on; a turn's proposals to one follower past
+`MAX_PROPOSAL_FRAME_BYTES` (1 MiB) go in more than one frame, and a turn
+of one proposal sends it as the `Proposal` or `RelayedProposal` it is. A
+follower takes each entry as the message it stands for, in order, in one
+step, so their adoptions share its next journal group; an entry it
+refuses leaves the others as they are. Re-sends, re-presentations,
+answers to a follower's ask and the re-proposals after a Sync are never
+framed.
+
+A read is served only by the leader of the ballot named in it, after a
+confirmation round of that ballot (`ProtocolMessage::ReadConfirm` /
+`ReadConfirmed`, appended at indices 20 and 21) started after the read
+arrived and after its executed and materialized state reached the read
+index; the served `response` is the encoded `Response` the ordered path
+would have recorded for a Range at that state. A refusal, or no answer
+by the frontend's deadline, sends the read down the ordered path
+(design Section 6.3). A voter admits `Read` under the same collector-role
+rule as `Submit`.
 
 `FastAck` and `SlowAck` carry the admission digest the sender accepted
 the command under. The command identity is the retry key and the
@@ -216,15 +272,30 @@ certificate binds one role and the role that may act for other
 principals is not the voter's. Frozen error codes of `ResponseV1::Err` are `wire_v1::codes` in
 `coord-types` (`0x0001` request identity conflict, `0x0002`
 backpressure, `0x0003` malformed request, `0x0004` not admitted, `0x0005`
-result too large, `0x0006` request too large; append-only); pending and
-unknown outcomes use the `Pending` and `Unknown` outcomes, not error
-codes. `0x0006` is a permanent refusal: what the request carries, as
+result too large, `0x0006` request too large, `0x0007` output withheld,
+`0x0008` result retired; append-only); pending and unknown outcomes use
+the `Pending` and `Unknown` outcomes, not error codes. `0x0006` is a permanent refusal: what the request carries, as
 the protocol counts it against its request limit (the bytes of its keys,
 values and range ends), exceeds the frontend's configured
 `max_request_bytes`. It is decided before
 anything is reserved, is answered under the invocation's own command
 identity, and is the same answer on every retry, so a client does not
 retry it.
+
+`0x0007` and `0x0008` answer for a command, not a refusal of it
+(task-d23). `0x0007`: the command executed, and its result is withheld
+from this caller, by the output gate under the current policy or because
+the session may no longer read it; `0x0004` never answers a command that
+executed. `0x0008`: the invocation's sequence is at or below its client
+instance's retirement floor and no result is kept, so whether it
+happened is not retrievable. Both are final; neither is retried. A
+retired sequence reaches a client as `0x0008` on a `Resolve`, and on a
+`Request` under a session that may no longer execute; on a `Request`
+under a live session, admission refuses it as `Rejected(RetryTooOld)`.
+`Unknown` means only that the endpoint, its memory and its durable
+record, holds nothing about the invocation; the client learns more by
+sending the identical `Request` again under the same retry key, which a
+domain that executed it answers from its record.
 
 ## API session binding (task-37)
 

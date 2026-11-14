@@ -4,6 +4,8 @@
 //! trip), retries preserve the binding, a recovering scheduler sees private
 //! bindings, and a replaced binding's expiration is stale on redb.
 
+mod support;
+
 use coord_core::effect::{BootId, PersistBatch};
 use coord_core::outbox::BarrierAllocator;
 use coord_redb_faultkit::{FaultBackend, FaultPlan};
@@ -146,7 +148,7 @@ impl<E: LocalEngine> Domain<E> {
     fn run(&mut self, request: &LogicalRequest, seq: u64) -> (Admission, coord_state::Response) {
         let b = binding(seq, request);
         let gated = self.worker.reader().snapshot().unwrap();
-        let admission = retry::admit(gated.view(), &b, |_| true).unwrap();
+        let admission = retry::admit(gated.view(), &b, |_| Ok(true)).unwrap();
         if let Admission::Retry(record) = &admission {
             let stored: coord_state::Response = postcard::from_bytes(&record.response).unwrap();
             return (admission.clone(), stored);
@@ -162,6 +164,7 @@ impl<E: LocalEngine> Domain<E> {
                 .unwrap()
                 .to_owned(),
         );
+        support::stage_bound(&mut self.worker, Some(&b), request);
         match apply_plan(
             &mut self.worker,
             self.alloc.allocate(),

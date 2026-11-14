@@ -57,6 +57,14 @@ the voter published to its frontend peer identity: `LeaderReply`,
 `FastAck` or `SlowAck`. Anything else in an `Evidence` frame is
 `NotEvidence` and is not counted.
 
+A frontend with a voter beside it sends a Range without an explicit
+revision to the leader of the ballot it follows as `Read` (`0x0107`),
+and answers it from that leader's `ReadAnswer` (`0x0702`) only when the
+answer is `Served` and comes from that leader; a refusal, an answer from
+anyone else or no answer within 1.5 s orders the read as a `Submit`
+instead (task-d50). The answer goes through the same output gate as an
+ordered result.
+
 ## Admission
 
 A request enters through the admission interface with the connection's
@@ -196,8 +204,44 @@ epoch, ballot and command:
    release must carry the same position, digest and response (a final
    release may follow a speculative one).
 
-A lone leader reply, a lone release, or a loosely counted majority never
-releases tentative data. The response is `ResponseV1 { command_id, Ok {
+**Answered on the release alone** (task-d100, step A). While the
+collector's node reads `Feature::AnswerOnRelease` active, it submits each
+new command as version 2 of `Submit`, which marks it. For a marked
+command the leader sends no `LeaderReply`, every voter sends its
+acknowledgements to the leader only, and the leader's `Release` (version
+2) carries the admission digest of the payload it decided. The
+collector answers a marked command on that release alone, once it is
+not speculative and its admission digest equals the one the command was
+submitted under; the checks of the release's sender, epoch, ballot and
+agreement with an earlier release stay. A speculative release, or one
+under other admission facts, is held as a release without the predicate
+is, and the command settles from the durable record against it or by a
+voter's refusal. A marked command that also gathers the predicate is
+released by rule 1 and 2 as before. Commands submitted before the switch
+keep the rule they were submitted under, so the two mix while the
+feature activates. An exact duplicate of a marked command reaching its
+leader after execution has the release published again, rebuilt from
+the leader's retry record and its table's admission digest.
+
+**Relayed to the leader alone** (task-d102, task-d100's step B). While
+the collector's node also reads `Feature::BatchedRound` active, which is
+activated only after `AnswerOnRelease`, it submits each new marked
+command as version 3 of `Submit` to its ballot's leader alone. The
+command is answered as a version-2 one is. The leader proposes it with
+its payload (`RelayedProposal`), and each follower adopts it from that
+proposal and acknowledges it to the leader only; a grouped leader sends
+a turn's proposals to each follower in one `ProposalFrame` (see
+`spec/wire-v1.md`). A voter that isn't
+leading refuses a version-3 submission with `Refused { NotLeading }`; the
+collector then submits the command at once as version 2 to every voter,
+and does the same for a relayed command that holds neither half of a
+release `RELAY_FALLBACK_MILLIS` after its submission. Until then it is
+asked again of its ballot's leader alone, and a ballot change re-targets
+it to the new leader. `NotLeading` says nothing about the command: it is
+never a reason to settle from the record.
+
+A lone leader reply, an unmarked command's lone release, or a loosely
+counted majority never releases tentative data. The response is `ResponseV1 { command_id, Ok {
 revision, result } }` with the exact response bytes, or `Err` with the
 frozen `RESULT_TOO_LARGE` code when the result does not fit the response
 bound.
@@ -228,6 +272,14 @@ as `SettledFromRecord` followed by the `Released` it produced, whose
   outcome; `Pending` while bound and collecting; `Err
   RequestIdentityConflict` when the key is bound to another command;
   `Unknown` for an identity never seen here or beyond the retained window.
+  `coordd` asks its durable record first (task-d23): the executed result,
+  gated against the request its payload row names; `Err OutputWithheld`
+  (`0x0007`) when the caller may not read it; `Err ResultRetired`
+  (`0x0008`) at or below the retirement floor, including for a session
+  retired or whose trust rule is disabled, whose floor row outlives its
+  retry rows. What the record does not
+  settle, and a result whose payload row is gone, is the collector's to
+  answer as above.
 
 ## Ballot changes
 
@@ -246,12 +298,17 @@ refresh are task-m02.
 Every transition is recorded as a `CollectorEvent` (`Submitted`,
 `Attached`, `Retained`, `Refused`, `Evidence`, `Held`, `Released`,
 `Cancelled`, `Resolved`, `TimedOut`, `Reconfigured`, `SettledFromRecord`,
-`Reoffered`, `Undisseminated`) with identities in lowercase hex. The three
+`Reoffered`, `Undisseminated`, `VoterRefused`, `Solicited`,
+`SolicitedLeader`, `RelayFellBack`) with identities in lowercase hex. The three
 added in revisions 2 and 3 appear only when a delivery was lost or did not go
 straight through, so the frozen revision-1 scenario produces the same trace it
-always did. The Rust reference trace of the frozen scenario is
+always did. Its voters are part of the scenario, though: since task-d74 a
+follower sends its acknowledgements to the leader and the frontend only, so
+evidence arrives in another order, and the fast release counts the two votes
+that arrived before it rather than all three. No collector rule changed; the
+trace was regenerated then. The Rust reference trace of the frozen scenario is
 `crates/coord-collector/fixtures/collector_trace_v1.json` (regenerate
-deliberately with `COORD_COLLECTOR_WRITE_FIXTURES=1`). The Go collector
+deliberately with `COORD_COLLECTOR_WRITE_FIXTURES=1`). It was regenerated when the leader's acceptance moved into its proposal batch (task-d89): the leader's adoption now rests on the same batch as its reply and reaches the collector just before it, so one hold reads `awaiting-votes` where it read `awaiting-release`. The events are the same, of the same kinds, and no collector rule changed. It was regenerated once more when task-d89 was stacked on task-d74's routing, with both orders in it; again no rule changed. The Go collector
 must produce the same trace for the same scenario; differential tests of
 loss, duplication, reordering, recovery and configuration change are
 task-m02.

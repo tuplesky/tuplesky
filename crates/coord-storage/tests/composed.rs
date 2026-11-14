@@ -16,6 +16,8 @@
 //! command has happened, and reporting an outcome on any of the others
 //! publishes a revision the next reader will not find.
 
+mod support;
+
 use coord_consensus::PayloadRecordV1;
 use coord_core::effect::{BootId, PersistBatch};
 use coord_core::outbox::BarrierAllocator;
@@ -26,11 +28,12 @@ use coord_storage::policy::{bootstrap_session, rule_update};
 use coord_storage::{
     Applier, ApplyOutcome, GroupLimits, JournaledDomain, Persistence, StoreWorker, complete, submit,
 };
-use coord_store_testkit::journal::ModelJournal;
+use coord_store_testkit::journal::{AppendScript, ModelJournal};
 use coord_store_testkit::model::{CommitScript, ModelEngine};
 use coord_types::ids::*;
 use coord_types::logical_v1::*;
 use coord_types::{CommandId, RetryKey};
+use support::Staged;
 
 const NS: NamespaceId = NamespaceId([5; 16]);
 const SESSION: SessionId = SessionId([3; 16]);
@@ -192,10 +195,10 @@ fn the_reference_and_journaled_drivers_agree_on_a_failure_free_workload() {
         let (command, record) = payload(seq, &request);
 
         let a = reference
-            .apply(command, &record)
+            .apply_staged(command, &record)
             .expect("reference applied");
         let b = journaled
-            .apply(command, &record)
+            .apply_staged(command, &record)
             .expect("journaled applied");
 
         assert_eq!(
@@ -357,7 +360,9 @@ fn another_batchs_completion_never_completes_this_application() {
     // Meanwhile a real command goes through and completes.
     let request = put(b"other", b"v");
     let (command, record) = payload(1, &request);
-    let applied = applier.apply(command, &record).expect("the other command");
+    let applied = applier
+        .apply_staged(command, &record)
+        .expect("the other command");
     assert!(applied.revision.is_some());
     assert!(applier.kv_revision().unwrap() > revision);
 
@@ -367,6 +372,115 @@ fn another_batchs_completion_never_completes_this_application() {
     assert!(
         refused.is_err(),
         "another batch's completion was taken as this one's: {refused:?}"
+    );
+}
+
+/// A protocol batch queued ahead of a command is neither taken for the
+/// command nor lost by it.
+///
+/// The applier and the protocol machine allocate barriers for the same
+/// boot and hand them to the same store, and both counted from one. So
+/// the applier's barrier for a command could be a vote's that was still
+/// queued: one lowering takes one batch, the vote's `Materialized` named
+/// the command's barrier, and the command was reported applied while its
+/// own batch was still queued. And whatever the lowerings made durable
+/// for the vote was dropped, so the send waiting on it never went.
+#[test]
+fn a_protocol_batch_lowered_by_an_application_is_neither_taken_for_it_nor_lost() {
+    use coord_core::event::StorageEvent;
+
+    let mut applier = journaled();
+    applier.share_foreign();
+    // The protocol machine's allocator for the same boot. The fixture's
+    // bootstrap took the first sequence, so the second is the one an
+    // applier counting from one issued next.
+    let mut protocol = BarrierAllocator::new(inc(), BOOT);
+    let _ = protocol.allocate();
+    let vote = protocol.allocate();
+    let (command, record) = payload(1, &put(b"k", b"v"));
+    applier
+        .store_mut()
+        .submit(
+            PersistBatch {
+                barrier: vote,
+                base: None,
+                // The vote carries the command's payload, as a vote does:
+                // the execution moves it (task-d113, step 2).
+                updates: vec![
+                    coord_core::effect::StoreUpdate {
+                        collection: coord_store_api::registry::Collection::ProtocolV1.id(),
+                        key: b"vote".to_vec(),
+                        value: Some(b"accepted".to_vec()),
+                    },
+                    coord_consensus::rows::payload_update(&command, &record).unwrap(),
+                ],
+            },
+            TransitionKind::Protocol,
+        )
+        .expect("queued");
+    assert_eq!(applier.store().queued(), 1);
+
+    let applied = applier.apply(command, &record).expect("applied");
+
+    // The command's own batch is readable, not still queued behind the
+    // vote.
+    assert_eq!(applier.store().queued(), 0, "the command's batch is queued");
+    assert_eq!(
+        Some(applier.kv_revision().unwrap()),
+        applied.revision,
+        "reported applied before its own batch was readable"
+    );
+
+    // What the lowering made of the vote is handed back, and only that.
+    let foreign = applier.take_foreign();
+    assert!(
+        foreign.iter().any(|e| matches!(e,
+            StorageEvent::JournalDurable { barrier_id, .. } if *barrier_id == vote)),
+        "the vote's durability was dropped: {foreign:?}"
+    );
+    assert!(
+        foreign.iter().all(|e| e.barrier() == Some(vote)),
+        "the applier handed back its own batch's facts: {foreign:?}"
+    );
+    assert!(applier.take_foreign().is_empty(), "handed back twice");
+}
+
+/// An applier no machine shares its store with keeps none of the facts it
+/// meets about other batches: nothing would ever take them, and a tool
+/// or a test that applies for its whole life would hold every one.
+#[test]
+fn an_applier_standing_alone_keeps_no_other_batchs_facts() {
+    let mut applier = journaled();
+    let mut other = BarrierAllocator::new(inc(), BOOT);
+    let _ = other.allocate();
+    let batch = other.allocate();
+    applier
+        .store_mut()
+        .submit(
+            PersistBatch {
+                barrier: batch,
+                base: None,
+                updates: vec![coord_core::effect::StoreUpdate {
+                    collection: coord_store_api::registry::Collection::ProtocolV1.id(),
+                    key: b"vote".to_vec(),
+                    value: Some(b"accepted".to_vec()),
+                }],
+            },
+            TransitionKind::Protocol,
+        )
+        .expect("queued");
+
+    let (command, record) = payload(1, &put(b"k", b"v"));
+    applier.apply_staged(command, &record).expect("applied");
+
+    assert_eq!(
+        applier.store().queued(),
+        0,
+        "the other batch was not lowered"
+    );
+    assert!(
+        applier.take_foreign().is_empty(),
+        "a standalone applier kept another batch's facts"
     );
 }
 
@@ -384,15 +498,15 @@ fn a_retry_finds_the_retained_outcome_and_does_not_execute_again() {
 
         let (first, second, revision_after) = if label == "reference" {
             let mut a = reference();
-            let first = a.apply(command, &record).unwrap();
+            let first = a.apply_staged(command, &record).unwrap();
             let after = a.kv_revision().unwrap();
-            let second = a.apply(command, &record).unwrap();
+            let second = a.apply_staged(command, &record).unwrap();
             (first, second, (after, a.kv_revision().unwrap()))
         } else {
             let mut a = journaled();
-            let first = a.apply(command, &record).unwrap();
+            let first = a.apply_staged(command, &record).unwrap();
             let after = a.kv_revision().unwrap();
-            let second = a.apply(command, &record).unwrap();
+            let second = a.apply_staged(command, &record).unwrap();
             (first, second, (after, a.kv_revision().unwrap()))
         };
 
@@ -768,9 +882,9 @@ fn a_boot_that_ends_between_the_record_and_the_projection_recovers_the_command()
     let mut applier =
         Applier::new(domain, BarrierAllocator::new(inc(), BootId([0x88; 16]))).expect("applier");
 
-    let first = applier.apply(command, &record).expect("applied");
+    let first = applier.apply_staged(command, &record).expect("applied");
     let revision = applier.kv_revision().unwrap();
-    let retry = applier.apply(command, &record).expect("retried");
+    let retry = applier.apply_staged(command, &record).expect("retried");
     assert_eq!(first, retry, "the retry produced a different outcome");
     assert_eq!(
         applier.kv_revision().unwrap(),
@@ -1048,6 +1162,7 @@ fn a_transition_stamped_below_the_fence_is_refused_as_fenced() {
 
     let (command, record) = payload(1, &put(b"k", b"v"));
     let refused = applier
+        // Refused at the fence before it lowers, so nothing is staged.
         .apply(command, &record)
         .expect_err("an apply below the fence is refused");
     assert!(
@@ -1055,4 +1170,288 @@ fn a_transition_stamped_below_the_fence_is_refused_as_fenced() {
             if coord_storage::materialize::is_fenced(e)),
         "{refused:?}"
     );
+}
+
+/// The workload the group tests run: overwrites of three keys, and a
+/// retry of an earlier command, which must resolve from the retained
+/// result whether that command is still in the open group or not.
+fn group_workload() -> Vec<(CommandId, PayloadRecordV1)> {
+    let mut commands: Vec<_> = (1..=10u64)
+        .map(|seq| payload(seq, &put(format!("k{}", seq % 3).as_bytes(), b"v")))
+        .collect();
+    commands.insert(6, commands[2].clone());
+    commands
+}
+
+/// A group of commands applied together gives each the outcome it gets
+/// applied alone, and costs one journal append and one projection
+/// commit (task-d47).
+///
+/// Within the group each command is planned over what the ones before it
+/// wrote, which the projection does not hold yet; nothing of the group
+/// is readable, and nothing is published to watches, until it has
+/// materialized.
+#[test]
+fn a_group_of_commands_lowers_once_and_matches_applying_them_one_at_a_time() {
+    let mut alone = journaled();
+    let one_at_a_time: Vec<_> = group_workload()
+        .iter()
+        .map(|(command, record)| alone.apply_staged(*command, record).expect("applied"))
+        .collect();
+
+    let mut grouped = journaled();
+    // The payloads first, as the protocol puts them, so the group is
+    // applications only (task-d113, step 2).
+    support::stage_all(grouped.store_mut(), &group_workload());
+    let revision_before = grouped.kv_revision().unwrap();
+    let published_before = grouped.hub().published();
+    let cost_before = grouped.store().cost().expect("counted").lowering;
+    assert!(grouped.begin_group());
+    let together: Vec<_> = group_workload()
+        .iter()
+        .map(|(command, record)| grouped.apply(*command, record).expect("applied"))
+        .collect();
+    assert_eq!(grouped.grouped(), 10, "the retry adds no batch");
+    // Decided, and not yet readable.
+    assert_eq!(grouped.kv_revision().unwrap(), revision_before);
+    assert_eq!(grouped.hub().published(), published_before);
+    assert_eq!(
+        grouped.store().cost().expect("counted").lowering,
+        cost_before
+    );
+
+    grouped.finish_group().expect("the group materializes");
+    assert!(!grouped.in_group());
+    let cost = grouped.store().cost().expect("counted").lowering;
+    assert_eq!(cost.appends - cost_before.appends, 1, "one journal append");
+    assert_eq!(
+        cost.commits - cost_before.commits,
+        1,
+        "one projection commit"
+    );
+    // What the group held, by its records (task-d84): one group of
+    // application outcomes only, a record for each command it executed.
+    let (groups, before) = (cost.groups, cost_before.groups);
+    assert_eq!(groups.application - before.application, 1);
+    assert_eq!(groups.protocol + groups.both, before.protocol + before.both);
+    assert_eq!(groups.application_records - before.application_records, 10);
+    assert_eq!(groups.protocol_records, before.protocol_records);
+
+    assert_eq!(together, one_at_a_time);
+    assert_eq!(grouped.kv_revision().unwrap(), alone.kv_revision().unwrap());
+    assert_eq!(grouped.hub().published(), alone.hub().published());
+    assert_eq!(grouped.store().unmaterialized(), 0);
+}
+
+/// A lost group is the applier's last (#185, review 6861674000). Its
+/// commands were reported applied, at positions and revisions no batch
+/// of this replica's will hold, so the next command is refused rather
+/// than planned at the lost group's first position again, as is every
+/// lowering and the lost command presented again; the replica restarts
+/// from its journal.
+///
+/// So is a read view (#281): one taken after the loss would lay the
+/// groups still in flight over the snapshot, behind a group that will
+/// never be journaled, and the gate's barrier is read from it.
+#[test]
+fn an_applier_that_lost_a_group_refuses_to_be_used() {
+    let commands = group_workload();
+    let mut applier = journaled();
+    support::stage_all(applier.store_mut(), &commands);
+    assert!(applier.begin_group());
+    for (command, record) in &commands[..2] {
+        applier.apply(*command, record).expect("applied");
+    }
+    applier
+        .store_mut()
+        .store_mut()
+        .journal_mut()
+        .unwrap()
+        .script_append(AppendScript::DefinitelyNotCommitted);
+    assert!(!applier.lost());
+    assert!(applier.read_view().is_ok(), "readable before the loss");
+    assert!(matches!(
+        applier.finish_group(),
+        Err(coord_storage::ApplyError::GroupLost)
+    ));
+    assert!(applier.lost());
+    let refused = |r: Result<(), coord_storage::ApplyError>| {
+        assert!(
+            matches!(r, Err(coord_storage::ApplyError::AfterGroupLost)),
+            "{r:?}"
+        );
+    };
+    applier.begin_group();
+    let (command, record) = &commands[2];
+    refused(applier.apply(*command, record).map(drop));
+    refused(applier.finish_group());
+    refused(applier.hand_off_group().map(drop));
+    refused(applier.settle().map(drop));
+    refused(applier.drain().map(drop));
+    refused(applier.read_view().map(drop));
+    let (command, record) = &commands[0];
+    refused(applier.apply(*command, record).map(drop));
+}
+
+/// A group's commands are planned over one snapshot of the projection,
+/// pinned by the first of them, where a command outside a group pins one
+/// of its own (task-d115): one read view a batch. The outcomes are the
+/// ones each gets applied alone.
+#[test]
+fn a_group_plans_every_command_over_one_snapshot() {
+    let snapshots = |applier: &Applier<JournaledDomain<ModelJournal, ModelEngine>>| {
+        applier
+            .store()
+            .store()
+            .projection(DOMAIN)
+            .expect("attached")
+            .snapshots()
+    };
+    let workload = group_workload();
+
+    let mut alone = journaled();
+    support::stage_all(alone.store_mut(), &workload);
+    let mut one_at_a_time = Vec::new();
+    for (command, record) in &workload {
+        let before = snapshots(&alone);
+        one_at_a_time.push(alone.apply(*command, record).expect("applied"));
+        assert!(snapshots(&alone) > before, "a command alone pins its own");
+    }
+
+    let mut grouped = journaled();
+    support::stage_all(grouped.store_mut(), &workload);
+    assert!(grouped.begin_group());
+    let before = snapshots(&grouped);
+    let together: Vec<_> = workload
+        .iter()
+        .map(|(command, record)| grouped.apply(*command, record).expect("applied"))
+        .collect();
+    assert_eq!(
+        snapshots(&grouped) - before,
+        1,
+        "{} commands, one snapshot",
+        workload.len()
+    );
+    grouped.finish_group().expect("the group materializes");
+    assert_eq!(together, one_at_a_time);
+    assert_eq!(grouped.kv_revision().unwrap(), alone.kv_revision().unwrap());
+
+    // The next group pins a snapshot of its own, which holds the first.
+    let next = payload(11, &put(b"k1", b"w"));
+    support::stage_all(grouped.store_mut(), std::slice::from_ref(&next));
+    assert!(grouped.begin_group());
+    let before = snapshots(&grouped);
+    let outcome = grouped.apply(next.0, &next.1).expect("applied");
+    assert_eq!(snapshots(&grouped) - before, 1);
+    grouped.finish_group().expect("the group materializes");
+    let expected = alone.apply_staged(next.0, &next.1).expect("applied");
+    assert_eq!(outcome, expected);
+}
+
+/// A group whose records reached the journal and whose projection commit
+/// never happened is recovered whole from the journal by the next boot:
+/// each command executed once, at the position it took (task-d47).
+#[test]
+fn a_boot_that_ends_between_a_groups_journal_sync_and_its_projection_commit_recovers_the_group() {
+    let mut applier = journaled();
+    support::stage_all(applier.store_mut(), &group_workload());
+    assert!(applier.begin_group());
+    let outcomes: Vec<_> = group_workload()
+        .iter()
+        .map(|(command, record)| applier.apply(*command, record).expect("applied"))
+        .collect();
+    let appended = applier
+        .store_mut()
+        .store_mut()
+        .append_pending()
+        .expect("the group reaches the journal");
+    assert_eq!(appended.appends, 1);
+    assert_eq!(appended.journaled, 10, "the whole group in one append");
+    assert_eq!(applier.store().store().unmaterialized(DOMAIN), 10);
+
+    // The boot ends here: the group durable, the projection behind it.
+    let (journal, mut engines): (ModelJournal, Vec<(DomainId, ModelEngine)>) =
+        applier.into_store().into_store().into_parts();
+    let engine = engines.pop().expect("one domain").1;
+    let mut next = JournaledStore::open(
+        journal,
+        CLUSTER,
+        REPLICA,
+        inc(),
+        BootId([0x88; 16]),
+        JournalLimits::default(),
+    )
+    .expect("reopened");
+    next.attach(DOMAIN, ShardId::new(0).unwrap(), engine)
+        .expect("attached");
+    assert_eq!(next.unmaterialized(DOMAIN), 0, "the replay took the group");
+    let base = next.application_base(DOMAIN).expect("attached");
+    let domain = JournaledDomain::new(
+        next,
+        DOMAIN,
+        Ballot {
+            epoch: base.configuration,
+            number: 0,
+            leader: REPLICA,
+        },
+    )
+    .expect("attached");
+    let mut applier =
+        Applier::new(domain, BarrierAllocator::new(inc(), BootId([0x88; 16]))).expect("applier");
+    let revision = applier.kv_revision().unwrap();
+
+    // Every command of the group is there, with the outcome it was
+    // reported with, and presenting it again executes nothing.
+    for ((command, record), outcome) in group_workload().iter().zip(&outcomes) {
+        assert_eq!(
+            &applier.apply_staged(*command, record).expect("retried"),
+            outcome
+        );
+    }
+    assert_eq!(applier.kv_revision().unwrap(), revision);
+    assert_eq!(
+        Some(revision),
+        outcomes.iter().filter_map(|o| o.revision).max()
+    );
+}
+
+/// A projection that refuses a group's commit owes the group, and the
+/// group still finishes: refused is not lost, and no command is planned
+/// again (task-d47).
+#[test]
+fn a_refused_projection_commit_of_a_group_is_redone_not_replanned() {
+    let mut alone = journaled();
+    let one_at_a_time: Vec<_> = group_workload()
+        .iter()
+        .map(|(command, record)| alone.apply_staged(*command, record).expect("applied"))
+        .collect();
+
+    let mut applier = journaled();
+    support::stage_all(applier.store_mut(), &group_workload());
+    assert!(applier.begin_group());
+    let together: Vec<_> = group_workload()
+        .iter()
+        .map(|(command, record)| applier.apply(*command, record).expect("applied"))
+        .collect();
+    applier
+        .store_mut()
+        .store_mut()
+        .projection(DOMAIN)
+        .unwrap()
+        .script_commit(CommitScript::DefinitelyNotCommitted);
+    applier
+        .finish_group()
+        .expect("the group materializes after all");
+    assert_eq!(together, one_at_a_time);
+    assert_eq!(applier.kv_revision().unwrap(), alone.kv_revision().unwrap());
+    assert_eq!(applier.store().unmaterialized(), 0);
+}
+
+/// The reference worker's base is its projection's own frontier, so it
+/// does not group: every command lowers as it is applied.
+#[test]
+fn the_reference_worker_applies_one_command_at_a_time() {
+    let mut applier = reference();
+    assert!(!applier.begin_group());
+    assert!(!applier.in_group());
 }

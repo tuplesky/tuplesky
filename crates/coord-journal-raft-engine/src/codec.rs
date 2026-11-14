@@ -18,17 +18,18 @@ fn corruption(what: &str, detail: impl core::fmt::Display) -> raft_engine::Error
 
 impl ValueCodec<JournalRecordV1> for RecordCodec {
     fn encode_to(v: &JournalRecordV1, buf: &mut Vec<u8>) -> raft_engine::Result<()> {
-        let bytes = v
-            .encode()
+        // Append only: bytes already in `buf` belong to other records, and
+        // an error leaves them as they were.
+        let start = buf.len();
+        v.encode_into(buf)
             .map_err(|e| corruption("journal record encode", e))?;
-        if bytes.len() > MAX_RECORD_BYTES {
+        if buf.len() - start > MAX_RECORD_BYTES {
+            buf.truncate(start);
             return Err(corruption(
                 "journal record encode",
                 "record exceeds MAX_RECORD_BYTES",
             ));
         }
-        // Append only: bytes already in `buf` belong to other records.
-        buf.extend_from_slice(&bytes);
         Ok(())
     }
 

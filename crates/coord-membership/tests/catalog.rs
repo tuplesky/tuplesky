@@ -142,7 +142,8 @@ fn catalog(
 fn a_committed_membership_verifies_a_catalog_its_own_voter_attested() {
     let one = Voter::new(1);
     let two = Voter::new(2);
-    let membership = membership(&[&one, &two], DOMAIN);
+    let three = Voter::new(3);
+    let membership = membership(&[&one, &two, &three], DOMAIN);
 
     let catalog = catalog(
         1,
@@ -166,7 +167,8 @@ fn a_committed_membership_verifies_a_catalog_its_own_voter_attested() {
 fn a_catalog_no_committed_voter_signed_is_refused() {
     let one = Voter::new(1);
     let two = Voter::new(2);
-    let membership = membership(&[&one, &two], DOMAIN);
+    let three = Voter::new(3);
+    let membership = membership(&[&one, &two, &three], DOMAIN);
 
     // A stranger's signature.
     let stranger = Voter::new(9);
@@ -212,7 +214,8 @@ fn a_catalog_never_says_who_the_voters_are() {
     let one = Voter::new(1);
     let two = Voter::new(2);
     let stranger = Voter::new(9);
-    let membership = membership(&[&one, &two], DOMAIN);
+    let three = Voter::new(3);
+    let membership = membership(&[&one, &two, &three], DOMAIN);
 
     let introduces = catalog(
         1,
@@ -243,4 +246,40 @@ fn a_catalog_never_says_who_the_voters_are() {
         Err(CatalogError::UnknownEpoch),
         "a catalog never introduces an epoch, whatever anchors it"
     );
+}
+
+/// An epoch has three or five voters, or one in the single-voter test
+/// profile; two and four are refused (task-d31).
+#[test]
+fn a_manifest_of_two_or_four_voters_is_refused() {
+    use coord_membership::membership::MembershipError;
+    for count in 1..=5u8 {
+        let manifest = GenesisManifest {
+            cluster: hex_id(&CLUSTER.0),
+            domain: hex_id(&[2; 16]),
+            epoch: 1,
+            voters: (1..=count)
+                .map(|n| VoterSeed {
+                    node: hex_id(&[n; 16]),
+                    incarnation: 1,
+                    public_key: b64url(&[n; 32]),
+                })
+                .collect(),
+            issuer_roots: vec!["cm9vdA".to_owned()],
+            wif_rules: vec![serde_json::json!({ "issuer": "test" })],
+            admin: hex_id(&[9; 16]),
+            protocol_version: 1,
+        };
+        let placed = Membership::from_genesis(&manifest);
+        match count {
+            2 | 4 => assert_eq!(
+                placed.err(),
+                Some(MembershipError::UnsupportedVoterCount {
+                    count: usize::from(count)
+                }),
+                "{count} voters"
+            ),
+            _ => assert_eq!(placed.expect("allowed").voter_count(), usize::from(count)),
+        }
+    }
 }

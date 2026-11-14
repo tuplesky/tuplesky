@@ -15,7 +15,7 @@
 //! `Effect::Established`. A leader reply, or any single response, can
 //! never establish anything here.
 
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
 
 use coord_core::capability::{EstablishError, EstablishedResult, EstablishmentEvidence};
@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use crate::commands::CommandTable;
 use crate::graph::ClosureProgress;
 use crate::phase::{GuardViolation, Phase, guard_execute};
-use crate::vote::{Learned, VoteSet};
+use crate::vote::{LearnedBy, VoteSet};
 
 /// Which learning predicates a replica applies (design Section 18.3:
 /// the slow path is the reference; fast learning is the measured
@@ -130,28 +130,50 @@ impl Learner {
     /// whose dependencies are committed; repeat while progress is made.
     /// Returns the commands committed. Fast and slow learning yield the
     /// same dependencies (the leader's); only the evidence differs.
-    pub fn commit_learned(
+    pub fn commit_learned<'a>(
         &mut self,
         table: &mut CommandTable,
-        votes: &BTreeMap<CommandId, VoteSet>,
+        votes: impl Fn(&CommandId) -> Option<&'a VoteSet>,
+    ) -> Vec<CommandId> {
+        self.commit_learned_where(table, votes, |_| true)
+    }
+
+    /// [`Learner::commit_learned`], over the accepted commands `eligible`
+    /// admits only. A leader commits its fresh proposal only once its
+    /// proposal batch is durable, since its own fast vote is that
+    /// proposal (task-d89): a follower's acknowledgement can arrive
+    /// before it, and a fast quorum counted over a volatile proposal is
+    /// one a restarted leader's report would deny.
+    pub fn commit_learned_where<'a>(
+        &mut self,
+        table: &mut CommandTable,
+        votes: impl Fn(&CommandId) -> Option<&'a VoteSet>,
+        eligible: impl Fn(&CommandId) -> bool,
     ) -> Vec<CommandId> {
         let mut committed = Vec::new();
         loop {
-            let candidates: Vec<(CommandId, Learned)> = votes
-                .iter()
-                .filter(|(c, _)| table.phase_of(c) == Some(Phase::Accept))
-                .filter_map(|(c, v)| {
+            // The commands at ACCEPT, not every vote set held: executed
+            // ones keep theirs until the history sweep, and a pass over
+            // them costs the history rather than the change (task-d46).
+            // The same commands as filtering the vote sets by phase, in
+            // the same order.
+            let candidates: Vec<(CommandId, LearnedBy)> = table
+                .in_accept()
+                .into_iter()
+                .filter(|c| eligible(c))
+                .filter_map(|c| {
+                    let v = votes(&c)?;
                     let learned = match self.mode {
-                        LearningMode::Full => v.learned(),
-                        LearningMode::SlowOnly => v.learned_slow(),
+                        LearningMode::Full => v.learned_by(),
+                        LearningMode::SlowOnly => v.learned_slow_by(),
                     }?;
-                    Some((*c, learned))
+                    Some((c, learned))
                 })
                 .collect();
             let mut progressed = false;
             for (c, learned) in candidates {
-                if table.commit(c).is_ok() {
-                    if matches!(learned, Learned::Fast { .. }) {
+                if table.commit_accepted(c) {
+                    if learned == LearnedBy::Fast {
                         self.fast.insert(c);
                     }
                     committed.push(c);
@@ -176,11 +198,13 @@ impl Learner {
         table: &CommandTable,
         seqnum_of: impl Fn(&CommandId) -> Option<u64>,
     ) -> Option<CommandId> {
+        // The ready records only (task-d107): a record blocked on a
+        // dependency is not looked at until that dependency executes. The
+        // choice among them stays here, since the sequence numbers are
+        // the caller's.
         table
-            .records()
-            .filter(|(_, r)| r.phase == Phase::Commit)
-            .filter(|(_, r)| guard_execute(&r.deps, |d| table.phase_of(d)).is_ok())
-            .map(|(c, _)| (seqnum_of(c).unwrap_or(u64::MAX), *c))
+            .ready()
+            .map(|c| (seqnum_of(c).unwrap_or(u64::MAX), *c))
             .min()
             .map(|(_, c)| c)
     }
@@ -213,8 +237,10 @@ impl Learner {
             });
         }
         let cursor = table.closure_start(command).map_err(LearnError::Guard)?;
+        // Stop at what already executed: its predecessors were
+        // established then (task-d53).
         let closed = match table
-            .closure_step(cursor, usize::MAX)
+            .unexecuted_closure_step(cursor, usize::MAX)
             .map_err(LearnError::Guard)?
         {
             ClosureProgress::Complete(c) => c.members.into_iter().collect(),

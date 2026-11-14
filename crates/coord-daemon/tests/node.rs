@@ -127,11 +127,16 @@ fn store(boot: BootId) -> Applier<StoreWorker<ModelEngine>> {
 /// One admitted client request, as a collector's submission would have
 /// produced it at the verifier boundary.
 fn admitted(sequence: u64) -> coord_core::event::AdmittedRequest {
+    admitted_putting(sequence, b"v".to_vec())
+}
+
+/// [`admitted`], putting `value`.
+fn admitted_putting(sequence: u64, value: Vec<u8>) -> coord_core::event::AdmittedRequest {
     let mut logical = LogicalRequest::new(
         NS,
         CanonicalOperation::Put(PutOp {
             key: b"k".to_vec(),
-            value: b"v".to_vec(),
+            value,
             lease: None,
             prev_kv: false,
         }),
@@ -166,15 +171,36 @@ fn admitted(sequence: u64) -> coord_core::event::AdmittedRequest {
 /// serving profile, where a record reaches the journal before the
 /// projection.
 fn journaled_follower(boot: BootId) -> Node<JournaledDomain<ModelJournal, ModelEngine>> {
-    let mut store = JournaledStore::open(
-        ModelJournal::new(),
-        CLUSTER,
-        r(1),
-        inc(),
-        boot,
-        JournalLimits::default(),
-    )
-    .unwrap();
+    let applier = journaled_applier(boot, r(1));
+    let bootstrapped = applier.store().application_base().execution_position;
+    let mut machine = Follower::new(FollowerConfig {
+        identity: identity(1),
+        quorum: quorum(),
+        genesis: ballot(),
+        frontend: FRONTEND,
+        capacity: 64,
+    })
+    .restore_execution(bootstrapped, []);
+    machine.set_learning(LearningMode::Full);
+    Node::new(Machine::Follower(Box::new(machine)), applier, FRONTEND)
+}
+
+/// A bootstrapped journal-first store for replica `me`.
+fn journaled_applier(
+    boot: BootId,
+    me: ReplicaId,
+) -> Applier<JournaledDomain<ModelJournal, ModelEngine>> {
+    journaled_applier_within(boot, me, JournalLimits::default())
+}
+
+/// [`journaled_applier`] under `limits`.
+fn journaled_applier_within(
+    boot: BootId,
+    me: ReplicaId,
+    limits: JournalLimits,
+) -> Applier<JournaledDomain<ModelJournal, ModelEngine>> {
+    let mut store =
+        JournaledStore::open(ModelJournal::new(), CLUSTER, me, inc(), boot, limits).unwrap();
     store
         .attach(DOMAIN, ShardId::new(0).unwrap(), ModelEngine::new())
         .unwrap();
@@ -215,18 +241,47 @@ fn journaled_follower(boot: BootId) -> Node<JournaledDomain<ModelJournal, ModelE
         },
     )
     .expect("attached");
-    let applier = Applier::new(domain, alloc).unwrap();
+    Applier::new(domain, alloc).unwrap()
+}
+
+/// A leader that is its domain's only voter, persisting through the
+/// journal: its own record is the quorum, so what it proposes it also
+/// executes.
+fn journaled_lone_leader(boot: BootId) -> Node<JournaledDomain<ModelJournal, ModelEngine>> {
+    journaled_lone_leader_within(boot, JournalLimits::default())
+}
+
+/// [`journaled_lone_leader`] under `limits`.
+fn journaled_lone_leader_within(
+    boot: BootId,
+    limits: JournalLimits,
+) -> Node<JournaledDomain<ModelJournal, ModelEngine>> {
+    let applier = journaled_applier_within(boot, r(0), limits);
     let bootstrapped = applier.store().application_base().execution_position;
-    let mut machine = Follower::new(FollowerConfig {
-        identity: identity(1),
-        quorum: quorum(),
-        genesis: ballot(),
-        frontend: FRONTEND,
-        capacity: 64,
-    })
-    .restore_execution(bootstrapped, []);
+    let alone = ConfigurationIdentity {
+        voters: vec![r(0)].into_iter().collect(),
+        ..identity(0)
+    };
+    let quorum = BallotConfiguration::c2(
+        epoch(),
+        ballot(),
+        [r(0)].into_iter().collect(),
+        [r(0)].into_iter().collect(),
+    )
+    .unwrap();
+    let mut machine = Leader::new(
+        LeaderConfig {
+            identity: alone,
+            quorum,
+            genesis: ballot(),
+            frontend: FRONTEND,
+            capacity: 64,
+        },
+        None,
+        bootstrapped,
+    );
     machine.set_learning(LearningMode::Full);
-    Node::new(Machine::Follower(Box::new(machine)), applier, FRONTEND)
+    Node::new(Machine::Leader(Box::new(machine)), applier, FRONTEND)
 }
 
 fn follower(boot: BootId) -> Node<StoreWorker<ModelEngine>> {
@@ -537,6 +592,47 @@ fn a_vote_rests_on_the_record_being_durable_not_on_the_projection() {
     );
 }
 
+/// A vote whose append ended uncertain is settled by a reconcile and
+/// goes out, rather than waiting for a command to execute.
+///
+/// An uncertain append leaves the domain refusing every later batch as
+/// not ready until something reconciles it. Only the applier did, when a
+/// command next executed, and it kept what the reconcile settled to
+/// itself: the vote waited for a new ballot or a restart, and so did
+/// the command that needed it.
+#[test]
+fn a_vote_whose_append_ended_uncertain_is_reconciled_and_released() {
+    let boot = BootId([8; 16]);
+    let mut follower = journaled_follower(boot);
+    follower
+        .on_event(
+            Event::Boot {
+                boot_id: boot,
+                incarnation: inc(),
+            },
+            &ballot(),
+        )
+        .expect("boot");
+
+    // The next append reaches the log, and says it may not have.
+    follower
+        .applier_mut()
+        .store_mut()
+        .store_mut()
+        .journal_mut()
+        .unwrap()
+        .script_append(coord_store_testkit::journal::AppendScript::Indeterminate { applied: true });
+
+    let out = follower
+        .on_event(Event::Admitted(admitted(1)), &ballot())
+        .expect("an uncertain append is reconciled, not a failed round");
+    assert!(
+        !out.frontend.is_empty(),
+        "the vote was not released once its record was known durable"
+    );
+    assert_eq!(follower.held(), 0, "a send is still waiting");
+}
+
 /// A voter that serves a write records the journal and materialization
 /// work it did (task-61), and the snapshot built from that recorder
 /// reports those stages with non-zero counts rather than zeroes.
@@ -621,4 +717,1301 @@ fn a_voter_that_served_a_write_reports_the_stages_it_passed_through() {
         .find(|r| r.stage == Stage::FanOut)
         .expect("every stage is reported");
     assert_eq!(fan_out.metrics.why(), Some(Unavailable::NotInstrumented));
+}
+
+/// Lowering in groups, a vote waits for the flush that journals it, and
+/// one flush journals every vote the events before it made, in one
+/// append (task-d47).
+///
+/// The events are carried out at once; only the lowering waits. What the
+/// votes justify is sent once their own barriers are journal-durable, as
+/// before, which is now at the flush.
+#[test]
+fn lowering_in_groups_a_vote_waits_for_the_flush_that_journals_it() {
+    let boot = BootId([8; 16]);
+    let mut follower = journaled_follower(boot);
+    follower
+        .on_event(
+            Event::Boot {
+                boot_id: boot,
+                incarnation: inc(),
+            },
+            &ballot(),
+        )
+        .expect("boot");
+    follower.lower_in_groups();
+    let appends = |node: &Node<JournaledDomain<ModelJournal, ModelEngine>>| {
+        node.applier().store().store().journal().appends()
+    };
+    let before = appends(&follower);
+
+    for sequence in 1..=3 {
+        let out = follower
+            .on_event(Event::Admitted(admitted(sequence)), &ballot())
+            .expect("admitted");
+        assert!(
+            out.frontend.is_empty() && out.peer.is_empty(),
+            "a vote went out before the flush that journals it"
+        );
+    }
+    assert_eq!(appends(&follower), before, "nothing was journaled yet");
+    // Each submission's records wait in the queue: the evidence for them
+    // is described once they are durable, so none of it exists yet.
+    assert_eq!(follower.applier().store().queued(), 3);
+
+    let out = follower.flush(&ballot()).expect("flushed");
+    assert_eq!(appends(&follower) - before, 1, "one append for every vote");
+    assert_eq!(follower.applier().store().queued(), 0);
+    assert_eq!(follower.held(), 0, "every vote was released by the flush");
+    assert!(!out.frontend.is_empty(), "the votes went to the collector");
+    // Nothing is ready to execute, so the flush also caught the
+    // projection up: it does not wait on execution that is not coming.
+    assert!(!follower.can_execute());
+    assert_eq!(follower.applier().store().unmaterialized(), 0);
+}
+
+/// Lowering in groups, the commands whose turn has come are applied as
+/// one group: one journal append and one projection commit for all of
+/// them, and their results go to the collector only once the group has
+/// materialized (task-d47).
+#[test]
+fn lowering_in_groups_the_commands_ready_together_execute_as_one_group() {
+    let boot = BootId([9; 16]);
+    let mut node = journaled_lone_leader(boot);
+    node.on_event(
+        Event::Boot {
+            boot_id: boot,
+            incarnation: inc(),
+        },
+        &ballot(),
+    )
+    .expect("boot");
+    node.lower_in_groups();
+    for sequence in 1..=5 {
+        node.on_event(Event::Admitted(admitted(sequence)), &ballot())
+            .expect("admitted");
+    }
+    node.flush(&ballot()).expect("flushed");
+    assert!(
+        node.can_execute(),
+        "the lone voter's records decide its proposals"
+    );
+
+    let cost = |node: &Node<JournaledDomain<ModelJournal, ModelEngine>>| {
+        node.applier().store().cost().expect("counted").lowering
+    };
+    let before = cost(&node);
+    let revision_before = node.applier().kv_revision().unwrap();
+    let out = node.execute(&ballot()).expect("executed");
+    let after = cost(&node);
+    assert_eq!(node.executed, 5);
+    assert_eq!(after.appends - before.appends, 1, "one journal append");
+    assert_eq!(after.commits - before.commits, 1, "one projection commit");
+    assert!(!node.applier().in_group());
+    assert!(node.applier().kv_revision().unwrap() > revision_before);
+    assert!(
+        !out.frontend.is_empty(),
+        "the results went to the collector"
+    );
+}
+
+/// Lowering in groups, a staged group is journaled by the flush with
+/// the protocol's batches, and materialized, its results handed out,
+/// only by [`Node::finish`] (task-d47).
+///
+/// So what the journal append released -- votes, on a voter with peers --
+/// goes out after one sync, not after the group's projection commit too.
+#[test]
+fn lowering_in_groups_a_staged_group_is_journaled_by_the_flush_and_answered_by_finish() {
+    let boot = BootId([10; 16]);
+    let mut node = journaled_lone_leader(boot);
+    node.on_event(
+        Event::Boot {
+            boot_id: boot,
+            incarnation: inc(),
+        },
+        &ballot(),
+    )
+    .expect("boot");
+    node.lower_in_groups();
+    for sequence in 1..=5 {
+        node.on_event(Event::Admitted(admitted(sequence)), &ballot())
+            .expect("admitted");
+    }
+    node.flush(&ballot()).expect("flushed");
+    assert!(node.can_execute());
+
+    let cost = |node: &Node<JournaledDomain<ModelJournal, ModelEngine>>| {
+        node.applier().store().cost().expect("counted").lowering
+    };
+    let before = cost(&node);
+    let revision_before = node.applier().kv_revision().unwrap();
+    let mut out = node.stage(&ballot()).expect("staged");
+    out.absorb(node.flush(&ballot()).expect("flushed"));
+    let journaled = cost(&node);
+    assert_eq!(node.executed, 5);
+    assert!(node.applier().in_group(), "the group stays staged");
+    assert_eq!(journaled.appends - before.appends, 1, "one journal append");
+    assert_eq!(
+        journaled.commits, before.commits,
+        "no projection commit yet"
+    );
+    assert_eq!(node.applier().kv_revision().unwrap(), revision_before);
+    assert!(
+        out.frontend.is_empty(),
+        "a result went out before its group materialized"
+    );
+
+    let out = node.finish(&ballot()).expect("finished");
+    let finished = cost(&node);
+    assert!(!node.applier().in_group());
+    assert_eq!(
+        finished.appends, journaled.appends,
+        "nothing left to journal"
+    );
+    assert_eq!(
+        finished.commits - journaled.commits,
+        1,
+        "one projection commit"
+    );
+    assert!(node.applier().kv_revision().unwrap() > revision_before);
+    assert!(
+        !out.frontend.is_empty(),
+        "the results went to the collector"
+    );
+}
+
+/// With the release rule (task-d90), lowering in groups, a staged group is journaled by the flush with
+/// the protocol's batches, and materialized only by [`Node::finish`]
+/// (task-d47). Its results go out as its commands execute, before the
+/// group is journaled (task-d90).
+///
+/// So what the journal append released -- votes, on a voter with peers --
+/// goes out after one sync, not after the group's projection commit too.
+#[test]
+fn lowering_in_groups_with_the_release_rule_a_staged_groups_results_go_out_at_the_stage() {
+    let boot = BootId([10; 16]);
+    let mut node = journaled_lone_leader(boot);
+    node.on_event(
+        Event::Boot {
+            boot_id: boot,
+            incarnation: inc(),
+        },
+        &ballot(),
+    )
+    .expect("boot");
+    node.lower_in_groups();
+    node.set_release_at_execution(true);
+    for sequence in 1..=5 {
+        node.on_event(Event::Admitted(admitted(sequence)), &ballot())
+            .expect("admitted");
+    }
+    node.flush(&ballot()).expect("flushed");
+    assert!(node.can_execute());
+
+    let cost = |node: &Node<JournaledDomain<ModelJournal, ModelEngine>>| {
+        node.applier().store().cost().expect("counted").lowering
+    };
+    let before = cost(&node);
+    let revision_before = node.applier().kv_revision().unwrap();
+    let staged = node.stage(&ballot()).expect("staged");
+    assert_eq!(
+        releases_in(&staged.frontend),
+        5,
+        "each result goes out as its command executes, before its group is journaled"
+    );
+    assert_eq!(cost(&node).appends, before.appends, "nothing journaled yet");
+    let mut out = node.flush(&ballot()).expect("flushed");
+    let journaled = cost(&node);
+    assert_eq!(node.executed, 5);
+    assert!(node.applier().in_group(), "the group stays staged");
+    assert_eq!(journaled.appends - before.appends, 1, "one journal append");
+    assert_eq!(
+        journaled.commits, before.commits,
+        "no projection commit yet"
+    );
+    assert_eq!(node.applier().kv_revision().unwrap(), revision_before);
+    assert!(
+        out.frontend.is_empty(),
+        "nothing else went out before the group materialized"
+    );
+
+    out = node.finish(&ballot()).expect("finished");
+    let finished = cost(&node);
+    assert!(!node.applier().in_group());
+    assert_eq!(
+        finished.appends, journaled.appends,
+        "nothing left to journal"
+    );
+    assert_eq!(
+        finished.commits - journaled.commits,
+        1,
+        "one projection commit"
+    );
+    assert!(node.applier().kv_revision().unwrap() > revision_before);
+    assert_eq!(releases_in(&out.frontend), 0, "released once");
+}
+
+/// Lowering in groups, a group whose batches would overfill the store's
+/// queue in bytes is lowered before the next command is applied, and
+/// that command is applied after it (task-d47; #138's review).
+///
+/// The queue here holds two of these commands' batches at most, and the
+/// group's count is far from its bound, so only the byte check stands
+/// between the third command and a refusal that would stop the voter.
+#[test]
+fn lowering_in_groups_a_group_that_would_overfill_the_queue_in_bytes_is_lowered_first() {
+    let boot = BootId([11; 16]);
+    let limits = JournalLimits {
+        max_queued_bytes_per_domain: 24 * 1024,
+        ..JournalLimits::default()
+    };
+    let mut node = journaled_lone_leader_within(boot, limits);
+    node.on_event(
+        Event::Boot {
+            boot_id: boot,
+            incarnation: inc(),
+        },
+        &ballot(),
+    )
+    .expect("boot");
+    node.lower_in_groups();
+    const COMMANDS: u64 = 6;
+    for sequence in 1..=COMMANDS {
+        node.on_event(
+            Event::Admitted(admitted_putting(sequence, vec![sequence as u8; 3 * 1024])),
+            &ballot(),
+        )
+        .expect("admitted");
+        node.flush(&ballot()).expect("flushed");
+    }
+    assert!(node.can_execute());
+
+    let cost = |node: &Node<JournaledDomain<ModelJournal, ModelEngine>>| {
+        node.applier().store().cost().expect("counted").lowering
+    };
+    let before = cost(&node);
+    let out = node
+        .execute(&ballot())
+        .expect("a full queue is lowered, not refused");
+    assert_eq!(node.executed, COMMANDS);
+    assert!(!node.applier().in_group());
+    assert!(
+        cost(&node).commits - before.commits > 1,
+        "the commands did not fit one group's queue"
+    );
+    assert!(
+        !out.frontend.is_empty(),
+        "the results went to the collector"
+    );
+}
+
+/// Lowering in groups, a proposal goes to the voters only once the flush
+/// has made its own record journal-durable (task-d47).
+///
+/// Nothing before the flush may send it: the record is only queued. A
+/// driver that reported the record durable before journaling it -- a
+/// release moved ahead of its sync -- fails here.
+#[test]
+fn lowering_in_groups_a_proposal_is_held_until_the_flush_that_journals_it() {
+    let boot = BootId([7; 16]);
+    let applier = journaled_applier(boot, r(0));
+    let bootstrapped = applier.store().application_base().execution_position;
+    let mut machine = Leader::new(
+        LeaderConfig {
+            identity: identity(0),
+            quorum: quorum(),
+            genesis: ballot(),
+            frontend: FRONTEND,
+            capacity: 64,
+        },
+        None,
+        bootstrapped,
+    );
+    machine.set_learning(LearningMode::Full);
+    let mut node = Node::new(Machine::Leader(Box::new(machine)), applier, FRONTEND);
+    node.on_event(
+        Event::Boot {
+            boot_id: boot,
+            incarnation: inc(),
+        },
+        &ballot(),
+    )
+    .expect("boot");
+    node.lower_in_groups();
+
+    for sequence in 1..=2 {
+        let out = node
+            .on_event(Event::Admitted(admitted(sequence)), &ballot())
+            .expect("admitted");
+        assert!(
+            out.peer.is_empty(),
+            "a proposal went out before its own record was journaled"
+        );
+    }
+    // The records wait in the queue, and nothing they justify has been
+    // sent.
+    assert_eq!(node.applier().store().queued(), 2);
+
+    let out = node.flush(&ballot()).expect("flushed");
+    assert_eq!(node.held(), 0, "the flush released every proposal");
+    let to: Vec<ReplicaId> = out.peer.iter().map(|(p, _)| p.replica).collect();
+    assert!(
+        to.contains(&r(1)) && to.contains(&r(2)),
+        "the proposals did not reach the voters: {to:?}"
+    );
+}
+
+/// Lend `node`'s projection commits to a manual materializer
+/// (task-d52), returning the handle that runs them.
+fn pipeline(
+    node: &mut Node<JournaledDomain<ModelJournal, ModelEngine>>,
+) -> coord_storage::ManualHandle<ModelEngine> {
+    let (materializer, handle) = coord_storage::ManualMaterializer::new();
+    node.applier_mut()
+        .store_mut()
+        .store_mut()
+        .pipeline(Box::new(materializer))
+        .expect("nothing out yet");
+    handle
+}
+
+/// A journaled lone leader, booted and lowering in groups.
+fn grouped_lone_leader(boot: BootId) -> Node<JournaledDomain<ModelJournal, ModelEngine>> {
+    let mut node = journaled_lone_leader(boot);
+    node.on_event(
+        Event::Boot {
+            boot_id: boot,
+            incarnation: inc(),
+        },
+        &ballot(),
+    )
+    .expect("boot");
+    node.lower_in_groups();
+    node
+}
+
+/// Admit `sequences`, then run one flush as the runtime does: stage the
+/// ready commands, journal them with the protocol's batches, finish.
+/// Returns the frames the collector was sent while the commands were
+/// admitted (the leader's evidence) and those the group's flush sent.
+fn admit_and_flush(
+    node: &mut Node<JournaledDomain<ModelJournal, ModelEngine>>,
+    sequences: std::ops::RangeInclusive<u64>,
+) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+    let mut frames = Vec::new();
+    for sequence in sequences {
+        let out = node
+            .on_event(
+                Event::Admitted(admitted_putting(sequence, vec![sequence as u8; 8])),
+                &ballot(),
+            )
+            .expect("admitted");
+        frames.extend(out.frontend);
+        frames.extend(node.flush(&ballot()).expect("flushed").frontend);
+    }
+    let mut out = node.stage(&ballot()).expect("staged");
+    out.absorb(node.flush(&ballot()).expect("flushed"));
+    out.absorb(node.finish(&ballot()).expect("finished"));
+    (frames, out.frontend)
+}
+
+fn retry_key_of(sequence: u64) -> RetryKey {
+    RetryKey {
+        cluster_id: CLUSTER,
+        domain_id: DOMAIN,
+        session_id: SESSION,
+        client_instance_id: ClientInstanceId([4; 16]),
+        request_sequence: RequestSequence::new(sequence).unwrap(),
+    }
+}
+
+/// The release frames among `frames`: the results the collector was
+/// sent, apart from the leader's evidence.
+fn releases_in(frames: &[Vec<u8>]) -> usize {
+    frames
+        .iter()
+        .filter(|bytes| {
+            let mut reader = coord_types::wire_v1::FrameReader::new();
+            reader.push(bytes).expect("bounded");
+            reader
+                .next_frame()
+                .expect("well formed")
+                .is_some_and(|frame| frame.kind == coord_collector::KIND_RELEASE)
+        })
+        .count()
+}
+
+/// Pipelined (task-d52), a group's results go out once the group is in
+/// the journal, before its projection commit comes back (task-d63,
+/// design Section 4.5); its watch revisions wait for the commit, and
+/// execution goes on meanwhile: the next group is planned over the one
+/// still in flight.
+#[test]
+fn pipelined_a_groups_results_go_out_once_journaled_and_its_projection_commit_follows() {
+    let mut node = grouped_lone_leader(BootId([13; 16]));
+    let handle = pipeline(&mut node);
+    let revision_before = node.applier().kv_revision().unwrap();
+    let base = node.applier().store().application_base().execution_position;
+    let through = |node: &Node<JournaledDomain<ModelJournal, ModelEngine>>| {
+        node.applier().store().materialized_through().unwrap()
+    };
+
+    let (_, frames) = admit_and_flush(&mut node, 1..=3);
+    assert_eq!(node.executed, 3);
+    assert_eq!(
+        releases_in(&frames),
+        3,
+        "each result goes out once its group is journaled"
+    );
+    assert_eq!(
+        through(&node),
+        base,
+        "before the projection has committed it"
+    );
+    assert_eq!(
+        node.awaiting_materialization(),
+        1,
+        "what else it led to waits"
+    );
+    assert_eq!(
+        node.applier().kv_revision().unwrap(),
+        revision_before,
+        "watches see nothing before the commit"
+    );
+    // The commit out when the group closed is the protocol's, lent by a
+    // flush while the commands were admitted; the group waits behind it
+    // and is lent once it is back.
+    assert_eq!(handle.waiting(), 1);
+    assert!(handle.run());
+    let out = node.settle(&ballot()).expect("settled");
+    assert_eq!(releases_in(&out.frontend), 0);
+    assert_eq!(through(&node), base, "the group is not committed yet");
+    assert_eq!(handle.waiting(), 1, "the group's commit is out");
+
+    // With the first group out, the next one executes over it, and its
+    // results go out with the first group's commit still out.
+    let (_, frames) = admit_and_flush(&mut node, 4..=6);
+    assert_eq!(node.executed, 6);
+    assert_eq!(releases_in(&frames), 3);
+    assert_eq!(node.awaiting_materialization(), 2);
+    assert_eq!(handle.waiting(), 1, "one commit out at a time");
+
+    // The commits come back, and nothing is released a second time.
+    assert!(handle.run());
+    let first = node.settle(&ballot()).expect("settled");
+    assert_eq!(releases_in(&first.frontend), 0, "released once");
+    assert_eq!(through(&node).get(), base.get() + 3);
+    assert_eq!(node.awaiting_materialization(), 1);
+    assert_eq!(handle.waiting(), 1);
+
+    assert!(handle.run());
+    let second = node.settle(&ballot()).expect("settled");
+    assert_eq!(releases_in(&second.frontend), 0, "released once");
+    assert_eq!(through(&node).get(), base.get() + 6);
+    assert_eq!(node.awaiting_materialization(), 0);
+    let revision = node.applier().kv_revision().unwrap();
+    assert_eq!(revision.get() - revision_before.get(), 6);
+}
+
+/// A group closed between flushes, at its command bound, is journaled
+/// when it is handed off, and its results go out then, before its
+/// projection commit (review of #163). The group was taken out of the
+/// open slot before its appends and joined the groups in flight after
+/// them, so the journal's report of it reached neither, and its results,
+/// and every later group's, waited for its commit.
+#[test]
+fn pipelined_a_group_closed_at_its_bound_releases_once_its_hand_off_journals_it() {
+    let mut node = grouped_lone_leader(BootId([14; 16]));
+    let _handle = pipeline(&mut node);
+    let base = node.applier().store().application_base().execution_position;
+    for sequence in 1..=33 {
+        node.on_event(
+            Event::Admitted(admitted_putting(sequence, vec![sequence as u8; 8])),
+            &ballot(),
+        )
+        .expect("admitted");
+        node.flush(&ballot()).expect("flushed");
+    }
+    // The stage closes the first group at 32 commands and hands it off,
+    // journaling it there.
+    let out = node.stage(&ballot()).expect("staged");
+    assert_eq!(
+        releases_in(&out.frontend),
+        32,
+        "the closed group's results go out once its hand-off journals it"
+    );
+    assert_eq!(
+        node.applier().store().materialized_through().unwrap(),
+        base,
+        "before its projection commit"
+    );
+}
+
+/// With the release rule (task-d90), a group closed between flushes, at its command bound, is journaled
+/// when it is handed off, and its establishments are carried out then,
+/// before its projection commit (review of #163). The group was taken out
+/// of the open slot before its appends and joined the groups in flight
+/// after them, so the journal's report of it reached neither, and its
+/// results, and every later group's, waited for its commit. Its results
+/// now go out as its commands execute (task-d90), and the establishments
+/// are what the hand-off's journaling releases.
+#[test]
+fn pipelined_with_the_release_rule_a_group_closed_at_its_bound_releases_as_it_executes() {
+    let mut node = grouped_lone_leader(BootId([14; 16]));
+    node.set_release_at_execution(true);
+    let _handle = pipeline(&mut node);
+    let base = node.applier().store().application_base().execution_position;
+    for sequence in 1..=33 {
+        node.on_event(
+            Event::Admitted(admitted_putting(sequence, vec![sequence as u8; 8])),
+            &ballot(),
+        )
+        .expect("admitted");
+        node.flush(&ballot()).expect("flushed");
+    }
+    // The stage closes the first group at 32 commands and hands it off,
+    // journaling it there.
+    let established = node.release_split().commands;
+    let out = node.stage(&ballot()).expect("staged");
+    assert_eq!(
+        releases_in(&out.frontend),
+        33,
+        "every result goes out as its command executes, the open group's too"
+    );
+    assert_eq!(
+        node.release_split().commands - established,
+        32,
+        "the closed group's establishments are carried out once its hand-off journals it"
+    );
+    assert_eq!(
+        node.applier().store().materialized_through().unwrap(),
+        base,
+        "before its projection commit"
+    );
+}
+
+/// Pipelined (task-d52), the same commands give the same results, the
+/// same frames to the collector and the same projection as on a node
+/// that commits on its own thread.
+#[test]
+fn pipelined_results_are_those_of_a_node_that_commits_on_its_own_thread() {
+    let run = |pipelined: bool| {
+        let mut node = grouped_lone_leader(BootId([14; 16]));
+        let handle = pipelined.then(|| pipeline(&mut node));
+        let mut frames = Vec::new();
+        for round in 0..4u64 {
+            let (admitted, flushed) = admit_and_flush(&mut node, round * 4 + 1..=round * 4 + 4);
+            frames.extend(admitted);
+            frames.extend(flushed);
+        }
+        if let Some(handle) = handle {
+            while handle.run() {
+                frames.extend(node.settle(&ballot()).expect("settled").frontend);
+            }
+            frames.extend(node.drain(&ballot()).expect("drained").frontend);
+        }
+        assert_eq!(node.executed, 16);
+        assert_eq!(node.awaiting_materialization(), 0);
+        let rows = {
+            let gated = node.applier().store().reader().snapshot().unwrap();
+            let mut rows = Vec::new();
+            for sequence in 1..=16 {
+                rows.push(
+                    coord_storage::retry::lookup(gated.view(), &retry_key_of(sequence))
+                        .unwrap()
+                        .expect("every command's result is recorded"),
+                );
+            }
+            rows
+        };
+        frames.sort();
+        (frames, rows, node.applier().kv_revision().unwrap())
+    };
+    let (frames, rows, revision) = run(false);
+    let (pipelined_frames, pipelined_rows, pipelined_revision) = run(true);
+    assert_eq!(pipelined_revision, revision);
+    assert_eq!(pipelined_rows, rows);
+    assert_eq!(pipelined_frames, frames);
+    // Contiguous positions, in the order the learner chose.
+    for (i, row) in rows.iter().enumerate().skip(1) {
+        assert_eq!(row.position.get(), rows[i - 1].position.get() + 1);
+    }
+}
+
+/// Lend `node`'s projection commits to a manual materializer under the
+/// replay profile with a commit hold no test reaches (task-d86): records
+/// are held until something asks for their commit, or a drain.
+fn pipeline_held(
+    node: &mut Node<JournaledDomain<ModelJournal, ModelEngine>>,
+) -> coord_storage::ManualHandle<ModelEngine> {
+    let store = node.applier_mut().store_mut().store_mut();
+    store
+        .replay_projection(coord_storage::journaled::DurableCadence {
+            commits: std::num::NonZeroU32::MAX,
+            records: std::num::NonZeroU32::MAX,
+        })
+        .expect("the model engine has working state");
+    store
+        .hold_projection_commits(coord_storage::journaled::CommitHold {
+            records: std::num::NonZeroU32::MAX,
+            wait: std::time::Duration::from_secs(3600),
+        })
+        .expect("the replay profile");
+    pipeline(node)
+}
+
+/// With projection commits held (task-d86), every group after the first
+/// is planned over groups no commit has carried yet, and a retry of a
+/// command in one of them is answered from its binding there: the
+/// results, the frames to the collector and the projection a drain
+/// leaves are those of a node whose commits are not held. Every command
+/// puts the same key, so each result depends on the groups before it.
+#[test]
+fn held_commits_plan_over_the_groups_they_hold_and_answer_retries_from_them() {
+    let run = |held: bool| {
+        let mut node = grouped_lone_leader(BootId([16; 16]));
+        let handle = if held {
+            pipeline_held(&mut node)
+        } else {
+            pipeline(&mut node)
+        };
+        let base = node.applier().store().application_base().execution_position;
+        let mut frames = Vec::new();
+        for round in 0..3u64 {
+            let (admitted, flushed) = admit_and_flush(&mut node, round * 3 + 1..=round * 3 + 3);
+            frames.extend(admitted);
+            frames.extend(flushed);
+        }
+        // A retry of a command from the first group, with the same
+        // request: answered from that group's binding.
+        let retry = node
+            .on_event(Event::Admitted(admitted_putting(2, vec![2; 8])), &ballot())
+            .expect("admitted");
+        frames.extend(retry.frontend);
+        let mut out = node.stage(&ballot()).expect("staged");
+        out.absorb(node.flush(&ballot()).expect("flushed"));
+        out.absorb(node.finish(&ballot()).expect("finished"));
+        frames.extend(out.frontend);
+        if held {
+            assert_eq!(
+                node.applier().store().materialized_through().unwrap(),
+                base,
+                "no group was committed while held"
+            );
+            assert!(node.applier().store().store().commit_holds() > 0);
+        }
+        while handle.run() {
+            frames.extend(node.settle(&ballot()).expect("settled").frontend);
+        }
+        frames.extend(node.drain(&ballot()).expect("drained").frontend);
+        while handle.run() {
+            frames.extend(node.settle(&ballot()).expect("settled").frontend);
+        }
+        assert_eq!(node.executed, 9);
+        assert_eq!(node.awaiting_materialization(), 0);
+        let rows = {
+            let gated = node.applier().store().reader().snapshot().unwrap();
+            (1..=9)
+                .map(|sequence| {
+                    coord_storage::retry::lookup(gated.view(), &retry_key_of(sequence))
+                        .unwrap()
+                        .expect("every command's result is recorded")
+                })
+                .collect::<Vec<_>>()
+        };
+        frames.sort();
+        (frames, rows, node.applier().kv_revision().unwrap())
+    };
+    let (frames, rows, revision) = run(false);
+    let (held_frames, held_rows, held_revision) = run(true);
+    assert_eq!(held_revision, revision);
+    assert_eq!(held_rows, rows);
+    assert_eq!(held_frames, frames);
+}
+
+/// A watch waits for its group's commit to see the group's events, so a
+/// group with events for an open watch asks for its commit, which then
+/// goes out whatever the hold says (task-d86); with no watch open the
+/// same group is held.
+#[test]
+fn a_group_with_events_for_an_open_watch_is_not_held() {
+    for watching in [false, true] {
+        let mut node = grouped_lone_leader(BootId([17; 16]));
+        let handle = pipeline_held(&mut node);
+        if watching {
+            let registration = node
+                .applier()
+                .hub()
+                .register(coord_storage::watch::WatchSpec {
+                    namespace: NS,
+                    key: vec![],
+                    range_end: Some(vec![0xff]),
+                    start_revision: None,
+                    prev_kv: false,
+                    progress_notify: false,
+                    queue_capacity: 64,
+                })
+                .unwrap();
+            node.applier()
+                .hub()
+                .replay_complete(registration.id)
+                .unwrap();
+        }
+        admit_and_flush(&mut node, 1..=2);
+        let lent = handle.waiting() > 0;
+        assert_eq!(lent, watching, "watching {watching}");
+    }
+}
+
+/// Where a pipelined node's boot ends (task-d52).
+#[derive(Clone, Copy, Debug)]
+enum EndsAt {
+    /// A group's projection commit is handed over and not started.
+    HandedOver,
+    /// A group is executed and journaled, and not handed over yet.
+    MidGroup,
+    /// A commit returned and its outcome was not taken back.
+    CommittedNotTaken,
+}
+
+/// End a pipelined node's boot at `point`, reopen its store and resolve
+/// every command it journaled: each is answered from the projection the
+/// next boot recovers, none `Unknown` or `Forgotten`.
+fn pipelined_boot_ends(point: EndsAt) {
+    let mut node = grouped_lone_leader(BootId([15; 16]));
+    let handle = pipeline(&mut node);
+    admit_and_flush(&mut node, 1..=3);
+    let journaled = match point {
+        EndsAt::HandedOver => {
+            assert_eq!(handle.waiting(), 1);
+            3
+        }
+        EndsAt::MidGroup => {
+            // A second group executed and journaled by the flush, never
+            // finished.
+            for sequence in 4..=6 {
+                node.on_event(
+                    Event::Admitted(admitted_putting(sequence, vec![sequence as u8; 8])),
+                    &ballot(),
+                )
+                .expect("admitted");
+                node.flush(&ballot()).expect("flushed");
+            }
+            node.stage(&ballot()).expect("staged");
+            node.flush(&ballot()).expect("flushed");
+            assert!(node.applier().in_group());
+            6
+        }
+        EndsAt::CommittedNotTaken => {
+            assert!(handle.run());
+            assert_eq!(handle.finished(), 1);
+            3
+        }
+    };
+    assert_eq!(node.executed, journaled);
+    let store = node.into_applier().into_store().into_store();
+    let (journal, mut engines) = store.into_parts();
+    let (_, engine) = engines.pop().expect("one domain");
+    let mut next = JournaledStore::open(
+        journal,
+        CLUSTER,
+        r(0),
+        inc(),
+        BootId([0x99; 16]),
+        JournalLimits::default(),
+    )
+    .unwrap();
+    next.attach(DOMAIN, ShardId::new(0).unwrap(), engine)
+        .unwrap();
+    let gated = next.reader(DOMAIN).unwrap().snapshot().unwrap();
+    for sequence in 1..=journaled {
+        let record = coord_storage::retry::lookup(gated.view(), &retry_key_of(sequence))
+            .unwrap()
+            .unwrap_or_else(|| panic!("{point:?}: command {sequence} is not answered"));
+        assert!(record.position.get() > 0);
+    }
+}
+
+#[test]
+fn pipelined_a_boot_that_ends_with_a_commit_handed_over_answers_every_journaled_command() {
+    pipelined_boot_ends(EndsAt::HandedOver);
+}
+
+#[test]
+fn pipelined_a_boot_that_ends_in_the_middle_of_a_group_answers_every_journaled_command() {
+    pipelined_boot_ends(EndsAt::MidGroup);
+}
+
+#[test]
+fn pipelined_a_boot_that_ends_before_a_commit_is_taken_back_answers_every_journaled_command() {
+    pipelined_boot_ends(EndsAt::CommittedNotTaken);
+}
+
+/// Lend `node`'s journal appends to a manual appender (task-d54),
+/// returning the handle that runs them. The projection commits are lent
+/// too: the runtime pipelines both.
+fn lend_journal(
+    node: &mut Node<JournaledDomain<ModelJournal, ModelEngine>>,
+) -> (
+    coord_storage::ManualHandle<ModelEngine>,
+    coord_storage::ManualAppendHandle<ModelJournal>,
+) {
+    let commits = pipeline(node);
+    let (appender, appends) = coord_storage::ManualAppender::new();
+    node.applier_mut()
+        .store_mut()
+        .store_mut()
+        .pipeline_journal(Box::new(appender))
+        .expect("nothing out yet");
+    (commits, appends)
+}
+
+/// Run whatever the appender and the materializer have waiting, settling
+/// after each as the runtime does when it is woken, until neither has
+/// anything; the frames the settles sent the collector.
+fn pump(
+    node: &mut Node<JournaledDomain<ModelJournal, ModelEngine>>,
+    commits: &coord_storage::ManualHandle<ModelEngine>,
+    appends: &coord_storage::ManualAppendHandle<ModelJournal>,
+) -> Vec<Vec<u8>> {
+    let mut frames = Vec::new();
+    loop {
+        let ran = appends.run() | commits.run();
+        if !ran {
+            return frames;
+        }
+        frames.extend(node.settle(&ballot()).expect("settled").frontend);
+    }
+}
+
+/// With the journal lent (task-d54) and the materializer never run, a
+/// group's results wait for the append that journals the group to be
+/// taken back, and not for its projection commit (task-d63): none goes
+/// out while the append is out, every one once it is back, and the
+/// projection has committed none of them.
+#[test]
+fn lending_the_journal_a_groups_results_wait_for_its_append_and_not_its_projection_commit() {
+    let mut node = grouped_lone_leader(BootId([17; 16]));
+    let (commits, appends) = lend_journal(&mut node);
+    let base = node.applier().store().application_base().execution_position;
+    let mut released = 0;
+    // Each command's record is journaled, and the append taken back, so
+    // the leader learns it. The materializer is never run.
+    for sequence in 1..=3 {
+        let out = node
+            .on_event(
+                Event::Admitted(admitted_putting(sequence, vec![sequence as u8; 8])),
+                &ballot(),
+            )
+            .expect("admitted");
+        released += releases_in(&out.frontend);
+        released += releases_in(&node.flush(&ballot()).expect("flushed").frontend);
+        while appends.run() {
+            released += releases_in(&node.settle(&ballot()).expect("settled").frontend);
+        }
+    }
+    assert_eq!(released, 0, "nothing executed yet");
+
+    // The group executes and is lent with its own append still out.
+    let mut out = node.stage(&ballot()).expect("staged");
+    out.absorb(node.flush(&ballot()).expect("flushed"));
+    out.absorb(node.finish(&ballot()).expect("finished"));
+    assert_eq!(node.executed, 3);
+    assert!(
+        node.applier().store().appending(),
+        "the group's append is still out"
+    );
+    assert_eq!(
+        releases_in(&out.frontend),
+        0,
+        "a result went out before its group was journaled"
+    );
+
+    // The append is synced and taken back: the results go out, and the
+    // projection still holds none of the group.
+    let mut frames = Vec::new();
+    while appends.run() {
+        frames.extend(node.settle(&ballot()).expect("settled").frontend);
+    }
+    assert_eq!(releases_in(&frames), 3, "every result once journaled");
+    assert_eq!(
+        node.applier().store().materialized_through().unwrap(),
+        base,
+        "before the projection has committed any of them"
+    );
+    assert!(node.awaiting_materialization() > 0);
+
+    // The commits follow, and nothing is released a second time.
+    let frames = pump(&mut node, &commits, &appends);
+    assert_eq!(releases_in(&frames), 0, "released once");
+    assert_eq!(node.awaiting_materialization(), 0);
+    assert_eq!(
+        node.applier().store().materialized_through().unwrap().get(),
+        base.get() + 3
+    );
+}
+
+/// With the release rule (task-d90) and the journal lent (task-d54) and the materializer never run, a
+/// group's results go out as its commands execute, with the append that
+/// journals the group still out (task-d90). Its establishments, which let
+/// the voter count the executions durable and forget them in their turn,
+/// wait for that append to be taken back, and not for the projection
+/// commit (task-d63): none while the append is out, every one once it is
+/// back, and the projection has committed none of them.
+#[test]
+fn lending_the_journal_results_go_out_before_the_append_and_establishments_wait_for_it() {
+    let mut node = grouped_lone_leader(BootId([17; 16]));
+    node.set_release_at_execution(true);
+    let (commits, appends) = lend_journal(&mut node);
+    let base = node.applier().store().application_base().execution_position;
+    let mut released = 0;
+    // Each command's record is journaled, and the append taken back, so
+    // the leader learns it. The materializer is never run.
+    for sequence in 1..=3 {
+        let out = node
+            .on_event(
+                Event::Admitted(admitted_putting(sequence, vec![sequence as u8; 8])),
+                &ballot(),
+            )
+            .expect("admitted");
+        released += releases_in(&out.frontend);
+        released += releases_in(&node.flush(&ballot()).expect("flushed").frontend);
+        while appends.run() {
+            released += releases_in(&node.settle(&ballot()).expect("settled").frontend);
+        }
+    }
+    assert_eq!(released, 0, "nothing executed yet");
+    let established = node.release_split().commands;
+
+    // The group executes and is lent with its own append still out.
+    let mut out = node.stage(&ballot()).expect("staged");
+    out.absorb(node.flush(&ballot()).expect("flushed"));
+    out.absorb(node.finish(&ballot()).expect("finished"));
+    assert_eq!(node.executed, 3);
+    assert!(
+        node.applier().store().appending(),
+        "the group's append is still out"
+    );
+    assert_eq!(
+        releases_in(&out.frontend),
+        3,
+        "every result went out before its group was journaled"
+    );
+    assert_eq!(
+        node.release_split().commands,
+        established,
+        "no establishment before the group is journaled"
+    );
+
+    // The append is synced and taken back: the establishments are
+    // carried out, nothing is released again, and the projection still
+    // holds none of the group.
+    let mut frames = Vec::new();
+    while appends.run() {
+        frames.extend(node.settle(&ballot()).expect("settled").frontend);
+    }
+    assert_eq!(releases_in(&frames), 0, "released once");
+    assert_eq!(
+        node.release_split().commands - established,
+        3,
+        "every establishment once journaled"
+    );
+    assert_eq!(
+        node.applier().store().materialized_through().unwrap(),
+        base,
+        "before the projection has committed any of them"
+    );
+    assert!(node.awaiting_materialization() > 0);
+
+    // The commits follow, and nothing is released a second time.
+    let frames = pump(&mut node, &commits, &appends);
+    assert_eq!(releases_in(&frames), 0, "released once");
+    assert_eq!(node.awaiting_materialization(), 0);
+    assert_eq!(
+        node.applier().store().materialized_through().unwrap().get(),
+        base.get() + 3
+    );
+}
+
+/// With the release rule switched on while commands are learned and not
+/// executed (task-d90), those commands keep the group's release: one may
+/// rest on a vote an older build cast before its voter upgraded. Their
+/// results wait for their group's append, as before the switch, and the
+/// commands admitted after it are released as they execute.
+#[test]
+fn lending_the_journal_commands_held_when_the_release_rule_switches_on_keep_the_groups_release() {
+    let mut node = grouped_lone_leader(BootId([19; 16]));
+    let (commits, appends) = lend_journal(&mut node);
+    let admit = |node: &mut Node<JournaledDomain<ModelJournal, ModelEngine>>,
+                 sequences: std::ops::RangeInclusive<u64>| {
+        let mut released = 0;
+        for sequence in sequences {
+            let out = node
+                .on_event(
+                    Event::Admitted(admitted_putting(sequence, vec![sequence as u8; 8])),
+                    &ballot(),
+                )
+                .expect("admitted");
+            released += releases_in(&out.frontend);
+            released += releases_in(&node.flush(&ballot()).expect("flushed").frontend);
+            while appends.run() {
+                released += releases_in(&node.settle(&ballot()).expect("settled").frontend);
+            }
+        }
+        released
+    };
+    // Learned, not executed: held when the rule switches on.
+    assert_eq!(admit(&mut node, 1..=3), 0, "nothing executed yet");
+    node.set_release_at_execution(true);
+    let mut out = node.stage(&ballot()).expect("staged");
+    out.absorb(node.flush(&ballot()).expect("flushed"));
+    out.absorb(node.finish(&ballot()).expect("finished"));
+    assert_eq!(node.executed, 3);
+    assert!(
+        node.applier().store().appending(),
+        "the group's append is still out"
+    );
+    assert_eq!(
+        releases_in(&out.frontend),
+        0,
+        "a command held at the switch was released before its group was journaled"
+    );
+    let mut frames = Vec::new();
+    while appends.run() {
+        frames.extend(node.settle(&ballot()).expect("settled").frontend);
+    }
+    assert_eq!(
+        releases_in(&frames),
+        3,
+        "each held command once its group is journaled"
+    );
+
+    // Admitted after the switch: released as each executes.
+    assert_eq!(admit(&mut node, 4..=6), 0, "nothing executed yet");
+    let mut out = node.stage(&ballot()).expect("staged");
+    out.absorb(node.flush(&ballot()).expect("flushed"));
+    out.absorb(node.finish(&ballot()).expect("finished"));
+    assert_eq!(node.executed, 6);
+    assert!(
+        node.applier().store().appending(),
+        "the group's append is still out"
+    );
+    assert_eq!(
+        releases_in(&out.frontend),
+        3,
+        "a command learned after the switch waits for its group"
+    );
+    let frames = pump(&mut node, &commits, &appends);
+    assert_eq!(releases_in(&frames), 0, "released once");
+}
+
+/// With the journal lent (task-d54), the leader's proposal waits for the
+/// append that makes its record durable to come back, not for the flush
+/// that lent it: the flush returns with the sync still out, and the
+/// settle that takes it back sends the proposal.
+#[test]
+fn lending_the_journal_a_proposal_is_held_until_its_append_is_taken_back() {
+    let boot = BootId([16; 16]);
+    let applier = journaled_applier(boot, r(0));
+    let bootstrapped = applier.store().application_base().execution_position;
+    let mut machine = Leader::new(
+        LeaderConfig {
+            identity: identity(0),
+            quorum: quorum(),
+            genesis: ballot(),
+            frontend: FRONTEND,
+            capacity: 64,
+        },
+        None,
+        bootstrapped,
+    );
+    machine.set_learning(LearningMode::Full);
+    let mut node = Node::new(Machine::Leader(Box::new(machine)), applier, FRONTEND);
+    node.on_event(
+        Event::Boot {
+            boot_id: boot,
+            incarnation: inc(),
+        },
+        &ballot(),
+    )
+    .expect("boot");
+    node.lower_in_groups();
+    let (commits, appends) = lend_journal(&mut node);
+    // The boot's own record went out on the domain thread before the
+    // journal was lent; nothing is out yet.
+    assert!(!appends.waiting());
+
+    let out = node
+        .on_event(Event::Admitted(admitted(1)), &ballot())
+        .expect("admitted");
+    assert!(out.peer.is_empty());
+    let out = node.flush(&ballot()).expect("flushed");
+    assert!(
+        out.peer.is_empty(),
+        "a proposal went out while its append was still out"
+    );
+    assert!(node.applier().store().appending());
+    assert!(appends.waiting());
+    assert_eq!(node.applier().store().queued(), 0, "sealed and lent");
+
+    // Synced but not taken back: still held.
+    assert!(appends.run());
+    let out = node.flush(&ballot()).expect("flushed");
+    let mut to: Vec<ReplicaId> = out.peer.iter().map(|(p, _)| p.replica).collect();
+    // A flush takes it back too, as a settle does; either is the domain
+    // thread taking the outcome, never the appender's thread.
+    if to.is_empty() {
+        let out = node.settle(&ballot()).expect("settled");
+        to = out.peer.iter().map(|(p, _)| p.replica).collect();
+    }
+    assert!(
+        to.contains(&r(1)) && to.contains(&r(2)),
+        "the proposal did not reach the voters once durable: {to:?}"
+    );
+    // Whatever the machine journaled in answer is the next append; the
+    // proposal itself is no longer held.
+    assert_eq!(node.held(), 0);
+    drop(commits);
+}
+
+/// A journaled flush (task-d54) returns with nothing out: the append the
+/// flush lent is waited for and taken back on the domain thread, and the
+/// proposal its record released goes out with it. A fence runs after one,
+/// so it never tests what is queued against a frontier a group out is
+/// not yet in.
+#[test]
+fn a_journaled_flush_waits_for_the_append_out_and_sends_what_it_released() {
+    let boot = BootId([18; 16]);
+    let applier = journaled_applier(boot, r(0));
+    let bootstrapped = applier.store().application_base().execution_position;
+    let mut machine = Leader::new(
+        LeaderConfig {
+            identity: identity(0),
+            quorum: quorum(),
+            genesis: ballot(),
+            frontend: FRONTEND,
+            capacity: 64,
+        },
+        None,
+        bootstrapped,
+    );
+    machine.set_learning(LearningMode::Full);
+    let mut node = Node::new(Machine::Leader(Box::new(machine)), applier, FRONTEND);
+    node.on_event(
+        Event::Boot {
+            boot_id: boot,
+            incarnation: inc(),
+        },
+        &ballot(),
+    )
+    .expect("boot");
+    node.lower_in_groups();
+    let (commits, appends) = lend_journal(&mut node);
+
+    node.on_event(Event::Admitted(admitted(1)), &ballot())
+        .expect("admitted");
+    let out = node.flush_journaled(&ballot()).expect("flushed");
+    assert!(
+        !node.applier().store().appending(),
+        "an append is still out"
+    );
+    assert!(!appends.waiting());
+    assert_eq!(node.applier().store().queued(), 0);
+    let to: Vec<ReplicaId> = out.peer.iter().map(|(p, _)| p.replica).collect();
+    assert!(
+        to.contains(&r(1)) && to.contains(&r(2)),
+        "the proposal did not reach the voters: {to:?}"
+    );
+    assert_eq!(node.held(), 0);
+    drop(commits);
+}
+
+/// With the journal lent (task-d54), the same commands give the same
+/// results, the same frames to the collector and the same projection as
+/// on a node that appends on its own thread.
+#[test]
+fn lending_the_journal_results_are_those_of_a_node_that_appends_on_its_own_thread() {
+    let run = |lending: bool| {
+        let mut node = grouped_lone_leader(BootId([17; 16]));
+        let handles = lending.then(|| lend_journal(&mut node));
+        let mut frames = Vec::new();
+        let settle = |node: &mut Node<JournaledDomain<ModelJournal, ModelEngine>>,
+                      frames: &mut Vec<Vec<u8>>| {
+            if let Some((commits, appends)) = &handles {
+                frames.extend(pump(node, commits, appends));
+            }
+        };
+        for round in 0..4u64 {
+            for sequence in round * 4 + 1..=round * 4 + 4 {
+                let out = node
+                    .on_event(
+                        Event::Admitted(admitted_putting(sequence, vec![sequence as u8; 8])),
+                        &ballot(),
+                    )
+                    .expect("admitted");
+                frames.extend(out.frontend);
+                frames.extend(node.flush(&ballot()).expect("flushed").frontend);
+                settle(&mut node, &mut frames);
+            }
+            let mut out = node.stage(&ballot()).expect("staged");
+            out.absorb(node.flush(&ballot()).expect("flushed"));
+            frames.extend(out.frontend);
+            settle(&mut node, &mut frames);
+            frames.extend(node.finish(&ballot()).expect("finished").frontend);
+            settle(&mut node, &mut frames);
+        }
+        frames.extend(node.drain(&ballot()).expect("drained").frontend);
+        assert_eq!(node.executed, 16);
+        assert_eq!(node.awaiting_materialization(), 0);
+        assert!(!node.applier().store().appending());
+        let rows = {
+            let gated = node.applier().store().reader().snapshot().unwrap();
+            let mut rows = Vec::new();
+            for sequence in 1..=16 {
+                rows.push(
+                    coord_storage::retry::lookup(gated.view(), &retry_key_of(sequence))
+                        .unwrap()
+                        .expect("every command's result is recorded"),
+                );
+            }
+            rows
+        };
+        frames.sort();
+        (frames, rows, node.applier().kv_revision().unwrap())
+    };
+    let (frames, rows, revision) = run(false);
+    let (lent_frames, lent_rows, lent_revision) = run(true);
+    assert_eq!(lent_revision, revision);
+    assert_eq!(lent_rows, rows);
+    assert_eq!(lent_frames, frames);
+}
+
+/// The release rule's switch carries the selection rule it shares a premise
+/// with (#197 review): a follower's campaigns leave out a re-proposal no
+/// reporter holds a payload row for only while the switch is on, and a
+/// leader that steps down to a follower keeps it.
+#[test]
+fn the_release_rule_switch_carries_the_selection_rule_across_a_role_change() {
+    let rules = |node: &Node<StoreWorker<ModelEngine>>| match node.machine() {
+        Machine::Follower(f) => f.selection_rules().leave_out_unheld,
+        Machine::Leader(_) => panic!("a follower"),
+    };
+    let mut node = follower(BootId([9; 16]));
+    assert!(!rules(&node), "off by default");
+    node.set_release_at_execution(true);
+    assert!(rules(&node));
+    node.set_release_at_execution(false);
+    assert!(!rules(&node));
+
+    let mut node = leader(BootId([10; 16]));
+    node.set_release_at_execution(true);
+    node.step_down(&ballot()).expect("stepped down");
+    assert!(
+        rules(&node),
+        "the follower it became selects under the rule"
+    );
+    let mut node = leader(BootId([11; 16]));
+    node.step_down(&ballot()).expect("stepped down");
+    assert!(!rules(&node), "and without the switch, as before");
 }

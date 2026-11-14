@@ -154,6 +154,60 @@ fn cross_collection_atomicity_with_read_your_writes_scans() {
     }
 }
 
+/// A snapshot keeps each table it has read open for its life (task-d58).
+/// The table it keeps is its own transaction's: a commit after the first
+/// read is invisible to the second, for point reads and scans alike, and a
+/// new snapshot sees it.
+#[test]
+fn a_snapshot_keeps_its_tables_and_sees_only_its_own_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = RedbHarness::create(dir.path());
+    let write = |h: &mut RedbHarness, key: &[u8], value: &[u8]| {
+        let mut tx = h.engine().begin_write().unwrap();
+        tx.put(Collection::KvCurrentV1.id(), key, value).unwrap();
+        tx.commit_durable().unwrap();
+    };
+    write(&mut h, b"a", b"1");
+    let reader = h.engine().reader();
+    let pinned = reader.snapshot().unwrap();
+    // The first read opens the table.
+    assert_eq!(
+        pinned.get(Collection::KvCurrentV1.id(), b"a").unwrap(),
+        Some(b"1".to_vec())
+    );
+    write(&mut h, b"a", b"2");
+    write(&mut h, b"b", b"1");
+    for _ in 0..2 {
+        assert_eq!(
+            pinned.get(Collection::KvCurrentV1.id(), b"a").unwrap(),
+            Some(b"1".to_vec()),
+            "the kept table is the snapshot's"
+        );
+        assert_eq!(
+            pinned.get(Collection::KvCurrentV1.id(), b"b").unwrap(),
+            None
+        );
+        let page = pinned
+            .scan_page(Collection::KvCurrentV1.id(), &ScanRequest::all(10, 1 << 20))
+            .unwrap();
+        assert_eq!(page.rows.len(), 1);
+    }
+    // Another table of the same snapshot opens on its own first read.
+    assert_eq!(
+        pinned.get(Collection::EventsV1.id(), b"none").unwrap(),
+        None
+    );
+    let fresh = reader.snapshot().unwrap();
+    assert_eq!(
+        fresh.get(Collection::KvCurrentV1.id(), b"a").unwrap(),
+        Some(b"2".to_vec())
+    );
+    assert_eq!(
+        fresh.get(Collection::KvCurrentV1.id(), b"b").unwrap(),
+        Some(b"1".to_vec())
+    );
+}
+
 #[test]
 fn open_never_creates_and_create_never_reinitializes() {
     let dir = tempfile::tempdir().unwrap();
@@ -377,6 +431,142 @@ fn profile_identity_record_is_verified_on_open() {
     ));
 }
 
+/// A store of another layout is refused with its format, not as damage
+/// (#243 review): its manifest lists the registry before task-d113's step 2
+/// and its database records format 2, or none (format 1). The open and a
+/// staging over it both name the format, and neither changes a byte of it.
+#[test]
+fn a_store_of_another_format_is_refused_with_its_format_and_left_as_it_was() {
+    let dir = tempfile::tempdir().unwrap();
+    drop(Generation::create(dir.path(), identity(), options()).unwrap());
+    let generation = dir.path().join("gen-000001");
+    let db_path = generation.join("domain.redb");
+    let manifest_path = generation.join("manifest.v1");
+    // The registry before step 2: no pending payloads, no decided records.
+    let mut manifest = coord_storage_redb::StoreManifestV1::read(&manifest_path).unwrap();
+    manifest.collections.retain(|(id, _)| {
+        *id != Collection::PendingPayloadV1.id().0 && *id != Collection::DecidedV1.id().0
+    });
+    manifest.write(&manifest_path).unwrap();
+    let set_format = |format: Option<u32>| {
+        let db = redb::Database::open(&db_path).unwrap();
+        let txn = db.begin_write().unwrap();
+        {
+            let mut table = txn
+                .open_table(coord_storage_redb::engine::table_definition(
+                    Collection::MetaV1,
+                ))
+                .unwrap();
+            match format {
+                Some(f) => {
+                    table
+                        .insert(b"format_version".as_slice(), f.to_be_bytes().as_slice())
+                        .unwrap();
+                }
+                None => {
+                    table.remove(b"format_version".as_slice()).unwrap();
+                }
+            }
+        }
+        txn.commit().unwrap();
+    };
+    for (recorded, named) in [(Some(2), 2), (None, 1)] {
+        set_format(recorded);
+        let before = std::fs::read(&db_path).unwrap();
+        let reason = |e: OpenError| match e {
+            OpenError::Format(reason) => reason,
+            other => panic!("format {named}: refused as {other:?}, not by its format"),
+        };
+        let opened = reason(
+            Generation::open_existing(dir.path(), identity(), options())
+                .err()
+                .expect("a store of another format opened"),
+        );
+        assert!(
+            opened.contains(&format!(
+                "store format {named} is not this build's ({})",
+                coord_store_api::registry::STORE_FORMAT_VERSION
+            )),
+            "{opened}"
+        );
+        let staged = reason(
+            coord_storage_redb::InactiveGeneration::stage(dir.path(), identity(), options())
+                .err()
+                .expect("a staging over a store of another format went ahead"),
+        );
+        assert_eq!(staged, opened);
+        assert!(
+            std::fs::read(&db_path).unwrap() == before,
+            "format {named}: the refusal changed the store"
+        );
+    }
+    // The same list with this build's format recorded is not another
+    // build's store: that stays damage.
+    set_format(Some(coord_store_api::registry::STORE_FORMAT_VERSION));
+    assert!(matches!(
+        Generation::open_existing(dir.path(), identity(), options()),
+        Err(OpenError::Corrupt(_))
+    ));
+}
+
+/// A store of another layout that was not closed cleanly, the upgrade after
+/// a crash, is refused as another build's store, not as damage (#247
+/// review). redb's read-only open won't read a file that needs a repair,
+/// so its format can't be named, and the refusal says why. It changes
+/// nothing: the file needs the same repair after it as before.
+#[test]
+fn a_store_of_another_format_not_closed_cleanly_is_refused_as_another_builds() {
+    let dir = tempfile::tempdir().unwrap();
+    drop(Generation::create(dir.path(), identity(), options()).unwrap());
+    let generation = dir.path().join("gen-000001");
+    let db_path = generation.join("domain.redb");
+    let manifest_path = generation.join("manifest.v1");
+    let mut manifest = coord_storage_redb::StoreManifestV1::read(&manifest_path).unwrap();
+    manifest.collections.retain(|(id, _)| {
+        *id != Collection::PendingPayloadV1.id().0 && *id != Collection::DecidedV1.id().0
+    });
+    manifest.write(&manifest_path).unwrap();
+    // A commit, then the file as a kill leaves it: the bytes taken while
+    // the database is still open, before a clean close writes its state.
+    let killed = {
+        let db = redb::Database::open(&db_path).unwrap();
+        let txn = db.begin_write().unwrap();
+        {
+            let mut table = txn
+                .open_table(coord_storage_redb::engine::table_definition(
+                    Collection::MetaV1,
+                ))
+                .unwrap();
+            table
+                .insert(b"format_version".as_slice(), 2u32.to_be_bytes().as_slice())
+                .unwrap();
+        }
+        txn.commit().unwrap();
+        std::fs::read(&db_path).unwrap()
+    };
+    std::fs::write(&db_path, &killed).unwrap();
+    assert!(
+        matches!(
+            redb::ReadOnlyDatabase::open(&db_path),
+            Err(redb::DatabaseError::RepairAborted)
+        ),
+        "the file needs a repair: the test shows nothing"
+    );
+    let reason = match Generation::open_existing(dir.path(), identity(), options()) {
+        Err(OpenError::Format(reason)) => reason,
+        Err(other) => panic!("refused as {other:?}, not as another build's store"),
+        Ok(_) => panic!("a store of another format opened"),
+    };
+    assert!(
+        reason.contains("a store of another build that was not closed cleanly"),
+        "{reason}"
+    );
+    assert!(
+        std::fs::read(&db_path).unwrap() == killed,
+        "the refusal changed the store"
+    );
+}
+
 /// Staging over a selected generation applies the checks an open does: a
 /// database swapped in under an intact manifest is refused, and nothing is
 /// staged, rather than the generation being silently replaced and pruned.
@@ -512,4 +702,108 @@ fn an_authorized_replacement_adopts_the_state_and_a_stale_one_is_fenced() {
             "adoption accepted a root belonging to somebody else"
         );
     }
+}
+
+/// One update: a put of `value`, or a delete.
+fn update(c: Collection, key: &[u8], value: Option<&[u8]>) -> coord_core::effect::StoreUpdate {
+    coord_core::effect::StoreUpdate {
+        collection: c.id(),
+        key: key.to_vec(),
+        value: value.map(<[u8]>::to_vec),
+    }
+}
+
+/// Every row of `c` a snapshot of `engine` holds.
+fn rows_of(engine: &RedbEngine, c: Collection) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let view = engine.reader().snapshot().unwrap();
+    view.scan_page(c.id(), &ScanRequest::all(1000, 1 << 20))
+        .unwrap()
+        .rows
+        .into_iter()
+        .map(|row| (row.key, row.value))
+        .collect()
+}
+
+/// A batch of updates opens each table once for the transaction
+/// (task-d86), and leaves what one put or delete each, in order, leaves:
+/// across collections, with a key written twice and a key put then
+/// deleted within the batch, and a delete of a key written before it.
+#[test]
+fn a_batch_of_updates_leaves_what_one_call_each_leaves() {
+    let batch = [
+        update(Collection::KvCurrentV1, b"a", Some(b"1")),
+        update(Collection::KvHistoryV1, b"a@1", Some(b"1")),
+        update(Collection::KvCurrentV1, b"b", Some(b"2")),
+        update(Collection::KvCurrentV1, b"a", Some(b"3")),
+        update(Collection::EventsV1, b"1/0", Some(b"put")),
+        update(Collection::KvCurrentV1, b"c", Some(b"4")),
+        update(Collection::KvCurrentV1, b"c", None),
+        update(Collection::KvCurrentV1, b"old", None),
+        update(Collection::KvHistoryV1, b"a@2", Some(b"3")),
+    ];
+    let collections = [
+        Collection::KvCurrentV1,
+        Collection::KvHistoryV1,
+        Collection::EventsV1,
+    ];
+    let run = |batched: bool| {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = RedbHarness::create(dir.path());
+        {
+            let mut tx = h.engine().begin_write().unwrap();
+            tx.put(Collection::KvCurrentV1.id(), b"old", b"0").unwrap();
+            tx.commit_durable().unwrap();
+        }
+        {
+            let mut tx = h.engine().begin_write().unwrap();
+            if batched {
+                tx.apply_updates(batch.iter()).unwrap();
+            } else {
+                for u in &batch {
+                    match &u.value {
+                        Some(v) => tx.put(u.collection, &u.key, v).unwrap(),
+                        None => tx.delete(u.collection, &u.key).unwrap(),
+                    }
+                }
+            }
+            // Read-your-writes after the batch, with its tables closed.
+            assert_eq!(
+                tx.get(Collection::KvCurrentV1.id(), b"a").unwrap(),
+                Some(b"3".to_vec())
+            );
+            tx.commit_durable().unwrap();
+        }
+        collections
+            .iter()
+            .map(|c| rows_of(h.engine(), *c))
+            .collect::<Vec<_>>()
+    };
+    let one_each = run(false);
+    assert_eq!(
+        one_each[0],
+        vec![
+            (b"a".to_vec(), b"3".to_vec()),
+            (b"b".to_vec(), b"2".to_vec())
+        ]
+    );
+    assert_eq!(run(true), one_each);
+}
+
+/// A batch naming a collection the registry does not know is refused,
+/// as a put to it is.
+#[test]
+fn a_batch_with_an_unregistered_collection_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = RedbHarness::create(dir.path());
+    let mut tx = h.engine().begin_write().unwrap();
+    let unknown = coord_core::effect::StoreUpdate {
+        collection: coord_core::effect::CollectionId(u16::MAX),
+        key: b"k".to_vec(),
+        value: Some(b"v".to_vec()),
+    };
+    let error = tx.apply_updates([&unknown]).unwrap_err();
+    assert_eq!(
+        error.class,
+        coord_store_api::engine::ErrorClass::Unsupported
+    );
 }

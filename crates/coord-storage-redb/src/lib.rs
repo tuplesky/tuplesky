@@ -4,9 +4,11 @@
 //! This crate maps the `coord-store-api` contract onto one redb database per
 //! domain generation: byte tables per logical collection, one cross-table
 //! read transaction as the pinned snapshot, and the unique write
-//! transaction committed with `Durability::Immediate` plus two-phase commit
-//! (quick repair off). Codecs, guards, MVCC, retries and checkpoints stay in
-//! common code; nothing here interprets row contents.
+//! transaction committed with `Durability::Immediate` (quick repair off):
+//! in two phases, or in one phase with redb's checksums once a journal is
+//! underneath (task-d48, Section 17.3.4). Codecs, guards, MVCC, retries
+//! and checkpoints stay in common code; nothing here interprets row
+//! contents.
 //!
 //! [`lifecycle`] implements the fail-closed generation lifecycle: explicit
 //! creation only, an exclusive root lock, a checksummed manifest and an

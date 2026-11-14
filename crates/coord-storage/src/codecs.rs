@@ -32,15 +32,10 @@ fn corrupt(what: &'static str) -> EngineError {
     EngineError::new(ErrorClass::Corrupt, what)
 }
 
+/// A row's value: `value` encoded in place after its envelope's header,
+/// in one buffer sized once.
 fn encode<T: Serialize>(kind: u16, value: &T) -> Result<Vec<u8>, EngineError> {
-    let payload = postcard::to_allocvec(value)
-        .map_err(|_| EngineError::new(ErrorClass::Limit, "record encode"))?;
-    StoreEnvelopeV1 {
-        record_kind: kind,
-        schema_version: 1,
-        payload,
-    }
-    .encode()
+    StoreEnvelopeV1::encode_value(kind, 1, value, "record encode")
 }
 
 fn decode<T: for<'de> Deserialize<'de>>(
@@ -118,6 +113,21 @@ pub fn lease_key(lease: &LeaseId, namespace: &NamespaceId, key: &[u8]) -> Vec<u8
     out.extend_from_slice(&current_key(namespace, key));
     out
 }
+
+/// The longest row key a command writes: a lease's reverse-index row
+/// ([`lease_key`]) of a logical key at its limit, every byte zero. That is
+/// the lease id, the namespace, the key escaped (each zero byte written as
+/// two) and the terminator. A current row's key is the same less the lease
+/// id, and an event row's key is its revision and ordinal.
+pub const LONGEST_ROW_KEY_BYTES: usize = LeaseId::LEN
+    + ordered_key::NAMESPACE_LEN
+    + 2 * coord_types::logical_v1::limits::MAX_KEY_BYTES
+    + 2;
+
+// A journal record holds every row key a command writes, so the record's
+// bound can't stop a voter on a key validation allowed. Its other end, at
+// most a checkpoint's row bound, is asserted in `coord-checkpoint`.
+const _: () = assert!(coord_journal_api::record::MAX_RECORD_KEY_BYTES >= LONGEST_ROW_KEY_BYTES);
 
 /// Prefix of every reverse-index key of `lease` in `namespace`.
 pub fn lease_key_prefix(lease: &LeaseId, namespace: &NamespaceId) -> Vec<u8> {
@@ -275,8 +285,11 @@ use coord_types::ids::{ClientInstanceId, ExecutionPosition, RequestSequence, Ses
 pub const RETRY_KIND: u16 = 0x0001;
 /// Record kind of a floor in `retry_floor_v1`.
 pub const RETRY_FLOOR_KIND: u16 = 0x0001;
-/// Record kind of an executed identity in `executed_v1`.
+/// Record kind of an executed identity, named by command in `executed_v1`
+/// (written by position in `execution_v1` since task-d113's step 2).
 pub const EXECUTED_KIND: u16 = 0x0001;
+/// Record kind of an executed row in `execution_v1` (task-d113, step 2).
+pub const EXECUTION_KIND: u16 = 0x0001;
 /// Record kind of the minimal session state in `session_v1` (task-18
 /// extends the record with principal, ceiling and generations).
 pub const SESSION_KIND: u16 = 0x0001;
@@ -306,7 +319,9 @@ pub struct RetryFloorV1 {
     pub width: u32,
 }
 
-/// Applied identity of a command in `executed_v1`.
+/// Applied identity of a command: the update a node's execution names by
+/// command in `executed_v1`, and the part of its `execution_v1` row
+/// (task-d113, step 2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutedRecordV1 {
     /// Execution position.
@@ -315,6 +330,17 @@ pub struct ExecutedRecordV1 {
     pub revision: Option<KvRevision>,
     /// Result digest.
     pub result_digest: Digest32,
+}
+
+/// An executed row as `execution_v1` holds it, by its position (task-d113,
+/// step 2): the executed identity, with the command it names, since the
+/// key no longer does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionRecordV1 {
+    /// The command executed at the position.
+    pub command: CommandId,
+    /// Its executed identity.
+    pub executed: ExecutedRecordV1,
 }
 
 /// Record kind of a grant commitment row in `auth_grant_v1`.
@@ -403,9 +429,43 @@ pub fn retry_floor_key(session: &SessionId, client: &ClientInstanceId) -> Vec<u8
     out
 }
 
-/// `executed_v1` key: the command identity bytes.
+/// `executed_v1` key: the command identity bytes. Only names the update;
+/// the lowering writes it by position (task-d113, step 2).
 pub fn executed_key(command: &CommandId) -> Vec<u8> {
     command.as_bytes().to_vec()
+}
+
+/// `execution_v1` key, and an executed command's `payload_v1` key: the
+/// execution position, big-endian (task-d113, step 2).
+pub fn position_key(position: ExecutionPosition) -> [u8; 8] {
+    position.to_be_bytes()
+}
+
+/// The position a `position_key` names.
+pub fn position_of(key: &[u8]) -> Result<ExecutionPosition, EngineError> {
+    ExecutionPosition::from_be_slice(key)
+        .map_err(|_| EngineError::new(ErrorClass::Corrupt, "a position key of the wrong length"))
+}
+
+/// A `decided_v1` value (task-d113, step 2): the configuration epoch the
+/// record was decided in, big-endian, then the dependency row's bytes as
+/// `protocol_v1` held them. Its key is the command's execution position.
+pub fn decided_value(epoch: [u8; 8], record: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8 + record.len());
+    out.extend_from_slice(&epoch);
+    out.extend_from_slice(record);
+    out
+}
+
+/// The epoch and the dependency row's bytes a `decided_v1` value holds.
+pub fn split_decided(bytes: &[u8]) -> Result<([u8; 8], &[u8]), EngineError> {
+    match bytes.split_first_chunk::<8>() {
+        Some((epoch, record)) => Ok((*epoch, record)),
+        None => Err(EngineError::new(
+            ErrorClass::Corrupt,
+            "a decided record shorter than its epoch",
+        )),
+    }
 }
 
 /// `session_v1` key: the session identity bytes.
@@ -436,6 +496,14 @@ pub fn encode_executed(record: &ExecutedRecordV1) -> Result<Vec<u8>, EngineError
 /// Decode an executed identity.
 pub fn decode_executed(bytes: &[u8]) -> Result<ExecutedRecordV1, EngineError> {
     decode(EXECUTED_KIND, bytes, "executed record")
+}
+/// Encode an executed row of `execution_v1`.
+pub fn encode_execution(record: &ExecutionRecordV1) -> Result<Vec<u8>, EngineError> {
+    encode(EXECUTION_KIND, record)
+}
+/// Decode an executed row of `execution_v1`.
+pub fn decode_execution(bytes: &[u8]) -> Result<ExecutionRecordV1, EngineError> {
+    decode(EXECUTION_KIND, bytes, "execution record")
 }
 /// Encode a session state.
 pub fn encode_session(record: &SessionRecord) -> Result<Vec<u8>, EngineError> {

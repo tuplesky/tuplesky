@@ -226,9 +226,14 @@ fn a_payload_change_conflicts_locally_and_from_the_server() {
         .unwrap();
     assert_eq!(c.state(id3), Some(&RequestState::Queued));
     assert!(c.take_completions().is_empty());
+    // Every attempt so far was refused before admission: the application
+    // can say so rather than "no answer".
+    assert_eq!((c.backpressured(id3), c.attempts(id3)), (1, 1));
     c.tick(6 + ClientConfig::default().backoff);
     let again = sends(&c.take_actions());
     assert_eq!(again[0].2, sent[0].2, "same invocation after backpressure");
+    // The second attempt is out and unanswered: no longer all refused.
+    assert_eq!((c.backpressured(id3), c.attempts(id3)), (1, 2));
     c.on_frame(200, c1, &err_frame(command3, codes::NOT_ADMITTED))
         .unwrap();
     assert_eq!(
@@ -667,5 +672,117 @@ fn finished_identity_bindings_do_not_accumulate_for_ever() {
         c.retired_through(),
         8,
         "the unknown request holds the floor where it is"
+    );
+}
+
+/// task-d23: `Unknown` ends a resolution, not the invocation. `retry()`
+/// after it submits the same invocation again, under the same identity
+/// and with the same bytes, and the domain answers it from its record.
+/// It used to replay the stored `Unknown` and send nothing, so a caller
+/// could never learn an outcome the domain still held.
+#[test]
+fn a_retry_after_unknown_submits_the_same_invocation_again() {
+    let mut c = client(ClientConfig::default());
+    let c1 = connected(&mut c, 0, 1);
+    let payload = put(b"a", b"1");
+    let id = c.submit(0, &payload, 50).unwrap();
+    let invocation = c.invocation(id).unwrap().clone();
+    let first = sends(&c.take_actions());
+    assert_eq!(first.len(), 1);
+    c.tick(50);
+    let _ = c.take_completions();
+    assert_eq!(resolves(&c.take_actions()).len(), 1);
+    c.on_frame(
+        51,
+        c1,
+        &outcome_frame(invocation.command_id, OutcomeV1::Unknown),
+    )
+    .unwrap();
+    assert_eq!(c.take_completions()[0].outcome, Outcome::Unknown);
+    assert_eq!(c.state(id), Some(&RequestState::Done(Outcome::Unknown)));
+
+    assert_eq!(c.retry(60, id.0, &payload, 50).unwrap(), id);
+    assert!(
+        c.take_completions().is_empty(),
+        "the unknown is not replayed"
+    );
+    let again = sends(&c.take_actions());
+    assert_eq!(again.len(), 1, "the invocation went out again");
+    assert_eq!(again[0].2, first[0].2, "same identity, same bytes");
+    c.on_frame(61, again[0].0, &ok_frame(invocation.command_id, 9))
+        .unwrap();
+    assert_eq!(
+        c.take_completions()[0].outcome,
+        Outcome::Established {
+            revision: Some(KvRevision::new(9).unwrap()),
+            result: vec![0xab],
+        }
+    );
+}
+
+/// task-d23: an executed command whose result is withheld, and one whose
+/// result is retired, are their own final outcomes. Neither is a refusal
+/// to admit, which throws the credential away, and neither is sent again
+/// on `retry()`.
+#[test]
+fn a_withheld_result_and_a_retired_one_are_their_own_outcomes() {
+    let mut c = client(ClientConfig::default());
+    let c1 = connected(&mut c, 0, 1);
+    for (key, code, outcome) in [
+        (&b"w"[..], codes::OUTPUT_WITHHELD, Outcome::Withheld),
+        (&b"r"[..], codes::RESULT_RETIRED, Outcome::Retired),
+    ] {
+        let payload = put(key, b"1");
+        let id = c.submit(0, &payload, 50).unwrap();
+        let command = c.invocation(id).unwrap().command_id;
+        let _ = c.take_actions();
+        c.on_frame(1, c1, &err_frame(command, code)).unwrap();
+        assert_eq!(c.take_completions()[0].outcome, outcome);
+        assert_eq!(c.state(id), Some(&RequestState::Done(outcome.clone())));
+        c.retry(2, id.0, &payload, 50).unwrap();
+        assert_eq!(c.take_completions()[0].outcome, outcome);
+        let actions = c.take_actions();
+        assert!(sends(&actions).is_empty(), "{actions:?}");
+        assert!(
+            !actions.iter().any(|a| matches!(a, SdkAction::Bind { .. })),
+            "the credential is kept: {actions:?}"
+        );
+    }
+    // A refusal to admit is still one, and still rebinds.
+    let payload = put(b"n", b"1");
+    let id = c.submit(3, &payload, 50).unwrap();
+    let command = c.invocation(id).unwrap().command_id;
+    let _ = c.take_actions();
+    c.on_frame(4, c1, &err_frame(command, codes::NOT_ADMITTED))
+        .unwrap();
+    assert_eq!(
+        c.take_completions()[0].outcome,
+        Outcome::Failed(RetryError::NotAdmitted)
+    );
+}
+
+/// A retry of a request this client holds as unknown keeps its earlier
+/// attempts: a BACKPRESSURE answer to the retry must not read as
+/// "nothing reached the domain" (Codex on #228).
+#[test]
+fn a_retried_unknown_outcome_keeps_its_attempts() {
+    let mut c = client(ClientConfig::default());
+    let c1 = connected(&mut c, 0, 1);
+    let request = put(b"a", b"1");
+    let id = c.submit(0, &request, 0).unwrap();
+    let command = c.invocation(id).unwrap().command_id;
+    let _ = c.take_actions();
+    c.on_frame(1, c1, &outcome_frame(command, OutcomeV1::Unknown))
+        .unwrap();
+    assert_eq!(c.state(id), Some(&RequestState::Done(Outcome::Unknown)));
+    let _ = c.take_completions();
+    assert_eq!(c.retry(2, id.0, &request, 0), Ok(id));
+    let _ = c.take_actions();
+    c.on_frame(3, c1, &err_frame(command, codes::BACKPRESSURE))
+        .unwrap();
+    assert_eq!(
+        (c.backpressured(id), c.attempts(id)),
+        (1, 2),
+        "the retry's refusal hid the first attempt"
     );
 }

@@ -147,4 +147,42 @@ pub enum CollectorEvent {
         /// Pending commands whose evidence was dropped.
         reset: usize,
     },
+    /// A voter refused the submission and said why (task-d22).
+    VoterRefused {
+        /// Command.
+        command: String,
+        /// The voter.
+        from: String,
+        /// `other-command`, `other-facts` or `forgotten`.
+        reason: String,
+    },
+    /// A pending command that held neither half of a release was
+    /// submitted to every voter again (task-d22).
+    Solicited {
+        /// Command.
+        command: String,
+        /// How many times it has been, this one included.
+        times: u32,
+    },
+    /// A pending command answered on the release alone, holding neither
+    /// half of a release one offer ceiling after its submission, was
+    /// submitted again to its ballot's leader only (task-d100, step A;
+    /// #204 review). Once a command, and it doesn't count toward
+    /// [`CollectorEvent::Solicited`]'s `times`.
+    SolicitedLeader {
+        /// Command.
+        command: String,
+        /// The leader it went to.
+        to: String,
+    },
+    /// A command relayed to its ballot's leader alone (task-d102,
+    /// task-d100's step B) was submitted to every voter as one answered
+    /// on the release alone: its leader did not answer within
+    /// [`crate::RELAY_FALLBACK_MILLIS`], or said it isn't leading.
+    RelayFellBack {
+        /// Command.
+        command: String,
+        /// The voters it was offered to.
+        targets: Vec<String>,
+    },
 }

@@ -1,0 +1,139 @@
+# Protocol simulator sweep (task-d71, design Section 4.9).
+#
+# Every row of task-d30's simulator at 1,000 seeds per row and size, with
+# catch-up and without: ten times task-d34's bar, so the next hole in a
+# recovery rule is found by the runner rather than by hand. Each row also
+# runs with half, three in four and every acknowledgement to a follower
+# lost (`PROTOCOL_SIM_PEER_ACK_LOSS`, task-d78): half found row 4's seed
+# 720, all found row 10's seed 540, and only three in four found row 9's
+# seed 296 (task-d80); rows 16 and 17 run under their own loss. Rows 1,
+# 2 and 22 run each seed again with task-d98's early proposals, and row 18
+# is the early send's own row. Rows 19 to 23 are L4's and L7's (task-d90,
+# task-d98): a result released before its execution group is durable,
+# each vote on a durable payload row, a payload batch failed under a
+# later vote, the leader crashed in task-d89's gate window, and early
+# proposals with late execution. CI's default
+# of 12 seeds per row and size stays in `cargo xtask test`. A failing
+# seed is printed with its row and size; replay it with
+# `PROTOCOL_SIM_ONE=row,voters,seed` and `PROTOCOL_SIM_TRACE=1`, and keep
+# it in `crates/coord-consensus/fixtures/protocol_sim/seeds.json` with
+# what it found. A dispatch can run every row with task-d100's marked
+# commands (`answer-on-release`, below every command, since a row checks
+# what its unmarked commands learned) and task-d102's relay and proposal
+# frames (`relay`, a share of the marked commands, and `frames`), each in
+# parts per million; the weekly run leaves them off.
+name: protocol-sim-sweep
+
+on:
+  workflow_dispatch:
+    inputs:
+      seeds:
+        description: "Seeds per row and size"
+        default: "1000"
+      answer-on-release:
+        description: "PROTOCOL_SIM_ANSWER_ON_RELEASE, parts per million: the share of commands marked to be answered on the leader's release alone (task-d100 step A); empty for none. Below 1000000: with every command marked, a row's own check of what its unmarked commands learned fails by construction"
+        default: ""
+      relay:
+        description: "PROTOCOL_SIM_RELAY, parts per million: the share of marked commands relayed to their ballot's leader alone (task-d102); needs answer-on-release; empty for none"
+        default: ""
+      frames:
+        description: "PROTOCOL_SIM_FRAMES, parts per million: the chance per step a leader sends its turn's proposals in frames (task-d102); empty for none"
+        default: ""
+  schedule:
+    # Weekly (Sundays 04:41 UTC), apart from CI's Monday run.
+    - cron: "41 4 * * 0"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  sweep:
+    name: row ${{ matrix.row }} (${{ matrix.catch-up }}, peer-ack loss ${{ matrix.peer-ack-loss || 'of the row' }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        row:
+          - row_1_fill_capacity_and_fail_the_leader
+          - row_2_different_maximum_tentative_sets
+          - row_3_dense_conflicts_and_an_early_missing_dependency
+          - row_4_acknowledgement_before_payload_repeated
+          - row_5_client_or_collector_dies_mid_dissemination
+          - row_9_repeated_interrupted_elections
+          - row_10_delayed_old_ballot_messages
+          - row_12_loss_beyond_the_repair_cache_window
+          - row_14_lost_responses_and_retries_under_one_identity
+          - row_16_repeated_elections_with_every_acknowledgement_to_a_follower_lost
+          - row_17_repeated_elections_with_half_the_acknowledgements_to_a_follower_lost
+          - row_18_the_leaders_proposal_before_its_batch_is_durable
+          - row_19_results_released_before_their_execution_group_is_durable
+          - row_20_each_vote_on_a_durable_payload_row
+          - row_21_a_payload_batch_failed_under_a_later_vote
+          - row_22_the_leader_crashed_in_the_gates_window
+          - row_23_early_proposals_with_late_execution
+        catch-up: [catch-up, no-catch-up]
+        # Parts per million; empty is the row's own.
+        peer-ack-loss: ["", "500000", "750000", "1000000"]
+        exclude:
+          - row: row_16_repeated_elections_with_every_acknowledgement_to_a_follower_lost
+            peer-ack-loss: "500000"
+          - row: row_16_repeated_elections_with_every_acknowledgement_to_a_follower_lost
+            peer-ack-loss: "750000"
+          - row: row_16_repeated_elections_with_every_acknowledgement_to_a_follower_lost
+            peer-ack-loss: "1000000"
+          - row: row_17_repeated_elections_with_half_the_acknowledgements_to_a_follower_lost
+            peer-ack-loss: "500000"
+          - row: row_17_repeated_elections_with_half_the_acknowledgements_to_a_follower_lost
+            peer-ack-loss: "750000"
+          - row: row_17_repeated_elections_with_half_the_acknowledgements_to_a_follower_lost
+            peer-ack-loss: "1000000"
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - name: Install the exact Rust toolchain from rust-toolchain.toml
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          cargo --version && rustc --version
+      - uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1 # v2.8.1
+        with:
+          key: protocol-sim-sweep
+      - name: Build the simulator (release)
+        run: cargo test --locked --release -p coord-consensus --test protocol_sim --no-run
+      - name: Sweep
+        env:
+          PROTOCOL_SIM_SEEDS: ${{ inputs.seeds || '1000' }}
+          NO_CATCH_UP: ${{ matrix.catch-up == 'no-catch-up' && '1' || '' }}
+          ROW: ${{ matrix.row }}
+          PEER_ACK_LOSS: ${{ matrix.peer-ack-loss }}
+          ANSWER_ON_RELEASE: ${{ inputs.answer-on-release }}
+          RELAY: ${{ inputs.relay }}
+          FRAMES: ${{ inputs.frames }}
+        run: |
+          if [ -n "$NO_CATCH_UP" ]; then export PROTOCOL_SIM_NO_CATCH_UP=1; fi
+          if [ -n "$PEER_ACK_LOSS" ]; then export PROTOCOL_SIM_PEER_ACK_LOSS="$PEER_ACK_LOSS"; fi
+          # task-d100's marked commands and task-d102's relay and frames,
+          # each in parts per million. The relay is a share of the marked
+          # commands, and a row checks what its unmarked commands learned,
+          # so a relay needs some commands marked and some not.
+          for v in ANSWER_ON_RELEASE RELAY FRAMES; do
+            case ${!v} in
+              "") ;;
+              *[!0-9]*) echo "::error::$v must be whole parts per million, not ${!v}"; exit 2 ;;
+              *) if [ "${!v}" -gt 1000000 ]; then echo "::error::$v is at most 1000000, not ${!v}"; exit 2; fi
+                 export "PROTOCOL_SIM_$v=${!v}" ;;
+            esac
+          done
+          if [ "${ANSWER_ON_RELEASE:-0}" -ge 1000000 ]; then
+            echo "::error::answer-on-release must be below 1000000: with every command marked, a row's check of its unmarked commands fails by construction"; exit 2
+          fi
+          if [ "${RELAY:-0}" -gt 0 ] && [ "${ANSWER_ON_RELEASE:-0}" -eq 0 ]; then
+            echo "::error::relay is a share of the marked commands; give answer-on-release too"; exit 2
+          fi
+          cargo test --locked --release -p coord-consensus --test protocol_sim -- \
+            --exact "$ROW" --nocapture

@@ -110,9 +110,9 @@ impl EstablishedResult {
         if evidence.position == ExecutionPosition::ZERO {
             return Err(EstablishError::ZeroPosition);
         }
-        let preds = &evidence.closed_predecessors;
-        for (i, p) in preds.iter().enumerate() {
-            if *p == evidence.command || preds[..i].contains(p) {
+        let mut seen = alloc::collections::BTreeSet::new();
+        for p in &evidence.closed_predecessors {
+            if *p == evidence.command || !seen.insert(p) {
                 return Err(EstablishError::InconsistentClosure);
             }
         }
@@ -205,6 +205,13 @@ pub struct ReleasedResult {
     established: EstablishedResult,
     response: Vec<u8>,
     speculative: bool,
+    /// The admission digest of the payload the leader decided, for a
+    /// command its collector answers on the release alone (task-d100,
+    /// step A). Not part of this type's serialized form: it rides a
+    /// release frame of its own version, so a version-1 release encodes
+    /// as it always has.
+    #[serde(skip)]
+    admission: Option<Digest32>,
 }
 
 impl ReleasedResult {
@@ -221,7 +228,22 @@ impl ReleasedResult {
             established,
             response,
             speculative,
+            admission: None,
         }
+    }
+
+    /// The same release, carrying the admission digest of the payload
+    /// the leader decided (task-d100, step A).
+    #[must_use]
+    pub const fn with_admission(mut self, admission: Digest32) -> Self {
+        self.admission = Some(admission);
+        self
+    }
+
+    /// The admission digest of the decided payload, where the release
+    /// carries one (task-d100, step A).
+    pub const fn admission(&self) -> Option<Digest32> {
+        self.admission
     }
 
     /// The established result.

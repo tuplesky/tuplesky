@@ -1,0 +1,5 @@
+# Commits of tuplesky/jepsen whose tests every jepsen job runs (the fork has
+# no CI of its own): a full commit SHA, then the namespace for
+# `lein test :only`, or run:FILE, a script of this repository run in that
+# commit's jepsen project with clojure.main, its output kept. Remove a line
+# once its pull request or issue has closed.

@@ -3,6 +3,8 @@
 //! current attachments in one atomic revision (all or nothing across a
 //! crash), and a retried grant neither grants twice nor takes a revision.
 
+mod support;
+
 use std::collections::BTreeMap;
 
 use coord_core::effect::{BootId, PersistBatch};
@@ -139,7 +141,7 @@ impl<E: LocalEngine> Domain<E> {
             let gated = self.worker.reader().snapshot().unwrap();
             let bound = seq.map(|s| binding(s, request));
             let admission = match &bound {
-                Some(b) => retry::admit(gated.view(), b, |_| true).unwrap(),
+                Some(b) => retry::admit(gated.view(), b, |_| Ok(true)).unwrap(),
                 None => Admission::New,
             };
             if let Admission::Retry(record) = &admission {
@@ -151,6 +153,7 @@ impl<E: LocalEngine> Domain<E> {
                 build_read_view(&gated, NS, principal, request, ViewBudget::default()).unwrap();
             let planned = plan(request, &view, &PlanLimits::default()).unwrap();
             drop(gated);
+            support::stage_bound(&mut self.worker, bound.as_ref(), request);
             match apply_plan(
                 &mut self.worker,
                 self.alloc.allocate(),
@@ -508,9 +511,11 @@ fn a_crash_during_revoke_leaves_all_attachments_or_none() {
 #[test]
 fn a_lease_at_its_byte_quota_is_still_revocable_in_one_batch() {
     // Worst case for the revoke batch: keys of the maximum length made of
-    // zero bytes (the ordered-key escaping doubles them in three row keys)
-    // holding values of the maximum length. The quota must admit exactly
-    // what one revocation can write below the worker's single-batch limit.
+    // zero bytes (the ordered-key escaping doubles them in the two row keys
+    // a revoke deletes) holding values of the maximum length. The quota must
+    // admit exactly what one revocation can write in one journal record,
+    // which is also below the worker's single-batch limit. That the batch is
+    // one record checks `attachment_cost`'s count of a key's copies.
     use coord_storage::lowering::batch_bytes;
     use coord_types::logical_v1::limits::{MAX_KEY_BYTES, MAX_VALUE_BYTES};
     let mut d = Domain::new(ModelEngine::new());
@@ -538,8 +543,8 @@ fn a_lease_at_its_byte_quota_is_still_revocable_in_one_batch() {
     let record = d.lease(L1).unwrap();
     assert_eq!(record.attached_bytes, fits * per_key);
     assert!(record.attached_bytes <= limits.max_lease_bytes);
-    // The materialized revoke batch, retry binding included, stays under
-    // the worker's single-batch limit and applies.
+    // The materialized revoke batch, retry binding included, is one journal
+    // record, stays under the worker's single-batch limit and applies.
     let r = revoke(L1);
     let bound = binding(7, &r);
     let gated = d.worker.reader().snapshot().unwrap();
@@ -549,6 +554,11 @@ fn a_lease_at_its_byte_quota_is_still_revocable_in_one_batch() {
     let batch =
         coord_storage::plan_to_batch(d.alloc.allocate(), NS, &planned, Some(&bound)).unwrap();
     let bytes = batch_bytes(&batch);
+    assert_eq!(
+        coord_storage::journaled::record_refusal(&batch),
+        None,
+        "a revoke batch of {bytes} bytes is one journal record"
+    );
     assert!(
         bytes <= GroupLimits::default().max_single_batch_bytes,
         "revoke batch of {bytes} bytes exceeds the single-batch limit"
@@ -724,8 +734,8 @@ fn active_lease_recovery_pages_past_tombstones_within_a_small_budget() {
         "the drained listing pages internally"
     );
     // A budget too small for even one row is an error, not an empty page
-    // that would never advance.
-    assert!(
+    // that would never advance: the budget's refusal, not the engine's.
+    assert!(matches!(
         active_leases_page(
             gated.view(),
             None,
@@ -733,7 +743,61 @@ fn active_lease_recovery_pages_past_tombstones_within_a_small_budget() {
                 max_rows: 1,
                 max_bytes: 8,
             }
+        ),
+        Err(coord_storage::ViewBuildError::BudgetExceeded)
+    ));
+}
+
+#[test]
+fn a_lease_row_past_the_bytes_left_ends_the_page_before_it() {
+    // The byte budget ends a page as the row budget does: the row past it
+    // is the next page's first. A page that asked the engine for only the
+    // bytes left was refused by the engine instead, its first row being
+    // larger than the page, and the whole scan failed.
+    use coord_storage::active_leases_page;
+    let mut d = Domain::new(ModelEngine::new());
+    let ids: Vec<LeaseId> = (0..3u8).map(|i| LeaseId([i + 0x10; 16])).collect();
+    for id in &ids {
+        d.run_as(ALICE, &grant(*id, 30));
+    }
+    let gated = d.worker.reader().snapshot().unwrap();
+    // The rows, as the scan charges them.
+    let rows = gated
+        .view()
+        .scan_page(
+            Collection::LeaseV1.id(),
+            &ScanRequest {
+                lower: std::ops::Bound::Unbounded,
+                upper: std::ops::Bound::Unbounded,
+                direction: coord_store_api::engine::Direction::Forward,
+                resume_after: None,
+                max_rows: 16.try_into().unwrap(),
+                max_bytes: (1 << 20).try_into().unwrap(),
+            },
         )
-        .is_err()
+        .unwrap()
+        .rows;
+    assert_eq!(rows.len(), 3);
+    let cost = |i: usize| u32::try_from(rows[i].key.len() + rows[i].value.len()).unwrap();
+    // Room for the first row and half the second.
+    let budget = ViewBudget {
+        max_rows: 100,
+        max_bytes: cost(0) + cost(1) / 2,
+    };
+    let page = active_leases_page(gated.view(), None, budget)
+        .expect("a page that ends before the row, not the engine's refusal");
+    assert_eq!(
+        page.leases.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        vec![ids[0]]
+    );
+    assert_eq!(page.next, Some(ids[0]));
+    // Paging on reaches the rest, one a page.
+    assert_eq!(
+        active_leases(gated.view(), budget)
+            .unwrap()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect::<Vec<_>>(),
+        ids
     );
 }

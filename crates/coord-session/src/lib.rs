@@ -34,9 +34,10 @@ pub use binding::{BindError, Binding, BindingConfig, verify_bind};
 /// verified with. A frontend whose set has none refuses every caller,
 /// which is worth finding out at startup rather than at the first bind.
 pub use coord_sts::usable_verification_keys;
-pub use frontend::{BoundFrontend, Delivered, Ingress};
+pub use frontend::{BoundFrontend, Delivered, GATE_HOLD_MILLIS, Ingress};
 pub use gate::{
-    AuthorizationBarrier, PolicyError, PolicySource, StorePolicySource, protected_keys,
+    AuthorizationBarrier, PolicyError, PolicySource, StorePolicySource, ViewPolicySource,
+    protected_keys,
 };
 pub use wire::{
     BindAckV1, BindV1, KIND_BIND, KIND_BIND_ACK, MAX_TOKEN_BYTES, SessionWireError, bind_ack_frame,

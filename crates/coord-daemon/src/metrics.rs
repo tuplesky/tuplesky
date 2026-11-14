@@ -39,6 +39,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use coord_consensus::Phase;
 use serde::{Deserialize, Serialize};
 
 /// Why a reading is not available.
@@ -118,7 +119,10 @@ pub enum Stage {
     DependencyClosure = 0x0004,
     /// The durable journal.
     Journal = 0x0005,
-    /// Materialization into the projection.
+    /// Materialization into the projection. Under the replay-backed
+    /// profile (task-j06) most of these commits are working ones, so the
+    /// stage's time is not a durable commit's; what a crash would leave
+    /// is `frontiers.projection_durable`.
     Materialization = 0x0006,
     /// Learning from evidence.
     EvidenceLearning = 0x0007,
@@ -130,7 +134,9 @@ pub enum Stage {
     Checkpoint = 0x000a,
     /// Bulk traffic's interference with everything else.
     BulkInterference = 0x000b,
-    /// Recovery.
+    /// Recovery. `coordd` samples the boot's replay of the journal into
+    /// the projection here, one a start (task-d55), so it is every
+    /// storage-holding role's, as the journal is.
     Recovery = 0x000c,
 }
 
@@ -183,14 +189,11 @@ impl Stage {
         let has = |role: Role| roles.roles().contains(&role);
         match self {
             // Every role journals and materializes its own storage.
-            Stage::Journal | Stage::Materialization | Stage::Checkpoint => {
+            Stage::Journal | Stage::Materialization | Stage::Checkpoint | Stage::Recovery => {
                 has(Role::Voter) || has(Role::Observer)
             }
             // Consensus stages belong to a voter.
-            Stage::FanOut
-            | Stage::DependencyClosure
-            | Stage::EvidenceLearning
-            | Stage::Recovery => has(Role::Voter),
+            Stage::FanOut | Stage::DependencyClosure | Stage::EvidenceLearning => has(Role::Voter),
             // The caller-facing stages belong to whatever serves callers.
             Stage::Admission | Stage::ClientTransit | Stage::Watches => {
                 has(Role::Frontend) || has(Role::Observer)
@@ -376,6 +379,12 @@ pub struct Frontiers {
     pub materialized: u64,
     /// `C`: the published local checkpoint boundary.
     pub checkpoint: u64,
+    /// The projection's last durable commit, under the replay-backed
+    /// profile (task-j06): what a crash leaves of `M`, and where the
+    /// next start replays from. Absent under the strict profile, where
+    /// it is `M`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection_durable: Option<u64>,
 }
 
 impl Frontiers {
@@ -445,6 +454,943 @@ pub struct MetricsSnapshot {
     pub view_age: Measure<Duration>,
     /// Engine pressure as the storage engine reports it.
     pub engine_pressure: Measure<Headroom>,
+    /// What this node's work has cost since it started, or why it has
+    /// no such reading (task-d45).
+    pub cost: Measure<Cost>,
+}
+
+/// What a voter's work has cost since it started (task-d45).
+///
+/// Every count is cumulative, so a reader divides one snapshot's
+/// difference from an earlier one by the commands executed between them
+/// and gets a per-command cost that does not depend on when the process
+/// started. The one windowed reading is [`Cost::recent`], the domain
+/// loop's busy time over the last reporting interval, because that is
+/// the reading a log of a killed daemon is read for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Cost {
+    /// Commands this replica applied.
+    pub executed: u64,
+    /// Lowerings that wrote something: a journal group, a projection
+    /// commit or both, wherever they ran -- the voter's own flush, the
+    /// applier's when it applied a command, and every reconcile.
+    pub lowerings: u64,
+    /// Journal groups appended.
+    pub journal_appends: u64,
+    /// Synced writes as the journal counts them: its groups, mapping
+    /// updates and compactions. Unavailable when the journal does not
+    /// count its own.
+    pub journal_syncs: Measure<u64>,
+    /// Projection transactions committed.
+    pub projection_commits: u64,
+    /// What ended the hold of each projection commit lent while a commit
+    /// hold applies (task-d86): its records, its wait, or an ask by who
+    /// asked. Zero without a hold.
+    #[serde(default)]
+    pub hold_ends: HoldEnds,
+    /// Time the domain loop spent working rather than waiting for an
+    /// event, since it started. A lowering's syncs are inside it, since
+    /// the loop waits for them.
+    pub busy: Duration,
+    /// How long the domain loop has been running.
+    pub uptime: Duration,
+    /// The last reporting interval alone, or why there is none: the first
+    /// snapshot of a run has no interval behind it.
+    pub recent: Measure<Interval>,
+    /// What this voter's re-sends of proposals did, over every ballot it
+    /// led (task-d49). Zero for a voter that never led.
+    pub resends: Resends,
+    /// Commands this voter established on the fast path (task-d50).
+    pub established_fast: u64,
+    /// Commands this voter established on the slow path (task-d50).
+    pub established_slow: u64,
+    /// What this voter's read barrier did, over every ballot it led
+    /// (task-d50). Zero for a voter that never led.
+    #[serde(default)]
+    pub reads: Reads,
+    /// CPU time used since the process started (task-d54), or why there
+    /// is no reading. Beside [`Cost::busy`], which counts the syncs the
+    /// loop waits for, it says what the work itself cost.
+    #[serde(default = "not_instrumented")]
+    pub cpu: Measure<Cpu>,
+    /// How often, and how long, the domain loop blocked on its pipeline
+    /// threads (task-d54), cumulative, or why there is no reading. Part
+    /// of [`Cost::busy`] that is not [`Cpu::domain`]: the loop waiting
+    /// for a journal append or a projection commit to come back.
+    #[serde(default = "not_instrumented")]
+    pub waits: Measure<PipelineWaits>,
+    /// Why the commands this voter established on the slow path missed
+    /// the fast one, and the fast acknowledgements it sent (task-d62).
+    #[serde(default)]
+    pub fast_path: FastPath,
+    /// The pre-acceptances this voter holds that the leader has not
+    /// ordered, as the snapshot found them (task-d62).
+    #[serde(default)]
+    pub unordered: UnorderedPreAcceptances,
+    /// From learned to released, over the commands this voter led
+    /// (task-d62).
+    #[serde(default)]
+    pub release: Release,
+    /// What this node's frontend took from a request's arrival to its
+    /// answer, writes and reads apart (task-d97, #191 review).
+    #[serde(default)]
+    pub answered: Answered,
+    /// What this node's frontend's output gate refused and held, and the
+    /// request records it keeps to authorize what it lets through (#185,
+    /// the withheld gets).
+    #[serde(default)]
+    pub gate: Gate,
+    /// Evidence frames this node's collector took for commands it
+    /// submitted as answered on the release alone (task-d100, step A;
+    /// #204 review): from voters that learned them from the leader's
+    /// proposal alone, and sent today's evidence.
+    #[serde(default)]
+    pub evidence_for_marked: u64,
+    /// Early solicits this node's collector sent to the leader alone, one
+    /// at most a marked command (task-d100, step A; #204 re-review): the
+    /// commands whose release took over a second to arrive.
+    #[serde(default)]
+    pub early_solicits: u64,
+    /// What this voter's transport carried to and from the other voters
+    /// (task-d62), or why there is no reading.
+    #[serde(default = "not_instrumented")]
+    pub traffic: Measure<Traffic>,
+    /// What the journal groups this voter appended held (task-d84).
+    #[serde(default)]
+    pub journal_groups: JournalGroups,
+    /// The domain loop's flushes: why it lowered when it did (task-d73),
+    /// and how many events it took between them, by plane (task-d102): a
+    /// batched round's frame is cut at a flush, so this is what a turn
+    /// can hold.
+    #[serde(default)]
+    pub flushes: Flushes,
+    /// The durable command records this voter holds, against what its
+    /// history sweep forgets (task-d110).
+    #[serde(default)]
+    pub history: History,
+    /// The domain loop's hand-offs to the runtime, by what made each
+    /// (task-d115, lever 8; #256 review).
+    #[serde(default)]
+    pub hand_offs: HandOffs,
+    /// What this voter's leaders sent of their fresh proposals and their
+    /// frontier, by kind (task-d102). Zero for a voter that never led.
+    #[serde(default)]
+    pub proposals: ProposalBytes,
+    /// What this node's collector relayed to the leader alone (task-d102).
+    #[serde(default)]
+    pub relay: Relay,
+    /// The command table, and what holds back its oldest unexecuted
+    /// record (task-d25, #98).
+    #[serde(default)]
+    pub table: Table,
+    /// The projection's index by command of its intake-keyed rows
+    /// (task-d113): its entries, and the bytes they take.
+    #[serde(default)]
+    pub intake_index: IntakeIndexSize,
+}
+
+/// The size of the projection's index by command of its intake-keyed rows
+/// (task-d113, the lead on #237).
+///
+/// Since step 2's bound, the intake part holds only rows of commands not
+/// yet executed, so `entries` is bounded by the table, not the history.
+/// The executed part (command to position) is what still grows until a
+/// floor forgets a prefix (task-d27): this is where that growth is read.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntakeIndexSize {
+    /// Entries held: one a live dependency or proposal row.
+    pub entries: u64,
+    /// The bytes they take, at what a row is estimated to take in the
+    /// map by command ([`coord_storage::intake::ENTRY_BYTES`]): an
+    /// estimate, since the map's buckets are not counted one by one.
+    pub bytes: u64,
+    /// The executed part's entries: one an executed row kept (step 2).
+    #[serde(default)]
+    pub executed: u64,
+    /// The bytes they take, at the most an entry is inferred to take
+    /// ([`coord_storage::intake::EXECUTED_ENTRY_BYTES`]): an estimate.
+    #[serde(default)]
+    pub executed_bytes: u64,
+}
+
+/// What ended the hold of each projection commit lent while a commit hold
+/// applies (task-d86, the lead on #185), each counted once, in the first
+/// of these that applies: an ask is counted only where the hold would
+/// otherwise have gone on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HoldEnds {
+    /// The records held reached the hold's count.
+    pub full: u64,
+    /// The hold's wait ran out.
+    pub deadline: u64,
+    /// A read due and not yet answerable from the projection asked.
+    pub read: u64,
+    /// A half-established entry's look for its execution record asked.
+    pub settle: u64,
+    /// Another ask: a release published again, a group's effects beyond
+    /// its results, a watch's events, a drain, a checkpoint.
+    pub other: u64,
+}
+
+impl HoldEnds {
+    /// The store's count, as the metrics line carries it.
+    pub const fn of(ends: coord_storage::HoldEnds) -> Self {
+        Self {
+            full: ends.full,
+            deadline: ends.deadline,
+            read: ends.read,
+            settle: ends.settle,
+            other: ends.other,
+        }
+    }
+}
+
+/// A voter's command table, and what holds back its oldest unexecuted
+/// record (task-d25, #98). A voter whose table is full of work it cannot
+/// execute refuses new work; this says how full, and behind what.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Table {
+    /// Records, placeholders included.
+    pub records: u64,
+    /// The table's bound, 0 for none.
+    pub capacity: u64,
+    /// Records holding their payload below EXECUTED.
+    pub unexecuted: u64,
+    /// Of those, the ones ready to execute.
+    pub ready: u64,
+    /// Pulled commands a catch-up window holds in hand, which execute
+    /// before anything else.
+    pub catch_up_window: u64,
+    /// What the oldest unexecuted record waits on, in the voter's order
+    /// (a leader's proposals, a follower's adoptions); none when the
+    /// table holds nothing below EXECUTED.
+    pub oldest_wait: Option<OldestWait>,
+}
+
+/// What holds back a table's oldest unexecuted record ([`Table`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OldestWait {
+    /// Its payload has not arrived.
+    Payload,
+    /// Not committed: at this phase.
+    Uncommitted {
+        /// Its phase.
+        phase: Phase,
+    },
+    /// Committed, behind its first dependency not executed: at this
+    /// phase, or none for a dependency this voter holds no payload of.
+    Dependency {
+        /// The dependency's phase.
+        phase: Option<Phase>,
+    },
+    /// Ready: nothing in the table holds it.
+    Ready,
+}
+
+impl OldestWait {
+    /// The reading of a table's [`coord_consensus::TableWait`].
+    pub const fn of(wait: coord_consensus::TableWait) -> Self {
+        match wait {
+            coord_consensus::TableWait::Payload => Self::Payload,
+            coord_consensus::TableWait::Uncommitted(phase) => Self::Uncommitted { phase },
+            coord_consensus::TableWait::Dependency(phase) => Self::Dependency { phase },
+            coord_consensus::TableWait::Ready => Self::Ready,
+        }
+    }
+}
+
+/// The domain loop's flushes, cumulative, one count a flush: why it
+/// lowered what its events left queued (task-d73), and how many events it
+/// took between flushes (task-d102). A flush with nothing more ready ends
+/// a group as early as it must; one cut by a bound ends it while events
+/// were still waiting, and is the only kind a longer turn could merge.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Flushes {
+    /// No event was ready (the select's flush arm) (task-d73).
+    pub idle: u64,
+    /// The loop had taken its bound of events since the last flush
+    /// (`FLUSH_EVENTS`), with more possibly ready (task-d73).
+    pub events: u64,
+    /// A full journal group's worth was queued (`FLUSH_QUEUED`)
+    /// (task-d73).
+    pub queued: u64,
+    /// Of all of them, the flushes taken while an append was out: what
+    /// they queued waits behind it, and joins the next group (task-d54,
+    /// task-d73).
+    pub appending: u64,
+    /// Flushes the loop took (task-d102).
+    pub flushes: u64,
+    /// API-plane events taken before them, summed over the flushes.
+    pub api_events: u64,
+    /// Peer-plane events taken before them, summed over the flushes.
+    pub peer_events: u64,
+    /// Flushes by the events taken since the one before: 0, 1, 2, 3-4,
+    /// 5-8, 9-16, 17-32, 33-63, 64 and more.
+    pub by_events: [u64; 9],
+}
+
+impl Flushes {
+    /// Count a flush after `api` API-plane events and `peer` peer-plane
+    /// ones.
+    pub fn count(&mut self, api: u64, peer: u64) {
+        self.flushes += 1;
+        self.api_events += api;
+        self.peer_events += peer;
+        let bucket = match api + peer {
+            0 => 0,
+            1 => 1,
+            2 => 2,
+            3..=4 => 3,
+            5..=8 => 4,
+            9..=16 => 5,
+            17..=32 => 6,
+            33..=63 => 7,
+            _ => 8,
+        };
+        self.by_events[bucket] += 1;
+    }
+}
+
+/// The domain loop's hand-offs to the runtime (task-d115, lever 8), by
+/// what made each, cumulative (#256 review). A hand-off wakes the lane
+/// senders the loop's sends queued frames for, and answers the callers it
+/// answered: one wake-up of a parked worker, however much it carries. Only
+/// a hand-off that carried something is counted.
+///
+/// A follower's turn has about one, the idle one after its batch of votes.
+/// A leader's has several: before and after its flush, after each burst of
+/// votes, after each commit's results. These say which.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HandOffs {
+    /// At a pass's start, once the oldest thing held had waited the
+    /// loop's bound (1 ms): on a loop that never runs out of events, the
+    /// only release.
+    pub bound: u64,
+    /// Before a flush, so that what the events so far queued does not
+    /// wait the flush out.
+    pub flush: u64,
+    /// Before the loop waits: no event waiting on either plane and nothing
+    /// more the voter can do.
+    pub idle: u64,
+    /// Before a caller's answer waits for room on its stream.
+    pub answer: u64,
+    /// Before a watch's stream is opened or written to.
+    pub watch: u64,
+}
+
+/// What made one of the domain loop's hand-offs (see [`HandOffs`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HandOff {
+    /// [`HandOffs::bound`].
+    Bound,
+    /// [`HandOffs::flush`].
+    Flush,
+    /// [`HandOffs::idle`].
+    Idle,
+    /// [`HandOffs::answer`].
+    Answer,
+    /// [`HandOffs::watch`].
+    Watch,
+}
+
+impl HandOffs {
+    /// Count one hand-off `cause` made.
+    pub fn count(&mut self, cause: HandOff) {
+        let n = match cause {
+            HandOff::Bound => &mut self.bound,
+            HandOff::Flush => &mut self.flush,
+            HandOff::Idle => &mut self.idle,
+            HandOff::Answer => &mut self.answer,
+            HandOff::Watch => &mut self.watch,
+        };
+        *n += 1;
+    }
+
+    /// Every hand-off counted.
+    pub const fn total(&self) -> u64 {
+        self.bound + self.flush + self.idle + self.answer + self.watch
+    }
+}
+
+/// What a voter's leaders sent of their fresh proposals and their
+/// frontier, by kind (task-d102), cumulative: what the batched round's
+/// frames save, and what is left to cut. A re-send, a re-presentation and
+/// an answer to a follower's ask are counted in [`Resends`], not here.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProposalBytes {
+    /// Proposals sent, one to each follower, framed or not.
+    pub proposals: u64,
+    /// Their bytes, without the payload records relayed proposals
+    /// carried: the votes, and each frame's header and length prefixes.
+    pub proposal_bytes: u64,
+    /// The payload records relayed proposals carried.
+    pub payload_bytes: u64,
+    /// Proposal frames sent: more than one proposal in one message.
+    pub frames: u64,
+    /// The proposals those frames carried.
+    pub framed: u64,
+    /// Frontier announcements (`Committed`) sent, one to each follower.
+    pub frontiers: u64,
+    /// Their bytes.
+    pub frontier_bytes: u64,
+}
+
+/// What a node's collector relayed to the leader alone (task-d102),
+/// cumulative.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Relay {
+    /// Submissions sent to the leader alone.
+    pub relayed: u64,
+    /// Of those, the ones that fell back to every voter: at the bound,
+    /// or at a `NotLeading` refusal.
+    pub fallbacks: u64,
+    /// `NotLeading` refusals taken.
+    pub not_leading: u64,
+    /// As a follower, since the node started (#224 review): proposal
+    /// frames taken.
+    #[serde(default)]
+    pub frames_taken: u64,
+    /// Payloads taken from relayed proposals.
+    #[serde(default)]
+    pub payloads_taken: u64,
+    /// Relayed proposals for a command it knew already.
+    #[serde(default)]
+    pub known: u64,
+    /// Relayed proposals whose payload it didn't take, so fetched if
+    /// wanted: not from the leader at its ballot, a payload that didn't
+    /// match the vote, or no room.
+    #[serde(default)]
+    pub not_taken: u64,
+    /// As a follower, since the node started: adoption batches its
+    /// proposal frames wrote (step 2b of the batching rule's 10.7).
+    #[serde(default)]
+    pub frame_batches: u64,
+    /// Adoptions in them.
+    #[serde(default)]
+    pub frame_adoptions: u64,
+}
+
+/// The durable command records a voter holds, and its history sweeps
+/// (task-d110). A sweep forgets only executed history, so a voter behind
+/// holds more than it can forget. The next sweep is due once `records` is
+/// past the table's capacity times four, and the records added and the
+/// commands executed since the last sweep come to more than half of
+/// `kept`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct History {
+    /// Durable command records the ledger holds now.
+    pub records: u64,
+    /// What the last sweep left, lowered as records left otherwise.
+    pub kept: u64,
+    /// Sweeps run since this boot.
+    pub sweeps: u64,
+    /// Entries in every other map of history forgetting drops (#221
+    /// review): payloads, served payloads, votes, adoptions, bindings,
+    /// answer-on-release, held waiters and a leader's proposals.
+    #[serde(default)]
+    pub entries: u64,
+    /// The largest of those maps.
+    #[serde(default)]
+    pub largest_map: u64,
+}
+
+/// What a voter's journal groups held, by their records (task-d84),
+/// cumulative: which of a turn's writes each synced group carried.
+///
+/// Each group is counted once, in the first of `protocol`,
+/// `application` and `both` that it fits, or as `other` when it holds
+/// neither kind (a checkpoint pointer alone, a lifecycle record).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JournalGroups {
+    /// Groups of protocol transitions and no application outcome.
+    pub protocol: u64,
+    /// Groups of application outcomes and no protocol transition.
+    pub application: u64,
+    /// Groups holding both.
+    pub both: u64,
+    /// Groups holding neither.
+    pub other: u64,
+    /// Protocol transitions journaled: promises, votes, adoptions and
+    /// Sync bindings.
+    pub protocol_records: u64,
+    /// Of those, the ones carrying a command's payload row.
+    pub payload_records: u64,
+    /// Application outcomes journaled, one an executed command.
+    pub application_records: u64,
+}
+
+/// What a voter's transport carried between voters (task-d62),
+/// cumulative over every peer link and lane. Where a link carries a
+/// turn's frames together (task-d61), frames over streams is the
+/// batching factor; elsewhere the two are equal.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Traffic {
+    /// Frames written to peers.
+    pub sent_frames: u64,
+    /// Their bytes.
+    pub sent_bytes: u64,
+    /// Streams opened to peers.
+    pub sent_streams: u64,
+    /// Frames to a peer lost before they were written.
+    pub sent_lost: u64,
+    /// Streams those frames were lost on: a refused stream loses every
+    /// frame it carried (task-d61).
+    #[serde(default)]
+    pub sent_lost_streams: u64,
+    /// Frames read from peers.
+    pub received_frames: u64,
+    /// Their bytes.
+    pub received_bytes: u64,
+    /// Streams peers opened to this voter.
+    pub received_streams: u64,
+    /// UDP datagrams QUIC sent on peer connections, acknowledgements
+    /// included (task-d61).
+    #[serde(default)]
+    pub datagrams_sent: u64,
+    /// UDP datagrams QUIC received on peer connections.
+    #[serde(default)]
+    pub datagrams_received: u64,
+    /// The system calls that sent those datagrams.
+    #[serde(default)]
+    pub send_calls: u64,
+    /// ACK frames QUIC sent on peer connections.
+    #[serde(default)]
+    pub acks_sent: u64,
+    /// ACK frames QUIC received on peer connections.
+    #[serde(default)]
+    pub acks_received: u64,
+    /// The same QUIC counts on this node's api connections, callers' and
+    /// collectors' (task-d70), so its datagrams split into its two planes.
+    #[serde(default)]
+    pub api: Datagrams,
+    /// The frames this node sent and took on its api connections, by
+    /// kind (task-d88's R3).
+    #[serde(default)]
+    pub api_frames: ApiFrames,
+    /// Handshakes refused because an observer's or learner's certificate
+    /// named a committed voter's node (design Section 20.4). No legitimate
+    /// peer today: until a prepared transition names a staged learner's
+    /// incarnation (task-d39), above zero means an issuer signed what it
+    /// never should, and an operator has a certificate to revoke.
+    #[serde(default)]
+    pub refused_voter_names: u64,
+}
+
+/// The api plane's frames at one node, by kind (task-d88's R3).
+///
+/// QUIC packs frames into datagrams as it sees fit, so datagrams cannot
+/// be split by kind; the frames can, and over the voters they show what
+/// the plane's datagrams carry. Every count is of frames this node
+/// handed to its transport, or took from it, on an api connection: a
+/// frame to or from a voter in this process does not cross the plane and
+/// is not counted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ApiFrames {
+    /// Submissions this node's collector sent to a voter elsewhere.
+    pub submissions: u64,
+    /// Reads this node's collector sent to a leader elsewhere (task-d50).
+    pub reads: u64,
+    /// Fast acknowledgements this voter returned to a collector
+    /// elsewhere.
+    pub fast_acks: u64,
+    /// Slow acknowledgements returned the same way.
+    pub slow_acks: u64,
+    /// The leader's replies returned the same way.
+    pub leader_replies: u64,
+    /// Other evidence returned the same way.
+    pub other_evidence: u64,
+    /// Releases returned the same way.
+    pub releases: u64,
+    /// Answers to a read returned the same way (task-d50).
+    pub read_answers: u64,
+    /// Frames of any other kind returned the same way.
+    pub other_returned: u64,
+    /// Frames callers sent: requests, resolutions, binds, watch opens.
+    pub requests: u64,
+    /// Submissions and reads collectors elsewhere sent this voter.
+    pub from_collectors: u64,
+}
+
+/// What QUIC sent and received on one class of connections (task-d70).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Datagrams {
+    /// UDP datagrams sent, acknowledgements included.
+    pub datagrams_sent: u64,
+    /// UDP datagrams received.
+    pub datagrams_received: u64,
+    /// The system calls that sent them.
+    pub send_calls: u64,
+    /// ACK frames sent.
+    pub acks_sent: u64,
+    /// ACK frames received.
+    pub acks_received: u64,
+}
+
+/// A pipeline thread's jobs and their three times (task-d62), summed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Jobs {
+    /// Jobs taken back.
+    pub count: u64,
+    /// From hand-over to the thread starting each.
+    pub queued: Duration,
+    /// The thread running each: the append and its sync, or the
+    /// projection's commit.
+    pub served: Duration,
+    /// From each one's end to the domain thread taking it back.
+    pub completed: Duration,
+    /// `queued`, distributed over the jobs (task-d97, #191 review).
+    #[serde(default)]
+    pub queued_each: Distribution,
+    /// `served`, distributed over the jobs: for the journal's appender,
+    /// each append and its sync, the disk's own tail.
+    #[serde(default)]
+    pub served_each: Distribution,
+}
+
+/// Why commands missed the fast path, and the fast acknowledgements a
+/// voter sent (task-d62), cumulative.
+///
+/// The `missed_*` counts add up to [`Cost::established_slow`]: each
+/// command this voter established on the slow path is classified from
+/// the votes it counted, read when the command executed. The reasons are
+/// the leader's for a leader, and a follower's own for a command it
+/// learned from its own votes; a command it executed from a commit it
+/// did not learn itself is unclassified.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FastPath {
+    /// A fast-set acknowledgement saw another conflict path.
+    pub missed_path: u64,
+    /// A fast-set acknowledgement saw the path but other direct
+    /// dependencies.
+    pub missed_deps: u64,
+    /// A fast-set acknowledgement the quorum needed had not arrived by
+    /// execution.
+    pub missed_missing: u64,
+    /// The fast quorum formed, after the slow one had decided.
+    pub missed_slow_first: u64,
+    /// No reason this voter could read.
+    pub missed_unclassified: u64,
+    /// Fast acknowledgements this voter sent as a fast-set follower.
+    pub acks: u64,
+    /// Of them, those sent while task-d34's `reordered` marker held its
+    /// path off every leader path. The marker is gone (task-d67): zero,
+    /// kept so a reading keeps its shape.
+    pub acks_reordered: u64,
+}
+
+/// The pre-acceptances a voter holds that the leader has not ordered
+/// (task-d62), at the snapshot. Not cumulative.
+///
+/// One the leader ordered a later command past is set aside (task-d67):
+/// its path log lets go of it, so it costs no fast decision after that,
+/// and its record stays until it is decided or a Sync releases it. One
+/// the next synchronization orders is gone by the next snapshot; an
+/// orphan the leader never orders shows as an age that grows from
+/// snapshot to snapshot.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnorderedPreAcceptances {
+    /// Pre-acceptances the leader has not ordered: pending in a path log,
+    /// or set aside and undecided.
+    pub pending: u64,
+    /// Of them, those set aside: the leader ordered a later command past
+    /// them (task-d67).
+    pub reordered: u64,
+    /// How long the oldest of those has been held, from the first
+    /// snapshot that saw it.
+    pub oldest: Duration,
+    /// For a leader, the commands its own path log holds pending. It
+    /// synchronizes each proposal as it makes it (task-d68), so this stays
+    /// zero. Zero for a follower.
+    #[serde(default)]
+    pub leader_log: u64,
+}
+
+/// From learned to released on the leader (task-d62), summed over
+/// [`Release::commands`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Release {
+    /// Commands timed: committed from this voter's own votes while it led,
+    /// and released by it.
+    pub commands: u64,
+    /// From committed to applied: predecessors executing.
+    pub predecessors: Duration,
+    /// From applied to its execution group closing.
+    pub group: Duration,
+    /// From the group closing to the release: the group's journal sync,
+    /// which releases it since task-d63 (`projection` before task-d83,
+    /// named for the commit it timed before then).
+    pub journal: Duration,
+    /// How each wait was distributed over the commands (task-d97).
+    #[serde(default)]
+    pub distributions: ReleaseDistributions,
+}
+
+/// What a node's frontend took from a caller's request read off its
+/// stream to the answer handed back to the transport (task-d97, #191
+/// review), at this node, writes and reads apart. Beside the client's
+/// own latency, it splits the client's tail into the server's and the
+/// network's; beside the parts, it says how much of the server's tail
+/// they hold.
+///
+/// An operation's answer is counted: one from consensus, from the read
+/// barrier, or from a retained result. An answer at the door, a refusal
+/// or a binding, is not an operation's and is not counted, and neither
+/// is a request whose caller went away or that was never answered.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Answered {
+    /// Requests other than a read.
+    #[serde(default)]
+    pub writes: Distribution,
+    /// Current reads.
+    #[serde(default)]
+    pub reads: Distribution,
+}
+
+/// What a frontend's output gate did with the results it was asked to
+/// disclose (#185), cumulative except where said.
+///
+/// A refusal here is `OUTPUT_WITHHELD`, which a client takes as final: an
+/// executed command whose result its session may not see. Counted on the
+/// node, a run shows refusals without a client to report them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Gate {
+    /// Results withheld: the barrier didn't permit them, or the gate had no
+    /// record of what the request asked.
+    pub denied: u64,
+    /// Results held because this node hadn't yet projected the session
+    /// they were for; the caller is told to ask again.
+    pub deferred: u64,
+    /// Request records the gate kept, as the snapshot found them.
+    pub remembered: u64,
+}
+
+/// The distributions of a command's waits from learned to released on
+/// the leader (task-d97), over the same commands as [`Release`]'s sums.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseDistributions {
+    /// From committed to applied.
+    #[serde(default)]
+    pub predecessors: Distribution,
+    /// From applied to its group closing.
+    #[serde(default)]
+    pub group: Distribution,
+    /// From the group closing to the release.
+    #[serde(default)]
+    pub journal: Distribution,
+    /// From learned to released.
+    #[serde(default)]
+    pub whole: Distribution,
+    /// From a submission's arrival at the leader's loop to learned: the
+    /// consensus round's own tail (#191 review), over the commands
+    /// submitted while it led.
+    #[serde(default)]
+    pub round: Distribution,
+}
+
+/// The domain loop's blocking takes from its pipeline threads (task-d54).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PipelineWaits {
+    /// Waits for a journal append on the appender's thread.
+    pub appender: Wait,
+    /// Waits for a projection commit on the materializer's thread.
+    pub materializer: Wait,
+    /// The appender's jobs, timed (task-d62).
+    #[serde(default)]
+    pub appender_jobs: Jobs,
+    /// The materializer's jobs, timed (task-d62).
+    #[serde(default)]
+    pub materializer_jobs: Jobs,
+}
+
+/// Blocking takes and their total time.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Wait {
+    /// Takes that found the job still running.
+    pub count: u64,
+    /// The time those takes blocked.
+    pub time: Duration,
+}
+
+/// CPU time a voter's process has used (task-d54), cumulative.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Cpu {
+    /// The domain loop's own thread.
+    pub domain: Duration,
+    /// Every thread of the process: the loop, the appender and the
+    /// materializer, the transport's workers.
+    pub process: Duration,
+    /// How the domain loop's thread was scheduled (task-d55), or why
+    /// there is no reading.
+    #[serde(default = "not_instrumented")]
+    pub domain_scheduling: Measure<Scheduling>,
+}
+
+/// How a thread was scheduled (task-d55), cumulative.
+///
+/// The domain loop's busy time less its CPU time, less the waits on its
+/// pipeline threads, is time it was neither computing nor counted as
+/// waiting. Runnable and not running is [`Scheduling::run_queue`]: a
+/// host with more runnable threads than cores. Otherwise it is a blocking
+/// call on the loop's own thread, which [`Scheduling::voluntary`] counts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Scheduling {
+    /// Time runnable and waiting for a CPU.
+    pub run_queue: Duration,
+    /// Times the thread gave up the CPU itself.
+    pub voluntary: u64,
+    /// Times the scheduler took the CPU from it.
+    pub involuntary: u64,
+    /// The domain loop's run-queue time a pass, distributed over a
+    /// sample of its passes (task-d97): the first pass to start both
+    /// [`RUN_QUEUE_SAMPLE_PERIOD`] and [`RUN_QUEUE_SAMPLE_PASSES`] passes
+    /// or more after the last sampled one, from its start to the next
+    /// pass's start. That is the pass's own preemptions and the wait to
+    /// run once something woke it again.
+    #[serde(default)]
+    pub run_queue_per_pass: Distribution,
+    /// The same, over the sampled passes in which the loop executed at
+    /// least one command (#191 review): the idle passes' near-zero waits
+    /// left out, so it compares with the commands' own tails.
+    #[serde(default)]
+    pub run_queue_per_working_pass: Distribution,
+}
+
+/// How far apart the domain loop's sampled passes start (task-d97): two
+/// reads of the thread's `schedstat` a sample, at most one sample a
+/// period and one in [`RUN_QUEUE_SAMPLE_PASSES`] passes, whichever is
+/// rarer.
+///
+/// The period bounds a busy loop (task-d115): a busy leader's loop takes
+/// some sixty passes a turn, and one in sixteen made the sample's reads 35
+/// of its 55 system calls a turn. A hundred samples a second still fill
+/// the distribution.
+pub const RUN_QUEUE_SAMPLE_PERIOD: Duration = Duration::from_millis(10);
+
+/// The fewest passes between two sampled ones: the count bounds an idle
+/// loop (#254 review). An idle loop passes 10 to 16 times a second, more
+/// than a period apart, so the period alone samples nearly every pass:
+/// 60 to 100 reads a second a voter where one in sixteen made about 10,
+/// and a host's idle domains multiply it.
+pub const RUN_QUEUE_SAMPLE_PASSES: u32 = 16;
+
+fn not_instrumented<T>() -> Measure<T> {
+    Measure::Unavailable(Unavailable::NotInstrumented)
+}
+
+/// What a leader's read barrier did (task-d50), cumulative.
+///
+/// The waits are summed over the reads served, so a reader divides them
+/// by [`Reads::served`] for the mean: how long a read waited for its
+/// confirmation round, for everything below its index to execute (which
+/// includes the round), and in all before it was answered.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Reads {
+    /// Reads answered by the barrier.
+    pub served: u64,
+    /// Reads refused, ordered by their frontends instead.
+    pub refused: u64,
+    /// Confirmation rounds started.
+    pub rounds: u64,
+    /// Confirmation rounds that confirmed.
+    pub confirmed: u64,
+    /// Milliseconds from arrival to confirmation, summed.
+    pub waited_confirm_ms: u64,
+    /// Milliseconds from arrival to the index executed, summed.
+    pub waited_index_ms: u64,
+    /// Milliseconds from arrival to the answer, summed.
+    pub waited_ms: u64,
+    /// The same wait, distributed over the reads served (task-d97), at
+    /// the barrier's millisecond resolution.
+    #[serde(default)]
+    pub waited: Distribution,
+    /// Snapshots pinned to answer reads: one per pump with a read due
+    /// (task-d58).
+    #[serde(default)]
+    pub snapshots: u64,
+    /// Due reads held again because the snapshot pinned for them had not
+    /// reached their position yet (task-d58).
+    #[serde(default)]
+    pub behind: u64,
+}
+
+/// What a leader's re-sends of proposals did (task-d49), cumulative.
+///
+/// A re-send is classified when it goes out: [`Resends::decided`],
+/// [`Resends::acknowledged`] and [`Resends::unanswered`] add up to every
+/// re-send. Whether an unanswered one was lost or late shows afterwards:
+/// [`Resends::late`] counts adoptions that arrived again, as duplicates,
+/// after a re-send, and [`Resends::lost`] the answers to a re-send that
+/// were not late.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Resends {
+    /// First sends of re-proposals held back from a new leader's first
+    /// batch; not re-sends.
+    pub deferred: u64,
+    /// First sends of held-back re-proposals that went out as a voter's
+    /// adoptions arrived, not on the re-send timer (the takeover gap on
+    /// #98).
+    #[serde(default)]
+    pub topped_up: u64,
+    /// Re-sends of a proposal already decided.
+    pub decided: u64,
+    /// Re-sends to a voter that had acknowledged the proposal on the
+    /// fast path.
+    pub acknowledged: u64,
+    /// Re-sends to a voter that had not answered the proposal.
+    pub unanswered: u64,
+    /// Answers to a re-send that were not late: the voter lacked the
+    /// proposal, or its first answer was lost.
+    pub lost: u64,
+    /// Answers that had been on their way when the re-send went out.
+    pub late: u64,
+    /// Decided proposals the leader stopped re-sending to a voter and left
+    /// to catch-up.
+    pub handed_off: u64,
+    /// Votes refused as duplicates, fast or slow.
+    pub duplicate_votes: u64,
+    /// Calls of the leader's re-send timer that looked for something to
+    /// send (task-d59), every 250 ms while it leads.
+    #[serde(default)]
+    pub calls: u64,
+    /// Proposals those calls looked at, over every voter (task-d59).
+    #[serde(default)]
+    pub scanned: u64,
+    /// The domain loop's time in those calls (task-d59), in all: the
+    /// loop does nothing else meanwhile.
+    #[serde(default)]
+    pub time: Duration,
+    /// The longest of those calls (task-d59).
+    #[serde(default)]
+    pub longest: Duration,
+    /// Copies of proposals, first sends and retries, that left before
+    /// their batch was durable, one per follower (task-d98). Zero unless
+    /// the domain activated `EarlyProposal`.
+    #[serde(default)]
+    pub early: u64,
+}
+
+impl Resends {
+    /// Every re-send, whatever its reason.
+    pub const fn resent(&self) -> u64 {
+        self.decided + self.acknowledged + self.unanswered
+    }
+}
+
+/// One reporting interval of the domain loop (task-d45).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Interval {
+    /// How long the interval was.
+    pub span: Duration,
+    /// How much of it the loop was busy.
+    pub busy: Duration,
+    /// Commands applied in it.
+    pub executed: u64,
+    /// CPU time the domain loop's thread used in it (task-d54).
+    #[serde(default = "not_instrumented")]
+    pub domain_cpu: Measure<Duration>,
 }
 
 impl MetricsSnapshot {
@@ -637,5 +1583,191 @@ impl Recorder {
                 },
             })
             .collect()
+    }
+}
+
+/// Buckets of a [`Distribution`]: the values below four microseconds
+/// one each, then four for each power of two up to 2^26 µs (about 67 s),
+/// so a value is placed within about a fifth of where it fell. A longer
+/// value falls in the last. The bucketing is `coord_storage::latency`'s,
+/// which the pipeline threads count their jobs in too.
+pub const DISTRIBUTION_BUCKETS: usize = coord_storage::latency::BUCKETS;
+
+/// How a wait was distributed, cumulative (task-d97): counts in
+/// log-linear buckets of microseconds and the longest seen.
+///
+/// A sum says what the mean was; it can't say what the slowest
+/// operations waited for, which is what a p99 is made of. A reader takes
+/// two snapshots' buckets apart for an interval and reads its quantiles
+/// from them. Printed sparse: only the buckets that counted something.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "SparseDistribution", into = "SparseDistribution")]
+pub struct Distribution {
+    /// Values counted in each bucket.
+    pub buckets: [u64; DISTRIBUTION_BUCKETS],
+    /// The longest value counted.
+    pub max: Duration,
+}
+
+impl From<coord_storage::latency::Counts> for Distribution {
+    fn from(counts: coord_storage::latency::Counts) -> Self {
+        Distribution {
+            buckets: counts.buckets,
+            max: counts.max,
+        }
+    }
+}
+
+impl Default for Distribution {
+    fn default() -> Self {
+        Distribution {
+            buckets: [0; DISTRIBUTION_BUCKETS],
+            max: Duration::ZERO,
+        }
+    }
+}
+
+impl Distribution {
+    /// The bucket `micros` falls in.
+    pub fn bucket(micros: u64) -> usize {
+        coord_storage::latency::bucket(micros)
+    }
+
+    /// The least value, in microseconds, bucket `index` holds.
+    pub fn lower(index: usize) -> u64 {
+        coord_storage::latency::lower(index)
+    }
+
+    /// Count `wait`.
+    pub fn record(&mut self, wait: Duration) {
+        self.buckets[coord_storage::latency::bucket_of(wait)] += 1;
+        self.max = self.max.max(wait);
+    }
+
+    /// Values counted.
+    pub fn count(&self) -> u64 {
+        self.buckets.iter().sum()
+    }
+
+    /// The value at quantile `q` (0 to 1): the upper edge of the bucket
+    /// it falls in, never past the longest seen. `None` with nothing
+    /// counted.
+    pub fn quantile(&self, q: f64) -> Option<Duration> {
+        let count = self.count();
+        if count == 0 {
+            return None;
+        }
+        let rank = ((q.clamp(0.0, 1.0) * count as f64).ceil() as u64).max(1);
+        let mut seen = 0;
+        for (index, n) in self.buckets.iter().enumerate() {
+            seen += n;
+            if seen >= rank {
+                let upper = if index + 1 < DISTRIBUTION_BUCKETS {
+                    Duration::from_micros(Self::lower(index + 1))
+                } else {
+                    self.max
+                };
+                return Some(upper.min(self.max));
+            }
+        }
+        Some(self.max)
+    }
+}
+
+/// A [`Distribution`] as it is printed: `[bucket, count]` pairs for the
+/// buckets that counted something.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct SparseDistribution {
+    #[serde(default)]
+    buckets: Vec<(usize, u64)>,
+    #[serde(default)]
+    max: Duration,
+}
+
+impl From<Distribution> for SparseDistribution {
+    fn from(d: Distribution) -> Self {
+        SparseDistribution {
+            buckets: d
+                .buckets
+                .iter()
+                .enumerate()
+                .filter(|(_, n)| **n > 0)
+                .map(|(i, n)| (i, *n))
+                .collect(),
+            max: d.max,
+        }
+    }
+}
+
+impl From<SparseDistribution> for Distribution {
+    fn from(s: SparseDistribution) -> Self {
+        let mut d = Distribution {
+            max: s.max,
+            ..Distribution::default()
+        };
+        for (i, n) in s.buckets {
+            if let Some(slot) = d.buckets.get_mut(i) {
+                *slot += n;
+            }
+        }
+        d
+    }
+}
+
+#[cfg(test)]
+mod distribution_tests {
+    use super::*;
+
+    /// Each bucket's lower edge falls in it, the one below it in the
+    /// bucket before, and the edges grow within about a fifth of each
+    /// other past the first few microseconds (task-d97).
+    #[test]
+    fn the_buckets_are_contiguous_and_within_a_fifth() {
+        for index in 0..DISTRIBUTION_BUCKETS {
+            let lower = Distribution::lower(index);
+            assert_eq!(Distribution::bucket(lower), index, "lower edge of {index}");
+            if index > 0 {
+                assert_eq!(Distribution::bucket(lower - 1), index - 1, "below {index}");
+            }
+            if index >= coord_storage::latency::SUB_BUCKETS && index + 1 < DISTRIBUTION_BUCKETS {
+                let next = Distribution::lower(index + 1);
+                assert!((next - lower) * 4 <= lower, "bucket {index} is too wide");
+            }
+        }
+        assert_eq!(Distribution::bucket(u64::MAX), DISTRIBUTION_BUCKETS - 1);
+    }
+
+    #[test]
+    fn quantiles_read_the_bucket_their_rank_falls_in() {
+        let mut d = Distribution::default();
+        assert_eq!(d.quantile(0.5), None);
+        // 98 of a millisecond, one of 12 ms, one of 40 ms.
+        for _ in 0..98 {
+            d.record(Duration::from_millis(1));
+        }
+        d.record(Duration::from_millis(12));
+        d.record(Duration::from_millis(40));
+        assert_eq!(d.count(), 100);
+        assert_eq!(d.max, Duration::from_millis(40));
+        let p50 = d.quantile(0.5).expect("p50");
+        assert!(p50 >= Duration::from_millis(1) && p50 <= Duration::from_micros(1_200));
+        let p99 = d.quantile(0.99).expect("p99");
+        assert!(p99 >= Duration::from_millis(12) && p99 <= Duration::from_micros(14_400));
+        assert_eq!(d.quantile(1.0), Some(Duration::from_millis(40)));
+    }
+
+    /// Printed sparse and read back whole; an older line without the
+    /// field reads as an empty distribution.
+    #[test]
+    fn a_distribution_prints_sparse_and_reads_back() {
+        let mut d = Distribution::default();
+        d.record(Duration::from_micros(3));
+        d.record(Duration::from_millis(7));
+        let text = serde_json::to_string(&d).expect("prints");
+        assert!(text.len() < 80, "{text}");
+        let back: Distribution = serde_json::from_str(&text).expect("reads");
+        assert_eq!(back, d);
+        let empty: Distribution = serde_json::from_str("{}").expect("reads");
+        assert_eq!(empty, Distribution::default());
     }
 }

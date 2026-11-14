@@ -6,6 +6,7 @@
 use std::collections::BTreeMap;
 
 use coord_types::ids::{ClusterId, ConfigurationEpoch, DomainId, ReplicaId, ReplicaIncarnation};
+use coord_types::wire_v1::PeerRole;
 
 use crate::genesis::GenesisManifest;
 
@@ -29,6 +30,20 @@ pub enum MembershipError {
         /// The node named twice.
         node: ReplicaId,
     },
+    /// A voter count the design does not allow (task-d31): an epoch has
+    /// three or five voters, or one in the single-voter test profile.
+    UnsupportedVoterCount {
+        /// Voters the manifest names.
+        count: usize,
+    },
+}
+
+/// Whether an epoch of `count` voters is one the design allows (task-d31):
+/// three or five, and one for the single-voter test profile. Two and four
+/// have no fast quorum the source protocol defines, and a four-voter epoch
+/// has none in the design at all.
+pub const fn supported_voter_count(count: usize) -> bool {
+    matches!(count, 1 | 3 | 5)
 }
 
 /// What a presented node credential is, against committed membership
@@ -131,6 +146,11 @@ impl Membership {
                 return Err(MembershipError::DuplicateVoter { node });
             }
         }
+        if !supported_voter_count(voters.len()) {
+            return Err(MembershipError::UnsupportedVoterCount {
+                count: voters.len(),
+            });
+        }
         Ok(Membership {
             cluster,
             domain,
@@ -150,6 +170,11 @@ impl Membership {
     /// Epoch.
     pub const fn epoch(&self) -> ConfigurationEpoch {
         self.epoch
+    }
+
+    /// How many voters the epoch commits (task-d31).
+    pub fn voter_count(&self) -> usize {
+        self.voters.len()
     }
 
     /// The committed voters, node order.
@@ -181,6 +206,19 @@ impl Membership {
     /// The committed incarnation of a voter node, if any.
     pub fn voter_incarnation(&self, node: &ReplicaId) -> Option<ReplicaIncarnation> {
         self.voters.get(node).map(|v| v.incarnation)
+    }
+
+    /// Whether a certificate for `role` naming `node` is an observer's
+    /// or a learner's naming a committed voter's node, at any generation
+    /// (design Section 10.1). task-d39 narrows it: a successor staged as
+    /// a learner binds at the incarnation a prepared transition names.
+    ///
+    /// A peer is known downstream by its replica identity, and a voter's
+    /// is not one a non-voter may hold. The binder refuses such a
+    /// certificate, and `coordd place` and `inspect` name it on the node
+    /// that holds it, where it can be replaced.
+    pub fn non_voter_names_voter(&self, node: &ReplicaId, role: PeerRole) -> bool {
+        matches!(role, PeerRole::Observer | PeerRole::Learner) && self.voters.contains_key(node)
     }
 
     /// What the credential a node presents *is*, against what this
