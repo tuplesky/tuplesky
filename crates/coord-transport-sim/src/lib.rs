@@ -331,14 +331,7 @@ impl Node {
         let quic_server = QuicServerConfig::try_from(server).expect("quic server");
         let limits = config.limits;
         let lane_config = |l: &LaneLimits| {
-            coord_transport::lane::transport_config(
-                l,
-                limits.idle_timeout,
-                limits.keep_alive,
-                limits.ack_frequency,
-                limits.reordering,
-            )
-            .expect("lane config")
+            coord_transport::lane::transport_config(l, &limits).expect("lane config")
         };
         let lane_transport = [
             lane_config(&limits.lanes[0]),
