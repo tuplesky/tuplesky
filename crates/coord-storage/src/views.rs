@@ -169,6 +169,39 @@ struct Budget {
     bytes: u32,
 }
 
+/// The fewest bytes a budgeted page asks for: more than any row a view
+/// reads, which is a key at its limit with its collection's prefix and an
+/// envelope at its limit with its header.
+///
+/// An engine refuses a page whose first row is larger than the page
+/// (`ErrorClass::Limit`, [`OrderedRead::scan_page`]). Were a page to ask
+/// for no more than the bytes the budget has left, a row that doesn't fit
+/// them would come back as that engine error, and a command whose view
+/// overruns the budget would stop the voter instead of being refused, at
+/// every voter and again on replay. Asking for at least a whole row leaves
+/// the refusal to [`Budget::charge`], which every replica makes the same
+/// way.
+const PAGE_BYTES_FLOOR: u32 = {
+    let floor = coord_store_api::envelope::MAX_ENVELOPE_PAYLOAD + 64 * 1024;
+    assert!(floor <= u32::MAX as usize);
+    floor as u32
+};
+
+const _: () = assert!(
+    coord_types::logical_v1::limits::MAX_KEY_BYTES + 1024 < 64 * 1024,
+    "a key at its limit, its collection's prefix and an envelope's header fit the floor's margin"
+);
+
+/// The byte limit for the next page of a budgeted scan: what the budget
+/// has left, and never less than [`PAGE_BYTES_FLOOR`]. A budget with no
+/// bytes left is refused before anything is read.
+fn page_bytes(budget: &Budget) -> Result<NonZeroU32, ViewBuildError> {
+    if budget.bytes == 0 {
+        return Err(ViewBuildError::BudgetExceeded);
+    }
+    Ok(NonZeroU32::new(budget.bytes.max(PAGE_BYTES_FLOOR)).expect("nonzero"))
+}
+
 impl Budget {
     fn charge(&mut self, rows: usize, bytes: usize) -> Result<(), ViewBuildError> {
         let rows = u32::try_from(rows).map_err(|_| ViewBuildError::BudgetExceeded)?;
@@ -200,14 +233,13 @@ fn scan_all<V: OrderedRead>(
         direction: Direction::Forward,
         resume_after: None,
         max_rows: NonZeroU32::new(256).expect("nonzero"),
-        // The page byte limit is the remaining view budget, so any
-        // schema-valid row (a value near `MAX_VALUE_BYTES` plus key and
-        // envelope) fits a page while the budget allows it.
-        max_bytes: NonZeroU32::new(budget.bytes).ok_or(ViewBuildError::BudgetExceeded)?,
+        max_bytes: page_bytes(budget)?,
     };
     loop {
-        request.max_bytes = NonZeroU32::new(budget.bytes).ok_or(ViewBuildError::BudgetExceeded)?;
+        request.max_bytes = page_bytes(budget)?;
         let page = view.scan_page(collection.id(), &request)?;
+        // A page may hold rows past the budget; the first of them is
+        // refused here.
         for row in &page.rows {
             budget.charge(1, row.key.len() + row.value.len())?;
         }
@@ -446,14 +478,16 @@ pub fn active_leases_page<V: OrderedRead>(
         direction: Direction::Forward,
         resume_after: after.map(|id| codecs::lease_row_key(&id)),
         max_rows: NonZeroU32::new(256).expect("nonzero"),
-        max_bytes: NonZeroU32::new(budget.bytes).ok_or(ViewBuildError::BudgetExceeded)?,
+        max_bytes: page_bytes(&budget)?,
     };
     let mut leases = Vec::new();
     let mut last: Option<LeaseId> = None;
     loop {
         request.max_rows =
             NonZeroU32::new(budget.rows.min(256)).ok_or(ViewBuildError::BudgetExceeded)?;
-        request.max_bytes = NonZeroU32::new(budget.bytes).ok_or(ViewBuildError::BudgetExceeded)?;
+        // At least a whole row, so a row past the bytes left ends the page
+        // below rather than failing the scan ([`PAGE_BYTES_FLOOR`]).
+        request.max_bytes = page_bytes(&budget)?;
         let page = view.scan_page(Collection::LeaseV1.id(), &request)?;
         for row in &page.rows {
             if budget.charge(1, row.key.len() + row.value.len()).is_err() {
