@@ -1207,7 +1207,7 @@ Each step has its own PRs and pair.
 - **Steps 0 to 5:** the plan of record through steps 4 and 5's Sync rule, by the re-check on #283 ([6868671574](https://github.com/tuplesky/tuplesky/pull/283#issuecomment-6868671574)). #283 is merged.
 - **Owed before 5a, now written:** a frame a voter holds by name without its bytes (step 4, and 5a). It doesn't block 4a or 4b.
 - **Step 0:** B0 and B1 are measured (below). **Step 1:** 1a is #286.
-- The thresholds (R12) stay provisional until the owner answers.
+- **The thresholds (R12) are the owner's, confirmed as written (2026-11-14).** The go/no-go below says what each one decides.
 - The first review's 16 points ([6865705600](https://github.com/tuplesky/tuplesky/pull/283#issuecomment-6865705600)) are marked (R1) to (R16) in the steps they change.
 
 **The rules every step keeps.**
@@ -1262,7 +1262,7 @@ Each step has its own PRs and pair.
   - Steps 1 and 2 need nothing. Step 0's bounds decide which of them goes first. The default is 1, then 2. Step 2 goes before the wire and journal steps either way, since its saving lands weeks before the decision's.
   - Steps 3, 4 and 5 are in the order safety needs, and only past the go/no-go below. Steps 6 and 7 follow step 5, ordered by their bounds.
 
-**The go/no-go for steps 3 to 5 (R12), written before B2 is measured.** B2 − B1 is the decision's saving: servers' CPU, ms an operation, locally at 120 callers, read as one pair of B2 against B1.
+**The go/no-go for steps 3 to 5 (R12), written before B2 is measured and confirmed by the owner as written (2026-11-14).** B2 − B1 is the decision's saving: servers' CPU, ms an operation, locally at 120 callers, read as one pair of B2 against B1. The local figures decide.
 - **Go at −0.10 or more** [about −0.15 on the 7763, 40% of the −0.38 the owner agreed on]. With steps 1 and 2, the frame alone then puts servers' CPU at about 0.85 to 0.94 of TLS etcd on the 7763 (10.1).
 - **Between −0.05 and −0.10, back to the owner.** The frame alone is then at 0.85 to 1.02 of etcd on the 7763: at it, and under it only at the band's better end. The owner chooses one of three:
   - steps 3 to 5 anyway;
@@ -1271,6 +1271,7 @@ Each step has its own PRs and pair.
 - **Under −0.05, stop.** The frame alone is then at or over etcd on the 7763, and the decision doesn't pay for 10 to 14 weeks and a protocol change. The reading goes to the owner beside lazy voters' −0.16 [7763].
 - **Latency, at any of the three.** If B2's p50 or p99 at 1 or 5 callers is above B1's by more than the base runs' spread, that goes to the owner with the CPU reading.
 - **The 9V45 isn't decided by this.** Getting under etcd there takes both the frame and lazy voters (10.1), whatever B2 shows.
+- **The 7763 figures in brackets** translate the local ones. They are re-read after testing's re-baseline of the load generator (review's note).
 
 **The steps.** The bounds now are local at 120 callers [7763]. Every one of them is to be measured at step 0 before its step is built.
 
@@ -1344,7 +1345,9 @@ Each step has its own PRs and pair.
   - At the bench's sizes a group is one record. Groups of large outcomes take a few.
   - B0 cuts a run at half the journal group's byte limit and at the record's update bound. At the bench's sizes neither binds, so it bounds step 1 as written.
 - **What recovery reads:** replay reads a group record as the application outcome of each command it names. Those are the same facts, in one record. The decision's records are untouched.
-- **Mixed versions:** the format is local, since only this voter reads its journal. 1b raises the local image version, which 1a's release reads and an older release refuses to open. So a voter goes back at most to 1a's release.
+- **Mixed versions:** the format is local, since only this voter reads its journal. 1b raises the journal record's format, the one it writes (`current`), from 1 to 2. 1a's release reads 2, since its window reads ahead to it, and an older release refuses it as unsupported. So a voter goes back at most to 1a's release.
+  - **Only the record's format moves.** The local checkpoint's stays as it is: raising it too would leave 1a unable to open a 1b image, and so close the way back.
+  - 1b raises `current` in the registry; it doesn't seal through `seal_as`, which stays for fixtures.
 - **Pinned by:**
   - a group of 32 outcomes near 1 MiB each, cut into records under the bounds;
   - a lone outcome over 1 MiB, in a record of its own;
@@ -1353,7 +1356,8 @@ Each step has its own PRs and pair.
   - the crash matrix's cuts at the group record: torn, durable but not acknowledged, and between two records of one group;
     - the last adds no state: per-command records already allow a crash between two commands of one group. Its expected result is that state's: the durable records' commands count as applied, and the rest are executed again;
   - a journal holding both forms replays to the same state as either alone;
-  - a fixture: 1a's release opens 1b's journal.
+  - a fixture: 1a's release opens 1b's journal;
+  - `frontier_after`'s group arm: once a group's record is durable, the next application extends the group's last position. It has no test before 1b, since 1a appends no group (review of #286).
 - **Bound:** B0. **Checkpoint:** half of B0, in the appender and the materializer, as µs a command. Application records a command at every voter fall from one to one a group.
 
 **Step 2: a follower takes a frame in one pass.** This is lever 2's steps 3 and 4 (6.7), in the form steps 4 and 5 extend.
