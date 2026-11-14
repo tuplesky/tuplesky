@@ -176,9 +176,20 @@ pub enum CollectorEvent {
         to: String,
     },
     /// A command relayed to its ballot's leader alone (task-d102,
+    /// task-d100's step B), which that leader took and hadn't answered
+    /// within [`crate::RELAY_FALLBACK_MILLIS`], was submitted to the
+    /// leader alone again, once (storm fix 3).
+    RelayAskedLeader {
+        /// Command.
+        command: String,
+        /// The leader it went to.
+        to: String,
+    },
+    /// A command relayed to its ballot's leader alone (task-d102,
     /// task-d100's step B) was submitted to every voter as one answered
     /// on the release alone: its leader did not answer within
-    /// [`crate::RELAY_FALLBACK_MILLIS`], or said it isn't leading.
+    /// [`crate::RELAY_FALLBACK_MILLIS`] of being asked again, never took
+    /// it, or said it isn't leading.
     RelayFellBack {
         /// Command.
         command: String,
