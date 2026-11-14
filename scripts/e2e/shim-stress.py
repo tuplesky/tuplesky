@@ -365,13 +365,28 @@ def final_read():
         p.stdin.close()
         p.wait()
         if answer["type"] == "ok":
-            return {m[1]: (m[2] or []) for m in answer["value"]}
+            return {m[1]: m[2] for m in answer["value"]}
         time.sleep(3)
+    return None
+
+
+def read_list(k, value, problems, what):
+    """A read's value as a list: an absent register (null) is empty, a
+    list is itself, and anything else, which this append-only workload
+    cannot produce, is a problem and `None`."""
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    problems.append(f"key {k}: {what} returned {value!r}, not a list or null")
     return None
 
 
 def check(ops, final):
     problems, failed, reads = [], set(), {}
+    if final is not None:
+        final = {k: read_list(k, v, problems, "the final read") for k, v in final.items()}
+        final = {k: v if v is not None else [] for k, v in final.items()}
     # When each (key, element) was first invoked as an append, whatever
     # its answer: a read may see an element only once its append began.
     invoked = {}
@@ -384,7 +399,9 @@ def check(ops, final):
         if answer["type"] == "ok":
             for m in answer["value"]:
                 if m[0] == "r":
-                    reads.setdefault(m[1], []).append((m[2] or [], t0, t1, id(mops)))
+                    r = read_list(m[1], m[2], problems, "an ok read")
+                    if r is not None:
+                        reads.setdefault(m[1], []).append((r, t0, t1, id(mops)))
     # The final read is a read like the others, begun after everything
     # else ended: a value an earlier read saw must still be in it.
     if final is not None:
@@ -436,7 +453,11 @@ def check(ops, final):
         read = {}
         for m in answer["value"]:
             if m[0] == "r" and m[1] not in read:
-                read[m[1]] = tuple(m[2] or [])
+                # A malformed read is reported above; it is no value here.
+                r = read_list(m[1], m[2], [], "an ok read")
+                if r is None:
+                    continue
+                read[m[1]] = tuple(r)
             elif m[0] == "append" and m[1] in read:
                 seen.setdefault((m[1], read[m[1]]), []).append(m[2])
                 del read[m[1]]
