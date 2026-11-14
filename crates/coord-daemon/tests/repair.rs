@@ -2740,6 +2740,9 @@ fn a_turns_relayed_proposals_leave_in_one_frame_at_the_flush() {
                 taken: 3,
                 known: 0,
                 not_taken: 0,
+                // Its three adoptions in one batch (step 2b).
+                frame_batches: 1,
+                frame_adoptions: 3,
             }
         );
     }

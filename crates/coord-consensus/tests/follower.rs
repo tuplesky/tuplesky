@@ -7,10 +7,10 @@
 use std::collections::BTreeSet;
 
 use coord_consensus::{
-    BallotConfiguration, CONSERVATIVE_KEY, CommandRecord, ConfigurationIdentity, FastAck, Follower,
-    FollowerConfig, FollowerRejection, FramedProposal, PayloadRecordV1, Phase, ProtocolMessage,
-    RelayTaken, ReplayRefusal, ReplicaRole, SlowAck, decode_dependency, decode_payload,
-    dependency_key,
+    BallotConfiguration, CONSERVATIVE_KEY, CommandRecord, ConfigurationIdentity, FRAME_BATCH_BYTES,
+    FRAME_BATCH_UPDATES, FastAck, Follower, FollowerConfig, FollowerRejection, FramedProposal,
+    PayloadRecordV1, Phase, ProtocolMessage, RelayTaken, ReplayRefusal, ReplicaRole, SlowAck,
+    decode_dependency, decode_payload, dependency_key,
 };
 use coord_core::capability::{AdmissionReceipt, AttestedAdmission, VerifierToken};
 use coord_core::effect::{BootId, Effect, PeerId};
@@ -22,7 +22,7 @@ use coord_sim::storage::StorageModel;
 use coord_store_api::registry::Collection;
 use coord_types::identity::Digest32;
 use coord_types::ids::*;
-use coord_types::logical_v1::{CanonicalOperation, LogicalRequest, PutOp};
+use coord_types::logical_v1::{BranchOp, CanonicalOperation, LogicalRequest, PutOp, TxnOp};
 use coord_types::wire_v1::{BoundedBytes, MessageV1, RequestV1};
 use coord_types::{CommandId, RetryKey};
 
@@ -2236,8 +2236,9 @@ fn framed(messages: Vec<ProtocolMessage>) -> ProtocolMessage {
 
 /// task-d102: a frame's proposals are taken in one step, each as the
 /// relayed proposal it stands for: both commands are adopted at once,
-/// their batches come out of the one step, and each gets one slow
-/// acknowledgement, to the leader alone.
+/// and each gets one slow acknowledgement, to the leader alone. Their
+/// rows go in one batch, under one barrier (step 2b of the batching
+/// rule's 10.7).
 #[test]
 fn a_frames_proposals_are_adopted_in_one_step() {
     let mut f = booted(1);
@@ -2262,9 +2263,14 @@ fn a_frames_proposals_are_adopted_in_one_step() {
         RelayTaken {
             frames: 1,
             taken: 2,
+            frame_batches: 1,
+            frame_adoptions: 2,
             ..RelayTaken::default()
         }
     );
+    let batches = persisted(&effects);
+    assert_eq!(batches.len(), 1, "one batch for the frame: {batches:?}");
+    assert_eq!(adopted_in(&batches[0]), vec![c1, c2]);
     assert!(f.held().is_empty(), "adopted at once");
     assert_eq!(f.table().phase_of(&c1), Some(Phase::Accept));
     assert_eq!(f.table().phase_of(&c2), Some(Phase::Accept));
@@ -2314,6 +2320,9 @@ fn a_refused_entry_leaves_the_frames_others_as_they_are() {
             taken: 1,
             known: 0,
             not_taken: 1,
+            // The one adoption, in the frame's one batch (step 2b).
+            frame_batches: 1,
+            frame_adoptions: 1,
         }
     );
     assert_ne!(f.table().phase_of(&c1), Some(Phase::Accept));
@@ -2343,4 +2352,438 @@ fn a_held_proposal_is_adopted_when_a_relayed_copy_brings_its_payload() {
         effects.iter().any(|e| matches!(e, Effect::Persist(_))),
         "the adoption batch: {effects:?}"
     );
+}
+
+// ---------------------------------------------------------------------
+// Step 2b of the batching rule's 10.7: a frame's adoptions in as few
+// batches as the frame's bounds allow.
+// ---------------------------------------------------------------------
+
+/// A follower like [`booted`], whose table holds `capacity` commands.
+fn booted_holding(me: u8, capacity: usize) -> Follower {
+    let mut f = Follower::new(FollowerConfig {
+        capacity,
+        ..config(me)
+    });
+    assert!(f.step(boot_event()).is_empty());
+    f
+}
+
+/// The payload record a relayed proposal of request `seq` carries, as
+/// [`relayed_payload`], for a transaction of `puts` puts of `value_len`
+/// bytes each.
+fn relayed_large(seq: u64, puts: usize, value_len: usize) -> (PayloadRecordV1, CommandId) {
+    let success = (0..puts)
+        .map(|i| {
+            BranchOp::Put(PutOp {
+                key: vec![i as u8, seq as u8],
+                value: vec![0xab; value_len],
+                lease: None,
+                prev_kv: false,
+            })
+        })
+        .collect();
+    let request = LogicalRequest::new(
+        NamespaceId([5; 16]),
+        CanonicalOperation::Txn(TxnOp {
+            compares: Vec::new(),
+            success,
+            failure: Vec::new(),
+        }),
+    );
+    let command = CommandId::derive(&retry_key(seq), &request).unwrap();
+    let logical = RequestV1::new(retry_key(seq), &request, 0, 0)
+        .unwrap()
+        .logical
+        .as_slice()
+        .to_vec();
+    let (mut payload, _) = relayed_payload(seq, 0, 0);
+    payload.logical = logical;
+    assert_eq!(payload.admission_digest(), admitted_under());
+    (payload, command)
+}
+
+/// The leader's relayed proposals of `payloads`, in that order, numbered
+/// from `first`: each ordered after the one before on the conservative
+/// key, as a leader's table orders them.
+fn leader_order(
+    leader_view: &mut coord_consensus::CommandTable,
+    payloads: Vec<(PayloadRecordV1, CommandId)>,
+    first: u64,
+) -> Vec<ProtocolMessage> {
+    payloads
+        .into_iter()
+        .enumerate()
+        .map(|(i, (payload, c))| {
+            let l = leader_view
+                .initialize(c, c.0, vec![CONSERVATIVE_KEY.to_vec()])
+                .unwrap();
+            relayed(
+                proposal(c, l.deps, first + i as u64, l.paths, l.path),
+                payload,
+            )
+        })
+        .collect()
+}
+
+/// The bytes task-d106's bounds count in a batch: its rows' keys and
+/// values.
+fn rows_bytes(batch: &coord_core::effect::PersistBatch) -> usize {
+    batch
+        .updates
+        .iter()
+        .map(|u| u.key.len() + u.value.as_ref().map_or(0, Vec::len))
+        .sum()
+}
+
+/// The commands whose dependency rows `batch` writes.
+fn adopted_in(batch: &coord_core::effect::PersistBatch) -> Vec<CommandId> {
+    batch
+        .updates
+        .iter()
+        .filter(|u| {
+            u.collection == Collection::ProtocolV1.id() && u.key.len() == 41 && u.key[8] == 0x01
+        })
+        .map(|u| CommandId(Digest32(u.key[9..].try_into().unwrap())))
+        .collect()
+}
+
+/// Step 2b (6.7's property test): a frame taken whole leaves what its
+/// entries taken one at a time leave. For frames of relayed proposals,
+/// plain proposals held for their payloads, payloads refused, proposals
+/// held before the frame and duplicates, a follower taking the frame and
+/// one taking each entry as the message it stands for end with the same
+/// path logs, records, held proposals and refusals, write the same rows
+/// in the same order, and acknowledge the same commands once those rows
+/// are durable. Only the batches differ: one for the frame, one an
+/// adoption for the entries.
+#[test]
+fn a_frame_taken_whole_leaves_what_its_entries_one_at_a_time_leave() {
+    let mut frames_with_two_or_more = 0;
+    for seed in 0..96u64 {
+        let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+        let mut next = |n: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % n
+        };
+        let n = 1 + next(7) as usize;
+        let mut leader_view = coord_consensus::CommandTable::new();
+        let mut before = Vec::new();
+        let mut entries = Vec::new();
+        let mut commands = Vec::new();
+        for i in 0..n {
+            let (payload, c) = relayed_payload(1_000 * seed + i as u64 + 1, i as u8, seed as u8);
+            commands.push(c);
+            let l = leader_view
+                .initialize(c, c.0, vec![CONSERVATIVE_KEY.to_vec()])
+                .unwrap();
+            let p = proposal(c, l.deps, i as u64, l.paths, l.path);
+            match next(5) {
+                // Held for its payload, which no copy brings.
+                0 => entries.push(p),
+                // Held before the frame; the frame brings its payload.
+                1 => {
+                    before.push(p.clone());
+                    entries.push(relayed(p, payload));
+                }
+                // A payload refused: held as one without it.
+                2 => {
+                    let mut other = payload;
+                    other.ack_through = 7;
+                    entries.push(relayed(p, other));
+                }
+                _ => entries.push(relayed(p, payload)),
+            }
+        }
+        if next(3) == 0 {
+            let k = next(entries.len() as u64) as usize;
+            entries.push(entries[k].clone());
+        }
+        let mut whole = booted(1);
+        let mut single = booted(1);
+        for p in &before {
+            whole.step(peer(0, p.clone()));
+            single.step(peer(0, p.clone()));
+        }
+        let whole_effects = whole.step(peer(0, framed(entries.clone())));
+        let mut single_effects = Vec::new();
+        for entry in entries {
+            single_effects.extend(single.step(peer(0, entry)));
+        }
+
+        // The same logs, records, held proposals and refusals.
+        assert_eq!(
+            whole.table().path_head(CONSERVATIVE_KEY),
+            single.table().path_head(CONSERVATIVE_KEY),
+            "seed {seed}"
+        );
+        for c in &commands {
+            assert_eq!(
+                whole.table().record(c),
+                single.table().record(c),
+                "seed {seed}"
+            );
+            assert_eq!(
+                whole.table().phase_of(c),
+                single.table().phase_of(c),
+                "seed {seed}"
+            );
+        }
+        assert_eq!(
+            whole.held().keys().collect::<Vec<_>>(),
+            single.held().keys().collect::<Vec<_>>(),
+            "seed {seed}"
+        );
+        assert_eq!(
+            whole.take_rejections(),
+            single.take_rejections(),
+            "seed {seed}"
+        );
+
+        // The same rows in the same order, in one batch for the frame.
+        let whole_batches = persisted(&whole_effects);
+        let single_batches = persisted(&single_effects);
+        let rows = |batches: &[coord_core::effect::PersistBatch]| {
+            batches
+                .iter()
+                .flat_map(|b| b.updates.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(rows(&whole_batches), rows(&single_batches), "seed {seed}");
+        let adoptions = single_batches.len();
+        assert_eq!(whole_batches.len(), adoptions.min(1), "seed {seed}");
+        assert_eq!(
+            whole.relay_taken().frame_adoptions,
+            adoptions as u64,
+            "seed {seed}"
+        );
+        assert_eq!(
+            whole.relay_taken().frame_batches,
+            adoptions.min(1) as u64,
+            "seed {seed}"
+        );
+        if adoptions >= 2 {
+            frames_with_two_or_more += 1;
+        }
+
+        // Nothing leaves before the rows are durable, and then the same
+        // acknowledgements do.
+        assert!(sends(&whole_effects).is_empty(), "seed {seed}");
+        assert!(sends(&single_effects).is_empty(), "seed {seed}");
+        let mut whole_sent = Vec::new();
+        for event in durable_of(&whole_effects, 1) {
+            whole_sent.extend(sends(&whole.step(event)));
+        }
+        let mut single_sent = Vec::new();
+        for event in durable_of(&single_effects, 1) {
+            single_sent.extend(sends(&single.step(event)));
+        }
+        assert_eq!(whole_sent, single_sent, "seed {seed}");
+        assert_eq!(whole_sent.len(), adoptions, "seed {seed}");
+        assert_eq!(
+            whole.take_rejections(),
+            single.take_rejections(),
+            "seed {seed}"
+        );
+    }
+    assert!(
+        frames_with_two_or_more >= 20,
+        "the seeds reach frames of several adoptions: {frames_with_two_or_more}"
+    );
+}
+
+/// Step 2b: a frame of more of the smallest commands than one batch's
+/// updates bound holds is written in batches cut in frame order, each
+/// within [`FRAME_BATCH_UPDATES`] and [`FRAME_BATCH_BYTES`]. Every entry
+/// is adopted and every adoption acknowledged once its batch is durable.
+#[test]
+fn a_frame_past_a_batchs_updates_bound_is_written_in_batches_within_the_bounds() {
+    // Each adoption writes its dependency row and its payload row.
+    let per_batch = FRAME_BATCH_UPDATES / 2;
+    let n = 2 * per_batch + 7;
+    let mut f = booted_holding(1, 2 * n);
+    let mut leader_view = coord_consensus::CommandTable::new();
+    let payloads: Vec<_> = (0..n)
+        .map(|i| relayed_payload(i as u64 + 1, (i % 251) as u8, (i / 251) as u8))
+        .collect();
+    let commands: Vec<CommandId> = payloads.iter().map(|(_, c)| *c).collect();
+    let effects = f.step(peer(0, framed(leader_order(&mut leader_view, payloads, 0))));
+    let batches = persisted(&effects);
+    assert_eq!(batches.len(), 3, "cut at {per_batch} adoptions");
+    let mut taken = Vec::new();
+    for batch in &batches {
+        assert!(batch.updates.len() <= FRAME_BATCH_UPDATES);
+        assert!(rows_bytes(batch) <= FRAME_BATCH_BYTES);
+        taken.extend(adopted_in(batch));
+    }
+    assert_eq!(taken, commands, "in frame order, each once");
+    assert_eq!(adopted_in(&batches[0]).len(), per_batch);
+    assert!(
+        batches.windows(2).all(|w| w[0].barrier < w[1].barrier),
+        "written in their barriers' order"
+    );
+    for c in &commands {
+        assert_eq!(f.table().phase_of(c), Some(Phase::Accept));
+    }
+    let taken = f.relay_taken();
+    assert_eq!((taken.frame_batches, taken.frame_adoptions), (3, n as u64));
+    assert!(sends(&effects).is_empty());
+    let mut released = Vec::new();
+    for event in durable_of(&effects, 1) {
+        released.extend(f.step(event));
+    }
+    let out = sends(&released);
+    assert_eq!(out.len(), n, "one acknowledgement an adoption");
+    assert!(
+        out.iter()
+            .all(|(to, m)| *to == r(0) && matches!(m, ProtocolMessage::SlowAck(_)))
+    );
+    assert!(f.take_rejections().is_empty());
+}
+
+/// Step 2b: large requests cut a frame's batches by bytes, and a request
+/// past [`FRAME_BATCH_BYTES`] alone -- one of the largest a request may
+/// be, 2 MiB -- is written in a batch of its own, under the journal
+/// record's bounds.
+#[test]
+fn a_frames_large_requests_cut_its_batches_by_bytes_and_one_past_the_bound_goes_alone() {
+    use coord_types::logical_v1::limits::MAX_REQUEST_BYTES;
+    let mut f = booted_holding(1, 16);
+    let mut leader_view = coord_consensus::CommandTable::new();
+    // A small request and two of about 400 KiB fit a batch; a third of
+    // those doesn't.
+    let mid = 400 * 1024;
+    // Two puts that take a request to within 8 KiB of its bound.
+    let half = (MAX_REQUEST_BYTES - 8 * 1024) / 2;
+    let payloads = vec![
+        relayed_payload(1, 1, 1),
+        relayed_large(2, 1, mid),
+        relayed_large(3, 1, mid),
+        relayed_large(4, 1, mid),
+        relayed_large(5, 2, half),
+        relayed_payload(6, 6, 6),
+    ];
+    assert!(payloads[4].0.logical.len() > FRAME_BATCH_BYTES);
+    let commands: Vec<CommandId> = payloads.iter().map(|(_, c)| *c).collect();
+    let effects = f.step(peer(0, framed(leader_order(&mut leader_view, payloads, 0))));
+    let batches = persisted(&effects);
+    let groups: Vec<Vec<CommandId>> = batches.iter().map(adopted_in).collect();
+    assert_eq!(
+        groups,
+        vec![
+            commands[0..3].to_vec(),
+            vec![commands[3]],
+            vec![commands[4]],
+            vec![commands[5]],
+        ],
+        "cut by bytes; the 2 MiB request alone"
+    );
+    for batch in &batches[..2] {
+        assert!(rows_bytes(batch) <= FRAME_BATCH_BYTES);
+    }
+    assert!(rows_bytes(&batches[2]) > FRAME_BATCH_BYTES);
+    assert_eq!(
+        batches[2].updates.len(),
+        2,
+        "its payload and dependency rows"
+    );
+    // The largest request a batch of its own holds is within what the
+    // journal's compile-time check counts for one.
+    assert!(rows_bytes(&batches[2]) <= coord_store_api::envelope::MAX_ENVELOPE_PAYLOAD);
+    assert_eq!(f.relay_taken().frame_batches, 4);
+    let mut released = Vec::new();
+    for event in durable_of(&effects, 1) {
+        released.extend(f.step(event));
+    }
+    assert_eq!(sends(&released).len(), commands.len());
+    assert!(f.take_rejections().is_empty());
+}
+
+/// Step 2b: a frame's batch that fails takes each of its adoptions down
+/// as a batch of its own would: each is reported, none is acknowledged,
+/// and the batch before it, durable, keeps its adoptions' votes. Then a
+/// crash keeps the prefix of the frame's batches the journal made
+/// durable: a follower recovered from the durable rows holds the first
+/// batch's adoptions and none of the second's, and the leader's re-sent
+/// proposals adopt the rest.
+#[test]
+fn a_frames_batches_fail_and_crash_as_its_adoptions_one_at_a_time_would() {
+    let per_batch = FRAME_BATCH_UPDATES / 2;
+    let n = per_batch + 3;
+    let payloads: Vec<_> = (0..n)
+        .map(|i| relayed_payload(i as u64 + 1, (i % 251) as u8, (i / 251) as u8))
+        .collect();
+    let commands: Vec<CommandId> = payloads.iter().map(|(_, c)| *c).collect();
+    let mut leader_view = coord_consensus::CommandTable::new();
+    let frame = leader_order(&mut leader_view, payloads.clone(), 0);
+
+    // The second batch fails.
+    let mut f = booted_holding(1, 2 * n);
+    let mut storage = StorageModel::default();
+    let effects = f.step(peer(0, framed(frame.clone())));
+    let batches = persisted(&effects);
+    assert_eq!(batches.len(), 2);
+    for batch in &batches {
+        storage.submit(batch.clone());
+    }
+    storage.complete(batches[0].barrier).unwrap();
+    let durable = f.step(Event::Storage(StorageEvent::JournalDurable {
+        barrier_id: batches[0].barrier,
+        journal_seq: LocalJournalSeq::new(1).unwrap(),
+    }));
+    assert_eq!(sends(&durable).len(), per_batch, "the first batch's votes");
+    let failed = f.step(Event::Storage(StorageEvent::Failed {
+        barrier_id: batches[1].barrier,
+        error: StorageError::NoSpace,
+    }));
+    assert!(sends(&failed).is_empty(), "none of the failed batch's");
+    assert_eq!(
+        f.take_rejections(),
+        commands[per_batch..]
+            .iter()
+            .map(|c| FollowerRejection::BatchFailed(*c))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(f.pending_sends(), 0, "its votes are dropped with it");
+
+    // A crash: the journal kept the first batch, and not the second.
+    storage.crash();
+    let rows = restore_rows(&storage);
+    let restored: BTreeSet<CommandId> = rows.iter().map(|(c, _)| *c).collect();
+    assert_eq!(
+        restored,
+        commands[..per_batch]
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>()
+    );
+    let mut recovered = Follower::recover(
+        FollowerConfig {
+            capacity: 2 * n,
+            ..config(1)
+        },
+        None,
+        rows,
+        restore_payloads(&storage),
+        ExecutionPosition::ZERO,
+    );
+    recovered.step(boot_event());
+    for c in &commands[per_batch..] {
+        assert_eq!(recovered.table().record(c), None, "lost with its batch");
+    }
+    // The leader sends the proposals it lacks a vote for again; the lost
+    // ones are adopted as they were the first time.
+    let resend = framed(frame[per_batch..].to_vec());
+    let again = recovered.step(peer(0, resend));
+    let again_batches = persisted(&again);
+    assert_eq!(again_batches.len(), 1);
+    assert_eq!(
+        adopted_in(&again_batches[0]),
+        commands[per_batch..].to_vec()
+    );
+    for c in &commands[per_batch..] {
+        assert_eq!(recovered.table().phase_of(c), Some(Phase::Accept));
+    }
 }

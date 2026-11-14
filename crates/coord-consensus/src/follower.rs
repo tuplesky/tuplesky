@@ -426,6 +426,10 @@ enum Pending {
     Vote(CommandId),
     /// Adoption batch; a catch-up window's names its first command.
     Adoption(CommandId),
+    /// A proposal frame's adoption batch (step 2b of the batching rule's
+    /// 10.7): every adoption it holds, in the order taken, each with the
+    /// vote counted once the batch is durable.
+    Adoptions(Vec<DeferredVote>),
     /// Rows written again of records whose batch failed, before they
     /// execute (#197 review); names the first.
     Carry(CommandId),
@@ -511,6 +515,83 @@ struct DeferredVote {
     vote: Vote,
 }
 
+/// The rows one batch of a proposal frame's adoptions may hold (step 2b
+/// of the batching rule's 10.7): task-d106's bound for COMMIT rows. A
+/// batch is closed before an adoption whose rows would take it past this
+/// or [`FRAME_BATCH_UPDATES`], and an adoption past either goes alone.
+/// `coord-storage` checks it against the journal's bound at compile time.
+pub const FRAME_BATCH_BYTES: usize = COMMIT_ROWS_BATCH_BYTES;
+
+/// The updates one batch of a proposal frame's adoptions may hold (step
+/// 2b): task-d106's bound for COMMIT rows, well within a journal
+/// record's.
+pub const FRAME_BATCH_UPDATES: usize = COMMIT_ROWS_BATCH_UPDATES;
+
+/// The batch a proposal frame's adoptions are being written in (step 2b):
+/// its barrier, whose `pending` entry names the adoptions, and its rows.
+#[derive(Debug)]
+struct FrameBatch {
+    barrier: BarrierId,
+    updates: Vec<StoreUpdate>,
+    /// The encoded rows' keys and values, as task-d106 counts them.
+    bytes: usize,
+}
+
+/// The bytes task-d106's bounds count for a row: its key and its value.
+fn row_bytes(update: &StoreUpdate) -> usize {
+    update.key.len() + update.value.as_ref().map_or(0, Vec::len)
+}
+
+/// The payload rows in flight: the batches writing them, each with the
+/// commands whose rows it holds, and an index from a command to those
+/// batches (step 2b). A frame's batch holds up to a frame's payload
+/// rows, and each adoption asks whether its command's row is being
+/// written; the index answers that without a scan of every batch.
+#[derive(Debug)]
+struct PayloadsInFlight {
+    by_barrier: BTreeMap<BarrierId, Vec<CommandId>>,
+    /// Each command's batches, in barrier order, without repeats.
+    by_command: crate::digest::DigestMap<CommandId, Vec<BarrierId>>,
+}
+
+impl PayloadsInFlight {
+    fn new() -> Self {
+        Self {
+            by_barrier: BTreeMap::new(),
+            by_command: crate::digest::map(),
+        }
+    }
+
+    /// `barrier`'s batch holds `command`'s payload row.
+    fn push(&mut self, barrier: BarrierId, command: CommandId) {
+        self.by_barrier.entry(barrier).or_default().push(command);
+        let barriers = self.by_command.entry(command).or_default();
+        if let Err(at) = barriers.binary_search(&barrier) {
+            barriers.insert(at, barrier);
+        }
+    }
+
+    /// `barrier`'s batch is durable or failed: its rows are no longer in
+    /// flight. Returns the commands whose rows it held.
+    fn remove(&mut self, barrier: &BarrierId) -> Option<Vec<CommandId>> {
+        let written = self.by_barrier.remove(barrier)?;
+        for command in &written {
+            if let Some(barriers) = self.by_command.get_mut(command) {
+                barriers.retain(|b| b != barrier);
+                if barriers.is_empty() {
+                    self.by_command.remove(command);
+                }
+            }
+        }
+        Some(written)
+    }
+
+    /// The batches writing `command`'s payload row.
+    fn writing(&self, command: &CommandId) -> &[BarrierId] {
+        self.by_command.get(command).map_or(&[], Vec::as_slice)
+    }
+}
+
 /// The follower machine of one domain.
 #[derive(Debug)]
 pub struct Follower {
@@ -585,7 +666,7 @@ pub struct Follower {
     deferred: BTreeMap<BarrierId, DeferredVote>,
     votes: crate::digest::DigestMap<CommandId, VoteSet>,
     payloads: BTreeMap<CommandId, PayloadRecordV1>,
-    durable_payloads: BTreeMap<BarrierId, Vec<CommandId>>,
+    durable_payloads: PayloadsInFlight,
     /// Commands whose record here is ahead of every row written of it,
     /// durable or in flight, because the batch that wrote it failed
     /// (#197 review): written again before they execute or a vote names
@@ -803,6 +884,16 @@ pub struct Follower {
     relayed_taken: u64,
     /// Proposal frames taken (task-d102).
     frames_taken: u64,
+    /// Whether a proposal frame is being taken: its adoptions share the
+    /// frame's batches (step 2b).
+    taking_frame: bool,
+    /// The frame's batch being filled, written at the frame's end or
+    /// before an adoption that would take it past its bounds.
+    frame_batch: Option<FrameBatch>,
+    /// Adoption batches proposal frames wrote (step 2b).
+    frame_batches: u64,
+    /// Adoptions in them.
+    frame_adoptions: u64,
     /// Relayed proposals whose command this replica knew already, so the
     /// proposal path decided and nothing was fetched (#224 review).
     relayed_known: u64,
@@ -826,6 +917,12 @@ pub struct RelayTaken {
     pub known: u64,
     /// Relayed proposals whose payload wasn't taken, to be fetched.
     pub not_taken: u64,
+    /// Adoption batches the frames wrote (step 2b): one a frame unless a
+    /// frame's adoptions passed a batch's bounds, or the frame wrote a
+    /// batch of another kind between two of them.
+    pub frame_batches: u64,
+    /// Adoptions in those batches.
+    pub frame_adoptions: u64,
 }
 
 impl RelayTaken {
@@ -835,6 +932,8 @@ impl RelayTaken {
         self.taken = self.taken.saturating_add(other.taken);
         self.known = self.known.saturating_add(other.known);
         self.not_taken = self.not_taken.saturating_add(other.not_taken);
+        self.frame_batches = self.frame_batches.saturating_add(other.frame_batches);
+        self.frame_adoptions = self.frame_adoptions.saturating_add(other.frame_adoptions);
     }
 }
 
@@ -969,6 +1068,10 @@ impl Follower {
             answer_on_release: BTreeSet::new(),
             relayed_taken: 0,
             frames_taken: 0,
+            taking_frame: false,
+            frame_batch: None,
+            frame_batches: 0,
+            frame_adoptions: 0,
             relayed_known: 0,
             relayed_not_taken: 0,
             catch_up: CatchUp::default(),
@@ -1015,7 +1118,7 @@ impl Follower {
             payload_requests: 0,
             campaign_selection_reads: 0,
             payloads,
-            durable_payloads: BTreeMap::new(),
+            durable_payloads: PayloadsInFlight::new(),
             unwritten: BTreeSet::new(),
             payload_unwritten: BTreeSet::new(),
             installs: BTreeMap::new(),
@@ -1222,7 +1325,7 @@ impl Follower {
             pending: BTreeMap::new(),
             votes: crate::digest::map(),
             payloads: state.payloads,
-            durable_payloads: BTreeMap::new(),
+            durable_payloads: PayloadsInFlight::new(),
             unwritten: BTreeSet::new(),
             payload_unwritten: BTreeSet::new(),
             installs: BTreeMap::new(),
@@ -1281,6 +1384,10 @@ impl Follower {
             answer_on_release: BTreeSet::new(),
             relayed_taken: 0,
             frames_taken: 0,
+            taking_frame: false,
+            frame_batch: None,
+            frame_batches: 0,
+            frame_adoptions: 0,
             relayed_known: 0,
             relayed_not_taken: 0,
             catch_up: CatchUp::default(),
@@ -1747,6 +1854,11 @@ impl Follower {
                         return Vec::new();
                     }
                 };
+            // The campaign is borrowed: the check `allocate` makes, by field.
+            debug_assert!(
+                self.frame_batch.is_none(),
+                "a barrier allocated while a proposal frame's batch is open"
+            );
             let barrier = self.alloc.as_mut().expect("booted").allocate();
             campaign.bound(barrier);
             return alloc::vec![Effect::Persist(PersistBatch {
@@ -1823,6 +1935,14 @@ impl Follower {
     /// one step, so the adoptions they lead to share the node's next
     /// journal group. One this follower refuses leaves the others as
     /// they are.
+    ///
+    /// The adoptions the frame leads to are written in as few batches as
+    /// the frame's bounds allow, each with one barrier and one `pending`
+    /// entry (step 2b of the batching rule's 10.7). Each is still taken
+    /// entry by entry, in the order taken today, so the path logs and the
+    /// held proposals come out as they did; only where its rows go
+    /// changes. No acknowledgement leaves before its batch is durable, as
+    /// before, so none leaves between two of the frame's adoptions.
     fn on_proposal_frame(
         &mut self,
         from: ReplicaId,
@@ -1831,6 +1951,11 @@ impl Follower {
         proposals: Vec<crate::messages::FramedProposal>,
     ) -> Vec<Effect> {
         self.frames_taken = self.frames_taken.saturating_add(1);
+        debug_assert!(
+            !self.taking_frame && self.frame_batch.is_none(),
+            "a proposal frame is taken whole, within one step"
+        );
+        self.taking_frame = true;
         let mut effects = Vec::new();
         for entry in proposals {
             let (vote, payload) = entry.into_vote(replica, ballot);
@@ -1839,7 +1964,71 @@ impl Follower {
                 None => self.on_proposal(from, vote),
             });
         }
+        self.taking_frame = false;
+        effects.extend(self.close_frame_batch());
         effects
+    }
+
+    /// Write the frame's batch being filled, if any (step 2b). Its
+    /// barrier was allocated at its first adoption, and nothing else was
+    /// allocated since, so the journal takes the batches in their
+    /// barriers' order.
+    fn close_frame_batch(&mut self) -> Option<Effect> {
+        let batch = self.frame_batch.take()?;
+        self.frame_batches = self.frame_batches.saturating_add(1);
+        Some(Effect::Persist(PersistBatch {
+            barrier: batch.barrier,
+            base: None,
+            updates: batch.updates,
+        }))
+    }
+
+    /// The barrier of the frame's batch an adoption with `updates` joins
+    /// (step 2b): the open batch's, unless they would take it past
+    /// [`FRAME_BATCH_BYTES`] or [`FRAME_BATCH_UPDATES`], in which case
+    /// that batch is written first, to `effects`, and a new one opened.
+    /// An adoption past either bound alone opens a batch the next
+    /// adoption closes, so it goes alone.
+    fn frame_barrier(&mut self, updates: &[StoreUpdate], effects: &mut Vec<Effect>) -> BarrierId {
+        let bytes: usize = updates.iter().map(row_bytes).sum();
+        if self.frame_batch.as_ref().is_some_and(|batch| {
+            batch.bytes + bytes > FRAME_BATCH_BYTES
+                || batch.updates.len() + updates.len() > FRAME_BATCH_UPDATES
+        }) {
+            effects.extend(self.close_frame_batch());
+        }
+        if let Some(batch) = &self.frame_batch {
+            return batch.barrier;
+        }
+        let barrier = self.alloc.as_mut().expect("booted").allocate();
+        self.frame_batch = Some(FrameBatch {
+            barrier,
+            updates: Vec::new(),
+            bytes: 0,
+        });
+        self.pending.insert(barrier, Pending::Adoptions(Vec::new()));
+        barrier
+    }
+
+    /// A barrier for a batch of its own, outside the frame's: the frame's
+    /// batch being filled is written first, to `effects`, so the journal
+    /// still takes batches in their barriers' order.
+    fn barrier_outside_frame(&mut self, effects: &mut Vec<Effect>) -> Option<BarrierId> {
+        effects.extend(self.close_frame_batch());
+        self.alloc.as_mut().map(BarrierAllocator::allocate)
+    }
+
+    /// A barrier for a batch of its own, where no proposal frame's batch
+    /// is open (step 2b). One allocated while a frame's batch is open
+    /// would have a newer barrier than that batch yet be written ahead of
+    /// it, at the frame's end; a path a frame can reach takes
+    /// [`Follower::barrier_outside_frame`] instead.
+    fn allocate(&mut self) -> BarrierId {
+        debug_assert!(
+            self.frame_batch.is_none(),
+            "a barrier allocated while a proposal frame's batch is open"
+        );
+        self.alloc.as_mut().expect("booted").allocate()
     }
 
     /// Proposal frames this follower took (task-d102).
@@ -1854,6 +2043,8 @@ impl Follower {
             taken: self.relayed_taken,
             known: self.relayed_known,
             not_taken: self.relayed_not_taken,
+            frame_batches: self.frame_batches,
+            frame_adoptions: self.frame_adoptions,
         }
     }
 
@@ -2023,7 +2214,7 @@ impl Follower {
             // while rows ahead of it are written and then taken again,
             // carried nothing (#213 review).
             self.sync_carried += sync_work(&decision).saturating_sub(given);
-            let barrier = self.alloc.as_mut().expect("booted").allocate();
+            let barrier = self.allocate();
             // The selection goes down with the marker, in the one batch.
             // A marker without it would let this replica restart claiming
             // it had synchronized ballot B while its command ledger still
@@ -2152,10 +2343,7 @@ impl Follower {
                     && let Some(payload) = self.payloads.get(command)
                 {
                     updates.push(payload_update(command, payload).expect("bounded"));
-                    self.durable_payloads
-                        .entry(barrier)
-                        .or_default()
-                        .push(*command);
+                    self.durable_payloads.push(barrier, *command);
                 }
                 updates.push(dependency_update(epoch, command, demoted).expect("bounded"));
                 self.ledger.stage(barrier, *command, demoted.clone());
@@ -2422,7 +2610,6 @@ impl Follower {
         let epoch = self.config.identity.epoch;
         let mut effects = Vec::new();
         let mut batch = CommitRowsBatch::default();
-        let size = |u: &StoreUpdate| u.key.len() + u.value.as_ref().map_or(0, Vec::len);
         for command in commands {
             let record = self.table.record(command).expect("held").clone();
             let mut rows = Vec::with_capacity(2);
@@ -2432,7 +2619,7 @@ impl Follower {
                 rows.push(payload_update(command, held).expect("bounded"));
             }
             rows.push(dependency_update(epoch, command, &record).expect("bounded"));
-            let bytes: usize = rows.iter().map(size).sum();
+            let bytes: usize = rows.iter().map(row_bytes).sum();
             if !batch.updates.is_empty()
                 && (batch.bytes + bytes > COMMIT_ROWS_BATCH_BYTES
                     || batch.updates.len() + rows.len() > COMMIT_ROWS_BATCH_UPDATES)
@@ -2458,19 +2645,16 @@ impl Follower {
         let CommitRowsBatch {
             updates,
             staged,
-            mut payloads,
+            payloads,
             ..
         } = batch;
-        let barrier = self.alloc.as_mut().expect("booted").allocate();
+        let barrier = self.allocate();
         let first = staged.first().map(|(c, _)| *c).expect("one");
         for (c, r) in staged {
             self.ledger.stage(barrier, c, r);
         }
-        if !payloads.is_empty() {
-            self.durable_payloads
-                .entry(barrier)
-                .or_default()
-                .append(&mut payloads);
+        for c in payloads {
+            self.durable_payloads.push(barrier, c);
         }
         self.pending.insert(barrier, Pending::CommitRows(first));
         Effect::Persist(PersistBatch {
@@ -2702,7 +2886,7 @@ impl Follower {
                     let _ = self.table.commit(command);
                 }
                 let record = self.table.record(&command).expect("installed").clone();
-                let barrier = self.alloc.as_mut().expect("booted").allocate();
+                let barrier = self.allocate();
                 let mut updates = alloc::vec![
                     dependency_update(self.config.identity.epoch, &command, &record)
                         .expect("bounded")
@@ -2870,12 +3054,12 @@ impl Follower {
             return Vec::new();
         };
         let epoch = self.config.identity.epoch;
-        let barrier = self.alloc.as_mut().expect("booted").allocate();
+        let barrier = self.allocate();
         let mut updates = Vec::new();
         for c in payloads_due {
             let payload = self.payloads.get(&c).expect("held");
             updates.push(payload_update(&c, payload).expect("bounded"));
-            self.durable_payloads.entry(barrier).or_default().push(c);
+            self.durable_payloads.push(barrier, c);
             self.payload_unwritten.remove(&c);
         }
         for c in due {
@@ -2884,7 +3068,7 @@ impl Follower {
                 && let Some(payload) = self.payloads.get(&c)
             {
                 updates.push(payload_update(&c, payload).expect("bounded"));
-                self.durable_payloads.entry(barrier).or_default().push(c);
+                self.durable_payloads.push(barrier, c);
             }
             updates.push(dependency_update(epoch, &c, &record).expect("bounded"));
             self.ledger.stage(barrier, c, record);
@@ -4382,6 +4566,10 @@ impl Follower {
         self.payloads.insert(command, entry.payload.clone());
         self.note_lacking(command);
         let epoch = self.config.identity.epoch;
+        debug_assert!(
+            self.frame_batch.is_none(),
+            "a barrier allocated while a proposal frame's batch is open"
+        );
         let (barrier, updates) = batch
             .get_or_insert_with(|| (self.alloc.as_mut().expect("booted").allocate(), Vec::new()));
         let barrier = *barrier;
@@ -5481,7 +5669,7 @@ impl Follower {
             .record(&command)
             .expect("just initialized")
             .clone();
-        let barrier = self.alloc.as_mut().expect("booted").allocate();
+        let barrier = self.allocate();
         let mut updates = alloc::vec![
             payload_update(&command, &payload).expect("bounded"),
             dependency_update(epoch, &command, &record).expect("bounded"),
@@ -5494,10 +5682,7 @@ impl Follower {
         })];
         self.pending.insert(barrier, Pending::Vote(command));
         self.ledger.stage(barrier, command, record);
-        self.durable_payloads
-            .entry(barrier)
-            .or_default()
-            .push(command);
+        self.durable_payloads.push(barrier, command);
         // Own vote joins whatever evidence (a held proposal) already
         // arrived for this command; it never replaces it.
         self.votes
@@ -5863,10 +6048,9 @@ impl Follower {
         let requires = match self.payload_row(&proposal.command) {
             Some(requires) => requires,
             None => {
-                let Some(alloc) = self.alloc.as_mut() else {
-                    return Vec::new();
+                let Some(barrier) = self.barrier_outside_frame(&mut effects) else {
+                    return effects;
                 };
-                let barrier = alloc.allocate();
                 let payload = &self.payloads[&proposal.command];
                 effects.push(Effect::Persist(PersistBatch {
                     barrier,
@@ -5875,10 +6059,7 @@ impl Follower {
                         payload_update(&proposal.command, payload).expect("bounded")
                     ],
                 }));
-                self.durable_payloads
-                    .entry(barrier)
-                    .or_default()
-                    .push(proposal.command);
+                self.durable_payloads.push(barrier, proposal.command);
                 alloc::vec![barrier]
             }
         };
@@ -5931,7 +6112,23 @@ impl Follower {
         deps: &[CommandId],
         updates: &mut Vec<StoreUpdate>,
     ) {
+        let carried = self.unwritten(command, deps, updates);
+        self.stage_unwritten(barrier, carried);
+    }
+
+    /// [`Follower::carry_unwritten`]'s rows, appended to `updates`, and
+    /// the records they carry, to be staged under the batch's barrier
+    /// once it is chosen ([`Follower::stage_unwritten`]). Staging changes
+    /// nothing the walk reads for another command, so gathering first and
+    /// staging after is the same as staging as it goes.
+    fn unwritten(
+        &self,
+        command: CommandId,
+        deps: &[CommandId],
+        updates: &mut Vec<StoreUpdate>,
+    ) -> Vec<(CommandId, CommandRecord)> {
         let epoch = self.config.identity.epoch;
+        let mut carried = Vec::new();
         let mut seen = BTreeSet::from([command]);
         let mut stack: Vec<CommandId> = deps.to_vec();
         while let Some(d) = stack.pop() {
@@ -5959,8 +6156,17 @@ impl Follower {
             updates.push(payload_update(&d, payload).expect("bounded"));
             updates.push(dependency_update(epoch, &d, &record).expect("bounded"));
             stack.extend(record.deps.iter().copied());
+            carried.push((d, record));
+        }
+        carried
+    }
+
+    /// Stage under `barrier` the records [`Follower::unwritten`] carried,
+    /// with their payload rows.
+    fn stage_unwritten(&mut self, barrier: BarrierId, carried: Vec<(CommandId, CommandRecord)>) {
+        for (d, record) in carried {
             self.ledger.stage(barrier, d, record);
-            self.durable_payloads.entry(barrier).or_default().push(d);
+            self.durable_payloads.push(barrier, d);
         }
     }
 
@@ -5985,9 +6191,10 @@ impl Follower {
         let failed = |b: &BarrierId| self.outbox.as_ref().is_some_and(|o| o.is_failed(b));
         let writing: Vec<BarrierId> = self
             .durable_payloads
+            .writing(command)
             .iter()
-            .filter(|(b, cs)| cs.contains(command) && !failed(b))
-            .map(|(b, _)| *b)
+            .filter(|b| !failed(b))
+            .copied()
             .chain(
                 self.catch_up
                     .running
@@ -6198,30 +6405,31 @@ impl Follower {
                 let epoch = self.config.identity.epoch;
                 let record = self.table.record(&command).expect("adopted").clone();
                 let admission = record.payload.unwrap_or_else(|| admission_digest(None, 0));
-                let barrier = self.alloc.as_mut().expect("booted").allocate();
                 let mut updates =
                     alloc::vec![dependency_update(epoch, &command, &record).expect("bounded")];
                 // The payload row with it, where none is durable or being
                 // written here (task-d90): its batch failed, or it was
                 // never written. The acknowledgement waits on the batch
                 // that writes it either way.
+                let mut payload_written = false;
                 if self.payload_row(&command).is_none()
                     && let Some(payload) = self.payloads.get(&command)
                 {
                     updates.push(payload_update(&command, payload).expect("bounded"));
-                    self.durable_payloads
-                        .entry(barrier)
-                        .or_default()
-                        .push(command);
+                    payload_written = true;
                 }
-                self.carry_unwritten(barrier, command, &record.deps, &mut updates);
-                effects.push(Effect::Persist(PersistBatch {
-                    barrier,
-                    base: None,
-                    updates,
-                }));
-                self.pending.insert(barrier, Pending::Adoption(command));
-                self.ledger.stage(barrier, command, record);
+                let carried = self.unwritten(command, &record.deps, &mut updates);
+                // Within a frame, the frame's batch, sized by the rows just
+                // gathered (step 2b); otherwise a batch of its own.
+                let barrier = if self.taking_frame {
+                    self.frame_barrier(&updates, &mut effects)
+                } else {
+                    self.allocate()
+                };
+                if payload_written {
+                    self.durable_payloads.push(barrier, command);
+                }
+                self.stage_unwritten(barrier, carried);
                 let ack = SlowAck {
                     replica: self.config.identity.replica,
                     ballot: self.config.quorum.ballot(),
@@ -6230,13 +6438,29 @@ impl Follower {
                 };
                 // Counted once the adoption row is durable, like the
                 // acknowledgement itself, which waits for the same batch.
-                self.deferred.insert(
-                    barrier,
-                    DeferredVote {
-                        command,
-                        vote: Vote::Slow(ack.clone()),
-                    },
-                );
+                let deferred = DeferredVote {
+                    command,
+                    vote: Vote::Slow(ack.clone()),
+                };
+                if self.taking_frame {
+                    let batch = self.frame_batch.as_mut().expect("opened");
+                    batch.bytes += updates.iter().map(row_bytes).sum::<usize>();
+                    batch.updates.extend(updates);
+                    match self.pending.get_mut(&barrier) {
+                        Some(Pending::Adoptions(adoptions)) => adoptions.push(deferred),
+                        _ => unreachable!("a frame's batch is pending as its adoptions"),
+                    }
+                    self.frame_adoptions = self.frame_adoptions.saturating_add(1);
+                } else {
+                    effects.push(Effect::Persist(PersistBatch {
+                        barrier,
+                        base: None,
+                        updates,
+                    }));
+                    self.pending.insert(barrier, Pending::Adoption(command));
+                    self.deferred.insert(barrier, deferred);
+                }
+                self.ledger.stage(barrier, command, record);
                 self.publish_to_leader_and_frontend(
                     command,
                     barrier,
@@ -6372,10 +6596,7 @@ impl Follower {
                 match event {
                     StorageEvent::JournalDurable { .. }
                         if self.payloads.contains_key(&c)
-                            && !self
-                                .durable_payloads
-                                .values()
-                                .any(|other| other.contains(&c)) =>
+                            && self.durable_payloads.writing(&c).is_empty() =>
                     {
                         self.served_payloads.insert(c);
                     }
@@ -6471,16 +6692,31 @@ impl Follower {
         }
         let mut reinstall = false;
         if let Some(barrier) = event.barrier()
-            && let Some(pending) = self.pending.get(&barrier).cloned()
+            && matches!(
+                event,
+                StorageEvent::JournalDurable { .. } | StorageEvent::Failed { .. }
+            )
+            && let Some(pending) = self.pending.remove(&barrier)
         {
             match event {
                 StorageEvent::JournalDurable { journal_seq, .. } => {
-                    self.pending.remove(&barrier);
                     self.ledger.durable(barrier, *journal_seq);
-                    if let Pending::Adoption(c) = pending
-                        && let Some(entry) = self.adopted.get_mut(&c)
+                    if let Pending::Adoption(c) = &pending
+                        && let Some(entry) = self.adopted.get_mut(c)
                     {
                         entry.1 = true;
+                    }
+                    // A frame's batch (step 2b): each adoption as one
+                    // batch of its own is taken here.
+                    if let Pending::Adoptions(adoptions) = pending {
+                        for deferred in adoptions {
+                            if let Some(entry) = self.adopted.get_mut(&deferred.command) {
+                                entry.1 = true;
+                            }
+                            if let Some(set) = self.votes.get_mut(&deferred.command) {
+                                let _ = set.add(deferred.vote);
+                            }
+                        }
                     }
                     // A window is one batch: every command of it is
                     // decided here now, and its payload is on disk.
@@ -6498,7 +6734,6 @@ impl Follower {
                     }
                 }
                 StorageEvent::Failed { .. } => {
-                    self.pending.remove(&barrier);
                     // A window whose installation failed is put back at
                     // the head of its page and installed again, rather
                     // than left waiting on a batch that will never be
@@ -6526,14 +6761,22 @@ impl Follower {
                     // The batch never happened: its vote is not evidence.
                     self.deferred.remove(&barrier);
                     self.ledger.failed(barrier);
-                    let command = match pending {
+                    match pending {
                         Pending::Vote(c)
                         | Pending::Adoption(c)
                         | Pending::Carry(c)
-                        | Pending::CommitRows(c) => c,
-                    };
-                    self.rejections
-                        .push(FollowerRejection::BatchFailed(command));
+                        | Pending::CommitRows(c) => {
+                            self.rejections.push(FollowerRejection::BatchFailed(c));
+                        }
+                        // Each adoption of a frame's batch, as one batch of
+                        // its own would be.
+                        Pending::Adoptions(adoptions) => {
+                            for deferred in adoptions {
+                                self.rejections
+                                    .push(FollowerRejection::BatchFailed(deferred.command));
+                            }
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -6984,11 +7227,8 @@ impl Follower {
         self.bindings.insert(payload.retry_key, command);
         self.payloads.insert(command, payload.clone());
         self.note_lacking(command);
-        let barrier = self.alloc.as_mut().expect("booted").allocate();
-        self.durable_payloads
-            .entry(barrier)
-            .or_default()
-            .push(command);
+        let barrier = self.allocate();
+        self.durable_payloads.push(barrier, command);
         let mut effects = alloc::vec![Effect::Persist(PersistBatch {
             barrier,
             base: None,
@@ -7031,7 +7271,7 @@ impl Follower {
         }
         let epoch = self.config.identity.epoch;
         let record = self.table.record(&command).expect("rebound").clone();
-        let barrier = self.alloc.as_mut().expect("booted").allocate();
+        let barrier = self.allocate();
         let mut updates = alloc::vec![
             payload_update(&command, &payload).expect("bounded"),
             dependency_update(epoch, &command, &record).expect("bounded"),
@@ -7044,10 +7284,7 @@ impl Follower {
         })];
         self.pending.insert(barrier, Pending::Vote(command));
         self.ledger.stage(barrier, command, record);
-        self.durable_payloads
-            .entry(barrier)
-            .or_default()
-            .push(command);
+        self.durable_payloads.push(barrier, command);
         effects.extend(self.advance_pending());
         effects
     }
