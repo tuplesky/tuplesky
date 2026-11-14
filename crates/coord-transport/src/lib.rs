@@ -51,7 +51,7 @@ pub use config::{
     Reordering, TlsProfile,
 };
 pub use endpoint::{
-    CloseCode, CloseReason, ConnectionId, Destination, Dialer, PathReading, RequestError,
+    CloseCode, CloseReason, ConnectionId, Destination, Dialer, PathReading, Refused, RequestError,
     Responder, SendError, TrafficReader, Transport, TransportError, TransportEvent, WakeHold,
 };
 pub use frames::{
