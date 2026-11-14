@@ -348,10 +348,11 @@ class SweepTests(unittest.TestCase):
         with open(os.path.join(path, "n2", "executed-at-end"), "w") as f:
             f.write("2400\n")
         with open(os.path.join(path, "n2", "coordd.log"), "a") as f:
-            # The log's refusal lines are said at powers of two; the exact
-            # count is each boot's `the api plane ended` line, summed.
-            f.write("this voter refused a submission: Backpressure (1 so far)\n")
-            f.write("this voter refused a submission: Backpressure (2 so far)\n")
+            # The machine's refusals are said at powers of two, a lower
+            # bound; the door's are exact on each boot's `the api plane
+            # ended` line, summed.
+            f.write("this voter's machine refused: Backpressure (1 so far)\n")
+            f.write("this voter's machine refused: Backpressure (2 so far)\n")
             f.write("the api plane ended: queued_local=9 queued_remote=1 not_a_voter=0 saturated=0 unavailable=0 "
                     "refused=3 released=5 returned=0\n")
             f.write("catch-up paths: pacer_asks=3 asked=9 pages=4 pulled=256\n")
@@ -363,14 +364,14 @@ class SweepTests(unittest.TestCase):
             f.write("the api plane ended: queued_local=9 queued_remote=1 refused=4 released=5\n")
             f.write("catch-up paths: pacer_asks=9 asked=50 pages=41 pulled=2624\n")
         step = sw.read_step("head", "120", path)
-        self.assertEqual(step.behind["n1"], sw.Behind(short=0, refused=None, pages=None))
+        self.assertEqual(step.behind["n1"], sw.Behind(short=0, backpressure=0, refused=None, pages=None))
         n2 = step.behind["n2"]
-        self.assertEqual((n2.short, n2.refused, n2.pages), (2600, 7, 41))
+        self.assertEqual((n2.short, n2.backpressure, n2.refused, n2.pages), (2600, 2, 7, 41))
         text = sw.render([step, sw.read_step("etcd", "120", self.store("e120", tuplesky=False))], "Sweep")
         self.assertIn("**Voters behind**", text)
         self.assertIn("| Step | Side | n1 | n2 |", text)
-        self.assertIn("| 120 | head | 0 / - / - | 2600 / 7 / 41 |", text)
-        self.assertIn("(each cell: commands short / refused at its door / catch-up pages)", text)
+        self.assertIn("| 120 | head | 0 / 0 / - | 2600 / ≥2 / 41 |", text)
+        self.assertIn("(each cell: commands short / `Backpressure` refusals, at least / catch-up pages)", text)
         behind = text.split("**Voters behind**")[1].split("**Against etcd")[0]
         self.assertNotIn("| 120 | etcd | 0 / ", behind)
         self.assertIn("**Voters behind, their relay and sends**", text)
@@ -378,8 +379,8 @@ class SweepTests(unittest.TestCase):
             (n2.payloads_taken, n2.not_taken, n2.sent_bytes_per_command, n2.sent_lost, n2.sent_lost_streams),
             (2390, 4, 200.0, 0, 0),
         )
-        self.assertIn("| 120 | head | n2 | 2600 | 7 | 41 | 2390 | 4 | 200 | 0 (0) |", text)
-        self.assertIn("| 120 | head | n1 | 0 | - | - | - | - | - | - |", text)
+        self.assertIn("| 120 | head | n2 | 2600 | ≥2 | 7 | 41 | 2390 | 4 | 200 | 0 (0) |", text)
+        self.assertIn("| 120 | head | n1 | 0 | 0 | - | - | - | - | - | - |", text)
 
     def test_the_voters_memory(self):
         path = self.store("m")
