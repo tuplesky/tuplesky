@@ -540,8 +540,9 @@ pub struct Path {
     pub accepted: bool,
     /// The smoothed round trip, in microseconds.
     pub rtt_micros: u64,
-    /// The least round trip seen, without the peer's ACK delay, in
-    /// microseconds.
+    /// The least raw round-trip sample over the connection's life, the
+    /// peer's ACK delay not taken out, in microseconds. It never
+    /// expires: a sample from before a path's delay changed stays.
     pub min_rtt_micros: u64,
     /// The congestion window, in bytes.
     pub cwnd: u64,

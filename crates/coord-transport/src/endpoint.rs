@@ -654,7 +654,9 @@ pub struct PathReading {
     pub accepted: bool,
     /// The smoothed round trip.
     pub rtt: Duration,
-    /// The least round trip seen, without the peer's ACK delay.
+    /// The least raw round-trip sample over the connection's life, the
+    /// peer's ACK delay not taken out (quinn's `RttEstimator::min`). It
+    /// never expires: a sample from before a path's delay changed stays.
     pub min_rtt: Duration,
     /// The congestion window, in bytes.
     pub cwnd: u64,
