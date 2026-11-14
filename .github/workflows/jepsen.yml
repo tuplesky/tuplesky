@@ -103,7 +103,7 @@ on:
         description: "Seconds every TupleSky voter's inbound peer-plane traffic is dropped from the workload's start, the collectors still reaching every voter (through --hold-peer-links; task-d67's start-up row); empty or 0 for none"
         default: ""
       pair-base:
-        description: "Run TupleSky in pairs on one runner against this base: a tuplesky ref (a branch, a tag or a full commit SHA, which actions/checkout needs whole) built beside the head, env:NAME=VALUE for the head's own build with that variable on every voter, harness:COORD_HARNESS_NAME=VALUE for the head's own build with that variable where the harness provisions it (a setting the harness writes into every voter's coordd.toml, such as COORD_HARNESS_PROJECTION_COMMIT_RECORDS=0), profile:strict or profile:replay for the head's own build on that journal profile (the profile input is the head's), or same for the head's own build (voter-workers BASE/HEAD then sets the sides apart); empty for one run"
+        description: "Run TupleSky in pairs on one runner against this base: a tuplesky ref (a branch, a tag or a full commit SHA, which actions/checkout needs whole) built beside the head, env:NAME=VALUE for the head's own build with that variable on every voter, harness:COORD_HARNESS_NAME=VALUE for the head's own build with that variable where the harness provisions it (a setting the harness writes into every voter's coordd.toml, such as COORD_HARNESS_PROJECTION_COMMIT_RECORDS=0), profile:strict or profile:replay for the head's own build on that journal profile (the profile input is the head's), quirks:LIST for the head's own build with the etcd mix drawn with those --etcd-register-quirks (register-etcd-mix workloads; first for the generator through jepsen 2057754 as it ran then, none for etcd's literal expression), or same for the head's own build (voter-workers BASE/HEAD then sets the sides apart); empty for one run"
         default: ""
       pairs:
         description: "How many base and head pairs, when pair-base is set (the order alternates from pair to pair; empty for 3); in a sweep, the steps the base runs at, comma-separated (empty for every step), where base and head each run twice in both orders, base, head, head, base"
@@ -287,7 +287,7 @@ jobs:
             cp "tuplesky/target/release/$b" "$RUNNER_TEMP/head-bin/" 2>/dev/null || true
           done
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
-        if: env.IN_PAIR_BASE != '' && env.IN_PAIR_BASE != 'same' && !startsWith(env.IN_PAIR_BASE, 'env:') && !startsWith(env.IN_PAIR_BASE, 'harness:') && !startsWith(env.IN_PAIR_BASE, 'profile:')
+        if: env.IN_PAIR_BASE != '' && env.IN_PAIR_BASE != 'same' && !startsWith(env.IN_PAIR_BASE, 'env:') && !startsWith(env.IN_PAIR_BASE, 'harness:') && !startsWith(env.IN_PAIR_BASE, 'profile:') && !startsWith(env.IN_PAIR_BASE, 'quirks:')
         with:
           ref: ${{ inputs.pair-base }}
           path: tuplesky-base
@@ -295,7 +295,7 @@ jobs:
       - name: Build the pair's base
         # Into the head's target directory, so the dependencies the two
         # share are not built twice; the head's binaries are put back after.
-        if: env.IN_PAIR_BASE != '' && env.IN_PAIR_BASE != 'same' && !startsWith(env.IN_PAIR_BASE, 'env:') && !startsWith(env.IN_PAIR_BASE, 'harness:') && !startsWith(env.IN_PAIR_BASE, 'profile:')
+        if: env.IN_PAIR_BASE != '' && env.IN_PAIR_BASE != 'same' && !startsWith(env.IN_PAIR_BASE, 'env:') && !startsWith(env.IN_PAIR_BASE, 'harness:') && !startsWith(env.IN_PAIR_BASE, 'profile:') && !startsWith(env.IN_PAIR_BASE, 'quirks:')
         working-directory: tuplesky-base
         run: |
           rustup show active-toolchain || rustup toolchain install
@@ -535,12 +535,33 @@ jobs:
             fi
             voter+=(--register-mix "$REGISTER_MIX")
           fi
-          if [ -n "$REGISTER_QUIRKS" ]; then
+          # The etcd mix's quirks $1 as this jepsen-ref takes them: first is
+          # all four (the generator through 2057754 as it ran then), and a
+          # ref from before 633fcf0, whose concurrent generator still updates
+          # in the whole test's context, has no whole-test-update to ask for.
+          quirks_for_ref() {
+            local q=$1
             if ! grep -q -- '--etcd-register-quirks' src/jepsen/tuplesky.clj; then
-              echo "::error::tuplesky/jepsen@$JEPSEN_REF has no --etcd-register-quirks; dispatch with a jepsen-ref that has it (50b71de2 or later), or the plain register-etcd-mix"
-              exit 1
+              echo "::error::tuplesky/jepsen@$JEPSEN_REF has no --etcd-register-quirks; dispatch with a jepsen-ref that has it (50b71de2 or later), or the plain register-etcd-mix" >&2
+              return 1
             fi
-            voter+=(--etcd-register-quirks "$REGISTER_QUIRKS")
+            if [ "$q" = first ]; then q=on-threads,process-limit,jitter,whole-test-update; fi
+            if [ "$q" != none ] && ! [[ $q =~ ^(on-threads|process-limit|jitter|whole-test-update)(,(on-threads|process-limit|jitter|whole-test-update))*$ ]]; then
+              echo "::error::not etcd-mix quirks: '$1' (on-threads, process-limit, jitter, whole-test-update, comma-separated, or first, or none)" >&2
+              return 1
+            fi
+            if [[ ",$q," == *,whole-test-update,* ]] && ! grep -q ':whole-test-update' src/jepsen/tuplesky.clj; then
+              if grep -q 'group-ctx' ../jepsen/src/jepsen/independent.clj; then
+                echo "::error::tuplesky/jepsen@$JEPSEN_REF updates a key's generator in its group's context and has no whole-test-update quirk to undo it" >&2
+                return 1
+              fi
+              q=$(sed -e 's/,*whole-test-update//' -e 's/^,//' <<< "$q")
+            fi
+            echo "${q:-none}"
+          }
+          if [ -n "$REGISTER_QUIRKS" ]; then
+            quirks=$(quirks_for_ref "$REGISTER_QUIRKS") || exit 1
+            voter+=(--etcd-register-quirks "$quirks")
           fi
           if [ -n "$HOLD_PEER_LINKS" ]; then
             if ! grep -q -- '--hold-peer-links' src/jepsen/tuplesky.clj; then
@@ -636,6 +657,23 @@ jobs:
           # A key's group of threads in the register workloads: 2n, n the
           # nodes (jepsen_key_groups.py; key 0 alone can hide it).
           key_group=$((2 * $(grep -c . "$RUNNER_TEMP/cluster/nodes")))
+          # The key-group gate over the runs LABEL=STORE: a run that leaves
+          # threads out of its keys, or stops some, fails the job; but a
+          # quirks: base, drawn as an older generator on purpose, is
+          # reported beside the rest and fails nothing.
+          key_groups() {
+            local r gated=() reported=()
+            for r in "$@"; do
+              if [[ $IN_PAIR_BASE == quirks:* && $r == base[@#]* ]]; then reported+=("$r"); else gated+=("$r"); fi
+            done
+            if [ ${#reported[@]} -gt 0 ] && ! python3 "$ci/jepsen_key_groups.py" --group-size "$key_group" "${reported[@]}"; then
+              echo "::warning::the base, the etcd mix drawn with ${IN_PAIR_BASE#quirks:}, left threads out of its keys or stopped some (Key groups in the summary; not counted)"
+            fi
+            if [ ${#gated[@]} -gt 0 ] && ! python3 "$ci/jepsen_key_groups.py" --group-size "$key_group" "${gated[@]}"; then
+              echo "::error::a run's load generator left threads out of its keys or stopped some (Key groups in the summary)"
+              return 1
+            fi
+          }
           beside=""; if [ "$ETCD_BESIDE" = true ]; then beside=", beside etcd $ETCD_VERSION${ETCD_HEADLINE:+ with $ETCD_HEADLINE}${ETCD_SIDE_ROWS:+ (and ${ETCD_SIDE_ROWS// / and })}"; fi
           if [ "$SWIFTPAXOS_BESIDE" = true ]; then beside+=", beside SwiftPaxos"; fi
           if [ -z "$IN_PAIR_BASE" ] && [ -z "$SWEEP" ]; then
@@ -664,10 +702,7 @@ jobs:
             if [ "$NEMESIS" = none ] && [ -n "$store" ]; then
               one_runs=("head=$store")
               if [ "$ETCD_BESIDE" = true ] && [ -n "${etcd_store:-}" ]; then one_runs+=("etcd=$etcd_store"); fi
-              if ! python3 "$ci/jepsen_key_groups.py" --group-size "$key_group" "${one_runs[@]}"; then
-                echo "::error::a run's load generator left threads out of its keys or stopped some (Key groups in the summary)"
-                rc=1
-              fi
+              key_groups "${one_runs[@]}" || rc=1
             fi
             exit $rc
           fi
@@ -699,6 +734,17 @@ jobs:
               fi
               base_bin=$head_bin base_args=(--voter-env "${IN_PAIR_BASE#env:}")
               base_name="$head_sha with ${IN_PAIR_BASE#env:}" ;;
+            quirks:*)
+              # The head's own build with the etcd mix drawn another way:
+              # the CLI's last --etcd-register-quirks wins, so the base's
+              # follows the head's.
+              if [ "$REGISTER_MIX" != etcd ]; then
+                echo "::error::pair-base $IN_PAIR_BASE: needs a register-etcd-mix workload"
+                exit 1
+              fi
+              base_quirks=$(quirks_for_ref "${IN_PAIR_BASE#quirks:}") || exit 1
+              base_bin=$head_bin base_args=(--etcd-register-quirks "$base_quirks")
+              base_name="$head_sha with the etcd mix's quirks ${IN_PAIR_BASE#quirks:}" ;;
             harness:*)
               # The head's own build with one of the harness's settings,
               # which `coord-harness provision` reads from the environment
@@ -897,10 +943,7 @@ jobs:
               ${runs[@]+"${runs[@]}"} || true
             # Every key on its whole group of threads, and no thread
             # stopped early: a run that isn't fails the job.
-            if ! python3 "$ci/jepsen_key_groups.py" --group-size "$key_group" ${runs[@]+"${runs[@]}"}; then
-              echo "::error::a run's load generator left threads out of its keys or stopped some (Key groups in the summary)"
-              rc=1
-            fi
+            key_groups ${runs[@]+"${runs[@]}"} || rc=1
             exit $rc
           fi
           # Paired: base and head in turn, the order alternating from pair
@@ -925,10 +968,7 @@ jobs:
           python3 "$ci/jepsen_pairs.py" \
             --title "TupleSky pairs: $head_sha (head) against $base_name (base)$beside, $WORKLOAD, $NEMESIS$TITLE_SUFFIX$STORE_SUFFIX$PROFILE_SUFFIX$CHECKPOINT_SUFFIX$WORKERS_SUFFIX$TUPLESKY_SUFFIX" \
             ${runs[@]+"${runs[@]}"} || true
-          if ! python3 "$ci/jepsen_key_groups.py" --group-size "$key_group" ${runs[@]+"${runs[@]}"}; then
-            echo "::error::a run's load generator left threads out of its keys or stopped some (Key groups in the summary)"
-            rc=1
-          fi
+          key_groups ${runs[@]+"${runs[@]}"} || rc=1
           exit $rc
       - name: Read how far each voter executed
         if: always() && env.CPU_MISS != 'true' && env.IN_PAIR_BASE == '' && env.SWEEP == ''

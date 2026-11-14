@@ -14,8 +14,9 @@
 #                  register-etcd-mix:QUIRKS draws it with these of the
 #                  first generator's differences from etcd's expression
 #                  (--etcd-register-quirks: on-threads, process-limit,
-#                  jitter, comma-separated; first for all three, the
-#                  generator through jepsen 2057754; none for etcd's
+#                  jitter, whole-test-update, comma-separated; first for
+#                  all four, the generator through jepsen 2057754 as it
+#                  ran on the Jepsen of its day; none for etcd's
 #                  literal expression, gen/reserve, whose reader split on
 #                  this Jepsen depends on timing)
 #   IN_NEMESIS     their faults; empty for the scenario's. A partition
@@ -161,16 +162,15 @@ if [ "$workload" = register-etcd-mix ]; then
 elif [[ $workload == register-etcd-mix:* ]]; then
   register_quirks=${workload#register-etcd-mix:}
   workload=register register_mix=etcd
-  if [ "$register_quirks" = first ]; then register_quirks=on-threads,process-limit,jitter; fi
   IFS=, read -ra quirk_list <<< "$register_quirks"
   if [ ${#quirk_list[@]} -eq 0 ]; then
-    echo "::error::register-etcd-mix:QUIRKS needs at least one of on-threads, process-limit, jitter, or first, or none" >&2; exit 1
+    echo "::error::register-etcd-mix:QUIRKS needs at least one of on-threads, process-limit, jitter, whole-test-update, or first, or none" >&2; exit 1
   fi
-  if [ "$register_quirks" = none ]; then quirk_list=(); fi
+  if [ "$register_quirks" = none ] || [ "$register_quirks" = first ]; then quirk_list=(); fi
   for quirk in ${quirk_list[@]+"${quirk_list[@]}"}; do
     case $quirk in
-      on-threads|process-limit|jitter) ;;
-      *) echo "::error::not an etcd-mix quirk: '$quirk' in $IN_WORKLOAD (on-threads, process-limit, jitter, or first, or none alone)" >&2; exit 1 ;;
+      on-threads|process-limit|jitter|whole-test-update) ;;
+      *) echo "::error::not an etcd-mix quirk: '$quirk' in $IN_WORKLOAD (on-threads, process-limit, jitter, whole-test-update, or first, or none alone)" >&2; exit 1 ;;
     esac
   done
 elif [ "$workload" = register-swiftpaxos-mix ]; then
@@ -397,6 +397,7 @@ case $register_mix in
     case $register_quirks in
       "") ;;
       none) suffix+=" as its literal expression (gen/reserve)" ;;
+      first) suffix+=" as its first generator drew it (all four quirks)" ;;
       *) suffix+=" with ${register_quirks//,/, }" ;;
     esac ;;
   swiftpaxos) suffix+=", SwiftPaxos's register mix (reads and writes, no cas)" ;;
