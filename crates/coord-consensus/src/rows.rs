@@ -7,7 +7,7 @@ use alloc::vec::Vec;
 use coord_core::capability::{AdmissionFacts, admission_digest};
 use coord_core::effect::StoreUpdate;
 use coord_store_api::engine::{EngineError, ErrorClass};
-use coord_store_api::envelope::{MAX_ENVELOPE_PAYLOAD, StoreEnvelopeV1};
+use coord_store_api::envelope::StoreEnvelopeV1;
 use coord_store_api::registry::Collection;
 use coord_types::identity::Digest32;
 use coord_types::ids::{Ballot, ConfigurationEpoch};
@@ -221,29 +221,16 @@ pub fn payload_key(command: &CommandId) -> Vec<u8> {
 }
 
 /// `StoreEnvelopeV1 { record_kind, schema_version, payload }` with
-/// `value` as its payload, in one allocation: postcard lays the envelope
-/// out as its fields in order and the payload as its length and then its
-/// bytes, so the value is encoded in place after that header rather than
-/// into a buffer of its own that the envelope's encoding then copies.
-/// The bytes are the envelope's (`envelope_is_the_envelopes_encoding`).
+/// `value` as its payload, in one allocation
+/// ([`StoreEnvelopeV1::encode_value`]). The bytes are the envelope's
+/// (`envelope_is_the_envelopes_encoding`).
 fn envelope_at<T: Serialize>(
     kind: u16,
     schema_version: u16,
     value: &T,
     what: &'static str,
 ) -> Result<Vec<u8>, EngineError> {
-    let limit = |_| EngineError::new(ErrorClass::Limit, what);
-    let len = postcard::experimental::serialized_size(value).map_err(limit)?;
-    if len > MAX_ENVELOPE_PAYLOAD {
-        return Err(EngineError::new(
-            ErrorClass::Limit,
-            "envelope payload exceeds limit",
-        ));
-    }
-    // Two `u16`s and a length, each at most a few varint bytes.
-    let header = (kind, schema_version, len);
-    let out = postcard::to_extend(&header, Vec::with_capacity(len + 16)).map_err(limit)?;
-    postcard::to_extend(value, out).map_err(limit)
+    StoreEnvelopeV1::encode_value(kind, schema_version, value, what)
 }
 
 fn envelope<T: Serialize>(
@@ -545,6 +532,7 @@ pub fn sync_update(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use coord_store_api::envelope::MAX_ENVELOPE_PAYLOAD;
     use coord_types::ids::{
         ClientInstanceId, ClusterId, DomainId, ReplicaId, RequestSequence, SessionId,
     };

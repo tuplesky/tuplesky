@@ -1193,7 +1193,8 @@ pub struct GroupMix {
     pub protocol_records: u64,
     /// Of those, the ones carrying a command's payload row.
     pub payload_records: u64,
-    /// Application outcomes journaled, one an executed command.
+    /// Application records journaled: one an executed command, or one a
+    /// group's record of several (the batching-rule doc's 10.7, step 1).
     pub application_records: u64,
 }
 
@@ -1211,7 +1212,9 @@ impl GroupMix {
                             self.payload_records += 1;
                         }
                     }
-                    RecordBody::ApplicationOutcome { .. } => application += 1,
+                    RecordBody::ApplicationOutcome { .. } | RecordBody::ApplicationGroup { .. } => {
+                        application += 1
+                    }
                     _ => {}
                 }
             }
@@ -4125,14 +4128,17 @@ fn project<E: LocalEngine>(
                 *failure = Some("materialization would skip a journaled record");
                 break;
             }
-            if let RecordBody::ApplicationOutcome { base, position, .. } = record.body() {
-                if *base != meta.frontier.as_base() {
+            // A group of outcomes is checked as one: its record holds
+            // them contiguous from its base (`check_body`), so the
+            // projection moves from that base to the last one's position.
+            if let Some((base, position)) = record.body().execution() {
+                if base != meta.frontier.as_base() {
                     *failure = Some("durable record's base does not extend the projection");
                     break;
                 }
                 meta.frontier = ExecutionFrontier {
                     configuration: base.configuration,
-                    execution_position: *position,
+                    execution_position: position,
                 };
             }
             // Intake order is the record's journal sequence, the one the
@@ -4415,17 +4421,16 @@ fn obsolete(ballot: &Ballot, promised: &Ballot) -> bool {
 }
 
 /// The execution frontier after a record: only an established application
-/// outcome moves it, and it moves to the position the record recorded, not
-/// to a position derived at materialization time.
+/// outcome moves it, or a group of them, and it moves to the position the
+/// record recorded (a group's last), not to a position derived at
+/// materialization time.
 fn frontier_after(frontier: ExecutionFrontier, record: &JournalRecordV1) -> ExecutionFrontier {
-    match record.body() {
-        RecordBody::ApplicationOutcome { base, position, .. } => ExecutionFrontier {
+    match record.body().execution() {
+        Some((base, position)) => ExecutionFrontier {
             configuration: base.configuration,
-            execution_position: *position,
+            execution_position: position,
         },
-        RecordBody::ProtocolTransition { .. }
-        | RecordBody::PublishLocalCheckpoint(_)
-        | RecordBody::Lifecycle(_) => frontier,
+        None => frontier,
     }
 }
 

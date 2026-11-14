@@ -19,6 +19,10 @@ use crate::seq::StoreSeq;
 /// is two values, two keys and headroom.
 pub const MAX_ENVELOPE_PAYLOAD: usize = 2 * (1024 * 1024) + 2 * (8 * 1024) + 4096;
 
+/// The most an envelope's header takes ahead of its payload's bytes: two
+/// `u16`s and the payload's length, as postcard's varints.
+const HEADER_MAX: usize = 3 + 3 + 10;
+
 /// Bounded value envelope.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoreEnvelopeV1 {
@@ -32,15 +36,42 @@ pub struct StoreEnvelopeV1 {
 
 impl StoreEnvelopeV1 {
     /// Encode; fails on oversized payloads.
+    ///
+    /// Postcard lays the envelope out as its fields in order, and the
+    /// payload as its length and then its bytes. So the header is encoded
+    /// and the payload copied after it as one slice, into a buffer sized
+    /// once, rather than pushed a byte at a time into a buffer grown as it
+    /// fills. The bytes are postcard's (`encode_is_postcards_encoding`).
     pub fn encode(&self) -> Result<Vec<u8>, EngineError> {
-        if self.payload.len() > MAX_ENVELOPE_PAYLOAD {
-            return Err(EngineError::new(
-                ErrorClass::Limit,
-                "envelope payload exceeds limit",
-            ));
-        }
-        postcard::to_allocvec(self)
-            .map_err(|_| EngineError::new(ErrorClass::Limit, "envelope encode failed"))
+        let len = self.payload.len();
+        let mut out = header(
+            self.record_kind,
+            self.schema_version,
+            len,
+            "envelope encode failed",
+        )?;
+        out.extend_from_slice(&self.payload);
+        Ok(out)
+    }
+
+    /// The envelope of `value`'s encoding, without building the envelope:
+    /// `value` is counted, then encoded in place after the header, in one
+    /// allocation, rather than into a buffer of its own that the
+    /// envelope's encoding then copies. The bytes are those of
+    /// `StoreEnvelopeV1 { record_kind, schema_version, payload }.encode()`
+    /// with `value`'s encoding as the payload
+    /// (`encode_value_is_the_envelope_of_the_values_encoding`). `what`
+    /// names the record when `value` doesn't encode.
+    pub fn encode_value<T: Serialize + ?Sized>(
+        record_kind: u16,
+        schema_version: u16,
+        value: &T,
+        what: &'static str,
+    ) -> Result<Vec<u8>, EngineError> {
+        let limit = |_| EngineError::new(ErrorClass::Limit, what);
+        let len = postcard::experimental::serialized_size(value).map_err(limit)?;
+        let out = header(record_kind, schema_version, len, what)?;
+        postcard::to_extend(value, out).map_err(limit)
     }
 
     /// Decode exactly; trailing bytes and oversized payloads are corruption.
@@ -61,6 +92,27 @@ impl StoreEnvelopeV1 {
         }
         Ok(env)
     }
+}
+
+/// An envelope's header for a payload of `len` bytes, in a buffer with
+/// room for the payload after it; fails on oversized payloads.
+fn header(
+    record_kind: u16,
+    schema_version: u16,
+    len: usize,
+    what: &'static str,
+) -> Result<Vec<u8>, EngineError> {
+    if len > MAX_ENVELOPE_PAYLOAD {
+        return Err(EngineError::new(
+            ErrorClass::Limit,
+            "envelope payload exceeds limit",
+        ));
+    }
+    postcard::to_extend(
+        &(record_kind, schema_version, len),
+        Vec::with_capacity(HEADER_MAX + len),
+    )
+    .map_err(|_| EngineError::new(ErrorClass::Limit, what))
 }
 
 /// The applied stamp persisted atomically with every projection update.
@@ -111,14 +163,12 @@ impl AppliedStamp {
 
     /// Encode as an envelope value.
     pub fn to_envelope(&self) -> Result<Vec<u8>, EngineError> {
-        let payload = postcard::to_allocvec(self)
-            .map_err(|_| EngineError::new(ErrorClass::Limit, "stamp encode failed"))?;
-        StoreEnvelopeV1 {
-            record_kind: STAMP_RECORD_KIND,
-            schema_version: STAMP_SCHEMA_VERSION,
-            payload,
-        }
-        .encode()
+        StoreEnvelopeV1::encode_value(
+            STAMP_RECORD_KIND,
+            STAMP_SCHEMA_VERSION,
+            self,
+            "stamp encode failed",
+        )
     }
 
     /// Decode from an envelope value; wrong kind/version is corruption.
