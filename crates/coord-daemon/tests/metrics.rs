@@ -9,9 +9,10 @@ use std::time::Duration;
 use coord_daemon::metrics::{
     Answered, Cost, Cpu, Datagrams, Distribution, Durability, FastPath, Flushes, Frontiers, Gate,
     HandOffs, Headroom, History, Interval, Jobs, JournalGroups, Lane, LaneReading, Latency,
-    MAX_REPORTED_SHARDS, Measure, MetricsSnapshot, OldestWait, PipelineWaits, ProposalBytes, Reads,
-    Recorder, Relay, Release, ReleaseDistributions, Resends, Scheduling, ShardIndex, ShardReading,
-    Stage, StageReading, Table, Traffic, Unavailable, UnorderedPreAcceptances, Wait,
+    MAX_REPORTED_SHARDS, Measure, MetricsSnapshot, Offers, OldestWait, Path, PipelineWaits, Plane,
+    ProposalBytes, Reads, Recorder, Relay, Release, ReleaseDistributions, Resends, Scheduling,
+    ShardIndex, ShardReading, Stage, StageReading, Table, Traffic, Unavailable,
+    UnorderedPreAcceptances, Wait,
 };
 use coord_daemon::role::RoleSet;
 
@@ -555,7 +556,48 @@ fn a_rendered_snapshot_carries_no_secret_or_key_shaped_text() {
                 executed: 90_000,
                 executed_bytes: 2_520_000,
             },
+            offers: Offers {
+                reoffered: 40,
+                solicited: 12,
+                refused: 7,
+                returned: 9000,
+                unreturnable: 3,
+            },
         }),
+        // A replica is named by four bytes, as the log lines name it: not
+        // an identity-shaped run.
+        paths: vec![
+            Path {
+                plane: Plane::Peer,
+                lane: Lane::Control,
+                role: coord_types::wire_v1::PeerRole::Voter,
+                replica: Some("0a1b2c3d".to_owned()),
+                connection: 4,
+                accepted: false,
+                rtt_micros: 140_312,
+                min_rtt_micros: 139_870,
+                cwnd: 1_048_576,
+                congestion_events: 12,
+                lost_packets: 310,
+                lost_bytes: 371_000,
+                sent_packets: 31_000,
+            },
+            Path {
+                plane: Plane::Api,
+                lane: Lane::Unary,
+                role: coord_types::wire_v1::PeerRole::Frontend,
+                replica: None,
+                connection: 9,
+                accepted: true,
+                rtt_micros: 141_002,
+                min_rtt_micros: 139_901,
+                cwnd: 38_400,
+                congestion_events: 220,
+                lost_packets: 2_400,
+                lost_bytes: 1_900_000,
+                sent_packets: 240_000,
+            },
+        ],
     };
     let rendered = serde_json::to_string(&snapshot).expect("a snapshot renders");
 

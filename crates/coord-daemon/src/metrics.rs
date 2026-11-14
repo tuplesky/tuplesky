@@ -457,6 +457,95 @@ pub struct MetricsSnapshot {
     /// What this node's work has cost since it started, or why it has
     /// no such reading (task-d45).
     pub cost: Measure<Cost>,
+    /// Each open connection's path to a voter or a collector, as QUIC
+    /// estimates it (the lead's item 2 on #185), on either plane. Empty
+    /// where the node has no transport yet.
+    #[serde(default)]
+    pub paths: Vec<Path>,
+}
+
+/// The plane a connection is on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Plane {
+    /// Between voters.
+    Peer,
+    /// Between collectors, clients and voters.
+    Api,
+}
+
+/// One open connection's path as QUIC estimates it (the lead's item 2 on
+/// #185, after the +loss1 reading): whether a link is held back by its
+/// congestion window, and by how much loss.
+///
+/// One a connection, and each lane is a connection of its own. Read for a
+/// voter's, an observer's or a learner's connections on either plane, and
+/// for a collector's on the api plane; never for a client's, which are as
+/// many as the callers. The counts are cumulative over the connection's
+/// life, and start again with a new connection: `connection` says which.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Path {
+    /// The plane.
+    pub plane: Plane,
+    /// The lane.
+    pub lane: Lane,
+    /// The role bound to the other end.
+    pub role: coord_types::wire_v1::PeerRole,
+    /// The replica at the other end, as the first four bytes of its
+    /// identity in hex, as the daemon's log lines name a voter. None for
+    /// a collector's connection this side accepted, whose binding names
+    /// no replica: `connection` tells those apart.
+    pub replica: Option<String>,
+    /// The connection, as this endpoint numbers them (never reused).
+    pub connection: u64,
+    /// Whether this side accepted it.
+    pub accepted: bool,
+    /// The smoothed round trip, in microseconds.
+    pub rtt_micros: u64,
+    /// The least round trip seen, without the peer's ACK delay, in
+    /// microseconds.
+    pub min_rtt_micros: u64,
+    /// The congestion window, in bytes.
+    pub cwnd: u64,
+    /// Congestion events: each one a cut of the window.
+    pub congestion_events: u64,
+    /// Packets this side sent and judged lost.
+    pub lost_packets: u64,
+    /// Their bytes.
+    pub lost_bytes: u64,
+    /// Packets this side sent.
+    pub sent_packets: u64,
+}
+
+impl Path {
+    /// The metrics line's reading of one of the transport's.
+    pub fn of(reading: &coord_transport::PathReading) -> Self {
+        let micros = |d: Duration| u64::try_from(d.as_micros()).unwrap_or(u64::MAX);
+        Self {
+            plane: match reading.class {
+                coord_transport::Class::Peer => Plane::Peer,
+                coord_transport::Class::Api => Plane::Api,
+            },
+            lane: match reading.lane {
+                coord_transport::Lane::Control => Lane::Control,
+                coord_transport::Lane::Unary => Lane::Unary,
+                coord_transport::Lane::Watch => Lane::Watch,
+                coord_transport::Lane::Bulk => Lane::Bulk,
+            },
+            role: reading.role,
+            replica: reading
+                .replica
+                .map(|r| r.0[..4].iter().map(|b| format!("{b:02x}")).collect()),
+            connection: reading.connection.0,
+            accepted: reading.accepted,
+            rtt_micros: micros(reading.rtt),
+            min_rtt_micros: micros(reading.min_rtt),
+            cwnd: reading.cwnd,
+            congestion_events: reading.congestion_events,
+            lost_packets: reading.lost_packets,
+            lost_bytes: reading.lost_bytes,
+            sent_packets: reading.sent_packets,
+        }
+    }
 }
 
 /// What a voter's work has cost since it started (task-d45).
@@ -586,6 +675,35 @@ pub struct Cost {
     /// (task-d113): its entries, and the bytes they take.
     #[serde(default)]
     pub intake_index: IntakeIndexSize,
+    /// What this node's collector offered and asked again, and what its
+    /// voter refused at its door or could not send back, since the node
+    /// started (the +loss1 reading on #185).
+    #[serde(default)]
+    pub offers: Offers,
+}
+
+/// What a node's collector sent again, and what its voter refused or could
+/// not send back, cumulative since the node started (the +loss1 reading on
+/// #185). Before these were on the metrics line, `reoffered` and
+/// `solicited` reached only the log, at powers of two, and `refused` only
+/// the api plane's end line at shutdown.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Offers {
+    /// Offers of a submission made again to a voter that had not taken
+    /// it: the same envelope, after the voter's lane refused it.
+    pub reoffered: u64,
+    /// Submissions of pending commands sent again to ask for evidence:
+    /// the relay's ask of the leader, and the ask of every voter
+    /// (task-d22).
+    pub solicited: u64,
+    /// Submissions this node's own voter refused at its door.
+    pub refused: u64,
+    /// Evidence and releases this voter handed to the transport for a
+    /// collector in another process.
+    pub returned: u64,
+    /// Evidence and releases for such a collector the transport did not
+    /// take: not sent, and not sent again.
+    pub unreturnable: u64,
 }
 
 /// The size of the projection's index by command of its intake-keyed rows
