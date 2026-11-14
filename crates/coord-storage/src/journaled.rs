@@ -2409,12 +2409,15 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
             _ => return Err(SubmitRefused::BaseMismatchedKind),
         };
         check_update_bounds(&submission.batch, &submission.kind).map_err(SubmitRefused::Record)?;
-        let bytes = batch_bytes(&submission.batch);
-        if bytes.saturating_add(RECORD_HEADER_ALLOWANCE) > MAX_RECORD_BYTES {
-            // Refused here rather than at sealing time, so a batch that
-            // could never become a valid record never occupies the queue.
-            return Err(SubmitRefused::Record(RecordError::TooLarge));
+        // Refused here rather than at sealing time, so a batch that could
+        // never become a valid record never occupies the queue. An
+        // application's batch is measured first by the applier, at every
+        // voter, with the same function, so it reaches here only when it
+        // fits.
+        if let Some(refusal) = record_refusal(&submission.batch) {
+            return Err(SubmitRefused::Record(refusal));
         }
+        let bytes = batch_bytes(&submission.batch);
         if state.queue.len() >= limits.max_queued_per_domain
             || state.queued_bytes + bytes > limits.max_queued_bytes_per_domain
         {
@@ -4468,27 +4471,53 @@ const _: () = assert!(
         <= MAX_RECORD_BYTES
 );
 
+// A lease at its quota is revoked, or expires, in one batch, and so in one
+// record: its attachments' worst case (`coord_state::attachment_cost`, the
+// measure `batch_bytes` takes) and 64 KiB for the batch's fixed rows, which
+// are the lease row, the revision counter, the retry binding and a
+// retirement of at most `MAX_RETIRE_PER_COMMAND` sequences.
+const _: () = assert!(coord_state::MAX_LEASE_BYTES as usize + 64 * 1024 <= RECORD_UPDATE_BYTES);
+
 fn check_update_bounds(batch: &PersistBatch, kind: &TransitionKind) -> Result<(), RecordError> {
     if batch.updates.is_empty() && matches!(kind, TransitionKind::Protocol) {
         return Err(RecordError::EmptyUpdates);
     }
+    Ok(())
+}
+
+/// Why `batch` can't be one journal record, or `None` when it can: more
+/// updates than a record holds, a key or a value longer than a record's,
+/// or more bytes than a record's once its header is allowed for.
+///
+/// A function of the batch alone, so every voter reaches the same answer
+/// for the same batch, whatever its store. The applier measures each
+/// command's batch with it before submitting, so a command too large for
+/// one record is a replicated refusal and not a voter's halt (design
+/// Section 4.5, the release rule's third requirement), and
+/// [`JournaledStore::submit`] refuses with it.
+pub fn record_refusal(batch: &PersistBatch) -> Option<RecordError> {
     if batch.updates.len() > MAX_RECORD_UPDATES {
-        return Err(RecordError::TooManyUpdates);
+        return Some(RecordError::TooManyUpdates);
     }
     for update in &batch.updates {
         if update.key.len() > MAX_RECORD_KEY_BYTES {
-            return Err(RecordError::KeyTooLong);
+            return Some(RecordError::KeyTooLong);
         }
         if update
             .value
             .as_ref()
             .is_some_and(|v| v.len() > MAX_RECORD_VALUE_BYTES)
         {
-            return Err(RecordError::ValueTooLong);
+            return Some(RecordError::ValueTooLong);
         }
     }
-    Ok(())
+    (batch_bytes(batch).saturating_add(RECORD_HEADER_ALLOWANCE) > MAX_RECORD_BYTES)
+        .then_some(RecordError::TooLarge)
 }
+
+/// The bytes one journal record holds for its updates, as `batch_bytes`
+/// measures them: the record's bound less its header's allowance.
+pub const RECORD_UPDATE_BYTES: usize = MAX_RECORD_BYTES - RECORD_HEADER_ALLOWANCE;
 
 /// Seal one queued transition at `seq`, chained onto `predecessor`: the
 /// stream's accepted durable head for the first record of an entry, the

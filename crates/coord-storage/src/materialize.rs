@@ -446,8 +446,20 @@ pub(crate) fn apply_plan_sharing<P: Persistence>(
     others: Option<&mut Vec<StorageEvent>>,
 ) -> Result<ApplyOutcome, EngineError> {
     let (batch, kind, pending) = prepare(barrier, namespace, plan, binding)?;
+    land_prepared_sharing(store, batch, kind, &pending, others)
+}
+
+/// Submit a batch [`prepare`] made and complete it, handing the events that
+/// are not its own to `others` ([`complete_sharing`]).
+pub(crate) fn land_prepared_sharing<P: Persistence>(
+    store: &mut P,
+    batch: PersistBatch,
+    kind: TransitionKind,
+    pending: &Pending,
+    others: Option<&mut Vec<StorageEvent>>,
+) -> Result<ApplyOutcome, EngineError> {
     match submit(store, batch, kind)? {
-        Submitted::Accepted => complete_sharing(store, &pending, others),
+        Submitted::Accepted => complete_sharing(store, pending, others),
         Submitted::Replan => Ok(ApplyOutcome::Replan),
         Submitted::Indeterminate => Ok(ApplyOutcome::Indeterminate),
     }
@@ -488,9 +500,5 @@ pub(crate) fn apply_refused_plan_sharing<P: Persistence>(
         plan.revision,
         pending.result_digest,
     )?);
-    match submit(store, batch, kind)? {
-        Submitted::Accepted => complete_sharing(store, &pending, others),
-        Submitted::Replan => Ok(ApplyOutcome::Replan),
-        Submitted::Indeterminate => Ok(ApplyOutcome::Indeterminate),
-    }
+    land_prepared_sharing(store, batch, kind, &pending, others)
 }

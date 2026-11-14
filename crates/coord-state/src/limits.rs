@@ -19,6 +19,20 @@
 /// it can see and this crate cannot.
 pub const MAX_RETAINED_RESPONSE_BYTES: usize = 2 * 1024 * 1024 + 8 * 1024;
 
+/// The most worst-case revocation bytes one lease may hold
+/// ([`PlanLimits::max_lease_bytes`]): one MiB under a journal record's
+/// 4 MiB, so revoking or expiring a lease at its quota is always one
+/// record.
+///
+/// It was 7 MiB, one MiB under the projection worker's 8 MiB single
+/// batch. But a node journals every command as one record, and a record
+/// holds 4 MiB, so a revoke or an expiry of a lease past about 4 MiB
+/// could never be recorded: every voter stopped on it, and an expiry is
+/// the domain's own command, so it can't be refused away. `coord-storage`
+/// checks this against the record's bound, which it can see and this
+/// crate cannot.
+pub const MAX_LEASE_BYTES: u64 = 3 * 1024 * 1024;
+
 /// Limits applied by the planner. Replicated semantic limits, not local
 /// scheduling budgets: lowering a local budget backpressures but cannot
 /// change a chosen result.
@@ -39,10 +53,10 @@ pub struct PlanLimits {
     pub max_lease_attachments: u32,
     /// Maximum worst-case deletion/event bytes of one lease's attachments
     /// (see [`attachment_cost`]), rechecked on every write of an attached
-    /// key. Revoking a lease writes all of it in one batch, so this must
-    /// stay below the storage worker's single-batch limit with headroom
-    /// for the batch's fixed rows (lease record, revision counter and retry
-    /// binding).
+    /// key. Revoking a lease writes all of it in one batch, which is one
+    /// journal record, so this must stay below the record's bound with
+    /// headroom for the batch's fixed rows (lease record, revision counter
+    /// and retry binding). See [`MAX_LEASE_BYTES`].
     ///
     /// [`attachment_cost`]: crate::attachment_cost
     pub max_lease_bytes: u64,
@@ -56,8 +70,7 @@ impl Default for PlanLimits {
             max_events_per_revision: 4096,
             max_delete_keys: 4096,
             max_lease_attachments: 128,
-            // One MiB under the worker's 8 MiB single-batch default.
-            max_lease_bytes: 7 * 1024 * 1024,
+            max_lease_bytes: MAX_LEASE_BYTES,
         }
     }
 }

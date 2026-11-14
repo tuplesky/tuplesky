@@ -84,7 +84,7 @@ impl LeaseRecord {
 /// bound on what one revocation writes for that key (current deletion,
 /// history tombstone, reverse-index deletion and event row, as the worker
 /// sizes a batch), so a lease within [`PlanLimits::max_lease_bytes`] is
-/// always revocable in one batch below the worker's single-batch limit.
+/// always revocable in one batch, and that batch is one journal record.
 ///
 /// [`PlanLimits::max_lease_bytes`]: crate::PlanLimits::max_lease_bytes
 pub fn attachment_cost(key: &[u8], value: &[u8]) -> u64 {

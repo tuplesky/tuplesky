@@ -513,7 +513,8 @@ fn a_lease_at_its_byte_quota_is_still_revocable_in_one_batch() {
     // Worst case for the revoke batch: keys of the maximum length made of
     // zero bytes (the ordered-key escaping doubles them in three row keys)
     // holding values of the maximum length. The quota must admit exactly
-    // what one revocation can write below the worker's single-batch limit.
+    // what one revocation can write in one journal record, which is also
+    // below the worker's single-batch limit.
     use coord_storage::lowering::batch_bytes;
     use coord_types::logical_v1::limits::{MAX_KEY_BYTES, MAX_VALUE_BYTES};
     let mut d = Domain::new(ModelEngine::new());
@@ -524,16 +525,19 @@ fn a_lease_at_its_byte_quota_is_still_revocable_in_one_batch() {
     let per_key = coord_state::attachment_cost(&vec![0; MAX_KEY_BYTES], &value);
     let fits = limits.max_lease_bytes / per_key;
     assert!(fits >= 2, "the default quota admits several maximal keys");
+    // Keys of nonzero bytes: a zero escapes to two bytes in a row key, and a
+    // key of zeros at its limit is a row key no journal record holds
+    // (`record_bound.rs`), whatever its lease.
     for i in 0..fits {
-        let mut key = vec![0u8; MAX_KEY_BYTES];
-        key[MAX_KEY_BYTES - 1] = i as u8;
+        let mut key = vec![b'k'; MAX_KEY_BYTES];
+        key[MAX_KEY_BYTES - 1] = b'0' + i as u8;
         assert_eq!(
             d.run_as(ALICE, &put(&key, &value, Some(L1))),
             Outcome::Put { prev: None }
         );
     }
-    let mut over = vec![0u8; MAX_KEY_BYTES];
-    over[MAX_KEY_BYTES - 1] = 0xff;
+    let mut over = vec![b'k'; MAX_KEY_BYTES];
+    over[MAX_KEY_BYTES - 1] = b'z';
     assert_eq!(
         d.run_as(ALICE, &put(&over, &value, Some(L1))),
         Outcome::ErrLeaseQuota
@@ -541,8 +545,8 @@ fn a_lease_at_its_byte_quota_is_still_revocable_in_one_batch() {
     let record = d.lease(L1).unwrap();
     assert_eq!(record.attached_bytes, fits * per_key);
     assert!(record.attached_bytes <= limits.max_lease_bytes);
-    // The materialized revoke batch, retry binding included, stays under
-    // the worker's single-batch limit and applies.
+    // The materialized revoke batch, retry binding included, is one journal
+    // record, stays under the worker's single-batch limit and applies.
     let r = revoke(L1);
     let bound = binding(7, &r);
     let gated = d.worker.reader().snapshot().unwrap();
@@ -552,6 +556,11 @@ fn a_lease_at_its_byte_quota_is_still_revocable_in_one_batch() {
     let batch =
         coord_storage::plan_to_batch(d.alloc.allocate(), NS, &planned, Some(&bound)).unwrap();
     let bytes = batch_bytes(&batch);
+    assert_eq!(
+        coord_storage::journaled::record_refusal(&batch),
+        None,
+        "a revoke batch of {bytes} bytes is one journal record"
+    );
     assert!(
         bytes <= GroupLimits::default().max_single_batch_bytes,
         "revoke batch of {bytes} bytes exceeds the single-batch limit"
