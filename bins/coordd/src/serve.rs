@@ -191,6 +191,13 @@ pub struct Counts {
     /// voter carried, whatever it held for that collector (task-d115,
     /// lever 4). `returned` over this is the frames a hand-off.
     pub returned_sends: u64,
+    /// Evidence and releases kept to be offered again: refused because
+    /// the collector's lane queue was full, or made while frames for that
+    /// collector were kept, and queued behind them
+    /// ([`coord_daemon::unreturned`]).
+    pub kept_returns: u64,
+    /// Of `returned`, frames that had been kept first.
+    pub returned_again: u64,
     /// Watches opened.
     pub watches: u64,
     /// Frames written onto a watch's own stream: events, progress and
@@ -1021,6 +1028,9 @@ pub struct Domain<P: Persistence> {
     /// Evidence this voter has produced for commands whose submitter it
     /// does not know yet, oldest first.
     parked: coord_daemon::parked::Parked,
+    /// Evidence and releases owed to collectors in other processes that
+    /// their lanes would not take yet, kept to be offered again.
+    unreturned: coord_daemon::unreturned::Unreturned,
     /// Where the last turn's look at the collector's half-held commands
     /// left off, so a command that cannot settle here does not keep the
     /// ones behind it from being looked at.
@@ -1364,6 +1374,35 @@ const PARKED_HOLD: core::time::Duration =
 /// and said apart from the hold expiring. Like the hold, what it drops
 /// is recoverable the same way (task-c02).
 const PARKED_EVIDENCE: usize = 1024;
+
+/// How many frames owed to collectors one domain keeps for want of room
+/// in their lanes, across every collector of the domain
+/// ([`coord_daemon::unreturned`]).
+///
+/// Per domain, not per node: the store is a [`Domain`]'s, so a node
+/// serving several domains keeps up to this many for each.
+///
+/// Sixty-four lanes' queues: a domain that has this many kept is not
+/// waiting out full queues but serving collectors that have stopped
+/// reading, and what a bound lets go a collector gets back by asking
+/// again.
+const UNRETURNED_FRAMES: usize = 64 * 64;
+
+/// How many bytes of frames owed to collectors one domain keeps, across
+/// every collector of the domain. Evidence and releases are small; this
+/// is the ceiling a large read answer would meet first.
+const UNRETURNED_BYTES: usize = 4 * 1024 * 1024;
+
+/// The most frames one domain keeps for any one collector's connection:
+/// four of its unary lane's queues, a sixteenth of the domain's bound.
+/// A collector that has stopped reading fills its own share and no more,
+/// so what another collector's full queue refuses is still kept: it
+/// takes sixteen stopped collectors to fill the store (#298 review).
+const UNRETURNED_CONNECTION_FRAMES: usize = UNRETURNED_FRAMES / 16;
+
+/// The most bytes one domain keeps for any one collector's connection, a
+/// sixteenth of the domain's bound, for the same reason.
+const UNRETURNED_CONNECTION_BYTES: usize = UNRETURNED_BYTES / 16;
 
 /// Held evidence is due to be let go when the oldest of it has waited
 /// the whole hold.
@@ -1933,6 +1972,12 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             resend_time: Default::default(),
             pages_asked: None,
             parked: coord_daemon::parked::Parked::new(PARKED_HOLD, PARKED_EVIDENCE),
+            unreturned: coord_daemon::unreturned::Unreturned::new(
+                UNRETURNED_FRAMES,
+                UNRETURNED_BYTES,
+                PARKED_HOLD,
+            )
+            .per_connection(UNRETURNED_CONNECTION_FRAMES, UNRETURNED_CONNECTION_BYTES),
             settle_cursor: 0,
             answered_otherwise: None,
             admission_halt: None,
@@ -2104,6 +2149,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                         .saturating_mul(coord_storage::intake::EXECUTED_ENTRY_BYTES),
                 }
             },
+            table_full: voter.node().table_full(),
             busy,
             uptime: now.saturating_duration_since(self.started),
             recent,
@@ -2153,10 +2199,13 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                     relayed: collector.relayed(),
                     fallbacks: collector.relay_fallbacks(),
                     not_leading: collector.not_leading(),
+                    asked_leader: collector.relay_leader_asks(),
                     frames_taken: taken.frames,
                     payloads_taken: taken.taken,
                     known: taken.known,
                     not_taken: taken.not_taken,
+                    kept: taken.kept,
+                    kept_taken: taken.kept_taken,
                     frame_batches: taken.frame_batches,
                     frame_adoptions: taken.frame_adoptions,
                 }
@@ -2344,6 +2393,9 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 refused: counts.refused,
                 returned: counts.returned,
                 unreturnable: counts.unreturnable,
+                kept: counts.kept_returns,
+                returned_again: counts.returned_again,
+                kept_now: self.unreturned.frames() as u64,
             }
         };
         MetricsSnapshot {
@@ -3354,7 +3406,13 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                     .as_ref()
                     .filter(|_| voter.leads())
                     .and_then(Deadline::next_deadline),
-                Deadline::next_deadline(&self.parked),
+                [
+                    Deadline::next_deadline(&self.parked),
+                    self.unreturned.next_due(),
+                ]
+                .into_iter()
+                .flatten()
+                .min(),
             ),
             Backing::Serving(_) => (None, None),
         };
@@ -3890,6 +3948,9 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         // evidence for a command belongs, so whatever was waiting for
         // one is tried again here.
         self.route_parked(api);
+        // And what a collector's full lane would not take is offered
+        // again once its turn has come.
+        self.offer_unreturned(api);
         Ok(did)
     }
 
@@ -4468,22 +4529,55 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     /// collector's frames in one hand-off, in the order the round made
     /// them (task-d115, lever 4). The transport admits each frame on its
     /// own, as one `send` did, and wakes the connection's sender once.
+    ///
+    /// What the transport refuses for a full queue is kept and offered
+    /// again (the +loss1 reading's fix 2): it was the collector's only
+    /// copy of a release. A collector with frames kept gets the round's
+    /// frames behind them (see [`coord_daemon::unreturned`]).
     fn return_to_collectors(&mut self, api: &Transport, returning: Returning) {
         let domain = self.frontend.membership.domain();
+        let now = std::time::Instant::now();
         for (id, frames) in returning.0 {
-            let sent = api.send_many(
-                coord_transport::Destination::Connection(coord_transport::ConnectionId(id)),
-                domain,
-                frames,
-            );
-            self.frontend.counts.returned_sends += 1;
-            for result in sent {
-                match result {
-                    Ok(()) => self.frontend.counts.returned += 1,
-                    Err(_) => self.frontend.counts.unreturnable += 1,
-                }
-            }
+            let offered = self.unreturned.send(id, frames, now, |frames| {
+                api.offer_many(
+                    coord_transport::Destination::Connection(coord_transport::ConnectionId(id)),
+                    domain,
+                    frames,
+                )
+            });
+            self.count_returns(offered);
         }
+    }
+
+    /// Offer again what is kept for collectors whose turn has come.
+    ///
+    /// Called at the end of every turn. On a quiet domain the next one's
+    /// time is registered as a deadline (see [`Deadline`]), so the loop
+    /// takes a turn when it comes.
+    fn offer_unreturned(&mut self, api: &Transport) {
+        if self.unreturned.is_empty() {
+            return;
+        }
+        let domain = self.frontend.membership.domain();
+        let offered = self
+            .unreturned
+            .offer_due(std::time::Instant::now(), |id, frames| {
+                api.offer_many(
+                    coord_transport::Destination::Connection(coord_transport::ConnectionId(id)),
+                    domain,
+                    frames,
+                )
+            });
+        self.count_returns(offered);
+    }
+
+    fn count_returns(&mut self, offered: coord_daemon::unreturned::Offered) {
+        let counts = &mut self.frontend.counts;
+        counts.returned_sends += offered.handoffs;
+        counts.returned += offered.returned;
+        counts.returned_again += offered.returned_again;
+        counts.kept_returns += offered.kept;
+        counts.unreturnable += offered.unreturnable;
     }
 
     /// Hold a frame until the submission that says where it belongs
@@ -8912,6 +9006,90 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
             heard.sort_by_key(key);
             owed_open.sort_by_key(key);
             assert_eq!(heard, owed_open);
+        }
+
+        /// What a collector's full lane refuses is kept and offered again,
+        /// and reaches the collector as the lane drains: nothing is let go
+        /// (the +loss1 reading's fix 2, #185).
+        ///
+        /// One round owes the collector twice what its lane's queue holds.
+        /// The hand-off admits what the queue takes and the transport
+        /// refuses the rest for a full queue. That rest is kept, the loop
+        /// registers a wake for it, and offered again at its turn it
+        /// reaches the collector: every frame the round owed, and nothing
+        /// counted `unreturnable`.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn frames_a_full_lane_refuses_are_kept_and_reach_the_collector_as_it_drains() {
+            use coord_transport::TransportEvent;
+
+            let (api, mut far, accepted, _) = collector_link().await;
+            let open = Origin::Connection(accepted.0);
+            let (mut leader, _handle) = held_leader(Duration::from_secs(3600));
+            let mut collector = collector();
+            let made = execute_from(&mut leader, &mut collector, 1, open);
+            let mut domain = domain(leader, collector);
+            let owed: Vec<Vec<u8>> = made
+                .into_iter()
+                .filter(|bytes| domain.owed_to(&frame(bytes)) == Some(open))
+                .collect();
+            assert!(!owed.is_empty());
+            let depth = coord_transport::LaneLimits::UNARY.queue_depth;
+            let round: Vec<Vec<u8>> = owed.iter().cycle().take(2 * depth).cloned().collect();
+            let total = round.len();
+            let mut sent: Vec<_> = round.iter().map(|bytes| frame(bytes)).collect();
+
+            // The collector's end reads as the lane drains, as a collector
+            // does.
+            let listener = tokio::spawn(async move {
+                let mut heard = Vec::new();
+                while heard.len() < total {
+                    match tokio::time::timeout(Duration::from_secs(10), far.next_event()).await {
+                        Ok(Some(TransportEvent::ApiDelivery { frame, .. })) => heard.push(frame),
+                        Ok(Some(_)) => {}
+                        Ok(None) | Err(_) => break,
+                    }
+                }
+                heard
+            });
+
+            domain.return_to_collectors(&api, super::super::Returning(vec![(accepted.0, round)]));
+            let counts = domain.frontend.counts;
+            assert_eq!(counts.unreturnable, 0, "{counts:?}");
+            assert!(
+                counts.kept_returns > 0,
+                "the queue took the whole round, so this shows nothing: {counts:?}"
+            );
+            assert_eq!(counts.returned + counts.kept_returns, total as u64);
+            assert_eq!(domain.unreturned.frames() as u64, counts.kept_returns);
+            // What is kept registers a wake, so a quiet domain takes the
+            // turn that offers it again.
+            let due = domain.unreturned.next_due().expect("kept frames are due");
+            assert!(domain.next_deadline().is_some_and(|at| at <= due));
+
+            // Offered again at their turn, as the loop's turns do.
+            let give_up = std::time::Instant::now() + Duration::from_secs(10);
+            while !domain.unreturned.is_empty() {
+                assert!(
+                    std::time::Instant::now() < give_up,
+                    "kept frames never left: {:?}",
+                    domain.frontend.counts
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                domain.offer_unreturned(&api);
+            }
+            let counts = domain.frontend.counts;
+            assert_eq!(
+                (counts.returned, counts.returned_again, counts.unreturnable),
+                (total as u64, counts.kept_returns, 0),
+                "{counts:?}"
+            );
+
+            let mut heard = listener.await.expect("the listener");
+            assert_eq!(heard.len(), total, "the collector heard every frame");
+            let key = |f: &coord_types::wire_v1::Frame| (f.kind, f.version, f.payload.clone());
+            heard.sort_by_key(key);
+            sent.sort_by_key(key);
+            assert_eq!(heard, sent);
         }
 
         /// A failure a peer's frame meets stops the voter, as one a turn

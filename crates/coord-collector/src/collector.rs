@@ -304,15 +304,28 @@ pub const SOLICIT_AFTER_MILLIS: u64 = 5 * OFFER_CEILING_MILLIS;
 pub const SOLICIT_LEADER_AFTER_MILLIS: u64 = OFFER_CEILING_MILLIS;
 
 /// How long a relayed entry (task-d102, task-d100's step B) waits on its
-/// leader before it is fanned out to every voter as a step-A submission.
+/// leader before the collector acts on it, in milliseconds: at the first
+/// bound it asks a leader that took the entry again, and otherwise, or at
+/// the next bound, it fans out.
 ///
 /// A relayed submission reaches one voter, so a leader that went away,
 /// or a view of the leader that is stale, would hold it until the
-/// all-voter solicit -- and that one goes to the leader alone too. Past
-/// this bound the entry is submitted as it would have been without the
-/// relay, and the voters' own acknowledgements to their leader decide
-/// it. A leader that answers that it isn't leading
-/// ([`SubmissionRefusal::NotLeading`]) brings this forward to at once.
+/// all-voter solicit -- and that one goes to the leader alone too.
+///
+/// At this bound, an entry whose leader took the relayed frame is
+/// submitted to that leader alone again, once (storm fix 3 on #185). The
+/// leader is the one voter that can publish a lost release again: an
+/// exact duplicate makes it do so once it has executed the command. One
+/// frame, where fanning out is a frame to every follower and their
+/// evidence back, and the followers are where a full table drops
+/// relayed payloads.
+///
+/// Past the bound again, or at the first bound for an entry its leader
+/// never took (the link refused it or went away), the entry is submitted
+/// as it would have been without the relay, and the voters' own
+/// acknowledgements to their leader decide it. A leader that answers
+/// that it isn't leading ([`SubmissionRefusal::NotLeading`]) brings the
+/// fan-out forward to at once, without asking it again.
 pub const RELAY_FALLBACK_MILLIS: u64 = OFFER_CEILING_MILLIS;
 
 /// What a submission produced.
@@ -671,10 +684,14 @@ struct Pending {
     /// (task-d102, task-d100's step B): `frame` is the relayed
     /// submission, and every voter but the leader is no destination.
     relayed: bool,
-    /// When a relayed entry still waiting is fanned out as a step-A
-    /// submission ([`RELAY_FALLBACK_MILLIS`]); `None` once it has been,
+    /// When a relayed entry still waiting is next acted on
+    /// ([`RELAY_FALLBACK_MILLIS`]): asked of its leader again, or fanned
+    /// out as a step-A submission. `None` once it has been fanned out,
     /// and for an entry never relayed.
     relay_fallback_at: Option<MonotonicMillis>,
+    /// Whether a relayed entry's leader was asked again at the bound, or
+    /// said it isn't leading: either way, the next bound fans it out.
+    relay_asked_leader: bool,
     /// The step-A submission a relayed entry falls back to: the same
     /// payload under the answer-on-release version.
     fanout_frame: Option<Arc<[u8]>>,
@@ -727,6 +744,9 @@ pub struct Collector {
     /// Relayed entries fanned out to every voter (diagnostic, task-d102):
     /// at [`RELAY_FALLBACK_MILLIS`], or at once on a `NotLeading`.
     relay_fallbacks: u64,
+    /// Relayed entries asked of their leader alone again at
+    /// [`RELAY_FALLBACK_MILLIS`] (diagnostic, storm fix 3).
+    relay_leader_asks: u64,
     /// `NotLeading` refusals taken for relayed entries (diagnostic).
     not_leading: u64,
     /// Submissions sent to the leader alone (diagnostic, task-d102).
@@ -750,6 +770,7 @@ impl Collector {
             early_solicits: 0,
             relay: false,
             relay_fallbacks: 0,
+            relay_leader_asks: 0,
             not_leading: 0,
             relayed: 0,
         }
@@ -803,6 +824,13 @@ impl Collector {
     /// [`RELAY_FALLBACK_MILLIS`] or on a leader's `NotLeading`.
     pub const fn relay_fallbacks(&self) -> u64 {
         self.relay_fallbacks
+    }
+
+    /// Relayed entries asked of their leader alone again at
+    /// [`RELAY_FALLBACK_MILLIS`], before any fan-out (storm fix 3): one
+    /// frame each, where a fan-out is one to every follower.
+    pub const fn relay_leader_asks(&self) -> u64 {
+        self.relay_leader_asks
     }
 
     /// `NotLeading` refusals this collector took for relayed entries.
@@ -1005,6 +1033,7 @@ impl Collector {
                 marked,
                 relayed,
                 relay_fallback_at: relayed.then(|| now.plus(RELAY_FALLBACK_MILLIS)),
+                relay_asked_leader: false,
                 fanout_frame,
                 dissemination: Dissemination {
                     envelope: Some(Arc::clone(&frame)),
@@ -1181,6 +1210,11 @@ impl Collector {
     /// [`SOLICIT_LEADER_AFTER_MILLIS`], to its ballot's leader alone: one
     /// destination of the budget. That one leaves the all-voter schedule
     /// and the count toward the record as they are.
+    ///
+    /// A relayed entry (task-d102) still waiting at
+    /// [`RELAY_FALLBACK_MILLIS`] is asked of its leader alone again, once,
+    /// if that leader took it, and fanned out to every voter a bound later
+    /// -- at once if the leader never took it or said it isn't leading.
     pub fn due_solicits(&mut self, now: MonotonicMillis, budget: usize) -> Vec<FanOut> {
         let voters: Vec<ReplicaId> = self.config.quorum.voters().iter().copied().collect();
         let leader = self.config.quorum.leader();
@@ -1188,9 +1222,37 @@ impl Collector {
         let mut spent = 0usize;
         for (command, entry) in &mut self.pending {
             let waiting = entry.released.is_none() && entry.votes.learned().is_none();
-            // A relayed entry its leader hasn't answered within the bound,
-            // or whose leader said it isn't leading, is submitted as a
-            // step-A one to every voter (task-d102).
+            // A relayed entry its leader took and hasn't answered within
+            // the bound is asked of that leader alone again, once: the
+            // leader is the one voter that can publish a lost release
+            // again (storm fix 3).
+            if waiting
+                && entry.relay_fallback_at.is_some_and(|at| at <= now)
+                && !entry.relay_asked_leader
+                && matches!(entry.dissemination.owed.get(&leader), Some(Owed::Queued))
+            {
+                if spent + 1 > budget {
+                    break;
+                }
+                entry.relay_asked_leader = true;
+                entry.relay_fallback_at = Some(now.plus(RELAY_FALLBACK_MILLIS));
+                spent += 1;
+                self.relay_leader_asks += 1;
+                record(&mut self.trace, || CollectorEvent::RelayAskedLeader {
+                    command: command_hex(command),
+                    to: replica_hex(&leader),
+                });
+                out.push(FanOut {
+                    command: *command,
+                    retry_key: entry.retry_key,
+                    targets: vec![leader],
+                    frame: Arc::clone(&entry.frame),
+                });
+                continue;
+            }
+            // One its leader still hasn't answered a bound after that, or
+            // never took, or whose leader said it isn't leading, is
+            // submitted as a step-A one to every voter (task-d102).
             if waiting && entry.relay_fallback_at.is_some_and(|at| at <= now) {
                 if spent + voters.len() > budget {
                     break;
@@ -1498,6 +1560,8 @@ impl Collector {
             if entry.relayed {
                 self.not_leading += 1;
                 entry.relay_fallback_at = Some(MonotonicMillis::ZERO);
+                // Asking it again would get the same answer.
+                entry.relay_asked_leader = true;
             }
             return Ok(Progress::Held(HoldReason::AwaitingRelease));
         }

@@ -63,16 +63,22 @@ impl FairQueue {
 
     /// Queue a frame for its group.
     pub fn push(&mut self, queued: Queued) -> Result<(), QueueError> {
+        self.push_or_return(queued).map_err(|(error, _)| error)
+    }
+
+    /// Queue a frame for its group, or hand it back with why not, so a
+    /// caller that means to offer it again need not have kept a copy.
+    pub fn push_or_return(&mut self, queued: Queued) -> Result<(), (QueueError, Queued)> {
         match self.groups.get_mut(&queued.group) {
             Some(q) => {
                 if q.len() >= self.depth {
-                    return Err(QueueError::GroupFull);
+                    return Err((QueueError::GroupFull, queued));
                 }
                 q.push_back(queued);
             }
             None => {
                 if self.groups.len() >= self.max_groups {
-                    return Err(QueueError::TooManyGroups);
+                    return Err((QueueError::TooManyGroups, queued));
                 }
                 self.ring.push_back(queued.group);
                 self.groups

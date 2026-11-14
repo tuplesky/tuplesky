@@ -535,10 +535,13 @@ fn a_rendered_snapshot_carries_no_secret_or_key_shaped_text() {
                 relayed: 4000,
                 fallbacks: 3,
                 not_leading: 1,
+                asked_leader: 5,
                 frames_taken: 500,
                 payloads_taken: 3900,
                 known: 20,
                 not_taken: 2,
+                kept: 6,
+                kept_taken: 5,
                 frame_batches: 480,
                 frame_adoptions: 3900,
             },
@@ -556,6 +559,7 @@ fn a_rendered_snapshot_carries_no_secret_or_key_shaped_text() {
                 executed: 90_000,
                 executed_bytes: 2_520_000,
             },
+            table_full: 31,
         }),
         // A replica is named by four bytes, as the log lines name it: not
         // an identity-shaped run.
@@ -598,6 +602,9 @@ fn a_rendered_snapshot_carries_no_secret_or_key_shaped_text() {
             refused: 7,
             returned: 9000,
             unreturnable: 3,
+            kept: 60,
+            returned_again: 57,
+            kept_now: 2,
         },
     };
     let rendered = serde_json::to_string(&snapshot).expect("a snapshot renders");
