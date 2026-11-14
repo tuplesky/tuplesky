@@ -892,11 +892,11 @@ pub struct Node<P: Persistence> {
     /// What this replica's re-sends did, over every ballot it led since
     /// boot (task-d49).
     resends: coord_consensus::ResendCounts,
-    /// Refusals this node's machine gave for want of room in its table
-    /// (`Backpressure`), over every role it held since boot: counted as
-    /// the driver drains them, exactly, where the log says them only at
-    /// each doubling.
-    backpressure: u64,
+    /// Times this node's machine found its table full (`Backpressure`),
+    /// over every role it held since boot: counted as the driver drains
+    /// them, exactly, where the log says them only at each doubling. Not
+    /// door refusals alone: see [`crate::metrics::Cost::table_full`].
+    table_full: u64,
     /// Whether a leader of this node sends its proposal before its batch
     /// is durable, where it may (task-d98). The node's, not the role's:
     /// every leader this node becomes is given it.
@@ -1023,7 +1023,7 @@ impl<P: Persistence> Node<P> {
             releases: VecDeque::new(),
             results: VecDeque::new(),
             resends: coord_consensus::ResendCounts::default(),
-            backpressure: 0,
+            table_full: 0,
             early_proposal: false,
             early_holders: None,
             early_without_activation: false,
@@ -1902,15 +1902,17 @@ impl<P: Persistence> Node<P> {
 
     /// Take what the machine refused since the last call, rendered.
     pub fn take_rejections(&mut self) -> Vec<String> {
-        let (rendered, backpressure) = self.machine_mut().take_rejections_counted();
-        self.backpressure += backpressure;
+        let (rendered, table_full) = self.machine_mut().take_rejections_counted();
+        self.table_full += table_full;
         rendered
     }
 
-    /// Refusals this node's machine gave for want of room in its table,
-    /// since boot, as of the last [`Self::take_rejections`].
-    pub const fn backpressure_refusals(&self) -> u64 {
-        self.backpressure
+    /// Times this node's machine found its table full, since boot, as of
+    /// the last [`Self::take_rejections`]: a submission or a payload
+    /// answer refused, or at a follower a proposal or a relayed payload
+    /// held for want of room.
+    pub const fn table_full(&self) -> u64 {
+        self.table_full
     }
 
     /// The command this replica cannot execute because it does not hold

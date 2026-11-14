@@ -1375,18 +1375,34 @@ const PARKED_HOLD: core::time::Duration =
 /// is recoverable the same way (task-c02).
 const PARKED_EVIDENCE: usize = 1024;
 
-/// How many frames owed to collectors a node keeps for want of room in
-/// their lanes, across every collector ([`coord_daemon::unreturned`]).
+/// How many frames owed to collectors one domain keeps for want of room
+/// in their lanes, across every collector of the domain
+/// ([`coord_daemon::unreturned`]).
 ///
-/// Sixty-four lanes' queues: a node that has this many kept is not
-/// waiting out a full queue but a collector that has stopped reading,
-/// and what a bound lets go the collector gets back by asking again.
+/// Per domain, not per node: the store is a [`Domain`]'s, so a node
+/// serving several domains keeps up to this many for each.
+///
+/// Sixty-four lanes' queues: a domain that has this many kept is not
+/// waiting out full queues but serving collectors that have stopped
+/// reading, and what a bound lets go a collector gets back by asking
+/// again.
 const UNRETURNED_FRAMES: usize = 64 * 64;
 
-/// How many bytes of frames owed to collectors a node keeps, across
-/// every collector. Evidence and releases are small; this is the ceiling
-/// a large read answer would meet first.
+/// How many bytes of frames owed to collectors one domain keeps, across
+/// every collector of the domain. Evidence and releases are small; this
+/// is the ceiling a large read answer would meet first.
 const UNRETURNED_BYTES: usize = 4 * 1024 * 1024;
+
+/// The most frames one domain keeps for any one collector's connection:
+/// four of its unary lane's queues, a sixteenth of the domain's bound.
+/// A collector that has stopped reading fills its own share and no more,
+/// so what another collector's full queue refuses is still kept: it
+/// takes sixteen stopped collectors to fill the store (#298 review).
+const UNRETURNED_CONNECTION_FRAMES: usize = UNRETURNED_FRAMES / 16;
+
+/// The most bytes one domain keeps for any one collector's connection, a
+/// sixteenth of the domain's bound, for the same reason.
+const UNRETURNED_CONNECTION_BYTES: usize = UNRETURNED_BYTES / 16;
 
 /// Held evidence is due to be let go when the oldest of it has waited
 /// the whole hold.
@@ -1960,7 +1976,8 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 UNRETURNED_FRAMES,
                 UNRETURNED_BYTES,
                 PARKED_HOLD,
-            ),
+            )
+            .per_connection(UNRETURNED_CONNECTION_FRAMES, UNRETURNED_CONNECTION_BYTES),
             settle_cursor: 0,
             answered_otherwise: None,
             admission_halt: None,
@@ -2132,9 +2149,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                         .saturating_mul(coord_storage::intake::EXECUTED_ENTRY_BYTES),
                 }
             },
-            refusals: coord_daemon::metrics::Refusals {
-                backpressure: voter.node().backpressure_refusals(),
-            },
+            table_full: voter.node().table_full(),
             busy,
             uptime: now.saturating_duration_since(self.started),
             recent,

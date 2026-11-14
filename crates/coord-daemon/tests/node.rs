@@ -317,11 +317,11 @@ fn leader(boot: BootId) -> Node<StoreWorker<ModelEngine>> {
     Node::new(Machine::Leader(Box::new(machine)), applier, FRONTEND)
 }
 
-/// The machine's refusals for want of room are counted by the node, from
-/// the enums, as the driver drains them: exactly, where the log says
+/// The times the machine found its table full are counted by the node,
+/// from the enums, as the driver drains them: exactly, where the log says
 /// them only at each doubling (testing's ask on #185).
 #[test]
-fn a_node_counts_its_machines_backpressure_refusals_as_it_drains_them() {
+fn a_node_counts_its_machines_table_full_rejections_as_it_drains_them() {
     let boot = BootId([7; 16]);
     let applier = store(boot);
     let bootstrapped = applier.store().application_base().execution_position;
@@ -346,7 +346,7 @@ fn a_node_counts_its_machines_backpressure_refusals_as_it_drains_them() {
         &ballot(),
     )
     .expect("boot");
-    assert_eq!(node.backpressure_refusals(), 0);
+    assert_eq!(node.table_full(), 0);
     // The first fills the table, which nothing here empties: no voter
     // answers, so nothing commits.
     for sequence in 1..=3 {
@@ -354,16 +354,16 @@ fn a_node_counts_its_machines_backpressure_refusals_as_it_drains_them() {
             .expect("admitted");
     }
     // Counted when drained, not before.
-    assert_eq!(node.backpressure_refusals(), 0);
+    assert_eq!(node.table_full(), 0);
     let rendered = node.take_rejections();
     assert_eq!(rendered, vec!["Backpressure".to_owned(); 2]);
-    assert_eq!(node.backpressure_refusals(), 2);
+    assert_eq!(node.table_full(), 2);
     // Drained once: a second take finds nothing and counts nothing more.
     assert!(node.take_rejections().is_empty());
     node.on_event(Event::Admitted(admitted(4)), &ballot())
         .expect("admitted");
     node.take_rejections();
-    assert_eq!(node.backpressure_refusals(), 3, "cumulative since boot");
+    assert_eq!(node.table_full(), 3, "cumulative since boot");
 }
 
 /// An admitted request is proposed: the batch behind it is persisted,

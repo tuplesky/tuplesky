@@ -21,11 +21,16 @@
 //! go as before, and so is everything kept for a connection that has
 //! gone.
 //!
-//! Everything here is held under three bounds, frames, bytes and a hold,
-//! and they are *performance* controls, not correctness boundaries: what
-//! they let go is recovered as it was before this existed, by the
-//! collector asking again. The hold is longer than the collector waits
-//! before it asks, so a kept frame normally leaves long before it.
+//! Everything here is held under bounds: frames and bytes over every
+//! connection, frames and bytes for any one connection, and a hold. The
+//! bound on one connection keeps a collector that has stopped reading
+//! from filling the store for every other (#298 review). They are
+//! *performance* controls, not correctness boundaries: what they let go
+//! is recovered as it was before this existed, by the collector asking
+//! again. The hold is longer than the collector waits before it asks, so
+//! a kept frame normally leaves long before it.
+//!
+//! One store is one domain's: the bounds are a domain's, not a node's.
 //!
 //! Time is an input here, as in [`crate::parked`]: the runtime passes the
 //! instant it is at, so the schedule and the hold are facts a test can
@@ -94,6 +99,8 @@ struct Kept {
 struct Owed {
     /// In the order the voter made them.
     frames: VecDeque<Kept>,
+    /// Their bytes.
+    bytes: usize,
     /// When they are offered again.
     due: Instant,
     /// The wait that set `due`, doubled when an offer admits nothing.
@@ -108,12 +115,15 @@ pub struct Unreturned {
     bytes: usize,
     max_frames: usize,
     max_bytes: usize,
+    max_connection_frames: usize,
+    max_connection_bytes: usize,
     hold: Duration,
 }
 
 impl Unreturned {
     /// Keep at most `max_frames` frames and `max_bytes` bytes of them,
-    /// each for at most `hold`.
+    /// each for at most `hold`. Any one connection may take all of it
+    /// until [`Self::per_connection`] says otherwise.
     pub fn new(max_frames: usize, max_bytes: usize, hold: Duration) -> Self {
         Unreturned {
             owed: BTreeMap::new(),
@@ -121,8 +131,34 @@ impl Unreturned {
             bytes: 0,
             max_frames,
             max_bytes,
+            max_connection_frames: max_frames,
+            max_connection_bytes: max_bytes,
             hold,
         }
+    }
+
+    /// Keep at most `frames` frames and `bytes` bytes for any one
+    /// connection, inside the bounds over all of them: a collector that
+    /// has stopped reading fills its own share and leaves the rest to the
+    /// others.
+    #[must_use]
+    pub fn per_connection(mut self, frames: usize, bytes: usize) -> Self {
+        self.max_connection_frames = frames.min(self.max_frames);
+        self.max_connection_bytes = bytes.min(self.max_bytes);
+        self
+    }
+
+    /// Whether one more frame of `len` bytes for `connection` is inside
+    /// every bound.
+    fn has_room(&self, connection: u64, len: usize) -> bool {
+        let (frames, bytes) = self
+            .owed
+            .get(&connection)
+            .map_or((0, 0), |owed| (owed.frames.len(), owed.bytes));
+        self.frames < self.max_frames
+            && self.bytes + len <= self.max_bytes
+            && frames < self.max_connection_frames
+            && bytes + len <= self.max_connection_bytes
     }
 
     /// Whether nothing is kept.
@@ -270,7 +306,8 @@ impl Unreturned {
         }
         let wait = if admitted { FIRST_WAIT } else { wait };
         for (fresh, kept) in again {
-            if self.frames + 1 > self.max_frames || self.bytes + kept.frame.len() > self.max_bytes {
+            let len = kept.frame.len();
+            if !self.has_room(connection, len) {
                 offered.unreturnable += 1;
                 continue;
             }
@@ -278,34 +315,36 @@ impl Unreturned {
                 offered.kept += 1;
             }
             self.frames += 1;
-            self.bytes += kept.frame.len();
-            self.owed
-                .entry(connection)
-                .or_insert_with(|| Owed {
-                    frames: VecDeque::new(),
-                    due: now + wait,
-                    wait,
-                })
-                .frames
-                .push_back(kept);
+            self.bytes += len;
+            let owed = self.owed.entry(connection).or_insert_with(|| Owed {
+                frames: VecDeque::new(),
+                bytes: 0,
+                due: now + wait,
+                wait,
+            });
+            owed.bytes += len;
+            owed.frames.push_back(kept);
         }
     }
 
     /// Keep `kept` at the back of `connection`'s frames, if the bounds
     /// allow; the connection already has frames kept.
     fn keep_back(&mut self, connection: u64, kept: Kept, now: Instant, offered: &mut Offered) {
-        if self.frames + 1 > self.max_frames || self.bytes + kept.frame.len() > self.max_bytes {
+        let len = kept.frame.len();
+        if !self.has_room(connection, len) {
             offered.unreturnable += 1;
             return;
         }
         let owed = self.owed.entry(connection).or_insert_with(|| Owed {
             frames: VecDeque::new(),
+            bytes: 0,
             due: now + FIRST_WAIT,
             wait: FIRST_WAIT,
         });
         self.frames += 1;
-        self.bytes += kept.frame.len();
+        self.bytes += len;
         offered.kept += 1;
+        owed.bytes += len;
         owed.frames.push_back(kept);
     }
 
@@ -510,6 +549,43 @@ mod tests {
         assert_eq!(late.handoffs, 0);
         assert_eq!(lane.offers, offers);
         assert!(kept.is_empty());
+    }
+
+    /// One connection's frames are bounded on their own, inside the bounds
+    /// over all of them (#298 review): a collector that has stopped
+    /// reading fills its share and no more, and what another connection's
+    /// full queue refuses is still kept.
+    #[test]
+    fn a_stopped_collector_keeps_no_more_than_its_share() {
+        let t0 = Instant::now();
+        // Eight frames in all, three a connection.
+        let mut kept = Unreturned::new(8, 1 << 20, HOLD).per_connection(3, 1 << 20);
+        let mut stopped = Lane1::new(0);
+        let offered = kept.send(1, frames(0..10), t0, |f| stopped.offer(f));
+        assert_eq!((offered.kept, offered.unreturnable), (3, 7));
+        let behind = kept.send(1, frames(10..12), t0, |f| stopped.offer(f));
+        assert_eq!((behind.kept, behind.unreturnable), (0, 2));
+        // Another connection's full queue: its frames are kept, in its
+        // own share.
+        let other = kept.send(2, frames(12..16), t0, |f| stopped.offer(f));
+        assert_eq!((other.kept, other.unreturnable), (3, 1));
+        assert_eq!(kept.frames(), 6);
+        // A third meets the bound over all of them: two places are left.
+        let third = kept.send(3, frames(16..20), t0, |f| stopped.offer(f));
+        assert_eq!((third.kept, third.unreturnable), (2, 2));
+        assert_eq!(kept.frames(), 8);
+        // Offered again and refused again, each share is kept again
+        // whole: a re-offer neither loses nor grows it.
+        let again = kept.offer_due(t0 + FIRST_WAIT, |_, f| stopped.offer(f));
+        assert_eq!((again.handoffs, again.unreturnable), (3, 0));
+        assert_eq!(kept.frames(), 8);
+        // By bytes: 4 bytes a frame, 8 a connection.
+        let mut by_bytes = Unreturned::new(64, 1 << 20, HOLD).per_connection(64, 8);
+        let offered = by_bytes.send(1, frames(0..3), t0, |f| stopped.offer(f));
+        assert_eq!((offered.kept, offered.unreturnable), (2, 1));
+        let other = by_bytes.send(2, frames(3..5), t0, |f| stopped.offer(f));
+        assert_eq!((other.kept, other.unreturnable), (2, 0));
+        assert_eq!((by_bytes.frames(), by_bytes.bytes()), (4, 16));
     }
 
     /// Connections are kept apart: one whose queue is full holds back
