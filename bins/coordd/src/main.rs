@@ -44,10 +44,11 @@ use coord_daemon::{Config, Diagnostics, Lifecycle, QuarantineReason, Readiness, 
 ///
 /// jemalloc took mimalloc v3's place (#185, lead 11:58). Read by function at
 /// 120 callers, its own functions cost about half of mimalloc's (55 µs a
-/// command less over five voters, most of it mimalloc zeroing fresh pages),
-/// but reallocations move more (about 13 more in copies), and the threads'
-/// CPU a command doesn't fall. A voter's resident memory is lower: about 17%
-/// at its high-water mark and 14% at a run's end.
+/// command less over five voters; mimalloc's largest part was its ordinary
+/// allocation path, `_mi_page_malloc_zero`, which `malloc` calls with `zero`
+/// false), but reallocations move more (about 13 more in copies), and the
+/// threads' CPU a command doesn't fall. A voter's resident memory is lower:
+/// about 17% at its high-water mark and 14% at a run's end.
 #[global_allocator]
 static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
