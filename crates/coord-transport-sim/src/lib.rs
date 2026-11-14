@@ -336,6 +336,7 @@ impl Node {
                 limits.idle_timeout,
                 limits.keep_alive,
                 limits.ack_frequency,
+                limits.reordering,
             )
             .expect("lane config")
         };
@@ -1278,6 +1279,17 @@ impl PacketWorld {
             .values()
             .filter(|c| c.phase == Phase::Ready)
             .count()
+    }
+
+    /// What quinn counts on each of a node's connections, in handle
+    /// order: packets sent, packets it called lost, congestion events,
+    /// the window and the round trip.
+    pub fn path_stats(&self, node: NodeId) -> Vec<quinn_proto::PathStats> {
+        self.nodes[node]
+            .connections
+            .values()
+            .map(|c| c.conn.stats().path)
+            .collect()
     }
 
     /// Frames a node queued, per lane (the message-level view).

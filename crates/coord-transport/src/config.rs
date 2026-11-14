@@ -95,6 +95,10 @@ pub struct Limits {
     /// `None` asks nothing, and QUIC's own cadence holds: an ACK every
     /// second ack-eliciting packet, within 25 ms.
     pub ack_frequency: Option<AckFrequency>,
+    /// How far out of order this endpoint's packets may arrive before its
+    /// loss detection calls the ones overtaken lost.
+    /// [`Reordering::DEFAULT`] by default.
+    pub reordering: Reordering,
 }
 
 /// The acknowledgement cadence an endpoint asks of its peers, through
@@ -132,6 +136,78 @@ impl AckFrequency {
     };
 }
 
+/// How far out of order a packet may arrive before loss detection calls
+/// it lost (#98's +jitter10 cell).
+///
+/// A sender calls a packet lost once a packet sent after it is
+/// acknowledged and either `packets` were sent after it, or it was sent
+/// more than `time_eighths / 8` of the round trip earlier (RFC 9002,
+/// Section 6.1). Each call is a retransmission and, at most once a round
+/// trip, a cut of the congestion window (CUBIC's to 0.7); quinn does not
+/// undo a cut it later finds spurious.
+///
+/// QUIC's thresholds, [`Reordering::QUIC`], are three packets and 9/8.
+/// They suit neither a path whose delay jitters nor this transport's
+/// acknowledgement cadence:
+/// - Jitter reorders: packets sent milliseconds apart swap places, and
+///   at a packet or more a millisecond far more than three are overtaken.
+/// - [`AckFrequency::DEFAULT`] lets the peer hold an acknowledgement up
+///   to its `max_ack_delay` (25 ms), longer than the eighth of a round
+///   trip QUIC's time threshold leaves.
+///
+/// In the packet simulator, a link of 50 ms each way that jitters by
+/// 10 ms either side and loses nothing had 269 to 290 of about 2,000
+/// packets called lost at QUIC's thresholds, the window cut about 200
+/// times, and the transfer take 49 to 54 s. At the default 0 or 1 were
+/// called lost, and it took 2.8 to 6.9 s.
+///
+/// The default calls loss by time alone, as Linux's RACK does once it
+/// has seen reordering (RFC 8985): no count of packets is reached, so
+/// a send rate that reorders more packets in the same milliseconds does
+/// not change it. A real loss is found 7/4 of a round trip after the
+/// packet was sent, where QUIC's thresholds find it about one round trip
+/// after, once three later packets are acknowledged. In the same
+/// simulator at 1% loss, the default still moved the transfer 2.4 to 6
+/// times sooner than QUIC's thresholds, with jitter or without.
+///
+/// The thresholds are the sender's, but the receiver decides when an
+/// acknowledgement goes: with [`AckFrequency`] set, the peer is asked to
+/// acknowledge out of order arrivals at once only when the gap could call
+/// a packet lost, `packets - 1` (quinn's advice), so never at the default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Reordering {
+    /// Packets sent after a packet, and acknowledged before it, that call
+    /// it lost. At least three (RFC 9002).
+    pub packets: u32,
+    /// The time threshold in eighths of the round trip: a packet is
+    /// called lost once this long has passed since it was sent and a
+    /// packet sent after it has been acknowledged. Nine is QUIC's 9/8; at
+    /// least nine.
+    pub time_eighths: u32,
+}
+
+impl Reordering {
+    /// QUIC's own thresholds (RFC 9002, and quinn's defaults): three
+    /// packets and 9/8 of the round trip. The control.
+    pub const QUIC: Reordering = Reordering {
+        packets: 3,
+        time_eighths: 9,
+    };
+
+    /// The thresholds by default: loss by time alone, at 7/4 of the round
+    /// trip.
+    pub const DEFAULT: Reordering = Reordering {
+        packets: u32::MAX,
+        time_eighths: 14,
+    };
+
+    /// The time threshold as quinn takes it, a multiple of the round
+    /// trip.
+    pub fn time_threshold(self) -> f32 {
+        self.time_eighths as f32 / 8.0
+    }
+}
+
 impl Default for Limits {
     fn default() -> Self {
         Limits {
@@ -150,6 +226,7 @@ impl Default for Limits {
             stream_frames: 64,
             stream_bytes: 256 * 1024,
             ack_frequency: Some(AckFrequency::DEFAULT),
+            reordering: Reordering::DEFAULT,
         }
     }
 }
