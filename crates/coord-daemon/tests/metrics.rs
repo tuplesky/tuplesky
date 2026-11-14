@@ -538,6 +538,8 @@ fn a_rendered_snapshot_carries_no_secret_or_key_shaped_text() {
                 payloads_taken: 3900,
                 known: 20,
                 not_taken: 2,
+                kept: 6,
+                kept_taken: 5,
                 frame_batches: 480,
                 frame_adoptions: 3900,
             },

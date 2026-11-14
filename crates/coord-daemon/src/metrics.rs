@@ -843,9 +843,17 @@ pub struct Relay {
     pub known: u64,
     /// Relayed proposals whose payload it didn't take, so fetched if
     /// wanted: not from the leader at its ballot, a payload that didn't
-    /// match the vote, or no room.
+    /// match the vote, or no room past the bound on kept payloads.
     #[serde(default)]
     pub not_taken: u64,
+    /// Relayed proposals whose payload it kept beside the held proposal
+    /// for want of table room, to take as the room comes rather than
+    /// fetch (the follower trap on #185).
+    #[serde(default)]
+    pub kept: u64,
+    /// Kept payloads it took as the room came, with no ask.
+    #[serde(default)]
+    pub kept_taken: u64,
     /// As a follower, since the node started: adoption batches its
     /// proposal frames wrote (step 2b of the batching rule's 10.7).
     #[serde(default)]
