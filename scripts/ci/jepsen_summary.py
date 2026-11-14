@@ -460,6 +460,10 @@ def parse_voter(lines) -> Voter:
                 snapshot = json.loads(line[len("metrics "):])
                 v.stages = parse_stages(snapshot)
                 v.cost = parse_cost(snapshot)
+                # Since #297 the offers are at the line's top level, no longer
+                # in `cost`: read them where the older lines had them.
+                if v.cost and isinstance(snapshot.get("offers"), dict) and isinstance(v.cost.raw, dict):
+                    v.cost.raw.setdefault("offers", snapshot["offers"])
                 if v.cost:
                     if leading is not None:
                         v.leaderships[-1][1] += v.cost.fast - established[0]
@@ -2350,6 +2354,49 @@ def resend_table(voters: dict) -> list[str]:
     return out
 
 
+def offers_table(voters: dict) -> list[str]:
+    """Each voter's offers and table-full refusals from its last `metrics`
+    line (#297, #298): what its collector offered again and asked again,
+    what its voter refused at the door, returned to collectors in other
+    processes, kept to offer again when a lane was full, returned of those,
+    holds now, and let go; and `table_full`, the exact count of what its
+    machine refused or could not hold for a full table, which the log's
+    `Backpressure` gives only at powers of two. [] from a build without
+    either."""
+    rows = []
+    for node, v in voters.items():
+        raw = (v.cost.raw or {}) if v.cost else {}
+        offers = raw.get("offers") if isinstance(raw.get("offers"), dict) else None
+        if offers is None and "table_full" not in raw:
+            continue
+        rows.append((node, v.cost.executed if v.cost else None, offers or {}, raw.get("table_full")))
+    if not rows:
+        return []
+    per = lambda n, executed: f"{n / executed:.3f}" if isinstance(n, (int, float)) and executed else "-"
+    out = [
+        "**Offers and a full table** (#297, #298, each voter's last `metrics` line: offered again is a "
+        "submission its collector offered a voter again after the voter's lane refused it; asked again, sent "
+        "again to ask for evidence; refused, refused at its voter's door; returned, evidence and releases its "
+        "voter handed to collectors in other processes, and of those returned again, ones kept first; kept, "
+        "those kept to offer again for a full lane, with those kept now and those let go; per command is over "
+        "the commands the voter executed; table full is what its machine refused or could not hold for a "
+        "full table, exactly, where the log's `Backpressure` says it at powers of two)",
+        "",
+        "| Node | Offered again | Asked again | Refused | Returned | Returned again | Kept | Kept now "
+        "| Let go | Kept per command | Returned again per command | Let go per command | Table full |",
+        "| --- " * 14 + "|",
+    ]
+    g = lambda d, k: d.get(k, "-")
+    for node, executed, o, full in rows:
+        out.append(
+            f"| {node} | {g(o, 'reoffered')} | {g(o, 'solicited')} | {g(o, 'refused')} | {g(o, 'returned')} "
+            f"| {g(o, 'returned_again')} | {g(o, 'kept')} | {g(o, 'kept_now')} | {g(o, 'unreturnable')} "
+            f"| {per(o.get('kept'), executed)} | {per(o.get('returned_again'), executed)} "
+            f"| {per(o.get('unreturnable'), executed)} | {full if full is not None else '-'} |")
+    out.append("")
+    return out
+
+
 def batching_table(voters: dict) -> list[str]:
     """The sweep's "Batching by voter" table (jepsen_sweep.turns_of_voter)
     for this run's voters: each domain loop's turns and what each carried,
@@ -3760,6 +3807,7 @@ def summarize(store: str, nodes: list[str], title: str, profile: str | None = No
             out.extend(leadership_table(voters))
             out.extend(resend_table(voters))
             out.extend(relay_table(voters))
+            out.extend(offers_table(voters))
             out.extend(paths_table(voters))
             out.extend(batching_table(voters))
             out.extend(hand_offs_table(voters))

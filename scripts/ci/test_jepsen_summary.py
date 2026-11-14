@@ -860,6 +860,20 @@ class CheckpointTests(unittest.TestCase):
                 f.write("coordd domain=d roles=[Voter]\n")
             self.assertEqual(js.admission_table(store, ["n1"]), [])
 
+    def test_offers_and_a_full_table(self):
+        cost = {"executed": 1000, "busy": {"secs": 1, "nanos": 0}, "uptime": {"secs": 60, "nanos": 0},
+                "recent": {"Unavailable": "NotInstrumented"}, "reads": {"served": 0}}
+        snapshot = {"stages": [], "cost": {"Observed": cost}}
+        line = lambda: "metrics " + json.dumps(snapshot) + "\n"
+        self.assertNotIn("**Offers and a full table**", self.summarize(line()))
+        # #297 put the offers at the line's top level, and table_full in cost.
+        snapshot["offers"] = {"reoffered": 4, "solicited": 7, "refused": 0, "returned": 3000,
+                              "unreturnable": 2, "kept": 50, "returned_again": 48, "kept_now": 0}
+        cost["table_full"] = 1234
+        text = self.summarize(line())
+        self.assertIn("**Offers and a full table** (#297, #298", text)
+        self.assertIn("| n1 | 4 | 7 | 0 | 3000 | 48 | 50 | 0 | 2 | 0.050 | 0.048 | 0.002 | 1234 |", text)
+
     def test_batching_by_voter(self):
         cost = {"executed": 2000, "busy": {"secs": 1, "nanos": 0}, "uptime": {"secs": 10, "nanos": 0},
                 "recent": {"Unavailable": "NotInstrumented"}, "reads": {"served": 5},
