@@ -1301,8 +1301,30 @@ Each step has its own PRs and pair.
   - commands a frame;
   - p50 and p99 at 1, 5 and 30 callers.
 - **The 30-caller floor again.** The pair of build 1 against build 6 at 30 callers ran, but its run directories were deleted for disk before its CPU was read. Only operations a second are left: build 6 at +42% over build 1, each run read against the base runs on either side of it (+28 to +50% by run; 2,766 a second against 3,871 on the means). B2's pair at 30 replaces it.
-- **Where it stands:** B0 and B1 are written, on a local scratch branch off the carry at `ba947188`. Their pairs are queued at 120, 30, 5 and 1 callers. B1W, B2 and B3 come after.
-- Under a week. Steps 1 and 2 need only B0 and B1.
+- **Where it stands (2026-11-14):** B0 and B1 are measured (#185, [6867636657](https://github.com/tuplesky/tuplesky/pull/185#issuecomment-6867636657)). B1W, B2 and B3 come before steps 4, 5 and 7.
+  - **The builds:** one scratch binary with both modes, local, off the carry at `ba947188`.
+  - **The pairs:** at 120, 30, 5 and 1 callers, the base and each bound alternating, four base runs and three of each bound. Each bound's run is read against the base runs on either side of it.
+
+| Callers | 120 | 30 | 5 | 1 |
+| --- | ---: | ---: | ---: | ---: |
+| B0: application records a command, every voter | 0.07 | 0.15 | 0.63 | 1.00 |
+| B1: protocol records a command, a follower | 0.11 | 0.27 | 0.81 | 1.00 |
+| Base: five voters' CPU, µs a command | 1,374 | 1,752 | 3,015 | 4,642 |
+| B0 | **−82 (−5.9%)** | +3 | +73 (+2.4%) | −2 |
+| B1 | **−77 (−5.6%)** | −32 (−1.8%) | +2 | −8 |
+
+  - **At 120 both show,** every run below the base's. Operations a second rise 3.9% under B0 and 4.4% under B1. p50 falls by 1.0 to 1.4 ms and p99 by 4 to 8 ms.
+    - **B0 moves the application half:** the appenders, −3.1 µs a command at the leader and −3.5 at a follower, and the materializers, −3.3 and −4.7.
+    - **B1 moves the protocol half and the settle:** a follower's loop, −10.8 (−8.2%), and its appender, −2.2. Its profiled pair puts the loop's in `on_relayed_proposal` (21.3 → 9.7) and the settle (13.9 → 9.3).
+  - **At 30** neither is told from the base's spread.
+  - **At 5,** B0's +73 isn't reproduced by its profiled pair (−52 and −308, against base runs 212 apart), so it is read as neither cost nor saving. That pair names two rows that rose beyond their spread: a follower's hand-off to the appender (`lower_once`, `append`, the channel send, the wake) and the leader's forgetting.
+  - **At 1,** neither batches and CPU doesn't move, but p99 rises: gets +0.20 ms under B0 and +0.14 under B1, against a base spread of 0.05. B0's p50 rises 0.02 to 0.03 ms.
+- **What it sets for steps 1 and 2:**
+  - step 1's checkpoint at 120 is about −20 µs a command over five voters, half of B0's −39 in the appenders and the materializers;
+  - step 2's is about −5.4 µs a command in a follower's loop, half of B1's;
+  - at 30 neither has anything to halve;
+  - at 1 and 5 callers, each step is held to no rise beyond the base's spread, in CPU or in latency (R16). Step 1's pair at 5 reads the two rows above by name.
+- Steps 1 and 2 need nothing more from step 0.
 
 **Step 1: one application record and one durability event a group.** This is the application half of 10.5's step 2 without the frame record, and the fifth item of 10.8.
 - **Which half is which.** 10.5 named the journal part "seal and settle", and its two halves fall in different steps.
@@ -1312,7 +1334,7 @@ Each step has its own PRs and pair.
 - **PRs:**
   - 1a: the journal's reader and replay take a group's application record, and nothing writes one;
   - 1b: the applier writes one application record a group in place of one a command, cut at the bounds below, and waits on one durability event for each.
-  - 1a doesn't need the split, and can start now. 1b is built with it.
+  - 1a doesn't need the split: it is #286. 1b is built with it.
 - **How 1b bounds a group's record (Codex).** An execution group holds up to 32 commands (`GROUP_COMMANDS`), and the applier's queue is bounded at 16 MiB, not at the record's 4 MiB and 4,096 updates. Each outcome is under the record's bounds today, but 32 together needn't be. Since #280 a record the store refuses stops the voter.
   - **The rule:** the same as step 2's. A group's outcomes go in records cut in execution order. A record closes before an outcome that would take it past 1,024 updates or 1 MiB of rows.
   - **An outcome over either bound goes alone,** in a record of its own, as every outcome does today.
