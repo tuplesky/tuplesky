@@ -1381,7 +1381,7 @@ Each step has its own PRs and pair.
   - At the bench's sizes a group is one record. Groups of large outcomes take a few.
   - B0 cut a run the same way, at half the journal group's bytes and at 1,024 updates. At the bench's sizes neither binds, so it bounds step 1 as written.
 - **What recovery reads:** replay reads a group record as the application outcome of each command it names. Those are the same facts, in one record. The decision's records are untouched.
-- **Mixed versions:** the format is local, since only this voter reads its journal. 1b raises the journal record's format, the one it writes (`current`), from 1 to 2. 1a's release reads 2, since its window reads ahead to it, and an older release refuses it as unsupported. So a voter goes back at most to 1a's release.
+- **Mixed versions:** the format is local, since only this voter reads its journal. 1b raises the journal record's format, the one it writes (`current`), from 1 to 2. 1a's release reads 2, since its window reads ahead to it. An older release can't read it, so a voter goes back at most to 1a's release. Such a release refuses a format-2 record as unsupported, or as malformed if its body is a group: the decoder decodes the body before it checks the format (`JournalRecordV1::decode`; Codex on #289).
   - **Only the record's format moves.** The local checkpoint's stays as it is: raising it too would leave 1a unable to open a 1b image, and so close the way back.
   - 1b raises `current` in the registry; it doesn't seal through `seal_as`, which stays for fixtures.
 - **Pinned by:**
@@ -1434,7 +1434,11 @@ Each step has its own PRs and pair.
 - **One PR.** Each piece is a new kind that every voter decodes before any voter sends or writes one:
   - a frame with its position in the domain's frame log, its predecessor's digest and its boundary bit (step 5), sent only while `FrameLog` is active, as `ProposalFrame` is behind `BatchedRound`;
   - the journal's frame record;
-    - **Its format is 3,** read ahead by step 3 and written by 4a, while 1b is parked. 2 is what 1a's release reads as a record that may hold a group's application outcomes, and nothing writes it. A frame record in 2 would read to that release as corrupt, not as unsupported. If 1b merges first, the frame record still takes 3.
+    - **Its format is 3,** read ahead by step 3 and written by 4a, while 1b is parked. 2 keeps its meaning, a record that may hold a group's application outcomes, which 1a's release reads and nothing writes. If 1b merges first, the frame record still takes 3.
+    - **A release before step 3 can't tell a frame record from a damaged one (Codex on #289).** `JournalRecordV1::decode` decodes the whole record, typed body included, before it checks the format. So 1a's release refuses a frame record as malformed, whatever its format number.
+      - That isn't a gap in the rollback rule: once 4a writes, a voter goes back at most to step 3's release, which reads frame records.
+      - **Step 3's PR moves the format check ahead of the body.** The format is the record's first field, so the decoder reads it, refuses one past `newest` as unsupported, and only then decodes the body. A kind added after step 3 then reads, to the release before it, as an unsupported format and not as a damaged record.
+      - Pinned by a fixture: a record at the next format with a body kind this build doesn't know is refused as `UnsupportedFormat`.
   - frame entries in a recovery report and in a Sync;
   - **the frame fetch (R7):** `FrameRequest { position, ballot, digest }`, answered with the frame record's bytes, which the asker checks against the digest. It is to frames what `PayloadRequest` is to payloads today.
 - **What recovery reads:** what it reads today.
