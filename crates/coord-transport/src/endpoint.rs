@@ -619,6 +619,79 @@ impl TrafficReader {
     pub fn read(&self) -> PeerTraffic {
         self.shared.read_traffic()
     }
+
+    /// The same as [`Transport::path_readings`].
+    pub fn path_readings(&self) -> Vec<PathReading> {
+        self.shared.path_readings()
+    }
+}
+
+/// One open connection's path as QUIC estimates it (the lead's item 2 on
+/// #185, after the +loss1 reading): whether a link is held back by its
+/// congestion window, and by how much loss.
+///
+/// Read for every connection to a voter, an observer or a learner, on
+/// either plane, and for every api connection of a collector
+/// ([`PeerRole::may_submit_for_clients`]); not for a client's, which are
+/// as many as the callers. Each lane is a connection of its own, so a
+/// link reads as one of these a lane. The counts are cumulative over the
+/// connection's life and start again with a new connection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PathReading {
+    /// The plane the connection is on.
+    pub class: Class,
+    /// Its lane.
+    pub lane: Lane,
+    /// The role bound to the other end.
+    pub role: PeerRole,
+    /// The replica at the other end, where the binding names one: a peer
+    /// role on either plane, or a voter this side dialed on the api
+    /// plane. A collector's connection this side accepted names none.
+    pub replica: Option<ReplicaId>,
+    /// The connection, for the reading that names no replica.
+    pub connection: ConnectionId,
+    /// Whether this side accepted it.
+    pub accepted: bool,
+    /// The smoothed round trip.
+    pub rtt: Duration,
+    /// The least round trip seen, without the peer's ACK delay.
+    pub min_rtt: Duration,
+    /// The congestion window, in bytes.
+    pub cwnd: u64,
+    /// Congestion events: each a cut of the window.
+    pub congestion_events: u64,
+    /// Packets this side sent and judged lost.
+    pub lost_packets: u64,
+    /// Their bytes.
+    pub lost_bytes: u64,
+    /// Packets this side sent.
+    pub sent_packets: u64,
+}
+
+impl PathReading {
+    fn of(peer: &Peer) -> Self {
+        let path = peer.conn.stats().path;
+        PathReading {
+            class: peer.class,
+            lane: peer.lane,
+            role: peer.identity.role,
+            replica: peer.identity.replica,
+            connection: peer.id,
+            accepted: peer.accepted,
+            rtt: path.rtt,
+            min_rtt: path.min_rtt,
+            cwnd: path.cwnd,
+            congestion_events: path.congestion_events,
+            lost_packets: path.lost_packets,
+            lost_bytes: path.lost_bytes,
+            sent_packets: path.sent_packets,
+        }
+    }
+
+    /// Whether a connection is read: not a client's.
+    fn reads(peer: &Peer) -> bool {
+        peer.identity.replica.is_some() || peer.identity.role.may_submit_for_clients()
+    }
 }
 
 /// Everything shared by the lanes to one destination.
@@ -829,6 +902,19 @@ struct Tls {
 impl Shared {
     fn read_traffic(&self) -> PeerTraffic {
         self.traffic.read(&self.peers)
+    }
+
+    fn path_readings(&self) -> Vec<PathReading> {
+        let mut readings: Vec<PathReading> = self
+            .peers
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|peer| PathReading::reads(peer))
+            .map(|peer| PathReading::of(peer))
+            .collect();
+        readings.sort_by_key(|r| (r.class == Class::Api, r.replica, r.connection, r.lane));
+        readings
     }
 
     /// The client configuration a dial of `class` presents now, and when
@@ -1774,6 +1860,13 @@ impl Transport {
         TrafficReader {
             shared: self.shared.clone(),
         }
+    }
+
+    /// Each open connection's path, as QUIC estimates it, for every
+    /// connection but a client's ([`PathReading`]), in plane, replica,
+    /// connection and lane order.
+    pub fn path_readings(&self) -> Vec<PathReading> {
+        self.shared.path_readings()
     }
 
     /// Accounting of one lane of a replica link, with the path RTT.
