@@ -2123,16 +2123,6 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                         .saturating_mul(coord_storage::intake::EXECUTED_ENTRY_BYTES),
                 }
             },
-            offers: {
-                let counts = &self.frontend.counts;
-                coord_daemon::metrics::Offers {
-                    reoffered: counts.reoffered,
-                    solicited: counts.solicited,
-                    refused: counts.refused,
-                    returned: counts.returned,
-                    unreturnable: counts.unreturnable,
-                }
-            },
             busy,
             uptime: now.saturating_duration_since(self.started),
             recent,
@@ -2357,6 +2347,27 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 }]
             })
             .unwrap_or_default();
+        // Both planes' connections to voters and collectors: the peer
+        // plane's, and the api plane's this node's collector dialed or a
+        // collector elsewhere dialed to it. The peer plane's come first,
+        // so a cap reached by many collectors leaves the voters' in.
+        let (paths, paths_unreported) = coord_daemon::metrics::Path::bounded(
+            self.plane.iter().flat_map(PeerPlane::path_readings).chain(
+                self.api_traffic
+                    .iter()
+                    .flat_map(coord_transport::TrafficReader::path_readings),
+            ),
+        );
+        let offers = {
+            let counts = &self.frontend.counts;
+            coord_daemon::metrics::Offers {
+                reoffered: counts.reoffered,
+                solicited: counts.solicited,
+                refused: counts.refused,
+                returned: counts.returned,
+                unreturnable: counts.unreturnable,
+            }
+        };
         MetricsSnapshot {
             stages: recorder.snapshot_stages(roles),
             lanes,
@@ -2368,20 +2379,9 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             view_age: Measure::Unavailable(Unavailable::NotInstrumented),
             engine_pressure: Measure::Unavailable(Unavailable::NoBound),
             cost: self.cost(),
-            // Both planes' connections to voters and collectors: the peer
-            // plane's, and the api plane's this node's collector dialed or
-            // a collector elsewhere dialed to it.
-            paths: self
-                .plane
-                .iter()
-                .flat_map(PeerPlane::path_readings)
-                .chain(
-                    self.api_traffic
-                        .iter()
-                        .flat_map(coord_transport::TrafficReader::path_readings),
-                )
-                .map(|reading| coord_daemon::metrics::Path::of(&reading))
-                .collect(),
+            paths,
+            paths_unreported,
+            offers,
         }
     }
 
@@ -6378,17 +6378,42 @@ fn endpoint(
             ),
         }
     }
-    // How far out of order a packet may arrive before loss detection
-    // calls it lost, overridden from the environment for the same reason:
-    // `<packets>,<eighths of the round trip>`, or `quic` for QUIC's own
-    // three packets and 9/8, the control. Unset, the transport's default.
+    // The loss thresholds, the congestion controller and the round trip
+    // assumed before one is measured, overridden from the environment for
+    // the same reason, on both planes: each is measured on a lossy,
+    // jittery path before a default moves (#185). Unset, the transport's
+    // defaults, which are QUIC's and quinn's.
+    //
+    // How far out of order a packet may arrive before loss detection calls
+    // it lost: `<packets>,<eighths of the round trip>`, `time` for loss by
+    // time alone at 7/4, or `quic` for QUIC's own three packets and 9/8.
     if let Ok(value) = std::env::var("COORDD_REORDERING") {
         match reordering(&value) {
             Some(reordering) => limits.reordering = reordering,
             None => eprintln!(
                 "COORDD_REORDERING={value:?} is not <packets>,<eighths of the \
-                 round trip> (at least 3 and 9) or quic: the default \
+                 round trip> (at least 3 and 9), time or quic: the default \
                  reordering thresholds are kept"
+            ),
+        }
+    }
+    // `cubic`, `bbr` or `newreno`.
+    if let Ok(value) = std::env::var("COORDD_CONGESTION") {
+        match congestion(&value) {
+            Some(congestion) => limits.congestion = congestion,
+            None => eprintln!(
+                "COORDD_CONGESTION={value:?} is not cubic, bbr or newreno: \
+                 the default congestion controller is kept"
+            ),
+        }
+    }
+    // `<milliseconds>`, from 1 to 1000.
+    if let Ok(value) = std::env::var("COORDD_INITIAL_RTT") {
+        match initial_rtt(&value) {
+            Some(rtt) => limits.initial_rtt = Some(rtt),
+            None => eprintln!(
+                "COORDD_INITIAL_RTT={value:?} is not a whole number of \
+                 milliseconds from 1 to 1000: quinn's initial round trip is kept"
             ),
         }
     }
@@ -6418,12 +6443,15 @@ fn ack_frequency(value: &str) -> Option<Option<coord_transport::AckFrequency>> {
 }
 
 /// Reordering thresholds written `<packets>,<eighths of the round trip>`,
-/// at least QUIC's three and nine, or `quic` for QUIC's own. `None` is a
-/// malformed value, or one below QUIC's.
+/// at least QUIC's three and nine, `time` for loss by time alone, or
+/// `quic` for QUIC's own. `None` is a malformed value, or one below
+/// QUIC's.
 fn reordering(value: &str) -> Option<coord_transport::Reordering> {
     let value = value.trim();
-    if value == "quic" {
-        return Some(coord_transport::Reordering::QUIC);
+    match value {
+        "quic" => return Some(coord_transport::Reordering::QUIC),
+        "time" => return Some(coord_transport::Reordering::BY_TIME),
+        _ => {}
     }
     let (packets, eighths) = value.split_once(',')?;
     let reordering = coord_transport::Reordering {
@@ -6433,6 +6461,26 @@ fn reordering(value: &str) -> Option<coord_transport::Reordering> {
     let quic = coord_transport::Reordering::QUIC;
     (reordering.packets >= quic.packets && reordering.time_eighths >= quic.time_eighths)
         .then_some(reordering)
+}
+
+/// A congestion controller written `cubic`, `bbr` or `newreno`. `None` is
+/// any other value.
+fn congestion(value: &str) -> Option<coord_transport::Congestion> {
+    match value.trim() {
+        "cubic" => Some(coord_transport::Congestion::Cubic),
+        "bbr" => Some(coord_transport::Congestion::Bbr),
+        "newreno" => Some(coord_transport::Congestion::NewReno),
+        _ => None,
+    }
+}
+
+/// An initial round trip written in whole milliseconds, from 1 to 1000.
+/// `None` is a malformed value or one outside that range.
+fn initial_rtt(value: &str) -> Option<std::time::Duration> {
+    let ms: u64 = value.trim().parse().ok()?;
+    (1..=1000)
+        .contains(&ms)
+        .then(|| std::time::Duration::from_millis(ms))
 }
 
 /// Why the endpoint could not be built.
@@ -7634,9 +7682,11 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
                 time_eighths: 10,
             })
         );
-        // `quic` is QUIC's own thresholds, the control.
+        // `quic` is QUIC's own thresholds, the default; `time` is loss by
+        // time alone.
         assert_eq!(super::reordering("quic"), Some(Reordering::QUIC));
         assert_eq!(super::reordering("3,9"), Some(Reordering::QUIC));
+        assert_eq!(super::reordering(" time "), Some(Reordering::BY_TIME));
         // Below QUIC's is refused: the setting tolerates more, never less.
         for refused in [
             "",
@@ -7650,6 +7700,28 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
             "off",
         ] {
             assert_eq!(super::reordering(refused), None, "{refused:?}");
+        }
+    }
+
+    #[test]
+    fn congestion_and_initial_round_trip_parse_from_the_environments_spelling() {
+        use coord_transport::Congestion;
+        assert_eq!(super::congestion("cubic"), Some(Congestion::Cubic));
+        assert_eq!(super::congestion(" bbr "), Some(Congestion::Bbr));
+        assert_eq!(super::congestion("newreno"), Some(Congestion::NewReno));
+        for refused in ["", "BBR", "reno", "bbr2", "cubic,bbr"] {
+            assert_eq!(super::congestion(refused), None, "{refused:?}");
+        }
+        assert_eq!(
+            super::initial_rtt(" 140 "),
+            Some(std::time::Duration::from_millis(140))
+        );
+        assert_eq!(
+            super::initial_rtt("1000"),
+            Some(std::time::Duration::from_secs(1))
+        );
+        for refused in ["", "0", "1001", "140ms", "-1", "0.5"] {
+            assert_eq!(super::initial_rtt(refused), None, "{refused:?}");
         }
     }
 

@@ -96,9 +96,15 @@ pub struct Limits {
     /// second ack-eliciting packet, within 25 ms.
     pub ack_frequency: Option<AckFrequency>,
     /// How far out of order this endpoint's packets may arrive before its
-    /// loss detection calls the ones overtaken lost.
-    /// [`Reordering::DEFAULT`] by default.
+    /// loss detection calls the ones overtaken lost. QUIC's own,
+    /// [`Reordering::QUIC`], by default.
     pub reordering: Reordering,
+    /// The congestion controller every connection of this endpoint runs
+    /// for what it sends. [`Congestion::Cubic`] by default.
+    pub congestion: Congestion,
+    /// The round trip a connection assumes until it has measured one.
+    /// `None` keeps quinn's 333 ms (RFC 9002, Section 6.2.2).
+    pub initial_rtt: Option<Duration>,
 }
 
 /// The acknowledgement cadence an endpoint asks of its peers, through
@@ -158,23 +164,27 @@ impl AckFrequency {
 /// In the packet simulator, a link of 50 ms each way that jitters by
 /// 10 ms either side and loses nothing had 269 to 290 of about 2,000
 /// packets called lost at QUIC's thresholds, the window cut about 200
-/// times, and the transfer take 49 to 54 s. At the default 0 or 1 were
-/// called lost, and it took 2.8 to 6.9 s.
+/// times, and the transfer take 49 to 54 s. At [`Reordering::BY_TIME`]
+/// 0 or 1 were called lost, and it took 2.8 to 6.9 s.
 ///
-/// The default calls loss by time alone, as Linux's RACK does once it
-/// has seen reordering (RFC 8985): no count of packets is reached, so
-/// a send rate that reorders more packets in the same milliseconds does
-/// not change it. A real loss is found 7/4 of a round trip after the
-/// packet was sent, where QUIC's thresholds find it about one round trip
-/// after, once three later packets are acknowledged. In the same
-/// simulator the default still moved the transfer sooner than QUIC's
+/// [`Reordering::BY_TIME`] calls loss by time alone, as Linux's RACK does
+/// once it has seen reordering (RFC 8985): no count of packets is
+/// reached, so a send rate that reorders more packets in the same
+/// milliseconds does not change it. A real loss is found 7/4 of a round
+/// trip after the packet was sent, where QUIC's thresholds find it about
+/// one round trip after, once three later packets are acknowledged. In
+/// the same simulator it still moved the transfer sooner than QUIC's
 /// thresholds with real loss: 2.2 to 5.3 times at 1% loss, with jitter
 /// or without, and 1.5 to 2 times at 3% without jitter.
+///
+/// QUIC's stay the default until testing's WAN cells confirm another
+/// (#185); a node picks one per run from `COORDD_REORDERING`.
 ///
 /// The thresholds are the sender's, but the receiver decides when an
 /// acknowledgement goes: with [`AckFrequency`] set, the peer is asked to
 /// acknowledge out of order arrivals at once only when the gap could call
-/// a packet lost, `packets - 1` (quinn's advice), so never at the default.
+/// a packet lost, `packets - 1` (quinn's advice), so never at
+/// [`Reordering::BY_TIME`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Reordering {
     /// Packets sent after a packet, and acknowledged before it, that call
@@ -189,15 +199,15 @@ pub struct Reordering {
 
 impl Reordering {
     /// QUIC's own thresholds (RFC 9002, and quinn's defaults): three
-    /// packets and 9/8 of the round trip. The control.
+    /// packets and 9/8 of the round trip. The default.
     pub const QUIC: Reordering = Reordering {
         packets: 3,
         time_eighths: 9,
     };
 
-    /// The thresholds by default: loss by time alone, at 7/4 of the round
-    /// trip.
-    pub const DEFAULT: Reordering = Reordering {
+    /// Loss by time alone, at 7/4 of the round trip: the thresholds
+    /// proposed for a path whose delay jitters.
+    pub const BY_TIME: Reordering = Reordering {
         packets: u32::MAX,
         time_eighths: 14,
     };
@@ -207,6 +217,29 @@ impl Reordering {
     pub fn time_threshold(self) -> f32 {
         self.time_eighths as f32 / 8.0
     }
+}
+
+/// The congestion controller a connection runs for what it sends.
+///
+/// Each end runs its own for its own packets. An accepted connection
+/// runs the one its endpoint was configured with, chosen before the
+/// peer's `Hello` names the lane, so a node's choice holds for every lane
+/// of a plane at both ends only when both ends make it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Congestion {
+    /// CUBIC (RFC 9438), quinn's default and this transport's until now:
+    /// a loss cuts the window to 0.7, at most once a round trip.
+    Cubic,
+    /// BBR, quinn's port of quiche's BBRv1, which quinn's documentation
+    /// marks experimental. It sizes the window from the bandwidth and the
+    /// shortest round trip it has measured, and a loss does not cut it:
+    /// while recovering it holds the window to what is in flight. quinn's
+    /// pacer spreads the window over the round trip and does not use the
+    /// pacing rate BBR computes.
+    Bbr,
+    /// NewReno (RFC 9002, Section 7): a loss halves the window, at most
+    /// once a round trip.
+    NewReno,
 }
 
 impl Default for Limits {
@@ -227,7 +260,9 @@ impl Default for Limits {
             stream_frames: 64,
             stream_bytes: 256 * 1024,
             ack_frequency: Some(AckFrequency::DEFAULT),
-            reordering: Reordering::DEFAULT,
+            reordering: Reordering::QUIC,
+            congestion: Congestion::Cubic,
+            initial_rtt: None,
         }
     }
 }

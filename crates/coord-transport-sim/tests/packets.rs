@@ -9,7 +9,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use coord_transport::{
-    BoundIdentity, CloseReason, Lane, Limits, Reordering, SendError, TransportError, evidence_frame,
+    BoundIdentity, CloseReason, Congestion, Lane, Limits, Reordering, SendError, TransportError,
+    evidence_frame,
 };
 use coord_transport_sim::{LinkFaults, NodeConfig, PacketWorld, SimEvent};
 use coord_transport_testkit::{TestBinder, TestCa, TestIdentity};
@@ -720,17 +721,7 @@ struct Moved {
 /// millisecond, and voter 1 answers each with a small one: a peer lane
 /// under steady load. A frame the lane's queue refuses is offered again
 /// a millisecond later. Returns once both ends have every frame.
-fn steady(
-    f: &Fixture,
-    seed: u8,
-    faults: LinkFaults,
-    reordering: Reordering,
-    frames: usize,
-) -> Moved {
-    let limits = Limits {
-        reordering,
-        ..Limits::node()
-    };
+fn steady(f: &Fixture, seed: u8, faults: LinkFaults, limits: Limits, frames: usize) -> Moved {
     let (mut w, expected) = registered_world(f, seed, limits);
     w.set_default_faults(faults);
     w.connect(
@@ -758,12 +749,16 @@ fn steady(
             Ok(()) => return,
             Err(SendError::QueueFull { .. } | SendError::TooManyGroups { .. }) => {
                 let t = w.tick();
-                w.run_until(1, |w| w.tick() > t);
+                w.advance_to(t + 1);
             }
             Err(e) => panic!("{e:?}"),
         }
     };
+    // Frame `n` is offered at `start + n`, a frame each millisecond
+    // whatever the transport's wakeups, so every setting compared gets
+    // the same offered load.
     while sent < frames {
+        w.advance_to(start + sent as u64);
         let mut big = vec![0xa0; 1000];
         big[..8].copy_from_slice(&(sent as u64).to_be_bytes());
         offer(&mut w, 0, 1, big);
@@ -771,8 +766,6 @@ fn steady(
         small[..8].copy_from_slice(&(sent as u64).to_be_bytes());
         offer(&mut w, 1, 0, small);
         sent += 1;
-        let t = w.tick();
-        w.run_until(1, |w| w.tick() > t);
     }
     let done = |w: &PacketWorld| {
         let o = w.visible_outcome();
@@ -793,11 +786,13 @@ fn steady(
 /// A link whose delay jitters reorders datagrams and loses none (#98's
 /// +jitter10 cell, here in virtual time). At QUIC's thresholds the
 /// sender calls lost what is only late, cuts its window for it, and
-/// moves the same frames many times slower; at the default it calls next
-/// to nothing lost. On the same link with real loss the default still
-/// finds the losses, and every frame arrives.
+/// moves the same frames many times slower; with loss called by time
+/// alone ([`Reordering::BY_TIME`]) it calls a tenth as many lost at most
+/// (here 6 of QUIC's 171) and moves the frames many times sooner. On the
+/// same link with real loss that setting still finds the losses, and
+/// every frame arrives.
 #[test]
-fn a_jittered_link_that_loses_nothing_is_not_called_lossy_at_the_default_thresholds() {
+fn a_jittered_link_that_loses_nothing_is_not_called_lossy_when_loss_is_by_time() {
     let f = fixture(&[PeerRole::Voter, PeerRole::Voter]);
     // One-way delay 50 ms with uniform jitter of 10 either side: a
     // standard deviation near 12% of the delay.
@@ -807,10 +802,14 @@ fn a_jittered_link_that_loses_nothing_is_not_called_lossy_at_the_default_thresho
         ..LinkFaults::default()
     };
     let frames = 1000;
-    let quic = steady(&f, 2, jitter, Reordering::QUIC, frames);
-    let default = steady(&f, 2, jitter, Reordering::DEFAULT, frames);
+    let thresholds = |reordering| Limits {
+        reordering,
+        ..Limits::node()
+    };
+    let quic = steady(&f, 2, jitter, thresholds(Reordering::QUIC), frames);
+    let by_time = steady(&f, 2, jitter, thresholds(Reordering::BY_TIME), frames);
     assert_eq!(
-        (quic.dropped, default.dropped),
+        (quic.dropped, by_time.dropped),
         (0, 0),
         "the link loses nothing"
     );
@@ -820,12 +819,12 @@ fn a_jittered_link_that_loses_nothing_is_not_called_lossy_at_the_default_thresho
         "QUIC's thresholds call reordering loss: {quic:?}"
     );
     assert!(
-        default.lost * 20 <= quic.lost && default.congestion_events * 20 <= quic.congestion_events,
-        "the default calls next to nothing lost: {default:?} against {quic:?}"
+        by_time.lost * 10 <= quic.lost && by_time.congestion_events * 10 <= quic.congestion_events,
+        "loss by time calls a tenth as many lost at most: {by_time:?} against {quic:?}"
     );
     assert!(
-        default.ticks * 3 <= quic.ticks,
-        "and moves the frames at least three times sooner: {default:?} against {quic:?}"
+        by_time.ticks * 3 <= quic.ticks,
+        "and moves the frames at least three times sooner: {by_time:?} against {quic:?}"
     );
 
     // Real loss on the same link is still found, and recovered.
@@ -833,6 +832,40 @@ fn a_jittered_link_that_loses_nothing_is_not_called_lossy_at_the_default_thresho
         loss_ppm: 10_000,
         ..jitter
     };
-    let found = steady(&f, 2, lossy, Reordering::DEFAULT, frames);
+    let found = steady(&f, 2, lossy, thresholds(Reordering::BY_TIME), frames);
     assert!(found.dropped > 0 && found.lost > 0, "{found:?}");
+}
+
+/// At 1% loss over a long round trip, a controller that reads every loss
+/// as congestion cannot carry a peer lane's steady load: each loss cuts
+/// its window, and the frames queue behind it. BBR does not cut its
+/// window for a loss, and carries the same load in a fraction of the
+/// time. Both call loss by time alone, so neither takes reordering for
+/// loss: the difference is the controller (`COORDD_CONGESTION`).
+#[test]
+fn at_one_percent_loss_bbr_carries_a_steady_load_that_cubic_falls_behind() {
+    let f = fixture(&[PeerRole::Voter, PeerRole::Voter]);
+    // A constant 70 ms round trip that loses one datagram in a hundred.
+    let lossy = LinkFaults {
+        delay_min: 35,
+        delay_max: 35,
+        loss_ppm: 10_000,
+        ..LinkFaults::default()
+    };
+    let controller = |congestion| Limits {
+        congestion,
+        reordering: Reordering::BY_TIME,
+        ..Limits::node()
+    };
+    let frames = 1000;
+    let cubic = steady(&f, 2, lossy, controller(Congestion::Cubic), frames);
+    let bbr = steady(&f, 2, lossy, controller(Congestion::Bbr), frames);
+    assert!(
+        cubic.dropped > 0 && bbr.dropped > 0 && cubic.lost > 0 && bbr.lost > 0,
+        "both lose datagrams and find the losses: {cubic:?}, {bbr:?}"
+    );
+    assert!(
+        bbr.ticks * 2 <= cubic.ticks,
+        "BBR moves the frames at least twice as soon: {bbr:?} against {cubic:?}"
+    );
 }

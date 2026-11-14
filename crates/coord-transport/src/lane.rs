@@ -6,12 +6,11 @@
 //! capability identifier and admitted only for roles that may use it.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use coord_types::wire_v1::{HelloV1, PeerRole};
 use quinn::VarInt;
 
-use crate::config::{AckFrequency, Reordering};
+use crate::config::{Congestion, Limits};
 
 /// One traffic lane of a peer link.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -191,31 +190,39 @@ impl LaneLimits {
     ];
 }
 
-/// The QUIC transport configuration of a lane: explicit CUBIC, the
-/// lane's stream limits and windows, keep-alive and idle timeout, and the
+/// The QUIC transport configuration of a lane: the lane's stream limits
+/// and windows, and the endpoint's keep-alive and idle timeout, loss
+/// thresholds, congestion controller, initial round trip, and the
 /// acknowledgement cadence asked of the peer, if any (task-d70).
 pub fn transport_config(
-    limits: &LaneLimits,
-    idle_timeout: Duration,
-    keep_alive: Duration,
-    ack_frequency: Option<AckFrequency>,
-    reordering: Reordering,
+    lane: &LaneLimits,
+    limits: &Limits,
 ) -> Result<Arc<quinn::TransportConfig>, String> {
+    let reordering = limits.reordering;
+    let congestion: Arc<dyn quinn::congestion::ControllerFactory + Send + Sync> =
+        match limits.congestion {
+            Congestion::Cubic => Arc::new(quinn::congestion::CubicConfig::default()),
+            Congestion::Bbr => Arc::new(quinn::congestion::BbrConfig::default()),
+            Congestion::NewReno => Arc::new(quinn::congestion::NewRenoConfig::default()),
+        };
     let mut transport = quinn::TransportConfig::default();
     transport
-        .max_concurrent_uni_streams(VarInt::from_u32(limits.max_uni_streams))
-        .max_concurrent_bidi_streams(VarInt::from_u32(limits.max_bidi_streams))
-        .stream_receive_window(varint(limits.stream_receive_window)?)
-        .receive_window(varint(limits.receive_window)?)
-        .send_window(limits.send_window)
+        .max_concurrent_uni_streams(VarInt::from_u32(lane.max_uni_streams))
+        .max_concurrent_bidi_streams(VarInt::from_u32(lane.max_bidi_streams))
+        .stream_receive_window(varint(lane.stream_receive_window)?)
+        .receive_window(varint(lane.receive_window)?)
+        .send_window(lane.send_window)
         .max_idle_timeout(Some(
-            quinn::IdleTimeout::try_from(idle_timeout).map_err(|e| e.to_string())?,
+            quinn::IdleTimeout::try_from(limits.idle_timeout).map_err(|e| e.to_string())?,
         ))
-        .keep_alive_interval(Some(keep_alive))
-        .congestion_controller_factory(Arc::new(quinn::congestion::CubicConfig::default()))
+        .keep_alive_interval(Some(limits.keep_alive))
+        .congestion_controller_factory(congestion)
         .packet_threshold(reordering.packets)
         .time_threshold(reordering.time_threshold());
-    if let Some(ack) = ack_frequency {
+    if let Some(rtt) = limits.initial_rtt {
+        transport.initial_rtt(rtt);
+    }
+    if let Some(ack) = limits.ack_frequency {
         let mut config = quinn::AckFrequencyConfig::default();
         config
             .ack_eliciting_threshold(VarInt::from_u32(ack.threshold))
