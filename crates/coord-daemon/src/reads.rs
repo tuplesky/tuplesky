@@ -50,11 +50,14 @@ pub const READ_WAIT_MILLIS: u64 = 1_000;
 /// two round trips, where etcd's read index takes one.
 ///
 /// Spaced instead, a read's round starts within this long of its
-/// arrival, so it waits one round trip and at most this much more. At
-/// most one round starts per spacing while reads keep arriving. On a LAN
-/// a round confirms long before the spacing ends, so the rule changes
-/// nothing there. A round that never confirms still holds nothing back
-/// for longer than this.
+/// arrival, so it waits one round trip and at most this much more. While
+/// a round is out, at most one more starts per spacing: across regions,
+/// where a round takes longer than the spacing, that is at most 200 a
+/// second while reads keep arriving. On a LAN a round confirms long
+/// before the spacing ends and leaves nothing to hold the next back, so
+/// rounds go one per confirmation, at task-d58's rate, and the rule
+/// changes nothing there. A round that never confirms still holds
+/// nothing back for longer than this.
 pub const ROUND_SPACING_MILLIS: u64 = 5;
 
 pub use coord_collector::servable;
@@ -963,6 +966,48 @@ mod tests {
         assert_eq!(due_now[0].read.request.retry_key.request_sequence.get(), 2);
     }
 
+    /// Rounds that overlap confirm out of order, ordinarily so across
+    /// regions once a round out holds the next back only for the
+    /// spacing. A later round's confirmation covers the reads before the
+    /// earlier round too, and the earlier round's late answer finds
+    /// nothing and covers nothing that arrived after it (review on #295).
+    #[test]
+    fn a_later_round_confirmed_first_covers_the_reads_before_the_earlier() {
+        let b = ballot(1);
+        let mut barrier = ReadBarrier::new();
+        barrier
+            .admit(Origin::Local, read(1, b, range()), leading(b, 3), T0)
+            .unwrap();
+        let first = barrier.round_to_start(b, 2, T0).unwrap();
+        let later = T0.plus(ROUND_SPACING_MILLIS);
+        barrier
+            .admit(Origin::Local, read(2, b, range()), leading(b, 4), later)
+            .unwrap();
+        let second = barrier.round_to_start(b, 2, later).unwrap();
+        assert!(second > first);
+        barrier.on_confirmed(ReplicaId([3; 16]), b, second, 2);
+        let (due, _) = barrier.take_due(leading(b, 4), later, |_| true, at(5));
+        let mut answered: Vec<u64> = due
+            .iter()
+            .map(|h| h.read.request.retry_key.request_sequence.get())
+            .collect();
+        answered.sort_unstable();
+        assert_eq!(answered, [1, 2], "the second round covers both reads");
+        // A read after the second round started; then the first round's
+        // answer comes late. It covers nothing: the read needs a round
+        // that started after it.
+        barrier
+            .admit(Origin::Local, read(3, b, range()), leading(b, 4), later)
+            .unwrap();
+        barrier.on_confirmed(ReplicaId([2; 16]), b, first, 2);
+        let (due, _) = barrier.take_due(leading(b, 4), later, |_| true, at(5));
+        assert!(
+            due.is_empty(),
+            "the first round's late answer covers nothing"
+        );
+        assert_eq!(barrier.counts.rounds, 2);
+    }
+
     /// What a model run of the barrier gave: the median wait of the
     /// client that reads in a loop and of the other reads, in ms, and
     /// the rounds started.
@@ -1057,6 +1102,18 @@ mod tests {
             if let Some(round) = barrier.round_to_start_spaced(b, 3, now, spacing) {
                 answers.entry(t + 2).or_default().push((near, round));
                 answers.entry(t + MODEL_RTT).or_default().push((far, round));
+            }
+            // The serve loop sleeps until `next_round_at`. After a pump, a
+            // time at or before now would wake it at once to start
+            // nothing: a spin (review on #295). The loop below takes only
+            // a later wake, so it would not show one. Under task-d58's
+            // rule the model still asks `next_round_at`, which assumes
+            // the shipped spacing, so only that spacing is checked.
+            if spacing == ROUND_SPACING_MILLIS {
+                assert!(
+                    barrier.next_round_at(b).is_none_or(|n| n.get() > t),
+                    "a wake at {t} or before would spin"
+                );
             }
             let (due, refused) = barrier.take_due(lead, now, |_| true, at(5));
             assert!(refused.is_empty());
