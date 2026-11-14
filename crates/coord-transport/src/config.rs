@@ -167,8 +167,9 @@ impl AckFrequency {
 /// not change it. A real loss is found 7/4 of a round trip after the
 /// packet was sent, where QUIC's thresholds find it about one round trip
 /// after, once three later packets are acknowledged. In the same
-/// simulator at 1% loss, the default still moved the transfer 2.4 to 6
-/// times sooner than QUIC's thresholds, with jitter or without.
+/// simulator the default still moved the transfer sooner than QUIC's
+/// thresholds with real loss: 2.2 to 5.3 times at 1% loss, with jitter
+/// or without, and 1.5 to 2 times at 3% without jitter.
 ///
 /// The thresholds are the sender's, but the receiver decides when an
 /// acknowledgement goes: with [`AckFrequency`] set, the peer is asked to
