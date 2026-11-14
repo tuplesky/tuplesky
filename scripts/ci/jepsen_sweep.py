@@ -172,6 +172,7 @@ COUNTS = (
     ("api_other_evidence", "Api other evidence", ("traffic", "Observed", "api_frames", "other_evidence")),
     ("evidence_for_marked", "Evidence for marked", ("evidence_for_marked",)),
     ("relayed", "Relayed to the leader alone", ("relay", "relayed")),
+    ("relay_asked_leader", "Relays that asked the leader alone again", ("relay", "asked_leader")),
     ("relay_fallbacks", "Relays fallen back", ("relay", "fallbacks")),
     ("relay_not_leading", "`NotLeading` refusals", ("relay", "not_leading")),
     ("relay_frames_taken", "Relayed frames taken", ("relay", "frames_taken")),

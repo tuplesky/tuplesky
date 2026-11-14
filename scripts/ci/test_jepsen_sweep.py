@@ -162,13 +162,14 @@ class SweepTests(unittest.TestCase):
         for node, relayed in (("n1", 0), ("n2", 8)):
             with open(os.path.join(path, node, "coordd.log")) as f:
                 line = json.loads(f.read()[len("metrics "):])
-            line["cost"]["Observed"]["relay"] = {"relayed": relayed, "fallbacks": 1, "not_leading": 0}
+            line["cost"]["Observed"]["relay"] = {"relayed": relayed, "fallbacks": 1, "not_leading": 0, "asked_leader": 2}
             line["cost"]["Observed"]["proposals"] = {"proposals": 40 if node == "n1" else 0, "frames": 10 if node == "n1" else 0}
             with open(os.path.join(path, node, "coordd.log"), "w") as f:
                 f.write("metrics " + json.dumps(line) + "\n")
         step = sw.read_step("head", "30", path)
         self.assertAlmostEqual(step.counts["relayed"], 0.8)
         self.assertAlmostEqual(step.counts["relay_fallbacks"], 0.2)
+        self.assertAlmostEqual(step.counts["relay_asked_leader"], 0.4)
         self.assertAlmostEqual(step.counts["proposals"], 4.0)
         self.assertAlmostEqual(step.counts["proposal_frames"], 1.0)
         self.assertNotIn("proposal_bytes", step.counts)

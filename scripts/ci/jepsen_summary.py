@@ -2362,21 +2362,23 @@ def relay_table(voters: dict) -> list[str]:
         return []
     out = [
         "**Leader relay and proposal frames** (task-d102, each voter's last boot, from its last `metrics` line: "
-        "relayed is the submissions its collector sent to the leader alone, fell back the ones of those sent to "
+        "relayed is the submissions its collector sent to the leader alone, asked the leader the ones of those "
+        "it asked the leader alone again at the bound before any fan-out (#300), fell back the ones sent to "
         "every voter after all, at the bound or at a `NotLeading` refusal; as a follower (#230), the proposal "
         "frames it took, the relayed payloads it took from them, the relayed proposals for a command it knew "
         "already, and those whose payload it did not take (not from the leader at its ballot, which every leader "
         "change gives some of, a payload that did not match the vote, or no room: 0 in a run without faults), "
+        "and the relayed payloads it kept and of those the ones it later took (#296); "
         "`-` from a build without them; then what its leaders sent of fresh "
         "proposals, one to each follower, and of frontier announcements, with the frames that carried more than "
         "one proposal; bytes leave out the payload records relayed proposals carried, given apart; per command is "
         "over the commands the voter executed; then the domain loop's flushes and the events it took between "
         "them, api / peer, since a frame is cut at a flush)",
         "",
-        "| Node | Relayed | Fell back | `NotLeading` | Frames taken | Payloads taken | Known | Not taken "
-        "| Proposals | Frames (proposals each) | Proposal bytes per command "
+        "| Node | Relayed | Asked the leader | Fell back | `NotLeading` | Frames taken | Payloads taken | Known "
+        "| Not taken | Kept | Kept, taken | Proposals | Frames (proposals each) | Proposal bytes per command "
         "| Payload bytes per command | Frontiers | Frontier bytes per command | Flushes | Events per flush (api / peer) |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        "| --- " * 19 + "|",
     ]
     per = lambda n, executed: f"{n / executed:.1f}" if executed else "-"
     for node, executed, relay, sent, flushes in rows:
@@ -2386,9 +2388,10 @@ def relay_table(voters: dict) -> list[str]:
         events = (f"{flushes.get('api_events', 0) / taken:.2f} / {flushes.get('peer_events', 0) / taken:.2f}"
                   if taken else "-")
         out.append(
-            f"| {node} | {relay.get('relayed', '-')} | {relay.get('fallbacks', '-')} | {relay.get('not_leading', '-')} "
+            f"| {node} | {relay.get('relayed', '-')} | {relay.get('asked_leader', '-')} | {relay.get('fallbacks', '-')} "
+            f"| {relay.get('not_leading', '-')} "
             f"| {relay.get('frames_taken', '-')} | {relay.get('payloads_taken', '-')} | {relay.get('known', '-')} "
-            f"| {relay.get('not_taken', '-')} "
+            f"| {relay.get('not_taken', '-')} | {relay.get('kept', '-')} | {relay.get('kept_taken', '-')} "
             f"| {sent.get('proposals', '-')} | {frames} ({each}) | {per(sent.get('proposal_bytes', 0), executed)} "
             f"| {per(sent.get('payload_bytes', 0), executed)} | {sent.get('frontiers', '-')} "
             f"| {per(sent.get('frontier_bytes', 0), executed)} | {taken if taken is not None else '-'} | {events} |"
