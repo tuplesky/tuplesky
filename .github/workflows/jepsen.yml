@@ -34,8 +34,15 @@ on:
   workflow_dispatch:
     inputs:
       jepsen-ref:
+        # The default is a commit, not a branch, so a push to the fork
+        # never changes what an undispatched run tests: tuplesky/jepsen's
+        # claude/partition-one-follower at its merge of the fork's main
+        # 3e6f96e (upstream v0.3.15 as 0.3.15-tuplesky, Elle 0.2.8, and
+        # the concurrent generator's update in its group's context), after
+        # a valid wr, append and register kill/partition pass on it
+        # (43552216758, 43553282949, 43554176506).
         description: Branch, tag or commit of tuplesky/jepsen to run
-        default: main
+        default: 055c0fa341549801e0ec83d4b8190f594cc6c89d
       scenario:
         description: "faults (kill, pause, partition at 20/s), throughput (no faults, unthrottled, register), wan (three simulated regions, packet faults), wan-throughput, or service (wr at about 80% reads, 1000 uniform keys, 300/s from 4 clients, no faults; etcd at the same rate)"
         type: choice
@@ -152,7 +159,7 @@ env:
   # Scheduled runs have no inputs; these are the dispatch defaults. The
   # load, faults and network come from the scenario, in each job's first
   # step (scripts/ci/jepsen_scenario.sh); a non-empty input overrides it.
-  JEPSEN_REF: ${{ inputs.jepsen-ref || 'main' }}
+  JEPSEN_REF: ${{ inputs.jepsen-ref || '055c0fa341549801e0ec83d4b8190f594cc6c89d' }}
   SCENARIO: ${{ inputs.scenario || 'faults' }}
   IN_WORKLOAD: ${{ inputs.workload }}
   IN_NEMESIS: ${{ inputs.nemesis }}

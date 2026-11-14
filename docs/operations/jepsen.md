@@ -159,8 +159,15 @@ uploaded as an artifact, without the provisioned run directory, which
 holds the domain's fixture keys. The containers share the runner's clock,
 so the workflow does not offer the `clock` fault.
 
-`jepsen-ref` defaults to `main` of `tuplesky/jepsen`, where the project
-merged (tuplesky/jepsen#1); a run can name another branch, tag or commit.
+`jepsen-ref` defaults to a pinned commit of `tuplesky/jepsen`,
+`055c0fa3` on `claude/partition-one-follower`: the fork's main at
+`3e6f96e` (upstream v0.3.15 as `0.3.15-tuplesky`, with Elle 0.2.8 and the
+concurrent generator's update in its group's context) merged into the
+branch that carries the harness's later options. A commit rather than a
+branch, so a push to the fork never changes what an undispatched run
+tests; it moves only after a `wr`, an `append` and a register
+kill/partition pass on the new commit are valid. A run can name another
+branch, tag or commit.
 
 #### Scenarios
 
