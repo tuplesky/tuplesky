@@ -872,6 +872,15 @@ impl<P: Persistence> Voter<P> {
         out
     }
 
+    /// When the round a read this leader holds waits for may start, if it
+    /// waits on [`crate::reads::ROUND_SPACING_MILLIS`]: the serve loop
+    /// wakes then, since on an idle domain nothing else arrives to pump
+    /// the reads.
+    pub fn next_read_round_at(&self) -> Option<MonotonicMillis> {
+        self.leading()
+            .and_then(|l| self.reads.next_round_at(l.ballot))
+    }
+
     /// Move the reads this voter holds along (task-d50): start the
     /// confirmation round a newly arrived read needs, answer every read
     /// whose round confirmed, whose index executed and whose snapshot
