@@ -1215,7 +1215,8 @@ Each step has its own PRs and pair.
 - **Bounded before it's built.** Inferred savings have come in at a quarter to a third of their estimates. So no step is built on an inferred figure.
   - Its saving is measured first on a scratch build, which gets no PR, as a pair against the carry.
   - Where the bound is under what a pair can see, a profiled pair measures it: the named functions' share before and after, as for #282.
-- **Re-measured on the carry just before its step is built (2026-11-14).** A bound read at step 0 is read again, as a pair on the carry of the day, immediately before its step is built. The step's checkpoint is half of that reading, not of step 0's. B2 − B1, which the go/no-go reads, is measured the same way, on the carry at the time.
+- **Re-measured on the carry its step is built on (2026-11-14).** A bound read at step 0 is read again, as a pair, before its step is built. The step's checkpoint is half of that reading, not of step 0's. B2 − B1, which the go/no-go reads, is measured the same way.
+  - **The bound's re-read and the step's pair run on the same carry commit.** If the step's branch takes a newer carry before its pair is read, the bound is read again on that carry, unless only docs or tests came in. That covers a newer carry at the branch's cut and one merged in later (review of #289).
   - **Why:** PRs merged between a bound and its step can take the same work first. B0 read −39 µs a command in the appenders and the materializers against `ba947188`.
   - By `ab209310` the carry had merged #280 to #287. In one alternation of the three builds, the carry's base was already below B0 (−10.4 µs a command in the appenders, −18.8 in the materializers), and below step 0's base by more than B0 took off it.
   - The work B0 removed was per-record work, and the merged PRs took most of it first, #284 above all: a record is checked against its stream instead of its digest again, and its encoded length is counted once.
@@ -1338,15 +1339,15 @@ Each step has its own PRs and pair.
 
 | Callers | 120 | 30 | 5 | 1 |
 | --- | ---: | ---: | ---: | ---: |
-| Protocol records a command, a follower | 0.11 | 0.25 | 0.81 | 1.00 |
+| B1's protocol records a command, a follower (the base's: 1.00 at every load) | 0.11 | 0.25 | 0.81 | 1.00 |
 | Base: five voters' CPU, µs a command | 890 | 1,070 | 1,785 | 3,257 |
-| B1 | **−65 (−7.3%)** | +65 | +152 | −106 |
+| B1 − base: five voters' CPU | **−65 (−7.3%)** | +65 | +152 | −106 |
 | The base runs' spread | 170 | 263 | 113 | 288 |
-| A follower's loop | **−9.4 (−10.5%)** | +5.3 | +13.9 | −8.7 |
+| B1 − base: a follower's loop | **−9.4 (−10.5%)** | +5.3 | +13.9 | −8.7 |
 
   - **At 120 B1 keeps what it bounds.**
     - A follower's loop reads −9.4 µs a command, against −10.8 at step 0. All three runs are below the base runs on either side of them: −11.0, −8.4 and −8.7.
-    - Operations a second rise 4.5%, and p50 falls 0.8 ms.
+    - Operations a second rise 4.5%.
     - The base runs drift today (797 to 968 µs a command), so the four followers' −37.5 is inside the base runs' spread of 63.
     - **So a profiled pair reads it** (b1 y1 b2 y2 b3 at 120). A follower's loop goes from 90.1 to 79.2 µs a command (−10.9). The functions B1 changes move beyond their own base spreads:
       - `on_relayed_proposal`: 14.6 → 6.9 (−7.7, spread 1.3);
@@ -1416,7 +1417,9 @@ Each step has its own PRs and pair.
   - `projection_commit_records` (32): the projection commit hold (task-d86).
   - **What step 2 changes.** Under B1 a follower writes 1.11 records a command at 120 callers, not 2.00. So each of those intervals spans 1.8 times as many commands at a follower. With 1b as well it would be 0.18 records a command, and about 11 times as many.
   - **Step 2's PR restates them in commands or bytes,** or keeps them in records and says in its body what each interval becomes. Its pair reports projection commits and checkpoint publications a command.
-  - **The hold's unit may be part of B1's materializer reading.** Under B1 a follower's projection commits fall from about 0.047 to 0.038 a command (−19%). In B1's profiled pair, its redb `commit` falls from 10.0 to 8.1 µs a command (base spread 1.3), and `project` falls from 37.8 to 33.8.
+    - **An effective value is per role.** A follower writes 2.00 records a command today at every load, and the leader's count needn't match it, so one figure in commands can keep one role's interval and move the other's. The PR body says what each interval becomes at the leader and at a follower.
+    - **A restatement that changes an effective value is read with and without it,** so step 2's own saving is told apart from the setting's. That is one alternation of three builds: the carry, step 2, and step 2 with the restatement, each run read against its neighbours (R13), as B0 was read against two bases. Two pairs against the carry would be the difference R13 rules out (review of #289).
+  - **The hold's unit may be part of B1's materializer reading.** Under B1 a follower's projection commits fall from about 0.047 to 0.038 a command (−19%). In B1's profiled pair, its redb `commit` falls from 10.0 to 8.1 µs a command (base spread 1.3), and its materializer thread from 38.6 to 34.7.
     - Under 1b the commits fell as much at every voter, with redb's `commit` flat (8.91 → 8.89 µs at a follower) and no saving in the materializers.
     - So step 2's checkpoint stays in a follower's loop. A saving in the materializers that a larger `projection_commit_records` alone would buy isn't step 2's.
 - **Pinned by:**
@@ -1428,7 +1431,7 @@ Each step has its own PRs and pair.
   - the crash matrix's cuts at a frame's batch and between two of its batches;
   - `protocol_sim`'s rows, unchanged.
 - **Bound:** B1. The inferred −15 to −21 µs a follower is about −0.04 to −0.05 ms an operation locally. A quarter to a third of that is −0.01 to −0.02, under what a pair sees, so the profiled pair may be the whole reading. Step 2 is built even then, since step 5 stands on it.
-- **Checkpoint:** half of B1 in a follower's loop, as µs a command, and one batch, one barrier and one storage event a frame at 120 callers. By B1 on `ab209310` that is about −4.7 µs a command (step 0), and B1 is read again on the carry step 2 is built on. Then the drift pair against the carry before step 1.
+- **Checkpoint:** half of B1 in a follower's loop, as µs a command, and one batch, one barrier and one storage event a frame at 120 callers. By B1 on `ab209310` that is about −4.7 µs a command (step 0 read −5.4). B1's re-read and step 2's pair run on the same carry commit, by the rule above. Then the drift pair against the carry before step 1.
 
 **Step 3: the frame log's kinds, read only.**
 - **One PR.** Each piece is a new kind that every voter decodes before any voter sends or writes one:
@@ -1439,6 +1442,8 @@ Each step has its own PRs and pair.
       - That isn't a gap in the rollback rule: once 4a writes, a voter goes back at most to step 3's release, which reads frame records.
       - **Step 3's PR moves the format check ahead of the body.** The format is the record's first field, so the decoder reads it, refuses one past `newest` as unsupported, and only then decodes the body. A kind added after step 3 then reads, to the release before it, as an unsupported format and not as a damaged record.
       - Pinned by a fixture: a record at the next format with a body kind this build doesn't know is refused as `UnsupportedFormat`.
+    - **A frame record below format 3 is refused,** as `check_body` refuses a group below format 2 (`GroupBeforeItsFormat`). `seal` runs `check_body`, so a frame record can't be written at 2, where 1a's release would read it as damaged. A format number then always names the body kinds a record may hold (review of #289).
+      - Pinned beside the fixture above: a frame record at format 2 is refused.
   - frame entries in a recovery report and in a Sync;
   - **the frame fetch (R7):** `FrameRequest { position, ballot, digest }`, answered with the frame record's bytes, which the asker checks against the digest. It is to frames what `PayloadRequest` is to payloads today.
 - **What recovery reads:** what it reads today.
