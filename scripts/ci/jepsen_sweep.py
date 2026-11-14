@@ -819,8 +819,11 @@ def head_against_base(steps: list[Step]) -> list[str]:
             return f"{(head / base - 1) * 100:+.1f}%" if (head is not None and base) else "-"
 
         def mean(side, get):
-            values = [get(p[side == "head"]) for p in pairs]
-            values = [v for v in values if v is not None]
+            # Over the pairs with this measure on both sides, so the two
+            # means cover the same repetitions: a run without CPU samples
+            # drops its pair from that measure's means, not its side alone.
+            both = [p for p in pairs if get(p[0]) is not None and get(p[1]) is not None]
+            values = [get(p[side == "head"]) for p in both]
             return sum(values) / len(values) if values else None
 
         if not out:

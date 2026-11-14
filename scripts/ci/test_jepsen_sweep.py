@@ -488,6 +488,19 @@ class HeadAgainstBaseTests(unittest.TestCase):
         self.assertIn("| 30 | 1 | head, base | +10.0% | -10.0% | -10.0% |", rows)
         self.assertFalse([r for r in rows if r.startswith("| 30 | 2 | ") or r.startswith("| 30 | mean | ")])
 
+    def test_a_measure_missing_from_one_run_drops_that_pair_from_its_means(self):
+        # Pair 1's head has no CPU samples: the CPU means are pair 2's alone,
+        # base 10 against head 11, not base (1 + 10) / 2 against head 11.
+        steps = [
+            self.made("base", 1, 1000.0, 1.0, 2.0),
+            self.made("head", 1, 1100.0, None, None),
+            self.made("head", 2, 1100.0, 11.0, 22.0),
+            self.made("base", 2, 1000.0, 10.0, 20.0),
+        ]
+        rows = [line for line in sw.render(steps, "Sweep").splitlines() if line.startswith("| 30 | ")]
+        self.assertIn("| 30 | 1 | base, head | +10.0% | - | - |", rows)
+        self.assertIn("| 30 | mean | both | +10.0% | +10.0% | +10.0% |", rows)
+
 
 class OfferedRateTests(unittest.TestCase):
     """CLIENTS@RATE steps: the label, the capacity and the crowded mark."""
