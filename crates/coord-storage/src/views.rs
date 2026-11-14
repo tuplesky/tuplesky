@@ -583,12 +583,12 @@ pub fn build_read_view<V: OrderedRead>(
             // Each touch is charged as the one-row scan it replaces
             // (`scan_all`) charged it, because the budget's refusal is a
             // replicated outcome: a touch with no bytes left is refused
-            // before it reads, a row larger than the bytes left is the
-            // page's `Limit` error, and a row is charged on every touch
-            // that finds it.
-            if budget.bytes == 0 {
-                return Err(ViewBuildError::BudgetExceeded);
-            }
+            // before it reads, a row larger than the bytes left is refused
+            // by the budget (`BudgetExceeded`), and a row is charged on
+            // every touch that finds it. A row larger than the page itself
+            // is the page's `Limit` error, as `scan_page` gives it; the
+            // page's floor is larger than any row a view reads.
+            let page = page_bytes(&budget)?;
             let (cost, value) = match exact.get(key.as_slice()) {
                 Some(cost) => (*cost, None),
                 None => {
@@ -600,7 +600,7 @@ pub fn build_read_view<V: OrderedRead>(
                 }
             };
             if let Some(cost) = cost {
-                if cost > budget.bytes as usize {
+                if cost > page.get() as usize {
                     return Err(EngineError::new(
                         ErrorClass::Limit,
                         "row larger than the page byte budget",
