@@ -4896,6 +4896,14 @@ fn a_node_refuses_a_store_that_activated_something_this_build_cannot_do() {
         report.contains("build schema=1") && report.contains("features=checkpoint-floor"),
         "the daemon did not report what this build is:\n{report}"
     );
+    // The journal's window reads ahead, so the line gives the versions
+    // read, and the one written beside them: an operator checking a fleet
+    // before a rollback sees which nodes read what a successor writes,
+    // and which already write it (10.7, step 1a).
+    assert!(
+        report.contains("journal=1..2 journal_writes=1 "),
+        "the build line did not give the journal's read window and written version:\n{report}"
+    );
 
     // Nothing activated: it serves, which is the coexistence half.
     assert_eq!(run(&path, &["--check"]).code, Some(0));
