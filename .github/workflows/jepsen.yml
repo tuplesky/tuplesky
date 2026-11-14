@@ -70,7 +70,7 @@ on:
         description: Voters (containers), 3 or 5
         default: "5"
       etcd-version:
-        description: "etcd for the baseline: a version such as 3.7.2, latest (the newest stable release), or none to skip it; beside, or beside:VERSION, runs it in the TupleSky job, on its runner and cluster, after each pair (or after the one run), with each TupleSky run's ratio to it, instead of in a job of its own on another runner. etcd runs at its own default snapshot count; /COUNT after any of them (beside/100) also runs it at --snapshot-count COUNT at each sweep step, labelled etcd-snapCOUNT; +tls before it (beside+tls, beside+tls+auth/100) makes etcd with TLS, client certificates required on both planes, the baseline every ratio is over, labelled etcd-tls, since TupleSky's QUIC is always encrypted, with plain etcd (etcd) as a side row, and +tls+auth adds a side row with a non-root user checked against a role's grant (etcd-tlsauth); in a sweep TupleSky runs first at odd steps and etcd at even ones, and without a pair TupleSky and the baseline run twice a step, in both orders; @fork after a beside setting (beside+tls@fork) runs the etcd test on the jepsen-ref's Jepsen jar in place of its own 0.3.11, readers drawn by thread as on 0.3.11"
+        description: "etcd for the baseline: a version such as 3.7.2, latest (the newest stable release), or none to skip it; beside, or beside:VERSION, runs it in the TupleSky job, on its runner and cluster, after each pair (or after the one run), with each TupleSky run's ratio to it, instead of in a job of its own on another runner. etcd runs at its own default snapshot count; /COUNT after any of them (beside/100) also runs it at --snapshot-count COUNT at each sweep step, labelled etcd-snapCOUNT; +tls before it (beside+tls, beside+tls+auth/100) makes etcd with TLS, client certificates required on both planes, the baseline every ratio is over, labelled etcd-tls, since TupleSky's QUIC is always encrypted, with plain etcd (etcd) as a side row, and +tls+auth adds a side row with a non-root user checked against a role's grant (etcd-tlsauth); in a sweep TupleSky runs first at odd steps and etcd at even ones, and without a pair TupleSky and the baseline run twice a step, in both orders; @fork after a beside setting (beside+tls@fork) runs the etcd test on the jepsen-ref's Jepsen jar in place of its own 0.3.11, readers drawn by thread as on 0.3.11; @tcp after any of them (beside+tls@tcp) tunes the node containers' TCP for etcd under a WAN, each container's own network namespace (BBR, tcp_rmem and tcp_wmem maxima of 16 MiB, no slow start after idle, tcp_notsent_lowat 131072; tcp_reordering and RACK left at the kernel's; TupleSky's QUIC is UDP, which none of them touch), and with etcd beside or @tcp the summary records each container's effective TCP settings at the start and after the runs"
         default: latest
       features:
         description: "Replicated features TupleSky's voters activate once every voter is submittable, before the nemesis and the workload (jepsen.tuplesky's --activate, task-d99), comma-separated in order, such as early-proposal,release-at-execution; NAME@SECS activates one under load, SECS into the workload (--activate-after), such as early-proposal,answer-on-release@60; a build without an admin socket (a pair's base before task-d99) is left as it is; empty for none; BASE/HEAD gives a pair's two sides their own lists (either may be empty)"
@@ -132,6 +132,7 @@ on:
       - scripts/ci/cpu_sampler.py
       - scripts/ci/jepsen_bounded.sh
       - scripts/ci/jepsen_cpu_quota.sh
+      - scripts/ci/jepsen_tcp.sh
       - scripts/ci/jepsen_etcd.sh
       - scripts/ci/jepsen_key_groups.py
       - scripts/ci/jepsen_fork_tests
@@ -190,6 +191,9 @@ env:
   ETCD_VERSION: ${{ inputs.etcd-version || 'latest' }}
   # etcd-version beside or beside:VERSION: etcd in the TupleSky job.
   ETCD_BESIDE: ${{ startsWith(inputs.etcd-version, 'beside') }}
+  # etcd-version ...@tcp: the node containers' TCP tuned for etcd
+  # (scripts/ci/jepsen_tcp.sh); default otherwise.
+  IN_ETCD_TCP: ${{ contains(inputs.etcd-version, '@tcp') && 'tuned' || 'default' }}
   # jepsen-io/etcd, pinned; its head when the baseline was added.
   ETCD_TEST_REPO: jepsen-io/etcd
   ETCD_TEST_REF: b47cc401f27bfb7c28afd9ac088b5f0dca4501b8
@@ -271,6 +275,12 @@ jobs:
               sudo modprobe -a sch_prio sch_netem cls_u32
             }
             lsmod | grep -E '^(sch_prio|sch_netem|cls_u32) '
+          fi
+          # etcd-version ...@tcp: BBR for the node containers' TCP, set in
+          # each container's own namespace (scripts/ci/jepsen_tcp.sh).
+          if [ "$IN_ETCD_TCP" = tuned ]; then
+            sudo modprobe tcp_bbr
+            grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control
           fi
       - name: Prepare the etcd test beside TupleSky
         # etcd-version beside: the etcd-baseline job's test, run on this runner and
@@ -472,6 +482,13 @@ jobs:
         # bursts to its period while the runner shows idle cores. Read
         # again after the runs, below.
         run: tuplesky/scripts/ci/jepsen_cpu_quota.sh "$RUNNER_TEMP/cluster/nodes" start
+      - name: Set the nodes' TCP
+        # etcd-version ...@tcp: best-effort TCP in each node container's
+        # own network namespace, for etcd's side; either way each
+        # container's effective values into the summary. With etcd beside
+        # or @tcp.
+        if: env.ETCD_BESIDE == 'true' || env.IN_ETCD_TCP == 'tuned'
+        run: tuplesky/scripts/ci/jepsen_tcp.sh "$RUNNER_TEMP/cluster/nodes" "$IN_ETCD_TCP" start
       - name: Deploy a domain on it and put a write through every voter
         run: |
           jepsen/tuplesky/docker/smoke.sh --dir "$RUNNER_TEMP/cluster" \
@@ -1183,6 +1200,9 @@ jobs:
       - name: Read the nodes' CPU quota again
         if: always() && env.CPU_MISS != 'true'
         run: tuplesky/scripts/ci/jepsen_cpu_quota.sh "$RUNNER_TEMP/cluster/nodes" "after the runs" || true
+      - name: Read the nodes' TCP again
+        if: always() && env.CPU_MISS != 'true' && (env.ETCD_BESIDE == 'true' || env.IN_ETCD_TCP == 'tuned')
+        run: tuplesky/scripts/ci/jepsen_tcp.sh "$RUNNER_TEMP/cluster/nodes" "$IN_ETCD_TCP" "after the runs" || true
       - name: Take the cluster down
         if: always() && env.CPU_MISS != 'true'
         run: jepsen/tuplesky/docker/down.sh --dir "$RUNNER_TEMP/cluster"
@@ -1237,6 +1257,12 @@ jobs:
             }
             lsmod | grep -E '^(sch_prio|sch_netem|cls_u32) '
           fi
+          # etcd-version ...@tcp: BBR for the node containers' TCP, set in
+          # each container's own namespace (scripts/ci/jepsen_tcp.sh).
+          if [ "$IN_ETCD_TCP" = tuned ]; then
+            sudo modprobe tcp_bbr
+            grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control
+          fi
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -1274,6 +1300,9 @@ jobs:
           if [ "$STORE" = tmpfs ]; then tmpfs=(--tmpfs /opt); fi
           jepsen/tuplesky/docker/up.sh --nodes "$NODES" --dir "$RUNNER_TEMP/cluster" \
             ${tmpfs[@]+"${tmpfs[@]}"}
+      - name: Set the nodes' TCP
+        # etcd-version ...@tcp: as in the TupleSky job (scripts/ci/jepsen_tcp.sh).
+        run: tuplesky/scripts/ci/jepsen_tcp.sh "$RUNNER_TEMP/cluster/nodes" "$IN_ETCD_TCP" start
       - name: Run the etcd test
         # The TupleSky test's rate, fault interval and operations per
         # register, bounded as it is (scripts/ci/jepsen_etcd.sh); with TLS

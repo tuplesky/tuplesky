@@ -27,6 +27,10 @@ prepare() {
   # run one interpreter and generator (#98). Only beside TupleSky, where
   # that jar is installed before the test's dependencies are fetched.
   local fork=""
+  # @tcp anywhere in it (beside+tls@tcp): the node containers' TCP tuned
+  # for etcd under a WAN, which the workflow does (IN_ETCD_TCP,
+  # scripts/ci/jepsen_tcp.sh); nothing for the test itself.
+  ETCD_VERSION=${ETCD_VERSION/@tcp/}
   case $ETCD_VERSION in
     *@fork*) fork=yes ETCD_VERSION=${ETCD_VERSION/@fork/} ;;
   esac

@@ -937,6 +937,33 @@ newer generator it reserves within each key's group, half of every group,
 so half the operations would be reads. `@fork` draws the 0.3.11 split by
 thread with `gen/on-threads`, as `jepsen.tuplesky`'s etcd mix does.
 
+`@tcp` after any etcd setting (`beside+tls@tcp`, in either job) tunes the
+node containers' TCP for etcd under a WAN, so a loss or jitter comparison
+gives etcd's transport the same best effort as TupleSky's tuned QUIC.
+`scripts/ci/jepsen_tcp.sh` writes, in each container's own network
+namespace:
+
+- `tcp_congestion_control` `bbr` (the job loads `tcp_bbr` beside netem);
+- `tcp_rmem` and `tcp_wmem` maxima of 16 MiB, over twice the largest
+  bandwidth-delay product here (140 ms at up to about 480 Mbit/s);
+- `tcp_slow_start_after_idle` 0;
+- `tcp_notsent_lowat` 131072.
+
+`tcp_reordering`, `tcp_max_reordering` and `tcp_recovery` (RACK) stay at
+the kernel's defaults, which already adapt to reordering. Docker mounts
+`/proc/sys` read-only in a container, so the script writes from the runner
+with `nsenter` into the container's namespace. It writes a setting only
+where the kernel keeps it per namespace (present under `/proc/sys` inside
+the namespace), and checks the runner's own value is unchanged after the
+write: one that changed is put back and reported as host-wide, never left
+set on the runner, where it would reach the other side's host too. The
+settings are TCP's alone, so TupleSky's QUIC, which is UDP, runs the same
+either way; what they change is etcd's peer traffic and the node's end of
+its clients' connections (the Jepsen JVM's end, on the runner, stays at
+the runner's settings). With etcd beside, or `@tcp`, the summary records
+every container's effective values, and the runner's, at the start and
+after the runs, for the default and tuned rows alike.
+
 With `leader-profile: call-graph`, `scripts/ci/server_profile.py` also
 runs beside every TupleSky and etcd run. Over 20 s of the settled
 workload it counts every server process's system calls, context switches
