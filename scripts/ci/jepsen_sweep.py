@@ -665,38 +665,44 @@ def turns_of(store: str) -> dict:
         if not os.path.exists(path):
             continue
         with open(path, encoding="utf-8", errors="replace") as f:
-            voter = js.parse_voter(f.readlines())
-        if not voter.cost or not voter.cost.executed:
-            continue
-        raw = voter.cost.raw or {}
-        executed = voter.cost.executed
-        per = lambda v: v / executed if v is not None else None
-        turns = count_at(raw, ("flushes", "flushes"))
-        peer_events = count_at(raw, ("flushes", "peer_events"))
-        api_events = count_at(raw, ("flushes", "api_events"))
-        uptime = raw.get("uptime")
-        up = cc.seconds(uptime) if isinstance(uptime, dict) and "secs" in uptime else None
-        peer_calls = count_at(raw, ("traffic", "Observed", "send_calls"))
-        api_calls = count_at(raw, ("traffic", "Observed", "api", "send_calls"))
-        proposals = count_at(raw, ("proposals", "proposals"))
-        frames = count_at(raw, ("proposals", "frames"))
-        domain = ((raw.get("cpu") or {}).get("Observed") or {}).get("domain")
-        loop_s = cc.seconds(domain) if isinstance(domain, dict) and "secs" in domain else None
-        rows[node] = Turns(
-            executed=executed,
-            turns=turns,
-            events_per_turn=((peer_events or 0) + (api_events or 0)) / turns
-            if turns and (peer_events is not None or api_events is not None) else None,
-            turns_per_s=turns / up if turns and up else None,
-            peer_datagrams=per(count_at(raw, ("traffic", "Observed", "datagrams_sent"))),
-            api_datagrams=per(count_at(raw, ("traffic", "Observed", "api", "datagrams_sent"))),
-            send_calls=per((peer_calls or 0) + (api_calls or 0))
-            if peer_calls is not None or api_calls is not None else None,
-            per_frame=proposals / frames if proposals and frames else None,
-            switches=per(count_at(raw, ("cpu", "Observed", "domain_scheduling", "Observed", "voluntary"))),
-            loop_ms=loop_s * 1000 / executed if loop_s is not None else None,
-        )
+            turns = turns_of_voter(js.parse_voter(f.readlines()))
+        if turns:
+            rows[node] = turns
     return rows
+
+
+def turns_of_voter(voter) -> "Turns | None":
+    """One voter's Turns (see turns_of), or None without a cost reading."""
+    if not voter.cost or not voter.cost.executed:
+        return None
+    raw = voter.cost.raw or {}
+    executed = voter.cost.executed
+    per = lambda v: v / executed if v is not None else None
+    turns = count_at(raw, ("flushes", "flushes"))
+    peer_events = count_at(raw, ("flushes", "peer_events"))
+    api_events = count_at(raw, ("flushes", "api_events"))
+    uptime = raw.get("uptime")
+    up = cc.seconds(uptime) if isinstance(uptime, dict) and "secs" in uptime else None
+    peer_calls = count_at(raw, ("traffic", "Observed", "send_calls"))
+    api_calls = count_at(raw, ("traffic", "Observed", "api", "send_calls"))
+    proposals = count_at(raw, ("proposals", "proposals"))
+    frames = count_at(raw, ("proposals", "frames"))
+    domain = ((raw.get("cpu") or {}).get("Observed") or {}).get("domain")
+    loop_s = cc.seconds(domain) if isinstance(domain, dict) and "secs" in domain else None
+    return Turns(
+        executed=executed,
+        turns=turns,
+        events_per_turn=((peer_events or 0) + (api_events or 0)) / turns
+        if turns and (peer_events is not None or api_events is not None) else None,
+        turns_per_s=turns / up if turns and up else None,
+        peer_datagrams=per(count_at(raw, ("traffic", "Observed", "datagrams_sent"))),
+        api_datagrams=per(count_at(raw, ("traffic", "Observed", "api", "datagrams_sent"))),
+        send_calls=per((peer_calls or 0) + (api_calls or 0))
+        if peer_calls is not None or api_calls is not None else None,
+        per_frame=proposals / frames if proposals and frames else None,
+        switches=per(count_at(raw, ("cpu", "Observed", "domain_scheduling", "Observed", "voluntary"))),
+        loop_ms=loop_s * 1000 / executed if loop_s is not None else None,
+    )
 
 
 def voter_costs(store: str) -> list:

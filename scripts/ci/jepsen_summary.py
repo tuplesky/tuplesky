@@ -192,6 +192,9 @@ class Voter:
     cost: Cost | None = None
     # The observed frontiers of the same line, or None without them.
     frontiers: dict | None = None
+    # The same line's `paths` (#297): one entry a QUIC path, or None
+    # from a build without them.
+    paths: list | None = None
     # Whether any `metrics` line this voter printed reports a projection
     # durable frontier, which only the replay profile does (task-j06).
     replay: bool = False
@@ -472,6 +475,8 @@ def parse_voter(lines) -> Voter:
                     held = seconds(v.cost.unordered.get("oldest"))
                     if v.oldest_unordered is None or held > v.oldest_unordered[0]:
                         v.oldest_unordered = (held, v.cost.uptime)
+                if isinstance(snapshot.get("paths"), list):
+                    v.paths = snapshot["paths"]
                 observed = (snapshot.get("frontiers") or {}).get("Observed")
                 if isinstance(observed, dict):
                     v.frontiers = observed
@@ -2345,6 +2350,99 @@ def resend_table(voters: dict) -> list[str]:
     return out
 
 
+def batching_table(voters: dict) -> list[str]:
+    """The sweep's "Batching by voter" table (jepsen_sweep.turns_of_voter)
+    for this run's voters: each domain loop's turns and what each carried,
+    datagrams and send calls a command, the leader's proposals a frame, and
+    the loop's parks and CPU a command. [] without readings."""
+    import jepsen_sweep  # the sweep imports this module; read at call time
+    rows = {node: t for node, v in voters.items() if (t := jepsen_sweep.turns_of_voter(v))}
+    if not rows:
+        return []
+    leader = next((n for n, v in voters.items() if v.cost and v.cost.served), None)
+    f2 = lambda v: f"{v:.2f}" if v is not None else "-"
+    f0 = lambda v: f"{v:.0f}" if v is not None else "-"
+    out = [
+        "**Batching by voter** (each voter, from its last `metrics` line over its last boot: its domain loop's "
+        "turns, each ending in one flush, and the commands and events (peer and api) a turn carried, with turns "
+        "a second over its uptime; its datagrams a command it executed, by plane, and its send calls a command, "
+        "both planes; the proposals a proposal frame where it sent any (the leader, starred); and its loop's "
+        "voluntary context switches, each a park and its wakeup, and its loop's CPU, a command)",
+        "",
+        "| Node | Executed | Turns | Commands a turn | Events a turn | Turns a second | Peer datagrams a command "
+        "| Api datagrams a command | Send calls a command | Proposals a frame | Loop parks a command "
+        "| Loop CPU a command (ms) |",
+        "| --- " * 12 + "|",
+    ]
+    for n in sorted(rows):
+        t = rows[n]
+        out.append(
+            f"| {n}{'*' if n == leader else ''} | {t.executed} | {t.turns if t.turns is not None else '-'} "
+            f"| {f2(t.per_turn)} | {f2(t.events_per_turn)} | {f0(t.turns_per_s)} | {f2(t.peer_datagrams)} "
+            f"| {f2(t.api_datagrams)} | {f2(t.send_calls)} | {f2(t.per_frame)} | {f2(t.switches)} "
+            f"| {'-' if t.loop_ms is None else f'{t.loop_ms:.3f}'} |")
+    out.append("")
+    return out
+
+
+def paths_table(voters: dict) -> list[str]:
+    """Each voter's QUIC paths (#297) from its last `metrics` line: the peer
+    plane's, one row a peer and lane that carried packets, and the api
+    plane's summed a voter; the smoothed round trip beside the least one
+    seen, which a connection never forgets, so a min_rtt far under the
+    path's round trip means the connection was dialed before the network
+    was shaped (and BBR, which sizes its window from it, is not readable).
+    [] from a build without paths."""
+    rows = [(node, v.paths) for node, v in voters.items() if v.paths]
+    if not rows:
+        return []
+    ms = lambda us: f"{us / 1000:.1f}" if isinstance(us, (int, float)) else "-"
+    out = [
+        "**QUIC paths** (#297, each voter's last `metrics` line: the peer plane's paths a peer and lane that "
+        "sent packets, then the api plane's summed over its paths; round trip is the smoothed one and least "
+        "is the least ever seen on the path, which a connection keeps for good: one far under the round trip "
+        "means the path was dialed before the network was shaped; window is the congestion window in bytes; "
+        "lost is the packets the sender declared lost, of those it sent)",
+        "",
+        "| Node | Plane | Lane | Peer | Round trip (ms) | Least round trip (ms) | Window (bytes) "
+        "| Congestion events | Lost packets | Sent packets | Lost |",
+        "| --- " * 11 + "|",
+    ]
+    early = []
+    for node, paths in rows:
+        api = {"sent": 0, "lost": 0, "events": 0, "n": 0, "min": None}
+        for p in sorted(paths, key=lambda p: (str(p.get("replica")), str(p.get("lane")))):
+            sent, lost = p.get("sent_packets") or 0, p.get("lost_packets") or 0
+            if p.get("plane") != "Peer":
+                api["sent"] += sent
+                api["lost"] += lost
+                api["events"] += p.get("congestion_events") or 0
+                api["n"] += 1
+                m = p.get("min_rtt_micros")
+                if isinstance(m, (int, float)):
+                    api["min"] = m if api["min"] is None else min(api["min"], m)
+                continue
+            if not sent:
+                continue
+            rtt, least = p.get("rtt_micros"), p.get("min_rtt_micros")
+            if (isinstance(rtt, (int, float)) and isinstance(least, (int, float)) and rtt >= 5000
+                    and least < rtt / 4 and sent >= 1000):
+                early.append(f"{node}→{str(p.get('replica'))[:2]} {p.get('lane')}")
+            share = f"{100 * lost / sent:.2f}%"
+            out.append(f"| {node} | peer | {p.get('lane', '-')} | {p.get('replica', '-')} | {ms(rtt)} | {ms(least)} "
+                       f"| {p.get('cwnd', '-')} | {p.get('congestion_events', '-')} | {lost} | {sent} | {share} |")
+        if api["n"]:
+            share = f"{100 * api['lost'] / api['sent']:.2f}%" if api["sent"] else "-"
+            out.append(f"| {node} | api ({api['n']} paths) | - | - | - | {ms(api['min'])} | - | {api['events']} "
+                       f"| {api['lost']} | {api['sent']} | {share} |")
+    out.append("")
+    if early:
+        out += [f"**Finding: {len(early)} busy peer path(s) keep a least round trip under a quarter of their round "
+                f"trip**, so they were dialed before the network was shaped: {', '.join(early[:8])}"
+                f"{' …' if len(early) > 8 else ''}. A BBR row with these is not readable.", ""]
+    return out
+
+
 def relay_table(voters: dict) -> list[str]:
     """task-d102's leader relay and proposal frames, each voter's last
     `metrics` line: what its collector sent to the leader alone, the ones
@@ -3662,6 +3760,8 @@ def summarize(store: str, nodes: list[str], title: str, profile: str | None = No
             out.extend(leadership_table(voters))
             out.extend(resend_table(voters))
             out.extend(relay_table(voters))
+            out.extend(paths_table(voters))
+            out.extend(batching_table(voters))
             out.extend(hand_offs_table(voters))
             out.extend(gate_table(voters))
             out.extend(refused_voter_names_line(voters))

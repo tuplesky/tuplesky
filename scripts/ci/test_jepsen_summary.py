@@ -860,6 +860,41 @@ class CheckpointTests(unittest.TestCase):
                 f.write("coordd domain=d roles=[Voter]\n")
             self.assertEqual(js.admission_table(store, ["n1"]), [])
 
+    def test_batching_by_voter(self):
+        cost = {"executed": 2000, "busy": {"secs": 1, "nanos": 0}, "uptime": {"secs": 10, "nanos": 0},
+                "recent": {"Unavailable": "NotInstrumented"}, "reads": {"served": 5},
+                "flushes": {"flushes": 500, "peer_events": 1500, "api_events": 500},
+                "proposals": {"proposals": 400, "frames": 50}}
+        line = "metrics " + json.dumps({"stages": [], "cost": {"Observed": cost}}) + "\n"
+        text = self.summarize(line)
+        self.assertIn("**Batching by voter** (each voter", text)
+        self.assertIn("| n1* | 2000 | 500 | 4.00 | 4.00 | 50 | - | - | - | 8.00 | - | - |", text)
+
+    def test_the_quic_paths(self):
+        cost = {"executed": 1000, "busy": {"secs": 1, "nanos": 0}, "uptime": {"secs": 60, "nanos": 0},
+                "recent": {"Unavailable": "NotInstrumented"}, "reads": {"served": 0}}
+        snapshot = {"stages": [], "cost": {"Observed": cost}}
+        line = lambda: "metrics " + json.dumps(snapshot) + "\n"
+        # A build from before #297: no table.
+        self.assertNotIn("**QUIC paths**", self.summarize(line()))
+        path = lambda plane, lane, replica, rtt, least, sent, lost: {
+            "plane": plane, "lane": lane, "role": "Voter", "replica": replica, "rtt_micros": rtt,
+            "min_rtt_micros": least, "cwnd": 120000, "congestion_events": 2, "lost_packets": lost,
+            "lost_bytes": lost * 1200, "sent_packets": sent}
+        snapshot["paths"] = [path("Peer", "Control", "02020202", 70000, 69000, 5000, 5),
+                             path("Peer", "Bulk", "02020202", 70000, 69000, 0, 0),
+                             path("Api", "Control", "aa", 70000, 68000, 300, 3),
+                             path("Api", "Control", "bb", 140000, 139000, 100, 1)]
+        text = self.summarize(line())
+        self.assertIn("**QUIC paths** (#297", text)
+        self.assertIn("| n1 | peer | Control | 02020202 | 70.0 | 69.0 | 120000 | 2 | 5 | 5000 | 0.10% |", text)
+        self.assertNotIn("| n1 | peer | Bulk |", text)
+        self.assertIn("| n1 | api (2 paths) | - | - | - | 68.0 | - | 4 | 4 | 400 | 1.00% |", text)
+        self.assertNotIn("dialed before the network was shaped:", text)
+        # A path dialed before the shaping keeps its sub-millisecond floor.
+        snapshot["paths"][0]["min_rtt_micros"] = 199
+        self.assertIn("**Finding: 1 busy peer path(s) keep a least round trip under a quarter", self.summarize(line()))
+
     def test_the_leader_relay_and_proposal_frames(self):
         cost = {"executed": 1000, "busy": {"secs": 1, "nanos": 0}, "uptime": {"secs": 60, "nanos": 0},
                 "recent": {"Unavailable": "NotInstrumented"}, "reads": {"served": 0}}
