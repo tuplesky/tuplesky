@@ -739,6 +739,20 @@ pub struct Cost {
     /// (task-d113): its entries, and the bytes they take.
     #[serde(default)]
     pub intake_index: IntakeIndexSize,
+    /// Times this node's protocol machine found its command table full
+    /// (`Backpressure`), as a leader or a follower, since the node started
+    /// (testing's ask on #185). Exact, where the log says them only at
+    /// each doubling.
+    ///
+    /// Not refusals at the door alone. At a leader each is a submission
+    /// the machine refused. At a follower it is that, a payload answer
+    /// refused, a leader's proposal held with no record made for it, or a
+    /// relayed payload the table had no room for (task-d102; kept since
+    /// #296): a follower behind on a full table counts these while no
+    /// caller was refused. A submission the voter refused before its
+    /// machine saw it is [`Offers::refused`].
+    #[serde(default)]
+    pub table_full: u64,
 }
 
 /// What a node's collector sent again, and what its voter refused or could
@@ -755,14 +769,30 @@ pub struct Offers {
     /// the relay's ask of the leader, and the ask of every voter
     /// (task-d22).
     pub solicited: u64,
-    /// Submissions this node's own voter refused at its door.
+    /// Submissions this node's own voter refused at its door, before its
+    /// machine saw them: malformed, or not a submission their submitter
+    /// may make. One its machine refused for a full table is
+    /// [`Cost::table_full`].
     pub refused: u64,
     /// Evidence and releases this voter handed to the transport for a
     /// collector in another process.
     pub returned: u64,
-    /// Evidence and releases for such a collector the transport did not
-    /// take: not sent, and not sent again.
+    /// Evidence and releases for such a collector let go unsent: the
+    /// connection had gone, the frame could never fit its lane, or it
+    /// was refused for a full queue and could not be kept, or was kept
+    /// past the hold ([`crate::unreturned`]).
     pub unreturnable: u64,
+    /// Evidence and releases kept to be offered again: refused because
+    /// the collector's lane queue was full, or made while frames for
+    /// that collector were kept, and queued behind them.
+    #[serde(default)]
+    pub kept: u64,
+    /// Of `returned`, frames that had been kept first.
+    #[serde(default)]
+    pub returned_again: u64,
+    /// Frames kept at this line, not yet returned or let go.
+    #[serde(default)]
+    pub kept_now: u64,
 }
 
 /// The size of the projection's index by command of its intake-keyed rows
