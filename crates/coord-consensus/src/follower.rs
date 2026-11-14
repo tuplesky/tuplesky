@@ -1034,6 +1034,11 @@ pub struct LearnPasses {
     pub skipped: u64,
     /// Passes a step of storage events passed over.
     pub skipped_storage: u64,
+    /// Of those, the ones passed over while this replica campaigned.
+    pub skipped_storage_campaigning: u64,
+    /// Of those, the ones passed over at a catch-up window's batch made
+    /// durable.
+    pub skipped_storage_window: u64,
 }
 
 /// What a follower is taking while it learns once for many inputs
@@ -2195,7 +2200,26 @@ impl Follower {
             if !touches_only {
                 self.learn_touched = None;
             }
+            // Two cases the rule needs no clause for, counted apart so the
+            // simulator shows its checks reach them: a campaign in
+            // progress, and a catch-up window's batch.
+            let campaigning = touches_only && self.campaign.is_some();
+            let window = touches_only
+                && event
+                    .barrier()
+                    .is_some_and(|b| self.catch_up.running.iter().any(|r| r.barrier == b));
+            let skipped = self.learn_passes.skipped_storage;
             effects.extend(self.step(Event::Storage(event)));
+            if self.learn_passes.skipped_storage > skipped {
+                let passes = &mut self.learn_passes;
+                if campaigning {
+                    passes.skipped_storage_campaigning =
+                        passes.skipped_storage_campaigning.saturating_add(1);
+                }
+                if window {
+                    passes.skipped_storage_window = passes.skipped_storage_window.saturating_add(1);
+                }
+            }
             if !touches_only {
                 self.learn_touched = None;
             }
@@ -2214,10 +2238,24 @@ impl Follower {
     /// deferred vote, and moves the ledger and the payloads served, which
     /// a pass doesn't read. It commits nothing, so no other command's
     /// dependencies become committed. Everything else a storage event
-    /// can set off is ruled out here: the Sync's own row, a catch-up
-    /// window, a campaign, a report due, a Sync held behind rows or a
-    /// promise, a reinstall owed, and rows to write again after a
-    /// failure.
+    /// can set off is ruled out here: the Sync's own row, a report due, a
+    /// Sync held behind rows or a promise, a reinstall owed, and rows to
+    /// write again after a failure.
+    ///
+    /// Two cases need no clause (#269 review):
+    /// - A catch-up window's batch: the window's commands were committed
+    ///   in the table when it was installed, so its batch made durable
+    ///   only marks the window runnable and its payloads served, which a
+    ///   pass doesn't read.
+    /// - A campaign: the storage events it acts on are its promise row
+    ///   and its selection's binding row, neither a vote or adoption
+    ///   batch, and the batches its report waits on, which a report due
+    ///   rules out. A Sync entry installed or a vote made while it runs
+    ///   is such a batch, and made durable it is the same fact as at any
+    ///   other time.
+    ///
+    /// The simulator's steps pass passes over in both, and its debug
+    /// check holds there (`rows_with_storage_steps_learn_once_a_step`).
     fn storage_touches_only(&self, event: &StorageEvent) -> bool {
         let (StorageEvent::JournalDurable { .. }, Some(barrier)) = (event, event.barrier()) else {
             return false;
@@ -2227,8 +2265,6 @@ impl Follower {
                 .sync_barrier
                 .as_ref()
                 .is_none_or(|(b, _)| *b != barrier)
-            && !self.catch_up.running.iter().any(|r| r.barrier == barrier)
-            && self.campaign.is_none()
             && self.report_due.is_none()
             && self.sync_behind_rows.is_none()
             && self.early_sync.is_none()

@@ -1013,6 +1013,10 @@ struct Stats {
     /// Learning passes a step of storage events passed over, at every
     /// follower (lever 2, step 1).
     storage_passes_skipped: u64,
+    /// Of those, the ones passed over while a follower campaigned, and at
+    /// a catch-up window's batch (#269 review).
+    storage_passes_skipped_campaigning: u64,
+    storage_passes_skipped_window: u64,
 }
 
 /// FNV-1a over `bytes`, continuing from `hash`.
@@ -1554,7 +1558,10 @@ impl Sim {
                 self.stats.stopped_stale += paths.stopped_stale;
                 self.stats.asked_ahead += paths.asked_ahead;
                 self.stats.taken_ahead += paths.taken_ahead;
-                self.stats.storage_passes_skipped += f.learn_passes().skipped_storage;
+                let passes = f.learn_passes();
+                self.stats.storage_passes_skipped += passes.skipped_storage;
+                self.stats.storage_passes_skipped_campaigning += passes.skipped_storage_campaigning;
+                self.stats.storage_passes_skipped_window += passes.skipped_storage_window;
                 let q = f.quorum().clone();
                 let (mut l, effects) = Leader::from_recovered(f.into_recovered(), q, &decision);
                 l.set_learning(LearningMode::Full);
@@ -2865,7 +2872,10 @@ impl Sim {
             self.stats.stopped_stale += paths.stopped_stale;
             self.stats.asked_ahead += paths.asked_ahead;
             self.stats.taken_ahead += paths.taken_ahead;
-            self.stats.storage_passes_skipped += f.learn_passes().skipped_storage;
+            let passes = f.learn_passes();
+            self.stats.storage_passes_skipped += passes.skipped_storage;
+            self.stats.storage_passes_skipped_campaigning += passes.skipped_storage_campaigning;
+            self.stats.storage_passes_skipped_window += passes.skipped_storage_window;
         }
     }
 
@@ -4472,12 +4482,17 @@ fn rows_with_pages_of_three_ask_ahead() {
 /// queue behind them, and execute late, with leaders sending frames.
 /// Every row's checks hold, debug builds check each learning pass passed
 /// over against every accepted command, and the steps pass some over.
+///
+/// Among them, passes passed over while a follower campaigned and at a
+/// catch-up window's batch made durable: the two cases
+/// `Follower::storage_touches_only` once ruled out and no longer does
+/// (#269 review). The check holds there too.
 #[test]
 fn rows_with_storage_steps_learn_once_a_step() {
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
     let mut failures = Vec::new();
-    let mut skipped = 0u64;
+    let (mut skipped, mut campaigning, mut window) = (0u64, 0u64, 0u64);
     for row in [1u8, 9, 21, 23] {
         let mut knobs = row_knobs(row);
         knobs.storage_steps = true;
@@ -4485,16 +4500,31 @@ fn rows_with_storage_steps_learn_once_a_step() {
         for n in [3u8, 5] {
             for seed in 0..seeds() {
                 match run_knobs(n, knobs, seed, None) {
-                    Ok(stats) => skipped += stats.storage_passes_skipped,
+                    Ok(stats) => {
+                        skipped += stats.storage_passes_skipped;
+                        campaigning += stats.storage_passes_skipped_campaigning;
+                        window += stats.storage_passes_skipped_window;
+                    }
                     Err(e) => failures.push(e),
                 }
             }
         }
     }
     std::panic::set_hook(hook);
-    println!("storage steps: {skipped} learning passes passed over");
+    println!(
+        "storage steps: {skipped} learning passes passed over, \
+         {campaigning} while campaigning, {window} at a catch-up window's batch"
+    );
     assert!(failures.is_empty(), "{}", failures.join("\n"));
     assert!(skipped > 0, "no step of storage events passed a pass over");
+    assert!(
+        campaigning > 0,
+        "no step passed a pass over while its follower campaigned"
+    );
+    assert!(
+        window > 0,
+        "no step passed a pass over at a catch-up window's batch"
+    );
 }
 
 #[test]
