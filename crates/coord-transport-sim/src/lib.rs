@@ -1294,6 +1294,12 @@ impl PacketWorld {
     /// across the links, then advance to the next wakeup. Returns false
     /// when nothing is pending.
     pub fn step(&mut self) -> bool {
+        self.step_within(u64::MAX)
+    }
+
+    /// One step, as [`PacketWorld::step`], that moves virtual time no
+    /// further than `limit` (which is past the current tick).
+    fn step_within(&mut self, limit: u64) -> bool {
         for i in 0..self.nodes.len() {
             self.nodes[i].drive_incoming(&self.clock);
             self.nodes[i].drive_outgoing(&self.clock);
@@ -1311,10 +1317,24 @@ impl PacketWorld {
             Some(t) => {
                 // Never spin at one tick: a timer that re-arms at "now"
                 // still moves virtual time forward by one tick.
-                self.clock.tick = t.max(self.clock.tick + 1);
+                self.clock.tick = t.max(self.clock.tick + 1).min(limit);
                 true
             }
             None => false,
+        }
+    }
+
+    /// Move virtual time to `tick` without passing it, driving every
+    /// node at each wakeup before it. A step jumps to the next wakeup,
+    /// which can be tens of milliseconds away, so a caller that acts on
+    /// a schedule (a frame each millisecond) advances to each time it
+    /// acts at rather than stepping. Nodes are driven at `tick` by the
+    /// next step, after the caller has acted. No-op at or past `tick`.
+    pub fn advance_to(&mut self, tick: u64) {
+        while self.clock.tick < tick {
+            if !self.step_within(tick) {
+                self.clock.tick = tick;
+            }
         }
     }
 

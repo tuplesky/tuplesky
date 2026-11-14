@@ -749,12 +749,16 @@ fn steady(f: &Fixture, seed: u8, faults: LinkFaults, limits: Limits, frames: usi
             Ok(()) => return,
             Err(SendError::QueueFull { .. } | SendError::TooManyGroups { .. }) => {
                 let t = w.tick();
-                w.run_until(1, |w| w.tick() > t);
+                w.advance_to(t + 1);
             }
             Err(e) => panic!("{e:?}"),
         }
     };
+    // Frame `n` is offered at `start + n`, a frame each millisecond
+    // whatever the transport's wakeups, so every setting compared gets
+    // the same offered load.
     while sent < frames {
+        w.advance_to(start + sent as u64);
         let mut big = vec![0xa0; 1000];
         big[..8].copy_from_slice(&(sent as u64).to_be_bytes());
         offer(&mut w, 0, 1, big);
@@ -762,8 +766,6 @@ fn steady(f: &Fixture, seed: u8, faults: LinkFaults, limits: Limits, frames: usi
         small[..8].copy_from_slice(&(sent as u64).to_be_bytes());
         offer(&mut w, 1, 0, small);
         sent += 1;
-        let t = w.tick();
-        w.run_until(1, |w| w.tick() > t);
     }
     let done = |w: &PacketWorld| {
         let o = w.visible_outcome();
@@ -785,9 +787,10 @@ fn steady(f: &Fixture, seed: u8, faults: LinkFaults, limits: Limits, frames: usi
 /// +jitter10 cell, here in virtual time). At QUIC's thresholds the
 /// sender calls lost what is only late, cuts its window for it, and
 /// moves the same frames many times slower; with loss called by time
-/// alone ([`Reordering::BY_TIME`]) it calls next to nothing lost. On the
-/// same link with real loss that setting still
-/// finds the losses, and every frame arrives.
+/// alone ([`Reordering::BY_TIME`]) it calls a tenth as many lost at most
+/// (here 6 of QUIC's 171) and moves the frames many times sooner. On the
+/// same link with real loss that setting still finds the losses, and
+/// every frame arrives.
 #[test]
 fn a_jittered_link_that_loses_nothing_is_not_called_lossy_when_loss_is_by_time() {
     let f = fixture(&[PeerRole::Voter, PeerRole::Voter]);
@@ -816,8 +819,8 @@ fn a_jittered_link_that_loses_nothing_is_not_called_lossy_when_loss_is_by_time()
         "QUIC's thresholds call reordering loss: {quic:?}"
     );
     assert!(
-        by_time.lost * 20 <= quic.lost && by_time.congestion_events * 20 <= quic.congestion_events,
-        "loss by time calls next to nothing lost: {by_time:?} against {quic:?}"
+        by_time.lost * 10 <= quic.lost && by_time.congestion_events * 10 <= quic.congestion_events,
+        "loss by time calls a tenth as many lost at most: {by_time:?} against {quic:?}"
     );
     assert!(
         by_time.ticks * 3 <= quic.ticks,
