@@ -116,6 +116,28 @@ class KeyGroupTests(unittest.TestCase):
         self.assertTrue(g.failed)
         self.assertEqual([t for t, _ in g.stopped], list(range(20, 30)))
 
+    def test_a_rate_limited_round_robin_does_not_stop(self):
+        # One operation a second over 10 threads in turn: each thread's
+        # last invocation is up to 9 s behind the run's last, and none
+        # stopped.
+        ops = []
+        for i in range(60):
+            t = i % 10
+            ops.append(invoke(i * 1000, t, i // 20, ":read" if t < 5 else ":write"))
+            ops.append(ok(i * 1000 + 5, t, i // 20, ":read" if t < 5 else ":write"))
+        g = kg.check("head@10", ops, 10)
+        self.assertEqual(g.stopped, [], kg.line(g))
+        self.assertFalse(g.failed, kg.line(g))
+
+    def test_a_thread_waiting_on_its_operation_is_not_stopped(self):
+        # Thread 29's last operation is invoked at 30 s and never completes:
+        # it waits on the server, not on the generator.
+        ops = [o for o in run(3, 10, 20, 100) if not (o.thread == "jepsen worker 29" and o.at > T0 + datetime.timedelta(seconds=30))]
+        ops.append(invoke(30_000, 29, 2 + 3 * 10))
+        ops.sort(key=lambda o: (o.at, o.type != "ok"))
+        g = kg.check("head@30", ops, 10)
+        self.assertNotIn(29, [t for t, _ in g.stopped], kg.line(g))
+
     def test_unkeyed_runs_are_skipped(self):
         ops = [js.Op(T0, "jepsen worker 0", "0", "invoke", ":txn", "[[:append 1 2]]", "")]
         g = kg.check("head@30", ops)

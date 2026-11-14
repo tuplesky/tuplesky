@@ -21,7 +21,12 @@ some keys two threads and others none). So, from each run's `jepsen.log`:
   invoked anything (its client still opening), or one whose own operation
   was open from the key's first invocation to its last; keys begun in the
   run's first 10 s (the warm-up) are reported, not held to it;
-- every thread must invoke within the run's last 5 s;
+- every thread must invoke within the run's last 5 s, or within three of
+  its turns if a turn comes slower (its own median gap between
+  invocations, or the run's, threads over invocations a second, whichever
+  is longer: a rate-limited run hands each thread work seldom), unless its
+  last operation was still open at the end (it is waiting on the server,
+  not the generator);
 - the threads that read are listed by group (reported, not checked).
 
 A run whose operations carry no `[key value]` tuple isn't keyed and is
@@ -41,8 +46,9 @@ import jepsen_summary as js
 
 KEY = re.compile(r"^\[(-?\d+)[ \]]")
 # A thread must have invoked within this many seconds of the run's last
-# invocation.
+# invocation, or within TAIL_TURNS of its turns when they come slower.
 TAIL_S = 5.0
+TAIL_TURNS = 3
 # A finished key is held to its whole group only with at least this many
 # operations a thread of the group.
 OPS_A_THREAD = 5
@@ -168,10 +174,22 @@ def check(label: str, ops: list, size: int | None = None) -> Groups:
             else:
                 g.short_small += 1
     end = invokes[-1][0]
+    # A thread's turn at the run's offered load: threads over invocations
+    # a second.
+    span_s = (end - start).total_seconds()
+    run_turn = g.threads * span_s / len(invokes) if span_s > 0 else 0.0
     for t in range(g.threads):
         at = last_of.get(t)
-        behind = (end - at).total_seconds() if at else None
-        if behind is None or behind > TAIL_S:
+        if at is None:
+            g.stopped.append((t, None))
+            continue
+        mine = spans.get(t, [])
+        if mine and (mine[-1][1] is None or mine[-1][1] >= end):
+            continue  # its last operation was still open: busy, not idle
+        gaps = sorted((b[0] - a[0]).total_seconds() for a, b in zip(mine, mine[1:]))
+        own_turn = gaps[len(gaps) // 2] if gaps else 0.0
+        behind = (end - at).total_seconds()
+        if behind > max(TAIL_S, TAIL_TURNS * max(own_turn, run_turn)):
             g.stopped.append((t, behind))
     for _, t, _, f in invokes:
         if f == ":read":
@@ -220,7 +238,8 @@ def render(groups: list[Groups]) -> str:
         "### Key groups",
         "",
         "Every finished key should be invoked on by every thread of its group that was free to take it (after "
-        f"the first {WARMUP_S:.0f} s), and every thread should invoke within the run's last {TAIL_S:.0f} s; a run "
+        f"the first {WARMUP_S:.0f} s), and every thread not waiting on an operation should invoke within the run's "
+        f"last {TAIL_S:.0f} s, or {TAIL_TURNS} of its turns if they come slower; a run "
         "that doesn't fails the job (the load generator ran it at fewer clients than it says).",
         "",
         "| Run | Threads | Group size × groups | Keys finished | Keys short of their group | Threads stopped early | Threads that read | |",
