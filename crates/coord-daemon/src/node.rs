@@ -512,6 +512,8 @@ impl Machine {
                 taken: 0,
                 known: 0,
                 not_taken: 0,
+                frame_batches: 0,
+                frame_adoptions: 0,
             },
             Machine::Follower(m) => m.relay_taken(),
         }

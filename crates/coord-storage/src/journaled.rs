@@ -4455,6 +4455,18 @@ const _: () = assert!(
         + RECORD_HEADER_ALLOWANCE
         <= MAX_RECORD_BYTES
 );
+// A follower writes a proposal frame's adoptions in batches it bounds the
+// same way (step 2b of the batching rule's 10.7): closed before an
+// adoption that would pass either bound, so a batch of several adoptions
+// stays within both, and one past them holds a single adoption, its
+// payload row and dependency row, which it already wrote as one batch.
+const _: () = assert!(coord_consensus::FRAME_BATCH_UPDATES <= MAX_RECORD_UPDATES);
+const _: () = assert!(
+    coord_consensus::FRAME_BATCH_BYTES
+        + coord_store_api::envelope::MAX_ENVELOPE_PAYLOAD
+        + RECORD_HEADER_ALLOWANCE
+        <= MAX_RECORD_BYTES
+);
 
 fn check_update_bounds(batch: &PersistBatch, kind: &TransitionKind) -> Result<(), RecordError> {
     if batch.updates.is_empty() && matches!(kind, TransitionKind::Protocol) {

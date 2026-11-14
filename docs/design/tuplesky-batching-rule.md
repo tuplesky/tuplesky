@@ -1229,6 +1229,7 @@ Each step has its own PRs and pair.
   - the fall, as µs a command, is at least half its bound;
   - and it is larger than the base runs' own spread of that same quantity, over at least the four base runs that gave the spread.
   - A part read from a profile is its share of samples times its thread's CPU a command, both from the same runs. A share alone moves when anything else on the thread moves.
+  - **A drifting base.** When the pair's base runs spread wider than the reading, the profiled pair decides, by function, with at least three base runs: the part named, read as its thread's CPU a command, must fall by more than its own base runs' spread, and the functions the step cuts must fall where its bound says they do. The base drifted in B1's re-read and again in 2b's pair (#290, accepted on its profiled pair).
   - The pair runs at 120 and 30 callers, five voters on tmpfs, replay.
   - A step that misses its checkpoint stops the plan: the next step isn't built until the lead has the reading.
 - **Every checkpoint reads latency (R16).** The owner's goal for batching is latency neutral at low load.
@@ -1400,9 +1401,13 @@ Each step has its own PRs and pair.
 - **Bound:** B0. **Checkpoint:** half of B0, in the appender and the materializer, as µs a command. Application records a command at every voter fall from one to one a group.
 
 **Step 2: a follower takes a frame in one pass.** This is lever 2's steps 3 and 4 (6.7), in the form steps 4 and 5 extend.
-- **PRs:**
+- **PRs,** 2b first, then 2a (lead, on #185):
   - 2a: the frame's checks run once. Each adoptable entry is adopted in one pass, without `held` or a `VoteSet`, and the path logs' suffixes are recomputed once a key at the frame's end.
-  - 2b: a frame's adoptions go in as few batches as the store's bounds allow, each with one barrier and one `pending` entry. The payload rows in flight are found through an index. Votes stay one a command, in one hand-off a turn (lever 8).
+  - 2b: a frame's adoptions go in as few batches as the store's bounds allow, each with one barrier and one `pending` entry naming its adoptions. Votes stay one a command, in one hand-off a turn (lever 8).
+    - **As built.** Adoption goes entry by entry in today's order, so the path logs and `held` are as today. Only where an adoption's rows go changes.
+    - **A batch of its own written mid-frame closes the frame's open batch first.** A decided command's acknowledgement is one. So batches go out in their barriers' order. Every other barrier is allocated with no frame batch open, which an assertion checks in every build: a miss stops the voter rather than reorder its journal.
+    - **The payload rows in flight are found through an index** by command, not a scan of the batches in flight.
+    - **Counts:** a follower's metrics line gives `frame_batches` and `frame_adoptions` beside `frames_taken`.
 - **How a frame's batch is split (R1).** Since #280 a batch the store refuses stops the voter. Full frames are what a new leader's backlog sends (#242), so one batch a frame would stop every follower at once, under a fault.
   - **The sizes.** A frame is cut at 1 MiB (`publish_frame`), and holds a larger request alone, up to 2 MiB. An entry is about 135 bytes without its payload and about 300 with a small one, so a full frame holds 3,500 to 7,700 entries and up to about 15,000 updates. A record is refused above 4,096 updates or 4 MiB, of which the store keeps 512 bytes for the record's header (`RECORD_HEADER_ALLOWANCE`).
   - **The rule.** The adoptions go in batches cut in frame order. A batch closes before an adoption that would take it past 1,024 updates or 1 MiB of rows. Those are task-d106's bounds for a follower's commit rows (`COMMIT_ROWS_BATCH_UPDATES`, `COMMIT_ROWS_BATCH_BYTES`), well under the record's.
@@ -1418,6 +1423,7 @@ Each step has its own PRs and pair.
   - **What step 2 changes.** Under B1 a follower writes 1.11 records a command at 120 callers, not 2.00. So each of those intervals spans 1.8 times as many commands at a follower. With 1b as well it would be 0.18 records a command, and about 11 times as many.
   - **Step 2's PR restates them in commands or bytes,** or keeps them in records and says in its body what each interval becomes. Its pair reports projection commits and checkpoint publications a command.
     - **An effective value is per role.** A follower writes 2.00 records a command today at every load, and the leader's count needn't match it, so one figure in commands can keep one role's interval and move the other's. The PR body says what each interval becomes at the leader and at a follower.
+    - **2b keeps them in records.** Its PR body gives what each interval becomes at the leader and at a follower, and its pair's projection commits and checkpoint publications a command.
     - **A restatement that changes an effective value is read with and without it,** so step 2's own saving is told apart from the setting's. That is one alternation of three builds: the carry, step 2, and step 2 with the restatement, each run read against its neighbours (R13), as B0 was read against two bases. Two pairs against the carry would be the difference R13 rules out (review of #289).
   - **The hold's unit may be part of B1's materializer reading.** Under B1 a follower's projection commits fall from about 0.047 to 0.038 a command (−19%). In B1's profiled pair, its redb `commit` falls from 10.0 to 8.1 µs a command (base spread 1.3), and its materializer thread from 38.6 to 34.7.
     - Under 1b the commits fell as much at every voter, with redb's `commit` flat (8.91 → 8.89 µs at a follower) and no saving in the materializers.
@@ -1427,8 +1433,8 @@ Each step has its own PRs and pair.
   - **a 1 MiB frame of the smallest commands:** taken in batches each under the record's bounds, the voter still running, and every adoption voted;
   - **a lone 2 MiB request:** its adoption in a batch alone, under the bounds;
   - a compile-time check that the split's bounds, with one largest adoption and the header allowance, are under the record's. `journaled.rs` checks the commit rows the same way: `COMMIT_ROWS_BATCH_BYTES + MAX_ENVELOPE_PAYLOAD + RECORD_HEADER_ALLOWANCE <= MAX_RECORD_BYTES`;
-  - the counts a turn: batches, barriers and storage events a frame, and passes over the ACCEPT set;
-  - the crash matrix's cuts at a frame's batch and between two of its batches;
+  - the counts a turn: batches, barriers and storage events a frame (2b), and passes over the ACCEPT set (#269, read as its own pair once 2b is in);
+  - **a crash between two of a frame's batches, and a batch that fails.** In the follower's storage model, a crash keeps the first batch's adoptions. The second's come back with the leader's re-send, adopted as the first time. A failed batch's adoptions are refused, and their votes dropped, as one adoption's are today. The store's crash matrix cuts the projection's commits, which step 2 doesn't change;
   - `protocol_sim`'s rows, unchanged.
 - **Bound:** B1. The inferred −15 to −21 µs a follower is about −0.04 to −0.05 ms an operation locally. A quarter to a third of that is −0.01 to −0.02, under what a pair sees, so the profiled pair may be the whole reading. Step 2 is built even then, since step 5 stands on it.
 - **Checkpoint:** half of B1 in a follower's loop, as µs a command, and one batch, one barrier and one storage event a frame at 120 callers. By B1 on `ab209310` that is about −4.7 µs a command (step 0 read −5.4). B1's re-read and step 2's pair run on the same carry commit, by the rule above. Then the drift pair against the carry before step 1.
