@@ -103,6 +103,19 @@ class KeyGroupTests(unittest.TestCase):
         self.assertEqual([t for t, _ in g.stopped], list(range(20, 30)))
         self.assertIn("20 (59 s before the end)", kg.line(g))
 
+    def test_a_starved_key_0_fails_unless_the_group_size_is_given(self):
+        # Key 0 ran without thread 4, and threads 20-29 stopped at 1 s:
+        # without a size the groups can't be read, which fails the run;
+        # with one, the stopped group fails it.
+        ops = run(3, 10, 20, 100, drop=lambda grp, i: {4} if (grp, i) == (0, 0) else set(),
+                  stop={t: 1000 for t in range(20, 30)})
+        g = kg.check("head@30", ops)
+        self.assertTrue(g.failed)
+        self.assertIn("can't tell the groups", kg.line(g))
+        g = kg.check("head@30", ops, 10)
+        self.assertTrue(g.failed)
+        self.assertEqual([t for t, _ in g.stopped], list(range(20, 30)))
+
     def test_unkeyed_runs_are_skipped(self):
         ops = [js.Op(T0, "jepsen worker 0", "0", "invoke", ":txn", "[[:append 1 2]]", "")]
         g = kg.check("head@30", ops)

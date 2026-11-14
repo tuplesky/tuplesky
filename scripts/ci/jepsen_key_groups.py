@@ -8,8 +8,10 @@ runs the test at fewer clients than it says, and a busy-clients figure blurs
 it (#98: the etcd mix's first generator, through `gen/process-limit`, gave
 some keys two threads and others none). So, from each run's `jepsen.log`:
 
-- the group size is the number of threads that invoked on key 0, the first
-  group's first key, and the threads `0 .. size - 1`; the threads are those
+- the group size is --group-size (2n for n nodes), or else the number of
+  threads that invoked on key 0, the first group's first key, which must
+  be the threads `0 .. size - 1` (a run where it isn't, and no size was
+  given, fails: a starved key 0 hides the groups); the threads are those
   up to the end of the last group that invoked (a whole group past it that
   never invoked can't be seen);
 - a key is finished when its group went on to another key, and every
@@ -78,7 +80,7 @@ class Groups:
 
     @property
     def failed(self) -> bool:
-        return bool(self.short or self.stopped)
+        return bool(self.short or self.stopped or self.note == UNREADABLE)
 
 
 def occupied(spans: list, start, end) -> bool:
@@ -94,7 +96,10 @@ def occupied(spans: list, start, end) -> bool:
     return i >= 0 and (spans[i][1] is None or spans[i][1] >= end)
 
 
-def check(label: str, ops: list) -> Groups:
+UNREADABLE = "**fails**: can't tell the groups (key 0 didn't run on threads 0 to n - 1, and no --group-size)"
+
+
+def check(label: str, ops: list, size: int | None = None) -> Groups:
     g = Groups(label)
     invokes = []
     # Each thread's operations as [invoked, completed or None], in order.
@@ -132,11 +137,12 @@ def check(label: str, ops: list) -> Groups:
         last_of[t] = at
         count[k] = count.get(k, 0) + 1
     g.keys = len(on)
-    zero = on.get(0)
-    size = len(zero) if zero else 0
-    if not size or zero != set(range(size)):
-        g.note = "can't tell the groups from key 0"
-        return g
+    if not size:
+        zero = on.get(0)
+        size = len(zero) if zero else 0
+        if not size or zero != set(range(size)):
+            g.note = UNREADABLE
+            return g
     g.size = size
     # Threads above the last that invoked, up to its group's end, never did.
     g.threads = -(-g.threads // size) * size
@@ -226,6 +232,10 @@ def render(groups: list[Groups]) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument(
+        "--group-size", type=int, metavar="N",
+        help="the threads a key's group holds, 2n for n nodes; without it, key 0's threads, which a starved run can hide",
+    )
     parser.add_argument("runs", nargs="*", metavar="LABEL=STORE")
     args = parser.parse_args()
     groups = []
@@ -237,7 +247,7 @@ def main() -> int:
         if not os.path.exists(log):
             continue
         with open(log, encoding="utf-8", errors="replace") as f:
-            groups.append(check(label, js.parse_ops(f.readlines())))
+            groups.append(check(label, js.parse_ops(f.readlines()), args.group_size))
     if not groups:
         return 0
     text = render(groups)

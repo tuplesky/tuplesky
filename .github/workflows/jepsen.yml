@@ -633,6 +633,9 @@ jobs:
               --title "SwiftPaxos: register, none, at $clients clients: $label" || true
           }
           head_sha=$(git -C "$GITHUB_WORKSPACE/tuplesky" rev-parse --short HEAD)
+          # A key's group of threads in the register workloads: 2n, n the
+          # nodes (jepsen_key_groups.py; key 0 alone can hide it).
+          key_group=$((2 * $(grep -c . "$RUNNER_TEMP/cluster/nodes")))
           beside=""; if [ "$ETCD_BESIDE" = true ]; then beside=", beside etcd $ETCD_VERSION${ETCD_HEADLINE:+ with $ETCD_HEADLINE}${ETCD_SIDE_ROWS:+ (and ${ETCD_SIDE_ROWS// / and })}"; fi
           if [ "$SWIFTPAXOS_BESIDE" = true ]; then beside+=", beside SwiftPaxos"; fi
           if [ -z "$IN_PAIR_BASE" ] && [ -z "$SWEEP" ]; then
@@ -661,7 +664,7 @@ jobs:
             if [ "$NEMESIS" = none ] && [ -n "$store" ]; then
               one_runs=("head=$store")
               if [ "$ETCD_BESIDE" = true ] && [ -n "${etcd_store:-}" ]; then one_runs+=("etcd=$etcd_store"); fi
-              if ! python3 "$ci/jepsen_key_groups.py" "${one_runs[@]}"; then
+              if ! python3 "$ci/jepsen_key_groups.py" --group-size "$key_group" "${one_runs[@]}"; then
                 echo "::error::a run's load generator left threads out of its keys or stopped some (Key groups in the summary)"
                 rc=1
               fi
@@ -894,7 +897,7 @@ jobs:
               ${runs[@]+"${runs[@]}"} || true
             # Every key on its whole group of threads, and no thread
             # stopped early: a run that isn't fails the job.
-            if ! python3 "$ci/jepsen_key_groups.py" ${runs[@]+"${runs[@]}"}; then
+            if ! python3 "$ci/jepsen_key_groups.py" --group-size "$key_group" ${runs[@]+"${runs[@]}"}; then
               echo "::error::a run's load generator left threads out of its keys or stopped some (Key groups in the summary)"
               rc=1
             fi
@@ -922,7 +925,7 @@ jobs:
           python3 "$ci/jepsen_pairs.py" \
             --title "TupleSky pairs: $head_sha (head) against $base_name (base)$beside, $WORKLOAD, $NEMESIS$TITLE_SUFFIX$STORE_SUFFIX$PROFILE_SUFFIX$CHECKPOINT_SUFFIX$WORKERS_SUFFIX$TUPLESKY_SUFFIX" \
             ${runs[@]+"${runs[@]}"} || true
-          if ! python3 "$ci/jepsen_key_groups.py" ${runs[@]+"${runs[@]}"}; then
+          if ! python3 "$ci/jepsen_key_groups.py" --group-size "$key_group" ${runs[@]+"${runs[@]}"}; then
             echo "::error::a run's load generator left threads out of its keys or stopped some (Key groups in the summary)"
             rc=1
           fi
