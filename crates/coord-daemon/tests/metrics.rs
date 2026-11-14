@@ -9,10 +9,10 @@ use std::time::Duration;
 use coord_daemon::metrics::{
     Answered, Cost, Cpu, Datagrams, Distribution, Durability, FastPath, Flushes, Frontiers, Gate,
     HandOffs, Headroom, History, Interval, Jobs, JournalGroups, Lane, LaneReading, Latency,
-    MAX_REPORTED_SHARDS, Measure, MetricsSnapshot, Offers, OldestWait, Path, PipelineWaits, Plane,
-    ProposalBytes, Reads, Recorder, Relay, Release, ReleaseDistributions, Resends, Scheduling,
-    ShardIndex, ShardReading, Stage, StageReading, Table, Traffic, Unavailable,
-    UnorderedPreAcceptances, Wait,
+    MAX_REPORTED_PATHS, MAX_REPORTED_SHARDS, Measure, MetricsSnapshot, Offers, OldestWait, Path,
+    PipelineWaits, Plane, ProposalBytes, Reads, Recorder, Relay, Release, ReleaseDistributions,
+    Resends, Scheduling, ShardIndex, ShardReading, Stage, StageReading, Table, Traffic,
+    Unavailable, UnorderedPreAcceptances, Wait,
 };
 use coord_daemon::role::RoleSet;
 
@@ -556,13 +556,6 @@ fn a_rendered_snapshot_carries_no_secret_or_key_shaped_text() {
                 executed: 90_000,
                 executed_bytes: 2_520_000,
             },
-            offers: Offers {
-                reoffered: 40,
-                solicited: 12,
-                refused: 7,
-                returned: 9000,
-                unreturnable: 3,
-            },
         }),
         // A replica is named by four bytes, as the log lines name it: not
         // an identity-shaped run.
@@ -598,6 +591,14 @@ fn a_rendered_snapshot_carries_no_secret_or_key_shaped_text() {
                 sent_packets: 240_000,
             },
         ],
+        paths_unreported: 3,
+        offers: Offers {
+            reoffered: 40,
+            solicited: 12,
+            refused: 7,
+            returned: 9000,
+            unreturnable: 3,
+        },
     };
     let rendered = serde_json::to_string(&snapshot).expect("a snapshot renders");
 
@@ -629,6 +630,66 @@ fn a_rendered_snapshot_carries_no_secret_or_key_shaped_text() {
     let parsed: MetricsSnapshot = serde_json::from_str(&rendered).expect("round trip");
     assert_eq!(parsed, snapshot);
     assert!(parsed.stage(Stage::Admission).is_some());
+
+    // A line from before the offers moved out of the cost reading, or
+    // before the paths were capped, still parses, and both read as none.
+    let mut older: serde_json::Value = serde_json::from_str(&rendered).expect("a value");
+    let fields = older.as_object_mut().expect("an object");
+    assert!(fields.remove("offers").is_some());
+    assert!(fields.remove("paths_unreported").is_some());
+    let older: MetricsSnapshot = serde_json::from_value(older).expect("an older line parses");
+    assert_eq!(older.offers, Offers::default());
+    assert_eq!(older.paths_unreported, 0);
+}
+
+/// A snapshot reports at most [`MAX_REPORTED_PATHS`] paths, in the order
+/// the transport gave them, and counts the rest (#297 review): a node
+/// that many collectors dial keeps a bounded line, and the peer plane's,
+/// given first, stay on it.
+#[test]
+fn paths_past_the_bound_are_counted_and_left_out() {
+    let reading = |connection: u64, replica: Option<u8>| coord_transport::PathReading {
+        class: match replica {
+            Some(_) => coord_transport::Class::Peer,
+            None => coord_transport::Class::Api,
+        },
+        lane: coord_transport::Lane::Unary,
+        role: match replica {
+            Some(_) => coord_types::wire_v1::PeerRole::Voter,
+            None => coord_types::wire_v1::PeerRole::Frontend,
+        },
+        replica: replica.map(|r| coord_types::ids::ReplicaId([r; 16])),
+        connection: coord_transport::ConnectionId(connection),
+        accepted: replica.is_none(),
+        rtt: Duration::from_millis(100),
+        min_rtt: Duration::from_millis(99),
+        cwnd: 12_000,
+        congestion_events: connection,
+        lost_packets: 0,
+        lost_bytes: 0,
+        sent_packets: 10,
+    };
+    let voters = (0..4u8).map(|i| reading(u64::from(i), Some(i + 1)));
+    let collectors = (4..400).map(|i| reading(i, None));
+    let (paths, unreported) = Path::bounded(voters.chain(collectors));
+    assert_eq!(paths.len(), MAX_REPORTED_PATHS);
+    assert_eq!(unreported, 400 - MAX_REPORTED_PATHS as u64);
+    assert!(
+        paths[..4]
+            .iter()
+            .all(|p| p.plane == Plane::Peer && p.replica.is_some()),
+        "the peer plane's paths are the first"
+    );
+    assert_eq!(paths[0].replica.as_deref(), Some("01010101"));
+    assert_eq!(
+        paths.last().map(|p| p.connection),
+        Some(MAX_REPORTED_PATHS as u64 - 1),
+        "the ones reported are the first given"
+    );
+
+    // Under the bound, nothing is left out.
+    let (all, none) = Path::bounded((0..10).map(|i| reading(i, None)));
+    assert_eq!((all.len(), none), (10, 0));
 }
 
 /// Readers and writers run concurrently and the recorder stays
