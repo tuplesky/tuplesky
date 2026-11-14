@@ -27,12 +27,12 @@
 //!   sequence. The ordinal is the update's place among the record's
 //!   updates.
 //! * **The index** ([`IntakeIndex`]): each live intake-keyed row, in
-//!   memory, by an 8-byte prefix of its command. No durable row is keyed
-//!   by command, so no random leaf comes back. A prefix two commands share
-//!   keeps both entries, and the full key, which carries the command,
-//!   settles which is whose. It is built at open from the rows
-//!   ([`IntakeIndex::build`]), kept by the lowering, and published with the
-//!   commit that changes it (rule (d)).
+//!   memory, under its whole command, a few rows a command (#185, lead
+//!   17:43). No durable row is keyed by command, so no random leaf comes
+//!   back. It is built at open from the rows ([`IntakeIndex::build`]),
+//!   kept by the lowering, and published with the commit that changes it
+//!   (rule (d)). It had kept each row under an 8-byte prefix of its
+//!   command, and read each answer's row to settle whose it was.
 //! * **One assignment** ([`Assigner`]): the lowering and the recovery
 //!   cut's overlay map a by-command key through the same function, so the
 //!   cut reads the keys materialization will write (rule (e)).
@@ -69,9 +69,10 @@
 //! executed command follows its record to `decided_v1`, and a later
 //! proposal row is dropped: the proposal is settled.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::ops::Bound;
 
+use coord_consensus::digest::DigestMap;
 use coord_consensus::rows::{DEPENDENCY_TAG, PROPOSAL_TAG};
 use coord_core::effect::{CollectionId, StoreUpdate};
 use coord_store_api::engine::{Direction, EngineError, ErrorClass, OrderedRead, ScanRequest};
@@ -112,14 +113,6 @@ pub struct IntakeOrder {
     pub seq: u64,
     /// The update's place among the record's updates.
     pub ordinal: u32,
-}
-
-impl IntakeOrder {
-    const MIN: IntakeOrder = IntakeOrder { seq: 0, ordinal: 0 };
-    const MAX: IntakeOrder = IntakeOrder {
-        seq: u64::MAX,
-        ordinal: u32::MAX,
-    };
 }
 
 /// Whether `tag` names rows this layout keys by intake order.
@@ -257,10 +250,46 @@ pub fn command_key_of(key: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
-/// One index entry: epoch, tag, the command's 8-byte prefix and the
-/// row's intake order. Ordered so that one command's entries in an epoch
-/// and tag are a range.
-type Entry = (u64, u8, u64, IntakeOrder);
+/// One of a command's intake-keyed rows: its region (the epoch and the
+/// tag) and its intake order, ordered so that a command's rows of one
+/// region are together and its epochs oldest first. 24 bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct RowAt {
+    epoch: u64,
+    tag: u8,
+    seq: u64,
+    ordinal: u32,
+}
+
+impl RowAt {
+    fn new(epoch: [u8; 8], tag: u8, order: IntakeOrder) -> Self {
+        RowAt {
+            epoch: u64::from_be_bytes(epoch),
+            tag,
+            seq: order.seq,
+            ordinal: order.ordinal,
+        }
+    }
+
+    const fn order(self) -> IntakeOrder {
+        IntakeOrder {
+            seq: self.seq,
+            ordinal: self.ordinal,
+        }
+    }
+
+    const fn epoch_bytes(self) -> [u8; 8] {
+        self.epoch.to_be_bytes()
+    }
+
+    fn is_in(self, epoch: [u8; 8], tag: u8) -> bool {
+        self.epoch == u64::from_be_bytes(epoch) && self.tag == tag
+    }
+}
+
+/// A command's intake-keyed rows, in order: its pending payload, and its
+/// dependency and proposal rows, one an epoch. A handful.
+type CommandRows = Vec<RowAt>;
 
 fn prefix(command: &CommandId) -> u64 {
     let mut p = [0u8; 8];
@@ -268,58 +297,131 @@ fn prefix(command: &CommandId) -> u64 {
     u64::from_be_bytes(p)
 }
 
-fn entry(epoch: [u8; 8], tag: u8, order: IntakeOrder, command: &CommandId) -> Entry {
-    (u64::from_be_bytes(epoch), tag, prefix(command), order)
+/// The bytes an intake part's row takes, an estimate the metrics line
+/// multiplies the rows by (#185, lead 17:43, the intake index). A command
+/// is one entry of a digest map, its 32-byte identity and its rows'
+/// vector, 57 bytes with the control byte, at 8/7 to 16/7 entries a
+/// bucket by the map's fill; and its rows, 24 bytes each and the
+/// allocation's own. At three rows a command (a leader's: the pending
+/// payload, a dependency row and a proposal row), 49 to 70 bytes a row.
+/// The ordered sets this replaced took 39 to 46 (#237's review).
+pub const ENTRY_BYTES: u64 = 64;
+
+/// The bytes an executed part's entry takes, an estimate the metrics line
+/// multiplies the entries by: a digest map's 16-byte prefix and position
+/// and its control byte, at 8/7 to 16/7 entries a bucket by the map's
+/// fill, 19 to 39. The ordered set this replaced took 27.1 as #243's
+/// review measured it.
+pub const EXECUTED_ENTRY_BYTES: u64 = 30;
+
+/// The executed part: each kept `execution_v1` row's position, by its
+/// command's 8-byte prefix, one probe a lookup. A prefix two executed
+/// commands share (their first eight bytes agree) keeps the first
+/// position in `first` and the rest in `more`.
+#[derive(Clone, Debug, Default)]
+struct Executed {
+    first: DigestMap<u64, u64>,
+    more: BTreeSet<(u64, u64)>,
 }
 
-fn range_of<'a>(
-    entries: &'a BTreeSet<Entry>,
-    epoch: [u8; 8],
-    tag: u8,
-    command: &CommandId,
-) -> impl Iterator<Item = &'a Entry> + use<'a> {
-    let e = u64::from_be_bytes(epoch);
-    let p = prefix(command);
-    entries.range((
-        Bound::Included((e, tag, p, IntakeOrder::MIN)),
-        Bound::Included((e, tag, p, IntakeOrder::MAX)),
-    ))
+impl Executed {
+    fn insert(&mut self, (prefix, position): (u64, u64)) {
+        match self.first.get(&prefix) {
+            None => {
+                self.first.insert(prefix, position);
+            }
+            Some(&held) if held == position => {}
+            Some(_) => {
+                self.more.insert((prefix, position));
+            }
+        }
+    }
+
+    fn remove(&mut self, (prefix, position): (u64, u64)) {
+        match self.first.get(&prefix) {
+            Some(&held) if held == position => {
+                let next = self
+                    .more
+                    .range((prefix, 0)..=(prefix, u64::MAX))
+                    .next()
+                    .copied();
+                match next {
+                    Some(next) => {
+                        self.more.remove(&next);
+                        self.first.insert(prefix, next.1);
+                    }
+                    None => {
+                        self.first.remove(&prefix);
+                    }
+                }
+            }
+            Some(_) => {
+                self.more.remove(&(prefix, position));
+            }
+            None => {}
+        }
+    }
+
+    /// The positions of `prefix`. A command executes once, so at most one
+    /// of them is a given command's; their order is not kept.
+    fn of(&self, prefix: u64) -> impl Iterator<Item = u64> + '_ {
+        self.first.get(&prefix).copied().into_iter().chain(
+            self.more
+                .range((prefix, 0)..=(prefix, u64::MAX))
+                .map(|&(_, position)| position),
+        )
+    }
+
+    fn contains(&self, (prefix, position): (u64, u64)) -> bool {
+        self.first.get(&prefix) == Some(&position) || self.more.contains(&(prefix, position))
+    }
+
+    fn len(&self) -> usize {
+        self.first.len() + self.more.len()
+    }
 }
 
-/// One entry as the index stores it, within its epoch and tag: the
-/// command's prefix, the sequence and the ordinal, 24 bytes.
-type Slot = (u64, u64, u32);
+/// Equal when they hold the same entries, whichever of a shared prefix's
+/// positions each keeps first.
+impl PartialEq for Executed {
+    fn eq(&self, other: &Self) -> bool {
+        self.len() == other.len()
+            && self.first.iter().all(|(&p, &at)| other.contains((p, at)))
+            && self.more.iter().all(|&e| other.contains(e))
+    }
+}
 
-/// The bytes an entry takes, slot and set nodes together, at the most
-/// review measured on #237 (39 to 46): what the metrics line multiplies
-/// the entries by. The design step had inferred 24 to 32.
-pub const ENTRY_BYTES: u64 = 46;
-
-/// The bytes an executed part's entry takes: the 16-byte pair and its
-/// share of the ordered set's nodes, 27.1 as review measured it with a
-/// counting allocator over 10⁵ and 10⁶ entries (#243 review; the design
-/// step had inferred 16 to 24), rounded up. The metrics line multiplies
-/// the executed entries by it.
-pub const EXECUTED_ENTRY_BYTES: u64 = 28;
+impl Eq for Executed {}
 
 /// The index by command of a projection's intake-keyed rows, in memory
 /// (design Section 17.1, "1. The index by command", its intake part).
 ///
-/// It holds an entry for each live dependency or proposal row, and it is
-/// the projection's at [`IntakeIndex::stamp`]: the lowering publishes a
+/// It holds each live dependency, proposal or pending payload row, and it
+/// is the projection's at [`IntakeIndex::stamp`]: the lowering publishes a
 /// commit's changes with the commit, before the read gate moves, so a
 /// snapshot the gate hands out is never ahead of it.
 ///
-/// Entries are kept by epoch and tag, of which a store has a few, each an
-/// ordered set of 24-byte slots: about 30 bytes a live row with the set's
-/// own overhead.
+/// **By the whole command** (#185, lead 17:43): the intake part is a map
+/// from each command with a live row to its rows, a slab of a few rows a
+/// command, so a lookup is one probe and its answer is the command's own.
+/// It had kept each row by an 8-byte prefix of the command in an ordered
+/// set an epoch and tag, so a lookup was a range in a tree, and each
+/// answer was read from the store to settle whose it was. The intake part
+/// holds only commands not yet executed (the bound), so the whole
+/// identity costs little.
+///
+/// The executed part keeps its prefix: it holds an entry for each kept
+/// execution, the history, and the row at a position names its command.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct IntakeIndex {
-    regions: BTreeMap<(u64, u8), BTreeSet<Slot>>,
+    /// The intake part: each command with a live intake-keyed row, and its
+    /// rows.
+    live: DigestMap<CommandId, CommandRows>,
+    /// The intake part's rows, over every command.
     len: usize,
     /// The executed part (step 2): each kept `execution_v1` row, as the
     /// command's prefix and the position.
-    executed: BTreeSet<(u64, u64)>,
+    executed: Executed,
     /// The journal sequence of the last commit published into it.
     stamp: u64,
 }
@@ -360,7 +462,7 @@ impl IntakeIndex {
                 order,
                 command,
             } => {
-                index.insert(entry(epoch, tag, order, &command));
+                index.insert(command, RowAt::new(epoch, tag, order));
                 Ok(())
             }
             ProtocolKey::ByCommand { .. } => Err(EngineError::new(
@@ -381,7 +483,7 @@ impl IntakeIndex {
                 )
             })?;
             let (epoch, tag) = PENDING_REGION;
-            index.insert(entry(epoch, tag, order, &command));
+            index.insert(command, RowAt::new(epoch, tag, order));
             Ok(())
         })?;
         scan_all(view, Collection::ExecutionV1, |key, value| {
@@ -420,55 +522,28 @@ impl IntakeIndex {
         Ok(index)
     }
 
-    fn insert(&mut self, (epoch, tag, prefix, order): Entry) {
-        if self
-            .regions
-            .entry((epoch, tag))
-            .or_default()
-            .insert((prefix, order.seq, order.ordinal))
-        {
+    fn insert(&mut self, command: CommandId, row: RowAt) {
+        let rows = self.live.entry(command).or_default();
+        if let Err(at) = rows.binary_search(&row) {
+            rows.insert(at, row);
             self.len += 1;
         }
     }
 
-    fn remove(&mut self, (epoch, tag, prefix, order): Entry) {
-        if let Some(region) = self.regions.get_mut(&(epoch, tag))
-            && region.remove(&(prefix, order.seq, order.ordinal))
-        {
-            self.len -= 1;
-            if region.is_empty() {
-                self.regions.remove(&(epoch, tag));
-            }
-        }
+    /// `command`'s rows, in order.
+    fn rows(&self, command: &CommandId) -> &[RowAt] {
+        self.live
+            .get(command)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
     }
 
-    /// The entries of `command`'s prefix in an epoch and tag, in order.
-    fn of(
-        &self,
-        epoch: [u8; 8],
-        tag: u8,
-        command: &CommandId,
-    ) -> impl Iterator<Item = Entry> + use<'_> {
-        let e = u64::from_be_bytes(epoch);
-        let p = prefix(command);
-        self.regions
-            .get(&(e, tag))
-            .into_iter()
-            .flat_map(move |region| {
-                region.range((
-                    Bound::Included((p, 0, 0)),
-                    Bound::Included((p, u64::MAX, u32::MAX)),
-                ))
-            })
-            .map(move |&(p, seq, ordinal)| (e, tag, p, IntakeOrder { seq, ordinal }))
-    }
-
-    /// Entries held.
+    /// Rows held in the intake part.
     pub fn len(&self) -> usize {
         self.len
     }
 
-    /// Whether it holds no entry.
+    /// Whether the intake part holds no row.
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -478,28 +553,30 @@ impl IntakeIndex {
         self.stamp
     }
 
-    /// The intake orders a row of `command` may have, in order: every
-    /// entry whose prefix is the command's. The key settles whose each is.
+    /// The intake orders of `command`'s rows of an epoch and tag, in
+    /// order. Each is the command's: the index keeps the whole command.
     pub fn candidates(
         &self,
         epoch: [u8; 8],
         tag: u8,
         command: &CommandId,
     ) -> impl Iterator<Item = IntakeOrder> + '_ {
-        self.of(epoch, tag, command).map(|(_, _, _, order)| order)
+        self.rows(command)
+            .iter()
+            .filter(move |row| row.is_in(epoch, tag))
+            .map(|row| row.order())
     }
 
-    /// The positions `command` may have executed at, in order: every
-    /// executed entry whose prefix is the command's. The row at the
-    /// position, which names its command, settles whose each is.
+    /// The positions `command` may have executed at: every executed entry
+    /// whose prefix is the command's. The row at the position, which
+    /// names its command, settles whose each is.
     pub fn executed_candidates(
         &self,
         command: &CommandId,
     ) -> impl Iterator<Item = ExecutionPosition> + '_ {
-        let p = prefix(command);
         self.executed
-            .range((p, 0)..=(p, u64::MAX))
-            .filter_map(|&(_, position)| ExecutionPosition::new(position).ok())
+            .of(prefix(command))
+            .filter_map(|position| ExecutionPosition::new(position).ok())
     }
 
     /// Executed entries held: the executed part's size.
@@ -507,18 +584,34 @@ impl IntakeIndex {
         self.executed.len()
     }
 
-    /// Publish `delta`, the changes of the commit stamped `stamp`.
+    /// Publish `delta`, the changes of the commit stamped `stamp`, made
+    /// over this index as it is: each command it changes takes the rows
+    /// the delta leaves it.
+    ///
+    /// Debug builds check the delta was made over this index at this
+    /// stamp (#282's review): a command's rows are replaced whole, so a
+    /// delta published onto another base would put back rows a later
+    /// commit had changed.
     pub fn publish(&mut self, delta: IndexDelta, stamp: u64) {
-        for e in delta.removed {
-            self.remove(e);
-        }
-        for e in delta.added {
-            self.insert(e);
+        debug_assert_eq!(
+            delta.base, self.stamp,
+            "an index delta made over the index at one stamp, published onto it at another"
+        );
+        for (command, rows) in delta.live {
+            let held = self.live.get(&command).map_or(0, Vec::len);
+            self.len = self.len - held + rows.len();
+            if rows.is_empty() {
+                self.live.remove(&command);
+            } else {
+                self.live.insert(command, rows);
+            }
         }
         for e in delta.executed_removed {
-            self.executed.remove(&e);
+            self.executed.remove(e);
         }
-        self.executed.extend(delta.executed_added);
+        for e in delta.executed_added {
+            self.executed.insert(e);
+        }
         self.stamp = stamp;
     }
 
@@ -567,23 +660,26 @@ fn describe(recorded: &[u8]) -> String {
 
 /// The index's changes since a base: one commit's, held until its outcome
 /// is known (rule (d)), or an overlay's over the index at its snapshot's
-/// stamp (rule (e)).
+/// stamp (rule (e)). It is published onto the base it was made over.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct IndexDelta {
-    added: BTreeSet<Entry>,
-    removed: BTreeSet<Entry>,
+    /// Each command whose intake-keyed rows this changes, with the rows
+    /// the changes leave it: none, if it has none left.
+    live: DigestMap<CommandId, CommandRows>,
     /// The same commit's changes to the key index (task-d105), which
     /// moves with this one.
     pub(crate) kv: crate::kv_index::KvDelta,
     executed_added: BTreeSet<(u64, u64)>,
     executed_removed: BTreeSet<(u64, u64)>,
+    /// The stamp of the index it was made over, which
+    /// [`IntakeIndex::publish`] checks in debug builds.
+    base: u64,
 }
 
 impl IndexDelta {
     /// Whether it changes nothing.
     pub fn is_empty(&self) -> bool {
-        self.added.is_empty()
-            && self.removed.is_empty()
+        self.live.is_empty()
             && self.executed_added.is_empty()
             && self.executed_removed.is_empty()
             && self.kv.is_empty()
@@ -598,18 +694,6 @@ impl IndexDelta {
     fn unexecute(&mut self, e: (u64, u64)) {
         if !self.executed_added.remove(&e) {
             self.executed_removed.insert(e);
-        }
-    }
-
-    fn add(&mut self, e: Entry) {
-        if !self.removed.remove(&e) {
-            self.added.insert(e);
-        }
-    }
-
-    fn remove(&mut self, e: Entry) {
-        if !self.added.remove(&e) {
-            self.removed.insert(e);
         }
     }
 }
@@ -637,9 +721,30 @@ pub enum Assigned {
 /// changes (`delta`), and reads a row through `read` at that state, its
 /// own earlier updates included. Each update is to be applied
 /// before the next is assigned.
+///
+/// The intake part keys each command whole and is kept with every write
+/// to an intake-keyed row, so where it holds a row the row is there: a
+/// rewrite or a delete takes its key from the index, without reading the
+/// row. Rows are read for their bytes (the pending payload an execution
+/// moves, the dependency row its decided record copies), and debug builds
+/// read every row the index answers with and check it is there.
 pub struct Assigner<'a> {
     base: &'a IntakeIndex,
     delta: IndexDelta,
+}
+
+/// Debug builds: check that a row the index holds is there.
+#[cfg(debug_assertions)]
+fn check_held(
+    read: &mut impl FnMut(CollectionId, &[u8]) -> Result<Option<Vec<u8>>, EngineError>,
+    collection: CollectionId,
+    key: &[u8],
+) -> Result<(), EngineError> {
+    assert!(
+        read(collection, key)?.is_some(),
+        "the intake index holds a row that is not there: {key:02x?}"
+    );
+    Ok(())
 }
 
 impl<'a> Assigner<'a> {
@@ -647,7 +752,10 @@ impl<'a> Assigner<'a> {
     pub fn new(base: &'a IntakeIndex) -> Self {
         Assigner {
             base,
-            delta: IndexDelta::default(),
+            delta: IndexDelta {
+                base: base.stamp,
+                ..IndexDelta::default()
+            },
         }
     }
 
@@ -666,32 +774,50 @@ impl<'a> Assigner<'a> {
         self.delta.kv.observe(update, old)
     }
 
-    fn live(&self, epoch: [u8; 8], tag: u8, command: &CommandId) -> Vec<IntakeOrder> {
-        let mut out: Vec<IntakeOrder> = self
-            .base
-            .of(epoch, tag, command)
-            .filter(|e| !self.delta.removed.contains(e))
-            .chain(range_of(&self.delta.added, epoch, tag, command).copied())
-            .map(|(_, _, _, order)| order)
-            .collect();
-        out.sort_unstable();
-        out.dedup();
-        out
+    /// `command`'s rows as this assignment has them: as its own changes
+    /// left them, else as the base holds them.
+    fn rows(&self, command: &CommandId) -> &[RowAt] {
+        match self.delta.live.get(command) {
+            Some(rows) => rows.as_slice(),
+            None => self.base.rows(command),
+        }
     }
 
-    fn live_executed(&self, command: &CommandId) -> Vec<u64> {
-        let p = prefix(command);
-        let mut out: Vec<u64> = self
-            .base
-            .executed
-            .range((p, 0)..=(p, u64::MAX))
-            .filter(|e| !self.delta.executed_removed.contains(e))
-            .chain(self.delta.executed_added.range((p, 0)..=(p, u64::MAX)))
-            .map(|&(_, position)| position)
-            .collect();
-        out.sort_unstable();
-        out.dedup();
-        out
+    /// `command`'s rows to change, taken from the base at the first
+    /// change.
+    fn rows_mut(&mut self, command: &CommandId) -> &mut CommandRows {
+        let base = self.base;
+        self.delta
+            .live
+            .entry(*command)
+            .or_insert_with(|| base.rows(command).to_vec())
+    }
+
+    fn add(&mut self, command: &CommandId, row: RowAt) {
+        if self.rows(command).binary_search(&row).is_err() {
+            let rows = self.rows_mut(command);
+            if let Err(at) = rows.binary_search(&row) {
+                rows.insert(at, row);
+            }
+        }
+    }
+
+    fn remove(&mut self, command: &CommandId, row: RowAt) {
+        if self.rows(command).binary_search(&row).is_ok() {
+            let rows = self.rows_mut(command);
+            if let Ok(at) = rows.binary_search(&row) {
+                rows.remove(at);
+            }
+        }
+    }
+
+    /// The intake order of `command`'s row of an epoch and tag, if it has
+    /// one: the first, if an image left it more than one.
+    fn row_of(&self, epoch: [u8; 8], tag: u8, command: &CommandId) -> Option<IntakeOrder> {
+        self.rows(command)
+            .iter()
+            .find(|row| row.is_in(epoch, tag))
+            .map(|row| row.order())
     }
 
     /// The position `command` executed at, if the executed part names one
@@ -701,7 +827,20 @@ impl<'a> Assigner<'a> {
         command: &CommandId,
         read: &mut impl FnMut(CollectionId, &[u8]) -> Result<Option<Vec<u8>>, EngineError>,
     ) -> Result<Option<ExecutionPosition>, EngineError> {
-        for position in self.live_executed(command) {
+        let p = prefix(command);
+        let removed = &self.delta.executed_removed;
+        let positions = self
+            .base
+            .executed
+            .of(p)
+            .filter(|position| !removed.contains(&(p, *position)))
+            .chain(
+                self.delta
+                    .executed_added
+                    .range((p, 0)..=(p, u64::MAX))
+                    .map(|&(_, position)| position),
+            );
+        for position in positions {
             let position = ExecutionPosition::new(position)
                 .map_err(|_| EngineError::new(ErrorClass::Corrupt, "an executed entry at zero"))?;
             if let Some(row) = read(Collection::ExecutionV1.id(), &position_key(position))?
@@ -714,71 +853,32 @@ impl<'a> Assigner<'a> {
     }
 
     /// `command`'s pending payload, if one is there: its intake order and
-    /// its bytes.
+    /// its bytes, read for an execution to move.
     fn pending_of(
         &self,
         command: &CommandId,
         read: &mut impl FnMut(CollectionId, &[u8]) -> Result<Option<Vec<u8>>, EngineError>,
     ) -> Result<Option<(IntakeOrder, Vec<u8>)>, EngineError> {
         let (epoch, tag) = PENDING_REGION;
-        for order in self.live(epoch, tag, command) {
-            if let Some(value) = read(
-                Collection::PendingPayloadV1.id(),
-                &pending_key(order, command),
-            )? {
-                return Ok(Some((order, value)));
-            }
-        }
-        Ok(None)
-    }
-
-    /// The epochs the index holds rows of `tag` in, this assignment's own
-    /// additions included, oldest first.
-    fn epochs(&self, tag: u8) -> BTreeSet<u64> {
-        let mut out: BTreeSet<u64> = self
-            .base
-            .regions
-            .keys()
-            .filter(|(_, t)| *t == tag)
-            .map(|(e, _)| *e)
-            .collect();
-        out.extend(
-            self.delta
-                .added
-                .iter()
-                .filter(|(_, t, _, _)| *t == tag)
-                .map(|(e, _, _, _)| *e),
+        let Some(order) = self.row_of(epoch, tag, command) else {
+            return Ok(None);
+        };
+        let value = read(
+            Collection::PendingPayloadV1.id(),
+            &pending_key(order, command),
+        )?;
+        debug_assert!(
+            value.is_some(),
+            "the intake index holds a pending payload that is not there"
         );
-        out
-    }
-
-    /// `command`'s rows of `tag` in every epoch, oldest epoch first: the
-    /// epoch, the intake order and the row's bytes.
-    #[allow(clippy::type_complexity)]
-    fn rows_of(
-        &self,
-        tag: u8,
-        command: &CommandId,
-        read: &mut impl FnMut(CollectionId, &[u8]) -> Result<Option<Vec<u8>>, EngineError>,
-    ) -> Result<Vec<([u8; 8], IntakeOrder, Vec<u8>)>, EngineError> {
-        let mut out = Vec::new();
-        for epoch in self.epochs(tag) {
-            let epoch = epoch.to_be_bytes();
-            for order in self.live(epoch, tag, command) {
-                if let Some(value) = read(
-                    Collection::ProtocolV1.id(),
-                    &intake_key(epoch, tag, order, command),
-                )? {
-                    out.push((epoch, order, value));
-                }
-            }
-        }
-        Ok(out)
+        Ok(value.map(|value| (order, value)))
     }
 
     /// At `command`'s execution at `position` (the bound): delete its
     /// dependency and proposal rows, and write the latest epoch's
-    /// dependency row to `decided_v1` under the position.
+    /// dependency row to `decided_v1` under the position. Its pending
+    /// payload's row has been taken by the caller; the command is left
+    /// with no row in the intake part.
     fn move_decided(
         &mut self,
         command: &CommandId,
@@ -786,33 +886,33 @@ impl<'a> Assigner<'a> {
         read: &mut impl FnMut(CollectionId, &[u8]) -> Result<Option<Vec<u8>>, EngineError>,
     ) -> Result<Vec<StoreUpdate>, EngineError> {
         let protocol = Collection::ProtocolV1.id();
-        let mut out = Vec::new();
-        let mut decided = None;
-        for (epoch, order, value) in self.rows_of(DEPENDENCY_TAG, command, read)? {
-            self.delta
-                .remove(entry(epoch, DEPENDENCY_TAG, order, command));
-            out.push(StoreUpdate {
+        let rows = std::mem::take(self.rows_mut(command));
+        let dependencies = rows.iter().filter(|row| row.tag == DEPENDENCY_TAG);
+        let proposals = rows.iter().filter(|row| row.tag == PROPOSAL_TAG);
+        let mut out: Vec<StoreUpdate> = dependencies
+            .clone()
+            .chain(proposals)
+            .map(|row| StoreUpdate {
                 collection: protocol,
-                key: intake_key(epoch, DEPENDENCY_TAG, order, command),
+                key: intake_key(row.epoch_bytes(), row.tag, row.order(), command),
                 value: None,
-            });
-            decided = Some(decided_value(epoch, &value));
-        }
-        for (epoch, order, _) in self.rows_of(PROPOSAL_TAG, command, read)? {
-            self.delta
-                .remove(entry(epoch, PROPOSAL_TAG, order, command));
-            out.push(StoreUpdate {
-                collection: protocol,
-                key: intake_key(epoch, PROPOSAL_TAG, order, command),
-                value: None,
-            });
-        }
-        if let Some(value) = decided {
-            out.push(StoreUpdate {
-                collection: Collection::DecidedV1.id(),
-                key: position_key(position).to_vec(),
-                value: Some(value),
-            });
+            })
+            .collect();
+        // The decided record is the latest epoch's dependency row: read
+        // for its bytes, from the latest down past any row not there.
+        for row in dependencies.rev() {
+            let key = intake_key(row.epoch_bytes(), row.tag, row.order(), command);
+            if let Some(value) = read(protocol, &key)? {
+                out.push(StoreUpdate {
+                    collection: Collection::DecidedV1.id(),
+                    key: position_key(position).to_vec(),
+                    value: Some(decided_value(row.epoch_bytes(), &value)),
+                });
+                break;
+            }
+            if cfg!(debug_assertions) {
+                panic!("the intake index holds a dependency row that is not there");
+            }
         }
         Ok(out)
     }
@@ -881,18 +981,20 @@ impl<'a> Assigner<'a> {
         match parse(&update.key) {
             ProtocolKey::Other => Ok(Assigned::AsIs),
             // A row named by its intake key: a trim step's deletion. It is
-            // lowered as it is, and the index follows it.
+            // lowered as it is, and the index follows it. No writer puts a
+            // row under its intake key (every put names its row by command,
+            // and this lowering keys it); the put is followed all the same.
             ProtocolKey::Intake {
                 epoch,
                 tag,
                 order,
                 command,
             } => {
-                let e = entry(epoch, tag, order, &command);
+                let row = RowAt::new(epoch, tag, order);
                 if update.value.is_some() {
-                    self.delta.add(e);
+                    self.add(&command, row);
                 } else {
-                    self.delta.remove(e);
+                    self.remove(&command, row);
                 }
                 Ok(Assigned::AsIs)
             }
@@ -901,19 +1003,14 @@ impl<'a> Assigner<'a> {
                 tag,
                 command,
             } => {
-                let mut found = None;
-                for order in self.live(epoch, tag, &command) {
-                    if read(
+                let found = self.row_of(epoch, tag, &command);
+                #[cfg(debug_assertions)]
+                if let Some(order) = found {
+                    check_held(
+                        &mut read,
                         Collection::ProtocolV1.id(),
                         &intake_key(epoch, tag, order, &command),
-                    )?
-                    .is_some()
-                    {
-                        found = Some(order);
-                        break;
-                    }
-                    // Another command's entry under the same prefix: a row
-                    // of this command at that order is not there.
+                    )?;
                 }
                 match (&update.value, found) {
                     // A rewrite stays in place, under its intake key.
@@ -927,11 +1024,11 @@ impl<'a> Assigner<'a> {
                             return Ok(moved);
                         }
                         let order = IntakeOrder { seq, ordinal };
-                        self.delta.add(entry(epoch, tag, order, &command));
+                        self.add(&command, RowAt::new(epoch, tag, order));
                         Ok(Assigned::Key(intake_key(epoch, tag, order, &command)))
                     }
                     (None, Some(order)) => {
-                        self.delta.remove(entry(epoch, tag, order, &command));
+                        self.remove(&command, RowAt::new(epoch, tag, order));
                         Ok(Assigned::Key(intake_key(epoch, tag, order, &command)))
                     }
                     (None, None) => Ok(self
@@ -964,24 +1061,30 @@ impl<'a> Assigner<'a> {
             // never takes an executed command's payload.
             return Ok(Assigned::Skip);
         }
-        let found = self.pending_of(&command, read)?;
+        // Only the key is needed: a rewrite or a delete takes the row's
+        // key from the index.
+        let found = self.row_of(epoch, tag, &command);
+        #[cfg(debug_assertions)]
+        if let Some(order) = found {
+            check_held(read, pending, &pending_key(order, &command))?;
+        }
         match (&update.value, found) {
-            (Some(value), Some((order, _))) => Ok(Assigned::Writes(vec![StoreUpdate {
+            (Some(value), Some(order)) => Ok(Assigned::Writes(vec![StoreUpdate {
                 collection: pending,
                 key: pending_key(order, &command),
                 value: Some(value.clone()),
             }])),
             (Some(value), None) => {
                 let order = IntakeOrder { seq, ordinal };
-                self.delta.add(entry(epoch, tag, order, &command));
+                self.add(&command, RowAt::new(epoch, tag, order));
                 Ok(Assigned::Writes(vec![StoreUpdate {
                     collection: pending,
                     key: pending_key(order, &command),
                     value: Some(value.clone()),
                 }]))
             }
-            (None, Some((order, _))) => {
-                self.delta.remove(entry(epoch, tag, order, &command));
+            (None, Some(order)) => {
+                self.remove(&command, RowAt::new(epoch, tag, order));
                 Ok(Assigned::Writes(vec![StoreUpdate {
                     collection: pending,
                     key: pending_key(order, &command),
@@ -1055,8 +1158,6 @@ impl<'a> Assigner<'a> {
                 ),
             ));
         };
-        let (epoch, tag) = PENDING_REGION;
-        self.delta.remove(entry(epoch, tag, order, &command));
         self.delta.execute((prefix(&command), position.get()));
         let mut writes = vec![
             row,
@@ -1071,6 +1172,8 @@ impl<'a> Assigner<'a> {
                 value: Some(payload),
             },
         ];
+        // The command's rows all go: the pending payload's above, and its
+        // dependency and proposal rows here.
         writes.extend(self.move_decided(&command, position, read)?);
         Ok(Assigned::Writes(writes))
     }
@@ -1121,8 +1224,11 @@ mod tests {
         assert!(later > key);
     }
 
+    /// Two commands whose first eight bytes agree, the prefix the index
+    /// once kept rows by: each keeps its own row, and a rewrite lands on
+    /// its own.
     #[test]
-    fn a_shared_prefix_keeps_both_entries_and_the_key_settles_whose() {
+    fn two_commands_of_one_prefix_keep_their_own_rows() {
         let epoch = 1u64.to_be_bytes();
         let mut a = [1u8; 32];
         let mut b = [1u8; 32];
@@ -1167,7 +1273,9 @@ mod tests {
                 &b
             )
         );
-        assert_eq!(assigner.into_delta().added.len(), 2);
+        let delta = assigner.into_delta();
+        assert_eq!(delta.live.len(), 2);
+        assert!(delta.live.values().all(|rows| rows.len() == 1), "{delta:?}");
     }
 
     /// The rows an assignment's updates leave, by collection and key: what
@@ -1308,7 +1416,7 @@ mod tests {
         let delta = assigner.into_delta();
         assert_eq!(delta.executed_added.len(), 1);
         assert!(
-            delta.added.is_empty(),
+            delta.live.values().all(Vec::is_empty),
             "the pending entry was added and moved: {delta:?}"
         );
     }
@@ -1366,6 +1474,30 @@ mod tests {
             rows.assign(&mut assigner, 4, 1, gone).unwrap(),
             Assigned::Skip
         );
+    }
+
+    /// A delta is published onto the index it was made over (#282's
+    /// review), and debug builds refuse one made at another stamp. Here two
+    /// deltas are made over one index and both published: the second's
+    /// commands would take the rows it left them, over whatever the first
+    /// had changed.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "published onto it at another")]
+    fn a_delta_made_over_another_stamp_is_refused_in_debug_builds() {
+        let mut base = IntakeIndex::default();
+        let mut rows = Rows::default();
+        let (first, second) = {
+            let mut a = Assigner::new(&base);
+            rows.assign(&mut a, 1, 0, payload(&cmd(1), Some(1)))
+                .unwrap();
+            let mut b = Assigner::new(&base);
+            rows.assign(&mut b, 2, 0, payload(&cmd(2), Some(2)))
+                .unwrap();
+            (a.into_delta(), b.into_delta())
+        };
+        base.publish(first, 1);
+        base.publish(second, 2);
     }
 
     fn protocol_row(tag: u8, epoch: u64, command: &CommandId, value: Option<u8>) -> StoreUpdate {
@@ -1527,5 +1659,92 @@ mod tests {
         .unwrap();
         assert_eq!(rows.of(Collection::DecidedV1), 0);
         assert_eq!(rows.of(Collection::ExecutionV1), 0);
+    }
+
+    /// A measurement, run by hand (`cargo test --release -p coord-storage
+    /// --lib -- --ignored assignment_cost`): the assignment's cost a
+    /// command, by commands a commit (#185, lead 17:43, the intake index).
+    ///
+    /// Each command is taken in (its payload, a dependency row and a
+    /// proposal row, one record) and later executed (its executed row, one
+    /// record), as a leader lowers it. The index starts with 2,000 commands
+    /// taken in and not executed, and 50,000 executed. Rows are read from an
+    /// ordered map in memory, the same before and after a change.
+    #[test]
+    #[ignore = "a measurement, run by hand"]
+    fn assignment_cost_by_commands_a_commit() {
+        fn id(n: u64) -> CommandId {
+            let mut bytes = [0u8; 32];
+            let mut x = n.wrapping_add(1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            for chunk in bytes.chunks_mut(8) {
+                x ^= x >> 31;
+                x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                x ^= x >> 29;
+                chunk.copy_from_slice(&x.to_be_bytes());
+            }
+            CommandId(Digest32(bytes))
+        }
+        struct Run {
+            base: IntakeIndex,
+            rows: Rows,
+            seq: u64,
+            next: u64,
+            oldest: u64,
+            position: u64,
+        }
+        impl Run {
+            fn commit(&mut self, intake: u64, execute: u64) {
+                let mut assigner = Assigner::new(&self.base);
+                for _ in 0..intake {
+                    let c = id(self.next);
+                    self.next += 1;
+                    let updates = [
+                        payload(&c, Some(7)),
+                        protocol_row(DEPENDENCY_TAG, 1, &c, Some(1)),
+                        protocol_row(PROPOSAL_TAG, 1, &c, Some(2)),
+                    ];
+                    for (i, u) in updates.into_iter().enumerate() {
+                        self.rows
+                            .assign(&mut assigner, self.seq, i as u32, u)
+                            .unwrap();
+                    }
+                    self.seq += 1;
+                }
+                for _ in 0..execute {
+                    let c = id(self.oldest);
+                    self.oldest += 1;
+                    self.rows
+                        .assign(&mut assigner, self.seq, 0, executed(&c, self.position))
+                        .unwrap();
+                    self.position += 1;
+                    self.seq += 1;
+                }
+                let delta = assigner.into_delta();
+                self.base.publish(delta, self.seq);
+            }
+        }
+        let mut run = Run {
+            base: IntakeIndex::default(),
+            rows: Rows::default(),
+            seq: 1,
+            next: 0,
+            oldest: 0,
+            position: 1,
+        };
+        for _ in 0..20 {
+            run.commit(100, 0);
+        }
+        for _ in 0..500 {
+            run.commit(100, 100);
+        }
+        for k in [4u64, 16, 64, 256] {
+            let commits = 20_000 / k;
+            let start = std::time::Instant::now();
+            for _ in 0..commits {
+                run.commit(k, k);
+            }
+            let ns = start.elapsed().as_nanos() as f64 / (commits * k) as f64;
+            println!("{k:>4} commands a commit: {ns:>8.0} ns a command (taken in and executed)");
+        }
     }
 }

@@ -526,6 +526,8 @@ impl Machine {
                 taken: 0,
                 known: 0,
                 not_taken: 0,
+                frame_batches: 0,
+                frame_adoptions: 0,
             },
             Machine::Follower(m) => m.relay_taken(),
         }
@@ -2855,6 +2857,9 @@ impl<P: Persistence> Node<P> {
             // replica restarts from it rather than plan them again.
             coord_storage::ApplyError::GroupLost => {
                 DriveError::Engine("an execution group was definitely not journaled".into())
+            }
+            coord_storage::ApplyError::AfterGroupLost => {
+                DriveError::Engine("the applier was used after an execution group was lost".into())
             }
             other => DriveError::Engine(format!("{other:?}")),
         }

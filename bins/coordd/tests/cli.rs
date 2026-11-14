@@ -2207,6 +2207,56 @@ async fn the_same_invocation_is_answered_the_same_way_after_a_restart() {
     );
 }
 
+/// A new session's first read is answered while the group that created
+/// the session waits for the projection to commit it (#281).
+///
+/// A read is served over the projection's snapshot with the journaled
+/// groups still in flight laid over it, and doesn't ask for a commit. Its
+/// output is reauthorized on the way out. That barrier read the committed
+/// snapshot, so a session created in a group held for a larger commit was
+/// one the node had never seen, and its read was answered pending. Here
+/// the hold outlasts the test. A session's record can still reach the
+/// commit first (the settle of a half-established entry asks for one), so
+/// five sessions each read once, and every read has to be answered.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_sessions_first_read_is_answered_while_the_projection_holds_its_commit() {
+    let dir = workspace("read-held-commit");
+    let ca = credentials(&dir, 1, coord_types::wire_v1::PeerRole::Voter);
+    genesis_of(&dir, 1, Some(&ca.node_spki));
+    let ring = sts_keys(&dir);
+    let path = config_only(&dir);
+    let text = std::fs::read_to_string(&path).expect("the config was written");
+    let journal = "[journal]\nroot = \"journal\"\nshards = 1\n";
+    assert!(text.contains(journal), "the config's journal section moved");
+    std::fs::write(
+        &path,
+        text.replace(
+            journal,
+            &format!(
+                "{journal}profile = \"journaled-replay-v1\"\n\
+                 projection_commit_records = 1000000\n\
+                 projection_commit_ms = 600000\n"
+            ),
+        ),
+    )
+    .expect("the config was rewritten");
+    assert_eq!(run(&path, &["init"]).code, Some(0));
+
+    let daemon = start(&path);
+    for session in 0x47..0x4c {
+        let caller = Caller::bind(&daemon, &ca, &ring, [session; 16]).await;
+        let answer = ask(&caller.connection, &caller.range(1, b"k"))
+            .await
+            .unwrap_or_else(|| panic!("the daemon answered the read\n{}", daemon.said()));
+        let outcome = response_of(&answer).outcome;
+        assert!(
+            matches!(outcome, coord_types::wire_v1::OutcomeV1::Ok { .. }),
+            "session {session:#x}'s first read was answered {outcome:?}:\n{}",
+            daemon.said()
+        );
+    }
+}
+
 /// A read retried after a restart is answered with its retained result,
 /// not refused.
 ///
@@ -4846,6 +4896,14 @@ fn a_node_refuses_a_store_that_activated_something_this_build_cannot_do() {
         report.contains("build schema=1") && report.contains("features=checkpoint-floor"),
         "the daemon did not report what this build is:\n{report}"
     );
+    // The journal's window reads ahead, so the line gives the versions
+    // read, and the one written beside them: an operator checking a fleet
+    // before a rollback sees which nodes read what a successor writes,
+    // and which already write it (10.7, step 1a).
+    assert!(
+        report.contains("journal=1..2 journal_writes=1 "),
+        "the build line did not give the journal's read window and written version:\n{report}"
+    );
 
     // Nothing activated: it serves, which is the coexistence half.
     assert_eq!(run(&path, &["--check"]).code, Some(0));
@@ -6279,10 +6337,12 @@ async fn a_leaf_that_falls_due_is_renewed_in_place_and_serving_carries_on() {
     let answer = ask(&early.connection, &early.put(1, b"k", b"v"))
         .await
         .expect("a caller connected before the renewal is served inside the old leaf's life");
-    assert!(matches!(
-        response_of(&answer).outcome,
-        coord_types::wire_v1::OutcomeV1::Ok { .. }
-    ));
+    let outcome = response_of(&answer).outcome;
+    assert!(
+        matches!(outcome, coord_types::wire_v1::OutcomeV1::Ok { .. }),
+        "the early caller's write was answered {outcome:?}:\n{}",
+        daemon.said()
+    );
     // ...and closed at it: that connection was authenticated under the
     // old leaf, and nothing is carried under a leaf past its end.
     until_past(old_not_after + 1).await;
@@ -6303,10 +6363,12 @@ async fn a_leaf_that_falls_due_is_renewed_in_place_and_serving_carries_on() {
     let answer = ask(&late.connection, &late.range(1, b"k"))
         .await
         .expect("a caller arriving after the old leaf's end is served");
-    assert!(matches!(
-        response_of(&answer).outcome,
-        coord_types::wire_v1::OutcomeV1::Ok { .. }
-    ));
+    let outcome = response_of(&answer).outcome;
+    assert!(
+        matches!(outcome, coord_types::wire_v1::OutcomeV1::Ok { .. }),
+        "the late caller's read was answered {outcome:?}:\n{}",
+        daemon.said()
+    );
     assert!(
         !daemon.said().contains("renewal expired"),
         "{}",

@@ -136,11 +136,11 @@ pub struct Voter<P: Persistence> {
     fenced_at: Option<Ballot>,
     /// The reads this voter holds as a leader (task-d50).
     reads: ReadBarrier,
-    /// The completed frontier read just before the last snapshot pinned
-    /// for due reads, when that snapshot was behind one of them
-    /// (task-d58). While the frontier still reads exactly this, a new
-    /// snapshot would show what that one did.
-    reads_behind_at: Option<u64>,
+    /// The projection's completed frontier and the journaled position
+    /// read just before the last view taken for due reads, when that view
+    /// was behind one of them (task-d58; #185, lead 17:43). While both
+    /// still read exactly this, a new view would show what that one did.
+    reads_behind_at: Option<(u64, Option<coord_types::ids::ExecutionPosition>)>,
     /// Marked commands whose release this voter, as their leader,
     /// publishes again once its projection holds their retry record
     /// (task-d100, step A). Bounded by [`ORIGINS`], oldest first: a
@@ -499,7 +499,15 @@ impl<P: Persistence> Voter<P> {
             return Ok(Outbound::default());
         }
         let before = self.ballot;
-        let message = coord_consensus::ProtocolMessage::decode(&frame).ok();
+        // What this voter acts on itself is below, and a leader's proposal
+        // frame is none of it: the frame goes to the machine undecoded,
+        // and the follower decodes it once (cost pass row 11). It is the
+        // largest message a follower takes, one a turn of its leader's.
+        let message = if coord_consensus::ProtocolMessage::is_proposal_frame(&frame) {
+            None
+        } else {
+            coord_consensus::ProtocolMessage::decode(&frame).ok()
+        };
         if let Some(coord_consensus::ProtocolMessage::NewLeader { ballot, .. }) = &message
             && higher(ballot, &self.ballot)
         {
@@ -920,28 +928,38 @@ impl<P: Persistence> Voter<P> {
         for (origin, answer) in refused {
             push_answer(&mut out, origin, &answer);
         }
-        // One snapshot for every read due in this pump (task-d58): each is
-        // due because everything below its index executed, so a snapshot
-        // pinned now covers all of them, and pinning one per read was a
-        // read transaction and a metadata read each. No snapshot (the
+        // One view for every read due in this pump (task-d58): each is
+        // due because everything below its index executed, so a view
+        // taken now covers all of them, and pinning one per read was a
+        // read transaction and a metadata read each. No view (the
         // projection is mid-commit, or quarantined) holds them all again,
-        // as a snapshot behind their position does.
+        // as a view behind their position does.
         //
-        // A read is due once its index has executed, and answerable once
-        // the projection has committed that far, which is later. Between
-        // the two every pump would pin a snapshot only to find it behind:
-        // ten per read served in the five-voter run. So once one was
-        // behind, none is pinned again until the completed frontier has
-        // moved from what it read before that one: a projection commit
-        // moves it, and nothing else changes what a snapshot shows.
-        // Moved either way, as a reattached projection's could, a new
-        // snapshot is pinned.
-        let reader = self.node.applier().store().reader();
-        let completed = reader.completed();
-        let gated = if due.is_empty() || self.reads_behind_at == Some(completed) {
+        // The view is the projection's snapshot with the journaled groups
+        // in flight laid over it (`Applier::read_view`; #185, lead 17:43):
+        // what a command planned there reads, and what a release has
+        // already disclosed. So a read is answerable once its index is in
+        // the journal, not once the projection has committed that far,
+        // and it asks for no commit: the reads' asks were what cut the
+        // leader's held commits short, 71% of them at 120 callers and 98%
+        // at 30.
+        //
+        // A read can still be due before it is answerable: its index in
+        // the group still open, or in one whose append is still out.
+        // Between the two every pump would take a view only to find it
+        // behind. So once one was behind, none is taken again until the
+        // projection's completed frontier or the journaled position has
+        // moved from what it read before that one: nothing else changes
+        // what the view shows. Moved either way, as a reattached
+        // projection's could, a new view is taken.
+        let reaches = (
+            self.node.applier().store().reader().completed(),
+            self.node.applier().journaled_through(),
+        );
+        let gated = if due.is_empty() || self.reads_behind_at == Some(reaches) {
             None
         } else {
-            reader.snapshot().ok()
+            self.node.applier().read_view().ok()
         };
         let mut again = Vec::new();
         for held in due {
@@ -976,15 +994,7 @@ impl<P: Persistence> Voter<P> {
         }
         if gated.is_some() {
             self.reads.pinned(again.len());
-            self.reads_behind_at = (!again.is_empty()).then_some(completed);
-        }
-        // A read due and not yet answerable waits for the projection, so
-        // its next commit is not held for a larger one (task-d86).
-        if !again.is_empty() {
-            self.node
-                .applier_mut()
-                .store_mut()
-                .request_projection_commit_for(coord_storage::AskCause::Read);
+            self.reads_behind_at = (!again.is_empty()).then_some(reaches);
         }
         for held in again.into_iter().rev() {
             self.reads.hold_again(held);

@@ -5,7 +5,8 @@
 - the cost model, per command and per turn;
 - the proposals that follow from the rule;
 - levers 1 and 2 (option 3 and the proposal frame as a unit) and the leader-log end state they lead to;
-- the buffer as the unit at every stage, filled by the load (Section 9).
+- the buffer as the unit at every stage, filled by the load (Section 9);
+- the frame as the unit of decision, a protocol change put to the owner (Section 10).
 
 What can be built without deciding the end state is in [Section 6.4](#64-what-can-be-built-without-deciding). The owner has parked option 3 and the leader log ([Section 8](#8-order-and-what-the-owner-decides)).
 
@@ -671,7 +672,7 @@ So nothing in this lever changes what is voted, what a quorum is, what is durabl
 - The two overlap only in `Follower::applied`, about 5 µs a lazy voter here, counted once.
 - At `e = 1` together they come to about 1.06 on the 7763: 1.13, less 0.087 for three lazy voters with the sender and the write-set check (#259's review), plus 0.016 for the overlap. With the transport on the loop's turn, about 0.99.
 
-**Code steps, each its own PR:**
+**Code steps, each its own PR.** Since the decision of 2026-11-13, 10.7 replaces this list: step 1 stays as #269, steps 2 to 4 are folded into 10.7's steps 2 and 6, and step 5 is dropped for the frame's acknowledgement (10.8).
 1. **Learning once a frame and once a step of events,** and the commit frontier through an index by sequence number. No wire or row change.
 2. **`Follower::applied` and forgetting once an execution group.** No wire or row change.
 3. **The frame's intake in one pass,** with the path logs once a key, and the property test above. No wire or row change.
@@ -1028,3 +1029,595 @@ The order is by the five-voter sum, each step one PR, with a both-orders pair on
 - a pair of the loops it changes, and a profile of the rows it claims, before and after. That measures the take, which settles the A and B estimates step by step (review carries them at half until then);
 - the audit's counts a buffer (batches, barriers, storage events, appends and vote messages a command);
 - for the caps, depth and p50/p99 at 30, 120 and 480 callers against Section 9.5's table.
+
+## 10. The frame as the unit of decision
+
+**Decided, 2026-11-13.** The owner: "Agreed on all 4 points."
+1. **The frame is the unit of decision.** It goes ahead.
+2. **Lazy voters are deferred.** 6.6 stays a design, and no step below builds it. Every follower still executes and materializes.
+3. **The fast path is kept.** Recovery is the source rule with frames as its entries (10.3): the variant of 10 to 14 weeks (10.6).
+4. **The store the exit is read on waits for the barrier-on disk reading.** Each step's checkpoint below is read on tmpfs, locally and on the runner. Whether we meet or beat TLS etcd is read on the store the owner picks once testing's run with write barriers on is in.
+
+10.7 is the step plan, and 10.8 says what it does to the named-cost queue. The rest of this section is the case as it was put to the owner, kept as the record.
+
+**As put to the owner: two decisions, and a choice inside the first.** Servers' CPU, ms an operation at 120 callers on the EPYC 7763 [on the 9V45], storage on. TLS etcd reads 1.07–1.13 [0.44–0.51]. Every figure is a best case (10.1).
+
+1. **The frame as the unit of decision** (this section). A follower takes the leader's frame whole: one append, one acknowledgement and one decision a frame.
+   - **Gives:** −0.38 [about −0.25], the difference between 10.1's rows. About −0.06 [−0.04] of it is step 2's journal format, which doesn't need the decision (10.5). Alone it reaches 0.79–0.82 [0.50–0.52]: 0.70 to 0.77 of etcd on the 7763, and 0.98 to 1.18 times etcd on the 9V45.
+   - **Weeks:** 10 to 14 with the fast path kept, 8 to 11 with it dropped (10.6).
+   - **Gives up:** it is a protocol change. Frame positions become durable and mean the same across ballots (10.2). Recovery and Sync read frames (10.3). Each step activates through task-d99, and a domain doesn't go back below it (10.5). The fault runs are earned again (10.6).
+2. **Lazy voters** (6.6). Voters that vote on the hot path and land the eager voters' agreed batches one batch behind.
+   - **Gives:** −0.16 [−0.09 to −0.10], measured with every follower lazy. At 6.6's one eager follower, with the sender and the write-set check paid, about −0.09 [−0.06], inferred (Section 8).
+   - **Alone** it reaches 1.01–1.06 [0.65–0.68], or 1.08–1.13 [0.68–0.72] at one eager follower. That is at etcd on the 7763, with no margin, and 1.3 to 1.6 times etcd on the 9V45.
+   - **Weeks:** 5 to 7, after proposals 1 and 2 (6.6).
+   - **Gives up:** the domain keeps five copies of the store, three of them a batch behind. A revoked grant can still authorize a result at a lazy frontend for up to 150 ms plus a message delay (6.6).
+   - **With the frame:** 0.63–0.66 [0.40–0.42], or 0.70–0.73 [0.44–0.47] at one eager follower. On the 9V45 it is the only row under etcd, 0.78 to 0.95 of it at best. At one eager follower it is 0.86 to 1.07 of etcd: at it, not under.
+3. **If the frame is the unit: the fast path kept at low load, or dropped** (10.4). Both give the same floor at load.
+   - **Kept, the recommendation.** Below the relay's threshold, a fast quorum on the leader's path decides a command before its frame does. Recovery stays today's source and possible-fast rules, with frames as their entries (10.3).
+   - **Dropped.** About 2 to 3 weeks less. Recovery becomes Multi-Paxos's slot rule, and the possible-fast rule goes (10.3). It gives up what 6.2 lists: a collector far from the leader pays the leg to it at every load.
+
+**Where the frame's figure comes from.** The structural floors round ([#185, 6854728753](https://github.com/tuplesky/tuplesky/pull/185#issuecomment-6854728753)) measured a follower that handles the leader's frame as a unit, one append and one acknowledgement a frame.
+- **At 120 callers** that takes −0.46 ms an operation off build 1's 0.86 locally [−0.67 of 1.31 on the 7763], at about 10 commands a frame. Its followers neither execute nor decode, so the floor holds the lazy voters' saving too.
+  - Lazy voters (6.6) and lever 2 redesigned (6.7) reach about −0.16 of it without a protocol change.
+  - About −0.04 [−0.06] is the seal and settle records. One record and one durability event a group in place of two a command is a local journal format change, not a protocol change (10.5, step 2).
+  - **The rest, up to about −0.26 [−0.38], needs the frame to be the unit of decision.** It is each command's own intake, vote, dependency record, rows, settle and forget at every follower.
+  - It is an upper bound: a residual of separate pairs (review on #185).
+- **At 5 callers** the floor is −0.50 of 1.86 [−0.72 of 2.92], storage off. That is the frame and the lazy voters together. The split between them, the other levers and etcd at 5 callers aren't measured.
+- **At 30 callers,** where a frame is 4.9 commands, the floor's pair is queued. It comes into 10.1 when it lands.
+
+This section covers the slow path's unit only. Option 3 and the leader executing for everyone (6.1 to 6.3) stay parked.
+
+### 10.1 The totals, four ways
+
+Servers' CPU, ms an operation at 120 callers, storage on. Every row is a best case (the bases below).
+
+| | Local | EPYC 7763 | EPYC 9V45 |
+| --- | ---: | ---: | ---: |
+| Neither | 0.79–0.84 | 1.17–1.22 | 0.74–0.78 |
+| Lazy voters only | 0.67–0.72 | 1.01–1.06 | 0.65–0.68 |
+| The frame only | 0.55–0.58 | 0.79–0.82 | 0.50–0.52 |
+| Both | 0.43–0.46 | 0.63–0.66 | 0.40–0.42 |
+| TLS etcd, testing's runs | — | 1.07–1.13 | 0.44–0.51 |
+
+**At 6.6's one eager follower,** lazy voters take about −0.09 on the 7763 in place of −0.16 (Section 8, inferred). "Lazy voters only" becomes 1.08–1.13 [0.68–0.72], and "Both" 0.70–0.73 [0.44–0.47].
+
+**The bases:**
+- **Neither:** build 1, less lever 2 redesigned (−0.04 to −0.06, estimated), long-lived API streams (−0.045, measured) and the bytes path (−0.044, measured). Then plus Section 9.6's storage, 0.07–0.10. The pairs overlap at the followers, so this is the best case.
+- **Lazy voters:** −0.12 locally, −0.16 on the 7763, measured with every follower lazy: no follower executed or materialized, and none paid for a batch, an agreement or a landing. 6.6's design keeps one eager follower and pays for those. They need the owner's ≤150 ms revocation bound.
+- **Both:** the measured floor, 0.364 [0.545], then the same storage. That floor is the follower above, with all four followers lazy, plus votes once a frame and the transport switches. It is before the bytes path and before step 5 (10.5).
+- **The frame only:** "Both" with the lazy voters' −0.12 [−0.16] added back.
+- **TLS etcd,** testing's runs at 120 callers: on the 7763, 43350571102 (1.082, 1.128) and 43429015655 (1.073); on the 9V45, 43353880409 (0.439) and 43437990761 (0.514).
+- **The 9V45:** scaled part by part from the 7763 with the runner's profiles of our build ([#98, 6856833756](https://github.com/tuplesky/tuplesky/pull/98#issuecomment-6856833756) and [6851041797](https://github.com/tuplesky/tuplesky/pull/98#issuecomment-6851041797)). Our transport there is 0.58× the 7763's, and our loops, appender and materializer 0.655×. Weighted by each total's transport share, every row scales by 0.63 to 0.64.
+
+**What they say:**
+- **The frame is the larger of the two:** −0.38 on the 7763, against the lazy voters' −0.16 at best. Alone, it is under etcd on the 7763, and at 0.98 to 1.18 times etcd on the 9V45, without the revocation bound.
+- **Lazy voters alone reach etcd on the 7763,** at 0.89 to 0.99 of it at best and 0.96 to 1.06 at one eager follower. That reaches it with no margin.
+- **On the 9V45, getting under etcd takes both.** Either alone is 0.98 to 1.6 times etcd.
+  - The faster core helps etcd more. Its transport falls 2.1× and its consensus and storage 2.3×, against our 1.7× and 1.5×.
+  - Our excess is consensus, execution and storage, mostly at the followers (6856833756).
+- **Neither** is 1.04 to 1.14 times etcd on the 7763, and 1.45 to 1.77 on the 9V45.
+
+### 10.2 The wire and the journal
+
+**On the wire:**
+- **The frame:** task-d102's `ProposalFrame` gets a position in the ballot's frame log and its predecessor's digest. A follower accepts it all or none, in position order, with every payload inside.
+- **Positions mean the same across ballots, and are durable.** Today a proposal's number is ballot-scoped and never persisted ([design 4.1](tuplesky-design.md#s4-1)), and 4.9 declined positions in recovery reports. The frame log reverses both: a frame's position is the domain's, carried from ballot to ballot and journaled with the frame.
+- **`FrameAccept { replica, ballot, through }`** acknowledges a prefix of frames once their records are durable. It replaces each frame command's `SlowAck`. The leader counts a majority a frame.
+- **`Committed { through }`** counts frame positions.
+- **A recovery report** adds each accepted frame above the voter's commit frontier as (position, ballot, digest), and marks each it holds by name only, without its bytes (10.7, step 4). A Sync names frames the same way.
+
+**In the journal:**
+- **One record a frame:** its bytes as received, its ballot and its position, durable before the acknowledgement leaves.
+- **A follower drops, for a frame command,** its dependency row, adoption record, payload row and vote state. The frame holds the payload, the position is the order, and the frame's phase is the command's.
+- **Under proposal 2** (4.1), the frame record is the protocol state.
+
+### 10.3 Recovery and takeover
+
+**Today.** Recovery's source and possible-fast rules read each command's durable phase, ballot, dependencies and path ([design 4.9](tuplesky-design.md#s4-9)).
+
+**For frame commands, they read the frame log instead.** A voter accepts frames in order, so its report is a prefix. A decided frame is in every majority, so under either rule below it is selected whole.
+
+**What selection is depends on the fast path (10.4).**
+- **With the fast path kept, the recommendation: the source rule, with frames as its entries.** It is today's rule (4.9), not Multi-Paxos's:
+  1. The frames accepted at the source ballot, the highest among the majority's reports, by position.
+  2. Reports below the source ballot supply committed frames only.
+  3. Then the candidates the possible-fast rule keeps, after the selected frames.
+- **Why not the slot rule there.** A slot rule protects what a majority accepted at a position. A fast decision is not that: it fixes a command's place by a fast quorum's equal paths, before any frame holding it is accepted. So a frame accepted only at an older ballot can take the place a fast decision already has. Review's case on #276 ([6858204830](https://github.com/tuplesky/tuplesky/pull/276#issuecomment-6858204830)), five voters L0, L, M1, M2 and Y:
+  - **At b0,** L0's frames at positions p to p + 3 reach only Y. They are not decided.
+  - **At b,** L's majority is L, M1 and M2, its fast set. Its Sync selects through p − 1. A collector then proposes c fast, and M1 and M2 pre-accept it after p − 1, as L orders it. c is decided and answered. L's own frame p, which holds c, reaches nobody, and L stops.
+  - **At b2,** the reports are M2's, Y's and L0's. The slot rule selects b0's frames at p to p + 3, since nothing else is at those positions, and c can only go after them, though its answer was computed right after p − 1. The source rule takes b as the source: Y and L0 are below it and supply only what they hold committed, so b0's frames aren't selected and c takes position p.
+- **With the fast path dropped, 10.4's alternative: the slot rule.** Every command is decided by its frame alone, so a decision is a majority's acceptance at a position. At each position, the selection takes the frame accepted at the highest ballot among a majority's reports, as Multi-Paxos selects a slot. The possible-fast rule and the per-command records it reads go.
+
+**Order.** Every fast and slow quorum includes the ballot's leader ([design 4.1](tuplesky-design.md#s4-1)), so the leader proposes every command under a sequence number, fast or not. Every command is therefore in a frame.
+- A fast decision decides a command early, by a fast quorum on the leader's path.
+- A command's place is its frame's position, then its index in the frame.
+- **Its dependencies are the conflicting commands at lower places.** A voter computes them from the order and the payloads' keys, so they need no record of their own.
+- **That covers a fast command decided before a conflicting frame command** (Codex on #276). The leader proposed it first, so its place is lower. A follower that lacks it can't execute the frame command until it gets it, as with a missing dependency today.
+- **With the fast path kept, a fast command keeps its record of its path and dependencies** for the possible-fast rule. Its place agrees with them, as its path agrees with the leader's order today.
+- Task-d71's rule reads the leader's order today through the records along dependencies. The order becomes a source it reads directly.
+- **What a voter carries into a Sync and what it serves** (task-d77, task-d80, task-d81) go by position: a committed frame is carried and served as a committed command is.
+
+**A takeover mid-frame.**
+- **The new leader re-proposes the selected frames whole,** at its ballot and in order, before new ones. No frame is ever split.
+- **A frame no reporter in the majority holds was not decided as a frame.** Its frame commands come back through their clients' retries.
+  - **With the fast path kept, a fast command in it may have been decided.** The possible-fast rule keeps it, and the new leader re-proposes it in a new frame after the selected ones.
+  - Its place holds: the member that pre-accepted it on the leader's path had accepted every frame before it, so those frames are all selected, and it comes right after them.
+  - With the fast path dropped, there is no such command.
+- **Execution resumes at the durable execution position** (task-d90), which can be inside a frame.
+- **A follower missing frame f waits for the leader's re-send** (task-d07) before taking f + 1. That is head-of-line blocking at one follower, bounded by the re-send.
+
+### 10.4 The fast path, a voter's right to propose, and what stays per command
+
+**The fast path: kept, narrowed to low load. This is the recommendation.**
+- **Every command is in the leader's frames** (10.3).
+- **Below the relay's threshold** (task-d100), a collector also proposes it fast, as today. A fast quorum on the leader's path decides it before its frame does, with per-command records and possible-fast recovery.
+- **At load,** collectors already relay to the leader, and the frame decides.
+- **Any voter still proposes and can lead.**
+
+**The alternative: the frame as the only path** (6.4). Recovery is the slot rule over one source, and the possible-fast rule goes (10.3), about 2 to 3 weeks less. It gives up what 6.2 lists: a collector far from the leader pays the leg to it. Both give the same floor at load.
+
+**Per command, unchanged:**
+- **Identity and admission facts.**
+- **Execution in the decided order, in groups as today.**
+- **A `ResponseV1` kept for the retry window,** and the frontend's answer.
+- **The retry window:** a client's sequences and `ack_through`, with deduplication at execution.
+- **Reads at their barrier.**
+
+### 10.5 The staged path
+
+Each step has its own PRs and pair.
+- **Every activation goes through task-d99,** with readers a release ahead of writers, so old and new records are both readable.
+- **A domain doesn't go back below a step it has activated.**
+
+| Step | Activation | Delivers, 7763 at 120 |
+| --- | --- | --- |
+| 1. Without a protocol change: rows (a) to (c), lever 2, API streams, the bytes path, and lazy voters if the owner takes them | Lever 2's vote message; lazy voters | To 1.01–1.06 with lazy voters, 1.17–1.22 without |
+| 2. One journal record a frame, and one record and one durability event a group for seal and settle, read beside the per-command records | None (local format) | About −0.07: the appender −0.01, and the seal and settle records −0.06 |
+| 3. Recovery and restart read frame records and reports | None | 0 |
+| 4. Followers take frames as the unit; the leader counts once a frame | `FrameDecision` | Up to −0.38 (follower), at about 10 commands a frame |
+| 5. The leader proposes by range, without per-command dependencies or records (27 + 13.5 + 16.8 µs a command) | The same | About −0.06, inferred |
+
+10.7 turns these steps into PRs, each with the measurement that bounds it before it is built and the checkpoint it has to reach.
+
+### 10.6 Fault runs and weeks
+
+**Fault runs:**
+- **`protocol_sim` rows** at three and five voters, with the oracle checking one order everywhere, over rows 1, 9, 21 and 23. Each of these is a row:
+  - a leader crash with a frame at 1 to n − 1 followers;
+  - repeated elections with different frames at one position;
+  - frames lost or reordered;
+  - a follower frames behind;
+  - conflicting fast and frame commands;
+  - activation over old records.
+- **A model test:** a decided frame is selected whole by every later Sync.
+- **The crash matrix's cuts at a frame record:** torn, and durable but not acknowledged.
+- **The runner's fault runs:** the leader killed or partitioned under load, a follower restarted mid-frame, and activation in a running domain.
+
+**Weeks:**
+- the design step, 1–2;
+- steps 2 to 5, 1, 3–4, 2–3 and 1–2;
+- the simulator, model and crash matrix, 2, alongside them;
+- the runner's runs, 1–2.
+
+**About 10 to 14 weeks with the fast path kept, 8 to 11 with it dropped.** Step 1, already in flight, isn't counted, and neither are lazy voters' 5 to 7 (6.6).
+
+### 10.7 The step plan
+
+**Where it stands (2026-11-14).**
+- **Steps 0 to 5:** the plan of record through steps 4 and 5's Sync rule, by the re-check on #283 ([6868671574](https://github.com/tuplesky/tuplesky/pull/283#issuecomment-6868671574)). #283 is merged.
+- **Owed before 5a, now written:** a frame a voter holds by name without its bytes (step 4, and 5a). It doesn't block 4a or 4b.
+- **Step 0:** B0 and B1 are measured (below), and B1 again on the carry `ab209310` before step 2 (below).
+- **Step 1:** 1a is #286. 1b is #288, parked: on today's carry it saves a few µs a command, inside a pair's noise, so it merges only with a later step that needs it, and none does (step 1, below).
+- **The thresholds (R12) are the owner's, confirmed as written (2026-11-14).** The go/no-go below says what each one decides.
+- The first review's 16 points ([6865705600](https://github.com/tuplesky/tuplesky/pull/283#issuecomment-6865705600)) are marked (R1) to (R16) in the steps they change.
+
+**The rules every step keeps.**
+- **Bounded before it's built.** Inferred savings have come in at a quarter to a third of their estimates. So no step is built on an inferred figure.
+  - Its saving is measured first on a scratch build, which gets no PR, as a pair against the carry.
+  - Where the bound is under what a pair can see, a profiled pair measures it: the named functions' share before and after, as for #282.
+- **Re-measured on the carry its step is built on (2026-11-14).** A bound read at step 0 is read again, as a pair, before its step is built. The step's checkpoint is half of that reading, not of step 0's. B2 − B1, which the go/no-go reads, is measured the same way.
+  - **The bound's re-read and the step's pair run on the same carry commit.** If the step's branch takes a newer carry before its pair is read, the bound is read again on that carry, unless only docs or tests came in. That covers a newer carry at the branch's cut and one merged in later (review of #289).
+  - **Why:** PRs merged between a bound and its step can take the same work first. B0 read −39 µs a command in the appenders and the materializers against `ba947188`.
+  - By `ab209310` the carry had merged #280 to #287. In one alternation of the three builds, the carry's base was already below B0 (−10.4 µs a command in the appenders, −18.8 in the materializers), and below step 0's base by more than B0 took off it.
+  - The work B0 removed was per-record work, and the merged PRs took most of it first, #284 above all: a record is checked against its stream instead of its digest again, and its encoded length is counted once.
+  - 1b, built in B0's shape, then saved about −5 µs a command by its profile (−2 in the appenders, −3 in the materializers), which its pair can't resolve. It has no measured gain to merge on ([6871540739](https://github.com/tuplesky/tuplesky/pull/185#issuecomment-6871540739)).
+- **What a pair can see.** The base runs alone span about ±3% at 120 callers. In the journal re-verify pair (#284, 10.8) that was 0.848 to 0.891 ms an operation, and 1,319 to 1,398 µs a command for the five voters. So a saving under about 0.03 ms an operation is read in the part it moves (the appender, a follower's loop, the leader's loop) and in the counts a turn, not in the total.
+- **Every reading is one pair (R13).** Two builds are compared by running them against each other, never as a difference of two pairs against a third. That difference is what left today's −0.38 an upper bound.
+  - Four runs of the base and three of the change, alternating.
+  - Each change run is read against the base runs on either side of it.
+- **The checkpoint (R14).** A step passes when, in the part named:
+  - the fall, as µs a command, is at least half its bound;
+  - and it is larger than the base runs' own spread of that same quantity, over at least the four base runs that gave the spread.
+  - A part read from a profile is its share of samples times its thread's CPU a command, both from the same runs. A share alone moves when anything else on the thread moves.
+  - **A drifting base.** When the pair's base runs spread wider than the reading, the profiled pair decides, by function, with at least three base runs: the part named, read as its thread's CPU a command, must still fall by at least half its bound and by more than its own base runs' spread, and the functions the step cuts must fall where its bound says they do. The base drifted in B1's re-read and again in 2b's pair (#290, accepted on its profiled pair).
+  - The pair runs at 120 and 30 callers, five voters on tmpfs, replay.
+  - A step that misses its checkpoint stops the plan: the next step isn't built until the lead has the reading.
+- **Every checkpoint reads latency (R16).** The owner's goal for batching is latency neutral at low load.
+  - Each pair also runs the same alternation at 5 callers and at one.
+  - It reports p50 and p99 of a get's and a put's service time at 1, 5 and 30 callers, and the commands a frame at each load, since the decision's saving follows that.
+  - A step whose p50 or p99 at 1 or 5 callers rises by more than the base runs' spread doesn't pass, whatever its CPU.
+- **A null step is read part by part (R15).** Steps 3 and 4 inactive should change nothing. A null pair's total inside ±3% lets through what it can't see, and three such steps could add 6% unseen. So a null step passes only when:
+  - the counts a turn are unchanged;
+  - and each part's CPU a command is inside its own base runs' spread: each loop, the appender, the materializer and tokio.
+  - **After steps 2 and 4, one pair runs the carry against the carry before step 1,** at 120 and 30 callers and, for latency, at 5 and 1.
+- **Shippable after every step.** A step does one of three things:
+  - it changes nothing on the wire or in a record;
+  - it writes only what the release before it already reads;
+  - or it is dark behind a replicated feature (task-d99).
+- **Feature gating.**
+  - A feature activates only once every voter's build knows it: task-d99 counts every configured voter's advertisement.
+  - **Prerequisites (R8),** in `requires` (`feature.rs`), as `BatchedRound` requires `AnswerOnRelease` today: `FrameLog` requires `BatchedRound`, and `FrameDecision` requires `FrameLog`. The order is `AnswerOnRelease`, `BatchedRound`, `FrameLog`, `FrameDecision`, each with its prepare marker as for the others.
+    - **`AnswerOnRelease`:** under it a collector marks every new submission and answers it on its leader's release alone. A collector counts `SlowAck` today (`collector.rs`), and 5b ends it for frame commands, so without this an unmarked command would wait for votes that no longer come.
+    - **`BatchedRound`:** step 3's frame is `ProposalFrame` with a position, and `ProposalFrame` is behind it.
+  - **Who has to know (R9).** Step 3's PR lists, by role, every decoder of each kind steps 3 to 5 add or change: the frame's position, predecessor and boundary bit; `FrameAccept`; `Committed { through }` by position; frames in reports and Syncs; the frame fetch. The activation waits for each role on that list.
+    - **Voters:** all of them, as task-d99 counts.
+    - **Collectors,** at voters and at frontends, read `SlowAck`. Under `AnswerOnRelease` they already answer on the release, so they need nothing new. A frontend isn't in task-d99's count.
+    - **A node whose build can't run an active feature refuses at open** (`an_activation_record_this_build_cannot_run_is_refused_at_open`, `tests/feature.rs`).
+    - **Pinned in step 3's PR, as a row:** whether a frontend or observer already running when `FrameDecision` activates stops on the record or carries on. If an observer reads `Committed` or a report, the count grows to observers.
+  - **A release (R10)** is a carry commit the lead names as one once testing's runner has run a domain on it.
+    - "Readers a release ahead of writers" means a writer's PR merges only after a release that holds its reader.
+    - The pairs: 1a before 1b; step 3 before 4a; step 4 before 5c.
+  - A build knows `FrameDecision` only from the PR that completes it (5c). Until then its paths run in the simulator and the tests only.
+  - A domain doesn't go back below a feature it has activated.
+- **Mixed versions are rows (R10).** Steps 3, 4 and 5 each add these, beside `tests/feature.rs`'s activation tests:
+  - a voter on the reader's build beside voters on the writer's, with the feature inactive: the domain runs as today, and nothing new is sent or written;
+  - the activation refused while that voter is there (`Missing`, as `activation_is_refused_without_every_voter_and_by_a_follower`);
+  - that voter upgraded, the activation, and the domain running with the feature active;
+  - that voter restarted on the reader's build after the activation: it refuses at open.
+- **Recovery.** Until step 5 activates, recovery decides from the per-command records it reads today. What a step adds is read beside them or checked against them, never used in their place.
+- **The order.** The largest measured saving first, among the steps whose prerequisites are in.
+  - The decision's saving is the largest: up to −0.26 locally [−0.38], an upper bound. But it needs steps 2 to 4 under it, and steps 3 and 4 save nothing.
+  - Steps 1 and 2 need nothing. Step 0's bounds decide which of them goes first. The default is 1, then 2. Step 2 goes before the wire and journal steps either way, since its saving lands weeks before the decision's.
+  - Steps 3, 4 and 5 are in the order safety needs, and only past the go/no-go below. Steps 6 and 7 follow step 5, ordered by their bounds.
+
+**The go/no-go for steps 3 to 5 (R12), written before B2 is measured and confirmed by the owner as written (2026-11-14).** B2 − B1 is the decision's saving: servers' CPU, ms an operation, locally at 120 callers, read as one pair of B2 against B1. The local figures decide.
+- **Go at −0.10 or more** [about −0.15 on the 7763, 40% of the −0.38 the owner agreed on]. With steps 1 and 2, the frame alone then puts servers' CPU at about 0.85 to 0.94 of TLS etcd on the 7763 (10.1).
+- **Between −0.05 and −0.10, back to the owner.** The frame alone is then at 0.85 to 1.02 of etcd on the 7763: at it, and under it only at the band's better end. The owner chooses one of three:
+  - steps 3 to 5 anyway;
+  - lazy voters (6.6) first;
+  - neither.
+- **Under −0.05, stop.** The frame alone is then at or over etcd on the 7763, and the decision doesn't pay for 10 to 14 weeks and a protocol change. The reading goes to the owner beside lazy voters' −0.16 [7763].
+- **Latency, at any of the three.** If B2's p50 or p99 at 1 or 5 callers is above B1's by more than the base runs' spread, that goes to the owner with the CPU reading.
+- **The 9V45 isn't decided by this.** Getting under etcd there takes both the frame and lazy voters (10.1), whatever B2 shows.
+- **The 7763 figures in brackets** translate the local ones. They are re-read after testing's re-baseline of the load generator (review's note).
+
+**The steps.** The bounds now are local at 120 callers [7763]. Every one of them is measured at step 0, and again on the carry just before its step is built (the rule above).
+
+| Step | Activation | Bound | Checkpoint |
+| --- | --- | --- | --- |
+| 0. The bounds | — | — | — |
+| 1. One application record and one durability event a group, split at the store's bounds | None: local format | B0 | Half of B0, in the appender and the materializer |
+| 2. A follower takes a frame in one pass: its adoptions in a few batches, split at the store's bounds | None | B1: −9.4 µs a command in a follower's loop on `ab209310` (step 0); −15 to −21 a follower inferred (6.7) | Half of B1, in a follower's loop |
+| 3. The frame log's kinds, read only, and the frame fetch | None: nothing writes or sends them | 0 | A null step |
+| 4. Frame records written in order beside the per-command ones; recovery selects both ways and checks they agree | `FrameLog`, dark | B1W against B1, one pair: the cost added | Inactive, a null step. Active, no more than its bound, and no disagreement |
+| 5. The frame decides above a boundary position | `FrameDecision` | B2 − B1, one pair; −0.26 [−0.38] an upper bound | The go/no-go above, then half of B2 − B1; then the runner's pair |
+| 6. Learning by frame position, forgetting by range | With `FrameDecision` | −4 to −6 µs a follower, inferred (6.7) | Half of its profiled share |
+| 7. The leader's own per-command records go | `FrameDecision` | About −0.06 [7763], inferred: B3 | Half of B3, in the leader's loop |
+
+**Step 0: the bounds.** No PR. Each bound is a scratch build measured as one pair: against the carry, or against another bound where the step's saving is their difference.
+- **B0: one application record a group.** Consecutive application outcomes are sealed as one journal record with one durability event, nothing else changed. It bounds step 1.
+- **B1: a follower takes a frame in one pass.** It writes every per-command record as today, with one batch, one barrier and one storage event a frame (cut at 64 adoptions), and its votes in one hand-off. It bounds step 2.
+- **B1W: B1 with step 4's writes, on B1's branch.** Decisions stay per command, as at step 4.
+  - The leader and every follower also journal each frame record, by step 4's rule: once its entries are adopted and its predecessor's record written, in a batch of its own.
+  - Every payload is in the frame.
+  - It is measured as one pair against B1, and bounds step 4's cost: what `FrameLog` adds to step 2, which step 4 is built on. Measured against B2, it would read the cost of putting per-command records back beside frame decisions instead.
+  - Recovery's second selection runs only at a Sync, so a pair without an election reads the records and the payloads. Its cost at a Sync is read in step 4's takeover rows.
+- **B2: the frame decides, on B1's branch,** so that B2 − B1 is the decision alone.
+  - It is build 6's follower that takes the frame as a unit, with execution and materialization put back: build 6's followers neither execute nor decode, so its floor holds the lazy voters' saving, which the owner deferred.
+  - It is measured as one pair against B1 (R13).
+- **B3: the leader proposes by range,** without per-command dependency rows or records. It bounds step 7.
+- **What every pair reports:**
+  - CPU a command by part;
+  - the counts a turn: records, batches, barriers and storage events a command;
+  - commands a frame;
+  - p50 and p99 at 1, 5 and 30 callers.
+- **The 30-caller floor again.** The pair of build 1 against build 6 at 30 callers ran, but its run directories were deleted for disk before its CPU was read. Only operations a second are left: build 6 at +42% over build 1, each run read against the base runs on either side of it (+28 to +50% by run; 2,766 a second against 3,871 on the means). B2's pair at 30 replaces it.
+- **Where it stands (2026-11-14):** B0 and B1 are measured (#185, [6867636657](https://github.com/tuplesky/tuplesky/pull/185#issuecomment-6867636657)). B1W, B2 and B3 come before steps 4, 5 and 7.
+  - **The builds:** one scratch binary with both modes, local, off the carry at `ba947188`.
+  - **The pairs:** at 120, 30, 5 and 1 callers, the base and each bound alternating, four base runs and three of each bound. Each bound's run is read against the base runs on either side of it.
+
+| Callers | 120 | 30 | 5 | 1 |
+| --- | ---: | ---: | ---: | ---: |
+| B0: application records a command, every voter | 0.07 | 0.15 | 0.63 | 1.00 |
+| B1: protocol records a command, a follower | 0.11 | 0.27 | 0.81 | 1.00 |
+| Base: five voters' CPU, µs a command | 1,374 | 1,752 | 3,015 | 4,642 |
+| B0 | **−82 (−5.9%)** | +3 | +73 (+2.4%) | −2 |
+| B1 | **−77 (−5.6%)** | −32 (−1.8%) | +2 | −8 |
+
+  - **At 120 both show,** every run below the base's. Operations a second rise 3.9% under B0 and 4.4% under B1. p50 falls by 1.0 to 1.4 ms and p99 by 4 to 8 ms.
+    - **B0 moves the application half:** the appenders, −3.1 µs a command at the leader and −3.5 at a follower, and the materializers, −3.3 and −4.7.
+    - **B1 moves the protocol half and the settle:** a follower's loop, −10.8 (−8.2%), and its appender, −2.2. Its profiled pair puts the loop's in `on_relayed_proposal` (21.3 → 9.7) and the settle (13.9 → 9.3).
+  - **At 30** neither is told from the base's spread.
+  - **At 5,** B0's +73 isn't reproduced by its profiled pair (−52 and −308, against base runs 212 apart), so it is read as neither cost nor saving. That pair names two rows that rose beyond their spread: a follower's hand-off to the appender (`lower_once`, `append`, the channel send, the wake) and the leader's forgetting.
+  - **At 1,** neither batches and CPU doesn't move, but p99 rises: gets +0.20 ms under B0 and +0.14 under B1, against a base spread of 0.05. B0's p50 rises 0.02 to 0.03 ms.
+- **What it sets for steps 1 and 2:**
+  - step 1's checkpoint at 120 is about −20 µs a command over five voters, half of B0's −39 in the appenders and the materializers;
+  - step 2's is about −5.4 µs a command in a follower's loop, half of B1's;
+  - at 30 neither has anything to halve;
+  - at 1 and 5 callers, each step is held to no rise beyond the base's spread, in CPU or in latency (R16). Step 1's pair at 5 reads the two rows above by name.
+- Steps 1 and 2 need nothing more from step 0.
+- **B1 again, on the carry `ab209310` (2026-11-14), before step 2 is built** (#185, [6872326710](https://github.com/tuplesky/tuplesky/pull/185#issuecomment-6872326710)). Step 0's scratch for B1 was ported onto that carry (local, never pushed), one binary as above, with the same alternation at each load.
+
+| Callers | 120 | 30 | 5 | 1 |
+| --- | ---: | ---: | ---: | ---: |
+| B1's protocol records a command, a follower (the base's: 1.00 at every load) | 0.11 | 0.25 | 0.81 | 1.00 |
+| Base: five voters' CPU, µs a command | 890 | 1,070 | 1,785 | 3,257 |
+| B1 − base: five voters' CPU | **−65 (−7.3%)** | +65 | +152 | −106 |
+| The base runs' spread | 170 | 263 | 113 | 288 |
+| B1 − base: a follower's loop | **−9.4 (−10.5%)** | +5.3 | +13.9 | −8.7 |
+
+  - **At 120 B1 keeps what it bounds.**
+    - A follower's loop reads −9.4 µs a command, against −10.8 at step 0. All three runs are below the base runs on either side of them: −11.0, −8.4 and −8.7.
+    - Operations a second rise 4.5%.
+    - The base runs drift today (797 to 968 µs a command), so the four followers' −37.5 is inside the base runs' spread of 63.
+    - **So a profiled pair reads it** (b1 y1 b2 y2 b3 at 120). A follower's loop goes from 90.1 to 79.2 µs a command (−10.9). The functions B1 changes move beyond their own base spreads:
+      - `on_relayed_proposal`: 14.6 → 6.9 (−7.7, spread 1.3);
+      - `settle`: 10.8 → 5.3 (−5.5, spread 3.1);
+      - `on_storage`: 6.7 → 2.7 (−3.9);
+      - `lower_once`: 11.1 → 7.0 (−4.1).
+    - Step 0's profiled pair read `on_relayed_proposal` 21.3 → 9.7 and `settle` 13.9 → 9.3.
+  - **Its appender share is gone,** as B0's was: +0.1 µs a command over four followers, against −9.0 at step 0. That was per-record work, which the carry took first (the rule above).
+  - **At 30 and at 5 it isn't told from the base.** At 30 the runs read +267, +98 and −172. At 5, two runs read +26 and +5. The third read +425, with every part on every node up about 25% and operations a second down 6%, which is the host and not B1.
+  - **Latency (R16).** At 1 and 5 callers, no p50 or p99 rises beyond the base runs' spread.
+    - At 5: get p50 +0.02 ms against a spread of 0.10, and p99 +0.01 against 0.75.
+    - At 1: p50 −0.02 to −0.04 ms, and p99 −0.05 to −0.01.
+    - Step 0's rise in a get's p99 at one caller (+0.14 ms) isn't reproduced.
+  - **What it sets for step 2:** about −4.7 µs a command in a follower's loop at 120 callers, half of today's −9.4, with no rise beyond the base's spread at 1 and 5.
+
+**Step 1: one application record and one durability event a group.** This is the application half of 10.5's step 2 without the frame record, and the fifth item of 10.8.
+- **Which half is which.** 10.5 named the journal part "seal and settle", and its two halves fall in different steps.
+  - **Step 1** is each command's application outcome record at every voter: sealed, appended and made durable once a command. B0 bounds it.
+  - **Step 2** is the protocol half and the settle: a follower's adoption record a command, and the storage event its machine settles for each. One batch a frame (2b) takes both to a few a frame, and B1 bounds them with the rest of step 2.
+  - So the floors round's −0.04 [−0.06] for the seal and settle records splits between B0 and B1. Step 1's bound is B0 alone.
+- **PRs:**
+  - 1a: the journal's reader and replay take a group's application record, and nothing writes one;
+  - 1b: the store seals each run of the queue's application outcomes as one record when it lowers them into a journal group, cut at the bounds below. The record's one durability event reports every outcome's barrier. This is B0's shape. The applier's cuts, an earlier shape, stopped ([6870490427](https://github.com/tuplesky/tuplesky/pull/185#issuecomment-6870490427)).
+  - **1b is parked (#288, 2026-11-14).** By the rule above, it doesn't merge without a measured gain, and on `ab209310` it saves a few µs a command (the reason under the rules). It merges with a later step's PR only if that step needs its writer or its run sealing, and none does: none of steps 2 to 7 changes how an application outcome is journaled, and none writes 1b's format (step 3's format line below).
+  - 1a doesn't need the split: it is #286. 1b is built with it.
+- **How 1b bounds a group's record (Codex).** An execution group holds up to 32 commands (`GROUP_COMMANDS`), and the applier's queue is bounded at 16 MiB, not at the record's 4 MiB and 4,096 updates. Each outcome is under the record's bounds today, but 32 together needn't be. Since #280 a record the store refuses stops the voter.
+  - **The rule:** a group's outcomes go in records cut in execution order. A record closes before an outcome that would take it past 1,024 updates, or past half the journal group's bytes in rows: 128 KiB at today's 256 KiB group (`run_bytes`).
+  - **Records stay under the format's bounds for a group record,** 1,024 updates and 1 MiB (`GROUP_RECORD_UPDATES`, `GROUP_RECORD_BYTES`), which are step 2's. The run's byte cap follows the journal group instead, so a run fits an ordinary group even with half of it taken by other domains' entries, and it never passes 1 MiB.
+  - **Why not 1 MiB (review of #288).** A run over the group's bytes could only take the large-record path, which takes a domain only when it is first in a lowering. Behind a domain with something queued at every lowering, its run could wait indefinitely. That matters once a voter serves several domains.
+  - **An outcome over either bound goes alone,** in a record of its own, as every outcome does today. Only such a lone outcome over the journal group takes the large-record path.
+  - **One durability event a record.** The group's answers wait on its last record, since the journal keeps records in order.
+  - At the bench's sizes a group is one record. Groups of large outcomes take a few.
+  - B0 cut a run the same way, at half the journal group's bytes and at 1,024 updates. At the bench's sizes neither binds, so it bounds step 1 as written.
+- **What recovery reads:** replay reads a group record as the application outcome of each command it names. Those are the same facts, in one record. The decision's records are untouched.
+- **Mixed versions:** the format is local, since only this voter reads its journal. 1b raises the journal record's format, the one it writes (`current`), from 1 to 2. 1a's release reads 2, since its window reads ahead to it. An older release can't read it, so a voter goes back at most to 1a's release. Such a release refuses a format-2 record as unsupported, or as malformed if its body is a group: the decoder decodes the body before it checks the format (`JournalRecordV1::decode`; Codex on #289).
+  - **Only the record's format moves.** The local checkpoint's stays as it is: raising it too would leave 1a unable to open a 1b image, and so close the way back.
+  - 1b raises `current` in the registry; it doesn't seal through `seal_as`, which stays for fixtures.
+- **Pinned by:**
+  - a group of 32 outcomes near the run's bytes each, cut into records under the bounds, past what the queue holds;
+  - a lone outcome over the run's bytes, in a record of its own: one in an ordinary journal group, and one over 1 MiB on the large-record path;
+  - a group past 1,024 updates;
+  - a run of large outcomes behind a domain with something queued at every lowering, durable within a few appends (review of #288);
+  - two consecutive outcomes at two ballots, sealed as two records, each under its own ballot;
+  - a compile-time check of the bounds against the record's, like `journaled.rs`'s for the commit rows, and of the run's bytes at the default group against them;
+  - the crash matrix's cuts at the group record: torn, durable but not acknowledged, and between two records of one group;
+    - the last adds no state: per-command records already allow a crash between two commands of one group. Its expected result is that state's: the durable records' commands count as applied, and the rest are executed again;
+  - a journal holding both forms replays to the same state as either alone;
+  - a fixture: 1a's release opens 1b's journal;
+  - `frontier_after`'s group arm: once a group's record is durable, the next application extends the group's last position. It has no test before 1b, since 1a appends no group (review of #286).
+- **Bound:** B0. **Checkpoint:** half of B0, in the appender and the materializer, as µs a command. Application records a command at every voter fall from one to one a group.
+
+**Step 2: a follower takes a frame in one pass.** This is lever 2's steps 3 and 4 (6.7), in the form steps 4 and 5 extend.
+- **PRs,** 2b first, then 2a (lead, on #185):
+  - 2a: the frame's checks run once. Each adoptable entry is adopted in one pass, without `held` or a `VoteSet`, and the path logs' suffixes are recomputed once a key at the frame's end.
+  - 2b: a frame's adoptions go in as few batches as the store's bounds allow, each with one barrier and one `pending` entry naming its adoptions. Votes stay one a command, in one hand-off a turn (lever 8).
+    - **As built.** Adoption goes entry by entry in today's order, so the path logs and `held` are as today. Only where an adoption's rows go changes.
+    - **A batch of its own written mid-frame closes the frame's open batch first.** A decided command's acknowledgement is one. So batches go out in their barriers' order. Every other barrier is allocated with no frame batch open, which an assertion checks in every build: a miss stops the voter rather than reorder its journal.
+    - **The payload rows in flight are found through an index** by command, not a scan of the batches in flight.
+    - **Counts:** a follower's metrics line gives `frame_batches` and `frame_adoptions` beside `frames_taken`.
+- **How a frame's batch is split (R1).** Since #280 a batch the store refuses stops the voter. Full frames are what a new leader's backlog sends (#242), so one batch a frame would stop every follower at once, under a fault.
+  - **The sizes.** A frame is cut at 1 MiB (`publish_frame`), and holds a larger request alone, up to 2 MiB. An entry is about 135 bytes without its payload and about 300 with a small one, so a full frame holds 3,500 to 7,700 entries and up to about 15,000 updates. A record is refused above 4,096 updates or 4 MiB, of which the store keeps 512 bytes for the record's header (`RECORD_HEADER_ALLOWANCE`).
+  - **The rule.** The adoptions go in batches cut in frame order. A batch closes before an adoption that would take it past 1,024 updates or 1 MiB of rows. Those are task-d106's bounds for a follower's commit rows (`COMMIT_ROWS_BATCH_UPDATES`, `COMMIT_ROWS_BATCH_BYTES`), well under the record's.
+  - **An adoption over either bound goes alone.** It is at most a 2 MiB payload row and a few small rows, under the record's bounds.
+  - **Each batch's votes go when it is durable.** The journal keeps batches in order, so the frame's last batch durable means all are.
+  - At 120 callers a frame (about 10 commands) is one batch. A full 1 MiB frame of the smallest commands is about fifteen.
+- **What recovery reads:** the same records as today. A crash keeps a prefix of a frame's batches. The adoptions in the batches it loses come back with the leader's re-send (task-d07), as a lost batch does today.
+- **Mixed versions:** nothing changes on the wire or in a record.
+- **Settings that count journal records, not commands (review of #288).** Three settings count a voter's journal records:
+  - checkpoint publication (`checkpoint_after_records`): 4,096 strict, and 65,536 with 30 s under replay;
+  - `projection_durable_records` (4,096): what a crash makes the next start replay;
+  - `projection_commit_records` (32): the projection commit hold (task-d86).
+  - **What step 2 changes.** Under B1 a follower writes 1.11 records a command at 120 callers, not 2.00. So each of those intervals spans 1.8 times as many commands at a follower. With 1b as well it would be 0.18 records a command, and about 11 times as many.
+  - **Step 2's PR restates them in commands or bytes,** or keeps them in records and says in its body what each interval becomes. Its pair reports projection commits and checkpoint publications a command.
+    - **An effective value is per role.** A follower writes 2.00 records a command today at every load, and the leader's count needn't match it, so one figure in commands can keep one role's interval and move the other's. The PR body says what each interval becomes at the leader and at a follower.
+    - **2b keeps them in records.** Its PR body gives what each interval becomes at the leader and at a follower, and its pair's projection commits and checkpoint publications a command.
+    - **A restatement that changes an effective value is read with and without it,** so step 2's own saving is told apart from the setting's. That is one alternation of three builds: the carry, step 2, and step 2 with the restatement, each run read against its neighbours (R13), as B0 was read against two bases. Two pairs against the carry would be the difference R13 rules out (review of #289).
+  - **The hold's unit may be part of B1's materializer reading.** Under B1 a follower's projection commits fall from about 0.047 to 0.038 a command (−19%). In B1's profiled pair, its redb `commit` falls from 10.0 to 8.1 µs a command (base spread 1.3), and its materializer thread from 38.6 to 34.7.
+    - Under 1b the commits fell as much at every voter, with redb's `commit` flat (8.91 → 8.89 µs at a follower) and no saving in the materializers.
+    - So step 2's checkpoint stays in a follower's loop. A saving in the materializers that a larger `projection_commit_records` alone would buy isn't step 2's.
+- **Pinned by:**
+  - 6.7's property test: a frame taken as a unit leaves every path log as taking its entries one at a time does;
+  - **a 1 MiB frame of the smallest commands:** taken in batches each under the record's bounds, the voter still running, and every adoption voted;
+  - **a lone 2 MiB request:** its adoption in a batch alone, under the bounds;
+  - a compile-time check that the split's bounds, with one largest adoption and the header allowance, are under the record's. `journaled.rs` checks the commit rows the same way: `COMMIT_ROWS_BATCH_BYTES + MAX_ENVELOPE_PAYLOAD + RECORD_HEADER_ALLOWANCE <= MAX_RECORD_BYTES`;
+  - the counts a turn: batches, barriers and storage events a frame (2b), and passes over the ACCEPT set (#269, read as its own pair once 2b is in);
+  - **a crash between two of a frame's batches, and a batch that fails.** In the follower's storage model, a crash keeps the first batch's adoptions. The second's come back with the leader's re-send, adopted as the first time. A failed batch's adoptions are refused, and their votes dropped, as one adoption's are today. The store's crash matrix cuts the projection's commits, which step 2 doesn't change;
+  - `protocol_sim`'s rows, unchanged.
+- **Bound:** B1. The inferred −15 to −21 µs a follower is about −0.04 to −0.05 ms an operation locally. A quarter to a third of that is −0.01 to −0.02, under what a pair sees, so the profiled pair may be the whole reading. Step 2 is built even then, since step 5 stands on it.
+- **Checkpoint:** half of B1 in a follower's loop, as µs a command, and one batch, one barrier and one storage event a frame at 120 callers. By B1 on `ab209310` that is about −4.7 µs a command (step 0 read −5.4). B1's re-read and step 2's pair run on the same carry commit, by the rule above. Then the drift pair against the carry before step 1.
+
+**Step 3: the frame log's kinds, read only.**
+- **One PR.** Each piece is a new kind that every voter decodes before any voter sends or writes one:
+  - a frame with its position in the domain's frame log, its predecessor's digest and its boundary bit (step 5), sent only while `FrameLog` is active, as `ProposalFrame` is behind `BatchedRound`;
+  - the journal's frame record;
+    - **Its format is 3,** read ahead by step 3 and written by 4a, while 1b is parked. 2 keeps its meaning, a record that may hold a group's application outcomes, which 1a's release reads and nothing writes. If 1b merges first, the frame record still takes 3.
+    - **A release before step 3 can't tell a frame record from a damaged one (Codex on #289).** `JournalRecordV1::decode` decodes the whole record, typed body included, before it checks the format. So 1a's release refuses a frame record as malformed, whatever its format number.
+      - That isn't a gap in the rollback rule: once 4a writes, a voter goes back at most to step 3's release, which reads frame records.
+      - **Step 3's PR moves the format check ahead of the body.** The format is the record's first field, so the decoder reads it, refuses one past `newest` as unsupported, and only then decodes the body. A kind added after step 3 then reads, to the release before it, as an unsupported format and not as a damaged record.
+      - Pinned by a fixture: a record at the next format with a body kind this build doesn't know is refused as `UnsupportedFormat`.
+    - **A frame record below format 3 is refused,** as `check_body` refuses a group below format 2 (`GroupBeforeItsFormat`). `seal` runs `check_body`, so a frame record can't be written at 2, where 1a's release would read it as damaged. A format number then always names the body kinds a record may hold (review of #289).
+      - Pinned beside the fixture above: a frame record at format 2 is refused.
+  - frame entries in a recovery report and in a Sync;
+  - **the frame fetch (R7):** `FrameRequest { position, ballot, digest }`, answered with the frame record's bytes, which the asker checks against the digest. It is to frames what `PayloadRequest` is to payloads today.
+- **What recovery reads:** what it reads today.
+- **Mixed versions:** this is the release every voter has to run before `FrameLog` can activate. Its PR also lists the decoders by role (R9).
+- **Pinned by:**
+  - each new kind's round trip;
+  - fixtures: a report and a Sync with frames decode, and one without them still does;
+  - while `FrameLog` is inactive, nothing sends or writes the new kinds;
+  - the row of a frontend or observer running when a feature it can't run activates (R9).
+- **Bound:** 0. **Checkpoint:** a null step.
+
+**Step 4: frame records written, and recovery checked against them.** Dark, behind `FrameLog`.
+- **PRs:**
+  - 4a: with `FrameLog` active, the leader gives each frame the next position in the domain's frame log, durable across ballots, and its predecessor's digest, and journals it. A follower journals the frame record: its bytes as received, its ballot and its position.
+    - **When the frame log starts (Codex).** task-d99's activation doesn't reach the order: each voter's own durable record turns a feature on, and the leader learns who holds it from `FeatureHeld` (`feature.rs`). So the leader starts giving frames positions once its own record holds `FrameLog` and every configured voter is in its holders set (`Features::holders`).
+    - A frame carries its position, so a follower journals the frame record by what the frame says, not by when its own record became durable.
+  - 4b: a recovery report adds each accepted frame above the voter's commit frontier as (position, ballot, digest), the leader's own included, and marks each it holds by name only. A Sync names frames the same way. Installing a Sync acts on a voter's frames at its marker (below). Recovery selects both ways, by 4.9's rules over the per-command records and by 10.3's source rule over the frames, and checks they agree.
+- **Every frame carries every payload from 4a (R4).** Today a frame carries a payload only for a relayed command.
+  - Under `FrameLog`, a fast command's payload also crosses the wire in the frame, a second time, below the relay's threshold.
+  - So the records step 4 writes are the ones step 5 reads, and step 4's check speaks for step 5.
+  - B1W counts the second crossing, at 1 and 5 callers, where it falls.
+- **When a follower writes a frame record (R2).** It writes frame f's record once it has adopted every entry of f and written f − 1's.
+  - So a voter's frame records are in position order with no gap, and its report's frames are a prefix, as 10.3 needs.
+  - It still adopts entries out of order, as today. Frame f + 1's entries are adopted while f is missing, and f + 1's record waits for f's.
+- **Where the record goes (R1).** It goes in a batch of its own, after the frame's adoption batches.
+  - A frame record is at most a 2 MiB request and its framing, under the record's 4 MiB. It never shares a batch with the per-command rows, whose payload rows hold the same bytes again.
+  - The journal keeps a prefix, so a durable frame record means every adoption before it is durable.
+- **What "agree" means (R2).** Take the commands in frames at `FrameLog` ballots, less those both selections take by the possible-fast rule. Let C be what the per-command rule selects, and F what the frame rule selects, in frame order. They agree when:
+  1. every command of F is in C, and over F's commands, C's dependencies order them as F does. A record's dependencies also reach commands below the selection, committed or executed, which F doesn't hold;
+  2. every command in C and not in F is in a frame above F's last, which some reporter in the majority adopted without reporting the frame: there is a gap below it at that reporter, or the frame's record isn't durable there yet.
+  - Clause 2 is what step 4 allows and step 5 ends. At step 4 a follower votes for an entry as it adopts it, so the leader can decide a command by its votes before any majority holds its frame whole. At step 5 a follower acknowledges only a prefix of whole frames.
+  - With no reporter in that state, C and F are equal, and the oracle asserts that equality then, not only clauses 1 and 2.
+- **What installing a Sync does to a voter's frames (re-review).**
+  - **Today, per command (design 4.9).** At its marker, installing a Sync holds each acceptance the Sync carries at the synchronized ballot, demotes each acceptance it doesn't carry, and releases each command it doesn't name. A voter's next report follows from those.
+  - **For frames, from 4b, the same at the marker.** At the marker's durability a voter holds each frame the Sync names in its own copy, after task-d80's merge, at the synchronized ballot. It reports no other frame above its commit frontier as accepted. Both are durable with the marker, and replay rebuilds them from it.
+    - **Its own copy, after task-d80's merge:** the merge carries a frame the voter holds committed, as 10.3 carries a committed command. Without it, a committed frame above the voter's frontier that the Sync leaves out would read as dropped by "no other frame".
+  - So a report gives each frame the ballot the voter holds it at: the Sync's, from the marker on, which is 4.9's own label for a carried acceptance (case 2). The reported ballot comes from the latest marker, not from the record. The frame record keeps the ballot it was received at, for the bytes.
+  - The replacement at arrival (R3) then only brings bytes.
+  - **Why it's needed.** 10.3's source rule takes the source as the reporters' synchronized ballot. Without this rule, "the frames accepted at the source ballot" reads two ways, and each loses something:
+    - **By the frame's own ballot, a decided frame is lost.** f is decided at b0. b's Sync names it, and a majority installs the Sync. b's leader stops before it re-proposes f. At b2 the source is b. f's records still say b0, below the source, and no reporter holds f committed, so rule 2 drops it.
+    - **By the reporter's ballot, #276's case comes back.** Y holds b0's frames p to p + 3, undecided, and is outside b's majority. b's Sync selects through p − 1. Y installs that Sync late and keeps the four frames until b's arrive. c is decided fast right after p − 1, and b's leader stops. At b2 a majority with Y in it reports at b: Y's four frames count as accepted at the source, and c goes after them.
+  - **Why at step 4, not only at step 5.** The per-command side demotes and releases at the marker, so the two selections compare fairly only if the frame side does the same there. In the second case, without the rule, step 4's check fails on clause 1: Y's frames are in F and their commands are not in C.
+- **A frame held by name, without its bytes (re-check; owed before 5a).**
+  - **Holding the name is needed.** In the first case above, the reporters at b2 that installed b's Sync may be ones that never received f. If only voters holding f's bytes held it at b, f could be lost again. So a voter holds a frame its Sync names with no record of it, and the replacement at arrival (R3) brings the bytes.
+  - **Without more, a takeover can stall.**
+    - At b0, g at q reaches only M1. b's Sync names g, from M1's report, and Y and M2 install it holding g by name.
+    - M1 and b's leader stop.
+    - At b2 the majority is M2, Y and a third voter. g is selected at source b and no reporter has its bytes, so 5a's new leader fetches g and waits for M1.
+    - That is a stall, not a loss: g was never decided, since a frame's acceptance needs its record. It is 4.9's item 4 again, which fixed the per-command form two ways: a report says a payload is present only where its row is, and a selection leaves out a pre-acceptance no reporter holds a payload row for, unless a selected entry was decided after it.
+  - **The rule:**
+    - **a report** marks each frame it holds by name only;
+    - **a selection** cuts the chain at the first selected frame no reporter holds bytes for.
+  - **Why the cut is safe.** No frame from there on was decided as a frame: a decided frame's record is at a majority, which the new majority meets, and a frame's acceptance is a prefix.
+  - **Fast commands** in the frames cut off are kept by the possible-fast rule, as 10.3 does for a frame no reporter holds.
+  - **At step 4** nothing decides on it, but the comparison can't read the commands of a frame nobody holds. Such a frame counts apart, as undetermined: neither a pass nor a disagreement. The simulator's oracle can always read it, so there it stays a full comparison.
+- **What recovery reads:** it decides from the per-command records, as today. The frame selection is computed and compared.
+  - A new leader that lacks a selected frame fetches it (step 3) for the comparison only. At step 4 the frame selection decides nothing, so the takeover doesn't wait on the fetch. Only the comparison does.
+- **A disagreement fails the run (R11).** That holds in the simulator's oracle, the crash matrix and the runner's fault runs, whose verdict reads the count (testing's). It is never only logged.
+- **Mixed versions:** `FrameLog` activates only once every voter runs step 3's release, and a domain doesn't go back below it. The rows above apply.
+  - In production it activates with `FrameDecision`, not alone. Alone it pays the frame's bytes a second time at the appender and on the wire, and saves nothing.
+  - Alone it runs in the simulator, the crash matrix and the runner's fault runs.
+- **Pinned by:**
+  - `protocol_sim` rows at three and five voters over rows 1, 9, 21 and 23, each of 10.6's cases a row, with the oracle that the two selections agree at every Sync;
+  - review's case on #276 (L0, L, M1, M2 and Y, 10.3) as a pinned seed: the case where a slot rule would select b0's frames;
+  - **a Sync's installation (re-review), two seeds:** the decided frame whose Sync was installed and whose leader stopped before re-proposing it, selected at b2; and Y installing b's Sync late with b0's four frames, with c ordered before them at b2. Each fails step 4's check without the rule. Each checks the reported ballot is the latest marker's, not the record's;
+  - **a frame held by name only (re-check), a third seed:** g at q reaches only M1, b's Sync names it, and b2's majority holds it by name. Each report marks g, and step 4 counts it as undetermined;
+  - the crash matrix's cut at a Sync's marker:
+    - torn: after replay the voter reports as it did before the Sync;
+    - durable but not acknowledged: it holds and reports exactly the frames the marker names, at the synchronized ballot;
+  - the model test that a decided frame is selected whole by every later Sync;
+  - the crash matrix's cuts at a frame record: torn, durable but not acknowledged, and between the frame's last adoption batch and its record;
+  - **replacing an unselected frame (R3).** A voter holds b0's frame at p durably, then takes b2's frame at p, and restarts both between the two records and after both:
+    - after both, replay ends with b2's frame at p;
+    - between them, it ends with b0's, and b2's leader re-sends;
+    - each asserts the ballot the voter reports for p as well as the bytes.
+  - the lone 2 MiB request under `FrameLog`: its adoption batch and its frame record each under the record's bounds (R1).
+- **Bound:** B1W against B1, one pair: the cost `FrameLog` adds.
+- **Checkpoint:** inactive, a null step. Active, no more than that bound, and no disagreement in the rows above. Then the drift pair against the carry before step 1.
+
+**Step 5: the frame decides.** `FrameDecision`, which requires `FrameLog`. Each PR lands dark, and the build knows the feature only from 5c. It starts only past the go/no-go above.
+- **The boundary is a frame position the leader chooses (R6; Codex).** task-d99's activation doesn't reach the order: each voter's own durable record turns a feature on, at its own time, and the leader learns who holds it from `FeatureHeld`. So no frame holds the activation, and a frame's rule can't depend on when a voter's record became durable.
+  - **Each frame says which it is:** a bit under its digest. The leader sets it on every frame it cuts once its own record holds `FrameDecision` and every configured voter is in its holders set. The first flagged frame in the chain is at position a. Every frame from a on is decided as a frame, and every frame below a per command.
+  - **So the chain records the boundary.** Every voter that holds a frame holds its rule, durably. A follower needn't know when anyone's activation became durable, or hold frame a itself, to know a frame's rule.
+  - **A follower takes a flagged frame whole and in order,** and an unflagged one entry by entry, as at step 4.
+  - **Flagged frames are a suffix of the chain:** a frame whose predecessor is flagged is flagged. Recovery and the oracle check it, and a frame that breaks it is refused.
+  - **A new leader** whose selected chain ends in a flagged frame flags every frame it cuts. One whose chain ends unflagged flags again by the rule above.
+  - **A selection is a prefix of frames,** so a takeover that doesn't select a selects nothing above it, and the boundary moves to a later frame.
+  - **A voter whose own record doesn't hold `FrameDecision` doesn't vote on a flagged frame,** as for a frame it can't take, until the re-send activates it. The leader flags only with every configured voter holding the feature, so this is a voter added after the activation.
+- **PRs:**
+  - 5a: recovery and Sync select frame commands by frames, under the source rule with frames as its entries (10.3).
+    - A new leader fetches any selected frame it lacks (step 3), then re-proposes the selected frames whole, at its ballot and in order, before new ones.
+    - Fast commands keep their records and the possible-fast rule.
+    - Installing a Sync holds and releases frames at its marker, by step 4's rule. The two seeds and the marker's crash cut are rows here too, now deciding.
+    - **A frame held by name only** (step 4): the selection cuts the chain at the first selected frame no reporter holds bytes for. So every frame a new leader fetches is held by some reporter in its majority, and the third seed's takeover doesn't wait on M1.
+  - **Every voter reports frame commands by frames, the deposed leader included (R5).** The leader journals each frame from 4a, so from 5a its report names its frame commands by frames, as a follower's does.
+    - Its per-command records stay until step 7, for its own use, and are no longer reported for frame commands.
+    - A selection never reads both kinds of report for one command.
+  - 5b: a follower's frame record is its only record for a frame command: no dependency row, adoption record, payload row or vote state. It acknowledges a prefix of frames with `FrameAccept { replica, ballot, through }` once their records are durable.
+  - 5c: the leader counts a majority a frame, `Committed { through }` counts frame positions, and the build declares the feature.
+- **What recovery reads:**
+  - for a frame command, frames, from every reporter;
+  - for a fast command, its records, as today;
+  - for a command in a frame below a, its per-command records. Reports carry them beside frames until the voter's commit frontier reaches a.
+- **Mixed versions:** it activates through task-d99, once every voter runs 5c's release, and never goes back. The boundary then follows by the leader's rule above. The rows above apply.
+- **Pinned by:**
+  - step 4's rows with `FrameDecision` active, the oracle one order everywhere;
+  - **the boundary (R6):**
+    - the activation in a running domain over old records, with frame a cut only once every voter holds it;
+    - the leader ahead of a follower across it, the follower at a − 3 when the leader cuts a + 2;
+    - a takeover that doesn't select frame a;
+    - a new leader whose selected chain ends flagged, which keeps flagging;
+    - a voter added after the activation, which votes on no flagged frame until the re-send activates it;
+  - conflicting fast and frame commands;
+  - a follower frames behind, waiting for the re-send;
+  - **a voter that rejoins across the boundary (R7),** its execution frontier below a and its donor's above:
+    - the donor's pages (task-d25) for frame commands come from its frame records for the payloads, and from the order for the dependencies (a page entry's `decided` is `None`, as for a command the donor keeps no row for);
+    - a reinstall from a checkpoint above a replays frame records;
+  - **a new leader that lacks a selected frame (R7)** fetches it before re-proposing it;
+  - the replacement cut of step 4, with no per-command records beside the frame records (R3);
+  - the crash matrix at a frame record with no per-command records beside it;
+  - the runner's fault runs (testing's): the leader killed or partitioned under load, a follower restarted mid-frame, and the activation in a running domain.
+- **Bound:** B2 − B1, one pair. Today's −0.26 [−0.38] is an upper bound: a residual of separate pairs.
+- **Checkpoint:** half of B2 − B1 as five voters' CPU a command, locally at 120 and 30 callers, with the latency rule. Then testing's pair on the 7763 against the carry before it.
+
+**Step 6: learning by frame position, forgetting by range.** This is lever 2's step 2 (6.7) with frames.
+- **One PR:**
+  - `learn` and the closure walk run once an execution group;
+  - forgetting goes by range, up to the durable execution frontier;
+  - the commit frontier is read by position, where #269 reads it by sequence number.
+- **What recovery reads:** as at step 5. No wire change.
+- **Pinned by:**
+  - the counts: passes over the ACCEPT set a frame, and forgets a group;
+  - the simulator's oracle that a command is forgotten only once its execution is durable (task-d90).
+- **Bound:** a profiled pair's share of `learn`, `forget_history` and `Learner::established`, as µs a command, before it's built. **Checkpoint:** half of that.
+
+**Step 7: the leader's own per-command records go.** For frame commands, the leader's per-command dependency rows and records go, as the followers' did at step 5 (27 + 13.5 + 16.8 µs a command, 10.5).
+- **One PR.** The leader's report already comes from its frame log from 5a (R5), so this changes what it writes, not what it reports.
+- **What recovery reads:** frames, at every voter.
+- **Mixed versions:** under `FrameDecision`.
+- **Pinned by:** step 5's rows, with the leader crashing at each cut.
+- **Bound:** B3. **Checkpoint:** half of B3, in the leader's loop.
+
+**Weeks.** The total is about 11 to 15, against 10.6's 10 to 14 with the design step done. The batch split, the frame fetch, the boundary bit and the mixed-version rows add about a week across steps 2 to 4, and step 7 loses its second PR.
+
+| Step | Weeks |
+| --- | ---: |
+| 0 | under 1 |
+| 1 | 1 |
+| 2 | 1 to 2 |
+| 3 | 1 to 2 |
+| 4 | 2 to 3 |
+| 5 | 3 to 4 |
+| 6 | 1 |
+| 7 | 1 |
+
+- The runner's runs take 1 to 2, alongside step 5.
+- The simulator, model and crash-matrix work is inside the steps, since each step pins its own.
+
+### 10.8 The named-cost queue against the frame work
+
+The lead's question, item by item (#185, 21:05): does the frame work subsume it? The items that survive and are cheap are done. The rest are dropped here, each with why.
+
+| Item | Subsumed? | Why | What happens |
+| --- | --- | --- | --- |
+| The intake index (#282) | No | The leader keeps its per-command rows until step 7, and fast commands keep theirs. The executed part answers the retry window at every voter. Step 5 shrinks a follower's intake part, not the leader's. | Kept: #282, merged. Its own measurement: −34 to −63% a command. The end-to-end pair doesn't see it. Its profiled pair does: the intake code in the materializer falls by 5.6 µs a command at the leader (−33%) and 4.0 at a follower (−26%), each more than the base runs' spread. |
+| The journal verified once, with each record's encoded length stored (`claude/journal-verify-once`) | No | Every record is still sealed or decoded, the frame record included, and a frame's record is the largest | Kept: #284, merged. The part it moves is the appender, about −6 µs a command at each voter: −36% at the leader and −38% at a follower at 120 callers, −30% and −29% at 30. Five voters' total at 120, −67 µs a command, is inside what a pair sees (base runs of 1,319 to 1,398), so it isn't a reading of it. |
+| The small items: schedstat through one held descriptor, `is_leading` read once, encode buffers sized once (`claude/small-costs`) | No | Loop housekeeping and encoding, the same with frames | Kept. Built; its suites, microbench and profiled pair run after step 0's pairs. |
+| The storage step with #269: lever 2's step 4, one batch and one barrier a frame | Yes | It is step 2b, built once in the form steps 4 and 5 extend: the frame's batch is where the frame record goes | Dropped as an item of its own. #269 itself, lever 2's step 1, is kept: learning once a frame doesn't wait for step 6. |
+| The journal's format: one record a group | No | An application outcome belongs to an execution group, at every voter, the leader included, with frames or without | Kept: it is step 1. The settle is step 2's (10.7). |
+
+**Lever 2's vote message by range (6.7, step 5): dropped.** Step 5b's `FrameAccept` is the frame's acknowledgement, all or none, with no exceptions to list. Between steps 2 and 5, votes stay one a command, in one hand-off a turn.

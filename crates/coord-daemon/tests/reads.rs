@@ -653,15 +653,8 @@ fn held_lone_leader() -> (Voter<Journaled>, coord_storage::ManualHandle<ModelEng
     (voter, handle)
 }
 
-/// A read held at the barrier until the projection shows what its index
-/// covers asks for the projection's commit, so a commit held for a larger
-/// one goes out at the next hand-off (task-d86). The put it reads is
-/// executed and journaled, its group's commit held, and nothing else
-/// asks: without the read's ask the hand-off lends nothing for the hour
-/// the hold names.
-#[test]
-fn a_read_held_at_the_barrier_asks_for_the_held_commit() {
-    let (mut voter, handle) = held_lone_leader();
+/// Submit the put of `k1` to `voter` as a collector would.
+fn submit_put(voter: &mut Voter<Journaled>) {
     let mut collector = Collector::new(CollectorConfig {
         quorum: quorum(),
         max_pending: 16,
@@ -682,6 +675,42 @@ fn a_read_held_at_the_barrier_asks_for_the_held_commit() {
         )
         .expect("driven")
         .expect("admitted");
+}
+
+/// The one answer `out` carries, as the `Response` bytes of a served
+/// read whose range holds exactly `k1`.
+fn served_k1(out: &Outbound) -> Vec<u8> {
+    let [(_, bytes)] = &out.reads[..] else {
+        panic!("one answer: {:?}", out.reads.len());
+    };
+    let response = response_bytes(bytes);
+    let decoded: coord_state::Response = postcard::from_bytes(&response).expect("a response");
+    let coord_state::Outcome::Range { items, .. } = &decoded.outcome else {
+        panic!("{decoded:?}");
+    };
+    let keys: Vec<&[u8]> = items.iter().map(|i| i.key.as_slice()).collect();
+    assert_eq!(keys, vec![b"k1".as_slice()], "the put is read");
+    response
+}
+
+/// A read held at the barrier is served over the groups in flight
+/// (#185, lead 17:43): once its index has executed and is in the
+/// journal, it is answered at once, with the put's group still held from
+/// the projection, and it asks for no commit. The same read once the
+/// projection has committed the put is answered with the same bytes.
+/// Before, the read waited for the projection and asked for its commit,
+/// which cut the held commit short (task-d86).
+#[test]
+fn a_read_held_at_the_barrier_is_served_over_the_held_commit_without_asking_for_it() {
+    use coord_storage::Persistence as _;
+    let (mut voter, handle) = held_lone_leader();
+    let base = voter
+        .node()
+        .applier()
+        .store()
+        .materialized_through()
+        .unwrap();
+    submit_put(&mut voter);
     for _ in 0..8 {
         if voter.node().executed == 1 {
             break;
@@ -695,22 +724,116 @@ fn a_read_held_at_the_barrier_asks_for_the_held_commit() {
 
     let t0 = MonotonicMillis::ZERO;
     let out = voter.on_read(&read(2), Origin::Connection(9), t0);
-    assert!(out.reads.is_empty(), "the read waits for the projection");
+    let served = served_k1(&out);
     voter.settle().expect("settled");
+    assert_eq!(handle.waiting(), 0, "the read asked for no commit");
     assert_eq!(
-        handle.waiting(),
-        1,
-        "the read's ask lends the held commit at the next hand-off"
+        voter
+            .node()
+            .applier()
+            .store()
+            .materialized_through()
+            .unwrap(),
+        base,
+        "the projection holds none of the put"
     );
+
+    // The projection commits the put; the same read is answered over it
+    // alone with the same bytes.
+    voter
+        .node_mut()
+        .applier_mut()
+        .store_mut()
+        .request_projection_commit();
+    voter.settle().expect("settled");
     assert!(handle.run());
     voter.settle().expect("settled");
-    let out = voter.pump_reads(t0);
-    let [(_, bytes)] = &out.reads[..] else {
-        panic!("one answer: {:?}", out.reads.len());
-    };
-    let answer = decode_read_answer(&frame(bytes)).expect("a read answer");
     assert!(
-        matches!(answer.outcome, ReadOutcomeV1::Served { .. }),
-        "{answer:?}"
+        voter
+            .node()
+            .applier()
+            .store()
+            .materialized_through()
+            .unwrap()
+            > base
+    );
+    assert_eq!(voter.node().applier().in_flight(), 0);
+    let out = voter.on_read(&read(3), Origin::Connection(9), t0);
+    assert_eq!(
+        served_k1(&out),
+        served,
+        "over the groups in flight, the bytes the projection gives"
+    );
+}
+
+/// What a read is served over is what a release has disclosed: a group
+/// whose journal append is still out is not laid over the projection
+/// (#185, lead 17:43). The read waits for the append, and is served once
+/// it is back, with the projection still holding none of the put and no
+/// commit asked for.
+#[test]
+fn a_read_whose_group_is_still_being_journaled_waits_for_the_append_and_not_the_commit() {
+    use coord_storage::Persistence as _;
+    let (mut voter, handle) = held_lone_leader();
+    let (appender, appends) = coord_storage::ManualAppender::new();
+    voter
+        .node_mut()
+        .applier_mut()
+        .store_mut()
+        .store_mut()
+        .pipeline_journal(Box::new(appender))
+        .expect("nothing out yet");
+    let base = voter
+        .node()
+        .applier()
+        .store()
+        .materialized_through()
+        .unwrap();
+    submit_put(&mut voter);
+    // The put's record is journaled and taken back, so the leader learns
+    // it; then it executes, and its group is handed off with its own
+    // append out.
+    for _ in 0..8 {
+        if voter.node().can_execute() {
+            break;
+        }
+        voter.flush().expect("flushed");
+        while appends.run() {
+            voter.settle().expect("settled");
+        }
+    }
+    assert!(voter.node().can_execute(), "the put is learned");
+    assert_eq!(voter.node().executed, 0);
+    voter.flush().expect("staged and journaled");
+    voter.finish().expect("handed off");
+    assert_eq!(voter.node().executed, 1);
+    assert!(
+        voter.node().applier().store().appending(),
+        "the group's append is still out"
+    );
+
+    let t0 = MonotonicMillis::ZERO;
+    let out = voter.on_read(&read(2), Origin::Connection(9), t0);
+    assert!(
+        out.reads.is_empty(),
+        "a read is not served over a group the journal does not hold yet"
+    );
+
+    while appends.run() {
+        voter.settle().expect("settled");
+    }
+    let out = voter.pump_reads(t0);
+    served_k1(&out);
+    voter.settle().expect("settled");
+    assert_eq!(handle.waiting(), 0, "the read asked for no commit");
+    assert_eq!(
+        voter
+            .node()
+            .applier()
+            .store()
+            .materialized_through()
+            .unwrap(),
+        base,
+        "the projection holds none of the put"
     );
 }

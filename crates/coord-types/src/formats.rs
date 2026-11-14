@@ -48,6 +48,10 @@ pub struct Window {
     pub oldest: u32,
     /// Version written.
     pub current: u32,
+    /// Newest version decoded: the one written, unless this build reads
+    /// ahead. A build that reads ahead decodes what its successor will
+    /// write, so a voter can go back to it from that successor.
+    pub newest: u32,
 }
 
 /// One independently versioned format.
@@ -116,31 +120,40 @@ impl Format {
 
     /// What this build reads and writes.
     ///
-    /// Every window is currently one version wide, because nothing has
-    /// had an incompatible change yet. Widening one is how a release
-    /// keeps reading its predecessor's bytes, and it is a reviewed
-    /// change to this table rather than a decoder that tries and sees.
+    /// Most windows are one version wide, because nothing has had an
+    /// incompatible change yet. Widening one is how a release keeps
+    /// reading its predecessor's bytes, or reads ahead what its successor
+    /// will write, and it is a reviewed change to this table rather than
+    /// a decoder that tries and sees.
     pub const fn window(self) -> Window {
         match self {
             Format::Command => Window {
                 oldest: 1,
                 current: 1,
+                newest: 1,
             },
             Format::Wire => Window {
                 oldest: 1,
                 current: 1,
+                newest: 1,
             },
+            // Reads ahead to 2, the first format whose records may hold a
+            // group's application outcomes, which its successor writes
+            // (the batching-rule doc's 10.7, step 1a).
             Format::JournalRecord => Window {
                 oldest: 1,
                 current: 1,
+                newest: 2,
             },
             Format::JournalMetadata => Window {
                 oldest: 1,
                 current: 1,
+                newest: 1,
             },
             Format::StoreSchema => Window {
                 oldest: 1,
                 current: 1,
+                newest: 1,
             },
             // 2, for two layouts that landed together. Task-d113, step 2:
             // executed rows and executed payloads by execution position,
@@ -151,6 +164,7 @@ impl Format {
             Format::SharedCheckpoint => Window {
                 oldest: 2,
                 current: 2,
+                newest: 2,
             },
             // 2 (task-d113, step 2): executed rows and executed payloads
             // by execution position, pending payloads and decided records
@@ -159,14 +173,17 @@ impl Format {
             Format::LocalCheckpoint => Window {
                 oldest: 2,
                 current: 2,
+                newest: 2,
             },
             Format::Backup => Window {
                 oldest: 1,
                 current: 1,
+                newest: 1,
             },
             Format::KineAdapter => Window {
                 oldest: 1,
                 current: 1,
+                newest: 1,
             },
         }
     }
@@ -179,12 +196,12 @@ impl Format {
     /// Whether this build can read `version`.
     ///
     /// Below the window is a format that has been retired; above it is
-    /// one written by a newer binary. Both are refusals: guessing at
-    /// either is how a store gets written by something that did not
-    /// understand it.
+    /// one written by a newer binary than this one reads. Both are
+    /// refusals: guessing at either is how a store gets written by
+    /// something that did not understand it.
     pub const fn supports(self, version: u32) -> bool {
         let window = self.window();
-        version >= window.oldest && version <= window.current
+        version >= window.oldest && version <= window.newest
     }
 
     /// Look up by frozen identifier.
@@ -212,14 +229,14 @@ pub enum FormatError {
         /// Oldest decoded.
         oldest: u32,
     },
-    /// Newer than anything this build writes: something else wrote it.
+    /// Newer than anything this build reads: something else wrote it.
     Newer {
         /// The format.
         format: Format,
         /// Version found.
         found: u32,
-        /// Newest understood.
-        current: u32,
+        /// Newest decoded.
+        newest: u32,
     },
 }
 
@@ -238,10 +255,10 @@ impl core::fmt::Display for FormatError {
             FormatError::Newer {
                 format,
                 found,
-                current,
+                newest,
             } => write!(
                 f,
-                "{} format {found} was written by a newer build than this one ({current})",
+                "{} format {found} was written by a newer build than this one reads ({newest})",
                 format.name()
             ),
         }
@@ -260,11 +277,11 @@ pub const fn admit(format: Format, version: u32) -> Result<(), FormatError> {
             oldest: window.oldest,
         });
     }
-    if version > window.current {
+    if version > window.newest {
         return Err(FormatError::Newer {
             format,
             found: version,
-            current: window.current,
+            newest: window.newest,
         });
     }
     Ok(())

@@ -599,9 +599,9 @@ pub struct Cost {
 pub struct IntakeIndexSize {
     /// Entries held: one a live dependency or proposal row.
     pub entries: u64,
-    /// The bytes they take, at the most review measured an entry to take
-    /// on #237 ([`coord_storage::intake::ENTRY_BYTES`]): an estimate, since
-    /// the ordered set's nodes are not counted one by one.
+    /// The bytes they take, at what a row is estimated to take in the
+    /// map by command ([`coord_storage::intake::ENTRY_BYTES`]): an
+    /// estimate, since the map's buckets are not counted one by one.
     pub bytes: u64,
     /// The executed part's entries: one an executed row kept (step 2).
     #[serde(default)]
@@ -846,6 +846,13 @@ pub struct Relay {
     /// match the vote, or no room.
     #[serde(default)]
     pub not_taken: u64,
+    /// As a follower, since the node started: adoption batches its
+    /// proposal frames wrote (step 2b of the batching rule's 10.7).
+    #[serde(default)]
+    pub frame_batches: u64,
+    /// Adoptions in them.
+    #[serde(default)]
+    pub frame_adoptions: u64,
 }
 
 /// The durable command records a voter holds, and its history sweeps

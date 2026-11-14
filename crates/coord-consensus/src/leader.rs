@@ -29,7 +29,7 @@ use coord_core::machine::DeterministicMachine;
 use coord_core::outbox::{BarrierAllocator, Outbox, PendingSend};
 use coord_types::identity::Digest32;
 use coord_types::ids::{Ballot, ExecutionPosition, LocalJournalSeq, ReplicaId, ReplicaIncarnation};
-use coord_types::wire_v1::{MessageV1, decode_stream};
+use coord_types::wire_v1::{MessageV1, RequestV1, decode_stream};
 use coord_types::{CommandId, RetryKey};
 use serde::{Deserialize, Serialize};
 
@@ -592,6 +592,13 @@ pub struct Leader {
     /// voter beside `mark_next_admitted`, so a leader proposes the
     /// command with its payload and a voter that isn't leading says so.
     mark_next_relayed: bool,
+    /// Whether this leader's configuration lets it lead at all: a voter,
+    /// in its quorum's epoch and voter set, and the leader its quorum's
+    /// ballot names (#185, lead 17:43). The configuration is fixed for
+    /// a leader's life (a reconfiguration makes a new one), so this is
+    /// read once at construction, not compared on every
+    /// [`Leader::is_leading`], which compared the voter sets each time.
+    configured_to_lead: bool,
     fenced: Option<FenceReason>,
     /// Entries of the selection this leader was handed that no order
     /// keeps: a dependency cycle, which is an invariant violation
@@ -752,6 +759,18 @@ fn ready_tails(decision: &SyncDecision, last: &[CommandId], ready: &[CommandId])
     tails
 }
 
+/// Whether `config` lets its leader lead at all, whatever its ballots
+/// say: what [`Leader::is_leading`] reads of the configuration.
+fn configured_to_lead(config: &LeaderConfig) -> bool {
+    let identity = &config.identity;
+    let quorum = &config.quorum;
+    identity.role == ReplicaRole::Voter
+        && identity.epoch == quorum.epoch()
+        && identity.voters == *quorum.voters()
+        && quorum.is_voter(&identity.replica)
+        && quorum.ballot().leader == identity.replica
+}
+
 impl Leader {
     /// A leader from its configuration, the recovered promise row and the
     /// application's durable execution position. The learner resumes from
@@ -786,6 +805,7 @@ impl Leader {
         );
         let table = CommandTable::with_capacity(config.capacity);
         Leader {
+            configured_to_lead: configured_to_lead(&config),
             replay: crate::replay::EvidenceStore::new(config.capacity),
             selection: None,
             // Every voter of the genesis ballot is in it from the start.
@@ -910,14 +930,16 @@ impl Leader {
         decision: &SyncDecision,
     ) -> (Self, Vec<Effect>) {
         let identity = state.identity.clone();
+        let config = LeaderConfig {
+            identity: state.identity,
+            genesis: quorum.ballot(),
+            quorum,
+            frontend: state.frontend,
+            capacity: state.capacity,
+        };
         let mut leader = Leader {
-            config: LeaderConfig {
-                identity: state.identity,
-                genesis: quorum.ballot(),
-                quorum,
-                frontend: state.frontend,
-                capacity: state.capacity,
-            },
+            configured_to_lead: configured_to_lead(&config),
+            config,
             boot: state.boot,
             alloc: state.alloc,
             outbox: state.outbox,
@@ -2753,17 +2775,12 @@ impl Leader {
     /// recovered from a durable seal row is fenced from its first step
     /// and a leader whose seal row failed is not (task-55).
     pub fn is_leading(&self) -> bool {
-        let identity = &self.config.identity;
-        let quorum = &self.config.quorum;
+        debug_assert_eq!(self.configured_to_lead, configured_to_lead(&self.config));
         self.fenced.is_none()
             && self.recovery_cycle.is_none()
             && !self.ballots.is_fenced()
-            && identity.role == ReplicaRole::Voter
-            && identity.epoch == quorum.epoch()
-            && identity.voters == *quorum.voters()
-            && quorum.is_voter(&identity.replica)
-            && self.ballots.promised() == quorum.ballot()
-            && quorum.ballot().leader == identity.replica
+            && self.configured_to_lead
+            && self.ballots.promised() == self.config.quorum.ballot()
             && self.ballots.in_flight().is_none()
     }
 
@@ -3003,21 +3020,30 @@ impl Leader {
             }
             return Vec::new();
         }
-        let request = match decode_stream(frame).as_deref() {
-            Ok([MessageV1::Request(r)]) => r.clone(),
+        // The request is taken out of the decoded stream, not copied: its
+        // logical bytes become the payload record's below.
+        let request = match decode_stream(frame).map(|mut m| (m.len(), m.pop())) {
+            Ok((1, Some(MessageV1::Request(r)))) => r,
             _ => {
                 self.rejections.push(Rejection::MalformedRequest);
                 return Vec::new();
             }
         };
-        let Ok(logical) = request.logical() else {
+        // `logical` checks that the bytes are the canonical encoding of the
+        // request they decode to, so the identity is derived from them as
+        // they are: what `CommandId::derive` would compute from an
+        // encoding made again.
+        if request.logical().is_err() {
             self.rejections.push(Rejection::MalformedRequest);
             return Vec::new();
-        };
-        let Ok(command) = CommandId::derive(&request.retry_key, &logical) else {
-            self.rejections.push(Rejection::MalformedRequest);
-            return Vec::new();
-        };
+        }
+        let command = CommandId::from_canonical(&request.retry_key, request.logical.as_slice());
+        let RequestV1 {
+            retry_key,
+            logical,
+            ack_through,
+            ..
+        } = request;
         self.admitted = Some(command);
         if self.mark_next_admitted {
             self.answer_on_release.insert(command);
@@ -3026,10 +3052,10 @@ impl Leader {
             self.relayed.insert(command);
         }
         let payload = PayloadRecordV1 {
-            retry_key: request.retry_key,
-            logical: request.logical.as_slice().to_vec(),
+            retry_key,
+            logical: logical.into_inner(),
             admission,
-            ack_through: request.ack_through,
+            ack_through,
         };
         // Identity: one retry key binds one payload, first presentation
         // wins. The same identity again is a duplicate only if the facts
@@ -3037,13 +3063,11 @@ impl Leader {
         // -- are the ones this leader proposed it under; and a duplicate
         // is answered rather than ignored, because the submitter
         // presenting it may never have received this leader's reply.
-        match self.bindings.get(&request.retry_key) {
+        match self.bindings.get(&retry_key) {
             Some(bound) if *bound != command => {
                 let bound = *bound;
-                self.rejections.push(Rejection::RequestIdentityConflict {
-                    retry_key: request.retry_key,
-                    bound,
-                });
+                self.rejections
+                    .push(Rejection::RequestIdentityConflict { retry_key, bound });
                 // Said only once the binding is durable (task-d22).
                 if self.served_payloads.contains(&bound) {
                     return self.refuse(command, SubmissionRefusal::OtherCommand { bound });
@@ -3058,7 +3082,7 @@ impl Leader {
                 return match accepted {
                     Some(accepted) if accepted == payload.admission_digest() => {
                         self.rejections.push(Rejection::Duplicate(command));
-                        self.repair_evidence(command, request.retry_key)
+                        self.repair_evidence(command, retry_key)
                     }
                     Some(accepted) => {
                         self.rejections
@@ -3099,12 +3123,12 @@ impl Leader {
             // exact duplicate whose binding was not kept, and
             // `PayloadConflict` is not a duplicate at all.
             Err(InitError::AlreadyInitialized) => {
-                self.bindings.insert(request.retry_key, command);
+                self.bindings.insert(retry_key, command);
                 if !self.payloads.contains_key(&command) {
-                    self.ledger.bound_bare(command, request.retry_key);
+                    self.ledger.bound_bare(command, retry_key);
                 }
                 self.rejections.push(Rejection::Duplicate(command));
-                return self.repair_evidence(command, request.retry_key);
+                return self.repair_evidence(command, retry_key);
             }
             Err(InitError::PayloadConflict) => {
                 self.rejections.push(Rejection::PayloadConflict(command));
@@ -3116,8 +3140,11 @@ impl Leader {
                 };
             }
         };
-        self.bindings.insert(request.retry_key, command);
-        self.payloads.insert(command, payload.clone());
+        self.bindings.insert(retry_key, command);
+        // The row is encoded before the record moves into the map, which
+        // keeps the only copy.
+        let payload_row = payload_update(&command, &payload).expect("bounded");
+        self.payloads.insert(command, payload);
         let ballot = self.config.quorum.ballot();
         let epoch = self.config.identity.epoch;
         let seqnum = self.seqnum;
@@ -3146,7 +3173,7 @@ impl Leader {
             .clone();
         let barrier = self.alloc.as_mut().expect("booted").allocate();
         let updates: Vec<StoreUpdate> = alloc::vec![
-            payload_update(&command, &payload).expect("bounded"),
+            payload_row,
             dependency_update(epoch, &command, &record).expect("bounded"),
             proposal_update(
                 epoch,

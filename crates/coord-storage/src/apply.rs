@@ -33,7 +33,8 @@ use coord_core::event::{StorageError, StorageEvent};
 use coord_state::KvEvent;
 use coord_store_api::engine::{CollectionId, OrderedRead, RowPage, ScanRequest, SnapshotSource};
 
-use crate::cut::{CutOverlay, RecoveryCut};
+use crate::authorizations::{AuthorizationCache, AuthorizationCacheStats};
+use crate::cut::{CutOverlay, LayeredOverlay, RecoveryCut};
 use crate::lowering::ExecutionFrontier;
 use crate::materialize::{
     ApplyOutcome, Pending, Submitted, apply_plan_sharing, apply_refused_plan_sharing, prepare,
@@ -42,7 +43,7 @@ use crate::persistence::Persistence;
 use crate::retry::{self, Admission, RetryBinding};
 use crate::view::{GatedView, ViewError};
 use crate::views::{
-    ViewBudget, ViewBuildError, build_authorized_view, build_internal_view, load_authorization,
+    ViewBudget, ViewBuildError, build_internal_view, build_view_under, load_authorization,
 };
 use crate::watch::{PublishError, WatchHub};
 
@@ -85,6 +86,24 @@ pub fn retained_is_authorized<V: coord_store_api::engine::OrderedRead>(
     Ok(authorize_retained(&auth, &namespace, request, &stored.outcome).is_ok())
 }
 
+/// What `binding`'s acknowledgement retires and how it is admitted, read
+/// from `view` row by row: [`retry::retirement`], then [`retry::admit`]
+/// with that retirement. What a command's authorization context answers
+/// ([`retry::retire_and_admit`]) when there is no context to answer from.
+fn retire_and_admit_by_reads<V: coord_store_api::engine::OrderedRead>(
+    view: &V,
+    binding: &RetryBinding,
+    ack_through: u64,
+    authorize: impl FnOnce(&crate::codecs::RetryRecordV1) -> Result<bool, EngineError>,
+) -> Result<(Option<retry::Retirement>, Admission), EngineError> {
+    let retires = retry::retirement(view, &binding.retry_key, ack_through)?;
+    let binding = RetryBinding {
+        retires,
+        ..binding.clone()
+    };
+    Ok((retires, retry::admit(view, &binding, authorize)?))
+}
+
 /// Why a command could not be applied.
 #[derive(Debug)]
 pub enum ApplyError {
@@ -116,6 +135,13 @@ pub enum ApplyError {
     /// in it were reported applied (task-d47). Nothing of the group was
     /// released; the replica restarts from its journal.
     GroupLost,
+    /// The applier was used after it reported [`ApplyError::GroupLost`].
+    /// The lost group's commands took positions and revisions that no
+    /// batch of this replica's will hold, so nothing more is planned,
+    /// lowered or settled here: a command planned now would take them
+    /// again, with results no other voter computed (#185, review
+    /// 6861674000).
+    AfterGroupLost,
     /// Within a group, the store has no room for the command's batch
     /// beside what is already queued (task-d47). Nothing was submitted or
     /// changed: the caller lowers the group and the queue, and applies the
@@ -178,9 +204,19 @@ pub struct Applier<P: Persistence> {
     /// Groups handed to a pipelined store and not yet known to have
     /// materialized (task-d52), oldest first.
     inflight: VecDeque<InFlight>,
+    /// The authorization contexts commands executed under, kept until a
+    /// landing writes a row they read ([`crate::authorizations`]). In a
+    /// cell because a command reads it while its planning view borrows
+    /// the applier.
+    authorizations: std::cell::RefCell<AuthorizationCache>,
     /// The position the projection was last seen committed through, by
     /// [`Applier::settle`] or a drain (task-d63).
     committed: Option<coord_types::ids::ExecutionPosition>,
+    /// Whether a group of this applier's was lost: met by the applier
+    /// ([`ApplyError::GroupLost`]), or by a node's lowering and noted
+    /// ([`Applier::note_journaled`]). Every use after it is refused
+    /// ([`ApplyError::AfterGroupLost`]).
+    lost: bool,
 }
 
 /// A group handed off to a pipelined store's materializer (task-d52).
@@ -205,13 +241,13 @@ struct InFlight {
 /// Commands applied as one group: planned one after another, each over
 /// what the ones before it wrote, and lowered together (task-d47).
 struct Group<V> {
-    /// Every row the group's batches write, in order, a later write of a
-    /// key winning: what a command planned after them reads through. On
-    /// a pipelined store it starts from the rows of the groups still in
-    /// flight (task-d52).
-    overlay: Arc<CutOverlay>,
-    /// The rows the group's own batches write, without those of the
-    /// groups in flight before it (task-d52).
+    /// On a pipelined store, the rows of the groups still in flight when
+    /// it began, each group's own, oldest first (task-d52). A command
+    /// planned in the group reads through them and then `own`, as layers:
+    /// none is copied into another (#185, lead 17:43, the commit cadence).
+    below: Vec<Arc<CutOverlay>>,
+    /// Every row the group's own batches write, in order, a later write of
+    /// a key winning (task-d52).
     own: Arc<CutOverlay>,
     /// Barriers of the group's batches.
     barriers: BTreeSet<BarrierId>,
@@ -230,8 +266,8 @@ struct Group<V> {
     ///
     /// A later snapshot would read the same. A plan reads only what
     /// applications write. While the group is open, those are its own
-    /// batches and the groups in flight when it began, and `overlay`
-    /// holds both. The groups in flight may commit meanwhile; a snapshot
+    /// batches and the groups in flight when it began, and `below` and
+    /// `own` hold both. The groups in flight may commit meanwhile; a snapshot
     /// that holds them reads the same, as at [`Applier::begin_group`].
     /// Nothing else applies a command until the group is lowered or
     /// handed off, and that drops the snapshot.
@@ -241,7 +277,7 @@ struct Group<V> {
 impl<V> Default for Group<V> {
     fn default() -> Self {
         Group {
-            overlay: Arc::default(),
+            below: Vec::new(),
             own: Arc::default(),
             barriers: BTreeSet::new(),
             unjournaled: BTreeSet::new(),
@@ -270,7 +306,12 @@ type Snapshot<P> = <<P as Persistence>::Reader as SnapshotSource>::View;
 /// What a command is planned against: the projection's snapshot, with a
 /// group's own unmaterialized writes over it.
 type PlanningView<'a, P> =
-    GatedView<RecoveryCut<PlanningSnapshot<'a, Snapshot<P>>, Arc<CutOverlay>>>;
+    GatedView<RecoveryCut<PlanningSnapshot<'a, Snapshot<P>>, LayeredOverlay>>;
+
+/// What a read held at the barrier is planned against
+/// ([`Applier::read_view`]): the projection's snapshot, with the rows of
+/// the journaled groups in flight above it laid over it.
+pub type ReadView<P> = GatedView<RecoveryCut<Snapshot<P>, LayeredOverlay>>;
 
 /// The snapshot under a command's plan: its own outside a group, or the
 /// one its group pinned (task-d115).
@@ -344,7 +385,42 @@ impl<P: Persistence> Applier<P> {
             group: None,
             inflight: VecDeque::new(),
             committed: None,
+            authorizations: std::cell::RefCell::default(),
+            lost: false,
         })
+    }
+
+    /// [`ApplyError::GroupLost`], remembered: from here on the applier
+    /// refuses to be used ([`Applier::lost`]).
+    fn group_lost(&mut self) -> ApplyError {
+        self.mark_lost();
+        ApplyError::GroupLost
+    }
+
+    /// Remember a lost group, met here or noted from a node's lowering.
+    /// Every use after it is refused, and the authorization contexts are
+    /// emptied: what the store took back may hold rows one was read over,
+    /// and the cache does not rest on the refusal (#279's review, debt 2).
+    fn mark_lost(&mut self) {
+        self.lost = true;
+        self.authorizations.get_mut().clear();
+    }
+
+    /// Refuse a use after a group was lost.
+    const fn usable(&self) -> Result<(), ApplyError> {
+        if self.lost {
+            Err(ApplyError::AfterGroupLost)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Whether a group of this applier's was lost. Its commands were
+    /// reported applied and are not in the journal, so the applier plans,
+    /// lowers and settles nothing more; the replica restarts from its
+    /// journal.
+    pub const fn lost(&self) -> bool {
+        self.lost
     }
 
     /// Keep the storage facts about other batches for
@@ -379,7 +455,7 @@ impl<P: Persistence> Applier<P> {
     /// Within a group, a batch of the group found definitely not journaled
     /// ends it: the commands it holds were already reported applied.
     fn reconcile(&mut self) -> Result<(), ApplyError> {
-        let settled = self.store.reconcile()?;
+        let settled = self.settle_store()?;
         self.note_all(&settled.events);
         let group_lost = self
             .group
@@ -389,9 +465,19 @@ impl<P: Persistence> Applier<P> {
             self.foreign.extend(settled.events);
         }
         if group_lost {
-            return Err(ApplyError::GroupLost);
+            return Err(self.group_lost());
         }
         Ok(())
+    }
+
+    /// Reconcile the store, emptying the authorization contexts first:
+    /// what the store settles can take back writes a context was read
+    /// over, so none is kept past an outcome that was unknown (#279's
+    /// review, debt 2). Every reconcile the applier makes goes through
+    /// here.
+    fn settle_store(&mut self) -> Result<crate::persistence::Lowered, ApplyError> {
+        self.authorizations.get_mut().clear();
+        Ok(self.store.reconcile()?)
     }
 
     /// Apply the commands that follow as one group (task-d47), when the
@@ -408,20 +494,20 @@ impl<P: Persistence> Applier<P> {
     /// Returns whether commands are now being grouped.
     pub fn begin_group(&mut self) -> bool {
         if self.group.is_none() && self.store.chains_applications() {
-            let mut group = Group::default();
             // The projection may not hold the groups still in flight yet,
             // so a command planned now reads through their rows as well,
             // oldest first. A snapshot that already holds some of them
             // reads the same: those rows are the ones it holds, and every
-            // later write is laid over them again.
-            if !self.inflight.is_empty() {
-                let mut overlay = CutOverlay::new();
-                for flight in &self.inflight {
-                    overlay.absorb(&flight.own);
-                }
-                group.overlay = Arc::new(overlay);
-            }
-            self.group = Some(group);
+            // later write is laid over them again. Each group's rows are
+            // laid as they are, shared, not copied into one overlay.
+            self.group = Some(Group {
+                below: self
+                    .inflight
+                    .iter()
+                    .map(|flight| Arc::clone(&flight.own))
+                    .collect(),
+                ..Group::default()
+            });
         }
         self.group.is_some()
     }
@@ -444,6 +530,7 @@ impl<P: Persistence> Applier<P> {
     /// cannot be planned again here. A batch journaled whose projection
     /// is still owed is not a failure; lowering goes on.
     pub fn finish_group(&mut self) -> Result<(), ApplyError> {
+        self.usable()?;
         let Some(mut group) = self.group.take() else {
             return Ok(());
         };
@@ -464,16 +551,16 @@ impl<P: Persistence> Applier<P> {
                     self.foreign.extend(lowered.events);
                 }
                 if group_lost {
-                    return Err(ApplyError::GroupLost);
+                    return Err(self.group_lost());
                 }
                 if lowered.indeterminate {
-                    let settled = self.store.reconcile()?;
+                    let settled = self.settle_store()?;
                     let group_lost = settled.events.iter().any(|e| lost(e, &group.barriers));
                     if self.sharing {
                         self.foreign.extend(settled.events);
                     }
                     if group_lost {
-                        return Err(ApplyError::GroupLost);
+                        return Err(self.group_lost());
                     }
                 } else if produced == 0
                     && self.store.queued() == 0
@@ -542,6 +629,7 @@ impl<P: Persistence> Applier<P> {
     pub fn hand_off_group(
         &mut self,
     ) -> Result<Option<coord_types::ids::ExecutionPosition>, ApplyError> {
+        self.usable()?;
         if !self.store.pipelined() {
             self.finish_group()?;
             return Ok(None);
@@ -627,6 +715,7 @@ impl<P: Persistence> Applier<P> {
     /// Returns the execution position the projection has committed:
     /// whatever was held to a position at or below it may go out.
     pub fn settle(&mut self) -> Result<coord_types::ids::ExecutionPosition, ApplyError> {
+        self.usable()?;
         if self.store.pipelined() {
             let handed = self.store.hand_off()?;
             self.take_lowered(handed, &BTreeSet::new())?;
@@ -638,6 +727,7 @@ impl<P: Persistence> Applier<P> {
     /// the projection commit out is waited for, and what was journaled
     /// meanwhile is committed after it.
     pub fn drain(&mut self) -> Result<coord_types::ids::ExecutionPosition, ApplyError> {
+        self.usable()?;
         if self.store.pipelined() {
             for _ in 0..GROUP_LOWERINGS {
                 // A drain waits for every group, so none is held for a
@@ -677,9 +767,23 @@ impl<P: Persistence> Applier<P> {
     /// Note a storage fact about one of this applier's batches, met by a
     /// lowering this applier did not run: a node's flush journals a staged
     /// group with the protocol's batches, and an append out on the
-    /// appender's thread is taken back by the node (task-d54). Only
-    /// `JournalDurable` is read (task-d63).
+    /// appender's thread is taken back by the node (task-d54).
+    /// `JournalDurable` is read (task-d63), and so is a batch of an open
+    /// or in-flight group definitely not journaled: the group is lost, met
+    /// where the node lowers, and the applier refuses to be used from
+    /// here on as if it had met the loss itself (#185, review 6861674000,
+    /// item 2).
     pub fn note_journaled(&mut self, event: &StorageEvent) {
+        let own = |barriers: &BTreeSet<BarrierId>| lost(event, barriers);
+        if self
+            .group
+            .as_ref()
+            .is_some_and(|group| own(&group.barriers))
+            || self.inflight.iter().any(|flight| own(&flight.barriers))
+        {
+            self.mark_lost();
+            return;
+        }
         let StorageEvent::JournalDurable { barrier_id, .. } = event else {
             return;
         };
@@ -714,6 +818,59 @@ impl<P: Persistence> Applier<P> {
             through = Some(through.map_or(flight.position, |seen| seen.max(flight.position)));
         }
         through
+    }
+
+    /// The view a read held at the barrier is planned against (#185,
+    /// lead 17:43), at the execution position it reaches: the
+    /// projection's snapshot, with the rows of the groups in flight above
+    /// its frontier laid over it, oldest first, as far as every batch of
+    /// theirs is in the journal.
+    ///
+    /// - **What it shows** is what [`Applier::journaled_through`] already
+    ///   lets a group's results go out at (design Section 4.5): executed,
+    ///   decided commands whose outcome is in the journal. A read served
+    ///   over it discloses nothing a release has not.
+    /// - **What it reads** is what a command planned at that position
+    ///   reads: the same snapshot and the same rows laid over it, as
+    ///   [`Applier::begin_group`] lays them. So the read is answered as
+    ///   the ordered path would answer it there, without waiting for the
+    ///   projection to commit those groups, and without asking it to.
+    /// - **Only groups above the snapshot's frontier are laid.** One the
+    ///   snapshot holds is read from it; laying it again under a later
+    ///   group the snapshot holds too would hide that group's rows. A
+    ///   group the snapshot holds in part is laid whole, and its rows
+    ///   are a superset of that part.
+    /// - **The open group is never laid:** it is not in flight until it
+    ///   is handed off, so a read whose index falls in it waits for that.
+    ///
+    /// Without a pipelined store nothing is ever in flight, and this is
+    /// the projection's snapshot as it is.
+    ///
+    /// **Refused once a group was lost** ([`ApplyError::AfterGroupLost`]):
+    /// the groups in flight behind it will never be journaled, so none of
+    /// them may be read, and neither may a barrier the gate reads from
+    /// this view.
+    pub fn read_view(&self) -> Result<ReadView<P>, ApplyError> {
+        self.usable()?;
+        let (view, meta, gate) = self.store.reader().snapshot()?.into_parts();
+        let committed = meta.frontier.execution_position;
+        let mut through = committed;
+        let mut overlay = LayeredOverlay::default();
+        for flight in self.inflight.iter().filter(|f| f.position > committed) {
+            if !flight.unjournaled.is_empty() {
+                break;
+            }
+            overlay.push(Arc::clone(&flight.own));
+            through = flight.position;
+        }
+        let mut reaches = meta;
+        reaches.frontier.execution_position = through;
+        let snapshot = GatedView::with_gate(view, meta, gate.clone());
+        Ok(GatedView::with_gate(
+            RecoveryCut::new(snapshot, overlay, meta.stamp.journal_seq()),
+            reaches,
+            gate,
+        ))
     }
 
     /// The barriers of every group handed off and not yet materialized.
@@ -754,17 +911,17 @@ impl<P: Persistence> Applier<P> {
             self.foreign.extend(lowered.events);
         }
         if group_lost {
-            return Err(ApplyError::GroupLost);
+            return Err(self.group_lost());
         }
         if lowered.indeterminate {
-            let settled = self.store.reconcile()?;
+            let settled = self.settle_store()?;
             self.note_all(&settled.events);
             let group_lost = settled.events.iter().any(|e| lost(e, barriers));
             if self.sharing {
                 self.foreign.extend(settled.events);
             }
             if group_lost {
-                return Err(ApplyError::GroupLost);
+                return Err(self.group_lost());
             }
         }
         Ok(())
@@ -807,7 +964,7 @@ impl<P: Persistence> Applier<P> {
             let durable = meta.stamp.journal_seq();
             let snapshot = GatedView::with_gate(PlanningSnapshot::Own(view), meta, gate.clone());
             return Ok(GatedView::with_gate(
-                RecoveryCut::new(snapshot, Arc::new(CutOverlay::new()), durable),
+                RecoveryCut::new(snapshot, LayeredOverlay::default(), durable),
                 meta,
                 gate,
             ));
@@ -833,7 +990,13 @@ impl<P: Persistence> Applier<P> {
         Ok(GatedView::with_gate(
             RecoveryCut::new(
                 snapshot,
-                group.overlay.clone(),
+                LayeredOverlay::new(
+                    group
+                        .below
+                        .iter()
+                        .cloned()
+                        .chain(std::iter::once(Arc::clone(&group.own))),
+                ),
                 snapshot_meta.stamp.journal_seq(),
             ),
             meta,
@@ -852,6 +1015,9 @@ impl<P: Persistence> Applier<P> {
         binding: Option<&RetryBinding>,
         refused: Option<&CommandId>,
     ) -> Result<ApplyOutcome, ApplyError> {
+        // Before the plan lands, so that whatever its outcome no context
+        // read before a write of its rows is used after it.
+        self.authorizations.get_mut().landing(&plan.mutations);
         if self.group.is_none() {
             let others = self.sharing.then_some(&mut self.foreign);
             return Ok(match refused {
@@ -892,7 +1058,6 @@ impl<P: Persistence> Applier<P> {
         match crate::materialize::submit(&mut self.store, batch, kind)? {
             Submitted::Accepted => {
                 let group = self.group.as_mut().expect("checked above");
-                Arc::make_mut(&mut group.overlay).extend(&updates);
                 Arc::make_mut(&mut group.own).extend(&updates);
                 group.barriers.insert(barrier);
                 group.unjournaled.insert(barrier);
@@ -948,6 +1113,20 @@ impl<P: Persistence> Applier<P> {
         }
     }
 
+    /// How the authorization contexts kept between commands have been
+    /// used ([`crate::authorizations`]).
+    pub fn authorization_cache(&self) -> AuthorizationCacheStats {
+        self.authorizations.borrow().stats()
+    }
+
+    /// Drop the authorization contexts kept between commands: what a
+    /// write of a session or policy row around the applier, through
+    /// [`Applier::store_mut`], calls before the next command. The
+    /// applier's own landings need not.
+    pub fn forget_authorizations(&mut self) {
+        self.authorizations.get_mut().clear();
+    }
+
     /// The watch hub fed by this applier.
     pub const fn hub(&self) -> &WatchHub {
         &self.hub
@@ -958,7 +1137,9 @@ impl<P: Persistence> Applier<P> {
         &self.store
     }
 
-    /// The same, mutably (administration batches).
+    /// The same, mutably (administration batches). A batch written
+    /// through it that writes a session or policy row is followed by
+    /// [`Applier::forget_authorizations`] before the next command.
     pub const fn store_mut(&mut self) -> &mut P {
         &mut self.store
     }
@@ -984,6 +1165,7 @@ impl<P: Persistence> Applier<P> {
         command: CommandId,
         payload: &PayloadRecordV1,
     ) -> Result<AppliedOutcome, ApplyError> {
+        self.usable()?;
         // Outside a group a command is planned over the projection alone,
         // so whatever a pipelined store still has in flight lands first.
         if self.group.is_none() && !self.inflight.is_empty() {
@@ -1294,12 +1476,59 @@ impl<P: Persistence> Applier<P> {
             // a filled window is the one that acknowledges everything
             // in it, and refusing it would leave the window shut for
             // good.
-            let retires = retry::retirement(gated.view(), &binding.retry_key, payload_ack)?;
+            //
+            // Both read the session's record and its trust rule, which the
+            // authorization context the command executes under holds, kept
+            // between commands until a landing writes one of them
+            // ([`crate::authorizations`]). So they are taken from it, and
+            // the floor is read once for both. A context that can't be
+            // loaded (over the schema's budget, or an engine failure) is
+            // read around as before; the view build below meets it again.
+            let loaded = self
+                .authorizations
+                .borrow_mut()
+                .load(gated.view(), namespace, &session);
+            let (retires, admission) = match &loaded {
+                Ok(context) => {
+                    let standing = context
+                        .session
+                        .as_ref()
+                        .map(|record| (record, context.valid_session().is_some()));
+                    let found = retry::retire_and_admit(
+                        gated.view(),
+                        binding,
+                        payload_ack,
+                        standing,
+                        authorized,
+                    )?;
+                    // Every test that executes a command checks that the
+                    // context answers as the rows do.
+                    #[cfg(debug_assertions)]
+                    {
+                        let read = retire_and_admit_by_reads(
+                            gated.view(),
+                            binding,
+                            payload_ack,
+                            |record| {
+                                retained_is_authorized(gated.view(), &session, request, record)
+                            },
+                        )?;
+                        assert_eq!(
+                            found, read,
+                            "admission from the authorization context differs from the view's"
+                        );
+                    }
+                    found
+                }
+                Err(_) => {
+                    retire_and_admit_by_reads(gated.view(), binding, payload_ack, authorized)?
+                }
+            };
             let binding = &RetryBinding {
                 retires,
                 ..binding.clone()
             };
-            match retry::admit(gated.view(), binding, authorized)? {
+            match admission {
                 Admission::New => {}
                 Admission::Retry(record) => {
                     drop(gated);
@@ -1365,8 +1594,15 @@ impl<P: Persistence> Applier<P> {
             // never a local setting: a command that overruns it overruns
             // it everywhere, so the rejection below is a replicated result
             // and not this node's resource limit leaking into the history.
-            let built =
-                build_authorized_view(&gated, namespace, &session, request, ViewBudget::SCHEMA);
+            let built = loaded.and_then(|authorization| {
+                build_view_under(
+                    &gated,
+                    namespace,
+                    authorization,
+                    request,
+                    ViewBudget::SCHEMA,
+                )
+            });
             let planned = match built {
                 Ok(view) => match plan(request, &view, &PlanLimits::default()) {
                     Ok(planned) => planned,
