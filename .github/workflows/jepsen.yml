@@ -55,7 +55,7 @@ on:
         description: "Comma-separated faults (kill, pause, partition, packet), or none; empty for the scenario's. Not clock: the containers share this runner's clock. TupleSky's partitions can be partition:TARGETS[:LO-HI[/EVERY]], TARGETS any, one or follower (a voter not leading), such as partition:follower:5-10/60; etcd and SwiftPaxos get plain partitions."
         default: ""
       wan:
-        description: "The network between the nodes: none, regions, regions:AB/AC/BC (three regions with those round trips in ms, such as regions:70/80/140), or one-way milliseconds between every two; +lossPERCENT and +jitterPERCENT after add standing loss and jitter between the nodes (regions:70/80/140+loss1); @local after puts each client beside the node it talks to, for every system (@first, the default, beside the first node); empty for the scenario's"
+        description: "The network between the nodes: none, regions, regions:AB/AC/BC (three regions with those round trips in ms, such as regions:70/80/140), or one-way milliseconds between every two; +lossPERCENT and +jitterPERCENT after add standing loss and jitter between the nodes (regions:70/80/140+loss1), and +inorder keeps the jittered packets in order (regions:70/80/140+jitter10+inorder); @local after puts each client beside the node it talks to, for every system (@first, the default, beside the first node); empty for the scenario's"
         default: ""
       time-limit:
         description: "Seconds of workload before healing; empty for the scenario's (300, or 120 for throughput)"

@@ -41,8 +41,9 @@
 #                  unthrottled; empty for the scenario's
 #   NODES          the cluster's nodes (5), for the register minimum
 #   IN_WAN         the network: none, regions, regions:AB/AC/BC (round trips
-#                  in ms), or one-way milliseconds, with +lossPERCENT and
-#                  +jitterPERCENT standing additions (jepsen.tuplesky.wan),
+#                  in ms), or one-way milliseconds, with +lossPERCENT,
+#                  +jitterPERCENT and +inorder (jitter without reordering)
+#                  standing additions (jepsen.tuplesky.wan),
 #                  and @local or @first after for where the clients sit
 #                  (WAN_CLIENTS; the harness's default, first, without);
 #                  empty for the scenario's

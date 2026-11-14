@@ -567,8 +567,12 @@ TupleSky against etcd on terms that are:
   `+jitterPERCENT` (`regions:70/80/140+loss1`, `+jitter10`): loss on the
   traffic between every two nodes, and jitter as that share of each
   pair's delay, normally distributed, which reorders packets for both
-  systems' transports alike. They hold for the whole run, unlike the
-  packet fault; the clients' traffic keeps its delay alone.
+  systems' transports alike. `+inorder` keeps the jittered packets in
+  order (each band between two nodes gets a 10gbit rate, so netem holds
+  a packet behind the one before it): the same delay variance without
+  reordering, to tell the two apart (`regions:70/80/140+jitter10+inorder`).
+  They hold for the whole run, unlike the packet fault; the clients'
+  traffic keeps its delay alone.
 * **The clients** run on the control node, which by default
   (`--wan-clients first`) sits beside `n1`, as a control node on real
   hosts sits in one region: each node's traffic to it is delayed by the
