@@ -35,7 +35,9 @@ use coord_types::ids::{Ballot, ExecutionPosition, LocalJournalSeq, ReplicaId, Re
 use coord_types::wire_v1::{MessageV1, decode_stream};
 use coord_types::{CommandId, RetryKey};
 
-use crate::ballot::{BallotState, ConfigurationIdentity, PromiseRejection, ReplicaRole};
+use crate::ballot::{
+    BallotState, ConfigurationIdentity, PromiseOutcome, PromiseRejection, ReplicaRole,
+};
 use crate::campaign::Campaign;
 use crate::catch_up::{
     CatchUp, CatchUpDivergence, CatchUpPaths, DonorExecution, OwnExecution, Running, SinceBoot,
@@ -425,7 +427,10 @@ pub const HELD_PROPOSAL_SLACK: usize = 8;
 /// taken as the room comes, with no ask. Bounded because a peer's frames
 /// are still a peer's input: four catch-up pages' worth, beside the
 /// `HELD_PROPOSAL_SLACK` tables of proposals held. A payload past the
-/// bound goes the old way and is asked for.
+/// bound goes the old way and is asked for. It bounds the records and
+/// their bytes ([`kept_relayed_size`]), not the maps around them: each
+/// one's key, sequence number and index entry, and its tree nodes' empty
+/// slots, a constant factor more for the smallest payloads.
 pub const MAX_KEPT_RELAYED_BYTES: usize = 4 * MAX_CATCH_UP_BYTES;
 
 /// What a kept relayed payload counts against
@@ -3917,9 +3922,7 @@ impl Follower {
         // Executed, the record is room once reclaimed: the payloads kept
         // for want of it are taken first, in the leader's order, and each
         // is adopted as its turn comes (the follower trap on #185).
-        while !self.kept.is_empty() && self.take_kept() {
-            effects.extend(self.advance_pending());
-        }
+        effects.extend(self.retake_kept());
         if self.diverged.is_none() && self.catch_up.running.is_empty() {
             effects.extend(self.install_catch_up());
             effects.extend(self.continue_catch_up());
@@ -5871,7 +5874,7 @@ impl Follower {
         let held = self.held.contains_key(&command);
         let mut kept = None;
         let took = if takes {
-            match self.take_relayed_payload(&proposal, payload) {
+            match self.take_relayed_payload(&proposal, payload, false) {
                 Relayed::Took => {
                     self.relayed_taken = self.relayed_taken.saturating_add(1);
                     true
@@ -5915,8 +5918,16 @@ impl Follower {
     /// Initialize the command a relayed proposal names from the payload
     /// it carries, where this replica would take it (see
     /// `on_relayed_proposal`), or a payload kept for want of room
-    /// (`take_kept`). The caller counts what became of it.
-    fn take_relayed_payload(&mut self, proposal: &FastAck, payload: PayloadRecordV1) -> Relayed {
+    /// (`take_kept`). The caller counts what became of it. `checked`: the
+    /// payload's identity was found to be its command's when it was kept,
+    /// so it is not hashed again at each retry; its admission is still
+    /// compared with the proposal held now.
+    fn take_relayed_payload(
+        &mut self,
+        proposal: &FastAck,
+        payload: PayloadRecordV1,
+        checked: bool,
+    ) -> Relayed {
         let command = proposal.command;
         // The payload's identity is the digest of its retry key and its
         // logical bytes as they came, not of a decode encoded again (cost
@@ -5926,9 +5937,14 @@ impl Follower {
         // the digest's collision resistance, bytes that hash to this
         // proposal's command are those bytes, and a decode here would
         // find nothing more. Bytes that aren't canonical never match.
-        let identity = CommandId::from_canonical(&payload.retry_key, &payload.logical);
+        let identity = if checked {
+            command
+        } else {
+            CommandId::from_canonical(&payload.retry_key, &payload.logical)
+        };
         debug_assert!(
-            identity != command
+            checked
+                || identity != command
                 || postcard::from_bytes::<coord_types::logical_v1::LogicalRequest>(
                     &payload.logical
                 )
@@ -6038,6 +6054,19 @@ impl Follower {
     /// next `advance_pending`, which adopts it once its turn comes, and
     /// the next one's turn comes with that adoption. Returns whether any
     /// was taken.
+    ///
+    /// Kept payloads are never asked for, so each is taken here or
+    /// dropped with its proposal. The guard leaves none waiting for ever:
+    /// - a higher promise made durable ends voting at this ballot until a
+    ///   new one is activated, and activating it drops what is kept;
+    /// - a halt is the end of this replica, a durable seal the end of
+    ///   voting in this configuration, and the role is the
+    ///   configuration's: none adopts a held proposal again, kept or not;
+    /// - a promise or seal row in flight ends either way: made durable,
+    ///   it is one of the above; failed, this replica votes at its ballot
+    ///   again with no new ballot to drop them and maybe no execution to
+    ///   come, so they are taken at the failure
+    ///   (`on_storage_event`, `retake_kept`).
     fn take_kept(&mut self) -> bool {
         if self.boot.is_none() || self.ballots.seal_held().is_some() || !self.may_vote() {
             return false;
@@ -6050,7 +6079,7 @@ impl Follower {
             let Some(proposal) = self.held.get(&command).map(|h| h.proposal.clone()) else {
                 continue;
             };
-            match self.take_relayed_payload(&proposal, payload) {
+            match self.take_relayed_payload(&proposal, payload, true) {
                 Relayed::Took => {
                     self.relayed_kept_taken = self.relayed_kept_taken.saturating_add(1);
                     self.held_check.insert(command);
@@ -6068,6 +6097,16 @@ impl Follower {
             }
         }
         took
+    }
+
+    /// Take the kept payloads there is room for, and adopt each as its
+    /// turn comes, until one is not taken.
+    fn retake_kept(&mut self) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        while !self.kept.is_empty() && self.take_kept() {
+            effects.extend(self.advance_pending());
+        }
+        effects
     }
 
     /// Set the bound on kept relayed payloads' bytes,
@@ -6755,7 +6794,7 @@ impl Follower {
         if let Some(outbox) = self.outbox.as_mut() {
             outbox.observe(event);
         }
-        self.ballots.on_storage(event);
+        let promise = self.ballots.on_storage(event);
         // Ledger bookkeeping covers every batch staged, as the leader's
         // does, and not only the ones this follower is waiting on: a batch
         // this replica staged while it led, and that completes after it
@@ -7015,6 +7054,20 @@ impl Follower {
             out.extend(self.advance_campaign());
         }
         out.extend(self.deliver_due_report());
+        // A promise or seal row that failed leaves this replica voting at
+        // its ballot again, if no other is in flight: the guard on kept
+        // payloads clears with no new ballot to drop them, and if the
+        // table's room came while the row was in flight, no execution may
+        // follow to take them (`take_kept`). Taken at the failure itself,
+        // not deferred as a reinstall is: their adoptions' batches failing
+        // in turn bring no promise outcome, so a store that refuses every
+        // batch can't loop it.
+        if matches!(
+            promise,
+            Some(PromiseOutcome::Failed(_) | PromiseOutcome::SealFailed(_))
+        ) {
+            out.extend(self.retake_kept());
+        }
         self.learn();
         if reinstall {
             self.catch_up_reinstall = true;

@@ -3133,3 +3133,192 @@ fn a_relayed_payload_past_the_kept_bound_is_not_kept_and_is_asked_for() {
     assert_eq!(f.held().len(), 1, "the third waits on its ask");
     assert!(asked.iter().all(|c| *c == order[fit + 2]), "{asked:?}");
 }
+
+/// Commit everything `f` adopted of `order`, each by the leader's own
+/// adoption (the other half of each slow majority), and execute none.
+fn commit_adopted(f: &mut Follower, order: &[CommandId], seq: &mut u64) {
+    for c in order {
+        if f.table().phase_of(c) == Some(Phase::Accept) {
+            let event = leader_adoption(f, *c);
+            let effects = f.step(event);
+            settle(f, effects, seq);
+        }
+        assert!(f.table().phase_of(c) >= Some(Phase::Commit), "{c:?}");
+    }
+}
+
+/// Execute what `f` can now, asking nothing; the commands, in order.
+fn execute_ready(f: &mut Follower, seq: &mut u64) -> Vec<CommandId> {
+    let mut executed = Vec::new();
+    while let Some(c) = f.next_executable() {
+        let outcome = coord_consensus::AppliedOutcome {
+            position: f.executed_through().checked_next().unwrap(),
+            revision: None,
+            result_digest: Digest32(c.0.0),
+            response: c.0.0.to_vec(),
+        };
+        let effects = f.applied(c, &outcome).unwrap();
+        settle(f, effects, seq);
+        executed.push(c);
+    }
+    executed
+}
+
+/// `from`'s Sync for `ballot`, naming nothing.
+fn empty_sync(from: u8, ballot: Ballot) -> Event {
+    peer(
+        from,
+        ProtocolMessage::Sync(coord_consensus::SyncDecision {
+            ballot,
+            source_ballot: self::ballot(0, 0),
+            entries: std::collections::BTreeMap::new(),
+            reproposed: BTreeSet::new(),
+        }),
+    )
+}
+
+/// A leader change under a full table (#296 review): the new ballot's
+/// activation drops the proposals held for the old one, and the payloads
+/// kept with them.
+#[test]
+fn a_new_ballot_drops_the_payloads_kept_with_the_old_ballots_proposals() {
+    let (capacity, over) = (8, 5);
+    let mut seq = 1;
+    let (mut f, _, _) = filled_by_relay(capacity, over, None, &mut seq);
+    assert_eq!(f.kept_relayed().0, over);
+    let promised = f.step(peer(
+        2,
+        ProtocolMessage::NewLeader {
+            ballot: ballot(1, 2),
+            executed: ExecutionPosition::ZERO,
+        },
+    ));
+    settle(&mut f, promised, &mut seq);
+    assert_eq!(f.ballots().promised(), ballot(1, 2));
+    assert_eq!(
+        f.kept_relayed().0,
+        over,
+        "kept while the new ballot is not active"
+    );
+    let synced = f.step(empty_sync(2, ballot(1, 2)));
+    settle(&mut f, synced, &mut seq);
+    assert_eq!(
+        f.ballots().synced(),
+        ballot(1, 2),
+        "{:?}",
+        f.take_rejections()
+    );
+    assert!(f.held().is_empty());
+    assert_eq!(f.kept_relayed(), (0, 0));
+    assert_eq!(f.missing_payload_count(usize::MAX), 0);
+}
+
+/// A catch-up page that installs a command whose payload is kept (#296
+/// review): the command is decided here now, under the page's payload,
+/// and its kept copy goes with its held proposal. The rest are kept still,
+/// and taken as the room comes.
+#[test]
+fn a_catch_up_page_that_installs_a_kept_command_drops_its_kept_copy() {
+    let (capacity, over) = (8, 5);
+    let fit = capacity + 1;
+    let mut seq = 1;
+    let (mut f, order, payloads) = filled_by_relay(capacity, over, None, &mut seq);
+    assert_eq!(f.kept_relayed().0, over);
+    // r2's page: everything through the first kept command, each decided
+    // in the leader's order.
+    let mut leader_view = coord_consensus::CommandTable::new();
+    let entries: Vec<coord_consensus::CatchUpEntry> = order[..=fit]
+        .iter()
+        .zip(&payloads)
+        .enumerate()
+        .map(|(i, (c, p))| {
+            let l = leader_view
+                .initialize(*c, c.0, vec![CONSERVATIVE_KEY.to_vec()])
+                .unwrap();
+            coord_consensus::CatchUpEntry {
+                command: *c,
+                payload: p.clone(),
+                decided: Some(CommandRecord {
+                    phase: Phase::Commit,
+                    deps: l.deps,
+                    keys: vec![CONSERVATIVE_KEY.to_vec()],
+                    payload: Some(admitted_under()),
+                    paths: l.paths,
+                    synced_seq: None,
+                    path: l.path,
+                }),
+                position: ExecutionPosition::new(i as u64 + 1).unwrap(),
+                revision: None,
+                result_digest: Digest32(c.0.0),
+            }
+        })
+        .collect();
+    let effects = f.step(peer(
+        2,
+        ProtocolMessage::CatchUpPage {
+            ballot: ballot(0, 0),
+            after: ExecutionPosition::ZERO,
+            through: ExecutionPosition::new(fit as u64 + 1).unwrap(),
+            entries,
+        },
+    ));
+    settle(&mut f, effects, &mut seq);
+    let installed = order[fit];
+    assert!(
+        f.table().phase_of(&installed) >= Some(Phase::Commit),
+        "{:?}",
+        f.take_rejections()
+    );
+    assert!(!f.held().contains_key(&installed));
+    assert_eq!(f.kept_relayed().0, over - 1, "its kept copy goes with it");
+    assert_eq!(f.missing_payload_count(usize::MAX), 0);
+    let mut asked = runtime_ask(&mut f);
+    let executed = execute_all(&mut f, &order, &mut seq, &mut asked);
+    assert_eq!(executed, order);
+    assert!(asked.is_empty(), "{asked:?}");
+    assert_eq!(f.relay_taken().kept_taken, (over - 1) as u64);
+    assert_eq!(f.kept_relayed(), (0, 0));
+}
+
+/// #296 review's question: a kept payload is taken only from `applied`,
+/// and never asked for. A promise row in flight stops the take; if it
+/// fails, this replica votes at its ballot again with no new ballot to
+/// drop what is kept, and here nothing is left to execute: every command
+/// taken was executed while the row was in flight. The kept payloads are
+/// taken at the failure, and the rest of the order follows.
+#[test]
+fn kept_payloads_are_taken_when_a_promise_row_fails_with_nothing_left_to_execute() {
+    let (capacity, over) = (8, 5);
+    let fit = capacity + 1;
+    let mut seq = 1;
+    let (mut f, order, _) = filled_by_relay(capacity, over, None, &mut seq);
+    commit_adopted(&mut f, &order[..fit], &mut seq);
+    let promise = f.step(peer(
+        2,
+        ProtocolMessage::NewLeader {
+            ballot: ballot(1, 2),
+            executed: ExecutionPosition::ZERO,
+        },
+    ));
+    let barrier = effects_barrier(&promise);
+    assert_eq!(execute_ready(&mut f, &mut seq), order[..fit]);
+    assert_eq!(f.kept_relayed().0, over, "not taken behind the promise");
+    assert_eq!(f.relay_taken().kept_taken, 0);
+    assert_eq!(f.next_executable(), None, "nothing left to execute");
+    let effects = f.step(Event::Storage(StorageEvent::Failed {
+        barrier_id: barrier,
+        error: StorageError::DefinitelyNotCommitted,
+    }));
+    settle(&mut f, effects, &mut seq);
+    assert_eq!(f.ballots().promised(), ballot(0, 0));
+    assert_eq!(
+        f.relay_taken().kept_taken,
+        over as u64,
+        "taken at the failure"
+    );
+    let mut asked = runtime_ask(&mut f);
+    let rest = execute_all(&mut f, &order, &mut seq, &mut asked);
+    assert_eq!(rest, order[fit..]);
+    assert!(asked.is_empty(), "{asked:?}");
+    assert_eq!(f.kept_relayed(), (0, 0));
+}
