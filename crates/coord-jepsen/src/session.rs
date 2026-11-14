@@ -256,10 +256,26 @@ impl Session {
         u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 
+    /// Discard the transport's queued events. The session reads nothing
+    /// from them (answers come back on their own streams), but the
+    /// transport waits for room to queue each connection's `Connected`
+    /// and `Closed`, the dial included: left to fill (1,024 a lane,
+    /// about 512 reconnects), the queue would stall every later dial
+    /// until it timed out. Taken before each dial and on each pass of a
+    /// request; only what is already queued, so this never waits.
+    async fn drain_events(&mut self) {
+        while self.transport.has_event() {
+            if self.transport.next_event().await.is_none() {
+                break;
+            }
+        }
+    }
+
     /// Dial the frontend and bind this session's credential on it, both
     /// by `by`. The SDK re-sends whatever it had in flight once the
     /// binding holds.
     async fn connect(&mut self, by: Instant) -> Result<(), String> {
+        self.drain_events().await;
         let connection = tokio::time::timeout(
             by.saturating_duration_since(Instant::now()),
             self.transport.connect(
@@ -410,6 +426,7 @@ impl Session {
         };
         let mut last = String::from("no-answer");
         loop {
+            self.drain_events().await;
             if let Some(answer) = self.finished(id, retire_unknown) {
                 return answer;
             }
