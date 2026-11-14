@@ -94,18 +94,38 @@ impl Machine {
     /// because the two roles refuse different things and a caller of
     /// this wants to say what happened, not to match on it.
     pub fn take_rejections(&mut self) -> Vec<String> {
-        match self {
+        self.take_rejections_counted().0
+    }
+
+    /// [`Self::take_rejections`], and how many of them were
+    /// `Backpressure`: the machine's table had no room. Counted from the
+    /// enums, before they are rendered, so the count does not depend on
+    /// how a reason reads.
+    pub fn take_rejections_counted(&mut self) -> (Vec<String>, u64) {
+        let mut backpressure = 0;
+        let rendered = match self {
             Machine::Leader(m) => m
                 .take_rejections()
                 .into_iter()
-                .map(|r| format!("{r:?}"))
+                .map(|r| {
+                    backpressure +=
+                        u64::from(matches!(r, coord_consensus::Rejection::Backpressure));
+                    format!("{r:?}")
+                })
                 .collect(),
             Machine::Follower(m) => m
                 .take_rejections()
                 .into_iter()
-                .map(|r| format!("{r:?}"))
+                .map(|r| {
+                    backpressure += u64::from(matches!(
+                        r,
+                        coord_consensus::FollowerRejection::Backpressure
+                    ));
+                    format!("{r:?}")
+                })
                 .collect(),
-        }
+        };
+        (rendered, backpressure)
     }
 
     /// Propose one of the service's own commands, where this replica
@@ -872,6 +892,11 @@ pub struct Node<P: Persistence> {
     /// What this replica's re-sends did, over every ballot it led since
     /// boot (task-d49).
     resends: coord_consensus::ResendCounts,
+    /// Refusals this node's machine gave for want of room in its table
+    /// (`Backpressure`), over every role it held since boot: counted as
+    /// the driver drains them, exactly, where the log says them only at
+    /// each doubling.
+    backpressure: u64,
     /// Whether a leader of this node sends its proposal before its batch
     /// is durable, where it may (task-d98). The node's, not the role's:
     /// every leader this node becomes is given it.
@@ -998,6 +1023,7 @@ impl<P: Persistence> Node<P> {
             releases: VecDeque::new(),
             results: VecDeque::new(),
             resends: coord_consensus::ResendCounts::default(),
+            backpressure: 0,
             early_proposal: false,
             early_holders: None,
             early_without_activation: false,
@@ -1876,7 +1902,15 @@ impl<P: Persistence> Node<P> {
 
     /// Take what the machine refused since the last call, rendered.
     pub fn take_rejections(&mut self) -> Vec<String> {
-        self.machine_mut().take_rejections()
+        let (rendered, backpressure) = self.machine_mut().take_rejections_counted();
+        self.backpressure += backpressure;
+        rendered
+    }
+
+    /// Refusals this node's machine gave for want of room in its table,
+    /// since boot, as of the last [`Self::take_rejections`].
+    pub const fn backpressure_refusals(&self) -> u64 {
+        self.backpressure
     }
 
     /// The command this replica cannot execute because it does not hold

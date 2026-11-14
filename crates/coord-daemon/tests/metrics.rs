@@ -562,7 +562,11 @@ fn a_rendered_snapshot_carries_no_secret_or_key_shaped_text() {
                 refused: 7,
                 returned: 9000,
                 unreturnable: 3,
+                kept: 60,
+                returned_again: 57,
+                kept_now: 2,
             },
+            refusals: coord_daemon::metrics::Refusals { backpressure: 31 },
         }),
         // A replica is named by four bytes, as the log lines name it: not
         // an identity-shaped run.

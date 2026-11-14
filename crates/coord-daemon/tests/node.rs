@@ -317,6 +317,55 @@ fn leader(boot: BootId) -> Node<StoreWorker<ModelEngine>> {
     Node::new(Machine::Leader(Box::new(machine)), applier, FRONTEND)
 }
 
+/// The machine's refusals for want of room are counted by the node, from
+/// the enums, as the driver drains them: exactly, where the log says
+/// them only at each doubling (testing's ask on #185).
+#[test]
+fn a_node_counts_its_machines_backpressure_refusals_as_it_drains_them() {
+    let boot = BootId([7; 16]);
+    let applier = store(boot);
+    let bootstrapped = applier.store().application_base().execution_position;
+    let mut machine = Leader::new(
+        LeaderConfig {
+            identity: identity(0),
+            quorum: quorum(),
+            genesis: ballot(),
+            frontend: FRONTEND,
+            capacity: 1,
+        },
+        None,
+        bootstrapped,
+    );
+    machine.set_learning(LearningMode::Full);
+    let mut node = Node::new(Machine::Leader(Box::new(machine)), applier, FRONTEND);
+    node.on_event(
+        Event::Boot {
+            boot_id: boot,
+            incarnation: inc(),
+        },
+        &ballot(),
+    )
+    .expect("boot");
+    assert_eq!(node.backpressure_refusals(), 0);
+    // The first fills the table, which nothing here empties: no voter
+    // answers, so nothing commits.
+    for sequence in 1..=3 {
+        node.on_event(Event::Admitted(admitted(sequence)), &ballot())
+            .expect("admitted");
+    }
+    // Counted when drained, not before.
+    assert_eq!(node.backpressure_refusals(), 0);
+    let rendered = node.take_rejections();
+    assert_eq!(rendered, vec!["Backpressure".to_owned(); 2]);
+    assert_eq!(node.backpressure_refusals(), 2);
+    // Drained once: a second take finds nothing and counts nothing more.
+    assert!(node.take_rejections().is_empty());
+    node.on_event(Event::Admitted(admitted(4)), &ballot())
+        .expect("admitted");
+    node.take_rejections();
+    assert_eq!(node.backpressure_refusals(), 3, "cumulative since boot");
+}
+
 /// An admitted request is proposed: the batch behind it is persisted,
 /// and the frames that go to the voters are the ones whose barriers that
 /// persist made durable.

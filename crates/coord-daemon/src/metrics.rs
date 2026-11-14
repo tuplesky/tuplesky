@@ -680,6 +680,10 @@ pub struct Cost {
     /// started (the +loss1 reading on #185).
     #[serde(default)]
     pub offers: Offers,
+    /// What this node's protocol machine refused, since the node started
+    /// (testing's ask on #185).
+    #[serde(default)]
+    pub refusals: Refusals,
 }
 
 /// What a node's collector sent again, and what its voter refused or could
@@ -701,9 +705,31 @@ pub struct Offers {
     /// Evidence and releases this voter handed to the transport for a
     /// collector in another process.
     pub returned: u64,
-    /// Evidence and releases for such a collector the transport did not
-    /// take: not sent, and not sent again.
+    /// Evidence and releases for such a collector let go unsent: the
+    /// connection had gone, the frame could never fit its lane, or it
+    /// was refused for a full queue and could not be kept, or was kept
+    /// past the hold ([`crate::unreturned`]).
     pub unreturnable: u64,
+    /// Evidence and releases kept to be offered again: refused because
+    /// the collector's lane queue was full, or made while frames for
+    /// that collector were kept, and queued behind them.
+    #[serde(default)]
+    pub kept: u64,
+    /// Of `returned`, frames that had been kept first.
+    #[serde(default)]
+    pub returned_again: u64,
+    /// Frames kept at this line, not yet returned or let go.
+    #[serde(default)]
+    pub kept_now: u64,
+}
+
+/// What this node's protocol machine refused, since the node started.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Refusals {
+    /// Refusals for want of room in the machine's command table
+    /// (`Backpressure`), as a leader or a follower. Exact: the log says
+    /// them only at each doubling.
+    pub backpressure: u64,
 }
 
 /// The size of the projection's index by command of its intake-keyed rows
