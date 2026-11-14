@@ -324,11 +324,17 @@ jobs:
           sudo perf --version || true
           # The loop runs a few dozen frames deep in the runtime; keep whole stacks.
           sudo sysctl -w kernel.perf_event_max_stack=1024 || true
+      # The fork's jar (jepsen/jepsen at a version with a suffix, such as
+      # 0.3.15-SNAPSHOT or 0.3.15-tuplesky) is installed from jepsen-ref
+      # every run and kept out of the cache, so a jar built from another
+      # commit at the same version is never restored. Released jars, such
+      # as the 0.3.11 that etcd's test uses, stay cached.
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.m2/repository
             ~/.lein/self-installs
+            !~/.m2/repository/jepsen/jepsen/*-*
           # With etcd beside TupleSky, its test's dependencies too.
           key: jepsen-m2-${{ hashFiles('jepsen/jepsen/project.clj', 'jepsen/tuplesky/project.clj', 'etcd-test/project.clj') }}
           restore-keys: jepsen-m2-
@@ -1349,6 +1355,7 @@ jobs:
             ~/.m2/repository
             ~/.lein/self-installs
             ~/go/pkg/mod
+            !~/.m2/repository/jepsen/jepsen/*-*
           key: jepsen-swiftpaxos-m2-${{ hashFiles('jepsen/jepsen/project.clj', 'jepsen/swiftpaxos/project.clj', 'jepsen/swiftpaxos/build.sh') }}
           restore-keys: jepsen-swiftpaxos-m2-
       - name: Build SwiftPaxos and its Jepsen client
