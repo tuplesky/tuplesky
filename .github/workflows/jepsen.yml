@@ -128,6 +128,7 @@ on:
       - scripts/ci/jepsen_etcd.sh
       - scripts/ci/jepsen_key_groups.py
       - scripts/ci/jepsen_fork_tests
+      - scripts/ci/jepsen_fork_snippets/**
       - scripts/ci/jepsen_pairs.py
       - scripts/ci/jepsen_sweep.py
       - scripts/ci/leader_profile.py
@@ -359,10 +360,12 @@ jobs:
         run: lein test
       - name: Test the jepsen fork's listed commits
         # tuplesky/jepsen runs no CI of its own: each line of
-        # scripts/ci/jepsen_fork_tests, a commit and a test namespace, is
-        # checked out beside the job's jepsen-ref and that namespace tested
-        # there, its result in the step summary. A failure marks this step
-        # and not the job's runs.
+        # scripts/ci/jepsen_fork_tests, a commit and a test namespace (or
+        # run:FILE, a script of this repository's run in that jepsen
+        # project with clojure.main, its output kept), is checked out
+        # beside the job's jepsen-ref and that namespace tested there, its
+        # result in the step summary. A failure marks this step and not the
+        # job's runs.
         continue-on-error: true
         env:
           LIST: ${{ github.workspace }}/tuplesky/scripts/ci/jepsen_fork_tests
@@ -371,10 +374,19 @@ jobs:
           while read -r sha ns _; do
             case $sha in ""|\#*) continue ;; esac
             dir="$RUNNER_TEMP/fork-$sha"
-            if ! git -C jepsen fetch -q --depth 1 origin "$sha" || ! git -C jepsen worktree add -q --detach "$dir" "$sha"; then
+            if [ ! -d "$dir" ] && { ! git -C jepsen fetch -q --depth 1 origin "$sha" || ! git -C jepsen worktree add -q --detach "$dir" "$sha"; }; then
               echo "::error::tuplesky/jepsen@$sha: could not check it out"
               echo "- tuplesky/jepsen@${sha:0:8} \`$ns\`: **not checked out**" >> "$GITHUB_STEP_SUMMARY"
               rc=1; continue
+            fi
+            if [[ $ns == run:* ]]; then
+              file=${ns#run:} log="$RUNNER_TEMP/fork-$sha-$(basename "$file").log"
+              cp "$GITHUB_WORKSPACE/tuplesky/$file" "$dir/jepsen/fork-snippet.clj"
+              if (cd "$dir/jepsen" && lein run -m clojure.main fork-snippet.clj) > "$log" 2>&1; then verdict=ran; else verdict="**exited $?**"; rc=1; fi
+              cat "$log"
+              { echo "- tuplesky/jepsen@${sha:0:8} \`$file\`: $verdict; its output:"; echo; echo '  ```'
+                grep -v -E '^(Retrieving|Compiling) ' "$log" | tail -n 40 | sed 's/^/  /'; echo '  ```'; } >> "$GITHUB_STEP_SUMMARY"
+              continue
             fi
             if (cd "$dir/jepsen" && lein test :only "$ns") 2>&1 | tee "$RUNNER_TEMP/fork-$sha.log"; [ "${PIPESTATUS[0]}" = 0 ]; then
               verdict=passes

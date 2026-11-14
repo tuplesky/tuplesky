@@ -1,5 +1,8 @@
 # Commits of tuplesky/jepsen whose tests every jepsen job runs (the fork has
 # no CI of its own): a full commit SHA, then the namespace for
-# `lein test :only`. Remove a line once its pull request has merged or
-# closed.
+# `lein test :only`, or run:FILE, a script of this repository run in that
+# commit's jepsen project with clojure.main, its output kept. Remove a line
+# once its pull request or issue has closed.
 c314832687c7076d3d7c0c15cd7b622eb5854d04 jepsen.independent-test tuplesky/jepsen#7
+b198081703628a372c614899691ebe67815a385e run:scripts/ci/jepsen_fork_snippets/issue8.clj tuplesky/jepsen#8 on main
+c314832687c7076d3d7c0c15cd7b622eb5854d04 run:scripts/ci/jepsen_fork_snippets/issue8.clj tuplesky/jepsen#8 on #7
