@@ -852,6 +852,14 @@ fn lowering_in_groups_a_staged_group_is_journaled_by_the_flush_and_answered_by_f
     assert_eq!(node.executed, 5);
     assert!(node.applier().in_group(), "the group stays staged");
     assert_eq!(journaled.appends - before.appends, 1, "one journal append");
+    // The five outcomes, queued as each landed, in one record of the
+    // flush's one append, with the protocol's batches (the batching-rule
+    // doc's 10.7, step 1b).
+    assert_eq!(
+        journaled.groups.application_records - before.groups.application_records,
+        1,
+        "one application record for the group"
+    );
     assert_eq!(
         journaled.commits, before.commits,
         "no projection commit yet"

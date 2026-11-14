@@ -325,7 +325,6 @@ fn report_backup(manifest: &coord_checkpoint::BackupManifestV1) {
     );
 }
 
-/// The first eight bytes of a digest, for a line an operator reads.
 /// A format's versions for the build line: the one it reads and writes,
 /// when its window is one version wide, or else `oldest..newest`, the
 /// versions it reads.
@@ -338,6 +337,7 @@ fn versions(f: coord_types::formats::Format) -> String {
     }
 }
 
+/// The first eight bytes of a digest, for a line an operator reads.
 fn hex16(bytes: &[u8; 32]) -> String {
     bytes[..8].iter().map(|b| format!("{b:02x}")).collect()
 }

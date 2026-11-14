@@ -31,7 +31,10 @@ use serde::{Deserialize, Serialize};
 use crate::frontier::{CheckpointPointerV1, LOCAL_CHECKPOINT_FORMAT_V1, OLDEST_POINTER_FORMAT};
 use crate::stream::StorageStreamId;
 
-/// Durable record format version. Bumped only by a reviewed schema change;
+/// The durable record format this build writes: 2 since the batching-rule
+/// doc's 10.7, step 1b, whose records may hold a group's application
+/// outcomes. The name is the original constant's; what it names is the
+/// registry's `current`. Bumped only by a reviewed schema change;
 /// unrelated to any wire version.
 pub const JOURNAL_RECORD_FORMAT_V1: u16 =
     coord_types::formats::Format::JournalRecord.current() as u16;
@@ -47,10 +50,9 @@ pub const MAX_RECORD_VALUE_BYTES: usize = MAX_ENVELOPE_PAYLOAD + 16;
 /// Predecessor digest of the first record of a stream.
 pub const GENESIS_PREDECESSOR: Digest32 = Digest32([0; 32]);
 /// The first record format whose records may hold a group's application
-/// outcomes ([`RecordBody::ApplicationGroup`]). This build reads it and
-/// writes [`JOURNAL_RECORD_FORMAT_V1`]: the writer of groups is its
-/// successor (the batching-rule doc's 10.7, steps 1a and 1b), and a voter
-/// can go back from that successor to this build.
+/// outcomes ([`RecordBody::ApplicationGroup`]). This build writes it (the
+/// batching-rule doc's 10.7, step 1b); the release before it (step 1a)
+/// reads it, so a voter can go back there.
 pub const JOURNAL_RECORD_FORMAT_GROUPS: u16 = 2;
 const _: () = assert!(
     coord_types::formats::Format::JournalRecord.supports(JOURNAL_RECORD_FORMAT_GROUPS as u32)

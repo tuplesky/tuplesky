@@ -4899,9 +4899,10 @@ fn a_node_refuses_a_store_that_activated_something_this_build_cannot_do() {
     // The journal's window reads ahead, so the line gives the versions
     // read, and the one written beside them: an operator checking a fleet
     // before a rollback sees which nodes read what a successor writes,
-    // and which already write it (10.7, step 1a).
+    // and which already write it (10.7, step 1a). This build writes the
+    // format of groups (step 1b).
     assert!(
-        report.contains("journal=1..2 journal_writes=1 "),
+        report.contains("journal=1..2 journal_writes=2 "),
         "the build line did not give the journal's read window and written version:\n{report}"
     );
 

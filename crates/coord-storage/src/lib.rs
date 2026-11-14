@@ -125,10 +125,11 @@ pub use authorizations::AuthorizationCacheStats;
 pub use compaction::{GcBudget, GcPlan, HoldGuard, RetentionHolds, plan_gc};
 pub use cut::{CutOverlay, RecoveryCut};
 pub use journaled::{
-    AppendDone, AppendJob, Appender, AskCause, CutError, DomainStatus, FlushReport, GroupMix,
-    HoldEnds, JournalLimits, JournaledError, JournaledStore, LoweringCost, MaterializeDone,
-    MaterializeJob, Materializer, PublishPhases, PublishThread, Published, Replayed, Submission,
-    SubmitRefused, ThreadClock, ThreadTime, TransitionKind,
+    AppendDone, AppendJob, Appender, AskCause, CutError, DomainStatus, FlushReport,
+    GROUP_RECORD_BYTES, GROUP_RECORD_UPDATES, GroupMix, HoldEnds, JournalLimits, JournaledError,
+    JournaledStore, LoweringCost, MaterializeDone, MaterializeJob, Materializer, PublishPhases,
+    PublishThread, Published, Replayed, Submission, SubmitRefused, ThreadClock, ThreadTime,
+    TransitionKind,
 };
 pub use lowering::{GroupDigest, batch_digest};
 pub use materialize::{

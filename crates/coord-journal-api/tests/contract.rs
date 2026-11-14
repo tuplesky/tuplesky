@@ -97,20 +97,36 @@ fn pointer(represented: u64) -> CheckpointPointerV1 {
 }
 
 fn genesis() -> JournalRecordV1 {
-    JournalRecordV1::seal(RecordDraft {
-        origin: origin(),
-        seq: seq(1),
-        predecessor: GENESIS_PREDECESSOR,
-        body: RecordBody::Lifecycle(LifecycleRecordV1::Genesis {
-            format: JOURNAL_RECORD_FORMAT_V1,
-        }),
-    })
+    genesis_at(JOURNAL_RECORD_FORMAT_V1)
+}
+
+/// A genesis record of `format`, naming it.
+fn genesis_at(format: u16) -> JournalRecordV1 {
+    JournalRecordV1::seal_as(
+        format,
+        RecordDraft {
+            origin: origin(),
+            seq: seq(1),
+            predecessor: GENESIS_PREDECESSOR,
+            body: RecordBody::Lifecycle(LifecycleRecordV1::Genesis { format }),
+        },
+    )
     .unwrap()
 }
 
-/// Genesis, boot, protocol, application and pointer records chained.
+/// The format this build reads and doesn't write: 1 since step 1b, the
+/// one every journal before it holds.
+const FORMAT_BEFORE_GROUPS: u16 = 1;
+
+/// Genesis, boot, protocol, application and pointer records chained, at
+/// the format this build writes.
 fn stream() -> Vec<JournalRecordV1> {
-    let mut out = vec![genesis()];
+    stream_at(JOURNAL_RECORD_FORMAT_V1)
+}
+
+/// [`stream`], every record sealed at `format`.
+fn stream_at(format: u16) -> Vec<JournalRecordV1> {
+    let mut out = vec![genesis_at(format)];
     let bodies = [
         RecordBody::Lifecycle(LifecycleRecordV1::Boot {
             boot: BootId([0xb0; 16]),
@@ -122,12 +138,15 @@ fn stream() -> Vec<JournalRecordV1> {
     for body in bodies {
         let last = out.last().unwrap();
         out.push(
-            JournalRecordV1::seal(RecordDraft {
-                origin: origin(),
-                seq: last.seq().checked_next().unwrap(),
-                predecessor: last.digest(),
-                body,
-            })
+            JournalRecordV1::seal_as(
+                format,
+                RecordDraft {
+                    origin: origin(),
+                    seq: last.seq().checked_next().unwrap(),
+                    predecessor: last.digest(),
+                    body,
+                },
+            )
             .unwrap(),
         );
     }
@@ -324,7 +343,7 @@ fn decode_rejects_tampering_truncation_trailing_bytes_and_formats() {
     );
     // One it reads is taken as written: the format is in the digest, so
     // a record's bytes relabelled with another format don't decode.
-    other[0] = JOURNAL_RECORD_FORMAT_GROUPS as u8;
+    other[0] = FORMAT_BEFORE_GROUPS as u8;
     assert_eq!(
         JournalRecordV1::decode(&other),
         Err(RecordError::DigestMismatch)
@@ -703,14 +722,16 @@ fn hex(b: &[u8]) -> String {
 #[test]
 fn record_format_fixture_is_frozen() {
     let kinds = ["genesis", "boot", "protocol", "application", "pointer"];
+    // Format 1's bytes, frozen: this build no longer writes it, and reads
+    // every journal written before it (step 1b).
     let fixture = RecordFixture {
         schema: "journal_record_v1".to_owned(),
-        format: JOURNAL_RECORD_FORMAT_V1,
+        format: FORMAT_BEFORE_GROUPS,
         max_record_bytes: MAX_RECORD_BYTES,
         max_record_updates: MAX_RECORD_UPDATES,
         max_record_key_bytes: MAX_RECORD_KEY_BYTES,
         max_record_value_bytes: MAX_RECORD_VALUE_BYTES,
-        records: stream()
+        records: stream_at(FORMAT_BEFORE_GROUPS)
             .iter()
             .zip(kinds)
             .map(|(r, kind)| {
@@ -736,6 +757,11 @@ fn record_format_fixture_is_frozen() {
         stored, fixture,
         "journal record fixture drifted; the durable format is frozen"
     );
+    // And this build reads it: each stored record decodes to the one
+    // sealed here, at format 1.
+    for ((_, _, bytes, _), record) in stored.records.iter().zip(stream_at(FORMAT_BEFORE_GROUPS)) {
+        assert_eq!(JournalRecordV1::decode(&unhex(bytes)).unwrap(), record);
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -844,7 +870,7 @@ fn a_group_of_outcomes_seals_decodes_and_verifies_at_its_format() {
 #[test]
 fn a_group_is_refused_in_a_record_of_the_format_before_it() {
     assert_eq!(
-        seal(seq(2), Digest32([7; 32]), group()),
+        seal_at(FORMAT_BEFORE_GROUPS, seq(2), Digest32([7; 32]), group()),
         Err(RecordError::GroupBeforeItsFormat)
     );
     let record = seal_at(
@@ -856,7 +882,7 @@ fn a_group_is_refused_in_a_record_of_the_format_before_it() {
     .unwrap();
     let mut bytes = record.encode().unwrap();
     assert_eq!(bytes[0], JOURNAL_RECORD_FORMAT_GROUPS as u8);
-    bytes[0] = JOURNAL_RECORD_FORMAT_V1 as u8;
+    bytes[0] = FORMAT_BEFORE_GROUPS as u8;
     assert_eq!(
         JournalRecordV1::decode(&bytes),
         Err(RecordError::GroupBeforeItsFormat)
@@ -944,23 +970,26 @@ fn a_group_is_held_to_its_outcomes_positions_and_counts() {
     );
 }
 
-/// The window reads ahead one format, and no further.
+/// This build writes format 2, the first whose records hold a group, and
+/// reads 1, which every journal before it holds; nothing past 2 (the
+/// batching-rule doc's 10.7, step 1b).
 #[test]
-fn this_build_writes_one_format_and_reads_the_next() {
+fn this_build_writes_the_format_of_groups_and_reads_the_one_before() {
     let window = Format::JournalRecord.window();
     assert_eq!(window.current, u32::from(JOURNAL_RECORD_FORMAT_V1));
-    assert_eq!(window.newest, u32::from(JOURNAL_RECORD_FORMAT_GROUPS));
-    assert_eq!(genesis().format(), JOURNAL_RECORD_FORMAT_V1);
-    // A stream its successor starts names that format, and opens here.
-    let genesis = seal_at(
+    assert_eq!(window.current, u32::from(JOURNAL_RECORD_FORMAT_GROUPS));
+    assert_eq!(window.newest, window.current);
+    assert_eq!(window.oldest, u32::from(FORMAT_BEFORE_GROUPS));
+    assert_eq!(genesis().format(), JOURNAL_RECORD_FORMAT_GROUPS);
+    assert_eq!(
+        seal(seq(2), Digest32([7; 32]), group()).unwrap().format(),
         JOURNAL_RECORD_FORMAT_GROUPS,
-        seq(1),
-        GENESIS_PREDECESSOR,
-        RecordBody::Lifecycle(LifecycleRecordV1::Genesis {
-            format: JOURNAL_RECORD_FORMAT_GROUPS,
-        }),
-    )
-    .unwrap();
+        "this build seals a group at the format it writes"
+    );
+    // A stream the release before it started names format 1, and opens
+    // here.
+    let genesis = genesis_at(FORMAT_BEFORE_GROUPS);
+    assert_eq!(genesis.format(), FORMAT_BEFORE_GROUPS);
     assert_eq!(
         JournalRecordV1::decode(&genesis.encode().unwrap()).unwrap(),
         genesis
@@ -982,13 +1011,18 @@ fn this_build_writes_one_format_and_reads_the_next() {
     );
 }
 
-/// What its successor writes, frozen: a stream begun at format 2, with a
-/// group of three outcomes, then a lone outcome and a protocol
-/// transition at format 2. This build decodes and chains every record,
-/// and seals the same bytes. The writer of groups (step 1b) is held to
-/// this file, so this release opens its journal.
+/// What this build writes, frozen by the release before it (step 1a): a
+/// stream begun at format 2, with a group of three outcomes, then a lone
+/// outcome and a protocol transition. This build seals these bytes with
+/// its own `seal`, at the format it writes, and decodes and chains the
+/// stored ones. 1a froze this file and reads it, so 1a's release opens
+/// the journal this build writes (the batching-rule doc's 10.7, step 1b).
 #[test]
 fn record_format_groups_fixture_is_frozen() {
+    assert_eq!(
+        JOURNAL_RECORD_FORMAT_V1, JOURNAL_RECORD_FORMAT_GROUPS,
+        "this build writes the format of groups"
+    );
     let mut records: Vec<JournalRecordV1> = Vec::new();
     let bodies = [
         RecordBody::Lifecycle(LifecycleRecordV1::Genesis {
@@ -1013,7 +1047,15 @@ fn record_format_groups_fixture_is_frozen() {
             Some(last) => (last.seq().checked_next().unwrap(), last.digest()),
             None => (seq(1), GENESIS_PREDECESSOR),
         };
-        records.push(seal_at(JOURNAL_RECORD_FORMAT_GROUPS, next, predecessor, body).unwrap());
+        records.push(
+            JournalRecordV1::seal(RecordDraft {
+                origin: origin(),
+                seq: next,
+                predecessor,
+                body,
+            })
+            .unwrap(),
+        );
     }
     let kinds = ["genesis", "boot", "group", "application", "protocol"];
     let fixture = RecordFixture {
@@ -1048,7 +1090,7 @@ fn record_format_groups_fixture_is_frozen() {
         serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     assert_eq!(
         stored, fixture,
-        "the groups fixture drifted; it is what this build reads of its successor's journal"
+        "the groups fixture drifted; it is what 1a's release reads of this build's journal"
     );
     // The stored bytes decode and chain, without this build sealing them.
     let mut expect = RecordExpectation::genesis(origin());

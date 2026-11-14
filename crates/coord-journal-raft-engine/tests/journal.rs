@@ -893,9 +893,9 @@ fn a_journal_retaining_a_pointer_of_an_older_image_format_opens() {
 /// application outcomes among them. Appended, the journal reopens and
 /// reads them back equal: the open decodes every retained record and
 /// checks the chain, so the codec, open's check and the chain all meet
-/// format 2 in the build that must read them. A record this build writes
-/// then follows them, as on a voter gone back from its successor, and the
-/// journal opens again.
+/// format 2 in the build that must read them. A record of format 1 then
+/// follows them, as the release before groups (step 1a) writes on a voter
+/// gone back to it, and the journal opens again.
 #[test]
 fn a_stream_of_the_format_a_successor_writes_reopens_and_reads_back_equal() {
     let dir = tempfile::tempdir().unwrap();
@@ -914,7 +914,9 @@ fn a_stream_of_the_format_a_successor_writes_reopens_and_reads_back_equal() {
             format: JOURNAL_RECORD_FORMAT_GROUPS,
         }),
         transition(1, 8),
-        // Three commands after position 4: two rows, none, one.
+        // Three commands after position 4: two rows, none, one. The one
+        // that changed no rows took no revision, so a group outcome
+        // without one goes through the codec as well (review of #287).
         RecordBody::ApplicationGroup {
             context: context(),
             base: ApplyBase {
@@ -925,7 +927,11 @@ fn a_stream_of_the_format_a_successor_writes_reopens_and_reads_back_equal() {
                 .into_iter()
                 .map(|(p, updates)| GroupOutcomeV1 {
                     position: position(p),
-                    revision: KvRevision::new(p * 10).ok(),
+                    revision: if updates == 0 {
+                        None
+                    } else {
+                        KvRevision::new(p * 10).ok()
+                    },
                     result_digest: Digest32([p as u8; 32]),
                     updates,
                 })
@@ -962,11 +968,12 @@ fn a_stream_of_the_format_a_successor_writes_reopens_and_reads_back_equal() {
         predecessor = record.digest();
         written.push(record);
     }
-    assert!(
-        written
-            .iter()
-            .any(|r| matches!(r.body(), RecordBody::ApplicationGroup { .. }))
-    );
+    assert!(written.iter().any(|r| matches!(
+        r.body(),
+        RecordBody::ApplicationGroup { outcomes, .. }
+            if outcomes.iter().any(|o| o.revision.is_none())
+                && outcomes.iter().any(|o| o.revision.is_some())
+    )));
     journal
         .append_group(&group(vec![(barrier(1), s.id, written.clone())]))
         .unwrap();
@@ -981,10 +988,22 @@ fn a_stream_of_the_format_a_successor_writes_reopens_and_reads_back_equal() {
         "every record reads back at the format it was sealed at"
     );
 
-    // This build writes format 1 after them, and the journal opens again.
+    // The release before groups writes format 1 after them, and the
+    // journal opens again.
     let last = written.last().unwrap();
-    let after = chain(s.origin, last.seq(), last.digest(), vec![transition(3, 8)]);
-    assert_eq!(after[0].format(), JOURNAL_RECORD_FORMAT_V1);
+    let after = vec![
+        JournalRecordV1::seal_as(
+            1,
+            RecordDraft {
+                origin: s.origin,
+                seq: last.seq().checked_next().unwrap(),
+                predecessor: last.digest(),
+                body: transition(3, 8),
+            },
+        )
+        .unwrap(),
+    ];
+    assert_eq!(after[0].format(), 1);
     reopened
         .append_group(&group(vec![(barrier(2), s.id, after.clone())]))
         .unwrap();

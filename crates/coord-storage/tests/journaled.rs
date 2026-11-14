@@ -23,8 +23,8 @@ use coord_journal_api::failure::JournalFailure;
 use coord_journal_api::frontier::CheckpointPointerV1;
 use coord_journal_api::group::GroupLimits;
 use coord_journal_api::record::{
-    GroupOutcomeV1, JOURNAL_RECORD_FORMAT_GROUPS, JournalRecordV1, LifecycleRecordV1, RecordBody,
-    RecordDraft, RecordError, RecordOrigin,
+    GENESIS_PREDECESSOR, GroupOutcomeV1, JOURNAL_RECORD_FORMAT_GROUPS, JOURNAL_RECORD_FORMAT_V1,
+    JournalRecordV1, LifecycleRecordV1, RecordBody, RecordDraft, RecordError, RecordOrigin,
 };
 use coord_journal_api::stream::ShardId;
 use coord_storage::journaled::{
@@ -1209,14 +1209,47 @@ fn a_journal_of_grouped_outcomes_replays_to_the_state_of_per_command_records() {
     }
 }
 
-/// The stream a voter leaves when it goes back from its successor to
-/// this build: genesis and promises at format 1, the outcomes at 2 as its
-/// successor wrote them, and this build's next command at 1 again. It
+/// Every record of the stream sealed again at `format`, and chained
+/// again: the journal a build that writes `format` would have left. Only
+/// for a journal nothing has been materialized from, whose projection
+/// names no record's digest.
+fn resealed_at(journal: &mut ModelJournal, format: u16) {
+    let stream = journal_stream(journal);
+    let records = journal.records(stream).to_vec();
+    journal.truncate_records(stream, 0);
+    let mut predecessor = GENESIS_PREDECESSOR;
+    for record in records {
+        let body = match record.body() {
+            RecordBody::Lifecycle(LifecycleRecordV1::Genesis { .. }) => {
+                RecordBody::Lifecycle(LifecycleRecordV1::Genesis { format })
+            }
+            other => other.clone(),
+        };
+        let resealed = JournalRecordV1::seal_as(
+            format,
+            RecordDraft {
+                origin: *record.origin(),
+                seq: record.seq(),
+                predecessor,
+                body,
+            },
+        )
+        .unwrap();
+        predecessor = resealed.digest();
+        journal.inject_record(stream, resealed);
+    }
+}
+
+/// The stream a voter leaves when it moves to this build from the release
+/// before it (step 1a), which wrote format 1: genesis and promises at 1,
+/// the outcomes at 2 as groups, and this build's next command at 2. It
 /// opens, and opens again after that, each time with the frontier at the
 /// fifth command and the per-command journal's rows, but for the stamp
-/// (the batching-rule doc's 10.7, step 1a; review's scratch test on #286).
+/// (the batching-rule doc's 10.7, steps 1a and 1b; review's scratch test
+/// on #286). The way back, a record of format 1 after them, is the
+/// raft-engine journal's test of a successor's stream.
 #[test]
-fn a_stream_of_formats_one_two_one_opens_and_opens_again() {
+fn a_stream_of_formats_one_then_two_opens_and_opens_again() {
     fn reopen(
         journal: ModelJournal,
         engine: ModelEngine,
@@ -1248,9 +1281,13 @@ fn a_stream_of_formats_one_two_one_opens_and_opens_again() {
         &[Form::Group(4)][..],
         &[Form::Single, Form::Group(2), Form::Single],
     ] {
-        let (mut journal, engine, prefix) = outcomes_unmaterialized();
+        let (mut journal, _, prefix) = outcomes_unmaterialized();
+        resealed_at(&mut journal, 1);
         regrouped(&mut journal, prefix, forms);
-        let (j, mut e) = replay_and_continue(journal, engine).into_parts();
+        // Resealed, every record has a new digest, and the projection's
+        // stamp names the last record it applied by its digest: the
+        // projection is rebuilt from the journal instead.
+        let (j, mut e) = replay_and_continue(journal, ModelEngine::new()).into_parts();
         let formats: Vec<u16> = j
             .records(journal_stream(&j))
             .iter()
@@ -1260,8 +1297,8 @@ fn a_stream_of_formats_one_two_one_opens_and_opens_again() {
         assert!(formats.contains(&2), "{formats:?}");
         assert_eq!(
             *formats.last().unwrap(),
-            1,
-            "{formats:?}: this build writes 1"
+            JOURNAL_RECORD_FORMAT_V1,
+            "{formats:?}: this build writes 2"
         );
         let again = reopen(j, e.pop().unwrap().1);
         assert_eq!(
@@ -1277,6 +1314,232 @@ fn a_stream_of_formats_one_two_one_opens_and_opens_again() {
             "{forms:?}"
         );
     }
+}
+
+/// Three outcomes queued at `at`, at positions 1 to 3 over the domain's
+/// base, one update each, and journaled in one append: the store seals
+/// the run as one group's record (the batching-rule doc's 10.7, step 1b),
+/// and the record is each outcome's durability. Journaled and not
+/// materialized.
+fn group_of_three(world: &mut World, at: Ballot) -> Vec<BarrierId> {
+    let base = world.store.application_base(A).unwrap();
+    assert_eq!(base.execution_position, ExecutionPosition::ZERO);
+    let barriers: Vec<BarrierId> = [(1, b"a", b"1"), (2, b"b", b"2"), (3, b"c", b"3")]
+        .into_iter()
+        .map(|(n, key, value)| {
+            world.application(A, at.number, position(n), vec![kv_update(key, value)])
+        })
+        .collect();
+    let report = world.store.append_pending().unwrap();
+    let durable: Vec<(BarrierId, LocalJournalSeq)> = report
+        .events
+        .iter()
+        .filter_map(|e| match e {
+            StorageEvent::JournalDurable {
+                barrier_id,
+                journal_seq,
+            } => Some((*barrier_id, *journal_seq)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        durable.iter().map(|d| d.0).collect::<Vec<_>>(),
+        barriers,
+        "each outcome's barrier is reported durable"
+    );
+    assert!(
+        durable.iter().all(|d| d.1 == durable[0].1),
+        "by one record: {durable:?}"
+    );
+    let journal = world.store.journal();
+    let record = journal.records(journal_stream(journal)).last().unwrap();
+    assert!(
+        matches!(
+            record.body(),
+            RecordBody::ApplicationGroup { outcomes, .. } if outcomes.len() == 3
+        ),
+        "{:?}",
+        record.body()
+    );
+    // Only the frontier the store holds journaled has moved past the
+    // projection's.
+    assert_eq!(world.store.unmaterialized(A), 1);
+    barriers
+}
+
+/// `frontier_after`'s group arm (the batching-rule doc's 10.7, step 1b;
+/// review of #286): once a group's record is durable, the frontier the
+/// store holds journaled is the group's last position. A fence recomputes
+/// the queue's frontier from it, so it keeps the next application, which
+/// extends the group. Read as moving nothing, the group would leave the
+/// journaled frontier at 0, and the fence would refuse an application
+/// that extends the journal.
+#[test]
+fn a_fence_keeps_the_application_after_a_durable_groups_record() {
+    let mut world = World::new();
+    world.protocol(A, ballot(1), promise(1));
+    world.store.flush().unwrap();
+    let at = Ballot {
+        epoch: world.store.application_base(A).unwrap().configuration,
+        number: 1,
+        leader: REPLICA,
+    };
+    group_of_three(&mut world, at);
+    let next = world.application(A, 1, position(4), vec![kv_update(b"d", b"4")]);
+    assert_eq!(
+        world.store.application_base(A).unwrap().execution_position,
+        position(4)
+    );
+
+    // A promise at the same ballot refuses nothing: the application is
+    // not obsolete, and it extends what the journal holds.
+    let refused = world.store.fence(A, at).unwrap();
+    assert!(refused.is_empty(), "{refused:?}");
+    assert_eq!(world.store.queued(A), 1);
+    let report = world.store.flush().unwrap();
+    assert!(
+        report.events.iter().any(|e| matches!(
+            e,
+            StorageEvent::Materialized { barrier_id, .. } if *barrier_id == next
+        )),
+        "{:?}",
+        report.events
+    );
+    assert_eq!(world.store.status(A), Some(DomainStatus::Ready));
+    assert_eq!(
+        world.store.application_base(A).unwrap().execution_position,
+        position(4)
+    );
+}
+
+/// The same arm where a queue is dropped: an append that definitely did
+/// not happen drops what was queued, and the queue's frontier starts
+/// again from the journaled one. After a durable group, that is the
+/// group's last position, so the application dropped with the queue is
+/// planned again from there and taken. Read as moving nothing, the group
+/// would have the domain report base 0, and a plan from it would take a
+/// position the journal already holds.
+#[test]
+fn a_dropped_queue_starts_again_from_a_durable_groups_last_position() {
+    let mut world = World::new();
+    world.protocol(A, ballot(1), promise(1));
+    world.store.flush().unwrap();
+    let at = Ballot {
+        epoch: world.store.application_base(A).unwrap().configuration,
+        number: 1,
+        leader: REPLICA,
+    };
+    group_of_three(&mut world, at);
+    let dropped = world.application(A, 1, position(4), vec![kv_update(b"d", b"4")]);
+    world
+        .store
+        .journal_mut()
+        .unwrap()
+        .script_append(AppendScript::DefinitelyNotCommitted);
+    let report = world.store.append_pending().unwrap();
+    assert!(
+        report.events.iter().any(|e| matches!(
+            e,
+            StorageEvent::Failed {
+                barrier_id,
+                error: StorageError::DefinitelyNotCommitted,
+            } if *barrier_id == dropped
+        )),
+        "{:?}",
+        report.events
+    );
+    assert_eq!(world.store.queued(A), 0);
+    assert_eq!(
+        world.store.application_base(A).unwrap().execution_position,
+        position(3),
+        "the queue starts again from the group's last position"
+    );
+    let again = world.application(A, 1, position(4), vec![kv_update(b"d", b"4")]);
+    let report = world.store.flush().unwrap();
+    assert!(
+        report.events.iter().any(|e| matches!(
+            e,
+            StorageEvent::Materialized { barrier_id, .. } if *barrier_id == again
+        )),
+        "{:?}",
+        report.events
+    );
+    assert_eq!(world.store.status(A), Some(DomainStatus::Ready));
+    assert_eq!(
+        world.store.application_base(A).unwrap().execution_position,
+        position(4)
+    );
+}
+
+/// A run of queued outcomes stops at a queued checkpoint pointer's place
+/// (the batching-rule doc's 10.7, step 1b; review of #164): the outcomes
+/// queued before the pointer go in one record right before it, and those
+/// queued after it in one record right after it. A run sealed across the
+/// pointer would put the outcomes queued after it ahead of it, which the
+/// pointer's order forbids.
+#[test]
+fn a_run_of_outcomes_stops_at_a_queued_checkpoint_pointer() {
+    let mut world = World::new();
+    world.protocol(A, ballot(1), promise(1));
+    world.store.flush().unwrap();
+    let pointer = CheckpointPointerV1 {
+        origin: world.store.origin(A).unwrap(),
+        represented: world.store.frontiers(A).unwrap().materialized(),
+        format: coord_journal_api::frontier::LOCAL_CHECKPOINT_FORMAT_V1,
+        manifest_digest: Digest32([0x5a; 32]),
+        checkpoint_id: Digest32([0x5b; 32]),
+    };
+    let before: Vec<BarrierId> = (1..=3u64)
+        .map(|n| world.application(A, 1, position(n), vec![kv_update(&[n as u8], b"v")]))
+        .collect();
+    world.store.queue_checkpoint(A, &pointer).unwrap();
+    let after: Vec<BarrierId> = (4..=5u64)
+        .map(|n| world.application(A, 1, position(n), vec![kv_update(&[n as u8], b"v")]))
+        .collect();
+    let report = world.store.append_pending().unwrap();
+    let durable: BTreeMap<BarrierId, LocalJournalSeq> = report
+        .events
+        .iter()
+        .filter_map(|e| match e {
+            StorageEvent::JournalDurable {
+                barrier_id,
+                journal_seq,
+            } => Some((*barrier_id, *journal_seq)),
+            _ => None,
+        })
+        .collect();
+    let seq = |barriers: &[BarrierId]| -> BTreeSet<LocalJournalSeq> {
+        barriers.iter().map(|b| durable[b]).collect()
+    };
+    assert_eq!(seq(&before).len(), 1, "one record before: {durable:?}");
+    assert_eq!(seq(&after).len(), 1, "one record after: {durable:?}");
+    assert!(seq(&before).first() < seq(&after).first());
+    let published = world
+        .store
+        .take_published(A)
+        .expect("the group carried the pointer")
+        .expect("published");
+    assert_eq!(published.published, pointer.represented);
+
+    let journal = world.store.journal();
+    let records = journal.records(journal_stream(journal));
+    let at = records
+        .iter()
+        .position(|r| {
+            matches!(r.body(), RecordBody::PublishLocalCheckpoint(p) if p.represented == pointer.represented)
+        })
+        .expect("the pointer is in the journal");
+    let positions = |r: &JournalRecordV1| -> Vec<u64> {
+        match r.body() {
+            RecordBody::ApplicationGroup { outcomes, .. } => {
+                outcomes.iter().map(|o| o.position.get()).collect()
+            }
+            other => panic!("not a group: {other:?}"),
+        }
+    };
+    assert_eq!(positions(&records[at - 1]), [1, 2, 3]);
+    assert_eq!(positions(&records[at + 1]), [4, 5]);
+    assert_eq!(records.len(), at + 2, "nothing after the second run");
 }
 
 /// A group whose base isn't the projection's frontier is refused at
