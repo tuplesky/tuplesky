@@ -38,12 +38,27 @@ pub const READS_HELD: usize = 4096;
 /// to answer sooner than the ordered path would.
 pub const READ_WAIT_MILLIS: u64 = 1_000;
 
-/// How long a confirmation round in flight keeps the next one from
-/// starting, in milliseconds (task-d58). Past it the round is presumed
-/// lost for that purpose only: it still confirms if its answers come.
-/// Well under [`READ_WAIT_MILLIS`], so one lost answer costs a read this
-/// much, not its whole wait.
-pub const ROUND_IN_FLIGHT_MILLIS: u64 = 100;
+/// How old the youngest confirmation round of a ballot must be before
+/// another may start, in milliseconds.
+///
+/// A read is covered only by a round started after it arrived. task-d58
+/// held the next round back until the one in flight confirmed (or was
+/// 100 ms old), so the reads that arrived meanwhile shared it. That cost
+/// nothing while a round confirmed in well under a millisecond. Across
+/// regions a round takes a quorum round trip, and a read that arrived
+/// just after one started waited for it and then for a whole new one:
+/// two round trips, where etcd's read index takes one.
+///
+/// Spaced instead, a read's round starts within this long of its
+/// arrival, so it waits one round trip and at most this much more. While
+/// a round is out, at most one more starts per spacing: across regions,
+/// where a round takes longer than the spacing, that is at most 200 a
+/// second while reads keep arriving. On a LAN a round confirms long
+/// before the spacing ends and leaves nothing to hold the next back, so
+/// rounds go one per confirmation, at task-d58's rate, and the rule
+/// changes nothing there. A round that never confirms still holds
+/// nothing back for longer than this.
+pub const ROUND_SPACING_MILLIS: u64 = 5;
 
 pub use coord_collector::servable;
 
@@ -190,17 +205,18 @@ impl ReadBarrier {
     }
 
     /// The round to start now, if a held read arrived after the last one
-    /// started and no round of `ballot` is in flight. Its number is what
-    /// the caller sends in `ReadConfirm`.
+    /// started and no round of `ballot` started within
+    /// [`ROUND_SPACING_MILLIS`]. Its number is what the caller sends in
+    /// `ReadConfirm`.
     ///
-    /// One round at a time (task-d58). A read covered only by a round
-    /// started after it arrived, a round per arrival was a round per
-    /// read: four requests and four answers at five voters, and a third
-    /// of them superseded before they confirmed. Waiting for the round in
-    /// flight lets every read that arrives meanwhile share the next one,
-    /// and the wait overlaps the read's wait for its index to execute,
-    /// which is the longer. A round in flight past
-    /// [`ROUND_IN_FLIGHT_MILLIS`] does not hold the next one back.
+    /// Spaced, not one per read (task-d58). A read is covered only by a
+    /// round started after it arrived, so a round per arrival was a round
+    /// per read: four requests and four answers at five voters, and a
+    /// third of them superseded before they confirmed. The reads that
+    /// arrive within a spacing share the next round. The round out need
+    /// not have confirmed: waiting for it, as task-d58 did, made a read
+    /// that arrived just after a round started wait two round trips
+    /// across regions.
     ///
     /// Where the leader alone is a slow quorum (`slow_size` one, a
     /// single voter), the round confirms as it starts: nothing else's
@@ -211,17 +227,51 @@ impl ReadBarrier {
         slow_size: usize,
         now: MonotonicMillis,
     ) -> Option<u64> {
-        let uncovered = self
-            .held
-            .iter()
-            .any(|h| h.read.ballot == ballot && h.after_round >= self.next_round);
-        if !uncovered {
+        self.round_to_start_spaced(ballot, slow_size, now, ROUND_SPACING_MILLIS)
+    }
+
+    /// When the round a held read of `ballot` waits for may start, if it
+    /// waits on the spacing: the youngest round's start plus
+    /// [`ROUND_SPACING_MILLIS`]. The loop wakes then, since on an idle
+    /// domain nothing else arrives to start it. `None` when no held read
+    /// waits for a round, or none of `ballot` is out (the next pump
+    /// starts one at once).
+    pub fn next_round_at(&self, ballot: Ballot) -> Option<MonotonicMillis> {
+        if !self.uncovered(ballot) {
             return None;
         }
-        let in_flight = self.rounds.values().any(|r| {
-            r.ballot == ballot && now.get().saturating_sub(r.started.get()) < ROUND_IN_FLIGHT_MILLIS
-        });
-        if in_flight {
+        self.rounds
+            .values()
+            .filter(|r| r.ballot == ballot)
+            .map(|r| r.started.plus(ROUND_SPACING_MILLIS))
+            .max()
+    }
+
+    /// Whether a held read of `ballot` arrived after the last round
+    /// started, so it needs one of its own.
+    fn uncovered(&self, ballot: Ballot) -> bool {
+        self.held
+            .iter()
+            .any(|h| h.read.ballot == ballot && h.after_round >= self.next_round)
+    }
+
+    /// [`ReadBarrier::round_to_start`] with the spacing given, so the
+    /// model test can run task-d58's rule beside this one.
+    fn round_to_start_spaced(
+        &mut self,
+        ballot: Ballot,
+        slow_size: usize,
+        now: MonotonicMillis,
+        spacing: u64,
+    ) -> Option<u64> {
+        if !self.uncovered(ballot) {
+            return None;
+        }
+        let too_soon = self
+            .rounds
+            .values()
+            .any(|r| r.ballot == ballot && now.get().saturating_sub(r.started.get()) < spacing);
+        if too_soon {
             return None;
         }
         let round = self.next_round;
@@ -839,9 +889,9 @@ mod tests {
         assert_eq!(refusal_of(&refused[0].1), Some(ReadRefusal::Expired));
     }
 
-    /// Reads that arrive while a round is in flight start none of their
-    /// own; the next round, started once that one confirms, covers them
-    /// all, and the round under way answers none of them (task-d58).
+    /// Reads that arrive within the spacing of a round start none of
+    /// their own; the next round covers them all, and the round under
+    /// way answers none of them (task-d58).
     #[test]
     fn reads_that_arrive_during_a_round_share_the_next() {
         let b = ballot(1);
@@ -857,7 +907,7 @@ mod tests {
             assert_eq!(
                 barrier.round_to_start(b, 2, T0),
                 None,
-                "one round in flight at a time"
+                "no second round within the spacing"
             );
         }
         barrier.on_confirmed(ReplicaId([2; 16]), b, first, 2);
@@ -875,30 +925,277 @@ mod tests {
         assert_eq!(barrier.counts.rounds, 2);
     }
 
-    /// A round that has not confirmed in [`ROUND_IN_FLIGHT_MILLIS`] does
-    /// not hold the next one back: a lost answer costs a read that long,
-    /// not its whole wait.
+    /// A round out holds the next one back for [`ROUND_SPACING_MILLIS`]
+    /// and no longer, confirmed or not, and the barrier says when the
+    /// held read's round may start, so the loop can wake for it.
     #[test]
-    fn a_round_in_flight_too_long_does_not_hold_the_next() {
+    fn a_round_out_holds_the_next_back_only_for_the_spacing() {
+        let b = ballot(1);
+        let mut barrier = ReadBarrier::new();
+        assert_eq!(barrier.next_round_at(b), None, "nothing held");
+        barrier
+            .admit(Origin::Local, read(1, b, range()), leading(b, 3), T0)
+            .unwrap();
+        assert_eq!(
+            barrier.next_round_at(b),
+            None,
+            "no round out: one starts now"
+        );
+        let first = barrier.round_to_start(b, 2, T0).unwrap();
+        assert_eq!(barrier.next_round_at(b), None, "the read is covered");
+        let soon = T0.plus(ROUND_SPACING_MILLIS - 1);
+        barrier
+            .admit(Origin::Local, read(2, b, range()), leading(b, 4), soon)
+            .unwrap();
+        assert_eq!(barrier.round_to_start(b, 2, soon), None);
+        let due = T0.plus(ROUND_SPACING_MILLIS);
+        assert_eq!(barrier.next_round_at(b), Some(due));
+        assert_eq!(barrier.next_round_at(ballot(2)), None, "another ballot's");
+        let second = barrier.round_to_start(b, 2, due).unwrap();
+        assert!(second > first, "the first has not confirmed");
+        assert_eq!(barrier.next_round_at(b), None);
+        // The first still confirms when its answer comes, and covers only
+        // the read before it; the second covers the other.
+        barrier.on_confirmed(ReplicaId([2; 16]), b, first, 2);
+        let (due_now, _) = barrier.take_due(leading(b, 4), due, |_| true, at(5));
+        assert_eq!(due_now.len(), 1);
+        assert_eq!(due_now[0].read.request.retry_key.request_sequence.get(), 1);
+        barrier.on_confirmed(ReplicaId([2; 16]), b, second, 2);
+        let (due_now, _) = barrier.take_due(leading(b, 4), due, |_| true, at(5));
+        assert_eq!(due_now.len(), 1);
+        assert_eq!(due_now[0].read.request.retry_key.request_sequence.get(), 2);
+    }
+
+    /// Rounds that overlap confirm out of order, ordinarily so across
+    /// regions once a round out holds the next back only for the
+    /// spacing. A later round's confirmation covers the reads before the
+    /// earlier round too, and the earlier round's late answer finds
+    /// nothing and covers nothing that arrived after it (review on #295).
+    #[test]
+    fn a_later_round_confirmed_first_covers_the_reads_before_the_earlier() {
         let b = ballot(1);
         let mut barrier = ReadBarrier::new();
         barrier
             .admit(Origin::Local, read(1, b, range()), leading(b, 3), T0)
             .unwrap();
         let first = barrier.round_to_start(b, 2, T0).unwrap();
-        let soon = T0.plus(ROUND_IN_FLIGHT_MILLIS - 1);
+        let later = T0.plus(ROUND_SPACING_MILLIS);
         barrier
-            .admit(Origin::Local, read(2, b, range()), leading(b, 4), soon)
+            .admit(Origin::Local, read(2, b, range()), leading(b, 4), later)
             .unwrap();
-        assert_eq!(barrier.round_to_start(b, 2, soon), None);
-        let late = T0.plus(ROUND_IN_FLIGHT_MILLIS);
-        let second = barrier.round_to_start(b, 2, late).unwrap();
+        let second = barrier.round_to_start(b, 2, later).unwrap();
         assert!(second > first);
-        // The first still confirms if its answer comes, and covers only
-        // the read before it.
+        barrier.on_confirmed(ReplicaId([3; 16]), b, second, 2);
+        let (due, _) = barrier.take_due(leading(b, 4), later, |_| true, at(5));
+        let mut answered: Vec<u64> = due
+            .iter()
+            .map(|h| h.read.request.retry_key.request_sequence.get())
+            .collect();
+        answered.sort_unstable();
+        assert_eq!(answered, [1, 2], "the second round covers both reads");
+        // A read after the second round started; then the first round's
+        // answer comes late. It covers nothing: the read needs a round
+        // that started after it.
+        barrier
+            .admit(Origin::Local, read(3, b, range()), leading(b, 4), later)
+            .unwrap();
         barrier.on_confirmed(ReplicaId([2; 16]), b, first, 2);
-        let (due, _) = barrier.take_due(leading(b, 4), late, |_| true, at(5));
-        assert_eq!(due.len(), 1);
-        assert_eq!(due[0].read.request.retry_key.request_sequence.get(), 1);
+        let (due, _) = barrier.take_due(leading(b, 4), later, |_| true, at(5));
+        assert!(
+            due.is_empty(),
+            "the first round's late answer covers nothing"
+        );
+        assert_eq!(barrier.counts.rounds, 2);
+    }
+
+    /// What a model run of the barrier gave: the median wait of the
+    /// client that reads in a loop and of the other reads, in ms, and
+    /// the rounds started.
+    #[derive(Debug)]
+    struct Modelled {
+        client_p50: u64,
+        others_p50: u64,
+        rounds: u64,
+    }
+
+    const MODEL_MILLIS: u64 = 30_000;
+    const MODEL_RTT: u64 = 70;
+
+    /// The barrier under the WAN run's shape on #185, with the leader in
+    /// us-east, and rounds held back for `spacing` (100 is task-d58's
+    /// rule: confirmed rounds are dropped, so a round out held the next
+    /// back until it confirmed).
+    ///
+    /// - A round confirms at its third answer, one quorum round trip
+    ///   ([`MODEL_RTT`]) after it starts; the nearest follower answers
+    ///   in 2 ms.
+    /// - One client reads in a loop: its next read arrives 1 ms after the
+    ///   last is answered.
+    /// - Other reads arrive every 1 to 19 ms (a fixed pseudo-random
+    ///   sequence).
+    /// - The leader pumps when a read or an answer arrives, and at
+    ///   [`ReadBarrier::next_round_at`], as the serve loop wakes for it.
+    fn model(spacing: u64) -> Modelled {
+        // Reads due to arrive, by time: whether each is the client's.
+        let mut sends: BTreeMap<u64, Vec<bool>> = BTreeMap::new();
+        sends.entry(1).or_default().push(true);
+        let mut x: u64 = 1;
+        let mut t = 0;
+        while t < MODEL_MILLIS {
+            x = x
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            t += 1 + (x >> 33) % 19;
+            sends.entry(t).or_default().push(false);
+        }
+        let (client, others, rounds) = drive(spacing, sends, true);
+        Modelled {
+            client_p50: p50(client),
+            others_p50: p50(others),
+            rounds,
+        }
+    }
+
+    /// The median of `v`.
+    fn p50(mut v: Vec<u64>) -> u64 {
+        v.sort_unstable();
+        v[v.len() / 2]
+    }
+
+    /// Drives the barrier through `sends` (the reads due to arrive, by
+    /// time, `true` marking the ones measured apart) under the model's
+    /// answers and pumps, and returns the waits of the marked reads, of
+    /// the others, and the rounds started. With `in_a_loop`, a marked
+    /// read is followed by the next 1 ms after it is answered.
+    fn drive(
+        spacing: u64,
+        mut sends: BTreeMap<u64, Vec<bool>>,
+        in_a_loop: bool,
+    ) -> (Vec<u64>, Vec<u64>, u64) {
+        let b = ballot(1);
+        let lead = Some(Leading {
+            ballot: b,
+            index: Some(1),
+            slow_size: 3,
+        });
+        let (near, far) = (ReplicaId([2; 16]), ReplicaId([3; 16]));
+        let mut barrier = ReadBarrier::new();
+        let mut answers: BTreeMap<u64, Vec<(ReplicaId, u64)>> = BTreeMap::new();
+        let mut clients = BTreeSet::new();
+        let (mut client, mut others) = (Vec::new(), Vec::new());
+        let mut seq = 0;
+        let mut t = 0;
+        while t <= MODEL_MILLIS {
+            let now = T0.plus(t);
+            for (from, round) in answers.remove(&t).unwrap_or_default() {
+                barrier.on_confirmed(from, b, round, 3);
+            }
+            for mine in sends.remove(&t).unwrap_or_default() {
+                seq += 1;
+                if mine {
+                    clients.insert(seq);
+                }
+                barrier
+                    .admit(Origin::Local, read(seq, b, range()), lead, now)
+                    .unwrap();
+            }
+            if let Some(round) = barrier.round_to_start_spaced(b, 3, now, spacing) {
+                answers.entry(t + 2).or_default().push((near, round));
+                answers.entry(t + MODEL_RTT).or_default().push((far, round));
+            }
+            // The serve loop sleeps until `next_round_at`. After a pump, a
+            // time at or before now would wake it at once to start
+            // nothing: a spin (review on #295). The loop below takes only
+            // a later wake, so it would not show one. Under task-d58's
+            // rule the model still asks `next_round_at`, which assumes
+            // the shipped spacing, so only that spacing is checked.
+            if spacing == ROUND_SPACING_MILLIS {
+                assert!(
+                    barrier.next_round_at(b).is_none_or(|n| n.get() > t),
+                    "a wake at {t} or before would spin"
+                );
+            }
+            let (due, refused) = barrier.take_due(lead, now, |_| true, at(5));
+            assert!(refused.is_empty());
+            for held in due {
+                let seq = held.read.request.retry_key.request_sequence.get();
+                let waited = t - held.arrived.get();
+                if clients.contains(&seq) {
+                    client.push(waited);
+                    if in_a_loop {
+                        sends.entry(t + 1).or_default().push(true);
+                    }
+                } else {
+                    others.push(waited);
+                }
+            }
+            let Some(next) = [
+                answers.keys().next().copied(),
+                sends.keys().next().copied(),
+                barrier.next_round_at(b).map(MonotonicMillis::get),
+            ]
+            .into_iter()
+            .flatten()
+            .filter(|&n| n > t)
+            .min() else {
+                break;
+            };
+            t = next;
+        }
+        (client, others, barrier.counts.rounds)
+    }
+
+    /// The model of the WAN run (#185): under task-d58's rule the client
+    /// that reads in a loop waits two quorum round trips, because its
+    /// read lands just after the round that answered it gave way to the
+    /// next; spaced, it waits one. A read at a random time waits about
+    /// one and a half round trips under task-d58's rule, and one spaced.
+    /// The rounds stay within one a spacing.
+    #[test]
+    fn a_read_waits_one_quorum_round_trip_not_two() {
+        let old = model(100);
+        let new = model(ROUND_SPACING_MILLIS);
+        assert!(old.client_p50 >= 2 * MODEL_RTT - 2, "{old:?}");
+        assert!(old.others_p50 >= MODEL_RTT + MODEL_RTT / 4, "{old:?}");
+        assert!(
+            new.client_p50 <= MODEL_RTT + ROUND_SPACING_MILLIS,
+            "{new:?}"
+        );
+        assert!(
+            new.others_p50 <= MODEL_RTT + ROUND_SPACING_MILLIS,
+            "{new:?}"
+        );
+        assert!(
+            new.rounds <= MODEL_MILLIS / ROUND_SPACING_MILLIS + 1,
+            "{new:?}"
+        );
+        // Printed for the PR's evidence (`--nocapture`).
+        println!("task-d58's rule: {old:?}; spaced: {new:?}");
+    }
+
+    /// An idle domain: two reads 2 ms apart every 200 ms, and nothing
+    /// else. The second arrives while the first's round is out, so it
+    /// waits for a round of its own, and on an idle domain only the wake
+    /// at the spacing's end starts that round before the first confirms.
+    /// Without it, as under task-d58's rule, the second read waits two
+    /// quorum round trips.
+    #[test]
+    fn on_an_idle_domain_the_wake_starts_a_held_reads_round() {
+        let pairs = |spacing| {
+            let mut sends: BTreeMap<u64, Vec<bool>> = BTreeMap::new();
+            for k in 0..MODEL_MILLIS / 200 {
+                sends.entry(200 * k + 1).or_default().push(false);
+                sends.entry(200 * k + 3).or_default().push(true);
+            }
+            let (second, first, _) = drive(spacing, sends, false);
+            (p50(first), p50(second))
+        };
+        let old = pairs(100);
+        let new = pairs(ROUND_SPACING_MILLIS);
+        assert_eq!(old.0, MODEL_RTT, "{old:?}");
+        assert!(old.1 >= 2 * MODEL_RTT - 2, "{old:?}");
+        assert_eq!(new.0, MODEL_RTT, "{new:?}");
+        assert_eq!(new.1, MODEL_RTT + ROUND_SPACING_MILLIS - 2, "{new:?}");
+        println!("idle pairs, first and second p50: task-d58's rule {old:?}; spaced {new:?}");
     }
 }

@@ -3425,6 +3425,15 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             .frontend
             .next_hold_deadline()
             .map(|at| self.started + std::time::Duration::from_millis(at.get()));
+        // A held read's round starts once the round out is
+        // `ROUND_SPACING_MILLIS` old, and on an idle domain nothing else
+        // arrives to start it.
+        let read_round = match &self.backing {
+            Backing::Voting(voter) => voter
+                .next_read_round_at()
+                .map(|at| self.started + std::time::Duration::from_millis(at.get())),
+            Backing::Serving(_) => None,
+        };
         // A working projection commit is made durable within its bound
         // on an idle domain too, and nothing arrives to say it is due
         // (task-j06).
@@ -3448,6 +3457,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             report,
             read,
             held,
+            read_round,
             durable_projection,
             held_commit,
         ]

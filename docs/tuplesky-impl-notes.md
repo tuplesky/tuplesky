@@ -9790,6 +9790,12 @@ round.
   and still confirms if its answers come
   (`a_round_in_flight_too_long_does_not_hold_the_next`). Nothing about
   when a read is due or what it may return changes.
+  *Later:* the hold is now a spacing, `ROUND_SPACING_MILLIS` (5 ms), with
+  the serve loop woken at its end. Across regions a read that arrived
+  just after a round started waited for that round and a whole new one,
+  two quorum round trips (the WAN run on #185). Spaced, it waits one
+  (`a_round_out_holds_the_next_back_only_for_the_spacing`,
+  `a_read_waits_one_quorum_round_trip_not_two`).
 - **Counted.** The `metrics` line's `reads` gains `snapshots`, the
   snapshots pinned for due reads, and `behind`, the due reads held again
   because theirs was behind them.
