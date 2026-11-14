@@ -55,7 +55,7 @@ on:
         description: "Comma-separated faults (kill, pause, partition, packet), or none; empty for the scenario's. Not clock: the containers share this runner's clock. TupleSky's partitions can be partition:TARGETS[:LO-HI[/EVERY]], TARGETS any, one or follower (a voter not leading), such as partition:follower:5-10/60; etcd and SwiftPaxos get plain partitions."
         default: ""
       wan:
-        description: "The network between the nodes: none, regions, or one-way milliseconds between every two; empty for the scenario's"
+        description: "The network between the nodes: none, regions, regions:AB/AC/BC (three regions with those round trips in ms, such as regions:70/80/140), or one-way milliseconds between every two; +lossPERCENT and +jitterPERCENT after add standing loss and jitter between the nodes (regions:70/80/140+loss1); @local after puts each client beside the node it talks to, for every system (@first, the default, beside the first node); empty for the scenario's"
         default: ""
       time-limit:
         description: "Seconds of workload before healing; empty for the scenario's (300, or 120 for throughput)"
@@ -487,7 +487,7 @@ jobs:
         # --wan only with a profile, so the faults scenario runs on a
         # harness from before it.
         run: |
-          wan=(); if [ "$WAN" != none ]; then wan=(--wan "$WAN"); fi
+          wan=(); if [ "$WAN" != none ]; then wan=(--wan "$WAN" ${WAN_CLIENTS:+--wan-clients "$WAN_CLIENTS"}); fi
           # Each side's workers: the head's (or the one run's), and in a
           # pair the base's, which BASE/HEAD sets apart.
           voter=() head_workers=() base_workers=()
@@ -1402,7 +1402,7 @@ jobs:
         # The TupleSky test's time limit, fault interval, rate, concurrency
         # and network, bounded the same way.
         run: |
-          wan=(); if [ "$WAN" != none ]; then wan=(--wan "$WAN"); fi
+          wan=(); if [ "$WAN" != none ]; then wan=(--wan "$WAN" ${WAN_CLIENTS:+--wan-clients "$WAN_CLIENTS"}); fi
           export JEPSEN_CPU_SAMPLES="$RUNNER_TEMP/cpu-samples.csv"
           "$GITHUB_WORKSPACE/tuplesky/scripts/ci/jepsen_bounded.sh" \
             $((TIME_LIMIT + 1200)) "$RUNNER_TEMP/cluster/nodes" -- lein run test \

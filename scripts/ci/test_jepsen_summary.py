@@ -344,6 +344,44 @@ class SummaryTests(unittest.TestCase):
         self.assertIn("round trips measured at setup; clients beside the first node", text)
         self.assertIn("| n1 | n2 | 66.4 | 66 |", text)
 
+    def test_latency_by_the_clients_region(self):
+        def wan_line(msg):
+            return f"2026-09-27 10:00:00,000{{GMT}}\tINFO\t[jepsen nemesis] jepsen.tuplesky.wan: {msg}\n"
+
+        def op_line(ms, thread, msg):
+            return f"2026-09-27 10:00:01,{ms}{{GMT}}\tINFO\t[{thread}] jepsen.print: {msg}\n"
+
+        nodes = ["n1", "n2", "n3", "n4", "n5"]
+        lines = [
+            wan_line('WAN regions: {"n1" "us-east", "n2" "us-west", "n3" "eu-west", "n4" "us-east", "n5" "us-west"}'),
+            wan_line("WAN clients: local"),
+            wan_line("WAN round trip n1 -> n2 : 70.4 ms, profile 70 ms"),
+            # Worker 0 (n1, us-east): a write in 40 ms; worker 3 (n4,
+            # us-east): a read in 2 ms; worker 2 (n3, eu-west): a write in
+            # 160 ms; worker 6 (n2, us-west, 6 mod 5): a fail, no latency.
+            op_line("000", "jepsen worker 0", "0\t:invoke\t:write\t1"),
+            op_line("000", "jepsen worker 3", "3\t:invoke\t:read\tnil"),
+            op_line("000", "jepsen worker 2", "2\t:invoke\t:write\t2"),
+            op_line("000", "jepsen worker 6", "6\t:invoke\t:cas\t[1 2]"),
+            op_line("002", "jepsen worker 3", "3\t:ok\t:read\t1"),
+            op_line("040", "jepsen worker 0", "0\t:ok\t:write\t1"),
+            op_line("050", "jepsen worker 6", "6\t:fail\t:cas\t[1 2]"),
+            op_line("160", "jepsen worker 2", "2\t:ok\t:write\t2"),
+        ]
+        self.assertEqual(js.parse_regions(lines)["n4"], "us-east")
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "jepsen.log"), "w") as f:
+                f.writelines(lines)
+            text = js.summarize(d, nodes, "Jepsen")
+        self.assertIn("**Latency by the clients' region**", text)
+        self.assertIn("| Region | Nodes | Clients | `ok`/s | All | `:read` | `:write` |", text)
+        self.assertIn("| us-east | n1, n4 | 2 | ", text)
+        row = next(l for l in text.splitlines() if l.startswith("| us-east |"))
+        self.assertTrue(row.endswith("| 2 / 40 | 2 / 2 | 40 / 40 |"), row)
+        row = next(l for l in text.splitlines() if l.startswith("| us-west |"))
+        self.assertTrue(row.endswith("| - | - | - |"), row)
+        self.assertIn("| eu-west | n3 | 1 | ", text)
+
     def test_missing_files_leave_sections_out(self):
         with tempfile.TemporaryDirectory() as empty:
             text = js.summarize(empty, [], "Jepsen")

@@ -116,6 +116,66 @@ edit(sys.argv[2],
 PY
   grep -n 'snapshot-count' "$test_dir/src/jepsen/etcd/db.clj" "$test_dir/src/jepsen/etcd.clj"
 
+  # Under a WAN profile (WAN, from jepsen_scenario.sh), etcd's timing for
+  # the round trips, as etcd's tuning guide says: a heartbeat about the
+  # largest round trip between members (rounded up to 50 ms) and an
+  # election timeout ten times it, where its defaults (100 and 1000 ms)
+  # assume a LAN. And JEPSEN_ETCD_LEADER, which `run` sets: the node to
+  # move the leadership to once the cluster is up, `first` for the first
+  # node, so each system's leader starts in the region the run names.
+  if [ "${WAN:-none}" != none ]; then
+    python3 - "$test_dir/src/jepsen/etcd/db.clj" "$WAN" <<'PY'
+import math, re, sys
+path, wan = sys.argv[1], sys.argv[2].split("+")[0]
+if wan == "regions":
+    rtt = 130
+elif wan.startswith("regions:"):
+    rtt = max(float(x) for x in wan[len("regions:"):].split("/"))
+else:
+    rtt = 2 * float(wan)
+heartbeat = max(100, int(math.ceil(rtt / 50.0)) * 50)
+election = 10 * heartbeat
+src = open(path).read()
+def edit(old, new):
+    global src
+    if src.count(old) != 1:
+        sys.exit(f"{path} no longer has: {old!r}")
+    src = src.replace(old, new)
+edit("      (when (:unsafe-no-fsync test) :--unsafe-no-fsync)\n",
+     f"      :--heartbeat-interval           {heartbeat}\n"
+     f"      :--election-timeout             {election}\n"
+     "      (when (:unsafe-no-fsync test) :--unsafe-no-fsync)\n")
+edit("(defrecord DB [tcpdump lazyfs]\n",
+     '(defn move-leader!\n'
+     '  "Moves the leadership to `want` (jepsen_etcd.sh, a WAN run): etcdctl\n'
+     '  over every member\'s client URL, with this node\'s certificate when the\n'
+     '  run is secured, retried while an election settles; logs where it ended."\n'
+     '  [test want]\n'
+     '  (let [ctl    (str dir "/etcdctl")\n'
+     '        eps    (str/join "," (map s/client-url (:nodes test)))\n'
+     '        script (str "if [ -f " dir "/tls/ca.crt ]; then set -- --cacert " dir "/tls/ca.crt"\n'
+     '                    " --cert " dir "/tls/node.crt --key " dir "/tls/node.key; fi; "\n'
+     '                    "id=$(" ctl " \\"$@\\" --endpoints " eps " member list"\n'
+     '                    " | awk -F\', \' \'$3 == \\"" want "\\" {print $1}\'); "\n'
+     '                    "for i in 1 2 3 4 5 6 7 8 9 10; do"\n'
+     '                    " " ctl " \\"$@\\" --endpoints " eps " move-leader $id && break; sleep 2; done; "\n'
+     '                    ctl " \\"$@\\" --endpoints " eps " endpoint status -w table")]\n'
+     '    (info "etcd leader to" want (str "(member " (pr-str want) "):\\n")\n'
+     '          (c/su (c/exec :bash :-c script)))))\n'
+     '\n'
+     "(defrecord DB [tcpdump lazyfs]\n")
+edit("    (reset! (:initialized? test) true)\n",
+     "    (reset! (:initialized? test) true)\n"
+     "    (when-let [want (not-empty (System/getenv \"JEPSEN_ETCD_LEADER\"))]\n"
+     "      (when (= node (first (:nodes test)))\n"
+     "        (move-leader! test (if (= want \"first\") (first (:nodes test)) want)))\n"
+     "      (jepsen/synchronize test))\n")
+open(path, "w").write(src)
+print(f"etcd under --wan {sys.argv[2]}: heartbeat {heartbeat} ms, election {election} ms")
+PY
+    grep -n 'heartbeat-interval\|election-timeout\|move-leader\|JEPSEN_ETCD_LEADER' "$test_dir/src/jepsen/etcd/db.clj"
+  fi
+
   # The swiftpaxos register mix (REGISTER_MIX, the workflow's
   # register-swiftpaxos-mix): reads and writes alone, n readers in each
   # key's group of 2n, as jepsen.swiftpaxos's register test draws them, so
@@ -283,11 +343,14 @@ if wan:
     edit(f"{root}/etcd.clj", [
         ("    :clock :member})", "    :clock :member :packet})"),
         ("                         :interval  (:nemesis-interval opts)})",
-         "                         :wan       (:wan opts)\n"
+         "                         :wan       (jepsen.tuplesky.wan/with-clients\n"
+         "                                      (:wan opts) (:wan-clients opts))\n"
          "                         :interval  (:nemesis-interval opts)})"),
         ('   [nil "--nemesis-interval SECONDS"',
-         '   [nil "--wan PROFILE" "none, regions, or one-way milliseconds (jepsen.tuplesky.wan)"\n'
+         '   [nil "--wan PROFILE" "none, regions, regions:AB/AC/BC or one-way milliseconds, +loss/+jitter after (jepsen.tuplesky.wan)"\n'
          '    :parse-fn #(jepsen.tuplesky.wan/parse-spec %)]\n\n'
+         '   [nil "--wan-clients WHERE" "first or local (jepsen.tuplesky.wan)"\n'
+         '    :parse-fn #(jepsen.tuplesky.wan/parse-clients %)]\n\n'
          '   [nil "--nemesis-interval SECONDS"'),
     ])
 PY
@@ -305,7 +368,7 @@ run() {
   # for 84 minutes after its time limit. No leader profile: it reads
   # TupleSky's voters.
   local samples=$1 wan=() snapshots=()
-  if [ "$WAN" != none ]; then wan=(--wan "$WAN"); fi
+  if [ "$WAN" != none ]; then wan=(--wan "$WAN" ${WAN_CLIENTS:+--wan-clients "$WAN_CLIENTS"}); fi
   # ETCD_SNAPSHOT_COUNT: a snapshot count for this run; etcd's own without.
   if [ -n "${ETCD_SNAPSHOT_COUNT:-}" ]; then snapshots=(--snapshot-count "$ETCD_SNAPSHOT_COUNT"); fi
   # ETCD_SECURE (tls or tls+auth): this run secured, on the edits
@@ -321,6 +384,11 @@ run() {
   esac
   export JEPSEN_CPU_SAMPLES=$samples
   unset JEPSEN_LEADER_PROFILE JEPSEN_LEADER_CALLGRAPH
+  # Under a WAN, etcd's leader starts on the first node, in the first
+  # region, as TupleSky's does (prepare's move-leader!); ETCD_LEADER names
+  # another node for a run that places it elsewhere.
+  unset JEPSEN_ETCD_LEADER
+  if [ "$WAN" != none ]; then export JEPSEN_ETCD_LEADER=${ETCD_LEADER:-first}; fi
   cd "$test_dir"
   "$ci/jepsen_bounded.sh" $((TIME_LIMIT + 1200)) "$RUNNER_TEMP/cluster/nodes" -- lein run test \
     --nodes-file "$RUNNER_TEMP/cluster/nodes" \

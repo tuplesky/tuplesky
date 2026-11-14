@@ -40,7 +40,11 @@
 #   IN_RATE        operations a second over all clients, 0 for
 #                  unthrottled; empty for the scenario's
 #   NODES          the cluster's nodes (5), for the register minimum
-#   IN_WAN         the network: none, regions, or one-way milliseconds;
+#   IN_WAN         the network: none, regions, regions:AB/AC/BC (round trips
+#                  in ms), or one-way milliseconds, with +lossPERCENT and
+#                  +jitterPERCENT standing additions (jepsen.tuplesky.wan),
+#                  and @local or @first after for where the clients sit
+#                  (WAN_CLIENTS; the harness's default, first, without);
 #                  empty for the scenario's
 #   IN_STORE       disk (default) or tmpfs: where TupleSky's voters and
 #                  etcd keep their stores (SwiftPaxos writes none)
@@ -253,6 +257,15 @@ if [ "$offered_steps" = true ] && [ $# -lt 2 ]; then
 fi
 concurrency=${1%%@*}
 wan=${IN_WAN:-$wan}
+# @local or @first: where the clients sit, for both systems' --wan-clients.
+wan_clients=""
+case $wan in
+  *@local|*@first) wan_clients=${wan##*@} wan=${wan%@*} ;;
+  *@*) echo "::error::wan '$wan': the clients go @local or @first" >&2; exit 1 ;;
+esac
+if [ "$wan" = none ] && [ -n "$wan_clients" ]; then
+  echo "::error::wan none places no clients" >&2; exit 1
+fi
 # A scenario's keys and read ratio are for the workloads they apply to; a
 # workload input of another drops them.
 case $workload in
@@ -388,7 +401,7 @@ load_suffix() {
       printf ', %s/s' "$rate"
     fi
   fi
-  if [ "$wan" != none ]; then printf ', wan %s' "$wan"; fi
+  if [ "$wan" != none ]; then printf ', wan %s%s' "$wan" "${wan_clients:+ ($wan_clients clients)}"; fi
 }
 steps_title=${sweep// /, }
 suffix=$(load_suffix "${steps_title:-$concurrency}" "$raised")
@@ -604,6 +617,7 @@ out=${GITHUB_ENV:-/dev/stdout}
   echo "SWIFTPAXOS_BESIDE=$swiftpaxos_beside"
   echo "SWIFTPAXOS_STEPS=$swiftpaxos_steps"
   echo "WAN=$wan"
+  echo "WAN_CLIENTS=$wan_clients"
   echo "RECOVERY_TIME=$recovery_time"
   echo "TITLE_SUFFIX=$suffix"
   echo "SWIFTPAXOS_TITLE_SUFFIX=$swiftpaxos_suffix"

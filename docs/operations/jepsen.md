@@ -560,7 +560,15 @@ TupleSky against etcd on terms that are:
   every pair by that many milliseconds. Each node's egress gets a prio
   qdisc with a netem band per distinct delay among its peers, and a u32
   filter per peer. The delays hold from the nemesis's setup to its
-  teardown, final reads included.
+  teardown, final reads included. `regions:AB/AC/BC` sets the three
+  regions' round trips instead, us-east to us-west, us-east to eu-west
+  and us-west to eu-west (`regions:70/80/140`), one way each half of it.
+* **Standing loss and jitter:** any profile may end in `+lossPERCENT` and
+  `+jitterPERCENT` (`regions:70/80/140+loss1`, `+jitter10`): loss on the
+  traffic between every two nodes, and jitter as that share of each
+  pair's delay, normally distributed, which reorders packets for both
+  systems' transports alike. They hold for the whole run, unlike the
+  packet fault; the clients' traffic keeps its delay alone.
 * **The clients** run on the control node, which by default
   (`--wan-clients first`) sits beside `n1`, as a control node on real
   hosts sits in one region: each node's traffic to it is delayed by the
@@ -569,6 +577,18 @@ TupleSky against etcd on terms that are:
   SwiftPaxos's fast path, where a client sends to every replica and waits
   for a quorum's answers, look free: 1 ms at p50 under a 33 to 65 ms WAN.
   `--wan-clients local` keeps that model, every client beside its node.
+  The workflow's `wan` input takes it as `@local` after the profile
+  (`regions:70/80/140@local`), for every system alike; `@first` or
+  nothing is the default.
+* **etcd under a WAN:** the job sets etcd's heartbeat to about the largest
+  round trip between members (rounded up to 50 ms, 150 ms for
+  `regions:70/80/140`) and its election timeout to ten times it, where
+  etcd's defaults (100 and 1,000 ms) assume a LAN, and moves its leadership
+  to `n1` once the cluster is up (`etcdctl move-leader`), where
+  TupleSky's leader starts, so both systems lead from the first region.
+* **Latency by region:** the job summary gives the clients' `ok` latency
+  by the region of the node each talks to (Jepsen binds worker N to node N
+  mod the node count, and each system's client opens its node alone).
 * **Checking the shaping:** the nemesis measures the round trip from `n1`
   to each node and from each node to the clients, logs it, and warns when
   one is short of the profile; the job summary lists them.

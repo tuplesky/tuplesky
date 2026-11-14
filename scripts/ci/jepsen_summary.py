@@ -137,6 +137,8 @@ STARTING = "Jepsen starting "
 # jepsen.tuplesky.wan's setup: "WAN round trip n1 -> n2 : 66.2 ms, profile 66 ms".
 WAN_RTT = re.compile(r"WAN round trip (\S+) -> (\S+) : (\S+) ms, profile (\S+) ms")
 WAN_CLIENTS = re.compile(r"WAN clients: (\S+)")
+# jepsen.tuplesky.wan's setup: 'WAN regions: {"n1" "us-east", "n2" "us-west"}'.
+WAN_REGIONS = re.compile(r"WAN regions: \{(.*)\}")
 
 
 @dataclass
@@ -561,6 +563,76 @@ def parse_network(lines) -> tuple[str | None, list[tuple[str, str, str, str]]]:
         if c:
             clients = c[1]
     return clients, rows
+
+
+def parse_regions(lines) -> dict:
+    """Each node's region under a simulated WAN, from the nemesis's setup
+    line, as {node: region}; empty without one."""
+    for line in lines:
+        m = FILE_LINE.match(line.rstrip("\n")) or CONSOLE_LINE.match(line.rstrip("\n"))
+        if not m or m["logger"] != "jepsen.tuplesky.wan":
+            continue
+        r = WAN_REGIONS.search(m["msg"])
+        if r:
+            return dict(re.findall(r'"([^"]+)" "([^"]+)"', r[1]))
+    return {}
+
+
+def region_table(client: list["Op"], end, nodes: list[str], regions: dict) -> list[str]:
+    """The clients' `ok` latency by the region of the node each talks to
+    (Jepsen binds worker N to node N mod the node count, and each system's
+    client opens its node alone), until `end` as the throughput is: with
+    local clients, a region's clients sit beside its nodes, so its rows are
+    what a client there sees."""
+    if not client or not regions:
+        return []
+    if end is None:
+        end = client[-1].at
+    order = []
+    for n in nodes:
+        r = regions.get(n)
+        if r is not None and r not in order:
+            order.append(r)
+    lat = collections.defaultdict(lambda: collections.defaultdict(list))
+    threads = collections.defaultdict(set)
+    oks = collections.Counter()
+    invoked = {}
+    for o in client:
+        if o.at > end:
+            break
+        if o.type == "invoke":
+            invoked[o.thread] = o
+            continue
+        inv = invoked.pop(o.thread, None)
+        region = regions.get(node_of(o, nodes))
+        if region is None:
+            continue
+        threads[region].add(o.thread)
+        if o.type == "ok" and inv is not None:
+            oks[region] += 1
+            ms = (o.at - inv.at).total_seconds() * 1000
+            lat[region][o.f].append(ms)
+            lat[region]["all"].append(ms)
+    fs = sorted({f for r in lat.values() for f in r if f != "all"})
+    secs = (end - client[0].at).total_seconds() or 1.0
+
+    def cell(ms):
+        if not ms:
+            return "-"
+        ms = sorted(ms)
+        return f"{percentile(ms, 0.5):.0f} / {percentile(ms, 0.99):.0f}"
+
+    out = ["**Latency by the clients' region** (each client's region is its node's, under the simulated WAN; "
+           "`ok`s only, p50 / p99 in ms, until the final heal or the last operation)",
+           "",
+           "| Region | Nodes | Clients | `ok`/s | All | " + " | ".join(f"`{f}`" for f in fs) + " |",
+           "| --- | --- | --- | --- | --- | " + " | ".join("---" for _ in fs) + " |"]
+    for r in order:
+        members = ", ".join(n for n in nodes if regions.get(n) == r)
+        out.append(f"| {r} | {members} | {len(threads[r])} | {oks[r] / secs:.1f} | {cell(lat[r]['all'])} | "
+                   + " | ".join(cell(lat[r].get(f)) for f in fs) + " |")
+    out.append("")
+    return out
 
 
 def percentile(sorted_ms: list[float], q: float) -> float:
@@ -3154,12 +3226,13 @@ def summarize(store: str, nodes: list[str], title: str, profile: str | None = No
     out = [f"## {title}", ""]
     log_path = os.path.join(store, "jepsen.log")
     ops = []
-    clients, network = None, []
+    clients, network, regions = None, [], {}
     if os.path.exists(log_path):
         with open(log_path, encoding="utf-8", errors="replace") as f:
             lines = f.readlines()
         ops = parse_ops(lines)
         clients, network = parse_network(lines)
+        regions = parse_regions(lines)
     results_path = os.path.join(store, "results.edn")
     if os.path.exists(results_path):
         with open(results_path, encoding="utf-8", errors="replace") as f:
@@ -3331,6 +3404,8 @@ def summarize(store: str, nodes: list[str], title: str, profile: str | None = No
         out.append("")
         out.append("</details>")
         out.append("")
+        if client:
+            out.extend(region_table(client, heal, nodes, regions))
 
     voters = {}
     for node in sorted(os.listdir(store)) if os.path.isdir(store) else []:
