@@ -412,6 +412,44 @@ pub(crate) const FORGET_CHECK_EVERY: u64 = 64;
 /// bounded because a peer's proposals are still a peer's input.
 pub const HELD_PROPOSAL_SLACK: usize = 8;
 
+/// The bytes of relayed payloads a follower keeps beside the proposals it
+/// holds for want of table room (the follower trap on #185).
+///
+/// A relayed proposal carries the only copy of its payload this replica
+/// is sent: the collector relayed the submission to the leader alone. A
+/// table with no room for the command used to drop the payload and hold
+/// the proposal without it, so the payload was asked for at once, and
+/// again at the runtime's pace, `MAX_PAYLOAD_TRANSFER` an ask, while the
+/// table that refused it was still full, and an answer that came back
+/// before the room did was refused in its turn. Kept, the payload is
+/// taken as the room comes, with no ask. Bounded because a peer's frames
+/// are still a peer's input: four catch-up pages' worth, beside the
+/// `HELD_PROPOSAL_SLACK` tables of proposals held. A payload past the
+/// bound goes the old way and is asked for.
+pub const MAX_KEPT_RELAYED_BYTES: usize = 4 * MAX_CATCH_UP_BYTES;
+
+/// What a kept relayed payload counts against
+/// [`MAX_KEPT_RELAYED_BYTES`]: its request bytes and the record around
+/// them.
+pub fn kept_relayed_size(payload: &PayloadRecordV1) -> usize {
+    core::mem::size_of::<PayloadRecordV1>() + payload.logical.len()
+}
+
+/// What became of a relayed proposal's payload
+/// (`Follower::take_relayed_payload`).
+enum Relayed {
+    /// Taken: the command is initialized from it.
+    Took,
+    /// The command is known here already, in some form: the proposal
+    /// path decides.
+    Known,
+    /// Not the payload its proposal names.
+    Mismatch,
+    /// No room in the table for its command now: handed back, to be kept.
+    /// Boxed, as the rare case: the other outcomes carry nothing.
+    NoRoom(alloc::boxed::Box<PayloadRecordV1>),
+}
+
 /// A leader proposal not yet adopted: held until the payload arrives and
 /// every dependency is at least ACCEPT.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -899,9 +937,24 @@ pub struct Follower {
     relayed_known: u64,
     /// Relayed proposals whose payload this replica didn't take: not from
     /// the leader at its ballot, a payload that didn't match the vote, or
-    /// no room. Each such command's payload is fetched, if it is wanted
-    /// (#224 review).
+    /// no room past the bound on kept payloads. Each such command's
+    /// payload is fetched, if it is wanted (#224 review).
     relayed_not_taken: u64,
+    /// Relayed payloads kept beside the proposals held for want of table
+    /// room ([`MAX_KEPT_RELAYED_BYTES`]), with each proposal's sequence
+    /// number. Every one is of a held proposal.
+    kept: BTreeMap<CommandId, (u64, PayloadRecordV1)>,
+    /// The same commands in the leader's order: the order their turns
+    /// come in.
+    kept_order: BTreeSet<(u64, CommandId)>,
+    /// What they count against the bound ([`kept_relayed_size`]).
+    kept_bytes: usize,
+    /// The bound: [`MAX_KEPT_RELAYED_BYTES`] unless lowered.
+    kept_bound: usize,
+    /// Relayed payloads kept for want of room.
+    relayed_kept: u64,
+    /// Kept payloads taken as the room came, with no ask.
+    relayed_kept_taken: u64,
 }
 
 /// What a follower did with the payloads relayed proposals carried
@@ -917,6 +970,12 @@ pub struct RelayTaken {
     pub known: u64,
     /// Relayed proposals whose payload wasn't taken, to be fetched.
     pub not_taken: u64,
+    /// Relayed proposals whose payload was kept beside the held proposal
+    /// for want of table room (the follower trap on #185), to be taken as
+    /// the room comes rather than fetched.
+    pub kept: u64,
+    /// Kept payloads taken as the room came, with no ask.
+    pub kept_taken: u64,
     /// Adoption batches the frames wrote (step 2b): one a frame unless a
     /// frame's adoptions passed a batch's bounds, or the frame wrote a
     /// batch of another kind between two of them.
@@ -932,6 +991,8 @@ impl RelayTaken {
         self.taken = self.taken.saturating_add(other.taken);
         self.known = self.known.saturating_add(other.known);
         self.not_taken = self.not_taken.saturating_add(other.not_taken);
+        self.kept = self.kept.saturating_add(other.kept);
+        self.kept_taken = self.kept_taken.saturating_add(other.kept_taken);
         self.frame_batches = self.frame_batches.saturating_add(other.frame_batches);
         self.frame_adoptions = self.frame_adoptions.saturating_add(other.frame_adoptions);
     }
@@ -1074,6 +1135,12 @@ impl Follower {
             frame_adoptions: 0,
             relayed_known: 0,
             relayed_not_taken: 0,
+            kept: BTreeMap::new(),
+            kept_order: BTreeSet::new(),
+            kept_bytes: 0,
+            kept_bound: MAX_KEPT_RELAYED_BYTES,
+            relayed_kept: 0,
+            relayed_kept_taken: 0,
             catch_up: CatchUp::default(),
             diverged: None,
             config,
@@ -1390,6 +1457,12 @@ impl Follower {
             frame_adoptions: 0,
             relayed_known: 0,
             relayed_not_taken: 0,
+            kept: BTreeMap::new(),
+            kept_order: BTreeSet::new(),
+            kept_bytes: 0,
+            kept_bound: MAX_KEPT_RELAYED_BYTES,
+            relayed_kept: 0,
+            relayed_kept_taken: 0,
             catch_up: CatchUp::default(),
             diverged: None,
         }
@@ -2050,6 +2123,8 @@ impl Follower {
             taken: self.relayed_taken,
             known: self.relayed_known,
             not_taken: self.relayed_not_taken,
+            kept: self.relayed_kept,
+            kept_taken: self.relayed_kept_taken,
             frame_batches: self.frame_batches,
             frame_adoptions: self.frame_adoptions,
         }
@@ -2391,6 +2466,9 @@ impl Follower {
         .expect("valid ballot");
         self.votes.clear();
         self.held.clear();
+        self.kept.clear();
+        self.kept_order.clear();
+        self.kept_bytes = 0;
         self.held_lacking.clear();
         self.rebinds.clear();
         self.held_check.clear();
@@ -2424,6 +2502,7 @@ impl Follower {
         self.votes.remove(command);
         self.adopted.remove(command);
         self.held.remove(command);
+        self.unkeep(command);
         self.note_lacking(*command);
         // Nothing waits on a released command: it will not move here
         // again, and the sweep that pruned such an entry is rare now
@@ -3835,6 +3914,12 @@ impl Follower {
         self.check_pulled(command, outcome);
         self.learn();
         self.forget_history(command);
+        // Executed, the record is room once reclaimed: the payloads kept
+        // for want of it are taken first, in the leader's order, and each
+        // is adopted as its turn comes (the follower trap on #185).
+        while !self.kept.is_empty() && self.take_kept() {
+            effects.extend(self.advance_pending());
+        }
         if self.diverged.is_none() && self.catch_up.running.is_empty() {
             effects.extend(self.install_catch_up());
             effects.extend(self.continue_catch_up());
@@ -4566,6 +4651,7 @@ impl Follower {
         // Decided here now: nothing the leader or a Sync offers for it is
         // to be adopted over the decision.
         self.held.remove(&command);
+        self.unkeep(&command);
         self.sync_pending.remove(&command);
         self.bindings
             .entry(entry.payload.retry_key)
@@ -4673,7 +4759,7 @@ impl Follower {
             if self.bindings.get(&payload.retry_key) == Some(&command) {
                 self.bindings.remove(&payload.retry_key);
             }
-            if self.held.contains_key(&command) {
+            if self.held.contains_key(&command) && !self.kept.contains_key(&command) {
                 self.held_lacking.insert(command);
             }
         }
@@ -4751,7 +4837,11 @@ impl Follower {
         // with every payload row there is (task-d26).
         self.bindings.retain(|_, c| !table.forgotten(c));
         self.adopted_lacking = lacking(self.adopted.keys(), &self.payloads);
-        self.held_lacking = lacking(self.held.keys(), &self.payloads);
+        let kept = &self.kept;
+        self.held_lacking = lacking(
+            self.held.keys().filter(|c| !kept.contains_key(c)),
+            &self.payloads,
+        );
         self.note_sync_all();
         let held = &self.held;
         self.held_waiters.retain(|_, waiting| {
@@ -4771,7 +4861,7 @@ impl Follower {
         } else {
             self.adopted_lacking.remove(&command);
         }
-        if lacks && self.held.contains_key(&command) {
+        if lacks && self.held.contains_key(&command) && !self.kept.contains_key(&command) {
             self.held_lacking.insert(command);
         } else {
             self.held_lacking.remove(&command);
@@ -4860,8 +4950,22 @@ impl Follower {
         );
         debug_assert_eq!(
             self.held_lacking,
-            lacking(self.held.keys(), &self.payloads),
+            lacking(
+                self.held.keys().filter(|c| !self.kept.contains_key(c)),
+                &self.payloads
+            ),
             "the held commands lacking a payload were not kept with the maps"
+        );
+        debug_assert!(
+            self.kept.keys().all(|c| self.held.contains_key(c))
+                && self.kept.len() == self.kept_order.len()
+                && self.kept_bytes
+                    == self
+                        .kept
+                        .values()
+                        .map(|(_, p)| kept_relayed_size(p))
+                        .sum::<usize>(),
+            "a kept payload outlived its held proposal, or its count drifted"
         );
         debug_assert!(
             self.held
@@ -5762,12 +5866,41 @@ impl Follower {
             && proposal.replica == from
             && proposal.ballot == self.config.quorum.ballot()
             && proposal.seqnum.is_some();
-        let held = self.held.contains_key(&proposal.command);
-        let took = takes && self.take_relayed_payload(&proposal, payload);
-        if !takes {
+        let command = proposal.command;
+        let seqnum = proposal.seqnum.unwrap_or(u64::MAX);
+        let held = self.held.contains_key(&command);
+        let mut kept = None;
+        let took = if takes {
+            match self.take_relayed_payload(&proposal, payload) {
+                Relayed::Took => {
+                    self.relayed_taken = self.relayed_taken.saturating_add(1);
+                    true
+                }
+                Relayed::Known => {
+                    self.relayed_known = self.relayed_known.saturating_add(1);
+                    false
+                }
+                Relayed::Mismatch => {
+                    self.relayed_not_taken = self.relayed_not_taken.saturating_add(1);
+                    false
+                }
+                Relayed::NoRoom(payload) => {
+                    self.rejections.push(FollowerRejection::Backpressure);
+                    kept = Some(*payload);
+                    false
+                }
+            }
+        } else {
             self.relayed_not_taken = self.relayed_not_taken.saturating_add(1);
-        }
+            false
+        };
         let mut effects = self.on_proposal(from, proposal);
+        // No room for the command: the proposal is held, and the payload
+        // it brought is kept with it rather than asked for again (the
+        // follower trap on #185).
+        if let Some(payload) = kept {
+            self.keep_relayed(command, seqnum, payload);
+        }
         // A proposal held for want of its payload, whose payload this copy
         // brought: `on_proposal` returns at a duplicate of one held, so the
         // hold is examined here, as a `PayloadResponse` has it examined.
@@ -5781,8 +5914,9 @@ impl Follower {
 
     /// Initialize the command a relayed proposal names from the payload
     /// it carries, where this replica would take it (see
-    /// `on_relayed_proposal`). Returns whether it took it.
-    fn take_relayed_payload(&mut self, proposal: &FastAck, payload: PayloadRecordV1) -> bool {
+    /// `on_relayed_proposal`), or a payload kept for want of room
+    /// (`take_kept`). The caller counts what became of it.
+    fn take_relayed_payload(&mut self, proposal: &FastAck, payload: PayloadRecordV1) -> Relayed {
         let command = proposal.command;
         // The payload's identity is the digest of its retry key and its
         // logical bytes as they came, not of a decode encoded again (cost
@@ -5806,8 +5940,7 @@ impl Follower {
         if identity != command || payload.admission_digest() != proposal.admission {
             self.rejections
                 .push(FollowerRejection::PayloadIdentityMismatch(command));
-            self.relayed_not_taken = self.relayed_not_taken.saturating_add(1);
-            return false;
+            return Relayed::Mismatch;
         }
         // Known here already, in any form: the proposal path decides.
         if self.table.is_initialized(&command)
@@ -5820,8 +5953,7 @@ impl Follower {
                 .selected_admission(&command)
                 .is_some_and(|d| d != proposal.admission)
         {
-            self.relayed_known = self.relayed_known.saturating_add(1);
-            return false;
+            return Relayed::Known;
         }
         let recovering = self.sync_pending.contains_key(&command)
             || self.campaign.as_ref().is_some_and(|c| {
@@ -5847,11 +5979,9 @@ impl Follower {
             .initialize_relayed(command, proposal.admission, keys, room)
             .is_err()
         {
-            // No room: the proposal is held as one without its payload,
-            // which is fetched once its turn comes.
-            self.rejections.push(FollowerRejection::Backpressure);
-            self.relayed_not_taken = self.relayed_not_taken.saturating_add(1);
-            return false;
+            // No room: the proposal is held, and the payload is handed
+            // back to be kept with it (`keep_relayed`).
+            return Relayed::NoRoom(alloc::boxed::Box::new(payload));
         }
         if let Some(c) = self.campaign.as_mut() {
             c.supply_moved();
@@ -5861,9 +5991,96 @@ impl Follower {
         self.bindings.insert(payload.retry_key, command);
         self.payloads.insert(command, payload);
         self.answer_on_release.insert(command);
-        self.relayed_taken = self.relayed_taken.saturating_add(1);
+        // A copy kept from an earlier relay of it is not wanted now.
+        self.unkeep(&command);
         self.note_lacking(command);
-        true
+        Relayed::Took
+    }
+
+    /// Keep `payload` beside its held proposal, for whose command the
+    /// table had no room (the follower trap on #185), under the bound
+    /// ([`MAX_KEPT_RELAYED_BYTES`]). A payload past the bound, or of a
+    /// proposal not held, is left, and fetched as any held proposal's is.
+    fn keep_relayed(&mut self, command: CommandId, seqnum: u64, payload: PayloadRecordV1) {
+        if self.kept.contains_key(&command) {
+            // Sent again (task-d07) while the first copy is kept.
+            self.relayed_known = self.relayed_known.saturating_add(1);
+            return;
+        }
+        let size = kept_relayed_size(&payload);
+        if !self.held.contains_key(&command)
+            || self.payloads.contains_key(&command)
+            || self.kept_bytes.saturating_add(size) > self.kept_bound
+        {
+            self.relayed_not_taken = self.relayed_not_taken.saturating_add(1);
+            return;
+        }
+        self.kept_bytes += size;
+        self.kept_order.insert((seqnum, command));
+        self.kept.insert(command, (seqnum, payload));
+        self.relayed_kept = self.relayed_kept.saturating_add(1);
+        self.note_lacking(command);
+    }
+
+    /// Drop the payload kept for `command`, if any: taken, or its held
+    /// proposal is gone. The caller notes what the command lacks.
+    fn unkeep(&mut self, command: &CommandId) {
+        if let Some((seqnum, payload)) = self.kept.remove(command) {
+            self.kept_order.remove(&(seqnum, *command));
+            self.kept_bytes -= kept_relayed_size(&payload);
+        }
+    }
+
+    /// Take the kept payloads the table has room for now (the follower
+    /// trap on #185), in the leader's order, as a relayed payload is taken
+    /// on arrival, and stop at the first it has no room for: the ones
+    /// after it are ordered after it. Each one taken is examined by the
+    /// next `advance_pending`, which adopts it once its turn comes, and
+    /// the next one's turn comes with that adoption. Returns whether any
+    /// was taken.
+    fn take_kept(&mut self) -> bool {
+        if self.boot.is_none() || self.ballots.seal_held().is_some() || !self.may_vote() {
+            return false;
+        }
+        let mut took = false;
+        while let Some(&(seqnum, command)) = self.kept_order.first() {
+            let (_, payload) = self.kept.remove(&command).expect("kept in order");
+            self.kept_order.remove(&(seqnum, command));
+            self.kept_bytes -= kept_relayed_size(&payload);
+            let Some(proposal) = self.held.get(&command).map(|h| h.proposal.clone()) else {
+                continue;
+            };
+            match self.take_relayed_payload(&proposal, payload) {
+                Relayed::Took => {
+                    self.relayed_kept_taken = self.relayed_kept_taken.saturating_add(1);
+                    self.held_check.insert(command);
+                    took = true;
+                }
+                Relayed::NoRoom(payload) => {
+                    self.kept_bytes += kept_relayed_size(&payload);
+                    self.kept_order.insert((seqnum, command));
+                    self.kept.insert(command, (seqnum, *payload));
+                    break;
+                }
+                // Known here another way meanwhile: the proposal goes the
+                // way a held one without a payload of its own goes.
+                Relayed::Known | Relayed::Mismatch => self.note_lacking(command),
+            }
+        }
+        took
+    }
+
+    /// Set the bound on kept relayed payloads' bytes,
+    /// [`MAX_KEPT_RELAYED_BYTES`] unless set: lowered by tests, and by a
+    /// runtime that would hold less for a peer.
+    pub fn set_kept_relayed_bound(&mut self, bytes: usize) {
+        self.kept_bound = bytes;
+    }
+
+    /// The relayed payloads kept for want of room, and their bytes as the
+    /// bound counts them (the follower trap on #185).
+    pub fn kept_relayed(&self) -> (usize, usize) {
+        (self.kept.len(), self.kept_bytes)
     }
 
     fn on_proposal(&mut self, from: ReplicaId, proposal: FastAck) -> Vec<Effect> {
@@ -6359,6 +6576,7 @@ impl Follower {
             }
             for command in ready {
                 let held = self.held.remove(&command).expect("ready");
+                self.unkeep(&command);
                 self.note_lacking(command);
                 // The proposal asserts the admission it was ordered under.
                 // Adopted under other attested facts, this replica would
