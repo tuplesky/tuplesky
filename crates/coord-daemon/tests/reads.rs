@@ -20,7 +20,7 @@ use coord_core::event::{AdmittedRequest, PeerProvenance};
 use coord_core::outbox::BarrierAllocator;
 use coord_daemon::mailbox::{Ingress, IngressBudget};
 use coord_daemon::node::{Machine, Node, Outbound};
-use coord_daemon::reads::ROUND_IN_FLIGHT_MILLIS;
+use coord_daemon::reads::ROUND_SPACING_MILLIS;
 use coord_daemon::voter::{Origin, Voter};
 use coord_membership::genesis::{GenesisManifest, VoterSeed};
 use coord_membership::membership::Membership;
@@ -426,9 +426,9 @@ impl Cluster {
 
 /// Two reads due in one pump are served from one snapshot (task-d58).
 ///
-/// The second read arrives once the first one's round has been in flight
-/// for [`ROUND_IN_FLIGHT_MILLIS`], so it starts a round of its own, and
-/// that round covers both. Once it confirms, one pump finds both due:
+/// The second read arrives once the first one's round has been out for
+/// [`ROUND_SPACING_MILLIS`], so it starts a round of its own, and that
+/// round covers both. Once it confirms, one pump finds both due:
 /// one snapshot is pinned and both are served from it, where each used to
 /// pin its own.
 #[test]
@@ -437,7 +437,7 @@ fn the_reads_due_in_one_pump_are_served_from_one_snapshot() {
     cluster.submit();
     cluster.settle();
     let t0 = MonotonicMillis::ZERO;
-    let later = t0.plus(ROUND_IN_FLIGHT_MILLIS);
+    let later = t0.plus(ROUND_SPACING_MILLIS);
 
     let out = cluster.voters[0].on_read(&read(2), Origin::Connection(9), t0);
     assert!(out.reads.is_empty(), "the first read is held, not answered");
@@ -490,7 +490,7 @@ fn a_read_only_transaction_is_served_at_the_barrier() {
     cluster.carry(0, out);
     cluster.settle();
 
-    let out = cluster.voters[0].pump_reads(t0.plus(ROUND_IN_FLIGHT_MILLIS));
+    let out = cluster.voters[0].pump_reads(t0.plus(ROUND_SPACING_MILLIS));
     let counts = cluster.voters[0].read_counts();
     assert_eq!(counts.served, 1, "{counts:?}");
     assert_eq!(counts.refused, 0, "{counts:?}");
