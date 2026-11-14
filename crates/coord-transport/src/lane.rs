@@ -227,7 +227,7 @@ pub fn transport_config(
         config
             .ack_eliciting_threshold(VarInt::from_u32(ack.threshold))
             .max_ack_delay(ack.max_delay)
-            .reordering_threshold(VarInt::from_u32(reordering.packets.saturating_sub(1)));
+            .reordering_threshold(VarInt::from_u32(reordering.peer_threshold()));
         transport.ack_frequency_config(Some(config));
     }
     Ok(Arc::new(transport))

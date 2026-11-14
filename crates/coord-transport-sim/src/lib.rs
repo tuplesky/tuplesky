@@ -68,7 +68,9 @@ pub const TICK: Duration = Duration::from_millis(1);
 pub struct LinkFaults {
     /// Minimum one-way delay in ticks.
     pub delay_min: u64,
-    /// Maximum one-way delay in ticks.
+    /// Maximum one-way delay in ticks. Both bounds are inclusive: each
+    /// datagram's delay is drawn uniformly from `delay_min..=delay_max`,
+    /// so equal bounds make a constant delay.
     pub delay_max: u64,
     /// Loss per datagram, parts per million.
     pub loss_ppm: u32,
@@ -1040,6 +1042,7 @@ pub struct PacketWorld {
     trace: blake3::Hasher,
     datagrams: u64,
     dropped: u64,
+    drop_next: BTreeMap<(NodeId, NodeId), u32>,
     time: Arc<VirtualTime>,
     sequence: u64,
 }
@@ -1071,6 +1074,7 @@ impl PacketWorld {
             trace: blake3::Hasher::new(),
             datagrams: 0,
             dropped: 0,
+            drop_next: BTreeMap::new(),
             time,
             sequence: 0,
         }
@@ -1084,6 +1088,13 @@ impl PacketWorld {
     /// Faults of one directed link.
     pub fn set_link(&mut self, from: NodeId, to: NodeId, faults: LinkFaults) {
         self.faults.insert((from, to), faults);
+    }
+
+    /// Drop the next `count` datagrams sent from `from` to `to`, before
+    /// the link's own faults: a loss placed where a test needs it, such
+    /// as a connection's first flight.
+    pub fn drop_next(&mut self, from: NodeId, to: NodeId, count: u32) {
+        self.drop_next.insert((from, to), count);
     }
 
     /// Current tick.
@@ -1278,10 +1289,20 @@ impl PacketWorld {
     /// order: packets sent, packets it called lost, congestion events,
     /// the window and the round trip.
     pub fn path_stats(&self, node: NodeId) -> Vec<quinn_proto::PathStats> {
+        self.connection_stats(node)
+            .into_iter()
+            .map(|s| s.path)
+            .collect()
+    }
+
+    /// All quinn counts on each of a node's connections, in handle order:
+    /// the path's, and the datagrams and frames sent and received (the
+    /// acknowledgements a node sent among them).
+    pub fn connection_stats(&self, node: NodeId) -> Vec<quinn_proto::ConnectionStats> {
         self.nodes[node]
             .connections
             .values()
-            .map(|c| c.conn.stats().path)
+            .map(|c| c.conn.stats())
             .collect()
     }
 
@@ -1370,6 +1391,13 @@ impl PacketWorld {
             .get(&(from, to))
             .copied()
             .unwrap_or(self.default_faults);
+        if let Some(left) = self.drop_next.get_mut(&(from, to))
+            && *left > 0
+        {
+            *left -= 1;
+            self.dropped += 1;
+            return;
+        }
         let name = format!("link-{from}-{to}");
         if faults.cut || bytes.len() > faults.mtu || self.rng.chance(&name, faults.loss_ppm) {
             self.dropped += 1;
@@ -1384,7 +1412,7 @@ impl PacketWorld {
             let mut delay = self.rng.range(
                 &name,
                 faults.delay_min,
-                faults.delay_max.max(faults.delay_min) + 1,
+                faults.delay_max.max(faults.delay_min),
             );
             if self.rng.chance(&name, faults.reorder_ppm) {
                 delay += faults.reorder_ticks;
