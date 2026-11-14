@@ -170,8 +170,9 @@ struct Budget {
 }
 
 /// The fewest bytes a budgeted page asks for: more than any row a view
-/// reads, which is a key at its limit with its collection's prefix and an
-/// envelope at its limit with its header.
+/// reads, which is a key at its limit as it is stored (escaped, with its
+/// collection's ids and terminator) and an envelope at its limit with its
+/// header.
 ///
 /// An engine refuses a page whose first row is larger than the page
 /// (`ErrorClass::Limit`, [`OrderedRead::scan_page`]). Were a page to ask
@@ -187,9 +188,15 @@ const PAGE_BYTES_FLOOR: u32 = {
     floor as u32
 };
 
+// A row key holds the request's key escaped (`ordered_key` writes each zero
+// byte as two), so a key at its limit is stored in up to twice its length.
+// The 64 covers the rest of the longest row key and its value's header: a
+// reverse-index row's two ids (the lease and the namespace, 32 bytes), the
+// key's terminator (2) and the envelope's header (`HEADER_MAX`, 16).
 const _: () = assert!(
-    coord_types::logical_v1::limits::MAX_KEY_BYTES + 1024 < 64 * 1024,
-    "a key at its limit, its collection's prefix and an envelope's header fit the floor's margin"
+    2 * coord_types::logical_v1::limits::MAX_KEY_BYTES + 64 < 64 * 1024,
+    "a key at its limit, escaped, with its row's ids, its terminator and an envelope's header \
+     fits the floor's margin"
 );
 
 /// The byte limit for the next page of a budgeted scan: what the budget
