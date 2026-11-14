@@ -890,7 +890,6 @@ fn admission_from_the_sessions_context_answers_as_its_rows_do() {
 #[test]
 fn an_exact_key_is_read_once_and_charged_on_every_touch_as_its_scans_were() {
     use coord_storage::ViewBuildError;
-    use coord_store_api::engine::ErrorClass;
     let mut d = Domain::new(ModelEngine::new());
     d.activate_session(8);
     assert_eq!(d.submit(1, &put(b"k", &[7; 100])).0, Admission::New);
@@ -967,9 +966,11 @@ fn an_exact_key_is_read_once_and_charged_on_every_touch_as_its_scans_were() {
         build(3, 3 * cost),
         Err(ViewBuildError::BudgetExceeded)
     ));
-    // Bytes for two touches: the third's row doesn't fit the page.
-    match build(3, 3 * cost - 1) {
-        Err(ViewBuildError::Engine(e)) => assert_eq!(e.class, ErrorClass::Limit),
-        other => panic!("{other:?}"),
-    }
+    // Bytes for two touches: the third's row is past the bytes left, and
+    // the budget refuses it, as `scan_all`'s page (at least its floor)
+    // returns the row for the budget to refuse.
+    assert!(matches!(
+        build(3, 3 * cost - 1),
+        Err(ViewBuildError::BudgetExceeded)
+    ));
 }
