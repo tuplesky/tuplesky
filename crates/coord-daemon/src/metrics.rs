@@ -17,6 +17,18 @@
 //!   Enforcing it in the types is the only enforcement that holds: a
 //!   naming convention is one careless `format!` away from a cardinality
 //!   explosion and a data leak in the same line.
+//!
+//!   One type adds to that: a [`Path`] series is keyed by its [`Plane`],
+//!   its [`PeerRole`](coord_types::wire_v1::PeerRole) and its lane, all
+//!   frozen, and by the replica at the other end. A replica is named by
+//!   the first four bytes of its identity, as the daemon's log lines name
+//!   a voter, and it is bounded by the domain's configuration: the
+//!   voters, observers and learners an operator set, never a caller. A
+//!   path's connection number is on the line too, but it is not a label:
+//!   it only marks where a connection's counts started again. And the
+//!   paths a snapshot carries are capped ([`MAX_REPORTED_PATHS`]), the
+//!   rest counted, so a node that many collectors dial still reports a
+//!   bounded line.
 //! * **The distinct durability quantities stay distinct.** A sync, the
 //!   whole-operation commit-return and backpressure are three different
 //!   numbers that a single "write latency" would blur. Section 22.3
@@ -458,10 +470,22 @@ pub struct MetricsSnapshot {
     /// no such reading (task-d45).
     pub cost: Measure<Cost>,
     /// Each open connection's path to a voter or a collector, as QUIC
-    /// estimates it (the lead's item 2 on #185), on either plane. Empty
-    /// where the node has no transport yet.
+    /// estimates it (the lead's item 2 on #185), on either plane, at most
+    /// [`MAX_REPORTED_PATHS`]. Empty where the node has no transport yet.
     #[serde(default)]
     pub paths: Vec<Path>,
+    /// Connections past [`MAX_REPORTED_PATHS`], left out of `paths`.
+    #[serde(default)]
+    pub paths_unreported: u64,
+    /// What this node's collector offered and asked again, and what its
+    /// voter refused at its door or could not send back, since the node
+    /// started (the +loss1 reading on #185). Here rather than in
+    /// [`Cost`], which is a voter's, so that a node with a frontend and no
+    /// voter reports its collector's too. They are counts of events, so a
+    /// role without them reads zero: a node with no voter refuses and
+    /// returns nothing.
+    #[serde(default)]
+    pub offers: Offers,
 }
 
 /// The plane a connection is on.
@@ -480,8 +504,22 @@ pub enum Plane {
 /// One a connection, and each lane is a connection of its own. Read for a
 /// voter's, an observer's or a learner's connections on either plane, and
 /// for a collector's on the api plane; never for a client's, which are as
-/// many as the callers. The counts are cumulative over the connection's
-/// life, and start again with a new connection: `connection` says which.
+/// many as the callers.
+///
+/// **A series is keyed by (`plane`, `role`, `lane`, `replica`).** The
+/// counts are cumulative over a connection's life and start again with a
+/// new one, after a redial or the peer's restart. `connection` only marks
+/// that: a reader that sees it change takes the new counts from zero, not
+/// as a fall. It is not a label. Two entries can share a key for a moment,
+/// when both ends of a pair dial and before one of the two connections is
+/// closed, and `connection` tells them apart until then.
+///
+/// A collector's connection this side accepted names no replica, so every
+/// collector that dialed this node shares its key: read those entries as
+/// samples of that plane, role and lane, and aggregate them (a sum of the
+/// counts, a spread of the round trips), not as one series.
+///
+/// At most [`MAX_REPORTED_PATHS`] a snapshot ([`Path::bounded`]).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Path {
     /// The plane.
@@ -495,7 +533,8 @@ pub struct Path {
     /// a collector's connection this side accepted, whose binding names
     /// no replica: `connection` tells those apart.
     pub replica: Option<String>,
-    /// The connection, as this endpoint numbers them (never reused).
+    /// The connection, as this endpoint numbers them (never reused): not
+    /// a label, only where the counts started again.
     pub connection: u64,
     /// Whether this side accepted it.
     pub accepted: bool,
@@ -516,7 +555,31 @@ pub struct Path {
     pub sent_packets: u64,
 }
 
+/// Most connections a snapshot reports a [`Path`] for. A voter's are
+/// bounded by its domain's configuration, four lanes a peer on each plane;
+/// the collectors that dial it are not, so the line is capped here rather
+/// than let grow with them. 256 is 64 peers' four lanes.
+pub const MAX_REPORTED_PATHS: usize = 256;
+
 impl Path {
+    /// The metrics line's readings of the transport's, in the order given,
+    /// at most [`MAX_REPORTED_PATHS`]; and how many past that were left
+    /// out. Only those reported are rendered.
+    pub fn bounded(
+        readings: impl IntoIterator<Item = coord_transport::PathReading>,
+    ) -> (Vec<Path>, u64) {
+        let mut paths = Vec::new();
+        let mut unreported = 0u64;
+        for reading in readings {
+            if paths.len() < MAX_REPORTED_PATHS {
+                paths.push(Path::of(&reading));
+            } else {
+                unreported += 1;
+            }
+        }
+        (paths, unreported)
+    }
+
     /// The metrics line's reading of one of the transport's.
     pub fn of(reading: &coord_transport::PathReading) -> Self {
         let micros = |d: Duration| u64::try_from(d.as_micros()).unwrap_or(u64::MAX);
@@ -675,11 +738,6 @@ pub struct Cost {
     /// (task-d113): its entries, and the bytes they take.
     #[serde(default)]
     pub intake_index: IntakeIndexSize,
-    /// What this node's collector offered and asked again, and what its
-    /// voter refused at its door or could not send back, since the node
-    /// started (the +loss1 reading on #185).
-    #[serde(default)]
-    pub offers: Offers,
     /// What this node's protocol machine refused, since the node started
     /// (testing's ask on #185).
     #[serde(default)]
