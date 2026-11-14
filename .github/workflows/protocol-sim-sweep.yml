@@ -14,6 +14,16 @@
 # `PROTOCOL_SIM_ONE=row,voters,seed` and `PROTOCOL_SIM_TRACE=1`, and keep
 # it in `crates/coord-consensus/fixtures/protocol_sim/seeds.json` with
 # what it found.
+#
+# The sweep above builds release, so neither of the simulator's debug
+# checks runs in it: `next_executable`'s ready set against a full walk
+# (task-d107), and each learning pass passed over against every accepted
+# command (#269). The `checked` job runs them, in release with
+# `coord-consensus`'s debug assertions on: every row at
+# `checked_seeds` (400 by default; about 30 minutes on four cores), and
+# the rows with storage steps (`rows_with_storage_steps_learn_once_a_step`,
+# rows 1, 9, 21 and 23 handed one step of storage events at once, which
+# no other row does) at `seeds`.
 name: protocol-sim-sweep
 
 on:
@@ -22,6 +32,9 @@ on:
       seeds:
         description: "Seeds per row and size"
         default: "1000"
+      checked_seeds:
+        description: "Seeds per row and size for every row with debug checks"
+        default: "400"
   schedule:
     # Weekly (Sundays 04:41 UTC), apart from CI's Monday run.
     - cron: "41 4 * * 0"
@@ -94,3 +107,42 @@ jobs:
           if [ -n "$PEER_ACK_LOSS" ]; then export PROTOCOL_SIM_PEER_ACK_LOSS="$PEER_ACK_LOSS"; fi
           cargo test --locked --release -p coord-consensus --test protocol_sim -- \
             --exact "$ROW" --nocapture
+
+  checked:
+    name: ${{ matrix.name }} (debug checks)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: every row
+            test: ""
+          - name: storage steps
+            test: rows_with_storage_steps_learn_once_a_step
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - name: Install the exact Rust toolchain from rust-toolchain.toml
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          cargo --version && rustc --version
+      - uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1 # v2.8.1
+        with:
+          key: protocol-sim-sweep-checked
+      - name: Build the simulator (release, debug checks on)
+        run: |
+          cargo test --locked --release \
+            --config 'profile.release.package.coord-consensus.debug-assertions=true' \
+            -p coord-consensus --test protocol_sim --no-run
+      - name: Sweep with debug checks
+        env:
+          PROTOCOL_SIM_SEEDS: ${{ matrix.test == '' && (inputs.checked_seeds || '400') || (inputs.seeds || '1000') }}
+          TEST: ${{ matrix.test }}
+        run: |
+          set -- --nocapture
+          if [ -n "$TEST" ]; then set -- --exact "$TEST" --nocapture; fi
+          cargo test --locked --release \
+            --config 'profile.release.package.coord-consensus.debug-assertions=true' \
+            -p coord-consensus --test protocol_sim -- "$@"
