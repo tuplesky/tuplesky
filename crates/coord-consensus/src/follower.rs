@@ -1066,13 +1066,19 @@ pub struct LearnPasses {
 pub struct UnreportedDrops {
     /// Possible-fast candidates a selection dropped whose dependencies
     /// reach a command no report holds and this replica doesn't hold
-    /// decided. Every selection made counts, bound or not: such a
-    /// selection is refused as [`FollowerRejection::Behind`] unless it
-    /// reaches the command only through a re-proposal.
+    /// decided. Every selection made counts, bound or not.
     pub undecided: u64,
     /// Selections bound that dropped a possible-fast candidate whose
-    /// dependencies reach a command no report holds.
-    pub bound: u64,
+    /// dependencies reach a command no report holds, where every such
+    /// command is one this replica holds decided: it executed it and
+    /// forgot it, and the drop is right.
+    pub bound_decided: u64,
+    /// Selections bound that dropped a possible-fast candidate whose
+    /// dependencies reach a command no report holds and this replica
+    /// doesn't hold decided. The simulator fails a run where it isn't
+    /// zero and the journal fails a failed batch's queue with it, as
+    /// `coordd`'s does (task-d119's note).
+    pub bound_undecided: u64,
 }
 
 /// What a follower is taking while it learns once for many inputs
@@ -2076,8 +2082,10 @@ impl Follower {
             );
             let barrier = self.alloc.as_mut().expect("booted").allocate();
             campaign.bound(barrier);
-            if campaign.selected_past_unreported() {
-                self.unreported_drops.bound += 1;
+            if campaign.selected_past_undecided() {
+                self.unreported_drops.bound_undecided += 1;
+            } else if campaign.selected_past_unreported() {
+                self.unreported_drops.bound_decided += 1;
             }
             return alloc::vec![Effect::Persist(PersistBatch {
                 barrier,
@@ -5730,9 +5738,9 @@ impl Follower {
     }
 
     /// Ask `leader` for its proposals of the adoptions this replica holds
-    /// without a sequence number of the ballot (task-d09), and of the
-    /// re-proposals a pending Sync entry waits on that it never took
-    /// (task-d119).
+    /// without a sequence number of the ballot (task-d09), and, while it
+    /// may vote in the ballot, of the re-proposals a pending Sync entry
+    /// waits on that it never took (task-d119).
     ///
     /// Paced by the frontier it answers, which the leader sends on its
     /// re-send timer, and bounded per ask, rotating through the set. The
@@ -5746,7 +5754,13 @@ impl Follower {
             return Vec::new();
         };
         let mut unsequenced = self.unsequenced_adoptions();
-        unsequenced.extend(self.sync_reproposals_lacking());
+        // Only while it can vote on the answer: a voter that promised a
+        // later ballot refuses every proposal of this one
+        // (`FencedByPromise`), so it would ask on every frontier and
+        // refuse every answer (#309 review).
+        if self.may_vote() {
+            unsequenced.extend(self.sync_reproposals_lacking());
+        }
         if unsequenced.is_empty() {
             return Vec::new();
         }

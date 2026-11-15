@@ -507,12 +507,13 @@ pub(crate) struct SelectionCounts {
     pub(crate) work: Cell<u64>,
     /// Possible-fast candidates the order check dropped whose
     /// dependencies reach, through the selection and the member's report,
-    /// a command no report holds (task-d119).
+    /// a command no report holds (task-d119). The walk doesn't follow a
+    /// record a Sync demoted: what it names is no order the source
+    /// ballot's leader gave.
     pub(crate) unreported: Cell<u64>,
     /// Of those, the ones where that command is one the candidate doesn't
-    /// hold decided either: a selection that names it is refused
-    /// ([`crate::follower::FollowerRejection::Behind`]) unless it reaches
-    /// the command only through a re-proposal.
+    /// hold decided either. Where the candidate holds it decided, it
+    /// executed it and forgot it, and the drop is right.
     pub(crate) unreported_undecided: Cell<u64>,
 }
 
@@ -1660,14 +1661,16 @@ fn possible_fast_decisions(
         };
         for c in dropped {
             // What the dropped candidate's dependencies reach that no
-            // report holds (task-d119): read for the counts, not the
-            // selection, so not counted as its work.
+            // report holds (task-d119). Read for the counts, not the
+            // selection, and counted as its work all the same, so the
+            // work bound covers everything a selection does.
             let (e, member) = &candidates[&c];
             let first = fast_reporters[*member];
             let (mut unreported, mut undecided) = (false, false);
             let mut seen = BTreeSet::new();
             let mut stack: Vec<CommandId> = e.deps.clone();
             while let Some(d) = stack.pop() {
+                tick();
                 if !seen.insert(d) {
                     continue;
                 }
@@ -1679,7 +1682,16 @@ fn possible_fast_decisions(
                 } else if decided.decided(&d) {
                     unreported |= !reported();
                 } else if let Some(r) = by_report[first].get(&d) {
-                    stack.extend(r.deps.iter().copied());
+                    // Not through a record a Sync demoted: a pre-acceptance
+                    // of an earlier ballot, and no order the source
+                    // ballot's leader gave. A fast decision at the source
+                    // counted the leader's record of `c`, and the leader
+                    // ordered `d` by its own re-proposal of it, so what the
+                    // demoted record names was never part of that decision.
+                    // The prefix check above reads it as absent too.
+                    if r.path != crate::graph::demoted_path() {
+                        stack.extend(r.deps.iter().copied());
+                    }
                 } else if !reported() {
                     unreported = true;
                     undecided = true;
@@ -2118,6 +2130,105 @@ mod tests {
         assert!(!decision.entries.contains_key(&id(15)), "C not kept");
         assert!(decision.reproposed.contains(&id(15)), "C re-proposed");
         assert!(decision.entries.contains_key(&id(0)), "A adopted");
+    }
+
+    /// A takeover whose candidates are all dropped, the counting walk's
+    /// worst shape (#309 review): `accepted` commands at ACCEPT chained on
+    /// one key, X at ACCEPT after all but the last of them and naming a D
+    /// no report holds, and `dropped` candidates the fast-set member alone
+    /// pre-accepted after X. Each candidate's closure misses the last
+    /// accepted command, so the order check drops it, and the counting
+    /// walk reads the whole chain from it (task-d119). The steps the
+    /// selection takes, the candidates it re-proposed, and the ones the
+    /// walk counted behind D.
+    fn dropped_work(accepted: u64, dropped: u64) -> (u64, usize, u64) {
+        let epoch = ConfigurationEpoch::new(1).unwrap();
+        let source =
+            BallotConfiguration::c2_default(epoch, ballot(0, 0), (0..3).map(r).collect()).unwrap();
+        let member = (1u8..3)
+            .find(|v| source.fast_set().contains(&r(*v)))
+            .unwrap();
+        let other = 3 - member;
+        let config =
+            BallotConfiguration::c2_default(epoch, ballot(1, other), (0..3).map(r).collect())
+                .unwrap();
+        // Every command on key 0.
+        let on_key = |i: u64| 5 * i;
+        let (d, x) = (on_key(accepted), on_key(accepted + 1));
+        let mut held: Vec<ReportEntry> = (0..accepted)
+            .map(|i| {
+                let deps = (i > 0).then(|| id(on_key(i - 1))).into_iter().collect();
+                entry(on_key(i), Phase::Accept, deps, 1)
+            })
+            .collect();
+        held.push(entry(
+            x,
+            Phase::Accept,
+            alloc::vec![id(d), id(on_key(accepted - 2))],
+            1,
+        ));
+        let mut of_member = held.clone();
+        let candidates: Vec<u64> = (0..dropped).map(|j| on_key(accepted + 2 + j)).collect();
+        for c in &candidates {
+            of_member.push(entry(*c, Phase::PreAccept, alloc::vec![id(x)], 1));
+        }
+        let report = |replica: u8, entries: Vec<ReportEntry>| RecoveryReport {
+            replica: r(replica),
+            ballot: ballot(1, other),
+            committed_ballot: ballot(0, 0),
+            entries,
+        };
+        let counts = SelectionCounts::default();
+        let decision = select_counted(
+            &config,
+            &[report(member, of_member), report(other, held)],
+            |_, _| false,
+            |_| None,
+            &|_: &CommandId| false,
+            SelectionRules::default(),
+            &counts,
+        )
+        .unwrap();
+        let reproposed = candidates
+            .iter()
+            .filter(|c| decision.reproposed.contains(&id(**c)))
+            .count();
+        (
+            counts.work.get(),
+            reproposed,
+            counts.unreported_undecided.get(),
+        )
+    }
+
+    /// The counting walk's steps are the selection's work (#309 review).
+    /// In its worst shape the walk reads the whole chain once a dropped
+    /// candidate, `accepted + 1` steps; the order check already reads it
+    /// about eleven times a candidate there (84,074 steps at 250 accepted
+    /// and 30 dropped without the walk, 91,604 with it). The steps grow
+    /// linearly in the commands reported, under a bound of sixteen walks
+    /// of the selection a candidate. (At 2,000 accepted the selection
+    /// passes [`MAX_REPORT_ENTRIES`] and re-proposes none of them.)
+    #[test]
+    fn a_takeover_that_drops_its_candidates_counts_their_walks_as_work() {
+        const DROPPED: u64 = 30;
+        let mut before = None;
+        for accepted in [125, 250, 500, 1_000] {
+            let (steps, reproposed, behind_d) = dropped_work(accepted, DROPPED);
+            assert_eq!(reproposed as u64, DROPPED, "every candidate dropped");
+            assert_eq!(behind_d, DROPPED, "every walk reached D");
+            let bound = 16 * DROPPED * (accepted + DROPPED);
+            assert!(
+                steps <= bound,
+                "{steps} steps over {accepted} accepted, bound {bound}"
+            );
+            if let Some(half) = before {
+                assert!(
+                    steps * 10 <= half * 21,
+                    "{steps} steps over {accepted} accepted, {half} over half as many"
+                );
+            }
+            before = Some(steps);
+        }
     }
 
     /// The cost a pass still has (task-d108 review): each pass judges every

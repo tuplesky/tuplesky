@@ -1066,8 +1066,11 @@ struct Stats {
     unreported_drops: u64,
     unreported_drop_runs: u32,
     /// Selections bound that dropped a possible-fast candidate whose
-    /// dependencies reach a command no report holds (task-d119).
+    /// dependencies reach a command no report holds, where the candidate
+    /// holds every such command decided (task-d119). Where it doesn't,
+    /// the run fails.
     bound_unreported: u64,
+    bound_unreported_undecided: u64,
 }
 
 /// FNV-1a over `bytes`, continuing from `hash`.
@@ -1618,7 +1621,8 @@ impl Sim {
                 self.stats.storage_passes_skipped_window += passes.skipped_storage_window;
                 let drops = f.unreported_drops();
                 self.stats.unreported_drops += drops.undecided;
-                self.stats.bound_unreported += drops.bound;
+                self.stats.bound_unreported += drops.bound_decided;
+                self.stats.bound_unreported_undecided += drops.bound_undecided;
                 let q = f.quorum().clone();
                 let (mut l, effects) = Leader::from_recovered(f.into_recovered(), q, &decision);
                 l.set_learning(LearningMode::Full);
@@ -2980,7 +2984,8 @@ impl Sim {
             self.stats.storage_passes_skipped_window += passes.skipped_storage_window;
             let drops = f.unreported_drops();
             self.stats.unreported_drops += drops.undecided;
-            self.stats.bound_unreported += drops.bound;
+            self.stats.bound_unreported += drops.bound_decided;
+            self.stats.bound_unreported_undecided += drops.bound_undecided;
         }
     }
 
@@ -3190,6 +3195,26 @@ impl Sim {
         self.check_released();
         for i in 0..self.n {
             self.fold_paths(i);
+        }
+        // A selection bound past a dropped possible-fast candidate whose
+        // dependencies reach a command no report holds and its candidate
+        // doesn't hold decided (task-d119). In the ways task-d119's note
+        // names, the selection's entries name such a command, and it is
+        // refused as `Behind`; the counting walk doesn't follow a record
+        // a Sync demoted (seed 2490, kept). A journal that goes on past a
+        // failed batch reaches one more way: a vote survives naming a
+        // command whose own batch failed at the only voter that held it,
+        // so no voter ever held that command durably (row 21, seed 10,
+        // three voters, kept with `fail_queue` off). `coordd`'s journal
+        // fails such a vote with that batch (#197 review), so the count
+        // fails the run only where the journal does that too.
+        let past_failed_batches = self.knobs.payload_fail > 0 && !self.knobs.fail_queue;
+        if self.stats.bound_unreported_undecided > 0 && !past_failed_batches {
+            self.fail(&format!(
+                "{} selections bound past a dropped candidate whose dependencies reach a \
+                 command no report holds and the candidate doesn't hold decided",
+                self.stats.bound_unreported_undecided
+            ));
         }
         self.stats.unreported_drop_runs = u32::from(self.stats.unreported_drops > 0);
         self.stats.ballots = self.highest_ballot;
@@ -5068,6 +5093,16 @@ struct Kept {
     /// The page size (`Knobs::page`); absent, the row's.
     #[serde(default)]
     page: Option<usize>,
+    /// The chances it found it with, in parts per million, of a message
+    /// held back until a later ballot, of a campaign and of a crash
+    /// (`Knobs::hold`, `Knobs::campaign`, `Knobs::crash`: task-d119's
+    /// targeted schedule); absent, the row's.
+    #[serde(default)]
+    hold: Option<u32>,
+    #[serde(default)]
+    campaign: Option<u32>,
+    #[serde(default)]
+    crash: Option<u32>,
     /// What it found, for the reader.
     #[allow(dead_code)]
     found: String,
@@ -5099,6 +5134,15 @@ impl Kept {
         }
         if let Some(page) = self.page {
             knobs.page = page;
+        }
+        if let Some(hold) = self.hold {
+            knobs.hold = hold;
+        }
+        if let Some(campaign) = self.campaign {
+            knobs.campaign = campaign;
+        }
+        if let Some(crash) = self.crash {
+            knobs.crash = crash;
         }
         run_knobs(self.voters, knobs, self.seed, self.catch_up)
     }
@@ -5140,9 +5184,10 @@ fn one_seed_from_the_environment() {
 /// and on a command no voter had executed; possible-fast candidates
 /// dropped behind a command no report holds and the candidate doesn't
 /// hold decided, and the runs with any; and selections bound with a
-/// candidate dropped behind a command no report holds. The loss of
-/// acknowledgements to followers and catch-up are the environment's, as
-/// in a sweep; `PROTOCOL_SIM_HOLD`, `PROTOCOL_SIM_CAMPAIGN` and
+/// candidate dropped behind a command no report holds and the new
+/// leader holds decided (one it doesn't hold decided fails the run).
+/// The loss of acknowledgements to followers and catch-up are the
+/// environment's, as in a sweep; `PROTOCOL_SIM_HOLD`, `PROTOCOL_SIM_CAMPAIGN` and
 /// `PROTOCOL_SIM_CRASH` (parts per million) set those chances where the
 /// note's targeted runs did. Without it, nothing runs.
 #[test]
@@ -5179,7 +5224,8 @@ fn seeds_from_the_environment() {
     }
     println!(
         "row {row} at {n} voters, seeds {}..{}: behind {} (on a command no voter executed {}), \
-         unreported drops {} in {} runs, bound past an unreported dependency {}, failed {}",
+         unreported drops {} in {} runs, bound past an unreported dependency held decided {}, \
+         failed {}",
         v[2],
         v[3],
         totals.behind,
