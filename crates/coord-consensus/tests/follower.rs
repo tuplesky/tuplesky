@@ -3797,11 +3797,14 @@ fn a_sync_that_releases_a_kept_command_undecided_drops_its_kept_copy() {
     let mut seq = 1;
     let (mut f, order, payloads) = filled_by_relay(capacity, over, None, &mut seq);
     commit_adopted(&mut f, &order[..fit], &mut seq);
+    // r2 executed as far as what this replica executes behind the promise:
+    // a candidate more than a table behind it at the report's cut would be
+    // refused there, and no report cut, nothing released (task-d119).
     let promise = f.step(peer(
         2,
         ProtocolMessage::NewLeader {
             ballot: ballot(1, 2),
-            executed: ExecutionPosition::ZERO,
+            executed: ExecutionPosition::new(fit as u64).unwrap(),
         },
     ));
     // Executed behind the promise: room comes, and nothing kept is taken.
