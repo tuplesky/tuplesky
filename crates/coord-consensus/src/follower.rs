@@ -726,11 +726,12 @@ pub struct Follower {
     /// A failed installation was put back: installation resumes at the
     /// next event that is not a failure.
     sync_reinstall: bool,
-    /// A catch-up window whose batch failed was put back at the head of
-    /// its page: it is installed again at the next event that is not a
-    /// failure, not at the failure itself, so a store that refuses every
-    /// batch fails one window a delivery rather than looping (#197
-    /// review).
+    /// A catch-up window whose batch failed is still in hand, with its
+    /// commands committed in the table and no row of theirs durable or in
+    /// flight: its rows are written again at the next event that is not a
+    /// failure (`Follower::rewrite_window`), not at the failure itself, so
+    /// a store that refuses every batch fails one window a delivery
+    /// rather than looping (#197 review).
     catch_up_reinstall: bool,
     served_payloads: alloc::collections::BTreeSet<CommandId>,
     /// Where the next bounded payload ask starts in the missing set, so
@@ -4523,6 +4524,49 @@ impl Follower {
         })]
     }
 
+    /// Write again, in one batch, the rows of the window in hand whose
+    /// batch failed (`catch_up_reinstall`): each command's payload row,
+    /// and its dependency row as the first installation wrote it -- the
+    /// record it is committed with here, or none for a command its donor
+    /// kept no row of. Nothing is checked again: what the installation
+    /// checked is in the table already, and a ballot activated since
+    /// changes none of it.
+    fn rewrite_window(&mut self) -> Vec<Effect> {
+        if self.catch_up.running.is_empty() || self.diverged.is_some() {
+            return Vec::new();
+        }
+        assert!(
+            self.frame_batch.is_none(),
+            "a barrier allocated while a proposal frame's batch is open"
+        );
+        let epoch = self.config.identity.epoch;
+        let barrier = self.alloc.as_mut().expect("booted").allocate();
+        let mut updates = Vec::new();
+        for running in &mut self.catch_up.running {
+            let command = running.command;
+            updates.push(payload_update(&command, &running.entry.payload).expect("bounded"));
+            if running.entry.decided.is_some() {
+                let record = self
+                    .table
+                    .record(&command)
+                    .expect("committed until executed")
+                    .clone();
+                updates.push(dependency_update(epoch, &command, &record).expect("bounded"));
+                self.ledger.stage(barrier, command, record);
+            } else {
+                updates.push(dependency_delete(epoch, &command));
+            }
+            running.barrier = barrier;
+        }
+        let first = self.catch_up.running.front().expect("in hand").command;
+        self.pending.insert(barrier, Pending::Adoption(first));
+        alloc::vec![Effect::Persist(PersistBatch {
+            barrier,
+            base: None,
+            updates,
+        })]
+    }
+
     /// Install one pulled command into the window `batch` is writing,
     /// allocating its barrier for the first (task-d25). What would stop a
     /// page ends the window instead, unless this is the window's first.
@@ -6998,28 +7042,31 @@ impl Follower {
                     }
                 }
                 StorageEvent::Failed { .. } => {
-                    // A window whose installation failed is put back at
-                    // the head of its page and installed again, rather
-                    // than left waiting on a batch that will never be
-                    // durable: nothing executes past it meanwhile, and no
-                    // further page is asked for (task-d08, task-d25). It
-                    // is installed at the next event that is not a
-                    // failure (`catch_up_reinstall`), as nothing else is
-                    // written at a failure (#197 review).
+                    // A window whose batch failed stays in hand and its
+                    // rows are written again, rather than left waiting on
+                    // a batch that will never be durable (task-d08,
+                    // task-d25): at the next event that is not a failure
+                    // (`catch_up_reinstall`), as nothing else is written
+                    // at a failure (#197 review). Its front is not durable
+                    // meanwhile, so nothing executes (`next_executable`),
+                    // no campaign starts (`Follower::campaign`), and no
+                    // further page is asked for.
+                    //
+                    // Not put back on the queue to be installed again, as
+                    // it was: its commands are committed in the table from
+                    // the first installation, and with no window in hand
+                    // the learner's order ran the front with no payload
+                    // row (protocol_sim row 21 with storage steps, three
+                    // voters, seed 260), a campaign could start, and an
+                    // installation after a Sync of a new ballot stopped
+                    // the page as one of a ballot left, which left the
+                    // commands committed with no rows at all.
                     if self
                         .catch_up
                         .running
                         .front()
                         .is_some_and(|r| r.barrier == barrier)
                     {
-                        let window = core::mem::take(&mut self.catch_up.running);
-                        for running in window.into_iter().rev() {
-                            self.catch_up.queue.push_front((
-                                running.donor.donor,
-                                running.donor.ballot,
-                                running.entry,
-                            ));
-                        }
                         reinstall = true;
                     }
                     // The batch never happened: its vote is not evidence.
@@ -7654,7 +7701,7 @@ impl DeterministicMachine for Follower {
                 effects.extend(self.advance_sync());
             }
             if core::mem::take(&mut self.catch_up_reinstall) {
-                effects.extend(self.install_catch_up());
+                effects.extend(self.rewrite_window());
             }
             effects.extend(self.carry_stale());
         }

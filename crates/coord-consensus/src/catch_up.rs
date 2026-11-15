@@ -95,10 +95,9 @@ pub(crate) struct Running {
     /// Whether that batch is durable: a pulled command executes only once
     /// its decision is on disk here, as any other commit's is.
     pub(crate) durable: bool,
-    /// The page entry it came from, put back at the head of the page with
-    /// the rest of its window if that batch fails, so it is installed
-    /// again rather than left waiting on a batch that will never be
-    /// durable.
+    /// The page entry it came from: what its rows are written again from
+    /// if that batch fails, rather than left waiting on a batch that will
+    /// never be durable.
     pub(crate) entry: CatchUpEntry,
 }
 

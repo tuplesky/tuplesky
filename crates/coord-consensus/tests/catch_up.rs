@@ -638,6 +638,40 @@ impl Cluster {
         }
     }
 
+    /// Step node `i` with `frame` from `from`, and return its effects
+    /// unhandled.
+    fn step_peer(&mut self, i: usize, from: ReplicaId, frame: Vec<u8>) -> Vec<Effect> {
+        self.nodes[i].step(Event::Peer(AuthenticatedPeerMessage::new(
+            PeerProvenance::from_transport(
+                from,
+                ReplicaIncarnation::new(1).unwrap(),
+                coord_types::wire_v1::PeerRole::Voter,
+                1,
+            ),
+            frame,
+        )))
+    }
+
+    /// Execute at most `n` of node `i`'s executable commands, each over
+    /// its payload row, durable or in a batch submitted, when its payload
+    /// is held: what `coordd`'s lowering requires (#243 review, rule (b)).
+    fn execute_checked(&mut self, i: usize, n: usize) {
+        for _ in 0..n {
+            let Some(c) = self.follower(i).next_executable() else {
+                return;
+            };
+            assert!(
+                self.follower(i).payload(&c).is_none()
+                    || self.nodes[i]
+                        .storage
+                        .holds_or_writes(Collection::PayloadV1.id().0, &c.0.0),
+                "r{i} ran {c:?} with its payload held and no payload row durable or in a \
+                 batch submitted"
+            );
+            self.execute_at_most(i, 1);
+        }
+    }
+
     fn deliver_page(&mut self, to: usize, from: u8, page: &ProtocolMessage) {
         self.deliver(to, r(from), page.encode());
     }
@@ -999,6 +1033,189 @@ fn a_store_that_refuses_every_batch_fails_one_window_a_page() {
     );
 }
 
+/// A window whose batch failed runs nothing until its rows are written
+/// again (protocol_sim row 21 with storage steps, three voters, seed
+/// 260). Its commands stay committed in the table from the installation.
+/// Put back on the queue, as the window was, `next_executable` read the
+/// learner's order, whose next command was the window's front: committed
+/// over executed dependencies, with no payload row durable or in a batch
+/// submitted, an execution `coordd`'s lowering refuses (rule (b)).
+/// Nothing marked it stale. At seed 260 the front was decided, over a
+/// durable dependency row of the same decision, so the failure left its
+/// record current, and its one payload row, the window's, is not tracked
+/// in `payload_unwritten`. The front here is one its donor kept no row
+/// of, which reaches the same state: a decided front with no row of its
+/// decision was marked stale at the failure and held back.
+#[test]
+fn a_window_whose_batch_failed_runs_nothing_until_its_rows_are_written_again() {
+    let mut runnable = 0;
+    for seed in [3, 5, 7, 11, 13] {
+        let (mut cluster, _) = left_behind(seed);
+        cluster.serve = false;
+        let after = cluster.follower(4).executed_through();
+        let mut page = cluster.page(0, ballot0(), after);
+        let ProtocolMessage::CatchUpPage { entries, .. } = &mut page else {
+            unreachable!()
+        };
+        // What a donor that swept the front's row sends.
+        entries[0].decided = None;
+        let entries = entries.clone();
+        let front = entries[0].command;
+        cluster.failing = Some((4, 1));
+        cluster.deliver_page(4, 0, &page);
+        assert_eq!(cluster.failed, 1, "seed {seed}");
+        let f = cluster.follower(4);
+        assert_eq!(
+            f.table().phase_of(&front),
+            Some(Phase::Commit),
+            "seed {seed}"
+        );
+        assert!(
+            !cluster.nodes[4]
+                .storage
+                .holds_or_writes(Collection::PayloadV1.id().0, &front.0.0),
+            "seed {seed}: the failed batch wrote the front's payload row"
+        );
+        // What the learner would run but for the gate: the front, over
+        // executed dependencies.
+        if f.table().record(&front).is_some_and(|r| {
+            r.deps
+                .iter()
+                .all(|d| matches!(f.table().phase_of(d), None | Some(Phase::Executed)))
+        }) {
+            runnable += 1;
+        }
+        assert_eq!(
+            f.next_executable(),
+            None,
+            "seed {seed}: ran a command of a window whose rows failed"
+        );
+        // The next event that is not a failure writes the window's rows
+        // again, and it runs first, each command over its payload row.
+        cluster.tick();
+        let (from, frame) = cluster.nodes[4].inbox.pop_front().expect("announced");
+        cluster.deliver(4, from, frame);
+        cluster.execute_checked(4, entries.len());
+        let from = after.get() as usize;
+        let ran = cluster.nodes[4].executed.len() - from;
+        assert!(ran > 0, "seed {seed}: the window never ran again");
+        assert_eq!(
+            cluster.nodes[4].executed[from..],
+            cluster.nodes[0].executed[from..from + ran],
+            "seed {seed}"
+        );
+        cluster.serve = true;
+        cluster.catching = vec![4];
+        cluster.settle_ticking(8);
+        assert_eq!(
+            cluster.nodes[4].executed, cluster.nodes[0].executed,
+            "seed {seed}"
+        );
+        assert_eq!(
+            cluster.follower(4).catch_up_divergence(),
+            None,
+            "seed {seed}"
+        );
+    }
+    assert!(runnable > 0, "no seed left the learner a front to run");
+}
+
+/// A campaign is not started while a window whose batch failed waits for
+/// its rows, as one is not while any window is in hand: the role change
+/// a won campaign is drops the window, and its comparison with the donor
+/// (task-d25). Put back on the queue, the window was not in hand.
+#[test]
+fn no_campaign_starts_while_a_failed_window_waits_for_its_rows() {
+    let (mut cluster, _) = left_behind(3);
+    cluster.serve = false;
+    let after = cluster.follower(4).executed_through();
+    let page = cluster.page(0, ballot0(), after);
+    cluster.failing = Some((4, 1));
+    cluster.deliver_page(4, 0, &page);
+    assert_eq!(cluster.failed, 1);
+    let _ = cluster.nodes[4].follower_mut().take_rejections();
+    let b1 = Ballot {
+        number: 1,
+        leader: r(4),
+        ..ballot0()
+    };
+    let effects = cluster.nodes[4].follower_mut().campaign(b1);
+    assert!(effects.is_empty(), "a campaign started: {effects:?}");
+    assert!(
+        cluster.nodes[4]
+            .follower_mut()
+            .take_rejections()
+            .contains(&FollowerRejection::CatchingUp)
+    );
+}
+
+/// A window whose batch failed, with a Sync of a new ballot activated at
+/// the next event, has its rows written again and runs over them. Put
+/// back on the queue and installed again, as it was, it was stopped there
+/// as a page of a ballot left (task-d08), and its commands stayed
+/// committed in the table, from the first installation, with no rows:
+/// the learner's order ran them with no payload row (rule (b)).
+#[test]
+fn a_failed_window_runs_over_its_rows_after_a_new_ballot_is_activated() {
+    for seed in [3, 5, 7, 11, 13] {
+        let (mut cluster, _) = left_behind(seed);
+        cluster.serve = false;
+        let b1 = Ballot {
+            number: 1,
+            ..ballot0()
+        };
+        cluster.deliver(
+            4,
+            r(0),
+            ProtocolMessage::NewLeader {
+                ballot: b1,
+                executed: ExecutionPosition::ZERO,
+            }
+            .encode(),
+        );
+        let after = cluster.follower(4).executed_through();
+        let page = cluster.page(0, ballot0(), after);
+        let front = entries_of(&page)[0].command;
+        // The window's batch is written; the Sync's marker after it.
+        let installed = cluster.step_peer(4, r(0), page.encode());
+        let window = persisted(installed);
+        let decision = coord_consensus::SyncDecision {
+            ballot: b1,
+            source_ballot: ballot0(),
+            entries: Default::default(),
+            reproposed: Default::default(),
+        };
+        let synced = cluster.step_peer(4, r(0), ProtocolMessage::Sync(decision).encode());
+        let marker = persisted(synced);
+        // The window's batch fails, and the marker is durable next: the
+        // first event after the failure that is not one activates the
+        // ballot, and then installs the window again.
+        let more = cluster.nodes[4].step(Event::Storage(StorageEvent::Failed {
+            barrier_id: window.barrier,
+            error: StorageError::DefinitelyNotCommitted,
+        }));
+        cluster.handle(4, more);
+        cluster.handle(4, vec![Effect::Persist(marker)]);
+        let f = cluster.follower(4);
+        assert_eq!(f.quorum().ballot(), b1, "seed {seed}");
+        assert_eq!(
+            f.table().phase_of(&front),
+            Some(Phase::Commit),
+            "seed {seed}"
+        );
+        let before = cluster.nodes[4].executed.len();
+        cluster.execute_checked(4, usize::MAX);
+        assert_eq!(
+            cluster.nodes[4].executed.get(before),
+            Some(&front),
+            "seed {seed}: the window did not run"
+        );
+        let f = cluster.follower(4);
+        assert_eq!(f.catch_up_paths().stopped_ballot, 0, "seed {seed}");
+        assert_eq!(f.catch_up_divergence(), None, "seed {seed}");
+    }
+}
+
 /// A page cut short of what the donor executed -- by the byte bound as
 /// much as the command bound -- is followed by the next ask as soon as it
 /// is executed, without waiting for the pacer (task-d08).
@@ -1029,6 +1246,17 @@ impl Cluster {
         self.handle(i, effects);
         self.settle();
     }
+}
+
+/// The one batch `effects` persist.
+fn persisted(effects: Vec<Effect>) -> coord_core::effect::PersistBatch {
+    let mut batches = effects.into_iter().filter_map(|e| match e {
+        Effect::Persist(batch) => Some(batch),
+        _ => None,
+    });
+    let batch = batches.next().expect("a batch");
+    assert!(batches.next().is_none(), "one batch");
+    batch
 }
 
 fn entries_of(page: &ProtocolMessage) -> &[CatchUpEntry] {
