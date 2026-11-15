@@ -19,7 +19,8 @@ use coord_types::ids::{Ballot, ReplicaId};
 use crate::phase::Phase;
 use crate::quorum::BallotConfiguration;
 use crate::recovery::{
-    CandidateDecisions, RecoveryError, RecoveryReport, SyncDecision, select_ruled,
+    CandidateDecisions, RecoveryError, RecoveryReport, SelectionCounts, SyncDecision,
+    select_counted,
 };
 use crate::summary::{PageError, ReportAssembler, ReportPage};
 
@@ -68,6 +69,13 @@ pub struct Campaign {
     rows_wanted: Vec<CommandId>,
     /// The rules its selection applies beyond task-29's (task-d90).
     rules: crate::recovery::SelectionRules,
+    /// Possible-fast candidates its selections dropped behind a command
+    /// no report holds and the candidate doesn't hold decided, every
+    /// selection made counted, since last taken (task-d119).
+    unreported_undecided: u64,
+    /// Whether the selection it holds dropped a possible-fast candidate
+    /// whose dependencies reach a command no report holds (task-d119).
+    selected_past_unreported: bool,
 }
 
 impl Campaign {
@@ -94,6 +102,8 @@ impl Campaign {
             sources: Vec::new(),
             rows_wanted: Vec::new(),
             rules: crate::recovery::SelectionRules::default(),
+            unreported_undecided: 0,
+            selected_past_unreported: false,
         }
     }
 
@@ -341,6 +351,21 @@ impl Campaign {
         self.assemblies
     }
 
+    /// Possible-fast candidates this campaign's selections dropped whose
+    /// dependencies reach a command no report holds and the candidate
+    /// doesn't hold decided, since the last call: every selection made
+    /// counted, kept or not (task-d119).
+    pub fn take_unreported_undecided(&mut self) -> u64 {
+        core::mem::take(&mut self.unreported_undecided)
+    }
+
+    /// Whether the selection this campaign holds dropped a possible-fast
+    /// candidate whose dependencies reach a command no report holds
+    /// (task-d119).
+    pub const fn selected_past_unreported(&self) -> bool {
+        self.decision.is_some() && self.selected_past_unreported
+    }
+
     /// Report pages held (task-d28).
     pub fn pages_held(&self) -> usize {
         self.assembler.pages_held()
@@ -487,15 +512,22 @@ impl Campaign {
         }
         let decision = loop {
             let source = |b: &Ballot| self.sources.iter().find(|c| c.ballot() == *b).cloned();
-            match select_ruled(
+            let counts = SelectionCounts::default();
+            let selected = select_counted(
                 &self.config,
                 &reports,
                 &supplied,
                 source,
                 &decided,
                 self.rules,
-            ) {
-                Ok(decision) => break decision,
+                &counts,
+            );
+            self.unreported_undecided += counts.unreported_undecided.get();
+            match selected {
+                Ok(decision) => {
+                    self.selected_past_unreported = counts.unreported.get() > 0;
+                    break decision;
+                }
                 // Rows the runtime reads for the candidate: waited for, as
                 // a payload is (task-d77).
                 Err(RecoveryError::ExecutedRowsUnread { commands }) => {

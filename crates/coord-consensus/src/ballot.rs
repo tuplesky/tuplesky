@@ -518,7 +518,9 @@ impl BallotState {
     /// Only a `NewLeader` that would otherwise be promised is refused
     /// this way; any other rejection is [`BallotState::on_new_leader`]'s
     /// to give. A refused ballot is remembered as outranked: the next
-    /// campaign here goes above it.
+    /// campaign here goes above it. A ballot promised here is held to the
+    /// same rule once more when its report is cut
+    /// ([`crate::role::PendingReport::behind`], task-d119).
     pub fn refuses_behind(
         &mut self,
         from: ReplicaId,
