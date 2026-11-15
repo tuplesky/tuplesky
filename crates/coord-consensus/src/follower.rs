@@ -3226,6 +3226,26 @@ impl Follower {
                 };
                 let barrier = self.allocate();
                 let mut updates = alloc::vec![row];
+                // Its own payload row, where its payload is held here with
+                // none durable or in flight (seed 275 of `relayed_rows`):
+                // taken from a relayed proposal (`take_relayed_payload`),
+                // whose adoption's batch would have written it, and the
+                // ballot changed before this replica adopted it. The walk
+                // below writes the payload rows of the entry's dependencies
+                // but starts with the entry itself as seen, so the row of
+                // the last entry of a chain was in no batch, and it
+                // executed with its payload held only in memory.
+                //
+                // Marked, not added to this batch: the gate in
+                // [`Follower::next_executable`] holds it back and
+                // [`Follower::carry_stale`] writes the row at the end of
+                // this step, in a batch of its own. The dependency row
+                // durable without the payload row is a state a crash may
+                // leave already, which protocol_sim row 21 cuts at; written
+                // in this batch, no run reached it any more (#185).
+                if self.payloads.contains_key(&command) && self.payload_row(&command).is_none() {
+                    self.payload_unwritten.insert(command);
+                }
                 self.carry_unwritten(barrier, command, &record.deps, &mut updates);
                 effects.push(Effect::Persist(PersistBatch {
                     barrier,
@@ -3295,9 +3315,16 @@ impl Follower {
                 && self.table.phase_of(&running.command) == Some(Phase::Commit))
             .then_some(running.command);
         }
-        self.learner
+        let next = self
+            .learner
             .next_executable(&self.table, |c| self.adopted.get(c).map(|(s, _)| *s))
-            .filter(|c| !self.stale(c))
+            .filter(|c| !self.stale(c));
+        debug_assert!(
+            next.is_none_or(|c| !self.payloads.contains_key(&c) || self.payload_row(&c).is_some()),
+            "{next:?} is executable with its payload held and no payload row durable or in a \
+             batch submitted"
+        );
+        next
     }
 
     /// Whether the newest row written here of `command`, durable or in
