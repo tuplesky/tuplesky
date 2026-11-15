@@ -913,6 +913,16 @@ pub struct Follower {
     /// A pulled command whose execution here disagreed with the donor's
     /// (task-d08): this replica executes nothing more.
     diverged: Option<CatchUpDivergence>,
+    /// The command a catch-up window committed here with no dependencies
+    /// because its donor kept no row of it (#302 review), so that it runs
+    /// at the donor's position: what the table holds of its dependencies
+    /// is no decision. Set when the window installs it, cleared when its
+    /// execution retires the record, so it names the record for as long
+    /// as the table holds it so. While it does, no row is made of those
+    /// dependencies ([`Follower::dependency_row`]), none is staged for the
+    /// report ([`Follower::stage_row`]), and no carry or report takes them
+    /// (#303 review).
+    bare: Option<CommandId>,
     /// What this replica published to the frontend for each command it
     /// still remembers, kept so an exact duplicate submission can offer
     /// it to the submitter again (task-c02). Never recovered: the outbox
@@ -1149,6 +1159,7 @@ impl Follower {
             relayed_kept_taken: 0,
             catch_up: CatchUp::default(),
             diverged: None,
+            bare: None,
             config,
             sync_barrier: None,
             sync_demoted: Vec::new(),
@@ -1471,6 +1482,7 @@ impl Follower {
             relayed_kept_taken: 0,
             catch_up: CatchUp::default(),
             diverged: None,
+            bare: None,
         }
         .resume_sync()
     }
@@ -1478,6 +1490,10 @@ impl Follower {
     /// Give up the role: everything durable or learned, nothing
     /// ballot-scoped.
     pub fn into_recovered(mut self) -> RecoveredState {
+        assert!(
+            self.bare.is_none(),
+            "a record whose dependencies are no decision handed to another role"
+        );
         // Held proposals are ballot-scoped and stay here; what the table
         // noted for them would only grow under the next role.
         self.table.watch_moves(false);
@@ -1543,6 +1559,14 @@ impl Follower {
     /// Start a campaign for `ballot` (this replica must be its leader):
     /// promise to itself durably, then ask every other voter.
     pub fn campaign(&mut self, ballot: Ballot) -> Vec<Effect> {
+        let held = self.bare;
+        let effects = self.campaign_inner(ballot);
+        self.check_leaving(held, &effects);
+        effects
+    }
+
+    /// [`Follower::campaign`], before the check where its batches leave.
+    fn campaign_inner(&mut self, ballot: Ballot) -> Vec<Effect> {
         let Some(boot) = self.boot else {
             return Vec::new();
         };
@@ -1559,11 +1583,13 @@ impl Follower {
                 .push(FollowerRejection::Unbacked { command });
             return Vec::new();
         }
-        if !self.catch_up.running.is_empty() {
+        if !self.catch_up.running.is_empty() || self.bare.is_some() {
             // A window's comparison with its donor is the follower's, and
             // the role change a won campaign is would drop it: the window
             // executes first, which takes no longer than its batch
-            // (task-d25).
+            // (task-d25). A record whose dependencies are no decision
+            // (`bare`) stays here too: the leader writes and reports what
+            // its table holds, and has no mark to hold back.
             self.rejections.push(FollowerRejection::CatchingUp);
             return Vec::new();
         }
@@ -1656,6 +1682,14 @@ impl Follower {
     /// Driven on an interval while the campaign selects; nothing is asked
     /// once the selection is made.
     pub fn request_report_pages(&mut self) -> Vec<Effect> {
+        let held = self.bare;
+        let effects = self.request_report_pages_inner();
+        self.check_leaving(held, &effects);
+        effects
+    }
+
+    /// [`Follower::request_report_pages`], before the check where its batches leave.
+    fn request_report_pages_inner(&mut self) -> Vec<Effect> {
         let (Some(campaign), Some(boot)) = (self.campaign.as_ref(), self.boot) else {
             return Vec::new();
         };
@@ -1703,6 +1737,14 @@ impl Follower {
     /// Resume a campaign whose selection was durably bound before a crash:
     /// the same decision is published again; nothing is reselected.
     pub fn resume_campaign(&mut self, decision: SyncDecision) -> Vec<Effect> {
+        let held = self.bare;
+        let effects = self.resume_campaign_inner(decision);
+        self.check_leaving(held, &effects);
+        effects
+    }
+
+    /// [`Follower::resume_campaign`], before the check where its batches leave.
+    fn resume_campaign_inner(&mut self, decision: SyncDecision) -> Vec<Effect> {
         if decision.ballot.leader != self.config.identity.replica
             || self.ballots.promised() != decision.ballot
         {
@@ -2164,6 +2206,14 @@ impl Follower {
     /// installed under the guards (missing payloads are fetched first),
     /// the ballot's fast set is activated and ballot-scoped votes reset.
     pub fn on_sync(&mut self, from: ReplicaId, decision: SyncDecision) -> Vec<Effect> {
+        let held = self.bare;
+        let effects = self.on_sync_inner(from, decision);
+        self.check_leaving(held, &effects);
+        effects
+    }
+
+    /// [`Follower::on_sync`], before the check where its batches leave.
+    fn on_sync_inner(&mut self, from: ReplicaId, decision: SyncDecision) -> Vec<Effect> {
         let promised = self.ballots.promised();
         if from == decision.ballot.leader
             && decision.ballot.compare_same_epoch(&promised) == Some(core::cmp::Ordering::Greater)
@@ -2433,8 +2483,10 @@ impl Follower {
                     updates.push(payload_update(command, payload).expect("bounded"));
                     self.durable_payloads.push(barrier, *command);
                 }
-                updates.push(dependency_update(epoch, command, demoted).expect("bounded"));
-                self.ledger.stage(barrier, *command, demoted.clone());
+                if let Some(row) = self.dependency_row(command, demoted) {
+                    updates.push(row);
+                    self.stage_row(barrier, *command, demoted.clone());
+                }
             }
             self.sync_demoted = demoted.into_iter().map(|(c, _)| c).collect();
             self.sync_released = released;
@@ -2562,7 +2614,7 @@ impl Follower {
             if r.phase == Phase::Commit
                 && !decision.entries.contains_key(c)
                 && !carried.contains_key(c)
-                && !self.bare_in_hand(c)
+                && !self.is_bare(c)
             {
                 held.push(*c);
                 carried.insert(
@@ -2700,18 +2752,20 @@ impl Follower {
     /// holds a single command's payload and dependency rows, the pair a
     /// vote already writes in one batch.
     fn write_commit_rows(&mut self, commands: &[CommandId]) -> Vec<Effect> {
-        let epoch = self.config.identity.epoch;
         let mut effects = Vec::new();
         let mut batch = CommitRowsBatch::default();
         for command in commands {
             let record = self.table.record(command).expect("held").clone();
+            let Some(dependencies) = self.dependency_row(command, &record) else {
+                continue;
+            };
             let mut rows = Vec::with_capacity(2);
             let payload = record.payload.is_some() && !self.served_payloads.contains(command);
             if payload {
                 let held = self.payloads.get(command).expect("writable");
                 rows.push(payload_update(command, held).expect("bounded"));
             }
-            rows.push(dependency_update(epoch, command, &record).expect("bounded"));
+            rows.push(dependencies);
             let bytes: usize = rows.iter().map(row_bytes).sum();
             if !batch.updates.is_empty()
                 && (batch.bytes + bytes > COMMIT_ROWS_BATCH_BYTES
@@ -2744,7 +2798,7 @@ impl Follower {
         let barrier = self.allocate();
         let first = staged.first().map(|(c, _)| *c).expect("one");
         for (c, r) in staged {
-            self.ledger.stage(barrier, c, r);
+            self.stage_row(barrier, c, r);
         }
         for c in payloads {
             self.durable_payloads.push(barrier, c);
@@ -2979,11 +3033,18 @@ impl Follower {
                     let _ = self.table.commit(command);
                 }
                 let record = self.table.record(&command).expect("installed").clone();
+                // The command a catch-up window committed here with no
+                // dependencies of its own (`bare`): kept at COMMIT, the
+                // record keeps them, and written here they were a durable
+                // decision of none, reported over the Sync's own entry
+                // (#303 review). Nothing is written: the Sync row holds
+                // the selection, which the report takes in its place, and
+                // the window runs the command at the donor's position.
+                let Some(row) = self.dependency_row(&command, &record) else {
+                    continue;
+                };
                 let barrier = self.allocate();
-                let mut updates = alloc::vec![
-                    dependency_update(self.config.identity.epoch, &command, &record)
-                        .expect("bounded")
-                ];
+                let mut updates = alloc::vec![row];
                 self.carry_unwritten(barrier, command, &record.deps, &mut updates);
                 effects.push(Effect::Persist(PersistBatch {
                     barrier,
@@ -2991,7 +3052,7 @@ impl Follower {
                     updates,
                 }));
                 self.pending.insert(barrier, Pending::Adoption(command));
-                self.ledger.stage(barrier, command, record);
+                self.stage_row(barrier, command, record);
                 self.installs
                     .insert(barrier, (self.ballots.synced(), command, entry));
             }
@@ -3113,12 +3174,15 @@ impl Follower {
         }
         let table = &self.table;
         let ledger = &self.ledger;
+        let bare = self.bare;
         self.unwritten.retain(|c| {
-            table.record(c).is_some_and(|record| {
-                ledger.newest(c).is_none_or(|row| {
-                    row.payload != record.payload || !crate::vote::same_set(&row.deps, &record.deps)
+            bare != Some(*c)
+                && table.record(c).is_some_and(|record| {
+                    ledger.newest(c).is_none_or(|row| {
+                        row.payload != record.payload
+                            || !crate::vote::same_set(&row.deps, &record.deps)
+                    })
                 })
-            })
         });
         let due: Vec<CommandId> = self
             .unwritten
@@ -3146,7 +3210,6 @@ impl Follower {
         let Some(first) = due.first().or(payloads_due.first()).copied() else {
             return Vec::new();
         };
-        let epoch = self.config.identity.epoch;
         let barrier = self.allocate();
         let mut updates = Vec::new();
         for c in payloads_due {
@@ -3156,16 +3219,19 @@ impl Follower {
             self.payload_unwritten.remove(&c);
         }
         for c in due {
+            self.unwritten.remove(&c);
             let record = self.table.record(&c).expect("retained").clone();
+            let Some(row) = self.dependency_row(&c, &record) else {
+                continue;
+            };
             if record.payload.is_some()
                 && let Some(payload) = self.payloads.get(&c)
             {
                 updates.push(payload_update(&c, payload).expect("bounded"));
                 self.durable_payloads.push(barrier, c);
             }
-            updates.push(dependency_update(epoch, &c, &record).expect("bounded"));
-            self.ledger.stage(barrier, c, record);
-            self.unwritten.remove(&c);
+            updates.push(row);
+            self.stage_row(barrier, c, record);
         }
         self.pending.insert(barrier, Pending::Carry(first));
         alloc::vec![Effect::Persist(PersistBatch {
@@ -3301,6 +3367,24 @@ impl Follower {
         // reported that stale record at the ballot its own selection
         // established, and the next selection re-proposed commands it had
         // committed.
+        //
+        // The command a catch-up window committed here with no dependencies
+        // of its own (`bare`) is in neither: the ledger holds no row of it
+        // once the window's batch is durable, before the window runs it,
+        // and its record is at COMMIT with dependencies no selection holds
+        // (#303 review). So no report names it, as for a command executed
+        // and forgotten, and catch-up brings it to a voter that lacks it.
+        debug_assert!(
+            self.bare.is_none_or(|c| {
+                self.ledger.record(&c).is_none()
+                    || self
+                        .catch_up
+                        .running
+                        .iter()
+                        .any(|r| r.command == c && !r.durable)
+            }),
+            "a durable row of a bare command once its window's batch is"
+        );
         let table = &self.table;
         overlay_selected(
             &mut report,
@@ -3349,6 +3433,17 @@ impl Follower {
     /// [`Follower::executed_rows_wanted`] named, `None` for one with no
     /// row, and the campaign tried again with them (task-d77).
     pub fn executed_rows(
+        &mut self,
+        rows: impl IntoIterator<Item = (CommandId, Option<CommandRecord>)>,
+    ) -> Vec<Effect> {
+        let held = self.bare;
+        let effects = self.executed_rows_inner(rows);
+        self.check_leaving(held, &effects);
+        effects
+    }
+
+    /// [`Follower::executed_rows`], before the check where its batches leave.
+    fn executed_rows_inner(
         &mut self,
         rows: impl IntoIterator<Item = (CommandId, Option<CommandRecord>)>,
     ) -> Vec<Effect> {
@@ -3687,6 +3782,14 @@ impl Follower {
     /// `from` -- the leader of the ballot this replica follows -- is
     /// usually the voter whose loss started the campaign.
     pub fn request_payloads(&mut self, from: ReplicaId) -> Vec<Effect> {
+        let held = self.bare;
+        let effects = self.request_payloads_inner(from);
+        self.check_leaving(held, &effects);
+        effects
+    }
+
+    /// [`Follower::request_payloads`], before the check where its batches leave.
+    fn request_payloads_inner(&mut self, from: ReplicaId) -> Vec<Effect> {
         let Some(boot) = self.boot else {
             return Vec::new();
         };
@@ -3901,6 +4004,18 @@ impl Follower {
         command: CommandId,
         outcome: &AppliedOutcome,
     ) -> Result<Vec<Effect>, LearnError> {
+        let held = self.bare;
+        let effects = self.applied_inner(command, outcome)?;
+        self.check_leaving(held, &effects);
+        Ok(effects)
+    }
+
+    /// [`Follower::applied`], before the check where its batches leave.
+    fn applied_inner(
+        &mut self,
+        command: CommandId,
+        outcome: &AppliedOutcome,
+    ) -> Result<Vec<Effect>, LearnError> {
         let result = self.learner.established(
             &mut self.table,
             command,
@@ -3979,6 +4094,9 @@ impl Follower {
         // of is never reported; one it did stays in the durable ledger
         // until the history sweep, as any executed command does.
         let _ = self.table.retire(&command);
+        if self.is_bare(&command) && self.table.record(&command).is_none() {
+            self.bare = None;
+        }
     }
 
     fn diverge(&mut self, command: CommandId, donor: DonorExecution, own: Option<OwnExecution>) {
@@ -4122,6 +4240,14 @@ impl Follower {
     /// a voter of this configuration. Published under the promised
     /// ballot, as payload transfer is: it is not a voting transition.
     pub fn request_catch_up(&mut self, donor: ReplicaId) -> Vec<Effect> {
+        let held = self.bare;
+        let effects = self.request_catch_up_inner(donor);
+        self.check_leaving(held, &effects);
+        effects
+    }
+
+    /// [`Follower::request_catch_up`], before the check where its batches leave.
+    fn request_catch_up_inner(&mut self, donor: ReplicaId) -> Vec<Effect> {
         if self.catch_up.busy() {
             self.catch_up.paths.declined_busy += 1;
             return Vec::new();
@@ -4543,20 +4669,38 @@ impl Follower {
         let epoch = self.config.identity.epoch;
         let barrier = self.alloc.as_mut().expect("booted").allocate();
         let mut updates = Vec::new();
-        for running in &mut self.catch_up.running {
+        let mut staged = Vec::new();
+        let mut removed = Vec::new();
+        for running in &self.catch_up.running {
             let command = running.command;
             updates.push(payload_update(&command, &running.entry.payload).expect("bounded"));
-            if running.entry.decided.is_some() {
+            let decided = running.entry.decided.as_ref().and_then(|_| {
                 let record = self
                     .table
                     .record(&command)
                     .expect("committed until executed")
                     .clone();
-                updates.push(dependency_update(epoch, &command, &record).expect("bounded"));
-                self.ledger.stage(barrier, command, record);
-            } else {
-                updates.push(dependency_delete(epoch, &command));
+                self.dependency_row(&command, &record)
+                    .map(|row| (row, record))
+            });
+            match decided {
+                Some((row, record)) => {
+                    updates.push(row);
+                    staged.push((command, record));
+                }
+                None => {
+                    updates.push(dependency_delete(epoch, &command));
+                    removed.push(command);
+                }
             }
+        }
+        for (command, record) in staged {
+            self.stage_row(barrier, command, record);
+        }
+        for command in removed {
+            self.ledger.stage_removal(barrier, command);
+        }
+        for running in &mut self.catch_up.running {
             running.barrier = barrier;
         }
         let first = self.catch_up.running.front().expect("in hand").command;
@@ -4696,6 +4840,16 @@ impl Follower {
                 .push(FollowerRejection::CatchUpNotInstalled(command));
             return Pulled::Stopped;
         }
+        // Committed here by the window with no dependencies, which are no
+        // decision: marked so that nothing writes or reports them (#303
+        // review). A record committed here already holds its decision.
+        if entry.decided.is_none() && !committed {
+            debug_assert!(
+                self.bare.is_none(),
+                "a bare command is a window of its own, run before the next"
+            );
+            self.bare = Some(command);
+        }
         // Decided here now: nothing the leader or a Sync offers for it is
         // to be adopted over the decision.
         self.held.remove(&command);
@@ -4715,13 +4869,26 @@ impl Follower {
             .get_or_insert_with(|| (self.alloc.as_mut().expect("booted").allocate(), Vec::new()));
         let barrier = *barrier;
         updates.push(payload_update(&command, &entry.payload).expect("bounded"));
-        if entry.decided.is_some() {
-            let record = self.table.record(&command).expect("installed").clone();
-            updates.push(dependency_update(epoch, &command, &record).expect("bounded"));
-            self.ledger.stage(barrier, command, record);
-        } else {
-            updates.push(dependency_delete(epoch, &command));
-            self.ledger.retain(|c| *c != command);
+        let record = self.table.record(&command).expect("installed").clone();
+        match entry
+            .decided
+            .as_ref()
+            .and_then(|_| self.dependency_row(&command, &record))
+        {
+            Some(row) => {
+                updates.push(row);
+                self.stage_row(barrier, command, record);
+            }
+            None => {
+                // Its durable row leaves the ledger now, and one still in
+                // flight -- an adoption's, say -- when this batch is
+                // durable, which is before the window runs: landing
+                // first, it is removed then, and landing later, it is
+                // older than the removal and ignored (#303 review).
+                updates.push(dependency_delete(epoch, &command));
+                self.ledger.retain(|c| *c != command);
+                self.ledger.stage_removal(barrier, command);
+            }
         }
         self.catch_up.running.push_back(Running {
             command,
@@ -5822,17 +5989,16 @@ impl Follower {
         if !(self.in_fast_set() && self.may_vote()) {
             self.table.demote(&command);
         }
-        let epoch = self.config.identity.epoch;
         let record = self
             .table
             .record(&command)
             .expect("just initialized")
             .clone();
+        let row = self
+            .dependency_row(&command, &record)
+            .expect("a record just initialized holds its own dependencies");
         let barrier = self.allocate();
-        let mut updates = alloc::vec![
-            payload_update(&command, &payload).expect("bounded"),
-            dependency_update(epoch, &command, &record).expect("bounded"),
-        ];
+        let mut updates = alloc::vec![payload_update(&command, &payload).expect("bounded"), row];
         self.carry_unwritten(barrier, command, &record.deps, &mut updates);
         let mut effects = alloc::vec![Effect::Persist(PersistBatch {
             barrier,
@@ -5840,7 +6006,7 @@ impl Follower {
             updates,
         })];
         self.pending.insert(barrier, Pending::Vote(command));
-        self.ledger.stage(barrier, command, record);
+        self.stage_row(barrier, command, record);
         self.durable_payloads.push(barrier, command);
         // Own vote joins whatever evidence (a held proposal) already
         // arrived for this command; it never replaces it.
@@ -6435,7 +6601,6 @@ impl Follower {
         deps: &[CommandId],
         updates: &mut Vec<StoreUpdate>,
     ) -> Vec<(CommandId, CommandRecord)> {
-        let epoch = self.config.identity.epoch;
         let mut carried = Vec::new();
         let mut seen = BTreeSet::from([command]);
         let mut stack: Vec<CommandId> = deps.to_vec();
@@ -6449,7 +6614,6 @@ impl Follower {
             // payload for ever (protocol_sim row 21 with its queue
             // failed, five voters, seed 378).
             if !seen.insert(d)
-                || self.bare_in_hand(&d)
                 || (self.ledger.written(&d) && !self.stale(&d) && self.payload_row(&d).is_some())
             {
                 continue;
@@ -6462,33 +6626,106 @@ impl Follower {
                 continue;
             }
             let record = record.clone();
+            let Some(row) = self.dependency_row(&d, &record) else {
+                continue;
+            };
             updates.push(payload_update(&d, payload).expect("bounded"));
-            updates.push(dependency_update(epoch, &d, &record).expect("bounded"));
+            updates.push(row);
             stack.extend(record.deps.iter().copied());
             carried.push((d, record));
         }
         carried
     }
 
-    /// Whether `command` is the window in hand of a command its donor kept
-    /// no row of (#302 review): committed here so that it runs at the
-    /// donor's position, with no dependencies, which are not its decision.
-    /// The window deletes its dependency row so that it is never reported
-    /// as one, and nothing else writes it: a Sync's carry and a vote's
-    /// rows leave it out. A restart forgets it, and catch-up brings it
-    /// again.
-    fn bare_in_hand(&self, command: &CommandId) -> bool {
-        self.catch_up
-            .running
-            .front()
-            .is_some_and(|r| r.command == *command && r.entry.decided.is_none())
+    /// Whether `command` is the one [`Follower::bare`] names: committed
+    /// here by a catch-up window with no dependencies, which are no
+    /// decision (#302 review). The window deletes its dependency row, and
+    /// nothing writes one again: a restart forgets it, and catch-up
+    /// brings it again.
+    fn is_bare(&self, command: &CommandId) -> bool {
+        self.bare == Some(*command)
+    }
+
+    /// The command a catch-up window committed here with no dependencies,
+    /// which are no decision, while the table holds it so (#303 review).
+    /// Its execution follows the donor's order; it has no dependencies to
+    /// compare.
+    pub const fn bare(&self) -> Option<CommandId> {
+        self.bare
+    }
+
+    /// The dependency row of `command` as `record` holds it, or none for
+    /// the command [`Follower::bare`] names (#303 review). Every row of a
+    /// record's dependencies this follower writes is made here: a Sync's
+    /// installation and its demotions, a carried commit's rows, a stale
+    /// record's, a vote's and an adoption's, the rows a batch carries for
+    /// what it names, a window's, a submission's and a rebinding's. So
+    /// none of them can write that one, whichever reaches it.
+    fn dependency_row(&self, command: &CommandId, record: &CommandRecord) -> Option<StoreUpdate> {
+        (!self.is_bare(command)).then(|| {
+            dependency_update(self.config.identity.epoch, command, record).expect("bounded")
+        })
+    }
+
+    /// Stage under `barrier` the record a row from
+    /// [`Follower::dependency_row`] was made of. The ledger is what the
+    /// report reads, so this is the one way a record reaches it, and the
+    /// command [`Follower::bare`] names never does.
+    fn stage_row(&mut self, barrier: BarrierId, command: CommandId, record: CommandRecord) {
+        assert!(
+            !self.is_bare(&command),
+            "a row staged of dependencies that are no decision"
+        );
+        self.ledger.stage(barrier, command, record);
+    }
+
+    /// The debug check where a batch leaves this follower (#303 review):
+    /// no batch that leaves while a command is bare in hand carries a
+    /// dependency row of it, whichever of the places that build one built
+    /// it, and whatever was added to the batch after. `held` is the
+    /// command [`Follower::bare`] named when the call began; one marked
+    /// during the call is bare from its window's batch on, and a row in a
+    /// batch before that one is older, removed when the window's is
+    /// durable.
+    fn check_leaving(&self, held: Option<CommandId>, effects: &[Effect]) {
+        if !cfg!(debug_assertions) {
+            return;
+        }
+        let epoch = self.config.identity.epoch;
+        let marked = self.bare.filter(|c| held != Some(*c)).and_then(|c| {
+            self.catch_up
+                .running
+                .iter()
+                .find(|r| r.command == c)
+                .map(|r| (c, r.barrier))
+        });
+        let mut from_window = false;
+        for effect in effects {
+            let Effect::Persist(batch) = effect else {
+                continue;
+            };
+            from_window |= marked.is_some_and(|(_, b)| b == batch.barrier);
+            let bare = held
+                .into_iter()
+                .chain(marked.filter(|_| from_window).map(|(c, _)| c));
+            for command in bare {
+                let row = dependency_delete(epoch, &command);
+                assert!(
+                    !batch.updates.iter().any(|u| u.collection == row.collection
+                        && u.key == row.key
+                        && u.value.is_some()),
+                    "a dependency row of {command:?}, bare in hand, leaves in batch {:?}",
+                    batch.barrier
+                );
+            }
+        }
     }
 
     /// Stage under `barrier` the records [`Follower::unwritten`] carried,
     /// with their payload rows.
     fn stage_unwritten(&mut self, barrier: BarrierId, carried: Vec<(CommandId, CommandRecord)>) {
         for (d, record) in carried {
-            self.ledger.stage(barrier, d, record);
+            self.stage_row(barrier, d, record);
             self.durable_payloads.push(barrier, d);
         }
     }
@@ -6677,6 +6914,15 @@ impl Follower {
                 let held = self.held.remove(&command).expect("ready");
                 self.unkeep(&command);
                 self.note_lacking(command);
+                // A command a catch-up window committed here with no
+                // dependencies, which are no decision (#303 review): its
+                // window runs it at the donor's position. Taken as a
+                // record committed here is, below, the proposal would
+                // write those dependencies as its row and acknowledge an
+                // acceptance no row holds. So it is dropped.
+                if self.is_bare(&command) {
+                    continue;
+                }
                 // The proposal asserts the admission it was ordered under.
                 // Adopted under other attested facts, this replica would
                 // execute a command the quorum never admitted as such --
@@ -6726,11 +6972,12 @@ impl Follower {
                 self.adopted
                     .insert(command, (held.proposal.seqnum.unwrap_or(u64::MAX), false));
                 self.note_lacking(command);
-                let epoch = self.config.identity.epoch;
                 let record = self.table.record(&command).expect("adopted").clone();
                 let admission = record.payload.unwrap_or_else(|| admission_digest(None, 0));
-                let mut updates =
-                    alloc::vec![dependency_update(epoch, &command, &record).expect("bounded")];
+                let mut updates = alloc::vec![
+                    self.dependency_row(&command, &record)
+                        .expect("an adopted record holds the leader's dependencies")
+                ];
                 // The payload row with it, where none is durable or being
                 // written here (task-d90): its batch failed, or it was
                 // never written. The acknowledgement waits on the batch
@@ -6784,7 +7031,7 @@ impl Follower {
                     self.pending.insert(barrier, Pending::Adoption(command));
                     self.deferred.insert(barrier, deferred);
                 }
-                self.ledger.stage(barrier, command, record);
+                self.stage_row(barrier, command, record);
                 self.publish_to_leader_and_frontend(
                     command,
                     barrier,
@@ -7610,13 +7857,12 @@ impl Follower {
             let _ = set.add(Vote::Fast(held.proposal.clone()));
             self.votes.insert(command, set);
         }
-        let epoch = self.config.identity.epoch;
         let record = self.table.record(&command).expect("rebound").clone();
+        let row = self
+            .dependency_row(&command, &record)
+            .expect("a record rebound is below COMMIT");
         let barrier = self.allocate();
-        let mut updates = alloc::vec![
-            payload_update(&command, &payload).expect("bounded"),
-            dependency_update(epoch, &command, &record).expect("bounded"),
-        ];
+        let mut updates = alloc::vec![payload_update(&command, &payload).expect("bounded"), row];
         self.carry_unwritten(barrier, command, &record.deps, &mut updates);
         let mut effects = alloc::vec![Effect::Persist(PersistBatch {
             barrier,
@@ -7624,7 +7870,7 @@ impl Follower {
             updates,
         })];
         self.pending.insert(barrier, Pending::Vote(command));
-        self.ledger.stage(barrier, command, record);
+        self.stage_row(barrier, command, record);
         self.durable_payloads.push(barrier, command);
         effects.extend(self.advance_pending());
         effects
@@ -7710,6 +7956,7 @@ impl DeterministicMachine for Follower {
     type Effect = Effect;
 
     fn step(&mut self, event: Event) -> Vec<Effect> {
+        let held = self.bare;
         let failure = matches!(event, Event::Storage(StorageEvent::Failed { .. }));
         let mut effects = self.step_event(event);
         if !failure {
@@ -7721,6 +7968,7 @@ impl DeterministicMachine for Follower {
             }
             effects.extend(self.carry_stale());
         }
+        self.check_leaving(held, &effects);
         effects
     }
 }
