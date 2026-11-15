@@ -2429,7 +2429,12 @@ fn a_sync_entry_whose_payload_came_relayed_is_executed_over_its_payload_row() {
         }),
     ));
     let all = settle(&mut f, synced, &mut seq);
-    assert_eq!(f.ballots().synced(), ballot(1, 2), "{:?}", f.take_rejections());
+    assert_eq!(
+        f.ballots().synced(),
+        ballot(1, 2),
+        "{:?}",
+        f.take_rejections()
+    );
     assert_eq!(f.table().phase_of(&c1), Some(Phase::Commit));
     assert_eq!(payload_rows(&all), 1, "its own payload row: {all:?}");
     let with_payload = persisted(&all)

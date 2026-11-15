@@ -104,8 +104,8 @@
 //! fast-set followers too, and must fail: at three voters one of them then
 //! commits over a vote the leader may lose.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::cell::{Cell, RefCell};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Once;
 
@@ -4090,7 +4090,9 @@ fn quietly<T>(f: impl FnOnce() -> T) -> std::thread::Result<T> {
             if QUIET.with(Cell::get) == 0 {
                 previous(info);
             } else {
-                let at = info.location().map(|l| format!("{}:{}", l.file(), l.line()));
+                let at = info
+                    .location()
+                    .map(|l| format!("{}:{}", l.file(), l.line()));
                 WHERE.with(|w| *w.borrow_mut() = at);
             }
         }));
@@ -4871,13 +4873,12 @@ fn first_failure(n: u8, knobs: Knobs) -> Option<String> {
 /// The first seed at which `knobs` fail, at `n` voters, with a failure
 /// that says `what`.
 fn first_failure_with(n: u8, knobs: Knobs, what: &str) -> Option<String> {
-    let found = (0..NEGATIVE_CONTROL_SEEDS).find_map(|seed| {
+    (0..NEGATIVE_CONTROL_SEEDS).find_map(|seed| {
         quietly(|| Sim::new(n, knobs, seed).run())
             .err()
             .map(|e| format!("seed {seed}: {}", panic_text(&*e)))
             .filter(|f| f.contains(what))
-    });
-    found
+    })
 }
 
 /// Row 19's negative control (task-d90, point 2): with the machines
