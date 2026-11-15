@@ -179,6 +179,12 @@ coordd --config <successor.toml> restore --dir <backup/> --fencing <fencing.json
 
 The same invocation without `--plan`, on the same node.
 
+Run it on every voter of the successor, with the same backup, the same
+attestation and each voter's own configuration: a voter brought up with
+`coordd init` instead starts below the backup's boundary, and until
+task-d32 no peer can bring it past, since a backup carries no record of
+how each restored command was decided.
+
 The restore writes into a staged generation of the *successor*
 cluster and selects nothing until it has finished: the generation is
 selected only after the transaction carrying the receipt has committed,
