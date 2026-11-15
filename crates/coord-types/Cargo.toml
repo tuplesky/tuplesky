@@ -1,0 +1,16 @@
+[package]
+name = "coord-types"
+description = "Versioned commands/DTOs, canonical identities, ordered-key encoding and bounded errors"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[package.metadata.tuplesky]
+role = "core"
+
+[dependencies]
+
+[dev-dependencies]

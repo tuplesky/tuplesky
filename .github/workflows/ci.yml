@@ -1,0 +1,109 @@
+# Entry workflow (task-01, design Section 12.4.1).
+#
+# 1. `classify` runs the repository-owned change filter before any toolchain
+#    setup and self-tests it.
+# 2. `docs` always runs the documentation checks (links, task graph, Mermaid).
+# 3. `build-test` (the reusable Rust/Go workflow) runs unless the change set is
+#    proven documentation-only. Scheduled and manual runs always run it fully.
+# 4. `CI` is the single stable required check. It runs even when a dependency
+#    failed or was skipped and converts results into pass/fail explicitly.
+#
+# Untrusted pull requests run with read-only permissions and no secrets.
+# `pull_request_target` is deliberately not used.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  merge_group:
+    types: [checks_requested]
+  workflow_dispatch:
+  schedule:
+    # Weekly full qualification run (Mondays 03:17 UTC).
+    - cron: "17 3 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  classify:
+    name: classify changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      docs_only: ${{ steps.classify.outputs.docs_only }}
+      reason: ${{ steps.classify.outputs.reason }}
+    steps:
+      - name: Check out (full history for merge-base and push ranges)
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: "3.12"
+      - name: Self-test the classifier, gate and documentation checker
+        run: python3 -m unittest discover -s scripts/ci -p 'test_*.py'
+      - name: Classify the change set
+        id: classify
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          MG_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          MG_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.sha }}
+        run: |
+          python3 scripts/ci/classify_changes.py \
+            --event-name "$EVENT_NAME" \
+            --base "${PR_BASE_SHA:-$MG_BASE_SHA}" \
+            --head "${PR_HEAD_SHA:-${MG_HEAD_SHA:-$PUSH_AFTER}}" \
+            --before "$PUSH_BEFORE" \
+            --output "$GITHUB_OUTPUT"
+
+  docs:
+    name: documentation checks
+    needs: classify
+    uses: ./.github/workflows/docs.yml
+    permissions:
+      contents: read
+
+  build-test:
+    name: build and test
+    needs: classify
+    if: needs.classify.outputs.docs_only != 'true'
+    uses: ./.github/workflows/build-test.yml
+    permissions:
+      contents: read
+    with:
+      full: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+
+  ci:
+    # Stable required check. Branch protection requires exactly this job.
+    name: CI
+    needs: [classify, docs, build-test]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - name: Evaluate gate
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+          DOCS_ONLY: ${{ needs.classify.outputs.docs_only }}
+          REASON: ${{ needs.classify.outputs.reason }}
+        run: |
+          echo "classifier: docs_only=$DOCS_ONLY reason=$REASON"
+          python3 scripts/ci/evaluate_gate.py

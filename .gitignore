@@ -1,0 +1,11 @@
+/target
+**/target/
+node_modules/
+__pycache__/
+*.pyc
+/tools/downloads/
+/tools/mermaid/puppeteer-config.runner.json
+/adapters/kine/bin/
+/docs/build/render/
+**/*.orig
+**/*.rej

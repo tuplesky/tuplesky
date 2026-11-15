@@ -1,0 +1,55 @@
+# Checksummed developer/CI tool manifest (task-01, design Section 16.1).
+#
+# `python3 scripts/ci/install_tools.py` downloads, verifies and installs the
+# binary tools for the current platform; `cargo xtask check-tools` verifies the
+# installed versions. Update a pin only in a reviewed change together with the
+# new checksum; never point at a floating "latest" URL.
+version = 1
+
+[[tool]]
+name = "cargo-deny"
+version = "0.18.9"
+purpose = "advisory/license/ban/source policy (deny.toml)"
+version_command = ["cargo", "deny", "--version"]
+version_pattern = "cargo-deny 0.18.9"
+
+[[tool.download]]
+platform = "x86_64-unknown-linux"
+url = "https://github.com/EmbarkStudios/cargo-deny/releases/download/0.18.9/cargo-deny-0.18.9-x86_64-unknown-linux-musl.tar.gz"
+sha256 = "491d04e4c05d7c92582e3d40ec94126c52472a546326a6d29473a5a4e73babd2"
+member = "cargo-deny-0.18.9-x86_64-unknown-linux-musl/cargo-deny"
+
+[[tool.download]]
+platform = "aarch64-unknown-linux"
+url = "https://github.com/EmbarkStudios/cargo-deny/releases/download/0.18.9/cargo-deny-0.18.9-aarch64-unknown-linux-musl.tar.gz"
+sha256 = "8bc65cc9f5573e1538f914a227e87f70586a50922b73d0def28ffd6f74514a53"
+member = "cargo-deny-0.18.9-aarch64-unknown-linux-musl/cargo-deny"
+
+[[tool]]
+name = "cargo-nextest"
+version = "0.9.99"
+purpose = "test runner with per-test process isolation and timeouts"
+version_command = ["cargo", "nextest", "--version"]
+version_pattern = "cargo-nextest 0.9.99"
+
+[[tool.download]]
+platform = "x86_64-unknown-linux"
+url = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.99/cargo-nextest-0.9.99-x86_64-unknown-linux-gnu.tar.gz"
+sha256 = "49442ae3f03e56e04581a251ace3edf700095aa7c1bba89fd16a1386295a70df"
+member = "cargo-nextest"
+
+[[tool.download]]
+platform = "aarch64-unknown-linux"
+url = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.99/cargo-nextest-0.9.99-aarch64-unknown-linux-gnu.tar.gz"
+sha256 = "2097164de24b364c9a518fb583bcc822577d29fa0083168126d0c9c3684e149f"
+member = "cargo-nextest"
+
+[[tool]]
+name = "mermaid-cli"
+version = "11.17.0"
+purpose = "renders every Mermaid block in the design package (docs CI job)"
+kind = "npm"
+lockfile = "tools/mermaid/package-lock.json"
+binary = "tools/mermaid/node_modules/.bin/mmdc"
+version_command = ["tools/mermaid/node_modules/.bin/mmdc", "--version"]
+version_pattern = "11.17.0"
