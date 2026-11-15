@@ -4835,6 +4835,14 @@ struct Kept {
     /// row's.
     #[serde(default)]
     frames: Option<u32>,
+    /// The share of commands answered on a release alone it found it
+    /// with (`Knobs::answer_on_release`); absent, the row's.
+    #[serde(default)]
+    answer_on_release: Option<u32>,
+    /// The share of marked commands relayed it found it with
+    /// (`Knobs::relay`); absent, the row's.
+    #[serde(default)]
+    relay: Option<u32>,
     /// What it found, for the reader.
     #[allow(dead_code)]
     found: String,
@@ -4851,6 +4859,12 @@ impl Kept {
         }
         if let Some(frames) = self.frames {
             knobs.frames = frames;
+        }
+        if let Some(share) = self.answer_on_release {
+            knobs.answer_on_release = share;
+        }
+        if let Some(share) = self.relay {
+            knobs.relay = share;
         }
         run_knobs(self.voters, knobs, self.seed, self.catch_up)
     }

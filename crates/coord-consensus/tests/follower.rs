@@ -2359,6 +2359,91 @@ fn a_refused_entry_leaves_the_frames_others_as_they_are() {
     assert_eq!(f.table().phase_of(&c2), Some(Phase::Accept));
 }
 
+/// Seed 275 of `relayed_rows` (row 9, three voters): a payload taken from
+/// a relayed proposal is held in memory, its row left to the adoption's
+/// batch. The proposal waits on a dependency this replica lacks, and the
+/// ballot changes before it is adopted; the new ballot's Sync names the
+/// command at COMMIT. The Sync's installation writes its dependency row,
+/// and its own payload row is written in the same step, in a batch of its
+/// own, before the command is executable. Before, no batch held it, and
+/// the command executed with its payload held only in memory.
+#[test]
+fn a_sync_entry_whose_payload_came_relayed_is_executed_over_its_payload_row() {
+    let mut seq = 1;
+    let mut f = booted(1);
+    let (_, c0) = relayed_payload(1, 1, 1);
+    let (p1, c1) = relayed_payload(2, 1, 2);
+    let mut leader_view = coord_consensus::CommandTable::new();
+    leader_view
+        .initialize(c0, c0.0, vec![CONSERVATIVE_KEY.to_vec()])
+        .unwrap();
+    let l1 = leader_view
+        .initialize(c1, c1.0, vec![CONSERVATIVE_KEY.to_vec()])
+        .unwrap();
+    assert_eq!(l1.deps, vec![c0]);
+    let payloads = Collection::PayloadV1.id();
+    let payload_rows = |effects: &[Effect]| -> usize {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Persist(b) => Some(b),
+                _ => None,
+            })
+            .flat_map(|b| b.updates.iter())
+            .filter(|u| u.collection == payloads && u.value.is_some())
+            .count()
+    };
+    let taken = f.step(peer(
+        0,
+        relayed(proposal(c1, vec![c0], 1, l1.paths, l1.path), p1),
+    ));
+    assert_eq!(f.relayed_taken(), 1);
+    assert!(f.payload(&c1).is_some(), "held");
+    assert_eq!(payload_rows(&taken), 0, "no row yet: {taken:?}");
+    settle(&mut f, taken, &mut seq);
+    assert_eq!(f.held().len(), 1, "waiting on c0");
+    let promised = f.step(peer(
+        2,
+        ProtocolMessage::NewLeader {
+            ballot: ballot(1, 2),
+            executed: ExecutionPosition::ZERO,
+        },
+    ));
+    settle(&mut f, promised, &mut seq);
+    let entry = coord_consensus::SyncEntry {
+        command: c1,
+        phase: Phase::Commit,
+        deps: Vec::new(),
+        path: coord_consensus::empty_path(),
+        paths: Vec::new(),
+        seqnum: 0,
+        admission: Some(admitted_under()),
+    };
+    let synced = f.step(peer(
+        2,
+        ProtocolMessage::Sync(coord_consensus::SyncDecision {
+            ballot: ballot(1, 2),
+            source_ballot: ballot(0, 0),
+            entries: [(c1, entry)].into_iter().collect(),
+            reproposed: BTreeSet::new(),
+        }),
+    ));
+    let all = settle(&mut f, synced, &mut seq);
+    assert_eq!(f.ballots().synced(), ballot(1, 2), "{:?}", f.take_rejections());
+    assert_eq!(f.table().phase_of(&c1), Some(Phase::Commit));
+    assert_eq!(payload_rows(&all), 1, "its own payload row: {all:?}");
+    let with_payload = persisted(&all)
+        .into_iter()
+        .find(|b| b.updates.iter().any(|u| u.collection == payloads))
+        .unwrap();
+    assert_eq!(
+        with_payload.updates.len(),
+        1,
+        "in a batch of its own: {with_payload:?}"
+    );
+    assert_eq!(f.next_executable(), Some(c1));
+}
+
 /// A chain of relayed proposals for `seqs`, each depending on the one
 /// before it, as a leader whose table saw them in that order proposes
 /// them.
