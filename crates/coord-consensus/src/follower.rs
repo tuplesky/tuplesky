@@ -801,6 +801,9 @@ pub struct Follower {
     /// The pages of the last report sent a candidate, which a lost page
     /// is answered from (task-d28).
     served_report: Option<crate::summary::ServedReport>,
+    /// The refusal sent a candidate at a report's cut in place of the
+    /// report, which a lost one is answered from (task-d119).
+    served_refusal: Option<crate::role::ServedRefusal>,
     /// The ballot this replica last reported for and the commands its
     /// report named (task-d24).
     report_cut: Option<(Ballot, BTreeSet<CommandId>)>,
@@ -1301,6 +1304,7 @@ impl Follower {
             behind_voters: None,
             report_due: None,
             served_report: None,
+            served_refusal: None,
             report_cut,
             sync_pending: BTreeMap::new(),
             sync_waiters: BTreeMap::new(),
@@ -1521,6 +1525,7 @@ impl Follower {
             // would stall a candidate that needs this replica's majority.
             report_due: state.report_due,
             served_report: state.served_report,
+            served_refusal: state.served_refusal,
             report_cut: state.report_cut,
             sync_pending: BTreeMap::new(),
             sync_waiters: BTreeMap::new(),
@@ -1616,6 +1621,7 @@ impl Follower {
             outbox: self.outbox,
             report_due: self.report_due,
             served_report: self.served_report,
+            served_refusal: self.served_refusal,
             report_cut: self.report_cut,
             frontend: self.config.frontend,
             capacity: self.config.capacity,
@@ -1823,13 +1829,25 @@ impl Follower {
     }
 
     /// Send `from` again the pages of the report this replica sent it
-    /// for `ballot` that it asks for (task-d28), from the same version.
+    /// for `ballot` that it asks for (task-d28), from the same version;
+    /// or the refusal it sent in place of that report (task-d119).
     fn answer_report_pages(
         &mut self,
         from: ReplicaId,
         ballot: Ballot,
         asked: &[u32],
     ) -> Vec<Effect> {
+        if let (Some(refused), Some(boot)) = (self.served_refusal, self.boot)
+            && refused.answers(from, ballot)
+        {
+            let reply = self
+                .ballots
+                .refusal(refused.to, ballot, boot, refused.executed);
+            if let Some(outbox) = self.outbox.as_mut() {
+                outbox.publish(reply);
+            }
+            return self.release();
+        }
         let (Some(served), Some(boot)) = (self.served_report.as_ref(), self.boot) else {
             return Vec::new();
         };
@@ -1871,6 +1889,11 @@ impl Follower {
                 return Vec::new();
             };
             self.rejections.push(FollowerRejection::Promise(refused));
+            self.served_refusal = Some(crate::role::ServedRefusal {
+                ballot: due.ballot,
+                to: due.to,
+                executed: own,
+            });
             let reply = self.ballots.refusal(due.to, due.ballot, boot, own);
             if let Some(outbox) = self.outbox.as_mut() {
                 outbox.publish(reply);

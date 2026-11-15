@@ -188,7 +188,7 @@ pub use recovery::{
     max_report_entries, select, select_decided, select_from, select_ruled, select_with,
 };
 pub use replay::{MAX_EVIDENCE_REPAIRS, ReplayRefusal};
-pub use role::{PendingReport, RecoveredState};
+pub use role::{PendingReport, RecoveredState, ServedRefusal};
 pub use rows::{
     PayloadRecordV1, PromiseRecordV1, ProposalRecordV1, SYNC_KIND, SYNC_SCHEMA_VERSION,
     SealRecordV1, SyncRecordV1, bounded_sync_update, decode_dependency, decode_payload,

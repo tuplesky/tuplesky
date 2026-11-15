@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 
 use coord_core::effect::{BarrierId, BootId, PeerId};
 use coord_core::outbox::{BarrierAllocator, Outbox};
-use coord_types::ids::{Ballot, ExecutionPosition};
+use coord_types::ids::{Ballot, ExecutionPosition, ReplicaId};
 use coord_types::{CommandId, RetryKey};
 
 use crate::ballot::{BallotState, ConfigurationIdentity};
@@ -48,6 +48,31 @@ impl PendingReport {
     }
 }
 
+/// A refusal a replica sent a candidate at its report's cut, in place of
+/// the report (task-d119).
+///
+/// It is kept as the pages of a report are (task-d28): the candidate has
+/// this replica's promise, so it waits for the report, and asks for its
+/// pages again when none arrive. A refusal that was lost is answered to
+/// that ask, or the campaign waits for its election timeout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ServedRefusal {
+    /// Ballot refused.
+    pub ballot: Ballot,
+    /// Candidate refused, at its authenticated incarnation.
+    pub to: PeerId,
+    /// What the replica executed through at the cut.
+    pub executed: ExecutionPosition,
+}
+
+impl ServedRefusal {
+    /// Whether `from`, asking for the pages of its report for `ballot`,
+    /// is answered with this refusal.
+    pub fn answers(&self, from: ReplicaId, ballot: Ballot) -> bool {
+        self.to.replica == from && self.ballot == ballot
+    }
+}
+
 /// State carried across a role change.
 #[derive(Debug)]
 pub struct RecoveredState {
@@ -81,6 +106,9 @@ pub struct RecoveredState {
     /// The pages of the last report this replica sent a candidate, which
     /// it answers a lost page from (task-d28).
     pub served_report: Option<ServedReport>,
+    /// The refusal this replica last sent a candidate at a report's cut,
+    /// which it answers a lost one from (task-d119).
+    pub served_refusal: Option<ServedRefusal>,
     /// The ballot this replica last reported for and the commands its
     /// report named: the only records a Sync of that ballot may release
     /// (task-d24).
