@@ -512,7 +512,10 @@ New counts on the metrics line:
 **Tests and acceptance:**
 - **In-process: a voter stopped under load and returned 100k behind, on a link of 140 ms round trip.**
   - Without loss, under `bbr` and `cubic`: it levels within Section 9's time for its measured E_p.
-  - With 0.1% loss under `cubic`, the test asserts three things: the voter doesn't level; the metrics name the path as the bound (the leader's queue toward it, and `paths[]`); and at a domain rate below the path's rate over the bytes a command, with the margin, it does hold level.
+  - **With the link's rate set below the live stream's** (a bandwidth limit on the link, not loss), the bottleneck is there by construction. The test asserts three things: the voter doesn't level; the metrics name the path as the bound (the leader's queue toward it, and `paths[]`); and at a domain rate below the link's rate over the bytes a command, with the margin, it does hold level.
+  - **With 0.1% loss under `cubic` and no rate limit,** the test doesn't assume the path is the bound, since Section 3's estimate is unsettled (Codex on #301). It first reads the leader's rate toward the voter from `paths[]` while the voter is level, then asserts against that reading:
+    - where the reading carries R·c·(1 + m), the voter levels within Section 9's time, as without loss;
+    - where it doesn't, the three assertions of the rate-limited case hold, with the reading as the path's rate.
   - In every case it never holds more than its kept bound or 9 pages, and never more than 5 asks outstanding to one donor.
 - **A lost head ask with the pipeline full:** with the first range's answer dropped and the other 8 slots holding later pages, the retry takes the head's slot, the hole fills, and held pages never exceed 9. The head's late answer, delivered after the retry's, is dropped and counted as `late`.
 - **A voter returned past the run's bound,** 200k behind on a path that carries more than R:
