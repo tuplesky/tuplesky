@@ -146,6 +146,12 @@ struct Cluster {
     drop_acks: Vec<(u8, u8)>,
     /// (from, to) pairs whose proposals are dropped.
     drop_proposals: Vec<(u8, u8)>,
+    /// (from, to) pairs whose commit frontiers (`Committed`) are dropped.
+    drop_committed: Vec<(u8, u8)>,
+    /// Voters sent a copy of every other voter's adoption acknowledgement
+    /// (`SlowAck`), as a voter of a build before task-d74 sent it to
+    /// every voter.
+    copy_acks_to: Vec<u8>,
     /// (from, to) pairs whose next report page is dropped, once each.
     drop_pages: Vec<(u8, u8)>,
     /// The voters' table capacity.
@@ -265,6 +271,8 @@ impl Cluster {
             no_execute: Vec::new(),
             drop_acks: Vec::new(),
             drop_proposals: Vec::new(),
+            drop_committed: Vec::new(),
+            copy_acks_to: Vec::new(),
             capacity,
             voters,
             frontend: Vec::new(),
@@ -371,6 +379,31 @@ impl Cluster {
                         )
                     {
                         continue;
+                    }
+                    if self.drop_committed.contains(&(i as u8, dest))
+                        && matches!(
+                            ProtocolMessage::decode(&frame).unwrap(),
+                            ProtocolMessage::Committed { .. }
+                        )
+                    {
+                        continue;
+                    }
+                    if !self.copy_acks_to.is_empty()
+                        && matches!(
+                            ProtocolMessage::decode(&frame).unwrap(),
+                            ProtocolMessage::SlowAck(_)
+                        )
+                    {
+                        for to in self.copy_acks_to.clone() {
+                            if usize::from(to) != i
+                                && to != dest
+                                && self.nodes[usize::from(to)].alive
+                            {
+                                self.nodes[usize::from(to)]
+                                    .inbox
+                                    .push_back((from, frame.clone()));
+                            }
+                        }
                     }
                     if let Some(at) = self.drop_pages.iter().position(|p| *p == (i as u8, dest))
                         && matches!(
@@ -1415,6 +1448,54 @@ fn a_follower_reports_a_command_until_its_execution_is_durable() {
     assert_eq!(
         reported(cluster.nodes[1].follower()),
         reported(cluster.nodes[2].follower())
+    );
+}
+
+/// A follower sent no commit frontier keeps the frontier's index no
+/// larger than its adoptions, which forgetting bounds (Codex on #269).
+///
+/// The leader's `Committed` frames to r1 are dropped, so r1 never holds
+/// a frontier. It is sent r2's adoption acknowledgements, as a voter of a
+/// build before task-d74 sent them to every voter, so it commits by
+/// votes, executes and forgets. The index's entries went only when a
+/// frontier passed them, so r1 kept one for every command it adopted, 200
+/// against a table of 32. They go with the adoption now.
+#[test]
+fn the_commit_frontiers_index_is_bounded_with_no_frontier_sent() {
+    let capacity = 32usize;
+    let commands = 200u64;
+    let mut cluster = Cluster::new(31);
+    cluster.drop_committed = vec![(0, 1)];
+    cluster.copy_acks_to = vec![1];
+    let mut most = 0;
+    for n in 0..commands {
+        cluster.admit(n + 1, (n % 250) as u8);
+        cluster.settle();
+        let maps = cluster.nodes[1].follower().history_maps();
+        assert!(
+            maps.frontier_ready <= maps.adopted,
+            "after {} commands, r1's commit frontier index holds more than its adoptions: {maps:?}",
+            n + 1
+        );
+        most = most.max(maps.frontier_ready);
+    }
+    assert!(cluster.committed_sent > 0, "the leader sent no frontier");
+    assert!(most > 0, "r1 indexed no adoption");
+    assert!(
+        most < capacity * 4,
+        "r1's commit frontier index reached {most} against a table of {capacity}"
+    );
+    assert_eq!(
+        cluster.nodes[1].executed_through().get(),
+        commands,
+        "r1 did not execute everything without a frontier"
+    );
+    let f = cluster.nodes[1].follower();
+    let maps = f.history_maps();
+    assert!(
+        maps.frontier_ready <= f.ledger().len(),
+        "r1's commit frontier index holds more than its ledger's {}: {maps:?}",
+        f.ledger().len()
     );
 }
 
