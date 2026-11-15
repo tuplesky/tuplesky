@@ -960,9 +960,13 @@ pub struct Follower {
     learn_passes: LearnPasses,
     /// Durable adoptions with a sequence number of their ballot, by that
     /// number: what [`Follower::commit_through_leader`] reads instead of
-    /// every accepted command (lever 2, step 1). An entry is dropped once
-    /// its command commits, and lazily once its adoption is no longer the
-    /// one it names; one whose command is below ACCEPT stays.
+    /// every accepted command (lever 2, step 1). An entry names its
+    /// command's adoption as `adopted` holds it: it goes when the frontier
+    /// passes its command committed, and with the adoption, wherever
+    /// `adopted` drops or replaces it (forgetting, the sweep, a release, a
+    /// proposal taken again), whether or not a frontier comes (Codex on
+    /// #269). One whose command is below ACCEPT stays. So it is never
+    /// larger than `adopted`, which forgetting bounds.
     frontier_ready: BTreeSet<(u64, CommandId)>,
     /// Relayed payloads kept beside the proposals held for want of table
     /// room ([`MAX_KEPT_RELAYED_BYTES`]), with each proposal's sequence
@@ -1074,6 +1078,16 @@ fn lacking<'a>(
         .filter(|c| !payloads.contains_key(c))
         .copied()
         .collect()
+}
+
+/// Whether `adopted` holds `command`'s durable adoption under `seqnum`:
+/// what an entry of the commit frontier's index names (Codex on #269).
+fn names_adoption(
+    adopted: &crate::digest::DigestMap<CommandId, (u64, bool)>,
+    seqnum: u64,
+    command: &CommandId,
+) -> bool {
+    matches!(adopted.get(command), Some(&(s, true)) if s == seqnum)
 }
 
 fn restored_bindings<'a>(
@@ -2671,7 +2685,9 @@ impl Follower {
         }
         self.served_payloads.remove(command);
         self.votes.remove(command);
-        self.adopted.remove(command);
+        if let Some((seqnum, _)) = self.adopted.remove(command) {
+            self.frontier_ready.remove(&(seqnum, *command));
+        }
         self.held.remove(command);
         self.unkeep(command);
         self.note_lacking(*command);
@@ -3352,6 +3368,7 @@ impl Follower {
             served_payloads: self.served_payloads.len(),
             votes: self.votes.len(),
             adopted: self.adopted.len(),
+            frontier_ready: self.frontier_ready.len(),
             bindings: self.bindings.len(),
             bare_bindings: self.ledger.bare_bindings(),
             answer_on_release: self.answer_on_release.len(),
@@ -4964,8 +4981,9 @@ impl Follower {
         self.served_payloads.remove(&command);
         self.votes.remove(&command);
         self.answer_on_release.remove(&command);
-        if self.adopted.remove(&command).is_some() {
+        if let Some((seqnum, _)) = self.adopted.remove(&command) {
             self.adopted_lacking.remove(&command);
+            self.frontier_ready.remove(&(seqnum, command));
         }
         if let Some(payload) = payload {
             if self.bindings.get(&payload.retry_key) == Some(&command) {
@@ -5020,6 +5038,17 @@ impl Follower {
             stray.is_none(),
             "a forgotten command's history was kept and is not in the forget queue: {stray:?}"
         );
+        // The commit frontier's index names only adoptions `adopted`
+        // holds, so forgetting bounds it as it bounds `adopted` (Codex on
+        // #269).
+        let unnamed = self
+            .frontier_ready
+            .iter()
+            .find(|(seqnum, c)| !names_adoption(&self.adopted, *seqnum, c));
+        debug_assert!(
+            unnamed.is_none(),
+            "the commit frontier's index names an adoption not held: {unnamed:?}"
+        );
     }
 
     /// The sweep itself, whatever the ledger's size.
@@ -5043,6 +5072,9 @@ impl Follower {
         // and kept without its payload it would read as a payload still
         // missing.
         self.adopted.retain(|c, _| !table.forgotten(c));
+        let adopted = &self.adopted;
+        self.frontier_ready
+            .retain(|(seqnum, c)| names_adoption(adopted, *seqnum, c));
         // A retry of a forgotten command is refused from the table's
         // executed answer (`on_request`), so its binding is not needed for
         // that, and kept it grew with every key ever submitted -- at boot,
@@ -5335,7 +5367,8 @@ impl Follower {
                     // raised again under the same adoption.
                     _ => {}
                 },
-                // Forgotten, or adopted again since.
+                // The table forgot it ahead of its history: the adoption
+                // goes with that history, and the entry with it.
                 _ => dropped.push((seqnum, c)),
             }
         }
@@ -6510,7 +6543,9 @@ impl Follower {
             if self.table.phase_of(&command) >= Some(Phase::Commit) {
                 return self.acknowledge_decided(&proposal, from);
             }
-            self.adopted.remove(&command);
+            if let Some((seqnum, _)) = self.adopted.remove(&command) {
+                self.frontier_ready.remove(&(seqnum, command));
+            }
             self.note_lacking(command);
         }
         if self.table.record(&command).is_none()
@@ -7004,8 +7039,12 @@ impl Follower {
                 // marker's batch demotes, and its own row follows that
                 // batch, so the table must not be demoted under it.
                 self.sync_demoted.retain(|c| *c != command);
-                self.adopted
-                    .insert(command, (held.proposal.seqnum.unwrap_or(u64::MAX), false));
+                if let Some((seqnum, _)) = self
+                    .adopted
+                    .insert(command, (held.proposal.seqnum.unwrap_or(u64::MAX), false))
+                {
+                    self.frontier_ready.remove(&(seqnum, command));
+                }
                 self.touch_learning(command);
                 self.note_lacking(command);
                 let epoch = self.config.identity.epoch;
