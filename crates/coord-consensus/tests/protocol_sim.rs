@@ -356,6 +356,10 @@ struct Knobs {
     /// that withholds it are drawn by the command's identity and the
     /// seed; every other donor serves its record. The voter served the
     /// entry ends its window before it and asks another donor (seed 73).
+    /// The drawn donor withholds only while another voter has executed
+    /// the command, so another can serve it: withheld at the one voter
+    /// that holds it, the record is lost to every asker, which no donor
+    /// of an epoch is in `coordd`, and the voters behind stop there.
     /// No row has a path that drops a donor's row of an executed command
     /// within its epoch, so without this no entry comes with no record.
     /// `PROTOCOL_SIM_FORGET_ROWS` sets it in every row.
@@ -2089,14 +2093,26 @@ impl Sim {
     }
 
     /// Whether `donor` serves `command` with no decided record
-    /// ([`Knobs::forget_rows`]): one donor a drawn command, so another
-    /// serves its record.
+    /// ([`Knobs::forget_rows`]): one donor a drawn command, while another
+    /// voter has executed it and can serve its record.
     fn withholds(&self, donor: u8, command: &CommandId) -> bool {
         let b = command.as_bytes();
         let salt = (self.seed as u32).wrapping_mul(0x9E37_79B9);
         let draw = u32::from_le_bytes([b[0], b[1], b[2], b[3]]) ^ salt;
         let which = u32::from_le_bytes([b[4], b[5], b[6], b[7]]) ^ salt;
-        draw % 1_000_000 < self.knobs.forget_rows && which % u32::from(self.n) == u32::from(donor)
+        draw % 1_000_000 < self.knobs.forget_rows
+            && which % u32::from(self.n) == u32::from(donor)
+            && self.executed_elsewhere(donor, command)
+    }
+
+    /// Whether a voter other than `donor` has executed `command` durably,
+    /// as its pages would serve it.
+    fn executed_elsewhere(&self, donor: u8, command: &CommandId) -> bool {
+        self.nodes
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| *j != usize::from(donor))
+            .any(|(_, n)| n.executed[..n.durable_executed].contains(command))
     }
 
     /// What `coordd` serves for a catch-up ask at `ballot` after
@@ -4608,8 +4624,9 @@ fn rows_with_donors_that_kept_no_rows() {
 /// 22, and row 1 with answers on release, seed 38, each with three in
 /// ten commands withheld. Each voter served an entry with no decided
 /// record ends its window and asks another donor, and both heal. With
-/// the record withheld at every donor, the refusal leaves the voter
-/// nowhere to get it, and no voter of one epoch withholds it in `coordd`.
+/// the record withheld at every donor, or at the one voter that has
+/// executed the command, the refusal leaves the voter nowhere to get
+/// it, and no voter of one epoch withholds it in `coordd`.
 #[test]
 fn the_two_campaign_stops_heal_when_another_donor_serves_the_record() {
     let mut row_12 = kept_knobs(12, false, None, None);
@@ -4627,8 +4644,8 @@ fn the_two_campaign_stops_heal_when_another_donor_serves_the_record() {
     for (run, outcome) in outcomes {
         let stats = outcome.unwrap_or_else(|e| panic!("{run}: {e}"));
         assert!(
-            stats.stopped_undecided > 0,
-            "{run}: no window stopped at an entry with no decided record"
+            stats.undecided_served > 0,
+            "{run}: no donor served an entry with no decided record"
         );
     }
 }
