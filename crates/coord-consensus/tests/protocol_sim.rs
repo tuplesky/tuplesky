@@ -4004,6 +4004,17 @@ fn run_kept(
     early: bool,
     fail_queue: Option<bool>,
 ) -> Result<Stats, String> {
+    run_knobs(
+        n,
+        kept_knobs(row, early, peer_ack_loss, fail_queue),
+        seed,
+        catch_up,
+    )
+}
+
+/// `row`'s knobs, with early proposals, the loss of acknowledgements to
+/// followers and the failed queue as [`run_kept`] says.
+fn kept_knobs(row: u8, early: bool, peer_ack_loss: Option<u32>, fail_queue: Option<bool>) -> Knobs {
     let mut knobs = row_knobs(row);
     if early {
         knobs = knobs.with_early();
@@ -4014,7 +4025,7 @@ fn run_kept(
     if let Some(on) = fail_queue {
         knobs.fail_queue = on;
     }
-    run_knobs(n, knobs, seed, catch_up)
+    knobs
 }
 
 /// One run with `knobs`, its panic caught and said with its seed.
@@ -4780,9 +4791,33 @@ struct Kept {
     /// absent, as the row says.
     #[serde(default)]
     fail_queue: Option<bool>,
+    /// Whether it found it with storage steps (`Knobs::storage_steps`);
+    /// absent, not.
+    #[serde(default)]
+    storage_steps: bool,
+    /// The frame budget it found it with (`Knobs::frames`); absent, the
+    /// row's.
+    #[serde(default)]
+    frames: Option<u32>,
     /// What it found, for the reader.
     #[allow(dead_code)]
     found: String,
+}
+
+impl Kept {
+    /// The seed run as it was found: as [`run_kept`] runs it, and with
+    /// storage steps and the frame budget it was found under, as
+    /// `rows_with_storage_steps_learn_once_a_step` runs its rows.
+    fn run(&self) -> Result<Stats, String> {
+        let mut knobs = kept_knobs(self.row, self.early, self.peer_ack_loss, self.fail_queue);
+        if self.storage_steps {
+            knobs.storage_steps = true;
+        }
+        if let Some(frames) = self.frames {
+            knobs.frames = frames;
+        }
+        run_knobs(self.voters, knobs, self.seed, self.catch_up)
+    }
 }
 
 #[test]
@@ -4792,21 +4827,7 @@ fn every_kept_seed_passes() {
         "/fixtures/protocol_sim/seeds.json"
     );
     let kept: Vec<Kept> = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
-    let failures: Vec<String> = kept
-        .iter()
-        .filter_map(|k| {
-            run_kept(
-                k.voters,
-                k.row,
-                k.seed,
-                k.catch_up,
-                k.peer_ack_loss,
-                k.early,
-                k.fail_queue,
-            )
-            .err()
-        })
-        .collect();
+    let failures: Vec<String> = kept.iter().filter_map(|k| k.run().err()).collect();
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
