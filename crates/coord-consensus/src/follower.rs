@@ -729,6 +729,11 @@ pub struct Follower {
     /// A failed installation was put back: installation resumes at the
     /// next event that is not a failure.
     sync_reinstall: bool,
+    /// A proposal was adopted while Sync entries wait to be installed:
+    /// they are examined again at the end of the step (task-d119). The
+    /// entry a re-proposal unblocks is otherwise examined only when a
+    /// payload or a Sync next arrives, which in a quiet domain is never.
+    sync_examine: bool,
     /// A catch-up window whose batch failed is still in hand, with its
     /// commands committed in the table and no row of theirs durable or in
     /// flight: its rows are written again at the next event that is not a
@@ -796,6 +801,9 @@ pub struct Follower {
     /// The pages of the last report sent a candidate, which a lost page
     /// is answered from (task-d28).
     served_report: Option<crate::summary::ServedReport>,
+    /// The refusal sent a candidate at a report's cut in place of the
+    /// report, which a lost one is answered from (task-d119).
+    served_refusal: Option<crate::role::ServedRefusal>,
     /// The ballot this replica last reported for and the commands its
     /// report named (task-d24).
     report_cut: Option<(Ballot, BTreeSet<CommandId>)>,
@@ -961,6 +969,9 @@ pub struct Follower {
     learn_scope: Option<LearnScope>,
     /// Learning passes made and passed over (lever 2, step 1).
     learn_passes: LearnPasses,
+    /// What its campaigns' selections dropped behind a command no report
+    /// holds (task-d119).
+    unreported_drops: UnreportedDrops,
     /// Durable adoptions with a sequence number of their ballot, by that
     /// number: what [`Follower::commit_through_leader`] reads instead of
     /// every accepted command (lever 2, step 1). An entry names its
@@ -1047,6 +1058,21 @@ pub struct LearnPasses {
     /// Of those, the ones passed over at a catch-up window's batch made
     /// durable.
     pub skipped_storage_window: u64,
+}
+
+/// What a follower's campaigns' selections dropped behind a command no
+/// report holds (task-d119; see [`Follower::unreported_drops`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UnreportedDrops {
+    /// Possible-fast candidates a selection dropped whose dependencies
+    /// reach a command no report holds and this replica doesn't hold
+    /// decided. Every selection made counts, bound or not: such a
+    /// selection is refused as [`FollowerRejection::Behind`] unless it
+    /// reaches the command only through a re-proposal.
+    pub undecided: u64,
+    /// Selections bound that dropped a possible-fast candidate whose
+    /// dependencies reach a command no report holds.
+    pub bound: u64,
 }
 
 /// What a follower is taking while it learns once for many inputs
@@ -1209,6 +1235,7 @@ impl Follower {
             learn_touched: None,
             learn_scope: None,
             learn_passes: LearnPasses::default(),
+            unreported_drops: UnreportedDrops::default(),
             frontier_ready: BTreeSet::new(),
             kept: BTreeMap::new(),
             kept_order: BTreeSet::new(),
@@ -1265,6 +1292,7 @@ impl Follower {
             payload_unwritten: BTreeSet::new(),
             installs: BTreeMap::new(),
             sync_reinstall: false,
+            sync_examine: false,
             catch_up_reinstall: false,
             ledger,
             learner: Learner::new(executed_through),
@@ -1276,6 +1304,7 @@ impl Follower {
             behind_voters: None,
             report_due: None,
             served_report: None,
+            served_refusal: None,
             report_cut,
             sync_pending: BTreeMap::new(),
             sync_waiters: BTreeMap::new(),
@@ -1472,6 +1501,7 @@ impl Follower {
             payload_unwritten: BTreeSet::new(),
             installs: BTreeMap::new(),
             sync_reinstall: false,
+            sync_examine: false,
             catch_up_reinstall: false,
             served_payloads: state.served_payloads,
             payload_cursor: 0,
@@ -1495,6 +1525,7 @@ impl Follower {
             // would stall a candidate that needs this replica's majority.
             report_due: state.report_due,
             served_report: state.served_report,
+            served_refusal: state.served_refusal,
             report_cut: state.report_cut,
             sync_pending: BTreeMap::new(),
             sync_waiters: BTreeMap::new(),
@@ -1535,6 +1566,7 @@ impl Follower {
             learn_touched: None,
             learn_scope: None,
             learn_passes: LearnPasses::default(),
+            unreported_drops: UnreportedDrops::default(),
             frontier_ready: BTreeSet::new(),
             kept: BTreeMap::new(),
             kept_order: BTreeSet::new(),
@@ -1589,6 +1621,7 @@ impl Follower {
             outbox: self.outbox,
             report_due: self.report_due,
             served_report: self.served_report,
+            served_refusal: self.served_refusal,
             report_cut: self.report_cut,
             frontend: self.config.frontend,
             capacity: self.config.capacity,
@@ -1685,6 +1718,7 @@ impl Follower {
                 incarnation: self.config.identity.incarnation,
             },
             requires: effects.reply.requires.clone(),
+            candidate: None,
         });
         let context = self.ballots.context(boot, ballot, LocalJournalSeq::ZERO);
         let outbox = self.outbox.as_mut().expect("booted");
@@ -1795,13 +1829,25 @@ impl Follower {
     }
 
     /// Send `from` again the pages of the report this replica sent it
-    /// for `ballot` that it asks for (task-d28), from the same version.
+    /// for `ballot` that it asks for (task-d28), from the same version;
+    /// or the refusal it sent in place of that report (task-d119).
     fn answer_report_pages(
         &mut self,
         from: ReplicaId,
         ballot: Ballot,
         asked: &[u32],
     ) -> Vec<Effect> {
+        if let (Some(refused), Some(boot)) = (self.served_refusal, self.boot)
+            && refused.answers(from, ballot)
+        {
+            let reply = self
+                .ballots
+                .refusal(refused.to, ballot, boot, refused.executed);
+            if let Some(outbox) = self.outbox.as_mut() {
+                outbox.publish(reply);
+            }
+            return self.release();
+        }
         let (Some(served), Some(boot)) = (self.served_report.as_ref(), self.boot) else {
             return Vec::new();
         };
@@ -1837,6 +1883,23 @@ impl Follower {
             return Vec::new();
         }
         self.report_due = None;
+        let own = self.learner.executed_through();
+        if let Some(refused) = due.behind(own, self.config.capacity as u64) {
+            let Some(boot) = self.boot else {
+                return Vec::new();
+            };
+            self.rejections.push(FollowerRejection::Promise(refused));
+            self.served_refusal = Some(crate::role::ServedRefusal {
+                ballot: due.ballot,
+                to: due.to,
+                executed: own,
+            });
+            let reply = self.ballots.refusal(due.to, due.ballot, boot, own);
+            if let Some(outbox) = self.outbox.as_mut() {
+                outbox.publish(reply);
+            }
+            return self.release();
+        }
         let report = self.report(due.ballot);
         self.report_cut = Some((
             due.ballot,
@@ -1901,13 +1964,13 @@ impl Follower {
                 ledger: &self.ledger,
                 rows: &self.executed_rows,
             };
-            match campaign.try_select_decided(
-                crate::recovery::MAX_REPORT_ENTRIES,
-                supplied,
-                decided,
-            ) {
-                Ok(None) => return Vec::new(),
-                Ok(Some(_)) => {}
+            let selected = campaign
+                .try_select_decided(crate::recovery::MAX_REPORT_ENTRIES, supplied, decided)
+                .map(|d| d.is_some());
+            self.unreported_drops.undecided += campaign.take_unreported_undecided();
+            match selected {
+                Ok(false) => return Vec::new(),
+                Ok(true) => {}
                 Err(e) => {
                     // Its own acceptance of a command whose payload no
                     // voter holds, every voter answered: every selection
@@ -2013,6 +2076,9 @@ impl Follower {
             );
             let barrier = self.alloc.as_mut().expect("booted").allocate();
             campaign.bound(barrier);
+            if campaign.selected_past_unreported() {
+                self.unreported_drops.bound += 1;
+            }
             return alloc::vec![Effect::Persist(PersistBatch {
                 barrier,
                 base: None,
@@ -2296,6 +2362,12 @@ impl Follower {
     /// This follower's learning passes (lever 2, step 1).
     pub const fn learn_passes(&self) -> LearnPasses {
         self.learn_passes
+    }
+
+    /// What this follower's campaigns' selections dropped behind a
+    /// command no report holds (task-d119).
+    pub const fn unreported_drops(&self) -> UnreportedDrops {
+        self.unreported_drops
     }
 
     /// Proposal frames this follower took (task-d102).
@@ -3815,10 +3887,23 @@ impl Follower {
     /// A dependency of a selected entry that the selection does not carry
     /// and this replica has not committed (task-d05).
     ///
-    /// A reporter that adopted an entry held its dependencies at ACCEPT
-    /// or beyond, so a dependency no majority report names is one every
-    /// such reporter executed and forgot. A replica without it committed
-    /// cannot get it from this selection, and cannot execute past it.
+    /// The premise: a reporter that adopted an entry held its
+    /// dependencies at ACCEPT or beyond, so a dependency no majority
+    /// report names is one every such reporter executed and forgot. A
+    /// replica without it committed cannot get it from this selection,
+    /// and cannot execute past it.
+    ///
+    /// A reporter can also hold an entry through a durable Sync it has
+    /// not finished installing, whose entry waits on a command that Sync
+    /// re-proposes and this reporter never received (task-d119's way
+    /// (2), seed 147). Its report names the entry and not the command, so
+    /// the premise breaks: the dependency may be one no voter executed.
+    /// The selection is refused all the same, and nothing is bound. That
+    /// is what keeps a fast decision chained behind such an entry from
+    /// being re-proposed under other dependencies (the known-gap test in
+    /// `recovery.rs`); its cost is a stall, since this replica does not
+    /// campaign again this boot and no catch-up brings a command no
+    /// voter executed.
     fn selection_gap(table: &CommandTable, decision: &SyncDecision) -> Option<CommandId> {
         decision
             .entries
@@ -5609,8 +5694,45 @@ impl Follower {
         unsequenced
     }
 
+    /// Commands a pending entry of the Sync this replica follows waits
+    /// on, which that Sync re-proposes and whose proposal this replica
+    /// never took (task-d119).
+    ///
+    /// Seed 147's node 1 refused three of ballot 7's re-proposals under a
+    /// promise to an older ballot (`FencedByPromise`), then installed
+    /// ballot 7's Sync, whose entry `9d97` names one of them. The leader
+    /// counted the voter's later adoptions and never sent it again, so
+    /// the entry waited for ever, and a later campaign whose reports held
+    /// no other copy found a dependency no report holds
+    /// (`selection_gap`). The voter asks for them as it asks for its
+    /// unsequenced adoptions: the leader answers with its durable
+    /// proposals of the ballot, which this replica votes on now that it
+    /// follows the ballot.
+    fn sync_reproposals_lacking(&self) -> Vec<CommandId> {
+        let ballot = self.config.quorum.ballot();
+        let Some(selection) = self
+            .synced_selection
+            .as_ref()
+            .filter(|d| d.ballot == ballot)
+        else {
+            return Vec::new();
+        };
+        self.sync_waiters
+            .keys()
+            .copied()
+            .filter(|d| {
+                selection.reproposed.contains(d)
+                    && !self.held.contains_key(d)
+                    && !self.adopted.contains_key(d)
+                    && self.table.phase_of(d) < Some(Phase::Accept)
+            })
+            .collect()
+    }
+
     /// Ask `leader` for its proposals of the adoptions this replica holds
-    /// without a sequence number of the ballot (task-d09).
+    /// without a sequence number of the ballot (task-d09), and of the
+    /// re-proposals a pending Sync entry waits on that it never took
+    /// (task-d119).
     ///
     /// Paced by the frontier it answers, which the leader sends on its
     /// re-send timer, and bounded per ask, rotating through the set. The
@@ -5624,6 +5746,7 @@ impl Follower {
             return Vec::new();
         };
         let mut unsequenced = self.unsequenced_adoptions();
+        unsequenced.extend(self.sync_reproposals_lacking());
         if unsequenced.is_empty() {
             return Vec::new();
         }
@@ -7164,6 +7287,9 @@ impl Follower {
                     barrier,
                     ProtocolMessage::SlowAck(ack),
                 );
+                if !self.sync_pending.is_empty() {
+                    self.sync_examine = true;
+                }
             }
         }
     }
@@ -7591,6 +7717,7 @@ impl Follower {
                             ballot,
                             to: from,
                             requires: effects.reply.requires.clone(),
+                            candidate: Some(executed),
                         });
                         if let Some(outbox) = self.outbox.as_mut() {
                             outbox.publish(effects.reply);
@@ -8095,8 +8222,14 @@ impl DeterministicMachine for Follower {
         let failure = matches!(event, Event::Storage(StorageEvent::Failed { .. }));
         let mut effects = self.step_event(event);
         if !failure {
-            if core::mem::take(&mut self.sync_reinstall) {
+            let examine = core::mem::take(&mut self.sync_examine);
+            if core::mem::take(&mut self.sync_reinstall) || examine {
                 effects.extend(self.advance_sync());
+            }
+            // What the entries installed now unblock among the held
+            // proposals.
+            if examine {
+                effects.extend(self.advance_pending());
             }
             if core::mem::take(&mut self.catch_up_reinstall) {
                 effects.extend(self.rewrite_window());

@@ -103,10 +103,10 @@ The restored cluster is a **new cluster** with a new cluster identity,
 and its membership comes from its own genesis (task-42) and from
 nowhere else. Generate the successor's genesis manifest and node
 credentials exactly as for a new deployment, and write the
-configuration (`<successor.toml>` below) of the node the restore will
-fill. Do **not** run `coordd init` on that node: the restore creates
-its first generation itself, and a node that already has one is
-refused.
+configuration (`<successor.toml>` below) of each voter the restore will
+fill: every voter of the successor (step 5). Do **not** run `coordd
+init` on any of them: the restore creates each voter's first generation
+itself, and a voter that already has one is refused.
 
 Restoring under the old cluster's identity is refused, and it is worth
 knowing why it is refused rather than merely discouraged: callers hold
@@ -184,6 +184,22 @@ attestation and each voter's own configuration: a voter brought up with
 `coordd init` instead starts below the backup's boundary, and until
 task-d32 no peer can bring it past, since a backup carries no record of
 how each restored command was decided.
+
+Check every voter once they are all up. A voter brought up with
+`coordd init` by mistake does not show from outside the cluster: every
+voter's `voters submittable=` line counts all its peers, and puts are
+answered. It shows only on that voter:
+
+* its `catch-up paths:` line's `stopped_undecided=` climbs while
+  `pulled=` stays at 0;
+* its `this voter is catching up from a peer's executed history` line
+  says 0 commands so far, and the position after `executed through`
+  does not move;
+* a read, at that voter, of a key the backup holds stays `Pending`.
+
+It stays that way: it asks its peers for what it lacks, and stops at
+every page they send, since they hold those commands as restored rows
+with no record of how each was decided.
 
 The restore writes into a staged generation of the *successor*
 cluster and selects nothing until it has finished: the generation is
