@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 
 use coord_core::effect::{BarrierId, BootId, PeerId};
 use coord_core::outbox::{BarrierAllocator, Outbox};
-use coord_types::ids::Ballot;
+use coord_types::ids::{Ballot, ExecutionPosition};
 use coord_types::{CommandId, RetryKey};
 
 use crate::ballot::{BallotState, ConfigurationIdentity};
@@ -25,6 +25,27 @@ pub struct PendingReport {
     pub to: PeerId,
     /// Barriers the report's pages wait for.
     pub requires: Vec<BarrierId>,
+    /// What the candidate said it executed through, in its `NewLeader`:
+    /// none for the replica's own campaign's report.
+    pub candidate: Option<ExecutionPosition>,
+}
+
+impl PendingReport {
+    /// The refusal owed in place of this report if the replica cutting
+    /// it, which executed through `own`, is now more than `window`
+    /// commands past the candidate (task-d119).
+    ///
+    /// The rule is task-d10's ([`BallotState::refuses_behind`]), read
+    /// again at the cut: the replica keeps executing between its promise
+    /// and the cut, which waits for the promise's batch, and a report cut
+    /// past the window can leave out a command the candidate never
+    /// executed while holding one that names it. Its candidate then finds
+    /// a dependency no report holds. Refused instead, it catches up first.
+    pub fn behind(&self, own: ExecutionPosition, window: u64) -> Option<crate::PromiseRejection> {
+        let candidate = self.candidate?;
+        (own.get() > candidate.get().saturating_add(window))
+            .then_some(crate::PromiseRejection::CandidateBehind { candidate, own })
+    }
 }
 
 /// State carried across a role change.

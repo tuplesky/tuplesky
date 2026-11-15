@@ -729,6 +729,11 @@ pub struct Follower {
     /// A failed installation was put back: installation resumes at the
     /// next event that is not a failure.
     sync_reinstall: bool,
+    /// A proposal was adopted while Sync entries wait to be installed:
+    /// they are examined again at the end of the step (task-d119). The
+    /// entry a re-proposal unblocks is otherwise examined only when a
+    /// payload or a Sync next arrives, which in a quiet domain is never.
+    sync_examine: bool,
     /// A catch-up window whose batch failed is still in hand, with its
     /// commands committed in the table and no row of theirs durable or in
     /// flight: its rows are written again at the next event that is not a
@@ -1284,6 +1289,7 @@ impl Follower {
             payload_unwritten: BTreeSet::new(),
             installs: BTreeMap::new(),
             sync_reinstall: false,
+            sync_examine: false,
             catch_up_reinstall: false,
             ledger,
             learner: Learner::new(executed_through),
@@ -1491,6 +1497,7 @@ impl Follower {
             payload_unwritten: BTreeSet::new(),
             installs: BTreeMap::new(),
             sync_reinstall: false,
+            sync_examine: false,
             catch_up_reinstall: false,
             served_payloads: state.served_payloads,
             payload_cursor: 0,
@@ -1705,6 +1712,7 @@ impl Follower {
                 incarnation: self.config.identity.incarnation,
             },
             requires: effects.reply.requires.clone(),
+            candidate: None,
         });
         let context = self.ballots.context(boot, ballot, LocalJournalSeq::ZERO);
         let outbox = self.outbox.as_mut().expect("booted");
@@ -1857,6 +1865,18 @@ impl Follower {
             return Vec::new();
         }
         self.report_due = None;
+        let own = self.learner.executed_through();
+        if let Some(refused) = due.behind(own, self.config.capacity as u64) {
+            let Some(boot) = self.boot else {
+                return Vec::new();
+            };
+            self.rejections.push(FollowerRejection::Promise(refused));
+            let reply = self.ballots.refusal(due.to, due.ballot, boot, own);
+            if let Some(outbox) = self.outbox.as_mut() {
+                outbox.publish(reply);
+            }
+            return self.release();
+        }
         let report = self.report(due.ballot);
         self.report_cut = Some((
             due.ballot,
@@ -5651,8 +5671,45 @@ impl Follower {
         unsequenced
     }
 
+    /// Commands a pending entry of the Sync this replica follows waits
+    /// on, which that Sync re-proposes and whose proposal this replica
+    /// never took (task-d119).
+    ///
+    /// Seed 147's node 1 refused three of ballot 7's re-proposals under a
+    /// promise to an older ballot (`FencedByPromise`), then installed
+    /// ballot 7's Sync, whose entry `9d97` names one of them. The leader
+    /// counted the voter's later adoptions and never sent it again, so
+    /// the entry waited for ever, and a later campaign whose reports held
+    /// no other copy found a dependency no report holds
+    /// (`selection_gap`). The voter asks for them as it asks for its
+    /// unsequenced adoptions: the leader answers with its durable
+    /// proposals of the ballot, which this replica votes on now that it
+    /// follows the ballot.
+    fn sync_reproposals_lacking(&self) -> Vec<CommandId> {
+        let ballot = self.config.quorum.ballot();
+        let Some(selection) = self
+            .synced_selection
+            .as_ref()
+            .filter(|d| d.ballot == ballot)
+        else {
+            return Vec::new();
+        };
+        self.sync_waiters
+            .keys()
+            .copied()
+            .filter(|d| {
+                selection.reproposed.contains(d)
+                    && !self.held.contains_key(d)
+                    && !self.adopted.contains_key(d)
+                    && self.table.phase_of(d) < Some(Phase::Accept)
+            })
+            .collect()
+    }
+
     /// Ask `leader` for its proposals of the adoptions this replica holds
-    /// without a sequence number of the ballot (task-d09).
+    /// without a sequence number of the ballot (task-d09), and of the
+    /// re-proposals a pending Sync entry waits on that it never took
+    /// (task-d119).
     ///
     /// Paced by the frontier it answers, which the leader sends on its
     /// re-send timer, and bounded per ask, rotating through the set. The
@@ -5666,6 +5723,7 @@ impl Follower {
             return Vec::new();
         };
         let mut unsequenced = self.unsequenced_adoptions();
+        unsequenced.extend(self.sync_reproposals_lacking());
         if unsequenced.is_empty() {
             return Vec::new();
         }
@@ -7206,6 +7264,9 @@ impl Follower {
                     barrier,
                     ProtocolMessage::SlowAck(ack),
                 );
+                if !self.sync_pending.is_empty() {
+                    self.sync_examine = true;
+                }
             }
         }
     }
@@ -7633,6 +7694,7 @@ impl Follower {
                             ballot,
                             to: from,
                             requires: effects.reply.requires.clone(),
+                            candidate: Some(executed),
                         });
                         if let Some(outbox) = self.outbox.as_mut() {
                             outbox.publish(effects.reply);
@@ -8137,8 +8199,14 @@ impl DeterministicMachine for Follower {
         let failure = matches!(event, Event::Storage(StorageEvent::Failed { .. }));
         let mut effects = self.step_event(event);
         if !failure {
-            if core::mem::take(&mut self.sync_reinstall) {
+            let examine = core::mem::take(&mut self.sync_examine);
+            if core::mem::take(&mut self.sync_reinstall) || examine {
                 effects.extend(self.advance_sync());
+            }
+            // What the entries installed now unblock among the held
+            // proposals.
+            if examine {
+                effects.extend(self.advance_pending());
             }
             if core::mem::take(&mut self.catch_up_reinstall) {
                 effects.extend(self.rewrite_window());

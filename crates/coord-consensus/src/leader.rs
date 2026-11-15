@@ -2028,6 +2028,15 @@ impl Leader {
         let Some(boot) = self.boot else {
             return Vec::new();
         };
+        let own = self.learner.executed_through();
+        if let Some(refused) = due.behind(own, self.config.capacity as u64) {
+            self.rejections.push(Rejection::Promise(refused));
+            let reply = self.ballots.refusal(due.to, due.ballot, boot, own);
+            if let Some(outbox) = self.outbox.as_mut() {
+                outbox.publish(reply);
+            }
+            return self.release();
+        }
         let report = self.report(due.ballot);
         self.report_cut = Some((
             due.ballot,
@@ -3941,6 +3950,7 @@ impl Leader {
                             ballot,
                             to: from,
                             requires: effects.reply.requires.clone(),
+                            candidate: Some(executed),
                         });
                         if let Some(outbox) = self.outbox.as_mut() {
                             outbox.publish(effects.reply);

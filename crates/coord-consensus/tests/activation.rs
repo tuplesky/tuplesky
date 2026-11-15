@@ -1811,6 +1811,129 @@ fn a_candidate_a_table_behind_is_refused_and_follows_the_voter_that_refused() {
     }
 }
 
+/// A voter that executes past the window between its promise and its
+/// report's cut refuses the candidate at the cut (task-d119).
+///
+/// Task-d10's refusal was read once, at `NewLeader`, and the report was
+/// cut later, once the promise's batch was durable; what the cut leaves
+/// out is what the voter has forgotten then. r2 stops at 40 and r1 goes
+/// on to 72, a table of 32 ahead exactly, so r1 promises; it holds a
+/// 73rd command committed and executes it before the promise is
+/// durable. Command 41 is then out of r1's window, and every command
+/// here names the one before it: cut then, r1's report held 42, naming
+/// 41, which r2 never executed and no report held.
+#[test]
+fn a_voter_a_window_ahead_at_its_cut_refuses_the_candidate_in_place_of_its_report() {
+    let mut cluster = Cluster::new(47);
+    for n in 0..40u64 {
+        cluster.admit(n + 1, 1);
+        cluster.settle();
+    }
+    cluster.crash(2);
+    for n in 40..72u64 {
+        cluster.admit(n + 1, 1);
+        cluster.settle();
+    }
+    assert_eq!(cluster.nodes[1].executed.len(), 72);
+    cluster.no_execute.push(1);
+    let last = cluster.admit(73, 1);
+    cluster.settle();
+    assert_eq!(cluster.nodes[1].executed.len(), 72);
+    assert_eq!(cluster.nodes[1].next_executable(), Some(last));
+    cluster.crash(0);
+    cluster.revive(2, quorum(ballot(0, 0)));
+    assert_eq!(cluster.nodes[2].executed.len(), 40);
+
+    let b = ballot(1, 2);
+    cluster.campaign(2, b);
+    // r1 takes the `NewLeader`: 72 is not more than a table past 40, so
+    // it promises. Its effects are held: the promise's batch is not
+    // durable yet.
+    let (from, frame) = cluster.nodes[1].inbox.pop_front().unwrap();
+    let message = ProtocolMessage::decode(&frame).unwrap();
+    assert!(
+        matches!(message, ProtocolMessage::NewLeader { .. }),
+        "{message:?}"
+    );
+    let promised = cluster.nodes[1].step(peer_event(from, message));
+    assert!(promised.iter().any(|e| matches!(e, Effect::Persist(_))));
+    assert!(cluster.nodes[1].follower_mut().take_rejections().is_empty());
+    // r1 executes its 73rd command meanwhile.
+    cluster.no_execute.retain(|i| *i != 1);
+    let position = cluster.nodes[1].executed_through().checked_next().unwrap();
+    let outcome = AppliedOutcome {
+        position,
+        revision: None,
+        result_digest: Digest32(last.0.0),
+        response: last.0.0.to_vec(),
+    };
+    let effects = cluster.nodes[1].applied(last, &outcome);
+    cluster.nodes[1].executed.push(last);
+    cluster.handle(1, effects);
+    // The promise's batch is durable now: the report is cut, or refused.
+    cluster.handle(1, promised);
+    let own = ExecutionPosition::new(73).unwrap();
+    let r1 = cluster.nodes[1].follower_mut().take_rejections();
+    assert_eq!(
+        r1,
+        vec![FollowerRejection::Promise(
+            coord_consensus::PromiseRejection::CandidateBehind {
+                candidate: ExecutionPosition::new(40).unwrap(),
+                own,
+            }
+        )]
+    );
+    let from_r1: Vec<ProtocolMessage> = cluster.nodes[2]
+        .inbox
+        .iter()
+        .filter(|(f, _)| *f == r(1))
+        .map(|(_, frame)| ProtocolMessage::decode(frame).unwrap())
+        .collect();
+    assert!(
+        !from_r1
+            .iter()
+            .any(|m| matches!(m, ProtocolMessage::ReportPage(_))),
+        "{from_r1:?}"
+    );
+    assert!(from_r1.contains(&ProtocolMessage::PromiseRefused {
+        ballot: b,
+        replica: r(1),
+        executed: own,
+    }));
+    cluster.settle();
+    assert!(!matches!(cluster.nodes[2].role, Some(Role::Leader(_))));
+    let r2 = cluster.nodes[2].follower_mut().take_rejections();
+    assert!(
+        r2.contains(&FollowerRejection::CampaignRefused {
+            by: r(1),
+            executed: own,
+        }),
+        "{r2:?}"
+    );
+    assert!(
+        !r2.iter()
+            .any(|x| matches!(x, FollowerRejection::Behind { .. })),
+        "{r2:?}"
+    );
+
+    // r1 leads above the ballot it promised, r0 back for a quorum that
+    // accepts what it proposes next; r2 follows, as in task-d10's test.
+    cluster.no_fetch.push(2);
+    cluster.revive(0, quorum(ballot(0, 0)));
+    cluster.campaign(1, ballot(2, 1));
+    cluster.settle();
+    assert!(matches!(cluster.nodes[1].role, Some(Role::Leader(_))));
+    assert_eq!(
+        cluster.nodes[2].follower().ballots().promised(),
+        ballot(2, 1)
+    );
+    let next = cluster.admit(1000, 1);
+    cluster.settle();
+    for i in [0usize, 1] {
+        assert_eq!(cluster.nodes[i].executed.last(), Some(&next), "node {i}");
+    }
+}
+
 /// A replica refused at a position campaigns again once it has executed
 /// that far, and not before (task-d10).
 ///
@@ -6773,6 +6896,138 @@ fn step_durably(f: &mut Follower, event: Event) {
     for e in durable_events(&effects) {
         f.step(e);
     }
+}
+
+/// A voter that refused a ballot's re-proposal under its promise, and
+/// then installed that ballot's Sync, whose entry names the re-proposed
+/// command, asks the leader for it on the leader's commit frontier
+/// (task-d119, asking again).
+///
+/// Seed 147's node 1: its promise was in flight when ballot 7's
+/// re-proposals of `9157` arrived (`FencedByPromise`), and the Sync's
+/// `9d97` names `9157`. Nothing sent the re-proposal again, so the entry
+/// waited for ever, and a later campaign whose reports held no other copy
+/// gave up on a dependency no report holds. Answered, the voter adopts
+/// the command and installs the entry.
+#[test]
+fn a_voter_asks_for_a_reproposal_its_promise_fenced_off_that_a_sync_entry_names() {
+    let b = ballot(1, 2);
+    let mut donor = standalone(2, 32);
+    let (d, admit_d) = admission(901, 9);
+    step_durably(&mut donor, admit_d);
+    let (x, admit_x) = admission(902, 9);
+    step_durably(&mut donor, admit_x);
+    let payload = |c: &CommandId| donor.payload(c).unwrap().clone();
+    let mut f = standalone(1, 32);
+    let promise = f.step(peer_event(
+        r(2),
+        ProtocolMessage::NewLeader {
+            ballot: b,
+            executed: ExecutionPosition::ZERO,
+        },
+    ));
+    // r2's re-proposal of d arrives while r1's promise is in flight.
+    let proposal = coord_consensus::FastAck {
+        replica: r(2),
+        ballot: b,
+        command: d,
+        deps: vec![],
+        paths: Vec::new(),
+        path: coord_consensus::empty_path(),
+        admission: payload(&d).admission_digest(),
+        seqnum: Some(0),
+    };
+    f.step(peer_event(
+        r(2),
+        ProtocolMessage::Proposal(proposal.clone()),
+    ));
+    assert!(
+        f.take_rejections()
+            .iter()
+            .any(|x| matches!(x, FollowerRejection::FencedByPromise { .. }))
+    );
+    for e in durable_events(&promise) {
+        f.step(e);
+    }
+    // The Sync holds x at ACCEPT naming d, which it re-proposes.
+    let mut entry = selected(x, &[d]);
+    entry.admission = Some(payload(&x).admission_digest());
+    step_durably(
+        &mut f,
+        peer_event(
+            r(2),
+            ProtocolMessage::Sync(SyncDecision {
+                ballot: b,
+                source_ballot: ballot(0, 0),
+                entries: BTreeMap::from([(x, entry)]),
+                reproposed: BTreeSet::from([d]),
+            }),
+        ),
+    );
+    step_durably(
+        &mut f,
+        peer_event(
+            r(2),
+            ProtocolMessage::PayloadResponse {
+                command: x,
+                payload: payload(&x),
+            },
+        ),
+    );
+    assert_eq!(f.quorum().ballot(), b);
+    assert!(
+        f.table().phase_of(&x) < Some(Phase::Accept),
+        "x waits for d"
+    );
+
+    // The leader's commit frontier: r1 asks it for d.
+    let asked = f.step(peer_event(
+        r(2),
+        ProtocolMessage::Committed {
+            ballot: b,
+            through: 0,
+        },
+    ));
+    let to_leader: Vec<ProtocolMessage> = asked
+        .iter()
+        .filter_map(|e| match e {
+            Effect::SendWhenDurable { to, frame, .. } if to.replica == r(2) => {
+                ProtocolMessage::decode(frame).ok()
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        to_leader.contains(&ProtocolMessage::ProposalRequest {
+            ballot: b,
+            commands: vec![d],
+        }),
+        "{to_leader:?}"
+    );
+    // Answered with the proposal and its payload: r1 adopts d, and x
+    // installs.
+    step_durably(
+        &mut f,
+        peer_event(r(2), ProtocolMessage::Proposal(proposal)),
+    );
+    step_durably(
+        &mut f,
+        peer_event(
+            r(2),
+            ProtocolMessage::PayloadResponse {
+                command: d,
+                payload: payload(&d),
+            },
+        ),
+    );
+    assert!(f.table().phase_of(&d) >= Some(Phase::Accept));
+    assert!(
+        f.table().phase_of(&x) >= Some(Phase::Accept),
+        "x at {:?}, d at {:?}: {:?}",
+        f.table().phase_of(&x),
+        f.table().phase_of(&d),
+        f.take_rejections()
+    );
 }
 
 /// task-d24: a voter whose table is full for new admission installs a
