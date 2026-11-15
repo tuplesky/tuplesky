@@ -350,15 +350,15 @@ struct Knobs {
     /// a page the ask ahead runs under every fault the row has.
     /// `PROTOCOL_SIM_PAGE` sets it in every row.
     page: usize,
-    /// Chance (parts per million) a donor serves a command of its page
-    /// with no decided record, as a donor that kept no dependency row of
-    /// it does (#302, #303 review). The voter it serves commits the
-    /// command with no dependencies, as a window of its own, and nothing
-    /// may write or report those. Every donor withholds the same commands,
-    /// drawn by the command's identity and the seed. No row has a path
-    /// that drops a donor's row of an executed command, so without this
-    /// no window is ever bare. `PROTOCOL_SIM_FORGET_ROWS` sets it in
-    /// every row.
+    /// Chance (parts per million) that one donor serves a command of its
+    /// page with no decided record, as a donor that kept no dependency
+    /// row of it would (#302, #303 review). The command and the one donor
+    /// that withholds it are drawn by the command's identity and the
+    /// seed; every other donor serves its record. The voter served the
+    /// entry ends its window before it and asks another donor (seed 73).
+    /// No row has a path that drops a donor's row of an executed command
+    /// within its epoch, so without this no entry comes with no record.
+    /// `PROTOCOL_SIM_FORGET_ROWS` sets it in every row.
     forget_rows: u32,
 }
 
@@ -1021,8 +1021,11 @@ struct Stats {
     /// (task-d25), likewise.
     asked_ahead: u64,
     taken_ahead: u64,
-    /// Entries donors served with no decided record (`Knobs::forget_rows`).
-    bare_served: u64,
+    /// Entries donors served with no decided record (`Knobs::forget_rows`),
+    /// and the windows voters stopped at one, summed over every follower
+    /// machine of the run.
+    undecided_served: u64,
+    stopped_undecided: u64,
     /// Learning passes a step of storage events passed over, at every
     /// follower (lever 2, step 1).
     storage_passes_skipped: u64,
@@ -1569,6 +1572,7 @@ impl Sim {
                 let paths = f.catch_up_paths();
                 self.stats.stopped_ballot += paths.stopped_ballot;
                 self.stats.stopped_stale += paths.stopped_stale;
+                self.stats.stopped_undecided += paths.stopped_undecided;
                 self.stats.asked_ahead += paths.asked_ahead;
                 self.stats.taken_ahead += paths.taken_ahead;
                 let passes = f.learn_passes();
@@ -2044,7 +2048,7 @@ impl Sim {
             let page = self.page(msg.to, b, after);
             self.stats.catch_up_pages += 1;
             if let ProtocolMessage::CatchUpPage { entries, .. } = &page {
-                self.stats.bare_served +=
+                self.stats.undecided_served +=
                     entries.iter().filter(|e| e.decided.is_none()).count() as u64;
             }
             self.net.push(Msg {
@@ -2084,13 +2088,15 @@ impl Sim {
         self.step_node(msg.to, event);
     }
 
-    /// Whether donors serve `command` with no decided record
-    /// ([`Knobs::forget_rows`]).
-    fn withholds(&self, command: &CommandId) -> bool {
+    /// Whether `donor` serves `command` with no decided record
+    /// ([`Knobs::forget_rows`]): one donor a drawn command, so another
+    /// serves its record.
+    fn withholds(&self, donor: u8, command: &CommandId) -> bool {
         let b = command.as_bytes();
-        let draw = u32::from_le_bytes([b[0], b[1], b[2], b[3]])
-            ^ (self.seed as u32).wrapping_mul(0x9E37_79B9);
-        draw % 1_000_000 < self.knobs.forget_rows
+        let salt = (self.seed as u32).wrapping_mul(0x9E37_79B9);
+        let draw = u32::from_le_bytes([b[0], b[1], b[2], b[3]]) ^ salt;
+        let which = u32::from_le_bytes([b[4], b[5], b[6], b[7]]) ^ salt;
+        draw % 1_000_000 < self.knobs.forget_rows && which % u32::from(self.n) == u32::from(donor)
     }
 
     /// What `coordd` serves for a catch-up ask at `ballot` after
@@ -2119,7 +2125,7 @@ impl Sim {
             entries.push(coord_consensus::CatchUpEntry {
                 command: *c,
                 payload: payload.clone(),
-                decided: rows.get(c).cloned().filter(|_| !self.withholds(c)),
+                decided: rows.get(c).cloned().filter(|_| !self.withholds(donor, c)),
                 position: ExecutionPosition::new(i as u64 + 1).unwrap(),
                 revision: None,
                 result_digest: digest_of(&response),
@@ -2294,15 +2300,11 @@ impl Sim {
             }
             Role::Follower(m) => {
                 let c = m.next_executable().expect("executable");
-                // A command a window committed with no dependencies holds
-                // none that are its decision (#303 review): oracle 1 checks
-                // its order, and oracle 3 has no dependencies to compare.
-                let deps = if m.bare() == Some(c) {
-                    None
-                } else {
-                    m.table().record(&c).map(|r| r.deps.clone())
-                };
-                (c, deps, m.executed_through())
+                (
+                    c,
+                    m.table().record(&c).map(|r| r.deps.clone()),
+                    m.executed_through(),
+                )
             }
         };
         let position = position.checked_next().unwrap();
@@ -2900,6 +2902,7 @@ impl Sim {
             let paths = f.catch_up_paths();
             self.stats.stopped_ballot += paths.stopped_ballot;
             self.stats.stopped_stale += paths.stopped_stale;
+            self.stats.stopped_undecided += paths.stopped_undecided;
             self.stats.asked_ahead += paths.asked_ahead;
             self.stats.taken_ahead += paths.taken_ahead;
             let passes = f.learn_passes();
@@ -4261,7 +4264,8 @@ fn run_row(row: u8) {
                         totals.stopped_stale += s.stopped_stale;
                         totals.asked_ahead += s.asked_ahead;
                         totals.taken_ahead += s.taken_ahead;
-                        totals.bare_served += s.bare_served;
+                        totals.undecided_served += s.undecided_served;
+                        totals.stopped_undecided += s.stopped_undecided;
                     }
                     Err(e) => failures.push(e),
                 }
@@ -4550,26 +4554,26 @@ fn rows_with_pages_of_three_ask_ahead() {
     );
 }
 
-/// Windows of commands their donor kept no row of, under faults (#303
-/// review). No row drops a donor's dependency row of an executed command,
-/// so the simulator never served an entry with no decided record (none
-/// in every row at 40 seeds). Here rows 1, 9, 12 and 24 run with donors
-/// that withhold one command in twenty: each is committed with no
-/// dependencies, as a window of its own, while elections, crashes,
-/// failed batches and Syncs go on around it. Every oracle holds, among
-/// them agreement on each command's dependencies, and the follower's
-/// debug check that no batch carries a row of such a command runs where
-/// debug assertions are on. It found a voter that ran such a command and
-/// restarted with a Sync row naming it: the row brought the command back
-/// as a placeholder that hid its execution, and a campaign whose
-/// selection named it asked its payload for ever (16 of 96 runs, before
-/// `CommandTable::restore_executed` took the placeholder as executed).
+/// Donors that kept no record of a command's decision, under faults
+/// (#303 review, seed 73). No row drops a donor's dependency row of an
+/// executed command, so the simulator never serves an entry with no
+/// decided record (none in every row at 40 seeds). Here rows 1, 9, 12
+/// and 24 run with one donor in twenty commands withholding the record,
+/// while elections, crashes, failed batches and Syncs go on around it.
+/// The voter served such an entry ends its window before it and asks
+/// another donor, and every run heals: every oracle holds and every
+/// voter executes everything. The follower's debug check that no window
+/// runs a command with no decided record runs where debug assertions are
+/// on. When the window ran such a command with no dependencies of its
+/// own instead, review's heavier knob, withholding at every donor, found
+/// two commands at one position and two dependency sets: a vote and an
+/// order that window took out of a report.
 #[test]
 fn rows_with_donors_that_kept_no_rows() {
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
     let mut failures = Vec::new();
-    let (mut pages, mut bare) = (0u64, 0u64);
+    let (mut pages, mut served, mut stopped) = (0u64, 0u64, 0u64);
     for row in [1u8, 9, 12, 24] {
         let mut knobs = row_knobs(row);
         knobs.forget_rows = 50_000;
@@ -4578,7 +4582,8 @@ fn rows_with_donors_that_kept_no_rows() {
                 match run_knobs(n, knobs, seed, Some(true)) {
                     Ok(stats) => {
                         pages += u64::from(stats.catch_up_pages);
-                        bare += stats.bare_served;
+                        served += stats.undecided_served;
+                        stopped += stats.stopped_undecided;
                     }
                     Err(e) => failures.push(e),
                 }
@@ -4586,12 +4591,46 @@ fn rows_with_donors_that_kept_no_rows() {
         }
     }
     std::panic::set_hook(hook);
-    println!("donors that kept no rows: {pages} pages, {bare} entries with no decided record");
+    println!(
+        "donors that kept no rows: {pages} pages, {served} entries with no decided record, \
+         {stopped} windows stopped at one"
+    );
     assert!(failures.is_empty(), "{}", failures.join("\n"));
     assert!(
-        bare > 0,
-        "no entry served with no decided record in {pages} pages"
+        served > 0 && stopped > 0,
+        "no window stopped at an entry with no decided record in {pages} pages"
     );
+}
+
+/// The two runs review's heavier knob stopped a campaign in when it
+/// withheld a command's record at every donor (`IncompatibleAccepted`),
+/// with one donor withholding each instead: row 12 at three voters, seed
+/// 22, and row 1 with answers on release, seed 38, each with three in
+/// ten commands withheld. Each voter served an entry with no decided
+/// record ends its window and asks another donor, and both heal. With
+/// the record withheld at every donor, the refusal leaves the voter
+/// nowhere to get it, and no voter of one epoch withholds it in `coordd`.
+#[test]
+fn the_two_campaign_stops_heal_when_another_donor_serves_the_record() {
+    let mut row_12 = kept_knobs(12, false, None, None);
+    row_12.forget_rows = 300_000;
+    let mut row_1 = kept_knobs(1, false, None, None);
+    row_1.forget_rows = 300_000;
+    row_1.answer_on_release = 500_000;
+    let outcomes = [
+        ("row 12, seed 22", run_knobs(3, row_12, 22, Some(true))),
+        (
+            "row 1 with answers on release, seed 38",
+            run_knobs(3, row_1, 38, Some(true)),
+        ),
+    ];
+    for (run, outcome) in outcomes {
+        let stats = outcome.unwrap_or_else(|e| panic!("{run}: {e}"));
+        assert!(
+            stats.stopped_undecided > 0,
+            "{run}: no window stopped at an entry with no decided record"
+        );
+    }
 }
 
 /// Lever 2, step 1: followers' journals complete runs of batches at
@@ -4906,6 +4945,17 @@ struct Kept {
     /// row's.
     #[serde(default)]
     frames: Option<u32>,
+    /// The share of commands answered on a release alone it found it
+    /// with (`Knobs::answer_on_release`); absent, the row's.
+    #[serde(default)]
+    answer_on_release: Option<u32>,
+    /// The share of commands a donor withheld the record of
+    /// (`Knobs::forget_rows`); absent, none.
+    #[serde(default)]
+    forget_rows: Option<u32>,
+    /// The page size (`Knobs::page`); absent, the row's.
+    #[serde(default)]
+    page: Option<usize>,
     /// What it found, for the reader.
     #[allow(dead_code)]
     found: String,
@@ -4922,6 +4972,15 @@ impl Kept {
         }
         if let Some(frames) = self.frames {
             knobs.frames = frames;
+        }
+        if let Some(share) = self.answer_on_release {
+            knobs.answer_on_release = share;
+        }
+        if let Some(share) = self.forget_rows {
+            knobs.forget_rows = share;
+        }
+        if let Some(page) = self.page {
+            knobs.page = page;
         }
         run_knobs(self.voters, knobs, self.seed, self.catch_up)
     }

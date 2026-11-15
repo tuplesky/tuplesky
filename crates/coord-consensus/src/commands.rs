@@ -1430,12 +1430,13 @@ impl CommandTable {
     /// A command with no record here is one whose rows are gone (a trimmed
     /// prefix): it is remembered as executed, which is all there is left
     /// to say about it. So is one the table holds only a placeholder of:
-    /// a durable Sync row names it and no row of its own is left, as for
-    /// a command a catch-up window ran with no decision, which writes
-    /// none (#303). Kept, the placeholder hid the execution -- `phase_of`
-    /// answered none -- and a selection that named the command asked its
-    /// payload for ever, since taking the payload of a command executed
-    /// here initializes nothing.
+    /// a durable Sync row names it and no row of its own is left. A
+    /// catch-up window that ran a command with no decided record made one
+    /// (#303), and no window does now (seed 73), but the execution row is
+    /// the evidence whatever made the placeholder. Kept, the placeholder
+    /// hid the execution -- `phase_of` answered none -- and a selection
+    /// that named the command asked its payload for ever, since taking the
+    /// payload of a command executed here initializes nothing.
     pub fn restore_executed(&mut self, command: &CommandId) {
         self.last_executed = Some(*command);
         self.note_execution(*command);
@@ -1799,6 +1800,22 @@ pub(crate) mod tests {
             assert_eq!(table.take_examined(), 1, "{blocked} blocked");
             assert_eq!(table.unexecuted_records(), blocked as usize + 1);
         }
+    }
+
+    /// A placeholder restored as executed is history, not a placeholder:
+    /// the execution row says the command ran here, whatever left a Sync
+    /// row naming it and no row of its own (#303).
+    #[test]
+    fn a_placeholder_restored_as_executed_is_history() {
+        let mut table = CommandTable::restore(Some(64), Vec::new());
+        table.expect(id(3)).unwrap();
+        // A placeholder has no phase to answer: it has bound nothing.
+        assert_eq!(table.phase_of(&id(3)), None);
+        assert!(table.record(&id(3)).is_some());
+        table.restore_executed(&id(3));
+        assert_eq!(table.phase_of(&id(3)), Some(Phase::Executed));
+        assert!(table.record(&id(3)).is_none(), "the placeholder stayed");
+        assert_eq!(table.undecided().count(), 0);
     }
 
     /// The oldest unexecuted record is the first in its owner's order,

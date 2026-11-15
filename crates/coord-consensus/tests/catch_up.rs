@@ -428,30 +428,6 @@ impl Cluster {
     /// `coordd` restores a voter: its volatile state is gone, and its
     /// adoptions come back without the ballot's sequence numbers.
     fn restart(&mut self, i: usize) {
-        self.restart_reading(i, false);
-    }
-
-    /// [`Cluster::restart`], reading the node's durable Sync rows as well,
-    /// as `coordd` and the simulator restore a voter: the selection of the
-    /// ballot it synchronized to resumes.
-    fn restart_with_syncs(&mut self, i: usize) {
-        self.restart_reading(i, true);
-    }
-
-    fn restart_reading(&mut self, i: usize, with_syncs: bool) {
-        // With its Sync rows, the voter comes back under the quorum it
-        // had, as the simulator restarts one under the active ballot's.
-        let (syncs, quorum): (Vec<_>, _) = if with_syncs {
-            (
-                sync_rows(self, i)
-                    .into_iter()
-                    .map(|d| (d.ballot, d))
-                    .collect(),
-                self.follower(i).quorum().clone(),
-            )
-        } else {
-            (Vec::new(), quorum())
-        };
         let capacity = self.capacity;
         let node = &mut self.nodes[i];
         node.inbox.clear();
@@ -488,19 +464,17 @@ impl Cluster {
                 )
             })
             .collect();
-        let mut f = Follower::recover_with_syncs(
+        let mut f = Follower::recover(
             FollowerConfig {
                 identity: identity(i as u8),
-                quorum,
+                quorum: quorum(),
                 genesis: ballot0(),
                 frontend: FRONTEND,
                 capacity,
             },
             promise,
-            None,
             rows,
             payloads.clone(),
-            syncs,
             ExecutionPosition::ZERO,
         )
         .restore_execution(
@@ -981,38 +955,52 @@ fn a_restart_in_the_middle_of_a_page_resumes_without_executing_twice() {
     assert_eq!(*executed, cluster.nodes[0].executed);
 }
 
-/// A command the donor keeps no decided record of is executed at the
-/// donor's position and goes to history: this voter keeps no dependency
-/// row of it, and its table no record (task-d08).
+/// A page whose first command has no decided record installs nothing
+/// (seed 73): the donor kept no record of the command's decision, and
+/// within an epoch every voter that executed it holds one, so the window
+/// stops there and the next ask goes to another donor. Installed with no
+/// dependencies of its own, as it was, the command ran at the donor's
+/// position and left this voter's report, which took a vote from the
+/// selections that needed it (row 3, seed 0) and its place in this
+/// voter's order from the ones that read its absence (seed 73). A donor
+/// that kept the record brings it, decided.
 #[test]
-fn a_command_the_donor_keeps_no_row_of_goes_to_history() {
+fn a_page_whose_first_command_has_no_decided_record_installs_nothing() {
     let (mut cluster, _) = left_behind(11);
+    cluster.serve = false;
     let after = cluster.follower(4).executed_through();
     let mut page = cluster.page(0, ballot0(), after);
     let ProtocolMessage::CatchUpPage { entries, .. } = &mut page else {
         unreachable!()
     };
-    let bare = entries[0].command;
-    entries[0].decided = None;
-    entries.truncate(1);
+    let first = entries[0].command;
+    let decided = entries[0].decided.take().expect("the donor's record");
+    let batches = cluster.batches[4];
+    let before = paths(&cluster);
     cluster.deliver_page(4, 0, &page);
     cluster.settle();
-    let f = cluster.follower(4);
-    assert_eq!(f.catch_up_divergence(), None);
-    // At the donor's position; the short page is followed by the rest.
+    assert_eq!(cluster.batches[4], batches, "a window was written");
     assert_eq!(
-        cluster.nodes[4].executed.get(after.get() as usize),
-        Some(&bare)
+        paths(&cluster).stopped_undecided,
+        before.stopped_undecided + 1
     );
-    assert_eq!(f.table().phase_of(&bare), Some(Phase::Executed));
-    assert!(
-        f.table().record(&bare).is_none(),
-        "the record went to history"
+    let f = cluster.follower(4);
+    assert!(f.table().phase_of(&first) < Some(Phase::Commit));
+    assert_eq!(f.executed_through(), after);
+    cluster.serve = true;
+    cluster.catching = vec![4];
+    cluster.settle_ticking(8);
+    assert_eq!(cluster.nodes[4].executed, cluster.nodes[0].executed);
+    assert_eq!(
+        cluster
+            .dependency_rows(4)
+            .into_iter()
+            .find(|(c, _)| *c == first)
+            .map(|(_, r)| r.deps),
+        Some(decided.deps),
+        "r4's row of it is not the donor's decision"
     );
-    assert!(
-        cluster.dependency_rows(4).iter().all(|(c, _)| *c != bare),
-        "r4 kept a dependency row the donor did not have"
-    );
+    assert_eq!(cluster.follower(4).catch_up_divergence(), None);
 }
 
 /// A pulled command whose installation batch fails is installed again,
@@ -1076,9 +1064,7 @@ fn a_store_that_refuses_every_batch_fails_one_window_a_page() {
 /// Nothing marked it stale. At seed 260 the front was decided, over a
 /// durable dependency row of the same decision, so the failure left its
 /// record current, and its one payload row, the window's, is not tracked
-/// in `payload_unwritten`. The front here is one its donor kept no row
-/// of, which reaches the same state: a decided front with no row of its
-/// decision was marked stale at the failure and held back.
+/// in `payload_unwritten`.
 #[test]
 fn a_window_whose_batch_failed_runs_nothing_until_its_rows_are_written_again() {
     let mut runnable = 0;
@@ -1086,13 +1072,8 @@ fn a_window_whose_batch_failed_runs_nothing_until_its_rows_are_written_again() {
         let (mut cluster, _) = left_behind(seed);
         cluster.serve = false;
         let after = cluster.follower(4).executed_through();
-        let mut page = cluster.page(0, ballot0(), after);
-        let ProtocolMessage::CatchUpPage { entries, .. } = &mut page else {
-            unreachable!()
-        };
-        // What a donor that swept the front's row sends.
-        entries[0].decided = None;
-        let entries = entries.clone();
+        let page = cluster.page(0, ballot0(), after);
+        let entries = entries_of(&page).to_vec();
         let front = entries[0].command;
         cluster.failing = Some((4, 1));
         cluster.deliver_page(4, 0, &page);
@@ -1339,19 +1320,23 @@ fn a_page_installs_as_one_window_in_one_batch() {
     }
 }
 
-/// A command the donor kept no dependency row of has nothing to chain
-/// it to the window before it, so it is a window of its own (task-d25).
+/// A window ends before a command with no decided record, which then
+/// stops the next window as its first (seed 73): the commands before it
+/// run, and it waits for a donor that kept the record. It was a window
+/// of its own, with no dependencies.
 #[test]
-fn a_command_the_donor_kept_no_row_of_is_a_window_of_its_own() {
+fn a_window_ends_before_a_command_with_no_decided_record() {
     let (mut cluster, _) = left_behind(31);
+    cluster.serve = false;
     let after = cluster.follower(4).executed_through();
     let mut page = cluster.page(0, ballot0(), after);
     let ProtocolMessage::CatchUpPage { entries, .. } = &mut page else {
         unreachable!()
     };
-    entries[3].decided = None;
+    let decided = entries[3].decided.take().expect("the donor's record");
     let entries = entries.clone();
     let batches = cluster.batches[4];
+    let before = paths(&cluster);
     cluster.deliver_page(4, 0, &page);
     assert_eq!(cluster.batches[4] - batches, 1);
     let f = cluster.follower(4);
@@ -1360,12 +1345,30 @@ fn a_command_the_donor_kept_no_row_of_is_a_window_of_its_own() {
     }
     assert!(f.table().phase_of(&entries[3].command) < Some(Phase::Commit));
     cluster.settle();
-    // Three windows: the three before it, it, and the rest.
-    assert_eq!(cluster.batches[4] - batches, 3);
-    let from = after.get() as usize;
+    // The three before it ran, and the window it then started stopped.
+    assert_eq!(cluster.batches[4] - batches, 1);
     assert_eq!(
-        cluster.nodes[4].executed[from..from + entries.len()],
-        cluster.nodes[0].executed[from..from + entries.len()]
+        paths(&cluster).stopped_undecided,
+        before.stopped_undecided + 1
+    );
+    let from = after.get() as usize;
+    assert_eq!(cluster.nodes[4].executed.len(), from + 3);
+    assert_eq!(
+        cluster.nodes[4].executed[from..],
+        cluster.nodes[0].executed[from..from + 3]
+    );
+    cluster.serve = true;
+    cluster.catching = vec![4];
+    cluster.settle_ticking(8);
+    assert_eq!(cluster.nodes[4].executed, cluster.nodes[0].executed);
+    assert_eq!(
+        cluster
+            .dependency_rows(4)
+            .into_iter()
+            .find(|(c, _)| *c == entries[3].command)
+            .map(|(_, r)| r.deps),
+        Some(decided.deps),
+        "r4's row of it is not the donor's decision"
     );
     assert_eq!(cluster.follower(4).catch_up_divergence(), None);
 }
@@ -2313,11 +2316,11 @@ fn a_page_past_the_bounds_is_taken_to_them_and_the_chain_goes_on() {
 
 /// A window is at most one page when the page in hand ends a window early
 /// and the page asked ahead queues behind its rest (task-d25 review's
-/// case): the first page's window ends at its tenth command, which the
-/// donor kept no row of. Without the limit in `install_catch_up`, the
-/// third window took the first page's last 115 and the whole second page,
-/// 240, past what the table's reserve is sized for
-/// (`RECOVERY_RESERVE_PARTS`).
+/// case): the first page's window ends at its tenth command, decided
+/// beside the ninth rather than after it, so no window chains it to the
+/// ninth. Without the limit in `install_catch_up`, the second window took
+/// the first page's last 116 and the whole second page, 241, past what
+/// the table's reserve is sized for (`RECOVERY_RESERVE_PARTS`).
 #[test]
 fn a_window_is_one_page_when_the_first_ends_early() {
     let mut cluster = left_far_behind(5, 2 * MAX_CATCH_UP_COMMANDS as u64 + 40);
@@ -2330,7 +2333,9 @@ fn a_window_is_one_page_when_the_first_ends_early() {
         unreachable!()
     };
     assert_eq!(entries.len(), MAX_CATCH_UP_COMMANDS);
-    entries[9].decided = None;
+    let beside = entries[8].decided.as_ref().expect("decided").deps.clone();
+    assert!(!beside.contains(&entries[8].command));
+    entries[9].decided.as_mut().expect("decided").deps = beside;
     cluster.deliver_page(4, 0, &first);
     assert_eq!(cluster.follower(4).table_waits().1, 9, "the first window");
     let next = start.get() + MAX_CATCH_UP_COMMANDS as u64;
@@ -2357,7 +2362,7 @@ fn a_window_is_one_page_when_the_first_ends_early() {
     }
     assert_eq!(
         windows,
-        vec![9, 1, MAX_CATCH_UP_COMMANDS, MAX_CATCH_UP_COMMANDS - 10],
+        vec![9, MAX_CATCH_UP_COMMANDS, MAX_CATCH_UP_COMMANDS - 9],
         "windows over two pages in hand"
     );
     cluster.serve = true;
@@ -2578,449 +2583,11 @@ fn a_command_past_the_byte_bound_alone_is_taken_by_itself() {
     assert_eq!(cluster.nodes[4].executed, cluster.nodes[0].executed);
 }
 
-/// The Sync rows node `i` holds durably: the selection of each ballot it
-/// synchronized to.
-fn sync_rows(cluster: &Cluster, i: usize) -> Vec<coord_consensus::SyncDecision> {
-    cluster.nodes[i]
-        .storage
-        .durable_rows()
-        .into_iter()
-        .filter(|(c, k, _)| *c == Collection::ProtocolV1.id().0 && k.len() == 33 && k[8] == 0x03)
-        .map(|(_, _, v)| coord_consensus::decode_sync(&v).unwrap().decision)
-        .collect()
-}
-
-/// r4 with the window of a command its donor kept no row of in hand, the
-/// window before it run: what a donor that swept the command's row sends
-/// (#302 review). The command is committed here with no dependencies,
-/// which are not its decision, for the window to run it at the donor's
-/// position. Returns its entry and the next one of the donor's page.
-fn holding_a_command_without_a_row(cluster: &mut Cluster) -> (CatchUpEntry, CatchUpEntry) {
-    let after = cluster.follower(4).executed_through();
-    let mut page = cluster.page(0, ballot0(), after);
-    let ProtocolMessage::CatchUpPage { entries, .. } = &mut page else {
-        unreachable!()
-    };
-    let next = entries[3].clone();
-    entries[2].decided = None;
-    entries.truncate(3);
-    let bare = entries[2].clone();
-    cluster.deliver_page(4, 0, &page);
-    cluster.execute_checked(4, 2);
-    let f = cluster.follower(4);
-    assert_eq!(f.next_executable(), Some(bare.command));
-    let record = f.table().record(&bare.command).expect("committed");
-    assert_eq!(
-        (record.phase, record.deps.as_slice()),
-        (Phase::Commit, &[][..])
-    );
-    let decided = cluster
-        .dependency_rows(0)
-        .into_iter()
-        .find(|(c, _)| *c == bare.command)
-        .map(|(_, r)| r.deps);
-    assert!(
-        decided.is_some_and(|d| !d.is_empty()),
-        "the donor decided it with no dependencies: the test shows nothing"
-    );
-    (bare, next)
-}
-
 fn ballot(number: u64, leader: u8) -> Ballot {
     Ballot {
         number,
         leader: r(leader),
         ..ballot0()
-    }
-}
-
-/// A Sync installed while the window of a command its donor kept no row
-/// of is in hand leaves the command out of what it carries (#302
-/// review): it is in no row here, so no report names it, a selection
-/// over the reports does not, and a restart forgets it, for catch-up to
-/// bring it again. Its window still runs it. Carried, as every record
-/// held at COMMIT is (task-d80), it was reported committed with no
-/// dependencies; the voters that decided it had forgotten it, so a
-/// selection took that, and a voter behind it that installed the
-/// selection ran it first, ahead of the commands it follows.
-#[test]
-fn a_sync_carries_no_command_its_donor_kept_no_row_of() {
-    for seed in [3, 5, 7, 11, 13] {
-        let (mut cluster, _) = left_behind(seed);
-        cluster.serve = false;
-        let (bare, _) = holding_a_command_without_a_row(&mut cluster);
-        let b1 = ballot(1, 0);
-        cluster.deliver(
-            4,
-            r(0),
-            ProtocolMessage::NewLeader {
-                ballot: b1,
-                executed: ExecutionPosition::ZERO,
-            }
-            .encode(),
-        );
-        let decision = coord_consensus::SyncDecision {
-            ballot: b1,
-            source_ballot: ballot0(),
-            entries: Default::default(),
-            reproposed: Default::default(),
-        };
-        cluster.deliver(4, r(0), ProtocolMessage::Sync(decision).encode());
-        let f = cluster.follower(4);
-        assert_eq!(f.quorum().ballot(), b1, "seed {seed}: the Sync installed");
-        assert!(
-            sync_rows(&cluster, 4)
-                .iter()
-                .all(|d| !d.entries.contains_key(&bare.command)),
-            "seed {seed}: the Sync row carries a command its donor kept no row of"
-        );
-        assert!(
-            cluster
-                .dependency_rows(4)
-                .iter()
-                .all(|(c, _)| *c != bare.command),
-            "seed {seed}: a row of it is durable"
-        );
-        let b2 = ballot(2, 1);
-        let report = f.report(b2);
-        assert!(
-            report.entries.iter().all(|e| e.command != bare.command),
-            "seed {seed}: reported as {:?}",
-            report
-                .entries
-                .iter()
-                .find(|e| e.command == bare.command)
-                .map(|e| (e.phase, &e.deps))
-        );
-        let reports = [
-            cluster.follower(1).report(b2),
-            cluster.follower(2).report(b2),
-            report,
-        ];
-        let config =
-            BallotConfiguration::c2_default(epoch(), b2, (0..VOTERS).map(r).collect()).unwrap();
-        let selected = coord_consensus::select(&config, &reports).expect("selected");
-        assert!(
-            !selected.entries.contains_key(&bare.command),
-            "seed {seed}: selected as {:?}",
-            selected
-                .entries
-                .get(&bare.command)
-                .map(|e| (e.phase, &e.deps))
-        );
-        // Its window still runs it, at the donor's position.
-        cluster.execute_checked(4, 1);
-        let ran = cluster.nodes[4].executed.len();
-        assert_eq!(
-            cluster.nodes[4].executed[ran - 1],
-            bare.command,
-            "seed {seed}"
-        );
-        assert_eq!(
-            cluster.nodes[4].executed[..],
-            cluster.nodes[0].executed[..ran],
-            "seed {seed}"
-        );
-    }
-}
-
-/// Nor does a Sync that names the command itself, at COMMIT with the
-/// donor's dependencies, installed while its window is in hand (#303
-/// review). The record keeps the window's none, as a record committed
-/// here keeps what it was committed with, but those are no decision and
-/// nothing makes a row of them: none of the command is durable here, the
-/// Sync row holds the donor's decision, and r4 reports nothing of it, so
-/// a selection over r1, r2 and r4 leaves it out, as it does a command
-/// executed and forgotten. Before, the installation wrote the record as
-/// a row, r4 reported (COMMIT, no dependencies) although its Sync row
-/// held the donor's, and the selection took that.
-#[test]
-fn a_sync_naming_a_command_its_donor_kept_no_row_of_writes_no_row_of_it() {
-    for seed in [3, 5, 7, 11, 13] {
-        let (mut cluster, _) = left_behind(seed);
-        cluster.serve = false;
-        let (bare, _) = holding_a_command_without_a_row(&mut cluster);
-        let decided = cluster
-            .dependency_rows(0)
-            .into_iter()
-            .find(|(c, _)| *c == bare.command)
-            .map(|(_, r)| r)
-            .expect("the donor's row");
-        let b1 = ballot(1, 0);
-        cluster.deliver(
-            4,
-            r(0),
-            ProtocolMessage::NewLeader {
-                ballot: b1,
-                executed: ExecutionPosition::ZERO,
-            }
-            .encode(),
-        );
-        let entry = coord_consensus::SyncEntry {
-            command: bare.command,
-            phase: Phase::Commit,
-            deps: decided.deps.clone(),
-            path: decided.path,
-            paths: decided.paths.clone(),
-            seqnum: decided.synced_seq.unwrap_or(0),
-            admission: decided.payload,
-        };
-        let decision = coord_consensus::SyncDecision {
-            ballot: b1,
-            source_ballot: ballot0(),
-            entries: [(bare.command, entry)].into_iter().collect(),
-            reproposed: Default::default(),
-        };
-        cluster.deliver(4, r(0), ProtocolMessage::Sync(decision).encode());
-        let f = cluster.follower(4);
-        assert_eq!(f.quorum().ballot(), b1, "seed {seed}: the Sync installed");
-        assert_eq!(
-            f.table()
-                .record(&bare.command)
-                .map(|r| (r.phase, r.deps.clone())),
-            Some((Phase::Commit, Vec::new())),
-            "seed {seed}: the record keeps what the window committed it with"
-        );
-        assert!(
-            sync_rows(&cluster, 4).iter().any(|d| d
-                .entries
-                .get(&bare.command)
-                .is_some_and(|e| e.deps == decided.deps)),
-            "seed {seed}: the Sync row holds the donor's decision"
-        );
-        assert!(
-            cluster
-                .dependency_rows(4)
-                .iter()
-                .all(|(c, _)| *c != bare.command),
-            "seed {seed}: a row of it is durable"
-        );
-        let b2 = ballot(2, 1);
-        let report = f.report(b2);
-        assert!(
-            report.entries.iter().all(|e| e.command != bare.command),
-            "seed {seed}: reported as {:?}",
-            report
-                .entries
-                .iter()
-                .find(|e| e.command == bare.command)
-                .map(|e| (e.phase, &e.deps))
-        );
-        let reports = [
-            cluster.follower(1).report(b2),
-            cluster.follower(2).report(b2),
-            report,
-        ];
-        let config =
-            BallotConfiguration::c2_default(epoch(), b2, (0..VOTERS).map(r).collect()).unwrap();
-        let selected = coord_consensus::select(&config, &reports).expect("selected");
-        assert!(
-            selected
-                .entries
-                .get(&bare.command)
-                .is_none_or(|e| e.deps == decided.deps),
-            "seed {seed}: selected as {:?}",
-            selected
-                .entries
-                .get(&bare.command)
-                .map(|e| (e.phase, &e.deps))
-        );
-        // Its window still runs it, at the donor's position, and no row of
-        // it is written after.
-        cluster.execute_checked(4, 1);
-        let ran = cluster.nodes[4].executed.len();
-        assert_eq!(
-            cluster.nodes[4].executed[ran - 1],
-            bare.command,
-            "seed {seed}"
-        );
-        assert_eq!(
-            cluster.nodes[4].executed[..],
-            cluster.nodes[0].executed[..ran],
-            "seed {seed}"
-        );
-        assert!(
-            cluster
-                .dependency_rows(4)
-                .iter()
-                .all(|(c, _)| *c != bare.command),
-            "seed {seed}: a row of it is durable once it ran"
-        );
-    }
-}
-
-/// Ran by its window and restarted, a command its donor kept no row of is
-/// executed here, though the Sync row names it (#303). Nothing of it is
-/// durable but its payload and the Sync row's entry, which brings it back
-/// as a placeholder; the execution is the executed row's. The placeholder
-/// hid it: `phase_of` answered none, so a selection that named it lacked
-/// it, and asked its payload for ever, as `rows_with_donors_that_kept_no_rows`
-/// found (row 1, three voters, seed 0).
-#[test]
-fn a_command_a_window_ran_bare_is_executed_after_a_restart_though_a_sync_row_names_it() {
-    for seed in [3, 5, 7, 11, 13] {
-        let (mut cluster, _) = left_behind(seed);
-        cluster.serve = false;
-        let (bare, _) = holding_a_command_without_a_row(&mut cluster);
-        let decided = cluster
-            .dependency_rows(0)
-            .into_iter()
-            .find(|(c, _)| *c == bare.command)
-            .map(|(_, r)| r)
-            .expect("the donor's row");
-        let b1 = ballot(1, 0);
-        cluster.deliver(
-            4,
-            r(0),
-            ProtocolMessage::NewLeader {
-                ballot: b1,
-                executed: ExecutionPosition::ZERO,
-            }
-            .encode(),
-        );
-        let entry = coord_consensus::SyncEntry {
-            command: bare.command,
-            phase: Phase::Commit,
-            deps: decided.deps.clone(),
-            path: decided.path,
-            paths: decided.paths.clone(),
-            seqnum: decided.synced_seq.unwrap_or(0),
-            admission: decided.payload,
-        };
-        let decision = coord_consensus::SyncDecision {
-            ballot: b1,
-            source_ballot: ballot0(),
-            entries: [(bare.command, entry)].into_iter().collect(),
-            reproposed: Default::default(),
-        };
-        cluster.deliver(4, r(0), ProtocolMessage::Sync(decision).encode());
-        assert_eq!(cluster.follower(4).quorum().ballot(), b1, "seed {seed}");
-        cluster.execute_checked(4, 1);
-        assert_eq!(
-            cluster.nodes[4].executed.last(),
-            Some(&bare.command),
-            "seed {seed}"
-        );
-        cluster.settle();
-        assert!(
-            sync_rows(&cluster, 4)
-                .iter()
-                .any(|d| d.entries.contains_key(&bare.command)),
-            "seed {seed}: no durable Sync row names it: the test shows nothing"
-        );
-        assert!(
-            cluster
-                .dependency_rows(4)
-                .iter()
-                .all(|(c, _)| *c != bare.command),
-            "seed {seed}: a row of it is durable: the test shows nothing"
-        );
-        cluster.restart_with_syncs(4);
-        let f = cluster.follower(4);
-        assert_eq!(f.quorum().ballot(), b1, "seed {seed}: the Sync resumed");
-        assert_eq!(
-            f.table().phase_of(&bare.command),
-            Some(Phase::Executed),
-            "seed {seed}: restarted as {:?}",
-            f.table()
-                .record(&bare.command)
-                .map(|r| (r.phase, r.payload))
-        );
-        let b2 = ballot(2, 4);
-        assert!(
-            f.report(b2)
-                .entries
-                .iter()
-                .all(|e| e.command != bare.command),
-            "seed {seed}: reported"
-        );
-    }
-}
-
-/// Nor do the rows a later command's batch carries (task-d90). Written
-/// with the batch of a Sync entry, an adoption or a payload that names
-/// it, each record the dependencies reach that has no row here gets one,
-/// so no durable row names a command this replica holds no row of. A
-/// command its donor kept no row of has none on purpose: written, its
-/// row is a durable decision of no dependencies, reported and restored
-/// as one. Here a Sync names the command after it, as a selection takes
-/// it from a voter that has not forgotten it.
-#[test]
-fn a_later_commands_rows_leave_out_a_command_its_donor_kept_no_row_of() {
-    for seed in [3, 5, 7, 11, 13] {
-        let (mut cluster, _) = left_behind(seed);
-        cluster.serve = false;
-        let (bare, next) = holding_a_command_without_a_row(&mut cluster);
-        let decided = next.decided.clone().expect("the donor's row of the next");
-        assert_eq!(decided.deps, vec![bare.command], "seed {seed}");
-        let b1 = ballot(1, 0);
-        cluster.deliver(
-            4,
-            r(0),
-            ProtocolMessage::NewLeader {
-                ballot: b1,
-                executed: ExecutionPosition::ZERO,
-            }
-            .encode(),
-        );
-        let entry = coord_consensus::SyncEntry {
-            command: next.command,
-            phase: Phase::Commit,
-            deps: decided.deps.clone(),
-            path: decided.path,
-            paths: decided.paths.clone(),
-            seqnum: decided.synced_seq.unwrap_or(0),
-            admission: decided.payload,
-        };
-        let decision = coord_consensus::SyncDecision {
-            ballot: b1,
-            source_ballot: ballot0(),
-            entries: [(next.command, entry)].into_iter().collect(),
-            reproposed: Default::default(),
-        };
-        cluster.deliver(4, r(0), ProtocolMessage::Sync(decision).encode());
-        cluster.deliver(
-            4,
-            r(0),
-            ProtocolMessage::PayloadResponse {
-                command: next.command,
-                payload: next.payload.clone(),
-            }
-            .encode(),
-        );
-        let f = cluster.follower(4);
-        assert_eq!(
-            f.table()
-                .record(&next.command)
-                .map(|r| (r.phase, r.deps.clone())),
-            Some((Phase::Commit, vec![bare.command])),
-            "seed {seed}: the next command installed"
-        );
-        assert!(
-            cluster
-                .dependency_rows(4)
-                .iter()
-                .all(|(c, _)| *c != bare.command),
-            "seed {seed}: the next command's batch wrote a row of it"
-        );
-        let report = f.report(ballot(2, 1));
-        assert!(
-            report.entries.iter().all(|e| e.command != bare.command),
-            "seed {seed}: reported"
-        );
-        // Its window runs it, and the next command after it.
-        cluster.execute_checked(4, 2);
-        let ran = cluster.nodes[4].executed.len();
-        assert_eq!(
-            cluster.nodes[4].executed[ran - 2..],
-            [bare.command, next.command],
-            "seed {seed}"
-        );
-        assert_eq!(
-            cluster.nodes[4].executed[..],
-            cluster.nodes[0].executed[..ran],
-            "seed {seed}"
-        );
     }
 }
 
@@ -3078,144 +2645,5 @@ fn a_window_whose_batch_failed_is_written_again_in_one_batch() {
                 "seed {seed}"
             );
         }
-    }
-}
-
-/// The rewrite deletes the dependency row of a command its donor kept
-/// no row of, as the installation did (#302 review): the command is
-/// committed here with no dependencies, which are not its decision, and
-/// is never reported. A row this replica holds of it from before -- here
-/// the pre-acceptance of its own submission, taken before it was cut off
-/// -- is gone once the rewrite is durable, as once the installation is.
-/// A record left in `unwritten` by a failed batch, which a window then
-/// installs with no dependencies, is not written again (#303 review, item
-/// 2). r4's vote on its own submission fails before r4 is cut off, and r4
-/// votes on nothing after, so the record waits, uncommitted and with no
-/// row, for the vote that names it. The window commits it with no
-/// dependencies, which are no decision. `carry_stale` writes every
-/// committed record in `unwritten` whose row is not current, and wrote
-/// this one at (COMMIT, no dependencies), in the same step and after the
-/// window's batch that deleted its row.
-#[test]
-fn a_record_a_failed_batch_left_unwritten_is_not_written_when_its_window_installs_it_bare() {
-    for seed in [3, 5, 7, 11, 13] {
-        let mut cluster = Cluster::new(seed, 8);
-        // r4 alone takes the domain's first request, and the batch of its
-        // vote fails; nothing of it reaches the others, which take it from
-        // their own clients while r4 is cut off.
-        cluster.failing = Some((4, 1));
-        let own = cluster.admit_to(1, &[4], 9);
-        assert_eq!(
-            cluster.failed, 1,
-            "seed {seed}: the vote's batch did not fail"
-        );
-        cluster.failing = None;
-        for node in &mut cluster.nodes {
-            node.inbox.clear();
-        }
-        cluster.down = vec![4];
-        for seq in 1..=40 {
-            cluster.admit(seq);
-            cluster.settle();
-        }
-        cluster.settle_ticking(2);
-        // Back, and nothing new: any later vote here would name it and
-        // write its row (`unwritten`), which is the fix for a failed vote.
-        cluster.serve = false;
-        cluster.down.clear();
-        let held = |cluster: &Cluster| cluster.dependency_rows(4).iter().any(|(c, _)| *c == own);
-        assert!(
-            !held(&cluster),
-            "seed {seed}: r4 holds a row of its submission"
-        );
-        assert!(
-            cluster
-                .follower(4)
-                .table()
-                .record(&own)
-                .is_some_and(|r| r.phase < Phase::Commit),
-            "seed {seed}: r4 holds no uncommitted record of its submission"
-        );
-        let after = cluster.follower(4).executed_through();
-        let mut page = cluster.page(0, ballot0(), after);
-        let ProtocolMessage::CatchUpPage { entries, .. } = &mut page else {
-            unreachable!()
-        };
-        assert_eq!(entries[0].command, own, "seed {seed}");
-        entries[0].decided = None;
-        entries.truncate(1);
-        cluster.deliver_page(4, 0, &page);
-        assert!(
-            cluster
-                .follower(4)
-                .table()
-                .record(&own)
-                .is_some_and(|r| r.phase == Phase::Commit && r.deps.is_empty()),
-            "seed {seed}: the window did not commit it bare"
-        );
-        assert!(!held(&cluster), "seed {seed}: a row of it is durable");
-        cluster.tick();
-        cluster.settle();
-        assert!(!held(&cluster), "seed {seed}: a row of it is durable");
-        cluster.execute_checked(4, 1);
-        assert_eq!(
-            cluster.nodes[4].executed.get(after.get() as usize),
-            Some(&own),
-            "seed {seed}"
-        );
-        assert!(
-            !held(&cluster),
-            "seed {seed}: a row of it is durable once it ran"
-        );
-    }
-}
-
-#[test]
-fn a_rewritten_window_deletes_the_row_of_a_command_its_donor_kept_no_row_of() {
-    for seed in [3, 5, 7, 11, 13] {
-        let mut own = None;
-        let (mut cluster, _) = left_behind_with(seed, |cluster| {
-            // r4 alone takes the domain's first request; nothing of it
-            // reaches the others, which take it from their own clients.
-            own = Some(cluster.admit_to(1, &[4], 9));
-            for node in &mut cluster.nodes {
-                node.inbox.clear();
-            }
-        });
-        let own = own.expect("submitted");
-        let held = |cluster: &Cluster| cluster.dependency_rows(4).iter().any(|(c, _)| *c == own);
-        assert!(
-            held(&cluster),
-            "seed {seed}: r4 holds no row of its submission"
-        );
-        cluster.serve = false;
-        let after = cluster.follower(4).executed_through();
-        let mut page = cluster.page(0, ballot0(), after);
-        let ProtocolMessage::CatchUpPage { entries, .. } = &mut page else {
-            unreachable!()
-        };
-        assert_eq!(entries[0].command, own, "seed {seed}");
-        entries[0].decided = None;
-        cluster.failing = Some((4, 1));
-        cluster.deliver_page(4, 0, &page);
-        assert_eq!(cluster.failed, 1, "seed {seed}");
-        assert!(
-            held(&cluster),
-            "seed {seed}: the failed batch deleted the row"
-        );
-        // The next event that is not a failure writes the window again.
-        cluster.tick();
-        let (from, frame) = cluster.nodes[4].inbox.pop_front().expect("announced");
-        cluster.deliver(4, from, frame);
-        assert!(
-            !held(&cluster),
-            "seed {seed}: the rewrite left r4's row of it"
-        );
-        cluster.execute_checked(4, 1);
-        assert_eq!(
-            cluster.nodes[4].executed.get(after.get() as usize),
-            Some(&own),
-            "seed {seed}"
-        );
     }
 }
