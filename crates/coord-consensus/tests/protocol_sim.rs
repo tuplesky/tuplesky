@@ -4067,6 +4067,15 @@ fn run_row(row: u8) {
         if range.start > 0 && (row != 21 || cut_21(&totals)) {
             break;
         }
+        if range.start > 0 {
+            println!(
+                "row 21: the first {} seeds missed the cut ({} payload crashes, {} restored \
+                 without payload); seeds {range:?} run too",
+                seeds(),
+                totals.payload_crashes,
+                totals.restored_without_payload
+            );
+        }
         for n in [3u8, 5] {
             for (seed, early) in range
                 .clone()
