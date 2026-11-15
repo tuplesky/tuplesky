@@ -233,7 +233,8 @@ The figures use R = 2,600 (the 480 step's leader), E = 3,500 (local cost, task-d
 
 The relays are dropped, and pages must outrun the domain: intake I > R, with I = min(K·P/C, E, path).
 - The follower is level after H/(I − R).
-- It needs (1 + m)·R ≤ min(`K_MAX`·P/C, E, path). The first term is Codex's condition on #301: with pages cut short at the byte bound, say 40 commands a page at C = 160 ms, `K_MAX` = 8 caps intake at 8 × 40 / 0.16 = 2,000 a second, below R = 2,600, so the follower loses ground however much it could execute.
+- It needs (1 + m)·R ≤ min(K_avail·P/C, E, path), where K_avail = min(`K_MAX`, 5·D) is the pipeline the D donors able to serve the range allow, at most 5 asks to each (Section 7). The first term is Codex's condition on #301: with pages cut short at the byte bound, say 40 commands a page at C = 160 ms, `K_MAX` = 8 caps intake at 8 × 40 / 0.16 = 2,000 a second, below R = 2,600, so the follower loses ground however much it could execute.
+- One donor alone caps it lower: K_avail = 5, so 125-command pages at C = 250 ms give 5 × 125 / 0.25 = 2,500 a second, below R = 2,600, where `K_MAX` would have given 4,000.
 - On a loss-bound path at 140 ms, four donors give about 1,700 a second, so it never closes.
 
 ### 4.3 Side by side
@@ -271,13 +272,13 @@ While a follower F is behind:
 - **Execution:** E ≥ (1 + m)·R. This is Section 13.1's admission rule with the margin stated. The admission ceiling stays the owner's (task-d26).
 - **The entry:** the live stream fits the path, so bytes a command × R × (1 + m) ≤ the path's rate (Section 3).
 - **The run:** R·H/I ≤ `KEPT_BOUND` / c, for the gap H the follower starts from.
-- **Past the run's bound,** where pages alone carry it: `K_MAX`·P/C ≥ (1 + m)·R, as well as E and the path. A follower that is pipeline-limited (Codex's 40-command pages) still gains where `K_MAX`·P/C > R, at that rate less R. Below R it falls behind, and the metrics (Section 10) say which bound it met.
+- **Past the run's bound,** where pages alone carry it: K_avail·P/C ≥ (1 + m)·R, with K_avail = min(`K_MAX`, 5·D) for the D donors able to serve the range (Section 7), as well as E and the path. A follower that is pipeline-limited (Codex's 40-command pages, or one donor) still gains where K_avail·P/C > R, at that rate less R. Below R it falls behind, and the metrics (Section 10) say which bound it met.
 
 **Why m = 1/2.** Under pages alone, the gap closes at least at R/2, so a voter stopped for t seconds is back within 2t. Under deep keep, the margin on E drains the run at least at R/2.
 
 ## 7. Pages in flight
 
-**How many.** While the hole is open, K = clamp(⌈I_target·C / P⌉, 2, `K_MAX`), where I_target is (1 + m)·R past the run's bound, and E otherwise. Today K is 2: one page in hand and one asked ahead.
+**How many.** While the hole is open, K = clamp(⌈I_target·C / P⌉, 2, K_avail), where I_target is (1 + m)·R past the run's bound, and E otherwise, and K_avail = min(`K_MAX`, 5·D) for the D donors at or past the range. Today K is 2: one page in hand and one asked ahead.
 - **R:** the advance of the newest page's `through` over the last second or more. Pages from any donor count, and the highest `through` seen wins, as `owed_through` does today.
 - **C:** each donor's ask-to-page time, smoothed by an eighth a sample.
 - **P:** the mean commands a page over the last eight pages.
@@ -291,7 +292,7 @@ While a follower F is behind:
 **Which donors.**
 - Asks go round the executors at the leader's frontier, so pages come over up to (voters − 1) bulk connections, each with its own window.
 - The leader takes one ask in K.
-- At most 5 asks are outstanding to any one donor (Section 9), so with fewer donors K is lower.
+- At most 5 asks are outstanding to any one donor (Section 9), so with one donor K is at most 5, and with two or more `K_MAX` binds. Section 6's condition and Section 4.2's intake use K_avail, not `K_MAX`, for that reason (Codex on #301).
 - A donor behind the range answers less or nothing, and the range is asked again of the leader.
 
 **A lost ask or page.** A range asked more than 2C + 100 ms ago and not answered is asked again of another donor. The pacer stays the backstop.
@@ -348,6 +349,8 @@ The leader keeps sending F the commit frontier.
 | Without loss, or `bbr` (pages at the margin) | 61 s | 61 s | 77 s |
 | CUBIC at 0.1% loss, four donors | the run passes 64 MiB at about 88k behind, so exempt, then never | 139 s | never |
 | CUBIC at 0.1% loss, one donor | exempt, then never | exempt, then never | never |
+
+**Pages at the margin assume two or more donors.** With one, K_avail = 5, and 125-command pages reach (1 + m)·R = 3,900 a second only while C ≤ 5 × 125 / 3,900 = 160 ms. At 140 ms round trip that leaves 20 ms for the donor to serve a page; past it, one donor holds intake below the margin (Section 4.2).
 
 **The worst case is that last row, and nothing in this design closes it.** At 140 ms with 0.1% loss and CUBIC, the live stream itself doesn't fit the path (Section 3): the follower falls behind before any climb starts. The fix is the controller or fewer bytes a command, not the climb.
 
