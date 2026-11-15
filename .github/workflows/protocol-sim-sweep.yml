@@ -129,6 +129,7 @@ jobs:
 
   checked:
     name: ${{ matrix.name }} (debug checks)
+    if: github.event_name != 'pull_request' || github.event.label.name == 'run-sweep'
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     strategy:
