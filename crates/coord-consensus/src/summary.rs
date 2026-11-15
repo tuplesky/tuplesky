@@ -808,6 +808,9 @@ pub struct HistoryMaps {
     pub votes: usize,
     /// Adoption order.
     pub adopted: usize,
+    /// Durable adoptions by sequence number, for the commit frontier
+    /// (lever 2, step 1).
+    pub frontier_ready: usize,
     /// Retry-key bindings.
     pub bindings: usize,
     /// Bindings with no payload here (the ledger's own).
@@ -829,6 +832,7 @@ impl HistoryMaps {
             + self.served_payloads
             + self.votes
             + self.adopted
+            + self.frontier_ready
             + self.bindings
             + self.bare_bindings
             + self.answer_on_release
@@ -844,6 +848,7 @@ impl HistoryMaps {
             self.served_payloads,
             self.votes,
             self.adopted,
+            self.frontier_ready,
             self.bindings,
             self.bare_bindings,
             self.answer_on_release,
