@@ -223,6 +223,11 @@ pub struct CatchUpPaths {
     /// Windows stopped for a stale page: this replica executed past where
     /// it starts.
     pub stopped_stale: u64,
+    /// Windows stopped at an entry with no decided record: its donor kept
+    /// no record of the command's decision. A window ends before such an
+    /// entry, which is then the next window's first and stops it, so the
+    /// next ask goes to another donor (seed 73).
+    pub stopped_undecided: u64,
 }
 
 impl CatchUpPaths {
@@ -250,6 +255,7 @@ impl CatchUpPaths {
         self.cut_short += other.cut_short;
         self.stopped_ballot += other.stopped_ballot;
         self.stopped_stale += other.stopped_stale;
+        self.stopped_undecided += other.stopped_undecided;
     }
 }
 

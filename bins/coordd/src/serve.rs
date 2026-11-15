@@ -1237,7 +1237,8 @@ impl CatchUpCounts {
 asked_ahead={} taken_ahead={} declined_unbooted={} declined_busy={} declined_stopped={} declined_unsynced={} \
 declined_donor={} dropped_ballot={} dropped_unsynced={} dropped_sender={} \
 ignored_busy={} ignored_stopped={} ignored_campaign={} ignored_after={} taken_stale={} \
-stale_unasked={} empty={} cut_short={} stopped_ballot={} stopped_stale={} served={served} \
+stale_unasked={} empty={} cut_short={} stopped_ballot={} stopped_stale={} stopped_undecided={} \
+served={served} \
 serve_us={} serve_longest_us={} unserved_sender={} \
 unserved_ballot={} unserved_stopped={} unserved_nothing_after={} unserved_no_order={} \
 unserved_order_above={} unserved_no_snapshot={} unserved_first_row={}",
@@ -1262,6 +1263,7 @@ unserved_order_above={} unserved_no_snapshot={} unserved_first_row={}",
             p.cut_short,
             p.stopped_ballot,
             p.stopped_stale,
+            p.stopped_undecided,
             serve_total.as_micros(),
             serve_longest.as_micros(),
             u.sender,
@@ -7011,6 +7013,7 @@ mod tests {
             cut_short: 16,
             stopped_ballot: 17,
             stopped_stale: 18,
+            stopped_undecided: 36,
             asked_ahead: 32,
             taken_ahead: 33,
         };
@@ -7041,7 +7044,8 @@ mod tests {
 asked_ahead=32 taken_ahead=33 declined_unbooted=3 declined_busy=4 declined_stopped=5 declined_unsynced=6 \
 declined_donor=7 dropped_ballot=8 dropped_unsynced=9 dropped_sender=10 \
 ignored_busy=11 ignored_stopped=12 ignored_campaign=13 ignored_after=14 taken_stale=28 \
-stale_unasked=29 empty=15 cut_short=16 stopped_ballot=17 stopped_stale=18 served=19 \
+stale_unasked=29 empty=15 cut_short=16 stopped_ballot=17 stopped_stale=18 stopped_undecided=36 \
+served=19 \
 serve_us=34 serve_longest_us=35 unserved_sender=20 \
 unserved_ballot=21 unserved_stopped=22 unserved_nothing_after=23 unserved_no_order=24 \
 unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";

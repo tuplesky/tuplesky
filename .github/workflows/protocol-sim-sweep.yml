@@ -12,7 +12,9 @@
 # gate's window, late execution, a donor lost mid-window) and
 # `relayed_rows` (rows 1, 9 and 14 with answers on release and relayed
 # payloads) run too: `relayed_rows` had only ever run at 12 seeds, and
-# its first run here found row 9's seed 275. CI's default
+# its first run here found row 9's seed 275. Row 24 runs with catch-up
+# only: its donor is lost mid-window, and without catch-up there is no
+# window (#306 review). CI's default
 # of 12 seeds per row and size stays in `cargo xtask test`. A failing
 # seed is printed with its row and size; replay it with
 # `PROTOCOL_SIM_ONE=row,voters,seed` and `PROTOCOL_SIM_TRACE=1`, and keep
@@ -22,6 +24,11 @@
 # what its unmarked commands learned) and task-d102's relay and proposal
 # frames (`relay`, a share of the marked commands, and `frames`), each in
 # parts per million; the weekly run leaves them off.
+#
+# Each job first checks that its `--exact` name lists a test: with a name
+# that matches nothing, libtest runs no test and passes, so a row renamed
+# or removed fails here rather than passing empty. The testing session
+# reads the Sunday run and reports it on the code branch's pull request.
 #
 # The sweep above builds release, so neither of the simulator's debug
 # checks runs in it: `next_executable`'s ready set against a full walk
@@ -126,6 +133,8 @@ jobs:
             peer-ack-loss: "750000"
           - row: row_17_repeated_elections_with_half_the_acknowledgements_to_a_follower_lost
             peer-ack-loss: "1000000"
+          - row: row_24_a_voter_behind_loses_the_donor_serving_its_pages
+            catch-up: no-catch-up
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
@@ -169,6 +178,12 @@ jobs:
           if [ "${RELAY:-0}" -gt 0 ] && [ "${ANSWER_ON_RELEASE:-0}" -eq 0 ]; then
             echo "::error::relay is a share of the marked commands; give answer-on-release too"; exit 2
           fi
+          # `--exact` with a name that matches nothing runs 0 tests and passes.
+          if ! cargo test --locked --release -p coord-consensus --test protocol_sim -- \
+              --exact "$ROW" --list | grep -qxF "$ROW: test"; then
+            echo "::error::no test named $ROW in protocol_sim"
+            exit 1
+          fi
           cargo test --locked --release -p coord-consensus --test protocol_sim -- \
             --exact "$ROW" --nocapture
 
@@ -207,7 +222,17 @@ jobs:
           TEST: ${{ matrix.test }}
         run: |
           set -- --nocapture
-          if [ -n "$TEST" ]; then set -- --exact "$TEST" --nocapture; fi
+          if [ -n "$TEST" ]; then
+            # `--exact` with a name that matches nothing runs 0 tests and passes.
+            if ! cargo test --locked --release \
+                --config 'profile.release.package.coord-consensus.debug-assertions=true' \
+                -p coord-consensus --test protocol_sim -- --exact "$TEST" --list \
+                | grep -qxF "$TEST: test"; then
+              echo "::error::no test named $TEST in protocol_sim"
+              exit 1
+            fi
+            set -- --exact "$TEST" --nocapture
+          fi
           cargo test --locked --release \
             --config 'profile.release.package.coord-consensus.debug-assertions=true' \
             -p coord-consensus --test protocol_sim -- "$@"
