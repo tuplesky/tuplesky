@@ -12,7 +12,9 @@
 # gate's window, late execution, a donor lost mid-window) and
 # `relayed_rows` (rows 1, 9 and 14 with answers on release and relayed
 # payloads) run too: `relayed_rows` had only ever run at 12 seeds, and
-# its first run here found row 9's seed 275. CI's default
+# its first run here found row 9's seed 275. Row 24 runs with catch-up
+# only: its donor is lost mid-window, and without catch-up there is no
+# window (#306 review). CI's default
 # of 12 seeds per row and size stays in `cargo xtask test`. A failing
 # seed is printed with its row and size; replay it with
 # `PROTOCOL_SIM_ONE=row,voters,seed` and `PROTOCOL_SIM_TRACE=1`, and keep
@@ -118,6 +120,8 @@ jobs:
             peer-ack-loss: "750000"
           - row: row_17_repeated_elections_with_half_the_acknowledgements_to_a_follower_lost
             peer-ack-loss: "1000000"
+          - row: row_24_a_voter_behind_loses_the_donor_serving_its_pages
+            catch-up: no-catch-up
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:

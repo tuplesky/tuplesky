@@ -366,6 +366,14 @@ struct Knobs {
     /// within its epoch, so without this no entry comes with no record.
     /// `PROTOCOL_SIM_FORGET_ROWS` sets it in every row.
     forget_rows: u32,
+    /// Whether every donor withholds a drawn command's record, as the
+    /// knob did before seed 73's fix (#307 review). A voter behind then
+    /// finds no donor to serve it, which `coordd` reaches only below a
+    /// restore's boundary, and stops there; it is the mode the bare window's failures were found
+    /// in, kept so the fixture's lines for them separate a build that
+    /// installs such an entry from one that refuses it.
+    /// `PROTOCOL_SIM_FORGET_EVERYWHERE=1` sets it.
+    forget_everywhere: bool,
 }
 
 impl Knobs {
@@ -417,6 +425,7 @@ impl Knobs {
         catch_up_lag: 0,
         page: coord_consensus::MAX_CATCH_UP_COMMANDS,
         forget_rows: 0,
+        forget_everywhere: false,
     };
 
     /// These knobs with task-d98's early proposals and the three faults
@@ -2096,15 +2105,20 @@ impl Sim {
 
     /// Whether `donor` serves `command` with no decided record
     /// ([`Knobs::forget_rows`]): one donor a drawn command, while another
-    /// voter has executed it and can serve its record.
+    /// voter has executed it and can serve its record; with
+    /// [`Knobs::forget_everywhere`], every donor.
     fn withholds(&self, donor: u8, command: &CommandId) -> bool {
         let b = command.as_bytes();
         let salt = (self.seed as u32).wrapping_mul(0x9E37_79B9);
         let draw = u32::from_le_bytes([b[0], b[1], b[2], b[3]]) ^ salt;
+        if draw % 1_000_000 >= self.knobs.forget_rows {
+            return false;
+        }
+        if self.knobs.forget_everywhere {
+            return true;
+        }
         let which = u32::from_le_bytes([b[4], b[5], b[6], b[7]]) ^ salt;
-        draw % 1_000_000 < self.knobs.forget_rows
-            && which % u32::from(self.n) == u32::from(donor)
-            && self.executed_elsewhere(donor, command)
+        which % u32::from(self.n) == u32::from(donor) && self.executed_elsewhere(donor, command)
     }
 
     /// Whether a voter other than `donor` has executed `command` durably,
@@ -4224,6 +4238,11 @@ fn row_knobs(row: u8) -> Knobs {
     {
         knobs.forget_rows = share;
     }
+    // `PROTOCOL_SIM_FORGET_EVERYWHERE=1`: every donor withholds the drawn
+    // commands' records, as before seed 73's fix (#307 review).
+    if std::env::var("PROTOCOL_SIM_FORGET_EVERYWHERE").as_deref() == Ok("1") {
+        knobs.forget_everywhere = true;
+    }
     // `PROTOCOL_SIM_FAIL_QUEUE=0` fails one batch at a time where the row
     // fails the queue behind it, `=1` the queue where it doesn't.
     match std::env::var("PROTOCOL_SIM_FAIL_QUEUE").as_deref() {
@@ -4996,6 +5015,10 @@ struct Kept {
     /// (`Knobs::forget_rows`); absent, none.
     #[serde(default)]
     forget_rows: Option<u32>,
+    /// Whether every donor withheld it (`Knobs::forget_everywhere`);
+    /// absent, one donor.
+    #[serde(default)]
+    forget_everywhere: bool,
     /// The page size (`Knobs::page`); absent, the row's.
     #[serde(default)]
     page: Option<usize>,
@@ -5024,6 +5047,9 @@ impl Kept {
         }
         if let Some(share) = self.forget_rows {
             knobs.forget_rows = share;
+        }
+        if self.forget_everywhere {
+            knobs.forget_everywhere = true;
         }
         if let Some(page) = self.page {
             knobs.page = page;

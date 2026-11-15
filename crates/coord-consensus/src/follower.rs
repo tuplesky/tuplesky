@@ -715,9 +715,12 @@ pub struct Follower {
     /// (#197 review): written again before they execute or a vote names
     /// them. See [`Follower::carry_stale`].
     unwritten: BTreeSet<CommandId>,
-    /// Commands whose payload row was in a batch that failed: written
-    /// again by [`Follower::carry_stale`] once a dependency row of theirs
-    /// is written without it.
+    /// Commands whose payload is held here with no payload row durable
+    /// or in flight: the batch that wrote the row failed, or no batch
+    /// wrote one, as for a Sync entry whose payload came relayed (marked
+    /// in [`Follower::advance_sync`], seed 275). Held back by
+    /// [`Follower::stale`] and written by [`Follower::carry_stale`] once
+    /// a dependency row of theirs is written without it.
     payload_unwritten: BTreeSet<CommandId>,
     /// A Sync entry's installation batch in flight, under its barrier,
     /// with the synchronized ballot it was installed at: a failed one is
@@ -3279,8 +3282,10 @@ impl Follower {
     /// Whether `command`'s record is ahead of its rows because the batch
     /// that wrote it failed, and is not yet written again.
     ///
-    /// Or its payload is (#243 review): held in memory, with the batch
-    /// that wrote its row failed and no row durable or in flight. The
+    /// Or its payload is (#243 review): held in memory with no row
+    /// durable or in flight, because the batch that wrote its row failed
+    /// or, for a Sync entry whose payload came relayed, because no batch
+    /// wrote one (seed 275, [`Follower::advance_sync`]). The
     /// store's lowering moves a command's pending payload to its position
     /// when it executes, and refuses an execution with none (task-d113's
     /// rule (b)); executed here, the voter would be lost until its state
@@ -4667,7 +4672,12 @@ impl Follower {
     /// A command the donor keeps no decided record of is not installed:
     /// the page ends before it, and the next ask goes to another donor
     /// (seed 73, #185). Within an epoch every voter that executed a
-    /// command holds its decided record, so one of them serves it.
+    /// command holds its decided record, so one of them serves it. A
+    /// donor serves no record for a command decided in another epoch, or
+    /// at or below a restore's boundary (a shared checkpoint carries no
+    /// node-private row), so no window runs one of those: a voter behind
+    /// such a boundary needs a checkpoint (task-d32; task-d27 and
+    /// task-d41 in the plan).
     ///
     /// The window is as many of the page's commands, from its head, as
     /// install cleanly in one batch: each is at the next position, is
@@ -4831,6 +4841,14 @@ impl Follower {
             // it, and its place in the voter's order from the ones that
             // read a command missing from a report as executed before
             // everything the report holds (task-d33's `from_below`).
+            //
+            // Each of the two holds within an epoch but for one case, and
+            // neither case is a window's. The first: a Sync's release
+            // (`on_sync`) drops a vote unexecuted, and the selection that
+            // released it read that vote. The second: a voter can accept a
+            // Sync entry naming a command it never held (node 1 at seed
+            // 147, #305); #305 covers it where another report holds the
+            // command, and task-d119 is open for where none does.
             return if previous.is_some() {
                 ends(entry)
             } else {
