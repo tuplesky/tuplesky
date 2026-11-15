@@ -350,6 +350,16 @@ struct Knobs {
     /// a page the ask ahead runs under every fault the row has.
     /// `PROTOCOL_SIM_PAGE` sets it in every row.
     page: usize,
+    /// Chance (parts per million) a donor serves a command of its page
+    /// with no decided record, as a donor that kept no dependency row of
+    /// it does (#302, #303 review). The voter it serves commits the
+    /// command with no dependencies, as a window of its own, and nothing
+    /// may write or report those. Every donor withholds the same commands,
+    /// drawn by the command's identity and the seed. No row has a path
+    /// that drops a donor's row of an executed command, so without this
+    /// no window is ever bare. `PROTOCOL_SIM_FORGET_ROWS` sets it in
+    /// every row.
+    forget_rows: u32,
 }
 
 impl Knobs {
@@ -400,6 +410,7 @@ impl Knobs {
         donor_crash: 0,
         catch_up_lag: 0,
         page: coord_consensus::MAX_CATCH_UP_COMMANDS,
+        forget_rows: 0,
     };
 
     /// These knobs with task-d98's early proposals and the three faults
@@ -1010,6 +1021,8 @@ struct Stats {
     /// (task-d25), likewise.
     asked_ahead: u64,
     taken_ahead: u64,
+    /// Entries donors served with no decided record (`Knobs::forget_rows`).
+    bare_served: u64,
     /// Learning passes a step of storage events passed over, at every
     /// follower (lever 2, step 1).
     storage_passes_skipped: u64,
@@ -2030,6 +2043,10 @@ impl Sim {
             }
             let page = self.page(msg.to, b, after);
             self.stats.catch_up_pages += 1;
+            if let ProtocolMessage::CatchUpPage { entries, .. } = &page {
+                self.stats.bare_served +=
+                    entries.iter().filter(|e| e.decided.is_none()).count() as u64;
+            }
             self.net.push(Msg {
                 from: msg.to,
                 to: msg.from,
@@ -2067,6 +2084,15 @@ impl Sim {
         self.step_node(msg.to, event);
     }
 
+    /// Whether donors serve `command` with no decided record
+    /// ([`Knobs::forget_rows`]).
+    fn withholds(&self, command: &CommandId) -> bool {
+        let b = command.as_bytes();
+        let draw = u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+            ^ (self.seed as u32).wrapping_mul(0x9E37_79B9);
+        draw % 1_000_000 < self.knobs.forget_rows
+    }
+
     /// What `coordd` serves for a catch-up ask at `ballot` after
     /// `after`: the donor's executed commands from there, each with its
     /// durable payload and dependency row, stopping at the first it
@@ -2093,7 +2119,7 @@ impl Sim {
             entries.push(coord_consensus::CatchUpEntry {
                 command: *c,
                 payload: payload.clone(),
-                decided: rows.get(c).cloned(),
+                decided: rows.get(c).cloned().filter(|_| !self.withholds(c)),
                 position: ExecutionPosition::new(i as u64 + 1).unwrap(),
                 revision: None,
                 result_digest: digest_of(&response),
@@ -2268,11 +2294,15 @@ impl Sim {
             }
             Role::Follower(m) => {
                 let c = m.next_executable().expect("executable");
-                (
-                    c,
-                    m.table().record(&c).map(|r| r.deps.clone()),
-                    m.executed_through(),
-                )
+                // A command a window committed with no dependencies holds
+                // none that are its decision (#303 review): oracle 1 checks
+                // its order, and oracle 3 has no dependencies to compare.
+                let deps = if m.bare() == Some(c) {
+                    None
+                } else {
+                    m.table().record(&c).map(|r| r.deps.clone())
+                };
+                (c, deps, m.executed_through())
             }
         };
         let position = position.checked_next().unwrap();
@@ -4097,6 +4127,14 @@ fn row_knobs(row: u8) -> Knobs {
     {
         knobs.page = page.max(1);
     }
+    // `PROTOCOL_SIM_FORGET_ROWS` (parts per million): the share of
+    // commands donors serve with no decided record (#303 review).
+    if let Some(share) = std::env::var("PROTOCOL_SIM_FORGET_ROWS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        knobs.forget_rows = share;
+    }
     // `PROTOCOL_SIM_FAIL_QUEUE=0` fails one batch at a time where the row
     // fails the queue behind it, `=1` the queue where it doesn't.
     match std::env::var("PROTOCOL_SIM_FAIL_QUEUE").as_deref() {
@@ -4148,6 +4186,15 @@ fn run_row(row: u8) {
     for range in [0..seeds(), seeds()..2 * seeds()] {
         if range.start > 0 && (row != 21 || cut_21(&totals)) {
             break;
+        }
+        if range.start > 0 {
+            println!(
+                "row 21: the first {} seeds missed the cut ({} payload crashes, {} restored \
+                 without payload); seeds {range:?} run too",
+                seeds(),
+                totals.payload_crashes,
+                totals.restored_without_payload
+            );
         }
         for n in [3u8, 5] {
             for (seed, early) in range
@@ -4214,6 +4261,7 @@ fn run_row(row: u8) {
                         totals.stopped_stale += s.stopped_stale;
                         totals.asked_ahead += s.asked_ahead;
                         totals.taken_ahead += s.taken_ahead;
+                        totals.bare_served += s.bare_served;
                     }
                     Err(e) => failures.push(e),
                 }
@@ -4499,6 +4547,50 @@ fn rows_with_pages_of_three_ask_ahead() {
     assert!(
         asked > 0 && taken > 0,
         "no page asked ahead ({asked}) or taken ahead ({taken}) of {pages}"
+    );
+}
+
+/// Windows of commands their donor kept no row of, under faults (#303
+/// review). No row drops a donor's dependency row of an executed command,
+/// so the simulator never served an entry with no decided record (none
+/// in every row at 40 seeds). Here rows 1, 9, 12 and 24 run with donors
+/// that withhold one command in twenty: each is committed with no
+/// dependencies, as a window of its own, while elections, crashes,
+/// failed batches and Syncs go on around it. Every oracle holds, among
+/// them agreement on each command's dependencies, and the follower's
+/// debug check that no batch carries a row of such a command runs where
+/// debug assertions are on. It found a voter that ran such a command and
+/// restarted with a Sync row naming it: the row brought the command back
+/// as a placeholder that hid its execution, and a campaign whose
+/// selection named it asked its payload for ever (16 of 96 runs, before
+/// `CommandTable::restore_executed` took the placeholder as executed).
+#[test]
+fn rows_with_donors_that_kept_no_rows() {
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let mut failures = Vec::new();
+    let (mut pages, mut bare) = (0u64, 0u64);
+    for row in [1u8, 9, 12, 24] {
+        let mut knobs = row_knobs(row);
+        knobs.forget_rows = 50_000;
+        for n in [3u8, 5] {
+            for seed in 0..seeds() {
+                match run_knobs(n, knobs, seed, Some(true)) {
+                    Ok(stats) => {
+                        pages += u64::from(stats.catch_up_pages);
+                        bare += stats.bare_served;
+                    }
+                    Err(e) => failures.push(e),
+                }
+            }
+        }
+    }
+    std::panic::set_hook(hook);
+    println!("donors that kept no rows: {pages} pages, {bare} entries with no decided record");
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    assert!(
+        bare > 0,
+        "no entry served with no decided record in {pages} pages"
     );
 }
 
