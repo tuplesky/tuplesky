@@ -1919,8 +1919,10 @@ mod tests {
         assert!(decision.reproposed.contains(&id(5)), "D re-proposed");
     }
 
-    /// KNOWN GAP, not a rule. This pins today's behaviour; it is an open
-    /// item on #185 until a design note settles it.
+    /// KNOWN GAP, not a rule. This pins today's behaviour, which the
+    /// no-report note under task-d119 (the plan) keeps: that task closes
+    /// the way seed 147's member came to hold X without D, and a rule for
+    /// the other way waits for a run that reaches it.
     ///
     /// The same shape with no report holding D at all. Today the member's
     /// closure stops at D, the order check reads that as an order that

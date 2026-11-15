@@ -4603,12 +4603,63 @@ Proposal 2 of [the batching rule](tuplesky-batching-rule.md#41-proposal-2-protoc
 - **Asking again.** A voter that refused a ballot's proposals under its promise, and then adopts that ballot's Sync, gets what it refused. Either the leader sends them again once the voter's promise reaches its ballot (task-d15's rule counts a fenced refusal as a vote still needed), or the follower asks for a Sync entry's dependency it doesn't hold, as it asks for a missing payload.
 - **The re-proposal.** A new leader re-proposes an acceptance whose dependency no report holds, or holds it back with its dependents and asks the voters for the dependency. It never drops the acceptance: the dependency may be decided and executed elsewhere.
 
+**The no-report case (design note).** The shape #305 pins as a known gap:
+- A member `m` of the source ballot's fast set reports `A` at ACCEPT, `X` at ACCEPT naming `D`, and `C` pre-accepted naming `X`.
+- The other report holds `A` and `X`. No report holds `D`.
+- A fast quorum decided `C` with `{X}`.
+
+The order check can't tell whether `A` ran before `D`, so it drops `C` and the selection re-proposes it. If a frontend learned `C` fast, a voter can then execute `C` under other dependencies than it learned. That is seed 147's failure.
+- **How a member holds `X` naming a `D` it doesn't hold.**
+  - Not by a pre-acceptance, which names only commands the voter holds with a payload.
+  - Not by a slow acceptance: adoption goes through `CommandTable::accept`, whose `guard_accept` refuses a dependency that isn't at ACCEPT or above in the voter's own table. An executed and retired command counts as held there.
+  - Not by a catch-up window, which installs decided records at COMMIT.
+
+  That leaves two ways:
+  1. `m` executed `D` and retired it.
+  2. `m` holds `X` only through a durable Sync it hasn't finished installing. `Follower::report` reports that Sync's selection while the installation of `X` waits for `D`. `m` votes at the Sync's ballot all the while, since the Sync is active once it's durable. Seed 147 took this way, with a fast decision.
+- **What keeping `C` would rest on.** `C` keeps `{X}` only if every adopted command that conflicts with it runs before it at every voter.
+  - **The stronger rule.** Keep `C` when `A`'s closure is known whole and doesn't reach `C`. Two decided conflicting commands are ordered, so `A` would then be in `C`'s closure, through `D`.
+  - **That premise broke four times, each a bug:**
+    - a full leader's first proposal after retirement (task-d06);
+    - a new leader's first proposal after an empty recovered order (task-d12);
+    - a bare catch-up window's `(COMMIT, [])` (#303, #307);
+    - an install that moved a key's latest back (seed 73, #307).
+  - **What a fifth break would cost.** Under today's rule, a re-proposed fast decision. Under the stronger rule, a silent fork that only the divergence stop (task-d06, task-d13) can catch.
+- **What a report could carry.**
+  - For way (1): `m`'s execution positions of the commands its entries name that it executed and forgot. The order check could then read `A` before `D`; this is task-d71's `executed_before`, read from the member as well as from the candidate. It changes the wire form of every report and needs a mixed-version gate (Section 11.7), which task-d71 declined.
+  - For way (2): no report holds any evidence, so no field helps.
+- **A schedule that reaches it.** A scratch probe, not committed, recorded every candidate the order check dropped. For each, it noted whether the candidate's walk reached a dependency that neither the selection nor the member's report holds and the new leader doesn't hold decided, and whether another report holds it. The simulator added:
+  - whether the member had executed that dependency, which is way (1);
+  - whether the leader had proposed the candidate, before the drop, with the dependencies and path the member reported, which a fast decision needs, and how many voters had acknowledged it so;
+  - whether a frontend learned it fast.
+
+  What it found:
+  - **Runs.** 87,000 runs, none failed:
+    - row 10 at three voters: 20,000 seeds at 750000 (follower-ack loss, in parts per million) without catch-up, 20,000 at 500000 with it, and 1,000 in each of the sweep's other six settings;
+    - row 10 at five voters: 8,000 seeds at 750000 without catch-up, and 1,000 in each of the other seven settings;
+    - row 10 at three voters, 10,000 seeds at 750000 without catch-up with a longer promise hold, a shorter campaign timeout and more crashes;
+    - rows 9, 16 and 17 at three and five voters, 2,000 seeds a setting: row 9 at its own loss with catch-up and without, rows 16 and 17 at theirs without.
+  - **The selection side is reached.** 182 drops in 112 seeds reached a dependency that no report held and the new leader didn't hold decided. How often, in seeds:
+    - row 10: one in 1,250 at three voters, one in 5,000 at five, and one in 900 with the targeted knobs;
+    - row 9, repeated interrupted elections: one in 100 at three voters with catch-up, one in 500 without it, and one in 1,300 at five;
+    - row 17, half the acknowledgements to a follower lost: one in 125 at three voters, one in 300 at five;
+    - row 16, every acknowledgement to a follower lost: one in 300 at three voters, one in 500 at five.
+  - **Every one is way (2).** No voter had executed the dependency, the member included.
+  - **None could have been a fast decision at the drop.** The leader had never proposed the candidate with the member's dependencies and path. No voter but the member had acknowledged it so, except once at five voters, where two had. In ten of them a frontend learned the command fast later, once it was proposed again; at the drop, none had.
+  - **What follows.** Seed 905 (row 10, three voters, 750000, no catch-up) is seed 147's way with no report holding the dependency: the member reports ballot 12's Sync, durable and not installed. The order check drops the candidate, the new leader gives its campaign up as `Behind` on the dependency, which the selection names and no report carries, and the run goes on to pass.
+
+  So the schedule reaches the selection's side of the gap through way (2), in some settings once in a hundred seeds, but no run put a fast decision behind a drop, and none reached way (1).
+- **Recommended.**
+  - Keep today's rule and the known-gap test.
+  - This task closes way (2) at its source. A member that reports a Sync's entry also holds, and reports, what the entry names: it asks for the dependency, or keeps it as the Sync re-proposes it. #305's rule then covers the case.
+  - Then add a debug check to the selection: a dropped fast candidate's walk never reaches a dependency that no report holds and the new leader doesn't hold decided. Today's runs fail it through way (2). Once this task lands, a run that fails it is way (1), which no report can show today. Only then are the report field and the stronger rule weighed.
+
 **Acceptance.**
 - A directed test of each part, each with a control that stalls without it.
 - Seed 147 still kept in `seeds.json`.
 - Row 10 at 1,000 seeds in the sweep's eight settings.
 
-**Review boundary:** liveness after a fenced refusal. No change to what a selection keeps: what it keeps when no report holds a dependency is the known gap the seed 147 fix pins, left to its own design note.
+**Review boundary:** liveness after a fenced refusal. No change to what a selection keeps: what it keeps when no report holds a dependency is the known gap the seed 147 fix pins, and the no-report note above says why it stays.
 
 ## Gate checklist and deferred work
 
