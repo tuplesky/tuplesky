@@ -19,6 +19,11 @@
 # it in `crates/coord-consensus/fixtures/protocol_sim/seeds.json` with
 # what it found.
 #
+# Each job first checks that its `--exact` name lists a test: with a name
+# that matches nothing, libtest runs no test and passes, so a row renamed
+# or removed fails here rather than passing empty. The testing session
+# reads the Sunday run and reports it on the code branch's pull request.
+#
 # The sweep above builds release, so neither of the simulator's debug
 # checks runs in it: `next_executable`'s ready set against a full walk
 # (task-d107), and each learning pass passed over against every accepted
@@ -135,6 +140,12 @@ jobs:
         run: |
           if [ -n "$NO_CATCH_UP" ]; then export PROTOCOL_SIM_NO_CATCH_UP=1; fi
           if [ -n "$PEER_ACK_LOSS" ]; then export PROTOCOL_SIM_PEER_ACK_LOSS="$PEER_ACK_LOSS"; fi
+          # `--exact` with a name that matches nothing runs 0 tests and passes.
+          if ! cargo test --locked --release -p coord-consensus --test protocol_sim -- \
+              --exact "$ROW" --list | grep -qxF "$ROW: test"; then
+            echo "::error::no test named $ROW in protocol_sim"
+            exit 1
+          fi
           cargo test --locked --release -p coord-consensus --test protocol_sim -- \
             --exact "$ROW" --nocapture
 
@@ -173,7 +184,17 @@ jobs:
           TEST: ${{ matrix.test }}
         run: |
           set -- --nocapture
-          if [ -n "$TEST" ]; then set -- --exact "$TEST" --nocapture; fi
+          if [ -n "$TEST" ]; then
+            # `--exact` with a name that matches nothing runs 0 tests and passes.
+            if ! cargo test --locked --release \
+                --config 'profile.release.package.coord-consensus.debug-assertions=true' \
+                -p coord-consensus --test protocol_sim -- --exact "$TEST" --list \
+                | grep -qxF "$TEST: test"; then
+              echo "::error::no test named $TEST in protocol_sim"
+              exit 1
+            fi
+            set -- --exact "$TEST" --nocapture
+          fi
           cargo test --locked --release \
             --config 'profile.release.package.coord-consensus.debug-assertions=true' \
             -p coord-consensus --test protocol_sim -- "$@"
