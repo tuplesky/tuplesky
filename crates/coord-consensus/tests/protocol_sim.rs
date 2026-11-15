@@ -105,7 +105,9 @@
 //! commits over a vote the leader may lose.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::cell::Cell;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::Once;
 
 use coord_consensus::{
     AppliedOutcome, BallotConfiguration, CommandRecord, ConfigurationIdentity, FastAck, Follower,
@@ -4028,6 +4030,73 @@ fn kept_knobs(row: u8, early: bool, peer_ack_loss: Option<u32>, fail_queue: Opti
     knobs
 }
 
+thread_local! {
+    /// Runs on this thread whose panic is caught and said with its seed
+    /// ([`quietly`]).
+    static QUIET: Cell<u32> = const { Cell::new(0) };
+    /// Where the last panic on this thread inside such a run was raised.
+    static WHERE: Cell<Option<(&'static str, u32)>> = const { Cell::new(None) };
+}
+
+/// Run `f` with its panic caught and the hook's output for it left out:
+/// the caller says the failure, with its seed.
+///
+/// Tests run side by side in one process, and the panic hook is the
+/// process's. Each test used to put a silent hook in for its runs and
+/// the one it took back after, so one test's silent hook could be in
+/// place when another's assertion failed, and its message was lost
+/// (`relayed_rows` on sweep run 43661328636). Two tests that swapped
+/// it at once could also leave the silent hook in for the rest of the
+/// process. Now one hook is put in, once, and it holds back only a
+/// panic raised on a thread inside this call; any other goes to the
+/// hook it replaced.
+fn quietly<T>(f: impl FnOnce() -> T) -> std::thread::Result<T> {
+    static HOOK: Once = Once::new();
+    HOOK.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if QUIET.with(Cell::get) == 0 {
+                previous(info);
+            } else {
+                WHERE.with(|w| w.set(info.location().map(|l| (l.file(), l.line()))));
+            }
+        }));
+    });
+    QUIET.with(|q| q.set(q.get() + 1));
+    WHERE.with(|w| w.set(None));
+    let outcome = catch_unwind(AssertUnwindSafe(f));
+    QUIET.with(|q| q.set(q.get() - 1));
+    outcome
+}
+
+/// A caught panic's message, and where it was raised.
+fn panic_text(e: &(dyn std::any::Any + Send)) -> String {
+    let text = e
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| e.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+        .unwrap_or_default();
+    match WHERE.with(Cell::get) {
+        Some((file, line)) => format!("{text} (at {file}:{line})"),
+        None => text,
+    }
+}
+
+/// Fail with every failing run, each said with its row, size and seed.
+/// Each is also printed on its own line first, so a long list stays
+/// readable in the test's output.
+fn assert_none_failed(failures: &[String]) {
+    for f in failures {
+        eprintln!("FAILED {f}");
+    }
+    assert!(
+        failures.is_empty(),
+        "{} failing seeds:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
 /// One run with `knobs`, its panic caught and said with its seed.
 fn run_knobs(n: u8, knobs: Knobs, seed: u64, catch_up: Option<bool>) -> Result<Stats, String> {
     let row = knobs.row;
@@ -4036,19 +4105,15 @@ fn run_knobs(n: u8, knobs: Knobs, seed: u64, catch_up: Option<bool>) -> Result<S
     } else {
         ""
     };
-    let outcome = catch_unwind(AssertUnwindSafe(|| {
+    let outcome = quietly(|| {
         let mut sim = Sim::new(n, knobs, seed);
         if let Some(on) = catch_up {
             sim.catch_up = on;
         }
         sim.run()
-    }));
+    });
     outcome.map_err(|e| {
-        let text = e
-            .downcast_ref::<String>()
-            .cloned()
-            .or_else(|| e.downcast_ref::<&str>().map(|s| (*s).to_owned()))
-            .unwrap_or_default();
+        let text = panic_text(&*e);
         format!("row {row}{early} at {n} voters, seed {seed}: {text}")
     })
 }
@@ -4120,10 +4185,6 @@ fn seeds() -> u64 {
 }
 
 fn run_row(row: u8) {
-    // Silence the per-seed panic output; failures are gathered and
-    // reported together, with their seeds.
-    let hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
     let mut failures = Vec::new();
     let mut totals = Stats::default();
     // Runs that learned nothing, and runs that did, at three and five.
@@ -4220,20 +4281,8 @@ fn run_row(row: u8) {
             }
         }
     }
-    std::panic::set_hook(hook);
     println!("row {row}: {totals:?}; runs that learned nothing (3, 5 voters): {idle:?}");
-    // Said here as well as in the assertion: rows run side by side, and
-    // another row's silenced hook may be the one installed when this one
-    // panics.
-    for f in &failures {
-        eprintln!("FAILED {f}");
-    }
-    assert!(
-        failures.is_empty(),
-        "{} failing seeds:\n{}",
-        failures.len(),
-        failures.join("\n")
-    );
+    assert_none_failed(&failures);
     // The scenario did something: commands executed, and elections and
     // crashes happened.
     assert!(
@@ -4355,8 +4404,6 @@ fn run_row(row: u8) {
 /// every loss and both catch-up settings, as the weekly sweep can.
 #[test]
 fn answer_on_release_rows() {
-    let hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
     let mut failures = Vec::new();
     let (mut answered, mut again) = (0usize, 0usize);
     for row in [1u8, 9, 14] {
@@ -4374,8 +4421,7 @@ fn answer_on_release_rows() {
             }
         }
     }
-    std::panic::set_hook(hook);
-    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    assert_none_failed(&failures);
     assert!(answered > 0, "no command was answered on a release alone");
     assert!(again > 0, "no leader published a release again");
 }
@@ -4390,8 +4436,6 @@ fn answer_on_release_rows() {
 /// oracle holds, and after healing every marked command is answered.
 #[test]
 fn relayed_rows() {
-    let hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
     let mut failures = Vec::new();
     let (mut answered, mut relayed, mut proposals, mut fallbacks) =
         (0usize, 0usize, 0usize, 0usize);
@@ -4413,8 +4457,7 @@ fn relayed_rows() {
             }
         }
     }
-    std::panic::set_hook(hook);
-    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    assert_none_failed(&failures);
     assert!(answered > 0, "no command was answered on a release alone");
     assert!(relayed > 0, "no command was relayed to a leader");
     assert!(proposals > 0, "no proposal carried its payload");
@@ -4429,8 +4472,6 @@ fn relayed_rows() {
 /// more than one proposal each, and relayed proposals rode in them.
 #[test]
 fn framed_rows() {
-    let hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
     let mut failures = Vec::new();
     let (mut frames, mut framed, mut relayed) = (0usize, 0usize, 0usize);
     for row in [1u8, 9, 14, 23] {
@@ -4451,8 +4492,7 @@ fn framed_rows() {
             }
         }
     }
-    std::panic::set_hook(hook);
-    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    assert_none_failed(&failures);
     assert!(frames > 0, "no proposal frame was sent");
     assert!(
         framed > frames,
@@ -4473,8 +4513,6 @@ fn framed_rows() {
 /// `PROTOCOL_SIM_NO_CATCH_UP` says: this is its test.
 #[test]
 fn rows_with_pages_of_three_ask_ahead() {
-    let hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
     let mut failures = Vec::new();
     let (mut pages, mut asked, mut taken) = (0u64, 0u64, 0u64);
     for row in [1u8, 9, 12, 24] {
@@ -4493,9 +4531,8 @@ fn rows_with_pages_of_three_ask_ahead() {
             }
         }
     }
-    std::panic::set_hook(hook);
     println!("pages of three: {pages} pages, {asked} asked ahead, {taken} taken ahead");
-    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    assert_none_failed(&failures);
     assert!(
         asked > 0 && taken > 0,
         "no page asked ahead ({asked}) or taken ahead ({taken}) of {pages}"
@@ -4515,8 +4552,6 @@ fn rows_with_pages_of_three_ask_ahead() {
 /// (#269 review). The check holds there too.
 #[test]
 fn rows_with_storage_steps_learn_once_a_step() {
-    let hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
     let mut failures = Vec::new();
     let (mut skipped, mut campaigning, mut window) = (0u64, 0u64, 0u64);
     for row in [1u8, 9, 21, 23] {
@@ -4536,12 +4571,11 @@ fn rows_with_storage_steps_learn_once_a_step() {
             }
         }
     }
-    std::panic::set_hook(hook);
     println!(
         "storage steps: {skipped} learning passes passed over, \
          {campaigning} while campaigning, {window} at a catch-up window's batch"
     );
-    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    assert_none_failed(&failures);
     assert!(skipped > 0, "no step of storage events passed a pass over");
     assert!(
         campaigning > 0,
@@ -4632,8 +4666,6 @@ fn row_18_the_leaders_proposal_before_its_batch_is_durable() {
 fn row_18_fails_when_the_fast_set_follower_gets_the_proposal_early_too() {
     const FAILED_AT: [u64; 2] = [492, 66];
     const ROW_18_CONTROL_SEEDS: u64 = 5_000;
-    let hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
     let knobs = Knobs {
         early_to_fast_set: true,
         ..Knobs::row(18)
@@ -4643,7 +4675,6 @@ fn row_18_fails_when_the_fast_set_follower_gets_the_proposal_early_too() {
         .into_iter()
         .chain(0..budget)
         .find_map(|seed| run_knobs(3, knobs, seed, None).err());
-    std::panic::set_hook(hook);
     let Some(failure) = failed else {
         panic!("row 18 passed {budget} seeds with the fast-set follower sent early too");
     };
@@ -4748,22 +4779,12 @@ fn first_failure(n: u8, knobs: Knobs) -> Option<String> {
 /// The first seed at which `knobs` fail, at `n` voters, with a failure
 /// that says `what`.
 fn first_failure_with(n: u8, knobs: Knobs, what: &str) -> Option<String> {
-    let hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
     let found = (0..NEGATIVE_CONTROL_SEEDS).find_map(|seed| {
-        catch_unwind(AssertUnwindSafe(|| Sim::new(n, knobs, seed).run()))
+        quietly(|| Sim::new(n, knobs, seed).run())
             .err()
-            .map(|e| {
-                let text = e
-                    .downcast_ref::<String>()
-                    .cloned()
-                    .or_else(|| e.downcast_ref::<&str>().map(|s| (*s).to_owned()))
-                    .unwrap_or_default();
-                format!("seed {seed}: {text}")
-            })
+            .map(|e| format!("seed {seed}: {}", panic_text(&*e)))
             .filter(|f| f.contains(what))
     });
-    std::panic::set_hook(hook);
     found
 }
 
@@ -4843,7 +4864,7 @@ fn every_kept_seed_passes() {
     );
     let kept: Vec<Kept> = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
     let failures: Vec<String> = kept.iter().filter_map(|k| k.run().err()).collect();
-    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    assert_none_failed(&failures);
 }
 
 /// `PROTOCOL_SIM_ONE=row,voters,seed` runs that one seed, with
