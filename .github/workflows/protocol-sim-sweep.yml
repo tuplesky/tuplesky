@@ -38,9 +38,27 @@ on:
   schedule:
     # Weekly (Sundays 04:41 UTC), apart from CI's Monday run.
     - cron: "41 4 * * 0"
+  # GitHub takes `schedule` and `workflow_dispatch` only from the default
+  # branch, and `main` doesn't hold this file, so neither has started it.
+  # A branch reaches it through a pull request, as jepsen.yml is reached:
+  # that one's `pull_request` trigger runs it once on a pull request that
+  # changes the harness, at its dispatch defaults. Here the trigger is the
+  # `run-sweep` label. Putting it on a pull request runs the sweep once on
+  # the pull request's merge commit, at the defaults below. Taking it off
+  # and putting it back runs it again and cancels the older run.
+  pull_request:
+    types: [labeled]
 
 permissions:
   contents: read
+
+# A second `run-sweep` label on a pull request cancels the run the first
+# started. Any other label starts a run whose jobs are all skipped (each
+# job's `if`), in a group of its own, so it cancels nothing. Scheduled and
+# dispatched runs wait for each other rather than cancel.
+concurrency:
+  group: protocol-sim-sweep-${{ github.event.pull_request.number || github.ref }}-${{ github.event.label.name || 'run' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -49,6 +67,7 @@ env:
 jobs:
   sweep:
     name: row ${{ matrix.row }} (${{ matrix.catch-up }}, peer-ack loss ${{ matrix.peer-ack-loss || 'of the row' }})
+    if: github.event_name != 'pull_request' || github.event.label.name == 'run-sweep'
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     strategy:
