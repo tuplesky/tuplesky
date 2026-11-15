@@ -157,7 +157,7 @@ pub use floor::{
 pub use follower::{
     COMMIT_ROWS_BATCH_BYTES, COMMIT_ROWS_BATCH_UPDATES, FRAME_BATCH_BYTES, FRAME_BATCH_UPDATES,
     Follower, FollowerConfig, FollowerRejection, HELD_PROPOSAL_SLACK, HeldProposal, LearnPasses,
-    MAX_KEPT_RELAYED_BYTES, RelayTaken, kept_relayed_size,
+    MAX_KEPT_RELAYED_BYTES, RelayTaken, UnreportedDrops, kept_relayed_size,
 };
 pub use graph::{
     Closure, ClosureCursor, ClosureProgress, PathLog, Position, anchored_path, chain,
@@ -188,7 +188,7 @@ pub use recovery::{
     max_report_entries, select, select_decided, select_from, select_ruled, select_with,
 };
 pub use replay::{MAX_EVIDENCE_REPAIRS, ReplayRefusal};
-pub use role::{PendingReport, RecoveredState};
+pub use role::{PendingReport, RecoveredState, ServedRefusal};
 pub use rows::{
     PayloadRecordV1, PromiseRecordV1, ProposalRecordV1, SYNC_KIND, SYNC_SCHEMA_VERSION,
     SealRecordV1, SyncRecordV1, bounded_sync_update, decode_dependency, decode_payload,
