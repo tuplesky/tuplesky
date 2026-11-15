@@ -331,7 +331,7 @@ While a follower F is behind:
 1. **What it keeps is one run** in the leader's sequence order, of at most `KEPT_BOUND` bytes, proposal and payload charged.
    - It starts only when the gap fits it.
    - Nothing in the run enters the table before its turn.
-2. **It holds at most `K_MAX` pages** asked for or outside the table, beside the one window the reserve holds.
+2. **It holds at most `K_MAX` pages** asked for or outside the table, beside the one window the reserve holds. A retry takes the slot of the ask it retires, and an answer no live ask covers is dropped (Section 7).
 3. **Pages fill only the hole,** from its executed position to the run's first command. They don't ask below the frontier, or past an ask's bound.
 4. **It is level within (H/I)·E_k/(E_k − R),** under the conditions below.
 
@@ -363,7 +363,7 @@ The inputs:
 - **Each ask carries an upper bound,** the next range's start, so a donor serves only that range. A page cut short at the byte bound leaves a hole, which is asked for at once, and exactly: the ask is the hole, not a page from its start (review's first item 3).
 - **A page that overlaps what F holds** (in the queue, the window or the run) is taken for the rest. The commands F already holds are dropped and counted as `overlap` on the metrics line.
 - The upper bound and the stop (below) ride the versioned extension (Section 5). Until it is active, a hole's ask brings a page from its start, as today, and the overlap is dropped and counted.
-- **`K_MAX` counts asks, not ranges.** A range asked again counts again, so at most 9 pages are held, under jitter too.
+- **`K_MAX` counts live asks and pages held.** Each range has at most one live ask, and a retry replaces the ask it retires rather than adding one (below), so at most 9 pages are held, under jitter too.
 - No ask starts below the executed frontier.
 - **No ask starts past the newest `through` F has seen.** A donor answers nothing for an `after` at or past its executed position (`serve_catch_up`, counted as `nothing_after`), and each such ask would be asked again after 2C + 100 ms (review's first item 4).
 - Pages are taken into a queue by position, outside the table. The window installs one page at a time, in order, and the reserve and the report bound are unchanged.
@@ -380,7 +380,10 @@ The inputs:
 - At most 5 asks are outstanding to any one donor (Section 9), so with one donor K is at most 5, and with two or more `K_MAX` binds. Section 6's condition and Section 4.2's intake use K_avail, not `K_MAX`, for that reason (Codex on #301).
 - A donor behind the range answers less or nothing, and the range is asked again of the leader.
 
-**A lost ask or page.** A range asked more than 2C + 100 ms ago and not answered is asked again of another donor. The pacer stays the backstop.
+**A lost ask or page** (Codex on #301). A range asked more than 2C + 100 ms ago and not answered is retired and asked again, of another donor where there is one.
+- **The retry takes the retired ask's slot.** It never needs a free one, so a lost ask at the head is asked again even with every other slot holding a later page. Without this, the pipeline could stay full with nothing installable.
+- **An answer is taken only while a live ask from that donor covers its range,** and taking it closes the ask. A late answer to a retired ask, or a second answer for a range already taken, is dropped and counted as `late`. With one donor, the retry goes to the same donor, and whichever answer comes first is taken.
+- **The pacer can't recover a lost ask:** `request_catch_up` declines while catch-up is busy (`declined_busy`, `follower.rs:4125`). This rule does. The pacer stays for a chain that has stopped with nothing outstanding.
 
 **A ballot change** (review's first item 7). A queued page carries its ballot, and one of a ballot F has left stops the install and clears the queue (`Pulled::Stopped`).
 - The design keeps that. Up to `K_MAX` pages, about 1,000 commands, are asked again at the new ballot: a fraction of a second at the intakes above.
@@ -482,7 +485,7 @@ New counts on the metrics line:
 - held proposals now;
 - the hole's size, K, C and R;
 - E_p and E_k, each over the last 10 s;
-- pages stale on arrival, `overlap` commands, and commands executed outside windows;
+- pages stale on arrival, `overlap` commands, `late` answers dropped, and commands executed outside windows;
 - acknowledgements withheld;
 - refusals by lane.
 
@@ -495,6 +498,7 @@ New counts on the metrics line:
   - Without loss, under `bbr` and `cubic`: it levels within Section 9's time for its measured E_k.
   - With 0.1% loss under `cubic`, the test asserts three things: the voter doesn't level; the metrics name the path as the bound (the leader's queue toward it, and `paths[]`); and at a domain rate below the path's rate over the bytes a command, with the margin, it does hold level.
   - In every case it never holds more than its kept bound or 9 pages, and never more than 5 asks outstanding to one donor.
+- **A lost head ask with the pipeline full:** with the first range's answer dropped and the other 8 slots holding later pages, the retry takes the head's slot, the hole fills, and held pages never exceed 9. The head's late answer, delivered after the retry's, is dropped and counted as `late`.
 - **A voter returned past the run's bound,** 200k behind on a path that carries more than R:
   - it is exempted from its first ask, and keeps nothing until its gap fits a run;
   - then it keeps one and levels;
