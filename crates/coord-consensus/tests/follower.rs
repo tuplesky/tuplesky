@@ -2369,6 +2369,20 @@ fn a_refused_entry_leaves_the_frames_others_as_they_are() {
 /// the command executed with its payload held only in memory.
 #[test]
 fn a_sync_entry_whose_payload_came_relayed_is_executed_over_its_payload_row() {
+    sync_entry_over_a_relayed_payload(Phase::Commit);
+}
+
+/// The same with the Sync's entry at ACCEPT (#306 review): its payload
+/// row is written at the installation, in a batch of its own, and the
+/// command is not executable while it is at ACCEPT.
+#[test]
+fn a_sync_entry_at_accept_whose_payload_came_relayed_has_its_payload_row_written() {
+    sync_entry_over_a_relayed_payload(Phase::Accept);
+}
+
+/// Seed 275's shape with the Sync's entry for the relayed command at
+/// `phase`.
+fn sync_entry_over_a_relayed_payload(phase: Phase) {
     let mut seq = 1;
     let mut f = booted(1);
     let (_, c0) = relayed_payload(1, 1, 1);
@@ -2412,7 +2426,7 @@ fn a_sync_entry_whose_payload_came_relayed_is_executed_over_its_payload_row() {
     settle(&mut f, promised, &mut seq);
     let entry = coord_consensus::SyncEntry {
         command: c1,
-        phase: Phase::Commit,
+        phase,
         deps: Vec::new(),
         path: coord_consensus::empty_path(),
         paths: Vec::new(),
@@ -2435,7 +2449,7 @@ fn a_sync_entry_whose_payload_came_relayed_is_executed_over_its_payload_row() {
         "{:?}",
         f.take_rejections()
     );
-    assert_eq!(f.table().phase_of(&c1), Some(Phase::Commit));
+    assert_eq!(f.table().phase_of(&c1), Some(phase));
     assert_eq!(payload_rows(&all), 1, "its own payload row: {all:?}");
     let with_payload = persisted(&all)
         .into_iter()
@@ -2446,7 +2460,8 @@ fn a_sync_entry_whose_payload_came_relayed_is_executed_over_its_payload_row() {
         1,
         "in a batch of its own: {with_payload:?}"
     );
-    assert_eq!(f.next_executable(), Some(c1));
+    let executable = (phase == Phase::Commit).then_some(c1);
+    assert_eq!(f.next_executable(), executable);
 }
 
 /// A chain of relayed proposals for `seqs`, each depending on the one

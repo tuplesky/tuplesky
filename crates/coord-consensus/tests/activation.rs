@@ -9377,8 +9377,9 @@ fn a_window_stopped_for_a_left_ballot_leaves_the_next_ask_at_the_frontier() {
     f.step(boot_event(1));
     assert_eq!(f.ballots().synced(), b2);
 
-    // A page of two windows: the second command's donor kept no row of
-    // it, so it is a window of its own.
+    // A page of two windows: the second command, on another key, was
+    // decided with no dependencies, so it doesn't name the first and is a
+    // window of its own.
     let pos = |n: u64| ExecutionPosition::new(n).unwrap();
     let (first, first_payload) = outside_command(101);
     let (second, second_payload) = outside_command(102);
@@ -9406,7 +9407,15 @@ fn a_window_stopped_for_a_left_ballot_leaves_the_next_ask_at_the_frontier() {
             coord_consensus::CatchUpEntry {
                 command: second,
                 payload: second_payload.clone(),
-                decided: None,
+                decided: Some(CommandRecord {
+                    phase: Phase::Commit,
+                    deps: Vec::new(),
+                    keys: vec![b"m".to_vec()],
+                    payload: Some(second_payload.admission_digest()),
+                    paths: Vec::new(),
+                    synced_seq: None,
+                    path: coord_consensus::empty_path(),
+                }),
                 position: pos(2),
                 revision: None,
                 result_digest: Digest32([0x92; 32]),

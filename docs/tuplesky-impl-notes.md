@@ -7067,7 +7067,9 @@ never closed its gap.
   - after the window's first, it names the command before it among
     those dependencies.
 - **A command the donor kept no row of is a window of its own.** It has
-  no dependencies to name. What would stop a page (a stale ballot or
+  no dependencies to name. (Seed 73 on #185 removed this: such an entry
+  is not installed, the window ends before it, and the follower asks
+  another donor.) What would stop a page (a stale ballot or
   position, a second decision, a command executed here already, a
   command not installable) ends the window instead, and is dealt with
   when it is the first of the next window, exactly as before.

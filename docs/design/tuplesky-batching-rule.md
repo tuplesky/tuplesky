@@ -1565,7 +1565,7 @@ Each step has its own PRs and pair.
   - conflicting fast and frame commands;
   - a follower frames behind, waiting for the re-send;
   - **a voter that rejoins across the boundary (R7),** its execution frontier below a and its donor's above:
-    - the donor's pages (task-d25) for frame commands come from its frame records for the payloads, and from the order for the dependencies (a page entry's `decided` is `None`, as for a command the donor keeps no row for);
+    - the donor's pages (task-d25) for frame commands come from its frame records for the payloads, and from the order for the dependencies. A page entry's `decided` must carry the record the order gives: since seed 73 a window ends before an entry with no decided record within its epoch, and the follower asks another donor, so an entry served with `decided` `None`, as this step first had it, is never installed;
     - a reinstall from a checkpoint above a replays frame records;
   - **a new leader that lacks a selected frame (R7)** fetches it before re-proposing it;
   - the replacement cut of step 4, with no per-command records beside the frame records (R3);
