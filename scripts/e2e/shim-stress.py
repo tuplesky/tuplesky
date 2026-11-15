@@ -538,7 +538,9 @@ def main():
         log(f"no workload operation completed ok ({len(ops)} recorded, {opens} sessions failed to open): "
             "the faults exercised nothing, so this is no pass")
         sys.exit(2)
-    log(f"no anomaly; final list lengths {[len(final[k]) for k in sorted(final)]}")
+    # A key no operation touched reads as null, which check() takes as an
+    # empty list; its own normalising is local, so count it as 0 here.
+    log(f"no anomaly; final list lengths {[len(final[k] or []) for k in sorted(final)]}")
 
 
 if __name__ == "__main__":
