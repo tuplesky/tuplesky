@@ -1429,7 +1429,13 @@ impl CommandTable {
     ///
     /// A command with no record here is one whose rows are gone (a trimmed
     /// prefix): it is remembered as executed, which is all there is left
-    /// to say about it.
+    /// to say about it. So is one the table holds only a placeholder of:
+    /// a durable Sync row names it and no row of its own is left, as for
+    /// a command a catch-up window ran with no decision, which writes
+    /// none (#303). Kept, the placeholder hid the execution -- `phase_of`
+    /// answered none -- and a selection that named the command asked its
+    /// payload for ever, since taking the payload of a command executed
+    /// here initializes nothing.
     pub fn restore_executed(&mut self, command: &CommandId) {
         self.last_executed = Some(*command);
         self.note_execution(*command);
@@ -1442,6 +1448,10 @@ impl CommandTable {
                     self.unexecuted -= 1;
                     self.unretired.push_back(*command);
                 }
+            }
+            Some(r) if r.phase == Phase::Start => {
+                self.records.remove(command);
+                self.history.insert(*command);
             }
             Some(_) => {}
             None => {
