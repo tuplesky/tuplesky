@@ -904,8 +904,8 @@ class CheckpointTests(unittest.TestCase):
         self.assertIn("| n1 | peer | Control | 02020202 | 70.0 | 69.0 | 120000 | 2 | 5 | 5000 | 0.10% |", text)
         self.assertNotIn("| n1 | peer | Bulk |", text)
         self.assertIn("| n1 | api (2 paths) | - | - | - | 68.0 | - | 4 | 4 | 400 | 1.00% |", text)
-        self.assertNotIn("dialed before the network was shaped:", text)
-        # A path dialed before the shaping keeps its sub-millisecond floor.
+        self.assertNotIn("samples shorter than the path can carry:", text)
+        # A sample shorter than the path can carry stays as its least for good.
         snapshot["paths"][0]["min_rtt_micros"] = 199
         self.assertIn("**Finding: 1 busy peer path(s) keep a least round trip under a quarter", self.summarize(line()))
 

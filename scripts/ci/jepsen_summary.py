@@ -2436,9 +2436,12 @@ def paths_table(voters: dict) -> list[str]:
     """Each voter's QUIC paths (#297) from its last `metrics` line: the peer
     plane's, one row a peer and lane that carried packets, and the api
     plane's summed a voter; the smoothed round trip beside the least one
-    seen, which a connection never forgets, so a min_rtt far under the
-    path's round trip means the connection was dialed before the network
-    was shaped (and BBR, which sizes its window from it, is not readable).
+    seen, which a connection never forgets. A min_rtt far under the path's
+    round trip is a sample shorter than the path can carry, not a real round
+    trip; the census on #98 places it mid-workload, after the path had shown
+    its shaped floor, on the busiest runs, so the likely cause is quinn's
+    receive timestamp (taken once a poll) trailing a later send. BBR sizes its
+    window from it, so a BBR row with one is read with that in mind.
     [] from a build without paths."""
     rows = [(node, v.paths) for node, v in voters.items() if v.paths]
     if not rows:
@@ -2448,7 +2451,7 @@ def paths_table(voters: dict) -> list[str]:
         "**QUIC paths** (#297, each voter's last `metrics` line: the peer plane's paths a peer and lane that "
         "sent packets, then the api plane's summed over its paths; round trip is the smoothed one and least "
         "is the least ever seen on the path, which a connection keeps for good: one far under the round trip "
-        "means the path was dialed before the network was shaped; window is the congestion window in bytes; "
+        "is a sample shorter than the path can carry, which BBR sizes its window from; window is the congestion window in bytes; "
         "lost is the packets the sender declared lost, of those it sent)",
         "",
         "| Node | Plane | Lane | Peer | Round trip (ms) | Least round trip (ms) | Window (bytes) "
@@ -2485,8 +2488,8 @@ def paths_table(voters: dict) -> list[str]:
     out.append("")
     if early:
         out += [f"**Finding: {len(early)} busy peer path(s) keep a least round trip under a quarter of their round "
-                f"trip**, so they were dialed before the network was shaped: {', '.join(early[:8])}"
-                f"{' …' if len(early) > 8 else ''}. A BBR row with these is not readable.", ""]
+                f"trip**, samples shorter than the path can carry: {', '.join(early[:8])}"
+                f"{' …' if len(early) > 8 else ''}. BBR sizes its window from this least round trip.", ""]
     return out
 
 

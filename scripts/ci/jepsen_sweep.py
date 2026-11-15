@@ -1508,7 +1508,8 @@ def render(steps: list[Step], title: str, baseline: str = "etcd") -> str:
             f"that sent {MIN_PATH_PACKETS} packets or more, by plane: the api plane is the clients' and "
             "collectors' links to the voters, the peer plane the voters' to each other; the congestion window's "
             "median and range in bytes, the packets declared lost of those sent, congestion events a path, and "
-            "the median smoothed and the least round trip, which near zero means a path dialed before the shaping)",
+            "the median smoothed and the least round trip, which far under the path's own is a sample shorter than "
+            "the path can carry)",
             "",
             "| Step | Side | Plane | Paths | Window p50 (min–max) | Lost of sent | Congestion events a path "
             "| Round trip p50 (ms) | Least round trip (ms) |",
