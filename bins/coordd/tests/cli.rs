@@ -207,6 +207,8 @@ pub struct Ca {
     /// endpoint catalog with it, which is the only way a catalog becomes
     /// this domain's rather than anybody's.
     node_key: Vec<u8>,
+    /// The cluster this authority's callers and catalog belong to.
+    cluster: [u8; 16],
 }
 
 impl Ca {
@@ -224,6 +226,7 @@ impl Ca {
             certificate,
             node_spki: Vec::new(),
             node_key: Vec::new(),
+            cluster: CLUSTER,
         }
     }
 
@@ -327,6 +330,7 @@ fn credentials_of_cluster(
     role: coord_types::wire_v1::PeerRole,
 ) -> Ca {
     let mut ca = Ca::new();
+    ca.cluster = cluster;
     let (certificate, key) = ca.issue(SERVER_NAME, cluster, replica, role);
     ca.node_spki = spki_of(certificate.der());
     ca.node_key = key.serialize_der();
@@ -405,7 +409,7 @@ fn endpoints(dir: &Path, ca: &Ca, count: u8, addresses: &[(u8, Vec<String>)]) {
         })
         .collect();
     let mut catalog = EndpointCatalogV1 {
-        cluster: coord_types::ids::ClusterId(CLUSTER),
+        cluster: coord_types::ids::ClusterId(ca.cluster),
         domain: coord_types::ids::DomainId(DOMAIN),
         epoch: coord_types::ids::ConfigurationEpoch::new(1).expect("nonzero"),
         generation: coord_types::ids::EndpointGeneration::new(1).expect("nonzero"),
@@ -1556,6 +1560,7 @@ fn start_with(config: &Path, env: &[(&str, &str)]) -> Running {
 struct Caller {
     connection: quinn::Connection,
     session: coord_types::ids::SessionId,
+    cluster: [u8; 16],
     _endpoint: quinn::Endpoint,
     // Kept alive: dropping the control stream ends the negotiation the
     // daemon bound this connection under.
@@ -1584,6 +1589,7 @@ impl Caller {
         Caller {
             connection,
             session: ack.session,
+            cluster: ca.cluster,
             _endpoint: endpoint,
             _control: control,
             _control_recv: control_recv,
@@ -1606,7 +1612,7 @@ impl Caller {
     ) {
         use coord_types::wire_v1::PeerRole;
 
-        let (certificate, key) = ca.issue("caller.coordd.test", CLUSTER, 0x0c, PeerRole::Client);
+        let (certificate, key) = ca.issue("caller.coordd.test", ca.cluster, 0x0c, PeerRole::Client);
         let mut roots = rustls::RootCertStore::empty();
         roots
             .add(rustls_pki_types::CertificateDer::from(
@@ -1643,7 +1649,7 @@ impl Caller {
         let (mut control, mut control_recv) = connection.open_bi().await.expect("control stream");
         let hello = coord_types::wire_v1::MessageV1::Hello(coord_types::wire_v1::HelloV1 {
             role: PeerRole::Client,
-            cluster_id: coord_types::ids::ClusterId(CLUSTER),
+            cluster_id: coord_types::ids::ClusterId(ca.cluster),
             domain_id: coord_types::ids::DomainId(DOMAIN),
             incarnation: None,
             capabilities: coord_types::wire_v1::BoundedVec::new(vec![
@@ -1692,7 +1698,7 @@ impl Caller {
     /// The retry key of this caller's `sequence`th invocation.
     fn invocation(&self, sequence: u64) -> coord_types::RetryKey {
         coord_types::RetryKey {
-            cluster_id: coord_types::ids::ClusterId(CLUSTER),
+            cluster_id: coord_types::ids::ClusterId(self.cluster),
             domain_id: coord_types::ids::DomainId(DOMAIN),
             session_id: self.session,
             client_instance_id: coord_types::ids::ClientInstanceId([0x0c; 16]),
@@ -2813,8 +2819,13 @@ struct Cluster {
 }
 
 fn three_voters(dir: &Path) -> Cluster {
-    let ca = Ca::new();
-    let mut ca = ca;
+    three_voters_of(dir, CLUSTER)
+}
+
+/// [`three_voters`] of `cluster`.
+fn three_voters_of(dir: &Path, cluster: [u8; 16]) -> Cluster {
+    let mut ca = Ca::new();
+    ca.cluster = cluster;
     let mut spki = Vec::new();
     let mut keys = Vec::new();
     let api: Vec<u16> = (0..3).map(|_| free_port()).collect();
@@ -2833,7 +2844,7 @@ fn three_voters(dir: &Path) -> Cluster {
         std::fs::create_dir_all(&node).expect("node dir");
         let (certificate, key) = ca.issue(
             SERVER_NAME,
-            CLUSTER,
+            cluster,
             n,
             coord_types::wire_v1::PeerRole::Voter,
         );
@@ -2849,7 +2860,7 @@ fn three_voters(dir: &Path) -> Cluster {
             std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
                 .expect("chmod");
         }
-        collector_credential(&node, &ca, CLUSTER, n);
+        collector_credential(&node, &ca, cluster, n);
         std::fs::write(
             node.join("sts-jwks.json"),
             serde_json::to_vec_pretty(&ring.jwks()).expect("jwks"),
@@ -2869,7 +2880,7 @@ fn three_voters(dir: &Path) -> Cluster {
         })
         .collect();
     let manifest = serde_json::json!({
-        "cluster": hex(&CLUSTER),
+        "cluster": hex(&cluster),
         "domain": hex(&DOMAIN),
         "epoch": 1,
         "voters": voters,
@@ -4692,6 +4703,127 @@ async fn a_backup_restores_a_new_cluster_and_refuses_to_restore_the_old_one() {
         ],
     );
     assert_eq!(again.code, Some(2), "{}", again.out);
+}
+
+/// One backup restores every voter of a three-voter successor, and the
+/// three serve the restored state and agree past it (#307; task-d27's
+/// note on a restore's boundary).
+///
+/// The runbook fills one node. A voter of the successor that started
+/// from `init` instead would hold nothing at or below the backup's
+/// boundary, and no donor can serve it those commands with a decided
+/// record, because a shared checkpoint carries none. So until task-d32
+/// every voter of a successor is restored from the same backup, under
+/// the same attestation, each on its own configuration. This is that
+/// flow end to end.
+#[tokio::test(flavor = "multi_thread")]
+async fn one_backup_restores_every_voter_of_a_successor() {
+    // Three voters on both sides, so that a release build serves them
+    // too: it refuses the one-voter test profile.
+    let dir = workspace("restore-every-voter");
+    let old = three_voters(&dir);
+    for config in &old.configs {
+        assert_eq!(run(config, &["init"]).code, Some(0), "each store is made");
+    }
+    {
+        let running: Vec<Running> = old.configs.iter().map(|c| start(c)).collect();
+        for node in &running {
+            assert!(
+                node.waits_to_say("voters submittable=2 of 2"),
+                "{}",
+                node.said()
+            );
+        }
+        let caller = Caller::bind(&running[0], &old.ca, &old.ring, [0x59; 16]).await;
+        ask(&caller.connection, &caller.put(1, b"k", b"v"))
+            .await
+            .unwrap_or_else(|| panic!("the cluster answered the request\n{}", running[0].said()));
+        // The backup is voter 1's store, so voter 1 has executed it.
+        let read = read_projected(&caller, 2, b"k")
+            .await
+            .expect("voter 1 answered the read");
+        assert_eq!(read_value(&read).as_deref(), Some(&b"v"[..]));
+    }
+    let out = dir.join("backup");
+    let taken = run(&old.configs[0], &["backup", "--out", out.to_str().unwrap()]);
+    assert_eq!(taken.code, Some(0), "{}", taken.err);
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.join("backup.json")).expect("manifest"))
+            .expect("json");
+
+    let new_dir = workspace("restore-every-voter-successor");
+    let new_cluster = [0xc7u8; 16];
+    let successor = three_voters_of(&new_dir, new_cluster);
+    let attestation = fencing_file(
+        &dir,
+        "fencing.json",
+        CLUSTER,
+        new_cluster,
+        &manifest["root"],
+    );
+    for (n, config) in successor.configs.iter().enumerate() {
+        let restored = run(
+            config,
+            &[
+                "restore",
+                "--dir",
+                out.to_str().unwrap(),
+                "--fencing",
+                attestation.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(
+            restored.code,
+            Some(0),
+            "voter {} of the successor was not restored:\n{}{}",
+            n + 1,
+            restored.out,
+            restored.err
+        );
+    }
+
+    let running: Vec<Running> = successor.configs.iter().map(|c| start(c)).collect();
+    for (n, node) in running.iter().enumerate() {
+        assert!(
+            node.waits_to_say("voters submittable=2 of 2"),
+            "restored voter {} cannot submit to the other two:\n{}",
+            n + 1,
+            node.said()
+        );
+    }
+
+    // The three agree on a command past the boundary...
+    let caller = Caller::bind(&running[0], &successor.ca, &successor.ring, [0x5b; 16]).await;
+    let Some(answer) = ask(&caller.connection, &caller.put(1, b"k2", b"w")).await else {
+        panic!(
+            "the restored voters never agreed on a new command\n-- voter 1 --\n{}\n-- voter 2 --\n{}\n-- voter 3 --\n{}",
+            running[0].said(),
+            running[1].said(),
+            running[2].said()
+        );
+    };
+    assert!(
+        matches!(
+            response_of(&answer).outcome,
+            coord_types::wire_v1::OutcomeV1::Ok { .. }
+        ),
+        "the restored voters answered the new command with {:?}",
+        response_of(&answer)
+    );
+
+    // ...and serve what the backup held, from each of them.
+    for (n, node) in running.iter().enumerate() {
+        let reader = Caller::bind(node, &successor.ca, &successor.ring, [0x60 + n as u8; 16]).await;
+        let read = read_projected(&reader, 1, b"k")
+            .await
+            .unwrap_or_else(|| panic!("restored voter {} did not answer the read", n + 1));
+        assert_eq!(
+            read_value(&read).as_deref(),
+            Some(&b"v"[..]),
+            "restored voter {} did not serve the backup's key",
+            n + 1
+        );
+    }
 }
 
 /// A restore that stopped after its policy and before its pin is refused
