@@ -1945,6 +1945,131 @@ fn a_refusal_at_the_cut_that_is_lost_is_sent_again_when_the_candidate_asks_for_i
     );
 }
 
+/// The leader's copy of the refusal at the cut (task-d119; #309 review).
+/// A leader that a candidate's `NewLeader` reaches promises and cuts its
+/// report in `deliver_due_report`, once the promise's batch is durable,
+/// and reads task-d10's rule again there as a follower does.
+///
+/// r1 leads ballot 2: it executed 72 commands, each naming the one
+/// before, and holds the 73rd committed and not yet executed. r2, which
+/// executed 40, campaigns; 72 is not more than a table past 40, so r1
+/// promises. Before the promise's batch is durable, r1 executes the
+/// 73rd. At the cut it refuses r2 instead of sending its report, keeps
+/// the refusal, and sends it again when r2 asks for the report's pages.
+#[test]
+fn a_leader_that_executes_past_the_window_before_its_cut_refuses_the_candidate() {
+    let b2 = ballot(2, 1);
+    let b3 = cut_past_the_window();
+    let pos = |n: u64| ExecutionPosition::new(n).unwrap();
+    let commands = chained_commands();
+    let id = |n: usize| commands[n - 1].0;
+    let (mut r1, _) = Leader::from_recovered(
+        chained_voter(1, b2, &commands, 73, 72).into_recovered(),
+        quorum(b2),
+        &SyncDecision {
+            ballot: b2,
+            source_ballot: ballot(1, 0),
+            entries: BTreeMap::new(),
+            reproposed: BTreeSet::new(),
+        },
+    );
+    let mut r2 = chained_voter(2, b2, &commands, 40, 40);
+    assert_eq!(r1.next_executable(), Some(id(73)));
+
+    // r2 campaigns, and r1 promises; the promise's batch is held.
+    let mut campaign = r2.campaign(b3);
+    for e in durable_events(&campaign.clone()) {
+        campaign.extend(settle_collecting(&mut r2, e));
+    }
+    let new_leader = sent_to(&campaign, r(1))
+        .into_iter()
+        .find(|m| matches!(m, ProtocolMessage::NewLeader { .. }))
+        .unwrap_or_else(|| panic!("no NewLeader to r1: {:?}", r2.take_rejections()));
+    let promised = r1.step(peer_event(r(2), new_leader));
+    assert!(r1.take_rejections().is_empty());
+
+    // r1 executes the 73rd before the cut.
+    let executed = r1
+        .applied(
+            id(73),
+            &AppliedOutcome {
+                position: pos(73),
+                revision: None,
+                result_digest: Digest32([0x73; 32]),
+                response: Vec::new(),
+            },
+        )
+        .unwrap();
+    assert_eq!(r1.executed_through(), pos(73));
+    let mut sent = promised.clone();
+    sent.extend(executed.iter().cloned());
+    let mut pending: VecDeque<Event> = durable_events(&executed).into();
+    // The promise's batch is durable: the report is cut, or refused.
+    pending.extend(durable_events(&promised));
+    while let Some(e) = pending.pop_front() {
+        let out = r1.step(e);
+        pending.extend(durable_events(&out));
+        sent.extend(out);
+    }
+
+    let own = pos(73);
+    assert_eq!(
+        r1.take_rejections(),
+        vec![coord_consensus::Rejection::Promise(
+            coord_consensus::PromiseRejection::CandidateBehind {
+                candidate: pos(40),
+                own,
+            }
+        )]
+    );
+    let refusal = ProtocolMessage::PromiseRefused {
+        ballot: b3,
+        replica: r(1),
+        executed: own,
+    };
+    let from_r1 = sent_to(&sent, r(2));
+    assert!(
+        !from_r1
+            .iter()
+            .any(|m| matches!(m, ProtocolMessage::ReportPage(_))),
+        "{from_r1:?}"
+    );
+    assert!(from_r1.contains(&refusal), "{from_r1:?}");
+
+    // The refusal is lost. r2 has r1's promise, so it asks for the
+    // report's pages, and r1 answers with the refusal it kept.
+    deliver(&mut r2, r(1), from_r1.into_iter().filter(|m| *m != refusal));
+    let asked = sent_to(&r2.request_report_pages(), r(1));
+    assert!(
+        asked.iter().any(|m| matches!(
+            m,
+            ProtocolMessage::ReportPageRequest { ballot, .. } if *ballot == b3
+        )),
+        "{asked:?}"
+    );
+    let mut answer = Vec::new();
+    for message in asked {
+        answer.extend(r1.step(peer_event(r(2), message)));
+    }
+    let answer = sent_to(&answer, r(2));
+    assert_eq!(answer, vec![refusal]);
+    deliver(&mut r2, r(1), answer);
+    let refused = r2.take_rejections();
+    assert!(
+        refused.contains(&FollowerRejection::CampaignRefused {
+            by: r(1),
+            executed: own,
+        }),
+        "{refused:?}"
+    );
+    assert!(
+        !refused
+            .iter()
+            .any(|x| matches!(x, FollowerRejection::Behind { .. })),
+        "{refused:?}"
+    );
+}
+
 /// The ballot r2 campaigns at in [`pulled_past_the_window`].
 fn cut_past_the_window() -> Ballot {
     ballot(3, 2)
@@ -1963,56 +2088,86 @@ struct PulledPastTheWindow {
     forgotten_before_the_cut: bool,
 }
 
-fn pulled_past_the_window() -> PulledPastTheWindow {
-    let b2 = ballot(2, 0);
-    let b3 = cut_past_the_window();
-    let pos = |n: u64| ExecutionPosition::new(n).unwrap();
-    let commands: Vec<(CommandId, coord_consensus::PayloadRecordV1)> =
-        (1..=73u64).map(outside_command).collect();
-    let id = |n: usize| commands[n - 1].0;
-    let record = |n: usize| CommandRecord {
+/// The commands of way (1)'s schedule (task-d119): 73, all on one key,
+/// each naming the one before.
+fn chained_commands() -> Vec<(CommandId, coord_consensus::PayloadRecordV1)> {
+    (1..=73u64).map(outside_command).collect()
+}
+
+/// The `n`th of `commands` decided at COMMIT, naming the one before.
+fn chained_record(
+    commands: &[(CommandId, coord_consensus::PayloadRecordV1)],
+    n: usize,
+) -> CommandRecord {
+    CommandRecord {
         phase: Phase::Commit,
-        deps: if n == 1 { Vec::new() } else { vec![id(n - 1)] },
+        deps: if n == 1 {
+            Vec::new()
+        } else {
+            vec![commands[n - 2].0]
+        },
         keys: vec![vec![7]],
         payload: Some(commands[n - 1].1.admission_digest()),
         paths: Vec::new(),
         synced_seq: Some(1),
         path: coord_consensus::empty_path(),
-    };
-    // A voter of ballot 2 that executed the first `n`, retired in order.
-    let voter = |me: u8, n: usize| {
-        let mut f = Follower::recover_with_syncs(
-            FollowerConfig {
-                identity: identity(me),
-                quorum: quorum(b2),
-                genesis: ballot(0, 0),
-                frontend: FRONTEND,
-                capacity: 32,
+    }
+}
+
+/// Voter `me` of ballot `b`, with a table of 32, holding the first `held`
+/// of `commands` decided and having executed the first `executed`,
+/// retired in order.
+fn chained_voter(
+    me: u8,
+    b: Ballot,
+    commands: &[(CommandId, coord_consensus::PayloadRecordV1)],
+    held: usize,
+    executed: usize,
+) -> Follower {
+    let pos = |n: u64| ExecutionPosition::new(n).unwrap();
+    let mut f = Follower::recover_with_syncs(
+        FollowerConfig {
+            identity: identity(me),
+            quorum: quorum(b),
+            genesis: ballot(0, 0),
+            frontend: FRONTEND,
+            capacity: 32,
+        },
+        Some(coord_consensus::PromiseRecordV1 {
+            promised: b,
+            synced: b,
+        }),
+        None,
+        (1..=held).map(|i| (commands[i - 1].0, chained_record(commands, i))),
+        commands[..held].iter().cloned(),
+        vec![(
+            b,
+            SyncDecision {
+                ballot: b,
+                source_ballot: ballot(1, 0),
+                entries: BTreeMap::new(),
+                reproposed: BTreeSet::new(),
             },
-            Some(coord_consensus::PromiseRecordV1 {
-                promised: b2,
-                synced: b2,
-            }),
-            None,
-            (1..=n).map(|i| (id(i), record(i))),
-            commands[..n].iter().cloned(),
-            vec![(
-                b2,
-                SyncDecision {
-                    ballot: b2,
-                    source_ballot: ballot(1, 0),
-                    entries: BTreeMap::new(),
-                    reproposed: BTreeSet::new(),
-                },
-            )],
-            pos(n as u64),
-        )
-        .restore_execution(pos(n as u64), (1..=n).map(id));
-        f.step(boot_event(me));
-        f
-    };
-    let mut r1 = voter(1, 72);
-    let mut r2 = voter(2, 40);
+        )],
+        pos(executed as u64),
+    )
+    .restore_execution(
+        pos(executed as u64),
+        commands[..executed].iter().map(|(c, _)| *c),
+    );
+    f.step(boot_event(me));
+    f
+}
+
+fn pulled_past_the_window() -> PulledPastTheWindow {
+    let b2 = ballot(2, 0);
+    let b3 = cut_past_the_window();
+    let pos = |n: u64| ExecutionPosition::new(n).unwrap();
+    let commands = chained_commands();
+    let id = |n: usize| commands[n - 1].0;
+    let record = |n: usize| chained_record(&commands, n);
+    let mut r1 = chained_voter(1, b2, &commands, 72, 72);
+    let mut r2 = chained_voter(2, b2, &commands, 40, 40);
     assert!(!r1.table().forgotten(&id(41)));
     assert_eq!(catch_up_asks(&r1.request_catch_up(r(0))), vec![pos(72)]);
 
@@ -7042,7 +7197,8 @@ fn a_selection_naming_a_dependency_no_report_holds_is_given_up_as_behind() {
         f.unreported_drops(),
         coord_consensus::UnreportedDrops {
             undecided: 1,
-            bound: 0
+            bound_decided: 0,
+            bound_undecided: 0,
         }
     );
     // It does not campaign again this boot.
@@ -7073,19 +7229,20 @@ fn step_durably(f: &mut Follower, event: Event) {
     }
 }
 
-/// A voter that refused a ballot's re-proposal under its promise, and
-/// then installed that ballot's Sync, whose entry names the re-proposed
-/// command, asks the leader for it on the leader's commit frontier
-/// (task-d119, asking again).
-///
-/// Seed 147's node 1: its promise was in flight when ballot 7's
-/// re-proposals of `9157` arrived (`FencedByPromise`), and the Sync's
-/// `9d97` names `9157`. Nothing sent the re-proposal again, so the entry
-/// waited for ever, and a later campaign whose reports held no other copy
-/// gave up on a dependency no report holds. Answered, the voter adopts
-/// the command and installs the entry.
-#[test]
-fn a_voter_asks_for_a_reproposal_its_promise_fenced_off_that_a_sync_entry_names() {
+/// Seed 147's node 1 in a test (task-d119): r1 refused ballot `b`'s
+/// re-proposal of `d` under its promise, then installed `b`'s Sync, whose
+/// `x` at ACCEPT names `d`. `x` waits for `d`. With the proposal of `d`
+/// and its payload, for the answer.
+struct FencedOffReproposal {
+    f: Follower,
+    b: Ballot,
+    d: CommandId,
+    x: CommandId,
+    proposal: coord_consensus::FastAck,
+    payload_d: coord_consensus::PayloadRecordV1,
+}
+
+fn fenced_off_reproposal_a_sync_entry_names() -> FencedOffReproposal {
     let b = ballot(1, 2);
     let mut donor = standalone(2, 32);
     let (d, admit_d) = admission(901, 9);
@@ -7154,6 +7311,37 @@ fn a_voter_asks_for_a_reproposal_its_promise_fenced_off_that_a_sync_entry_names(
         f.table().phase_of(&x) < Some(Phase::Accept),
         "x waits for d"
     );
+    FencedOffReproposal {
+        f,
+        b,
+        d,
+        x,
+        proposal,
+        payload_d: payload(&d),
+    }
+}
+
+/// A voter that refused a ballot's re-proposal under its promise, and
+/// then installed that ballot's Sync, whose entry names the re-proposed
+/// command, asks the leader for it on the leader's commit frontier
+/// (task-d119, asking again).
+///
+/// Seed 147's node 1: its promise was in flight when ballot 7's
+/// re-proposals of `9157` arrived (`FencedByPromise`), and the Sync's
+/// `9d97` names `9157`. Nothing sent the re-proposal again, so the entry
+/// waited for ever, and a later campaign whose reports held no other copy
+/// gave up on a dependency no report holds. Answered, the voter adopts
+/// the command and installs the entry.
+#[test]
+fn a_voter_asks_for_a_reproposal_its_promise_fenced_off_that_a_sync_entry_names() {
+    let FencedOffReproposal {
+        mut f,
+        b,
+        d,
+        x,
+        proposal,
+        payload_d,
+    } = fenced_off_reproposal_a_sync_entry_names();
 
     // The leader's commit frontier: r1 asks it for d, and the leader
     // answers what it is asked.
@@ -7164,15 +7352,7 @@ fn a_voter_asks_for_a_reproposal_its_promise_fenced_off_that_a_sync_entry_names(
             through: 0,
         },
     ));
-    let to_leader: Vec<ProtocolMessage> = asked
-        .iter()
-        .filter_map(|e| match e {
-            Effect::SendWhenDurable { to, frame, .. } if to.replica == r(2) => {
-                ProtocolMessage::decode(frame).ok()
-            }
-            _ => None,
-        })
-        .collect();
+    let to_leader = sent_to(&asked, r(2));
     let asked_for_d = to_leader.iter().any(|m| {
         matches!(m, ProtocolMessage::ProposalRequest { ballot, commands }
             if *ballot == b && commands.contains(&d))
@@ -7189,7 +7369,7 @@ fn a_voter_asks_for_a_reproposal_its_promise_fenced_off_that_a_sync_entry_names(
                 r(2),
                 ProtocolMessage::PayloadResponse {
                     command: d,
-                    payload: payload(&d),
+                    payload: payload_d,
                 },
             ),
         );
@@ -7210,6 +7390,48 @@ fn a_voter_asks_for_a_reproposal_its_promise_fenced_off_that_a_sync_entry_names(
             commands: vec![d],
         }),
         "{to_leader:?}"
+    );
+}
+
+/// The same voter, once it promised a later ballot, doesn't ask for the
+/// re-proposal (#309 review): it would refuse the answer under its
+/// promise (`FencedByPromise`), so asking on every frontier of the old
+/// leader is traffic with no use.
+#[test]
+fn a_voter_that_promised_a_later_ballot_does_not_ask_for_a_reproposal() {
+    let FencedOffReproposal { mut f, b, d, x, .. } = fenced_off_reproposal_a_sync_entry_names();
+    // r0's campaign for a later ballot: r1 promises it durably.
+    step_durably(
+        &mut f,
+        peer_event(
+            r(0),
+            ProtocolMessage::NewLeader {
+                ballot: ballot(2, 0),
+                executed: ExecutionPosition::ZERO,
+            },
+        ),
+    );
+    assert_eq!(f.ballots().promised(), ballot(2, 0));
+    assert_eq!(f.quorum().ballot(), b, "it still follows b");
+    // r2, not knowing it is deposed, sends b's frontier.
+    let asked = f.step(peer_event(
+        r(2),
+        ProtocolMessage::Committed {
+            ballot: b,
+            through: 0,
+        },
+    ));
+    let to_leader = sent_to(&asked, r(2));
+    assert!(
+        !to_leader.iter().any(|m| matches!(
+            m,
+            ProtocolMessage::ProposalRequest { commands, .. } if commands.contains(&d)
+        )),
+        "{to_leader:?}"
+    );
+    assert!(
+        f.table().phase_of(&x) < Some(Phase::Accept),
+        "x still waits"
     );
 }
 
