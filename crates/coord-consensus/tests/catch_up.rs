@@ -682,8 +682,15 @@ impl Cluster {
 /// still holds, so r4 is left with proposals it cannot adopt and
 /// submissions it cannot learn, and its table fills.
 fn left_behind(seed: u64) -> (Cluster, usize) {
+    left_behind_with(seed, |_| {})
+}
+
+/// [`left_behind`], with `before` done to the cluster before r4 is cut
+/// off.
+fn left_behind_with(seed: u64, before: impl FnOnce(&mut Cluster)) -> (Cluster, usize) {
     let capacity = 8;
     let mut cluster = Cluster::new(seed, capacity);
+    before(&mut cluster);
     cluster.down = vec![4];
     for seq in 1..=40 {
         cluster.admit(seq);
@@ -2543,4 +2550,350 @@ fn a_command_past_the_byte_bound_alone_is_taken_by_itself() {
     cluster.serve = true;
     cluster.ask(4);
     assert_eq!(cluster.nodes[4].executed, cluster.nodes[0].executed);
+}
+
+/// The Sync rows node `i` holds durably: the selection of each ballot it
+/// synchronized to.
+fn sync_rows(cluster: &Cluster, i: usize) -> Vec<coord_consensus::SyncDecision> {
+    cluster.nodes[i]
+        .storage
+        .durable_rows()
+        .into_iter()
+        .filter(|(c, k, _)| *c == Collection::ProtocolV1.id().0 && k.len() == 33 && k[8] == 0x03)
+        .map(|(_, _, v)| coord_consensus::decode_sync(&v).unwrap().decision)
+        .collect()
+}
+
+/// r4 with the window of a command its donor kept no row of in hand, the
+/// window before it run: what a donor that swept the command's row sends
+/// (#302 review). The command is committed here with no dependencies,
+/// which are not its decision, for the window to run it at the donor's
+/// position. Returns its entry and the next one of the donor's page.
+fn holding_a_command_without_a_row(cluster: &mut Cluster) -> (CatchUpEntry, CatchUpEntry) {
+    let after = cluster.follower(4).executed_through();
+    let mut page = cluster.page(0, ballot0(), after);
+    let ProtocolMessage::CatchUpPage { entries, .. } = &mut page else {
+        unreachable!()
+    };
+    let next = entries[3].clone();
+    entries[2].decided = None;
+    entries.truncate(3);
+    let bare = entries[2].clone();
+    cluster.deliver_page(4, 0, &page);
+    cluster.execute_checked(4, 2);
+    let f = cluster.follower(4);
+    assert_eq!(f.next_executable(), Some(bare.command));
+    let record = f.table().record(&bare.command).expect("committed");
+    assert_eq!(
+        (record.phase, record.deps.as_slice()),
+        (Phase::Commit, &[][..])
+    );
+    let decided = cluster
+        .dependency_rows(0)
+        .into_iter()
+        .find(|(c, _)| *c == bare.command)
+        .map(|(_, r)| r.deps);
+    assert!(
+        decided.is_some_and(|d| !d.is_empty()),
+        "the donor decided it with no dependencies: the test shows nothing"
+    );
+    (bare, next)
+}
+
+fn ballot(number: u64, leader: u8) -> Ballot {
+    Ballot {
+        number,
+        leader: r(leader),
+        ..ballot0()
+    }
+}
+
+/// A Sync installed while the window of a command its donor kept no row
+/// of is in hand leaves the command out of what it carries (#302
+/// review): it is in no row here, so no report names it, a selection
+/// over the reports does not, and a restart forgets it, for catch-up to
+/// bring it again. Its window still runs it. Carried, as every record
+/// held at COMMIT is (task-d80), it was reported committed with no
+/// dependencies; the voters that decided it had forgotten it, so a
+/// selection took that, and a voter behind it that installed the
+/// selection ran it first, ahead of the commands it follows.
+#[test]
+fn a_sync_carries_no_command_its_donor_kept_no_row_of() {
+    for seed in [3, 5, 7, 11, 13] {
+        let (mut cluster, _) = left_behind(seed);
+        cluster.serve = false;
+        let (bare, _) = holding_a_command_without_a_row(&mut cluster);
+        let b1 = ballot(1, 0);
+        cluster.deliver(
+            4,
+            r(0),
+            ProtocolMessage::NewLeader {
+                ballot: b1,
+                executed: ExecutionPosition::ZERO,
+            }
+            .encode(),
+        );
+        let decision = coord_consensus::SyncDecision {
+            ballot: b1,
+            source_ballot: ballot0(),
+            entries: Default::default(),
+            reproposed: Default::default(),
+        };
+        cluster.deliver(4, r(0), ProtocolMessage::Sync(decision).encode());
+        let f = cluster.follower(4);
+        assert_eq!(f.quorum().ballot(), b1, "seed {seed}: the Sync installed");
+        assert!(
+            sync_rows(&cluster, 4)
+                .iter()
+                .all(|d| !d.entries.contains_key(&bare.command)),
+            "seed {seed}: the Sync row carries a command its donor kept no row of"
+        );
+        assert!(
+            cluster
+                .dependency_rows(4)
+                .iter()
+                .all(|(c, _)| *c != bare.command),
+            "seed {seed}: a row of it is durable"
+        );
+        let b2 = ballot(2, 1);
+        let report = f.report(b2);
+        assert!(
+            report.entries.iter().all(|e| e.command != bare.command),
+            "seed {seed}: reported as {:?}",
+            report
+                .entries
+                .iter()
+                .find(|e| e.command == bare.command)
+                .map(|e| (e.phase, &e.deps))
+        );
+        let reports = [
+            cluster.follower(1).report(b2),
+            cluster.follower(2).report(b2),
+            report,
+        ];
+        let config =
+            BallotConfiguration::c2_default(epoch(), b2, (0..VOTERS).map(r).collect()).unwrap();
+        let selected = coord_consensus::select(&config, &reports).expect("selected");
+        assert!(
+            !selected.entries.contains_key(&bare.command),
+            "seed {seed}: selected as {:?}",
+            selected
+                .entries
+                .get(&bare.command)
+                .map(|e| (e.phase, &e.deps))
+        );
+        // Its window still runs it, at the donor's position.
+        cluster.execute_checked(4, 1);
+        let ran = cluster.nodes[4].executed.len();
+        assert_eq!(
+            cluster.nodes[4].executed[ran - 1],
+            bare.command,
+            "seed {seed}"
+        );
+        assert_eq!(
+            cluster.nodes[4].executed[..],
+            cluster.nodes[0].executed[..ran],
+            "seed {seed}"
+        );
+    }
+}
+
+/// Nor do the rows a later command's batch carries (task-d90). Written
+/// with the batch of a Sync entry, an adoption or a payload that names
+/// it, each record the dependencies reach that has no row here gets one,
+/// so no durable row names a command this replica holds no row of. A
+/// command its donor kept no row of has none on purpose: written, its
+/// row is a durable decision of no dependencies, reported and restored
+/// as one. Here a Sync names the command after it, as a selection takes
+/// it from a voter that has not forgotten it.
+#[test]
+fn a_later_commands_rows_leave_out_a_command_its_donor_kept_no_row_of() {
+    for seed in [3, 5, 7, 11, 13] {
+        let (mut cluster, _) = left_behind(seed);
+        cluster.serve = false;
+        let (bare, next) = holding_a_command_without_a_row(&mut cluster);
+        let decided = next.decided.clone().expect("the donor's row of the next");
+        assert_eq!(decided.deps, vec![bare.command], "seed {seed}");
+        let b1 = ballot(1, 0);
+        cluster.deliver(
+            4,
+            r(0),
+            ProtocolMessage::NewLeader {
+                ballot: b1,
+                executed: ExecutionPosition::ZERO,
+            }
+            .encode(),
+        );
+        let entry = coord_consensus::SyncEntry {
+            command: next.command,
+            phase: Phase::Commit,
+            deps: decided.deps.clone(),
+            path: decided.path,
+            paths: decided.paths.clone(),
+            seqnum: decided.synced_seq.unwrap_or(0),
+            admission: decided.payload,
+        };
+        let decision = coord_consensus::SyncDecision {
+            ballot: b1,
+            source_ballot: ballot0(),
+            entries: [(next.command, entry)].into_iter().collect(),
+            reproposed: Default::default(),
+        };
+        cluster.deliver(4, r(0), ProtocolMessage::Sync(decision).encode());
+        cluster.deliver(
+            4,
+            r(0),
+            ProtocolMessage::PayloadResponse {
+                command: next.command,
+                payload: next.payload.clone(),
+            }
+            .encode(),
+        );
+        let f = cluster.follower(4);
+        assert_eq!(
+            f.table()
+                .record(&next.command)
+                .map(|r| (r.phase, r.deps.clone())),
+            Some((Phase::Commit, vec![bare.command])),
+            "seed {seed}: the next command installed"
+        );
+        assert!(
+            cluster
+                .dependency_rows(4)
+                .iter()
+                .all(|(c, _)| *c != bare.command),
+            "seed {seed}: the next command's batch wrote a row of it"
+        );
+        let report = f.report(ballot(2, 1));
+        assert!(
+            report.entries.iter().all(|e| e.command != bare.command),
+            "seed {seed}: reported"
+        );
+        // Its window runs it, and the next command after it.
+        cluster.execute_checked(4, 2);
+        let ran = cluster.nodes[4].executed.len();
+        assert_eq!(
+            cluster.nodes[4].executed[ran - 2..],
+            [bare.command, next.command],
+            "seed {seed}"
+        );
+        assert_eq!(
+            cluster.nodes[4].executed[..],
+            cluster.nodes[0].executed[..ran],
+            "seed {seed}"
+        );
+    }
+}
+
+/// The rewrite stages in the ledger each decided record it writes, as
+/// the installation did (#302 review). The failure dropped their staged
+/// rows, leaving the records ahead of them; staged again, they are
+/// current when `carry_stale` looks in the same step, so the event after
+/// the failure writes the window's rows in one batch and nothing writes
+/// them twice. Once that batch is durable, each is reported at COMMIT
+/// with the donor's dependencies.
+#[test]
+fn a_window_whose_batch_failed_is_written_again_in_one_batch() {
+    for seed in [3, 5, 7, 11, 13] {
+        let (mut cluster, _) = left_behind(seed);
+        cluster.serve = false;
+        let after = cluster.follower(4).executed_through();
+        let page = cluster.page(0, ballot0(), after);
+        cluster.failing = Some((4, 1));
+        cluster.deliver_page(4, 0, &page);
+        assert_eq!(cluster.failed, 1, "seed {seed}");
+        let window: Vec<&CatchUpEntry> = entries_of(&page)
+            .iter()
+            .filter(|e| cluster.follower(4).table().phase_of(&e.command) == Some(Phase::Commit))
+            .collect();
+        assert!(
+            window.len() > 1,
+            "seed {seed}: a window of one shows little"
+        );
+        cluster.tick();
+        let (from, frame) = cluster.nodes[4].inbox.pop_front().expect("announced");
+        let effects = cluster.step_peer(4, from, frame);
+        let written: Vec<usize> = effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Persist(batch) => Some(batch.updates.len()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            written,
+            [2 * window.len()],
+            "seed {seed}: batches written at the event after the failure, by rows"
+        );
+        cluster.handle(4, effects);
+        let report = cluster.follower(4).report(ballot(1, 1));
+        for e in &window {
+            let decided = e.decided.as_ref().expect("the donor's row");
+            assert_eq!(
+                report
+                    .entries
+                    .iter()
+                    .find(|r| r.command == e.command)
+                    .map(|r| (r.phase, &r.deps)),
+                Some((Phase::Commit, &decided.deps)),
+                "seed {seed}"
+            );
+        }
+    }
+}
+
+/// The rewrite deletes the dependency row of a command its donor kept
+/// no row of, as the installation did (#302 review): the command is
+/// committed here with no dependencies, which are not its decision, and
+/// is never reported. A row this replica holds of it from before -- here
+/// the pre-acceptance of its own submission, taken before it was cut off
+/// -- is gone once the rewrite is durable, as once the installation is.
+#[test]
+fn a_rewritten_window_deletes_the_row_of_a_command_its_donor_kept_no_row_of() {
+    for seed in [3, 5, 7, 11, 13] {
+        let mut own = None;
+        let (mut cluster, _) = left_behind_with(seed, |cluster| {
+            // r4 alone takes the domain's first request; nothing of it
+            // reaches the others, which take it from their own clients.
+            own = Some(cluster.admit_to(1, &[4], 9));
+            for node in &mut cluster.nodes {
+                node.inbox.clear();
+            }
+        });
+        let own = own.expect("submitted");
+        let held = |cluster: &Cluster| cluster.dependency_rows(4).iter().any(|(c, _)| *c == own);
+        assert!(
+            held(&cluster),
+            "seed {seed}: r4 holds no row of its submission"
+        );
+        cluster.serve = false;
+        let after = cluster.follower(4).executed_through();
+        let mut page = cluster.page(0, ballot0(), after);
+        let ProtocolMessage::CatchUpPage { entries, .. } = &mut page else {
+            unreachable!()
+        };
+        assert_eq!(entries[0].command, own, "seed {seed}");
+        entries[0].decided = None;
+        cluster.failing = Some((4, 1));
+        cluster.deliver_page(4, 0, &page);
+        assert_eq!(cluster.failed, 1, "seed {seed}");
+        assert!(
+            held(&cluster),
+            "seed {seed}: the failed batch deleted the row"
+        );
+        // The next event that is not a failure writes the window again.
+        cluster.tick();
+        let (from, frame) = cluster.nodes[4].inbox.pop_front().expect("announced");
+        cluster.deliver(4, from, frame);
+        assert!(
+            !held(&cluster),
+            "seed {seed}: the rewrite left r4's row of it"
+        );
+        cluster.execute_checked(4, 1);
+        assert_eq!(
+            cluster.nodes[4].executed.get(after.get() as usize),
+            Some(&own),
+            "seed {seed}"
+        );
+    }
 }

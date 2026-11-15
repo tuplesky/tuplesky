@@ -2562,6 +2562,7 @@ impl Follower {
             if r.phase == Phase::Commit
                 && !decision.entries.contains_key(c)
                 && !carried.contains_key(c)
+                && !self.bare_in_hand(c)
             {
                 held.push(*c);
                 carried.insert(
@@ -6448,6 +6449,7 @@ impl Follower {
             // payload for ever (protocol_sim row 21 with its queue
             // failed, five voters, seed 378).
             if !seen.insert(d)
+                || self.bare_in_hand(&d)
                 || (self.ledger.written(&d) && !self.stale(&d) && self.payload_row(&d).is_some())
             {
                 continue;
@@ -6466,6 +6468,20 @@ impl Follower {
             carried.push((d, record));
         }
         carried
+    }
+
+    /// Whether `command` is the window in hand of a command its donor kept
+    /// no row of (#302 review): committed here so that it runs at the
+    /// donor's position, with no dependencies, which are not its decision.
+    /// The window deletes its dependency row so that it is never reported
+    /// as one, and nothing else writes it: a Sync's carry and a vote's
+    /// rows leave it out. A restart forgets it, and catch-up brings it
+    /// again.
+    fn bare_in_hand(&self, command: &CommandId) -> bool {
+        self.catch_up
+            .running
+            .front()
+            .is_some_and(|r| r.command == *command && r.entry.decided.is_none())
     }
 
     /// Stage under `barrier` the records [`Follower::unwritten`] carried,
