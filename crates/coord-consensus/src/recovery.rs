@@ -1252,6 +1252,18 @@ fn possible_fast_decisions(
     // with `member`, that member holds undecided), and the candidate did
     // not decide itself: the ones the selection re-proposes and the new
     // leader chains after the recovered order (task-d71).
+    //
+    // With `member`, a command it holds no record of counts too when
+    // another report holds it undecided (seed 147, row 10, three voters,
+    // no catch-up, loss 750000). The member's acceptance that names it is
+    // the leader's -- here the entry of a durable Sync whose installation
+    // waits for it, after the member refused its re-proposal while its
+    // promise was in flight -- so the member's never holding it says
+    // nothing of an execution there. The selection re-proposes it, and
+    // the candidate follows it as it follows any re-proposal. Left out,
+    // the member's closure stopped at it, the order check dropped the
+    // candidate a fast quorum had decided, and the candidate was
+    // re-proposed under other dependencies.
     let undecided_reached = |deps: &[CommandId],
                              candidates: &BTreeMap<CommandId, (ReportEntry, usize)>,
                              member: Option<usize>|
@@ -1270,7 +1282,8 @@ fn possible_fast_decisions(
                 stack.extend(e.deps.iter().copied());
             } else if !decided.decided(&d)
                 && match member {
-                    Some(m) => record(m, &d).is_some_and(|r| r.phase < Phase::Commit),
+                    Some(m) => record(m, &d)
+                        .map_or_else(|| held_undecided.contains(&d), |r| r.phase < Phase::Commit),
                     None => held_undecided.contains(&d),
                 }
             {
@@ -1835,6 +1848,145 @@ mod tests {
             .entries
             .push(entry(22, Phase::PreAccept, alloc::vec![id(2)], 9));
         assert_eq!(select(&twice), select(&once));
+    }
+
+    /// Seed 147's shape (protocol_sim row 10, three voters, no catch-up,
+    /// three in four acknowledgements to a follower lost). The source
+    /// leader r0 ordered A, D, X, C on one key, each after the one before.
+    /// The fast-set member restarted and refused D's re-proposal while its
+    /// promise was in flight, and was never sent it again. It took r0's
+    /// Sync, which keeps X at ACCEPT naming D, and whose installation of X
+    /// waits for D; and it pre-accepted C after X. So it reports A and X at
+    /// ACCEPT and C pre-accepted, and no record of D. A fast quorum of r0
+    /// and the member decided C with the dependency {X}. The other reporter
+    /// holds A and X, and D at an old pre-acceptance (`other_holds_d`) or
+    /// not at all.
+    fn a_fast_candidate_behind_an_unheld_dependency(other_holds_d: bool) -> SyncDecision {
+        let epoch = ConfigurationEpoch::new(1).unwrap();
+        let source =
+            BallotConfiguration::c2_default(epoch, ballot(0, 0), (0..3).map(r).collect()).unwrap();
+        let member = (1u8..3)
+            .find(|v| source.fast_set().contains(&r(*v)))
+            .unwrap();
+        let other = 3 - member;
+        let config =
+            BallotConfiguration::c2_default(epoch, ballot(1, other), (0..3).map(r).collect())
+                .unwrap();
+        // All on one key.
+        let (a, d, x, c) = (0u64, 5, 10, 15);
+        let held = alloc::vec![
+            entry(a, Phase::Accept, Vec::new(), 1),
+            entry(x, Phase::Accept, alloc::vec![id(d)], 1),
+        ];
+        let mut of_member = held.clone();
+        of_member.push(entry(c, Phase::PreAccept, alloc::vec![id(x)], 1));
+        let mut of_other = held;
+        if other_holds_d {
+            of_other.push(entry(d, Phase::PreAccept, Vec::new(), 4));
+        }
+        let report = |replica: u8, entries: Vec<ReportEntry>| RecoveryReport {
+            replica: r(replica),
+            ballot: ballot(1, other),
+            committed_ballot: ballot(0, 0),
+            entries,
+        };
+        select_counted(
+            &config,
+            &[report(member, of_member), report(other, of_other)],
+            |_, _| false,
+            |_| None,
+            &|_: &CommandId| false,
+            SelectionRules::default(),
+            &Cell::new(0),
+        )
+        .unwrap()
+    }
+
+    /// Seed 147 (row 10, three voters, no catch-up, loss 750000): a fast
+    /// candidate whose member's closure stops at a command the member
+    /// never held, which another report holds undecided. The selection
+    /// re-proposes that command and keeps the candidate with the
+    /// dependencies it was learned with, after it. Before, the member's
+    /// cut closure was read as an order that left A out, the candidate was
+    /// re-proposed, and a voter executed it under other dependencies than
+    /// the frontend learned.
+    #[test]
+    fn a_fast_candidate_behind_a_dependency_its_member_never_held_is_kept() {
+        let decision = a_fast_candidate_behind_an_unheld_dependency(true);
+        let kept = decision.entries.get(&id(15)).map(|e| e.deps.clone());
+        assert_eq!(kept, Some(alloc::vec![id(10)]), "C kept with {{X}}");
+        assert!(!decision.reproposed.contains(&id(15)), "C not re-proposed");
+        assert!(decision.reproposed.contains(&id(5)), "D re-proposed");
+    }
+
+    /// KNOWN GAP, not a rule. This pins today's behaviour; it is an open
+    /// item on #185 until a design note settles it.
+    ///
+    /// The same shape with no report holding D at all. Today the member's
+    /// closure stops at D, the order check reads that as an order that
+    /// leaves A out, and C is re-proposed. But a fast quorum decided C with
+    /// {X}: re-proposed, C may execute somewhere under other dependencies
+    /// than the frontend learned, which is seed 147's failure again if a
+    /// run reaches this shape. task-d71's model test
+    /// `a_candidate_after_a_command_executed_after_an_adopted_one_is_kept`
+    /// re-proposes in the same shape ("nothing known, nothing kept") though
+    /// its own story says c was decided fast. A rule that keeps C here must
+    /// show it cannot leave C unordered against A when the member executed
+    /// and forgot D before A (the test below).
+    #[test]
+    fn known_gap_a_fast_candidate_behind_a_dependency_no_report_holds_is_reproposed() {
+        let decision = a_fast_candidate_behind_an_unheld_dependency(false);
+        assert!(decision.reproposed.contains(&id(15)), "C re-proposed");
+        assert!(!decision.entries.contains_key(&id(15)), "C not kept");
+        assert!(!decision.reproposed.contains(&id(5)), "D held by no report");
+    }
+
+    /// What any rule that closes the gap above must still do. No report
+    /// holds D, and A follows X as well: the source leader ordered D, X,
+    /// A, C, and the member pre-accepted C after X before it took A. Every
+    /// reporter may have executed and forgotten D, so D orders nothing
+    /// between A and C, and kept with {X}, C would be unordered against A.
+    /// So C is re-proposed after the recovered order, A included.
+    #[test]
+    fn a_candidate_beside_an_adopted_command_that_follows_the_same_unheld_dependency_is_reproposed()
+    {
+        let epoch = ConfigurationEpoch::new(1).unwrap();
+        let source =
+            BallotConfiguration::c2_default(epoch, ballot(0, 0), (0..3).map(r).collect()).unwrap();
+        let member = (1u8..3)
+            .find(|v| source.fast_set().contains(&r(*v)))
+            .unwrap();
+        let other = 3 - member;
+        let config =
+            BallotConfiguration::c2_default(epoch, ballot(1, other), (0..3).map(r).collect())
+                .unwrap();
+        // All on one key.
+        let (a, d, x, c) = (0u64, 5, 10, 15);
+        let held = alloc::vec![
+            entry(x, Phase::Accept, alloc::vec![id(d)], 1),
+            entry(a, Phase::Accept, alloc::vec![id(x)], 1),
+        ];
+        let mut of_member = held.clone();
+        of_member.push(entry(c, Phase::PreAccept, alloc::vec![id(x)], 1));
+        let report = |replica: u8, entries: Vec<ReportEntry>| RecoveryReport {
+            replica: r(replica),
+            ballot: ballot(1, other),
+            committed_ballot: ballot(0, 0),
+            entries,
+        };
+        let decision = select_counted(
+            &config,
+            &[report(member, of_member), report(other, held)],
+            |_, _| false,
+            |_| None,
+            &|_: &CommandId| false,
+            SelectionRules::default(),
+            &Cell::new(0),
+        )
+        .unwrap();
+        assert!(!decision.entries.contains_key(&id(15)), "C not kept");
+        assert!(decision.reproposed.contains(&id(15)), "C re-proposed");
+        assert!(decision.entries.contains_key(&id(0)), "A adopted");
     }
 
     /// The cost a pass still has (task-d108 review): each pass judges every
