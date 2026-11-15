@@ -39,6 +39,7 @@
 
 pub mod budget;
 pub mod config;
+pub mod congestion;
 pub mod endpoint;
 pub mod frames;
 pub mod identity;

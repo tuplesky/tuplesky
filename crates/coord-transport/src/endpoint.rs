@@ -678,6 +678,16 @@ pub struct PathReading {
     pub min_rtt: Duration,
     /// The congestion window, in bytes.
     pub cwnd: u64,
+    /// Where the connection runs BBR: the least round trip BBR sizes its
+    /// window from, the one [`GuardedBbr`](crate::congestion::GuardedBbr)
+    /// adopted. None under another controller, or before a packet was
+    /// acknowledged.
+    pub bbr_min_rtt: Option<Duration>,
+    /// Where the connection runs BBR: how many times quinn's least fell
+    /// on a late sample and was not adopted
+    /// ([`GuardedBbr::late_minimums`](crate::congestion::GuardedBbr::late_minimums)).
+    /// None under another controller.
+    pub late_minimums: Option<u64>,
     /// Congestion events: each a cut of the window.
     pub congestion_events: u64,
     /// Packets this side sent and judged lost.
@@ -691,6 +701,12 @@ pub struct PathReading {
 impl PathReading {
     fn of(peer: &Peer) -> Self {
         let path = peer.conn.stats().path;
+        let bbr = peer
+            .conn
+            .congestion_state()
+            .into_any()
+            .downcast::<crate::congestion::GuardedBbr>()
+            .ok();
         PathReading {
             class: peer.class,
             lane: peer.lane,
@@ -701,6 +717,8 @@ impl PathReading {
             rtt: path.rtt,
             min_rtt: path.min_rtt,
             cwnd: path.cwnd,
+            bbr_min_rtt: bbr.as_ref().and_then(|bbr| bbr.adopted_min_rtt()),
+            late_minimums: bbr.as_ref().map(|bbr| bbr.late_minimums()),
             congestion_events: path.congestion_events,
             lost_packets: path.lost_packets,
             lost_bytes: path.lost_bytes,
