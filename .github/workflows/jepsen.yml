@@ -110,7 +110,7 @@ on:
         description: "Seconds every TupleSky voter's inbound peer-plane traffic is dropped from the workload's start, the collectors still reaching every voter (through --hold-peer-links; task-d67's start-up row); empty or 0 for none"
         default: ""
       pair-base:
-        description: "Run TupleSky in pairs on one runner against this base: a tuplesky ref (a branch, a tag or a full commit SHA, which actions/checkout needs whole) built beside the head, env:NAME=VALUE for the head's own build with that variable on every voter, harness:COORD_HARNESS_NAME=VALUE for the head's own build with that variable where the harness provisions it (a setting the harness writes into every voter's coordd.toml, such as COORD_HARNESS_PROJECTION_COMMIT_RECORDS=0), profile:strict or profile:replay for the head's own build on that journal profile (the profile input is the head's), quirks:LIST for the head's own build with the etcd mix drawn with those --etcd-register-quirks (register-etcd-mix workloads; first for the generator through jepsen 2057754 as it ran then, none for etcd's literal expression), or same for the head's own build (voter-workers BASE/HEAD then sets the sides apart); empty for one run"
+        description: "Run TupleSky in pairs on one runner against this base: a tuplesky ref (a branch, a tag or a full commit SHA, which actions/checkout needs whole) built beside the head, env:NAME=VALUE for the head's own build with that variable on every voter, harness:COORD_HARNESS_NAME=VALUE for the head's own build with that variable where the harness provisions it (a setting the harness writes into every voter's coordd.toml, such as COORD_HARNESS_PROJECTION_COMMIT_RECORDS=0), profile:strict or profile:replay for the head's own build on that journal profile (the profile input is the head's), quirks:LIST for the head's own build with the etcd mix drawn with those --etcd-register-quirks (register-etcd-mix workloads; first for the generator through jepsen 2057754 as it ran then, none for etcd's literal expression), or same for the head's own build (voter-workers BASE/HEAD then sets the sides apart); REF+env:NAME=VALUE runs that ref's build on both sides, the base with that variable on every voter, such as a product branch's commit+env:COORDD_CONGESTION=bbr (this branch's build then serves only the client); empty for one run"
         default: ""
       pairs:
         description: "How many base and head pairs, when pair-base is set (the order alternates from pair to pair; empty for 3); in a sweep, the steps the base runs at, comma-separated (empty for every step), where base and head each run twice in both orders, base, head, head, base"
@@ -305,10 +305,12 @@ jobs:
           for b in coordd coord-harness coord-jepsen coord-jepsen-executed coordctl; do
             cp "tuplesky/target/release/$b" "$RUNNER_TEMP/head-bin/" 2>/dev/null || true
           done
+          # REF+env:NAME=VALUE checks out REF alone.
+          echo "PAIR_BASE_REF=${IN_PAIR_BASE%%+env:*}" >> "$GITHUB_ENV"
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         if: env.IN_PAIR_BASE != '' && env.IN_PAIR_BASE != 'same' && !startsWith(env.IN_PAIR_BASE, 'env:') && !startsWith(env.IN_PAIR_BASE, 'harness:') && !startsWith(env.IN_PAIR_BASE, 'profile:') && !startsWith(env.IN_PAIR_BASE, 'quirks:')
         with:
-          ref: ${{ inputs.pair-base }}
+          ref: ${{ env.PAIR_BASE_REF }}
           path: tuplesky-base
           persist-credentials: false
       - name: Build the pair's base
@@ -842,6 +844,21 @@ jobs:
               fi
               base_bin=$head_bin
               base_name="$head_sha with $base_harness" ;;
+            *+env:*)
+              # That ref's build on both sides, the base with the variable:
+              # this branch's build serves only the client, which the base's
+              # build step copied beside the ref's binaries where it has none.
+              if ! grep -q -- '--voter-env' src/jepsen/tuplesky.clj; then
+                echo "::error::tuplesky/jepsen@$JEPSEN_REF has no --voter-env; dispatch with a jepsen-ref that has it"
+                exit 1
+              fi
+              if ! grep -q max_admitted_per_second \
+                  "$GITHUB_WORKSPACE/tuplesky-base/crates/coord-harness/src/bin/coord-harness.rs"; then
+                echo "::warning::pair-base $IN_PAIR_BASE provisions no admission rate: its frontends admit the daemon's 1000 a second, the head's $ADMISSION_RATE"
+              fi
+              head_bin=$base_bin base_args=(--voter-env "${IN_PAIR_BASE#*+env:}")
+              head_sha="$PAIR_BASE_REF at $(git -C "$GITHUB_WORKSPACE/tuplesky-base" rev-parse --short HEAD)"
+              base_name="$head_sha with ${IN_PAIR_BASE#*+env:}" ;;
             *)
               # A base from before the admission rate was provisioned
               # leaves its frontends at the daemon's 1,000 a second.
