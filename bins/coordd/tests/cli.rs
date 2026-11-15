@@ -4739,7 +4739,7 @@ async fn one_backup_restores_every_voter_of_a_successor() {
             .await
             .unwrap_or_else(|| panic!("the cluster answered the request\n{}", running[0].said()));
         // The backup is voter 1's store, so voter 1 has executed it.
-        let read = read_projected(&caller, 2, b"k")
+        let read = ask(&caller.connection, &caller.range(2, b"k"))
             .await
             .expect("voter 1 answered the read");
         assert_eq!(read_value(&read).as_deref(), Some(&b"v"[..]));
@@ -4814,7 +4814,7 @@ async fn one_backup_restores_every_voter_of_a_successor() {
     // ...and serve what the backup held, from each of them.
     for (n, node) in running.iter().enumerate() {
         let reader = Caller::bind(node, &successor.ca, &successor.ring, [0x60 + n as u8; 16]).await;
-        let read = read_projected(&reader, 1, b"k")
+        let read = ask(&reader.connection, &reader.range(1, b"k"))
             .await
             .unwrap_or_else(|| panic!("restored voter {} did not answer the read", n + 1));
         assert_eq!(
