@@ -181,10 +181,13 @@ So about 380 B a command, about 1.0 MB/s at R = 2,600. n1's `proposals.proposal_
 |---|---|---|
 | Live stream to one follower at R = 2,600 (about 380 B a command) | about 1.0 MB/s | about 1.0 MB/s |
 | Loss-bound window at 0.1% (estimate) | 0.67 to 0.81 MB/s | 0.33 to 0.40 MB/s |
-| Observed | n5's control connection carried every relay, about 2,500 a second: about 0.95 MB/s at 380 B | none in this run |
+| Observed (testing, `traffic.received_bytes`, #98) | n5 received 0.98 to 0.99 MB/s while level, and 1.34 to 1.71 MB/s once behind | none in this run |
 
 **What this says.**
-- **At 70 ms the estimate under-reads.** n5 received about 0.95 MB/s against the estimated 0.67 to 0.81, so the real window was at least the stream's rate. The margin is unknown. #297's `paths[]` (the window and losses on n1 → n5 control) reads it directly, and n5's run predates #297.
+- **At 70 ms the estimate under-reads.** While level, n5 received 0.98 to 0.99 MB/s, nearly all of it the relayed stream on n1's control connection, against the estimated 0.67 to 0.81 for one connection.
+  - Once behind, n5 received 1.34 to 1.71 MB/s. That is all streams in, mostly from n1 (leader and donor), and not split by connection.
+  - Over the control and bulk connections together, that is about twice the one-connection estimate. So it doesn't settle a single connection's window.
+  - #297's `paths[]` (the window and losses on each n1 → n5 connection) reads it directly, and n5's run predates #297.
 - **At 140 ms, by the same estimate,** the window halves and the stream doesn't fit, by a factor of 2.5 to 3. A follower 140 ms from the leader, on a 0.1%-loss path with CUBIC, would then not stay level at 2,600 a second, whatever catch-up does: once the leader's queue toward it fills, frames are dropped (Section 2.2), and each is a hole in what the follower keeps.
 - **That 140 ms conclusion is an estimate, and the estimate under-reads at 70 ms.** It waits on `paths[]` or a 140 ms cell before it feeds the `bbr` decision.
 - The fixes, if it holds, are the controller or fewer bytes a command:
@@ -208,13 +211,19 @@ Notation:
 - **H:** the hole, the gap when the follower starts keeping.
 - **I:** intake from pages while the hole is filled. It is at most E_p and at most the path.
 - **E_p:** the follower's rate executing pulled commands, installed a page to a batch. task-d25's local cost gives 3,500 a second, and the runner estimate 4,500.
-- **E_k:** its rate draining a kept run on the live path. This is a different cost from E_p:
+- **E_k:** its rate draining a kept run by adoption, one proposal at a time, as today's path would. This is a different cost from E_p:
   - a kept proposal adopted outside a frame takes a batch of its own;
   - today it sends a `SlowAck` to the leader and to the frontend (Section 4.4);
   - it is committed by the frontier, and then executes (`advance_pending`).
+- **E_d:** the drain's rate. It is E_p for the run's decided part, which this design installs a window at a time (Section 4.1), and E_k for what is still adopted.
 - **c:** the memory charge for a kept command.
 
-**E_k isn't measured.** n3's drain is the one reading. Between about 40 and 60 s n3 executed about 59k commands: 3,000 a second if steady, and up to about 4,400 if the hole took the first 8 s. Testing is reading it from n3's 10 s metrics lines. The tables below give the range, and I'll redo them when that reading is posted. The code step counts E_p and E_k on the metrics line.
+**E_k is measured as a range** (testing, from n3's 10 s metrics lines in the +loss0.1 run, #98).
+- In the 10 s in which n3 drained its kept payloads, it executed 2,778 a second while the leader ran at 2,320. It took 26,496 kept payloads and 4,320 commands from 102 pages.
+- That interval also holds the time before the hole was filled, so 2,800 a second is a lower bound.
+- The loop was 66% busy, at 0.144 ms of domain CPU a command against 0.082 ms when level. So it runs out at about 4,200 a second.
+
+The tables use E_k = 2,800, the measured figure, and give 4,200, its bound, beside it. The code step counts E_p and E_k on the metrics line.
 
 The figures use R = 2,600 (the 480 step's leader) and c = 500 B. The figure c is today's charge of about 330 B plus the held proposal, which today's bound doesn't charge; the code step measures it.
 
@@ -225,32 +234,36 @@ The figures use R = 2,600 (the 480 step's leader) and c = 500 B. The figure c is
    - The bound is in bytes, set by configuration (64 MiB here), and it charges the held proposal too.
    - It starts a run only when its gap fits one (Section 8).
 2. Catch-up fills only the hole: from the follower's executed position up to the run's first command. The hole doesn't move, so page intake needs to be above zero, not above R.
-3. Once the hole is filled, the run adopts in sequence order:
-   - each proposal's predecessor is at ACCEPT, and the leader's frontier (far ahead) commits it;
-   - it executes at E_k, with no network;
-   - the table's 1,000 bound holds: a kept command enters the table only when its turn has come (reserve room), and execution frees the room.
+3. Once the hole is filled, the run drains in sequence order, with no network:
+   - **Its decided part, nearly all of it, as windows.** A kept proposal of the current ballot at or below the highest commit frontier F has received in that ballot is decided, with the dependencies it carries (the argument of Section 8). F installs those as committed records a window at a time, as a page's decided entries are (`install_pulled`): one batch a window, no adoption and no `SlowAck`. They execute at E_p.
+   - **The part above the frontier** is adopted one at a time, as a live relay is: its predecessor is at ACCEPT, and the next frontier commits it. That is about R times a round trip and the frontier's interval, a few hundred commands.
+   - **Why windows:** adopted one at a time, the run would drain at the measured E_k = 2,800, below (1 + m)·R = 3,900 and only 200 a second over R. The windows make the drain cost what a page costs.
+   - the table's 1,000 bound holds: a window takes the catch-up reserve, as a page does, an adopted command enters the table only in its turn, and execution frees the room.
 4. The follower is level when the run is drained. It never left the live stream, so there is no handoff.
 
 **What breaks the run, and what then.**
 - **A command missing from the run** stops adoption at it, under the conservative key, as at n5. Pages then go on past that point, because the follower has nothing executable, as today's pacer rule says (task-d25). A gap costs pages, not correctness.
 - **The kept bound reached,** because intake fell after the run started: later relays are not kept, because each would sit behind a new hole. The run's end is fixed, and F asks for the exemption (Section 8), as it would have at the start.
 
-**Its numbers** (a stop of t seconds, so H = R·t):
+**Its numbers** (a stop of t seconds, so H = R·t), with E_d the drain's rate:
 - Filling the hole takes H/I. Meanwhile the run grows at R, to R·H/I, which is c·R²·t/I of memory.
-- The run drains at E_k − R, so the follower is level after (H/I)·E_k/(E_k − R).
-- It needs E_k > R, the run to fit the bound (R·H/I ≤ bound / c), and the entry condition of Section 3.
+- The run drains at E_d − R, so the follower is level after (H/I)·E_d/(E_d − R).
+- It needs E_d > R, the run to fit the bound (R·H/I ≤ bound / c), and the entry condition of Section 3.
 - 64 MiB at 500 B is about 134k commands, 52 s of the live stream at R = 2,600.
 
-| A 100k gap, R = 2,600 | I | Hole filled | Run at its peak | Level at E_k = 3,000 | E_k = 3,500 | E_k = 4,400 |
+| A 100k gap, R = 2,600 | I | Hole filled | Run at its peak | Level, drained as windows (E_d = E_p) | Adopted one at a time, E_k = 2,800 | E_k = 4,200 |
 |---|---|---|---|---|---|---|
-| Pages at the margin, a path without loss, E_p = 4,500 | 3,900 | 25.6 s | 67k, 33 MB | 192 s | 100 s | 63 s |
-| The same, E_p = 3,500 | 3,500 | 28.6 s | 74k, 37 MB | 214 s | 111 s | 70 s |
+| Pages at the margin, a path without loss, E_p = 4,500 | 3,900 | 25.6 s | 67k, 33 MB | 61 s | 359 s | 67 s |
+| The same, E_p = 3,500 | 3,500 | 28.6 s | 74k, 37 MB | 111 s | 400 s | 75 s |
 | A loss-bound path at 140 ms with CUBIC, one or four donors | | | | never, if Section 3's estimate holds | never | never |
+
+E_p = 3,500 is task-d25's local cost, and E_k's 4,200 a bound read on the runner, so the second row's last cell compares across machines.
 
 **n5's prediction** (review's second design review), from its own figures:
 - At 50 s n5 was 4,117 behind, its pages came at about 950 a second, and the leader ran at 2,570.
 - So the hole fills in 4.3 s, and the run peaks near 11k, about 5.6 MB.
-- n5 is level after 30 s at E_k = 3,000, 16 s at 3,500, and 10 s at 4,400. That is the rerun's prediction (Section 10).
+- Drained as windows, n5 is level after 10 s at E_p = 4,500, or 17 s at 3,500. That is the rerun's prediction (Section 10).
+- Adopted one at a time, it would take 61 s at the measured E_k = 2,800, and 11 s at its bound of 4,200.
 
 Pages only never closes n5's gap, since 950 is below R.
 
@@ -268,27 +281,29 @@ The relays are dropped, and pages must outrun the domain: intake I > R, with I =
 | | Deep keep | Pages only |
 |---|---|---|
 | What intake from pages must beat | 0 | R, with margin |
-| Bounded by | E_k, once the hole is filled | min(pipeline, E_p, path) |
+| Bounded by | E_p for the run's decided part, once the hole is filled | min(pipeline, E_p, path) |
 | 100k at 140 ms, loss-bound, CUBIC | never, if Section 3's estimate holds | never |
-| 100k without loss, E_p = 4,500 | 63 to 192 s, by E_k from 4,400 down to 3,000 | 77 s |
-| 100k without loss, E_p = 3,500 | 70 to 214 s | 111 s |
-| n5 (4,117 behind, pages at 950 a second) | 10 to 30 s | never |
+| 100k without loss, E_p = 4,500 | 61 s (359 s adopted one at a time, at E_k = 2,800) | 77 s |
+| 100k without loss, E_p = 3,500 | 111 s (400 s at E_k = 2,800) | 111 s |
+| n5 (4,117 behind, pages at 950 a second) | 10 to 17 s (61 s at E_k = 2,800) | never |
 | Memory | the kept bound, and a run only when the gap fits it | 9 pages: about 1 MiB typically, 27 MiB at worst |
 | Network | the live stream it must carry anyway, plus the hole's pages | every command twice: the relay it drops, and the page |
-| Where it fails | the run's bound, E_k ≤ R, or the stream not fitting the path (Section 3) | any path or pipeline below (1 + m)·R |
+| Where it fails | the run's bound, E_p ≤ R, or the stream not fitting the path (Section 3) | any path or pipeline below (1 + m)·R |
 
-**Which is faster.** At the same page intake I, deep keep is no slower than pages only exactly when E_k ≥ I:
-- (H/I)·E_k/(E_k − R) ≤ H/(I − R) reduces to E_k ≥ I.
-- Where the drain is slower than the pages, pages only levels sooner. At E_k = 3,000 against I = 3,500 that is 214 s against 111 s.
+**Which is faster.** At the same page intake I, deep keep is no slower than pages only exactly when its drain rate E_d ≥ I:
+- (H/I)·E_d/(E_d − R) ≤ H/(I − R) reduces to E_d ≥ I.
+- **Drained as windows, E_d = E_p ≥ I always,** since pages are installed at E_p too. So deep keep is never slower than pages only, and equal where pages run at E_p.
+- **Adopted one at a time, at the measured E_k = 2,800, it is far slower** wherever I is above 2,800: 359 s against 77 s for 100k at the margin. That is why the decided part drains as windows.
 - Where I ≤ R, as at n5, only deep keep closes at all.
 
-So deep keep's case rests on the 70 ms path, on paths without loss, and on E_k. The code step measures E_k and E_p in the same run.
+So deep keep's case rests on the stream reaching the follower (Section 3) and on the drain by windows. The code step measures E_p and E_k in the same run.
 
 ### 4.4 No acknowledgement the leader doesn't need
 
 **Today the drain acknowledges every command it adopts.**
 - Each adoption sends a `SlowAck` to the leader and to the frontend (`advance_pending`, `follower.rs:6627`), at E_k a second, for commands the leader decided long ago.
-- That is Section 2.2's burst made continuous: 3,000 to 4,500 frames a second into a 256-frame queue.
+- Adopted one at a time, a run would make Section 2.2's burst continuous: 2,800 to 4,200 frames a second into a 256-frame queue.
+- Drained as windows (Section 4.1), the run's decided part sends none, since it isn't adopted. The rule below still covers held chains adopted all at once at or below the frontier, which is Section 2.2's burst itself.
 - Each one is work at the leader (`collect`, `leader.rs:4147`).
 
 **The rule.** F sends the leader no `SlowAck` for a proposal of the current ballot whose sequence number is at or below the highest commit frontier (`Committed { through }`) F has received in that ballot. Above it, F sends as today. There is no wire change.
@@ -312,6 +327,7 @@ So deep keep's case rests on the 70 ms path, on paths without loss, and on E_k. 
 
 Deep keep first, K pages in flight for the hole, no acknowledgement the leader doesn't need, and the exemption only for a gap no run fits:
 1. **Deep keep** (Section 4.1).
+   - Its decided part drains as windows, at E_p, not by adoption at E_k.
    - A run starts only when the gap fits it (Section 8).
    - The kept bound is in bytes, set by configuration, 64 MiB by default, per behind follower per domain (Section 9).
    - The held-proposal bound follows it, rather than being a multiple of the table.
@@ -333,10 +349,10 @@ While a follower F is behind:
    - Nothing in the run enters the table before its turn.
 2. **It holds at most `K_MAX` pages** asked for or outside the table, beside the one window the reserve holds. A retry takes the slot of the ask it retires, and an answer no live ask covers is dropped (Section 7).
 3. **Pages fill only the hole,** from its executed position to the run's first command. They don't ask below the frontier, or past an ask's bound.
-4. **It is level within (H/I)·E_k/(E_k − R),** under the conditions below.
+4. **It is level within (H/I)·E_p/(E_p − R),** draining its decided part as windows, under the conditions below.
 
 **Conditions**, each with the margin m = 1/2:
-- **Execution:** E_k ≥ (1 + m)·R. Section 13.1's admission rule states it for the execution rate; this is the drain's rate, which the code step measures. The admission ceiling stays the owner's (task-d26).
+- **Execution:** E_p ≥ (1 + m)·R. Section 13.1's admission rule states it for the execution rate. Adopted one at a time, the measured E_k = 2,800 would fail it, which is why the decided part drains as windows. The admission ceiling stays the owner's (task-d26).
 - **The entry:** the live stream fits the path, so bytes a command × R × (1 + m) ≤ the path's rate (Section 3).
 - **The run:** R·G/I ≤ `KEPT_BOUND` / (c·(1 + m)) when F starts keeping, for its gap G (Section 8).
 - **While exempt,** where pages alone carry it:
@@ -344,7 +360,7 @@ While a follower F is behind:
   - A follower that is pipeline-limited (Codex's 40-command pages, or one donor) still gains where K_avail·P/C > R, at that rate less R.
   - Below R it falls behind, and the metrics (Section 10) say which bound it met.
 
-**Why m = 1/2.** Under pages alone, the gap closes at least at R/2, so a voter stopped for t seconds is back within 2t. Under deep keep, the margin on E_k drains the run at least at R/2.
+**Why m = 1/2.** Under pages alone, the gap closes at least at R/2, so a voter stopped for t seconds is back within 2t. Under deep keep, the margin on E_p drains the run at least at R/2.
 
 ## 7. Pages in flight
 
@@ -433,13 +449,13 @@ The leader still sends F the commit frontier, Syncs, read confirmations and feat
 
 **A ballot change and the run** (review's second item 5). `activate` clears `held` and `kept` today (`follower.rs:2474-2475`). So with a 64 MiB run, a leader change during a climb drops up to 134k kept commands, and the hole becomes the old hole and the old run. The design keeps the run's decided part:
 - **What is decided.** A kept proposal of the old ballot whose sequence number is at or below the highest commit frontier F received from that ballot's leader is decided, with the dependencies it carries. That is how `commit_through_leader` reads the frontier for a proposal F adopted (`follower.rs:5053`). A ballot change takes away F's right to adopt it (task-d12), not the fact.
-- **That part stays.** At the change it goes into the table in turn as a committed record, as a page's decided entry does (`install_pulled`), not by adoption.
+- **That part stays.** At the change it goes into the table in turn as a committed record, as a page's decided entry does (`install_pulled`), not by adoption. It is the drain's own path (Section 4.1), so the change only stops the adoption of what is above the frontier.
   - Its payload is checked against the proposal's admission digest, as a kept payload is today.
   - A Sync of the new ballot can't demote a commit (task-d80).
   - A selection naming one of these commands under other facts halts F, as it does for any commit (task-d14).
 - **The part above the frontier is dropped.** Undecided, it is the new leader's to decide. It is at most what the old leader proposed after the last frontier F received: about R times a round trip and the frontier's interval, a few hundred commands at 70 to 140 ms, which pages bring.
 - **So a climb through one leader change costs the election,** plus the dropped part's pages.
-- **The code PR argues this** against task-d12, task-d14 and task-d80. If the argument fails, it falls back to clearing the run, and the loss is bounded by the run: the run's size over I, in seconds of pages.
+- **The code PR argues this** against task-d12, task-d14 and task-d80, once for both uses: the drain by windows and the change. If the argument fails, the drain falls back to adoption one at a time, at E_k, and a ballot change to clearing the run, with the loss bounded by the run: the run's size over I, in seconds of pages.
 - **Test:** a leader change during the drain (Section 10).
 
 ## 9. Bounds
@@ -460,7 +476,7 @@ The leader still sends F the commit frontier, Syncs, read confirmations and feat
 
 | The path | Deep keep, 64 MiB | Pages only |
 |---|---|---|
-| Without loss, or `bbr` (pages at the margin) | 63 to 192 s, by E_k from 4,400 down to 3,000 | 77 s |
+| Without loss, or `bbr` (pages at the margin) | 61 s drained as windows (359 s adopted one at a time, at E_k = 2,800) | 77 s |
 | CUBIC at 0.1% loss, one or four donors | never, if Section 3's estimate holds | never |
 
 **Pages at the margin assume two or more donors.** With one, K_avail = 5, and 125-command pages reach (1 + m)·R = 3,900 a second only while C ≤ 5 × 125 / 3,900 = 160 ms. At 140 ms round trip that leaves 20 ms for the donor to serve a page; past it, one donor holds intake below the margin (Section 4.2).
@@ -476,7 +492,7 @@ The leader still sends F the commit frontier, Syncs, read confirmations and feat
 - the kept run, sized by bytes from configuration, charging the proposal, and started only when the gap fits it;
 - relays into the table only in turn;
 - no `SlowAck` to the leader at or below the commit frontier (Section 4.4);
-- the run's decided part kept across a ballot change (Section 8);
+- the run's decided part installed as committed records a window at a time, in the drain and across a ballot change (Sections 4.1 and 8);
 - K pages in flight for the hole, from the frontier, and not past the newest `through` seen (the upper bound and the stop come with step 2);
 - refused control frames kept and offered again, as on the api plane.
 
@@ -495,7 +511,7 @@ New counts on the metrics line:
 
 **Tests and acceptance:**
 - **In-process: a voter stopped under load and returned 100k behind, on a link of 140 ms round trip.**
-  - Without loss, under `bbr` and `cubic`: it levels within Section 9's time for its measured E_k.
+  - Without loss, under `bbr` and `cubic`: it levels within Section 9's time for its measured E_p.
   - With 0.1% loss under `cubic`, the test asserts three things: the voter doesn't level; the metrics name the path as the bound (the leader's queue toward it, and `paths[]`); and at a domain rate below the path's rate over the bytes a command, with the margin, it does hold level.
   - In every case it never holds more than its kept bound or 9 pages, and never more than 5 asks outstanding to one donor.
 - **A lost head ask with the pipeline full:** with the first range's answer dropped and the other 8 slots holding later pages, the retry takes the head's slot, the hole fills, and held pages never exceed 9. The head's late answer, delivered after the retry's, is dropped and counted as `late`.
@@ -509,11 +525,12 @@ New counts on the metrics line:
 - **Negative controls:**
   - with the held cap of today (8,000), n5's shape drops relays and doesn't level;
   - K fixed at 2 fills the hole more slowly, by the ratio Section 7 gives;
+  - with the run adopted one at a time, as today's path would, the drain runs at E_k, and the 100k case takes several times as long;
   - with the exemption off, the leader's bytes to the follower run at its whole rate;
   - with the acknowledgement rule off, the leader's counted adoptions from F grow by the run;
   - with the run cleared at a ballot change, as today, the hole grows by the run.
 - **Testing:** the +loss0.1 cell at 480 again.
-  - **The prediction for n5** (Section 4.1): level within 10 to 30 s of its first page, by E_k from 4,400 down to 3,000 (16 s at 3,500), with a run near 11k commands, about 6 MB.
+  - **The prediction for n5** (Section 4.1): level within 10 to 17 s of its first page, by E_p from 4,500 down to 3,500, with a run near 11k commands, about 6 MB.
   - Read:
     - n5's executed rate beside the leader's;
     - the run's size;
@@ -527,7 +544,7 @@ New counts on the metrics line:
 - **Acknowledgements a frame at a time,** which would remove the rest of Section 2.2's burst. That is a protocol change. Section 4.4 removes most of it at its source.
 - **The admission sent once per session,** which would take about 165 to 200 B off every copy (Section 3). That is a format change, sized first by a counting build.
 - **Two windows installed at once,** which would raise E_p and needs the reserve for two windows.
-- **The admission ceiling against E_k** (the owner's, task-d26).
+- **The admission ceiling against E_p** (the owner's, task-d26).
 - **The controller per lane** (#299; `bbr` stays a switch, the lead's decision). Section 3 is an input to it.
 - **A node-wide kept budget** across domains, which comes with multi-domain hosting (Section 9).
 - **A behind follower's frontend sending its callers elsewhere,** which is storm fix 1's.
