@@ -4672,6 +4672,12 @@ The order check can't tell whether `A` ran before `D`, so it drops `C`, and the 
   - **What follows.** Seed 905 (row 10, three voters, 750000, no catch-up) is seed 147's way with no report holding the dependency: the member reports ballot 12's Sync, durable and not installed. The order check drops the candidate, the new leader gives its campaign up as `Behind` on the dependency, which the selection names and no report carries, and the run goes on to pass.
 
   So the schedule reaches the selection's side of the gap through way (2), in some settings once in a hundred seeds, but no run put a fast decision behind a drop, and none reached way (1).
+- **Reproducing it.** The probe's count of drops is now the simulator's, on its stats line since task-d119's first commit, with the probe's walk. That line also carries two more counts: campaigns given up as `Behind`, with those on a command no voter executed, and selections bound past such a drop.
+  - **One row and size over a range of seeds.** `seeds_from_the_environment` runs `PROTOCOL_SIM_RANGE=row,voters,from,to` under the row's knobs.
+  - **The sweep's variables.** `PROTOCOL_SIM_PEER_ACK_LOSS` (parts per million) and `PROTOCOL_SIM_NO_CATCH_UP=1`.
+  - **The targeted schedule.** `PROTOCOL_SIM_HOLD=160000 PROTOCOL_SIM_CAMPAIGN=12000 PROTOCOL_SIM_CRASH=5000`.
+
+  For example: `PROTOCOL_SIM_RANGE=10,3,0,10000 PROTOCOL_SIM_PEER_ACK_LOSS=750000 PROTOCOL_SIM_NO_CATCH_UP=1 PROTOCOL_SIM_HOLD=160000 PROTOCOL_SIM_CAMPAIGN=12000 PROTOCOL_SIM_CRASH=5000 cargo test --release -p coord-consensus --test protocol_sim seeds_from_the_environment -- --exact --nocapture`. The figures above are that commit's. Later commits change them: this task's own fix moves the schedule (above, "What the runs show after it").
 - **Recommended.**
   - Keep today's rule and the known-gap test.
   - This task closes way (1), and way (2) where the member can still vote at the Sync's ballot: it asks for the dependency. Where the member promised a later ballot first, way (2) stays open, and what closes it is the lead's decision (above, "What asking leaves").
