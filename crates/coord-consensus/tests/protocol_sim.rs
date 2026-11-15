@@ -105,7 +105,7 @@
 //! commits over a vote the leader may lose.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Once;
 
@@ -4064,8 +4064,10 @@ thread_local! {
     /// Runs on this thread whose panic is caught and said with its seed
     /// ([`quietly`]).
     static QUIET: Cell<u32> = const { Cell::new(0) };
-    /// Where the last panic on this thread inside such a run was raised.
-    static WHERE: Cell<Option<(&'static str, u32)>> = const { Cell::new(None) };
+    /// Where the last panic on this thread inside such a run was raised,
+    /// as `file:line`: the hook's location borrows from the panic, so it
+    /// is kept as text.
+    static WHERE: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
 /// Run `f` with its panic caught and the hook's output for it left out:
@@ -4088,12 +4090,13 @@ fn quietly<T>(f: impl FnOnce() -> T) -> std::thread::Result<T> {
             if QUIET.with(Cell::get) == 0 {
                 previous(info);
             } else {
-                WHERE.with(|w| w.set(info.location().map(|l| (l.file(), l.line()))));
+                let at = info.location().map(|l| format!("{}:{}", l.file(), l.line()));
+                WHERE.with(|w| *w.borrow_mut() = at);
             }
         }));
     });
     QUIET.with(|q| q.set(q.get() + 1));
-    WHERE.with(|w| w.set(None));
+    WHERE.with(|w| *w.borrow_mut() = None);
     let outcome = catch_unwind(AssertUnwindSafe(f));
     QUIET.with(|q| q.set(q.get() - 1));
     outcome
@@ -4106,8 +4109,8 @@ fn panic_text(e: &(dyn std::any::Any + Send)) -> String {
         .cloned()
         .or_else(|| e.downcast_ref::<&str>().map(|s| (*s).to_owned()))
         .unwrap_or_default();
-    match WHERE.with(Cell::get) {
-        Some((file, line)) => format!("{text} (at {file}:{line})"),
+    match WHERE.with(|w| w.borrow().clone()) {
+        Some(at) => format!("{text} (at {at})"),
         None => text,
     }
 }
