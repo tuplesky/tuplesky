@@ -76,6 +76,9 @@ pub struct Campaign {
     /// Whether the selection it holds dropped a possible-fast candidate
     /// whose dependencies reach a command no report holds (task-d119).
     selected_past_unreported: bool,
+    /// Of those, whether that command is one the candidate doesn't hold
+    /// decided either.
+    selected_past_undecided: bool,
 }
 
 impl Campaign {
@@ -104,6 +107,7 @@ impl Campaign {
             rules: crate::recovery::SelectionRules::default(),
             unreported_undecided: 0,
             selected_past_unreported: false,
+            selected_past_undecided: false,
         }
     }
 
@@ -366,6 +370,13 @@ impl Campaign {
         self.decision.is_some() && self.selected_past_unreported
     }
 
+    /// Whether the selection this campaign holds dropped a possible-fast
+    /// candidate whose dependencies reach a command no report holds and
+    /// the candidate doesn't hold decided (task-d119).
+    pub const fn selected_past_undecided(&self) -> bool {
+        self.decision.is_some() && self.selected_past_undecided
+    }
+
     /// Report pages held (task-d28).
     pub fn pages_held(&self) -> usize {
         self.assembler.pages_held()
@@ -526,6 +537,7 @@ impl Campaign {
             match selected {
                 Ok(decision) => {
                     self.selected_past_unreported = counts.unreported.get() > 0;
+                    self.selected_past_undecided = counts.unreported_undecided.get() > 0;
                     break decision;
                 }
                 // Rows the runtime reads for the candidate: waited for, as
