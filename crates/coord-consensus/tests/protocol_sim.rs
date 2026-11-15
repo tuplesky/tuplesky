@@ -4138,70 +4138,85 @@ fn run_row(row: u8) {
     } else {
         &[false]
     };
-    for n in [3u8, 5] {
-        for (seed, early) in (0..seeds()).flat_map(|s| variants.iter().map(move |e| (s, *e))) {
-            match run_kept(n, row, seed, None, None, early, None) {
-                Ok(s) => {
-                    if s.learned == 0 {
-                        idle[usize::from(n == 5)] += 1;
-                    } else {
-                        busy[usize::from(n == 5)] += 1;
+    // Row 21's cut (below) is reached in few runs: a follower crashed
+    // while it wrote a payload row again, in 15 to 20 of the 120 runs of
+    // seeds 0 to 59. A schedule change can leave the default seeds short
+    // of it, as keeping a failed catch-up window in hand did, so the next
+    // as many seeds then run too, each checked as every seed is. Raising
+    // the row's fault draws instead would move its kept seeds' schedules.
+    let cut_21 = |t: &Stats| t.restored_without_payload > 0 && t.payload_crashes > 0;
+    for range in [0..seeds(), seeds()..2 * seeds()] {
+        if range.start > 0 && (row != 21 || cut_21(&totals)) {
+            break;
+        }
+        for n in [3u8, 5] {
+            for (seed, early) in range
+                .clone()
+                .flat_map(|s| variants.iter().map(move |e| (s, *e)))
+            {
+                match run_kept(n, row, seed, None, None, early, None) {
+                    Ok(s) => {
+                        if s.learned == 0 {
+                            idle[usize::from(n == 5)] += 1;
+                        } else {
+                            busy[usize::from(n == 5)] += 1;
+                        }
+                        totals.executed += s.executed;
+                        totals.learned += s.learned;
+                        totals.campaigns += s.campaigns;
+                        totals.crashes += s.crashes;
+                        totals.leader_crashes += s.leader_crashes;
+                        totals.catch_up_pages += s.catch_up_pages;
+                        totals.caught_up += s.caught_up;
+                        totals.ballots += s.ballots;
+                        totals.heal_steps = totals.heal_steps.max(s.heal_steps);
+                        totals.conflicts += s.conflicts;
+                        totals.peak_records = totals.peak_records.max(s.peak_records);
+                        totals.peak_ledger = totals.peak_ledger.max(s.peak_ledger);
+                        totals.peak_bindings = totals.peak_bindings.max(s.peak_bindings);
+                        totals.peak_held = totals.peak_held.max(s.peak_held);
+                        totals.peak_examinations_pct =
+                            totals.peak_examinations_pct.max(s.peak_examinations_pct);
+                        totals.decisions = fold(totals.decisions, &s.decisions.to_be_bytes());
+                        totals.released += s.released;
+                        totals.compared += s.compared;
+                        totals.executions_lost += s.executions_lost;
+                        totals.peak_undurable = totals.peak_undurable.max(s.peak_undurable);
+                        totals.total_crashes += s.total_crashes;
+                        totals.cut_decided += s.cut_decided;
+                        totals.votes_checked += s.votes_checked;
+                        totals.payload_crashes += s.payload_crashes;
+                        totals.payload_windows += s.payload_windows;
+                        totals.payload_failures += s.payload_failures;
+                        totals.queue_failures += s.queue_failures;
+                        totals.queue_orders += s.queue_orders;
+                        totals.restored_without_payload += s.restored_without_payload;
+                        totals.cut_released += s.cut_released;
+                        totals.cut_durable += s.cut_durable;
+                        totals.gate_windows += s.gate_windows;
+                        totals.gate_crashes += s.gate_crashes;
+                        totals.left_out += s.left_out;
+                        totals.early_sends += s.early_sends;
+                        totals.window_crashes += s.window_crashes;
+                        totals.window_deposes += s.window_deposes;
+                        totals.left_out_executed += s.left_out_executed;
+                        totals.answered_on_release += s.answered_on_release;
+                        totals.released_again += s.released_again;
+                        totals.relayed += s.relayed;
+                        totals.relay_fallbacks += s.relay_fallbacks;
+                        totals.relayed_proposals += s.relayed_proposals;
+                        totals.frames += s.frames;
+                        totals.framed += s.framed;
+                        totals.donor_crashes += s.donor_crashes;
+                        totals.donor_crashes_taken += s.donor_crashes_taken;
+                        totals.donor_crashes_again += s.donor_crashes_again;
+                        totals.stopped_ballot += s.stopped_ballot;
+                        totals.stopped_stale += s.stopped_stale;
+                        totals.asked_ahead += s.asked_ahead;
+                        totals.taken_ahead += s.taken_ahead;
                     }
-                    totals.executed += s.executed;
-                    totals.learned += s.learned;
-                    totals.campaigns += s.campaigns;
-                    totals.crashes += s.crashes;
-                    totals.leader_crashes += s.leader_crashes;
-                    totals.catch_up_pages += s.catch_up_pages;
-                    totals.caught_up += s.caught_up;
-                    totals.ballots += s.ballots;
-                    totals.heal_steps = totals.heal_steps.max(s.heal_steps);
-                    totals.conflicts += s.conflicts;
-                    totals.peak_records = totals.peak_records.max(s.peak_records);
-                    totals.peak_ledger = totals.peak_ledger.max(s.peak_ledger);
-                    totals.peak_bindings = totals.peak_bindings.max(s.peak_bindings);
-                    totals.peak_held = totals.peak_held.max(s.peak_held);
-                    totals.peak_examinations_pct =
-                        totals.peak_examinations_pct.max(s.peak_examinations_pct);
-                    totals.decisions = fold(totals.decisions, &s.decisions.to_be_bytes());
-                    totals.released += s.released;
-                    totals.compared += s.compared;
-                    totals.executions_lost += s.executions_lost;
-                    totals.peak_undurable = totals.peak_undurable.max(s.peak_undurable);
-                    totals.total_crashes += s.total_crashes;
-                    totals.cut_decided += s.cut_decided;
-                    totals.votes_checked += s.votes_checked;
-                    totals.payload_crashes += s.payload_crashes;
-                    totals.payload_windows += s.payload_windows;
-                    totals.payload_failures += s.payload_failures;
-                    totals.queue_failures += s.queue_failures;
-                    totals.queue_orders += s.queue_orders;
-                    totals.restored_without_payload += s.restored_without_payload;
-                    totals.cut_released += s.cut_released;
-                    totals.cut_durable += s.cut_durable;
-                    totals.gate_windows += s.gate_windows;
-                    totals.gate_crashes += s.gate_crashes;
-                    totals.left_out += s.left_out;
-                    totals.early_sends += s.early_sends;
-                    totals.window_crashes += s.window_crashes;
-                    totals.window_deposes += s.window_deposes;
-                    totals.left_out_executed += s.left_out_executed;
-                    totals.answered_on_release += s.answered_on_release;
-                    totals.released_again += s.released_again;
-                    totals.relayed += s.relayed;
-                    totals.relay_fallbacks += s.relay_fallbacks;
-                    totals.relayed_proposals += s.relayed_proposals;
-                    totals.frames += s.frames;
-                    totals.framed += s.framed;
-                    totals.donor_crashes += s.donor_crashes;
-                    totals.donor_crashes_taken += s.donor_crashes_taken;
-                    totals.donor_crashes_again += s.donor_crashes_again;
-                    totals.stopped_ballot += s.stopped_ballot;
-                    totals.stopped_stale += s.stopped_stale;
-                    totals.asked_ahead += s.asked_ahead;
-                    totals.taken_ahead += s.taken_ahead;
+                    Err(e) => failures.push(e),
                 }
-                Err(e) => failures.push(e),
             }
         }
     }

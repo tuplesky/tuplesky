@@ -1380,13 +1380,8 @@ fn server_config(
     // Accepted connections start with the floor of every lane's
     // limits (credit can only be raised once advertised); the lane
     // declared in `Hello` raises them to its own.
-    let floor = lane::transport_config(
-        &LaneLimits::floor(&limits.lanes),
-        limits.idle_timeout,
-        limits.keep_alive,
-        limits.ack_frequency,
-    )
-    .map_err(TransportError::Tls)?;
+    let floor = lane::transport_config(&LaneLimits::floor(&limits.lanes), limits)
+        .map_err(TransportError::Tls)?;
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server));
     server_config
         .transport_config(floor)
@@ -1470,13 +1465,7 @@ impl Transport {
             &limits,
         )?;
         let lane_config = |i: usize| {
-            lane::transport_config(
-                &limits.lanes[i],
-                limits.idle_timeout,
-                limits.keep_alive,
-                limits.ack_frequency,
-            )
-            .map_err(TransportError::Tls)
+            lane::transport_config(&limits.lanes[i], &limits).map_err(TransportError::Tls)
         };
         let lane_transport: [Arc<quinn::TransportConfig>; 4] = [
             lane_config(0)?,

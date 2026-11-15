@@ -6350,6 +6350,45 @@ fn endpoint(
             ),
         }
     }
+    // The loss thresholds, the congestion controller and the round trip
+    // assumed before one is measured, overridden from the environment for
+    // the same reason, on both planes: each is measured on a lossy,
+    // jittery path before a default moves (#185). Unset, the transport's
+    // defaults, which are QUIC's and quinn's.
+    //
+    // How far out of order a packet may arrive before loss detection calls
+    // it lost: `<packets>,<eighths of the round trip>`, `time` for loss by
+    // time alone at 7/4, or `quic` for QUIC's own three packets and 9/8.
+    if let Ok(value) = std::env::var("COORDD_REORDERING") {
+        match reordering(&value) {
+            Some(reordering) => limits.reordering = reordering,
+            None => eprintln!(
+                "COORDD_REORDERING={value:?} is not <packets>,<eighths of the \
+                 round trip> (at least 3, and 9 to 32 eighths), time or quic: \
+                 the default reordering thresholds are kept"
+            ),
+        }
+    }
+    // `cubic`, `bbr` or `newreno`.
+    if let Ok(value) = std::env::var("COORDD_CONGESTION") {
+        match congestion(&value) {
+            Some(congestion) => limits.congestion = congestion,
+            None => eprintln!(
+                "COORDD_CONGESTION={value:?} is not cubic, bbr or newreno: \
+                 the default congestion controller is kept"
+            ),
+        }
+    }
+    // `<milliseconds>`, from 1 to 1000.
+    if let Ok(value) = std::env::var("COORDD_INITIAL_RTT") {
+        match initial_rtt(&value) {
+            Some(rtt) => limits.initial_rtt = Some(rtt),
+            None => eprintln!(
+                "COORDD_INITIAL_RTT={value:?} is not a whole number of \
+                 milliseconds from 1 to 1000: quinn's initial round trip is kept"
+            ),
+        }
+    }
     Transport::with_socket(socket, identity, std::sync::Arc::new(binder), limits)
         .map_err(|e| TransportError::Endpoint(format!("{e:?}")))
 }
@@ -6373,6 +6412,50 @@ fn ack_frequency(value: &str) -> Option<Option<coord_transport::AckFrequency>> {
         threshold: threshold.trim().parse().ok()?,
         max_delay: delay,
     }))
+}
+
+/// Reordering thresholds written `<packets>,<eighths of the round trip>`,
+/// at least QUIC's three and nine and at most
+/// [`Reordering::MAX_TIME_EIGHTHS`](coord_transport::Reordering::MAX_TIME_EIGHTHS)
+/// eighths, `time` for loss by time alone, or `quic` for QUIC's own.
+/// `None` is a malformed value, or one out of those bounds.
+fn reordering(value: &str) -> Option<coord_transport::Reordering> {
+    let value = value.trim();
+    match value {
+        "quic" => return Some(coord_transport::Reordering::QUIC),
+        "time" => return Some(coord_transport::Reordering::BY_TIME),
+        _ => {}
+    }
+    let (packets, eighths) = value.split_once(',')?;
+    let reordering = coord_transport::Reordering {
+        packets: packets.trim().parse().ok()?,
+        time_eighths: eighths.trim().parse().ok()?,
+    };
+    let quic = coord_transport::Reordering::QUIC;
+    (reordering.packets >= quic.packets
+        && (quic.time_eighths..=coord_transport::Reordering::MAX_TIME_EIGHTHS)
+            .contains(&reordering.time_eighths))
+    .then_some(reordering)
+}
+
+/// A congestion controller written `cubic`, `bbr` or `newreno`. `None` is
+/// any other value.
+fn congestion(value: &str) -> Option<coord_transport::Congestion> {
+    match value.trim() {
+        "cubic" => Some(coord_transport::Congestion::Cubic),
+        "bbr" => Some(coord_transport::Congestion::Bbr),
+        "newreno" => Some(coord_transport::Congestion::NewReno),
+        _ => None,
+    }
+}
+
+/// An initial round trip written in whole milliseconds, from 1 to 1000.
+/// `None` is a malformed value or one outside that range.
+fn initial_rtt(value: &str) -> Option<std::time::Duration> {
+    let ms: u64 = value.trim().parse().ok()?;
+    (1..=1000)
+        .contains(&ms)
+        .then(|| std::time::Duration::from_millis(ms))
 }
 
 /// Why the endpoint could not be built.
@@ -7560,6 +7643,70 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
             "none",
         ] {
             assert_eq!(super::ack_frequency(malformed), None, "{malformed:?}");
+        }
+    }
+
+    #[test]
+    fn reordering_thresholds_parse_from_the_environments_spelling() {
+        use coord_transport::Reordering;
+        assert_eq!(
+            super::reordering(" 16, 10 "),
+            Some(Reordering {
+                packets: 16,
+                time_eighths: 10,
+            })
+        );
+        // `quic` is QUIC's own thresholds, the default; `time` is loss by
+        // time alone.
+        assert_eq!(super::reordering("quic"), Some(Reordering::QUIC));
+        assert_eq!(super::reordering("3,9"), Some(Reordering::QUIC));
+        assert_eq!(super::reordering(" time "), Some(Reordering::BY_TIME));
+        assert_eq!(
+            super::reordering("3,32"),
+            Some(Reordering {
+                packets: 3,
+                time_eighths: Reordering::MAX_TIME_EIGHTHS,
+            })
+        );
+        // Below QUIC's is refused: the setting tolerates more, never less.
+        // Past four round trips is refused too: a loss would wait for the
+        // probe timeout.
+        for refused in [
+            "",
+            "16",
+            "16,",
+            ",10",
+            "2,10",
+            "16,8",
+            "3,33",
+            "3,100000",
+            "sixteen,10",
+            "16,1.25",
+            "off",
+        ] {
+            assert_eq!(super::reordering(refused), None, "{refused:?}");
+        }
+    }
+
+    #[test]
+    fn congestion_and_initial_round_trip_parse_from_the_environments_spelling() {
+        use coord_transport::Congestion;
+        assert_eq!(super::congestion("cubic"), Some(Congestion::Cubic));
+        assert_eq!(super::congestion(" bbr "), Some(Congestion::Bbr));
+        assert_eq!(super::congestion("newreno"), Some(Congestion::NewReno));
+        for refused in ["", "BBR", "reno", "bbr2", "cubic,bbr"] {
+            assert_eq!(super::congestion(refused), None, "{refused:?}");
+        }
+        assert_eq!(
+            super::initial_rtt(" 140 "),
+            Some(std::time::Duration::from_millis(140))
+        );
+        assert_eq!(
+            super::initial_rtt("1000"),
+            Some(std::time::Duration::from_secs(1))
+        );
+        for refused in ["", "0", "1001", "140ms", "-1", "0.5"] {
+            assert_eq!(super::initial_rtt(refused), None, "{refused:?}");
         }
     }
 
