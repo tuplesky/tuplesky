@@ -7396,22 +7396,38 @@ fn a_voter_asks_for_a_reproposal_its_promise_fenced_off_that_a_sync_entry_names(
 /// The same voter, once it promised a later ballot, doesn't ask for the
 /// re-proposal (#309 review): it would refuse the answer under its
 /// promise (`FencedByPromise`), so asking on every frontier of the old
-/// leader is traffic with no use.
+/// leader is traffic with no use. While the promise is in flight, sends
+/// of the old ballot still go out, which is seed 147's window, so only
+/// the gate keeps the ask in; once the promise is durable, the outbox
+/// drops them as well.
 #[test]
 fn a_voter_that_promised_a_later_ballot_does_not_ask_for_a_reproposal() {
     let FencedOffReproposal { mut f, b, d, x, .. } = fenced_off_reproposal_a_sync_entry_names();
-    // r0's campaign for a later ballot: r1 promises it durably.
-    step_durably(
-        &mut f,
-        peer_event(
-            r(0),
-            ProtocolMessage::NewLeader {
-                ballot: ballot(2, 0),
-                executed: ExecutionPosition::ZERO,
-            },
-        ),
+    let asks_for_d = |effects: &[Effect]| {
+        sent_to(effects, r(2)).iter().any(|m| {
+            matches!(
+                m,
+                ProtocolMessage::ProposalRequest { commands, .. } if commands.contains(&d)
+            )
+        })
+    };
+    // r0's campaign for a later ballot: r1's promise is in flight.
+    let promise = f.step(peer_event(
+        r(0),
+        ProtocolMessage::NewLeader {
+            ballot: ballot(2, 0),
+            executed: ExecutionPosition::ZERO,
+        },
+    ));
+    assert_eq!(
+        f.ballots().in_flight().map(|p| p.ballot),
+        Some(ballot(2, 0))
     );
-    assert_eq!(f.ballots().promised(), ballot(2, 0));
+    assert_eq!(
+        f.ballots().promised(),
+        b,
+        "the durable promise is still b's"
+    );
     assert_eq!(f.quorum().ballot(), b, "it still follows b");
     // r2, not knowing it is deposed, sends b's frontier.
     let asked = f.step(peer_event(
@@ -7421,14 +7437,20 @@ fn a_voter_that_promised_a_later_ballot_does_not_ask_for_a_reproposal() {
             through: 0,
         },
     ));
-    let to_leader = sent_to(&asked, r(2));
-    assert!(
-        !to_leader.iter().any(|m| matches!(
-            m,
-            ProtocolMessage::ProposalRequest { commands, .. } if commands.contains(&d)
-        )),
-        "{to_leader:?}"
-    );
+    assert!(!asks_for_d(&asked), "{:?}", sent_to(&asked, r(2)));
+    // And again once the promise is durable.
+    for e in durable_events(&promise) {
+        f.step(e);
+    }
+    assert_eq!(f.ballots().promised(), ballot(2, 0));
+    let asked = f.step(peer_event(
+        r(2),
+        ProtocolMessage::Committed {
+            ballot: b,
+            through: 0,
+        },
+    ));
+    assert!(!asks_for_d(&asked), "{:?}", sent_to(&asked, r(2)));
     assert!(
         f.table().phase_of(&x) < Some(Phase::Accept),
         "x still waits"
