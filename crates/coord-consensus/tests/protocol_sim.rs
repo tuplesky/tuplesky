@@ -864,6 +864,10 @@ struct Sim {
     reoffered: BTreeSet<CommandId>,
     /// Commands executed anywhere: each has a record that answers it.
     executed_anywhere: BTreeSet<CommandId>,
+    /// The command each node's current follower machine gave its
+    /// campaign up as `Behind` on, once counted: a machine that gave up
+    /// refuses every later campaign of its boot on the same command.
+    behind_counted: Vec<Option<CommandId>>,
     /// Faults have stopped.
     healing: bool,
     /// Entries and edges of the Syncs each node's current machine was
@@ -1048,6 +1052,22 @@ struct Stats {
     /// a catch-up window's batch (#269 review).
     storage_passes_skipped_campaigning: u64,
     storage_passes_skipped_window: u64,
+    /// Campaigns given up as `Behind` (task-d05), and of those the ones
+    /// on a command no voter had executed when it gave up: what the
+    /// selection names and no report carries, which no catch-up brings
+    /// either, so nobody leads until a voter that holds it does
+    /// (task-d119).
+    behind: u32,
+    behind_unexecuted: u32,
+    /// Possible-fast candidates selections dropped whose dependencies
+    /// reach a command no report holds and the candidate doesn't hold
+    /// decided, every selection made counted, summed over every follower
+    /// machine; and whether the run had any (task-d119's note).
+    unreported_drops: u64,
+    unreported_drop_runs: u32,
+    /// Selections bound that dropped a possible-fast candidate whose
+    /// dependencies reach a command no report holds (task-d119).
+    bound_unreported: u64,
 }
 
 /// FNV-1a over `bytes`, continuing from `hash`.
@@ -1136,6 +1156,7 @@ impl Sim {
             forgotten: BTreeSet::new(),
             reoffered: BTreeSet::new(),
             executed_anywhere: BTreeSet::new(),
+            behind_counted: vec![None; usize::from(n)],
             healing: false,
             sync_work: vec![0; usize::from(n)],
             sync_entries: vec![0; usize::from(n)],
@@ -1543,6 +1564,7 @@ impl Sim {
                 };
                 node.role = Some(Role::Follower(f));
                 self.window[usize::from(i)] = false;
+                self.behind_counted[usize::from(i)] = None;
                 if let Some(t) = self.trace.as_mut() {
                     t.push_back(format!("{:>5} node {i} deposed", self.step));
                 }
@@ -1594,6 +1616,9 @@ impl Sim {
                 self.stats.storage_passes_skipped += passes.skipped_storage;
                 self.stats.storage_passes_skipped_campaigning += passes.skipped_storage_campaigning;
                 self.stats.storage_passes_skipped_window += passes.skipped_storage_window;
+                let drops = f.unreported_drops();
+                self.stats.unreported_drops += drops.undecided;
+                self.stats.bound_unreported += drops.bound;
                 let q = f.quorum().clone();
                 let (mut l, effects) = Leader::from_recovered(f.into_recovered(), q, &decision);
                 l.set_learning(LearningMode::Full);
@@ -2648,6 +2673,17 @@ impl Sim {
             let why = match node.role.as_mut() {
                 Some(Role::Follower(f)) => {
                     let rejections = f.take_rejections();
+                    for r in &rejections {
+                        if let FollowerRejection::Behind { missing } = r
+                            && self.behind_counted[usize::from(i)] != Some(*missing)
+                        {
+                            self.behind_counted[usize::from(i)] = Some(*missing);
+                            self.stats.behind += 1;
+                            if !self.executed_anywhere.contains(missing) {
+                                self.stats.behind_unexecuted += 1;
+                            }
+                        }
+                    }
                     if let Some(t) = self.trace.as_mut() {
                         for r in &rejections {
                             let text = format!("{r:?}");
@@ -2794,6 +2830,7 @@ impl Sim {
         node.boot = node.boot.wrapping_add(1).max(1);
         let boot = node.boot;
         node.role = Some(Role::Follower(f));
+        self.behind_counted[usize::from(i)] = None;
         self.note(|| format!("restart node {i} at {}", bn(&active)));
         self.step_node(i, boot_event(boot));
     }
@@ -2941,6 +2978,9 @@ impl Sim {
             self.stats.storage_passes_skipped += passes.skipped_storage;
             self.stats.storage_passes_skipped_campaigning += passes.skipped_storage_campaigning;
             self.stats.storage_passes_skipped_window += passes.skipped_storage_window;
+            let drops = f.unreported_drops();
+            self.stats.unreported_drops += drops.undecided;
+            self.stats.bound_unreported += drops.bound;
         }
     }
 
@@ -3151,6 +3191,7 @@ impl Sim {
         for i in 0..self.n {
             self.fold_paths(i);
         }
+        self.stats.unreported_drop_runs = u32::from(self.stats.unreported_drops > 0);
         self.stats.ballots = self.highest_ballot;
         self.stats.gate_windows = self.gate_seen.len();
         let mut decisions = 0xcbf2_9ce4_8422_2325;
@@ -4367,6 +4408,11 @@ fn run_row(row: u8) {
                         totals.taken_ahead += s.taken_ahead;
                         totals.undecided_served += s.undecided_served;
                         totals.stopped_undecided += s.stopped_undecided;
+                        totals.behind += s.behind;
+                        totals.behind_unexecuted += s.behind_unexecuted;
+                        totals.unreported_drops += s.unreported_drops;
+                        totals.unreported_drop_runs += s.unreported_drop_runs;
+                        totals.bound_unreported += s.bound_unreported;
                     }
                     Err(e) => failures.push(e),
                 }
@@ -5087,6 +5133,63 @@ fn one_seed_from_the_environment() {
     }
     let stats = Sim::new(v[1] as u8, knobs, v[2]).run();
     println!("{stats:?}");
+}
+
+/// `PROTOCOL_SIM_RANGE=row,voters,from,to` runs those seeds and says
+/// what task-d119's note counts, summed: campaigns given up as `Behind`,
+/// and on a command no voter had executed; possible-fast candidates
+/// dropped behind a command no report holds and the candidate doesn't
+/// hold decided, and the runs with any; and selections bound with a
+/// candidate dropped behind a command no report holds. The loss of
+/// acknowledgements to followers and catch-up are the environment's, as
+/// in a sweep; `PROTOCOL_SIM_HOLD`, `PROTOCOL_SIM_CAMPAIGN` and
+/// `PROTOCOL_SIM_CRASH` (parts per million) set those chances where the
+/// note's targeted runs did. Without it, nothing runs.
+#[test]
+fn seeds_from_the_environment() {
+    let Ok(spec) = std::env::var("PROTOCOL_SIM_RANGE") else {
+        return;
+    };
+    let v: Vec<u64> = spec.split(',').map(|x| x.trim().parse().unwrap()).collect();
+    let (row, n) = (v[0] as u8, v[1] as u8);
+    let mut knobs = row_knobs(row);
+    let chance = |name: &str| std::env::var(name).ok().and_then(|s| s.parse::<u32>().ok());
+    if let Some(hold) = chance("PROTOCOL_SIM_HOLD") {
+        knobs.hold = hold;
+    }
+    if let Some(campaign) = chance("PROTOCOL_SIM_CAMPAIGN") {
+        knobs.campaign = campaign;
+    }
+    if let Some(crash) = chance("PROTOCOL_SIM_CRASH") {
+        knobs.crash = crash;
+    }
+    let mut totals = Stats::default();
+    let mut failures = Vec::new();
+    for seed in v[2]..v[3] {
+        match run_knobs(n, knobs, seed, None) {
+            Ok(s) => {
+                totals.behind += s.behind;
+                totals.behind_unexecuted += s.behind_unexecuted;
+                totals.unreported_drops += s.unreported_drops;
+                totals.unreported_drop_runs += s.unreported_drop_runs;
+                totals.bound_unreported += s.bound_unreported;
+            }
+            Err(e) => failures.push(e),
+        }
+    }
+    println!(
+        "row {row} at {n} voters, seeds {}..{}: behind {} (on a command no voter executed {}), \
+         unreported drops {} in {} runs, bound past an unreported dependency {}, failed {}",
+        v[2],
+        v[3],
+        totals.behind,
+        totals.behind_unexecuted,
+        totals.unreported_drops,
+        totals.unreported_drop_runs,
+        totals.bound_unreported,
+        failures.len()
+    );
+    assert_none_failed(&failures);
 }
 
 /// Row 21's queue failure reaches the order `coordd`'s journal fails a

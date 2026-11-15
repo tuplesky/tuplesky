@@ -495,21 +495,36 @@ pub fn select_ruled(
         source_configuration,
         decided,
         rules,
-        &Cell::new(0),
+        &SelectionCounts::default(),
     )
 }
 
-/// [`select_ruled`], adding to `work` a step for every record, dependency
-/// and order fact the selection reads (task-d108): what the tests bound
-/// its cost by.
-fn select_counted(
+/// What a selection counts besides what it selects.
+#[derive(Debug, Default)]
+pub(crate) struct SelectionCounts {
+    /// A step for every record, dependency and order fact the selection
+    /// reads (task-d108): what the tests bound its cost by.
+    pub(crate) work: Cell<u64>,
+    /// Possible-fast candidates the order check dropped whose
+    /// dependencies reach, through the selection and the member's report,
+    /// a command no report holds (task-d119).
+    pub(crate) unreported: Cell<u64>,
+    /// Of those, the ones where that command is one the candidate doesn't
+    /// hold decided either: a selection that names it is refused
+    /// ([`crate::follower::FollowerRejection::Behind`]) unless it reaches
+    /// the command only through a re-proposal.
+    pub(crate) unreported_undecided: Cell<u64>,
+}
+
+/// [`select_ruled`], adding to `counts` (task-d108, task-d119).
+pub(crate) fn select_counted(
     config: &BallotConfiguration,
     reports: &[RecoveryReport],
     supplied: impl Fn(&CommandId, Option<Digest32>) -> bool,
     source_configuration: impl Fn(&Ballot) -> Option<BallotConfiguration>,
     decided: &impl CandidateDecisions,
     rules: SelectionRules,
-    work: &Cell<u64>,
+    counts: &SelectionCounts,
 ) -> Result<SyncDecision, RecoveryError> {
     let mut seen = BTreeSet::new();
     for r in reports {
@@ -784,7 +799,7 @@ fn select_counted(
         &mut entries,
         &from_below,
         decided,
-        work,
+        counts,
     );
     for c in entries.keys() {
         reproposed.remove(c);
@@ -921,8 +936,9 @@ fn possible_fast_decisions(
     entries: &mut BTreeMap<CommandId, SyncEntry>,
     from_below: &BTreeSet<CommandId>,
     decided: &impl CandidateDecisions,
-    work: &Cell<u64>,
+    counts: &SelectionCounts,
 ) {
+    let work = &counts.work;
     let tick = || work.set(work.get().saturating_add(1));
     // The fast set of the source ballot: its own configuration where the
     // candidate knows it (task-d31), else the default rule every
@@ -1643,6 +1659,35 @@ fn possible_fast_decisions(
             settled
         };
         for c in dropped {
+            // What the dropped candidate's dependencies reach that no
+            // report holds (task-d119): read for the counts, not the
+            // selection, so not counted as its work.
+            let (e, member) = &candidates[&c];
+            let first = fast_reporters[*member];
+            let (mut unreported, mut undecided) = (false, false);
+            let mut seen = BTreeSet::new();
+            let mut stack: Vec<CommandId> = e.deps.clone();
+            while let Some(d) = stack.pop() {
+                if !seen.insert(d) {
+                    continue;
+                }
+                let reported = || by_report.iter().any(|b| b.contains_key(&d));
+                if let Some(x) = entries.get(&d) {
+                    stack.extend(x.deps.iter().copied());
+                } else if let Some((x, _)) = candidates.get(&d) {
+                    stack.extend(x.deps.iter().copied());
+                } else if decided.decided(&d) {
+                    unreported |= !reported();
+                } else if let Some(r) = by_report[first].get(&d) {
+                    stack.extend(r.deps.iter().copied());
+                } else if !reported() {
+                    unreported = true;
+                    undecided = true;
+                }
+            }
+            let add = |cell: &Cell<u64>, yes: bool| cell.set(cell.get() + u64::from(yes));
+            add(&counts.unreported, unreported);
+            add(&counts.unreported_undecided, undecided);
             candidates.remove(&c);
         }
     }
@@ -1759,7 +1804,7 @@ mod tests {
             (0..3).map(r).collect(),
         )
         .unwrap();
-        let work = Cell::new(0);
+        let counts = SelectionCounts::default();
         let decision = select_counted(
             &config,
             reports,
@@ -1767,7 +1812,7 @@ mod tests {
             |_| None,
             &|_: &CommandId| false,
             SelectionRules::default(),
-            &work,
+            &counts,
         )
         .unwrap();
         let adopted = decision
@@ -1775,7 +1820,7 @@ mod tests {
             .values()
             .filter(|e| e.phase == Phase::Accept)
             .count();
-        (work.get(), adopted)
+        (counts.work.get(), adopted)
     }
 
     /// Each step is a record, dependency or order fact read. Walked per
@@ -1831,7 +1876,7 @@ mod tests {
                 |_| None,
                 &|_: &CommandId| false,
                 SelectionRules::default(),
-                &Cell::new(0),
+                &SelectionCounts::default(),
             )
             .unwrap()
         };
@@ -1861,7 +1906,11 @@ mod tests {
     /// and the member decided C with the dependency {X}. The other reporter
     /// holds A and X, and D at an old pre-acceptance (`other_holds_d`) or
     /// not at all.
-    fn a_fast_candidate_behind_an_unheld_dependency(other_holds_d: bool) -> SyncDecision {
+    fn a_fast_candidate_behind_an_unheld_dependency(
+        other_holds_d: bool,
+        decided: &impl CandidateDecisions,
+        counts: &SelectionCounts,
+    ) -> SyncDecision {
         let epoch = ConfigurationEpoch::new(1).unwrap();
         let source =
             BallotConfiguration::c2_default(epoch, ballot(0, 0), (0..3).map(r).collect()).unwrap();
@@ -1895,9 +1944,9 @@ mod tests {
             &[report(member, of_member), report(other, of_other)],
             |_, _| false,
             |_| None,
-            &|_: &CommandId| false,
+            decided,
             SelectionRules::default(),
-            &Cell::new(0),
+            counts,
         )
         .unwrap()
     }
@@ -1912,24 +1961,39 @@ mod tests {
     /// the frontend learned.
     #[test]
     fn a_fast_candidate_behind_a_dependency_its_member_never_held_is_kept() {
-        let decision = a_fast_candidate_behind_an_unheld_dependency(true);
+        let counts = SelectionCounts::default();
+        let decision =
+            a_fast_candidate_behind_an_unheld_dependency(true, &|_: &CommandId| false, &counts);
         let kept = decision.entries.get(&id(15)).map(|e| e.deps.clone());
         assert_eq!(kept, Some(alloc::vec![id(10)]), "C kept with {{X}}");
         assert!(!decision.reproposed.contains(&id(15)), "C not re-proposed");
         assert!(decision.reproposed.contains(&id(5)), "D re-proposed");
+        // Nothing dropped, so nothing counted (task-d119).
+        assert_eq!(
+            (counts.unreported.get(), counts.unreported_undecided.get()),
+            (0, 0)
+        );
     }
 
-    /// KNOWN GAP, not a rule. This pins today's behaviour, which the
-    /// no-report note under task-d119 (the plan) keeps: that task closes
-    /// the way seed 147's member came to hold X without D, and a rule for
-    /// the other way waits for a run that reaches it.
+    /// KNOWN GAP in the selection, which the candidate closes. This pins
+    /// today's selection, which the no-report note under task-d119 (the
+    /// plan) keeps.
     ///
-    /// The same shape with no report holding D at all. Today the member's
+    /// The same shape with no report holding D at all. The member's
     /// closure stops at D, the order check reads that as an order that
-    /// leaves A out, and C is re-proposed. But a fast quorum decided C with
-    /// {X}: re-proposed, C may execute somewhere under other dependencies
-    /// than the frontend learned, which is seed 147's failure again if a
-    /// run reaches this shape. task-d71's model test
+    /// leaves A out, and C is re-proposed. A fast quorum decided C with
+    /// {X}, so a voter given C's re-proposal could execute it under other
+    /// dependencies than the frontend learned, seed 147's failure. None is
+    /// given it: X is selected naming D, which the selection neither
+    /// carries nor re-proposes, so a candidate that does not hold D
+    /// committed refuses to bind it and gives its campaign up as `Behind`
+    /// (`Follower::selection_gap`, task-d05; the activation test
+    /// `a_selection_naming_a_dependency_no_report_holds_is_given_up_as_behind`).
+    /// The cost is a stall, not a fork. A candidate that holds D decided
+    /// does bind it, and there the drop is right: it executed everything D
+    /// reaches, so an adopted A it has not executed runs after D at every
+    /// voter, and one it executed before D is read by `executed_before`
+    /// (the two tests after this one). task-d71's model test
     /// `a_candidate_after_a_command_executed_after_an_adopted_one_is_kept`
     /// re-proposes in the same shape ("nothing known, nothing kept") though
     /// its own story says c was decided fast. A rule that keeps C here must
@@ -1937,10 +2001,75 @@ mod tests {
     /// and forgot D before A (the test below).
     #[test]
     fn known_gap_a_fast_candidate_behind_a_dependency_no_report_holds_is_reproposed() {
-        let decision = a_fast_candidate_behind_an_unheld_dependency(false);
+        let counts = SelectionCounts::default();
+        let decision =
+            a_fast_candidate_behind_an_unheld_dependency(false, &|_: &CommandId| false, &counts);
         assert!(decision.reproposed.contains(&id(15)), "C re-proposed");
         assert!(!decision.entries.contains_key(&id(15)), "C not kept");
         assert!(!decision.reproposed.contains(&id(5)), "D held by no report");
+        assert!(decision.entries[&id(10)].deps.contains(&id(5)), "X names D");
+        // The drop the simulator counts (task-d119): C, behind D, which no
+        // report holds and the candidate does not hold decided.
+        assert_eq!(
+            (counts.unreported.get(), counts.unreported_undecided.get()),
+            (1, 1)
+        );
+    }
+
+    /// What the candidate executed, in order, for the known gap's bound
+    /// half (#308 review).
+    struct ExecutedInOrder(Vec<CommandId>);
+
+    impl CandidateDecisions for ExecutedInOrder {
+        fn decided(&self, command: &CommandId) -> bool {
+            self.0.contains(command)
+        }
+
+        fn executed_before(&self, first: &CommandId, then: &CommandId) -> bool {
+            let at = |c: &CommandId| self.0.iter().position(|e| e == c);
+            matches!((at(first), at(then)), (Some(a), Some(b)) if a < b)
+        }
+    }
+
+    /// The known gap's shape where the candidate executed and forgot D
+    /// and holds nothing else decided: the selection is bound (D is
+    /// committed at the candidate), and C is re-proposed. Rightly: the
+    /// candidate executed everything D reaches, and not A, so A runs after
+    /// D at every voter, and C with {X} does not reach A through D.
+    #[test]
+    fn a_fast_candidate_behind_a_dependency_only_the_candidate_decided_is_reproposed() {
+        let counts = SelectionCounts::default();
+        let decision = a_fast_candidate_behind_an_unheld_dependency(
+            false,
+            &ExecutedInOrder(alloc::vec![id(5)]),
+            &counts,
+        );
+        assert!(decision.reproposed.contains(&id(15)), "C re-proposed");
+        assert!(!decision.entries.contains_key(&id(15)), "C not kept");
+        // No report holds D, and the candidate holds it decided.
+        assert_eq!(
+            (counts.unreported.get(), counts.unreported_undecided.get()),
+            (1, 0)
+        );
+    }
+
+    /// The same, where the candidate also executed A, before D: its own
+    /// order says A ran before D, so C with {X} follows A through D, and
+    /// C is kept with the dependencies it was learned with.
+    #[test]
+    fn a_fast_candidate_behind_a_dependency_the_candidate_executed_after_a_is_kept() {
+        let counts = SelectionCounts::default();
+        let decision = a_fast_candidate_behind_an_unheld_dependency(
+            false,
+            &ExecutedInOrder(alloc::vec![id(0), id(5)]),
+            &counts,
+        );
+        let kept = decision.entries.get(&id(15)).map(|e| e.deps.clone());
+        assert_eq!(kept, Some(alloc::vec![id(10)]), "C kept with {{X}}");
+        assert_eq!(
+            (counts.unreported.get(), counts.unreported_undecided.get()),
+            (0, 0)
+        );
     }
 
     /// What any rule that closes the gap above must still do. No report
@@ -1983,7 +2112,7 @@ mod tests {
             |_| None,
             &|_: &CommandId| false,
             SelectionRules::default(),
-            &Cell::new(0),
+            &SelectionCounts::default(),
         )
         .unwrap();
         assert!(!decision.entries.contains_key(&id(15)), "C not kept");

@@ -6667,6 +6667,95 @@ fn interrupted_campaigns_leave_the_candidates_memory_flat() {
     assert_eq!(c.pages_held(), 0);
 }
 
+/// task-d119's no-report case at the candidate (#308 review): the
+/// recovery test `known_gap_a_fast_candidate_behind_a_dependency_no_report_holds_is_reproposed`
+/// shows the selection re-proposing C; this shows nothing binds it.
+///
+/// A member of the source ballot's fast set reports A and X at ACCEPT, X
+/// naming D, and C pre-accepted naming X, with no record of D: it holds X
+/// only through a Sync it has not finished installing (way (2), seed 147).
+/// The candidate holds none of them. The selection keeps X naming D and
+/// neither carries nor re-proposes D, and the candidate does not hold D
+/// committed, so it refuses to bind the selection (task-d05's selection
+/// gap) and gives its campaign up as `Behind` on D. Nothing is bound, so
+/// C's re-proposal reaches no voter; the cost is that this candidate does
+/// not campaign again this boot.
+#[test]
+fn a_selection_naming_a_dependency_no_report_holds_is_given_up_as_behind() {
+    let id = |n: u8| CommandId(Digest32([0x90 + n; 32]));
+    // All on one key, each after the one before.
+    let entry = |c: CommandId, phase: Phase, deps: &[CommandId]| {
+        let path = Digest32([1; 32]);
+        coord_consensus::ReportEntry {
+            command: c,
+            phase,
+            deps: deps.to_vec(),
+            path,
+            paths: vec![(vec![0], path)],
+            seqnum: 1,
+            keys: vec![vec![0]],
+            payload_present: true,
+            admission: None,
+        }
+    };
+    let (a, d, x, c) = (id(0), id(5), id(10), id(15));
+    let source = quorum(ballot(0, 0));
+    let member = (1u8..3)
+        .find(|v| source.fast_set().contains(&r(*v)))
+        .unwrap();
+    let candidate = 3 - member;
+    let mut f = standalone(candidate, 32);
+    let b = ballot(1, candidate);
+    let effects = f.campaign(b);
+    for e in durable_events(&effects) {
+        f.step(e);
+    }
+    f.step(peer_event(
+        r(member),
+        ProtocolMessage::Promise {
+            ballot: b,
+            synced: ballot(0, 0),
+            replica: r(member),
+        },
+    ));
+    let report = RecoveryReport {
+        replica: r(member),
+        ballot: b,
+        committed_ballot: ballot(0, 0),
+        entries: vec![
+            entry(a, Phase::Accept, &[]),
+            entry(x, Phase::Accept, &[d]),
+            entry(c, Phase::PreAccept, &[x]),
+        ],
+    };
+    for page in coord_consensus::paginate(&report, coord_consensus::MAX_PAGE_ENTRIES) {
+        f.step(peer_event(r(member), ProtocolMessage::ReportPage(page)));
+    }
+    let rejections = f.take_rejections();
+    assert!(
+        rejections.contains(&FollowerRejection::Behind { missing: d }),
+        "{rejections:?}"
+    );
+    assert!(f.campaign_state().is_none(), "the campaign was given up");
+    assert!(f.won().is_none());
+    // The selection dropped C behind D, which no report holds and the
+    // candidate does not hold decided; nothing was bound.
+    assert_eq!(
+        f.unreported_drops(),
+        coord_consensus::UnreportedDrops {
+            undecided: 1,
+            bound: 0
+        }
+    );
+    // It does not campaign again this boot.
+    assert!(f.campaign(ballot(2, candidate)).is_empty());
+    assert_eq!(
+        f.take_rejections(),
+        vec![FollowerRejection::Behind { missing: d }]
+    );
+    assert_eq!(f.ballots().promised(), b);
+}
+
 fn standalone(id: u8, capacity: usize) -> Follower {
     let mut f = Follower::new(FollowerConfig {
         identity: identity(id),
