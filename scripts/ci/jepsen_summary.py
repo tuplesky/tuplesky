@@ -2887,6 +2887,74 @@ def leader_loop_split(path: str, top: int = 25) -> list[str]:
     return out
 
 
+# The nemesis operations that are not faults: the quiescent barrier at
+# the end of a run (jepsen.tuplesky.barrier), which runs after the final
+# reads and so must not count as the final heal or end a throughput window.
+NOT_FAULTS = {":barrier"}
+
+
+def fault_ops(ops: list[Op]) -> list[Op]:
+    """The nemesis's completed fault operations, in order: each fault as
+    the nemesis logs it, without the end-of-run barrier."""
+    return [o for o in ops if o.process == ":nemesis" and o.type == "info" and o.f not in NOT_FAULTS]
+
+
+@dataclass
+class Barrier:
+    """The quiescent barrier's result, from the store's barrier.txt
+    (jepsen.tuplesky.barrier): whether every voter reached the highest
+    executed position within the bound, and each voter's row."""
+    result: str
+    bound_s: str
+    waited_s: str
+    target: str
+    voters: list[dict[str, str]]
+
+    @property
+    def behind(self) -> list[dict[str, str]]:
+        """The voters that didn't reach the target: a gap, or no line."""
+        return [v for v in self.voters if v.get("fresh") != "yes" or v.get("gap") != "0"]
+
+
+def read_barrier(store: str) -> Barrier | None:
+    """The store's barrier.txt, or None for a run without a barrier."""
+    path = os.path.join(store, "barrier.txt")
+    if not os.path.exists(path):
+        return None
+    fields = []
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            pairs = dict(w.split("=", 1) for w in line.split() if "=" in w)
+            if pairs:
+                fields.append(pairs)
+    if not fields or "result" not in fields[0]:
+        return None
+    head = fields[0]
+    return Barrier(head["result"], head.get("bound_s", "?"), head.get("waited_s", "?"),
+                   head.get("target", "-"), [v for v in fields[1:] if "node" in v])
+
+
+def barrier_section(b: Barrier | None) -> list[str]:
+    """The barrier's result and a row per voter; [] without one."""
+    if b is None:
+        return []
+    if b.result == "caught-up":
+        head = (f"**Barrier:** every voter reached executed position {b.target} "
+                f"{b.waited_s} s after the clients stopped (bound {b.bound_s} s).")
+    else:
+        names = ", ".join(v["node"] for v in b.behind) or "none named"
+        head = (f"**Barrier: not every voter caught up.** Within {b.bound_s} s of the clients stopping, "
+                f"{names} didn't reach the highest executed position, {b.target}.")
+    out = [head, "",
+           "| Voter | Executed | Gap | A metrics line since the barrier began | Running at the end |",
+           "| --- | --- | --- | --- | --- |"]
+    for v in b.voters:
+        out.append(f"| {v['node']} | {v.get('executed', '-')} | {v.get('gap', '-')} "
+                   f"| {v.get('fresh', '-')} | {v.get('running', '-')} |")
+    out.append("")
+    return out
+
+
 def node_of(op: Op, nodes: list[str]) -> str:
     """Jepsen binds worker thread N to node N mod the node count."""
     m = WORKER.match(op.thread)
@@ -3423,13 +3491,18 @@ def summarize(store: str, nodes: list[str], title: str, profile: str | None = No
     else:
         valid, anomalies = "no results.edn (the test did not finish)", []
     out.append(f"**Verdict:** `:valid? {valid}`" if not valid.startswith("no ") else f"**Verdict:** {valid}")
+    barrier = read_barrier(store)
+    if barrier is not None and barrier.result != "caught-up":
+        out.append("")
+        out.append("**Barrier: not every voter caught up** with the clients stopped: "
+                   + ", ".join(v["node"] for v in barrier.behind) + " (below).")
     if anomalies:
         out.append("")
         out.append("**Anomalies:** " + ", ".join(f"`{a}`" for a in anomalies))
     out.append("")
 
     client = [o for o in ops if not o.process.startswith(":")]
-    nemesis = [o for o in ops if o.process == ":nemesis" and o.type == "info"]
+    nemesis = fault_ops(ops)
     done = [o for o in client if o.type != "invoke"]
     if client:
         start = client[0].at
@@ -3524,6 +3597,11 @@ def summarize(store: str, nodes: list[str], title: str, profile: str | None = No
                 row_[1] += 1
                 row_[2]["no answer"] += 1
             if per:
+                # Every configured voter counts (#312 A): one no final read
+                # was sent to has served none.
+                for node in nodes:
+                    if node not in per:
+                        per[node][2]["no final read was invoked"] += 0
                 served = sum(1 for r in per.values() if r[0])
                 out.append(f"**After the final heal:** {served} of {len(per)} nodes served a final read.")
                 out.append("")
@@ -3531,9 +3609,11 @@ def summarize(store: str, nodes: list[str], title: str, profile: str | None = No
                 out.append("| --- | --- | --- | --- |")
                 for node in sorted(per):
                     ok, bad, why = per[node]
-                    reasons = "; ".join(f"`{r}` ×{n}" for r, n in why.most_common(3))
+                    reasons = "; ".join(f"`{r}` ×{n}" if n else r for r, n in why.most_common(3))
                     out.append(f"| {node} | {ok} | {bad} | {reasons} |")
                 out.append("")
+
+        out.extend(barrier_section(read_barrier(store)))
 
         fails = collections.Counter(reason(o) for o in done if o.type != "ok" and o.error)
         if fails:

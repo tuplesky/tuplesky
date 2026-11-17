@@ -776,6 +776,31 @@ jobs:
               return 1
             fi
           }
+          # The quiescent barrier (#313 T4, #312 A): after the final reads,
+          # with the clients stopped, every voter of each TupleSky run must
+          # reach the highest executed position within the jepsen-ref's
+          # --barrier-seconds (barrier.txt in its store). A run whose voter
+          # didn't fails the job and is named; a jepsen-ref without the
+          # barrier writes no barrier.txt, which is warned once.
+          barriers() {
+            local r label store bad=0 warned=0
+            for r in "$@"; do
+              label=${r%%=*}; store=${r#*=}
+              if [[ $label == etcd* || $label == swiftpaxos* ]]; then continue; fi
+              if [ ! -f "$store/barrier.txt" ]; then
+                if [ "$warned" = 0 ]; then
+                  echo "::warning::$label: no barrier.txt; tuplesky/jepsen@$JEPSEN_REF may have no end-of-run barrier, so no voter's catch-up was checked"
+                  warned=1
+                fi
+                continue
+              fi
+              if ! head -n 1 "$store/barrier.txt" | grep -q '^result=caught-up '; then
+                echo "::error::$label: not every voter reached the highest executed position at the barrier: $(awk '/^node=/ && !(/ fresh=yes/ && / gap=0 /) {sub(/^node=/, ""); printf "%s%s", sep, $0; sep="; "}' "$store/barrier.txt") ($(head -n 1 "$store/barrier.txt"))"
+                bad=1
+              fi
+            done
+            return $bad
+          }
           beside=""; if [ "$ETCD_BESIDE" = true ]; then beside=", beside etcd $ETCD_VERSION${ETCD_JEPSEN:+ on Jepsen $ETCD_JEPSEN}${ETCD_HEADLINE:+ with $ETCD_HEADLINE}${ETCD_SIDE_ROWS:+ (and ${ETCD_SIDE_ROWS// / and })}"; fi
           if [ "$SWIFTPAXOS_BESIDE" = true ]; then beside+=", beside SwiftPaxos"; fi
           if [ -z "$IN_PAIR_BASE" ] && [ -z "$SWEEP" ]; then
@@ -784,7 +809,7 @@ jobs:
             run_one "$GITHUB_WORKSPACE/tuplesky/target/release" "$RUNNER_TEMP" "$graph" \
               ${head_workers[@]+"${head_workers[@]}"} || rc=$?
             store=$(readlink -f store/latest || true)
-            if [ -n "$store" ]; then echo "$rc" > "$store/test-exit"; fi
+            if [ -n "$store" ]; then echo "$rc" > "$store/test-exit"; barriers "head=$store" || rc=1; fi
             # One run: the etcd baseline alone, with TLS where the input
             # asks for it (ETCD_HEADLINE), as a sweep's headline is; its
             # side rows need a sweep.
@@ -1065,6 +1090,7 @@ jobs:
               --title "TupleSky sweep: $head_sha (head)${base_name:+ and $base_name (base)}$beside, $WORKLOAD, $NEMESIS$TITLE_SUFFIX$STORE_SUFFIX$PROFILE_SUFFIX$CHECKPOINT_SUFFIX$WORKERS_SUFFIX$TUPLESKY_SUFFIX" \
               ${runs[@]+"${runs[@]}"} || compared=$?
             qualified "$compared" "the sweep"
+            barriers ${runs[@]+"${runs[@]}"} || rc=1
             # Every key on its whole group of threads, and no thread
             # stopped early: a run that isn't fails the job.
             key_groups ${runs[@]+"${runs[@]}"} || rc=1
@@ -1094,6 +1120,7 @@ jobs:
             --title "TupleSky pairs: $head_sha (head) against $base_name (base)$beside, $WORKLOAD, $NEMESIS$TITLE_SUFFIX$STORE_SUFFIX$PROFILE_SUFFIX$CHECKPOINT_SUFFIX$WORKERS_SUFFIX$TUPLESKY_SUFFIX" \
             ${runs[@]+"${runs[@]}"} || compared=$?
           qualified "$compared" "the pairs"
+          barriers ${runs[@]+"${runs[@]}"} || rc=1
           key_groups ${runs[@]+"${runs[@]}"} || rc=1
           exit $rc
       - name: Read how far each voter executed

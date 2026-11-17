@@ -1844,3 +1844,78 @@ class PartitionsTest(unittest.TestCase):
         os.remove(os.path.join(self.dir.name, "cpu-samples-nodes.csv"))
         text = js.summarize(self.dir.name, ["n1", "n2", "n3"], "TupleSky")
         self.assertIn("| n2 | 10 | 10.0 | - | - | - | 1.0 |", text)
+
+
+class BarrierTests(unittest.TestCase):
+    """#313 T4 / #312 A: the quiescent barrier at the end of a run, and the
+    final reads over every configured voter."""
+
+    # The barrier's operation comes after the final reads: it must not be
+    # read as the final heal, which would leave no final reads at all.
+    BARRIER_OPS = "".join(
+        [
+            file_line("10:01:52", "jepsen nemesis", ":nemesis\t:info\t:barrier\tnil"),
+            file_line("10:02:05", "jepsen nemesis",
+                      ':nemesis\t:info\t:barrier\t{:result :behind, :target 120}'),
+        ]
+    )
+
+    def store(self, d, barrier=None, log=LOG):
+        with open(os.path.join(d, "jepsen.log"), "w") as f:
+            f.write(log)
+        with open(os.path.join(d, "results.edn"), "w") as f:
+            f.write(RESULTS)
+        if barrier is not None:
+            with open(os.path.join(d, "barrier.txt"), "w") as f:
+                f.write(barrier)
+        return d
+
+    def test_fault_ops_leave_the_barrier_out(self):
+        ops = js.parse_ops((LOG + self.BARRIER_OPS).splitlines(keepends=True))
+        self.assertEqual([o.f for o in js.fault_ops(ops)], [":kill", ":kill", ":start"])
+
+    def test_the_barrier_is_not_the_final_heal(self):
+        with tempfile.TemporaryDirectory() as d:
+            text = js.summarize(self.store(d, log=LOG + self.BARRIER_OPS), ["n1", "n2"], "Jepsen")
+        self.assertIn("| 4 | 2 | 2 | 0 | 10:01:42 (+101 s) | 10:00:40 (+39 s) |", text)
+        self.assertIn("1 of 2 nodes served a final read", text)
+
+    def test_final_reads_count_every_configured_voter(self):
+        # n3 is configured but no final read was invoked on it: it counts,
+        # as a node that served none.
+        with tempfile.TemporaryDirectory() as d:
+            text = js.summarize(self.store(d), ["n1", "n2", "n3"], "Jepsen")
+        self.assertIn("1 of 3 nodes served a final read", text)
+        self.assertIn("| n3 | 0 | 0 | no final read was invoked |", text)
+
+    def test_caught_up(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.store(d, "result=caught-up bound_s=60 waited_s=12.1 target=120\n"
+                          "node=n1 executed=120 gap=0 fresh=yes running=yes\n"
+                          "node=n2 executed=120 gap=0 fresh=yes running=yes\n")
+            b = js.read_barrier(d)
+            text = js.summarize(d, ["n1", "n2"], "Jepsen")
+        self.assertEqual(b.behind, [])
+        self.assertIn("**Barrier:** every voter reached executed position 120 12.1 s after the clients stopped "
+                      "(bound 60 s).", text)
+        self.assertNotIn("not every voter caught up", text)
+
+    def test_behind_names_the_voters(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.store(d, "result=behind bound_s=60 waited_s=60.2 target=120\n"
+                          "node=n1 executed=120 gap=0 fresh=yes running=yes\n"
+                          "node=n2 executed=40 gap=80 fresh=yes running=yes\n"
+                          "node=n3 executed=- gap=- fresh=no running=no\n")
+            b = js.read_barrier(d)
+            text = js.summarize(d, ["n1", "n2", "n3"], "Jepsen")
+        self.assertEqual([v["node"] for v in b.behind], ["n2", "n3"])
+        self.assertIn("**Barrier: not every voter caught up** with the clients stopped: n2, n3 (below).", text)
+        self.assertIn("| n2 | 40 | 80 | yes | yes |", text)
+        self.assertIn("| n3 | - | - | no | no |", text)
+
+    def test_no_barrier(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertIsNone(js.read_barrier(d))
+            with open(os.path.join(d, "barrier.txt"), "w") as f:
+                f.write("garbage\n")
+            self.assertIsNone(js.read_barrier(d))

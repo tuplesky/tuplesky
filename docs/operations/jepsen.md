@@ -1059,7 +1059,23 @@ of lines. `scripts/ci/jepsen_summary.py` reads the test's store
   latency percentiles (p50, p95, p99, max) among the `ok` ones by then,
   from the log's millisecond times;
 * each node's final reads after the heal, and why the others failed,
-  which says whether the domain served again;
+  which says whether the domain served again. Every configured voter
+  counts, so one that no final read was sent to counts as serving none
+  (#312 A);
+* the quiescent barrier (#313 T4), from the store's `barrier.txt`. After
+  the final reads, with the clients stopped, every voter must reach the
+  highest executed position any voter reports within the `jepsen-ref`'s
+  `--barrier-seconds` (60 s by default). The positions are read live,
+  from each voter's `metrics` lines (`cost.executed`, every 10 s). Only a
+  line printed after the barrier began counts, so a voter that is down
+  or hung shows with no line, not at its stale position. The summary
+  gives each voter's position and gap, and flags a barrier not met next
+  to the verdict. The job fails on such a run and names the voters
+  behind. A `jepsen-ref` without the barrier (before `7fe33ba`) writes
+  no `barrier.txt`, and the job warns that no voter's catch-up was
+  checked. The barrier is a fault-package operation, but it isn't a
+  fault: it is left out of the final heal, the throughput window and
+  every fault table;
 * the commonest reasons an operation was not `ok`, and the faults in
   order;
 * each node back serving after each fault: the seconds from each

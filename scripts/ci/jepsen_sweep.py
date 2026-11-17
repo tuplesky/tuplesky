@@ -1045,7 +1045,7 @@ def read_step(side: str, step_name: str, store: str, rep: int = 1) -> Step:
     client = [o for o in ops if not o.process.startswith(":")]
     if not client:
         return step
-    nemesis = [o for o in ops if o.process == ":nemesis" and o.type == "info"]
+    nemesis = js.fault_ops(ops)
     start, end = window(client)
     if nemesis:
         end = nemesis[-1].at

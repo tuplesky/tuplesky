@@ -285,7 +285,7 @@ def read_run(label: str, store: str) -> Run:
     with open(log, encoding="utf-8", errors="replace") as f:
         ops = js.parse_ops(f.readlines())
     client = [o for o in ops if not o.process.startswith(":")]
-    nemesis = [o for o in ops if o.process == ":nemesis" and o.type == "info"]
+    nemesis = js.fault_ops(ops)
     heal = nemesis[-1].at if nemesis else None
     oks, secs, latencies = js.throughput(client, heal)
     if secs > 0:
