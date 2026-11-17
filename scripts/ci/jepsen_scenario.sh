@@ -182,6 +182,20 @@ elif [ "$workload" = register-swiftpaxos-mix ]; then
   workload=register register_mix=swiftpaxos
 fi
 nemesis=${IN_NEMESIS:-$nemesis}
+# lag-follower:SECS, alone, is #313 T4's no-traffic cell (jepsen.tuplesky's
+# --lag-follower): one follower killed 10 s into the workload and left down;
+# after the final reads, with no client running, it starts cut off from
+# every other node for SECS, is healed, and the barrier checks it catches
+# up. etcd's faults are none; SwiftPaxos keeps its own (its input or the
+# scenario's), so a dispatch of this cell skips it.
+lag_follower=""
+if [[ ",$nemesis," == *,lag-follower:* ]]; then
+  if ! [[ $nemesis =~ ^lag-follower:([0-9]+)$ ]] || [ "${BASH_REMATCH[1]}" = 0 ]; then
+    echo "::error::$nemesis: lag-follower:SECS is a cell of its own, with a positive whole SECS and no other fault, such as lag-follower:10" >&2
+    exit 1
+  fi
+  lag_follower=${BASH_REMATCH[1]} nemesis=none
+fi
 # A partition among the faults may carry TupleSky's partition options,
 # partition:TARGETS[:LO-HI[/EVERY]] (jepsen.tuplesky's --partition-targets
 # and --partition-seconds), such as partition:follower:5-10/60: one voter
@@ -598,6 +612,10 @@ case ${IN_LEADER_PROFILE:-false} in
     fi ;;
 esac
 
+if [ -n "$lag_follower" ]; then
+  tuplesky_suffix+=", a follower killed at 10 s and started cut off for $lag_follower s with no traffic"
+fi
+
 tuplesky_suffix+=", admission $admission/s a frontend"
 
 out=${GITHUB_ENV:-/dev/stdout}
@@ -644,5 +662,6 @@ out=${GITHUB_ENV:-/dev/stdout}
   echo "KILL_TARGETS=$kill_targets"
   echo "PARTITION_TARGETS=$partition_targets"
   echo "PARTITION_SECONDS=$partition_seconds"
+  echo "LAG_FOLLOWER=$lag_follower"
   echo "TUPLESKY_SUFFIX=$tuplesky_suffix"
 } >> "$out"

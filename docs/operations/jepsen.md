@@ -1075,7 +1075,13 @@ of lines. `scripts/ci/jepsen_summary.py` reads the test's store
   no `barrier.txt`, and the job warns that no voter's catch-up was
   checked. The barrier is a fault-package operation, but it isn't a
   fault: it is left out of the final heal, the throughput window and
-  every fault table;
+  every fault table. `nemesis: lag-follower:SECS` is the barrier's
+  no-traffic cell (`--lag-follower`, #312 finding 3): one follower is
+  killed 10 s into the workload and left down. After the final reads,
+  with no client running, it starts cut off from every other node for
+  SECS, then is healed, so only catch-up can bring it back, and the
+  barrier checks that it does. It takes no other fault; etcd runs with
+  none, and SwiftPaxos keeps its own setting, so skip it;
 * the commonest reasons an operation was not `ok`, and the faults in
   order;
 * each node back serving after each fault: the seconds from each
