@@ -878,6 +878,8 @@ Bound buffers and close slow consumers with a resumption requirement. Do not sil
 
 **The retained strict authorization profile authorizes each selected output batch against an ordered authorization barrier.** Share a barrier only among batches already selected for that check, not as an indefinite lease. This prevents isolated frontends/observers from making new permission decisions from stale policy. Previously authorized bytes may arrive after revocation because the network cannot recall them. Observer policy/session replay and subscription admission are additional safeguards, not a replacement for this per-output requirement.
 
+**A voter's barrier is bounded in staleness (#312).** A voter's frontend reads the barrier from that voter's own store, and a voter cut off from the domain stops learning what the domain decides, revocations among them. So its policy answers only within an allowance (`[limits] max_policy_staleness_millis`, 5 s by default) of the last loop pass on which the voter had a leader and reached a majority. Here "had a leader" means it leads, or holds a link to the voter its promised ballot names. Past the allowance the barrier is unavailable, and every reader of one denies: binds are refused, output is withheld, and a watch's batch closes the watch. A voter that has seen no such pass since it started answers nothing from its policy. The peer plane's idle timeout is 5 s, so a cut-off voter stops about 10 s after it last heard the domain. Two cases are not bounded. One is a voter that is linked and led but behind the domain's decisions. The other is a process with no voter, which follows no ballot and so has no such signal.
+
 <a id="s6-5"></a>
 ### 6.5 Retries and ambiguous outcomes
 

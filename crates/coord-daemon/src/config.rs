@@ -89,6 +89,20 @@ pub struct Limits {
     /// ([`DEFAULT_MAX_ADMITTED_PER_SECOND`]).
     #[serde(default = "default_max_admitted_per_second")]
     pub max_admitted_per_second: u32,
+    /// How long, in milliseconds, a voter's frontend still answers from
+    /// its own policy after the last pass on which the voter had a leader
+    /// and reached a majority (#312). Past it, the policy barrier is
+    /// unavailable: binds are refused, output is withheld and watches
+    /// close, until the voter has both again. A voter that has had
+    /// neither since it started is past it.
+    ///
+    /// A voter cut off from the domain stops learning revocations. This
+    /// bounds how long it goes on authorizing from what it last learned:
+    /// the transport's idle timeout on the peer plane (5 s) for its links
+    /// to drop, then this. A local setting: no replicated result depends
+    /// on it.
+    #[serde(default = "default_max_policy_staleness_millis")]
+    pub max_policy_staleness_millis: u64,
 }
 
 /// The checkpoint interval in records a strict configuration that names
@@ -129,6 +143,15 @@ const fn default_max_admitted_per_second() -> u32 {
     DEFAULT_MAX_ADMITTED_PER_SECOND
 }
 
+/// The policy staleness a configuration that names none gets: with the
+/// peer plane's 5 s idle timeout, a cut-off voter stops authorizing from
+/// its own policy about 10 s after it last heard the domain (#312).
+pub const DEFAULT_MAX_POLICY_STALENESS_MILLIS: u64 = 5_000;
+
+const fn default_max_policy_staleness_millis() -> u64 {
+    DEFAULT_MAX_POLICY_STALENESS_MILLIS
+}
+
 /// The command table capacity a configuration that names none gets: the
 /// largest (task-d20).
 pub const DEFAULT_COMMAND_TABLE_CAPACITY: usize = MAX_COMMAND_TABLE_CAPACITY;
@@ -165,6 +188,7 @@ impl Default for Limits {
             checkpoint_after_seconds: None,
             command_table_capacity: default_command_table_capacity(),
             max_admitted_per_second: default_max_admitted_per_second(),
+            max_policy_staleness_millis: default_max_policy_staleness_millis(),
         }
     }
 }

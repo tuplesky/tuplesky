@@ -1132,6 +1132,9 @@ pub struct Domain<P: Persistence> {
     renewals: Vec<Renewing>,
     /// When this voter campaigns (task-d01); `None` where no voter runs.
     election: Option<crate::election::Election>,
+    /// When this voter last had a leader and reached a majority, which
+    /// bounds how long its frontend answers from its own policy (#312).
+    recency: Recency,
     /// The ballot and role this voter last said it had, so the line is
     /// said when either changes and not on every turn.
     role_said: Option<(coord_types::ids::Ballot, bool)>,
@@ -1996,6 +1999,9 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             dialling: BTreeMap::new(),
             renewals: Vec::new(),
             election,
+            recency: Recency::new(std::time::Duration::from_millis(
+                coord_daemon::config::DEFAULT_MAX_POLICY_STALENESS_MILLIS,
+            )),
             role_said: None,
             fenced_said: 0,
             floor_said: coord_daemon::floor::FloorCounts::default(),
@@ -2017,6 +2023,23 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             answering: Vec::new(),
             answering_since: None,
         }
+    }
+
+    /// Answer from this voter's own policy for at most `allowance` after
+    /// the last pass on which it had a leader and reached a majority
+    /// (#312; `[limits] max_policy_staleness_millis`).
+    #[must_use]
+    pub fn policy_staleness(mut self, allowance: std::time::Duration) -> Self {
+        self.recency = Recency::new(allowance);
+        self
+    }
+
+    /// Whether this node's policy may still be read for an answer (#312):
+    /// a voter's while it is within its allowance of having had a leader
+    /// and a majority. A process with no voter has no such signal, and
+    /// is not bounded here.
+    fn policy_fresh(&self) -> bool {
+        self.election.is_none() || self.recency.fresh(std::time::Instant::now())
     }
 
     /// Wake when `materialized` is notified, and take back what the
@@ -3663,6 +3686,8 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 std::time::Instant::now(),
             );
             let majority = (held + 1) * 2 > voters;
+            self.recency
+                .observe(led, majority, std::time::Instant::now());
             let campaigning = voter.node().machine().campaigning();
             if let Some(why) =
                 election.observe(led, majority, campaigning, std::time::Instant::now())
@@ -4940,9 +4965,11 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         connection: u64,
         frame: &Frame,
     ) -> Option<Vec<u8>> {
+        let fresh = self.policy_fresh();
         retained_answer(
             &mut self.frontend.frontend,
             self.backing.applier().store(),
+            fresh,
             health,
             connection,
             frame,
@@ -4964,9 +4991,12 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         {
             return;
         }
-        let policy = ReadViewPolicy {
-            applier: self.backing.applier(),
-            budget: ViewBudget::default(),
+        let policy = Fresh {
+            source: ReadViewPolicy {
+                applier: self.backing.applier(),
+                budget: ViewBudget::default(),
+            },
+            fresh: self.policy_fresh(),
         };
         let delivery = match self.frontend.frontend.deliver(delivery, &policy) {
             Delivered::Answer(delivery) => delivery,
@@ -5066,9 +5096,12 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                     self.respond_inline(responder, answer).await;
                     return;
                 }
-                let policy = StorePolicySource {
-                    store: self.backing.applier().store(),
-                    budget: ViewBudget::default(),
+                let policy = Fresh {
+                    source: StorePolicySource {
+                        store: self.backing.applier().store(),
+                        budget: ViewBudget::default(),
+                    },
+                    fresh: self.policy_fresh(),
                 };
                 // Admission is the frontend's decision about this frame:
                 // verified and admitted, answered, or refused at the door.
@@ -5529,9 +5562,12 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             // and the close it was acknowledged with is written there.
             let mut lost = false;
             loop {
-                let policy = StorePolicySource {
-                    store: self.backing.applier().store(),
-                    budget: ViewBudget::default(),
+                let policy = Fresh {
+                    source: StorePolicySource {
+                        store: self.backing.applier().store(),
+                        budget: ViewBudget::default(),
+                    },
+                    fresh: self.policy_fresh(),
                 };
                 let frames = self
                     .frontend
@@ -6478,6 +6514,77 @@ impl core::fmt::Display for TransportError {
     }
 }
 
+/// When a voter last had a leader and reached a majority, and how long
+/// after that its own policy may still answer (#312).
+///
+/// A voter cut off from the domain stops learning what the domain
+/// decides, revocations among them, and its store goes on saying what
+/// it last learned. Its frontend reads policy from that store. So a
+/// caller bound to it, or binding to it, would go on being authorized
+/// from a policy the domain has since revoked, for as long as the
+/// partition lasted. This bounds that: each pass observes whether the
+/// voter is led -- it leads, or holds a link to the leader it promised
+/// -- and reaches a majority, and the policy answers only within the
+/// allowance of the last pass that saw both. A voter that has not seen
+/// both since it started answers nothing from its policy.
+///
+/// What it does not bound: a voter that is linked and led but lagging,
+/// whose links hold while it falls behind the domain's decisions; and a
+/// process with no voter, which follows no ballot and has no such
+/// signal.
+#[derive(Clone, Copy, Debug)]
+struct Recency {
+    /// The last pass that saw a leader and a majority.
+    last: Option<std::time::Instant>,
+    /// How long after it the policy may still answer.
+    allowance: std::time::Duration,
+}
+
+impl Recency {
+    const fn new(allowance: std::time::Duration) -> Self {
+        Recency {
+            last: None,
+            allowance,
+        }
+    }
+
+    /// A pass at `now` saw whether the voter was led and reached a
+    /// majority.
+    fn observe(&mut self, led: bool, majority: bool, now: std::time::Instant) {
+        if led && majority {
+            self.last = Some(now);
+        }
+    }
+
+    /// Whether the policy may answer at `now`.
+    fn fresh(&self, now: std::time::Instant) -> bool {
+        self.last
+            .is_some_and(|at| now.saturating_duration_since(at) <= self.allowance)
+    }
+}
+
+/// A policy source that reads nothing once its node's policy may be
+/// stale (#312): every barrier is unavailable, which every caller of
+/// one takes as a denial -- a bind refused, an establishment not
+/// confirmed, output withheld, a watch closed.
+struct Fresh<S> {
+    source: S,
+    fresh: bool,
+}
+
+impl<S: PolicySource> PolicySource for Fresh<S> {
+    fn barrier(
+        &self,
+        namespace: NamespaceId,
+        session: &SessionId,
+    ) -> Result<AuthorizationBarrier, PolicyError> {
+        if !self.fresh {
+            return Err(PolicyError::Unavailable);
+        }
+        self.source.barrier(namespace, session)
+    }
+}
+
 /// Barriers over the view a read is served from (#281): the projection's
 /// snapshot with the journaled groups still in flight laid over it.
 ///
@@ -6515,8 +6622,9 @@ impl<P: Persistence> PolicySource for ReadViewPolicy<'_, P> {
 /// on: a request to admission, a resolve to the collector.
 ///
 /// [`Domain::retained`] with what it reads named: the frontend that holds
-/// the caller's binding and this node's store. Split out so it can be
-/// asked of a frontend bound on a node whose projection is behind.
+/// the caller's binding, this node's store, and whether its policy may
+/// still be read (#312). Split out so it can be asked of a frontend bound
+/// on a node whose projection is behind.
 ///
 /// A resolve is answered from the record too (task-d23). The collector
 /// remembers a bounded window of outcomes, and only those it collected
@@ -6528,6 +6636,7 @@ impl<P: Persistence> PolicySource for ReadViewPolicy<'_, P> {
 fn retained_answer<P: Persistence>(
     frontend: &mut BoundFrontend,
     store: &P,
+    fresh: bool,
     health: &ClockHealth,
     connection: u64,
     frame: &Frame,
@@ -6645,9 +6754,12 @@ fn retained_answer<P: Persistence>(
         retry_key: key,
         frame: MessageV1::Response(response).encode().ok()?,
     };
-    let policy = StorePolicySource {
-        store,
-        budget: ViewBudget::default(),
+    let policy = Fresh {
+        source: StorePolicySource {
+            store,
+            budget: ViewBudget::default(),
+        },
+        fresh,
     };
     match frontend.deliver_retained(delivery, command, &logical, &policy) {
         Delivered::Answer(delivery) => Some(delivery.frame),
@@ -7328,7 +7440,8 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
                 .encode()
                 .unwrap(),
         );
-        let answered = super::retained_answer(&mut frontend, &store, &health, CONNECTION, &request);
+        let answered =
+            super::retained_answer(&mut frontend, &store, true, &health, CONNECTION, &request);
         assert!(
             answered.is_none(),
             "a session this node has not projected was refused ahead of admission: {:?}",
@@ -7358,8 +7471,9 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
             })
             .unwrap();
         assert_eq!(store.flush().unwrap().committed, 1);
-        let refused = super::retained_answer(&mut frontend, &store, &health, CONNECTION, &request)
-            .expect("a retired session is refused");
+        let refused =
+            super::retained_answer(&mut frontend, &store, true, &health, CONNECTION, &request)
+                .expect("a retired session is refused");
         let messages = decode_stream(&refused).unwrap();
         let [MessageV1::Response(response)] = messages.as_slice() else {
             panic!("not one response")
@@ -7377,7 +7491,7 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
                       store: &StoreWorker<ModelEngine>,
                       frame: &Frame|
          -> Option<OutcomeV1> {
-            let bytes = super::retained_answer(frontend, store, &health, CONNECTION, frame)?;
+            let bytes = super::retained_answer(frontend, store, true, &health, CONNECTION, frame)?;
             match decode_stream(&bytes).unwrap().as_slice() {
                 [MessageV1::Response(response)] => Some(response.outcome.clone()),
                 other => panic!("{other:?}"),
@@ -7570,6 +7684,330 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
             code_of(answer(&mut frontend, &store, &request_frame(key6))),
             Some(coord_collector::codes::NOT_ADMITTED)
         );
+    }
+
+    /// A voter cut off from the domain stops authorizing from its own
+    /// policy once the allowance of its last pass with a leader and a
+    /// majority has passed (#312).
+    ///
+    /// The follower here keeps a live, bound client connection. The
+    /// domain revokes the caller's read through a majority the follower
+    /// is not part of, so the follower's own store goes on granting it.
+    /// Within the allowance it still answers from that store: that is the
+    /// bound, not zero. Past it, the same question is withheld and a new
+    /// bind is refused, until a pass sees a leader and a majority again.
+    #[test]
+    fn a_cut_off_voter_stops_answering_from_its_policy_after_the_allowance() {
+        use coord_authn::ClockHealth;
+        use coord_collector::{
+            Admission, AdmissionLimits, Collector, CollectorConfig, Dispatcher, MonotonicMillis,
+        };
+        use coord_core::effect::{BootId, PersistBatch};
+        use coord_core::outbox::BarrierAllocator;
+        use coord_session::{BindError, BindingConfig, BoundFrontend, Ingress, PolicySource as _};
+        use coord_state::Response;
+        use coord_state::plan::Outcome;
+        use coord_state::policy::{Action as PolicyAction, KeyInterval, PolicyRule};
+        use coord_storage::{GroupLimits, StoreWorker, WatchHub};
+        use coord_store_testkit::model::ModelEngine;
+        use coord_sts::{KeyRing, ServiceClaims, SigningKey};
+        use coord_types::ids::{
+            Ballot, ClientInstanceId, ClusterId, ConfigurationEpoch, DomainId, KvRevision,
+            NamespaceId, PolicyRuleId, PrincipalId, ReplicaId, ReplicaIncarnation, RequestSequence,
+            SessionId,
+        };
+        use coord_types::logical_v1::{CanonicalOperation, KeyRange, LogicalRequest, RangeOp};
+        use coord_types::wire_v1::{
+            Frame, FrameReader, MessageV1, OutcomeV1, RequestV1, decode_stream,
+        };
+        use coord_types::{CommandId, RetryKey};
+        use std::time::{Duration, Instant};
+
+        const CLUSTER: ClusterId = ClusterId([1; 16]);
+        const DOMAIN: DomainId = DomainId([2; 16]);
+        const SESSION: SessionId = SessionId([3; 16]);
+        const ALICE: PrincipalId = PrincipalId([0xa; 16]);
+        const NS: NamespaceId = NamespaceId([5; 16]);
+        const NOW: u64 = 1_700_000_000;
+        const CONNECTION: u64 = 7;
+        let frame_of = |bytes: &[u8]| -> Frame {
+            let mut reader = FrameReader::new();
+            reader.push(bytes).unwrap();
+            reader.next_frame().unwrap().unwrap()
+        };
+        let health = ClockHealth::healthy(NOW, 5);
+        fn policy(
+            store: &StoreWorker<ModelEngine>,
+            fresh: bool,
+        ) -> super::Fresh<coord_session::StorePolicySource<'_, StoreWorker<ModelEngine>>> {
+            super::Fresh {
+                source: coord_session::StorePolicySource {
+                    store,
+                    budget: coord_storage::views::ViewBudget::default(),
+                },
+                fresh,
+            }
+        }
+
+        // The caller's read of `k`, and the rule that grants it.
+        let mut logical = LogicalRequest::new(
+            NS,
+            CanonicalOperation::Range(RangeOp {
+                range: KeyRange::exact(b"k".to_vec()),
+                revision: None,
+                limit: 0,
+                keys_only: false,
+                count_only: false,
+            }),
+        );
+        logical.canonicalize();
+        let rule = PolicyRuleId([1; 16]);
+        let grant = coord_storage::policy::rule_update(
+            &rule,
+            &PolicyRule {
+                principal: ALICE,
+                action: PolicyAction::Read,
+                namespace: NS,
+                interval: KeyInterval {
+                    lower: vec![],
+                    upper: Some(b"z".to_vec()),
+                },
+            },
+        )
+        .unwrap();
+        let retry = RetryKey {
+            cluster_id: CLUSTER,
+            domain_id: DOMAIN,
+            session_id: SESSION,
+            client_instance_id: ClientInstanceId([4; 16]),
+            request_sequence: RequestSequence::new(2).unwrap(),
+        };
+        let command = CommandId::derive(&retry, &logical).unwrap();
+        // The read executed: its retained result, with the payload row
+        // that says what it asked (task-d23).
+        let response = postcard::to_allocvec(&Response {
+            revision: KvRevision::new(3).unwrap(),
+            outcome: Outcome::Range {
+                items: vec![],
+                count: 0,
+                more: false,
+            },
+        })
+        .unwrap();
+        let digest = coord_storage::retry::result_digest(&response);
+        let position = coord_types::ids::ExecutionPosition::new(3).unwrap();
+        let mut updates =
+            coord_storage::policy::bootstrap_session(&SESSION, ALICE, 4, true).unwrap();
+        updates.push(grant.clone());
+        updates.push(coord_core::StoreUpdate {
+            collection: coord_store_api::Collection::RetryV1.id(),
+            key: coord_storage::codecs::retry_key(&retry),
+            value: Some(
+                coord_storage::codecs::encode_retry(&coord_storage::codecs::RetryRecordV1 {
+                    command_id: command,
+                    position,
+                    revision: None,
+                    result_digest: digest,
+                    response,
+                })
+                .unwrap(),
+            ),
+        });
+        updates.push(
+            coord_consensus::rows::payload_update(
+                &command,
+                &coord_consensus::PayloadRecordV1 {
+                    retry_key: retry,
+                    logical: logical.canonical_bytes().unwrap(),
+                    admission: None,
+                    ack_through: 0,
+                },
+            )
+            .unwrap(),
+        );
+        updates
+            .push(coord_storage::retry::executed_update(&command, position, None, digest).unwrap());
+
+        // The follower, and a voter of the majority, with the same state.
+        let incarnation = ReplicaIncarnation::new(1).unwrap();
+        let boot = BootId([1; 16]);
+        let mut barriers = BarrierAllocator::new(incarnation, boot);
+        let mut open = |updates: Vec<coord_core::StoreUpdate>| {
+            let mut store = StoreWorker::open(
+                ModelEngine::new(),
+                boot,
+                incarnation,
+                GroupLimits::default(),
+            )
+            .unwrap();
+            store
+                .submit(PersistBatch {
+                    barrier: barriers.allocate(),
+                    base: Some(store.application_base()),
+                    updates,
+                })
+                .unwrap();
+            assert_eq!(store.flush().unwrap().committed, 1);
+            store
+        };
+        let follower = open(updates.clone());
+        let majority = open(updates);
+        let hub = WatchHub::new(KvRevision::ZERO, KvRevision::ZERO);
+
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let ring = KeyRing::new(SigningKey::from_pkcs8_der("sts-1", &key.serialize_der()).unwrap());
+        let config = BindingConfig {
+            issuer: "https://sts.cluster-1".into(),
+            resource: "tuplesky://cluster-1".into(),
+            jwks: ring.jwks(),
+            cluster: CLUSTER,
+            domain: DOMAIN,
+        };
+        let epoch = ConfigurationEpoch::new(1).unwrap();
+        let voters: Vec<_> = (0..3u8).map(|i| ReplicaId([i; 16])).collect();
+        let quorum = coord_consensus::BallotConfiguration::c2_default(
+            epoch,
+            Ballot {
+                epoch,
+                number: 0,
+                leader: voters[0],
+            },
+            voters.into_iter().collect(),
+        )
+        .unwrap();
+        let mut frontend = BoundFrontend::new(
+            Dispatcher::new(
+                Admission::new(CLUSTER, DOMAIN, AdmissionLimits::default()),
+                Collector::new(CollectorConfig {
+                    quorum,
+                    max_pending: 64,
+                    max_resolved: 16,
+                    max_undelivered_bytes: usize::MAX,
+                }),
+                16,
+            ),
+            config.clone(),
+            4,
+            64,
+        );
+        let credential = ring
+            .sign(&ServiceClaims {
+                iss: config.issuer.clone(),
+                sub: hex(&ALICE.0),
+                aud: config.resource.clone(),
+                sid: hex(&SESSION.0),
+                scope: PolicyAction::FULL_CEILING,
+                rule: hex(&SESSION.0),
+                generation: 1,
+                jti: hex(&[9u8; 32]),
+                iat: NOW,
+                exp: NOW + 1000,
+            })
+            .unwrap()
+            .into_bytes();
+        let bind = frame_of(&coord_session::bind_frame(&credential).unwrap());
+        let request = frame_of(
+            &MessageV1::Request(RequestV1::new(retry, &logical, 0, 0).unwrap())
+                .encode()
+                .unwrap(),
+        );
+        let ask = |frontend: &mut BoundFrontend, fresh: bool| -> OutcomeV1 {
+            let bytes =
+                super::retained_answer(frontend, &follower, fresh, &health, CONNECTION, &request)
+                    .expect("the record answers");
+            match decode_stream(&bytes).unwrap().as_slice() {
+                [MessageV1::Response(response)] => response.outcome.clone(),
+                other => panic!("{other:?}"),
+            }
+        };
+        let withheld = |outcome: &OutcomeV1| {
+            matches!(outcome, OutcomeV1::Err { code, .. }
+                if *code == coord_collector::codes::OUTPUT_WITHHELD)
+        };
+
+        // Led, with a majority: the caller binds on the follower, a live
+        // connection, and its read is answered.
+        let allowance = Duration::from_secs(5);
+        let mut recency = super::Recency::new(allowance);
+        assert!(!recency.fresh(Instant::now()), "nothing seen yet");
+        let led = Instant::now();
+        recency.observe(true, true, led);
+        assert!(matches!(
+            frontend.on_frame(
+                &health,
+                MonotonicMillis::new(0),
+                CONNECTION,
+                &bind,
+                &hub,
+                &policy(&follower, recency.fresh(led))
+            ),
+            Ingress::Bound(_)
+        ));
+        assert!(matches!(
+            ask(&mut frontend, recency.fresh(led)),
+            OutcomeV1::Ok { .. }
+        ));
+
+        // The follower is cut off: no link to its leader, and then its
+        // leader's link but no majority. Neither is a pass that counts.
+        recency.observe(false, false, led + Duration::from_secs(1));
+        recency.observe(true, false, led + Duration::from_secs(2));
+        // The majority revokes the read. The follower never learns it:
+        // its store still grants what the majority's no longer does.
+        let mut revoke = grant;
+        revoke.value = None;
+        let mut majority = majority;
+        majority
+            .submit(PersistBatch {
+                barrier: barriers.allocate(),
+                base: Some(majority.application_base()),
+                updates: vec![revoke],
+            })
+            .unwrap();
+        assert_eq!(majority.flush().unwrap().committed, 1);
+        let read_granted = |store: &StoreWorker<ModelEngine>| {
+            policy(store, true)
+                .barrier(NS, &SESSION)
+                .unwrap()
+                .permits_read(b"k")
+        };
+        assert!(!read_granted(&majority), "the majority revoked it");
+        assert!(read_granted(&follower), "the follower never learned it");
+
+        // Within the allowance, the follower still answers from its store.
+        let edge = led + allowance;
+        assert!(matches!(
+            ask(&mut frontend, recency.fresh(edge)),
+            OutcomeV1::Ok { .. }
+        ));
+        // Past it, nothing more: the read is withheld, and a new bind is
+        // refused.
+        let past = edge + Duration::from_millis(1);
+        assert!(!recency.fresh(past));
+        let answered = ask(&mut frontend, recency.fresh(past));
+        assert!(withheld(&answered), "{answered:?}");
+        assert!(matches!(
+            frontend.on_frame(
+                &health,
+                MonotonicMillis::new(0),
+                CONNECTION + 1,
+                &bind,
+                &hub,
+                &policy(&follower, recency.fresh(past))
+            ),
+            Ingress::Rejected(BindError::Unavailable)
+        ));
+        // Control: the follower's store alone would have answered.
+        assert!(matches!(ask(&mut frontend, true), OutcomeV1::Ok { .. }));
+        // A pass with a leader and a majority opens it again. A voter led
+        // and linked answers from its own store, caught up or not: the
+        // lagging voter this does not bound.
+        let back = past + Duration::from_secs(1);
+        recency.observe(true, true, back);
+        assert!(matches!(
+            ask(&mut frontend, recency.fresh(back)),
+            OutcomeV1::Ok { .. }
+        ));
     }
 
     /// Held evidence registers when it is due to be let go.
@@ -9586,6 +10024,35 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
                     .projection_commit_due(),
                 None
             );
+        }
+
+        /// Only a pass that sees a leader and a majority opens a voter's
+        /// policy (#312). A lone leader's turn does; a follower holding no
+        /// link to the voter it follows never does; and the allowance
+        /// runs out without another.
+        #[tokio::test]
+        async fn only_a_pass_with_a_leader_and_a_majority_opens_the_policy() {
+            let api = transport();
+            let hour = Duration::from_secs(3600);
+            let (leader, _commits) = held_leader(hour);
+            let mut leading = domain(leader, collector());
+            assert!(!leading.policy_fresh(), "nothing seen since it started");
+            leading.turn(&api).await.expect("a turn");
+            assert!(leading.policy_fresh(), "it leads, a majority of one");
+
+            let voters: std::collections::BTreeSet<ReplicaId> =
+                (1..=3u8).map(|n| ReplicaId([n; 16])).collect();
+            let (follower, _its_commits) = held_voter(ReplicaId([2; 16]), hour, voters);
+            let mut following = domain(follower, collector());
+            following.turn(&api).await.expect("a turn");
+            assert!(!following.policy_fresh(), "no link to the voter it follows");
+
+            let (leader, _lapsing_commits) = held_leader(hour);
+            let mut lapsing =
+                domain(leader, collector()).policy_staleness(Duration::from_millis(1));
+            lapsing.turn(&api).await.expect("a turn");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            assert!(!lapsing.policy_fresh(), "the allowance ran out");
         }
 
         /// A half-established entry's record is found within one commit

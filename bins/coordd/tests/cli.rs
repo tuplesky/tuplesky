@@ -1471,6 +1471,19 @@ fn start(config: &Path) -> Running {
     start_with(config, &[])
 }
 
+/// Wait for a restarted single voter to lead again before a caller
+/// binds to it. A voter answers from its own policy only once it has had
+/// a leader and a majority since it started (#312), and a restarted
+/// voter has neither until its campaign wins: a bind before that is
+/// refused.
+fn leads_again(daemon: &Running) {
+    assert!(
+        daemon.waits_until(60, |said| said.contains("this voter leads")),
+        "the restarted voter never led\n{}",
+        daemon.said()
+    );
+}
+
 /// Start `coordd` with `env` added to its environment and leave it
 /// serving.
 fn start_with(config: &Path, env: &[(&str, &str)]) -> Running {
@@ -2197,6 +2210,7 @@ async fn the_same_invocation_is_answered_the_same_way_after_a_restart() {
     // process that held it; what answers now is the record the command
     // left behind.
     let daemon = start(&path);
+    leads_again(&daemon);
     let caller = Caller::bind(&daemon, &ca, &ring, [0x44; 16]).await;
     let answer = ask(&caller.connection, &caller.put(1, b"k", b"v"))
         .await
@@ -2304,6 +2318,7 @@ async fn a_read_retried_after_a_restart_gets_its_retained_result() {
     );
 
     let daemon = start(&path);
+    leads_again(&daemon);
     let caller = Caller::bind(&daemon, &ca, &ring, [0x46; 16]).await;
     let answer = ask(&caller.connection, &caller.range(2, b"k"))
         .await
@@ -2676,13 +2691,21 @@ async fn one_co_located_voter_is_not_a_quorum() {
         .expect("written");
     send.finish().expect("finished");
 
-    // Held, not answered and not closed. The caller is waiting on
-    // evidence from two voters that are not running, which is the
-    // correct thing for it to be waiting on.
+    // Not acknowledged. Held, the caller waits on evidence from two
+    // voters that are not running, which is the correct thing for it to
+    // be waiting on. Or refused at the door: a voter that has not had a
+    // leader and a majority since it started does not read its policy
+    // (#312), and this one, alone of three, never has.
     let mut buf = [0u8; 4096];
     let early = tokio::time::timeout(Duration::from_secs(3), recv.read(&mut buf)).await;
+    let refused = matches!(
+        &early,
+        Ok(Err(quinn::ReadError::ConnectionLost(
+            quinn::ConnectionError::ApplicationClosed(close)
+        ))) if close.reason[..] == b"bind refused"[..]
+    );
     assert!(
-        early.is_err(),
+        early.is_err() || refused,
         "one voter established a session for a quorum of three: {early:?}"
     );
 }
@@ -4041,6 +4064,7 @@ async fn a_node_publishes_its_own_baseline_and_comes_back_on_it() {
     // the image was taken, so it is inside the image; the journal no
     // longer holds the records that produced it.
     let daemon = start(&path);
+    leads_again(&daemon);
     let caller = Caller::bind(&daemon, &ca, &ring, [0x44; 16]).await;
     let answer = ask(&caller.connection, &caller.put(1, b"k", b"v"))
         .await
@@ -4426,6 +4450,7 @@ async fn a_replacement_in_an_edited_genesis_is_quarantined_before_anything_is_ad
     std::fs::write(dir.join("collector.pem"), &retired_collector).expect("collector cert");
     std::fs::write(dir.join("collector.key"), &retired_collector_key).expect("collector key");
     let daemon = start(&path);
+    leads_again(&daemon);
     let caller = Caller::bind(&daemon, &ca, &ring, [0x5a; 16]).await;
     let answer = ask(&caller.connection, &caller.put(1, b"k", b"v"))
         .await
