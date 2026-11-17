@@ -143,7 +143,7 @@ jobs:
         run: |
           rustup show active-toolchain || rustup toolchain install
           cargo --version && rustc --version
-      - uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1 # v2.8.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: protocol-sim-sweep
       - name: Build the simulator (release)
@@ -208,7 +208,7 @@ jobs:
         run: |
           rustup show active-toolchain || rustup toolchain install
           cargo --version && rustc --version
-      - uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1 # v2.8.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: protocol-sim-sweep-checked
       - name: Build the simulator (release, debug checks on)
