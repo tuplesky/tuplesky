@@ -1066,7 +1066,14 @@ of lines. `scripts/ci/jepsen_summary.py` reads the test's store
   the final reads, with the clients stopped, every voter must reach the
   highest executed position any voter reports within the `jepsen-ref`'s
   `--barrier-seconds` (60 s by default). The positions are read live,
-  from each voter's `metrics` lines (`cost.executed`, every 10 s). Only a
+  from each voter's `metrics` lines, every 10 s: the executed rows the
+  voter's store keeps (`cost.intake_index.executed`, from `82e5972`).
+  `cost.executed` isn't a position: it counts what the running process
+  executed, so a voter restarted late reads low however far it is,
+  which failed `7fe33ba`'s barrier on a run whose stores all ended at
+  one position. A floor that forgets a prefix of executed rows lowers
+  the kept count, so a run with floors can show a gap that isn't lag;
+  each voter's `executed-at-end`, read from its store, tells which. Only a
   line printed after the barrier began counts, so a voter that is down
   or hung shows with no line, not at its stale position. The summary
   gives each voter's position and gap, and flags a barrier not met next
