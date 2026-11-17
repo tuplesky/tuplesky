@@ -2221,6 +2221,17 @@ mod tests {
                 steps <= bound,
                 "{steps} steps over {accepted} accepted, bound {bound}"
             );
+            // The walk's own steps, pinned (#310 review): the order check
+            // takes 84,074 here, and each dropped candidate's walk reads
+            // the chain once, `accepted + 1` steps. Left uncounted, the
+            // bounds above still hold.
+            if accepted == 250 {
+                assert_eq!(
+                    steps,
+                    84_074 + DROPPED * (accepted + 1),
+                    "the counting walk's steps over {accepted} accepted"
+                );
+            }
             if let Some(half) = before {
                 assert!(
                     steps * 10 <= half * 21,
