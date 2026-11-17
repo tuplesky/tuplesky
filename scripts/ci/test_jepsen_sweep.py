@@ -1,10 +1,13 @@
 """Tests for jepsen_sweep.py: python3 -m unittest test_jepsen_sweep (from scripts/ci)."""
 
 import datetime
+import io
 import json
 import os
+import sys
 import tempfile
 import unittest
+from unittest import mock
 
 import jepsen_sweep as sw
 
@@ -87,6 +90,8 @@ class SweepTests(unittest.TestCase):
         os.makedirs(path)
         with open(os.path.join(path, "jepsen.log"), "w") as f:
             f.writelines(history())
+        with open(os.path.join(path, "results.edn"), "w") as f:
+            f.write("{:workload {:valid? true},\n :valid? true}\n")
         if tuplesky:
             for node, served, loop in (("n1", 4, 3.0), ("n2", 0, 1.0)):
                 os.makedirs(os.path.join(path, node))
@@ -339,6 +344,52 @@ class SweepTests(unittest.TestCase):
         self.assertIn("| 30 | head | 1.00× | 1.00× | 1.00× | 1.00× | 1.00× | 1.00× | - |", text)
         # No etcd at 60: no ratio row for it.
         self.assertNotIn("| 60 | head | 1.00×", text)
+
+    def test_a_bad_baseline_gives_no_ratio_and_the_sweep_exits_3(self):
+        # #312, #8: an etcd run that failed, was cut short or left no
+        # verdict gives no ratio; the head's own rows stay.
+        cases = {
+            "invalid, exit 42": ({"results.edn": "{:valid? false}\n :valid? false}\n", "test-exit": "42\n"},
+                                 "the test exited with status 42; `:valid? false`"),
+            "interrupted": ({"test-exit": "124\n"}, "the test exited with status 124"),
+            "no results.edn": ({"results.edn": None}, "no results.edn (the test did not finish)"),
+            "no history": ({"jepsen.log": ""}, "no client operations in jepsen.log"),
+        }
+        head = self.store("h")
+        for i, (case, (files, why)) in enumerate(cases.items()):
+            with self.subTest(case):
+                etcd = self.store(f"e{i}", tuplesky=False)
+                for name, text in files.items():
+                    if text is None:
+                        os.remove(os.path.join(etcd, name))
+                    else:
+                        with open(os.path.join(etcd, name), "w") as f:
+                            f.write(text)
+                argv = ["jepsen_sweep.py", f"head@30={head}", f"etcd@30={etcd}"]
+                with mock.patch.object(sys, "argv", argv), mock.patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": ""}), \
+                        mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+                    self.assertEqual(sw.main(), 3)
+                text = out.getvalue()
+                self.assertIn("**Not qualified: 1 of 2 runs left out of every table below**", text)
+                self.assertIn(f"| 30 | etcd | `{etcd}` | {why} |", text)
+                self.assertIn("| 30 | head | 0.4 | 0.5 |", text)
+                self.assertNotIn("| 30 | etcd | 0.4 |", text)
+                self.assertNotIn("**Against etcd at the same step**", text)
+        argv = ["jepsen_sweep.py", f"head@30={head}", f"etcd@30={self.store('good', tuplesky=False)}"]
+        with mock.patch.object(sys, "argv", argv), mock.patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": ""}), \
+                mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            self.assertEqual(sw.main(), 0)
+        self.assertIn("**Against etcd at the same step**", out.getvalue())
+
+    def test_an_unqualified_head_measures_no_capacity(self):
+        good, bad = self.store("h1"), self.store("h2")
+        with open(os.path.join(bad, "test-exit"), "w") as f:
+            f.write("1\n")
+        steps = [sw.read_step("head", "30", good), sw.read_step("head", "30", bad, 2)]
+        self.assertIsNone(steps[0].unqualified)
+        self.assertEqual(steps[1].unqualified, "the test exited with status 1")
+        self.assertAlmostEqual(sw.capacity(steps, "30"), steps[0].completed_per_s)
+        self.assertIsNone(sw.capacity(steps[1:], "30"))
 
     def test_batching_by_voter(self):
         path = self.store("h120")
@@ -666,6 +717,19 @@ class BaselineTests(unittest.TestCase):
             "| 30 | head mean | - | 0.55× | 2.20× | - | - | - | - |",
         ])
         self.assertIn("etcd's with TLS on both planes", text)
+
+    def test_an_unqualified_baseline_run_leaves_the_mean(self):
+        # #312, #8: etcd-tls #2 was invalid, so the ratios are over #1 alone.
+        steps = [
+            self.made("head", 1, 1000.0, 1.0),
+            self.made("etcd-tls", 1, 2100.0, 0.55),
+            self.made("etcd-tls", 2, 1900.0, 0.45),
+        ]
+        steps[2].unqualified = "`:valid? false`"
+        text = sw.render(steps, "Sweep", "etcd-tls")
+        self.assertIn("**Not qualified: 1 of 3 runs left out of every table below**", text)
+        self.assertIn("| 30 | etcd-tls #2 | `/s` | `:valid? false` |", text)
+        self.assertIn("| 30 | head | - | 0.48× | 1.82× | - | - | - | - |", text)
 
     def test_without_the_baseline_at_a_step_no_ratio(self):
         text = sw.render([self.made("head", 1, 1000.0, 1.0), self.made("etcd", 1, 2000.0, 0.5)], "Sweep", "etcd-tls")

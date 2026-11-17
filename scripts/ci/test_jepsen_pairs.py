@@ -51,7 +51,12 @@ def store(root, name, read_ms, leader_loop_s, process_s):
         f.write(metrics(4, 1000, leader_loop_s, process_s))
     with open(os.path.join(path, "n2", "coordd.log"), "w") as f:
         f.write(metrics(0, 1000, 0.4, process_s))
+    with open(os.path.join(path, "results.edn"), "w") as f:
+        f.write(VALID)
     return path
+
+
+VALID = "{:workload {:valid? true},\n :valid? true}\n"
 
 
 class PairTests(unittest.TestCase):
@@ -370,6 +375,8 @@ class PairTests(unittest.TestCase):
             for i, second in enumerate((0, 3, 6, 10)):
                 f.write(op(f"10:00:{second:02d},000", i, "invoke"))
                 f.write(op(f"10:00:{second:02d},{read_ms:03d}", i, "ok"))
+        with open(os.path.join(path, "results.edn"), "w") as f:
+            f.write(VALID)
         if servers_s is not None:
             with open(os.path.join(path, "cpu-samples.csv"), "w") as f:
                 f.write("time,host_busy_s,host_total_s,cpus,servers_s,steal_s\n"
@@ -407,6 +414,75 @@ class PairTests(unittest.TestCase):
         self.assertIn("| 1 | head | 0.4 (1.00×) | 40 (4.00×) | 40 (4.00×) | - |", text)
         self.assertIn("| head, mean of 1 | 1.00× | 4.00× | 4.00× | - |", text)
         self.assertIn("no pair to compare", text)
+
+    # #312, #8: a baseline that failed, was cut short, left no verdict or
+    # no history gives no ratio, and the comparison says which and why.
+    BAD_BASELINES = {
+        "invalid, exit 42": ({"results.edn": "{:workload {:valid? false},\n :valid? false}\n", "test-exit": "42\n"},
+                             "the test exited with status 42; `:valid? false`"),
+        "valid, but interrupted": ({"results.edn": VALID, "test-exit": "124\n"}, "the test exited with status 124"),
+        "no results.edn": ({"results.edn": None}, "no results.edn (the test did not finish)"),
+        "unknown verdict": ({"results.edn": "{:workload {:valid? :unknown},\n :valid? :unknown}\n"},
+                            "`:valid? :unknown`"),
+        "no history": ({"jepsen.log": ""}, "no client operations in jepsen.log"),
+    }
+
+    def spoil(self, path, files):
+        for name, text in files.items():
+            if text is None:
+                os.remove(os.path.join(path, name))
+            else:
+                with open(os.path.join(path, name), "w") as f:
+                    f.write(text)
+
+    def test_a_bad_etcd_baseline_gives_no_ratio(self):
+        for case, (files, why) in self.BAD_BASELINES.items():
+            with self.subTest(case):
+                etcd = self.etcd_store("bad-" + case.replace(" ", "-").replace(",", ""), 10)
+                self.spoil(etcd.store, files)
+                argv = ["jepsen_pairs.py", "head=" + self.runs[1].store, "etcd=" + etcd.store]
+                with mock.patch.object(sys, "argv", argv), mock.patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": ""}), \
+                        mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+                    self.assertEqual(jp.main(), 3)
+                text = out.getvalue()
+                self.assertIn("**Not qualified: 1 of 2 runs left out of every table below**", text)
+                self.assertIn(f"| 2 | etcd | `{etcd.store}` | {why} |", text)
+                self.assertNotIn("×", text)
+                self.assertNotIn("**Against etcd on this runner**", text)
+
+    def test_a_bad_run_drops_its_pair_and_its_etcd_comparison_only(self):
+        # Pair 1 ran base#1, head#1, etcd#1; pair 2 head#2, base#2, etcd#2.
+        # Pair 2's base is invalid and pair 1's etcd run interrupted: no pair
+        # difference for pair 2, no etcd ratio for pair 1, and pair 2's head
+        # against its own etcd run.
+        def numbered(run, n):
+            run.pair = n
+            return run
+
+        self.spoil(self.runs[3].store, {"results.edn": "{:valid? false}\n :valid? false}\n"})
+        e1, e2 = self.etcd_store("e1", 10), self.etcd_store("e2", 20)
+        self.spoil(e1.store, {"test-exit": "124\n"})
+        runs = [jp.read_run(r.label, r.store) for r in self.runs]
+        runs = [numbered(runs[0], 1), numbered(runs[1], 1), numbered(jp.read_run("etcd", e1.store), 1),
+                numbered(runs[2], 2), numbered(runs[3], 2), numbered(jp.read_run("etcd", e2.store), 2)]
+        text = jp.render(runs, "Paired")
+        self.assertIn("**Not qualified: 2 of 6 runs left out of every table below**", text)
+        self.assertIn("| mean (smallest to largest) of 1 |", text)
+        self.assertIn("| 1 | etcd | 0.4 | 20 | 20 | - |", text)
+        self.assertIn("| 1 | head | 0.4 (1.00×) | 30 (1.50×) | 30 (1.50×) | - |", text)
+        self.assertNotIn("| base, mean of", text)
+        self.assertIn("| head, mean of 1 |", text)
+
+    def test_a_good_baseline_is_drawn_and_exits_0(self):
+        etcd = self.etcd_store("good", 10)
+        self.spoil(etcd.store, {"test-exit": "0\n"})
+        self.assertIsNone(jp.read_run("etcd", etcd.store).unqualified)
+        argv = ["jepsen_pairs.py", "head=" + self.runs[1].store, "etcd=" + etcd.store]
+        with mock.patch.object(sys, "argv", argv), mock.patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": ""}), \
+                mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            self.assertEqual(jp.main(), 0)
+        self.assertNotIn("Not qualified", out.getvalue())
+        self.assertIn("| 1 | head | 0.4 (1.00×) | 40 (4.00×) | 40 (4.00×) | - |", out.getvalue())
 
     def test_the_leaders_tails_and_early_copies_by_pair(self):
         def with_tails(path, slow_ms, early):

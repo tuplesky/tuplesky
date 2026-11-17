@@ -34,6 +34,13 @@ and, with `etcd` runs, each TupleSky run's ratio to its etcd run and each
 build's mean ratio,
 as Markdown, to `$GITHUB_STEP_SUMMARY` when it is set and to standard
 output either way.
+
+A run enters a difference, a ratio or a mean only when its test exited
+with status 0 (`test-exit`, which the workflow writes), it left client
+operations in `jepsen.log`, and its `results.edn` says `:valid? true`
+(`jepsen_summary.eligibility`; #312, #8). Any other run is listed, with
+why, and left out with its pair or its etcd comparison, and the script
+exits 3.
 """
 from __future__ import annotations
 
@@ -53,6 +60,9 @@ class Run:
     # The pair the run belongs to, where the job numbered it (LABEL#N): a
     # run that left no store is then a gap, not a shift.
     pair: int | None = None
+    # Why the run may not enter a comparison (`jepsen_summary.eligibility`),
+    # None when it may.
+    unqualified: str | None = None
     ok_per_s: float | None = None
     read_p99: float | None = None
     # Every `ok` operation's latency, whatever its function (ms).
@@ -268,6 +278,7 @@ RESEND = (
 
 def read_run(label: str, store: str) -> Run:
     run = Run(label, store)
+    run.unqualified = js.eligibility(store)
     log = os.path.join(store, "jepsen.log")
     if not os.path.exists(log):
         return run
@@ -790,7 +801,12 @@ def runner_models(runs: list[Run]) -> str:
 def etcd_table(runs: list[Run]) -> list[str]:
     """Each TupleSky run's measures and their ratio to its etcd run's, then
     each build's mean ratio, smallest to largest, over the etcd runs."""
-    groups = [(e, rs) for e, rs in beside_etcd(runs) if rs]
+    # Grouped as the job ran them, then without the runs that may not be
+    # compared: an etcd run that may not takes its group with it.
+    groups = [
+        (e, [r for r in rs if not r.unqualified]) for e, rs in beside_etcd(runs) if not e.unqualified
+    ]
+    groups = [(e, rs) for e, rs in groups if rs]
     if not groups:
         return []
     out = [
@@ -838,9 +854,34 @@ def etcd_table(runs: list[Run]) -> list[str]:
     return out
 
 
+def unqualified_table(runs: list[Run]) -> list[str]:
+    """The runs left out of every comparison, and why (#312, #8)."""
+    left = [(i, r) for i, r in enumerate(runs, 1) if r.unqualified]
+    if not left:
+        return []
+    out = [
+        f"**Not qualified: {len(left)} of {len(runs)} runs left out of every table below** (a run enters a "
+        "difference, a ratio or a mean only when its test exited with status 0, it left client operations in "
+        "`jepsen.log`, and its `results.edn` says `:valid? true`; a pair or an etcd comparison with such a run "
+        "in it is not drawn; each run's own summary and its store keep what it holds)",
+        "",
+        "| Run, in the order run | Build | Store | Why |",
+        "| --- | --- | --- | --- |",
+    ]
+    for i, r in left:
+        out.append(f"| {i} | {r.label}{f' #{r.pair}' if r.pair is not None else ''} | `{r.store}` | {r.unqualified} |")
+    out.append("")
+    return out
+
+
 def render(runs: list[Run], title: str) -> str:
     out = [f"## {title}", ""]
-    paired = pairs(runs)
+    out.extend(unqualified_table(runs))
+    # Paired as the job ran them, then the pairs with a run that may not be
+    # compared left out; the tables are over the runs that may.
+    paired = [(b, h) for b, h in pairs(runs) if not b.unqualified and not h.unqualified]
+    everyone = runs
+    runs = [r for r in runs if not r.unqualified]
     out.extend(
         group_tables(
             runs,
@@ -851,7 +892,7 @@ def render(runs: list[Run], title: str) -> str:
             "loop's CPU per command less the followers' mean)",
         )
     )
-    out.extend(etcd_table(runs))
+    out.extend(etcd_table(everyone))
     if any(getattr(r, a) is not None for r in runs for a, _, _ in TRAFFIC):
         out.extend(
             group_tables(
@@ -945,7 +986,9 @@ def main() -> int:
         sys.stdout.write(f"::group::{a.title}\n{text}::endgroup::\n")
     else:
         sys.stdout.write(text)
-    return 0
+    # 3: drawn, but a run was left out of it as not qualified, so the
+    # comparison is not one to cite as it stands.
+    return 3 if any(r.unqualified for r in runs) else 0
 
 
 if __name__ == "__main__":

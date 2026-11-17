@@ -68,6 +68,13 @@ over the step; and each TupleSky side's ratio to the etcd run at the same
 step, and SwiftPaxos's. It writes
 Markdown to `$GITHUB_STEP_SUMMARY` when it is set and to standard output
 either way.
+
+A run enters a table only when its test exited with status 0 (`test-exit`,
+which the workflow writes), it left client operations in `jepsen.log`, and
+its `results.edn` says `:valid? true` (`jepsen_summary.eligibility`; #312,
+#8). Any other run is listed, with why, and left out, so a pair with it is
+not drawn and a step whose baseline runs are all left out has no ratios;
+the script then exits 3, and `--capacity` reads only qualified head runs.
 """
 from __future__ import annotations
 
@@ -90,6 +97,9 @@ class Step:
     store: str
     # The side's Nth run at this step (`#N` in its label), 1 for the first.
     rep: int = 1
+    # Why the run may not enter a comparison (`jepsen_summary.eligibility`),
+    # None when it may.
+    unqualified: str | None = None
     ok_per_s: float | None = None
     completed_per_s: float | None = None
     completed: int = 0
@@ -402,7 +412,11 @@ def not_ok_table(steps: list[Step], top: int = 3) -> list[str]:
 def capacity(steps: list[Step], step: str) -> float | None:
     """The head's completions a second at a step, the mean of its runs
     there: what a later step's share of the capacity is a share of."""
-    values = [s.completed_per_s for s in steps if s.step == step and s.side == "head" and s.completed_per_s]
+    values = [
+        s.completed_per_s
+        for s in steps
+        if s.step == step and s.side == "head" and s.completed_per_s and not s.unqualified
+    ]
     return sum(values) / len(values) if values else None
 
 
@@ -1022,6 +1036,7 @@ def server_counts(step: Step, client: list) -> None:
 
 def read_step(side: str, step_name: str, store: str, rep: int = 1) -> Step:
     step = Step(side, step_name, store, rep)
+    step.unqualified = js.eligibility(store)
     log = os.path.join(store, "jepsen.log")
     if not os.path.exists(log):
         return step
@@ -1231,8 +1246,31 @@ def etcd_profile_table(steps: list[Step]) -> list[str]:
     return out
 
 
+def unqualified_table(steps: list[Step]) -> list[str]:
+    """The runs left out of every table, and why (#312, #8)."""
+    left = [s for s in steps if s.unqualified]
+    if not left:
+        return []
+    out = [
+        f"**Not qualified: {len(left)} of {len(steps)} runs left out of every table below** (a run enters a "
+        "difference, a ratio or a mean only when its test exited with status 0, it left client operations in "
+        "`jepsen.log`, and its `results.edn` says `:valid? true`; a pair with such a run in it is not drawn, and a "
+        "step whose baseline runs are all left out has no ratios; each run's own summary and its store keep what "
+        "it holds)",
+        "",
+        "| Step | Side | Store | Why |",
+        "| --- | --- | --- | --- |",
+    ]
+    for s in left:
+        out.append(f"| {name(s)} | `{s.store}` | {s.unqualified} |")
+    out.append("")
+    return out
+
+
 def render(steps: list[Step], title: str, baseline: str = "etcd") -> str:
     out = [f"## {title}", ""]
+    out += unqualified_table(steps)
+    steps = [s for s in steps if not s.unqualified]
     models = sorted({f"{s.model} ({s.cpus} CPUs)" for s in steps if s.model})
     if models:
         out += [f"**Runner:** {'; '.join(models)}", ""]
@@ -1657,7 +1695,9 @@ def main() -> int:
     if summary:
         with open(summary, "a") as f:
             f.write(text)
-    return 0
+    # 3: drawn, but a run was left out of it as not qualified, so the
+    # sweep is not one to cite as it stands.
+    return 3 if any(s.unqualified for s in steps) else 0
 
 
 if __name__ == "__main__":

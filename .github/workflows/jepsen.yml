@@ -674,23 +674,39 @@ jobs:
             "$ci/jepsen_bounded.sh" $((TIME_LIMIT + 1200)) "$RUNNER_TEMP/cluster/nodes" -- \
               "${common[@]}" --concurrency "$CONCURRENCY" ${STEP_RATE:+--rate "$STEP_RATE"} --bin-dir "$bin" "$@"
           }
+          # A comparison script's status $1, for the comparison named $2: 3
+          # when it left a run out as not qualified (its test failed, was
+          # cut short, or isn't `:valid? true`; #312, #8), which fails the
+          # job, since the comparison is not one to cite as it stands.
+          qualified() {
+            case $1 in
+              0) ;;
+              3) echo "::error::$2: a run was not qualified and was left out of every difference and ratio (Not qualified, in the summary)"; rc=1 ;;
+              *) echo "::warning::$2: the comparison ended with status $1" ;;
+            esac
+          }
           # With etcd beside TupleSky, the etcd test once on this runner and cluster,
           # its samples in $1, summarized as the etcd-baseline job's is and
           # named $2; its store in etcd_store.
           etcd_previous="" etcd_store=""
           etcd_one() {
-            local dir=$1 label=$2 snapshots=${3:-} secure=${4:-} store
+            local dir=$1 label=$2 snapshots=${3:-} secure=${4:-} store status=0
             mkdir -p "$dir"
             # $3: a snapshot count for this run; etcd's own default without.
             # $4: tls or tls+auth, this run secured (etcd-version VERSION+tls).
             (cd "$GITHUB_WORKSPACE" && ETCD_SNAPSHOT_COUNT=$snapshots ETCD_SECURE=$secure ETCD_RATE=${STEP_RATE:-$ETCD_RATE} "$ci/jepsen_etcd.sh" run "$dir/cpu-samples.csv") \
-              || echo "::warning::$label: the etcd test ended with status $?"
+              || status=$?
+            if [ "$status" != 0 ]; then echo "::warning::$label: the etcd test ended with status $status"; fi
             store=$(readlink -f "$GITHUB_WORKSPACE/etcd-test/store/latest" || true)
             if [ -z "$store" ] || [ "$store" = "$etcd_previous" ]; then
               echo "::warning::$label: the etcd test left no store"
               return 1
             fi
             etcd_previous=$store etcd_store=$store
+            # The test's status, which the comparisons read with its
+            # verdict: a run that failed, was cut short or isn't
+            # `:valid? true` gives no ratio (jepsen_summary.eligibility).
+            echo "$status" > "$store/test-exit"
             cp "$dir"/cpu-samples* "$store"/ 2>/dev/null || true
             python3 "$ci/jepsen_summary.py" "$store" --nodes-file "$RUNNER_TEMP/cluster/nodes" \
               --title "etcd $ETCD_VERSION${ETCD_JEPSEN:+ on Jepsen $ETCD_JEPSEN}${snapshots:+ at --snapshot-count $snapshots}${secure:+ with $secure}: $WORKLOAD, $NEMESIS$TITLE_SUFFIX$STORE_SUFFIX: $label" || true
@@ -701,7 +717,7 @@ jobs:
           # its store in swiftpaxos_store.
           swiftpaxos_previous="" swiftpaxos_store=""
           swiftpaxos_one() {
-            local dir=$1 label=$2 clients=$3 store
+            local dir=$1 label=$2 clients=$3 store status=0
             mkdir -p "$dir"
             (cd "$GITHUB_WORKSPACE/jepsen/swiftpaxos" && \
               unset JEPSEN_LEADER_PROFILE JEPSEN_LEADER_CALLGRAPH && \
@@ -715,13 +731,15 @@ jobs:
                 --rate "$RATE" \
                 --time-limit "$TIME_LIMIT" \
                 --concurrency "$clients") \
-              || echo "::warning::$label: the SwiftPaxos test ended with status $?"
+              || status=$?
+            if [ "$status" != 0 ]; then echo "::warning::$label: the SwiftPaxos test ended with status $status"; fi
             store=$(readlink -f "$GITHUB_WORKSPACE/jepsen/swiftpaxos/store/latest" || true)
             if [ -z "$store" ] || [ "$store" = "$swiftpaxos_previous" ]; then
               echo "::warning::$label: the SwiftPaxos test left no store"
               return 1
             fi
             swiftpaxos_previous=$store swiftpaxos_store=$store
+            echo "$status" > "$store/test-exit"
             cp "$dir"/cpu-samples* "$store"/ 2>/dev/null || true
             python3 "$ci/jepsen_summary.py" "$store" --nodes-file "$RUNNER_TEMP/cluster/nodes" \
               --title "SwiftPaxos: register, none, at $clients clients: $label" || true
@@ -766,6 +784,7 @@ jobs:
             run_one "$GITHUB_WORKSPACE/tuplesky/target/release" "$RUNNER_TEMP" "$graph" \
               ${head_workers[@]+"${head_workers[@]}"} || rc=$?
             store=$(readlink -f store/latest || true)
+            if [ -n "$store" ]; then echo "$rc" > "$store/test-exit"; fi
             # One run: the etcd baseline alone, with TLS where the input
             # asks for it (ETCD_HEADLINE), as a sweep's headline is; its
             # side rows need a sweep.
@@ -774,9 +793,11 @@ jobs:
             if [ "$ETCD_BESIDE" = true ] && [ -n "$store" ] \
               && etcd_one "$RUNNER_TEMP/etcd" "beside TupleSky${ETCD_HEADLINE:+, $ETCD_HEADLINE}" "" "${ETCD_HEADLINE:-}"; then
               cp "$RUNNER_TEMP"/cpu-samples* "$store"/ 2>/dev/null || true
+              compared=0
               python3 "$ci/jepsen_pairs.py" \
                 --title "TupleSky $head_sha$one_beside on one runner: $WORKLOAD, $NEMESIS$TITLE_SUFFIX$STORE_SUFFIX$PROFILE_SUFFIX$CHECKPOINT_SUFFIX$WORKERS_SUFFIX$TUPLESKY_SUFFIX" \
-                "head=$store" "etcd=$etcd_store" || true
+                "head=$store" "etcd=$etcd_store" || compared=$?
+              qualified "$compared" "the comparison with etcd"
             fi
             if [ "$SWIFTPAXOS_BESIDE" = true ]; then
               swiftpaxos_one "$RUNNER_TEMP/swiftpaxos" "beside TupleSky" "$SWIFTPAXOS_STEPS" || true
@@ -873,7 +894,7 @@ jobs:
           # when $2 is "graph", named $3 in its summary's title and $4 in
           # the final table.
           one_side() {
-            local side=$1 graph=$2 where=$3 label=$4 dir name store
+            local side=$1 graph=$2 where=$3 label=$4 dir name store status=0
             n=$((n + 1))
             dir="$RUNNER_TEMP/run-$n"
             local profile=$PROFILE
@@ -889,7 +910,7 @@ jobs:
               fi
               COORD_HARNESS_JOURNAL_PROFILE=$base_profile \
                 run_one "$base_bin" "$dir" "$graph" ${base_workers[@]+"${base_workers[@]}"} \
-                ${base_args[@]+"${base_args[@]}"} || rc=$?
+                ${base_args[@]+"${base_args[@]}"} || status=$?
               if [ -n "$harness_was" ]; then
                 export "$harness_name${harness_was}"
               elif [ -n "$harness_name" ]; then
@@ -897,15 +918,17 @@ jobs:
               fi
               name=$base_name
             else
-              run_one "$head_bin" "$dir" "$graph" ${head_workers[@]+"${head_workers[@]}"} || rc=$?
+              run_one "$head_bin" "$dir" "$graph" ${head_workers[@]+"${head_workers[@]}"} || status=$?
               name=$head_sha
             fi
+            if [ "$status" != 0 ]; then rc=$status; fi
             store=$(readlink -f store/latest || true)
             if [ -z "$store" ] || [ "$store" = "$previous" ]; then
               echo "::warning::$where, $side: the test left no store"
               return 0
             fi
             previous=$store
+            echo "$status" > "$store/test-exit"
             cp "$dir"/cpu-samples* "$dir"/leader-profile*.txt "$dir"/follower-profile*.txt "$dir"/transport-profile*.txt "$dir"/materializer-profile*.txt "$dir"/appender-profile*.txt "$store"/ 2>/dev/null || true
             for db in "$store"/n*/domain.redb; do
               [ -e "$db" ] || continue
@@ -1036,10 +1059,12 @@ jobs:
                 if [ -n "$capacity" ]; then echo "capacity at step $step: the head completed $capacity operations a second"; fi
               fi
             done
+            compared=0
             python3 "$ci/jepsen_sweep.py" \
               ${ETCD_HEADLINE:+--baseline "etcd-${ETCD_HEADLINE//+/}"} \
               --title "TupleSky sweep: $head_sha (head)${base_name:+ and $base_name (base)}$beside, $WORKLOAD, $NEMESIS$TITLE_SUFFIX$STORE_SUFFIX$PROFILE_SUFFIX$CHECKPOINT_SUFFIX$WORKERS_SUFFIX$TUPLESKY_SUFFIX" \
-              ${runs[@]+"${runs[@]}"} || true
+              ${runs[@]+"${runs[@]}"} || compared=$?
+            qualified "$compared" "the sweep"
             # Every key on its whole group of threads, and no thread
             # stopped early: a run that isn't fails the job.
             key_groups ${runs[@]+"${runs[@]}"} || rc=1
@@ -1064,9 +1089,11 @@ jobs:
               if etcd_one "$RUNNER_TEMP/run-$n" "pair $i${ETCD_HEADLINE:+, $ETCD_HEADLINE}" "" "${ETCD_HEADLINE:-}"; then runs+=("etcd#$i=$etcd_store"); fi
             fi
           done
+          compared=0
           python3 "$ci/jepsen_pairs.py" \
             --title "TupleSky pairs: $head_sha (head) against $base_name (base)$beside, $WORKLOAD, $NEMESIS$TITLE_SUFFIX$STORE_SUFFIX$PROFILE_SUFFIX$CHECKPOINT_SUFFIX$WORKERS_SUFFIX$TUPLESKY_SUFFIX" \
-            ${runs[@]+"${runs[@]}"} || true
+            ${runs[@]+"${runs[@]}"} || compared=$?
+          qualified "$compared" "the pairs"
           key_groups ${runs[@]+"${runs[@]}"} || rc=1
           exit $rc
       - name: Read how far each voter executed

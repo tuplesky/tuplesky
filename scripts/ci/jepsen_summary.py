@@ -423,6 +423,38 @@ def parse_results(text: str) -> tuple[str, list[str]]:
     return valid, anomalies
 
 
+def eligibility(store: str) -> str | None:
+    """Why a run's store may not enter a comparison (a ratio, a difference
+    or a mean over runs), or None when it may (#312, #8): its test exited
+    with status 0 (`test-exit`, where the workflow wrote one), it left a
+    `jepsen.log` with client operations, and its `results.edn` says
+    `:valid? true`. The store's own summary still shows what it holds."""
+    why = []
+    path = os.path.join(store, "test-exit")
+    if os.path.exists(path):
+        with open(path, encoding="utf-8", errors="replace") as f:
+            status = f.read().strip()
+        if status != "0":
+            why.append(f"the test exited with status {status or '(none recorded)'}")
+    log = os.path.join(store, "jepsen.log")
+    if not os.path.exists(log):
+        why.append("no jepsen.log")
+    else:
+        with open(log, encoding="utf-8", errors="replace") as f:
+            # To the first client operation, not the whole history.
+            if not any(not o.process.startswith(":") for line in f for o in parse_ops([line])):
+                why.append("no client operations in jepsen.log")
+    path = os.path.join(store, "results.edn")
+    if not os.path.exists(path):
+        why.append("no results.edn (the test did not finish)")
+    else:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            valid, _ = parse_results(f.read())
+        if valid != "true":
+            why.append(f"`:valid? {valid}`")
+    return "; ".join(why) or None
+
+
 def read_executed_at_end(node_dir) -> str:
     """The voter's highest executed position at the end, as the job wrote it
     from the store: "-" when there is no such file, "?" when it holds
