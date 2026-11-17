@@ -394,6 +394,17 @@ struct Knobs {
     /// installs such an entry from one that refuses it.
     /// `PROTOCOL_SIM_FORGET_EVERYWHERE=1` sets it.
     forget_everywhere: bool,
+    /// Every holder gone for good (task-d119's third option, #185). At
+    /// the first campaign given up as `Behind` on a command no voter
+    /// executed, while no voter leads and every voter that holds that
+    /// command, in its table or its durable rows, is down: with
+    /// `Some(true)` those voters never come back, their storage
+    /// destroyed; with `Some(false)` the moment is only marked, the
+    /// control. From the mark the run counts whether any voter led, the
+    /// campaigns given up as `Behind` and the boots of the voters left,
+    /// and while healing it restarts every live voter [`GONE_BOOTS`]
+    /// times more, as an operator's restarts would. `None`: neither.
+    holders_gone: Option<bool>,
 }
 
 impl Knobs {
@@ -447,6 +458,7 @@ impl Knobs {
         page: coord_consensus::MAX_CATCH_UP_COMMANDS,
         forget_rows: 0,
         forget_everywhere: false,
+        holders_gone: None,
     };
 
     /// These knobs with task-d98's early proposals and the three faults
@@ -832,6 +844,10 @@ const KEYS: usize = 4;
 /// admitted (oracle 6). In a round every message in flight is delivered,
 /// every journal completes, and every node executes what it can.
 const HEAL_BUDGET: u32 = 400;
+
+/// The restarts of every live voter while healing after
+/// `Knobs::holders_gone`'s mark, past the one healing starts with.
+const GONE_BOOTS: u32 = 3;
 /// Rounds between the frontend's offers of what has not settled.
 const OFFER_EVERY: u32 = 8;
 /// Rounds between the runtime's timers while healing.
@@ -903,6 +919,13 @@ struct Sim {
     /// campaign up as `Behind` on, once counted: a machine that gave up
     /// refuses every later campaign of its boot on the same command.
     behind_counted: Vec<Option<CommandId>>,
+    /// The commands campaigns were given up as `Behind` on, counted in
+    /// this check and not yet read by `Knobs::holders_gone`.
+    gave_up: Vec<CommandId>,
+    /// The voters `Knobs::holders_gone` destroyed: they never restart.
+    destroyed: BTreeSet<u8>,
+    /// The command `Knobs::holders_gone` marked its moment on.
+    gone_mark: Option<CommandId>,
     /// Faults have stopped.
     healing: bool,
     /// Entries and edges of the Syncs each node's current machine was
@@ -1108,6 +1131,16 @@ struct Stats {
     /// the run fails.
     bound_unreported: u64,
     bound_unreported_undecided: u64,
+    /// `Knobs::holders_gone`: the command its mark is on, the voters it
+    /// destroyed (a mask), whether any voter led from the mark on, the
+    /// campaigns given up as `Behind` from it and of those the ones on
+    /// the marked command, and the boots of the voters left from it.
+    gone_on: Option<CommandId>,
+    gone: u8,
+    led_after_gone: bool,
+    behind_after_gone: u32,
+    behind_after_gone_on_it: u32,
+    boots_after_gone: u32,
 }
 
 /// FNV-1a over `bytes`, continuing from `hash`.
@@ -1199,6 +1232,9 @@ impl Sim {
             reoffered: BTreeSet::new(),
             executed_anywhere: BTreeSet::new(),
             behind_counted: vec![None; usize::from(n)],
+            gave_up: Vec::new(),
+            destroyed: BTreeSet::new(),
+            gone_mark: None,
             healing: false,
             sync_work: vec![0; usize::from(n)],
             sync_entries: vec![0; usize::from(n)],
@@ -2790,6 +2826,7 @@ impl Sim {
                             if !self.executed_anywhere.contains(missing) {
                                 self.stats.behind_unexecuted += 1;
                             }
+                            self.gave_up.push(*missing);
                         }
                     }
                     if let Some(t) = self.trace.as_mut() {
@@ -2829,6 +2866,58 @@ impl Sim {
                 self.fail(&format!("node {i} stopped: {why}"));
             }
         }
+        for missing in core::mem::take(&mut self.gave_up) {
+            self.holders_gone(missing);
+        }
+        if self.gone_mark.is_some() && self.leader_index().is_some() {
+            self.stats.led_after_gone = true;
+        }
+    }
+
+    /// `Knobs::holders_gone`, at a campaign given up as `Behind` on
+    /// `missing`.
+    fn holders_gone(&mut self, missing: CommandId) {
+        let Some(destroy) = self.knobs.holders_gone else {
+            return;
+        };
+        if let Some(on) = self.gone_mark {
+            self.stats.behind_after_gone += 1;
+            self.stats.behind_after_gone_on_it += u32::from(on == missing);
+            return;
+        }
+        if self.executed_anywhere.contains(&missing) || self.leader_index().is_some() {
+            return;
+        }
+        let holders: Vec<u8> = (0..self.n)
+            .filter(|v| self.holds_anywhere(*v, &missing))
+            .collect();
+        if holders.is_empty() || holders.iter().any(|v| self.nodes[usize::from(*v)].alive()) {
+            return;
+        }
+        self.gone_mark = Some(missing);
+        self.stats.gone_on = Some(missing);
+        if destroy {
+            for v in &holders {
+                self.destroyed.insert(*v);
+                self.stats.gone |= 1u8 << *v;
+            }
+        }
+        self.note(|| {
+            format!(
+                "holders of {} gone ({}): {holders:?}",
+                short(&missing),
+                if destroy { "destroyed" } else { "marked" }
+            )
+        });
+    }
+
+    /// Whether node `v` holds `command`: in its table, or in a durable
+    /// record or payload row it would restart with.
+    fn holds_anywhere(&self, v: u8, command: &CommandId) -> bool {
+        let storage = &self.nodes[usize::from(v)].storage;
+        self.phase(v, command).is_some()
+            || dependency_rows(storage).iter().any(|(c, _)| c == command)
+            || payload_rows(storage).iter().any(|(c, _)| c == command)
     }
 
     /// Node `i` was given the Sync `d`: its table may hold that many
@@ -2877,6 +2966,12 @@ impl Sim {
 
     /// Restart node `i` from its durable rows, as `coordd` does.
     fn restart(&mut self, i: u8) {
+        if self.destroyed.contains(&i) {
+            return;
+        }
+        if self.gone_mark.is_some() {
+            self.stats.boots_after_gone += 1;
+        }
         let n = self.n;
         let node = &mut self.nodes[usize::from(i)];
         let promise = promise_row(&node.storage);
@@ -3759,6 +3854,16 @@ impl Sim {
         self.heal_start = start;
         for k in 0..HEAL_BUDGET {
             self.step = start + k;
+            // `Knobs::holders_gone`: every live voter restarts again, and
+            // each boot may campaign afresh.
+            if self.gone_mark.is_some() && k > 0 && k % (HEAL_BUDGET / (GONE_BOOTS + 1)) == 0 {
+                for i in 0..self.n {
+                    if self.nodes[usize::from(i)].alive() {
+                        self.crash(i);
+                        self.restart(i);
+                    }
+                }
+            }
             if k % OFFER_EVERY == 0 && self.leader_index().is_some() {
                 self.offer_unsettled();
             }
@@ -3799,6 +3904,11 @@ impl Sim {
         // run still holds every safety and budget oracle up to here, which
         // is what the sweep without catch-up is for (task-d71).
         if !self.catch_up {
+            return;
+        }
+        // With its holders destroyed the domain isn't meant to heal: the
+        // run reads what it did instead (`Knobs::holders_gone`).
+        if !self.destroyed.is_empty() {
             return;
         }
         let unsettled = self.unsettled();
@@ -4896,6 +5006,63 @@ fn the_two_campaign_stops_heal_when_another_donor_serves_the_record() {
     }
 }
 
+/// Option (c)'s permanent case (task-d121): the one voter that held a
+/// command another depends on loses its storage for good. Row 10 at
+/// three voters under task-d119's targeted schedule (acknowledgements to
+/// followers lost three times in four, no catch-up, holds, campaigns and
+/// crashes as its runs set them), seed 2135. Every voter is down, and
+/// node 2 alone holds the command in its rows, when a
+/// campaign is given up as `Behind` on it: a selection names it as a
+/// dependency and no report holds it. With node 2's storage destroyed,
+/// the two voters left are restarted three times more each while healing
+/// and neither ever leads: each campaign is given up as `Behind` on the
+/// same command, which nothing can bring back. With node 2's storage
+/// only marked, the same run leads again. Task-d121 reads such a
+/// dependency as undecided, and then this run leads.
+#[test]
+fn a_dependency_whose_only_holder_is_destroyed_leaves_the_domain_without_a_leader() {
+    let knobs = |destroy| Knobs {
+        peer_ack_loss: 750_000,
+        hold: 160_000,
+        campaign: 12_000,
+        crash: 5_000,
+        holders_gone: Some(destroy),
+        ..Knobs::row(10)
+    };
+    let run =
+        |destroy| run_knobs(3, knobs(destroy), 2135, Some(false)).unwrap_or_else(|e| panic!("{e}"));
+    let (gone, marked) = (run(true), run(false));
+    let Some(on) = gone.gone_on else {
+        panic!("seed 2135 no longer reaches a moment with every holder down: {gone:?}");
+    };
+    assert_eq!(
+        marked.gone_on,
+        Some(on),
+        "the control marks another command"
+    );
+    assert_eq!(gone.gone, 0b100, "not node 2 alone destroyed");
+    assert!(
+        !gone.led_after_gone,
+        "a voter led after {}'s only holder was destroyed",
+        short(&on)
+    );
+    assert!(
+        gone.behind_after_gone_on_it > 0,
+        "no campaign given up as `Behind` on {} after the mark",
+        short(&on)
+    );
+    assert!(
+        gone.boots_after_gone >= 2 * GONE_BOOTS,
+        "the two voters left booted {} times after the mark",
+        gone.boots_after_gone
+    );
+    assert!(
+        marked.led_after_gone,
+        "the control never led after the mark: the stall is not the destroyed storage's"
+    );
+    assert_eq!(marked.gone, 0, "the control destroyed storage");
+}
+
 /// Lever 2, step 1: followers' journals complete runs of batches at
 /// once, each run handed over as one step of storage events, under rows
 /// that crash leaders, repeat elections, fail payload batches with the
@@ -5331,11 +5498,29 @@ fn seeds_from_the_environment() {
     if let Some(crash) = chance("PROTOCOL_SIM_CRASH") {
         knobs.crash = crash;
     }
+    // `PROTOCOL_SIM_HOLDERS_GONE=1` destroys the holders, `=0` only marks
+    // the moment (`Knobs::holders_gone`); each run that reaches it says
+    // what followed.
+    if let Ok(gone) = std::env::var("PROTOCOL_SIM_HOLDERS_GONE") {
+        knobs.holders_gone = Some(gone == "1");
+    }
     let mut totals = Stats::default();
     let mut failures = Vec::new();
     for seed in v[2]..v[3] {
         match run_knobs(n, knobs, seed, None) {
             Ok(s) => {
+                if let Some(on) = s.gone_on {
+                    println!(
+                        "seed {seed}: holders of {} gone (mask {:b}), led after {}, \
+                         behind after {} ({} on it), boots after {}",
+                        short(&on),
+                        s.gone,
+                        s.led_after_gone,
+                        s.behind_after_gone,
+                        s.behind_after_gone_on_it,
+                        s.boots_after_gone
+                    );
+                }
                 totals.behind += s.behind;
                 totals.behind_unexecuted += s.behind_unexecuted;
                 totals.unreported_drops += s.unreported_drops;
